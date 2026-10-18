@@ -269,7 +269,7 @@ projection families so these surfaces do not grow as separate products inside th
 | Architecture | `docs/concepts/architecture.adoc`
 | Strategic roadmap | `docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc`
 | Tech debt register | `docs/10-quality/TECHNICAL_DEBT.adoc`
-| Multi-model review (Feb 2026) | `docs/MULTI_MODEL_ARCHITECTURE_REVIEW.md`
+| Multi-model review (Feb 2026) | `docs/MULTI_MODEL_ARCHITECTURE_REVIEW.md` (removed; in git history)
 |===
 
 == Section 2: Research-Grounded Design Direction
@@ -993,7 +993,7 @@ plan §"Recommended First Implementation Slice" item 7.
 ==== 6.1.1 AXIS Refactor
 
 Replace per-engine isolated index implementations with the SOLID redesign already
-proposed in `docs/SOLID_VECTOR_FRAMEWORK_REDESIGN.md`:
+proposed in `docs/SOLID_VECTOR_FRAMEWORK_REDESIGN.md` (removed; in git history):
 
 * **EngineCapabilities** trait declares supported indexes / quant / pruning / search modes.
 * **SearchStrategy** trait separates strategies (DirectScan, Hnsw, Ivf, Ann, ProgressiveQuant,
@@ -1934,10 +1934,10 @@ Each ADR is a sticky decision; new turns should not relitigate without explicit 
 | link:techdebt/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc[WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc]
 | Add `proximadb-records`, `proximadb-types`, `proximadb-buffer-pool` to the new-foundation-crates list. Add `proximadb-relational` to the modality-runtime list. Confirm the cleanup items in §10.4 of this spec.
 
-| link:../docs/_archive/reviews/SOLID_VECTOR_FRAMEWORK_REDESIGN.md[SOLID_VECTOR_FRAMEWORK_REDESIGN.md]
+| `SOLID_VECTOR_FRAMEWORK_REDESIGN.md` (removed 2026-10-17; in git history)
 | Already aligned. Reference Section 6.1 of this spec; bind the redesign to Phase F (workspace extraction of `proximadb-vector`).
 
-| link:../docs/_archive/reviews/MULTI_MODEL_ARCHITECTURE_REVIEW.md[MULTI_MODEL_ARCHITECTURE_REVIEW.md]
+| `MULTI_MODEL_ARCHITECTURE_REVIEW.md` (removed 2026-10-17; in git history)
 | Mark superseded by this spec for the architectural recommendations; the gap analysis in §1.2 of this spec carries the conclusions forward.
 |===
 

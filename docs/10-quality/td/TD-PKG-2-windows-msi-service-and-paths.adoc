@@ -1,0 +1,30 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PKG-2: the Windows MSI installs no service and splits config from the shortcuts
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-17). Found by reading `deploy/packaging/wix/proximadb.wxs`.
+| Priority | **MEDIUM** — the documented Windows service commands fail.
+| Component | `deploy/packaging/wix/proximadb.wxs`
+|===
+
+== Problems
+
+* There is no `ServiceInstall` element, so no `proximadb` Windows service exists:
+  `Start-Service proximadb` fails.
+* `config.toml` is installed next to the binaries in `C:\Program Files\ProximaDB\`, while
+  `C:\ProgramData\ProximaDB\` (the config directory the Start-menu shortcuts point at) is created
+  empty.
+* The MSI creates `C:\ProgramData\ProximaDBData\` empty, but the shipped `config.toml` is the
+  development config: every root is `/tmp/proximadb/…`, so data lands under `\tmp\proximadb\`
+  on the current drive.
+* The "ProximaDB Server" Start-menu shortcut runs from `C:\Program Files\ProximaDB\`, where a
+  non-elevated user cannot create `./log`, so the server's log appender panics at startup.
+
+== Fix
+
+Install a Windows service (`ServiceInstall` + `ServiceControl`) that runs the server with an
+explicit `--config`, place the config where the shortcuts and the service expect it, and add an
+install-and-start smoke to the Windows release job.

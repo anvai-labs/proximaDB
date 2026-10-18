@@ -125,10 +125,11 @@ Git worktrees isolate *source*, but two agents running servers/tests in parallel
 also share **runtime** state — TCP ports, data dirs, the Docker daemon,
 registries. Isolate those too:
 
-- **Server ports.** The default server binds 5678 (REST) / 5679 (gRPC) / 5680
-  (Flight) / 5433 (pgwire); two servers on the same port collide. Give each
-  agent's server its own ports via `PROXIMADB_REST_PORT` / `PROXIMADB_GRPC_PORT`
-  / `PROXIMADB_ARROW_IPC_PORT` (or `0` for an OS-assigned ephemeral port).
+- **Server ports.** The default server binds 5678 (REST, gRPC and Flight
+  multiplexed) and 5433 (pgwire); two servers on the same port collide. Give
+  each agent's server its own port with `-p <port>` and its own pgwire port in a
+  per-agent config (`[api] pg_port`). The `PROXIMADB_*_PORT` environment
+  variables are not read by any code.
 - **Point tests at your server.** Integration tests honor `REST_API_URL`
   (default `http://127.0.0.1:5678`) — set it to your agent's server so suites in
   different worktrees don't hit one shared instance. (A few legacy tests still

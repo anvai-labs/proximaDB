@@ -34,12 +34,11 @@ ROOT = Path(__file__).resolve().parents[1]
 SUPPORT_AUTHORITY = ROOT / "docs/SUPPORTED_SURFACE.adoc"
 
 # Customer-facing narrative docs in scope. Excludes the authority doc itself plus
-# internal/historical/design trees (_internal, _archive, 12-design, 06-internals).
+# internal/design trees (_internal, 12-design, 06-internals).
 SCOPE_GLOBS = [
     "README.adoc",
     "SUPPORTED_SURFACE.md",
     "docs/README.md",
-    "docs/INDEX.adoc",
     "docs/00-product/*.adoc",
     "docs/05-concepts/*.adoc",
     "docs/05-concepts/*.md",

@@ -1,0 +1,143 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TPC-DS evidence — spec Parquet layout + pruning ladder, per engine (2026-10-18)
+:toc: left
+:icons: font
+// status-as-of: 2026-10-18
+
+NOTE: Measured on a working-tree snapshot that predates develop's ADR-094 Layer A landing; the
+harness loaded via INSERT + `ALTER TABLE … MATERIALIZE`. The fixes and layout apply unchanged to
+Layer A files (same Parquet reader); re-run the ledger on develop to refresh the absolute numbers.
+
+[.lead]
+A/B of the TD-OLAPFMT-2 Parquet layout (page index, spec SBBF Bloom, declared sort order) and
+read-side pruning (page-index `RowSelection`, persisted-SBBF point probes) against the legacy
+layout, across the three TPC perf-ledger sweeps — native (Volcano over PAX), DataFusion over
+Parquet, DuckDB in-process over the same Parquet files. Plus the measurement that found the
+dominant OLAP cost (table open = O(WAL) decode) and the fix.
+
+== Setup
+
+----
+ harness   tests/tpc_perf_ledger_e2e.rs  (63 TPC-DS queries: 52 official + 11 feature)
+ data      seeded Rust generator, SF 0.02, loaded over pgwire, then ALTER TABLE … MATERIALIZE
+ build     test profile (ProximaDB code -O0; arrow/parquet -O3, other deps -O2), 4 vCPU, 15 GB
+ arms      base_*  PROXIMADB_PARQUET_WRITE_POLICY=legacy
+                   PROXIMADB_PARQUET_READ_BLOOM_DISABLE=1 PROXIMADB_PARQUET_READ_PAGE_PRUNE_DISABLE=1
+           spec_*  defaults (TD-OLAPFMT-2)
+           *_rg64k default 65,536-row groups (8,192-row pages)
+           *_rg4k  4,096-row groups (1,024-row pages) — many splits per table
+----
+
+SF 0.05 could not run: the cgroup OOM-killed the process at 13.7 GB RSS inside MATERIALIZE
+(whole-table in-memory scan), identically with both layouts — recorded in TD-OLAPFMT-3.
+
+Absolute latencies are debug-build numbers for ProximaDB's own code (DuckDB is optimized C++);
+only within-engine A/B deltas are meaningful. Run-to-run noise, read off the arms that do
+*not* touch the changed code (native, DuckDB), is ±5–10%.
+
+== Results
+
+=== Correctness
+
+Every query that succeeded in both arms returned identical row counts, in both pairs
+(DataFusion 63/63, DuckDB 56/63, native 40/63 — the same failures in both arms. Native:
+17 queries use comma-joined `FROM` lists, 4 use derived tables (both unsupported), 2 hit plan /
+scan expression errors. DuckDB: q7/q17/q25/q29/q50/q65/q76 report "duckdb returned no
+batches": DataFusion returns 0 rows for exactly these seven at SF 0.02, and
+`DuckDbLocalEngine` (`src/query/execution/duckdb_engine.rs`) errored on an empty result instead
+of returning an empty set — fixed in the same change by taking the schema from the DuckDB Arrow
+stream).
+
+=== Totals per engine (repeat temperature; DuckDB first)
+
+[cols="2,1,2,2,2,2",options="header"]
+|===
+| Engine / pair | Queries | Wall Σ ms base → spec | Bytes read base → spec | Splits pruned | Page-index rows elided
+| DataFusion, 64k groups | 63 | 767,810 → 773,222 (+0.7%) | 85.84 MB → 84.33 MB (*−1.8%*) | 3/223 → 3/223 | *773,376* (181 of 2,310 pages)
+| DataFusion, 4k groups | 63 | 786,437 → 813,690 (+3.5%) | 338.78 MB → 339.99 MB (+0.4%) | 252/978 → 252/978 | 53,248 (91 of 9,775 pages)
+| DuckDB, 64k | 56 | 2,158 → 2,339 | n/a (external reader) | — | —
+| Native (Volcano/PAX), 64k | 40 | 79,580 → 83,647 | n/a (PAX path, unchanged) | — | —
+|===
+
+=== Where pruning paid (DataFusion, 64k groups, per query)
+
+[cols="1,2,2,2",options="header"]
+|===
+| Query | Pages pruned / evaluated | Rows elided | Bytes read base → spec
+| q61 | 30 / 133 | 98,816 | 3,125,317 → 2,628,050 (*−15.9%*)
+| q25 | 14 / 100 | 49,408 | 2,673,412 → 2,365,968 (−11.5%)
+| q19 | 14 / 70 | 49,408 | 1,968,366 → 1,767,241 (−10.2%)
+| q7 | 6 / 84 | 33,024 | 1,735,117 → 1,556,051 (−10.3%)
+| q29 | 12 / 100 | 41,216 | 2,562,510 → 2,345,686 (−8.5%)
+| q8 | 14 / 50 | 49,408 | 1,380,320 → 1,262,313 (−8.6%)
+| q52 | 14 / 29 | 49,408 | 1,305,290 → 1,240,363 (−5.0%)
+|===
+
+These are the date-filtered star joins: the fact table is clustered by date
+(`sorting_columns` now declared), the `date_dim` build side resolves to a key range at run
+time, and the page index skips the out-of-range pages *inside* the single surviving row
+group — exactly the level row-group pruning cannot reach at this scale.
+
+=== Why the wall clock did not move: table open is 99.7% of a DataFusion query
+
+[cols="2,1,1",options="header"]
+|===
+| Arm | median wall ms | median `open_ms`
+| base_rg64k | 11,836 | 11,776
+| spec_rg64k | 11,890 | 11,859
+|===
+
+`open_ms` is the table-registration phase before planning. It was dominated by the ADR-025
+delta merge: `changed_oids_since` probes both the name-keyed and the object_id-keyed WAL
+collection (ADR-031 dual-read); the object_id key was never written, its watermark was
+`None`, and the TD-OLAP-17 fast path treated `None` as "unknown" — so **the whole canonical
+WAL was decoded for every table on every query**. Fixed by `TableWalAppender::tracks_collection_high_water`; see the post-fix section.
+
+=== Why Bloom pruned nothing at SF 0.02 (honest negative)
+
+* Dimension tables filtered by equality (`item`, `store`, `customer_demographics`, …) are
+  below the 8,192-row Bloom threshold at SF 0.02, so no SBBF is written for them.
+* Fact tables are clustered by date; date predicates are already exact on min/max.
+* Join runtime filters (DataFusion dynamic filters) are evaluated against min/max and the
+  page index but not yet probed against SBBF; that is the case where Bloom pays on fact
+  tables (`ss_item_sk IN (build keys)` over date-clustered row groups) and is the next
+  reader slice.
+
+The write side is verified by unit tests (SBBF present, spec-hashed, no false negatives; the
+INT32 encoding fix). The `bytes_read` +0.4% in the 4k pair is the extra footer/index metadata
+read with many small row groups.
+
+== Post-fix: table-open cost (same SF 0.02, spec layout)
+
+[cols="2,1,1,1,1,1",options="header"]
+|===
+| DataFusion, repeat | Σ wall ms | median ms | median `open_ms` | bytes read | rows
+| base (legacy layout) | 767,810 | 11,836 | 11,776 | 85.84 MB | —
+| spec (TD-OLAPFMT-2) | 773,222 | 11,890 | 11,859 | 84.33 MB | identical
+| *spec + WAL fix* | *2,052* | *33* | *4* | 84.27 MB | *identical*
+|===
+
+* *374× less total DataFusion time* on the 63-query TPC-DS set; median 11.8 s → 33 ms. The
+  per-query floor was the whole-WAL decode in table open, not the scan.
+* DataFusion's median (33 ms) is now on par with DuckDB in-process (35 ms) on this workload —
+  the "DuckDB 4–70× faster" gap recorded in TD-OLAP-15 was dominated by this open cost.
+* DuckDB 56/63 → *63/63* (empty-result fix); native unchanged (40/63, PAX/Volcano path).
+* Row counts identical to the baseline for every query in every engine.
+* With the open floor gone, the scan-level savings from the pruning ladder (−8% to −16% bytes
+  on the date-filtered star joins) are no longer masked; quantifying their wall-clock effect
+  needs SF ≥ 0.1, which needs data loaded through the ADR-094 Layer A path (or TD-OLAPFMT-3)
+  rather than the in-memory MATERIALIZE to fit this host.
+
+== Reproduce
+
+----
+export RUST_MIN_STACK=16777216 TPC_PERF_BENCHMARK=tpcds TPC_PERF_SCALE=0.02
+# baseline
+PROXIMADB_PARQUET_WRITE_POLICY=legacy PROXIMADB_PARQUET_READ_BLOOM_DISABLE=1 \
+PROXIMADB_PARQUET_READ_PAGE_PRUNE_DISABLE=1 TPC_PERF_LEDGER_OUT=base.json \
+  cargo test --test tpc_perf_ledger_e2e --features duckdb -- tpc_perf_ledger --exact --ignored --nocapture
+# spec
+TPC_PERF_LEDGER_OUT=spec.json \
+  cargo test --test tpc_perf_ledger_e2e --features duckdb -- tpc_perf_ledger --exact --ignored --nocapture
+----

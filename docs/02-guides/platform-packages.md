@@ -1,6 +1,19 @@
 # Platform Packages Installation Guide
 
-This guide covers installing ProximaDB v0.2.0 using native platform packages on Linux and Windows.
+This guide covers installing ProximaDB from native platform packages on Linux and Windows. Each
+release on [GitHub Releases](https://github.com/anvai-labs/proximaDB/releases) ships RPM, DEB and
+MSI packages. The commands resolve the latest release:
+
+```bash
+VERSION=$(curl -fsSL https://api.github.com/repos/anvai-labs/proximaDB/releases/latest \
+  | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
+BASE=https://github.com/anvai-labs/proximaDB/releases/download/v$VERSION
+```
+
+> **Known issues:** the RPM/DEB service unit cannot start and the packaged config keeps data
+> under `/tmp` (TD-PKG-1); the MSI installs no Windows service (TD-PKG-2). Both are scheduled for
+> v0.5. Until then, run the server binary directly or use Docker; see the
+> [installation guide](../01-quick-start/install.md) for workarounds.
 
 ## Table of Contents
 
@@ -18,19 +31,18 @@ This guide covers installing ProximaDB v0.2.0 using native platform packages on 
 
 ### Supported Distributions
 
-- Red Hat Enterprise Linux (RHEL) 8+
-- CentOS 8+
-- Fedora 35+
-- Other RPM-based distributions
+See [Linux requirements](../01-quick-start/install.md#linux-requirements-archive-deb-rpm-homebrew)
+for the distributions each release is verified on. Note that **v0.4.1 and earlier** need glibc
+2.35 and `libssl.so.3`: their `.el8.rpm` does not run on RHEL/Rocky 8 or 9.
 
 ### Installation
 
 ```bash
 # Download the RPM package
-wget https://github.com/anvai-labs/proximaDB/releases/download/v0.2.0/proximadb-0.2.0-1.el8.x86_64.rpm
+wget "$BASE/proximadb-$VERSION-1.el8.x86_64.rpm"
 
 # Install the package
-sudo rpm -ivh proximadb-0.2.0-1.el8.x86_64.rpm
+sudo rpm -ivh "proximadb-$VERSION-1.el8.x86_64.rpm"
 
 # Start the service
 sudo systemctl start proximadb
@@ -44,7 +56,7 @@ sudo systemctl enable proximadb
 - **Binaries**: `/usr/bin/` (proximadb-server, proximadb-bench, proximadb-migrate)
 - **Configuration**: `/etc/proximadb/config.toml`
 - **Service**: `/usr/lib/systemd/system/proximadb.service`
-- **Data**: `/var/lib/proximadb/`
+- **Data**: `/var/lib/proximadb/` (after the TD-PKG-1 workaround in the installation guide; the shipped config uses `/tmp`)
 - **Logs**: `/var/log/proximadb/`
 
 ### Verification
@@ -80,18 +92,17 @@ sudo rm -rf /var/lib/proximadb /var/log/proximadb
 
 ### Supported Distributions
 
-- Debian 11+
-- Ubuntu 20.04+
-- Other DEB-based distributions
+See [Linux requirements](../01-quick-start/install.md#linux-requirements-archive-deb-rpm-homebrew).
+**v0.4.1 and earlier** need Ubuntu 22.04+ or Debian 12+.
 
 ### Installation
 
 ```bash
 # Download the DEB package
-wget https://github.com/anvai-labs/proximaDB/releases/download/v0.2.0/proximadb_0.2.0_amd64.deb
+wget "$BASE/proximadb_${VERSION}_amd64.deb"
 
 # Install the package
-sudo dpkg -i proximadb_0.2.0_amd64.deb
+sudo dpkg -i "proximadb_${VERSION}_amd64.deb"
 
 # Start the service
 sudo systemctl start proximadb
@@ -105,7 +116,7 @@ sudo systemctl enable proximadb
 - **Binaries**: `/usr/bin/` (proximadb-server, proximadb-bench, proximadb-migrate)
 - **Configuration**: `/etc/proximadb/config.toml`
 - **Service**: `/lib/systemd/system/proximadb.service`
-- **Data**: `/var/lib/proximadb/`
+- **Data**: `/var/lib/proximadb/` (after the TD-PKG-1 workaround in the installation guide; the shipped config uses `/tmp`)
 - **Logs**: `/var/log/proximadb/`
 
 ### Verification
@@ -148,7 +159,7 @@ sudo rm -rf /var/lib/proximadb /var/log/proximadb
 ### Installation
 
 **Method 1: Double-click**
-1. Download `proximadb-0.2.0-x64.msi`
+1. Download `proximadb-<version>-x64.msi`
 2. Double-click the file
 3. Follow the installation wizard
 4. Complete the installation
@@ -156,12 +167,12 @@ sudo rm -rf /var/lib/proximadb /var/log/proximadb
 **Method 2: Command Line**
 ```powershell
 # Download the MSI (or use the link above)
-msiexec /i proximadb-0.2.0-x64.msi
+msiexec /i proximadb-<version>-x64.msi
 ```
 
 **Method 3: Silent Installation**
 ```powershell
-msiexec /i proximadb-0.2.0-x64.msi /qn /norestart
+msiexec /i proximadb-<version>-x64.msi /qn /norestart
 ```
 
 ### What Gets Installed
@@ -170,8 +181,8 @@ msiexec /i proximadb-0.2.0-x64.msi /qn /norestart
   - `proximadb-server.exe`
   - `proximadb-bench.exe`
   - `proximadb-migrate.exe`
-- **Configuration**: `C:\ProgramData\ProximaDB\config.toml`
-- **Data**: `C:\ProgramData\ProximaDB\data\`
+- **Configuration**: `C:\Program Files\ProximaDB\config.toml`
+- **Data**: `C:\ProgramData\ProximaDBData\` is created empty; the shipped config writes under `\tmp\proximadb\` until you point its roots there (TD-PKG-2)
 - **Service**: Windows Service (optional)
 
 ### Verification
@@ -193,7 +204,7 @@ curl http://localhost:5678/health
 
 **Method 2: Command Line**
 ```powershell
-msiexec /x proximadb-0.2.0-x64.msi
+msiexec /x proximadb-<version>-x64.msi
 ```
 
 ---
@@ -205,7 +216,7 @@ msiexec /x proximadb-0.2.0-x64.msi
 The default configuration file is installed at:
 
 - **Linux**: `/etc/proximadb/config.toml`
-- **Windows**: `C:\ProgramData\ProximaDB\config.toml`
+- **Windows**: `C:\Program Files\ProximaDB\config.toml`
 
 ### Default Ports
 
@@ -215,7 +226,7 @@ The default configuration file is installed at:
 ### Default Data Directory
 
 - **Linux**: `/var/lib/proximadb`
-- **Windows**: `C:\ProgramData\ProximaDB\data`
+- **Windows**: `C:\ProgramData\ProximaDBData`
 
 ---
 
@@ -248,7 +259,8 @@ sudo systemctl disable proximadb
 
 ### Windows Service
 
-If installed as a service:
+If installed as a service (the MSI does not install one yet — TD-PKG-2; these commands apply only
+to a service you registered yourself, for example with `sc.exe create`):
 
 ```powershell
 # Start service
@@ -282,7 +294,7 @@ sudo nano /etc/proximadb/config.toml
 
 **Windows:**
 ```powershell
-notepad "C:\ProgramData\ProximaDB\config.toml"
+notepad "C:\Program Files\ProximaDB\config.toml"
 ```
 
 ### Key Configuration Options
@@ -303,8 +315,7 @@ port = 5678
 # pg_port = 5433
 
 [storage]
-# Storage engine: sst, helix, viper, nova, raptor, swift
-default_engine = "sst"
+# The vector engine is chosen per collection at create time (pass "engine": "sst"); there is no server-wide key.
 
 [api]
 # API settings
@@ -332,17 +343,16 @@ sudo systemctl status proximadb
 # View logs
 sudo journalctl -u proximadb -n 50
 
-# Check configuration
-sudo proximadb-server --config /etc/proximadb/config.toml --check
+# Run in the foreground to see configuration errors
+sudo -u proximadb proximadb-server --config /etc/proximadb/config.toml
 ```
 
 **Windows:**
 ```powershell
-# Check service status
-Get-Service proximadb
+# No Windows service is installed (TD-PKG-2); run the server in the foreground instead
 
 # Run server manually to see errors
-& "C:\Program Files\ProximaDB\proximadb-server.exe" --config "C:\ProgramData\ProximaDB\config.toml"
+& "C:\Program Files\ProximaDB\proximadb-server.exe" --config "C:\Program Files\ProximaDB\config.toml"
 ```
 
 ### Port Already in Use
@@ -460,8 +470,8 @@ proximadb-server --version
 # Get build information
 proximadb-server --build-info
 
-# Check configuration
-proximadb-server --config /etc/proximadb/config.toml --check
+# Run in the foreground to see configuration errors
+proximadb-server --config /etc/proximadb/config.toml
 
 # Health check
 curl http://localhost:5678/health
@@ -476,8 +486,8 @@ curl http://localhost:5678/metrics
 
 After installation:
 
-1. **Configure**: Edit `/etc/proximadb/config.toml` (Linux) or `C:\ProgramData\ProximaDB\config.toml` (Windows)
-2. **Start Service**: `sudo systemctl start proximadb` (Linux) or Start Service (Windows)
+1. **Configure**: Edit `/etc/proximadb/config.toml` (Linux) or `C:\Program Files\ProximaDB\config.toml` (Windows)
+2. **Start**: `sudo systemctl start proximadb` (Linux, once TD-PKG-1 is fixed) or run `proximadb-server.exe` (Windows; no service until TD-PKG-2)
 3. **Verify**: `curl http://localhost:5678/health`
 4. **Create Collection**: Use the API or Python SDK
 5. **Start Ingesting**: Add vectors and data

@@ -7,7 +7,7 @@
 
 == Status
 
-Proposed — **never formally accepted, but implemented** (status reconciled 2026-10-15): T-A…T-H
+Accepted (owner decision 2026-10-17, ADR-096 reconcile; implemented — open residual slices stay tracked in their TDs). Formerly: Proposed — **never formally accepted, but implemented** (status reconciled 2026-10-15): T-A…T-H
 and R1, R2, R3 (a)(b)(c), R3-bis all shipped (2026-05-31 → 2026-06-02; commits cited inline;
 `1a041d5c4` wired warm-tier cold-load serving into the ANN advisor). **Open residuals:** R3(c)
 LIOS `io_uring` overlap of the fetch with serving (throughput only); the informational cold-start

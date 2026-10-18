@@ -58,18 +58,12 @@ PULSAR and QUASAR are retired as graph engine variants.
 
 [source,python]
 ----
-from proximadb_sdk import ProximaDBClient
+from proximadb_sdk import ProximaDBClient, Protocol
 
-client = ProximaDBClient("http://localhost:5678")
+client = ProximaDBClient(url="http://localhost:5678", protocol=Protocol.REST)
 
-client.create_graph(
-    name="recommendations",
-    engine="orion",
-    engine_config={
-        "enable_wal": True,
-        "memory_pool_size_mb": 512,
-    },
-)
+# create_graph takes no engine argument.
+client.create_graph("recommendations", name="Recommendations")
 ----
 
 == Guidance

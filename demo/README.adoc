@@ -16,7 +16,6 @@ image:https://img.shields.io/badge/files-20%20total-brightgreen[Streamlined] ima
 
 == 🚀 Quick Start
 
-image::demo-learning-path.svg[Demo Learning Path, width=900, align=center]
 
 .Demo Suite Structure
 [%autowidth.stretch, cols="^1h,^1,2", options="header", frame="none", grid="rows", stripes="even"]

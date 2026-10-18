@@ -3,13 +3,11 @@
   "_td": "TD-DOCSITE-1",
   "unpublished_asciidoc": [
     "01-quick-start/CONTEXT_SERVING_MVP.adoc",
-    "02-guides/SYNERGY_SUMMARY.adoc",
     "02-guides/arrow-export-guide.adoc",
     "02-guides/cdc-debezium-integration.adoc",
     "02-guides/observability-grafana-prometheus.adoc",
     "02-guides/sdk-python-guide.adoc",
     "02-guides/unified-port-migration.adoc",
-    "02-guides/unified-rust-ecosystem-strategy.adoc",
     "03-api-reference/agent-tools.adoc",
     "03-api-reference/client-surface-map.adoc",
     "03-api-reference/configuration.adoc",
@@ -28,7 +26,6 @@
     "05-concepts/graph-engines.adoc",
     "05-concepts/hybrid-fusion.adoc",
     "05-concepts/storage-engines.adoc",
-    "05-concepts/vision.adoc",
     "SUPPORTED_SURFACE.adoc",
     "release-notes/v0.2.0.adoc",
     "release-notes/v0.2.2.adoc"

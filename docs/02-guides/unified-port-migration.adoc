@@ -125,13 +125,13 @@ grpc_client = ProximaDBClient(
 .After (Unified Mode - Recommended)
 [source,python]
 ----
-from proximadb_sdk import ProximaDBClient
+from proximadb_sdk import ProximaDBClient, Protocol
 
-# Single URL for all protocols
-client = ProximaDBClient(url="http://localhost:5678")
+# Single URL for all protocols. Pass the protocol explicitly: the automatic choice is gRPC, and a
+# collection created over gRPC cannot store records yet (TD-GRPCCREATE-1).
+client = ProximaDBClient(url="http://localhost:5678", protocol=Protocol.REST)
 
-# Protocol auto-selected based on operation
-# Or explicitly specify protocol
+# gRPC on the same port (protocol multiplexed)
 grpc_client = ProximaDBClient(
     url="http://localhost:5678",
     protocol="grpc",  # Same port, protocol multiplexed

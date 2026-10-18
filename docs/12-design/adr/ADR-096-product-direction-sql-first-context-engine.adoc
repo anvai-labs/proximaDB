@@ -1,0 +1,135 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= ADR-096: Product direction — a SQL-first context engine on object storage, one planning frame
+:toc: left
+:toclevels: 2
+:last-updated: 2026-10-17
+
+[cols="1,3"]
+|===
+| Status | **Accepted (2026-10-17).** Decisions D1–D4 were taken by the product owner; D5 is the governance that keeps them from drifting.
+| Date | 2026-10-17
+| Deciders | Vijaykumar Singh
+| Supersedes (in part) | The *framing* sections of `DATA_WAREHOUSE_AND_ENGINEERING_COURSE_CORRECTION_2026_06_04` ("compete directly with Snowflake/Databricks/Trino"); the milestone lists in `00-product/VISION.adoc` and `00-product/PRD.adoc`; the numbered-phase frame of `STRATEGIC_ROADMAP.adoc`. Engineering mandates (pgwire, object storage, `ComputeScheduler` routing, ADR-094/095) are unchanged. OLAP execution: DataFusion is the executor (ADR-052); native operators exist only as ADR-054's default-off, ledger-gated plane.
+| Relates to | ADR-052 (OLAP executor), ADR-094 (one substrate, format follows modality), ADR-095 (Postgres-compatible OLTP), `SUPPORTED_SURFACE.adoc` (support contract), `MVP_TRUST_CORRIDOR.toml`
+|===
+
+== 1. Problem
+
+Four documents answered "what are we building next" four different ways, and development
+followed only one of them:
+
+[cols="1,3", options="header"]
+|===
+| Source | Its answer
+| `VISION.adoc` | "The Context Database": five native models (vectors, documents, graphs, time-series, events) in one embedded engine, proven by migrating the ibkrtrading system; Year 1 = beat Milvus/Qdrant/Weaviate on vector benchmarks.
+| `PRD.adoc` | Release plan v0.3 "Context", v0.4 "Trading" (replace ibkrtrading's SQLite), v0.5 "Consolidation", v1.0 "Production".
+| Course correction (2026-06-04) | Compete directly with enterprise warehouses through a Postgres-compatible front door, relational first, object storage first, Rust-native distributed execution.
+| `SUPPORTED_SURFACE.adoc` + MVP corridor | The supported promise is REST v2 record operations on SST, single node; pgwire is explicitly outside the corridor.
+|===
+
+What actually shipped in v0.3/v0.4 was the course correction's engineering: the unified storage
+substrate (ADR-094), pgwire `vector_search` and `<->`, DataFusion/DuckDB OLAP routing and delete
+vectors; atomic COMMIT and writer fencing (ADR-095) followed on `develop`, unreleased as of v0.4.1. The PRD's v0.4 "Trading" release did
+not happen. Every time a contributor picked a document to steer by, they risked building
+against a direction the code had already left. That is the churn this ADR removes.
+
+Further conflicts found in the same audit, all resolved by the documents this ADR updates:
+
+* The vision listed VIPER as a supported engine with latency numbers; ADR-093 deprecated VIPER
+  and the numbers were never in the evidence ledger.
+* The vision's non-goals said "not an OLAP warehouse" and pointed OLTP at TD-110, while TPC-H and
+  TPC-DS over pgwire are the conformance driver and ADR-095 plans OLTP.
+* The vision promised "a unified SQL-extended query language", while the support contract routes
+  ANSI SQL to pgwire and native cross-modal queries to `/api/v2/query`.
+* Six ADRs were implemented but never accepted, ADR-094 was "Proposed" after its phases merged,
+  and several roadmap dates (Raft, DiskANN, serverless) disagreed across documents.
+
+== 2. Decisions
+
+=== D1 — Identity: a SQL-first context engine on object storage
+
+ProximaDB is a **Postgres-compatible SQL engine over object storage in which vectors, JSON
+documents and graph relationships are first-class**. The front door is SQL over the PostgreSQL
+wire protocol, including transactional writes (ADR-095). Vectors, JSON and graph are expressed
+inside SQL (table functions, the pgvector `<->` operator, JSON operators); the native REST v2
+record API is the programmatic surface for applications and SDKs.
+
+* What the product is *for*: applications and agents that need retrieval, transactional state,
+  analytics and relationships over the same governed data, without five databases and the
+  pipelines between them.
+* What makes it different: one canonical record, standard interfaces outside, and storage,
+  cache and engine co-designed against the cost that dominates in the cloud — object-store
+  round trips and egress.
+* Support sequencing is unchanged: the **supported MVP corridor remains REST v2 record
+  operations on SST** until pgwire's own gates close (tenant isolation and ABAC on pgwire,
+  conformance ratchets, crash/restart on each object store). D1 sets the direction; the support
+  contract still decides what may be claimed. pgwire becomes Supported per object store: on each
+  backend where the corridor's crash/restart and economic suites pass over pgwire.
+* The brand and category name stay "The Context Database"; "SQL-first context engine on object
+  storage" is what it is.
+* Not the identity: a general-purpose cloud data warehouse competing feature-for-feature with
+  Snowflake or Databricks, and not a pure vector database. Analytics (DataFusion over Parquet,
+  ADR-052) is a capability of the engine, measured by TPC-H/TPC-DS conformance, not the
+  positioning.
+
+=== D2 — ibkrtrading is a use case, not the anchor
+
+The ibkrtrading embedded migration is one design-partner use case
+(`docs/11-usecases/IBKRTRADING_DOGFOOD.adoc`, tracked by TD-030). It is no longer the vision's
+proof story or the "Phase 0" adoption gate, and its requirements (embedded mode, sub-millisecond
+OHLC reads, MiFID II audit) do not set the product's priority order.
+
+=== D3 — Every data model is a projection of one canonical record
+
+The durable vision keeps multiple data models, stated as **projections over one canonical
+record** (ADR-094: one substrate, format follows modality), not as independent "native
+engines". Sequencing follows D1: SQL and vectors first; documents and graph next as SQL-visible
+projections; time-series, events and observability graduate later from Beta infrastructure.
+No document may claim a model as a supported engine unless the support contract does.
+
+=== D4 — One planning frame: a release-based roadmap
+
+`STRATEGIC_ROADMAP.adoc` is the only plan. It is organised by release (v0.5, v0.6, v0.7,
+v1.0, then "later"), each with a theme, exit criteria and the TDs that carry the work.
+
+* `VISION.adoc` keeps the durable outcomes and non-goals, and no dated milestone lists.
+* `PRD.adoc` keeps positioning, personas and prioritised requirements, and no release table.
+* The numbered phases (1–8, 2.5) survive only as history inside the roadmap.
+* Adoption phases describe go-to-market, not engineering sequence.
+
+=== D5 — Governance that keeps this from drifting again
+
+. **A change of direction is an ADR.** Vision, PRD and roadmap text may not change the
+  identity, the front door, the model breadth or the planning frame without one.
+. **One authority per question**, listed in `docs/README.md`: support contract, vision, roadmap,
+  system map, ADR index, work ledger, evidence ledger. Other documents link to them instead of
+  restating them.
+. **A document that disagrees with its authority is a bug**, fixed in the PR that finds it.
+. **Superseded documents are deleted and their links repointed** (git keeps history); there is
+  no archive tree.
+. **Every engineering slice ships with tests first and an end-to-end smoke where the slice
+  touches durability or a wire protocol** (see `docs/06-internals/contributing.md`), so the
+  roadmap's exit criteria are executable, not prose.
+. **The reconcile is repeated** at each release cut: re-run the conflict audit in §1 against the
+  authorities and fix what drifted.
+
+== 3. Consequences
+
+* `VISION.adoc`, `PRD.adoc`, `STRATEGIC_ROADMAP.adoc`, `SUPPORTED_SURFACE.adoc` (authority
+  table and positioning), the course-correction document (banner), `README.adoc`,
+  `docs/index.md`, the work ledger and the diagrams are rewritten or re-bannered to match, in the
+  same change set as this ADR.
+* ADRs whose status lagged their implementation are accepted by owner decision: ADR-094, and
+  ADR-023, 030, 036, 055, 089 and 091 as implemented (open residual slices stay in their TDs).
+* TD-077 (distributed transport), cited as the blocker for all multi-node work but never filed,
+  is filed.
+* SWIFT and RAPTOR are deleted in v0.6, executing ADR-006 §3, alongside VIPER's stage-3 removal
+  (owner decision, 2026-10-17).
+* Work that serves the old framing is not deleted, but is sequenced after the releases its
+  framing no longer leads: DiskANN, in-database inference, Raft distribution, serverless modes.
+
+== 4. Not decided here
+
+* Which cloud object store is the first GA backend (S3, Azure Blob or GCS).
+* Pricing and packaging, and the open-core boundary beyond `OPEN_CORE.md`.

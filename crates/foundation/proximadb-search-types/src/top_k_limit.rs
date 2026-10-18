@@ -83,6 +83,15 @@ pub fn bounded_prealloc(k: usize) -> usize {
     k.min(DEFAULT_MAX_TOP_K)
 }
 
+/// Narrow a `top_k` to the `u16` carried by `SearchParams::top_k`,
+/// SATURATING at `u16::MAX` (TD-SECSCAN-1 §5). A bare `k as u16` wrapped
+/// (65,536 → 0, 70,000 → 4,464). Use this only where the field is a planning
+/// hint or `k` is already bounded by the server cap; where the `u16` is a hard
+/// result limit and `k` may exceed it, reject or split instead.
+pub fn u16_top_k_hint(k: usize) -> u16 {
+    u16::try_from(k).unwrap_or(u16::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +123,17 @@ mod tests {
     fn prealloc_is_bounded() {
         assert_eq!(bounded_prealloc(5), 5);
         assert_eq!(bounded_prealloc(usize::MAX), DEFAULT_MAX_TOP_K);
+    }
+
+    /// TD-SECSCAN-1 §5 residual: the bare `k as u16` narrowing wrapped
+    /// (65,536 → 0, 70,000 → 4,464). The hint saturates instead.
+    #[test]
+    fn u16_top_k_hint_saturates_at_the_boundary() {
+        assert_eq!(u16_top_k_hint(0), 0);
+        assert_eq!(u16_top_k_hint(10), 10);
+        assert_eq!(u16_top_k_hint(65_535), u16::MAX);
+        assert_eq!(u16_top_k_hint(65_536), u16::MAX);
+        assert_eq!(u16_top_k_hint(70_000), u16::MAX);
+        assert_eq!(u16_top_k_hint(usize::MAX), u16::MAX);
     }
 }

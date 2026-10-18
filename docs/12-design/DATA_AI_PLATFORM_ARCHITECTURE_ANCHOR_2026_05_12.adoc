@@ -5,6 +5,15 @@
 :sectnums:
 :revdate: 2026-05-12
 
+[IMPORTANT]
+====
+*Superseded as direction (2026-10-17)* by
+link:adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096]: ProximaDB is a SQL-first
+context engine on object storage, not a direct competitor to Databricks, Snowflake or Trino, and
+Rust-native MPP is sequenced after v1.0 (TD-077). Read this document for history and for the
+design detail it still holds; take direction and sequencing from ADR-096 and the release roadmap.
+====
+
 [.lead]
 This is the go-forward architecture anchor for ProximaDB as a comprehensive data and AI
 platform. It complements

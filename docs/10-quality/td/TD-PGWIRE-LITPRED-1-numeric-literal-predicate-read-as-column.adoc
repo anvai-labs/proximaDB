@@ -1,0 +1,38 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGWIRE-LITPRED-1: a numeric literal in a WHERE comparison is read as a column name
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-17). Observed once; root cause not located.
+| Priority | **MEDIUM**: valid ANSI SQL is rejected (`XX000`) on a pgwire surface. Tautologies like `WHERE 1 = 1` are common in generated SQL (ORMs, query builders, BI tools).
+| Component | pgwire SELECT predicate lowering for vector-profile tables (exact site not yet traced)
+| Relates to | link:TD-PGWIRE-VECDEL-1-vector-table-delete-still-visible.adoc[TD-PGWIRE-VECDEL-1] (found while probing its read paths)
+|===
+
+== Observed (2026-10-17)
+
+----
+CREATE TABLE t (id VARCHAR PRIMARY KEY, embedding VECTOR(1));
+SELECT id FROM t WHERE 1 = 1;
+-- ERROR XX000: execution failed: Column '1' does not exist in table 't'
+----
+
+A comparison on a real column (`WHERE id <> 'zz'`) works on the same table, so the failure is
+specific to a literal operand on the left-hand side being resolved as an identifier.
+
+== Not yet known
+
+* Whether plain (non-vector) relational tables are affected. Only a vector-profile table was
+  probed.
+* Whether other literal shapes fail the same way (`WHERE 'a' = 'a'`, `WHERE 1 = id`,
+  `WHERE TRUE`).
+* Which lowering step resolves the literal as a column.
+
+== Next step
+
+Add a pgwire e2e test over a plain and a vector-profile table covering the literal shapes above.
+Then trace the lowering for the failing shapes and fix it: a literal operand must lower to a
+constant, never a column reference. Keep the server error specific (`42703` for a genuinely
+missing column, not `XX000`).

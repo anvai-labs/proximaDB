@@ -706,7 +706,7 @@ enable_metadata_compression = true  # Compress metadata
 
 ```toml
 [storage.hybrid_block_engines]
-default_engine = "sst"              # Default hybrid block engine
+# The engine is chosen per collection at create time (default: sst)
 auto_selection = true               # Enable automatic engine selection
 performance_monitoring = true      # Monitor performance for adaptation
 workload_analysis_window_minutes = 15  # Workload analysis window

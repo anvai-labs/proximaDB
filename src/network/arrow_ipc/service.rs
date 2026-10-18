@@ -1676,7 +1676,14 @@ impl FlightService for ProximaFlightService {
                     proximadb_runtime::PortIdentity::from(&auth_context),
                 )
                 .await
-                .map_err(|e| TonicStatus::internal(format!("Search failed: {}", e)))?;
+                .map_err(|e| {
+                    // Wrong-dimension / empty / non-finite query vector or
+                    // over-cap top_k: the client's argument (TD-SECSCAN-1 §5).
+                    match crate::services::operations::vectors::client_argument_message(&e) {
+                        Some(message) => TonicStatus::invalid_argument(message),
+                        None => TonicStatus::internal(format!("Search failed: {}", e)),
+                    }
+                })?;
 
             // Egress-aware shaping (co-design D2): for a chargeable (far)
             // client, encode the result batches with ZSTD — a lossless

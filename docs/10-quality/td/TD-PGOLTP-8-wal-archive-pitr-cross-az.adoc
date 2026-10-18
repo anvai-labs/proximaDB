@@ -1,0 +1,32 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGOLTP-8: WAL archive to object storage — PITR and cross-AZ restore
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Open (filed 2026-10-16). Priority 8 of ADR-095.
+| Severity | Medium. EBS volumes are single-AZ. Without an archive, losing the AZ loses the WAL tail.
+| Component | `src/storage/persistence/write_ahead_log/{pitr,backup,background_manager}.rs`, `DrPathBuilder`, metering (KSU)
+| Realizes | ADR-095 D6
+| Relates to | TD-LTAP-4 (branching / PITR as metadata ops), TD-116 (WAL archival + `AS OF`), TD-LTAP-3 (quorum WAL stays Won't Do), TD-OBJSTORE-1 (object-store durability)
+|===
+
+== Design
+
+* Ship sealed WAL segments asynchronously to
+  `data/{tenant}/{ns}/_wal_archive/{writer_epoch}/{start_lsn}-{end_lsn}`, built by
+  `DrPathBuilder`, written with `write_if_absent`, and stamped with the writer epoch. The access
+  tier is set per PUT through `ObjectAccessTier` (ADR-036).
+* `archive_lag` is a metric and an SLO (OLTP default target ≤ 1 s). It is the cross-AZ RPO on
+  AWS. On Azure ZRS or GCP regional disks the volume already gives RPO 0.
+* **Restore:** fresh volume + base (manifest at checkpoint) + archive replay up to a target LSN
+  or timestamp, either as PITR or as a new branch (feeds TD-LTAP-4).
+* Archive GC follows the PITR window and the branch references (Iceberg-style expiry, never
+  prefix deletion; see the orphan-deletion decision in #1948).
+
+== Acceptance
+
+* Kill the volume (delete the directory), restore on a fresh one: all commits older than
+  `archive_lag` are present, and the loss window matches the metric.
+* PITR to an LSN reproduces the exact table state (checksum) at that LSN.

@@ -1,0 +1,22 @@
+# Production-shaped agent-memory demo — one engine, real server-side BGE
+# embeddings, volumes for data + models. Run everything with ./run.sh
+#
+#   docker compose up -d --build       # engine on http://localhost:5678
+#   python3 seed_and_query.py          # seed + search + write + read-back
+#   docker compose down -v             # teardown
+services:
+  proximadb:
+    build:
+      context: ../..
+      dockerfile: demo/agent-memory/Dockerfile.onnx
+    image: proximadb-agent-memory:latest
+    container_name: proximadb-agent-memory
+    ports:
+      - "5678:5678"
+    volumes:
+      - ./data:/data
+      - ./models:/var/lib/proximadb/models
+    environment:
+      PROXIMADB_EMBED_MODEL_DIR: /var/lib/proximadb/models
+      PROXIMADB_TOKENIZER_PATH: /var/lib/proximadb/models/tokenizer.json
+    restart: unless-stopped

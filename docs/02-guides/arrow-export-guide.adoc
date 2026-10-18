@@ -20,14 +20,14 @@ ProximaDB provides native Arrow Flight support for exporting data to analytics t
 
 |ProximaBlocks
 |`.sst`
-|SST (default)
+|SST
 
 |Parquet
 |`.parquet`
-|Nova, VIPER
+|NOVA (VIPER: deprecated, existing collections only)
 |===
 
-All formats are accessible via Arrow Flight on port 5680.
+All formats are accessible via Arrow Flight on the multiplexed port 5678.
 
 == Quick Start
 
@@ -38,7 +38,7 @@ All formats are accessible via Arrow Flight on port 5680.
 from proximadb_sdk import connect_arrow
 
 # Connect to Arrow Flight endpoint
-with connect_arrow(host="localhost", port=5680) as client:
+with connect_arrow(host="localhost", port=5678) as client:
     # List available files
     files = client.list_files("my_collection")
     for f in files:
@@ -64,7 +64,7 @@ with connect_arrow(host="localhost", port=5680) as client:
 import pyarrow.flight as flight
 
 # Connect to Arrow Flight
-client = flight.connect("grpc://localhost:5680")
+client = flight.connect("grpc://localhost:5678")
 
 # List files in a collection
 for info in client.list_flights(b"my_collection"):
@@ -94,7 +94,7 @@ Use `ArrowFlightClient.bulk_upsert()` for simple request/response writes and
 import pyarrow as pa
 from proximadb_sdk.protocols.arrow_flight import ArrowFlightClient
 
-client = ArrowFlightClient("grpc://localhost:5680")
+client = ArrowFlightClient("grpc://localhost:5678")
 
 records = pa.table({
     "id": ["r1", "r2"],
@@ -219,14 +219,14 @@ INSTALL arrow;
 LOAD arrow;
 
 -- Query ProximaDB files directly
-SELECT * FROM arrow_scan('grpc://localhost:5680', 'my_collection/data/block_0.arrow');
+SELECT * FROM arrow_scan('grpc://localhost:5678', 'my_collection/data/block_0.arrow');
 
 -- Analytics on vectors
 SELECT
     id,
     metadata->>'category' as category,
     array_length(vector) as dimension
-FROM arrow_scan('grpc://localhost:5680', 'my_collection/data/block_0.arrow')
+FROM arrow_scan('grpc://localhost:5678', 'my_collection/data/block_0.arrow')
 WHERE metadata->>'category' = 'tech';
 ----
 
@@ -238,7 +238,7 @@ import polars as pl
 from pyarrow import flight
 
 # Connect and read
-client = flight.connect("grpc://localhost:5680")
+client = flight.connect("grpc://localhost:5678")
 flights = list(client.list_flights(b'my_collection'))
 reader = client.do_get(flights[0].endpoints[0].ticket)
 df = pl.from_arrow(reader.read_all())
@@ -260,13 +260,13 @@ from proximadb_sdk import ArrowExportClient, connect_arrow
 # Using class directly
 client = ArrowExportClient(
     host="localhost",
-    port=5680,
+    port=5678,
     tls=False,
     auth_token="optional_token"
 )
 
 # Using convenience function
-client = connect_arrow(host="localhost", port=5680)
+client = connect_arrow(host="localhost", port=5678)
 
 # Context manager
 with connect_arrow() as client:
@@ -421,7 +421,7 @@ result = conn.execute("""
 ----
 # Check connectivity
 try:
-    with connect_arrow(host="localhost", port=5680) as client:
+    with connect_arrow(host="localhost", port=5678) as client:
         files = client.list_files("test")
         print(f"Connected! Found {len(files)} files")
 except Exception as e:
@@ -434,7 +434,7 @@ If you see "Format not supported" errors:
 
 1. Check that the file exists and has a valid extension
 2. Ensure the ProximaDB server is running with Arrow Flight enabled
-3. Verify the collection uses a supported engine (SST, Nova, VIPER)
+3. Verify the collection uses an exportable engine (SST, or NOVA; VIPER only for existing collections)
 
 === Large File Timeouts
 
@@ -459,7 +459,7 @@ Enable Arrow Flight in `config.toml`:
 [api]
 rest_port = 5678
 grpc_port = 5679
-arrow_flight_port = 5680  # Arrow Flight endpoint
+arrow_flight_port = 5678  # Arrow Flight endpoint
 
 [storage.sst_config]
 block_format = "ArrowBlock"  # Use Arrow format for new flushes
@@ -481,7 +481,7 @@ Choose the block format based on your use case:
 |Analytics/export workloads
 |Native Arrow, fastest scans
 
-|Parquet (Nova/VIPER)
+|Parquet (NOVA; VIPER deprecated)
 |Columnar analytics
 |Best compression, excellent for batch processing
 |===

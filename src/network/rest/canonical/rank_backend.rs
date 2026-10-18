@@ -132,9 +132,16 @@ impl HybridSearchBackend for ProductionHybridBackend {
             .vector_ops
             .search(request, proximadb_runtime::PortIdentity::anonymous())
             .await
-            .map_err(|err| RankError::ModelInference {
-                model_id: "production_hybrid_backend.vector".to_string(),
-                reason: format!("vector search failed for '{collection}': {err}"),
+            .map_err(|err| {
+                // A wrong-dimension / empty / non-finite query vector or
+                // over-cap top_k is the client's argument (TD-SECSCAN-1 §5).
+                match crate::services::operations::vectors::client_argument_message(&err) {
+                    Some(message) => RankError::InvalidArgument(message),
+                    None => RankError::ModelInference {
+                        model_id: "production_hybrid_backend.vector".to_string(),
+                        reason: format!("vector search failed for '{collection}': {err}"),
+                    },
+                }
             })?;
 
         let results = response
@@ -169,6 +176,8 @@ mod tests {
         last_request: Mutex<Option<VectorSearchRequest>>,
         results: Mutex<Vec<SearchVectorRecord>>,
         fail_with: Mutex<Option<String>>,
+        /// Fail with a typed client-argument error instead of a plain one.
+        fail_typed: bool,
     }
 
     impl CapturingVectorPort {
@@ -177,6 +186,7 @@ mod tests {
                 last_request: Mutex::new(None),
                 results: Mutex::new(results),
                 fail_with: Mutex::new(None),
+                fail_typed: false,
             }
         }
 
@@ -185,6 +195,7 @@ mod tests {
                 last_request: Mutex::new(None),
                 results: Mutex::new(Vec::new()),
                 fail_with: Mutex::new(Some(message.into())),
+                fail_typed: false,
             }
         }
     }
@@ -198,6 +209,12 @@ mod tests {
         ) -> anyhow::Result<VectorOperationResponse> {
             *self.last_request.lock().unwrap() = Some(request.clone());
             if let Some(reason) = self.fail_with.lock().unwrap().clone() {
+                if self.fail_typed {
+                    return Err(
+                        crate::services::operations::vectors::InvalidQueryVector::other(reason)
+                            .into(),
+                    );
+                }
                 return Err(anyhow::anyhow!(reason));
             }
             let records = self.results.lock().unwrap().clone();
@@ -380,5 +397,32 @@ mod tests {
         backend.vector_search("docs", &[0.1, 0.2]).await.unwrap();
         let captured = port.last_request.lock().unwrap().clone().unwrap();
         assert_eq!(captured.top_k, 7);
+    }
+
+    /// TD-SECSCAN-1 §5: the vector leg's typed client-argument error becomes
+    /// `RankError::InvalidArgument` (HTTP 400 at the rank route) instead of
+    /// being flattened into a `ModelInference` failure (HTTP 500); a plain
+    /// upstream failure stays `ModelInference`.
+    #[tokio::test]
+    async fn vector_search_keeps_client_argument_errors_distinct() {
+        let mut port = CapturingVectorPort::failing(
+            "Query vector has dimension 3 but collection 'docs' expects dimension 4",
+        );
+        port.fail_typed = true;
+        let backend = ProductionHybridBackend::new(Arc::new(port), empty_indexes());
+        match backend.vector_search("docs", &[1.0, 2.0, 3.0]).await {
+            Err(RankError::InvalidArgument(message)) => {
+                assert!(message.contains("dimension 3"), "{message}")
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        let backend = ProductionHybridBackend::new(
+            Arc::new(CapturingVectorPort::failing("synthetic upstream failure")),
+            empty_indexes(),
+        );
+        assert!(matches!(
+            backend.vector_search("docs", &[1.0]).await,
+            Err(RankError::ModelInference { .. })
+        ));
     }
 }

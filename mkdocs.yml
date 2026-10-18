@@ -34,10 +34,8 @@ docs_dir: docs
 exclude_docs: |
   # Font license ships in the repo beside the font; not a page (TD-DOCSITE-1 guard).
   stylesheets/fonts/Inter-OFL.txt
-  _archive/
   _internal/
   06-internals/
-  09-roadmap/
   10-quality/
   12-design/
   agent-rules/
@@ -52,8 +50,6 @@ exclude_docs: |
   00-product/
   # Internal RFC drafts and templates.
   rfcs/
-  # The site's own entry point is docs/index.md; INDEX.adoc is the repo-tree index.
-  INDEX.adoc
   # The coverage guard's baseline is build input, not a page.
   .site-coverage-baseline.json
   # assets/ itself stays published — the images are referenced by real pages —
@@ -150,7 +146,6 @@ nav:
   - Operations:
       - Overview: 04-operations/index.md
       - "Release procedure (one tag, every registry)": 04-operations/release/release-procedure.md
-      - "Release: v0.2.1 macOS": 04-operations/release/v0.2.1-macos-support.md
 
 extra_css:
   - stylesheets/tokens.css

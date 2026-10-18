@@ -89,6 +89,15 @@ impl TableRecordMutation {
     }
 }
 
+/// One `write_mutations` call captured during a transaction, replayed by
+/// [`TableRecordStore::commit_atomic`] (ADR-095 D3).
+#[derive(Debug, Clone)]
+pub struct StagedTableWrite {
+    pub table_schema: CatalogTableSchema,
+    pub mutations: Vec<TableRecordMutation>,
+    pub tenant_context: Option<TenantContext>,
+}
+
 /// Point lookup request against a cataloged table/collection.
 #[derive(Debug, Clone)]
 pub struct TableRecordGetRequest {
@@ -146,6 +155,23 @@ pub trait TableWalAppender: Send + Sync {
         tenant_id: Option<String>,
     ) -> Result<Vec<CanonicalWalEntry>>;
 
+    /// Append `operations` as ONE all-or-nothing unit (ADR-095 D3, TD-PGOLTP-1):
+    /// after a crash either every entry is recovered or none is. Each operation
+    /// carries its own tenant, because one transaction may span tenants'
+    /// tables. Sequence numbers are contiguous and returned in input order.
+    ///
+    /// The default refuses rather than degrading to a non-atomic append, so a
+    /// caller that needs atomicity can never silently get a partial commit.
+    async fn append_operations_atomic(
+        &self,
+        operations: Vec<(CanonicalOperation, Option<String>)>,
+    ) -> Result<Vec<CanonicalWalEntry>> {
+        let _ = operations;
+        Err(anyhow!(
+            "this WAL appender does not support atomic multi-operation appends"
+        ))
+    }
+
     /// Read every canonical WAL entry this appender has durably recorded, oldest first.
     /// The default returns nothing (appenders without a readable log opt out); the framed
     /// appender overrides it. Used by the CDC change-feed to surface row-level changes.
@@ -164,6 +190,18 @@ pub trait TableWalAppender: Send + Sync {
     /// is per-collection, not global.
     fn collection_max_sequence_for(&self, _collection_id: &str) -> Option<u64> {
         None
+    }
+
+    /// `true` when the appender maintains a watermark for EVERY collection it
+    /// has ever written (on append and on recovery), so a `None` from
+    /// [`collection_max_sequence_for`](Self::collection_max_sequence_for) means
+    /// "this collection has no entries" rather than "unknown". Lets the change
+    /// feed skip the O(WAL) decode for never-written keys — e.g. the
+    /// object_id-keyed half of the ADR-031 dual-read, which otherwise decoded the
+    /// whole WAL per table per OLAP query (measured: ~99.7% of DataFusion query
+    /// time at TPC-DS SF 0.02).
+    fn tracks_collection_high_water(&self) -> bool {
+        false
     }
 }
 
@@ -223,7 +261,7 @@ pub struct TableRecordWriteResult {
 }
 
 impl TableRecordWriteResult {
-    fn success(record_ids: Vec<String>) -> Self {
+    pub(crate) fn success(record_ids: Vec<String>) -> Self {
         Self {
             success: true,
             record_ids,
@@ -233,7 +271,7 @@ impl TableRecordWriteResult {
         }
     }
 
-    fn failure(error: impl Into<String>, error_code: impl Into<String>) -> Self {
+    pub(crate) fn failure(error: impl Into<String>, error_code: impl Into<String>) -> Self {
         Self {
             success: false,
             record_ids: Vec::new(),
@@ -581,6 +619,28 @@ pub trait TableRecordStore: Send + Sync {
         Ok(())
     }
 
+    /// Make every batch durable as ONE all-or-nothing unit, then apply them in
+    /// order (ADR-095 D3, TD-PGOLTP-1). Each batch is what one `write_mutations`
+    /// call staged during a transaction; order matters (INSERT then UPDATE of the
+    /// same key). Implementations must re-validate INSERT-absent / UPDATE-exists
+    /// against current state in staged order before making anything durable.
+    ///
+    /// The default refuses: a store that cannot commit atomically must never
+    /// silently degrade to per-batch writes.
+    async fn commit_atomic(
+        &self,
+        batches: Vec<StagedTableWrite>,
+    ) -> Result<Vec<TableRecordWriteResult>> {
+        let tables: Vec<&str> = batches
+            .iter()
+            .map(|batch| batch.table_schema.name.as_str())
+            .collect();
+        Err(crate::services::txn_staging::AtomicCommitUnsupported(format!(
+            "atomic transaction commit is not supported by the record store for table(s) {tables:?}"
+        ))
+        .into())
+    }
+
     /// Get the current visible record for a key.
     ///
     /// `read_context` (present only under `abac-policy`) is the FA-b required
@@ -829,7 +889,9 @@ fn wal_collection_id(table_schema: &CatalogTableSchema, object_id_keying: bool) 
 ///
 /// `primary` always equals `wal_collection_id(table_schema, gate)`, so the memtable,
 /// its indexes, and the WAL are keyed identically within a gate state.
-fn memtable_partition_keys(table_schema: &CatalogTableSchema) -> (String, Option<String>) {
+pub(crate) fn memtable_partition_keys(
+    table_schema: &CatalogTableSchema,
+) -> (String, Option<String>) {
     let keying = wal_object_id_keying_enabled();
     let primary = wal_collection_id(table_schema, keying);
     let legacy = if keying && primary != table_schema.name {
@@ -1132,6 +1194,33 @@ impl TableRecordStore for CatalogRoutingTableRecordStore {
             .await
     }
 
+    /// One atomic unit needs one log: delegate only when every batch routes to
+    /// the same underlying store; otherwise refuse (never split a commit).
+    async fn commit_atomic(
+        &self,
+        batches: Vec<StagedTableWrite>,
+    ) -> Result<Vec<TableRecordWriteResult>> {
+        let Some(first) = batches.first() else {
+            return Ok(Vec::new());
+        };
+        let target = self.store_for_schema(&first.table_schema).clone();
+        // Compare data addresses: `Arc::ptr_eq` on `dyn` also compares vtables.
+        // (`usize`, not a raw pointer, so the future stays `Send`.)
+        let address = |store: &Arc<dyn TableRecordStore>| Arc::as_ptr(store) as *const () as usize;
+        let target_address = address(&target);
+        if let Some(other) = batches
+            .iter()
+            .find(|batch| address(self.store_for_schema(&batch.table_schema)) != target_address)
+        {
+            return Err(crate::services::txn_staging::AtomicCommitUnsupported(format!(
+                "atomic transaction commit spans storage routes ('{}' and '{}' use different stores)",
+                first.table_schema.name, other.table_schema.name
+            ))
+            .into());
+        }
+        target.commit_atomic(batches).await
+    }
+
     async fn write_mutations(
         &self,
         table_schema: &CatalogTableSchema,
@@ -1225,6 +1314,20 @@ impl TableRecordStore for CatalogRoutingTableRecordStore {
     ) -> Result<Vec<ChangeRow>> {
         self.iceberg_store
             .read_changes_since(collection_id, since_lsn)
+            .await
+    }
+
+    /// Forward the tenant-scoped feed too: the trait default would fall back to the
+    /// tenant-agnostic `read_changes_since`, leaking another tenant's changes into
+    /// the OLAP read-merge whenever this router is the store in use.
+    async fn read_changes_since_scoped(
+        &self,
+        collection_id: &str,
+        tenant: Option<&str>,
+        since_lsn: u64,
+    ) -> Result<Vec<ChangeRow>> {
+        self.iceberg_store
+            .read_changes_since_scoped(collection_id, tenant, since_lsn)
             .await
     }
 }
@@ -1722,9 +1825,24 @@ pub struct DirectWalTableRecordStore {
     /// `lookup_secondary`, then maintained on every `write_mutations`.
     secondary_index:
         parking_lot::RwLock<std::collections::HashMap<(String, String), TableSecondaryIndex>>,
+    /// ADR-095 review F2: set when an atomic commit's group frame became durable
+    /// but applying it to memory failed. The in-memory state is then a partial
+    /// transaction, so every read and write is refused until a restart replays
+    /// the WAL — never serve a half-applied commit.
+    poisoned: std::sync::atomic::AtomicBool,
 }
 
 impl DirectWalTableRecordStore {
+    /// TD-OLAP-17 fast path: no entry for `collection_id` can exceed `since_lsn`
+    /// when its watermark is at/below it, or when the appender tracks every
+    /// collection and has none for this one.
+    fn change_feed_is_empty(&self, collection_id: &str, since_lsn: u64) -> bool {
+        match self.wal_appender.collection_max_sequence_for(collection_id) {
+            Some(max) => max <= since_lsn,
+            None => self.wal_appender.tracks_collection_high_water(),
+        }
+    }
+
     /// Create a direct writer that routes every `(tenant, collection)` partition
     /// to the single supplied `storage`. This is the non-isolated shape used by
     /// single-tenant unit tests and callers that intentionally share one store;
@@ -1869,7 +1987,19 @@ impl DirectWalTableRecordStore {
             wal_appender,
             unique_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
             secondary_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Refuse when a durable commit could not be applied (see `poisoned`).
+    fn ensure_healthy(&self) -> Result<()> {
+        if self.poisoned.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(anyhow!(
+                "relational record store is poisoned: a committed transaction could not be \
+                 applied in memory; restart the server to replay the WAL"
+            ));
+        }
+        Ok(())
     }
 
     /// Resolve the tenant scope key from an optional tenant context.
@@ -1903,6 +2033,108 @@ impl DirectWalTableRecordStore {
         let index_key = (tenant_id.to_string(), collection_id.to_string());
         self.unique_index.write().remove(&index_key);
         self.secondary_index.write().remove(&index_key);
+    }
+
+    /// Apply already-durable mutations to the memtable partitions and the
+    /// incremental UNIQUE/secondary indexes (shared by `write_mutations` and
+    /// `commit_atomic`). `lsns[i]` is the WAL sequence of `storage_actions[i]`;
+    /// `None` = the positional mapping could not be trusted.
+    async fn apply_storage_actions(
+        &self,
+        table_schema: &CatalogTableSchema,
+        partition: &Arc<dyn RecordStorage>,
+        legacy_partition: Option<&Arc<dyn RecordStorage>>,
+        index_key: &(String, String),
+        storage_actions: Vec<(TableRecordMutationKind, ProximaRecord)>,
+        lsns: Option<&[u64]>,
+    ) -> Result<Vec<String>> {
+        // TD-110 Slice C: maintain the UNIQUE/PK index incrementally — but only
+        // once it has been built (first `check_unique_conflict`). Until then the
+        // lazy build captures these writes from current state, so skipping is
+        // safe; checking once avoids per-write work for tables never probed.
+        let index_primary_key = schema_primary_key_column(table_schema);
+        let maintain_index = !schema_unique_column_sets(table_schema).is_empty()
+            && self.unique_index.read().contains_key(index_key);
+        // TD-127: maintain the secondary index on the same once-built basis as the
+        // UNIQUE/PK index — until first `lookup_secondary` builds it, the lazy
+        // build captures these writes from current state, so skipping is safe.
+        let maintain_secondary = !secondary_index_disabled()
+            && !schema_secondary_index_columns(table_schema).is_empty()
+            && self.secondary_index.read().contains_key(index_key);
+        let maintain_any = maintain_index || maintain_secondary;
+
+        let mut record_ids = Vec::with_capacity(storage_actions.len());
+        for (idx, (kind, record)) in storage_actions.into_iter().enumerate() {
+            // `None` when the positional mapping could not be trusted (above), in
+            // which case the store gets no LSN and reports "cannot truncate"
+            // rather than a minimum derived from a partial set.
+            let lsn = lsns.as_ref().and_then(|v| v.get(idx).copied());
+            let key = RecordKey::from(&record);
+            match kind {
+                TableRecordMutationKind::Insert
+                | TableRecordMutationKind::Upsert
+                | TableRecordMutationKind::Update => {
+                    if maintain_any {
+                        let written = match lsn {
+                            Some(lsn) => {
+                                partition.upsert_record_at_lsn(record.clone(), lsn).await?
+                            }
+                            None => partition.upsert_record(record.clone()).await?,
+                        };
+                        record_ids.push(written.oid);
+                        if maintain_index
+                            && let Some(index) = self.unique_index.write().get_mut(index_key)
+                        {
+                            index.upsert(&record, index_primary_key.as_deref());
+                        }
+                        if maintain_secondary
+                            && let Some(index) = self.secondary_index.write().get_mut(index_key)
+                        {
+                            index.upsert(&record);
+                        }
+                    } else {
+                        let written = match lsn {
+                            Some(lsn) => partition.upsert_record_at_lsn(record, lsn).await?,
+                            None => partition.upsert_record(record).await?,
+                        };
+                        record_ids.push(written.oid);
+                    }
+                    // ADR-031 O3 migrate-on-write: drain any pre-flip copy from the
+                    // legacy name-keyed partition so it can't resurrect on a later
+                    // dual-read (memtable deletes don't tombstone). No-op when absent.
+                    if let Some(legacy) = &legacy_partition {
+                        legacy.delete_record(&key).await?;
+                    }
+                }
+                TableRecordMutationKind::Delete => {
+                    partition.delete_record(&key).await?;
+                    // Delete from BOTH partitions during the cutover window.
+                    if let Some(legacy) = &legacy_partition {
+                        legacy.delete_record(&key).await?;
+                    }
+                    if maintain_index
+                        && let Some(index) = self.unique_index.write().get_mut(index_key)
+                    {
+                        index.delete(&record.oid);
+                    }
+                    if maintain_secondary
+                        && let Some(index) = self.secondary_index.write().get_mut(index_key)
+                    {
+                        index.delete(&record.oid);
+                    }
+                    record_ids.push(record.oid);
+                }
+                TableRecordMutationKind::OverwriteSnapshot
+                | TableRecordMutationKind::ReplacePartitions
+                | TableRecordMutationKind::Merge => {
+                    return Err(anyhow!(
+                        "mutation kind {kind:?} reached the apply step for table '{}'; only row mutations are applied here",
+                        table_schema.name
+                    ));
+                }
+            }
+        }
+        Ok(record_ids)
     }
 
     /// ADR-031 O3: the primary record partition for a table, plus — during an oid
@@ -2218,9 +2450,7 @@ impl TableRecordStore for DirectWalTableRecordStore {
         // TD-OLAP-17 fast-path: skip the O(WAL) scan when the collection's
         // high-water hasn't advanced past `since_lsn` (no entry can satisfy
         // `sequence_number > since_lsn`). `None` ⇒ appender doesn't track ⇒ scan.
-        if let Some(max) = self.wal_appender.collection_max_sequence_for(collection_id)
-            && max <= since_lsn
-        {
+        if self.change_feed_is_empty(collection_id, since_lsn) {
             return Ok(Vec::new());
         }
         let entries = self.wal_appender.read_all_entries().await?;
@@ -2246,9 +2476,7 @@ impl TableRecordStore for DirectWalTableRecordStore {
         // TD-OLAP-17 fast-path (tenant-agnostic): the collection high-water is a
         // sufficient condition for emptiness across ALL tenants — if no entry for
         // this collection exceeds `since_lsn`, the tenant filter cannot add any.
-        if let Some(max) = self.wal_appender.collection_max_sequence_for(collection_id)
-            && max <= since_lsn
-        {
+        if self.change_feed_is_empty(collection_id, since_lsn) {
             return Ok(Vec::new());
         }
         let entries = self.wal_appender.read_all_entries().await?;
@@ -2269,6 +2497,7 @@ impl TableRecordStore for DirectWalTableRecordStore {
         mutations: Vec<TableRecordMutation>,
         tenant_context: Option<&TenantContext>,
     ) -> Result<TableRecordWriteResult> {
+        self.ensure_healthy()?;
         let mut operations = Vec::with_capacity(mutations.len());
         let mut storage_actions = Vec::with_capacity(mutations.len());
         let projections = projection_directives_for_schema(table_schema);
@@ -2395,91 +2624,194 @@ impl TableRecordStore for DirectWalTableRecordStore {
             None
         };
 
-        // TD-110 Slice C: maintain the UNIQUE/PK index incrementally — but only
-        // once it has been built (first `check_unique_conflict`). Until then the
-        // lazy build captures these writes from current state, so skipping is
-        // safe; checking once avoids per-write work for tables never probed.
-        let index_primary_key = schema_primary_key_column(table_schema);
-        let maintain_index = !schema_unique_column_sets(table_schema).is_empty()
-            && self.unique_index.read().contains_key(&index_key);
-        // TD-127: maintain the secondary index on the same once-built basis as the
-        // UNIQUE/PK index — until first `lookup_secondary` builds it, the lazy
-        // build captures these writes from current state, so skipping is safe.
-        let maintain_secondary = !secondary_index_disabled()
-            && !schema_secondary_index_columns(table_schema).is_empty()
-            && self.secondary_index.read().contains_key(&index_key);
-        let maintain_any = maintain_index || maintain_secondary;
-
-        let mut record_ids = Vec::with_capacity(storage_actions.len());
-        for (idx, (kind, record)) in storage_actions.into_iter().enumerate() {
-            // `None` when the positional mapping could not be trusted (above), in
-            // which case the store gets no LSN and reports "cannot truncate"
-            // rather than a minimum derived from a partial set.
-            let lsn = lsns.as_ref().and_then(|v| v.get(idx).copied());
-            let key = RecordKey::from(&record);
-            match kind {
-                TableRecordMutationKind::Insert
-                | TableRecordMutationKind::Upsert
-                | TableRecordMutationKind::Update => {
-                    if maintain_any {
-                        let written = match lsn {
-                            Some(lsn) => {
-                                partition.upsert_record_at_lsn(record.clone(), lsn).await?
-                            }
-                            None => partition.upsert_record(record.clone()).await?,
-                        };
-                        record_ids.push(written.oid);
-                        if maintain_index
-                            && let Some(index) = self.unique_index.write().get_mut(&index_key)
-                        {
-                            index.upsert(&record, index_primary_key.as_deref());
-                        }
-                        if maintain_secondary
-                            && let Some(index) = self.secondary_index.write().get_mut(&index_key)
-                        {
-                            index.upsert(&record);
-                        }
-                    } else {
-                        let written = match lsn {
-                            Some(lsn) => partition.upsert_record_at_lsn(record, lsn).await?,
-                            None => partition.upsert_record(record).await?,
-                        };
-                        record_ids.push(written.oid);
-                    }
-                    // ADR-031 O3 migrate-on-write: drain any pre-flip copy from the
-                    // legacy name-keyed partition so it can't resurrect on a later
-                    // dual-read (memtable deletes don't tombstone). No-op when absent.
-                    if let Some(legacy) = &legacy_partition {
-                        legacy.delete_record(&key).await?;
-                    }
-                }
-                TableRecordMutationKind::Delete => {
-                    partition.delete_record(&key).await?;
-                    // Delete from BOTH partitions during the cutover window.
-                    if let Some(legacy) = &legacy_partition {
-                        legacy.delete_record(&key).await?;
-                    }
-                    if maintain_index
-                        && let Some(index) = self.unique_index.write().get_mut(&index_key)
-                    {
-                        index.delete(&record.oid);
-                    }
-                    if maintain_secondary
-                        && let Some(index) = self.secondary_index.write().get_mut(&index_key)
-                    {
-                        index.delete(&record.oid);
-                    }
-                    record_ids.push(record.oid);
-                }
-                TableRecordMutationKind::OverwriteSnapshot
-                | TableRecordMutationKind::ReplacePartitions
-                | TableRecordMutationKind::Merge => {
-                    unreachable!("unsupported kinds rejected above")
-                }
-            }
-        }
+        let record_ids = self
+            .apply_storage_actions(
+                table_schema,
+                &partition,
+                legacy_partition.as_ref(),
+                &index_key,
+                storage_actions,
+                lsns.as_deref(),
+            )
+            .await?;
 
         Ok(TableRecordWriteResult::success(record_ids))
+    }
+
+    /// ADR-095 D3 / TD-PGOLTP-1: make a whole transaction durable as ONE WAL
+    /// group frame, then apply it in staged order.
+    ///
+    /// The staged statements were validated against base ∪ staged under the
+    /// tables' op-locks, but writers that do not take op-locks (INSERT…SELECT,
+    /// DDL, graph merge-back) can still change a key, and `RecordUpsert` has no
+    /// conflict semantics. So INSERT-absent / UPDATE-exists is re-checked here
+    /// against current partitions, in staged order with a local overlay, BEFORE
+    /// anything is durable; a mismatch aborts the whole commit (40001).
+    async fn commit_atomic(
+        &self,
+        batches: Vec<StagedTableWrite>,
+    ) -> Result<Vec<TableRecordWriteResult>> {
+        self.ensure_healthy()?;
+        use crate::services::txn_staging::{CommitOutcomeUnknown, TxnSerializationConflict};
+
+        struct PlannedBatch {
+            table_schema: CatalogTableSchema,
+            partition: Arc<dyn RecordStorage>,
+            legacy_partition: Option<Arc<dyn RecordStorage>>,
+            index_key: (String, String),
+            storage_actions: Vec<(TableRecordMutationKind, ProximaRecord)>,
+        }
+
+        let mut operations: Vec<(CanonicalOperation, Option<String>)> = Vec::new();
+        let mut planned: Vec<PlannedBatch> = Vec::with_capacity(batches.len());
+        // (tenant, collection, oid) -> present after the mutations planned so far.
+        let mut overlay: std::collections::HashMap<(String, String, String), bool> =
+            std::collections::HashMap::new();
+
+        for batch in batches {
+            let tenant_context = batch.tenant_context.as_ref();
+            let tenant_scope = Self::tenant_key(tenant_context);
+            let tenant_id = tenant_context.map(|tenant| tenant.tenant_id.clone());
+            let projections = projection_directives_for_schema(&batch.table_schema);
+            let (collection_id, _) = memtable_partition_keys(&batch.table_schema);
+            let (partition, legacy_partition) =
+                self.partitions_for(&tenant_scope, &batch.table_schema);
+            let mut storage_actions = Vec::with_capacity(batch.mutations.len());
+
+            for mutation in batch.mutations {
+                let record = mutation.record;
+                let overlay_key = (
+                    tenant_scope.clone(),
+                    collection_id.clone(),
+                    record.oid.clone(),
+                );
+                let present = match overlay.get(&overlay_key) {
+                    Some(present) => *present,
+                    None => {
+                        let key = RecordKey::from(&record);
+                        partition.get_record(&key).await?.is_some()
+                            || match &legacy_partition {
+                                Some(legacy) => legacy.get_record(&key).await?.is_some(),
+                                None => false,
+                            }
+                    }
+                };
+                match mutation.kind {
+                    TableRecordMutationKind::Insert if present => {
+                        return Err(TxnSerializationConflict(format!(
+                            "row '{}' of table '{}' was inserted concurrently",
+                            record.oid, batch.table_schema.name
+                        ))
+                        .into());
+                    }
+                    TableRecordMutationKind::Update if !present => {
+                        return Err(TxnSerializationConflict(format!(
+                            "row '{}' of table '{}' was deleted concurrently",
+                            record.oid, batch.table_schema.name
+                        ))
+                        .into());
+                    }
+                    TableRecordMutationKind::Insert
+                    | TableRecordMutationKind::Update
+                    | TableRecordMutationKind::Upsert => {
+                        overlay.insert(overlay_key, true);
+                        operations.push((
+                            CanonicalOperation::RecordUpsert {
+                                collection_id: collection_id.clone(),
+                                record: Box::new(record.clone()),
+                                projections: projections.clone(),
+                            },
+                            tenant_id.clone(),
+                        ));
+                    }
+                    TableRecordMutationKind::Delete => {
+                        overlay.insert(overlay_key, false);
+                        operations.push((
+                            CanonicalOperation::RecordDelete {
+                                collection_id: collection_id.clone(),
+                                oid: record.oid.clone(),
+                                projections: projections.clone(),
+                            },
+                            tenant_id.clone(),
+                        ));
+                    }
+                    TableRecordMutationKind::OverwriteSnapshot
+                    | TableRecordMutationKind::ReplacePartitions
+                    | TableRecordMutationKind::Merge => {
+                        return Err(anyhow!(
+                            "mutation kind {:?} for table '{}' cannot be committed atomically",
+                            mutation.kind,
+                            batch.table_schema.name
+                        ));
+                    }
+                }
+                storage_actions.push((mutation.kind, record));
+            }
+
+            planned.push(PlannedBatch {
+                index_key: (tenant_scope, collection_id),
+                table_schema: batch.table_schema,
+                partition,
+                legacy_partition,
+                storage_actions,
+            });
+        }
+
+        let expected = operations.len();
+        let entries = match self.wal_appender.append_operations_atomic(operations).await {
+            Ok(entries) => entries,
+            Err(err)
+                if err.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<crate::services::canonical_wal::WalAppendIndeterminate>()
+                        .is_some()
+                }) =>
+            {
+                return Err(CommitOutcomeUnknown(format!("{err:#}")).into());
+            }
+            Err(err) => return Err(err),
+        };
+
+        // Durable from here on: any failure is "outcome unknown", never a
+        // plain error the client could read as "not committed".
+        if entries.len() != expected {
+            return Err(CommitOutcomeUnknown(format!(
+                "atomic append returned {} entries for {} operations",
+                entries.len(),
+                expected
+            ))
+            .into());
+        }
+        let lsns: Vec<u64> = entries.iter().map(|entry| entry.sequence_number).collect();
+        let mut results = Vec::with_capacity(planned.len());
+        let mut offset = 0usize;
+        for batch in planned {
+            let count = batch.storage_actions.len();
+            let batch_lsns = &lsns[offset..offset + count];
+            offset += count;
+            let record_ids = self
+                .apply_storage_actions(
+                    &batch.table_schema,
+                    &batch.partition,
+                    batch.legacy_partition.as_ref(),
+                    &batch.index_key,
+                    batch.storage_actions,
+                    Some(batch_lsns),
+                )
+                .await
+                .map_err(|err| {
+                    // Durable but only partly applied: refuse to serve it.
+                    self.poisoned
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    tracing::error!(
+                        error = %format!("{err:#}"),
+                        "applying a durable atomic commit failed; record store poisoned until restart"
+                    );
+                    CommitOutcomeUnknown(format!("{err:#}"))
+                })?;
+            results.push(TableRecordWriteResult::success(record_ids));
+        }
+        Ok(results)
     }
 
     async fn get_by_key(
@@ -2489,6 +2821,7 @@ impl TableRecordStore for DirectWalTableRecordStore {
         tenant_context: Option<&TenantContext>,
         #[cfg(feature = "abac-policy")] read_context: &ReadContext,
     ) -> Result<TableRecordGetResponse> {
+        self.ensure_healthy()?;
         // Pass `None`: the partition already scopes the tenant structurally, so
         // no per-record tenant filter is needed (TD-064).
         let tenant = Self::tenant_key(tenant_context);
@@ -2536,6 +2869,7 @@ impl TableRecordStore for DirectWalTableRecordStore {
         tenant_context: Option<&TenantContext>,
         #[cfg(feature = "abac-policy")] _read_context: &ReadContext,
     ) -> Result<TableRecordScanResponse> {
+        self.ensure_healthy()?;
         let tenant = Self::tenant_key(tenant_context);
         let (primary, legacy) = self.partitions_for(&tenant, table_schema);
         let Some(legacy) = legacy else {
@@ -2579,6 +2913,7 @@ impl TableRecordStore for DirectWalTableRecordStore {
         tenant_context: Option<&TenantContext>,
         #[cfg(feature = "abac-policy")] _read_context: &ReadContext,
     ) -> Result<TableRecordScanResponse> {
+        self.ensure_healthy()?;
         let tenant = Self::tenant_key(tenant_context);
         let (primary, legacy) = self.partitions_for(&tenant, table_schema);
         let Some(legacy) = legacy else {
@@ -2629,6 +2964,7 @@ impl TableRecordStore for DirectWalTableRecordStore {
         exclude_oids: &std::collections::HashSet<String>,
         tenant_context: Option<&TenantContext>,
     ) -> Result<Option<UniqueConflict>> {
+        self.ensure_healthy()?;
         let tenant_scope = Self::tenant_key(tenant_context);
         self.ensure_unique_index_built(table_schema, &tenant_scope)
             .await?;
@@ -2659,6 +2995,7 @@ impl TableRecordStore for DirectWalTableRecordStore {
         values: &std::collections::HashSet<String>,
         tenant_context: Option<&TenantContext>,
     ) -> Result<Option<Vec<String>>> {
+        self.ensure_healthy()?;
         if secondary_index_disabled() {
             return Ok(None);
         }
@@ -2761,7 +3098,7 @@ fn canonical_open_table_format(format: &CatalogPhysicalFormat) -> Option<Canonic
     }
 }
 
-fn proxima_record_to_get_response(
+pub(crate) fn proxima_record_to_get_response(
     record: ProximaRecord,
     _table_schema: &CatalogTableSchema,
     include_vector: bool,

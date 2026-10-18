@@ -50,7 +50,7 @@ graph TB
 
     subgraph "Storage Engines"
         SST["SST Engine\nLSM-tree / ProximaBlocks\nOLTP optimized"]
-        VIPER["VIPER Engine\nColumnar / Parquet\nOLAP optimized"]
+        VIPER["VIPER Engine (deprecated, ADR-093)\nexisting collections only"]
         NOVA["NOVA Engine\nAdvanced columnar\nQuantization"]
         HELIX["HELIX Engine\nPCA + Hilbert curves\nHigh-dim"]
         ORION["ORION Engine\nGraph storage"]

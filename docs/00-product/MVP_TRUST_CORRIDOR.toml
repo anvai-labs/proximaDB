@@ -4,6 +4,8 @@ product_name = "ProximaDB"
 positioning = "Object-storage-native context serving for SQL, JSON, and vectors"
 deployment = "single-node"
 canonical_api = "REST /api/v2"
+# The corridor's engine. Its smokes set "engine": "sst" explicitly: a REST/gRPC create that omits
+# the engine is auto-routed to HELIX until TD-ENGSEL-1 makes SST the automatic default (v0.5).
 default_engine = "sst"
 
 [promise]
@@ -75,14 +77,14 @@ evidence = ["tests/release_smoke_v2.rs"]
 [[exclusion]]
 id = "pgwire"
 tier = "beta"
-reason = "Autocommit SQL subset; multi-tenant ABAC propagation and bypass closure are not yet complete."
-tracking = ["docs/10-quality/td/TD-ABAC-10-pgwire-identity-constructor.adoc", "docs/10-quality/td/TD-ABAC-11-mint-and-fail-closed-composition.adoc"]
+reason = "Beta SQL with transactions (ADR-018 P2.D); pgwire identity/ABAC parity, vector-table tenancy and published-image reachability are not complete. pgwire enters the corridor at roadmap v1.0 (ADR-096)."
+tracking = ["docs/10-quality/td/TD-ABAC-10-pgwire-identity-constructor.adoc", "docs/10-quality/td/TD-PGWIRE-VECTENANT-1-pgwire-vector-collections-outside-tenant-boundary.adoc", "docs/10-quality/td/TD-PGWIRE-CONTAINER-1-pgwire-unreachable-in-a-container-without-auth.adoc"]
 
 [[exclusion]]
 id = "multi_tenant_abac"
 tier = "beta"
-reason = "Metadata filters are query predicates, not authorization. Stable-ID totality and fail-closed cross-surface ABAC are incomplete."
-tracking = ["docs/10-quality/td/TD-ABAC-10-pgwire-identity-constructor.adoc", "docs/10-quality/td/TD-ABAC-11-mint-and-fail-closed-composition.adoc"]
+reason = "Metadata filters are query predicates, not authorization. Cross-surface fail-closed authorization and retiring the per-row tenant predicate are incomplete (stable tenant IDs landed with TD-ABAC-11)."
+tracking = ["docs/10-quality/td/TD-ABAC-10-pgwire-identity-constructor.adoc", "docs/10-quality/td/TD-AUTHZ-1-adr090-program-tracker.adoc", "docs/10-quality/td/TD-TENANT-2-retire-per-row-tenant-predicate.adoc"]
 
 [[exclusion]]
 id = "multimodel_projections"
@@ -100,7 +102,7 @@ tracking = ["docs/SUPPORTED_SURFACE.adoc"]
 id = "full_sql"
 tier = "experimental"
 reason = "PostgreSQL transaction, constraint, procedural, and broad SQL parity are out of scope."
-tracking = ["roadmap/techdebt/TD_110_OLTP_OLAP_HTAP_STORAGE_AND_CONSTRAINTS_PLAN_2026_06_04.adoc"]
+tracking = ["docs/12-design/adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc", "docs/10-quality/td/TD-PGOLTP-1-atomic-commit-record-group-commit.adoc", "roadmap/techdebt/TD_110_OLTP_OLAP_HTAP_STORAGE_AND_CONSTRAINTS_PLAN_2026_06_04.adoc"]
 
 [release]
 binary_targets = [

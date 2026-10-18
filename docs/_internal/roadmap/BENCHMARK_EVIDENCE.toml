@@ -445,7 +445,7 @@ id = "recall_at_10"
 claim = "~97% Recall@10 (HNSW, M=32)"
 metric = "recall_at_10_pct"
 status = "measured"
-asserted_in = ["README.adoc:97", "docs/10-quality/benchmarks/BENCHMARKS.adoc:18"]
+asserted_in = ["README.adoc:264", "docs/10-quality/benchmarks/BENCHMARKS.adoc:18"]
 bench_source = "benches/bench_24_recall_at_k_engine.rs"
 bench_command = "PROXIMADB_BENCH_ENGINE=sst PROXIMADB_BENCH_VECTOR_COUNT=100000 cargo bench --bench bench_24_recall_at_k_engine"
 artifact = "docs/_internal/status/TD_096_S1_RECALL_RECONCILIATION_2026_06_28.adoc"
@@ -591,56 +591,15 @@ id = "tst_ohlc_latency"
 claim = "Sub-millisecond OHLC bar queries (TST engine)"
 metric = "ohlc_query_latency_ms"
 status = "aspirational"
-asserted_in = ["docs/00-product/PRD.adoc:128"]
+asserted_in = ["docs/11-usecases/IBKRTRADING_DOGFOOD.adoc:272"]
 bench_source = ""
 bench_command = ""
 artifact = ""
 hardware = ""
 date = ""
 version = ""
-notes = "PRD acceptance criterion for the Beta TST engine. No benchmark under benches/ measures OHLC query latency."
+notes = "Success criterion of the ibkrtrading use case (ADR-096 D2 moved trading-specific targets out of the PRD). No benchmark under benches/ measures OHLC query latency; Beta TST engine."
 
-[[claims]]
-id = "tst_ingest_rate"
-claim = ">100K bars/second sustained ingest (TST engine)"
-metric = "tst_ingest_bars_per_sec"
-status = "aspirational"
-asserted_in = ["docs/00-product/PRD.adoc:131"]
-bench_source = ""
-bench_command = ""
-artifact = ""
-hardware = ""
-date = ""
-version = ""
-notes = "PRD acceptance criterion; no TST ingest benchmark exists."
-
-[[claims]]
-id = "recovery_time"
-claim = "<5s recovery"
-metric = "recovery_time_s"
-status = "aspirational"
-asserted_in = ["docs/00-product/PRD.adoc:59"]
-bench_source = ""
-bench_command = ""
-artifact = ""
-hardware = ""
-date = ""
-version = ""
-notes = "Platform-engineer requirement; recovery time is not benchmarked."
-
-[[claims]]
-id = "asof_join_latency"
-claim = "ASOF join point-in-time lookup performance (TST engine)"
-metric = "asof_join_latency_ms"
-status = "aspirational"
-asserted_in = ["docs/00-product/PRD.adoc:125"]
-bench_source = ""
-bench_command = ""
-artifact = ""
-hardware = ""
-date = ""
-version = ""
-notes = "PRD acceptance criterion for the Beta TST engine; no ASOF-join benchmark exists."
 
 [[claims]]
 id = "cloud_latency"

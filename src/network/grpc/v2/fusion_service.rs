@@ -164,11 +164,17 @@ impl ProximaFusionService for ProximaFusionServiceImpl {
                 }),
         };
 
-        let (items, stats) = self
-            .fusion
-            .graph_fusion_search(params)
-            .await
-            .map_err(|e| Status::internal(format!("fusion search failed: {e}")))?;
+        let (items, stats) = self.fusion.graph_fusion_search(params).await.map_err(|e| {
+            // Same mapping as the REST fusion-search handler (TD-SECSCAN-1 §5).
+            match crate::services::operations::vectors::client_argument_message(&e) {
+                Some(message) => Status::invalid_argument(format!("fusion search: {message}")),
+                // Server fault: log the cause chain, return a stable message.
+                None => {
+                    tracing::error!(error = %format!("{e:#}"), "v2 gRPC FusionSearch failed");
+                    Status::internal("fusion search failed")
+                }
+            }
+        })?;
 
         let results = items
             .into_iter()

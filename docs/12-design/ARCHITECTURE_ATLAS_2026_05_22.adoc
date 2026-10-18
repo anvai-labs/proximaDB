@@ -19,8 +19,7 @@ authority boundaries, and where lower-level module maps live.
 
 1. This atlas for system shape and connectedness.
 2. `MODULE_COMPONENT_LLD_2026_05_22.adoc` for per-module component breakdown.
-3. `DOCUMENTATION_CONSOLIDATION_AND_ARCHIVE_PLAN_2026_05_22.adoc` for doc ownership and archive
-   rules.
+3. `WORK_LEDGER_2026_10_15.adoc` for the status of every design, ADR and TD document.
 4. Existing active blueprints and ADRs in `docs/12-design/README.adoc`.
 
 == Non-Negotiable Architecture Invariants

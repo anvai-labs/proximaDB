@@ -43,6 +43,12 @@ pub enum RankError {
 
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The request's own argument is invalid (e.g. a wrong-dimension query
+    /// vector reaching a retrieval backend). Request boundaries answer it as
+    /// a client error (HTTP 400), not a pipeline failure (TD-SECSCAN-1 §5).
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 pub type RankResult<T> = Result<T, RankError>;

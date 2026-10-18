@@ -61,7 +61,10 @@ services:
       # "PostgreSQL wire protocol" in deploy/README.md and
       # TD-PGWIRE-CONTAINER-1 for the SCRAM prerequisite to changing that.
     volumes:
-      - proximadb-data:/var/lib/proximadb
+      - proximadb-data:/data/proximadb
+      # Required until TD-PKG-3 is fixed: the built-in config keeps data in /tmp inside the
+      # container. Create proximadb.toml as shown in the installation guide (Docker section).
+      - ./proximadb.toml:/config/config.toml:ro
     environment:
       - RUST_LOG=info
     restart: unless-stopped
@@ -90,7 +93,7 @@ curl http://localhost:5678/health
 ```json
 {
   "status": "healthy",
-  "version": "0.2.0",
+  "version": "X.Y.Z",
   "uptime_seconds": 123456,
   "collections": 10,
   "total_vectors": 1000000
@@ -291,11 +294,14 @@ worker_threads = 8  # Set to CPU cores
 
 ### Engine Selection
 
-| Workload | Engine | Config |
-|----------|--------|--------|
-| Real-time | SST | `memtable_size_mb = 512` |
-| Analytics | VIPER | `parquet_row_group_size = 10000` |
-| Mixed | RAPTOR | Auto-tuning enabled |
+| Workload | Choice | Notes |
+|----------|--------|-------|
+| Vector and context search | SST collection (pass `"engine": "sst"`) | Supported; `memtable_size_mb = 512` for write-heavy ingestion |
+| Analytical SQL | Relational table + `ALTER TABLE … MATERIALIZE` | Routes to DataFusion over Parquet |
+| Mixed read/write layout | NOVA collection | Beta; measure against SST first |
+
+VIPER is deprecated and SWIFT/RAPTOR are experimental (deleted in roadmap v0.6); do not create
+new collections on them. See the storage engine guide (`docs/05-concepts/storage-engines.adoc`).
 
 ---
 

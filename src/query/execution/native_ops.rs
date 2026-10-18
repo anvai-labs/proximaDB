@@ -1355,9 +1355,20 @@ fn walk_inner(plan: &PhysicalPlan, scan_ctx: Option<&ScanCtx>) -> Result<Walked,
             // shadow probe. Absent an injection, fall through to the PAX path (#807).
             if let Some(source) = INJECTED_SCAN_SOURCE.with(|s| s.borrow_mut().take()) {
                 let cur_schema = source.output_schema();
+                // A pushed-down `Scan.predicate` must still be applied row-by-row:
+                // the parquet source only *prunes* (row groups / pages, a superset),
+                // so the exact filter is a FilterProject directly above it. An
+                // expression native cannot lower declines the whole query (→ DF).
+                let ops = match predicate {
+                    Some(p) => vec![OpSpec::FilterProject {
+                        predicate: Some(PhysExpr::lower(p)?),
+                        projection: None,
+                    }],
+                    None => Vec::new(),
+                };
                 return Ok(Walked {
                     source,
-                    ops: Vec::new(),
+                    ops,
                     cur_schema,
                     limit: None,
                 });

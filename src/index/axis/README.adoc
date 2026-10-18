@@ -1490,7 +1490,7 @@ let status = migration_engine.get_migration_status(collection_id).await?;
 
 == Future Enhancements
 
-**Planned Features** (see link:../../../docs/09-roadmap/[Roadmap]):
+**Planned Features** (see link:../../../docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc[Roadmap]):
 
 === Short-Term (Q1-Q2 2025)
 
@@ -1536,7 +1536,7 @@ let status = migration_engine.get_migration_status(collection_id).await?;
 
 * Architecture Overview
 * Storage Engines Documentation
-* link:../../../docs/09-roadmap/[Development Roadmap]
+* link:../../../docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc[Roadmap]
 
 **External Resources**:
 

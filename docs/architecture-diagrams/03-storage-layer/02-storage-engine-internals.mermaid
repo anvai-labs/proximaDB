@@ -34,7 +34,7 @@ graph TB
     end
 
     subgraph "VIPER Engine (src/storage/engines/viper/)"
-        VIPER_ROOT["VIPER Engine\nParquet Columnar · OLAP\nArrow-native"]
+        VIPER_ROOT["VIPER Engine (deprecated, ADR-093)\nParquet Columnar · existing collections only"]
         VIPER_PARQUET["Parquet Writer\nArrow RecordBatch → Parquet\nRow-group sizing\nDictionary encoding"]
         VIPER_ICEBERG["Iceberg Integration\nManifest management\nSnapshot isolation\nTime-travel"]
         VIPER_ROOT --> VIPER_PARQUET

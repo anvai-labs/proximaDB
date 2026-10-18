@@ -684,8 +684,7 @@ if __name__ == "__main__":
 ### Resources
 
 - **Demo README**: `demo/README.md` - Environment setup and troubleshooting
-- **API Documentation**: `docs/reference/rest-api-specification.adoc`
-- **Performance Guide**: `docs/performance/README.adoc`
+- **API Documentation**: `docs/03-api-reference/index.md`
 - **Example Demos**: See `demo/quickstart/basic_demo.py` for simple example
 
 ### Questions?

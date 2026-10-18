@@ -456,6 +456,324 @@ async fn v2_filtered_scan_survives_flush() {
     );
 }
 
+/// TD-PGWIRE-VECDEL-1 (storage-inclusive scan): a record that was FLUSHED and
+/// then deleted must not come back from `records/scan`. The scan merges the
+/// unflushed WAL delta with flushed storage; it read the deduplicating memtable
+/// reader, which drops a tombstoned winner, so the unflushed delete never met
+/// the flushed live copy and the merge resurrected it (invariant #16d).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v2_scan_hides_a_record_deleted_after_flush() {
+    let server = TestServer::start().await.expect("server start");
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .no_proxy()
+        .build()
+        .unwrap();
+    let base = server.base_url();
+    let name = format!(
+        "v2_flush_del_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+
+    let create = http
+        .post(format!("{base}/api/v2/collections"))
+        .json(&json!({
+            "name": name,
+            "dimension": 1,
+            "engine": "sst",
+            "enable_proxima_record": true
+        }))
+        .send()
+        .await
+        .expect("create");
+    let create_status = create.status();
+    let create_body = create.text().await.expect("create response body");
+    assert!(
+        create_status.is_success(),
+        "create: {create_status} {create_body}"
+    );
+
+    let insert = http
+        .post(format!("{base}/api/v2/collections/{name}/records/batch"))
+        .json(&json!({
+            "records": [
+                { "id": "keep", "vector": [0.0] },
+                { "id": "gone", "vector": [0.0] }
+            ],
+            "upsert": true
+        }))
+        .send()
+        .await
+        .expect("insert");
+    assert!(insert.status().is_success(), "insert: {}", insert.status());
+    sleep(Duration::from_millis(500)).await;
+
+    // Both live copies are now flushed; the delete below stays unflushed.
+    server.force_flush(&name).await.expect("force flush");
+    assert!(
+        !server.persisted_pax_files().is_empty(),
+        "setup: force-flush must publish a PAX segment; physical files: {:?}",
+        server.persisted_files()
+    );
+
+    let delete = http
+        .delete(format!("{base}/api/v2/collections/{name}/records/gone"))
+        .send()
+        .await
+        .expect("delete");
+    assert!(delete.status().is_success(), "delete: {}", delete.status());
+
+    let resp = http
+        .post(format!("{base}/api/v2/collections/{name}/records/scan"))
+        .json(&json!({ "limit": 10 }))
+        .send()
+        .await
+        .expect("scan");
+    assert!(resp.status().is_success(), "scan status {}", resp.status());
+    let body: serde_json::Value = resp.json().await.expect("scan json");
+    let recs = body
+        .get("records")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        ids(&recs),
+        ["keep".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        "a record deleted after flush must not be resurrected by the scan: {body}"
+    );
+
+    let get = http
+        .get(format!("{base}/api/v2/collections/{name}/records/gone"))
+        .send()
+        .await
+        .expect("get");
+    assert_eq!(
+        get.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "the by-id read must agree with the scan"
+    );
+
+    // Vector search over the flushed segment must not return it either.
+    let resp = http
+        .post(format!("{base}/api/v2/collections/{name}/search"))
+        .json(&json!({ "vector": [0.0], "top_k": 10 }))
+        .send()
+        .await
+        .expect("search");
+    assert!(
+        resp.status().is_success(),
+        "search status {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.expect("search json");
+    let hits = body
+        .get("results")
+        .or_else(|| body.get("hits"))
+        .or_else(|| body.get("records"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        ids(&hits),
+        ["keep".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        "vector search must not return a record deleted after flush: {body}"
+    );
+}
+
+/// The by-id read must not let a STALE unflushed tombstone hide a newer flushed
+/// copy. Flush retires vector batches but deliberately retains tombstone-only
+/// batches (tombstone persistence is still open, TD-USUB-1), so after
+/// delete → re-insert → flush the memtable holds only the old tombstone while
+/// storage holds the live re-insert. A by-id read that trusted the memtable's
+/// dead winner without consulting storage returned 404 for a live record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v2_get_returns_a_record_reinserted_after_delete_and_flush() {
+    let server = TestServer::start().await.expect("server start");
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .no_proxy()
+        .build()
+        .unwrap();
+    let base = server.base_url();
+    let name = format!(
+        "v2_reinsert_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let create = http
+        .post(format!("{base}/api/v2/collections"))
+        .json(&json!({
+            "name": name,
+            "dimension": 1,
+            "engine": "sst",
+            "enable_proxima_record": true
+        }))
+        .send()
+        .await
+        .expect("create");
+    assert!(create.status().is_success(), "create: {}", create.status());
+
+    let upsert = |v: f32| {
+        let http = http.clone();
+        let url = format!("{base}/api/v2/collections/{name}/records/batch");
+        async move {
+            let resp = http
+                .post(url)
+                .json(&json!({ "records": [ { "id": "x", "vector": [v] } ], "upsert": true }))
+                .send()
+                .await
+                .expect("upsert");
+            assert!(resp.status().is_success(), "upsert: {}", resp.status());
+        }
+    };
+
+    upsert(0.0).await;
+    sleep(Duration::from_millis(200)).await;
+    let delete = http
+        .delete(format!("{base}/api/v2/collections/{name}/records/x"))
+        .send()
+        .await
+        .expect("delete");
+    assert!(delete.status().is_success(), "delete: {}", delete.status());
+    sleep(Duration::from_millis(200)).await;
+    upsert(1.0).await;
+    sleep(Duration::from_millis(500)).await;
+
+    // Flush: the re-insert goes to storage; the tombstone-only batch stays.
+    server.force_flush(&name).await.expect("force flush");
+
+    let get = http
+        .get(format!("{base}/api/v2/collections/{name}/records/x"))
+        .send()
+        .await
+        .expect("get");
+    let status = get.status();
+    let body = get.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "a record re-inserted after its delete must be readable after flush: {body}"
+    );
+    let got: serde_json::Value = serde_json::from_str(&body).expect("get json");
+    let vector = got
+        .get("vector")
+        .or_else(|| got.get("record").and_then(|r| r.get("vector")))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        vector,
+        json!([1.0]),
+        "the by-id read must return the RE-INSERTED version, not the deleted original: {body}"
+    );
+
+    let resp = http
+        .post(format!("{base}/api/v2/collections/{name}/records/scan"))
+        .json(&json!({ "limit": 10 }))
+        .send()
+        .await
+        .expect("scan");
+    let body: serde_json::Value = resp.json().await.expect("scan json");
+    let recs = body
+        .get("records")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        ids(&recs),
+        ["x".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        "the scan must agree with the by-id read: {body}"
+    );
+}
+
+/// Two versions of one id flushed together: the by-id read must return the
+/// newer one. (Probe for the flushed point-lookup winner rule.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v2_get_returns_the_newer_of_two_flushed_versions() {
+    let server = TestServer::start().await.expect("server start");
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .no_proxy()
+        .build()
+        .unwrap();
+    let base = server.base_url();
+    let name = format!(
+        "v2_twover_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let create = http
+        .post(format!("{base}/api/v2/collections"))
+        .json(&json!({ "name": name, "dimension": 1, "engine": "sst", "enable_proxima_record": true }))
+        .send()
+        .await
+        .expect("create");
+    assert!(create.status().is_success(), "create: {}", create.status());
+    for v in [0.0_f32, 1.0] {
+        let resp = http
+            .post(format!("{base}/api/v2/collections/{name}/records/batch"))
+            .json(&json!({ "records": [ { "id": "x", "vector": [v] } ], "upsert": true }))
+            .send()
+            .await
+            .expect("upsert");
+        assert!(resp.status().is_success(), "upsert: {}", resp.status());
+        sleep(Duration::from_millis(200)).await;
+    }
+    let before: serde_json::Value = http
+        .get(format!("{base}/api/v2/collections/{name}/records/x"))
+        .send()
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+    server.force_flush(&name).await.expect("force flush");
+    let after: serde_json::Value = http
+        .get(format!("{base}/api/v2/collections/{name}/records/x"))
+        .send()
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        before.get("vector"),
+        Some(&json!([1.0])),
+        "pre-flush: {before}"
+    );
+    assert_eq!(
+        after.get("vector"),
+        Some(&json!([1.0])),
+        "post-flush must keep the newer version: {after}"
+    );
+    let scan: serde_json::Value = http
+        .post(format!("{base}/api/v2/collections/{name}/records/scan"))
+        .json(&json!({ "limit": 10, "include_vector": true }))
+        .send()
+        .await
+        .expect("scan")
+        .json()
+        .await
+        .expect("scan json");
+    let recs = scan
+        .get("records")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(recs.len(), 1, "one current version per id: {scan}");
+    assert_eq!(
+        recs[0].get("vector"),
+        Some(&json!([1.0])),
+        "the scan must also serve the newer flushed version: {scan}"
+    );
+}
+
 /// TD-READFID-1: a point read on an `fp32` collection must return the written
 /// f32 vector BYTE-EXACTLY after the record is flushed to a PAX segment.
 ///
@@ -581,4 +899,133 @@ async fn v2_fp32_point_read_is_byte_exact_after_flush() {
             "POST-FLUSH rec-{i} is not the written f32 (TD-READFID-1): got {got:?} want {want:?}"
         );
     }
+}
+
+/// TD-READFID-2: the exact-f32 tier must SURVIVE compaction on the production
+/// path. Compaction inputs reach the tier predicates as `file://{abs}` URLs;
+/// before the fix the predicates `std::fs::read` those URLs, fail, and conclude
+/// "no input has the tier", so the merged segment was written lossy and an
+/// `fp32` collection re-lossified at its first compaction.
+///
+/// Drives the real trigger: five forced flushes reach the default L0 threshold
+/// (`L0_COMPACTION_THRESHOLD = 5`), the flush enqueues compaction, and the
+/// background worker merges the five tier'd segments into one. No test-only
+/// compaction entry point is used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v2_fp32_point_read_is_byte_exact_after_compaction() {
+    let server = TestServer::start().await.expect("server start");
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .no_proxy()
+        .build()
+        .unwrap();
+    let base = server.base_url();
+    let name = format!(
+        "v2_fp32_cmp_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let dim: usize = 8;
+    let flushes: usize = 5;
+    let per_flush: usize = 3;
+
+    let create = http
+        .post(format!("{base}/api/v2/collections"))
+        .json(&json!({
+            "name": name,
+            "dimension": dim,
+            "engine": "sst",
+            "distance_metric": "euclidean",
+            "canonical_embedding_precision": "fp32",
+        }))
+        .send()
+        .await
+        .expect("create");
+    let create_status = create.status();
+    let create_body = create.text().await.expect("create response body");
+    assert!(
+        create_status.is_success(),
+        "create: {create_status} {create_body}"
+    );
+
+    let written: Vec<Vec<f32>> = (0..flushes * per_flush)
+        .map(|i| {
+            (0..dim)
+                .map(|j| ((i * dim + j) as f32 * 0.017_291).cos() * 0.613 + j as f32 * 0.011)
+                .collect()
+        })
+        .collect();
+
+    for flush in 0..flushes {
+        let records: Vec<serde_json::Value> = (flush * per_flush..(flush + 1) * per_flush)
+            .map(|i| json!({ "id": format!("rec-{i}"), "vector": written[i] }))
+            .collect();
+        let insert = http
+            .post(format!("{base}/api/v2/collections/{name}/records/batch"))
+            .json(&json!({ "records": records }))
+            .send()
+            .await
+            .expect("insert");
+        assert!(
+            insert.status().is_success(),
+            "insert: {} {}",
+            insert.status(),
+            insert.text().await.unwrap_or_default()
+        );
+        server.force_flush(&name).await.expect("force flush");
+    }
+
+    // Every flushed segment carries the exact tier (TD-READFID-1). Then wait
+    // for the background compaction the fifth flush enqueued to retire them.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let merged = loop {
+        let pax = server.persisted_pax_files();
+        if pax.len() == 1 {
+            break pax[0].clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "compaction never merged the {flushes} flushed segments: {pax:?}"
+        );
+        sleep(Duration::from_millis(250)).await;
+    };
+
+    let merged_bytes = std::fs::read(&merged).expect("read merged segment");
+    let merged_is_exact =
+        proximadb::storage::engines::sst::segment_format::pax_segment_has_exact_vector_authority(
+            &merged_bytes,
+        );
+
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    let mut mismatches = Vec::new();
+    for (i, want) in written.iter().enumerate() {
+        let id = format!("rec-{i}");
+        let resp = http
+            .get(format!("{base}/api/v2/collections/{name}/records/{id}"))
+            .send()
+            .await
+            .expect("get");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("get json");
+        assert!(status.is_success(), "get {id}: {status} {body}");
+        let got: Vec<f32> = body
+            .get("vector")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("get {id}: no vector in {body}"))
+            .iter()
+            .map(|x| x.as_f64().expect("numeric component") as f32)
+            .collect();
+        if bits(&got) != bits(want) {
+            mismatches.push(format!("{id}: got {got:?} want {want:?}"));
+        }
+    }
+    assert!(
+        merged_is_exact && mismatches.is_empty(),
+        "POST-COMPACTION fp32 fidelity lost (TD-READFID-2): merged segment {merged} \
+         has_exact_authority={merged_is_exact}; {} of {} records differ: {mismatches:#?}",
+        mismatches.len(),
+        written.len()
+    );
 }

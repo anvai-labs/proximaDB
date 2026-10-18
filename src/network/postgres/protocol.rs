@@ -363,6 +363,31 @@ impl TransactionBuffer {
     }
 }
 
+/// An atomic COMMIT whose outcome is unknown (SQLSTATE 08007, sent as FATAL).
+/// Propagating it ends the connection (ADR-095 review F2).
+#[derive(Debug)]
+struct AtomicCommitFatal(String);
+
+impl std::fmt::Display for AtomicCommitFatal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "atomic COMMIT outcome unknown; connection closed: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for AtomicCommitFatal {}
+
+/// Outcome of [`PostgresProtocol::execute_autocommit_dml`]: an ordinary
+/// statement error (mapped by the caller as before) or a failure of the atomic
+/// commit machinery (mapped by `send_autocommit_atomic_failure`).
+enum AutocommitFailure {
+    Statement(anyhow::Error),
+    Atomic(crate::services::atomic_txn::AtomicTxnError),
+}
+
 /// SQLSTATE for a failed DmlService statement: a typed relational integrity
 /// violation (TD-DML-1) maps to its PostgreSQL class (23505 unique, 23503
 /// foreign key, 23514 check, 21000 cardinality); anything else keeps the
@@ -2049,6 +2074,10 @@ impl PostgresProtocol {
                 .await;
             match exec_result {
                 Ok(Ok(())) => {}
+                // A FATAL (atomic commit outcome unknown) was already sent: end the
+                // connection instead of following it with an ERROR + ReadyForQuery
+                // (review S4a F2).
+                Ok(Err(e)) if e.downcast_ref::<AtomicCommitFatal>().is_some() => return Err(e),
                 Ok(Err(e)) => {
                     self.send_error("ERROR", "XX000", &format!("execution failed: {}", e))
                         .await?;
@@ -2150,7 +2179,26 @@ impl PostgresProtocol {
         approx_bytes: usize,
         table: String,
         write_tenant: String,
-    ) -> Result<(), String> {
+    ) -> Result<(), (&'static str, String)> {
+        // ADR-095 review B1: INSERT…SELECT / INSERT OVERWRITE write through the
+        // table-write executor, which would bypass transaction staging and make
+        // them durable before COMMIT. Refuse them in an atomic transaction.
+        if crate::services::oltp_gate::atomic_commit_enabled()
+            && matches!(
+                statement,
+                crate::services::dml::DmlStatement::InsertSelect { .. }
+                    | crate::services::dml::DmlStatement::InsertOverwrite { .. }
+            )
+        {
+            self.session.write().await.fail_transaction();
+            self.transaction_buffer.clear();
+            return Err((
+                "0A000",
+                "INSERT … SELECT / INSERT OVERWRITE inside an atomic transaction is not supported yet; \
+                 the transaction has been aborted (ADR-095)"
+                    .to_string(),
+            ));
+        }
         if self.transaction_buffer.entries.len() >= TRANSACTION_MAX_ENTRIES
             || self
                 .transaction_buffer
@@ -2160,8 +2208,11 @@ impl PostgresProtocol {
         {
             self.session.write().await.fail_transaction();
             self.transaction_buffer.clear();
-            return Err(format!(
-                "transaction exceeds the in-memory write buffer limit ({TRANSACTION_MAX_ENTRIES} statements / {TRANSACTION_MAX_BYTES} bytes); the transaction has been aborted (ADR-018 P2.D)"
+            return Err((
+                "54000",
+                format!(
+                    "transaction exceeds the in-memory write buffer limit ({TRANSACTION_MAX_ENTRIES} statements / {TRANSACTION_MAX_BYTES} bytes); the transaction has been aborted (ADR-018 P2.D)"
+                ),
             ));
         }
         self.transaction_buffer.total_bytes = self
@@ -2256,6 +2307,10 @@ impl PostgresProtocol {
                             // for ROLLBACK. The error response is already on
                             // the wire.
                             error!("transaction COMMIT replay failed: {error:#}");
+                            if error.downcast_ref::<AtomicCommitFatal>().is_some() {
+                                // FATAL already sent: end the connection.
+                                return Err(error);
+                            }
                             // Only the single-statement path owns its RFQ here —
                             // batch/extended paths send exactly one RFQ at
                             // Sync/batch end; an extra one desyncs the wire.
@@ -2285,6 +2340,252 @@ impl PostgresProtocol {
         Ok(())
     }
 
+    /// ADR-095 D3 / TD-PGOLTP-1: COMMIT as ONE durable unit.
+    ///
+    /// 1. Hold the op-locks of every buffered table (+ cascade closure) for the
+    ///    whole commit.
+    /// 2. Re-execute the buffered statements against a staging store: same DML
+    ///    service, constraint checks and resolution, but nothing is written.
+    /// 3. Make every captured write durable with one WAL group frame, then apply.
+    ///
+    /// Any failure before step 3 leaves NOTHING durable. Step 3 runs in its own
+    /// task, outside the statement timeout, so a client disconnect or timeout
+    /// cannot cancel it between the durable append and the in-memory apply.
+    /// Crash atomicity + all-or-nothing, not isolation: concurrent readers can
+    /// observe a commit mid-apply until TD-PGOLTP-4.
+    async fn commit_buffer_atomically(
+        &mut self,
+        dml_service: Arc<crate::services::dml::DmlService>,
+        timeout_ms: Option<u64>,
+    ) -> Result<()> {
+        use crate::services::atomic_txn::{AtomicStatement, execute_atomically};
+
+        let entries = std::mem::take(&mut self.transaction_buffer.entries);
+        self.transaction_buffer.total_bytes = 0;
+        let statements: Vec<AtomicStatement> = entries
+            .iter()
+            .map(|entry| AtomicStatement {
+                statement: entry.statement.clone(),
+                tenant: entry.tenant_ctx.clone(),
+                table: entry.table.clone(),
+            })
+            .collect();
+        // Boxed for the same stack reason as `execute_autocommit_dml`.
+        let outcome = Box::pin(execute_atomically(
+            &dml_service,
+            &statements,
+            timeout_ms.map(std::time::Duration::from_millis),
+        ))
+        .await;
+
+        // Mandate #16b: invalidate whenever the commit may have reached the WAL
+        // — after success, and after an outcome-unknown failure too.
+        // Cascade children are written too (review S4a F11): invalidate every
+        // table the unit wrote, in the session's write tenant.
+        let written: Vec<String> = match &outcome {
+            Ok(done) => done.written_tables.clone(),
+            Err(error) => error.maybe_written_tables().to_vec(),
+        };
+        let maybe_durable = match &outcome {
+            Ok(_) => true,
+            Err(error) => error.maybe_durable(),
+        };
+        if maybe_durable {
+            let mut seen = std::collections::HashSet::new();
+            for entry in &entries {
+                if seen.insert((entry.write_tenant.clone(), entry.table.clone())) {
+                    super::relational_pipeline::invalidate_olap_result_cache_for(
+                        &entry.write_tenant,
+                        &entry.table,
+                    )
+                    .await;
+                }
+            }
+            if let Some(write_tenant) = entries.first().map(|entry| entry.write_tenant.clone()) {
+                for table in &written {
+                    if seen.insert((write_tenant.clone(), table.clone())) {
+                        super::relational_pipeline::invalidate_olap_result_cache_for(
+                            &write_tenant,
+                            table,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+        match outcome {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let message = format!("at COMMIT: {}", error.message());
+                if error.maybe_durable() {
+                    // The commit may be durable. Like PostgreSQL, never let the
+                    // client believe either outcome: FATAL and drop the
+                    // connection, so no ROLLBACK tag can follow a committed
+                    // transaction.
+                    self.send_error("FATAL", "08007", &message).await?;
+                    return Err(AtomicCommitFatal(message).into());
+                }
+                // Nothing was committed and the transaction is over: the session
+                // returns to idle, as after a failed COMMIT in PostgreSQL.
+                self.send_error("ERROR", error.sqlstate("25P02"), &message)
+                    .await?;
+                self.session.write().await.rollback_transaction();
+                Err(anyhow!("atomic transaction commit failed: {message}"))
+            }
+        }
+    }
+
+    /// ADR-095 / TD-PGOLTP-1 S4a: run one autocommit DML statement.
+    ///
+    /// With `[oltp] atomic_commit` on, the canonical WAL writes each
+    /// `write_mutations` call as ONE group frame, so a statement that makes a
+    /// single write call — INSERT, UPDATE, UPSERT, or a DELETE with no ON DELETE
+    /// children — is already crash-atomic on the direct path. INSERT … SELECT
+    /// is NOT: the table-write executor writes in 1024-row batches (one call
+    /// each), a known gap recorded in TD-PGOLTP-1. Only a DELETE whose cascade
+    /// closure is non-empty writes several tables in several calls; that one
+    /// runs as a one-statement atomic unit, so child and parent rows commit
+    /// together. If the unit cannot be formed (lock-set resolution fails) or is
+    /// refused as unsupported (a non-relational route, the oltp-integrity key
+    /// store) nothing was written and the statement runs on the direct path —
+    /// non-atomic across tables, logged at warn.
+    async fn execute_autocommit_dml(
+        &self,
+        dml_service: &Arc<crate::services::dml::DmlService>,
+        statement: crate::services::dml::DmlStatement,
+        tenant_ctx: Option<&crate::storage::tenant::context::TenantContext>,
+        table: &str,
+        write_tenant: &str,
+    ) -> std::result::Result<crate::services::dml::DmlResult, AutocommitFailure> {
+        use crate::services::atomic_txn::{
+            AtomicStatement, AtomicTxnError, execute_atomically_with_lock_set, lock_set_for,
+        };
+        use crate::services::dml::DmlStatement;
+
+        let gate_on = crate::services::oltp_gate::atomic_commit_enabled();
+        if gate_on && matches!(statement, DmlStatement::Delete { .. }) {
+            let unit = [AtomicStatement {
+                statement: statement.clone(),
+                tenant: tenant_ctx.cloned(),
+                table: table.to_string(),
+            }];
+            // A resolution failure here is the statement's own failure (unknown
+            // table, …): let the direct path report it with its usual SQLSTATE.
+            let lock_set = lock_set_for(dml_service, &unit).await.unwrap_or_default();
+            if lock_set.len() > 1 {
+                let timeout = self
+                    .session
+                    .read()
+                    .await
+                    .parameters
+                    .get("statement_timeout")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|ms| *ms > 0)
+                    .map(std::time::Duration::from_millis);
+                // Boxed: an `async fn` is sized for ALL its branches, so leaving
+                // the (large) atomic future inline would grow every autocommit
+                // statement's future. The pgwire workers already run close to
+                // their stack limit (TD-STACK-1).
+                match Box::pin(execute_atomically_with_lock_set(
+                    dml_service,
+                    &unit,
+                    timeout,
+                    lock_set,
+                ))
+                .await
+                {
+                    Ok(mut done) => {
+                        // The caller invalidates `table`; the cascade children
+                        // were written too (F11).
+                        for child in done.written_tables.iter().filter(|t| t.as_str() != table) {
+                            super::relational_pipeline::invalidate_olap_result_cache_for(
+                                write_tenant,
+                                child,
+                            )
+                            .await;
+                        }
+                        return done.results.pop().ok_or_else(|| {
+                            AutocommitFailure::Atomic(AtomicTxnError::Setup(anyhow!(
+                                "atomic execution returned no result"
+                            )))
+                        });
+                    }
+                    Err(AtomicTxnError::Statement { error, .. }) => {
+                        return Err(AutocommitFailure::Statement(error));
+                    }
+                    Err(AtomicTxnError::Unsupported(reason)) => {
+                        tracing::warn!(
+                            %reason,
+                            table,
+                            "cascading DELETE cannot commit atomically; running it on the direct \
+                             path (child and parent rows are NOT written as one unit)"
+                        );
+                    }
+                    Err(other) => return Err(AutocommitFailure::Atomic(other)),
+                }
+            }
+        }
+        match dml_service.execute_scoped(statement, tenant_ctx).await {
+            Ok(result) => Ok(result),
+            // With the gate on, an indeterminate WAL write on the direct path is
+            // reported like the atomic path's: outcome unknown, FATAL 08007.
+            Err(error)
+                if gate_on
+                    && error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<crate::services::canonical_wal::WalAppendIndeterminate>(
+                            )
+                            .is_some()
+                    }) =>
+            {
+                Err(AutocommitFailure::Atomic(AtomicTxnError::OutcomeUnknown {
+                    reason: format!("{error:#}"),
+                    written_tables: vec![table.to_string()],
+                }))
+            }
+            // A poisoned appender refused before writing: nothing landed, but
+            // every write will fail until a restart — say so instead of letting
+            // the statement fallback (e.g. 42P01) suggest a client error.
+            Err(error)
+                if gate_on
+                    && error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<crate::services::canonical_wal::WalAppenderPoisoned>()
+                            .is_some()
+                    }) =>
+            {
+                Err(AutocommitFailure::Atomic(AtomicTxnError::Commit(error)))
+            }
+            Err(error) => Err(AutocommitFailure::Statement(error)),
+        }
+    }
+
+    /// Report an [`AutocommitFailure::Atomic`] on the wire. An outcome-unknown
+    /// failure is FATAL 08007 and ends the connection (the error is returned).
+    async fn send_autocommit_atomic_failure(
+        &mut self,
+        error: crate::services::atomic_txn::AtomicTxnError,
+        write_tenant: &str,
+        table: &str,
+    ) -> Result<()> {
+        let message = error.message();
+        if error.maybe_durable() {
+            super::relational_pipeline::invalidate_olap_result_cache_for(write_tenant, table).await;
+            for written in error
+                .maybe_written_tables()
+                .iter()
+                .filter(|t| t.as_str() != table)
+            {
+                super::relational_pipeline::invalidate_olap_result_cache_for(write_tenant, written)
+                    .await;
+            }
+            self.send_error("FATAL", "08007", &message).await?;
+            return Err(AtomicCommitFatal(message).into());
+        }
+        self.send_error("ERROR", error.sqlstate("XX000"), &message)
+            .await
+    }
+
     /// Drain the P2.D write buffer: sequential `execute_scoped` per entry.
     /// First failure → the error is sent, the transaction FAILS, and the
     /// already-replayed statements stay durable (documented divergence —
@@ -2308,6 +2609,9 @@ impl PostgresProtocol {
             .get("statement_timeout")
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|ms| *ms > 0);
+        if crate::services::oltp_gate::atomic_commit_enabled() {
+            return self.commit_buffer_atomically(dml_service, timeout_ms).await;
+        }
         let entries = std::mem::take(&mut self.transaction_buffer.entries);
         let mut replayed_bytes = 0usize;
         for (index, entry) in entries.iter().enumerate() {
@@ -5467,7 +5771,7 @@ impl PostgresProtocol {
                             .await;
                     }
                     let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
-                    if let Err(reason) = self
+                    if let Err((sqlstate, reason)) = self
                         .transaction_push(
                             statement,
                             tenant_ctx,
@@ -5477,7 +5781,7 @@ impl PostgresProtocol {
                         )
                         .await
                     {
-                        return self.send_error("ERROR", "54000", &reason).await;
+                        return self.send_error("ERROR", sqlstate, &reason).await;
                     }
                     let tag = if kind == "INSERT" {
                         format!("INSERT 0 {}", tag_rows.unwrap_or(0))
@@ -5486,8 +5790,14 @@ impl PostgresProtocol {
                     };
                     return self.send_command_complete(&tag).await;
                 }
-                match dml_service
-                    .execute_scoped(statement, tenant_ctx.as_ref())
+                match self
+                    .execute_autocommit_dml(
+                        dml_service,
+                        statement,
+                        tenant_ctx.as_ref(),
+                        &table,
+                        &write_tenant,
+                    )
                     .await
                 {
                     Ok(result) => {
@@ -5505,7 +5815,12 @@ impl PostgresProtocol {
                         self.send_command_complete(&format!("INSERT 0 {}", result.rows_affected))
                             .await
                     }
-                    Err(e) => {
+                    Err(AutocommitFailure::Atomic(error)) => {
+                        return self
+                            .send_autocommit_atomic_failure(error, &write_tenant, &table)
+                            .await;
+                    }
+                    Err(AutocommitFailure::Statement(e)) => {
                         if let Some((resource, holder)) =
                             crate::errors::extract_dml_lock_conflict(&e)
                         {
@@ -5634,7 +5949,7 @@ impl PostgresProtocol {
                             .await;
                     }
                     let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
-                    if let Err(reason) = self
+                    if let Err((sqlstate, reason)) = self
                         .transaction_push(
                             statement,
                             tenant_ctx,
@@ -5644,7 +5959,7 @@ impl PostgresProtocol {
                         )
                         .await
                     {
-                        return self.send_error("ERROR", "54000", &reason).await;
+                        return self.send_error("ERROR", sqlstate, &reason).await;
                     }
                     let tag = if kind == "INSERT" {
                         format!("INSERT 0 {}", tag_rows.unwrap_or(0))
@@ -5653,8 +5968,14 @@ impl PostgresProtocol {
                     };
                     return self.send_command_complete(&tag).await;
                 }
-                match dml_service
-                    .execute_scoped(statement, tenant_ctx.as_ref())
+                match self
+                    .execute_autocommit_dml(
+                        dml_service,
+                        statement,
+                        tenant_ctx.as_ref(),
+                        &table,
+                        &write_tenant,
+                    )
                     .await
                 {
                     Ok(result) => {
@@ -5672,7 +5993,12 @@ impl PostgresProtocol {
                         self.send_command_complete(&format!("DELETE {}", result.rows_affected))
                             .await
                     }
-                    Err(e) => {
+                    Err(AutocommitFailure::Atomic(error)) => {
+                        return self
+                            .send_autocommit_atomic_failure(error, &write_tenant, &table)
+                            .await;
+                    }
+                    Err(AutocommitFailure::Statement(e)) => {
                         if let Some((resource, holder)) =
                             crate::errors::extract_dml_lock_conflict(&e)
                         {
@@ -5792,7 +6118,7 @@ impl PostgresProtocol {
                             .await;
                     }
                     let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
-                    if let Err(reason) = self
+                    if let Err((sqlstate, reason)) = self
                         .transaction_push(
                             statement,
                             tenant_ctx,
@@ -5802,7 +6128,7 @@ impl PostgresProtocol {
                         )
                         .await
                     {
-                        return self.send_error("ERROR", "54000", &reason).await;
+                        return self.send_error("ERROR", sqlstate, &reason).await;
                     }
                     let tag = if kind == "INSERT" {
                         format!("INSERT 0 {}", tag_rows.unwrap_or(0))
@@ -5811,8 +6137,14 @@ impl PostgresProtocol {
                     };
                     return self.send_command_complete(&tag).await;
                 }
-                match dml_service
-                    .execute_scoped(statement, tenant_ctx.as_ref())
+                match self
+                    .execute_autocommit_dml(
+                        dml_service,
+                        statement,
+                        tenant_ctx.as_ref(),
+                        &table,
+                        &write_tenant,
+                    )
                     .await
                 {
                     Ok(result) => {
@@ -5830,7 +6162,12 @@ impl PostgresProtocol {
                         self.send_command_complete(&format!("UPDATE {}", result.rows_affected))
                             .await
                     }
-                    Err(e) => {
+                    Err(AutocommitFailure::Atomic(error)) => {
+                        return self
+                            .send_autocommit_atomic_failure(error, &write_tenant, &table)
+                            .await;
+                    }
+                    Err(AutocommitFailure::Statement(e)) => {
                         if let Some((resource, holder)) =
                             crate::errors::extract_dml_lock_conflict(&e)
                         {

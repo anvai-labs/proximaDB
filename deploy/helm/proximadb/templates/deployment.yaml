@@ -63,6 +63,7 @@ spec:
               value: {{ .Values.proximadb.server.metricsPort | quote }}
             - name: PROXIMADB_DATA_DIR
               value: {{ include "proximadb.dataDir" . | quote }}
+            # Not read by the server; the engine is chosen per collection (TD-ENGSEL-1).
             - name: PROXIMADB_DEFAULT_ENGINE
               value: {{ .Values.proximadb.storage.defaultEngine | quote }}
             - name: PROXIMADB_WAL_ENABLED

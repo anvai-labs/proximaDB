@@ -192,7 +192,7 @@ ProximaDB provides comprehensive enterprise security capabilities aligned with i
 * Security incident response procedures
 * Compliance documentation and audit support
 
-For comprehensive security configuration, see link:../02-guides/security_guide.adoc[Security Configuration Guide].
+For comprehensive security configuration, see link:../../04-operations/security.adoc[Security guide].
 
 == Support and Service Level Agreements
 

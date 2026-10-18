@@ -185,7 +185,7 @@ config:
     request_timeout: 120
 
   storage:
-    default_engine: "sst"
+    default_engine: "sst"  # not read by the server; engine is chosen per collection (TD-ENGSEL-1)
     data_directory: "/data/proximadb"
     wal_enabled: true
     wal_directory: "/data/proximadb/wal"

@@ -1974,13 +1974,27 @@ impl SharedServices {
                     .data_dir
                     .join("pgwire")
                     .join("canonical-records.wal");
+                // ADR-095: with atomic commit on, this WAL is the transaction log of
+                // record; serving without it (the legacy warn-and-continue) would
+                // silently drop committed rows, so failures are fatal.
+                let atomic_commit = crate::services::oltp_gate::atomic_commit_enabled();
                 match crate::services::FramedTableWalAppender::open(&wal_path).await {
                     Ok(appender) => {
+                        if atomic_commit {
+                            appender.enable_atomic_groups();
+                        }
                         info!(
+                            atomic_commit,
                             "✅ SharedServices: canonical WAL appender opened at {} (shared by graph checkpoint emission + pgwire direct writes)",
                             wal_path.display()
                         );
                         Some(Arc::new(appender))
+                    }
+                    Err(e) if atomic_commit => {
+                        anyhow::bail!(
+                            "canonical WAL at {} could not be opened and [oltp] atomic_commit is on; refusing to serve without the transaction log: {e:#}",
+                            wal_path.display()
+                        );
                     }
                     Err(e) => {
                         warn!(
@@ -2010,11 +2024,22 @@ impl SharedServices {
                     appender.clone(),
                 ),
             );
+            let atomic_commit = crate::services::oltp_gate::atomic_commit_enabled();
             match appender.read_entries().await {
                 Ok(entries) => {
                     if let Err(e) = store.replay_wal_entries(entries).await {
+                        if atomic_commit {
+                            anyhow::bail!(
+                                "canonical record-store WAL replay failed with [oltp] atomic_commit on; refusing to serve partial state: {e:#}"
+                            );
+                        }
                         warn!("SharedServices: canonical record-store WAL replay failed: {e}");
                     }
+                }
+                Err(e) if atomic_commit => {
+                    anyhow::bail!(
+                        "reading the canonical WAL failed with [oltp] atomic_commit on; refusing to serve: {e:#}"
+                    );
                 }
                 Err(e) => {
                     warn!("SharedServices: reading canonical WAL for shared store failed: {e}")
