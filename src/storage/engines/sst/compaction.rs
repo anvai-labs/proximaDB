@@ -1688,7 +1688,12 @@ impl Compaction {
     async fn drain_pending_for_dir(&self, collection_data_dir: &Path) -> Result<()> {
         // Hold the ledger lock across this whole load-modify-save sequence.
         let _ledger_guard = retirement_ledger::ledger_lock().await;
-        let mut ledger = retirement_ledger::load_ledger(collection_data_dir);
+        let mut ledger = retirement_ledger::load_ledger(collection_data_dir).map_err(|error| {
+            crate::core::StorageError::SstEngine(format!(
+                "load retire-pending ledger for {}: {error:#}",
+                collection_data_dir.display()
+            ))
+        })?;
         if ledger.pending.is_empty() {
             return Ok(());
         }

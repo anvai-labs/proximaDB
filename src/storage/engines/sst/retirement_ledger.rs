@@ -53,9 +53,38 @@ pub(crate) fn global_known_collection_dirs() -> &'static RwLock<HashSet<String>>
 
 /// Register a collection data dir for the reconciler sweep (called from task
 /// scheduling, check_compaction_needed, and query discovery).
+///
+/// The FIRST registration of a dir in this process also loads its sidecar
+/// into the pending set. That is the boot path: the set is process memory, so
+/// after a restart the obligations recorded by an earlier run would otherwise
+/// leave the read-path filter until the reconciler's next drain, and their
+/// superseded inputs would serve beside the compacted output meanwhile.
 pub(crate) fn register_collection_dir(dir: &Path) {
-    if let Ok(mut set) = global_known_collection_dirs().write() {
-        set.insert(dir.to_string_lossy().into_owned());
+    let newly_registered = match global_known_collection_dirs().write() {
+        Ok(mut set) => set.insert(dir.to_string_lossy().into_owned()),
+        Err(_) => false,
+    };
+    if !newly_registered {
+        return;
+    }
+    match load_ledger(dir) {
+        Ok(ledger) => {
+            let inputs: Vec<String> = ledger
+                .pending
+                .into_iter()
+                .flat_map(|entry| entry.inputs)
+                .collect();
+            if !inputs.is_empty() {
+                mark_pending(&inputs);
+            }
+        }
+        Err(error) => tracing::error!(
+            dir = %dir.display(),
+            error = %format!("{error:#}"),
+            "retire-pending ledger unreadable at registration: its superseded inputs are NOT \
+             filtered from discovery, and recording or draining obligations for this dir \
+             fails until the sidecar is repaired"
+        ),
     }
 }
 
@@ -116,7 +145,7 @@ pub(crate) async fn record_pending(
     let _ledger_guard = ledger_lock().await;
     mark_pending(failed_inputs);
     crate::metrics::operational_metrics::PAX_RETIREMENT_RECORD_TOTAL.inc();
-    let mut ledger = load_ledger(collection_data_dir);
+    let mut ledger = load_ledger(collection_data_dir)?;
     ledger.pending.push(PendingRetirement {
         output: output.to_string_lossy().into_owned(),
         inputs: failed_inputs.to_vec(),
@@ -126,25 +155,36 @@ pub(crate) async fn record_pending(
     write_ledger(collection_data_dir, &ledger)
 }
 
-/// Load the sidecar's pending obligations (missing file = empty).
-pub(crate) fn load_ledger(collection_data_dir: &Path) -> LedgerFile {
+/// Load the sidecar's pending obligations. A missing file is an empty ledger;
+/// anything else that is not a clean parse is an error.
+///
+/// Fail closed: reading an unreadable or corrupt sidecar as empty let the next
+/// `record_pending` write a fresh ledger over it, silently discarding every
+/// obligation it held — and with them the only record that those superseded
+/// inputs must stop serving and be deleted.
+pub(crate) fn load_ledger(collection_data_dir: &Path) -> Result<LedgerFile> {
     let path = sidecar_path(collection_data_dir);
     match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        Err(_) => LedgerFile {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse retire-pending ledger {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(LedgerFile {
             version: 1,
             updated_at: now_iso(),
             pending: Vec::new(),
-        },
+        }),
+        Err(error) => {
+            Err(error).with_context(|| format!("read retire-pending ledger {}", path.display()))
+        }
     }
 }
 
+/// Callers MUST hold [`ledger_lock`] across their whole load-modify-write
+/// sequence: two workers (one executing a retirement, one sweeping) could
+/// otherwise lose updates. Taking it here would be too late (after the load)
+/// and would deadlock (the async mutex is not re-entrant). Cross-PROCESS races
+/// degrade to an idempotent re-drain (deletes are NotFound-idempotent), never
+/// to loss.
 fn write_ledger(collection_data_dir: &Path, ledger: &LedgerFile) -> Result<()> {
-    // Hold the ledger lock across load-modify-write sequences: two workers
-    // (one executing a retirement, one sweeping) could otherwise lose updates.
-    // Cross-PROCESS races degrade to an idempotent re-drain (deletes are
-    // NotFound-idempotent), never to loss.
-    let _guard = ledger_lock();
     let mut ledger = ledger.clone();
     ledger.updated_at = now_iso();
     let data = serde_json::to_vec_pretty(&ledger).context("serialize retire-pending ledger")?;
@@ -215,7 +255,10 @@ mod tests {
         let data_dir = dir.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
 
-        assert!(load_ledger(&data_dir).pending.is_empty(), "missing = empty");
+        assert!(
+            load_ledger(&data_dir).unwrap().pending.is_empty(),
+            "missing = empty"
+        );
 
         record_pending(
             &data_dir,
@@ -224,7 +267,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let loaded = load_ledger(&data_dir);
+        let loaded = load_ledger(&data_dir).unwrap();
         assert_eq!(loaded.pending.len(), 1);
         assert_eq!(loaded.pending[0].inputs.len(), 2);
         assert_eq!(loaded.pending[0].output, "s3://b/coll/L3_x.pax");
@@ -237,7 +280,70 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(load_ledger(&data_dir).pending.len(), 2);
+        assert_eq!(load_ledger(&data_dir).unwrap().pending.len(), 2);
+    }
+
+    /// A corrupt sidecar is an error, never an empty ledger — and recording a
+    /// new obligation must not overwrite it (that would discard every
+    /// obligation it held).
+    #[tokio::test]
+    async fn a_corrupt_ledger_fails_closed_and_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let sidecar = sidecar_path(&data_dir);
+        std::fs::write(&sidecar, b"{ not json").unwrap();
+
+        assert!(load_ledger(&data_dir).is_err(), "corrupt = error");
+        assert!(
+            record_pending(
+                &data_dir,
+                Path::new("s3://b/coll/L3_x.pax"),
+                &["s3://b/coll/L2_a.pax".into()],
+            )
+            .await
+            .is_err(),
+            "recording onto a corrupt ledger must fail loudly"
+        );
+        assert_eq!(
+            std::fs::read(&sidecar).unwrap(),
+            b"{ not json",
+            "the corrupt sidecar must be left for repair, not replaced"
+        );
+    }
+
+    /// After a restart the pending set is empty; the first registration of a
+    /// dir reloads its sidecar so superseded inputs are filtered again before
+    /// the reconciler drains them.
+    #[tokio::test]
+    async fn first_registration_reloads_recorded_obligations_into_the_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let input = format!("probe-{}-boot-reload.pax", std::process::id());
+        // Write the sidecar as an earlier process would have left it.
+        let ledger = LedgerFile {
+            version: 1,
+            updated_at: now_iso(),
+            pending: vec![PendingRetirement {
+                output: "s3://b/coll/L3_x.pax".into(),
+                inputs: vec![input.clone()],
+                recorded_at: now_iso(),
+                attempts: 0,
+            }],
+        };
+        write_ledger(&data_dir, &ledger).unwrap();
+        assert!(
+            !pending_paths().contains(&input),
+            "a fresh process starts empty"
+        );
+
+        register_collection_dir(&data_dir);
+        assert!(
+            pending_paths().contains(&input),
+            "registration must reload the recorded obligation into the filter"
+        );
+        mark_drained(&[input]);
     }
 
     /// TD-COMPACT-13 T4b: pending-set mark/drain updates the filter set.
