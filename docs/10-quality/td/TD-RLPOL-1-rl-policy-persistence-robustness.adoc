@@ -1,0 +1,37 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-RLPOL-1: RL policy persistence robustness — atomic checkpoint save, read-error observability, aside-name stamping
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed from the adversarial review of #2072's tail commits (2026-10-19). All three items are small, contained hardening of `rl_policy.json` persistence; none is a data-loss bug on its own.
+| Priority | **P3** — learned-state displacement only (the policy is a cache and re-learns), plus log-visibility nits.
+| Component | `src/query/rl_planner/bandit.rs` (`save_to_file`, `load_from_file`), `src/query/rl_planner/mod.rs` (`set_aside_unreadable_policy`), `crates/binding/proximadb-embedded/src/lib.rs` (caller logging).
+| Relates to | TD-RLNAN-1 (unreadable policy must never block startup; set-aside shipped in #2073), TD-RL-1 (policy as cache; seeding/harvest)
+|===
+
+== Findings (from the review of the merged loader contract)
+
+1. **Non-atomic checkpoint save.** `save_to_file` (bandit.rs ~452) uses `tokio::fs::write`
+   (truncate + write). A `load` racing a concurrent checkpoint save can read a
+   truncated-but-valid file, fail to parse, and — since #2072's `ab2417fad` — rename the
+   *valid* file aside instead of leaving it in place. Impact: displaced learned state
+   (kept for diagnosis, re-saved at the next checkpoint). **Fix:** tempfile + `rename`
+   atomic save in the same directory.
+2. **Weak observability on hard read errors in the embedded caller.** The embedded binding
+   logs `load_policy` hard errors at `debug!` (proximadb-embedded lib.rs ~944); parse errors
+   (the common case) now ride the loader's `warn!`, but a missing/unreadable file in embedded
+   deployments is nearly invisible. **Fix:** raise to `warn!` (or `info!` with a distinct
+   message) in the embedded caller.
+3. **Millis-stamp aside-name collisions.** `set_aside_unreadable_policy` names the aside
+   `<path>.unreadable-<millis>`; two simultaneous set-asides of *different* files can
+   collide on the same name (same path + same millisecond) and clobber. Astronomically
+   rare, cache-only impact. **Fix (fold into 1):** append a short random suffix, or derive
+   the name from content hash + PID.
+
+== Direction
+
+One slice: atomic save (1) + caller log level (2) + stamp hardening (3), with a unit test
+per behavior (load-during-save sees either old or new full file; aside names unique under
+repeated set-asides). No gate, no migration — the on-disk format does not change.
