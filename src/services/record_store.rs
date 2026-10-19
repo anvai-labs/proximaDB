@@ -340,6 +340,28 @@ fn normalize_object_path_prefix(location: &str) -> String {
     without_scheme.trim_matches('/').to_string()
 }
 
+/// Encode a partition identity component (tenant id or collection key) as one
+/// path segment, INJECTIVELY: `[A-Za-z0-9.-]` pass through and every other
+/// byte (including `_` itself) becomes `_XX` hex. Two distinct tables must
+/// never share a spill prefix — `sanitize_object_path_segment` maps `a/b` and
+/// `a_b` to the same string, which here would merge their rows.
+fn spill_path_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("_{byte:02X}"));
+        }
+    }
+    // `.` and `..` alone would be path navigation, and an empty segment would
+    // collapse a level; all three get an explicit marker instead.
+    match out.as_str() {
+        "" | "." | ".." => format!("_{out}_"),
+        _ => out,
+    }
+}
+
 fn sanitize_object_path_segment(value: &str) -> String {
     let sanitized = value
         .chars()
@@ -1910,6 +1932,90 @@ impl DirectWalTableRecordStore {
     /// prefix. That is why slice 2b (WAL truncation) requires catalog-registered
     /// segments first: truncation may only reference a segment whose location is
     /// recorded somewhere recovery can read it. See TD-USUB-1.
+    /// The production constructor (TD-SEAM-3 / TD-USUB-1 item iii): with the
+    /// spill gate (`PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT`) unset this is
+    /// exactly [`Self::new_partitioned`]; with it set, partitions spill to
+    /// local Parquet segments under `spill_root`, beside the canonical WAL they
+    /// recover with — `{spill_root}/{tenant}/{collection}`, each component
+    /// encoded injectively ([`spill_path_segment`]).
+    ///
+    /// Local, not object storage, for now: the WAL itself is a local file, so
+    /// segments next to it are durable exactly as long as it is, and recovery
+    /// needs no catalog lookup to find them. Object-store placement waits for
+    /// catalog registration of the prefix (TD-USUB-1 item ii).
+    pub async fn open_for_server(
+        wal_appender: Arc<dyn TableWalAppender>,
+        spill_root: std::path::PathBuf,
+    ) -> Result<Self> {
+        if crate::services::record_spill::configured_flush_threshold().is_none() {
+            return Ok(Self::new_partitioned(wal_appender));
+        }
+        // An empty root would put segments at `/{tenant}/{collection}`.
+        if spill_root.as_os_str().is_empty() {
+            anyhow::bail!("record spill: the spill gate is set but no spill root was configured");
+        }
+        let filesystem = Arc::new(
+            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
+                crate::storage::persistence::filesystem::local::LocalConfig::default(),
+            )
+            .await
+            .map_err(|e| anyhow!("record spill: local filesystem init failed: {e}"))?,
+        );
+        let root = spill_root
+            .to_string_lossy()
+            .trim_end_matches('/')
+            .to_string();
+        tracing::info!(
+            spill_root = %root,
+            "relational record spill enabled: partitions flush to local Parquet segments"
+        );
+        Ok(Self::new_spilling(
+            wal_appender,
+            filesystem,
+            Arc::new(move |tenant_id: &str, collection: &str| {
+                format!(
+                    "{root}/{}/{}",
+                    spill_path_segment(tenant_id),
+                    spill_path_segment(collection)
+                )
+            }),
+        ))
+    }
+
+    /// Flush every live partition's write buffer to durable segments
+    /// ([`RecordStore::flush`]; a no-op for a memtable partition). Called on
+    /// graceful shutdown AFTER the servers stop, so no write races it.
+    ///
+    /// Every partition is attempted even if one fails; the error names each
+    /// failure. A failed flush loses nothing — the rows stay resident and the
+    /// WAL, which is never truncated past an unflushed row, replays them.
+    pub async fn flush_partitions(&self) -> Result<usize> {
+        let partitions: Vec<((String, String), Arc<dyn RecordStorage>)> = self
+            .partitions
+            .read()
+            .iter()
+            .map(|(key, partition)| (key.clone(), partition.clone()))
+            .collect();
+        let mut failures = Vec::new();
+        for ((tenant_id, collection), partition) in &partitions {
+            if let Err(error) = partition.flush().await {
+                failures.push(format!(
+                    "(tenant '{tenant_id}', collection '{collection}'): {error:#}"
+                ));
+            }
+        }
+        if failures.is_empty() {
+            Ok(partitions.len())
+        } else {
+            Err(anyhow!(
+                "flushing {} of {} record partition(s) failed: {}",
+                failures.len(),
+                partitions.len(),
+                failures.join("; ")
+            ))
+        }
+    }
+
     pub fn new_spilling(
         wal_appender: Arc<dyn TableWalAppender>,
         filesystem: Arc<dyn crate::storage::persistence::filesystem::FileSystem>,
@@ -5692,6 +5798,122 @@ mod tests {
         assert!(
             store.min_unflushed_lsn().await.is_err(),
             "one refusing partition makes the whole tier refuse"
+        );
+
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+    }
+
+    #[test]
+    fn spill_path_segment_is_injective_and_never_navigates() {
+        let samples = [
+            "a/b", "a_b", "a_2Fb", "A.b-c", "", ".", "..", "tenant a", "é",
+        ];
+        let encoded: Vec<String> = samples.iter().map(|s| spill_path_segment(s)).collect();
+        let unique: std::collections::HashSet<&String> = encoded.iter().collect();
+        assert_eq!(unique.len(), samples.len(), "{encoded:?}");
+        for e in &encoded {
+            assert!(
+                !e.contains('/') && !e.is_empty() && e != "." && e != "..",
+                "{e}"
+            );
+        }
+        assert_eq!(spill_path_segment("orders-2026.v1"), "orders-2026.v1");
+    }
+
+    /// With the gate unset the production constructor is the legacy memtable
+    /// store and writes nothing under the spill root.
+    #[tokio::test]
+    async fn open_for_server_without_the_gate_is_the_partitioned_memtable() {
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("record-spill");
+        let store = DirectWalTableRecordStore::open_for_server(
+            Arc::new(RecordingWalAppender::default()),
+            root.clone(),
+        )
+        .await
+        .expect("open");
+        store
+            .replay_wal_entries((1..=20u64).map(|lsn| {
+                CanonicalWalEntry::new(
+                    lsn,
+                    CanonicalOperation::RecordUpsert {
+                        collection_id: "orders".to_string(),
+                        record: Box::new(ProximaRecord {
+                            oid: format!("r{lsn}"),
+                            ..Default::default()
+                        }),
+                        projections: vec![],
+                    },
+                    Some("tenant-a".to_string()),
+                )
+            }))
+            .await
+            .expect("replay");
+        assert_eq!(store.flush_partitions().await.expect("flush"), 1);
+        assert!(
+            !root.exists(),
+            "no spill object may be written with the gate unset"
+        );
+    }
+
+    /// With the gate set, the production constructor spills under
+    /// `{root}/{tenant}/{collection}` and `flush_partitions` makes the resident
+    /// tail durable, so the tier floor then has no constraint.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn open_for_server_with_the_gate_spills_under_the_root_and_flushes_on_shutdown() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("record-spill");
+        let store = DirectWalTableRecordStore::open_for_server(
+            Arc::new(RecordingWalAppender::default()),
+            root.clone(),
+        )
+        .await
+        .expect("open");
+        // 6 rows at threshold 4: 4 flush on the way, 2 stay resident.
+        store
+            .replay_wal_entries((1..=6u64).map(|lsn| {
+                CanonicalWalEntry::new(
+                    lsn,
+                    CanonicalOperation::RecordUpsert {
+                        collection_id: "orders/eu".to_string(),
+                        record: Box::new(ProximaRecord {
+                            oid: format!("r{lsn}"),
+                            ..Default::default()
+                        }),
+                        projections: vec![],
+                    },
+                    Some("tenant-a".to_string()),
+                )
+            }))
+            .await
+            .expect("replay");
+        let partition_dir = root.join("tenant-a").join("orders_2Feu");
+        let segments = |dir: &std::path::Path| -> usize {
+            std::fs::read_dir(dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| e.file_name().to_string_lossy().starts_with("spill-"))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            segments(&partition_dir),
+            1,
+            "one threshold flush during replay"
+        );
+
+        store.flush_partitions().await.expect("shutdown flush");
+        assert_eq!(
+            segments(&partition_dir),
+            2,
+            "the resident tail is now durable"
         );
 
         unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
