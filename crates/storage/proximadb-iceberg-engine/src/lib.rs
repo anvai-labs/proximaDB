@@ -812,7 +812,8 @@ mod tests {
         .unwrap();
         let stamped = with_iceberg_field_ids(batch).unwrap();
         let bytes =
-            record_batches_to_parquet_bytes(&[stamped.clone()], stamped.schema(), None).unwrap();
+            record_batches_to_parquet_bytes(std::slice::from_ref(&stamped), stamped.schema(), None)
+                .unwrap();
         let reader =
             parquet::file::serialized_reader::SerializedFileReader::new(Bytes::from(bytes))
                 .unwrap();

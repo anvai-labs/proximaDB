@@ -157,9 +157,12 @@ fn read_avro_bytes<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a [u8], Stora
     Ok(out)
 }
 
+/// Avro container header metadata: `(key, value)` byte pairs, in file order.
+type AvroHeaderEntries = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// The header metadata entries of an Avro object container file, in order, and
 /// the offset where the sync marker begins.
-fn avro_header_entries(buf: &[u8]) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, usize), StorageError> {
+fn avro_header_entries(buf: &[u8]) -> Result<(AvroHeaderEntries, usize), StorageError> {
     if buf.len() < 4 || &buf[..4] != AVRO_MAGIC {
         return Err(ser_err("avro header", "not an Avro object container"));
     }
@@ -198,7 +201,7 @@ fn with_verbatim_schema(
         .map_err(|e| ser_err("avro header schema", e))?
         .to_string();
     let empty_body;
-    let (entries, body): (Vec<(Vec<u8>, Vec<u8>)>, &[u8]) = if container.is_empty() {
+    let (entries, body): (AvroHeaderEntries, &[u8]) = if container.is_empty() {
         let mut entries = vec![
             (b"avro.schema".to_vec(), Vec::new()),
             (b"avro.codec".to_vec(), b"null".to_vec()),
