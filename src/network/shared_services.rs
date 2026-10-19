@@ -1978,7 +1978,7 @@ impl SharedServices {
                 // record; serving without it (the legacy warn-and-continue) would
                 // silently drop committed rows, so failures are fatal.
                 let atomic_commit = crate::services::oltp_gate::atomic_commit_enabled();
-                match crate::services::FramedTableWalAppender::open(&wal_path).await {
+                match crate::services::FramedTableWalAppender::open_shared(&wal_path).await {
                     Ok(appender) => {
                         if atomic_commit {
                             appender.enable_atomic_groups();
@@ -1998,7 +1998,7 @@ impl SharedServices {
                             "✅ SharedServices: canonical WAL appender opened at {} (shared by graph checkpoint emission + pgwire direct writes)",
                             wal_path.display()
                         );
-                        Some(Arc::new(appender))
+                        Some(appender)
                     }
                     Err(e) if atomic_commit => {
                         anyhow::bail!(

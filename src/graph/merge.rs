@@ -736,8 +736,12 @@ pub async fn write_back_merge(
         return Ok(None);
     }
 
-    // Write to WAL using the FramedTableWalAppender
-    let appender = crate::services::FramedTableWalAppender::open(wal_path)
+    // Write through the process's ONE appender for this file. Opening a
+    // second one gave it its own sequence counter: the shared appender then
+    // reissued the merge's sequence numbers, and never saw the merge entries
+    // in its per-collection high-water marks (the change-feed fast path could
+    // skip them).
+    let appender = crate::services::FramedTableWalAppender::open_shared(wal_path)
         .await
         .context("opening WAL appender for merge write-back")?;
 

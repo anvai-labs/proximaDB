@@ -400,28 +400,24 @@ impl MultiServer {
                 );
                 shared
             } else {
-                Arc::new(
-                    crate::services::FramedTableWalAppender::open(&wal_path)
+                crate::services::FramedTableWalAppender::open_shared(&wal_path)
                         .await
                         .with_context(|| {
                             format!(
                                 "opening pgwire direct canonical WAL at {} (no shared appender in SharedServices)",
                                 wal_path.display()
                             )
-                        })?,
-                )
+                        })?
             }
         } else {
-            Arc::new(
-                crate::services::FramedTableWalAppender::open(&wal_path)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "opening pgwire direct canonical WAL at {} (custom path; cannot share)",
-                            wal_path.display()
-                        )
-                    })?,
-            )
+            crate::services::FramedTableWalAppender::open_shared(&wal_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "opening pgwire direct canonical WAL at {} (custom path; cannot share)",
+                        wal_path.display()
+                    )
+                })?
         };
         // ADR-095: one group frame per multi-row append when atomic commit is
         // on (idempotent for the shared appender, which SharedServices armed).
