@@ -3,7 +3,7 @@
 = ADR-097: Foundational seams S1–S9 and a single logical IR (DataFusion) with native physical operators
 :toc: left
 :toclevels: 2
-:last-updated: 2026-10-18
+:last-updated: 2026-10-19
 
 [cols="1,3"]
 |===
@@ -109,6 +109,28 @@ metadata tree, its own identity) is a defect against this ADR.
 ProximaDB is the **lakehouse system of record for AI context — analytics is the proof, not the
 product.** Every modality lands as an open table on object storage under one catalog, one record
 identity and one snapshot. This refines ADR-096 D1; it does not change ADR-096's decisions.
+
+=== D2 amendment (2026-10-19) — HNSW projection lifecycle on AXIS
+
+Owner direction: keep AXIS's HNSW engine and change its role, not its implementation.
+
+* The graph is *defined* as the HNSW over the PAX segment set the catalog snapshot names.
+  A ground-up rebuild from PAX is that definition, executed: it is the repair path.
+  Index-on-flush (TD-112) maintains the graph between rebuilds.
+* AXIS's versioned `SerializableHnswState` is persisted as an S7 projection. It is stamped with
+  the segment set and LSN it covers.
+* Boot cases:
+** **Stamp matches:** load the projection.
+** **Segments added since:** apply only the delta.
+** **Stamp invalid, or inputs compacted away:** rebuild in the background, serving from PAX
+   meanwhile.
+* Deletes are tombstones until a set ratio triggers a rebuild.
+* The S8 cost spine routes to HNSW only within a per-node memory budget.
+* **Prerequisite:** exact vectors.
+** Default PAX keeps no exact copy, so TD-PAXPREC-1 (an fp16 exact tier) lands first.
+** Until then, HNSW is refused for collections without a declared exact tier.
+
+Tracked as TD-SEAM-13.
 
 == Alternatives considered
 
