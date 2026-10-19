@@ -470,11 +470,23 @@ impl ContextualBanditPlanner {
         let mut loaded: ContextualBanditPlanner = match serde_json::from_str(&json) {
             Ok(loaded) => loaded,
             Err(error) => {
-                tracing::warn!(
-                    path,
-                    %error,
-                    "RL planner policy file is invalid; starting with a fresh policy"
-                );
+                // TD-RLNAN-1: move the unreadable policy aside so a bad file
+                // never lingers; keep it beside the original for diagnosis,
+                // and start fresh either way.
+                match super::set_aside_unreadable_policy(path).await {
+                    Ok(aside) => tracing::warn!(
+                        path,
+                        aside_path = %aside,
+                        %error,
+                        "RL planner policy file is invalid; moved aside, starting with a fresh policy"
+                    ),
+                    Err(rename_error) => tracing::warn!(
+                        path,
+                        %error,
+                        %rename_error,
+                        "RL planner policy file is invalid and could not be moved aside; starting with a fresh in-memory policy"
+                    ),
+                }
                 return Ok(false);
             }
         };
