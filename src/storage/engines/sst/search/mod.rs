@@ -283,6 +283,34 @@ impl Drop for ComputeMsGuard {
 // TODO(serverless follow-up): source this from config per storage class.
 const EXACT_SCAN_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// A segment's contribution to the Adaptive exact gate's row count.
+enum SegmentCountFact {
+    /// Countable and exact-scannable: this many rows.
+    Rows(usize),
+    /// A PAX segment without exact f32 authority: the collection cannot be
+    /// exact-scanned at all.
+    Lossy,
+    /// Not countable (legacy PAX, unknown format, read error): contributes 0.
+    Unknown,
+}
+
+/// What the Adaptive exact gate needs from a PAX segment footer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaxFooterFacts {
+    row_count: usize,
+    /// The segment carries authoritative f32 values (`has_f32_tier`), so an
+    /// exact scan over it is permitted.
+    exact_authority: bool,
+}
+
+/// Footer facts of immutable PAX segment objects, keyed by object URL
+/// (see `SstEngine::pax_footer_facts`).
+static PAX_FOOTER_FACTS: once_cell::sync::Lazy<dashmap::DashMap<String, PaxFooterFacts>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+const PAX_FOOTER_FACTS_CACHE_MAX: usize = 100_000;
+/// Bound on concurrent footer/header reads in `segment_vector_count`.
+const FOOTER_FACTS_CONCURRENCY: usize = 32;
+
 /// ADR-028: resolve the collection's `index_policy` into the exact-scan decision
 /// inputs for the SST adaptive route. Returns `(byte_budget, pin_exact)`:
 ///
@@ -320,13 +348,73 @@ impl SstEngine {
             Ok(files) => files,
             Err(_) => return 0,
         };
+        // Concurrent waves: footer facts / legacy headers for every segment are
+        // independent reads, so a cold first query pays ~one round trip of
+        // latency per `FOOTER_FACTS_CONCURRENCY` segments, not one per segment
+        // (PAX spec study TE-P2, change #6; TD-PAXMETA-1 removes the reads).
         let mut total = 0usize;
-        for file_path in &files {
-            if let Ok(Some(entry_count)) = self.legacy_sst_entry_count(&file_path.url).await {
-                total = total.saturating_add(entry_count);
+        for chunk in files.chunks(FOOTER_FACTS_CONCURRENCY) {
+            let counts = join_all(chunk.iter().map(|f| self.segment_count_fact(&f.url))).await;
+            for count in counts {
+                match count {
+                    // An exact scan needs authoritative f32 values in EVERY
+                    // segment: one lossy (RaBitQ/SQ8-only) segment would make
+                    // `search_pax_file_exact` refuse the scan. So the whole
+                    // collection reads as "uncounted" (0) and Adaptive stays on
+                    // the cascade — the pre-existing behaviour for such data.
+                    SegmentCountFact::Lossy => return 0,
+                    SegmentCountFact::Rows(rows) => total = total.saturating_add(rows),
+                    SegmentCountFact::Unknown => {}
+                }
             }
         }
         total
+    }
+
+    /// One segment's contribution to `segment_vector_count`.
+    async fn segment_count_fact(&self, url: &str) -> SegmentCountFact {
+        if url.ends_with(".pax") {
+            match self.pax_footer_facts(url).await {
+                Some(facts) if !facts.exact_authority => SegmentCountFact::Lossy,
+                Some(facts) => SegmentCountFact::Rows(facts.row_count),
+                None => SegmentCountFact::Unknown,
+            }
+        } else {
+            match self.legacy_sst_entry_count(url).await {
+                Ok(Some(rows)) => SegmentCountFact::Rows(rows),
+                _ => SegmentCountFact::Unknown,
+            }
+        }
+    }
+
+    /// Footer facts of a coalesced PAX segment — `row_count` and whether it
+    /// carries the exact f32 tier — read once per object and then served from
+    /// [`PAX_FOOTER_FACTS`]. Segment objects are immutable (compaction writes new
+    /// ones), so a URL's facts never change: the two ranged reads are paid once
+    /// per segment, not per query. `None` for a legacy (non-coalesced) PAX
+    /// segment or any read error — the gate then treats that segment as
+    /// uncounted, as before (TD-SEAM-11).
+    async fn pax_footer_facts(&self, url: &str) -> Option<PaxFooterFacts> {
+        if let Some(facts) = PAX_FOOTER_FACTS.get(url) {
+            return Some(*facts);
+        }
+        let port = self.filesystem_port();
+        let footer =
+            crate::storage::engines::sst::segment_format::read_coalesced_segment_footer(&port, url)
+                .await
+                .ok()
+                .flatten()?;
+        let facts = PaxFooterFacts {
+            row_count: usize::try_from(footer.row_count).ok()?,
+            exact_authority: footer.has_f32_tier,
+        };
+        if PAX_FOOTER_FACTS.len() >= PAX_FOOTER_FACTS_CACHE_MAX {
+            // Bounded: entries for compacted-away segments are never read again,
+            // so a full reset only costs a re-read of live segments.
+            PAX_FOOTER_FACTS.clear();
+        }
+        PAX_FOOTER_FACTS.insert(url.to_string(), facts);
+        Some(facts)
     }
 
     /// Read the count carried by a legacy `SST1` header.
@@ -3123,6 +3211,61 @@ mod tests {
                 .is_err(),
             "unknown/legacy paths must retain the mixed-format magic sniff"
         );
+    }
+
+    /// TD-SEAM-11: the Adaptive exact gate reads a PAX segment's row count and
+    /// exact-f32 authority from its footer (cached per immutable object), so a
+    /// small collection WITH the f32 tier can take the exact scan, while a
+    /// lossy (RaBitQ/SQ8-only) segment keeps the whole collection on the cascade.
+    #[tokio::test]
+    async fn pax_footer_facts_report_rows_and_exact_authority() {
+        use crate::storage::engines::sst::segment_format::write_pax_segment_with_f32_tier;
+        use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+        // Coalesced RaBitQ layout (the default write), env-pinned like the
+        // segment_format tests.
+        unsafe { std::env::set_var("PROXIMADB_PAX_COALESCED_RABITQ", "1") };
+        let rec = |oid: &str, v: Vec<f32>| {
+            let mut r = ProximaRecord {
+                oid: oid.into(),
+                tenant_id: "t".into(),
+                ..Default::default()
+            };
+            r.embeddings.push(EmbeddingCell {
+                modality: "dense".into(),
+                dim: v.len() as u32,
+                values: EmbeddingValues::Fp32(v),
+                ..Default::default()
+            });
+            r
+        };
+        let records: Vec<_> = (0..5)
+            .map(|i| rec(&format!("r{i}"), vec![i as f32, 1.0, -1.0, 0.5]))
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = create_test_engine().await;
+        for (name, f32_tier) in [("exact.pax", true), ("lossy.pax", false)] {
+            let path = dir.path().join(name);
+            write_pax_segment_with_f32_tier(
+                &path,
+                &records,
+                "col",
+                1,
+                proximadb_block_format::VectorQuant::RaBitQ,
+                f32_tier,
+                None,
+                None,
+            )
+            .unwrap();
+            let url = format!("file://{}", path.display());
+            let facts = engine
+                .pax_footer_facts(&url)
+                .await
+                .expect("coalesced footer facts");
+            assert_eq!(facts.row_count, 5, "{name}");
+            assert_eq!(facts.exact_authority, f32_tier, "{name}");
+            // Served from the cache once read (the object is immutable).
+            assert_eq!(PAX_FOOTER_FACTS.get(&url).map(|f| *f), Some(facts));
+        }
     }
 
     #[tokio::test]

@@ -4,8 +4,8 @@ product_name = "ProximaDB"
 positioning = "Object-storage-native context serving for SQL, JSON, and vectors"
 deployment = "single-node"
 canonical_api = "REST /api/v2"
-# The corridor's engine. Its smokes set "engine": "sst" explicitly: a REST/gRPC create that omits
-# the engine is auto-routed to HELIX until TD-ENGSEL-1 makes SST the automatic default (v0.5).
+# The corridor's engine. SST is also the automatic default for a REST/gRPC create that omits the
+# engine (TD-ENGSEL-1; pinned by tests/release_smoke_v2.rs rest_v2_create_without_engine_defaults_to_sst).
 default_engine = "sst"
 
 [promise]

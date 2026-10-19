@@ -23,10 +23,10 @@
 //!   index. The right choice for a pure-vector collection that doesn't
 //!   want the build/memory cost of an AXIS HNSW.
 //!
-//! The original mental model — "SST is default for everything" — produces
-//! pathological behaviour on vector collections that don't opt into an
-//! index. The heuristic in this module routes such collections to HELIX
-//! instead.
+//! An earlier version routed vector collections without an index to HELIX.
+//! That put the default path on a Beta engine with open recall defects
+//! (2% recall@10 measured), so TD-ENGSEL-1 returned them to SST, whose PAX
+//! segment cascade (IVF cells → RaBitQ → SQ8 rerank) is the index.
 //!
 //! # Heuristic
 //!
@@ -45,8 +45,8 @@
 //!    `quantization.enabled = true`, choose **SST**. Indexes + progressive
 //!    quantization compensate for SST's block-pruning limitation.
 //! 5. Otherwise (vector collection with no index and no quantization
-//!    and no recall_target) choose **HELIX**. Its Hilbert-sorted
-//!    blocks deliver ANN-quality recall without an external index.
+//!    and no recall_target) choose **SST** (TD-ENGSEL-1). HELIX is an
+//!    explicit opt-in: `storage_engine = HELIX` or `index_policy.mode = "helix"`.
 //!
 //! # Observability
 //!
@@ -84,7 +84,10 @@ pub mod reasons {
     pub const HAS_QUANTIZATION: &str = "has_quantization_route_sst";
     pub const HAS_BOTH: &str = "has_index_and_quantization_route_sst";
     pub const RECALL_TARGET_SET: &str = "recall_target_route_sst";
-    pub const VECTOR_NO_INDEX: &str = "vector_no_index_route_helix";
+    /// TD-ENGSEL-1: a vector collection with no index, quantization, recall
+    /// target or policy lands on SST, the supported default. HELIX (Beta) is an
+    /// explicit opt-in (`storage_engine` or `index_policy.mode = "helix"`).
+    pub const VECTOR_NO_INDEX: &str = "vector_no_index_route_sst";
     pub const NON_VECTOR_DEFAULT_SST: &str = "non_vector_default_sst";
     /// `index_policy.mode == "helix"` — owner forced the HELIX engine (ADR-028).
     pub const POLICY_FORCE_HELIX: &str = "index_policy_mode_helix";
@@ -196,14 +199,13 @@ pub fn infer_storage_engine(config: &CollectionConfig) -> (StorageEngine, &'stat
         (false, false) => {}
     }
 
-    // (4) No index, no quantization. Two sub-cases:
-    //   * Vector collection (dimension > 0): route to HELIX so the
-    //     Hilbert-sorted block layout delivers usable recall without an
-    //     external index.
-    //   * Non-vector collection (dimension = 0, e.g. metadata-only
-    //     storage): SST is the right home.
+    // (4) No index, no quantization: SST either way (TD-ENGSEL-1, owner
+    //     decision 2026-10-17). A vector collection is served by SST's PAX
+    //     cascade — the segment is the index — which the support contract and
+    //     the MVP corridor promise; HELIX (Beta, open recall TDs) measured 2%
+    //     recall@10 on this default path and is now an explicit opt-in.
     if config.dimension > 0 {
-        (StorageEngine::Helix, reasons::VECTOR_NO_INDEX)
+        (StorageEngine::Sst, reasons::VECTOR_NO_INDEX)
     } else {
         (StorageEngine::Sst, reasons::NON_VECTOR_DEFAULT_SST)
     }
@@ -237,7 +239,7 @@ mod tests {
         cfg.storage_engine = Some(StorageEngine::Unspecified as i32);
         let (engine, reason) = infer_storage_engine(&cfg);
         // Falls through to heuristic — vector collection, no index → HELIX.
-        assert_eq!(engine, StorageEngine::Helix);
+        assert_eq!(engine, StorageEngine::Sst);
         assert_eq!(reason, reasons::VECTOR_NO_INDEX);
     }
 
@@ -285,10 +287,10 @@ mod tests {
     }
 
     #[test]
-    fn vector_no_index_no_quantization_picks_helix() {
+    fn vector_no_index_no_quantization_picks_sst() {
         let cfg = vec_config("t7");
         let (engine, reason) = infer_storage_engine(&cfg);
-        assert_eq!(engine, StorageEngine::Helix);
+        assert_eq!(engine, StorageEngine::Sst);
         assert_eq!(reason, reasons::VECTOR_NO_INDEX);
     }
 
@@ -326,7 +328,7 @@ mod tests {
             ..Default::default()
         });
         let (engine, reason) = infer_storage_engine(&cfg);
-        assert_eq!(engine, StorageEngine::Helix);
+        assert_eq!(engine, StorageEngine::Sst);
         assert_eq!(reason, reasons::VECTOR_NO_INDEX);
     }
 
@@ -410,7 +412,7 @@ mod tests {
         let mut cfg = vec_config("p4");
         cfg.index_policy = policy("exact");
         let (engine, reason) = infer_storage_engine(&cfg);
-        assert_eq!(engine, StorageEngine::Helix);
+        assert_eq!(engine, StorageEngine::Sst);
         assert_eq!(reason, reasons::VECTOR_NO_INDEX);
     }
 

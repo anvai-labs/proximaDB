@@ -1,0 +1,900 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= PAX Spec Thought Experiments — Manifest, Global Clusters, Reader/Writer and Compaction (toward PAX v4)
+:toc: left
+:toclevels: 2
+:icons: font
+:last-updated: 2026-10-19
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Proposed (design study, 2026-10-19).** Documentation and analysis only. Nothing here changes a default, a format byte or a TD status. Each proposal is evidence-gated by the experiment plan in §5.
+| Date | 2026-10-19
+| Relates to | link:../10-quality/td/TD-PAXMETA-1-collection-level-segment-facts.adoc[TD-PAXMETA-1] (the trigger), link:PAX_V3_UNIFIED_SUBSTRATE_SPEC_2026_09.adoc[PAX v3 spec], link:adr/ADR-062-coalesced-rabitq-header-self-describing-footer-pax-layout.adoc[ADR-062], link:adr/ADR-065-clustered-tier-regions-single-segment.adoc[ADR-065], link:adr/ADR-085-persistent-pax-warm-tier.adoc[ADR-085], link:adr/ADR-089-filter-aware-pax-cascade.adoc[ADR-089], link:adr/ADR-094-unified-storage-substrate-and-compute-seam.adoc[ADR-094], link:adr/ADR-026-pax-canonical-vector-path.adoc[ADR-026], ADR-097 D2 and `LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc` Part C (see the note below), link:../10-quality/td/TD-RDSTRAT-9-collection-read-cost-envelope.adoc[TD-RDSTRAT-9], link:../10-quality/td/TD-CACHE-9-persistent-pax-warm-tier.adoc[TD-CACHE-9], link:../10-quality/td/TD-PAXRG-1-row-group-region-d.adoc[TD-PAXRG-1], link:../10-quality/td/TD-COMPACT-10-l2-segment-consolidation-gap.adoc[TD-COMPACT-10], link:../10-quality/td/TD-COMPACT-13-compaction-input-retirement-race.adoc[TD-COMPACT-13], link:../10-quality/td/TD-DELVEC-1-cold-tier-deletion-vectors.adoc[TD-DELVEC-1], TD-SEAM-10, TD-SEAM-11
+| Cost spine | `Latency ≈ DEPTH × RTT + critical-path bytes / bandwidth`; optimise DEPTH ≫ WIDTH ≫ BYTES ≫ CPU (link:VECTOR_OBJECT_ECONOMY_ROUTE_HLD_LLD_2026_05_27.adoc[VOE HLD]:47-57; ADR-033 as cited by TD-PAXMETA-1)
+|===
+
+NOTE: ADR-097 (`docs/12-design/adr/ADR-097-foundational-seams-single-logical-ir.adoc`) and
+`docs/12-design/LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc` are **not in this checkout**
+(`vector-p5a-defaults`). They exist on branch `lakehouse-seams-iceberg-single-writer`,
+commit `635757f2`. Citations to them below use line numbers from that commit (ADR-097 D2 at
+:82-92; seams Part C at :263-355, P5 at :509-521). This document takes the decided direction as
+given: PAX is the vector authority, with a collection-global centroid directory, cluster-contiguous
+compaction with A+B co-located, and HNSW only as a hot projection.
+
+== 1. Executive summary
+
+PAX today is a sound *segment* format: one self-describing object, a fixed-offset hot tier and a
+Parquet-style footer. What it lacks is a *collection* level. Every collection-level fact (row
+counts, tiers, cell directories, the live set itself) is found by listing the prefix and opening
+each segment. Each segment then runs its own four-wave cascade. Three measured symptoms follow:
+
+* **20–80 GET/q cold at 1M.** On a clean single segment, 21.95 GET/q and 58.5 MB/q
+  (`RDSTRAT13_SIFT1M_LADDER_2026_08_31.adoc`:26). On an overlapping L2+L2+L3 set, 50.57 GET/q and
+  125.5 MB/q.
+* **52.9 GET/q, 130.9 MB/q and 417 ms p50 at BIGANN 10M**, nprobe 22/305, recall 0.9804
+  (`BIGANN_NPROBE_GEOMETRY_COMPLETE_2026_08_06.adoc`:71).
+* **A 3× p50 swing from live-set ambiguity alone** (2977 ms vs 9029 ms, TD-COMPACT-13). A
+  manifest-defined serving set prevents this by construction.
+
+This study's central finding goes beyond "add a manifest". **Cell geometry is currently tied to
+the range-GET unit.** `k_c = N·dim / IOP_target` (`block_cluster.rs`:260-274) makes one cell's
+SQ8 roughly one IOP: 8 MiB on S3 (`iops_budget.rs`:97-102). Cells are therefore 33k–67k rows at
+128d. Even the economy nprobe probes 20–53% of a 1M collection, and the survivor pool
+(`max(100·k, 1%·N, 1000)`, `segment_format.rs`:2039-2076) makes Region-B reads approach whole
+cells. Decoupling *cluster size*, which governs recall and bytes, from *range size*, which governs
+GETs and latency, is the largest byte lever. Together with a manifest-resident global directory,
+it is also the precondition for ≤3 waves.
+
+=== Ranked changes (impact × effort)
+
+[cols="1,5,1,1,1,1", options="header"]
+|===
+| # | Change | Impact | Effort | Score | TE
+| 1 | **Collection manifest `PXM1` becomes the serving set.** It replaces the per-query LIST and the per-segment footer reads, uses create-only commit, and carries row counts, tiers, DV references, zone maps and a copy of each segment's 88 B header prefix. | High | M | ★★★★★ | P2, P1, P3, P6
+| 2 | **Decouple cluster size from range size.** Use fine clusters of about 1–4k rows, balanced or split. The planner coalesces adjacent probed clusters into backend-sized ranges. Replace the `1%·N` survivor pool with an error-bound (RaBitQ confidence-interval) pool. | High (bytes 3–30×) | M | ★★★★★ | P4, P1
+| 3 | **Collection-global centroid directory and assign-at-flush.** Cluster ids are global and segments keep per-cluster extents, so probing cost stops growing with segment count. The directory is hierarchical at ≥10M. | High | L | ★★★★ | P1, P3
+| 4 | **Cell-addressed layout v2.** The A0 cell directory addresses rows (no row-ordinal stride arithmetic), which allows interleaved `[A_c\|B_c\|ids_c\|fcodes_c]` runs. A co-location rule decides interleaved vs split per collection. | Med-High (−1 wave) | M | ★★★★ | P4, P1, P7
+| 5 | **Reader mechanics.** Make bounded wave issuance default-ON, add hedged GETs for ranges ≤4 MiB, and (split layout) speculatively prefetch Region D for the top `2k` RaBitQ candidates in the survivor-B wave. | Med (p99, −1 wave) | S | ★★★★ | P9
+| 6 | Interim fix: make `segment_vector_count` and the rebuild checks read footers in parallel, using `read_coalesced_segment_footer` instead of whole-object reads. | Med | S | ★★★ | P2
+| 7 | Exact-authority rule. Persist `fp16` canonical precision as fp16 (Region C), make WAL truncation conditional on exact authority, and place Region C as a cold tail. | Med (correctness, $) | S-M | ★★★ | P5
+| 8 | Per-cluster filter summaries plus in-run filter codes, so Stage F stops reading all of Region D. | High for filtered | M | ★★★ | P7
+| 9 | Per-cluster live counts and DVs in the manifest. Inflate the pool by `1/(1−d)` and compact at cluster granularity. | Med | M | ★★ | P6, P3
+| 10 | Cluster-run cache keys and W-TinyLFU admission for Region-B and Region-D cache entries. | Med (warm) | S | ★★ | P8
+| 11 | Base+delta compaction controller (write-amp vs GET envelope; implements TD-RDSTRAT-9). | Med | L | ★★ | P3
+| 12 | Per-dimension or per-cluster SQ8 parameters, and RaBitQ residuals against cluster centroids. | Med (pool shrink) | M | ★★ | P5, P4
+|===
+
+**Top 5:** #1 manifest-as-serving-set; #2 fine clusters with an error-bound pool; #3 global
+directory with assign-at-flush; #4 cell-addressed v2 with the co-location rule; #5 default waves,
+hedging and speculative D.
+
+**Expected end state at 1M×128 on S3.** Cold after process start: 2–3 sequential waves. With the
+manifest and directory cached: 2 waves (cluster runs, then D), or 1 if ids are inline. 12–26 GET/q
+and 6–12 MB/q, versus 21.95 GET/q, 58.5 MB/q and 5 waves today. Every number in that sentence is
+a modelled projection to be confirmed by §5. None of it is a claim.
+
+== 2. Ground truth: what the reader and writer do today
+
+=== 2.1 Format (single layout, `SEG_LAYOUT_VERSION = 1`)
+
+----
+[prefix 88 B: PXH1|ver|pad3|A off/len|B off/len|footer off/len|A0 off/len|C off/len]
+[A0: PXA0 coarse directory: PCA model, k_c centroids, radii, 72 B cell entries]
+[A: RaBitQ codes, stride 8 + ceil(d/8)]  [B: SQ8 codes, d B/row]  [C?: f32]  [OPR?]
+[D: row groups (≥256 KiB), per-RG zone map + OID chunk address in footer]
+[footer: row_count, region mirrors, sq8_min/scale, embed_dim, has_f32_tier, block table,
+         optional sections tags 2..7]  [footer_len u64][PAXSEG01]
+----
+
+Sources: `segment_layout.rs`:52-69 (prefix), :158-184 (`SegmentHeaderPrefix`), :515-592
+(`SegmentFooterIndex`), :462-505 (section tags 2–7); `coarse_directory.rs`:24-36 (A0 layout) and
+:138-157 (`CoarseCellEntry`: row range plus A/B/C extents and D block range); `coalesced_rabitq.rs`:365
+(`code_stride = 8 + ceil(d/8)`).
+
+Observations that drive the TEs:
+
+. **Region B is addressed by stride arithmetic:** `codes_base = sq8_off + codes_offset(row_count)`,
+  then `row × dim` (`segment_format.rs`:4224). The cell directory has `b_off/b_len`, but rerank
+  does not route through it. Interleaving A and B therefore needs a layout-version change (§4).
+. **SQ8 has one `(min, scale)` pair per segment** for all dimensions (`segment_layout.rs`:535-536).
+. **The header's bytes 5..8 are reserved zero** (`segment_layout.rs`:193). The parser rejects any
+  version other than 1 (`:219-223`). This is the clean mixed-read hook ADR-065 Q2 anticipated.
+. **A0 persists the PCA model in f32.** Cells are listed in Hilbert order of the projected
+  centroid, and block boundaries never straddle cells (`coarse_directory.rs`:1-23).
+
+=== 2.2 Cold read path per segment (coarse probe default-ON)
+
+[cols="1,3,2", options="header"]
+|===
+| Wave | Reads | Source
+| W0 | `LIST` of the collection prefix. The listing is the serving set, minus pending retirements. | `search/mod.rs`:2614, :2634-2650
+| W1 | Header prefix. 1 MiB prefetch by default (`PROXIMADB_PAX_PREFIX_PREFETCH_BYTES`), which usually covers A0 and the RaBitQ region header. | `segment_format.rs`:3184-3193, :3996-4011
+| W2 | Probed Region-A cell ranges, plus the footer riding the same wave (TD-RDSTRAT-13 C4) | :3358-3433, :4051-4068
+| W3 | Region-B ranges for the survivor pool `M = max(100k, ⌈0.01·N⌉, 1000)` | :2039-2076, :4210-4450
+| W4 | Region-D per-RG OID chunks for the top-k | :4605-4700
+| +F | With a filter: Stage F runs before W1, doing HEAD, header, footer and then **all D bodies** (footer-stats pruning is default-OFF) | :1212-1282
+| +A | `Adaptive` mode: `segment_vector_count` makes **2 sequential GETs per segment** in a `for … .await` loop (first touch only; then the per-URL cache) | `search/mod.rs`:333-362, :371-392
+|===
+
+Segments fan out in parallel (`join_all`, `search/mod.rs`:1554). Cold DEPTH is therefore about
+5 waves for a plain query, about 9 with a filter, and about 5 + 2F on a first-touch `Adaptive`
+query. GET count is roughly F × (2 + r_A + r_B + r_D). TD-COMPACT-10:20 measured about 7–8
+GETs per segment before range splitting.
+
+The rebuild guards are worse. `durable_vector_count_for_rebuild` and
+`all_segments_coarse_rabitq_pax_without_f32_tier` do a **full `fs.read` of every `.pax`**
+(`search/mod.rs`:975-1024), because `.pax` has no cheaper count path.
+
+=== 2.3 Writer geometry
+
+* `k_c = clamp(N_usable·dim / iop_target, 2, 4096)` (`block_cluster.rs`:267-273). `iop_target` is
+  8 MiB on S3/GCS, 4 MiB on Azure and 1 MiB locally (`iops_budget.rs`:81-125, :152-160).
+* nprobe is `ceil(2·√k_c)`, clamped by min 3 (`segment_format.rs`:3107-3116;
+  `config.rs`:1756-1758). The multiplier is process-global; BIGANN showed a global policy is
+  unsafe across corpora (`BIGANN_…COMPLETE`:84-96).
+* Flush floor is 128 MB predicted (about 0.9M vectors at 128d), with a 300 s timer for trickle
+  collections (`config.rs`:1300-1313). Compaction uses `level_multiplier 1.0` and higher-level
+  threshold 2 (TD-COMPACT-10), and k-means is retrained on every compaction (TD-COMPACT-1 S3 open).
+* The publish primitive is create-only `put_if_absent` (`proximadb-object-store/src/lib.rs`:329).
+  A per-collection VOE directory already exists at `oedir/v{epoch}.bin`, but it is written by
+  overwrite (`object_economy_directory.rs`:342-346, :439-459). There is precedent for a collection
+  object, though not for create-only commit.
+
+=== 2.4 Arithmetic conventions used below
+
+[cols="1,2", options="header"]
+|===
+| Symbol | Assumption (state-of-practice; to be calibrated in §5 E0)
+| `t0` | S3 time-to-first-byte 20–50 ms; **30 ms** used for point estimates
+| `b_s` | Per-GET stream throughput **≈ 80 MB/s** (AWS S3 performance guidelines: ~85–90 MB/s per request)
+| `b_n` | Node aggregate **≈ 1.2 GB/s** (10 Gbps)
+| Wave time | `t0 + max_range/b_s`, or `bytes_wave/b_n` if larger
+| `$GET` | S3 Standard **$0.0004 / 1k** ($0.40 per 1M GETs). `LIST` **$0.005 / 1k**. Azure Hot is about 10× cheaper per op (`PAX_RANGED_READ_MULTICLOUD_COST_2026_06_25.adoc`:40-50).
+| Storage | S3 Standard **$0.023 / GB-month**
+| Bytes/row | A = `8+⌈d/8⌉` (24 B @128d, 104 B @768d); B = `d`; f32 = `4d`; fp16 = `2d`
+|===
+
+Wire bytes are free same-region but cost latency and NIC. RDSTRAT13 measured a transfer-dominated
+bed, where 98% of p50 was transfer (`RDSTRAT13…`:49-53). Bytes are therefore a first-class term
+here, not an afterthought.
+
+== 3. Thought experiments
+
+=== TE-P1 — Cold query at 1M / 10M / 100M (128d and 768d) on S3
+
+*Scenario.* Unfiltered top-10 query, recall@10 ≥ 0.98, one fully compacted segment (the best case
+for today). Process freshly started, no DRAM or NVMe cache.
+
+*Today (modelled from §2; S3 8 MiB target).* Rows probed = `N·nprobe/k_c`. Bytes ≈ (A+B) of the
+probed cells, because the measured bytes match whole-cell B reads: 370k rows × 152 B = 56 MB
+against 58.5 MB measured.
+
+[cols="2,1,1,1,1,1,1,1", options="header"]
+|===
+| Shape | `k_c` | nprobe | rows probed | MB/q | GET/q | waves | p50 model
+| **Measured** 1M×128, Azure 4 MiB (RDSTRAT13 clean) | 30 | 11 | 370k (37%) | 58.5 | 21.95 | 5 | 356 ms disk / 2977 ms @100 ms toxiproxy
+| **Measured** 10M×128, Azure 4 MiB (BIGANN) | 305 | 22 | ~721k | 130.9 | 52.9 | 5 | 417 ms (Azurite)
+| 1M×128 S3 | 15 | 8 | 533k (53%) | ~81 | ~30 | 5 | ~420 ms
+| 1M×768 S3 | 91 | 20 | 220k (22%) | ~192 | ~40 | 5 | ~450 ms
+| 10M×128 S3 | 152 | 25 | 1.64M (16%) | ~250 | ~50 | 5 | ~600 ms
+| 10M×768 S3 | 915 | 61 | 667k (6.7%) | ~580 | ~105 | 5 | ~850 ms
+| 100M×768 S3 | 4096 (cap; formula 9155) | 128 | 3.1M | ~2,700 | >300 | 5 | multi-second
+|===
+
+Model p50 for 1M×128 is LIST 40 + W1 43 + W2 130 + W3 130 + W4 35 + rank about 40, ≈ 420 ms.
+An 8 MiB range costs `30 + 105` ms. Rank compute is measured at 34–48 ms
+(`RDSTRAT13…`:55-59, :94-100). Real S3 is not window-limited the way toxiproxy is, so the model
+sits between the disk bed (356 ms) and the proxy bed (2977 ms).
+
+Two structural observations:
+
+* **Waves are constant (5) but GETs and bytes scale with cell size × nprobe × segments.** With F
+  segments of N/F rows, per-segment probing sums to `F·2√(k/F) = 2√(kF)` cells. Probed rows grow
+  as `√F`, and the fixed per-segment GETs grow as F.
+* **The survivor pool scales with N.** `M = ⌈0.01·N⌉` gives 10k at 1M and 100k at 10M, so B reads
+  saturate whole probed cells. ADR-062 (:363-366) already flags M as needing "a measured
+  segment-scale/confidence rule".
+
+*What proven systems do.*
+
+* **turbopuffer** (SPFresh-based centroid index). The cold path downloads the centroid index,
+  picks the closest clusters, and fetches those clusters' ranges "in one large round trip". That is
+  about 3–4 round trips, ~400 ms at ~100 ms per round trip, with NVMe and memory caches behind it.
+  ANN v3 nests clusters hierarchically for 100B-vector namespaces
+  (https://turbopuffer.com/docs/architecture, https://turbopuffer.com/blog/ann-v3). The published
+  1M cold p50 differs across doc versions (402 ms / 874 ms). Treat it as orientation only.
+* **SPANN** (NeurIPS 2021) keeps centroids in memory and balanced, size-limited posting lists on
+  disk, replicates boundary vectors, and probes only lists with `d(q,c_i) ≤ (1+ε)·d(q,c_1)`.
+  **SPFresh** (SOSP 2023) adds LIRE rebalancing: split oversized lists, reassign only neighbours.
+* **LanceDB** IVF-PQ on object storage keeps partition centroids in the index file, reads only the
+  probed partitions, and refines with full vectors.
+* **DiskANN/Vamana** achieves recall with dozens of dependent SSD reads per query (beam search).
+  That is fine at ~100 µs per NVMe read but about 10–20 sequential 30–100 ms round trips on S3.
+  This is why centroid indexes win on object storage.
+* **Milvus/Zilliz** tiered storage lazily loads segments from object storage to local disk, so cold
+  first-touch is a segment download and the design relies on caching, not small cold depth.
+
+*Proposed path* (manifest + global directory + fine clusters + v2 runs):
+
+----
+W0  manifest PXM1 (+ inline or adjacent centroid directory)   — cached after first touch
+W1  probed cluster runs [A_c | B_c | ids_c] across live segments — one parallel wave
+W2  Region D payload for top-k (only if metadata/payload requested, else skipped)
+----
+
+[cols="2,1,1,1,1,1,1", options="header"]
+|===
+| Shape | rows/cluster → k | nprobe (assumed) | rows probed | MB/q | GET/q | waves (cold-start / dir cached)
+| 1M×128 | 2k → 500 | ~28 | 56k (5.6%) | ~8.5 (co-located) | 12–26 | 3 / 2 (1 if ids inline, no payload)
+| 1M×768 | 1k → 1,000 | ~57 | 57k | 50 co-located or 7.4 split | 15–40 | 3 / 2 (co-located) or 4 / 3 (split)
+| 10M×128 | 2k → 5,000 | ~77 | 154k (1.5%) | ~23 | 25–50 | 3 / 2
+| 10M×768 | 1k → 10,000 (hier.) | ~158 | 158k | ~18 split (A 16.4 + B pool 1.5) | 50–90 | 4 / 3
+| 100M×768 | 2k → 50,000 (2-level) | ~200 leaves | 400k | ~45 split | 80–150 | 4 / 3
+|===
+
+The nprobe column extrapolates the BIGANN quality fit `1.72·k^0.447`
+(`BIGANN_…COMPLETE`:79-82), multiplied by 1.5 for 768d as the BGE gap suggests (:84-89). **This is
+a hypothesis, not evidence.** The fit was measured at roughly constant rows per cell (about 33k)
+with N varying, so it does not by itself predict finer cells at fixed N.
+
+The one in-repo fixed-N anchor is consistent with the direction but proves no magnitude. At
+N=100k, `IVF_K=64` (1.6k rows/cell) reached recall 0.9808 probing 25% of cells at 2.67 MB/q. The
+natural `k_c=3` needed 67–100% (TD-IVF2ENGAGE-1:30-31; `BIGANN_…COMPLETE`:52-62). §5 E2 measures
+it properly.
+
+*Expected effect.* DEPTH goes from 5 to 2–3, which is structural. Bytes drop 3–30×, conditional on
+E2. GET/q at 1M reaches ≤20 when the planner coalesces adjacent clusters. At 10M×768 the binding
+term becomes **GET count versus bytes**, not depth. That is where SPANN-style boundary replication
+of A (≈ +30–60% of Region-A bytes) and super-run coalescing are the next levers.
+
+*GET cost at the proposed point.* 20 GET/q is $8 per 1M queries on S3 and about $0.8 on Azure
+Hot. Removing the per-query LIST saves $5 per 1M queries. That one op costs as much as 12.5 GETs.
+
+*Risks and compat.*
+
+Fine clusters enlarge A0 to about `k·(n_comp·4 + 72)` B: ≈ 100 KB at k=500 (n_comp 32) and
+≈ 3.3 MB at k=10k (n_comp 64), so ≥10M needs a hierarchical directory (TE-P4). Small runs at 128d
+(~300 KB) raise GET count unless coalesced; the adaptive range estimator (ADR-065:143-162) is the
+existing mechanism. v1 segments stay readable through today's path (§4.5).
+
+=== TE-P2 — Collection-level metadata (TD-PAXMETA-1)
+
+*Scenario.* A collection has 12 live segments: 1 base, 3 L1 and 8 L0 trickle. A restart is
+followed by an `Adaptive` query, an AXIS rebuild check and an Iceberg publication.
+
+*Today.* One LIST, then `segment_vector_count` makes 2 GETs **sequentially** per segment: 24
+dependent GETs, ≈ 720 ms at t0 = 30 ms, before routing (`search/mod.rs`:339-361). The rebuild
+guards read 12 whole objects (`search/mod.rs`:984-990, :1015). The query then runs 12 parallel
+cascades. Iceberg cannot list `.pax` as data files at all (data files must be Parquet, ORC or
+Avro).
+
+*What proven systems do.* Parquet keeps stats in each file's footer, so the reader opens every
+file. Iceberg goes one level up: manifests hold per-file `record_count`, `file_size_in_bytes`,
+`lower/upper_bounds` and `null_value_counts`, so planning prunes without opening files, and commit
+is an atomic pointer swap. Delta Lake writes `_delta_log/NNNN.json` with put-if-absent, so the
+entry's existence *is* the commit, and each `add` action carries file stats. Lance keeps versioned
+manifests whose fragments carry `physical_rows` and a deletion-file reference. S3 has supported
+`If-None-Match` conditional writes since 2024, so Delta-style create-only commit needs no external
+lock.
+
+*Proposed: `PXM1` collection manifest.* It is a full snapshot rather than a delta, sectioned and
+checksummed, published via `put_if_absent` at
+`<collection>/_pax/manifest/m-{seq:020}.pxm`.
+
+[cols="2,1,3", options="header"]
+|===
+| Field | Bytes | Purpose
+| `magic PXM1`, `version`, `flags` | 8 | Mixed-read dispatch
+| `collection_id`, `manifest_seq`, `parent_seq`, `writer_epoch` (fence) | 32+ | Lineage and single-writer fencing
+| `catalog_snapshot_id`, `lsn_lo/hi` covered | 24 | Ties to the canonical WAL (ADR-020) and to Iceberg snapshots
+| `centroid_dir {url\|inline, off, len, sha256, model_generation, dim, n_comp, k, levels}` | ~80 | Global directory (TE-P4); inline when ≤ 1 MiB
+| `nprobe_calibration {calib_id, recall_target, k_buckets, curve}` | ~64 | Collection-scoped nprobe; per BIGANN, a global policy is refuted
+| `totals {rows, live_rows, bytes, segments}` | 32 | TD-PAXMETA-1 acceptance: O(1) Adaptive routing
+| **Per segment**: `url` (content-addressed), `size`, `sha256/etag`, `format`, `layout_version`, `layout_flags`, `level`, `lsn_lo/hi`, `row_count`, `live_rows`, `embed_dim`, `embed_count`, `metric_epoch`, `tier_mask {rabitq1,sq8,fp16,f32}`, `exact_authority`, `canonical_precision`, `model_generation` | ~140 + url | Replaces the footer reads for routing, rebuild and coarse-RaBitQ checks
+| Per segment: **`header_prefix[88]` copy** | 88 | Lets the reader skip W1 for this segment: it knows A0, A, B, footer and C extents up front
+| Per segment: `dv_ref {inline\|url, off, len, gen, cardinality}` | 32 (+ inline ≤ 16 KiB) | TE-P6
+| Per segment: zone map per declared filter column `{col_id, min16, max16, nulls}` | ~40/col | Segment pruning (TE-P7); Iceberg `lower/upper_bounds` export
+| Per segment × cluster (optional section): `{global_cluster_id, row_lo, row_hi, run_off, run_len, live}` | 28 | Present when the segment's A0 is keyed by global ids; lets W1 skip per-segment A0
+|===
+
+*Size.* About 300 B per segment plus 40 B per filter column. Twelve segments with 5 columns come
+to about 6 KB. A thousand segments come to about 0.5 MB. The per-cluster section is about 28 B ×
+clusters × segments: 14 KB for one base at 500 clusters, and 1.4 MB for 50k clusters, which goes
+to a referenced sub-object (Iceberg-style two-level).
+
+*Commit protocol (create-only, crash-safe).*
+
+. Publish new segment objects via `put_if_absent` under content-addressed names. This is unchanged.
+. Read the current manifest `n`, build `n+1`, then `put_if_absent(m-{n+1})`. **Its existence is the
+  commit**, as in Delta.
+. A lost race (`AlreadyExists`) means another writer won. The single collection writer is fenced
+  by `writer_epoch`. Re-read, rebase if the inputs are still live, otherwise abandon and leave the
+  outputs as orphans.
+. Advance the catalog hint `pax_manifest_seq = n+1` (best effort) and append a WAL
+  `PaxManifestCommit{seq, sha}` record so recovery and S2 truncation can see it.
+. Retention: inputs dropped by manifest `n+1` are deleted only after `retention ≥ max query
+  duration + cache TTL` (default 1 h). The existing retirement ledger
+  (`retirement_ledger.rs`, TD-COMPACT-13) runs the deletes.
+
+[cols="2,3", options="header"]
+|===
+| Crash point | Outcome
+| After segment PUTs, before the manifest | Orphan objects, never served (not in any manifest). Ledger GC after the grace period.
+| After the manifest PUT, before the catalog hint | Readers on hint `n` do `LIST _pax/manifest/ start-after=m-{n}` (1 op, on miss or periodically) and find `n+1`.
+| Concurrent compactor and flusher | The second `put_if_absent` fails and rebases. The serving set is never a union of both (the TD-COMPACT-13 class cannot occur).
+| Corrupt or partial manifest | Checksum fails. Fall back to `n-1`, and then to the LIST + footer path, which is today's behaviour.
+|===
+
+*Reader resolution.* Use the catalog hint, or the in-RAM cached seq. Then fetch the manifest: one
+GET of ~6 KB, cached in RAM forever since it is immutable. With no manifest present, use LIST plus
+the TD-SEAM-11 footer-facts cache (`search/mod.rs`:295-299), which is today's path.
+
+*Divergence rule.* The object wins (`PAX_V3…`:181-182). A manifest entry whose `size` or
+`header_prefix` disagrees with a fetched object invalidates that entry. The segment is then served
+through the footer path and a rebuild is scheduled.
+
+*Relation to ADR-062 D1.* D1 rejected a collection-level **RaBitQ** sidecar (ADR-062:430-432)
+because it splits data across objects. `PXM1` carries only rebuildable metadata (ADR-045 Layer B
+and the S7 projection). Every segment remains self-describing, and the manifest can be rebuilt from
+footers. The VOE `oedir` sidecar is the closest precedent and should fold into `PXM1` rather than
+remain a third collection object.
+
+*Iceberg export.* `row_count → record_count`, `size → file_size_in_bytes`, zone maps →
+`lower/upper_bounds`, DVs → v3 `deletion-vector-v1` Puffin blobs. `.pax` itself stays unlisted in
+Iceberg. Only the optional Parquet projection (seams doc Part C) is a data file.
+
+*Expected effect.* Cold `Adaptive` routing goes from 2F sequential GETs to 1 GET (the
+TD-PAXMETA-1 acceptance). The rebuild checks read no bodies. The `header_prefix` copy skips W1 per
+segment. The per-query LIST disappears, and the superseded-input race is ruled out structurally.
+
+*Risks.* There are two sources of truth for the live set during migration, the manifest and LIST.
+The rule is that once a collection has any manifest, LIST is used only for discovery of newer
+manifests, never for segments. The manifest must also be fenced against the S2 WAL authority.
+
+=== TE-P3 — Write path, small files and compaction policy
+
+*Scenario.* 10M×768 bulk load. Bytes per row ≈ 104 (A) + 768 (B) + ~80 (D) ≈ 950 B, so a 128 MB
+flush is about 135k rows and N/S_flush ≈ 74 flushes. Plus a trickle collection at 10 vec/s.
+
+*Today.* The trickle collection flushes every 300 s, about 3k rows each: 288 tiny L0 objects per
+day, each adding about 7 GETs/q until compacted. Bulk compaction pairs equal sizes (multiplier 1.0,
+threshold 2), which behaves like a binary counter, and k-means is retrained on every rewrite
+(TD-COMPACT-1 S3 open).
+
+[cols="2,1,1,2", options="header"]
+|===
+| Policy | Write amp (rows rewritten / row ingested) | Max live segments | Read cost per extra segment
+| Today: pairwise leveled (binary counter) | `1 + log2(74)` ≈ **7.2** | popcount ≤ ⌈log2 74⌉ = 7 (3 at N=74) | +2 + nprobe_seg ranges (per-segment cells)
+| Size-tiered, T=4 | `1 + log4(74)` ≈ **4.1** | ≤ 3 per tier × 4 tiers | Same
+| **Base + delta, assign-at-flush, α=1** | `1 + (1+α)/α` ≈ **3** amortised | 1 base + ≤ 4 deltas | +≈1 coalesced range per probed cluster present in that delta (global cluster ids)
+| Cluster-granular merge (SPFresh/LIRE) | ≈ 1 + touched-cluster fraction | 1 base (multi-object shards) + small deltas | Only rewritten shards change
+|===
+
+Writes are about 9.5 GB × WA. PUT fees are negligible: multipart parts cost $0.005/1k. The real
+costs are compaction CPU, k-means, and **cache invalidation**: every rewrite purges warm NVMe
+entries for the rewritten objects.
+
+*What proven systems do.* RocksDB-style leveling trades write amp for read amp; tiering does the
+opposite. turbopuffer and SPFresh search a WAL tail exhaustively and update the index
+incrementally: SPFresh LIRE splits an over-limit posting list and reassigns only boundary
+neighbours, so writes stay local. Lance merges small fragments and rewrites a fragment whose
+deleted rows exceed a threshold (`materialize_deletions_threshold`, default 10%; to verify).
+
+*Proposed.*
+
+. **Trickle never makes tiny objects.** Below the flush floor, rows stay in the WAL tail or
+  memtable and are served by exact scan, merged with ANN results (seams Part C "Unindexed WAL
+  tail = exact scan"). The 300 s timer bounds replay only (`config.rs`:1300-1306). Its flush then
+  goes to the *delta* tier, not a new searchable L0, once S2 WAL segmentation lands.
+. **Train-at-compaction, assign-at-flush with frozen global centroids.** Flush orders rows by
+  nearest global cluster and writes per-cluster runs keyed by global id. A delta's probe cost is
+  then about one range per probed cluster present in it, with no per-delta A0 ranking and no
+  per-delta nprobe.
+. **Base rebuild is triggered by geometry, not file count.** Retrain or rebalance when any of
+  these holds: max/mean cluster rows > 2.0 (already 2.63 at 10M, `BIGANN_…COMPLETE`:51-57);
+  mean assignment-distance drift > 10% vs training time; rows appended since training > 50% of
+  trained rows.
++
+Otherwise merge deltas into the base by **cluster-range shards**, reusing the persisted model.
+This closes TD-COMPACT-1 S3 and TD-IVF-1.
+. **Write-amp/GET controller.** TD-RDSTRAT-9 owns it and should run in observe mode first. It
+  chooses α and the delta cap from measured GET/q × QPS × $GET against
+  WA × bytes × compaction $/GB.
+
+*Effect.* Write amp falls from about 7 to about 3. Live searchable segments stay at ≤ 5
+regardless of ingest pattern. Per-delta read cost becomes O(probed clusters) ranges, not
+O(2 + nprobe_seg).
+
+*Risks.*
+
+* Frozen centroids degrade under distribution shift. The drift trigger above is the mitigation.
+* A multi-object base (shards) is several objects, but each shard is still a self-contained PAX
+  segment with its own footer, so ADR-062 D1 holds per object. The manifest commit makes the
+  shard set atomic.
+
+=== TE-P4 — Clustering geometry
+
+*Scenario.* 1M×128 on S3, top-10, recall 0.98.
+
+*Today.* `k_c = N·d/8 MiB = 15`, so a cell is 67k rows: 1.6 MB of A and 8.5 MB of B. The
+geometric nprobe of 8 probes 53% of the data. Even the measured economy point at Azure 4 MiB probes
+5–6 of 30 cells (17–20%) (`BIGANN_…COMPLETE`:55). Cell size is chosen so that **one cell's B is
+one IOP**. That optimises GETs per cell but makes the probing quantum huge.
+
+*Two decoupled knobs.*
+
+* **Cluster size `R_c`** sets recall per byte. Finer clusters waste fewer rows per probed cluster.
+  The ANN literature sits at tens to thousands of rows per list. Faiss guidance is `nlist ≈
+  4–16·√N`, about 60–250 rows per list at 1M, which is fine for RAM but too GET-heavy for objects.
+  SPANN limits posting-list length.
+* **Range size `R_max`** sets GETs and latency. A wave costs `t0 + R_max/b_s`. At 30 ms and
+  80 MB/s, transfer equals TTFB at `R* = t0·b_s ≈ 2.4 MB`. Above it a range is
+  throughput-dominated: 8 MiB takes 135 ms in total. Below it, GET fees dominate. This matches the
+  measured Azurite knees: 8 MiB for latency and 16 MiB for operation count (ADR-065:143-148).
+
+*Proposed sizing.*
+
+----
+R_c   = clamp(target_rows, 512, 8192)       # default 2k @≤256d, 1k @768d (E2 calibrates)
+k     = ceil(N_base / R_c)
+dir   = k·(n_comp·4 + 72) bytes; if dir > 1 MiB → two-level: L1 = ceil(√k) centroids (cached),
+        L2 leaf pages of ~√k centroids each fetched in one wave
+nprobe: SPANN-style distance ratio d(q,c_i) ≤ (1+ε)·d(q,c_1), plus a row-aware stop
+        (accumulate rows until pool target; this guards the 2.63 max/mean imbalance),
+        clamped by the manifest's collection-scoped calibration curve
+planner: sort probed runs by offset; merge if gap ≤ R* (bytes transferable in one TTFB);
+         split if a run > R_max; choose R_max via the existing adaptive estimator
+----
+
+*Balanced clusters.* Use balanced k-means or an SPFresh split of lists larger than 2×R_c. The
+reason is the latency tail: a wave is as slow as its largest range, and the 10M bed's largest cell
+is 2.63× the mean.
+
+*Pool.* Replace `max(100k, 1%·N, 1000)` with RaBitQ's error-bound rerank. The RaBitQ estimator
+comes with a confidence interval (Gao & Long, SIGMOD 2024). Rerank only the candidates whose lower
+bound is below the current k-th upper bound, with a cap of `c·k`. The pool then scales with k and
+estimator confidence, not with N. That is the "measured segment-scale/confidence rule"
+ADR-062:363-366 asks for.
+
+*Co-locating B per cluster (seams Part C step 3).* Co-locate when the extra transfer is cheaper
+than the wave it saves:
+
+----
+co-locate  ⇔  (rows_probed · B_bytes_per_row) / b_n  ≤  t0
+----
+
+[cols="2,1,1,2", options="header"]
+|===
+| Shape (proposed geometry) | B bytes probed | transfer @1.2 GB/s | Decision
+| 1M×128 (56k rows) | 7.2 MB | 6 ms | **co-locate** (save ~35 ms wave)
+| 1M×768 (57k rows) | 44 MB | 37 ms | borderline; per-collection E3
+| 10M×128 (154k) | 19.7 MB | 16 ms | co-locate
+| 10M×768 (158k) | 121 MB | 101 ms | **split**: A-run wave + survivor-B wave (pool ≈ 2k×768 = 1.5 MB)
+| 100M×768 (400k) | 307 MB | 256 ms | split
+|===
+
+The rule is computed at compaction from the collection's dimension and observed nprobe. It is
+recorded in the header flags and the manifest. The reader honours either layout.
+
+*Region D rehydration wave.* Top-k OIDs need W4 (≤ k small GETs). Option (a): inline ids in the
+run, adding 16–36 B/row (about +16% bytes at 128d, +3% at 768d), which removes W4 for id-only
+results. Option (b), split mode only: **speculatively issue D for the top `2k` RaBitQ candidates
+in the same wave as the survivor-B fetch**. That hides W4 behind the B wave at the cost of ≤ k
+extra small GETs. In co-located mode W4 is already the only wave after W1, so only (a) removes it.
+Recommend (b) by default for split collections and (a) as a per-collection layout flag.
+
+*Risks.* Recall at fixed nprobe falls with finer clusters, so nprobe rises; the bytes win is net
+only if `rows_probed` falls, which E2 measures. Boundary replication, if adopted, duplicates rows
+across runs; the merge already dedupes by score and OID (ADR-065:94-96).
+
+=== TE-P5 — Quantization tiers and exact authority
+
+*Ground truth (traced by the coordinator, re-verified here).*
+
+* Default PAX persists **no exact f32**: RaBitQ main column plus SQ8 rerank
+  (`src/storage/engines/sst/flush/mod.rs`:1360-1395, :1473-1476). The exact tier is opt-in via
+  `pax_f32_tier:on`, declared `canonical_embedding_precision=fp32` or `PROXIMADB_PAX_F32_TIER`
+  (:1457-1484). `PROXIMADB_PAX_QUANT_DISABLE` forces RawF32 (:1296-1301). fp16 exists only as an
+  opt-in rerank tier (:1523-1560; `proximadb-block-format/src/writer.rs`:776-800) or as a
+  `VectorQuant::Fp16` main column (`writer.rs`:187-200).
+* **Spec gap.** `canonical_embedding_precision=fp16` rounds before the WAL
+  (`src/services/operations/vectors/legacy.rs`:1801-1827), but the PAX writer promotes back to f32
+  (`proximadb-block-format/src/record.rs`:336-344). The collection pays the rounding loss and gets
+  no fp16 saving on disk.
+* HELIX, NOVA and VIPER persist f32 plus quantized copies, and the Arrow/Parquet projection always
+  writes f32 (TD-111). TD-READFID-1 (lossy point reads on default collections) is by design.
+
+*Storage arithmetic, 768d* (100M vectors; $ per month at $0.023/GB):
+
+[cols="2,1,1,1,2", options="header"]
+|===
+| Tier | B/vector | GB @100M | $/month @100M | Role
+| RaBitQ 1-bit (A) | 104 | 10.4 | $0.24 | Rank (always)
+| SQ8 (B) | 768 | 76.8 | $1.77 | Rerank (default)
+| fp16 (C) | 1,536 | 153.6 | $3.53 | Exact for fp16-canonical collections; near-exact rerank
+| f32 (C) | 3,072 | 307.2 | $7.07 | Exact authority
+| Default today (A+B) | 872 | 87.2 | $2.01 | —
+|===
+
+Per 1M vectors, f32 costs $0.07/month. **Storage is not the reason to omit exact values.** The
+real costs are writer buffering, compaction I/O (every rewrite moves 3–4× the bytes) and cache
+pollution when C is co-mingled with hot data. A cold tail placement removes the last of these.
+
+*Proven practice.* LanceDB, Milvus, turbopuffer, Parquet and Iceberg all keep the
+full-precision source and treat PQ/SQ as index projections. RaBitQ's paper pairs IVF with
+residuals to the **cluster** centroid, where estimator variance falls with the residual norm. The
+in-repo bake-off rejected new lossy tiers: SQ6, TurboQuant4 and RaBitQ4 reached recall 0.917–0.981
+(ADR-062:344-349). So: no new lossy tier.
+
+*Proposed.*
+
+. **Exact-authority invariant tied to WAL truncation (S2).** Once the WAL is truncated past an
+  LSN, the segment becomes the recovery authority by reference (`PAX_V3…`:267). Truncation may
+  pass a segment's `lsn_hi` only if `exact_authority = true`, or if the collection explicitly
+  declares `canonical_embedding_precision = lossy_ok`. The manifest makes this an O(1) check.
+  ADR-062's rule ("may omit canonical f32 only when … a durable canonical rebuild source outside
+  that file", :375-381) is otherwise violated silently after truncation.
+. **Persist fp16 as fp16.** For `canonical_precision=fp16`, write Region C as fp16 at 2 B/dim
+  instead of promoting to f32. That halves the exact tier, with no extra loss, because the value
+  was already rounded at ingest.
+. **Region C is a cold tail.** Place it after D and before the footer, so no ANN wave ever
+  coalesces across it. `CoarseCellEntry.c_off/c_len` already addresses it per cell for
+  `include_vectors`.
+. **Quantizer parameters at finer scope.** Per-dimension SQ8 `(min, scale)` costs 8d B per segment.
+  Per-cluster residual SQ8 costs 8d B per cluster, about 3 MB at 500 clusters × 768d. RaBitQ
+  residuals against the cluster centroid require the full-dim centroid in A0: k·d·4, about
+  1.5 MB at 500 × 768. The expected effect is a tighter estimator and a smaller error-bound pool.
+  Gate it on E5. `ParameterScope::ClusterRun` already exists in the descriptor enum
+  (`segment_layout.rs`:392-398).
+. **Default exact tier.** Keep it opt-in, but make `canonical_embedding_precision` *required* at
+  collection creation, with an explicit `lossy_ok`. Today `Unspecified` silently means "no exact"
+  (`flush/mod.rs`:1473-1476; TD-READFID-1).
+
+*Risks.* Per-cluster parameters couple the quantizer to the clustering, so a retrain re-encodes
+the data. That is acceptable, because rewrites already re-encode (ADR-062 D8: regenerate
+projections only from the canonical source). Without an exact tier, a re-cluster with re-encoding
+is lossy-to-lossy and **forbidden**. Collections without exact authority therefore keep their old
+codes and can only move runs, which is one more argument for invariant 1.
+
+=== TE-P6 — Deletes and updates
+
+*Scenario.* 1M-row base, 2% deletes per day, upserts as delete plus insert. One week later 14% is
+dead, skewed toward hot clusters.
+
+*Today.* With `cold-deletion-vectors` default-OFF, deletes are tombstones applied by the MVCC merge
+and physically removed at compaction. DV plumbing (`PDV2`, gen → Roaring) and the OID→position
+resolver region exist behind the feature (TD-DELVEC-1).
+
+*Effect on ANN.* Dead rows still take rank slots. With dead fraction `d` in the probed clusters, a
+pool of M survivors yields only `(1−d)·M` live candidates. At d = 14% and M sized for recall, the
+effective pool shrinks by 14% and recall drops unless M is inflated. Dead bytes are also fetched
+(14% of W1 bytes). A skew toward hot clusters makes the local `d` larger than the global one.
+
+*Proven practice.* Iceberg v3 keeps one DV per data file (Roaring in a Puffin blob) referenced
+from the manifest entry. Lance references a per-fragment deletion file from the manifest and
+materialises deletions above a threshold. SPFresh deletes via a version map and garbage-collects
+during split and reassign.
+
+*Proposed.*
+
+* The manifest per-segment entry holds a `dv_ref`. DVs ≤ 16 KiB are inlined: 1% of 1M rows is
+  about 10k positions, roughly 20 KB in Roaring array containers, which is borderline. Larger DVs
+  are referenced. Inlining keeps DVs off the critical path (W0). A referenced DV is fetched in
+  parallel with W1, because the run fetch does not depend on it; only the merge does.
+* The per-cluster section carries `live` counts. The reader inflates per-cluster pool quotas by
+  `1/(1−d_c)`, and nprobe's row-aware stop counts **live** rows.
+* Compaction trigger: rewrite a cluster run, or its shard, when `d_c > 20%` or a segment's
+  `d > 10%`. That is cluster-granular, not whole-segment (TE-P3).
+
+*Risks.* MVCC-versioned DVs (gen ≤ snapshot) must survive manifest retention. A reader on manifest
+`n` needs DV generations as of its snapshot. Inlining DVs into the immutable manifest snapshot
+gives exactly that.
+
+=== TE-P7 — Filtering
+
+*Scenario.* 1M×768, filter `tenant = X AND lang = 'de'` selecting 2%. Also a relational join that
+produces an allow-set of 5k OIDs (ADR-097 `FilteredAnnExec`).
+
+*Today (ADR-089, filtered cascade default-ON).* Stage F does HEAD, header, footer, then **every
+Region-D body**, coalesced (`segment_format.rs`:1220-1282). Footer-stats pruning
+(`SECTION_BLOCK_FILTERABLE_STATS`, tag 7) is default-OFF. At `m` B/row of metadata that is
+`N·m` bytes, about 100 MB at m=100, and three extra sequential waves before the probe. The probe
+then walks cells nearest-first, counting `allow ∩ cell` until nprobe is reached and the pool is
+filled (`segment_format.rs`:3300-3325), which is good.
+
+*Proven practice.* Parquet and Iceberg use zone maps and Bloom filters at file, row-group and
+page level. Qdrant and Weaviate use payload indexes and ACORN-style filtered traversal. LanceDB
+prefilters with scalar (bitmap/btree) indexes. turbopuffer filters natively over attribute
+indexes. The common idea: **resolve the filter from an index much smaller than the data**, and
+fetch vector bytes only for clusters that can match.
+
+*Proposed (layered).*
+
+. **Segment pruning:** manifest zone maps (TE-P2), at zero GETs.
+. **Cluster pruning:** per-cluster summaries in the directory for *declared* filter columns. Use a
+  value bitmap for low cardinality (≤ 64 values: 8 B/cluster) and a 256 B Bloom filter otherwise.
+  Clusters with no possible match are never fetched.
+. **In-run filter codes:** dictionary ids, 1–2 B/row, stored inside the cluster run. The rank
+  applies the predicate in W1 without touching D. This is about +1.5% bytes at 128d, and it is
+  ADR-045's "filter + vector co-location" applied to the run.
+. **High-cardinality or join allow-sets:** resolve OIDs to positions through the OPR region (one
+  wave, cacheable). Route on cost:
+** If `|allow|·4d ≤ EXACT_SCAN_MAX_BYTES` (`search/mod.rs`:284) and exact authority exists,
+   compute exact distances over the allowed rows (prefilter).
+** Otherwise run a filtered probe with nprobe expansion, which exists today.
++
+DataFusion dynamic filters deliver the allow-set after the join build side, so the cost is the
+build side, not an extra PAX wave.
+
+*Effect.* Filtered DEPTH falls from about 9 to 2–3 (W0 cached, W1 runs, W2 D). Stage-F bytes fall
+from `N·m` to the per-cluster summaries, which are in RAM.
+
+*Risk.* Only declared columns get summaries. Undeclared props fall back to Stage F, which should
+use the footer-stats path at minimum.
+
+=== TE-P8 — Caching
+
+*Scenario.* 10M×768 collection, 50 QPS diverse queries, a 64 GB RAM node with 1 TB NVMe.
+
+[cols="2,1,1,2", options="header"]
+|===
+| Object | Size @10M×768 | Tier | Admission
+| Manifest + L1 directory | ≤ 2 MB | RAM, pinned | Always (on publish: `cache_on_write`)
+| L2 directory pages / per-segment A0 | ~3 MB | RAM | Always
+| Region A runs | 1.04 GB | NVMe (RAM if budget allows) | On publish (`invariant` policy, ADR-085 D3)
+| Region B runs | 7.7 GB | NVMe | Frequency-gated (W-TinyLFU doorkeeper)
+| Region D OID/payload chunks | ~1 GB | NVMe | Frequency-gated
+| Result cache | — | RAM | Exact query hash (TD-CACHE-8: not a real warm number)
+|===
+
+*Today.* Invariants cache hit rate is 99.96% and survivor-range hit rate is 38.2% on 200 diverse
+queries (`CACHE_HOT_VS_COLD_1M…`:41-48). Local-disk warm measured 2.00 GET/q but p50 57.76 ms
+(FAIL), which was traced to a 4 MiB integrity unit and fixed to 64 KiB CRC chunks (TD-CACHE-9:67-75).
+Survivor entries are keyed by exact byte range plus parent region (`survivor_range_cache.rs`;
+ADR-085 D2).
+
+*Proven practice.* turbopuffer serves warm queries from NVMe and memory at about 14 ms p50 at
+1M. Caffeine's W-TinyLFU frequency admission resists one-hit-wonder scans. Cache entries should be
+keyed by the logical fetch unit, not by arbitrary byte ranges.
+
+*Proposed.* Key B and D entries by `(segment_sha, global_cluster_id, tier)`, the v2 fetch unit, so
+overlapping-range misses disappear and the 38% partial-overlap hit rate becomes a whole-run hit
+rate. Admit through a TinyLFU doorkeeper, and pin the manifest and directory. After compaction
+publish, pre-populate A runs and the top-decile hottest clusters from the
+replaced objects, mapping old to new cluster ids through `model_generation`, so warm sets survive
+rewrites instead of being purged (TD-COMPACT-13 purge path).
+
+*Warm target.* W1 from NVMe is 1–8 MB at ~3 GB/s, about 0.3–3 ms. D chunks come from NVMe and rank
+takes about 5 ms. The target is **≤ 15 ms p50 at 1M** (turbopuffer reference about 14 ms) and
+≤ 30 ms at 10M.
+
+*Risk.* NVMe capacity at 100M×768 is 87 GB for A+B, which is fine. RAM must never hold B, which
+the tier policy enforces.
+
+=== TE-P9 — Reader mechanics
+
+*Scenario.* 1M×128 on S3 with 22 GETs per query. S3 TTFB p50 is 30 ms and p99 about 150 ms
+(state-of-practice; calibrate in E0).
+
+*Today.* Bounded wave issuance (`PROXIMADB_READ_RANGES_INFLIGHT`) is opt-in. It measured
+1.61–2.81× p50 wins at GET parity with identical results (`RDSTRAT12_…RTT_LADDER`:9-15), and
+1.17–1.64× on MinIO, where about half the cascade stayed unwaved (`RDSTRAT12_…MINIO_S3`:17-21,
+:44-56). Wave split (`WAVE_SPLIT_MB`) had one unexplained result divergence
+(`RDSTRAT12_…R4`:15-21). No hedging exists, and `segment_vector_count` is a sequential loop.
+
+*Tail arithmetic.* With 22 independent GETs per wave and per-GET p99 = 150 ms,
+P(wave ≥ p99 of one GET) = 1 − 0.99^22 ≈ 20%. **One query in five pays at least one p99 GET per
+wave.** Across 4 waves, about 59% of queries hit at least one slow GET. Hedging changes this
+directly. Dean & Barroso, "The Tail at Scale" (CACM 2013): hedging after a short delay cut the
+99.9th-percentile latency of a 1,000-key fan-out from 1,800 ms to 74 ms, with only 2% more requests.
+
+*Proposed.*
+
+. Make INFLIGHT default-ON with width `min(ranges, 32)`. Keep WAVE_SPLIT off until the divergence
+  is root-caused.
+. **Hedged GETs.** For ranges ≤ 4 MiB, if no first byte arrives within `max(2·t0_p50, p95_TTFB)`,
+  issue a duplicate and take the first response. Budget ≤ 5% extra GETs, with a per-node token
+  bucket. Larger ranges get split instead of hedged.
+. **Speculative D** (TE-P4 (b)); **single-flight** per cache key so 50 QPS on hot clusters does
+  not multiply GETs (verify `get_or_fetch` semantics); parallel footer reads for
+  `segment_vector_count` as the interim before the manifest (ranked #6).
+
+*Effect.* p99/p50 shrinks toward 2× for about +2–5% GETs ($0.02–0.05 per 1M queries at 20 GET/q).
+
+== 4. Proposed PAX v4 delta (format, manifest, compatibility, migration)
+
+"v4" names the spec revision. On the wire it is header **`SEG_LAYOUT_VERSION = 2`** ("cell-addressed").
+`1` remains readable forever, following mandate #8 and the ADR-065 Q2 rule (`segment_layout.rs`:52-63).
+
+=== 4.1 Header prefix (88 B, same size)
+
+[cols="1,1,3", options="header"]
+|===
+| Offset | Field | Change
+| 0..4 | `PXH1` | Unchanged
+| 4 | `layout_version` | **2** when any flag below is set; otherwise writers keep emitting 1
+| 5..6 | `layout_flags u16` (was reserved) | bit0 `INTERLEAVED_RUNS` (A\|B per cluster); bit1 `IDS_INLINE`; bit2 `FILTER_CODES_INLINE`; bit3 `GLOBAL_CLUSTER_IDS`; bit4 `C_COLD_TAIL`
+| 7 | `addressing u8` | 0 = row-ordinal stride (v1 semantics); 1 = cell-addressed (rows resolve via A0 v2 run extents)
+| 8..88 | Region extents | Unchanged meaning. Under `INTERLEAVED_RUNS`, `rabitq_off/len` and `sq8_off/len` span the run area, and per-tier access **must** use the cell table.
+|===
+
+A v1 reader rejects version 2 cleanly at `parse` (`segment_layout.rs`:219-223). That is the
+intended mixed-read behaviour: no mis-read, and the caller falls back.
+
+=== 4.2 Region A0 v2 (`PXA0`, version 2)
+
+* Header adds `model_generation u32`, `levels u8` (1 or 2), `cluster_id_space u8` (0 = local,
+  1 = collection-global) and `run_entry_size u16`. The PCA model is unchanged; full-dim centroids
+  for residual RaBitQ (TE-P5) are optional behind a flag.
+* Cell entries grow from 72 to 96 B. They keep `row_begin/end`, `a/b/c off,len` and
+  `d_block_begin/end`, and add `global_cluster_id u32`, `live_rows u32`, `ids_off/len` (0 =
+  absent), `fcodes_off/len` and `params_off u32`.
+* Optional per-cluster filter-summary (TE-P7) and parameter (TE-P5) blocks are referenced by
+  `{off, len}` and skippable, following the ADR-062 D5 auxiliary-region rule.
+
+=== 4.3 Footer: additive optional sections (no footer-version bump)
+
+[cols="1,2,3", options="header"]
+|===
+| Tag | Section | Payload
+| 8 | `SEGMENT_FACTS` | `lsn_lo/hi`, `live_rows`, `tier_mask`, `exact_authority`, `canonical_precision`, `model_generation`, `sha256(A0)`. This is the source the manifest is rebuilt from.
+| 9 | `METRIC_CONTRACT` | `metric_epoch`, normalisation (`none`/`unit_l2`). Closes the ADR-062 :208-216 descriptor tail.
+| 10 | `SQ8_PARAMS_PER_DIM` | `d × (min f32, scale f32)`. When absent, the legacy global `sq8_min/scale` applies.
+| 11 | `RUN_LAYOUT` | Mirror of the header flags and addressing, plus the run order (Hilbert / graph)
+|===
+
+Unknown tags are skipped (`typed_footer_unknown_optional_section_is_skipped`). Recognised-malformed
+sections fail closed, as ADR-062 D4 requires.
+
+=== 4.4 Region layout under v2
+
+----
+INTERLEAVED (co-location rule true):
+[prefix 88][A0 v2][run_0 = A_0 | B_0 | ids_0? | fcodes_0?][run_1]…[run_k-1][OPR][D row groups][C cold tail?][footer]
+
+SPLIT (co-location rule false; v1-compatible ordering, cell-addressed):
+[prefix 88][A0 v2][A runs in cluster order][B runs in cluster order][OPR][D][C cold tail?][footer]
+----
+
+Collection-level objects:
+
+* `<coll>/_pax/manifest/m-{seq:020}.pxm`: `PXM1` (TE-P2 field table), created with
+  `put_if_absent`.
+* `<coll>/_pax/cdir/{sha256}.pxcd`: the global centroid directory (`PXCD`), content-addressed and
+  referenced from the manifest. It is inlined in the manifest when ≤ 1 MiB. Two-level form:
+  L1 centroids inline, L2 leaf pages as fixed-size pages so that one wave fetches the probed pages.
+
+Single-object atomicity per segment (ADR-062 D1, ADR-065) is preserved. Collection atomicity moves
+from "LIST plus retirement ledger" to the manifest commit. That is an improvement, and it is the
+Iceberg/Delta/Lance model.
+
+=== 4.5 Compatibility matrix
+
+[cols="2,2,2,2", options="header"]
+|===
+| Reader \ data | v1 segment, no manifest | v1 segments + manifest | v2 segments + manifest
+| Today's binary | ✔ | ✔ (manifest ignored; LIST path) | ✘ rejects v2 at header parse (`Ok(None)`), then falls to the generic path, which cannot decode v2. **Must not be deployed mixed**: roll out reader-first.
+| v4 reader | ✔ (LIST + footer facts cache) | ✔ manifest serving set; per-segment W1 skipped through the `header_prefix` copy; v1 row-stride addressing | ✔ full path
+|===
+
+Rollout follows ADR-062's reader-first rule. The order is:
+
+. Ship the reader that understands manifest and v2, default-ON for reading.
+. Write manifests (default-ON once E1 passes).
+. Write v2 segments (per-collection `pax_layout=v2` tag, default-OFF until E2/E3 pass).
+
+=== 4.6 Migration via compaction
+
+* A manifest is bootstrapped by **reading footers once** (TD-SEAM-11 facts plus header prefix) and
+  publishing `m-0` with `put_if_absent`. No data is rewritten.
+* v1 to v2 happens on the next compaction of a collection tagged `pax_layout=v2`. Compaction
+  already decodes and re-clusters; it now also assigns rows to global clusters (training the
+  directory if none exists), writes runs, emits A0 v2 and commits a new manifest.
+* Collections without exact authority can move runs but cannot re-encode (TE-P5 risk). Their
+  migration is limited to `addressing=1` with SPLIT layout and existing codes, and is flagged in
+  the manifest.
+* Kill-switches: `PROXIMADB_PAX_MANIFEST_READ=0` falls back to LIST, and the write gates are
+  per-collection tags (registered in `ENV_GATE_REGISTRY.adoc`).
+
+== 5. Experiment plan
+
+All runs follow the existing evidence discipline: release profile, binary SHA, deterministic settle
+(`--explicit-flush-every-rows`, `--max-segments`), quiescence barrier, paired arms in both orders,
+and result-identity hashes. A `BENCHMARK_EVIDENCE.toml` claim is required before any default flip.
+
+=== 5.1 Harnesses (in repo)
+
+[cols="2,3", options="header"]
+|===
+| Harness | Use
+| `scripts/bench/sift1m_get_reduction.py` | 3-phase post-write / local-disk-warm / object-cold. Has `--storage-url s3://… --s3-endpoint`, `--azurite`, `--read-ranges-inflight`, `--ivf-k`, `--nprobe`, `--n-comp`, `--rank-degree`, `--max-segments`, `--explicit-flush-every-rows`, and GET/byte/fetch-round meters (`proximadb_read_ranges_fetch_rounds_total`, `proximadb_ivf_fetch_rounds_total`). The primary harness for E1–E4 and E7.
+| Toxiproxy RTT ladder (external runner; `RDSTRAT12_SIFT1M_RTT_LADDER`, `RDSTRAT13_SIFT1M_LADDER`) | Waves vs RTT. Note its window-limited transfer: report bytes alongside p50.
+| `scripts/bench/nprobe_sweep.py`, `analyze_nprobe_geometry.py`, `bigann_prefix_groundtruth.py` | BIGANN 100K–10M geometry matrix (E2)
+| `scripts/bench/range_cap_sweep.py`, `coalesce_sweep.py` | R_max / gap sweeps (E3)
+| `scripts/bench/cache_hot_vs_cold_1m.py`, `cache_tier_sweep.py`, `sift_rest_warmtier_sweep.py` | Warm tier (E8)
+| `scripts/bench/context_corridor.py` | Filtered ANN vs Qdrant (E7; ADR-089 baseline)
+| `tests/sift_pax_recall_ratchet_test.rs` (`sift_pax_cascade_recall_at_10_ratchet[_rg_layout]`, `sift_ivf2_coarse_probe_recall_ratchet`, `sift_pax_filtered_cascade_recall_ratchet`) | Recall ratchets, run unchanged against v2
+| `tests/sst_compaction_reclustering_test.rs`, `sst_ivf2_compaction_route_proof_test.rs`, `sst_compaction_retirement_test.rs`, `sst_compaction_retirement_fault_test.rs` | Compaction correctness, manifest commit and crash matrix (E1, E6)
+| `benches/pax_residual_tail_write_amplification.rs`, `benches/bench_vector_object_economy_e2e.rs` | Write amp (E6); end-to-end VOE economy
+|===
+
+=== 5.2 Datasets
+
+SIFT1M (128d) and BIGANN prefixes 1M/10M (128d, ground truth via `bigann_prefix_groundtruth.py`).
+BGE-base 768d from the repo's contracts (`bge_base_v15_quality_contract.toml`). A 100M point is
+only a modelled extrapolation until a bed exists; do not claim it.
+
+=== 5.3 Metrics (every arm)
+
+GET/q (physical, wire), sequential waves/q (`fetch_rounds`), MB/q, p50/p95/p99 for object-cold,
+local-disk-warm and post-write, recall@10 and @100, result-identity hash, $/1M queries
+(`GET·$0.4 + LIST·$5 + hedges`, priced separately for S3 and Azure), write amp (bytes written /
+bytes ingested), compaction wall time and RSS, and manifest and directory size.
+
+=== 5.4 Experiments and gates
+
+[cols="1,3,3", options="header"]
+|===
+| Exp | Design | Pass gate (fail = do not flip)
+| E0 | Calibrate `t0`, `b_s`, `b_n` and the TTFB tail on real S3 same-region, and on MinIO with and without toxiproxy | Recorded constants replace §2.4 assumptions
+| E1 (TE-P2) | Manifest ON vs OFF on 1, 12 and 40-segment beds; restart; `Adaptive` first query; rebuild checks; crash-injection matrix (4 crash points) | Cold Adaptive ≤ 1 metadata GET (TD-PAXMETA-1); rebuild checks read 0 bodies; LIST/q = 0; zero superseded-segment serving across 50 compaction cycles; recall and identity unchanged
+| E2 (TE-P4) | Fixed N=1M SIFT and BIGANN 10M: `R_c ∈ {33k (today), 8k, 4k, 2k, 1k}` × nprobe sweep × pool {today, error-bound}; one segment | Pareto: at recall@10 ≥ 0.98, MB/q ≤ ⅓ of today at ≤ today's GET/q (1M); report the 10M curve without a gate
+| E3 (TE-P4) | Interleaved vs split at 128d and 768d; `R_max ∈ {2,4,8,16} MiB`; gap ∈ {0, R*} | Co-location rule's prediction matches the measured winner in ≥ 3/4 cells; waves −1 where predicted; RSS ≤ +10%
+| E4 (TE-P1) | End-to-end 1M×128 S3/MinIO, manifest + global dir + v2 vs today, cold-start and dir-cached | **≤ 3 waves cold-start, ≤ 2 cached; ≤ 20 GET/q; recall ≥ 0.98**; p50 within 1.2× of the E0 model; identity stable across restart
+| E5 (TE-P5) | Per-dimension SQ8 and RaBitQ residual vs global, at a fixed error-bound pool | Pool size −30% or MB/q −20% at equal recall; no p95 regression
+| E6 (TE-P3, P6) | 10M×768 ingest: pairwise leveled vs base+delta(α=1); trickle 10 vec/s for 24 h; deletes at 2%/day | WA ≤ 4; live searchable segments ≤ 5 at all times; recall ≥ 0.98 at 14% dead with pool inflation; no lost rows (row accounting)
+| E7 (TE-P7) | Corridor harness at 1M: 2% and 0.1% selectivity; allow-set join of 5k OIDs | Filtered waves ≤ 3; MB/q ≤ 2× unfiltered; recall@10 ≥ 0.98; p50 ≤ 5× Qdrant at 1M (from 38× at 80k)
+| E8 (TE-P8) | Warm tier with cluster-run keys + TinyLFU vs byte-range keys; 1M and 10M diverse queries | Warm p50 ≤ 15 ms at 1M and ≤ 30 ms at 10M; NVMe hit ≥ 80% after warm-up; restart keeps ≥ 90% of hits
+| E9 (TE-P9) | Hedge ON/OFF, INFLIGHT default, speculative D on the E4 bed with injected tail (toxiproxy jitter) | p99 −40% at ≤ +5% GETs; identity unchanged; WAVE_SPLIT stays OFF unless its divergence is reproduced and fixed
+|===
+
+== 6. Proposed TDs (for registration; TECHNICAL_DEBT.adoc not edited)
+
+[cols="1,4", options="header"]
+|===
+| Proposed id | Title — scope
+| TD-PAXMETA-1 (exists) | Collection-level segment facts. Implement via TD-PAXV4-1.
+| TD-PAXV4-1 | **`PXM1` collection manifest as the serving set**: create-only commit, retention, catalog hint, LIST fallback, rebuild from footers; replaces per-query LIST and footer reads (TE-P2).
+| TD-PAXV4-2 | **Header-prefix copy in manifest entries**: skip per-segment W1 when the manifest is present (TE-P2, TE-P1).
+| TD-PAXV4-3 | **Collection-global centroid directory (`PXCD`) + assign-at-flush**: global cluster ids in A0 v2; the TD-SEAM-10 implementation slice (TE-P1, TE-P3).
+| TD-PAXV4-4 | **Cell-addressed layout v2**: `layout_flags`/`addressing` in header bytes 5..8; rerank and D resolve through the cell table, not stride arithmetic (TE-P4, §4).
+| TD-PAXV4-5 | **Decouple cluster size from IOP target**: replace `N·dim/iop_target` (`block_cluster.rs`:273) with `R_c`-based k, balanced/split clustering, run coalescing with gap ≤ `t0·b_s` (TE-P4).
+| TD-PAXV4-6 | **Error-bound survivor pool**: replace `max(100k, 1%N, 1000)` (`segment_format.rs`:2039-2076) with a RaBitQ confidence-interval rerank, capped at c·k (TE-P4).
+| TD-PAXV4-7 | **A+B co-location rule**: compute interleaved vs split at compaction; record in header and manifest (TE-P4).
+| TD-PAXV4-8 | **Region D wave removal**: speculative D prefetch for top-2k candidates; optional inline ids (TE-P4, TE-P9).
+| TD-PAXV4-9 | **Collection-scoped nprobe**: distance-ratio + row-aware stop, calibration curve persisted in the manifest with calibration identity (TE-P4; BIGANN refutation).
+| TD-PAXV4-10 | **Hierarchical directory ≥ 10M**: L1 inline, L2 leaf pages fetched in one wave (TE-P1, TE-P4).
+| TD-PAXV4-11 | **Exact-authority invariant for WAL truncation**: truncate past `lsn_hi` only with `exact_authority` or declared `lossy_ok`; make `canonical_embedding_precision` explicit at create (TE-P5).
+| TD-PAXV4-12 | **fp16 canonical persisted as fp16 Region C**: stop promoting to f32 (`record.rs`:336-344); Region C as a cold tail (TE-P5).
+| TD-PAXV4-13 | **Per-dimension / per-cluster quantizer parameters**: SQ8 per-dim (footer tag 10), RaBitQ residual to cluster centroid (TE-P5).
+| TD-PAXV4-14 | **DVs and per-cluster live counts in the manifest**: pool inflation `1/(1−d_c)`; cluster-granular delete-compaction trigger (TE-P6).
+| TD-PAXV4-15 | **Per-cluster filter summaries + in-run filter codes**: Stage F without the whole-D read; selectivity routing for join allow-sets (TE-P7).
+| TD-PAXV4-16 | **Cluster-run cache keys + W-TinyLFU admission**: generation-mapped warm-set carry-over across compaction (TE-P8).
+| TD-PAXV4-17 | **Hedged GETs + default-ON bounded waves**; single-flight per cache key (TE-P9).
+| TD-PAXV4-18 | **Interim: parallel footer facts for `segment_vector_count`; rebuild checks via `read_coalesced_segment_footer`, not full `fs.read`** (`search/mod.rs`:339-361, :975-1024) (TE-P2).
+| TD-PAXV4-19 | **Base+delta compaction with persisted model and geometric retrain triggers** (imbalance > 2.0, drift > 10%, appended > 50%); the TD-RDSTRAT-9 controller in observe mode first (TE-P3).
+| TD-PAXV4-20 | **Trickle flushes go to the delta tier / WAL-tail exact scan, not searchable L0 objects** (TE-P3; depends on S2 WAL segmentation).
+| TD-PAXV4-21 | **Fold the VOE `oedir` sidecar into `PXM1`**, or retire it, so there is one collection metadata object (TE-P2).
+|===
+
+== 7. Claims not verified in this study
+
+* turbopuffer internals: cluster sizes, quantization, exact round-trip count. They come from public
+  docs and search excerpts; the doc pages could not be fetched from this environment, and the
+  published 1M cold p50 varies by doc version (402 vs 874 ms).
+* Per-request S3 throughput (≈ 80 MB/s), TTFB distribution and node bandwidth are
+  state-of-practice assumptions until E0.
+* All "proposed" rows in TE-P1 rely on extrapolating the BIGANN nprobe fit to finer cells at fixed
+  N, which that fit does not cover. E2 is the decisive measurement.
+* The SPANN, SPFresh, LanceDB, DiskANN, Milvus, Iceberg v3 DV, Delta log and Lance manifest
+  descriptions are from the published literature and docs as recalled. The Lance
+  `materialize_deletions_threshold` default (10%) is from memory.
+* Whether a listing cache sits above `discover_sstable_files`. None was found in
+  `search/mod.rs`:2594-2690, which suggests one LIST per query, but a filesystem-layer cache was
+  not exhaustively ruled out.
+* The `flush/mod.rs` and `record.rs` line references in TE-P5 came from the coordinator's trace.
+  `flush/mod.rs`:1296-1301 and :1457-1484, `record.rs`:336-344 and `legacy.rs`:1801-1810 were
+  re-read here. The `flush/mod.rs` :1360-1395 and :1523-1560 ranges and the `writer.rs` ranges
+  were not.
