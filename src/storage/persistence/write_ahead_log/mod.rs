@@ -4214,6 +4214,11 @@ mod td_flush_8_catalog_walk_tests {
         schema
             .properties
             .insert("collection.name".to_string(), "diag_coll".to_string());
+        // Written by the collection writer (as every real collection entry is).
+        schema.properties.insert(
+            proximadb_catalog::table_properties::COLLECTION_PROVENANCE_PROPERTY.to_string(),
+            proximadb_catalog::table_properties::COLLECTION_PROVENANCE_VALUE.to_string(),
+        );
         UnlistedDefaultNamespaceCatalog {
             table: TableIdentifier::new(vec!["default".to_string()], "diag_coll"),
             schema,

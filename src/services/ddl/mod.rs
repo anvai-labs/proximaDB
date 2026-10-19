@@ -807,6 +807,7 @@ impl DdlService {
                     engine,
                     if_not_exists,
                     properties,
+                    tenant,
                 )
                 .await
             }
@@ -978,10 +979,21 @@ impl DdlService {
         properties: HashMap<String, String>,
         tenant: Option<&str>,
     ) -> Result<DdlResult> {
-        let (catalog, table_id) = self
+        let resolved = self
             .catalog_manager
             .resolve_table_scoped(table_name, tenant)
-            .await?;
+            .await;
+        // The name is held by an entry this tenant may not see: creating it is
+        // refused exactly as for a name that already exists.
+        if let Err(error) = &resolved
+            && proximadb_catalog::TableNotVisible::is(error)
+        {
+            if if_not_exists {
+                return Ok(DdlResult::already_exists("Table", table_name));
+            }
+            return Err(anyhow!("Table '{}' already exists", table_name));
+        }
+        let (catalog, table_id) = resolved?;
 
         // Check if table exists
         if catalog.table_exists(&table_id).await? {
@@ -1025,10 +1037,18 @@ impl DdlService {
         purge: bool,
         tenant: Option<&str>,
     ) -> Result<DdlResult> {
-        let (catalog, table_id) = self
+        let resolved = self
             .catalog_manager
             .resolve_table_scoped(table_name, tenant)
-            .await?;
+            .await;
+        // An entry this tenant may not see is answered exactly as a missing one.
+        if let Err(error) = &resolved
+            && proximadb_catalog::TableNotVisible::is(error)
+            && if_exists
+        {
+            return Ok(DdlResult::not_found("Table", table_name));
+        }
+        let (catalog, table_id) = resolved?;
 
         // Check if table exists
         if !catalog.table_exists(&table_id).await? {
@@ -1381,8 +1401,21 @@ impl DdlService {
         engine: Option<String>,
         if_not_exists: bool,
         mut properties: HashMap<String, String>,
+        tenant: Option<&str>,
     ) -> Result<DdlResult> {
-        let (catalog, table_id) = self.catalog_manager.resolve_table(collection_name).await?;
+        let resolved = self
+            .catalog_manager
+            .resolve_table_scoped(collection_name, tenant)
+            .await;
+        if let Err(error) = &resolved
+            && proximadb_catalog::TableNotVisible::is(error)
+        {
+            if if_not_exists {
+                return Ok(DdlResult::already_exists("Collection", collection_name));
+            }
+            return Err(anyhow!("Collection '{}' already exists", collection_name));
+        }
+        let (catalog, table_id) = resolved?;
 
         // Check if collection exists
         if catalog.table_exists(&table_id).await? {
@@ -1440,6 +1473,11 @@ impl DdlService {
 
         let schema = self.build_catalog_schema(&table_id.name, columns, Vec::new(), properties)?;
 
+        if !catalog.namespace_exists(&table_id.namespace).await? {
+            catalog
+                .create_namespace_for_tenant(&table_id.namespace, HashMap::new(), tenant)
+                .await?;
+        }
         // Create the collection/table
         catalog.create_table(&table_id, schema).await?;
 
@@ -1470,6 +1508,9 @@ impl DdlService {
         constraints: Vec<TableConstraint>,
         properties: HashMap<String, String>,
     ) -> Result<CatalogTableSchema> {
+        // System-written properties (a collection's record, its owner) are
+        // never client-settable.
+        proximadb_catalog::table_properties::ensure_no_reserved_table_properties(&properties)?;
         let mut schema = CatalogTableSchema::new(table_name);
         schema.properties = properties;
 
@@ -3265,6 +3306,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::network::rest::canonical::rank::HybridSearchBackend for NoopHybridBackend {
+        async fn scope_collection(
+            &self,
+            _collection: &str,
+            _request_tenant: &str,
+        ) -> proximadb_rank_core::RankResult<()> {
+            Ok(())
+        }
         async fn bm25_search(
             &self,
             _collection: &str,

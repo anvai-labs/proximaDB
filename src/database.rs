@@ -1318,10 +1318,13 @@ impl ProximaDB {
 
         if let Some(planner) = query::rl_planner::get_rl_planner() {
             if std::path::Path::new(&policy_path).exists() {
+                // A learned policy is a cache: an unreadable one never blocks startup.
                 match planner.load_policy(&policy_path).await {
-                    Ok(()) => tracing::info!("✅ RL policy loaded from {}", policy_path),
-                    // TD-RLNAN-1: learned tuning state must never stop the server
-                    // from starting; set it aside and learn afresh.
+                    Ok(true) => tracing::info!("✅ RL policy loaded from {}", policy_path),
+                    // Already reported (and reset) by the loader.
+                    Ok(false) => {}
+                    // TD-RLNAN-1: on a hard read error, move the unreadable file
+                    // aside so a bad policy never lingers; still never block boot.
                     Err(error) => {
                         match query::rl_planner::set_aside_unreadable_policy(&policy_path).await {
                             Ok(aside) => tracing::warn!(

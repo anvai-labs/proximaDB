@@ -158,14 +158,16 @@ impl AqlSource for VectorAqlSource {
                     .to_string(),
             ));
         }
+        let tenant = ctx.resolution_tenant(&collection)?;
         let start = Instant::now();
 
         // Perform vector search
         // For AQL, we use the vector_ops directly.
         let search_results = self
             .vector_ops
-            .unified_search_v1(
+            .unified_search_v1_for_tenant(
                 &collection,
+                tenant,
                 vector,
                 top_k as usize,
                 None, // No filter pushdown implemented in this skeleton

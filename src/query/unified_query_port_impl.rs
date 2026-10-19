@@ -399,6 +399,28 @@ pub struct UnifiedQueryPortImpl {
     adapter: Arc<QueryFacadeAdapter>,
     cache: Arc<PreparedStatementCache>,
     catalog_manager: Option<Arc<CatalogManager>>,
+    /// Client-facing prepared-statement handles: a random id per statement,
+    /// owned by the tenant that prepared it. Only the owner can execute,
+    /// delete or count it; any other id reads as not found.
+    prepared: Arc<dashmap::DashMap<String, PreparedHandle>>,
+}
+
+/// A client-facing prepared statement: its owner, the shared cache's id, and
+/// the owner's execution count.
+#[derive(Debug, Clone)]
+struct PreparedHandle {
+    owner: String,
+    cache_id: String,
+    executions: u64,
+}
+
+/// The owner key of the scope in force: the request tenant, or a reserved key
+/// for internal execution. No scope owns nothing.
+fn prepared_owner() -> Option<String> {
+    match crate::query::request_scope::current_scope()? {
+        crate::query::request_scope::RequestScope::Tenant(tenant) => Some(tenant),
+        crate::query::request_scope::RequestScope::Internal(_) => Some("_internal".to_string()),
+    }
 }
 
 impl UnifiedQueryPortImpl {
@@ -410,6 +432,7 @@ impl UnifiedQueryPortImpl {
                 PreparedStatementConfig::default(),
             )),
             catalog_manager: None,
+            prepared: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -422,7 +445,15 @@ impl UnifiedQueryPortImpl {
             adapter,
             cache,
             catalog_manager: None,
+            prepared: Arc::new(dashmap::DashMap::new()),
         }
+    }
+
+    /// The shared cache id of `statement_id` when the scope in force owns it.
+    fn owned_cache_id(&self, statement_id: &str) -> Option<String> {
+        let owner = prepared_owner()?;
+        let handle = self.prepared.get(statement_id)?;
+        (handle.owner == owner).then(|| handle.cache_id.clone())
     }
 
     /// Attach xCatalog so port-backed EXPLAIN can expose planner-native authority metadata.
@@ -645,10 +676,23 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         _cache_results: bool,
         ttl_seconds: Option<u64>,
     ) -> Result<String> {
+        let owner =
+            prepared_owner().ok_or_else(|| anyhow!("prepare_statement: no request scope"))?;
         let ttl = Duration::from_secs(ttl_seconds.unwrap_or(3600));
-        self.cache
+        let cache_id = self
+            .cache
             .prepare_with_ttl(&query, ttl)
-            .map_err(|e| anyhow!("prepare_statement failed: {}", e))
+            .map_err(|e| anyhow!("prepare_statement failed: {}", e))?;
+        let statement_id = format!("stmt_{}", uuid::Uuid::new_v4().simple());
+        self.prepared.insert(
+            statement_id.clone(),
+            PreparedHandle {
+                owner,
+                cache_id,
+                executions: 0,
+            },
+        );
+        Ok(statement_id)
     }
 
     async fn execute_prepared(
@@ -658,9 +702,12 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         _collection: Option<String>,
     ) -> Result<serde_json::Value> {
         let params = proxima_values_to_params(parameters);
+        let cache_id = self
+            .owned_cache_id(&statement_id)
+            .ok_or_else(|| anyhow!("prepared statement not found: {}", statement_id))?;
         let sql = self
             .cache
-            .execute_sql(&statement_id, &params)
+            .execute_sql(&cache_id, &params)
             .map_err(|e| match e {
                 PreparedStatementError::NotFound(_) => {
                     anyhow!("prepared statement not found: {}", statement_id)
@@ -675,23 +722,44 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
             .federated_query(&sql)
             .await
             .context("execute_prepared federated_query failed")?;
+        if let Some(mut handle) = self.prepared.get_mut(&statement_id) {
+            handle.executions += 1;
+        }
         Self::result_to_json(result, None)
     }
 
     async fn delete_prepared(&self, statement_id: String) -> Result<()> {
-        self.cache
-            .drop_statement(&statement_id)
-            .map_err(|e| anyhow!("delete_prepared failed: {}", e))
+        let cache_id = self.owned_cache_id(&statement_id).ok_or_else(|| {
+            anyhow!("delete_prepared failed: prepared statement not found: {statement_id}")
+        })?;
+        self.prepared.remove(&statement_id);
+        // The shared cache may hold the same text for another handle; dropping
+        // it there is safe only when no other handle refers to it.
+        if !self
+            .prepared
+            .iter()
+            .any(|entry| entry.value().cache_id == cache_id)
+        {
+            let _ = self.cache.drop_statement(&cache_id);
+        }
+        Ok(())
     }
 
     async fn get_prepared_stats(&self, _statement_ids: Vec<String>) -> Result<serde_json::Value> {
+        // Counts cover only the caller's own statements.
+        let owner = prepared_owner();
+        let (statements, executions) = self
+            .prepared
+            .iter()
+            .filter(|entry| Some(&entry.value().owner) == owner.as_ref())
+            .fold((0u64, 0u64), |(n, e), entry| {
+                (n + 1, e + entry.value().executions)
+            });
         let stats = self.cache.stats();
         Ok(serde_json::json!({
-            "cached_statements": stats.cached_statements,
+            "cached_statements": statements,
             "max_statements": stats.max_statements,
-            "total_executions": stats.total_executions,
-            "total_access_count": stats.total_access_count,
-            "oldest_statement_age_secs": stats.oldest_statement_age_secs,
+            "total_executions": executions,
         }))
     }
 }

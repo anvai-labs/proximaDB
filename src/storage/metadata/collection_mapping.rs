@@ -340,6 +340,24 @@ pub(crate) fn collection_from_catalog_schema(
     let Some(id) = schema.properties.get("collection.id").cloned() else {
         return Ok(None);
     };
+    // Only an entry the collection writer recorded is a collection: it carries
+    // the provenance marker (which no client-facing write path can set), or —
+    // for entries written before the marker — its object id is the collection
+    // id (the writer adopts the collection id as the entry's object id).
+    let written_by_collection_writer = schema
+        .properties
+        .get(proximadb_catalog::table_properties::COLLECTION_PROVENANCE_PROPERTY)
+        .is_some_and(|value| {
+            value == proximadb_catalog::table_properties::COLLECTION_PROVENANCE_VALUE
+        })
+        || (schema.object_id.is_some() && id.parse::<u64>().ok() == schema.object_id);
+    if !written_by_collection_writer {
+        tracing::warn!(
+            table = %table_id,
+            "catalog entry describes a collection but was not recorded by the collection writer; ignored"
+        );
+        return Ok(None);
+    }
 
     let name = schema
         .properties
@@ -743,6 +761,10 @@ pub(crate) fn catalog_schema_from_collection(
     schema
         .properties
         .insert("asset.kind".to_string(), "collection".to_string());
+    schema.properties.insert(
+        proximadb_catalog::table_properties::COLLECTION_PROVENANCE_PROPERTY.to_string(),
+        proximadb_catalog::table_properties::COLLECTION_PROVENANCE_VALUE.to_string(),
+    );
     schema
         .properties
         .insert("asset.capability.vector".to_string(), "true".to_string());
@@ -925,6 +947,49 @@ fn storage_engine_from_catalog(engine: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    /// Every table-level property key this mapping reads to reconstruct a
+    /// collection (and its owner) is reserved: no client-facing table write can
+    /// set it. Keys read from column or layout properties, and test-only keys,
+    /// are listed explicitly; any other key read here must be reserved.
+    #[test]
+    fn every_table_property_the_mapping_reads_is_reserved() {
+        const NOT_TABLE_PROPERTIES: &[&str] = &[
+            "dimension",            // column property
+            "proxima.max_length",   // column property
+            "proxima.text_storage", // column property
+            "storage_engine",       // storage-layout property
+            "status",               // test fixture key
+        ];
+        let source = include_str!("collection_mapping.rs");
+        let mut keys = std::collections::BTreeSet::new();
+        let marker = ".get(\"";
+        let mut rest = source;
+        while let Some(at) = rest.find(marker) {
+            rest = &rest[at + marker.len()..];
+            if let Some(end) = rest.find("\")") {
+                keys.insert(rest[..end].to_string());
+            }
+        }
+        assert!(
+            keys.contains("collection.id"),
+            "scan found the reads: {keys:?}"
+        );
+        for key in keys {
+            if NOT_TABLE_PROPERTIES.contains(&key.as_str()) {
+                continue;
+            }
+            assert!(
+                proximadb_catalog::table_properties::is_reserved_table_property(&key),
+                "table property `{key}` is read by the collection mapping but is not reserved"
+            );
+        }
+        assert!(
+            proximadb_catalog::table_properties::is_reserved_table_property(
+                CANONICAL_SCHEMA_PROPERTY
+            )
+        );
+    }
+
     use super::*;
 
     /// TD-GRPCCREATE-1: the reserved band built for a dim-3 collection with a

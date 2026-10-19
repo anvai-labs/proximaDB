@@ -619,7 +619,8 @@ impl MultiServer {
                     } else {
                         None
                     },
-                ));
+                ))
+                .layer(crate::network::grpc::auth::GrpcRequestScopeLayer);
 
             // ── Create backend services (doc + observability need data-dir paths) ──
 
@@ -1292,7 +1293,8 @@ impl MultiServer {
                     } else {
                         None
                     },
-                ));
+                ))
+                .layer(crate::network::grpc::auth::GrpcRequestScopeLayer);
 
             // Standard grpc.health.v1.Health service for k8s/LB probes.
             let (health_reporter, standard_health_server) = tonic_health::server::health_reporter();
@@ -1693,7 +1695,8 @@ impl MultiServer {
                     } else {
                         None
                     },
-                ));
+                ))
+                .layer(crate::network::grpc::auth::GrpcRequestScopeLayer);
 
             // Standard grpc.health.v1.Health service for k8s/LB probes.
             let (std_health_reporter, standard_health_server) =

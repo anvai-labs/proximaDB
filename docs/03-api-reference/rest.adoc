@@ -185,6 +185,12 @@ curl -s http://localhost:5678/metrics/prometheus | grep canonical_bytes
 # proximadb_embedding_precision_canonical_bytes{collection="embeddings_fp16",precision="fp16"} N
 ----
 
+NOTE: `/metrics/prometheus` and `/metrics/json` are operator endpoints: their
+series carry every tenant's `tenant_id` and collection names. With
+authentication enabled they require the `ViewSystemMetrics` permission (the
+`admin` role); without authentication (single-tenant development) they are
+open, so do not expose the listener to tenants in that mode.
+
 === POST /api/v1/vectors/batch
 
 [source,bash]

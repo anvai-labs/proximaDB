@@ -254,7 +254,7 @@ impl RLPlanner {
     }
 
     /// Load persisted policy from file
-    pub async fn load_policy(&self, path: &str) -> anyhow::Result<()> {
+    pub async fn load_policy(&self, path: &str) -> anyhow::Result<bool> {
         let mut bandit = self.bandit.write().await;
         bandit.load_from_file(path).await
     }
@@ -313,14 +313,26 @@ mod tests {
         .expect("write");
 
         let planner = RLPlanner::default();
-        assert!(
-            planner.load_policy(&path).await.is_err(),
-            "a policy with a null weight does not load"
-        );
+        // Merged contract: load_policy reports `Ok(false)` for an unreadable
+        // policy (the caller must not log a misleading "loaded" line), and the
+        // loader itself sets the bad file aside (TD-RLNAN-1).
+        let loaded = planner
+            .load_policy(&path)
+            .await
+            .expect("load_policy does not fail on an unreadable policy");
+        assert!(!loaded, "a policy with a null weight does not load");
 
-        let aside = set_aside_unreadable_policy(&path).await.expect("set aside");
         assert!(!std::path::Path::new(&path).exists(), "original moved away");
-        assert!(std::path::Path::new(&aside).exists(), "kept for diagnosis");
+        let kept: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            kept.iter()
+                .any(|f| f.starts_with("rl_policy.json.unreadable-")),
+            "kept for diagnosis beside the original, found {kept:?}"
+        );
     }
 
     #[tokio::test]

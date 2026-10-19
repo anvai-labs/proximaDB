@@ -382,7 +382,7 @@ impl RLPlannerIntegration {
     }
 
     /// Load learned policy from file
-    pub async fn load_policy(&self, path: &str) -> anyhow::Result<()> {
+    pub async fn load_policy(&self, path: &str) -> anyhow::Result<bool> {
         let planner = self.planner.read().await;
         planner.load_policy(path).await
     }

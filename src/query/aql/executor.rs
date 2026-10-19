@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::query::aql::{
-    AqlFrom, AqlPredicate, AqlQuery, AqlResult, AqlSource, AqlValue, AuditContext, AuditFrame,
-    AuditOp, AuditOutcome, AuditTrail, JoinType, Result, is_query_vector_field,
+    AqlFrom, AqlPredicate, AqlQuery, AqlResult, AqlScope, AqlSource, AqlValue, AuditContext,
+    AuditFrame, AuditOp, AuditOutcome, AuditTrail, JoinType, Result, is_query_vector_field,
 };
 
 use crate::services::audit_sink::{AuditEventSink, AuditRecord, EventLogAuditSink};
@@ -45,15 +45,49 @@ impl AqlExecutor {
         self.sources.insert(name, source);
     }
 
-    /// Execute an AQL query and return results along with an audit trail.
-    pub async fn execute(&self, query: AqlQuery) -> Result<(AqlResult, AuditTrail)> {
+    /// Execute an AQL query as explicit internal (system) work: sources resolve
+    /// collections without a tenant. Request handlers use
+    /// [`Self::execute_for_tenant`].
+    pub async fn execute_as_internal(&self, query: AqlQuery) -> Result<(AqlResult, AuditTrail)> {
+        self.execute_in_scope(query, AqlScope::Internal).await
+    }
+
+    /// Execute an AQL query for a request acting as `request_tenant`: sources
+    /// resolve collections within that tenant. An empty tenant denies.
+    pub async fn execute_for_tenant(
+        &self,
+        query: AqlQuery,
+        request_tenant: String,
+    ) -> Result<(AqlResult, AuditTrail)> {
+        self.execute_in_scope(query, AqlScope::Tenant(request_tenant))
+            .await
+    }
+
+    async fn execute_in_scope(
+        &self,
+        query: AqlQuery,
+        scope: AqlScope,
+    ) -> Result<(AqlResult, AuditTrail)> {
         let mut ctx = AuditContext::new();
+        ctx.scope = scope;
         let started_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
 
-        let result = self.execute_internal(&query, &query.from, &mut ctx).await;
+        // The request scope matches the AQL scope, so anything a source calls
+        // without an explicit tenant resolves the same way.
+        let scope = ctx.scope.clone();
+        let run = self.execute_internal(&query, &query.from, &mut ctx);
+        let result = match scope {
+            AqlScope::Tenant(tenant) if !tenant.is_empty() => {
+                crate::query::request_scope::with_request_tenant(tenant, run).await
+            }
+            AqlScope::Internal => {
+                crate::query::request_scope::with_internal_scope("aql internal", run).await
+            }
+            AqlScope::Tenant(_) | AqlScope::Unset => run.await,
+        };
 
         let finished_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)

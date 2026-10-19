@@ -49,6 +49,11 @@ pub enum RankError {
     /// a client error (HTTP 400), not a pipeline failure (TD-SECSCAN-1 §5).
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    /// The addressed collection is not resolvable for this request (missing,
+    /// or not resolvable by the request tenant — one error, one response).
+    #[error("{0}")]
+    CollectionNotFound(String),
 }
 
 pub type RankResult<T> = Result<T, RankError>;

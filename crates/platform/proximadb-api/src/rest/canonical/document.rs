@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
-    Router,
+    Extension, Router,
     extract::{Json, Path, Query, State},
     response::Json as JsonResponse,
     routing::{get, post},
@@ -26,6 +26,17 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 use crate::rest::errors::{RestError, RestResult};
+use crate::rest::state::TenantContext;
+
+/// Compose the request tenant's storage key for a client-supplied collection name.
+///
+/// Every handler addresses storage only through this key, so a request reaches only
+/// its own tenant's collections; a name carrying a `/` (sent literally or
+/// percent-encoded) is rejected before it reaches storage.
+fn scoped_collection(tenant: &TenantContext, collection: &str) -> RestResult<String> {
+    proximadb_tenant::scoped_resource_key(&tenant.tenant_id, collection)
+        .map_err(|e| RestError::InvalidArgument(format!("invalid document collection: {e}")))
+}
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -206,9 +217,11 @@ pub fn create_document_router() -> Router<DocumentRestState> {
 
 async fn create_collection(
     State(state): State<DocumentRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Json(request): Json<CreateDocumentCollectionRequestBody>,
 ) -> RestResult<JsonResponse<serde_json::Value>> {
     info!("Creating document collection: {}", request.name);
+    let scoped = scoped_collection(&tenant, &request.name)?;
 
     let index_definitions: Vec<IndexDefinition> = request
         .indexes
@@ -230,7 +243,7 @@ async fn create_collection(
         .collect();
 
     let config = DocumentCollectionConfig {
-        name: request.name.clone(),
+        name: scoped,
         json_schema: None,
         indexes: index_definitions,
         enable_fulltext: false,
@@ -256,6 +269,7 @@ async fn create_collection(
 
 async fn list_collections(
     State(state): State<DocumentRestState>,
+    Extension(tenant): Extension<TenantContext>,
 ) -> RestResult<JsonResponse<serde_json::Value>> {
     let resp = state
         .document_port
@@ -263,12 +277,17 @@ async fn list_collections(
         .await
         .map_err(|e| RestError::Internal(format!("Failed to list collections: {}", e)))?;
 
+    // Only the request tenant's collections, under their tenant-clean names.
     let collections: Vec<serde_json::Value> = resp
         .collections
         .iter()
-        .map(|c| {
+        .filter_map(|c| {
+            proximadb_tenant::unscoped_resource_name(&tenant.tenant_id, &c.name)
+                .map(|name| (c, name))
+        })
+        .map(|(c, name)| {
             serde_json::json!({
-                "name": c.name,
+                "name": name,
                 "document_count": c.document_count,
                 "storage_size_bytes": c.storage_size_bytes
             })
@@ -282,8 +301,10 @@ async fn list_collections(
 
 async fn get_collection_info(
     State(state): State<DocumentRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(collection): Path<String>,
 ) -> RestResult<JsonResponse<serde_json::Value>> {
+    let scoped = scoped_collection(&tenant, &collection)?;
     let resp = state
         .document_port
         .list_collections(ListDocumentCollectionsRequest {})
@@ -293,11 +314,11 @@ async fn get_collection_info(
     let info = resp
         .collections
         .into_iter()
-        .find(|c| c.name == collection)
+        .find(|c| c.name == scoped)
         .ok_or_else(|| RestError::CollectionNotFound(collection.clone()))?;
 
     Ok(JsonResponse(serde_json::json!({
-        "name": info.name,
+        "name": collection,
         "document_count": info.document_count,
         "indexes": info.indexes.iter().map(|i| serde_json::json!({
             "name": i.name,
@@ -309,13 +330,16 @@ async fn get_collection_info(
 
 async fn delete_collection(
     State(state): State<DocumentRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(collection): Path<String>,
 ) -> RestResult<JsonResponse<serde_json::Value>> {
     info!("Deleting document collection: {}", collection);
 
     state
         .document_port
-        .delete_collection(DeleteDocumentCollectionRequest { collection })
+        .delete_collection(DeleteDocumentCollectionRequest {
+            collection: scoped_collection(&tenant, &collection)?,
+        })
         .await
         .map_err(|e| RestError::Internal(format!("Failed to delete collection: {}", e)))?;
 
@@ -324,6 +348,7 @@ async fn delete_collection(
 
 async fn insert_document(
     State(state): State<DocumentRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(collection): Path<String>,
     Json(request): Json<CreateDocumentRequest>,
 ) -> RestResult<JsonResponse<DocumentResponse>> {
@@ -334,7 +359,7 @@ async fn insert_document(
     let resp = state
         .document_port
         .insert_document(InsertDocumentRequest {
-            collection,
+            collection: scoped_collection(&tenant, &collection)?,
             id: request.id,
             document: Some(sql_object),
         })
@@ -350,6 +375,7 @@ async fn insert_document(
 
 async fn get_document(
     State(state): State<DocumentRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path((collection, id)): Path<(String, String)>,
     Query(params): Query<DocumentQueryParams>,
 ) -> RestResult<JsonResponse<DocumentResponse>> {
@@ -363,7 +389,7 @@ async fn get_document(
     let resp = state
         .document_port
         .get_document(GetDocumentRequest {
-            collection,
+            collection: scoped_collection(&tenant, &collection)?,
             id: id.clone(),
             projection,
         })
@@ -388,6 +414,7 @@ async fn get_document(
 
 async fn delete_document(
     State(state): State<DocumentRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path((collection, id)): Path<(String, String)>,
 ) -> RestResult<JsonResponse<serde_json::Value>> {
     debug!("Deleting document: {}/{}", collection, id);
@@ -395,7 +422,7 @@ async fn delete_document(
     state
         .document_port
         .delete_document(DeleteDocumentRequest {
-            collection,
+            collection: scoped_collection(&tenant, &collection)?,
             id: id.clone(),
         })
         .await
@@ -408,6 +435,7 @@ async fn delete_document(
 
 async fn query_documents(
     State(state): State<DocumentRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(collection): Path<String>,
     Query(params): Query<DocumentQueryParams>,
 ) -> RestResult<JsonResponse<QueryResponse>> {
@@ -431,7 +459,7 @@ async fn query_documents(
     let resp = state
         .document_port
         .query_documents(QueryDocumentsRequest {
-            collection,
+            collection: scoped_collection(&tenant, &collection)?,
             filter,
             projection,
             sort: Vec::new(),
@@ -466,6 +494,7 @@ async fn query_documents(
 
 async fn update_document(
     State(state): State<DocumentRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path((collection, id)): Path<(String, String)>,
     Json(request): Json<UpdateDocumentBody>,
 ) -> RestResult<JsonResponse<serde_json::Value>> {
@@ -507,7 +536,7 @@ async fn update_document(
     let resp = state
         .document_port
         .update_document(UpdateDocumentRequest {
-            collection,
+            collection: scoped_collection(&tenant, &collection)?,
             id: id.clone(),
             updates,
             expected_version: request.expected_version,
@@ -524,6 +553,7 @@ async fn update_document(
 
 async fn batch_insert_documents(
     State(state): State<DocumentRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(collection): Path<String>,
     Json(request): Json<BatchInsertRequest>,
 ) -> RestResult<JsonResponse<BatchInsertResponse>> {
@@ -533,6 +563,7 @@ async fn batch_insert_documents(
         collection
     );
 
+    let scoped = scoped_collection(&tenant, &collection)?;
     let mut inserted: u64 = 0;
     let mut failed: u64 = 0;
 
@@ -548,7 +579,7 @@ async fn batch_insert_documents(
         match state
             .document_port
             .insert_document(InsertDocumentRequest {
-                collection: collection.clone(),
+                collection: scoped.clone(),
                 id: doc.id.clone(),
                 document: Some(sql_object),
             })
@@ -564,6 +595,7 @@ async fn batch_insert_documents(
 
 async fn aggregate_documents(
     State(state): State<DocumentRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(collection): Path<String>,
     Json(request): Json<AggregateRequest>,
 ) -> RestResult<JsonResponse<AggregateResponse>> {
@@ -578,7 +610,7 @@ async fn aggregate_documents(
     let resp = state
         .document_port
         .aggregate_documents(AggregateDocumentsRequest {
-            collection,
+            collection: scoped_collection(&tenant, &collection)?,
             filter: None,
             pipeline,
         })
@@ -595,10 +627,12 @@ async fn aggregate_documents(
 
 async fn create_index(
     State(_state): State<DocumentRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(collection): Path<String>,
     Json(request): Json<IndexDefinitionRequest>,
 ) -> RestResult<JsonResponse<serde_json::Value>> {
     info!("Creating index on {}: {:?}", collection, request.path);
+    scoped_collection(&tenant, &collection)?;
     Err(RestError::InvalidArgument(
         "Creating indexes on existing collections is not yet supported; \
          specify indexes when creating the collection."
@@ -608,8 +642,10 @@ async fn create_index(
 
 async fn list_indexes(
     State(state): State<DocumentRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(collection): Path<String>,
 ) -> RestResult<JsonResponse<serde_json::Value>> {
+    let scoped = scoped_collection(&tenant, &collection)?;
     let resp = state
         .document_port
         .list_collections(ListDocumentCollectionsRequest {})
@@ -619,7 +655,7 @@ async fn list_indexes(
     let info = resp
         .collections
         .into_iter()
-        .find(|c| c.name == collection)
+        .find(|c| c.name == scoped)
         .ok_or_else(|| RestError::CollectionNotFound(collection.clone()))?;
 
     Ok(JsonResponse(serde_json::json!({
@@ -876,6 +912,10 @@ mod tests {
         }
     }
 
+    fn tenant() -> Extension<TenantContext> {
+        Extension(TenantContext::default_tenant())
+    }
+
     fn state() -> State<DocumentRestState> {
         State(DocumentRestState {
             document_port: Arc::new(MockDocumentPort),
@@ -974,6 +1014,7 @@ mod tests {
     async fn document_collection_handlers_route_through_document_port() {
         let JsonResponse(created) = create_collection(
             state(),
+            tenant(),
             Json(CreateDocumentCollectionRequestBody {
                 name: "docs".to_string(),
                 indexes: vec![
@@ -998,26 +1039,27 @@ mod tests {
         .unwrap();
         assert_eq!(created["collection"], "docs");
 
-        let JsonResponse(listed) = list_collections(state()).await.unwrap();
+        let JsonResponse(listed) = list_collections(state(), tenant()).await.unwrap();
         assert_eq!(listed["collections"][0]["name"], "docs");
 
-        let JsonResponse(info) = get_collection_info(state(), Path("docs".to_string()))
+        let JsonResponse(info) = get_collection_info(state(), tenant(), Path("docs".to_string()))
             .await
             .unwrap();
         assert_eq!(info["document_count"], 2);
 
-        let JsonResponse(indexes) = list_indexes(state(), Path("docs".to_string()))
+        let JsonResponse(indexes) = list_indexes(state(), tenant(), Path("docs".to_string()))
             .await
             .unwrap();
         assert_eq!(indexes["indexes"][0]["path"], "name");
 
-        let JsonResponse(deleted) = delete_collection(state(), Path("docs".to_string()))
+        let JsonResponse(deleted) = delete_collection(state(), tenant(), Path("docs".to_string()))
             .await
             .unwrap();
         assert_eq!(deleted["success"], true);
 
         let err = create_index(
             state(),
+            tenant(),
             Path("docs".to_string()),
             Json(IndexDefinitionRequest {
                 name: None,
@@ -1036,6 +1078,7 @@ mod tests {
     async fn document_crud_query_batch_and_aggregate_handlers_return_expected_shapes() {
         let JsonResponse(inserted) = insert_document(
             state(),
+            tenant(),
             Path("docs".to_string()),
             Json(CreateDocumentRequest {
                 id: Some("doc-1".to_string()),
@@ -1049,6 +1092,7 @@ mod tests {
 
         let JsonResponse(got) = get_document(
             state(),
+            tenant(),
             Path(("docs".to_string(), "doc-1".to_string())),
             Query(DocumentQueryParams {
                 projection: Some("name,count".to_string()),
@@ -1063,6 +1107,7 @@ mod tests {
 
         let JsonResponse(query) = query_documents(
             state(),
+            tenant(),
             Path("docs".to_string()),
             Query(DocumentQueryParams {
                 projection: Some("name".to_string()),
@@ -1077,6 +1122,7 @@ mod tests {
 
         let JsonResponse(updated) = update_document(
             state(),
+            tenant(),
             Path(("docs".to_string(), "doc-1".to_string())),
             Json(UpdateDocumentBody {
                 updates: vec![
@@ -1094,14 +1140,18 @@ mod tests {
         .unwrap();
         assert_eq!(updated["new_version"], 4);
 
-        let JsonResponse(deleted) =
-            delete_document(state(), Path(("docs".to_string(), "doc-1".to_string())))
-                .await
-                .unwrap();
+        let JsonResponse(deleted) = delete_document(
+            state(),
+            tenant(),
+            Path(("docs".to_string(), "doc-1".to_string())),
+        )
+        .await
+        .unwrap();
         assert_eq!(deleted["id"], "doc-1");
 
         let JsonResponse(batch) = batch_insert_documents(
             state(),
+            tenant(),
             Path("docs".to_string()),
             Json(BatchInsertRequest {
                 documents: vec![
@@ -1123,6 +1173,7 @@ mod tests {
 
         let JsonResponse(aggregate) = aggregate_documents(
             state(),
+            tenant(),
             Path("docs".to_string()),
             Json(AggregateRequest {
                 pipeline: vec![
@@ -1140,5 +1191,186 @@ mod tests {
         let _query_handler = DocumentQueryHandler::new();
         assert_eq!(default_limit(), 100);
         assert_eq!(default_index_type(), "btree");
+    }
+
+    /// Records the storage key each call addresses; lists keys of several tenants.
+    #[derive(Default)]
+    struct KeyRecordingPort {
+        keys: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl KeyRecordingPort {
+        fn record(&self, key: &str) {
+            self.keys.lock().unwrap().push(key.to_string());
+        }
+    }
+
+    #[async_trait]
+    impl DocumentPort for KeyRecordingPort {
+        async fn create_collection(
+            &self,
+            request: CreateDocumentCollectionRequest,
+        ) -> Result<CreateDocumentCollectionResponse> {
+            let name = request.config.map(|c| c.name).unwrap_or_default();
+            self.record(&name);
+            Ok(CreateDocumentCollectionResponse {
+                collection_id: name,
+                success: true,
+            })
+        }
+        async fn list_collections(
+            &self,
+            _request: ListDocumentCollectionsRequest,
+        ) -> Result<ListDocumentCollectionsResponse> {
+            let info = |name: &str| DocumentCollectionInfo {
+                name: name.to_string(),
+                document_count: 1,
+                storage_size_bytes: 1,
+                indexes: Vec::new(),
+            };
+            Ok(ListDocumentCollectionsResponse {
+                collections: vec![info("plain"), info("acme/mine"), info("globex/theirs")],
+            })
+        }
+        async fn delete_collection(
+            &self,
+            request: DeleteDocumentCollectionRequest,
+        ) -> Result<DeleteDocumentCollectionResponse> {
+            self.record(&request.collection);
+            Ok(DeleteDocumentCollectionResponse { success: true })
+        }
+        async fn insert_document(
+            &self,
+            request: InsertDocumentRequest,
+        ) -> Result<InsertDocumentResponse> {
+            self.record(&request.collection);
+            Ok(InsertDocumentResponse {
+                id: "d".to_string(),
+                version: 1,
+            })
+        }
+        async fn get_document(&self, request: GetDocumentRequest) -> Result<GetDocumentResponse> {
+            self.record(&request.collection);
+            Ok(GetDocumentResponse {
+                document: None,
+                version: 0,
+                found: false,
+            })
+        }
+        async fn update_document(
+            &self,
+            request: UpdateDocumentRequest,
+        ) -> Result<UpdateDocumentResponse> {
+            self.record(&request.collection);
+            Ok(UpdateDocumentResponse {
+                new_version: 1,
+                success: true,
+            })
+        }
+        async fn delete_document(
+            &self,
+            request: DeleteDocumentRequest,
+        ) -> Result<DeleteDocumentResponse> {
+            self.record(&request.collection);
+            Ok(DeleteDocumentResponse { deleted: false })
+        }
+        async fn query_documents(
+            &self,
+            request: QueryDocumentsRequest,
+        ) -> Result<QueryDocumentsResponse> {
+            self.record(&request.collection);
+            Ok(QueryDocumentsResponse {
+                documents: Vec::new(),
+                total_count: Some(0),
+                query_time_ms: 0,
+            })
+        }
+        async fn aggregate_documents(
+            &self,
+            request: AggregateDocumentsRequest,
+        ) -> Result<AggregateDocumentsResponse> {
+            self.record(&request.collection);
+            Ok(AggregateDocumentsResponse {
+                results: Vec::new(),
+                query_time_ms: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn every_document_handler_addresses_only_the_request_tenants_keys() {
+        let port = Arc::new(KeyRecordingPort::default());
+        let st = || {
+            State(DocumentRestState {
+                document_port: port.clone(),
+            })
+        };
+        let acme = || Extension(TenantContext::new("acme"));
+
+        insert_document(
+            st(),
+            acme(),
+            Path("docs".to_string()),
+            Json(CreateDocumentRequest {
+                id: None,
+                document: serde_json::json!({"a": 1}),
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = get_document(
+            st(),
+            acme(),
+            Path(("docs".to_string(), "d".to_string())),
+            Query(DocumentQueryParams {
+                projection: None,
+                limit: 10,
+                filter: None,
+            }),
+        )
+        .await;
+        delete_document(st(), acme(), Path(("docs".to_string(), "d".to_string())))
+            .await
+            .unwrap();
+        delete_collection(st(), acme(), Path("docs".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            port.keys.lock().unwrap().iter().all(|k| k == "acme/docs"),
+            "{:?}",
+            port.keys.lock().unwrap()
+        );
+
+        // Listing shows only acme's own collections, under clean names.
+        let JsonResponse(listed) = list_collections(st(), acme()).await.unwrap();
+        assert_eq!(
+            listed["collections"],
+            serde_json::json!([{
+                "name": "mine", "document_count": 1, "storage_size_bytes": 1
+            }])
+        );
+        // Another tenant's collection reads as missing.
+        assert!(matches!(
+            get_collection_info(st(), acme(), Path("theirs".to_string())).await,
+            Err(RestError::CollectionNotFound(_))
+        ));
+        let JsonResponse(info) = get_collection_info(st(), acme(), Path("mine".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(info["name"], "mine");
+
+        // A name carrying a separator never reaches storage, for any tenant.
+        port.keys.lock().unwrap().clear();
+        for tenant in [acme(), tenant()] {
+            assert!(matches!(
+                delete_collection(st(), tenant, Path("globex/theirs".to_string())).await,
+                Err(RestError::InvalidArgument(_))
+            ));
+        }
+        assert!(matches!(
+            get_collection_info(st(), tenant(), Path("globex/theirs".to_string())).await,
+            Err(RestError::InvalidArgument(_))
+        ));
+        assert!(port.keys.lock().unwrap().is_empty());
     }
 }

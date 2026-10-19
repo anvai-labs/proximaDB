@@ -116,6 +116,11 @@ pub async fn execute_query(
     };
 
     result.map(Json).map_err(|error| {
+        // A query addressing a collection that does not resolve for the
+        // request (missing, or not resolvable by its tenant) is 404.
+        if let Some(missing) = crate::services::operations::vectors::collection_not_found(&error) {
+            return ApiError::CollectionNotFound(missing.identifier.clone());
+        }
         error!("v2 query execution failed: {}", error);
         ApiError::Internal(format!("Query execution failed: {}", error))
     })

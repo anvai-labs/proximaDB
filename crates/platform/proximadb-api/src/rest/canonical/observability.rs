@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
-    Router,
+    Extension, Router,
     extract::{Json, Path, State},
     response::Json as JsonResponse,
     routing::post,
@@ -23,6 +23,15 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::rest::errors::{RestError, RestResult};
+use crate::rest::state::TenantContext;
+
+/// The storage key of a client-named observability namespace for the request
+/// tenant: always tenant-qualified, so a request reaches only its own
+/// tenant's namespaces (another tenant's reads as missing).
+fn tenant_namespace(tenant: &TenantContext, namespace: &str) -> RestResult<String> {
+    proximadb_tenant::tenant_qualified_key(&tenant.tenant_id, namespace)
+        .map_err(|e| RestError::InvalidArgument(format!("invalid namespace: {e}")))
+}
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -271,8 +280,10 @@ pub fn create_observability_router() -> Router<ObservabilityRestState> {
 
 async fn create_namespace(
     State(state): State<ObservabilityRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Json(request): Json<CreateNamespaceRequestBody>,
 ) -> RestResult<JsonResponse<serde_json::Value>> {
+    let storage_name = tenant_namespace(&tenant, &request.name)?;
     let retention = RetentionConfig {
         hot_retention_hours: (request.hot_retention_days * 24) as u64,
         warm_retention_days: request.warm_retention_days as u64,
@@ -281,7 +292,7 @@ async fn create_namespace(
     };
 
     let config = ObservabilityNamespaceConfig {
-        name: request.name.clone(),
+        name: storage_name,
         retention: Some(retention),
         ingestion: None,
         alert_rules: Vec::new(),
@@ -303,9 +314,11 @@ async fn create_namespace(
 
 async fn ingest_log(
     State(state): State<ObservabilityRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(namespace): Path<String>,
     Json(request): Json<LogEntryRequest>,
 ) -> RestResult<JsonResponse<IngestResponse>> {
+    let namespace = tenant_namespace(&tenant, &namespace)?;
     let entry = convert_log_request(&request)?;
 
     let result = state
@@ -327,9 +340,11 @@ async fn ingest_log(
 
 async fn ingest_logs(
     State(state): State<ObservabilityRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(namespace): Path<String>,
     Json(request): Json<BulkLogRequest>,
 ) -> RestResult<JsonResponse<IngestResponse>> {
+    let namespace = tenant_namespace(&tenant, &namespace)?;
     debug!("Ingesting {} logs into {}", request.logs.len(), namespace);
 
     let entries: Vec<LogEntry> = request
@@ -357,9 +372,11 @@ async fn ingest_logs(
 
 async fn query_logs(
     State(state): State<ObservabilityRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(namespace): Path<String>,
     Json(request): Json<LogQueryRequest>,
 ) -> RestResult<JsonResponse<LogResponse>> {
+    let namespace = tenant_namespace(&tenant, &namespace)?;
     debug!("Querying logs in namespace: {}", namespace);
 
     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -414,9 +431,11 @@ async fn query_logs(
 
 async fn ingest_metric(
     State(state): State<ObservabilityRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(namespace): Path<String>,
     Json(request): Json<MetricSampleRequest>,
 ) -> RestResult<JsonResponse<IngestResponse>> {
+    let namespace = tenant_namespace(&tenant, &namespace)?;
     let sample = convert_metric_request(&request);
 
     let result = state
@@ -437,9 +456,11 @@ async fn ingest_metric(
 
 async fn ingest_metrics(
     State(state): State<ObservabilityRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(namespace): Path<String>,
     Json(request): Json<BulkMetricRequest>,
 ) -> RestResult<JsonResponse<IngestResponse>> {
+    let namespace = tenant_namespace(&tenant, &namespace)?;
     debug!(
         "Ingesting {} metrics into {}",
         request.metrics.len(),
@@ -463,9 +484,11 @@ async fn ingest_metrics(
 
 async fn aggregate_metrics(
     State(state): State<ObservabilityRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(namespace): Path<String>,
     Json(request): Json<MetricAggregationRequest>,
 ) -> RestResult<JsonResponse<MetricAggResponse>> {
+    let namespace = tenant_namespace(&tenant, &namespace)?;
     debug!("Aggregating metrics in namespace: {}", namespace);
 
     let result = state
@@ -824,6 +847,10 @@ mod tests {
         }
     }
 
+    fn tenant() -> Extension<TenantContext> {
+        Extension(TenantContext::default_tenant())
+    }
+
     fn state() -> State<ObservabilityRestState> {
         State(ObservabilityRestState {
             observability_port: Arc::new(MockObservabilityPort),
@@ -942,6 +969,7 @@ mod tests {
     async fn observability_handlers_route_successful_requests_through_port() {
         let JsonResponse(namespace) = create_namespace(
             state(),
+            tenant(),
             Json(CreateNamespaceRequestBody {
                 name: "ops".to_string(),
                 hot_retention_days: 2,
@@ -955,6 +983,7 @@ mod tests {
 
         let JsonResponse(single_log) = ingest_log(
             state(),
+            tenant(),
             Path("ops".to_string()),
             Json(LogEntryRequest {
                 timestamp_ns: Some(1),
@@ -971,6 +1000,7 @@ mod tests {
 
         let JsonResponse(bulk_logs) = ingest_logs(
             state(),
+            tenant(),
             Path("ops".to_string()),
             Json(BulkLogRequest {
                 logs: vec![LogEntryRequest {
@@ -989,6 +1019,7 @@ mod tests {
 
         let JsonResponse(logs) = query_logs(
             state(),
+            tenant(),
             Path("ops".to_string()),
             Json(LogQueryRequest {
                 start_time_ns: None,
@@ -1008,6 +1039,7 @@ mod tests {
 
         let JsonResponse(single_metric) = ingest_metric(
             state(),
+            tenant(),
             Path("ops".to_string()),
             Json(MetricSampleRequest {
                 name: "latency".to_string(),
@@ -1022,6 +1054,7 @@ mod tests {
 
         let JsonResponse(bulk_metrics) = ingest_metrics(
             state(),
+            tenant(),
             Path("ops".to_string()),
             Json(BulkMetricRequest {
                 metrics: vec![MetricSampleRequest {
@@ -1038,6 +1071,7 @@ mod tests {
 
         let JsonResponse(aggregated) = aggregate_metrics(
             state(),
+            tenant(),
             Path("ops".to_string()),
             Json(MetricAggregationRequest {
                 metric_name: "latency".to_string(),

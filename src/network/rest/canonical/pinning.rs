@@ -23,14 +23,58 @@
 //! * `GET /api/v2/collections/pinning` — list all pinned collections.
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, State},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::network::middleware::tenant::TenantContext;
 use crate::network::rest::canonical::handlers::AppState;
 use crate::storage::collection_pinning::{CollectionPinTarget, PinState};
+
+/// Whether `collection_id` names a collection visible to the request tenant.
+/// Another tenant's collection and a missing one are indistinguishable.
+pub(crate) async fn collection_visible_to_request(
+    state: &AppState,
+    tenant: &TenantContext,
+    collection_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    match state
+        .collection_service
+        .collection_for_tenant(collection_id, Some(&tenant.tenant_id))
+        .await
+    {
+        Ok(Some(_)) => Ok(()),
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            format!("Collection '{collection_id}' not found"),
+        )),
+    }
+}
+
+/// The names and ids of every collection visible to the request tenant, for
+/// filtering registry listings down to the tenant's own entries.
+pub(crate) async fn visible_collection_keys(
+    state: &AppState,
+    tenant: &TenantContext,
+) -> std::collections::HashSet<String> {
+    let ctx = state
+        .collection_service
+        .request_tenant_context(Some(&tenant.tenant_id))
+        .ok()
+        .flatten();
+    state
+        .collection_service
+        .list_collections_with_tenant_context(ctx.as_ref())
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|c| c.config.map(|cfg| (c.id, cfg.name)))
+        .flat_map(|(id, name)| [id, name])
+        .filter(|key| !key.is_empty())
+        .collect()
+}
 
 /// PATCH body. Two shapes supported:
 ///
@@ -81,9 +125,11 @@ impl PinResponse {
 /// `PATCH /api/v2/collections/:collection_id/pin`
 pub async fn patch_pin(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(collection_id): Path<String>,
     Json(body): Json<PinRequest>,
 ) -> Result<(StatusCode, Json<PinResponse>), (StatusCode, String)> {
+    collection_visible_to_request(&state, &tenant, &collection_id).await?;
     let registry = &state.pin_registry;
 
     if body.pinned {
@@ -114,8 +160,10 @@ pub async fn patch_pin(
 /// `GET /api/v2/collections/:collection_id/pin`
 pub async fn get_pin(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(collection_id): Path<String>,
 ) -> Result<Json<PinResponse>, (StatusCode, String)> {
+    collection_visible_to_request(&state, &tenant, &collection_id).await?;
     let registry = &state.pin_registry;
 
     match registry.get(&collection_id) {
@@ -141,16 +189,19 @@ pub struct PinListResponse {
     pub items: Vec<PinListItem>,
 }
 
-/// `GET /api/v2/collections/pinning` — operator-dashboard view of
-/// every currently pinned collection.
+/// `GET /api/v2/collections/pinning` — the pinned collections visible to the
+/// request tenant.
 pub async fn list_pins(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
 ) -> Result<Json<PinListResponse>, (StatusCode, String)> {
     let registry = &state.pin_registry;
+    let visible = visible_collection_keys(&state, &tenant).await;
 
     let items: Vec<PinListItem> = registry
         .list()
         .into_iter()
+        .filter(|(collection_id, _)| visible.contains(collection_id))
         .map(|(collection_id, state)| PinListItem {
             collection_id,
             target: state.target,

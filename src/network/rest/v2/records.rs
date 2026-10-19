@@ -2560,13 +2560,17 @@ pub struct ChangesQuery {
 pub async fn get_changes(
     Path(collection_id): Path<String>,
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Query(q): Query<ChangesQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // The table is resolved within the request tenant, and the feed carries only
+    // that tenant's writes; a table outside the tenant reads as missing.
     let changes = state
         .record_ops
-        .table_changes(&collection_id, q.since_lsn)
+        .table_changes_for_tenant(&collection_id, &tenant.tenant_id, q.since_lsn)
         .await
-        .map_err(|e| ApiError::Internal(format!("change-feed read failed: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("change-feed read failed: {e}")))?
+        .ok_or_else(|| ApiError::CollectionNotFound(collection_id.clone()))?;
     let next_lsn = changes.iter().map(|c| c.lsn).max();
     Ok(Json(serde_json::json!({
         "collection": collection_id,

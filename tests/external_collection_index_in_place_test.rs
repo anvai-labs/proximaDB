@@ -94,159 +94,176 @@ async fn catalog_manager() -> Arc<CatalogManager> {
 
 #[tokio::test]
 async fn external_parquet_indexed_in_place_and_searchable_without_copy() {
-    let dim = 56;
-    let parquet = std::env::temp_dir().join(format!(
-        "proximadb_f5_it_{}.parquet",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let expect = write_external_parquet(&parquet, 40, dim);
-    allowlist_parent_of(&parquet);
+    // Internal caller: this test drives the service directly (no request scope).
+    proximadb::query::request_scope::with_internal_scope(
+        "external collection service test",
+        async move {
+            let dim = 56;
+            let parquet = std::env::temp_dir().join(format!(
+                "proximadb_f5_it_{}.parquet",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let expect = write_external_parquet(&parquet, 40, dim);
+            allowlist_parent_of(&parquet);
 
-    let cat = catalog_manager().await;
-    let axis = Arc::new(AxisManager::new(AxisConfig::default()).await.unwrap());
-    let svc = ExternalCollectionService::new(
-        Arc::new(ExternalCollectionRegistry::new()),
-        cat.clone(),
-        axis.clone(),
+            let cat = catalog_manager().await;
+            let axis = Arc::new(AxisManager::new(AxisConfig::default()).await.unwrap());
+            let svc = ExternalCollectionService::new(
+                Arc::new(ExternalCollectionRegistry::new()),
+                cat.clone(),
+                axis.clone(),
+            )
+            .with_axis_runtime_enabled(true);
+
+            // Register un-copied.
+            let spec = ExternalCollectionSpec::parquet(
+                "ext_papers",
+                parquet.to_str().unwrap(),
+                "id",
+                "vector",
+                dim,
+            );
+            let ec = svc.register(spec).await.unwrap();
+            assert_eq!(ec.status, ExternalCollectionStatus::Registered);
+
+            // (a) Catalog authority is FederatedRead — ProximaDB does not own the records.
+            let (catalog, identifier) = cat.resolve_table("ext_papers").await.unwrap();
+            let schema = catalog.get_table(&identifier).await.unwrap();
+            assert_eq!(
+                schema.storage_layouts[0].authority,
+                CatalogAuthorityMode::FederatedRead
+            );
+            assert_eq!(
+                schema.storage_layouts[0].location.as_deref(),
+                Some(parquet.to_str().unwrap())
+            );
+
+            // Build the ProximaDB-owned index in place.
+            let count = svc.build(&ec.id).await.unwrap();
+            assert_eq!(count, 40);
+            assert!(axis.has_ivf_index("ext_papers").await);
+            let built = svc.get(&ec.id).unwrap();
+            assert_eq!(built.status, ExternalCollectionStatus::Ready);
+            assert_eq!(built.indexed_record_count, 40);
+
+            // (c) Projection republished Fresh with the external snapshot id as lineage.
+            let proj = svc.projection("ext_papers").await.unwrap().unwrap();
+            assert_eq!(proj.freshness_state, ProjectionFreshnessState::Fresh);
+            assert_eq!(proj.source_range.as_deref(), Some(ec.snapshot_id.as_str()));
+
+            // Search routes through the same AxisManager path and returns the exact row
+            // WITH its full record federated from the source (Slice 2: props, not just id).
+            let (qid, qvec) = &expect[7];
+            let hits = svc.search(&ec.id, qvec.clone(), 5).await.unwrap();
+            assert!(!hits.is_empty(), "external index must return hits");
+            assert_eq!(&hits[0].id, qid, "top-1 must be the exact external row");
+            match &hits[0].record.props["title"] {
+                proximadb_records::ProximaTreeNode::Value(
+                    proximadb_data_model::ProximaValue::String(s),
+                ) => assert_eq!(s, "title-7", "hit must carry the source's title metadata"),
+                other => panic!("title prop wrong: {other:?}"),
+            }
+
+            // (b) No copy: the snapshot id is stable across register+build (build did
+            // not rewrite the source) and the source file is still present. The index
+            // lives only in the in-memory AxisManager; no storage engine was wired, so
+            // ProximaDB structurally cannot have copied the records.
+            assert_eq!(
+                ec.snapshot_id, built.snapshot_id,
+                "snapshot id must be stable across register+build (source untouched)"
+            );
+            assert!(parquet.exists(), "external source must still be present");
+
+            // Slice 2 staleness-refresh: unchanged source is not stale; mutating the
+            // source (more rows) makes refresh rebuild in place and advance the snapshot.
+            assert!(!svc.is_stale(&ec.id).unwrap());
+            write_external_parquet(&parquet, 50, dim);
+            assert!(
+                svc.is_stale(&ec.id).unwrap(),
+                "changed source must be stale"
+            );
+            let outcome = svc.refresh(&ec.id).await.unwrap();
+            assert!(
+                outcome.stale_detected && outcome.rebuilt,
+                "stale source must rebuild"
+            );
+            assert_eq!(outcome.indexed_record_count, 50);
+            assert_ne!(
+                outcome.snapshot_id, built.snapshot_id,
+                "snapshot must advance"
+            );
+            let refreshed = svc.get(&ec.id).unwrap();
+            assert_eq!(refreshed.indexed_record_count, 50);
+            let proj2 = svc.projection("ext_papers").await.unwrap().unwrap();
+            assert_eq!(proj2.freshness_state, ProjectionFreshnessState::Fresh);
+            assert_eq!(
+                proj2.source_range.as_deref(),
+                Some(outcome.snapshot_id.as_str())
+            );
+
+            let _ = std::fs::remove_file(&parquet);
+        },
     )
-    .with_axis_runtime_enabled(true);
-
-    // Register un-copied.
-    let spec = ExternalCollectionSpec::parquet(
-        "ext_papers",
-        parquet.to_str().unwrap(),
-        "id",
-        "vector",
-        dim,
-    );
-    let ec = svc.register(spec).await.unwrap();
-    assert_eq!(ec.status, ExternalCollectionStatus::Registered);
-
-    // (a) Catalog authority is FederatedRead — ProximaDB does not own the records.
-    let (catalog, identifier) = cat.resolve_table("ext_papers").await.unwrap();
-    let schema = catalog.get_table(&identifier).await.unwrap();
-    assert_eq!(
-        schema.storage_layouts[0].authority,
-        CatalogAuthorityMode::FederatedRead
-    );
-    assert_eq!(
-        schema.storage_layouts[0].location.as_deref(),
-        Some(parquet.to_str().unwrap())
-    );
-
-    // Build the ProximaDB-owned index in place.
-    let count = svc.build(&ec.id).await.unwrap();
-    assert_eq!(count, 40);
-    assert!(axis.has_ivf_index("ext_papers").await);
-    let built = svc.get(&ec.id).unwrap();
-    assert_eq!(built.status, ExternalCollectionStatus::Ready);
-    assert_eq!(built.indexed_record_count, 40);
-
-    // (c) Projection republished Fresh with the external snapshot id as lineage.
-    let proj = svc.projection("ext_papers").await.unwrap().unwrap();
-    assert_eq!(proj.freshness_state, ProjectionFreshnessState::Fresh);
-    assert_eq!(proj.source_range.as_deref(), Some(ec.snapshot_id.as_str()));
-
-    // Search routes through the same AxisManager path and returns the exact row
-    // WITH its full record federated from the source (Slice 2: props, not just id).
-    let (qid, qvec) = &expect[7];
-    let hits = svc.search(&ec.id, qvec.clone(), 5).await.unwrap();
-    assert!(!hits.is_empty(), "external index must return hits");
-    assert_eq!(&hits[0].id, qid, "top-1 must be the exact external row");
-    match &hits[0].record.props["title"] {
-        proximadb_records::ProximaTreeNode::Value(proximadb_data_model::ProximaValue::String(
-            s,
-        )) => assert_eq!(s, "title-7", "hit must carry the source's title metadata"),
-        other => panic!("title prop wrong: {other:?}"),
-    }
-
-    // (b) No copy: the snapshot id is stable across register+build (build did
-    // not rewrite the source) and the source file is still present. The index
-    // lives only in the in-memory AxisManager; no storage engine was wired, so
-    // ProximaDB structurally cannot have copied the records.
-    assert_eq!(
-        ec.snapshot_id, built.snapshot_id,
-        "snapshot id must be stable across register+build (source untouched)"
-    );
-    assert!(parquet.exists(), "external source must still be present");
-
-    // Slice 2 staleness-refresh: unchanged source is not stale; mutating the
-    // source (more rows) makes refresh rebuild in place and advance the snapshot.
-    assert!(!svc.is_stale(&ec.id).unwrap());
-    write_external_parquet(&parquet, 50, dim);
-    assert!(
-        svc.is_stale(&ec.id).unwrap(),
-        "changed source must be stale"
-    );
-    let outcome = svc.refresh(&ec.id).await.unwrap();
-    assert!(
-        outcome.stale_detected && outcome.rebuilt,
-        "stale source must rebuild"
-    );
-    assert_eq!(outcome.indexed_record_count, 50);
-    assert_ne!(
-        outcome.snapshot_id, built.snapshot_id,
-        "snapshot must advance"
-    );
-    let refreshed = svc.get(&ec.id).unwrap();
-    assert_eq!(refreshed.indexed_record_count, 50);
-    let proj2 = svc.projection("ext_papers").await.unwrap().unwrap();
-    assert_eq!(proj2.freshness_state, ProjectionFreshnessState::Fresh);
-    assert_eq!(
-        proj2.source_range.as_deref(),
-        Some(outcome.snapshot_id.as_str())
-    );
-
-    let _ = std::fs::remove_file(&parquet);
+    .await
 }
 
 /// F5 Slice 3: register with a BM25 text column → build → hybrid (vector + text)
 /// search fuses a lexical-only match in alongside the vector match.
 #[tokio::test]
 async fn external_hybrid_search_fuses_text_and_vector() {
-    let dim = 48;
-    let parquet = std::env::temp_dir().join(format!(
-        "proximadb_f5_hyb_{}.parquet",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let expect = write_external_parquet(&parquet, 40, dim);
-    allowlist_parent_of(&parquet);
+    // Internal caller: this test drives the service directly (no request scope).
+    proximadb::query::request_scope::with_internal_scope(
+        "external collection service test",
+        async move {
+            let dim = 48;
+            let parquet = std::env::temp_dir().join(format!(
+                "proximadb_f5_hyb_{}.parquet",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let expect = write_external_parquet(&parquet, 40, dim);
+            allowlist_parent_of(&parquet);
 
-    let cat = catalog_manager().await;
-    let axis = Arc::new(AxisManager::new(AxisConfig::default()).await.unwrap());
-    let svc =
-        ExternalCollectionService::new(Arc::new(ExternalCollectionRegistry::new()), cat, axis)
+            let cat = catalog_manager().await;
+            let axis = Arc::new(AxisManager::new(AxisConfig::default()).await.unwrap());
+            let svc = ExternalCollectionService::new(
+                Arc::new(ExternalCollectionRegistry::new()),
+                cat,
+                axis,
+            )
             .with_axis_runtime_enabled(true);
 
-    let spec = ExternalCollectionSpec::parquet(
-        "ext_hybrid",
-        parquet.to_str().unwrap(),
-        "id",
-        "vector",
-        dim,
+            let spec = ExternalCollectionSpec::parquet(
+                "ext_hybrid",
+                parquet.to_str().unwrap(),
+                "id",
+                "vector",
+                dim,
+            )
+            .with_text_column("title");
+            let ec = svc.register(spec).await.unwrap();
+            svc.build(&ec.id).await.unwrap();
+            assert!(
+                svc.has_fulltext_index("ext_hybrid"),
+                "BM25 index built over the title column"
+            );
+
+            // Vector query points at doc-3; lexical query is doc-7's title.
+            let (_qid, qvec) = &expect[3];
+            let hybrid = svc
+                .hybrid_search(&ec.id, qvec.clone(), Some("title-7".to_string()), 5)
+                .await
+                .unwrap();
+            let ids: Vec<&str> = hybrid.iter().map(|h| h.id.as_str()).collect();
+            assert!(ids.contains(&"doc-7"), "lexical match fused in: {ids:?}");
+            assert!(ids.contains(&"doc-3"), "vector match retained: {ids:?}");
+            // Fused hits still carry federated props from the source.
+            let d7 = hybrid.iter().find(|h| h.id == "doc-7").unwrap();
+            assert!(d7.record.props.contains_key("title"));
+
+            let _ = std::fs::remove_file(&parquet);
+        },
     )
-    .with_text_column("title");
-    let ec = svc.register(spec).await.unwrap();
-    svc.build(&ec.id).await.unwrap();
-    assert!(
-        svc.has_fulltext_index("ext_hybrid"),
-        "BM25 index built over the title column"
-    );
-
-    // Vector query points at doc-3; lexical query is doc-7's title.
-    let (_qid, qvec) = &expect[3];
-    let hybrid = svc
-        .hybrid_search(&ec.id, qvec.clone(), Some("title-7".to_string()), 5)
-        .await
-        .unwrap();
-    let ids: Vec<&str> = hybrid.iter().map(|h| h.id.as_str()).collect();
-    assert!(ids.contains(&"doc-7"), "lexical match fused in: {ids:?}");
-    assert!(ids.contains(&"doc-3"), "vector match retained: {ids:?}");
-    // Fused hits still carry federated props from the source.
-    let d7 = hybrid.iter().find(|h| h.id == "doc-7").unwrap();
-    assert!(d7.record.props.contains_key("title"));
-
-    let _ = std::fs::remove_file(&parquet);
+    .await
 }
 
 /// Allowlist the parquet's own directory for this test process.

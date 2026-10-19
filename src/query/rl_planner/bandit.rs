@@ -450,16 +450,47 @@ impl ContextualBanditPlanner {
 
     /// Save planner state to file
     pub async fn save_to_file(&self, path: &str) -> anyhow::Result<()> {
-        let json = serde_json::to_string_pretty(self)?;
+        // JSON has no NaN/inf (serde writes them as null, which cannot be read
+        // back): persist only finite learned values.
+        let mut persisted = self.clone();
+        persisted.make_finite();
+        let json = serde_json::to_string_pretty(&persisted)?;
         tokio::fs::write(path, json).await?;
         tracing::info!("Saved RL planner state to {}", path);
         Ok(())
     }
 
     /// Load planner state from file
-    pub async fn load_from_file(&mut self, path: &str) -> anyhow::Result<()> {
+    /// Returns whether a policy was loaded (`false` when the file was unreadable
+    /// and a fresh policy is kept).
+    pub async fn load_from_file(&mut self, path: &str) -> anyhow::Result<bool> {
         let json = tokio::fs::read_to_string(path).await?;
-        let loaded: ContextualBanditPlanner = serde_json::from_str(&json)?;
+        // An unreadable policy is a learned cache, not data: start fresh rather
+        // than fail startup.
+        let mut loaded: ContextualBanditPlanner = match serde_json::from_str(&json) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                // TD-RLNAN-1: move the unreadable policy aside so a bad file
+                // never lingers; keep it beside the original for diagnosis,
+                // and start fresh either way.
+                match super::set_aside_unreadable_policy(path).await {
+                    Ok(aside) => tracing::warn!(
+                        path,
+                        aside_path = %aside,
+                        %error,
+                        "RL planner policy file is invalid; moved aside, starting with a fresh policy"
+                    ),
+                    Err(rename_error) => tracing::warn!(
+                        path,
+                        %error,
+                        %rename_error,
+                        "RL planner policy file is invalid and could not be moved aside; starting with a fresh in-memory policy"
+                    ),
+                }
+                return Ok(false);
+            }
+        };
+        loaded.make_finite();
 
         self.action_stats = loaded.action_stats;
         self.context_weights = loaded.context_weights;
@@ -476,7 +507,33 @@ impl ContextualBanditPlanner {
             self.action_stats.len(),
             self.total_updates
         );
-        Ok(())
+        Ok(true)
+    }
+
+    /// Replace non-finite learned values: a non-finite weight becomes 0.0 and a
+    /// non-finite (or non-positive) Beta parameter resets to the uniform prior.
+    fn make_finite(&mut self) {
+        for stats in self.action_stats.values_mut() {
+            if !stats.alpha.is_finite() || stats.alpha <= 0.0 {
+                stats.alpha = 1.0;
+            }
+            if !stats.beta.is_finite() || stats.beta <= 0.0 {
+                stats.beta = 1.0;
+            }
+        }
+        for weights in self.context_weights.values_mut() {
+            for weight in weights.weights.iter_mut() {
+                if !weight.is_finite() {
+                    *weight = 0.0;
+                }
+            }
+            if !weights.learning_rate.is_finite() {
+                weights.learning_rate = 0.01;
+            }
+        }
+        if !self.exploration_rate.is_finite() {
+            self.exploration_rate = 0.1;
+        }
     }
 
     /// Get top-k best actions for a given state
@@ -814,5 +871,41 @@ mod tests {
 
         // Cleanup
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn non_finite_policy_values_are_never_persisted_and_bad_files_reset() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rl_policy.json");
+        let path = path.to_str().expect("utf8 path");
+
+        let mut planner = ContextualBanditPlanner::new(0.1, true);
+        planner.context_weights.insert(
+            1,
+            ContextWeights {
+                weights: vec![0.5, f64::NAN, f64::INFINITY],
+                learning_rate: 0.01,
+            },
+        );
+        planner.save_to_file(path).await.expect("save");
+        let mut reloaded = ContextualBanditPlanner::new(0.1, true);
+        reloaded.load_from_file(path).await.expect("load");
+        assert_eq!(reloaded.context_weights[&1].weights, vec![0.5, 0.0, 0.0]);
+
+        // A file that cannot be read back (e.g. null where a number belongs)
+        // starts a fresh policy instead of failing.
+        tokio::fs::write(
+            path,
+            r#"{"action_stats":{},"context_weights":{"1":{"weights":[null],"learning_rate":0.01}},"exploration_rate":0.1,"total_updates":3,"engine_update_counts":{}}"#,
+        )
+        .await
+        .expect("write");
+        let mut fresh = ContextualBanditPlanner::new(0.1, true);
+        let loaded = fresh
+            .load_from_file(path)
+            .await
+            .expect("invalid file must not fail");
+        assert!(!loaded, "an invalid file is reported as not loaded");
+        assert_eq!(fresh.total_updates(), 0);
     }
 }

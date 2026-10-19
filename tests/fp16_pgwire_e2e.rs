@@ -207,8 +207,13 @@ async fn pgwire_create_table_with_canonical_embedding_precision_fp16() {
         server.rest_base_url(),
         table_name
     );
+    // Read as the SAME tenant the pgwire session wrote as: the startup
+    // `database` (here `proximadb`) is the pgwire tenant boundary, and a REST
+    // request with no header would act as the default tenant — a different
+    // tenant, which reads this table as missing.
     let resp = http_client
         .get(&get_url)
+        .header("X-Tenant-ID", "proximadb")
         .send()
         .await
         .expect("REST GET collection");

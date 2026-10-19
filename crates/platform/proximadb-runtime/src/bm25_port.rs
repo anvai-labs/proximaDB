@@ -34,4 +34,16 @@ pub trait BM25IndexPort: Send + Sync {
         collection: String,
         documents: Vec<BM25Document>,
     ) -> Result<BM25IndexResult>;
+
+    /// Index for a request acting as `request_tenant`: the collection is
+    /// resolved within that tenant first, and one it may not resolve is
+    /// answered exactly like a missing one. Default: no scoping.
+    async fn index_documents_for_tenant(
+        &self,
+        collection: String,
+        documents: Vec<BM25Document>,
+        _request_tenant: &str,
+    ) -> Result<BM25IndexResult> {
+        self.index_documents(collection, documents).await
+    }
 }

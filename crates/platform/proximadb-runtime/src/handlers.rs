@@ -503,7 +503,12 @@ impl ApiHandlersPort for UnifiedHandlers {
                 resp.affected_count = if deleted { 1 } else { 0 };
             }
             CollectionOperation::CollectionGetIdByName => {
-                let resolved = self.collection.resolve_collection_id(collection_id).await?;
+                // Resolved within the request tenant, like CollectionGet.
+                let resolved = self
+                    .collection
+                    .get_collection(collection_id, tenant_id)
+                    .await?
+                    .map(|collection| collection.id);
                 resp.success = resolved.is_some();
                 if let Some(id) = resolved {
                     resp.metadata.insert("collection_id".to_string(), id);
@@ -967,7 +972,16 @@ mod tests {
         assert!(calls.iter().any(|call| call.starts_with("get:docs")));
         assert!(calls.iter().any(|call| call.starts_with("list:")));
         assert!(calls.iter().any(|call| call.starts_with("delete:docs")));
-        assert!(calls.iter().any(|call| call == "resolve:docs"));
+        // CollectionGetIdByName resolves within the request tenant (a scoped
+        // get), not through the unscoped name resolver.
+        assert!(!calls.iter().any(|call| call == "resolve:docs"));
+        assert!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("get:docs"))
+                .count()
+                >= 2
+        );
 
         let mut missing_config = collection_request(CollectionOperation::CollectionCreate);
         missing_config.collection_config = None;

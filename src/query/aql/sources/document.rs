@@ -105,6 +105,15 @@ impl AqlSource for DocumentAqlSource {
 
     async fn execute(&self, query: &AqlQuery, ctx: &mut AuditContext) -> Result<AqlResult> {
         let collection = self.extract_doc_params(query);
+        // The storage key is composed within the request tenant (the same key the
+        // document surfaces use); internal execution reads the name as given.
+        let storage_key = match ctx.resolution_tenant(&collection)? {
+            Some(tenant) => {
+                crate::storage::document::service::scoped_document_collection(tenant, &collection)
+                    .map_err(|_| crate::query::aql::collection_not_found(&collection))?
+            }
+            None => collection.clone(),
+        };
         let start = Instant::now();
 
         // Perform document query
@@ -115,7 +124,7 @@ impl AqlSource for DocumentAqlSource {
 
         let query_result = self
             .doc_svc
-            .query_documents(&collection, params)
+            .query_documents(&storage_key, params)
             .await
             .map_err(|e| {
                 // Not an SST engine error — wraps a downstream document

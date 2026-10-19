@@ -824,6 +824,11 @@ pub fn apply_evolution(
                     .insert(key.clone(), col_name);
             }
             SchemaChange::SetTableOption { key, value } => {
+                // System-written properties (a collection's record and owner)
+                // are never set through schema evolution.
+                if crate::table_properties::is_reserved_table_property(key) {
+                    anyhow::bail!("table property '{key}' is reserved and cannot be set");
+                }
                 match key.to_lowercase().as_str() {
                     "props_auto_promotion" => {
                         new_schema.props_auto_promotion.enabled =
@@ -1824,6 +1829,38 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn set_table_option_refuses_reserved_keys_in_any_case() {
+        let schema = base_schema();
+        let set = |key: &str| {
+            apply_evolution(
+                &schema,
+                &CatalogSchemaEvolution {
+                    changes: vec![SchemaChange::SetTableOption {
+                        key: key.to_string(),
+                        value: "x".to_string(),
+                    }],
+                },
+            )
+        };
+        for key in [
+            "owner",
+            "OWNER",
+            "tags",
+            "Tags",
+            "collection.id",
+            "Asset.Kind",
+            "vector.dimension",
+        ] {
+            assert!(set(key).is_err(), "{key} must be refused");
+        }
+        let evolved = set("custom_option").expect("ordinary option");
+        assert_eq!(
+            evolved.properties.get("custom_option").map(String::as_str),
+            Some("x")
+        );
     }
 
     #[test]

@@ -549,7 +549,7 @@ async fn execute_pgvector_plan(
             matches!(column, PgVectorOutputColumn::Metadata { source, .. } if source.eq_ignore_ascii_case("metadata"))
         }))
         .then_some(requested_metadata.as_slice());
-        match dml
+        let exact = match dml
             .search_table_vectors_exact(
                 &plan.search.collection,
                 vector_column,
@@ -563,8 +563,16 @@ async fn execute_pgvector_plan(
                 &controls,
             )
             .await
-            .map_err(|error| format!("catalog-table vector search failed: {error}"))?
         {
+            // A catalog entry this tenant may not see is no catalog table for
+            // it: fall through to the collection path, which answers exactly
+            // as for a name that does not exist.
+            Err(error) if proximadb_catalog::TableNotVisible::is(&error) => None,
+            other => {
+                other.map_err(|error| format!("catalog-table vector search failed: {error}"))?
+            }
+        };
+        match exact {
             Some(results) => results,
             None => vector_ops
                 .unified_search_native(&plan.search, identity)

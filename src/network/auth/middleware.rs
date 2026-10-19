@@ -482,6 +482,10 @@ fn determine_required_permission(method: &str, path: &str) -> Option<Permission>
             Some(Permission::ExecuteSqlQueries)
         }
 
+        // Operational metrics (Prometheus scrape, JSON metrics): they carry
+        // every tenant's series, so they are an operator surface.
+        path if path.starts_with("/metrics") => Some(Permission::ViewSystemMetrics),
+
         // System endpoints
         path if path.starts_with("/system") => match method {
             "GET" => {
@@ -1044,6 +1048,15 @@ mod tests {
             determine_required_permission("POST", "/system/config"),
             Some(Permission::ConfigureSystem)
         );
+
+        // Operational metrics carry every tenant's series: operator-only.
+        for path in ["/metrics/prometheus", "/metrics/json", "/metrics"] {
+            assert_eq!(
+                determine_required_permission("GET", path),
+                Some(Permission::ViewSystemMetrics),
+                "{path}"
+            );
+        }
     }
 
     #[test]

@@ -49,6 +49,7 @@ pub use proximadb_network_middleware::cors;
 pub mod metrics;
 pub use proximadb_network_middleware::rate_limit;
 pub mod request_id;
+pub mod request_scope;
 pub mod tenant;
 pub use proximadb_network_middleware::timeout;
 pub mod tls;

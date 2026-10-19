@@ -118,6 +118,10 @@ pub struct ExternalCollection {
     pub updated_at_ms: i64,
     /// Failure detail when `status == Failed`.
     pub error: Option<String>,
+    /// The tenant that registered it (`None` = the default tenant). Only that
+    /// tenant sees or operates on it.
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 impl ExternalCollection {
@@ -133,7 +137,13 @@ impl ExternalCollection {
             created_at_ms: now,
             updated_at_ms: now,
             error: None,
+            tenant: None,
         }
+    }
+
+    /// Whether a request acting as `tenant` may see this collection.
+    pub fn visible_to(&self, tenant: &str) -> bool {
+        proximadb_tenant::resolve_request_tenant(self.tenant.as_deref()) == tenant
     }
 
     /// Whether the collection has a built, queryable index.
