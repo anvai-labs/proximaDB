@@ -184,11 +184,36 @@ fn avro_header_entries(buf: &[u8]) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, usize), S
 }
 
 /// Re-encode `container`'s header with `avro.schema` set to `schema_json` verbatim.
-fn with_verbatim_schema(container: Vec<u8>, schema_json: &str) -> Result<Vec<u8>, StorageError> {
+///
+/// apache-avro writes no header at all when nothing was appended (an empty
+/// manifest), so an empty `container` gets a fresh header — `avro.schema`,
+/// `avro.codec` = `null`, `user_metadata` and a new sync marker — with no data
+/// blocks, which is a valid, empty Avro object container.
+fn with_verbatim_schema(
+    container: Vec<u8>,
+    schema_json: &str,
+    user_metadata: &[(String, String)],
+) -> Result<Vec<u8>, StorageError> {
     let compact = serde_json::from_str::<serde_json::Value>(schema_json)
         .map_err(|e| ser_err("avro header schema", e))?
         .to_string();
-    let (entries, body_start) = avro_header_entries(&container)?;
+    let empty_body;
+    let (entries, body): (Vec<(Vec<u8>, Vec<u8>)>, &[u8]) = if container.is_empty() {
+        let mut entries = vec![
+            (b"avro.schema".to_vec(), Vec::new()),
+            (b"avro.codec".to_vec(), b"null".to_vec()),
+        ];
+        entries.extend(
+            user_metadata
+                .iter()
+                .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec())),
+        );
+        empty_body = uuid::Uuid::new_v4().into_bytes();
+        (entries, &empty_body[..])
+    } else {
+        let (entries, body_start) = avro_header_entries(&container)?;
+        (entries, &container[body_start..])
+    };
     let mut out = Vec::with_capacity(container.len() + compact.len());
     out.extend_from_slice(AVRO_MAGIC);
     write_avro_long(&mut out, entries.len() as i64);
@@ -204,7 +229,7 @@ fn with_verbatim_schema(container: Vec<u8>, schema_json: &str) -> Result<Vec<u8>
         out.extend_from_slice(value);
     }
     write_avro_long(&mut out, 0);
-    out.extend_from_slice(&container[body_start..]);
+    out.extend_from_slice(body);
     Ok(out)
 }
 
@@ -428,19 +453,25 @@ pub fn write_manifest(
     let schema =
         Schema::parse_str(MANIFEST_SCHEMA_JSON).map_err(|e| ser_err("parse manifest schema", e))?;
     let mut writer = Writer::new(&schema, Vec::new());
-    if let Some(h) = header {
-        for (k, v) in [
-            ("schema", h.schema_json.to_string()),
-            ("schema-id", "0".to_string()),
-            ("partition-spec", "[]".to_string()),
-            ("partition-spec-id", "0".to_string()),
-            ("format-version", h.format_version.as_i32().to_string()),
-            ("content", "data".to_string()),
-        ] {
-            writer
-                .add_user_metadata(k.to_string(), v)
-                .map_err(|e| ser_err("manifest header metadata", e))?;
-        }
+    let user_metadata: Vec<(String, String)> = header
+        .map(|h| {
+            vec![
+                ("schema".to_string(), h.schema_json.to_string()),
+                ("schema-id".to_string(), "0".to_string()),
+                ("partition-spec".to_string(), "[]".to_string()),
+                ("partition-spec-id".to_string(), "0".to_string()),
+                (
+                    "format-version".to_string(),
+                    h.format_version.as_i32().to_string(),
+                ),
+                ("content".to_string(), "data".to_string()),
+            ]
+        })
+        .unwrap_or_default();
+    for (k, v) in &user_metadata {
+        writer
+            .add_user_metadata(k.clone(), v)
+            .map_err(|e| ser_err("manifest header metadata", e))?;
     }
     for f in files {
         let entry = AvroManifestEntry {
@@ -469,7 +500,7 @@ pub fn write_manifest(
     let container = writer
         .into_inner()
         .map_err(|e| ser_err("finish manifest", e))?;
-    with_verbatim_schema(container, MANIFEST_SCHEMA_JSON)
+    with_verbatim_schema(container, MANIFEST_SCHEMA_JSON, &user_metadata)
 }
 
 /// Read an Iceberg v2 manifest Avro back into the data-file list.
@@ -527,7 +558,7 @@ pub fn write_manifest_list(manifests: &[ManifestFileMeta]) -> Result<Vec<u8>, St
     let container = writer
         .into_inner()
         .map_err(|e| ser_err("finish manifest list", e))?;
-    with_verbatim_schema(container, MANIFEST_LIST_SCHEMA_JSON)
+    with_verbatim_schema(container, MANIFEST_LIST_SCHEMA_JSON, &[])
 }
 
 /// Read an Iceberg v2 manifest list back into its entries.
@@ -994,6 +1025,30 @@ mod tests {
             read_manifest(&write_manifest(&files(), 9, None).unwrap()).unwrap(),
             files()
         );
+    }
+
+    /// A snapshot with no data files still writes valid, readable (empty) Avro
+    /// containers — apache-avro alone emits zero bytes here.
+    #[test]
+    fn empty_manifest_and_list_are_valid_avro() {
+        let schema = schema_json(&two_fields()).to_string();
+        let manifest = write_manifest(
+            &[],
+            1,
+            Some(&ManifestHeader {
+                schema_json: &schema,
+                format_version: FormatVersion::V2,
+            }),
+        )
+        .unwrap();
+        assert!(read_manifest(&manifest).unwrap().is_empty());
+        let reader = Reader::new(&manifest[..]).unwrap();
+        assert_eq!(
+            reader.user_metadata().get("format-version").map(|v| &v[..]),
+            Some(&b"2"[..])
+        );
+        let list = write_manifest_list(&[]).unwrap();
+        assert!(read_manifest_list(&list).unwrap().is_empty());
     }
 
     #[test]
