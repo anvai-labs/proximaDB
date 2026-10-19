@@ -544,12 +544,13 @@ impl SstEngine {
         // the in-block RaBitQ cascade below (mixed-read). Any I/O error / `None`
         // also falls through (safe degradation, never an incorrect result).
         //
-        // Filtered queries: with the ADR-089 P1 gate ON, a Stage-F metadata
-        // pre-scan builds a row allow-set and the cascade ranks ONLY matching
-        // rows (row-accurate — same `evaluate_filter_proxima` semantics as the
-        // exact path). Gate OFF (default), a non-coalesced segment, or any
+        // Filtered queries: with the ADR-089 P1 gate ON (the default), a
+        // Stage-F metadata pre-scan builds a row allow-set and the cascade
+        // ranks ONLY matching rows (row-accurate — same `evaluate_filter_proxima`
+        // semantics as the exact path). Gate OFF (kill-switch
+        // `PROXIMADB_PAX_FILTERED_CASCADE=0`), a non-coalesced segment, or any
         // stage-F failure routes the filtered query past the cascade to the
-        // exact materialize-and-rank path below, exactly as before.
+        // exact materialize-and-rank path below.
         {
             use crate::storage::engines::sst::segment_format::{
                 pax_filtered_cascade_enabled, pax_filtered_row_allow,
@@ -558,7 +559,8 @@ impl SstEngine {
             // ADR-089 / TD-FPRUNE-1 P1: a filtered query builds a predicate
             // row allow-set from the Region-D metadata (Stage F) and runs the
             // cascade restricted to matching rows — instead of declining into
-            // the whole-object exact scan. Default-OFF env gate; any stage-F
+            // the whole-object exact scan. Default-ON env gate (flipped
+            // 2026-08-31, see `pax_filtered_cascade_enabled`); any stage-F
             // failure or a non-coalesced segment falls back to the exact path
             // (fail-safe, never an incorrect result).
             let row_allow = match filter_expression {

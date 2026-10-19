@@ -416,22 +416,38 @@ impl RelationalPredicateTree {
 /// primitive type name for the published `TableMetadata` schema. Kept in lock-step with
 /// the Parquet physical types so an external Iceberg reader's schema matches the file.
 /// Timestamps map to the v3 nanosecond types (ProximaDB is nanosecond-native).
-fn iceberg_type_for(arrow: &arrow_schema::DataType) -> &'static str {
-    use arrow_schema::DataType as D;
+fn iceberg_type_for(arrow: &arrow_schema::DataType) -> String {
+    use arrow_schema::{DataType as D, TimeUnit};
     match arrow {
-        D::Boolean => "boolean",
-        D::Int8 | D::Int16 | D::Int32 => "int",
-        D::Int64 | D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64 => "long",
-        D::Float16 | D::Float32 => "float",
-        D::Float64 => "double",
-        D::Date32 | D::Date64 => "date",
-        D::Timestamp(_, Some(_)) => "timestamptz_ns",
-        D::Timestamp(_, None) => "timestamp_ns",
-        D::Utf8 | D::LargeUtf8 => "string",
-        D::Binary | D::LargeBinary | D::FixedSizeBinary(_) => "binary",
+        D::Boolean => "boolean".into(),
+        D::Int8 | D::Int16 | D::Int32 => "int".into(),
+        D::Int64 | D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64 => "long".into(),
+        D::Float16 | D::Float32 => "float".into(),
+        D::Float64 => "double".into(),
+        D::Date32 | D::Date64 => "date".into(),
+        D::Decimal128(p, s) | D::Decimal256(p, s) => format!("decimal({p},{s})"),
+        // Iceberg's v2 `timestamp` is microseconds; nanoseconds need v3's `_ns` types
+        // (see `iceberg_format_version_for`).
+        D::Timestamp(TimeUnit::Nanosecond, Some(_)) => "timestamptz_ns".into(),
+        D::Timestamp(TimeUnit::Nanosecond, None) => "timestamp_ns".into(),
+        D::Timestamp(_, Some(_)) => "timestamptz".into(),
+        D::Timestamp(_, None) => "timestamp".into(),
+        D::Utf8 | D::LargeUtf8 => "string".into(),
+        D::FixedSizeBinary(n) => format!("fixed[{n}]"),
+        D::Binary | D::LargeBinary => "binary".into(),
         // JSON columns materialize as Utf8 today; v3 `variant` is a follow-up.
-        _ => "string",
+        _ => "string".into(),
     }
+}
+
+/// ADR-097 D3: publish Iceberg **v2** — the version external readers (PyIceberg,
+/// DuckDB, Trino) verifiably read — unless a column needs a v3-only type
+/// (nanosecond timestamps). v3 deletion vectors / row lineage / `variant` follow
+/// once an external v3 reader is in the read-back gate.
+fn iceberg_needs_v3(
+    fields: &[proximadb_storage_common::object_store_bridge::IcebergSnapshotField],
+) -> bool {
+    fields.iter().any(|f| f.type_name.ends_with("_ns"))
 }
 
 /// A stable, well-formed UUID string derived deterministically from the table's object
@@ -2515,7 +2531,7 @@ impl DmlService {
             &records,
         );
 
-        // 6. Best-effort: also publish a spec-shaped Iceberg snapshot (v3) — Avro manifest
+        // 6. Best-effort: also publish a spec-shaped Iceberg snapshot (v2) — Avro manifest
         //    + manifest list + TableMetadata under `{prefix}/metadata` — so EXTERNAL Iceberg
         //    engines (Spark/Trino/DuckDB/PyIceberg) can read the table. This is purely
         //    additive interop: ProximaDB's own SELECT path reads via the catalog storage
@@ -2531,7 +2547,7 @@ impl DmlService {
                 |(i, f)| proximadb_storage_common::object_store_bridge::IcebergSnapshotField {
                     id: (i + 1) as i32,
                     name: f.name().clone(),
-                    type_name: iceberg_type_for(f.data_type()).to_string(),
+                    type_name: iceberg_type_for(f.data_type()),
                     required: !f.is_nullable(),
                 },
             )
@@ -2543,16 +2559,20 @@ impl DmlService {
         let table_uuid = deterministic_table_uuid(&prefix);
         let data_prefix = object_store::path::Path::from(format!("{prefix}/data"));
         let metadata_prefix = format!("{prefix}/metadata");
+        // The Iceberg table `location` is the table ROOT (`data/` and `metadata/` are
+        // its children), unlike the catalog layout location above, which is the
+        // directory of immediate parquet files.
+        let table_root = format!("{}/{prefix}", warehouse_root_url.trim_end_matches('/'));
         if let Err(e) = bridge
             .publish_iceberg_table(
                 &data_prefix,
                 &metadata_prefix,
                 &table_uuid,
-                &location,
+                &table_root,
                 &iceberg_fields,
                 now_ms, // snapshot id (unique per materialize)
                 now_ms, // timestamp ms
-                true,   // v3 (ProximaDB default)
+                iceberg_needs_v3(&iceberg_fields),
             )
             .await
         {
@@ -7000,11 +7020,27 @@ impl DmlService {
                     })
                     .unwrap_or(ProximaValue::Null)
             }),
-            ProximaType::Decimal { .. } => {
+            ProximaType::Decimal { precision, scale } => {
                 if matches!(val, SqlValueLiteral::Null) && column.nullable {
                     return Ok(ProximaValue::Null);
                 }
-                self.literal_to_string(val).map(ProximaValue::Decimal)
+                // Store the canonical text at the declared scale (`12.5` →
+                // `12.50` for DECIMAL(10,2)) so every read path — pgwire rows,
+                // Parquet `Decimal128`, Iceberg — agrees, and reject a value
+                // that is not a number or overflows the declared precision.
+                // Numeric literals reach here as f64 (exact to 15 significant
+                // digits; TD-SEAM-1 residual for wider decimals).
+                let text = self.literal_to_string(val)?;
+                proximadb_storage_common::proxima_arrow::canonical_decimal_text(
+                    &text, *precision, *scale,
+                )
+                .map(ProximaValue::Decimal)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "value '{text}' for column '{column_name}' is not a valid \
+                         DECIMAL({precision},{scale})"
+                    )
+                })
             }
             ProximaType::SparseVector { .. } => Err(anyhow!(
                 "Sparse vector DML literal lowering is not implemented for column '{}'",

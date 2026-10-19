@@ -46,6 +46,10 @@ Read these in order for future-shaping architecture work:
 4. link:adr/ADR-052-analytics-execution-competitiveness-codesign.adoc[ADR-052] and ADR-054 +
    OLAP execution: DataFusion is the executor behind the `ComputeBackend` seam; native operators
    exist only as ADR-054's default-off, ledger-gated plane.
+   link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097] amends both: DataFusion
+   `LogicalPlan` is the single logical IR and native operators plug in as `ExecutionPlan` adapters;
+   the seams S1–S9 are the contracts every modality plugs into (design:
+   link:LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10]).
 5. link:adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc[ADR-095] +
    Postgres-compatible OLTP: reattachable WAL volume, writer-epoch fencing, transactions.
 
@@ -177,6 +181,13 @@ Active blueprints, continuing the reading order:
    per-surface fusion is *incorrect by construction* (cosine≈Gaussian vs graph≈power-law need PIT
    calibration only the shared `Fuser` provides). Resolves where `EntityService.SearchEntities` (PR
    #278) fits: entity-typed view over the seam, no standalone vector-ANN. Adds TD-146.
+
+25. link:LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] +
+   Accepted direction (owner decision 2026-10-18; implementation Open): thought experiments
+   TE-1..TE-9, the foundational seams S1–S9 (identity, durable WAL, Layer A landing, one Iceberg
+   writer, streaming scan providers, one logical IR, index projections, cost, governance), the
+   vector-tier comparison against turbopuffer / memory HNSW / AXIS IVF with the round-trip-depth
+   plan, and phases P0–P6 with gates. Decisions in ADR-097; tracked by TD-SEAM-1..11.
 
 == Stable Reference Docs
 

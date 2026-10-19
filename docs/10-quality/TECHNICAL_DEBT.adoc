@@ -235,6 +235,50 @@ Co-design D1/D3 work — the dominant cloud-DB cost term. See `PROXIMADB_AS_LAKE
 | Service-layer tenant validation is **inert in production** — `*_with_tenant_context` guards on `tenant_manager.is_some()` but nothing calls `with_tenant_manager`, so every request falls through unscoped (and a per-query predicate is the wrong mechanism). *Foundation + REST config slice landed:* `proximadb_tenant::TenantDeploymentMode` + `resolve_request_tenant_for_mode` define the explicit `SingleTenant{default}` vs `MultiTenant` fail-closed contract; `[server.tenant] mode = "single_tenant"|"multi_tenant"` now resolves at startup (with compatibility `auto`), and REST derives `TenantExtractorConfig` from that mode while validating resolved tenant ids structurally before handlers see them. Residual: wire the same resolved mode through gRPC/pgwire/Flight; `MultiTenant` rejects missing tenants everywhere, `SingleTenant` injects the configured default; then retire the inert predicate. See ADR-032.
 |===
 
+=== C2. Lakehouse Seams (ADR-097)
+
+Phased work from link:../12-design/LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10]
+(seams S1–S9, phases P1–P5) under link:../12-design/adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097].
+Filed 2026-10-18 as one row each; the design doc holds the detail, gates and file:line evidence.
+
+[cols="1,3,1,1,1,1,5", options="header"]
+|===
+| ID | Area | Pri | Status | Dim | Pillar | Notes
+
+| TD-SEAM-1 | Iceberg single writer + external read-back gate (S4, P1) | HIGH | In Progress | D1,D5 | REL
+| `proximadb-iceberg-engine` becomes the only Iceberg writer (spec fixes: absolute URIs, Avro header metadata, parent ids, sequence numbers, append/overwrite; format v2); REST `load_table` serves the writer's `metadata.json` verbatim for published tables. *Landed (slice 1):* writer spec fixes + Parquet field ids + name mapping + Avro headers that keep Iceberg `field-id`s (apache-avro drops them); DECIMAL end to end (DDL keeps the declared precision/scale instead of the `Decimal(38,10)` placeholder, exact `Decimal128` materialization and read-back, Iceberg `decimal(p,s)` bounds); v2 unless a column needs a v3-only type; REST prefers engine metadata (`engine_published_metadata`); gate `tests/iceberg_interop_e2e.rs` (pyiceberg REST + static, DuckDB) values equal pgwire across two snapshots, required in CI's storage lane. *Open (slice 2):* the DataFusion bulk-append `_manifests` tree (`table_write_executor.rs`) still publishes through the legacy path with synthesized, unresolvable manifest-list URLs — move it onto `publish_iceberg_snapshot`; nested/list columns still map to `string`. Seams doc §6 P1.
+
+| TD-SEAM-2 | Segmented canonical WAL + truncation (S2, P2) | HIGH | Open | D1,D3 | REL
+| Rotation + per-collection sparse index in `FramedTableWalAppender`; range-read `read_changes_since`; first `serde(default)` field; truncation only at `min_unflushed_lsn` (TD-USUB-1 slice 2b; non-spill `Ok(None)` = refuse; TD-066 crash matrix). Today the table WAL is never truncated. Seams doc §6 P2.
+
+| TD-SEAM-3 | Layer A production wiring with `ParquetWritePolicy` + system columns (S1/S3, P2) | HIGH | Open | D1,D5 | REL
+| `new_spilling` at both production sites (`shared_services.rs`, `multi_server.rs`); spill encoder uses `ParquetWritePolicy`, the catalog schema and `__proxima_*` columns; obligation drain; shutdown `flush_partitions()`; `""` tenant spills. Builds on TD-USUB-1/11. Seams doc §6 P2.
+
+| TD-SEAM-4 | Streaming MATERIALIZE / incremental publisher (S4, P2) | HIGH | Open | D1,D3 | REL
+| Multi-part, bounded-memory publication with fenced snapshot advance; insert-vs-update by probing published key stats/SBBF, not WAL history; keep the real `oid`. Gate: TPC-DS SF1 loads on a release build without OOM, peak RSS recorded. Links link:td/TD-OLAPFMT-3-incremental-parquet-publication.adoc[TD-OLAPFMT-3], link:td/TD-USUB-10-incremental-publication-before-any-automation.adoc[TD-USUB-10] (slices 1–3). Seams doc §6 P2.
+
+| TD-SEAM-5 | Streaming `LayerATableProvider` + `PaxTableProvider` wiring (S5/S9, P3) | HIGH | Open | D4,D5 | PERF
+| Streaming provider over `scan_table_relational` with pushdown, ABAC and WAL-tail union, replacing `MemTable` + 1M cap; wire `PaxTableProvider` into `prepare_dataframe` / `route_select_inner`; UDTF-only queries to DataFusion; SBBF probe for join runtime filters. Gate: `native_table_capability_parity_e2e` green. Seams doc §6 P3.
+
+| TD-SEAM-6 | `FilteredAnnExec` with filter/limit/dynamic-filter pushdown, returns `oid` (S6, P3) | HIGH | Open | D4,D1 | PERF
+| Replaces the eager `VectorSearchTableProvider`; `supports_filters_pushdown` via `lower_vector_filter`, `limit`, dynamic-filter absorb; emits `oid`/metric/score; `Sort(distance)+Limit → ANN` rule. Re-homes TD-OLAP-13's vector operator (premise superseded by ADR-097 D1). Gates: `filtered_ann_recall_bands` ≥ 0.95 per band; TE-1 over pgwire with pushed filters in `EXPLAIN`. Seams doc §6 P3.
+
+| TD-SEAM-7 | Observability onto the canonical WAL + time-partitioned Layer A (S2/S3, P4) | MED | Open | D1,D3 | OE
+| Route `ObservabilityStorage` writes through `TableWalAppender`; time-partitioned Layer A, Iceberg `day/hour(ts)` partitions, retention = `RecordPartitionDrop` + snapshot expiry; `ObsTimeTable` provider. Gate: TE-3 at 50k rows/s, freshness ≤ 2 s, release build. Seams doc §6 P4.
+
+| TD-SEAM-8 | Graph `RecordUpsert` emission + edges table; ORION as a projection (S2/S7, P4) | MED | Open | D1,D4 | REL
+| Emit `RecordUpsert` for nodes/edges before ORION apply; edges table sorted `(src,label,dst)`; ORION CSR rebuilt from it at `checkpoint_lsn`; `graph_traverse` → `GraphExpandExec` returning `oid`. Gate: TD-XMODAL-10 pgwire reachability test. Seams doc §6 P4.
+
+| TD-SEAM-9 | Cross-modal subject delete (S1/S4, P4) | MED | Open | D5,D1 | SEC
+| `subject` system column; Iceberg v2 position deletes; deletion vectors on the PAX cascade. Gate: one delete removes the subject from every modality and from the next published snapshot (TE-4). Seams doc §6 P4.
+
+| TD-SEAM-10 | PAX collection-global centroid directory + cluster-contiguous compaction (S7, P5b) | MED | Open | D1,D3 | COST
+| `centroids.pax` per collection snapshot as an S7 projection; compaction co-locates each cluster's RaBitQ (A) + SQ8 (B) bytes so nprobe costs one parallel wave. Retires the AXIS IVF disk path (ADR-097 D2). Gate: SIFT1M on MinIO with injected latency ≤ 3 waves, ≤ 20 GET/q, recall ≥ 0.98; BIGANN 10M re-measured. Seams doc §5, §6 P5.
+
+| TD-SEAM-11 | P5a vector quick fixes: engine default, `.pax` vector count, L2 cache default (S8, P5a) | HIGH | Open | D4,D3 | PERF
+| Engine default → SST/PAX, not HELIX (TD-ENGSEL-1); `segment_vector_count` for `.pax` (returns 0 today, so Adaptive never picks exact, `sst/search/mod.rs:318-353`); local-disk L2 cache on by default when a scratch volume is configured (ADR-085). Seams doc §5, §6 P5.
+|===
+
 === D. Elastic Compute / Scale-to-Zero / Continuous Discovery
 
 `VECTOR_LAKEBASE_ALIGNMENT_2026_05_28.adoc` R1/R4 — "resources follow the data".

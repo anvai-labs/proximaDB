@@ -109,3 +109,100 @@ async fn ensure_table_metadata_materializes_history_from_manifest_log() {
         .expect("ensure 3");
     assert_eq!(again.table_uuid, md.table_uuid);
 }
+
+/// ADR-097 D3: a table whose published Parquet layout was written by the Iceberg
+/// engine (MATERIALIZE) is served from the engine's own `metadata.json`, verbatim,
+/// with an absolute `metadata-location` — not from the synthesized `_manifests`
+/// tree, whose manifest-list URLs do not resolve.
+#[tokio::test]
+async fn load_table_serves_engine_published_metadata_verbatim() {
+    use proximadb_catalog::{CatalogAuthorityMode, CatalogPhysicalFormat, CatalogStorageLayout};
+    use proximadb_iceberg_engine::iceberg::{FormatVersion, IcebergField};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = format!("file://{}", dir.path().display());
+    let table_root = format!("{root}/t/ns/events");
+    let engine = IcebergObjectStoreBridge::from_url(&root).expect("bridge");
+    let fields = vec![IcebergField {
+        id: 1,
+        name: "id".into(),
+        type_name: "string".into(),
+        required: false,
+    }];
+    for snapshot_id in [41, 42] {
+        engine
+            .publish_iceberg_snapshot(
+                &BridgeObjectPath::from("t/ns/events/data"),
+                "t/ns/events/metadata",
+                "uuid-events",
+                &table_root,
+                &fields,
+                snapshot_id,
+                1_700_000_000_000 + snapshot_id,
+                FormatVersion::V2,
+            )
+            .await
+            .expect("publish");
+    }
+
+    let svc = IcebergRestService::new(
+        Arc::new(CatalogManager::new()),
+        "wh",
+        "grpc://localhost:5680",
+        "http://localhost:5678/iceberg/v1",
+    );
+    let mut schema = CatalogTableSchema::new("events").with_column(CatalogColumn::new(
+        1,
+        "id",
+        ProximaType::String,
+    ));
+    schema.storage_layouts = vec![CatalogStorageLayout {
+        name: "parquet-snapshot".to_string(),
+        authority: CatalogAuthorityMode::ProjectionPublication,
+        physical_format: CatalogPhysicalFormat::Parquet,
+        location: Some(format!("{table_root}/data")),
+        ..Default::default()
+    }];
+    let id = TableIdentifier::new(vec!["default".to_string()], "events".to_string());
+
+    let (md, location) = svc
+        .ensure_table_metadata(&id, &schema)
+        .await
+        .expect("ensure");
+    assert_eq!(
+        location,
+        engine.metadata_file_uri("t/ns/events/metadata", 1),
+        "metadata-location is the engine's latest metadata file"
+    );
+    assert_eq!(md.location, table_root);
+    assert_eq!(md.current_snapshot_id, Some(42));
+    assert_eq!(md.snapshots.len(), 1);
+    assert_eq!(md.snapshots[0].parent_snapshot_id, Some(41));
+    assert!(
+        md.snapshots[0].manifest_list.starts_with(&table_root),
+        "manifest list is an absolute URI under the table: {}",
+        md.snapshots[0].manifest_list
+    );
+    assert_eq!(
+        md.extra.get("last-sequence-number"),
+        Some(&serde_json::json!(2)),
+        "spec-required fields the REST struct does not model survive"
+    );
+    assert!(
+        md.properties.contains_key("schema.name-mapping.default"),
+        "name mapping is served for field-id-less Parquet"
+    );
+
+    // Serialized response round-trips the engine document (no fields dropped).
+    let served = serde_json::to_value(&md).unwrap();
+    let written: serde_json::Value = serde_json::from_slice(
+        &engine
+            .read_table_metadata("t/ns/events/metadata", 1)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    for key in written.as_object().unwrap().keys() {
+        assert!(served.get(key).is_some(), "served metadata lost `{key}`");
+    }
+}

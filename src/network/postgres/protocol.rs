@@ -3413,7 +3413,7 @@ impl PostgresProtocol {
         for row in &result.rows {
             let cells: Vec<Option<String>> = row
                 .iter()
-                .map(super::relational_pipeline::text_encode)
+                .map(super::relational_pipeline::wire_text)
                 .collect();
             self.send_data_row_nullable(&cells).await?;
         }
@@ -4810,7 +4810,7 @@ impl PostgresProtocol {
             // legacy simple-query encoder.
             let values = row
                 .iter()
-                .map(super::relational_pipeline::text_encode)
+                .map(super::relational_pipeline::wire_text)
                 .collect::<Vec<_>>();
             self.send_data_row_nullable(&values).await?;
             rows_sent += 1;
@@ -7242,7 +7242,7 @@ impl PostgresProtocol {
             let mut offsets: Vec<usize> = Vec::with_capacity(end - start + 1);
             offsets.push(0);
             for row in &state.result.rows[start..end] {
-                page.extend(row.iter().map(super::relational_pipeline::text_encode));
+                page.extend(row.iter().map(super::relational_pipeline::wire_text));
                 offsets.push(page.len());
             }
             state.next_row = end;
