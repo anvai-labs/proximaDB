@@ -58,7 +58,7 @@ it is also the precondition for ≤3 waves.
 | 4 | **Cell-addressed layout v2.** The A0 cell directory addresses rows (no row-ordinal stride arithmetic), which allows interleaved `[A_c\|B_c\|ids_c\|fcodes_c]` runs. A co-location rule decides interleaved vs split per collection. | Med-High (−1 wave) | M | ★★★★ | P4, P1, P7
 | 5 | **Reader mechanics.** Make bounded wave issuance default-ON, add hedged GETs for ranges ≤4 MiB, and (split layout) speculatively prefetch Region D for the top `2k` RaBitQ candidates in the survivor-B wave. | Med (p99, −1 wave) | S | ★★★★ | P9
 | 6 | Interim fix: make `segment_vector_count` and the rebuild checks read footers in parallel, using `read_coalesced_segment_footer` instead of whole-object reads. | Med | S | ★★★ | P2
-| 7 | Exact-authority rule. Persist `fp16` canonical precision as fp16 (Region C), make WAL truncation conditional on exact authority, and place Region C as a cold tail. | Med (correctness, $) | S-M | ★★★ | P5
+| 7 | Exact-authority rule. Make **fp16 the default exact tier** (cold Region C, fp32 opt-in, declared fp16 stored as fp16), make WAL truncation conditional on exact authority, and define "exact" as exact over the stored precision. Gated on E10. | Med-High (correctness, bytes/q) | S-M | ★★★★ | P5
 | 8 | Per-cluster filter summaries plus in-run filter codes, so Stage F stops reading all of Region D. | High for filtered | M | ★★★ | P7
 | 9 | Per-cluster live counts and DVs in the manifest. Inflate the pool by `1/(1−d)` and compact at cluster granularity. | Med | M | ★★ | P6, P3
 | 10 | Cluster-run cache keys and W-TinyLFU admission for Region-B and Region-D cache entries. | Med (warm) | S | ★★ | P8
@@ -548,9 +548,39 @@ in-repo bake-off rejected new lossy tiers: SQ6, TurboQuant4 and RaBitQ4 reached 
   1.5 MB at 500 × 768. The expected effect is a tighter estimator and a smaller error-bound pool.
   Gate it on E5. `ParameterScope::ClusterRun` already exists in the descriptor enum
   (`segment_layout.rs`:392-398).
-. **Default exact tier.** Keep it opt-in, but make `canonical_embedding_precision` *required* at
-  collection creation, with an explicit `lossy_ok`. Today `Unspecified` silently means "no exact"
-  (`flush/mod.rs`:1473-1476; TD-READFID-1).
+. **Default exact tier: fp16 (owner direction 2026-10-19, gated on E10).** Persist an exact tier
+  by default, as **fp16** in the cold Region C. fp32 stays an opt-in: declared `fp32` precision
+  or `pax_f32_tier`. A declared `fp16` precision is stored as fp16, never re-widened. "Exact
+  search" is defined as exact with respect to the *stored* precision. `lossy_ok` stays available
+  for collections that want RaBitQ+SQ8 only (TD-PAXPREC-1). Today `Unspecified` silently means
+  "no exact copy at all" (`flush/mod.rs`:1473-1476; TD-READFID-1), and declared fp16 is rounded
+  and then written as f32: the worst of both.
++
+*Why fp16 and not fp32 by default.*
++
+** *Accuracy.* fp16 keeps an 11-bit significand, so relative error is ≤ 2^-11 ≈ 4.9e-4.
+   Normalized embedding components in [-1, 1] lose nothing meaningful. Cosine and dot shift by
+   about 1e-4 to 1e-3, below the embedding models' own noise, and recall@10 deltas are typically
+   ≤ 0.5%, often 0. bf16 (8-bit significand, about 0.4%) is the weaker choice for this tier.
+** *Failure modes.*
+*** Unnormalized vectors above 65,504 overflow. Detect at ingest and fall back to fp32 per
+    collection.
+*** Near-tie ranking can flip.
+*** Bit-exact round trips (audit, hashing) need fp32.
+*** fp16 accumulation must not be used: compute in fp32 accumulators, which is standard.
+** *Market practice.* fp32 is still the common default copy, but a half-precision option is
+   standard:
+*** pgvector `halfvec`;
+*** Milvus `FLOAT16_VECTOR` / `BFLOAT16_VECTOR`;
+*** Qdrant `datatype: float16` with originals on disk for rescoring;
+*** Elasticsearch quantizes by default and keeps raw floats for rescoring;
+*** turbopuffer and LanceDB support fp16.
++
+The prevailing pattern is "a full-precision copy on cheap storage, plus a compressed search tier".
+fp16 as that copy halves it.
+** *Cost (1M×768).* fp32 3.07 GB vs fp16 1.54 GB. At $0.023/GB-month the storage difference is
+   small ($0.07 vs $0.035). The lever is **bytes per query**: rerank and rehydration reads halve,
+   which is the ADR-033 axis.
 
 *Risks.* Per-cluster parameters couple the quantizer to the clustering, so a retrain re-encodes
 the data. That is acceptable, because rewrites already re-encode (ADR-062 D8: regenerate
@@ -847,6 +877,7 @@ bytes ingested), compaction wall time and RSS, and manifest and directory size.
 | E6 (TE-P3, P6) | 10M×768 ingest: pairwise leveled vs base+delta(α=1); trickle 10 vec/s for 24 h; deletes at 2%/day | WA ≤ 4; live searchable segments ≤ 5 at all times; recall ≥ 0.98 at 14% dead with pool inflation; no lost rows (row accounting)
 | E7 (TE-P7) | Corridor harness at 1M: 2% and 0.1% selectivity; allow-set join of 5k OIDs | Filtered waves ≤ 3; MB/q ≤ 2× unfiltered; recall@10 ≥ 0.98; p50 ≤ 5× Qdrant at 1M (from 38× at 80k)
 | E8 (TE-P8) | Warm tier with cluster-run keys + TinyLFU vs byte-range keys; 1M and 10M diverse queries | Warm p50 ≤ 15 ms at 1M and ≤ 30 ms at 10M; NVMe hit ≥ 80% after warm-up; restart keeps ≥ 90% of hits
+| E10 (TE-P5) | Exact-tier precision: fp32 vs fp16 vs bf16 Region C on SIFT1M, BIGANN 10M and one 768d text-embedding set (normalized), plus an unnormalized dot-product set. Measure recall@10, top-k set flips vs the fp32 oracle, rerank and rehydration MB/q, and the overflow rate at ingest. | Make fp16 the default **only if** recall@10 drops by ≤ 0.002 absolute and top-10 flips stay ≤ 1% on every normalized set. Rehydration MB/q must fall by ≥ 45%. Overflow must be detected and routed to fp32 with no silent clamping. The unnormalized set reports without a gate.
 | E9 (TE-P9) | Hedge ON/OFF, INFLIGHT default, speculative D on the E4 bed with injected tail (toxiproxy jitter) | p99 −40% at ≤ +5% GETs; identity unchanged; WAVE_SPLIT stays OFF unless its divergence is reproduced and fixed
 |===
 
@@ -856,6 +887,7 @@ bytes ingested), compaction wall time and RSS, and manifest and directory size.
 |===
 | Proposed id | Title — scope
 | TD-PAXMETA-1 (exists) | Collection-level segment facts. Implement via TD-PAXV4-1.
+| TD-PAXPREC-1 (filed) | **Exact-tier precision**: fp16 default exact tier in a cold Region C; fp32 opt-in; declared fp16 persisted as fp16 (not re-widened); "exact" defined over the stored precision; fp16 overflow detection; unknown `canonical_embedding_precision` rejected, not silently ignored. Gated on E10 (TE-P5).
 | TD-PAXV4-1 | **`PXM1` collection manifest as the serving set**: create-only commit, retention, catalog hint, LIST fallback, rebuild from footers; replaces per-query LIST and footer reads (TE-P2).
 | TD-PAXV4-2 | **Header-prefix copy in manifest entries**: skip per-segment W1 when the manifest is present (TE-P2, TE-P1).
 | TD-PAXV4-3 | **Collection-global centroid directory (`PXCD`) + assign-at-flush**: global cluster ids in A0 v2; the TD-SEAM-10 implementation slice (TE-P1, TE-P3).
