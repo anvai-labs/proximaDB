@@ -30,3 +30,16 @@
 * **Acceptance re-run:** campaign re-run where every arm's query-time live set is single-level; object_cold p50 variance between arms of the same pair collapses; the clean-bed reference (2977 ms @100 ms proxy, 356 ms disk) becomes the stable recorded number. Then re-measure the ledger claim `rdstrat13_l3l2_retirement_race` to `fixed` (it is still `status = "measured"`). The harness settle gate may then drop its workaround once the engine guarantees it.
 * **Follow-up:** `L0_recovery_{id}` naming vs `is_tiered_filename`.
 * **Follow-up:** publication moves are themselves delete-sensitive (a transient staging-delete failure fails publication — fail-safe today, retry-worthy later).
+* **Follow-up (found 2026-10-19):** the sidecar is written with `std::fs` to `PathBuf::from(data_url)`. On an object-store deployment (`data_url = s3://…`), the "durable" ledger therefore lands under a LOCAL relative directory named `s3:/…`. It survives a restart only on the same host with the same working directory, and never reaches a replacement container. The fix is to make the ledger generic over `FileSystem` and write it beside the segments; a plain PUT is already atomic on object stores. The Layer A deletion-obligation drain (TD-USUB-1 item i) needs the same change before it reuses this ledger.
+
+== Hardening (2026-10-19)
+
+Found while assessing the ledger for reuse by the Layer A drain:
+
+* **`load_ledger` fails closed.** A missing sidecar is still an empty ledger. Before this, an unreadable or corrupt sidecar also read as empty, so the next `record_pending` wrote a fresh ledger over it and silently discarded every obligation it held. Now it is an error:
+** `record_pending` fails loudly, so the compaction fails, as it already does for an unrecordable obligation.
+** The drain returns the error.
+** The corrupt file is left in place for repair.
+* **`write_ledger` no longer pretends to lock.** Its `let _guard = ledger_lock();` built the lock future and never awaited it, so it took no lock. Every caller already holds the real lock across load, modify and write. The contract is now documented on the function. Awaiting the lock there would deadlock, because the async mutex is not re-entrant.
+* **Boot reload.** The pending set is process memory. After a restart, recorded obligations left the discovery filter until the reconciler's next drain, so superseded inputs served beside the compacted output in the meantime. The first `register_collection_dir` of a dir in a process now loads that dir's sidecar into the set.
+* **Tests:** `a_corrupt_ledger_fails_closed_and_is_not_overwritten`, `first_registration_reloads_recorded_obligations_into_the_filter`.
