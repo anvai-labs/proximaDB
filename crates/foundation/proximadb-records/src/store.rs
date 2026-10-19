@@ -203,15 +203,25 @@ pub trait RecordStore: Send + Sync {
     /// The lowest WAL LSN this store still needs retained — i.e. the minimum LSN
     /// among records it holds that are **not** yet in a durable segment.
     ///
-    /// `None` means "nothing to retain on my account", which is the default for
-    /// every store that does not track LSNs. A caller computing a truncation
-    /// point must treat `None` as *no constraint from this store* and must still
-    /// respect every other store's answer.
+    /// `Ok(None)` means "nothing to retain on my account"; a caller computing a
+    /// truncation point must still respect every other store's answer. `Err`
+    /// means "do not truncate on my account".
+    ///
+    /// **The default refuses.** A store that does not override this tracks no
+    /// LSNs and has no durable segment: its rows exist only in memory, so the
+    /// WAL is their only durable copy. Answering `Ok(None)` ("no constraint")
+    /// would be fail-OPEN — a truncation honouring it discards those rows on
+    /// the next restart (TD-USUB-1 slice 2b: "a non-spill partition must be an
+    /// unconditional refusal"). Only a store that can prove its residents are
+    /// durable elsewhere (today `SpillRecordStorage`) overrides it.
     ///
     /// Deliberately not called `flushed_up_to`: this is a minimum over an
     /// unordered resident set, not a contiguous prefix.
     async fn min_unflushed_lsn(&self) -> RecordStoreResult<Option<u64>> {
-        Ok(None)
+        Err(anyhow::anyhow!(
+            "this record store keeps no durable segments and tracks no WAL LSNs, so the WAL \
+             is the only durable copy of its rows: do not truncate on its account"
+        ))
     }
 
     async fn get_record(&self, key: &RecordKey) -> RecordStoreResult<Option<ProximaRecord>>;
@@ -669,5 +679,30 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// A store that does not override `min_unflushed_lsn` tracks no LSNs and
+    /// keeps no durable segment, so it must REFUSE truncation rather than answer
+    /// "no constraint" — even while empty, since the default cannot tell
+    /// (TD-USUB-1 slice 2b: a non-spill partition is an unconditional refusal).
+    #[tokio::test]
+    async fn default_min_unflushed_lsn_refuses_truncation() {
+        let store = MemoryRecordStore::default();
+        assert!(store.min_unflushed_lsn().await.is_err(), "empty store");
+        store
+            .upsert_record_at_lsn(
+                ProximaRecord {
+                    oid: "r1".to_string(),
+                    ..ProximaRecord::default()
+                },
+                7,
+            )
+            .await
+            .expect("upsert");
+        let err = store
+            .min_unflushed_lsn()
+            .await
+            .expect_err("a store whose rows live only in memory must refuse");
+        assert!(err.to_string().contains("do not truncate"), "got: {err}");
     }
 }
