@@ -1983,8 +1983,18 @@ impl SharedServices {
                         if atomic_commit {
                             appender.enable_atomic_groups();
                         }
+                        // P2.1 (ADR-097 S2): opt-in segment rotation of the shared
+                        // canonical WAL. Off until P2.2 truncation lands and a
+                        // soak passes: an older binary would not read sealed
+                        // segments (downgrade safety, same stance as ADR-095).
+                        let segment_bytes =
+                            crate::services::canonical_wal::canonical_wal_segment_bytes();
+                        if segment_bytes > 0 {
+                            appender.enable_segment_rotation(segment_bytes);
+                        }
                         info!(
                             atomic_commit,
+                            segment_bytes,
                             "✅ SharedServices: canonical WAL appender opened at {} (shared by graph checkpoint emission + pgwire direct writes)",
                             wal_path.display()
                         );

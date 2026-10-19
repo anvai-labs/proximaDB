@@ -46,9 +46,41 @@ fn torn_tail_counter() -> IntCounter {
     })
 }
 
+fn segment_rotation_counter() -> IntCounter {
+    register_int_counter!(
+        "proximadb_canonical_wal_segment_rotations_total",
+        "Canonical WAL active files sealed into segments (P2.1 segment rotation)"
+    )
+    .unwrap_or_else(|_| {
+        IntCounter::new(
+            "proximadb_canonical_wal_segment_rotations_total_fallback",
+            "fallback",
+        )
+        .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
+    })
+}
+
 lazy_static! {
     static ref TORN_TAIL_TRUNCATIONS: IntCounter = torn_tail_counter();
+    static ref SEGMENT_ROTATIONS: IntCounter = segment_rotation_counter();
 }
+
+/// Env gate for P2.1 segment rotation of the shared canonical WAL: rotate the
+/// active file once it reaches this many bytes. Unset, `0` or unparsable = off.
+pub const SEGMENT_BYTES_ENV: &str = "PROXIMADB_CANONICAL_WAL_SEGMENT_BYTES";
+
+/// The configured rotation size for the shared canonical WAL (`0` = off).
+pub fn canonical_wal_segment_bytes() -> u64 {
+    std::env::var(SEGMENT_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// A reader racing a rotation re-reads (or waits 1 ms while one is mid-rename);
+/// rotations are size-bounded (tens of MiB apart), so more than this many
+/// attempts in one read means something is wrong.
+const MAX_ROTATION_RETRIES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppendFault {
@@ -155,6 +187,139 @@ pub struct FramedTableWalAppender {
     /// (parking_lot) so the sync trait method `collection_max_sequence_for` can
     /// read it without `.await`. Never regresses (worst case = scan).
     collection_max: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
+    /// P2.1 (ADR-097 S2): rotate the active file into a sealed segment once it
+    /// reaches this many bytes. `0` = never rotate (the default; only the shared
+    /// pgwire canonical WAL opts in via [`Self::enable_segment_rotation`]).
+    segment_bytes: AtomicU64,
+    /// Sealed segments (`{path}.{first_seq:020}.seg`), oldest first, with the
+    /// LSN ranges a range read uses to skip them.
+    sealed: parking_lot::RwLock<Vec<SegmentSummary>>,
+    /// Running summary of the active file at `path`.
+    active: parking_lot::Mutex<SegmentSummary>,
+    /// Rotation generation, seqlock style: odd while a rotation is moving the
+    /// active file into a segment, even otherwise. A reader that started on an
+    /// odd value, or saw the value change mid-read, may have missed entries
+    /// that moved from the active file into a new segment, and re-reads.
+    rotations: AtomicU64,
+}
+
+/// LSN coverage of one WAL segment: its overall sequence range and, per
+/// collection, the range of that collection's entries. A range read
+/// ([`FramedTableWalAppender::read_entries_since`]) opens only segments whose
+/// summary can contain a matching entry.
+#[derive(Debug, Clone, Default)]
+struct SegmentSummary {
+    path: PathBuf,
+    first_seq: Option<u64>,
+    last_seq: u64,
+    /// collection id → highest sequence of that collection in this segment.
+    collection_max: std::collections::HashMap<String, u64>,
+    /// Whether any entry carries no collection (catalog/checkpoint ops), which
+    /// a collection-scoped read never needs.
+    has_uncollected: bool,
+}
+
+impl SegmentSummary {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            ..Default::default()
+        }
+    }
+
+    fn observe(&mut self, entry: &CanonicalWalEntry) {
+        let seq = entry.sequence_number;
+        self.first_seq = Some(self.first_seq.map_or(seq, |f| f.min(seq)));
+        self.last_seq = self.last_seq.max(seq);
+        match collection_id_of(&entry.operation) {
+            Some(c) => {
+                let cur = self.collection_max.entry(c.to_string()).or_insert(0);
+                *cur = (*cur).max(seq);
+            }
+            None => self.has_uncollected = true,
+        }
+    }
+
+    /// Whether this segment can hold an entry for `collection_id` with
+    /// sequence `> since`.
+    fn may_contain(&self, collection_id: &str, since: u64) -> bool {
+        self.last_seq > since
+            && self
+                .collection_max
+                .get(collection_id)
+                .is_some_and(|max| *max > since)
+    }
+}
+
+/// Path of the sealed segment whose first entry has sequence `first_seq`.
+fn sealed_segment_path(active: &Path, first_seq: u64) -> PathBuf {
+    let mut name = active
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".{first_seq:020}.seg"));
+    active.with_file_name(name)
+}
+
+/// Sealed segments next to `active`, ordered by first sequence. Files are
+/// matched exactly (`{name}.{20 digits}.seg`), so torn-tail quarantine files and
+/// compaction temps are never mistaken for segments.
+async fn discover_sealed_segments(active: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    let (Some(dir), Some(name)) = (active.parent(), active.file_name()) else {
+        return Ok(Vec::new());
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let prefix = format!("{}.", name.to_string_lossy());
+    let mut out = Vec::new();
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("listing canonical WAL segments in {}", dir.display()));
+        }
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        let Some(rest) = file_name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(digits) = rest.strip_suffix(".seg") else {
+            continue;
+        };
+        if digits.len() == 20
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(first_seq) = digits.parse::<u64>()
+        {
+            out.push((first_seq, entry.path()));
+        }
+    }
+    out.sort_by_key(|(first_seq, _)| *first_seq);
+    Ok(out)
+}
+
+/// Read every complete entry of a sealed segment. A sealed segment was synced
+/// before it was sealed, so anything short of a clean parse is corruption and
+/// fails closed (unlike the active file, whose torn tail is repaired on open).
+async fn read_sealed_segment(path: &Path) -> Result<Vec<CanonicalWalEntry>> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("reading canonical WAL segment {}", path.display()))?;
+    let scan = scan_wal_bytes(&bytes, path)?;
+    if scan.valid_len != bytes.len() {
+        bail!(
+            "sealed canonical WAL segment {} is truncated or corrupt at byte {} of {}",
+            path.display(),
+            scan.valid_len,
+            bytes.len()
+        );
+    }
+    Ok(scan.entries)
 }
 
 /// Extract the `collection_id` a canonical operation targets, if any (the
@@ -177,7 +342,31 @@ impl FramedTableWalAppender {
             })?;
         }
 
-        let recovery = recover_wal_state(&path).await?;
+        // Sealed segments are discovered whether or not this appender rotates:
+        // a WAL rotated by an earlier run must read back in full.
+        let mut sealed = Vec::new();
+        let mut sealed_last = 0u64;
+        let mut sealed_collection_max: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        for (_, segment_path) in discover_sealed_segments(&path).await? {
+            let mut summary = SegmentSummary::new(segment_path.clone());
+            for entry in read_sealed_segment(&segment_path).await? {
+                summary.observe(&entry);
+            }
+            sealed_last = sealed_last.max(summary.last_seq);
+            for (c, max) in &summary.collection_max {
+                let cur = sealed_collection_max.entry(c.clone()).or_insert(0);
+                *cur = (*cur).max(*max);
+            }
+            sealed.push(summary);
+        }
+
+        let mut recovery = recover_wal_state(&path).await?;
+        recovery.last_sequence = recovery.last_sequence.max(sealed_last);
+        for (c, max) in sealed_collection_max {
+            let cur = recovery.collection_max.entry(c).or_insert(0);
+            *cur = (*cur).max(max);
+        }
         if recovery.valid_len < recovery.file_len {
             // An unacknowledged torn tail (appends ack only after `sync_data`).
             // Keep the dropped bytes beside the WAL before truncating, so a
@@ -203,6 +392,11 @@ impl FramedTableWalAppender {
             truncate_wal(&path, recovery.valid_len).await?;
         }
 
+        let mut active = SegmentSummary::new(path.clone());
+        for entry in &recovery.active_entries {
+            active.observe(entry);
+        }
+
         Ok(Self {
             path,
             next_sequence: AtomicU64::new(recovery.last_sequence),
@@ -211,7 +405,118 @@ impl FramedTableWalAppender {
             fence: WriterFence::global(),
             poisoned: AtomicBool::new(false),
             collection_max: parking_lot::Mutex::new(recovery.collection_max),
+            segment_bytes: AtomicU64::new(0),
+            sealed: parking_lot::RwLock::new(sealed),
+            active: parking_lot::Mutex::new(active),
+            rotations: AtomicU64::new(0),
         })
+    }
+
+    /// P2.1 (ADR-097 S2): seal the active file into a segment once it reaches
+    /// `bytes`, so later range reads and truncation work segment by segment
+    /// instead of over one ever-growing file. `0` disables rotation.
+    pub fn enable_segment_rotation(&self, bytes: u64) {
+        self.segment_bytes.store(bytes, Ordering::SeqCst);
+    }
+
+    /// Seal the active file: rename it to `{path}.{first_seq:020}.seg`. Called
+    /// under the append lock after a synced append, so the sealed segment holds
+    /// only acknowledged, complete frames. A failed rename leaves everything in
+    /// the active file (nothing is lost; rotation is retried on the next append).
+    async fn rotate_active(&self) {
+        let summary = {
+            let active = self.active.lock();
+            if active.first_seq.is_none() {
+                return;
+            }
+            active.clone()
+        };
+        let Some(first_seq) = summary.first_seq else {
+            return;
+        };
+        let sealed_path = sealed_segment_path(&self.path, first_seq);
+        // Odd generation: readers that overlap the rename re-read.
+        self.rotations.fetch_add(1, Ordering::SeqCst);
+        if let Err(err) = tokio::fs::rename(&self.path, &sealed_path).await {
+            self.rotations.fetch_add(1, Ordering::SeqCst);
+            tracing::warn!(
+                wal = %self.path.display(),
+                segment = %sealed_path.display(),
+                error = %err,
+                "canonical WAL: segment rotation failed; continuing on the active file"
+            );
+            return;
+        }
+        if let Some(dir) = self.path.parent()
+            && let Ok(handle) = std::fs::File::open(dir)
+        {
+            let _ = handle.sync_all();
+        }
+        let mut sealed_summary = summary;
+        sealed_summary.path = sealed_path;
+        self.sealed.write().push(sealed_summary);
+        *self.active.lock() = SegmentSummary::new(self.path.clone());
+        // Even again: the segment list and active summary agree with the disk.
+        self.rotations.fetch_add(1, Ordering::SeqCst);
+        SEGMENT_ROTATIONS.inc();
+    }
+
+    /// Entries with `sequence_number > since` from every segment that can hold
+    /// an entry for `collection_id`, oldest first. Segments whose summary rules
+    /// the collection out are not read, so a change-feed read costs the
+    /// segments it needs, not the whole log. Entries of other collections in a
+    /// read segment are returned too; callers filter by collection.
+    pub async fn read_entries_since(
+        &self,
+        collection_id: &str,
+        since: u64,
+    ) -> Result<Vec<CanonicalWalEntry>> {
+        for _ in 0..MAX_ROTATION_RETRIES {
+            let generation = self.rotations.load(Ordering::SeqCst);
+            if generation % 2 == 1 {
+                // A rotation is mid-rename; it finishes in one rename + fsync.
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                continue;
+            }
+            let out = self.read_entries_since_once(collection_id, since).await?;
+            if self.rotations.load(Ordering::SeqCst) == generation {
+                return Ok(out);
+            }
+        }
+        bail!("canonical WAL kept rotating during a range read; retry later")
+    }
+
+    async fn read_entries_since_once(
+        &self,
+        collection_id: &str,
+        since: u64,
+    ) -> Result<Vec<CanonicalWalEntry>> {
+        let sealed: Vec<PathBuf> = self
+            .sealed
+            .read()
+            .iter()
+            .filter(|s| s.may_contain(collection_id, since))
+            .map(|s| s.path.clone())
+            .collect();
+        let read_active = self.active.lock().may_contain(collection_id, since);
+        let mut out = Vec::new();
+        for segment in sealed {
+            out.extend(
+                read_sealed_segment(&segment)
+                    .await?
+                    .into_iter()
+                    .filter(|e| e.sequence_number > since),
+            );
+        }
+        if read_active {
+            out.extend(
+                read_active_file(&self.path)
+                    .await?
+                    .into_iter()
+                    .filter(|e| e.sequence_number > since),
+            );
+        }
+        Ok(out)
     }
 
     /// Make every multi-operation `append_operations` a single all-or-nothing
@@ -373,6 +678,20 @@ impl FramedTableWalAppender {
                 }
             }
         }
+        {
+            let mut active = self.active.lock();
+            for entry in &entries {
+                active.observe(entry);
+            }
+        }
+
+        // P2.1: seal the active file once it is large enough. Still under the
+        // append lock, after `sync_data`, so the next append opens a fresh file.
+        let segment_bytes = self.segment_bytes.load(Ordering::SeqCst);
+        if segment_bytes > 0 && pre_len + frames.len() as u64 >= segment_bytes {
+            drop(file);
+            self.rotate_active().await;
+        }
 
         Ok(entries)
     }
@@ -398,7 +717,8 @@ impl FramedTableWalAppender {
         self.next_sequence.fetch_max(floor, Ordering::SeqCst);
     }
 
-    /// Read all complete entries currently present in the WAL.
+    /// Read all complete entries currently present in the WAL: every sealed
+    /// segment, oldest first, then the active file.
     pub async fn read_entries(&self) -> Result<Vec<CanonicalWalEntry>> {
         read_entries_from_path(&self.path).await
     }
@@ -426,6 +746,14 @@ impl proximadb_storage_ports::CanonicalWalReaderPort for CanonicalWalReaderBridg
 impl TableWalAppender for FramedTableWalAppender {
     async fn read_all_entries(&self) -> Result<Vec<CanonicalWalEntry>> {
         self.read_entries().await
+    }
+
+    async fn read_entries_since(
+        &self,
+        collection_id: &str,
+        since: u64,
+    ) -> Result<Vec<CanonicalWalEntry>> {
+        FramedTableWalAppender::read_entries_since(self, collection_id, since).await
     }
 
     async fn append_operations(
@@ -599,6 +927,8 @@ struct WalRecoveryState {
     file_len: u64,
     /// Bytes after `valid_len` (the torn tail), quarantined before truncation.
     tail: Vec<u8>,
+    /// Entries recovered from the active file (seeds its segment summary).
+    active_entries: Vec<CanonicalWalEntry>,
 }
 
 async fn recover_wal_state(path: &Path) -> Result<WalRecoveryState> {
@@ -611,6 +941,7 @@ async fn recover_wal_state(path: &Path) -> Result<WalRecoveryState> {
                 valid_len: 0,
                 file_len: 0,
                 tail: Vec::new(),
+                active_entries: Vec::new(),
             });
         }
         Err(err) => {
@@ -646,10 +977,35 @@ async fn recover_wal_state(path: &Path) -> Result<WalRecoveryState> {
         valid_len: scan.valid_len as u64,
         file_len: bytes.len() as u64,
         tail: bytes[scan.valid_len..].to_vec(),
+        active_entries: scan.entries,
     })
 }
 
+/// Every complete entry of the WAL at `path`: sealed segments oldest first, then
+/// the active file (P2.1). A WAL that never rotated is just its active file.
 async fn read_entries_from_path(path: &Path) -> Result<Vec<CanonicalWalEntry>> {
+    // A rotation between listing the segments and reading the active file would
+    // move entries out of the file we are about to read; the segment list then
+    // differs on the second look, and we re-read.
+    for _ in 0..MAX_ROTATION_RETRIES {
+        let segments = discover_sealed_segments(path).await?;
+        let mut out = Vec::new();
+        for (_, segment) in &segments {
+            out.extend(read_sealed_segment(segment).await?);
+        }
+        out.extend(read_active_file(path).await?);
+        if discover_sealed_segments(path).await? == segments {
+            return Ok(out);
+        }
+    }
+    bail!(
+        "canonical WAL {} kept rotating during a read; retry later",
+        path.display()
+    )
+}
+
+/// Complete entries of the active WAL file (a missing file reads as empty).
+async fn read_active_file(path: &Path) -> Result<Vec<CanonicalWalEntry>> {
     let bytes = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -781,6 +1137,16 @@ fn encode_group_frame(entries: &[CanonicalWalEntry], out: &mut Vec<u8>) -> Resul
 /// preserved verbatim (not reassigned), the live appender's monotonic counter
 /// and the snapshot watermark stay consistent across the rewrite.
 pub async fn rewrite_canonical_wal(path: &Path, entries: &[CanonicalWalEntry]) -> Result<()> {
+    // A rotated WAL keeps history in sealed segments this rewrite would not
+    // touch, so a rewrite could resurrect or duplicate entries. Rotation and
+    // rewrite-compaction are separate retention mechanisms; refuse the mix.
+    if !discover_sealed_segments(path).await?.is_empty() {
+        bail!(
+            "refusing to rewrite canonical WAL {}: it has sealed segments (segment \
+             rotation and rewrite-compaction must not be combined)",
+            path.display()
+        );
+    }
     let mut frames = Vec::new();
     for entry in entries {
         encode_frame(entry, &mut frames)?;

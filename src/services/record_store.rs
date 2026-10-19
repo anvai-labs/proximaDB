@@ -179,6 +179,25 @@ pub trait TableWalAppender: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Entries with `sequence_number > since` that may belong to
+    /// `collection_id`, oldest first (callers still filter by collection). The
+    /// default reads everything; a segmented WAL (P2.1) reads only the segments
+    /// whose LSN summary can contain a match, so a change-feed read stops
+    /// costing the whole log.
+    async fn read_entries_since(
+        &self,
+        collection_id: &str,
+        since: u64,
+    ) -> Result<Vec<CanonicalWalEntry>> {
+        let _ = collection_id;
+        Ok(self
+            .read_all_entries()
+            .await?
+            .into_iter()
+            .filter(|e| e.sequence_number > since)
+            .collect())
+    }
+
     /// Highest sequence_number assigned to an entry for `collection_id`, when the
     /// appender tracks per-collection watermarks. `None` (default) = unknown ⇒ the
     /// caller must scan. Used by the TD-OLAP-17 fast-path in `read_changes_since`:
@@ -2454,7 +2473,10 @@ impl TableRecordStore for DirectWalTableRecordStore {
         if self.change_feed_is_empty(collection_id, since_lsn) {
             return Ok(Vec::new());
         }
-        let entries = self.wal_appender.read_all_entries().await?;
+        let entries = self
+            .wal_appender
+            .read_entries_since(collection_id, since_lsn)
+            .await?;
         let mut out: Vec<ChangeRow> = entries
             .iter()
             .filter(|e| e.sequence_number > since_lsn)
@@ -2480,7 +2502,10 @@ impl TableRecordStore for DirectWalTableRecordStore {
         if self.change_feed_is_empty(collection_id, since_lsn) {
             return Ok(Vec::new());
         }
-        let entries = self.wal_appender.read_all_entries().await?;
+        let entries = self
+            .wal_appender
+            .read_entries_since(collection_id, since_lsn)
+            .await?;
         let want = tenant.filter(|t| !t.is_empty());
         let mut out: Vec<ChangeRow> = entries
             .iter()

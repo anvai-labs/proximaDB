@@ -112,7 +112,7 @@ P1 and P5a can start now; P2 → P3 → P4; P6 (benchmarks) runs throughout.
 |===
 | TD | Phase | Scope | Status
 | TD-SEAM-1 | P1 | Iceberg single writer (`proximadb-iceberg-engine`) + external read-back CI gate | In Progress
-| TD-SEAM-2 | P2 | Segmented canonical WAL, per-collection index, truncation at `min_unflushed_lsn` | Open
+| TD-SEAM-2 | P2 | Segmented canonical WAL, per-collection index, truncation at `min_unflushed_lsn` | In Progress (P2.1 rotation + range reads landed; P2.2 truncation open)
 | TD-SEAM-3 | P2 | Layer A production wiring with `ParquetWritePolicy` + `__proxima_*` system columns | Open
 | TD-SEAM-4 | P2 | Streaming MATERIALIZE / incremental publisher (TD-OLAPFMT-3, TD-USUB-10) | Open
 | TD-SEAM-5 | P3 | Streaming `LayerATableProvider` + `PaxTableProvider` wiring | Open
