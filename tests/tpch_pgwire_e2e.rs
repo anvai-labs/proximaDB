@@ -535,16 +535,16 @@ async fn tpch_accuracy_anchored_phase(client: &tokio_postgres::Client) {
             .simple_query(&format!("DROP TABLE IF EXISTS {name}"))
             .await
         {
-            eprintln!("DROP IF EXISTS {name} errored (retrying create): {}", explain_err(&e));
+            eprintln!(
+                "DROP IF EXISTS {name} errored (retrying create): {}",
+                explain_err(&e)
+            );
         }
         if client.simple_query(ddl).await.is_err() {
-            let _ = client
-                .simple_query(&format!("DROP TABLE {name}"))
-                .await;
-            client
-                .simple_query(ddl)
-                .await
-                .unwrap_or_else(|e| panic!("CREATE {name} after stale-state retry: {}", explain_err(&e)));
+            let _ = client.simple_query(&format!("DROP TABLE {name}")).await;
+            client.simple_query(ddl).await.unwrap_or_else(|e| {
+                panic!("CREATE {name} after stale-state retry: {}", explain_err(&e))
+            });
         }
     }
     for sql in DATA {
