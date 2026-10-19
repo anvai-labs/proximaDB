@@ -42,7 +42,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -132,14 +131,6 @@ fn detect_backend(connection_string: &str) -> OltpBackend {
     } else {
         OltpBackend::Sqlite
     }
-}
-
-#[allow(dead_code)] // Scaffolding for oltp-catalog feature work
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 // ============================================================================

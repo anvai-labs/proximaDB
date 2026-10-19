@@ -948,7 +948,7 @@ impl DdlService {
             params,
             return_ty,
             body: body.to_string(),
-            created_at_ms: crate::services::function_store::now_ms(),
+            created_at_ms: proximadb_kernel::time::now_unix_ms(),
         };
         // Register live (this also validates the body via the shared frontend lowering) ...
         crate::services::function_store::register_stored_function(&stored)

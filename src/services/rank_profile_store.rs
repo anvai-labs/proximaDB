@@ -135,13 +135,6 @@ impl CanonicalWalRankProfileStore {
     }
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 fn now_ns() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -217,7 +210,7 @@ impl RankProfileStore for CanonicalWalRankProfileStore {
                 version,
                 tenant: tenant.clone(),
                 spec_toml,
-                created_at_ms: now_ms(),
+                created_at_ms: proximadb_kernel::time::now_unix_ms(),
             }
         };
         let record = profile_to_record(&profile);

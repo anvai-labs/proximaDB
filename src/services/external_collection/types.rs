@@ -5,6 +5,7 @@
 //! (`CatalogAuthorityMode::FederatedRead`) while ProximaDB owns and serves a
 //! vector index built over it. These are the durable registry records.
 
+use proximadb_kernel::time::now_unix_ms;
 use serde::{Deserialize, Serialize};
 
 /// Open-table format of the external source. Parquet is the only format wired
@@ -127,7 +128,7 @@ pub struct ExternalCollection {
 impl ExternalCollection {
     /// Create a freshly `Registered` external collection for `spec`.
     pub fn new(spec: ExternalCollectionSpec, snapshot_id: impl Into<String>) -> Self {
-        let now = now_ms();
+        let now = now_unix_ms();
         Self {
             id: format!("ext_{}", uuid::Uuid::new_v4().simple()),
             spec,
@@ -153,9 +154,6 @@ impl ExternalCollection {
 }
 
 /// Current epoch milliseconds.
-pub(crate) fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
-}
 
 #[cfg(test)]
 mod tests {
