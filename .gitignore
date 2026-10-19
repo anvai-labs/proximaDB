@@ -251,7 +251,6 @@ lambda-package/
 function-package/
 
 # Docker artifacts
-.dockerignore
 docker-compose.override.yml
 
 # Terraform state files

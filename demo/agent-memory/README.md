@@ -33,7 +33,7 @@ PASS  write → later search finds agent-written memory
 ALL PASS
 ```
 
-Teardown: `./run.sh down` · Explore: engine stays up on `http://localhost:5678` (REST v2).
+Teardown: `./run.sh down` (keeps `./data`) · full clean slate: `./run.sh reset` · the engine listens on **loopback only** (it runs unauthenticated).
 
 ## The API flow (what production does)
 
