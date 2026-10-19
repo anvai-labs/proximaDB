@@ -211,17 +211,25 @@ async fn pg_rows(
     out
 }
 
-/// Iceberg namespace of a table created over pgwire: the session is tenant-scoped
+/// Tenant of a table created over pgwire: the session is tenant-scoped
 /// (`resolve_table_scoped` prefixes the tenant — `proximadb`, the database), so the
-/// table lives at `proximadb.default`, not `default`.
-const NAMESPACE: &str = "proximadb.default";
+/// catalog entry lives at `proximadb.default`. The Iceberg REST catalog resolves
+/// every request within the request tenant (#2072): a client selects the tenant
+/// with `X-Tenant-ID` and addresses the table by its client namespace `default`.
+const TENANT: &str = "proximadb";
+const NAMESPACE: &str = "default";
 
 /// `metadata-location` served by ProximaDB's Iceberg REST catalog for `table`.
 async fn rest_metadata_location(rest_port: u16, table: &str) -> serde_json::Value {
     let http = reqwest::Client::builder().no_proxy().build().expect("http");
     let url =
         format!("http://127.0.0.1:{rest_port}/iceberg/v1/namespaces/{NAMESPACE}/tables/{table}");
-    let resp = http.get(&url).send().await.expect("load_table");
+    let resp = http
+        .get(&url)
+        .header("X-Tenant-ID", TENANT)
+        .send()
+        .await
+        .expect("load_table");
     assert!(
         resp.status().is_success(),
         "load_table {url}: {}",
@@ -263,7 +271,14 @@ fn external_readback(
             "--rest-uri",
             &format!("http://127.0.0.1:{rest_port}/iceberg"),
         ])
-        .args(["--namespace", NAMESPACE, "--table", table])
+        .args([
+            "--namespace",
+            NAMESPACE,
+            "--tenant",
+            TENANT,
+            "--table",
+            table,
+        ])
         .args(["--metadata-location", metadata_location])
         .arg("--expected")
         .arg(&expected)

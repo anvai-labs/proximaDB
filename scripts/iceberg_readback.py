@@ -68,7 +68,11 @@ def read_pyiceberg_rest(args, columns):
     _require_module("pyiceberg")
     from pyiceberg.catalog import load_catalog
 
-    catalog = load_catalog("proximadb", type="rest", uri=args.rest_uri)
+    props = {"type": "rest", "uri": args.rest_uri}
+    if args.tenant:
+        # The REST catalog resolves within the request tenant (X-Tenant-ID).
+        props["header.X-Tenant-ID"] = args.tenant
+    catalog = load_catalog("proximadb", **props)
     table = catalog.load_table((*args.namespace.split("."), args.table))
     return table.scan(selected_fields=tuple(columns)).to_arrow().to_pylist(), table.metadata_location
 
@@ -106,6 +110,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--rest-uri", required=True)
     p.add_argument("--namespace", required=True, help="dot-separated, e.g. proximadb.default")
+    p.add_argument("--tenant", default="", help="X-Tenant-ID for the REST catalog")
     p.add_argument("--table", required=True)
     p.add_argument("--metadata-location", required=True)
     p.add_argument("--expected", required=True, help="JSON {columns: [...], rows: [[text|null]]}")
