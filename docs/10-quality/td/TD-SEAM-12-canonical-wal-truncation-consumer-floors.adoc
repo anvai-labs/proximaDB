@@ -1,0 +1,69 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SEAM-12: Canonical-WAL truncation must respect every consumer, and four of them have no low-water mark
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-19 from a survey of every reader of the shared canonical WAL (`data_dir/pgwire/canonical-records.wal`), done before implementing truncation (TD-SEAM-2 / P2.2).
+| Priority | **HIGH as a gate on P2.2.** Zero today: nothing truncates the WAL.
+| Component | `src/services/canonical_wal.rs`, `src/services/record_store.rs`, `src/services/{rank_profile_store,function_store}.rs`, `src/graph/merge.rs`, `src/network/rest/v2/records.rs` (change feed), `src/network/postgres/relational_pipeline.rs` (OLAP delta merge)
+| Relates to | TD-SEAM-2, TD-USUB-1 (slice 2b), TD-OLAPFMT-3, ADR-012 (branch merge), ADR-097 S2
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+Truncation (deleting sealed segments, P2.1) is safe only below the minimum of every consumer's
+needs. The record tier's floor (`DirectWalTableRecordStore::min_unflushed_lsn`) is one input of
+several:
+
+[cols="2,3,3", options="header"]
+|===
+| Consumer | Needs | Low-water mark today
+| Startup replay into record partitions | entries from the oldest unflushed row | `min_unflushed_lsn` (record tier; refuses for memtable partitions)
+| Rank-profile store (`__proxima_rank_profiles__`) | **all history**: rebuilt from a full WAL read | **none**
+| SQL function store (`__proxima_functions__`) | **all history** | **none**
+| REST change feed (`/changes?since_lsn=`) | entries after the client's cursor | **none**: the cursor lives in the client
+| OLAP delta merge over published Parquet | entries after each table's `snapshot_lsn` | durable catalog layout property; no cross-table enumerator
+| Graph branch merge (ADR-012) | base records up to the merge base plus branch entries | **none**
+| ORION checkpoint correlation | newest `Checkpoint` per graph (metrics only) | none (metric degrades to `None`)
+| Change-feed fast path, MATERIALIZE LSN capture | newest entry per collection | in-memory high-water, rebuilt on open
+|===
+
+== Floor and APIs P2.2 needs
+
+The truncator reads these in this order, and deletes a sealed segment only if its `last_seq` is
+below `floor`:
+
+----
+W  = appender.last_sequence()                       // first
+R  = min(in-flight reservations)                    // writes appended, not yet applied
+P  = record_store.min_unflushed_lsn()?              // Err => do not truncate
+S  = min(snapshot_lsn + 1) over delta-merge tables
+floor = min(W + 1, R, P, S, cdc_retention_floor)
+----
+
+New APIs:
+
+* `TableWalAppender::last_sequence`.
+* An in-flight reservation registry around each append-then-apply pair in
+  `DirectWalTableRecordStore` (`write_mutations`, `commit_atomic`, `drop_table_records`). It is
+  released by a drop guard.
+* `FramedTableWalAppender::truncate_below(floor)` and `retained_floor()`.
+* An enumerator of published `snapshot_lsn` values.
+
+== Hazards to close first
+
+. **Rank profiles and SQL functions** need a snapshot (or a forward re-append of the live set)
+  before any truncation. Until then they must block it.
+. **Branch merge** needs a durable merge-base record, or must block truncation below the oldest
+  branch entry. Its second-appender bug is fixed separately (`open_shared`, 2026-10-19).
+. **The change feed** must return an explicit "history truncated" error (e.g. HTTP 410) when
+  `since_lsn + 1 < retained_floor`. Today it would return a partial result silently.
+. **Readers must survive truncation.** `read_entries_from_path` and `read_entries_since_once`
+  must retry when a segment file vanishes mid-read. Truncation bumps the rotation generation
+  (odd while deleting).
+. **No sequence reuse after restart.** If truncation removes every sealed segment while the active
+  file is empty, reopening derives `last_sequence = 0`. Persist a floor marker, or always keep the
+  newest sealed segment.

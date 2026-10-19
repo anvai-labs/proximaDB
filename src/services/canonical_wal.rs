@@ -251,6 +251,19 @@ impl SegmentSummary {
     }
 }
 
+/// Live appenders by absolute WAL path, for [`FramedTableWalAppender::open_shared`].
+/// An async mutex because an open (recovery included) runs under it.
+fn shared_appenders() -> &'static tokio::sync::Mutex<
+    std::collections::HashMap<PathBuf, std::sync::Weak<FramedTableWalAppender>>,
+> {
+    static REGISTRY: std::sync::OnceLock<
+        tokio::sync::Mutex<
+            std::collections::HashMap<PathBuf, std::sync::Weak<FramedTableWalAppender>>,
+        >,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Path of the sealed segment whose first entry has sequence `first_seq`.
 fn sealed_segment_path(active: &Path, first_seq: u64) -> PathBuf {
     let mut name = active
@@ -334,6 +347,36 @@ fn collection_id_of(op: &CanonicalOperation) -> Option<&str> {
 
 impl FramedTableWalAppender {
     /// Open or create a framed binary canonical WAL file.
+    /// The process's ONE appender for the WAL file at `path`: the live
+    /// instance if any caller still holds one, otherwise a freshly opened one.
+    ///
+    /// Two appenders over one file each keep their own sequence counter, so
+    /// whichever wrote second reissues the other's sequence numbers, and each
+    /// misses the other's entries in its per-collection high-water marks and
+    /// segment summaries (the change-feed fast path then skips them). Every
+    /// production opener of a shared file goes through here. Plain [`open`]
+    /// stays for owners of a private file (and for tests that reopen on
+    /// purpose).
+    ///
+    /// Keyed by the absolute path, as given (not symlink-resolved). Holds only
+    /// weak references, so dropping the last handle releases the file and a
+    /// later call opens — and recovers — it afresh. Opens are serialized, so
+    /// two first callers cannot both run recovery on one file.
+    ///
+    /// [`open`]: Self::open
+    pub async fn open_shared(path: impl Into<PathBuf>) -> Result<Arc<Self>> {
+        let path = path.into();
+        let key = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+        let mut registry = shared_appenders().lock().await;
+        if let Some(live) = registry.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Ok(live);
+        }
+        let appender = Arc::new(Self::open(path).await?);
+        registry.retain(|_, weak| weak.strong_count() > 0);
+        registry.insert(key, Arc::downgrade(&appender));
+        Ok(appender)
+    }
+
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         if let Some(parent) = path.parent() {

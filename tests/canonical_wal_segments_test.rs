@@ -263,3 +263,38 @@ async fn range_reads_racing_rotation_never_lose_acknowledged_entries() -> Result
     assert_eq!(wal.read_entries().await?.len(), 200);
     Ok(())
 }
+
+#[tokio::test]
+async fn open_shared_returns_one_appender_per_file() -> Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("canonical-records.wal");
+
+    let first = FramedTableWalAppender::open_shared(&path).await?;
+    let second =
+        FramedTableWalAppender::open_shared(dir.path().join("canonical-records.wal")).await?;
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "one live appender per file"
+    );
+    let a = first
+        .append_operations(vec![upsert("a", "a1")], None)
+        .await?;
+    let b = second
+        .append_operations(vec![upsert("a", "a2")], None)
+        .await?;
+    assert_eq!((a[0].sequence_number, b[0].sequence_number), (1, 2));
+
+    // A different file is a different appender.
+    let other = FramedTableWalAppender::open_shared(dir.path().join("other.wal")).await?;
+    assert!(!std::sync::Arc::ptr_eq(&first, &other));
+
+    // Once every handle is gone the file is released; the next open recovers
+    // it afresh and continues the sequence.
+    drop((first, second));
+    let reopened = FramedTableWalAppender::open_shared(&path).await?;
+    let c = reopened
+        .append_operations(vec![upsert("a", "a3")], None)
+        .await?;
+    assert_eq!(c[0].sequence_number, 3);
+    Ok(())
+}
