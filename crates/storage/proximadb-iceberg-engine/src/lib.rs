@@ -57,7 +57,8 @@ use proximadb_records::ProximaRecord;
 use proximadb_storage_common::object_store_bridge::{CommitOutcome, ObjectStoreBridge};
 use proximadb_storage_common::parquet_write_policy::{ParquetLayoutHints, ParquetWritePolicy};
 use proximadb_storage_common::proxima_arrow::infer_proxima_schema_strict;
-use proximadb_storage_common::proxima_parquet::proxima_records_to_parquet_bytes_with_policy;
+use proximadb_storage_common::proxima_arrow::proxima_records_to_record_batch;
+use proximadb_storage_common::proxima_parquet::record_batches_to_parquet_bytes;
 use proximadb_storage_common::proxima_schema::ProximaSchema;
 
 /// Parquet writer policy for the warehouse publication tier (MATERIALIZE
@@ -68,6 +69,33 @@ use proximadb_storage_common::proxima_schema::ProximaSchema;
 /// yields a plain, mixed-read-safe Parquet file.
 fn warehouse_write_policy() -> ParquetWritePolicy {
     ParquetWritePolicy::from_env()
+}
+
+/// Stamp Iceberg field ids (`PARQUET:field_id`) on the top-level columns: field id
+/// `i + 1` for column `i`, the same assignment the publisher's Iceberg schema uses
+/// (`materialize_table_to_parquet` numbers `schema.to_arrow_schema()` fields from 1).
+/// Iceberg readers resolve Parquet columns by field id; the table's
+/// `schema.name-mapping.default` covers files written before this.
+fn with_iceberg_field_ids(batch: RecordBatch) -> Result<RecordBatch, StorageError> {
+    const FIELD_ID: &str = "PARQUET:field_id";
+    let fields: Vec<arrow_schema::Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let mut md = f.metadata().clone();
+            md.insert(FIELD_ID.to_string(), (i + 1).to_string());
+            f.as_ref().clone().with_metadata(md)
+        })
+        .collect();
+    let schema = Arc::new(ArrowSchema::new_with_metadata(
+        fields,
+        batch.schema().metadata().clone(),
+    ));
+    batch
+        .with_schema(schema)
+        .map_err(|e| StorageError::Serialization(format!("iceberg field ids: {e}")))
 }
 
 /// Spec-shaped Iceberg v2 manifest / manifest-list (Avro) + TableMetadata (JSON) content.
@@ -89,19 +117,87 @@ fn read_err(context: &str, e: impl std::fmt::Display) -> StorageError {
 #[derive(Clone)]
 pub struct IcebergObjectStoreBridge {
     store: ProximaObjectStore,
+    /// The URL this bridge's base prefix was opened from, when known. Iceberg
+    /// metadata must reference files by absolute URI for external readers, so the
+    /// publisher joins bridge-relative keys onto this; without it, it falls back
+    /// to bridge-relative keys (readable only by ProximaDB).
+    root_url: Option<String>,
+}
+
+/// Join a bridge-relative key onto a store root URL (`memory://` + `k` stays
+/// `memory://k`; `file:///wh` + `k` is `file:///wh/k`).
+fn join_uri(root: &str, key: &str) -> String {
+    if root.ends_with("://") {
+        format!("{root}{key}")
+    } else {
+        format!("{}/{key}", root.trim_end_matches('/'))
+    }
 }
 
 impl IcebergObjectStoreBridge {
-    /// Wrap an existing object-store handle.
+    /// Wrap an existing object-store handle. Published Iceberg metadata then uses
+    /// bridge-relative paths; call [`with_root_url`](Self::with_root_url) to make
+    /// them absolute.
     pub fn new(store: ProximaObjectStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            root_url: None,
+        }
     }
 
     /// Open the bridge directly from a URL (see [`ProximaObjectStore::from_url`]).
     pub fn from_url(url: &str) -> Result<Self, StorageError> {
         Ok(Self {
             store: ProximaObjectStore::from_url(url)?,
+            root_url: Some(url.to_string()),
         })
+    }
+
+    /// Record the URL the wrapped store's base prefix corresponds to.
+    pub fn with_root_url(mut self, url: impl Into<String>) -> Self {
+        self.root_url = Some(url.into());
+        self
+    }
+
+    /// The absolute URI of a bridge-relative key, or the key itself when the
+    /// bridge has no root URL.
+    pub fn object_uri(&self, key: &str) -> String {
+        match &self.root_url {
+            Some(root) => join_uri(root, key),
+            None => key.to_string(),
+        }
+    }
+
+    /// Map a path recorded in Iceberg metadata back to a bridge-relative key.
+    ///
+    /// Absolute URIs under this bridge's root are stripped to the key. A URI
+    /// under the table `location` (but not under this bridge's root — e.g. the
+    /// metadata was written through a warehouse-root bridge and is now read
+    /// through a table-root bridge) is re-rooted at `table_prefix`, the
+    /// bridge-relative prefix of that table. Relative paths pass through.
+    fn resolve_recorded_path(
+        &self,
+        recorded: &str,
+        table_location: Option<&str>,
+        table_prefix: &str,
+    ) -> Path {
+        if let Some(root) = &self.root_url {
+            let root_prefix = join_uri(root, "");
+            if let Some(key) = recorded.strip_prefix(&root_prefix) {
+                return Path::from(key);
+            }
+        }
+        if let Some(loc) = table_location {
+            let loc_prefix = join_uri(loc, "");
+            if let Some(rest) = recorded.strip_prefix(&loc_prefix) {
+                return if table_prefix.is_empty() {
+                    Path::from(rest)
+                } else {
+                    Path::from(format!("{table_prefix}/{rest}"))
+                };
+            }
+        }
+        Path::from(recorded)
     }
 
     /// Borrow the underlying [`ProximaObjectStore`].
@@ -185,7 +281,7 @@ impl IcebergObjectStoreBridge {
                 Err(_) => (0, Vec::new()),
             };
             data_files.push(iceberg::DataFileMeta {
-                file_path: key.as_ref().to_string(),
+                file_path: self.object_uri(key.as_ref()),
                 record_count,
                 file_size_in_bytes: size as i64,
                 column_stats,
@@ -194,40 +290,72 @@ impl IcebergObjectStoreBridge {
         let added_records: i64 = data_files.iter().map(|f| f.record_count).sum();
         let added_files = data_files.len() as i64;
 
-        // 2. Write the Avro manifest + manifest list.
-        let manifest_bytes = iceberg::write_manifest(&data_files, snapshot_id)?;
+        // 2. Lineage from the previous metadata document, if any.
+        let committer = metadata::MetadataCommitter::new(self.store.clone(), metadata_prefix);
+        let parent = committer.latest_version().await?;
+        let parent_json = match parent {
+            Some(v) => Some(
+                String::from_utf8(committer.read_metadata(v).await?.to_vec())
+                    .map_err(|e| read_err("parent metadata utf8", e))?,
+            ),
+            None => None,
+        };
+        let parent_location = parent.map(|v| self.object_uri(&committer.metadata_location(v)));
+        let lineage =
+            iceberg::Lineage::from_parent(parent_json.as_deref(), parent_location.as_deref())?;
+
+        // 3. Write the Avro manifest + manifest list.
+        let schema_json = iceberg::schema_json(fields).to_string();
+        let manifest_bytes = iceberg::write_manifest(
+            &data_files,
+            snapshot_id,
+            Some(&iceberg::ManifestHeader {
+                schema_json: &schema_json,
+                format_version,
+            }),
+        )?;
         let manifest_path = Path::from(format!("{metadata_prefix}/{snapshot_id}-m0.avro"));
         self.store
             .put(&manifest_path, Bytes::from(manifest_bytes.clone()))
             .await?;
         let manifest_list = vec![iceberg::ManifestFileMeta {
-            manifest_path: manifest_path.as_ref().to_string(),
+            manifest_path: self.object_uri(manifest_path.as_ref()),
             manifest_length: manifest_bytes.len() as i64,
             added_files_count: added_files as i32,
             added_rows_count: added_records,
             added_snapshot_id: snapshot_id,
+            sequence_number: lineage.sequence_number,
+            first_row_id: (format_version == iceberg::FormatVersion::V3)
+                .then_some(lineage.first_row_id),
         }];
         let list_bytes = iceberg::write_manifest_list(&manifest_list)?;
         let list_path = Path::from(format!("{metadata_prefix}/snap-{snapshot_id}-list.avro"));
         self.store.put(&list_path, Bytes::from(list_bytes)).await?;
 
-        // 3. Build + atomically commit the TableMetadata.
-        let committer = metadata::MetadataCommitter::new(self.store.clone(), metadata_prefix);
-        let parent = committer.latest_version().await?;
-        let sequence_number = parent.map(|p| p as i64 + 1).unwrap_or(1);
+        // 4. Build + atomically commit the TableMetadata.
+        let list_uri = self.object_uri(list_path.as_ref());
         let json = iceberg::build_table_metadata(
-            format_version,
-            table_uuid,
-            table_location,
-            fields,
-            snapshot_id,
-            sequence_number,
-            list_path.as_ref(),
-            timestamp_ms,
-            added_files,
-            added_records,
+            &iceberg::SnapshotCommit {
+                format_version,
+                table_uuid,
+                location: table_location,
+                fields,
+                snapshot_id,
+                manifest_list_location: &list_uri,
+                timestamp_ms,
+                added_files,
+                added_records,
+            },
+            &lineage,
         )?;
         committer.commit(parent, Bytes::from(json)).await
+    }
+
+    /// Absolute location of metadata `version` under `metadata_prefix` — what an
+    /// Iceberg catalog serves as `metadata-location`.
+    pub fn metadata_file_uri(&self, metadata_prefix: &str, version: u64) -> String {
+        let committer = metadata::MetadataCommitter::new(self.store.clone(), metadata_prefix);
+        self.object_uri(&committer.metadata_location(version))
     }
 
     /// Resolve the data-file keys of the current snapshot in the Iceberg metadata log at
@@ -245,13 +373,26 @@ impl IcebergObjectStoreBridge {
         let Some(list_loc) = iceberg::current_manifest_list(meta_json)? else {
             return Ok(Vec::new());
         };
-        let list_bytes = self.store.get(&Path::from(list_loc)).await?;
+        // Recorded paths are absolute URIs (or legacy bridge-relative keys). The
+        // table prefix re-roots URIs under the table `location` when this bridge is
+        // opened somewhere other than the writer's root.
+        let table_location = serde_json::from_str::<serde_json::Value>(meta_json)
+            .ok()
+            .and_then(|v| v.get("location").and_then(|l| l.as_str()).map(String::from));
+        let table_prefix = metadata_prefix
+            .trim_end_matches('/')
+            .strip_suffix("metadata")
+            .map(|p| p.trim_end_matches('/'))
+            .unwrap_or("");
+        let resolve =
+            |p: &str| self.resolve_recorded_path(p, table_location.as_deref(), table_prefix);
+        let list_bytes = self.store.get(&resolve(&list_loc)).await?;
         let manifests = iceberg::read_manifest_list(&list_bytes)?;
         let mut out = Vec::new();
         for m in manifests {
-            let mbytes = self.store.get(&Path::from(m.manifest_path)).await?;
+            let mbytes = self.store.get(&resolve(&m.manifest_path)).await?;
             for df in iceberg::read_manifest(&mbytes)? {
-                out.push(Path::from(df.file_path));
+                out.push(resolve(&df.file_path));
             }
         }
         Ok(out)
@@ -371,12 +512,10 @@ impl ObjectStoreBridge for IcebergObjectStoreBridge {
         let hints = ParquetLayoutHints {
             sort_columns: sort_columns.to_vec(),
         };
-        let bytes = proxima_records_to_parquet_bytes_with_policy(
-            records,
-            schema,
-            &warehouse_write_policy(),
-            &hints,
-        )?;
+        let batch = with_iceberg_field_ids(proxima_records_to_record_batch(records, schema)?)?;
+        let props = warehouse_write_policy().writer_properties(&batch, &hints);
+        let arrow_schema = batch.schema();
+        let bytes = record_batches_to_parquet_bytes(&[batch], arrow_schema, Some(props))?;
         self.store.put(path, Bytes::from(bytes)).await
     }
 
@@ -651,6 +790,137 @@ mod tests {
         assert_eq!(ages.value(1), 41);
         // The inferred dense-vector column round-tripped as a column too.
         assert!(batch.column_by_name("vector").is_some());
+    }
+
+    /// Published Parquet carries Iceberg field ids (`i + 1`) on its columns, so
+    /// Iceberg readers resolve columns by id rather than by name.
+    #[test]
+    fn published_parquet_columns_carry_iceberg_field_ids() {
+        use parquet::file::reader::FileReader;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![Some("x")])),
+            ],
+        )
+        .unwrap();
+        let stamped = with_iceberg_field_ids(batch).unwrap();
+        let bytes =
+            record_batches_to_parquet_bytes(&[stamped.clone()], stamped.schema(), None).unwrap();
+        let reader =
+            parquet::file::serialized_reader::SerializedFileReader::new(Bytes::from(bytes))
+                .unwrap();
+        let descr = reader.metadata().file_metadata().schema_descr_ptr();
+        let ids: Vec<i32> = descr
+            .root_schema()
+            .get_fields()
+            .iter()
+            .map(|f| f.get_basic_info().id())
+            .collect();
+        assert_eq!(ids, vec![1, 2], "field ids land in the Parquet schema");
+    }
+
+    /// ADR-097 D3: a URL-rooted bridge records absolute URIs (what external readers
+    /// need), and a bridge opened at the TABLE root — the TD-USUB-10 manifest-driven
+    /// reader — resolves them back to keys. Before absolute URIs, that reader got
+    /// warehouse-relative keys it could not resolve and silently fell back to
+    /// listing. A second publish chains onto the first.
+    #[tokio::test]
+    async fn absolute_uris_resolve_from_warehouse_and_table_roots() {
+        let root = "memory:///warehouse";
+        let wh = IcebergObjectStoreBridge::from_url(root).unwrap();
+        let data_key = "t/ns/tbl/data/part-0.parquet";
+        let r0 = record("r0", vec![("age", ProximaValue::Int64(7))]);
+        wh.write_records_to_parquet(&Path::from(data_key), &[r0], None)
+            .await
+            .unwrap();
+        let fields = vec![iceberg::IcebergField {
+            id: 1,
+            name: "age".into(),
+            type_name: "long".into(),
+            required: false,
+        }];
+        let table_location = format!("{root}/t/ns/tbl");
+        for (snapshot_id, expected) in [
+            (11, CommitOutcome::Committed(0)),
+            (12, CommitOutcome::Committed(1)),
+        ] {
+            let out = wh
+                .publish_iceberg_snapshot(
+                    &Path::from("t/ns/tbl/data"),
+                    "t/ns/tbl/metadata",
+                    "uuid-abs",
+                    &table_location,
+                    &fields,
+                    snapshot_id,
+                    1_700_000_000_000 + snapshot_id,
+                    iceberg::FormatVersion::V2,
+                )
+                .await
+                .unwrap();
+            assert_eq!(out, expected);
+        }
+
+        let meta = wh
+            .read_table_metadata("t/ns/tbl/metadata", 1)
+            .await
+            .unwrap();
+        let mj: serde_json::Value = serde_json::from_slice(&meta).unwrap();
+        assert_eq!(mj["location"], table_location);
+        assert_eq!(mj["snapshots"][0]["parent-snapshot-id"], 11);
+        assert_eq!(mj["last-sequence-number"], 2);
+        let list = mj["snapshots"][0]["manifest-list"].as_str().unwrap();
+        assert!(
+            list.starts_with("memory:///warehouse/t/ns/tbl/metadata/"),
+            "{list}"
+        );
+        assert_eq!(
+            mj["metadata-log"][0]["metadata-file"],
+            wh.metadata_file_uri("t/ns/tbl/metadata", 0)
+        );
+
+        // Warehouse-root reader.
+        let files = wh
+            .read_iceberg_snapshot("t/ns/tbl/metadata", 1)
+            .await
+            .unwrap();
+        assert_eq!(files, vec![Path::from(data_key)]);
+
+        // Table-root reader (the TD-USUB-10 manifest-driven selection path). Both
+        // bridges share the in-memory store only through the same process-global
+        // `memory://` registry, so re-open through the warehouse store with a
+        // table-root URL to model the second bridge.
+        let table_bridge =
+            IcebergObjectStoreBridge::new(ProximaObjectStore::new(wh.object_store().store()))
+                .with_root_url("memory:///elsewhere");
+        let rebased = table_bridge.resolve_recorded_path(
+            &format!("{table_location}/data/part-0.parquet"),
+            Some(&table_location),
+            "",
+        );
+        assert_eq!(rebased.as_ref(), "data/part-0.parquet");
+        let rebased_under_prefix = table_bridge.resolve_recorded_path(
+            &format!("{table_location}/data/part-0.parquet"),
+            Some(&table_location),
+            "some/prefix",
+        );
+        assert_eq!(
+            rebased_under_prefix.as_ref(),
+            "some/prefix/data/part-0.parquet"
+        );
+        // Legacy relative paths pass through unchanged.
+        assert_eq!(
+            table_bridge
+                .resolve_recorded_path("t/ns/tbl/data/x.parquet", None, "")
+                .as_ref(),
+            "t/ns/tbl/data/x.parquet"
+        );
     }
 
     /// End-to-end Iceberg publish: write a Parquet data file, publish a v3 snapshot

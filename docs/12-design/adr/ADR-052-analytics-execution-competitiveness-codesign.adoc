@@ -5,6 +5,7 @@
 [cols="1,3"]
 |===
 |Status|Accepted (ratified 2026-07-04; supersedes the NATIVE_OLAP_ENGINE_BLUEPRINT_2026_06_22 §3/§4-P3 native-operator end-state; composes with ADR-039/ADR-050)
+|Amended by|link:ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097] (2026-10-18). The non-goal "the defensible competitive niche is **vector + OLAP + lakehouse (3-mode) co-design**; graph/document are stretch modes" is amended: the niche is the *lakehouse system of record for AI context* across all modalities (ADR-097 D4), with graph, document and observability landing on the same seams S1–S9. The executor decision (DataFusion) is reinforced: DataFusion `LogicalPlan` is the single logical IR (ADR-097 D1).
 |Date|2026-07-03 (proposed) / 2026-07-04 (accepted)
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-039 (DataFusion swappable backend / `LogicalNode` seam), ADR-050 (cost-based route selection + stats-fed planning), ADR-033 (Parquet-OLAP / PAX-vector dual path), ADR-027/026 (PAX unified substrate), ADR-037/038 (statistics substrate + freshness), ADR-025 (deletion vectors), `NATIVE_OLAP_ENGINE_BLUEPRINT_2026_06_22.adoc`, `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc`

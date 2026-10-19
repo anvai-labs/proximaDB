@@ -226,6 +226,10 @@ pub struct IcebergSnapshot {
     pub summary: IcebergSnapshotSummary,
     #[serde(rename = "schema-id", skip_serializing_if = "Option::is_none")]
     pub schema_id: Option<i32>,
+    /// Fields this struct does not model (e.g. v3 `first-row-id`, `added-rows`),
+    /// kept so writer-produced metadata is served verbatim.
+    #[serde(flatten, default)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// A named snapshot reference (`refs` map entry): a branch or tag pointing at a snapshot.
@@ -300,6 +304,11 @@ pub struct IcebergTableMetadata {
     /// snapshot; this is the substrate for git-style agent branching (TD-117).
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub refs: HashMap<String, IcebergSnapshotRef>,
+    /// Fields this struct does not model — `last-sequence-number` (required from
+    /// v2), v3 `next-row-id`, … — kept so metadata written by the Iceberg engine is
+    /// served verbatim (ADR-097 D3).
+    #[serde(flatten, default)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Response for loading a table (GET /v1/namespaces/{ns}/tables/{table})
@@ -854,6 +863,11 @@ impl IcebergRestService {
         identifier: &TableIdentifier,
         schema: &CatalogTableSchema,
     ) -> Result<(IcebergTableMetadata, String)> {
+        // ADR-097 D3: a table published by the Iceberg engine (MATERIALIZE) is served
+        // from the engine's own `metadata.json`, verbatim — one writer, one tree.
+        if let Some(published) = engine_published_metadata(schema).await {
+            return Ok(published);
+        }
         let mut md = self.catalog_schema_to_iceberg_metadata(identifier, schema);
         let ns = identifier.namespace.join("\x1f");
         let default_location = format!(
@@ -921,6 +935,10 @@ impl IcebergRestService {
                 md.current_snapshot_id = current;
                 md.snapshots = snaps;
                 md.snapshot_log = log;
+                md.extra.insert(
+                    "last-sequence-number".to_string(),
+                    serde_json::json!(latest + 1),
+                );
             }
         }
 
@@ -1287,6 +1305,7 @@ impl IcebergRestService {
                 },
             },
             schema_id: Some(schema.schema_version),
+            extra: HashMap::new(),
         };
 
         // Default partition spec: partition by tenant_id (field id=2)
@@ -1339,6 +1358,7 @@ impl IcebergRestService {
             ])],
             metadata_log: vec![],
             refs: HashMap::from([("main".to_string(), IcebergSnapshotRef::branch(snapshot_id))]),
+            extra: HashMap::from([("last-sequence-number".to_string(), serde_json::json!(1))]),
         }
     }
 
@@ -1461,6 +1481,43 @@ fn uuid_from_name(name: &str) -> String {
     )
 }
 
+/// Iceberg metadata written by the engine's single writer
+/// (`IcebergObjectStoreBridge::publish_iceberg_snapshot`) for a table with a
+/// published Parquet layout: `(metadata, metadata-location)` of the latest
+/// `{table root}/metadata/v*.metadata.json`, or `None` when the table has no
+/// URL-addressed published layout or nothing has been published there yet.
+///
+/// The layout `location` is the directory of the parquet files
+/// (`{table root}/data`); the engine writes metadata to its sibling.
+async fn engine_published_metadata(
+    schema: &CatalogTableSchema,
+) -> Option<(IcebergTableMetadata, String)> {
+    const METADATA_DIR: &str = "metadata";
+    let location = schema.storage_layouts.iter().rev().find_map(|l| {
+        (l.authority == crate::CatalogAuthorityMode::ProjectionPublication
+            && l.physical_format == crate::CatalogPhysicalFormat::Parquet)
+            .then_some(l.location.as_deref())
+            .flatten()
+    })?;
+    if !location.contains("://") {
+        return None;
+    }
+    let table_root = location.trim_end_matches('/').strip_suffix("/data")?;
+    let bridge = proximadb_iceberg_engine::IcebergObjectStoreBridge::from_url(table_root).ok()?;
+    let version = bridge.latest_metadata_version(METADATA_DIR).await.ok()??;
+    let bytes = bridge
+        .read_table_metadata(METADATA_DIR, version)
+        .await
+        .ok()?;
+    match serde_json::from_slice::<IcebergTableMetadata>(&bytes) {
+        Ok(md) => Some((md, bridge.metadata_file_uri(METADATA_DIR, version))),
+        Err(err) => {
+            debug!("iceberg: engine metadata under {table_root} is unreadable: {err}");
+            None
+        }
+    }
+}
+
 /// Derive a materialized table's object-store base prefix from its catalog schema,
 /// mirroring the write path's `object_write_base_path` (explicit-location branch). Returns
 /// `None` for tables without an object-store location (not yet materialized), for which
@@ -1554,6 +1611,7 @@ fn build_snapshot_chain(
                 extra,
             },
             schema_id: Some(schema_id),
+            extra: HashMap::new(),
         });
         log.push(HashMap::from([
             ("timestamp-ms".to_string(), serde_json::json!(now_ms)),

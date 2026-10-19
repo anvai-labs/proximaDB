@@ -418,6 +418,12 @@ jobs:
               # TD-RECALL-2/#1406: track what can break the outcome, not who
               # owns the file.
               - 'tests/sift_pax_recall_ratchet_test.rs'
+              # ADR-097 D3 / TD-SEAM-1: the external Iceberg read-back gate runs in
+              # this lane; the writer, the REST catalog and the gate itself feed it.
+              - 'crates/storage/proximadb-iceberg-engine/**'
+              - 'crates/control/proximadb-catalog/src/iceberg_rest_service.rs'
+              - 'tests/iceberg_interop_e2e.rs'
+              - 'scripts/iceberg_readback.py'
             # Cloud object-store Cool-tier validation (TD-168). The tier-mapping code
             # lives in the object-store crate + the cold-payload store; the orchestration
             # is scripts/run_cloud_emulator_tests.sh. Re-run the (cheap) emulator tier
@@ -2643,10 +2649,25 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+      # ADR-097 D3 / TD-SEAM-1: external Iceberg read-back gate. Pinned readers
+      # that are NOT ProximaDB read a pgwire-materialized table back value-for-
+      # value (tests/iceberg_interop_e2e.rs -> scripts/iceberg_readback.py).
+      - name: Set up Python (Iceberg read-back readers)
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install pinned Iceberg readers
+        run: |
+          python -m pip install "pyiceberg[pyarrow]==0.12.0" "duckdb==1.5.6"
+          python -c "import duckdb; c = duckdb.connect(); c.sql('INSTALL iceberg'); c.sql('LOAD iceberg')"
       - name: Run Storage Integration Tests
+        env:
+          # Every reader must run; a missing one fails instead of skipping.
+          PROXIMADB_ICEBERG_READBACK_REQUIRE: "pyiceberg-rest,pyiceberg-static,duckdb"
+          PROXIMADB_PYTHON: python
         run: |
           # Run only explicitly named storage test files (avoids compiling all tests)
-          for test_file in tests/*sst*.rs tests/*storage*.rs tests/*wal*.rs tests/embedded_tenant_context.rs tests/td112_postflush_recall_e2e.rs tests/mlflow_run_store_test.rs; do
+          for test_file in tests/*sst*.rs tests/*storage*.rs tests/*wal*.rs tests/embedded_tenant_context.rs tests/td112_postflush_recall_e2e.rs tests/mlflow_run_store_test.rs tests/iceberg_interop_e2e.rs; do
             if [ -f "$test_file" ]; then
               test_name=$(basename "$test_file" .rs)
               echo "Running $test_name..."
