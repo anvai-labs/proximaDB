@@ -2042,6 +2042,59 @@ impl DirectWalTableRecordStore {
             .clone()
     }
 
+    /// The lowest canonical-WAL LSN the relational record tier still needs: the
+    /// minimum of every live partition's [`RecordStore::min_unflushed_lsn`].
+    /// One input to WAL truncation (TD-SEAM-2 / TD-USUB-1 slice 2b); the other
+    /// WAL consumers (change-feed readers, graph checkpoints) bound it too.
+    ///
+    /// * `Ok(None)`: no partition holds an unflushed row.
+    /// * `Ok(Some(lsn))`: entries below `lsn` are durable elsewhere on this
+    ///   tier's account.
+    /// * `Err`: do not truncate. Any partition refusing makes the whole tier
+    ///   refuse; there is no partial answer. A plain memtable partition refuses
+    ///   (the trait default), so with the spill gate unset — every partition a
+    ///   memtable — this always refuses unless no partition exists.
+    ///
+    /// Shared-storage mode ([`Self::new`]) refuses unconditionally: its one
+    /// backing store is not a per-partition durable store.
+    ///
+    /// **What this does NOT cover: writes in flight.** The write path appends
+    /// to the WAL first and applies to the partition after, so an entry that is
+    /// durable in the WAL but not yet resident in any partition is invisible
+    /// here. A truncation must therefore also be bounded by the lowest LSN any
+    /// in-flight write can hold (a reservation taken before its append) and by
+    /// a WAL position read BEFORE this call. That reservation is P2.2's to add,
+    /// alongside the truncation that needs it; this answer alone is not a safe
+    /// truncation point.
+    ///
+    /// The partition list is snapshotted first, so the read lock is not held
+    /// across the per-partition awaits.
+    pub async fn min_unflushed_lsn(&self) -> Result<Option<u64>> {
+        if self.shared_storage {
+            anyhow::bail!(
+                "shared-storage record store: one backing store for every partition is not \
+                 durable per partition, so the WAL cannot be truncated on its account"
+            );
+        }
+        let partitions: Vec<((String, String), Arc<dyn RecordStorage>)> = self
+            .partitions
+            .read()
+            .iter()
+            .map(|(key, partition)| (key.clone(), partition.clone()))
+            .collect();
+        let mut floor: Option<u64> = None;
+        for ((tenant_id, collection), partition) in partitions {
+            let partition_floor = partition.min_unflushed_lsn().await.with_context(|| {
+                format!("record partition (tenant '{tenant_id}', collection '{collection}') refuses WAL truncation")
+            })?;
+            floor = match (floor, partition_floor) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        Ok(floor)
+    }
+
     /// Remove ALL in-RAM state for one `(tenant, collection)` partition: the
     /// partition itself (recreated empty on demand) and any lazily built
     /// UNIQUE/secondary index for it. The WAL marker that keeps this
@@ -5524,6 +5577,122 @@ mod tests {
                 segment_files()
             );
         }
+
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+    }
+
+    /// The record tier's truncation floor refuses for every non-durable shape:
+    /// a memtable partition (the trait default) and shared-storage mode. An
+    /// empty partitioned store has no constraint.
+    #[tokio::test]
+    async fn record_tier_floor_refuses_for_memtable_and_shared_storage() {
+        let partitioned =
+            DirectWalTableRecordStore::new_partitioned(Arc::new(RecordingWalAppender::default()));
+        assert_eq!(
+            partitioned.min_unflushed_lsn().await.ok(),
+            Some(None),
+            "no partition, no constraint"
+        );
+        partitioned
+            .replay_wal_entries(vec![CanonicalWalEntry::new(
+                1,
+                CanonicalOperation::RecordUpsert {
+                    collection_id: "orders".to_string(),
+                    record: Box::new(ProximaRecord {
+                        oid: "r1".to_string(),
+                        ..Default::default()
+                    }),
+                    projections: vec![],
+                },
+                Some("tenant-a".to_string()),
+            )])
+            .await
+            .expect("replay");
+        let err = partitioned
+            .min_unflushed_lsn()
+            .await
+            .expect_err("a memtable partition holds its rows only in memory");
+        assert!(
+            format!("{err:#}").contains("collection 'orders'"),
+            "{err:#}"
+        );
+
+        let shared = DirectWalTableRecordStore::new(
+            Arc::new(crate::services::MemtableRecordStorage::new()),
+            Arc::new(RecordingWalAppender::default()),
+        );
+        assert!(
+            shared.min_unflushed_lsn().await.is_err(),
+            "shared storage refuses unconditionally"
+        );
+    }
+
+    /// With the spill gate on, the tier floor is the minimum over spill
+    /// partitions' resident LSNs — and ONE refusing partition (here the
+    /// untenanted one, which falls back to a memtable) makes the whole tier
+    /// refuse.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn record_tier_floor_is_the_minimum_over_spill_partitions() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let fs = Arc::new(
+            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
+                crate::storage::persistence::filesystem::local::LocalConfig::default(),
+            )
+            .await
+            .expect("local filesystem"),
+        );
+        let store = DirectWalTableRecordStore::new_spilling(
+            Arc::new(RecordingWalAppender::default()),
+            fs,
+            Arc::new(move |tenant_id: &str, collection: &str| {
+                format!("{base}/{tenant_id}/{collection}")
+            }),
+        );
+        let upsert = |lsn: u64, tenant: &str, collection: &str| {
+            CanonicalWalEntry::new(
+                lsn,
+                CanonicalOperation::RecordUpsert {
+                    collection_id: collection.to_string(),
+                    record: Box::new(ProximaRecord {
+                        oid: format!("r{lsn}"),
+                        ..Default::default()
+                    }),
+                    projections: vec![],
+                },
+                Some(tenant.to_string()),
+            )
+        };
+
+        // `orders`: LSNs 1..=6 at threshold 4 — 1..=4 flush, 5 and 6 stay
+        // resident. `items`: LSNs 7 and 8, both resident.
+        let mut entries: Vec<CanonicalWalEntry> = (1..=6)
+            .map(|lsn| upsert(lsn, "tenant-a", "orders"))
+            .collect();
+        entries.extend((7..=8).map(|lsn| upsert(lsn, "tenant-a", "items")));
+        store.replay_wal_entries(entries).await.expect("replay");
+        assert_eq!(
+            store.min_unflushed_lsn().await.ok(),
+            Some(Some(5)),
+            "the minimum resident LSN across spill partitions"
+        );
+
+        // An untenanted partition is a memtable (no tombstone stamp possible),
+        // so it refuses — and so does the tier.
+        store
+            .replay_wal_entries(vec![upsert(9, "", "orders")])
+            .await
+            .expect("replay");
+        assert!(
+            store.min_unflushed_lsn().await.is_err(),
+            "one refusing partition makes the whole tier refuse"
+        );
 
         unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
     }
