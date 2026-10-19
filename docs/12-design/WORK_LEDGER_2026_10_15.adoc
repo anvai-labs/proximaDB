@@ -123,6 +123,7 @@ P1 and P5a can start now; P2 → P3 → P4; P6 (benchmarks) runs throughout.
 | TD-SEAM-10 | P5b | PAX collection-global centroid directory + cluster-contiguous compaction | Open
 | TD-SEAM-11 | P5a | TD-ENGSEL-1 default, `.pax` `segment_vector_count`, L2 cache default | In Progress (default + `.pax` facts landed #2078; L2 cache default open)
 | TD-SEAM-12 | P2.2 gate | Canonical-WAL truncation floor across all twelve consumers (four have no low-water mark) | Open
+| TD-SEAM-13 | P5c | HNSW on AXIS as a persisted, stamped projection of PAX; ground-up rebuild = repair; needs TD-PAXPREC-1 | Open (design decided 2026-10-19)
 |===
 
 Corrections made with this filing (premise verification): TD-OLAPFMT-2's "row-identical across

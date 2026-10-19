@@ -410,7 +410,7 @@ Dependencies: P1 ∥ P5a can start now. P2 → P3 → P4. P6 runs throughout.
 | P2 | S1/S2/S3 one write path | TD-SEAM-2, TD-SEAM-3, TD-SEAM-4
 | P3 | S5/S6/S9 format-independent SQL and the multimodal operator | TD-SEAM-5, TD-SEAM-6
 | P4 | Modalities onto the seams | TD-SEAM-7, TD-SEAM-8, TD-SEAM-9
-| P5 | Vector tier economics | TD-SEAM-11 (P5a), TD-SEAM-10 (P5b), TD-112 (P5c)
+| P5 | Vector tier economics | TD-SEAM-11 (P5a), TD-SEAM-10 (P5b), TD-SEAM-13 + TD-112 (P5c; TD-PAXPREC-1 first)
 | P6 | Proof | TPC ratchet (TD-OLAP-4), multimodal benchmark
 |===
 
@@ -517,7 +517,7 @@ every selectivity band; the TE-1 query runs over pgwire with `EXPLAIN` showing p
 ** Cluster-contiguous compaction with A+B co-located.
 ** *Gate:* SIFT1M on MinIO with injected latency reaches ≤ 3 sequential waves, ≤ 20 GET/query,
    recall ≥ 0.98; BIGANN 10M is re-measured.
-* **P5c:** HNSW as a persisted hot projection (TD-112) built from PAX; AXIS IVF disk path
+* **P5c:** HNSW as a persisted hot projection (TD-112) built from PAX, on the AXIS engine — lifecycle in TD-SEAM-13 (stamped projection, delta on boot, ground-up rebuild as repair, exact-tier prerequisite TD-PAXPREC-1); AXIS IVF disk path
   retired in favour of P5b.
 
 === P6 — Proof
