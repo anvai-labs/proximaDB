@@ -95,30 +95,54 @@ pub(crate) fn configured_flush_threshold() -> Option<usize> {
         .filter(|n| *n > 0)
 }
 
+/// One resident row: the value, the write that produced it, and that write's
+/// WAL LSN, stored together so a single map insert replaces all three.
+///
+/// **Why the generation (TD-USUB-15).** `flush` snapshots the memtable, PUTs
+/// the snapshot, then evicts what it wrote. `upsert_record` does not take
+/// `flush_guard`, so a newer value for a snapshotted oid can land during the
+/// PUT. Evicting by KEY then discarded that newer value: reads fell back to the
+/// flushed copy, and with nothing resident `min_unflushed_lsn` answered "no
+/// constraint" — under WAL truncation, a permanent, silent loss. Eviction is
+/// therefore `remove_if(generation == snapshotted generation)`: only the value
+/// this flush made durable is evicted, atomically per key. A generation, not
+/// `updated_at_ns` or record equality: the caller supplies timestamps (two
+/// writes can share one), and `ProximaRecord` equality is neither cheap nor a
+/// statement about which write it was.
+///
+/// **Why the LSN lives here (it used to be a separate `oid → LSN` map).** Two
+/// maps cannot be updated as one step, and each ordering of the two inserts
+/// left a window: a flush evicting between them either dropped the new write's
+/// LSN (untracked, fail closed until the next flush) or kept an LSN for a row
+/// that was no longer resident (pinning truncation forever, since no later
+/// flush would iterate it). Bundled, the snapshot, the eviction and the LSN
+/// association are one per-key operation.
+///
+/// The LSN is kept off `ProximaRecord` so the central record type is untouched
+/// and the LSN never has to survive the Parquet round trip: once a row is in a
+/// segment it is durable there and stops constraining truncation, which is
+/// exactly when its `Resident` is evicted. `None` means the write came through
+/// plain `upsert_record` with no prior LSN for the oid, which is why
+/// `min_unflushed_lsn` refuses to answer while any resident row is untracked.
+#[derive(Debug, Clone)]
+struct Resident {
+    record: ProximaRecord,
+    generation: u64,
+    lsn: Option<u64>,
+}
+
 /// A relational record store that keeps recent rows resident and flushes older
 /// ones to durable Parquet segments, serving reads as a merge over both.
 #[derive(Debug)]
 pub struct SpillRecordStorage {
     /// Resident rows. Always strictly newer than any segment copy.
-    memtable: DashMap<String, ProximaRecord>,
+    memtable: DashMap<String, Resident>,
     /// Oids deleted after having been flushed. Suppresses the segment copy on
     /// read; cleared for an oid that is re-inserted.
     tombstones: DashSet<String>,
-    /// `oid → durable WAL LSN` for rows still RESIDENT, i.e. not yet in a
-    /// segment. The minimum over this map is the lowest LSN the WAL must retain
-    /// on this partition's account (TD-USUB-1, slice 2b prerequisite).
-    ///
-    /// Kept beside the memtable rather than on `ProximaRecord` so the central
-    /// record type is untouched and the LSN never has to survive the Parquet
-    /// round trip — once a row is in a segment it is durable there, and its LSN
-    /// stops constraining truncation, which is exactly when this entry is
-    /// dropped.
-    ///
-    /// Populated only through [`RecordStore::upsert_record_at_lsn`]. A write
-    /// arriving via plain `upsert_record` contributes **no** entry — which is
-    /// why `min_unflushed_lsn` refuses to answer when any resident row is
-    /// untracked, rather than returning a minimum that silently excludes it.
-    resident_lsns: DashMap<String, u64>,
+    /// Source of [`Resident::generation`]: bumped by every write to the
+    /// memtable, so two writes of one oid never share a generation.
+    next_generation: AtomicU64,
     /// Flushed segment paths, oldest first. Later entries shadow earlier ones.
     segments: parking_lot::RwLock<Vec<String>>,
     /// Serializes `flush` against any other structural mutation of the
@@ -281,7 +305,7 @@ impl SpillRecordStorage {
         Self {
             memtable: DashMap::new(),
             tombstones: DashSet::new(),
-            resident_lsns: DashMap::new(),
+            next_generation: AtomicU64::new(0),
             segments: parking_lot::RwLock::new(Vec::new()),
             flush_guard: tokio::sync::Mutex::new(()),
             unresolved_segment_writes: AtomicU64::new(0),
@@ -612,7 +636,10 @@ impl SpillRecordStorage {
         let _publish = self.flush_guard.lock().await;
         // The RESIDENT rows, kept separate from what gets written. These are the
         // only rows this flush may evict from the memtable afterwards.
-        let residents: Vec<ProximaRecord> = self
+        //
+        // Each carries the generation it was snapshotted at, which is what the
+        // post-commit eviction compares against (TD-USUB-15).
+        let residents: Vec<Resident> = self
             .memtable
             .iter()
             .map(|entry| entry.value().clone())
@@ -692,7 +719,7 @@ impl SpillRecordStorage {
         // was wrong, and the way it was wrong is worth keeping: the post-commit
         // eviction loop iterates `residents`, so suppressing the live row from
         // the object while still evicting it DESTROYED an acknowledged INSERT —
-        // and dropping its `resident_lsns` entry removed the very `tracked <
+        // and dropping its LSN association removed the very `tracked <
         // resident` signal that was failing closed for it, so slice 2b would then
         // discard the WAL entry too. A committed row in no segment, no memtable
         // and no WAL.
@@ -716,7 +743,7 @@ impl SpillRecordStorage {
         // the order becomes knowable; then this block resolves the race instead
         // of refusing it.
         let resident_oids: std::collections::HashSet<&str> =
-            residents.iter().map(|r| r.oid.as_str()).collect();
+            residents.iter().map(|r| r.record.oid.as_str()).collect();
         let ambiguous: std::collections::HashSet<String> = tombstoned
             .iter()
             .filter(|oid| resident_oids.contains(oid.as_str()))
@@ -736,9 +763,9 @@ impl SpillRecordStorage {
         // What this flush actually handles: everything except the ambiguous oids.
         // `evicting` is also exactly the set the post-commit loop may evict, so
         // "evicted" implies "written" by construction.
-        let evicting: Vec<ProximaRecord> = residents
+        let evicting: Vec<Resident> = residents
             .iter()
-            .filter(|r| !ambiguous.contains(&r.oid))
+            .filter(|r| !ambiguous.contains(&r.record.oid))
             .cloned()
             .collect();
         let persisting: Vec<&String> = tombstoned
@@ -777,7 +804,7 @@ impl SpillRecordStorage {
         // `residents`)"; that combination destroyed an acknowledged INSERT and
         // flipped truncation fail-open. The ambiguity block above explains why
         // this store cannot resolve that race at all.
-        let mut written: Vec<ProximaRecord> = evicting.clone();
+        let mut written: Vec<ProximaRecord> = evicting.iter().map(|r| r.record.clone()).collect();
 
         // `persisting` is empty whenever the tenant is unusable, because
         // `tombstoned` is — both derive from the one binding above.
@@ -916,12 +943,17 @@ impl SpillRecordStorage {
         // snapshot. NOT the raw `residents` either: that evicted ambiguous rows
         // this flush deliberately did not write, destroying an acknowledged
         // INSERT and dropping the `tracked < resident` signal protecting it.
-        for record in &evicting {
-            self.memtable.remove(&record.oid);
-            // The row is durable in the segment now, so its WAL entry no longer
-            // constrains truncation. Dropping the association here is what makes
-            // `min_unflushed_lsn` advance.
-            self.resident_lsns.remove(&record.oid);
+        //
+        // And only if the resident value is STILL the one written: an upsert
+        // landing during the PUT replaced it with a newer generation, which is
+        // in no segment and must stay resident, LSN and all (TD-USUB-15). An
+        // evicted row is durable in the segment, so its WAL entry stops
+        // constraining truncation — that is what makes `min_unflushed_lsn`
+        // advance.
+        for resident in &evicting {
+            self.memtable.remove_if(&resident.record.oid, |_, current| {
+                current.generation == resident.generation
+            });
         }
 
         // Clear ONLY the snapshotted tombstones, and only now that the segment
@@ -943,6 +975,48 @@ impl SpillRecordStorage {
             self.tombstones.remove(oid);
         }
         Ok(Some(path))
+    }
+
+    /// The one memtable write path: value, fresh generation and LSN replace the
+    /// resident entry in a single insert (see [`Resident`]).
+    ///
+    /// A plain `upsert_record` (`lsn == None`) of an oid that is already
+    /// tracked keeps that LSN. It is a lower bound on this write's own WAL
+    /// entry, so retaining from it also retains the new write — the same answer
+    /// the separate LSN map used to give, which a plain upsert never touched.
+    async fn upsert_resident(
+        &self,
+        record: ProximaRecord,
+        lsn: Option<u64>,
+    ) -> Result<ProximaRecord> {
+        // Re-inserting a previously deleted oid must clear its tombstone, or the
+        // new row would stay invisible behind the suppression of the old one.
+        self.tombstones.remove(&record.oid);
+        let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
+        match self.memtable.entry(record.oid.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut current) => {
+                let lsn = lsn.or(current.get().lsn);
+                current.insert(Resident {
+                    record: record.clone(),
+                    generation,
+                    lsn,
+                });
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(Resident {
+                    record: record.clone(),
+                    generation,
+                    lsn,
+                });
+            }
+        }
+
+        if let Some(threshold) = self.flush_threshold
+            && self.memtable.len() >= threshold
+        {
+            self.flush().await?;
+        }
+        Ok(record)
     }
 
     /// Decode one segment back to records through the canonical mixed-format
@@ -976,7 +1050,7 @@ impl SpillRecordStorage {
             }
         }
         for entry in self.memtable.iter() {
-            merged.insert(entry.key().clone(), entry.value().clone());
+            merged.insert(entry.key().clone(), entry.value().record.clone());
         }
         for oid in self.tombstones.iter() {
             merged.remove(oid.key());
@@ -1010,17 +1084,7 @@ impl SpillRecordStorage {
 #[async_trait]
 impl RecordStore for SpillRecordStorage {
     async fn upsert_record(&self, record: ProximaRecord) -> RecordStoreResult<ProximaRecord> {
-        // Re-inserting a previously deleted oid must clear its tombstone, or the
-        // new row would stay invisible behind the suppression of the old one.
-        self.tombstones.remove(&record.oid);
-        self.memtable.insert(record.oid.clone(), record.clone());
-
-        if let Some(threshold) = self.flush_threshold
-            && self.memtable.len() >= threshold
-        {
-            self.flush().await?;
-        }
-        Ok(record)
+        self.upsert_resident(record, None).await
     }
 
     async fn upsert_record_at_lsn(
@@ -1028,18 +1092,13 @@ impl RecordStore for SpillRecordStorage {
         record: ProximaRecord,
         lsn: u64,
     ) -> RecordStoreResult<ProximaRecord> {
-        // Record the association BEFORE the write, so a flush triggered by this
-        // very insert already sees it and can evict it. Doing it afterwards
-        // would leave a flushed oid tracked as resident, pinning the WAL at an
-        // LSN that is in fact already durable in a segment.
-        self.resident_lsns.insert(record.oid.clone(), lsn);
-        self.upsert_record(record).await
+        self.upsert_resident(record, Some(lsn)).await
     }
 
     /// Minimum LSN among resident (unflushed) rows.
     ///
     /// Deliberately does NOT call `ensure_discovered`, and must not: it reads
-    /// only `resident_lsns` and `tombstones`, both in memory, and discovery adds
+    /// only the resident LSNs and `tombstones`, both in memory, and discovery adds
     /// to neither — it adds *flushed* segments, whose rows are by definition no
     /// longer resident and no longer constrain truncation. Adding the call would
     /// be harmless but misleading about what this answer depends on.
@@ -1106,7 +1165,8 @@ impl RecordStore for SpillRecordStorage {
         if resident == 0 {
             return Ok(None);
         }
-        let tracked = self.resident_lsns.len();
+        let lsns: Vec<u64> = self.memtable.iter().filter_map(|e| e.value().lsn).collect();
+        let tracked = lsns.len();
         if tracked < resident {
             return Err(anyhow::anyhow!(
                 "spill: cannot compute a safe truncation point — {} resident row(s) but only {} \
@@ -1117,7 +1177,7 @@ impl RecordStore for SpillRecordStorage {
                 tracked
             ));
         }
-        Ok(self.resident_lsns.iter().map(|e| *e.value()).min())
+        Ok(lsns.into_iter().min())
     }
 
     async fn get_record(&self, key: &RecordKey) -> RecordStoreResult<Option<ProximaRecord>> {
@@ -1134,7 +1194,7 @@ impl RecordStore for SpillRecordStorage {
             // The memtable is strictly newer than any segment, so a dead
             // resident copy means the row is dead — return None rather than
             // falling through to a stale segment copy.
-            let record = entry.value().clone();
+            let record = entry.value().record.clone();
             return Ok((!record.is_dead(now_ns)).then_some(record));
         }
         // Newest segment first: a later flush shadows an earlier copy.
@@ -1196,7 +1256,7 @@ impl RecordStore for SpillRecordStorage {
             let removed = self.memtable.remove(&key.oid);
             let resident_was_dead = removed
                 .as_ref()
-                .is_some_and(|(_, record)| record.is_dead(now_ns));
+                .is_some_and(|(_, resident)| resident.record.is_dead(now_ns));
             let was_resident = removed.is_some() && !resident_was_dead;
             let has_segments = !self.segments.read().is_empty();
 
@@ -1209,13 +1269,12 @@ impl RecordStore for SpillRecordStorage {
             if has_segments {
                 self.tombstones.insert(key.oid.clone());
             }
-            // A deleted row is no longer resident, so its INSERT's LSN stops
-            // constraining truncation. The DELETE's own LSN is a separate
-            // matter: if the row had been flushed, the tombstone above is the
-            // only in-memory evidence of the deletion and `min_unflushed_lsn`
-            // fails closed on it — dropping this association does NOT release
-            // that obligation.
-            self.resident_lsns.remove(&key.oid);
+            // The `remove` above also dropped the row's LSN (it lives in the
+            // `Resident`), so its INSERT stops constraining truncation. The
+            // DELETE's own LSN is a separate matter: if the row had been
+            // flushed, the tombstone above is the only in-memory evidence of the
+            // deletion and `min_unflushed_lsn` fails closed on it — dropping the
+            // association does NOT release that obligation.
 
             (was_resident, resident_was_dead, has_segments)
         };
@@ -2550,9 +2609,13 @@ mod tests {
         // The ONLY unflushed state is one ambiguous oid.
         store.memtable.insert(
             "k".to_string(),
-            ProximaRecord {
-                tenant_id: "tenant-a".to_string(),
-                ..record("k", "v2")
+            Resident {
+                record: ProximaRecord {
+                    tenant_id: "tenant-a".to_string(),
+                    ..record("k", "v2")
+                },
+                generation: u64::MAX,
+                lsn: None,
             },
         );
         store.tombstones.insert("k".to_string());
@@ -2610,9 +2673,13 @@ mod tests {
         store.flush().await?;
         store.memtable.insert(
             "k".to_string(),
-            ProximaRecord {
-                tenant_id: "tenant-a".to_string(),
-                ..record("k", "v2")
+            Resident {
+                record: ProximaRecord {
+                    tenant_id: "tenant-a".to_string(),
+                    ..record("k", "v2")
+                },
+                generation: u64::MAX,
+                lsn: None,
             },
         );
         store.tombstones.insert("k".to_string());
@@ -2899,14 +2966,10 @@ mod tests {
     /// inserts, and does NOT take `flush_guard`) would have had its fresh row
     /// evicted. A live row, lost.
     ///
-    /// **Scope, stated because the obvious generalisation is FALSE.** This
-    /// covers the TOMBSTONED oid only — `residents` is empty here, since `k` was
-    /// flushed and then deleted. The same hazard exists for a RESIDENT oid whose
-    /// value changes mid-flush (`memtable.remove` is unconditional by key, so a
-    /// newer value written during the PUT window is evicted), and this change
-    /// does NOT close it. That half is TD-USUB-15, and it is a stated
-    /// prerequisite of slice 2b: today WAL replay recovers the lost value, but
-    /// once truncation acts on `min_unflushed_lsn` it will not.
+    /// **Scope.** This covers the TOMBSTONED oid only — `residents` is empty
+    /// here, since `k` was flushed and then deleted. The RESIDENT half (an oid
+    /// whose value changes mid-flush) is TD-USUB-15, pinned by
+    /// `an_upsert_of_a_resident_oid_during_the_put_is_not_evicted`.
     #[tokio::test]
     async fn an_upsert_of_a_tombstoned_oid_after_the_snapshot_is_not_evicted() -> Result<()> {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2961,6 +3024,102 @@ mod tests {
             status_is(&got, "v2"),
             "and it must be the NEW value, not the flushed one"
         );
+        Ok(())
+    }
+
+    /// TD-USUB-15: a NEW VALUE for a RESIDENT oid written while the flush is
+    /// parked in its PUT must survive the flush, with its own LSN.
+    ///
+    /// The resident mirror of the tombstoned test above. Before the fix the
+    /// post-commit loop evicted by key: `v2` (written after the snapshot, into
+    /// no segment) was discarded, reads fell back to the flushed `v1`, and with
+    /// nothing resident `min_unflushed_lsn` answered `Ok(None)` — under WAL
+    /// truncation, `v2`'s WAL entry would then be discarded too and the row
+    /// permanently `v1`. Mutation check: an unconditional
+    /// `self.memtable.remove(&resident.record.oid)` in that loop fails all three
+    /// assertions.
+    #[tokio::test]
+    async fn an_upsert_of_a_resident_oid_during_the_put_is_not_evicted() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        std::mem::forget(dir);
+
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let fs = Arc::new(BarrierFs {
+            inner: LocalFileSystem::new(LocalConfig::default())
+                .await
+                .expect("local filesystem"),
+            reached: reached.clone(),
+            release: release.clone(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            fail_writes: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store = Arc::new(
+            SpillRecordStorage::with_flush_threshold(fs.clone(), base, None)
+                .with_tenant("tenant-a"),
+        );
+
+        RecordStore::upsert_record_at_lsn(store.as_ref(), record("a", "v1"), 10).await?;
+
+        // Park the flush inside its PUT, AFTER it snapshotted `a:v1`.
+        fs.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let flusher = {
+            let store = store.clone();
+            tokio::spawn(async move { store.flush().await })
+        };
+        reached.notified().await;
+
+        // `upsert_record` takes no `flush_guard`, so this lands mid-PUT.
+        RecordStore::upsert_record_at_lsn(store.as_ref(), record("a", "v2"), 20).await?;
+
+        release.notify_one();
+        let path = flusher.await.expect("join")?.expect("the flush publishes");
+
+        // The flushed object holds v1, as snapshotted ...
+        let rows = store.read_segment(&path).await?;
+        assert!(
+            rows.iter().any(|r| r.oid == "a" && status_is(r, "v1")),
+            "the segment holds the snapshotted value"
+        );
+        // ... and v2, which is in no segment, is still resident and served.
+        assert_eq!(store.resident_len(), 1, "v2 must stay resident");
+        let got = store
+            .get_record(&RecordKey::new("a".to_string()))
+            .await?
+            .expect("the row must still exist");
+        assert!(status_is(&got, "v2"), "reads must serve the NEW value");
+        // And truncation is still pinned at v2's LSN, not released.
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(store.as_ref()).await?,
+            Some(20),
+            "v2's WAL entry is its only durable copy, so it must constrain truncation"
+        );
+
+        // The next flush makes v2 durable and releases the constraint.
+        store.flush().await?.expect("v2 publishes");
+        assert_eq!(store.resident_len(), 0);
+        assert_eq!(RecordStore::min_unflushed_lsn(store.as_ref()).await?, None);
+        let got = store
+            .get_record(&RecordKey::new("a".to_string()))
+            .await?
+            .expect("row");
+        assert!(status_is(&got, "v2"));
+        Ok(())
+    }
+
+    /// A plain `upsert_record` of a tracked oid keeps the earlier LSN: it is a
+    /// lower bound on the new write's own WAL entry, so truncation stays safe —
+    /// the behaviour of the separate LSN map this replaced (TD-USUB-15).
+    #[tokio::test]
+    async fn a_plain_upsert_of_a_tracked_oid_keeps_its_lsn() -> Result<()> {
+        let s = store(None).await;
+        RecordStore::upsert_record_at_lsn(&s, record("a", "v1"), 7).await?;
+        s.upsert_record(record("a", "v2")).await?;
+        assert_eq!(RecordStore::min_unflushed_lsn(&s).await?, Some(7));
+        // An untracked oid still fails closed.
+        s.upsert_record(record("b", "v1")).await?;
+        assert!(RecordStore::min_unflushed_lsn(&s).await.is_err());
         Ok(())
     }
 
