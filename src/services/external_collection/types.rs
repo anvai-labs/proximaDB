@@ -153,8 +153,6 @@ impl ExternalCollection {
     }
 }
 
-/// Current epoch milliseconds.
-
 #[cfg(test)]
 mod tests {
     use super::*;

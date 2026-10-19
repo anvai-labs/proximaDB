@@ -123,7 +123,7 @@ pub fn register_stored_function(f: &StoredFunction) -> Result<()> {
     Ok(())
 }
 
-/// Current wall-clock time in milliseconds since the Unix epoch (function install timestamp).
+/// Current wall-clock time in nanoseconds since the Unix epoch.
 fn now_ns() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
