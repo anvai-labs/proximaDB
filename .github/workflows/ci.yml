@@ -2665,6 +2665,11 @@ jobs:
           # Every reader must run; a missing one fails instead of skipping.
           PROXIMADB_ICEBERG_READBACK_REQUIRE: "pyiceberg-rest,pyiceberg-static,duckdb"
           PROXIMADB_PYTHON: python
+          # iceberg_interop_e2e drives a full server in a dev-profile build; its
+          # pgwire DDL/MATERIALIZE chain overflows tokio's default ~2 MiB worker
+          # stack (reproduced locally). Same remedy as the query lane; on the
+          # step, not the job, so the rust-cache key is unchanged.
+          RUST_MIN_STACK: "8388608"
         run: |
           # Run only explicitly named storage test files (avoids compiling all tests)
           for test_file in tests/*sst*.rs tests/*storage*.rs tests/*wal*.rs tests/embedded_tenant_context.rs tests/td112_postflush_recall_e2e.rs tests/mlflow_run_store_test.rs tests/iceberg_interop_e2e.rs; do

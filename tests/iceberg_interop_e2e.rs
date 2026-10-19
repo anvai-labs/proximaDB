@@ -299,23 +299,32 @@ async fn materialized_table_reads_back_in_external_iceberg_engines() {
         let _ = conn.await;
     });
 
-    // DECIMAL is deliberately absent: MATERIALIZE cannot encode it yet
-    // (`proxima_arrow` has no Decimal materialization — TD-SEAM-1 residual).
+    // DECIMAL(10,2) exercises the exact-decimal path end to end: catalog
+    // precision/scale → Decimal128 Parquet → Iceberg `decimal(10,2)` + bounds.
     let table = "store_returns_rb";
-    let cols = ["sr_id", "sr_item", "sr_amount", "sr_date", "sr_qty"];
+    let cols = [
+        "sr_id",
+        "sr_item",
+        "sr_amount",
+        "sr_price",
+        "sr_date",
+        "sr_qty",
+    ];
     client
         .simple_query(&format!(
             "CREATE TABLE {table} (sr_id INT PRIMARY KEY, sr_item VARCHAR, \
-             sr_amount DOUBLE PRECISION, sr_date DATE, sr_qty BIGINT)"
+             sr_amount DECIMAL(10,2), sr_price DOUBLE PRECISION, sr_date DATE, \
+             sr_qty BIGINT)"
         ))
         .await
         .expect("create");
     client
         .simple_query(&format!(
-            "INSERT INTO {table} (sr_id, sr_item, sr_amount, sr_date, sr_qty) VALUES \
-             (1, 'AAAA', 12.5, '2024-01-02', 3), \
-             (2, 'BBBB', 0.75, '2024-02-29', NULL), \
-             (3, NULL, 1000.25, '2023-12-31', 9000000000)"
+            "INSERT INTO {table} (sr_id, sr_item, sr_amount, sr_price, sr_date, sr_qty) \
+             VALUES \
+             (1, 'AAAA', 12.50, 12.5, '2024-01-02', 3), \
+             (2, 'BBBB', -0.99, 0.75, '2024-02-29', NULL), \
+             (3, NULL, 1000.00, 1000.25, '2023-12-31', 9000000000)"
         ))
         .await
         .expect("insert");
@@ -326,8 +335,9 @@ async fn materialized_table_reads_back_in_external_iceberg_engines() {
         if round == 1 {
             client
                 .simple_query(&format!(
-                    "INSERT INTO {table} (sr_id, sr_item, sr_amount, sr_date, sr_qty) \
-                     VALUES (4, 'DDDD', 7.25, '2024-06-30', 1)"
+                    "INSERT INTO {table} \
+                     (sr_id, sr_item, sr_amount, sr_price, sr_date, sr_qty) \
+                     VALUES (4, 'DDDD', 7.25, 7.25, '2024-06-30', 1)"
                 ))
                 .await
                 .expect("insert 2");
@@ -357,6 +367,15 @@ async fn materialized_table_reads_back_in_external_iceberg_engines() {
         );
         let md = &load["metadata"];
         assert_eq!(md["format-version"], 2);
+        let amount_type = md["schemas"][0]["fields"]
+            .as_array()
+            .and_then(|fs| fs.iter().find(|f| f["name"] == "sr_amount"))
+            .map(|f| f["type"].clone());
+        assert_eq!(
+            amount_type,
+            Some(serde_json::json!("decimal(10,2)")),
+            "DECIMAL keeps its declared precision/scale through to Iceberg"
+        );
         assert_eq!(md["last-sequence-number"], (round + 1) as i64);
         let snapshot = &md["snapshots"][0];
         assert!(

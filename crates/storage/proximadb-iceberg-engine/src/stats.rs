@@ -28,6 +28,8 @@ const TRUNCATE_LEN: usize = 16;
 #[derive(Clone, Debug, PartialEq, PartialOrd)]
 enum Bound {
     Int(i64),
+    /// A big-endian two's-complement fixed-length value (wide decimals), widened.
+    Wide(i128),
     Float(f64),
     Bool(bool),
     Bytes(Vec<u8>),
@@ -50,13 +52,53 @@ fn bounds_of(stats: &Statistics) -> Option<(Bound, Bound)> {
             Bound::Bytes(s.min_opt()?.data().to_vec()),
             Bound::Bytes(s.max_opt()?.data().to_vec()),
         ),
+        // FIXED_LEN_BYTE_ARRAY carries wide decimals (precision > 18) as big-endian
+        // two's complement; only decimal columns encode a bound from it.
+        Statistics::FixedLenByteArray(s) => (
+            Bound::Wide(be_signed(s.min_opt()?.data())?),
+            Bound::Wide(be_signed(s.max_opt()?.data())?),
+        ),
         _ => return None,
     })
+}
+
+/// Sign-extend big-endian two's-complement bytes (at most 16) to `i128`.
+fn be_signed(bytes: &[u8]) -> Option<i128> {
+    if bytes.is_empty() || bytes.len() > 16 {
+        return None;
+    }
+    let fill = if bytes[0] & 0x80 != 0 { 0xFF } else { 0x00 };
+    let mut buf = [fill; 16];
+    buf[16 - bytes.len()..].copy_from_slice(bytes);
+    Some(i128::from_be_bytes(buf))
+}
+
+/// Iceberg's decimal bound: the unscaled value as the *minimum* number of
+/// big-endian two's-complement bytes (Appendix D).
+fn decimal_bound(v: i128) -> Vec<u8> {
+    let bytes = v.to_be_bytes();
+    let mut start = 0;
+    while start < 15 {
+        let (b, next) = (bytes[start], bytes[start + 1]);
+        if (b == 0x00 && next & 0x80 == 0) || (b == 0xFF && next & 0x80 != 0) {
+            start += 1;
+        } else {
+            break;
+        }
+    }
+    bytes[start..].to_vec()
 }
 
 /// Serialize a folded bound per the Iceberg type, or `None` when the type is
 /// not covered (no bound is always valid).
 fn encode(type_name: &str, bound: &Bound, is_upper: bool) -> Option<Vec<u8>> {
+    if type_name.starts_with("decimal(") {
+        return match bound {
+            Bound::Int(v) => Some(decimal_bound(*v as i128)),
+            Bound::Wide(v) => Some(decimal_bound(*v)),
+            _ => None,
+        };
+    }
     match (type_name, bound) {
         ("int" | "date", Bound::Int(v)) => i32::try_from(*v).ok().map(|v| v.to_le_bytes().to_vec()),
         ("long", Bound::Int(v)) => Some(v.to_le_bytes().to_vec()),
@@ -138,7 +180,15 @@ pub fn iceberg_column_stats(
                 None => bounds_valid = false,
             }
         }
-        let (lower_bound, upper_bound) = if bounds_valid {
+        // A decimal bound is the column's UNSCALED value, so it is only meaningful
+        // when the Parquet column really is DECIMAL-annotated (same scale);
+        // otherwise a plain integer would be misread as unscaled.
+        let decimal_ok = !field.type_name.starts_with("decimal(")
+            || matches!(
+                schema.column(leaf).logical_type_ref(),
+                Some(parquet::basic::LogicalType::Decimal { .. })
+            );
+        let (lower_bound, upper_bound) = if bounds_valid && decimal_ok {
             (
                 lower
                     .as_ref()
@@ -272,7 +322,55 @@ mod tests {
             &[field(9, "missing", "long"), field(1, "d", "decimal(9,2)")],
         );
         assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].lower_bound, None, "uncovered type → no bound");
+        assert_eq!(
+            stats[0].lower_bound, None,
+            "decimal over a non-DECIMAL Parquet column → no bound"
+        );
         assert_eq!(stats[0].value_count, Some(10));
+    }
+
+    #[test]
+    fn decimal_bounds_use_minimal_big_endian_twos_complement() {
+        assert_eq!(decimal_bound(0), vec![0x00]);
+        assert_eq!(decimal_bound(1250), vec![0x04, 0xE2]);
+        assert_eq!(decimal_bound(127), vec![0x7F]);
+        assert_eq!(decimal_bound(128), vec![0x00, 0x80]);
+        assert_eq!(decimal_bound(-1), vec![0xFF]);
+        assert_eq!(decimal_bound(-129), vec![0xFF, 0x7F]);
+        assert_eq!(be_signed(&[0xFF, 0x7F]), Some(-129));
+        assert_eq!(be_signed(&[0x04, 0xE2]), Some(1250));
+        assert_eq!(
+            encode("decimal(10,2)", &Bound::Int(1250), false),
+            Some(vec![0x04, 0xE2])
+        );
+        assert_eq!(
+            encode("decimal(30,2)", &Bound::Wide(-129), true),
+            Some(vec![0xFF, 0x7F])
+        );
+    }
+
+    #[test]
+    fn decimal_column_gets_manifest_bounds() {
+        use arrow_array::Decimal128Array;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amt",
+            DataType::Decimal128(10, 2),
+            false,
+        )]));
+        let values = Decimal128Array::from(vec![1250_i128, -99, 100_000])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+        let mut buf = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let meta = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(buf))
+            .unwrap()
+            .metadata()
+            .clone();
+        let stats = iceberg_column_stats(&meta, &[field(1, "amt", "decimal(10,2)")]);
+        assert_eq!(stats[0].lower_bound, Some(decimal_bound(-99)));
+        assert_eq!(stats[0].upper_bound, Some(decimal_bound(100_000)));
     }
 }

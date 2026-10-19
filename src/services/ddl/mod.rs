@@ -1715,12 +1715,19 @@ impl DdlService {
             SqlDataType::Decimal { precision, scale } => {
                 properties.insert("precision".to_string(), precision.to_string());
                 properties.insert("scale".to_string(), scale.to_string());
-                // Placeholder precision/scale; the authoritative values live in
-                // column properties (matching the legacy CatalogDataType::Decimal
-                // dimensionless mapping).
+                // The declared precision/scale ARE the type: Arrow (`Decimal128`),
+                // Parquet and Iceberg (`decimal(p,s)`) all derive from them. A
+                // precision above Decimal128's 38 digits is held at 38 (the
+                // declared value stays in the column properties).
+                if *scale > *precision {
+                    return Err(anyhow!(
+                        "DECIMAL({precision},{scale}): scale must not exceed precision"
+                    ));
+                }
+                let precision = (*precision).clamp(1, 38) as u8;
                 ProximaType::Decimal {
-                    precision: 38,
-                    scale: 10,
+                    precision,
+                    scale: (*scale).min(precision as u32) as u8,
                 }
             }
             SqlDataType::Varchar { max_length } => {

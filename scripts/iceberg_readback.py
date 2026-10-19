@@ -15,8 +15,9 @@ order of the first column. Driven by tests/iceberg_interop_e2e.rs:
       --namespace default --table t --metadata-location file:///.../v...json \
       --expected expected.json [--require pyiceberg-rest,pyiceberg-static,duckdb]
 
-An engine that cannot be loaded (module or DuckDB extension missing) is SKIPPED
-unless named in --require. Exit 0 = every non-skipped engine matched.
+A reader that is not installed (module or DuckDB extension missing) is SKIPPED
+unless named in --require; a reader that runs and errors always FAILS. Exit 0 =
+at least one reader ran and every reader that ran matched; 2 = none ran.
 """
 
 import argparse
@@ -50,7 +51,21 @@ def first_key_sort(rows):
     return sorted(rows, key=key)
 
 
+class Unavailable(Exception):
+    """The reader is not installed here (module or DuckDB extension missing)."""
+
+
+def _require_module(name):
+    import importlib
+
+    try:
+        return importlib.import_module(name)
+    except ImportError as e:
+        raise Unavailable(f"{name} not installed: {e}") from e
+
+
 def read_pyiceberg_rest(args, columns):
+    _require_module("pyiceberg")
     from pyiceberg.catalog import load_catalog
 
     catalog = load_catalog("proximadb", type="rest", uri=args.rest_uri)
@@ -59,6 +74,7 @@ def read_pyiceberg_rest(args, columns):
 
 
 def read_pyiceberg_static(args, columns):
+    _require_module("pyiceberg")
     from pyiceberg.table import StaticTable
 
     table = StaticTable.from_metadata(args.metadata_location)
@@ -66,11 +82,13 @@ def read_pyiceberg_static(args, columns):
 
 
 def read_duckdb(args, columns):
-    import duckdb
-
+    duckdb = _require_module("duckdb")
     con = duckdb.connect()
-    con.sql("INSTALL iceberg")
-    con.sql("LOAD iceberg")
+    try:
+        con.sql("INSTALL iceberg")
+        con.sql("LOAD iceberg")
+    except duckdb.Error as e:
+        raise Unavailable(f"DuckDB iceberg extension unavailable: {e}") from e
     path = args.metadata_location.removeprefix("file://")
     cols = ", ".join(f'"{c}"' for c in columns)
     rel = con.sql(f"SELECT {cols} FROM iceberg_scan('{path}')")
@@ -103,12 +121,16 @@ def main():
     for name, reader in READERS.items():
         try:
             rows, served_location = reader(args, columns)
-        except Exception as e:  # noqa: BLE001 — classify below
-            if name in required:
-                report[name] = {"status": "ERROR", "error": f"{type(e).__name__}: {e}"}
-                failed = True
-            else:
-                report[name] = {"status": "SKIP", "reason": f"{type(e).__name__}: {e}"}
+        except Unavailable as e:
+            # Only a reader that is not installed may be skipped, and only when
+            # it is not required.
+            status = "ERROR" if name in required else "SKIP"
+            report[name] = {"status": status, "reason": str(e)}
+            failed |= name in required
+            continue
+        except Exception as e:  # noqa: BLE001 — a reader that ran and failed is a failure
+            report[name] = {"status": "ERROR", "error": f"{type(e).__name__}: {e}"}
+            failed = True
             continue
         got = first_key_sort([[text(r[c]) for c in columns] for r in rows])
         entry = {"status": "OK" if got == want else "MISMATCH", "rows": len(got)}
@@ -123,7 +145,11 @@ def main():
             failed = True
         report[name] = entry
 
+    ran = [n for n, r in report.items() if r["status"] != "SKIP"]
     print(json.dumps(report, indent=2))
+    if not ran:
+        print("no reader ran", file=sys.stderr)
+        sys.exit(2)
     sys.exit(1 if failed else 0)
 
 

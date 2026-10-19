@@ -42,17 +42,18 @@
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, Date32Builder, FixedSizeBinaryBuilder, Float32Builder,
-    Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder, StringBuilder,
-    UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
+    BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, FixedSizeBinaryBuilder,
+    Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder,
+    StringBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
 };
 use std::collections::HashMap;
 
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, FixedSizeBinaryArray, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch,
-    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray,
+    RecordBatch, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use proximadb_kernel::error::StorageError;
@@ -315,6 +316,9 @@ fn build_column(records: &[ProximaRecord], col: &ProximaColumn) -> Result<ArrayR
             Ok(Arc::new(b.finish()) as ArrayRef)
         }
         ProximaType::DenseVector { dim, .. } => build_vector_column(records, col, *dim as u32),
+        ProximaType::Decimal { precision, scale } => {
+            build_decimal_column(records, col, *precision, *scale)
+        }
         other => Err(StorageError::Serialization(format!(
             "proxima_arrow: column `{}` has type {:?}, which has no canonical ProximaValue→Arrow \
              materialization yet",
@@ -421,6 +425,127 @@ fn build_timestamp_column(
 // ProximaValue extractors (None = emit Arrow null; modest, widening-only coercions)
 // ---------------------------------------------------------------------------
 
+/// Largest precision a `Decimal128` holds (38 decimal digits).
+const MAX_DECIMAL128_PRECISION: u8 = 38;
+
+/// Build a `Decimal128(precision, scale)` column. Values are the exact decimal text
+/// INSERT stores (`ProximaValue::Decimal`), decimal-looking strings, integers or
+/// floats, rescaled to `scale` (round half away from zero). A value that is not a
+/// number, or needs more than `precision` digits, is an error — never a silent
+/// truncation or NULL.
+fn build_decimal_column(
+    records: &[ProximaRecord],
+    col: &ProximaColumn,
+    precision: u8,
+    scale: u8,
+) -> Result<ArrayRef, StorageError> {
+    if precision == 0 || precision > MAX_DECIMAL128_PRECISION || scale > precision {
+        return Err(StorageError::Serialization(format!(
+            "proxima_arrow: column `{}` has DECIMAL({precision},{scale}); Decimal128 supports \
+             precision 1..=38 with scale <= precision",
+            col.name
+        )));
+    }
+    let limit = 10i128.pow(precision as u32);
+    let mut b = Decimal128Builder::with_capacity(records.len());
+    for r in records {
+        let Some(v) = tree_get(&r.props, &col.name) else {
+            b.append_null();
+            continue;
+        };
+        if matches!(v, ProximaValue::Null) {
+            b.append_null();
+            continue;
+        }
+        let unscaled = pv_as_decimal_unscaled(v, scale)
+            .filter(|u| u.unsigned_abs() < limit as u128)
+            .ok_or_else(|| {
+                StorageError::Serialization(format!(
+                    "proxima_arrow: value {v:?} in column `{}` is not representable as \
+                     DECIMAL({precision},{scale})",
+                    col.name
+                ))
+            })?;
+        b.append_value(unscaled);
+    }
+    let array = b
+        .finish()
+        .with_precision_and_scale(precision, scale as i8)
+        .map_err(|e| StorageError::Serialization(format!("proxima_arrow: decimal column: {e}")))?;
+    Ok(Arc::new(array) as ArrayRef)
+}
+
+/// The unscaled `i128` of `v` at `scale` (`12.345` at scale 2 → `1235`).
+fn pv_as_decimal_unscaled(v: &ProximaValue, scale: u8) -> Option<i128> {
+    match v {
+        ProximaValue::Decimal(s) | ProximaValue::String(s) => parse_decimal_unscaled(s, scale),
+        ProximaValue::Float16(x) | ProximaValue::Float32(x) if x.is_finite() => {
+            parse_decimal_unscaled(&(*x as f64).to_string(), scale)
+        }
+        ProximaValue::Float64(x) if x.is_finite() => parse_decimal_unscaled(&x.to_string(), scale),
+        _ => {
+            let int = pv_as_i64(v)
+                .map(i128::from)
+                .or_else(|| pv_as_u64(v).map(i128::from))?;
+            int.checked_mul(10i128.checked_pow(scale as u32)?)
+        }
+    }
+}
+
+/// Parse decimal text (`[+-]digits[.digits]`, optional `e[+-]N` exponent) into its
+/// unscaled value at `scale`, rounding half away from zero. `None` if malformed or
+/// out of `i128` range.
+pub fn parse_decimal_unscaled(text: &str, scale: u8) -> Option<i128> {
+    let t = text.trim();
+    let (negative, t) = match t.as_bytes().first()? {
+        b'-' => (true, &t[1..]),
+        b'+' => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let (mantissa, exponent) = match t.find(['e', 'E']) {
+        Some(i) => (&t[..i], t[i + 1..].parse::<i32>().ok()?),
+        None => (t, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    // Digits of the value with the decimal point shifted `exponent` places right;
+    // the point sits `point` digits from the left.
+    let digits: Vec<u8> = int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .map(|c| c - b'0')
+        .collect();
+    let point = int_part.len() as i64 + exponent as i64;
+    let keep = point + scale as i64; // digits left of the rounding position
+    let mut unscaled: i128 = 0;
+    for i in 0..keep.max(0) {
+        let d = if (i as usize) < digits.len() {
+            digits[i as usize]
+        } else {
+            0
+        };
+        unscaled = unscaled.checked_mul(10)?.checked_add(d as i128)?;
+    }
+    let next = usize::try_from(keep)
+        .ok()
+        .and_then(|k| digits.get(k))
+        .copied()
+        .unwrap_or(0);
+    if keep >= 0 && next >= 5 {
+        unscaled = unscaled.checked_add(1)?;
+    }
+    Some(if negative { -unscaled } else { unscaled })
+}
+
 fn pv_as_bool(v: &ProximaValue) -> Option<bool> {
     match v {
         ProximaValue::Boolean(b) => Some(*b),
@@ -515,7 +640,7 @@ pub const INFERRED_VECTOR_COLUMN: &str = "vector";
 
 /// Map a concrete [`ProximaValue`] to the [`ProximaType`] the canonical converter can
 /// materialize. Returns `None` for `Null` and for variants without a scalar Arrow column in
-/// [`build_column`] (Decimal — needs precision/scale; Time/Timestamp; Array/Map/Struct;
+/// [`build_column`] (Decimal — needs a declared precision/scale; Time/Timestamp; Array/Map/Struct;
 /// identifier (Uuid/ULID) and sparse/quantized vectors) so inference never produces a column
 /// the converter would reject.
 fn proxima_value_to_data_type(v: &ProximaValue) -> Option<ProximaType> {
@@ -784,6 +909,9 @@ pub fn arrow_cell_to_proxima_value(array: &ArrayRef, row: usize) -> Option<Proxi
         Some(ProximaValue::Float64(a.value(row)))
     } else if let Some(a) = any.downcast_ref::<Date32Array>() {
         Some(ProximaValue::Date(a.value(row)))
+    } else if let Some(a) = any.downcast_ref::<Decimal128Array>() {
+        // Exact decimal text at the column's scale (`12.50`), the same form INSERT stores.
+        Some(ProximaValue::Decimal(a.value_as_string(row)))
     } else {
         any.downcast_ref::<BinaryArray>()
             .map(|a| ProximaValue::Binary(a.value(row).to_vec()))
@@ -1488,6 +1616,104 @@ mod tests {
         assert_eq!(
             tree_get(&back[1].props, "name"),
             Some(&ProximaValue::String("bob".into()))
+        );
+    }
+
+    // --- DECIMAL: exact Decimal128 materialization ---------------------------
+
+    #[test]
+    fn parse_decimal_unscaled_rescales_and_rounds_half_away_from_zero() {
+        let p = parse_decimal_unscaled;
+        assert_eq!(p("12.50", 2), Some(1250));
+        assert_eq!(p("12.5", 2), Some(1250));
+        assert_eq!(p("12", 2), Some(1200));
+        assert_eq!(p("-0.995", 2), Some(-100));
+        assert_eq!(p("12.344", 2), Some(1234));
+        assert_eq!(p("12.345", 2), Some(1235));
+        assert_eq!(p(".5", 0), Some(1));
+        assert_eq!(p("1e3", 2), Some(100_000));
+        assert_eq!(p("5E-3", 2), Some(1));
+        assert_eq!(p("4e-4", 2), Some(0));
+        assert_eq!(p("+7.25", 2), Some(725));
+        for bad in ["", "-", ".", "1.2.3", "12a", "1e", "--1"] {
+            assert_eq!(p(bad, 2), None, "{bad:?} is not a decimal");
+        }
+    }
+
+    #[test]
+    fn decimal_column_materializes_and_round_trips_exactly() {
+        let records = vec![
+            record_with_props("a", vec![("amt", ProximaValue::Decimal("12.50".into()))]),
+            record_with_props("b", vec![("amt", ProximaValue::Decimal("-0.99".into()))]),
+            record_with_props("c", vec![("amt", ProximaValue::Int64(1000))]),
+            record_with_props("d", vec![("amt", ProximaValue::Float64(7.25))]),
+            record_with_props("e", vec![]),
+        ];
+        let column = col(
+            1,
+            "amt",
+            ProximaType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+            true,
+        );
+        let array = build_column(&records, &column).expect("decimal column");
+        assert_eq!(array.data_type(), &ArrowDataType::Decimal128(10, 2));
+        let back: Vec<Option<ProximaValue>> = (0..records.len())
+            .map(|i| arrow_cell_to_proxima_value(&array, i))
+            .collect();
+        assert_eq!(
+            back,
+            vec![
+                Some(ProximaValue::Decimal("12.50".into())),
+                Some(ProximaValue::Decimal("-0.99".into())),
+                Some(ProximaValue::Decimal("1000.00".into())),
+                Some(ProximaValue::Decimal("7.25".into())),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn decimal_overflow_and_garbage_fail_loudly() {
+        let column = col(
+            1,
+            "amt",
+            ProximaType::Decimal {
+                precision: 4,
+                scale: 2,
+            },
+            true,
+        );
+        let too_wide = vec![record_with_props(
+            "a",
+            vec![("amt", ProximaValue::Decimal("123.45".into()))],
+        )];
+        assert!(
+            build_column(&too_wide, &column).is_err(),
+            "5 digits > DECIMAL(4,2)"
+        );
+        let garbage = vec![record_with_props(
+            "a",
+            vec![("amt", ProximaValue::String("abc".into()))],
+        )];
+        assert!(
+            build_column(&garbage, &column).is_err(),
+            "never a silent NULL"
+        );
+        let bad_type = col(
+            1,
+            "amt",
+            ProximaType::Decimal {
+                precision: 39,
+                scale: 2,
+            },
+            true,
+        );
+        assert!(
+            build_column(&[], &bad_type).is_err(),
+            "Decimal128 caps at 38 digits"
         );
     }
 }

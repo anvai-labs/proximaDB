@@ -105,6 +105,109 @@ const MANIFEST_LIST_SCHEMA_JSON: &str = r#"
 }
 "#;
 
+// --- Avro container header: keep Iceberg field ids --------------------------
+//
+// apache-avro 0.16 re-serializes the schema into the container header's
+// `avro.schema` and drops custom field attributes — Iceberg's `field-id` — on the
+// way. Iceberg readers (PyIceberg, Java) resolve manifest fields by those ids and
+// reject a manifest without them ("missing field-id"). So after writing, the
+// header is re-encoded with the schema JSON verbatim. Data blocks follow the
+// header's sync marker and are copied byte-for-byte.
+
+const AVRO_MAGIC: &[u8; 4] = b"Obj\x01";
+
+fn read_avro_long(buf: &[u8], pos: &mut usize) -> Result<i64, StorageError> {
+    let mut n: u64 = 0;
+    let mut shift = 0;
+    loop {
+        let byte = *buf
+            .get(*pos)
+            .ok_or_else(|| ser_err("avro header", "truncated varint"))?;
+        *pos += 1;
+        n |= u64::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        if shift > 63 {
+            return Err(ser_err("avro header", "varint overflow"));
+        }
+    }
+    Ok((n >> 1) as i64 ^ -((n & 1) as i64))
+}
+
+fn write_avro_long(out: &mut Vec<u8>, v: i64) {
+    let mut n = ((v << 1) ^ (v >> 63)) as u64;
+    while n >= 0x80 {
+        out.push((n as u8) | 0x80);
+        n >>= 7;
+    }
+    out.push(n as u8);
+}
+
+fn read_avro_bytes<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a [u8], StorageError> {
+    let len = usize::try_from(read_avro_long(buf, pos)?)
+        .map_err(|_| ser_err("avro header", "negative length"))?;
+    let end = pos
+        .checked_add(len)
+        .filter(|end| *end <= buf.len())
+        .ok_or_else(|| ser_err("avro header", "truncated entry"))?;
+    let out = &buf[*pos..end];
+    *pos = end;
+    Ok(out)
+}
+
+/// The header metadata entries of an Avro object container file, in order, and
+/// the offset where the sync marker begins.
+fn avro_header_entries(buf: &[u8]) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, usize), StorageError> {
+    if buf.len() < 4 || &buf[..4] != AVRO_MAGIC {
+        return Err(ser_err("avro header", "not an Avro object container"));
+    }
+    let mut pos = 4;
+    let mut entries = Vec::new();
+    loop {
+        let mut count = read_avro_long(buf, &mut pos)?;
+        if count == 0 {
+            break;
+        }
+        if count < 0 {
+            count = -count;
+            read_avro_long(buf, &mut pos)?; // block size in bytes — unused
+        }
+        for _ in 0..count {
+            let key = read_avro_bytes(buf, &mut pos)?.to_vec();
+            let value = read_avro_bytes(buf, &mut pos)?.to_vec();
+            entries.push((key, value));
+        }
+    }
+    Ok((entries, pos))
+}
+
+/// Re-encode `container`'s header with `avro.schema` set to `schema_json` verbatim.
+fn with_verbatim_schema(container: Vec<u8>, schema_json: &str) -> Result<Vec<u8>, StorageError> {
+    let compact = serde_json::from_str::<serde_json::Value>(schema_json)
+        .map_err(|e| ser_err("avro header schema", e))?
+        .to_string();
+    let (entries, body_start) = avro_header_entries(&container)?;
+    let mut out = Vec::with_capacity(container.len() + compact.len());
+    out.extend_from_slice(AVRO_MAGIC);
+    write_avro_long(&mut out, entries.len() as i64);
+    for (key, value) in &entries {
+        let value: &[u8] = if key == b"avro.schema" {
+            compact.as_bytes()
+        } else {
+            value
+        };
+        write_avro_long(&mut out, key.len() as i64);
+        out.extend_from_slice(key);
+        write_avro_long(&mut out, value.len() as i64);
+        out.extend_from_slice(value);
+    }
+    write_avro_long(&mut out, 0);
+    out.extend_from_slice(&container[body_start..]);
+    Ok(out)
+}
+
 /// Public description of one data file in a snapshot.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DataFileMeta {
@@ -363,9 +466,10 @@ pub fn write_manifest(
             .append_ser(&entry)
             .map_err(|e| ser_err("append manifest entry", e))?;
     }
-    writer
+    let container = writer
         .into_inner()
-        .map_err(|e| ser_err("finish manifest", e))
+        .map_err(|e| ser_err("finish manifest", e))?;
+    with_verbatim_schema(container, MANIFEST_SCHEMA_JSON)
 }
 
 /// Read an Iceberg v2 manifest Avro back into the data-file list.
@@ -420,9 +524,10 @@ pub fn write_manifest_list(manifests: &[ManifestFileMeta]) -> Result<Vec<u8>, St
             .append_ser(&mf)
             .map_err(|e| ser_err("append manifest_file", e))?;
     }
-    writer
+    let container = writer
         .into_inner()
-        .map_err(|e| ser_err("finish manifest list", e))
+        .map_err(|e| ser_err("finish manifest list", e))?;
+    with_verbatim_schema(container, MANIFEST_LIST_SCHEMA_JSON)
 }
 
 /// Read an Iceberg v2 manifest list back into its entries.
@@ -857,6 +962,49 @@ mod tests {
             v["metadata-log"][0]["metadata-file"],
             "file:///wh/m/v0.metadata.json"
         );
+    }
+
+    /// Iceberg readers resolve manifest fields by `field-id`; the container header
+    /// must carry them (apache-avro alone drops them), and the rewritten header
+    /// must still decode.
+    #[test]
+    fn avro_header_schema_keeps_iceberg_field_ids() {
+        for bytes in [
+            write_manifest(&files(), 9, None).unwrap(),
+            write_manifest_list(&[ManifestFileMeta::default()]).unwrap(),
+        ] {
+            let (entries, _) = avro_header_entries(&bytes).unwrap();
+            let schema = entries
+                .iter()
+                .find(|(k, _)| k == b"avro.schema")
+                .map(|(_, v)| String::from_utf8(v.clone()).unwrap())
+                .expect("avro.schema header");
+            let v: serde_json::Value = serde_json::from_str(&schema).unwrap();
+            let fields = v["fields"].as_array().unwrap();
+            assert!(
+                fields.iter().all(|f| f.get("field-id").is_some()),
+                "every top-level field carries its Iceberg field-id: {schema}"
+            );
+            assert!(
+                Reader::new(&bytes[..]).is_ok(),
+                "rewritten container decodes"
+            );
+        }
+        assert_eq!(
+            read_manifest(&write_manifest(&files(), 9, None).unwrap()).unwrap(),
+            files()
+        );
+    }
+
+    #[test]
+    fn avro_long_round_trips() {
+        for v in [0i64, 1, -1, 63, -64, 64, 300, -300, i64::MAX, i64::MIN] {
+            let mut buf = Vec::new();
+            write_avro_long(&mut buf, v);
+            let mut pos = 0;
+            assert_eq!(read_avro_long(&buf, &mut pos).unwrap(), v);
+            assert_eq!(pos, buf.len());
+        }
     }
 
     #[test]
