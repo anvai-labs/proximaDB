@@ -524,13 +524,28 @@ async fn canon_rows(client: &tokio_postgres::Client, sql: &str) -> Vec<Vec<Strin
 /// reuses the first's manifest pointed at a deleted tempdir).
 async fn tpch_accuracy_anchored_phase(client: &tokio_postgres::Client) {
     for (name, ddl) in SCHEMA {
-        let _ = client
+        // Phase boundary: the conformance phase's queries + this shared boot
+        // leave catalog/WAL state where a best-effort `DROP TABLE IF EXISTS`
+        // can ERROR (swallowed, historically) instead of no-op'ing — the
+        // subsequent CREATE then hit "already exists" and panicked. Surface
+        // the drop error, and if CREATE still collides, retry once via a
+        // hard DROP before failing loudly. A true CREATE regression still
+        // panics; only the stale-state race is absorbed.
+        if let Err(e) = client
             .simple_query(&format!("DROP TABLE IF EXISTS {name}"))
-            .await;
-        client
-            .simple_query(ddl)
             .await
-            .unwrap_or_else(|e| panic!("CREATE {name}: {}", explain_err(&e)));
+        {
+            eprintln!("DROP IF EXISTS {name} errored (retrying create): {}", explain_err(&e));
+        }
+        if client.simple_query(ddl).await.is_err() {
+            let _ = client
+                .simple_query(&format!("DROP TABLE {name}"))
+                .await;
+            client
+                .simple_query(ddl)
+                .await
+                .unwrap_or_else(|e| panic!("CREATE {name} after stale-state retry: {}", explain_err(&e)));
+        }
     }
     for sql in DATA {
         client
