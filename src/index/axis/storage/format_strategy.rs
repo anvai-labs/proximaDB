@@ -27,6 +27,11 @@ use bincode;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+// The single SerializationError for the axis storage subsystem lives in
+// `serialization`; this module reuses it (the Avro/Compression arms were
+// folded there) instead of defining a second enum.
+use super::serialization::SerializationError;
+
 /// Serialization format for AXIS indexes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IndexSerializationFormat {
@@ -191,26 +196,6 @@ impl IndexFormatStrategy {
             }
         }
     }
-}
-
-/// Serialization errors
-#[derive(Debug, thiserror::Error)]
-pub enum SerializationError {
-    /// Bincode encode/decode failure
-    #[error("Bincode error: {0}")]
-    Bincode(#[from] bincode::Error),
-
-    /// Apache Avro encode/decode failure
-    #[error("Avro error: {0}")]
-    Avro(String),
-
-    /// Compression or decompression failure
-    #[error("Compression error: {0}")]
-    Compression(String),
-
-    /// Underlying I/O error
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
 }
 
 /// Migration helper to convert between formats
