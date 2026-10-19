@@ -547,6 +547,13 @@ impl SpillRecordStorage {
                 // comment claimed the flush race as the reason, which was wrong
                 // — the guard is load-bearing, for purge.
                 let _exclusive = self.flush_guard.lock().await;
+                // Complete an interrupted DROP before adopting anything under
+                // the prefix (TD-USUB-1 item i). Runs before the listing and
+                // before any flush of this store, so a recreated table's first
+                // segment cannot be written while a marker still names that
+                // path — which is what makes deleting the recorded paths safe
+                // now that segment names are resumed counters, not nonces.
+                self.drain_purge_obligation().await?;
                 let objects = self.list_partition_objects().await?;
 
                 let mut found: Vec<(u64, String)> = Vec::with_capacity(objects.len());
@@ -977,6 +984,106 @@ impl SpillRecordStorage {
         Ok(Some(path))
     }
 
+    /// Where a purge records the exact paths it is deleting. Not spill-shaped,
+    /// so discovery and purge listings never treat it as a segment.
+    fn purge_obligation_path(&self) -> String {
+        format!(
+            "{}/{PURGE_OBLIGATION_NAME}",
+            self.base_path.trim_end_matches('/')
+        )
+    }
+
+    /// Read the purge obligation under this prefix: `None` when there is none.
+    /// Anything other than a clean read and parse is an error — reading a
+    /// damaged marker as "no obligation" would let the dropped rows serve.
+    async fn load_purge_obligation(&self) -> Result<Option<PurgeObligation>> {
+        let path = self.purge_obligation_path();
+        match self.filesystem.read(&path).await {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .with_context(|| format!("spill: parse purge obligation '{path}'")),
+            Err(err) if is_absent(&err) => Ok(None),
+            Err(err) => Err(anyhow::anyhow!(
+                "spill: read purge obligation '{path}' failed: {err}"
+            )),
+        }
+    }
+
+    /// Record (or extend) the purge obligation with `paths`. A marker left by an
+    /// earlier failed purge is merged, not replaced: its paths are still owed.
+    async fn record_purge_obligation(&self, paths: &[String]) -> Result<()> {
+        let mut obligation = self.load_purge_obligation().await?.unwrap_or_default();
+        obligation.version = PURGE_OBLIGATION_VERSION;
+        for path in paths {
+            if !obligation.paths.contains(path) {
+                obligation.paths.push(path.clone());
+            }
+        }
+        let bytes =
+            serde_json::to_vec_pretty(&obligation).context("spill: serialize purge obligation")?;
+        let path = self.purge_obligation_path();
+        let options = crate::storage::persistence::filesystem::FileOptions {
+            create_dirs: true,
+            overwrite: true,
+            ..Default::default()
+        };
+        self.filesystem
+            .write(&path, &bytes, Some(options))
+            .await
+            .map_err(|e| anyhow::anyhow!("spill: write purge obligation '{path}' failed: {e}"))
+    }
+
+    async fn clear_purge_obligation(&self) -> Result<()> {
+        let path = self.purge_obligation_path();
+        match self.filesystem.delete(&path).await {
+            Ok(()) => Ok(()),
+            Err(err) if is_absent(&err) => Ok(()),
+            Err(err) => Err(anyhow::anyhow!(
+                "spill: delete purge obligation '{path}' failed: {err}"
+            )),
+        }
+    }
+
+    /// Finish a purge an earlier store at this prefix recorded but did not
+    /// complete: delete exactly the recorded paths, then the marker. Every
+    /// recorded path must be one of THIS prefix's spill objects; anything else
+    /// is refused rather than deleted, so a damaged or foreign marker cannot
+    /// turn into a delete of someone else's data. Fails closed: the caller
+    /// (discovery) then refuses to serve until a later attempt succeeds.
+    async fn drain_purge_obligation(&self) -> Result<()> {
+        let Some(obligation) = self.load_purge_obligation().await? else {
+            return Ok(());
+        };
+        let prefix = format!("{}/", self.base_path.trim_end_matches('/'));
+        for path in &obligation.paths {
+            let name = path.strip_prefix(&prefix).unwrap_or("");
+            if name.is_empty() || name.contains('/') || !is_spill_segment(name) {
+                return Err(anyhow::anyhow!(
+                    "spill: purge obligation under '{prefix}' names '{path}', which is not a \
+                     spill segment of this partition; refusing to delete it or to serve"
+                ));
+            }
+        }
+        for path in &obligation.paths {
+            match self.filesystem.delete(path).await {
+                Ok(()) => {}
+                Err(err) if is_absent(&err) => {}
+                Err(err) => {
+                    return Err(anyhow::anyhow!(
+                        "spill: completing an interrupted purge failed at '{path}': {err}"
+                    ));
+                }
+            }
+        }
+        self.clear_purge_obligation().await?;
+        tracing::warn!(
+            prefix = %prefix,
+            objects = obligation.paths.len(),
+            "spill: completed an interrupted DROP purge before serving this partition"
+        );
+        Ok(())
+    }
+
     /// The one memtable write path: value, fresh generation and LSN replace the
     /// resident entry in a single insert (see [`Resident`]).
     ///
@@ -1353,6 +1460,17 @@ impl RecordStore for SpillRecordStorage {
         // absence. See that method.
         let objects = self.list_partition_objects().await?;
 
+        // Intent before action (TD-USUB-1 item i): record the EXACT paths this
+        // purge is about to delete, so a failure or crash part-way leaves
+        // positive evidence for the next store at this prefix to finish the
+        // job — instead of orphaned segments that a same-name re-creation
+        // would adopt as its own rows. Exact paths, never "re-list and delete":
+        // a re-listing would also delete the recreated table's segments.
+        if !objects.is_empty() {
+            let paths: Vec<String> = objects.iter().map(|o| o.path.clone()).collect();
+            self.record_purge_obligation(&paths).await?;
+        }
+
         for object in &objects {
             match self.filesystem.delete(&object.path).await {
                 Ok(()) => {}
@@ -1378,6 +1496,8 @@ impl RecordStore for SpillRecordStorage {
         // idempotence), and BOTH pieces of state are cleared on every path so an
         // orphan reaper calling purge standalone cannot leave a store whose
         // segments are gone while its tombstones survive.
+        // Every recorded path is gone; the obligation is discharged.
+        self.clear_purge_obligation().await?;
         self.segments.write().clear();
         self.tombstones.clear();
         // The prefix has been reconciled by deletion, so any orphan an
@@ -1459,6 +1579,19 @@ struct PartitionObject {
     /// string.
     path: String,
     seq: Option<u64>,
+}
+
+/// Name of the purge-obligation marker under a partition prefix
+/// (TD-USUB-1 item i). Deliberately not spill-shaped.
+const PURGE_OBLIGATION_NAME: &str = "purge-obligation.json";
+const PURGE_OBLIGATION_VERSION: u32 = 1;
+
+/// The exact objects a DROP's purge set out to delete. Positive evidence: the
+/// drain deletes these paths and nothing else.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct PurgeObligation {
+    version: u32,
+    paths: Vec<String>,
 }
 
 /// Filename prefix and extension of a spill segment.
@@ -3120,6 +3253,128 @@ mod tests {
         // An untracked oid still fails closed.
         s.upsert_record(record("b", "v1")).await?;
         assert!(RecordStore::min_unflushed_lsn(&s).await.is_err());
+        Ok(())
+    }
+
+    /// TD-USUB-1 item i: a completed purge leaves neither segments nor its
+    /// obligation marker behind.
+    #[tokio::test]
+    async fn a_completed_purge_leaves_no_obligation_marker() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let store = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None)
+            .with_tenant("tenant-a");
+        store.upsert_record(record("a", "v1")).await?;
+        store.flush().await?;
+        store.upsert_record(record("b", "v1")).await?;
+        store.flush().await?;
+        assert_eq!(segment_files_on_disk(&base), 2);
+
+        RecordStore::purge_durable_objects(&store).await?;
+        assert_eq!(segment_files_on_disk(&base), 0);
+        assert!(
+            !std::path::Path::new(&base)
+                .join(PURGE_OBLIGATION_NAME)
+                .exists(),
+            "a discharged obligation must not linger"
+        );
+        Ok(())
+    }
+
+    /// TD-USUB-1 item i: a purge interrupted after recording its obligation
+    /// (the state a crash or a failed delete leaves) is COMPLETED by the next
+    /// store at that prefix before it serves anything — and the recreated
+    /// table's own segment, which reuses the first recorded NAME, survives,
+    /// because the drain runs before that store can write.
+    ///
+    /// Mutation check: removing the `drain_purge_obligation` call from
+    /// discovery serves the dropped rows `a` and `b`.
+    #[tokio::test]
+    async fn an_interrupted_purge_is_completed_before_the_next_store_serves() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let dropped = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None)
+            .with_tenant("tenant-a");
+        dropped.upsert_record(record("a", "v1")).await?;
+        dropped.flush().await?;
+        dropped.upsert_record(record("b", "v1")).await?;
+        dropped.flush().await?;
+        // The purge recorded its intent, then died before deleting anything.
+        let paths: Vec<String> = dropped.segments.read().clone();
+        assert_eq!(paths.len(), 2);
+        dropped.record_purge_obligation(&paths).await?;
+        drop(dropped);
+
+        // The recreated table's store at the same prefix.
+        let recreated = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None)
+            .with_tenant("tenant-a");
+        for oid in ["a", "b"] {
+            assert!(
+                recreated
+                    .get_record(&RecordKey::new(oid.to_string()))
+                    .await?
+                    .is_none(),
+                "dropped row '{oid}' must not serve in the recreated table"
+            );
+        }
+        assert_eq!(
+            segment_files_on_disk(&base),
+            0,
+            "the recorded paths were deleted"
+        );
+        assert!(
+            !std::path::Path::new(&base)
+                .join(PURGE_OBLIGATION_NAME)
+                .exists()
+        );
+
+        // Its first segment reuses sequence 0 — a name the obligation recorded.
+        recreated.upsert_record(record("new", "v1")).await?;
+        let path = recreated.flush().await?.expect("publishes");
+        assert_eq!(path, paths[0], "the reissued name is one the marker held");
+        drop(recreated);
+
+        let next_boot = SpillRecordStorage::with_flush_threshold(fs, base.clone(), None)
+            .with_tenant("tenant-a");
+        assert!(
+            next_boot
+                .get_record(&RecordKey::new("new".to_string()))
+                .await?
+                .is_some(),
+            "the recreated table's own segment must survive"
+        );
+        Ok(())
+    }
+
+    /// A damaged marker, or one naming anything but this prefix's own spill
+    /// segments, fails closed: the partition refuses to serve and nothing is
+    /// deleted.
+    #[tokio::test]
+    async fn a_damaged_or_foreign_purge_obligation_fails_closed() -> Result<()> {
+        for marker in [
+            b"{ not json".to_vec(),
+            br#"{"version":1,"paths":["/etc/passwd"]}"#.to_vec(),
+        ] {
+            let (fs, base) = fs_and_base().await;
+            let writer = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None)
+                .with_tenant("tenant-a");
+            writer.upsert_record(record("a", "v1")).await?;
+            writer.flush().await?;
+            drop(writer);
+            std::fs::write(
+                std::path::Path::new(&base).join(PURGE_OBLIGATION_NAME),
+                &marker,
+            )?;
+
+            let reader = SpillRecordStorage::with_flush_threshold(fs, base.clone(), None)
+                .with_tenant("tenant-a");
+            assert!(
+                reader
+                    .get_record(&RecordKey::new("a".to_string()))
+                    .await
+                    .is_err(),
+                "a marker this store cannot trust must refuse service"
+            );
+            assert_eq!(segment_files_on_disk(&base), 1, "and delete nothing");
+        }
         Ok(())
     }
 

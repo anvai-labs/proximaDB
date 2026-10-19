@@ -2029,12 +2029,38 @@ impl SharedServices {
         let canonical_record_store: Option<
             Arc<crate::services::record_store::DirectWalTableRecordStore>,
         > = if let Some(appender) = canonical_wal_appender.clone() {
-            let store = Arc::new(
-                crate::services::record_store::DirectWalTableRecordStore::new_partitioned(
-                    appender.clone(),
-                ),
-            );
             let atomic_commit = crate::services::oltp_gate::atomic_commit_enabled();
+            // TD-SEAM-3: spill-backed partitions when the spill gate is set
+            // (default unset ⇒ exactly the legacy partitioned memtable), with
+            // segments beside the WAL they recover with.
+            let spill_root = opt_config
+                .map(|cfg| cfg.server.data_dir.join("pgwire").join("record-spill"))
+                .unwrap_or_default();
+            let store =
+                match crate::services::record_store::DirectWalTableRecordStore::open_for_server(
+                    appender.clone(),
+                    spill_root,
+                )
+                .await
+                {
+                    Ok(store) => Arc::new(store),
+                    Err(e) if atomic_commit => {
+                        anyhow::bail!(
+                            "opening the spill-backed record store failed with [oltp] atomic_commit on: {e:#}"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "SharedServices: spill-backed record store unavailable ({e:#}); \
+                         falling back to in-memory partitions"
+                        );
+                        Arc::new(
+                        crate::services::record_store::DirectWalTableRecordStore::new_partitioned(
+                            appender.clone(),
+                        ),
+                    )
+                    }
+                };
             match appender.read_entries().await {
                 Ok(entries) => {
                     if let Err(e) = store.replay_wal_entries(entries).await {

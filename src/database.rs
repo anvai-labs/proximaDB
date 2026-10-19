@@ -1210,11 +1210,33 @@ impl ProximaDB {
         }
 
         // 3. Shutdown servers
+        // Held across `stop` so the relational record store can be flushed
+        // once no surface can write to it any more (TD-SEAM-3).
+        let record_store = self.canonical_record_store();
         if let Some(mut multi_server) = self.multi_server.take() {
             multi_server
                 .stop()
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to stop multi-server: {}", e))?;
+        }
+
+        // 3a. Make spill-backed relational partitions' resident rows durable.
+        // A no-op for memtable partitions (the default). Best-effort with a
+        // timeout: a failure loses nothing — the canonical WAL is never
+        // truncated past an unflushed row, so replay recovers it.
+        if let Some(record_store) = record_store {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                record_store.flush_partitions(),
+            )
+            .await
+            {
+                Ok(Ok(partitions)) => {
+                    tracing::debug!(partitions, "relational record partitions flushed")
+                }
+                Ok(Err(e)) => tracing::warn!("relational record partition flush failed: {e:#}"),
+                Err(_) => tracing::warn!("relational record partition flush timed out"),
+            }
         }
 
         // 4. Stop storage engine with timeout
