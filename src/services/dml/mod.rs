@@ -7020,11 +7020,27 @@ impl DmlService {
                     })
                     .unwrap_or(ProximaValue::Null)
             }),
-            ProximaType::Decimal { .. } => {
+            ProximaType::Decimal { precision, scale } => {
                 if matches!(val, SqlValueLiteral::Null) && column.nullable {
                     return Ok(ProximaValue::Null);
                 }
-                self.literal_to_string(val).map(ProximaValue::Decimal)
+                // Store the canonical text at the declared scale (`12.5` →
+                // `12.50` for DECIMAL(10,2)) so every read path — pgwire rows,
+                // Parquet `Decimal128`, Iceberg — agrees, and reject a value
+                // that is not a number or overflows the declared precision.
+                // Numeric literals reach here as f64 (exact to 15 significant
+                // digits; TD-SEAM-1 residual for wider decimals).
+                let text = self.literal_to_string(val)?;
+                proximadb_storage_common::proxima_arrow::canonical_decimal_text(
+                    &text, *precision, *scale,
+                )
+                .map(ProximaValue::Decimal)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "value '{text}' for column '{column_name}' is not a valid \
+                         DECIMAL({precision},{scale})"
+                    )
+                })
             }
             ProximaType::SparseVector { .. } => Err(anyhow!(
                 "Sparse vector DML literal lowering is not implemented for column '{}'",

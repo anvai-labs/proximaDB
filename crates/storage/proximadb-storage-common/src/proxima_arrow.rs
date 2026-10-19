@@ -546,6 +546,29 @@ pub fn parse_decimal_unscaled(text: &str, scale: u8) -> Option<i128> {
     Some(if negative { -unscaled } else { unscaled })
 }
 
+/// Render an unscaled decimal at `scale` (`1250`, 2 → `"12.50"`), the same text
+/// Arrow's `Decimal128Array::value_as_string` produces.
+pub fn format_decimal_unscaled(unscaled: i128, scale: u8) -> String {
+    let digits = unscaled.unsigned_abs().to_string();
+    let sign = if unscaled < 0 { "-" } else { "" };
+    if scale == 0 {
+        return format!("{sign}{digits}");
+    }
+    let scale = scale as usize;
+    let padded = format!("{digits:0>width$}", width = scale + 1);
+    let (int_part, frac_part) = padded.split_at(padded.len() - scale);
+    format!("{sign}{int_part}.{frac_part}")
+}
+
+/// Canonical text of a DECIMAL(`precision`,`scale`) value from SQL literal text:
+/// rescaled to exactly `scale` digits (round half away from zero). `None` when
+/// the text is not a number or needs more than `precision` digits.
+pub fn canonical_decimal_text(text: &str, precision: u8, scale: u8) -> Option<String> {
+    let unscaled = parse_decimal_unscaled(text, scale)?;
+    let limit = 10u128.checked_pow(precision as u32)?;
+    (unscaled.unsigned_abs() < limit).then(|| format_decimal_unscaled(unscaled, scale))
+}
+
 fn pv_as_bool(v: &ProximaValue) -> Option<bool> {
     match v {
         ProximaValue::Boolean(b) => Some(*b),
@@ -1673,6 +1696,32 @@ mod tests {
                 None,
             ]
         );
+    }
+
+    #[test]
+    fn canonical_decimal_text_rescales_to_the_declared_scale() {
+        assert_eq!(format_decimal_unscaled(1250, 2), "12.50");
+        assert_eq!(format_decimal_unscaled(-99, 2), "-0.99");
+        assert_eq!(format_decimal_unscaled(5, 3), "0.005");
+        assert_eq!(format_decimal_unscaled(42, 0), "42");
+        assert_eq!(
+            canonical_decimal_text("12.5", 10, 2).as_deref(),
+            Some("12.50")
+        );
+        assert_eq!(
+            canonical_decimal_text("1000", 10, 2).as_deref(),
+            Some("1000.00")
+        );
+        assert_eq!(
+            canonical_decimal_text("-0.995", 10, 2).as_deref(),
+            Some("-1.00")
+        );
+        assert_eq!(
+            canonical_decimal_text("123.45", 4, 2),
+            None,
+            "exceeds precision"
+        );
+        assert_eq!(canonical_decimal_text("abc", 10, 2), None);
     }
 
     #[test]

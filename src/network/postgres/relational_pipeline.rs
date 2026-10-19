@@ -2726,6 +2726,74 @@ pub fn pg_type_for(t: &ProximaType) -> PgType {
     }
 }
 
+/// Nanoseconds in one `unit`.
+fn unit_nanos(unit: proximadb_data_model::TimeUnit) -> i64 {
+    use proximadb_data_model::TimeUnit as U;
+    match unit {
+        U::Second => 1_000_000_000,
+        U::Millisecond => 1_000_000,
+        U::Microsecond => 1_000,
+        U::Nanosecond => 1,
+    }
+}
+
+/// `HH:MM:SS[.ffffff]`, Postgres style: up to microseconds, trailing zeros trimmed.
+fn pg_time_of_day(t: chrono::NaiveTime) -> String {
+    use chrono::Timelike;
+    let base = t.format("%H:%M:%S").to_string();
+    let micros = t.nanosecond() / 1_000;
+    if micros == 0 {
+        base
+    } else {
+        let frac = format!("{micros:06}");
+        format!("{base}.{}", frac.trim_end_matches('0'))
+    }
+}
+
+/// pgwire **result-cell** text: the Postgres text output a client parses for
+/// the advertised type (`pg_type_for`). DATE is `YYYY-MM-DD`, TIMESTAMP is
+/// `YYYY-MM-DD HH:MM:SS[.ffffff]`, TIMESTAMPTZ appends `+00`, TIME is
+/// `HH:MM:SS[.ffffff]`; every other value renders as [`text_encode`].
+///
+/// [`text_encode`] stays the canonical *key* form (PK / secondary-index probes
+/// match the stored oid text, e.g. a DATE key's day count), so the two must not
+/// be merged: this one is only for DataRow cells.
+pub fn wire_text(v: &ProximaValue) -> Option<String> {
+    use ProximaValue as V;
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?.and_hms_opt(0, 0, 0)?;
+    let datetime = |ticks: i64, unit| {
+        let nanos = (ticks as i128) * (unit_nanos(unit) as i128);
+        let secs = nanos.div_euclid(1_000_000_000) as i64;
+        let sub = nanos.rem_euclid(1_000_000_000) as u32;
+        chrono::DateTime::from_timestamp(secs, sub).map(|d| d.naive_utc())
+    };
+    match v {
+        V::Date(days) => Some(
+            epoch
+                .date()
+                .checked_add_signed(chrono::Duration::days(*days as i64))
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| days.to_string()),
+        ),
+        V::Timestamp(t, unit) => Some(
+            datetime(*t, *unit)
+                .map(|d| format!("{} {}", d.format("%Y-%m-%d"), pg_time_of_day(d.time())))
+                .unwrap_or_else(|| t.to_string()),
+        ),
+        V::TimestampTz(t, unit) => Some(
+            datetime(*t, *unit)
+                .map(|d| format!("{} {}+00", d.format("%Y-%m-%d"), pg_time_of_day(d.time())))
+                .unwrap_or_else(|| t.to_string()),
+        ),
+        V::Time(t, unit) => Some(
+            datetime(*t, *unit)
+                .map(|d| pg_time_of_day(d.time()))
+                .unwrap_or_else(|| t.to_string()),
+        ),
+        other => text_encode(other),
+    }
+}
+
 /// Text-encode a [`ProximaValue`] for the pgwire text format.
 /// Returns `None` for SQL `NULL` (the caller emits the pgwire
 /// null sentinel `-1` length).
@@ -5335,6 +5403,49 @@ mod tests {
             resolver
                 .secondary_index_columns(&TableId::new("edges"))
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn wire_text_renders_postgres_temporal_text() {
+        use proximadb_data_model::TimeUnit;
+        // 2024-01-02 = day 19724 since the Unix epoch.
+        assert_eq!(
+            wire_text(&ProximaValue::Date(19724)),
+            Some("2024-01-02".into())
+        );
+        assert_eq!(
+            wire_text(&ProximaValue::Date(-1)),
+            Some("1969-12-31".into())
+        );
+        assert_eq!(
+            wire_text(&ProximaValue::Timestamp(
+                1_704_164_645_000,
+                TimeUnit::Millisecond
+            )),
+            Some("2024-01-02 03:04:05".into())
+        );
+        assert_eq!(
+            wire_text(&ProximaValue::Timestamp(
+                1_704_164_645_123_456_789,
+                TimeUnit::Nanosecond
+            )),
+            Some("2024-01-02 03:04:05.123456".into())
+        );
+        assert_eq!(
+            wire_text(&ProximaValue::TimestampTz(1_704_164_645, TimeUnit::Second)),
+            Some("2024-01-02 03:04:05+00".into())
+        );
+        assert_eq!(
+            wire_text(&ProximaValue::Time(3_723_500_000, TimeUnit::Microsecond)),
+            Some("01:02:03.5".into())
+        );
+        // Non-temporal values are unchanged, and the KEY form stays the raw count.
+        assert_eq!(wire_text(&ProximaValue::Int64(7)), Some("7".into()));
+        assert_eq!(wire_text(&ProximaValue::Null), None);
+        assert_eq!(
+            text_encode(&ProximaValue::Date(19724)),
+            Some("19724".into())
         );
     }
 
