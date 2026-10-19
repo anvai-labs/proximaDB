@@ -2217,9 +2217,36 @@ impl DirectWalTableRecordStore {
                     summary.deletes_replayed += 1;
                 }
                 CanonicalOperation::RecordPartitionDrop { collection_id } => {
-                    // DROP TABLE: void the partition (+ its lazily built index
-                    // state). Upserts replayed after this entry re-seed the
-                    // partition — a table recreated post-drop starts empty.
+                    // DROP TABLE: purge the partition's durable objects, then void
+                    // it (+ its lazily built index state). Upserts replayed after
+                    // this entry re-seed the partition — a table recreated
+                    // post-drop starts empty.
+                    //
+                    // The purge mirrors the live `drop_table_records` (TD-USUB-20).
+                    // Without it, a spill partition that crossed its flush
+                    // threshold earlier in THIS replay has written the dropped
+                    // rows into segments; voiding the map entry leaves them on
+                    // disk, and the next access's discovery adopts them into the
+                    // re-created table. Safe under WAL truncation: truncation only
+                    // discards entries below `min_unflushed_lsn`, so a drop that
+                    // replay still sees is at or above it, and every post-drop row
+                    // a purge here deletes is still in the WAL after it and
+                    // replays back. A failure propagates: serving the dropped rows
+                    // would be silently wrong (mandate #1).
+                    //
+                    // Shared-storage mode cannot purge one partition (every key is
+                    // one backing store); the live path declines there too.
+                    if !self.shared_storage {
+                        self.partition(&tenant_id, &collection_id)
+                            .purge_durable_objects()
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "replaying RecordPartitionDrop for '{collection_id}': \
+                                     purging durable objects"
+                                )
+                            })?;
+                    }
                     self.drop_partition_state(&tenant_id, &collection_id);
                 }
                 // Checkpoints, CDC barriers, and system-catalog mutations carry
@@ -5374,6 +5401,129 @@ mod tests {
             !scanned.iter().any(|r| r.oid == "r0"),
             "the deleted row must not come back after its tombstone was persisted"
         );
+
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+    }
+
+    /// TD-USUB-20: replaying `insert × N → RecordPartitionDrop → insert` into a
+    /// spilling store must leave the re-created table holding ONLY the post-drop
+    /// row, with no pre-drop segment left under its prefix.
+    ///
+    /// The N inserts cross the flush threshold during replay, so the dropped
+    /// rows reach segments. Before the fix the replay drop arm only voided the
+    /// map entry; the next access rebuilt the partition over the same prefix,
+    /// discovery adopted those segments, and the dropped rows came back.
+    /// Mutation check: removing the purge from the replay drop arm fails both
+    /// assertions. A second replay over the same prefix (the next boot) must
+    /// agree.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn replayed_drop_purges_segments_written_earlier_in_the_replay() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let base = root.to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let fs = Arc::new(
+            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
+                crate::storage::persistence::filesystem::local::LocalConfig::default(),
+            )
+            .await
+            .expect("local filesystem"),
+        );
+        let build = |fs: Arc<crate::storage::persistence::filesystem::local::LocalFileSystem>| {
+            let base = base.clone();
+            DirectWalTableRecordStore::new_spilling(
+                Arc::new(RecordingWalAppender::default()),
+                fs,
+                Arc::new(move |tenant_id: &str, collection: &str| {
+                    format!("{base}/{tenant_id}/{collection}")
+                }),
+            )
+        };
+        let tenant = Some("tenant-a".to_string());
+        let upsert = |lsn: u64, oid: &str| {
+            CanonicalWalEntry::new(
+                lsn,
+                CanonicalOperation::RecordUpsert {
+                    collection_id: "orders".to_string(),
+                    record: Box::new(ProximaRecord {
+                        oid: oid.to_string(),
+                        variation_id: Some("orders".to_string()),
+                        ..Default::default()
+                    }),
+                    projections: vec![],
+                },
+                tenant.clone(),
+            )
+        };
+        let mut entries: Vec<CanonicalWalEntry> = (0..8u64)
+            .map(|i| upsert(i + 1, &format!("old{i}")))
+            .collect();
+        entries.push(CanonicalWalEntry::new(
+            9,
+            CanonicalOperation::RecordPartitionDrop {
+                collection_id: "orders".to_string(),
+            },
+            tenant.clone(),
+        ));
+        entries.push(upsert(10, "new0"));
+
+        let segment_files = || -> Vec<String> {
+            std::fs::read_dir(root.join("tenant-a").join("orders"))
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .filter(|n| n.starts_with("spill-"))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        async fn scan_oids(store: &DirectWalTableRecordStore) -> Vec<String> {
+            let mut oids: Vec<String> = store
+                .scan_records(
+                    &CatalogTableSchema::new("orders"),
+                    TableRecordScanRequest {
+                        filter: None,
+                        table_id: "orders".to_string(),
+                        limit: None,
+                        include_vector: false,
+                        include_props: true,
+                    },
+                    Some(&TenantContext::for_tenant_id("tenant-a")),
+                    #[cfg(feature = "abac-policy")]
+                    &ReadContext::system(SystemReadReason::Statistics, "record_store::tests"),
+                )
+                .await
+                .expect("scan")
+                .into_iter()
+                .map(|r| r.oid)
+                .collect();
+            oids.sort();
+            oids
+        }
+
+        for boot in 0..2 {
+            let store = build(fs.clone());
+            store
+                .replay_wal_entries(entries.clone())
+                .await
+                .expect("replay must succeed");
+            assert_eq!(
+                scan_oids(&store).await,
+                ["new0"],
+                "boot {boot}: the re-created table must hold only the post-drop row"
+            );
+            assert!(
+                segment_files().is_empty(),
+                "boot {boot}: no pre-drop segment may survive the replayed drop: {:?}",
+                segment_files()
+            );
+        }
 
         unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
     }

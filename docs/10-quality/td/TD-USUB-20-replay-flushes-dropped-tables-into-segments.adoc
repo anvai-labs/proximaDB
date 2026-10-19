@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Filed 2026-10-19 while mapping the Layer A production wiring (TD-SEAM-3).
+| Status | **Resolved 2026-10-19** (replay purges like the live DROP; see Resolution). Filed the same day while mapping the Layer A production wiring (TD-SEAM-3).
 | Priority | **HIGH as a gate on wiring `new_spilling` in production**, zero today: no production site builds a spill partition, so replay never flushes.
 | Component | `src/services/record_store.rs` (`replay_wal_entries`, its `RecordPartitionDrop` arm; `drop_table_records`), `src/services/record_spill.rs` (`upsert_record_at_lsn` → threshold flush, `purge_durable_objects`, `ensure_discovered`)
 | Relates to | TD-USUB-1 (items i and iii), TD-SEAM-3, TD-SEAM-2 (truncation), mandate #16a
@@ -57,3 +57,25 @@ Mutation check: removing the purge from the replay arm must fail it.
 A complementary option, not yet checked: with `PROXIMADB_WAL_OBJECT_ID_KEY` on, the partition key
 is the table's object id, and each incarnation would get its own prefix. That holds only if the id
 is unique per incarnation.
+
+== Resolution (2026-10-19)
+
+Step 1 of "How to apply". The replay `RecordPartitionDrop` arm in `replay_wal_entries` now calls
+`purge_durable_objects` on the partition before `drop_partition_state`, as the live
+`drop_table_records` does.
+
+* It is skipped in shared-storage mode, where the live path also declines.
+* A purge failure propagates. Serving dropped rows would be silently wrong (mandate #1).
+
+Step 2 (suppressing threshold flushes during replay) was not taken. With the purge in place, the
+per-boot rewrite affects only tables that are *not* dropped. That is bounded by truncation
+(TD-SEAM-2) and compaction, not by this TD.
+
+The test `replayed_drop_purges_segments_written_earlier_in_the_replay`
+(`src/services/record_store.rs`) replays `8 × insert → drop → insert` at threshold 4 into a
+spilling store, twice over the same prefix (two boots). After each replay it asserts that:
+
+* the re-created table holds exactly `new0`;
+* no `spill-*` object remains.
+
+Mutation check: removing the purge fails both assertions.
