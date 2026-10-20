@@ -12,8 +12,8 @@
 
 use std::path::{Path as FsPath, PathBuf};
 
-use tempfile::TempDir;
 use std::time::Duration;
+use tempfile::TempDir;
 use tokio::time::sleep;
 
 #[path = "common/pg_server.rs"]
