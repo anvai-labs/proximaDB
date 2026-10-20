@@ -5843,9 +5843,9 @@ mod tests {
     }
 
     /// With the spill gate on, the tier floor is the minimum over spill
-    /// partitions' resident LSNs — and ONE refusing partition (here the
-    /// untenanted one, which falls back to a memtable) makes the whole tier
-    /// refuse.
+    /// partitions' resident LSNs — the untenanted (`""`) partition included,
+    /// since it spills too — and ONE refusing partition (a memtable) makes the
+    /// whole tier refuse.
     ///
     /// Process-isolated under nextest, so the env gate does not leak.
     #[tokio::test]
@@ -5863,6 +5863,8 @@ mod tests {
             .await
             .expect("local filesystem"),
         );
+        let store_fs = fs.clone();
+        let refusing_base = format!("{base}/mixed");
         let store = DirectWalTableRecordStore::new_spilling(
             Arc::new(RecordingWalAppender::default()),
             fs,
@@ -5898,14 +5900,49 @@ mod tests {
             "the minimum resident LSN across spill partitions"
         );
 
-        // An untenanted partition is a memtable (no tombstone stamp possible),
-        // so it refuses — and so does the tier.
+        // The untenanted partition spills like any other, so it reports its
+        // resident LSN instead of refusing; the minimum is unchanged.
         store
             .replay_wal_entries(vec![upsert(9, "", "orders")])
             .await
             .expect("replay");
+        assert_eq!(
+            store.min_unflushed_lsn().await.ok(),
+            Some(Some(5)),
+            "an untenanted spill partition answers, it does not refuse"
+        );
+
+        // A memtable partition has no durable copy of its rows, so it refuses —
+        // and one refusal makes the whole tier refuse.
+        let spill_fs = store_fs.clone();
+        let spill_base = refusing_base.clone();
+        let mixed = DirectWalTableRecordStore::with_storage_factory(
+            Arc::new(RecordingWalAppender::default()),
+            Arc::new(move |tenant_id: &str, collection: &str| {
+                if collection == "legacy" {
+                    Arc::new(crate::services::MemtableRecordStorage::new())
+                        as Arc<dyn RecordStorage>
+                } else {
+                    Arc::new(
+                        crate::services::SpillRecordStorage::with_flush_threshold(
+                            spill_fs.clone(),
+                            format!("{spill_base}/{tenant_id}/{collection}"),
+                            Some(4),
+                        )
+                        .with_tenant(tenant_id),
+                    ) as Arc<dyn RecordStorage>
+                }
+            }),
+        );
+        mixed
+            .replay_wal_entries(vec![
+                upsert(1, "tenant-a", "orders"),
+                upsert(2, "tenant-a", "legacy"),
+            ])
+            .await
+            .expect("replay");
         assert!(
-            store.min_unflushed_lsn().await.is_err(),
+            mixed.min_unflushed_lsn().await.is_err(),
             "one refusing partition makes the whole tier refuse"
         );
 
