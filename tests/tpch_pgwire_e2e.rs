@@ -17,7 +17,7 @@ const TPCH_RATCHET: usize = 22;
 /// ADR-040 accuracy ratchet (TD-182 P1): number of TPC-H queries whose FULL
 /// result set is anchored against a hand-derived expected table over the seed
 /// data and passes (`canon_rows` comparison). Only goes up.
-const TPCH_ACCURATE_RATCHET: usize = 15;
+const TPCH_ACCURATE_RATCHET: usize = 16;
 
 #[path = "common/pg_server.rs"]
 mod pg_server;
@@ -348,12 +348,12 @@ fn tpch_expected() -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
             ]],
         ),
         // Q3: o1 only (BUILDING customer, orderdate < 1995-03-15, ship after);
-        // L4 revenue 2000*0.9 = 1800 (L5 shipped 1994). o_orderdate renders as
-        // a day-number (1995-02-15 = 9176) on the aggregate route — a KNOWN-BAD
-        // rendering (DATE column fidelity); the VALUE columns are the assertion.
-        // KNOWN-BAD: a DATE-rendering fix will change the 3rd column and trip
-        // this pin — re-anchor with the correct DATE string at that point.
-        ("Q3-KNOWN-BAD", vec![vec!["1", "1800", "9176", "0"]]),
+        // of o1's lines only L4 (shipdate 1995-04-01) passes the ship predicate
+        // (L1 ships 1995-03-10, L5 1994-05-10) → revenue 2000*0.9 = 1800.
+        // Formerly KNOWN-BAD: pgwire rendered DATE as days-since-epoch (1995-02-15
+        // = 9176); fixed by the Postgres-text DATE/TIME/TIMESTAMP rendering
+        // (#2075) — the pin tripped and Q3 is now anchored value-correct.
+        ("Q3", vec![vec!["1", "1800", "1995-02-15", "0"]]),
         // Q4: no orders in 1993-Q3 → empty.
         ("Q4", vec![]),
         // Q5: o2's customer is GERMANY (EUROPE), excluded by AMERICA → empty.
