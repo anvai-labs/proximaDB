@@ -506,16 +506,17 @@ fn tpcds_expected() -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
             ],
         ),
         // win_running: per-day revenue + running total in date order. d_date
-        // renders as a day-number (1999-11-05 = 10900 …) on this route — DATE
-        // column-fidelity is a known rendering follow-up; the daily/running
-        // VALUE columns are the assertion.
+        // used to render as a day-number (1999-11-05 = 10900 …) on this
+        // route; fixed by the Postgres-text DATE rendering (#2075) — the
+        // anchor tripped and is re-pinned value-correct with the DATE
+        // strings (day numbers were 10900/11262/11276/11301).
         (
             "win_running",
             vec![
-                vec!["10900", "19.99", "19.99"],
-                vec!["11262", "69.48", "89.47"],
-                vec!["11276", "49.95", "139.42"],
-                vec!["11301", "42", "181.42"],
+                vec!["1999-11-05", "19.99", "19.99"],
+                vec!["2000-11-01", "69.48", "89.47"],
+                vec!["2000-11-15", "49.95", "139.42"],
+                vec!["2000-12-10", "42", "181.42"],
             ],
         ),
         // cte (TD-185a closed by #1860): WITH now executes; anchored to the
@@ -553,13 +554,29 @@ fn tpcds_expected() -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
 /// reuses the first's manifest pointed at a deleted tempdir).
 async fn tpcds_accuracy_anchored_phase(client: &tokio_postgres::Client) {
     for (name, ddl) in SCHEMA {
-        let _ = client
+        // Phase boundary (ported from tpch_pgwire_e2e, #2080): the
+        // conformance phase's queries + this shared boot leave catalog/WAL
+        // state where a best-effort `DROP TABLE IF EXISTS` can ERROR
+        // (swallowed, historically) instead of no-op'ing — the subsequent
+        // CREATE then hit "already exists" and panicked. Surface the drop
+        // error, and if CREATE still collides, retry once via a hard DROP
+        // before failing loudly. A true CREATE regression still panics;
+        // only the stale-state race is absorbed.
+        if let Err(e) = client
             .simple_query(&format!("DROP TABLE IF EXISTS {name}"))
-            .await;
-        client
-            .simple_query(ddl)
             .await
-            .unwrap_or_else(|e| panic!("CREATE {name}: {}", explain_err(&e)));
+        {
+            eprintln!(
+                "DROP IF EXISTS {name} errored (retrying create): {}",
+                explain_err(&e)
+            );
+        }
+        if client.simple_query(ddl).await.is_err() {
+            let _ = client.simple_query(&format!("DROP TABLE {name}")).await;
+            client.simple_query(ddl).await.unwrap_or_else(|e| {
+                panic!("CREATE {name} after stale-state retry: {}", explain_err(&e))
+            });
+        }
     }
     for sql in DATA {
         client
