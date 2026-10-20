@@ -82,6 +82,7 @@ anyhow.workspace = true
 openssl = { version = "0.10", optional = true }
 clap.workspace = true
 proximadb = { path = "../../", default-features = false }
+proximadb-kernel = { path = "../../crates/foundation/proximadb-kernel" }
 proximadb-embedding = { path = "../../crates/modalities/proximadb-embedding" }
 proximadb-runtime-common.workspace = true
 # Only for the explicit CryptoProvider::install_default() at boot — see main().

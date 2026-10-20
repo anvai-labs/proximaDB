@@ -146,13 +146,6 @@ pub fn read_state(data_dir: &Path) -> Option<RuntimeState> {
     serde_json::from_slice(&raw).ok()
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 #[cfg(unix)]
 fn pid_is_alive(pid: u32) -> bool {
     // Signal 0 probes existence without delivering anything.
@@ -181,7 +174,9 @@ impl RuntimeStateWriter {
     /// on a read-only or unusual filesystem; clients simply lose the
     /// observability the contract offers.
     pub fn start(data_dir: &Path, config_path: Option<String>) -> Self {
-        let now = now_ms();
+        // RuntimeState timestamps are u64 while the shared kernel clock is i64;
+        // epoch millis are never negative, so the cast is lossless.
+        let now = proximadb_kernel::time::now_unix_ms() as u64;
         let state = RuntimeState {
             pid: std::process::id(),
             phase: Phase::Starting,
@@ -214,7 +209,7 @@ impl RuntimeStateWriter {
                         break;
                     }
                     if let Ok(mut guard) = state.lock() {
-                        guard.updated_at_ms = now_ms();
+                        guard.updated_at_ms = proximadb_kernel::time::now_unix_ms() as u64;
                         write_state(&data_dir, &guard);
                     }
                 }
@@ -228,7 +223,7 @@ impl RuntimeStateWriter {
     pub fn set_phase(&self, phase: Phase) {
         if let Ok(mut guard) = self.state.lock() {
             guard.phase = phase;
-            guard.updated_at_ms = now_ms();
+            guard.updated_at_ms = proximadb_kernel::time::now_unix_ms() as u64;
             write_state(&self.data_dir, &guard);
         }
     }

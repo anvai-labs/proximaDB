@@ -560,11 +560,13 @@ impl DeltaCatalog {
     }
 
     /// Get current timestamp in milliseconds
+    ///
+    /// Thin wrapper over the shared kernel clock (`proximadb_kernel::time`).
+    /// Deliberate behavior change: the old body propagated a pre-epoch clock
+    /// as an error, while the kernel helper clamps to 0 — the same trade-off
+    /// every other clock call site in the workspace already makes.
     fn now_ms() -> Result<i64> {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| anyhow!("System time error: {}", e))
-            .map(|d| d.as_millis() as i64)
+        Ok(proximadb_kernel::time::now_unix_ms())
     }
 
     /// Build schema string for Delta log

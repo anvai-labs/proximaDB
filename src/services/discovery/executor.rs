@@ -12,10 +12,11 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
-use super::job::{DiscoveryJob, DiscoveryJobResult, DiscoveryJobStatus, now_ms};
+use super::job::{DiscoveryJob, DiscoveryJobResult, DiscoveryJobStatus};
 use super::passes::PassContext;
 use super::registry::DiscoveryRegistry;
 use crate::services::snapshot::{SnapshotPin, SnapshotPublishCoordinator};
+use proximadb_kernel::time::now_unix_ms;
 
 /// Default poll interval for the background loop.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -108,7 +109,7 @@ impl DiscoveryJobExecutor {
 
         // 5. Fold the result into the job record and mark Complete.
         job.status = DiscoveryJobStatus::Complete;
-        job.completed_at_ms = Some(now_ms());
+        job.completed_at_ms = Some(now_unix_ms());
         job.input_record_count = result.input_record_count;
         job.refined_record_count = result.refined_record_count;
         job.removed_count = result.removed_count;
@@ -137,7 +138,7 @@ impl DiscoveryJobExecutor {
         warn!("discovery job {} aborted: {}", job.job_id, msg);
         job.status = DiscoveryJobStatus::Failed;
         job.error = Some(msg);
-        job.completed_at_ms = Some(now_ms());
+        job.completed_at_ms = Some(now_unix_ms());
         self.registry.upsert(job.clone());
     }
 }

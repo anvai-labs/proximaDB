@@ -124,6 +124,14 @@ pub enum SerializationError {
     #[error("Bincode error: {0}")]
     Bincode(#[from] bincode::Error),
 
+    /// Apache Avro encode/decode failure
+    #[error("Avro error: {0}")]
+    Avro(String),
+
+    /// Compression or decompression failure
+    #[error("Compression error: {0}")]
+    Compression(String),
+
     /// The file does not start with the expected `AXIS` magic bytes
     #[error("Invalid magic bytes")]
     InvalidMagic,
@@ -1507,6 +1515,23 @@ mod tests {
 
         let serialized = bincode::serialize(&metadata).unwrap();
         let deserialized: AxisSerializedIndexMetadata = bincode::deserialize(&serialized).unwrap();
+
+        // The format_strategy arms (Avro/Compression) folded into this enum —
+        // keep their renderings stable across the merge.
+        assert_eq!(
+            crate::index::axis::storage::serialization::SerializationError::Avro(
+                "schema".to_string()
+            )
+            .to_string(),
+            "Avro error: schema"
+        );
+        assert_eq!(
+            crate::index::axis::storage::serialization::SerializationError::Compression(
+                "zstd".to_string()
+            )
+            .to_string(),
+            "Compression error: zstd"
+        );
 
         assert_eq!(metadata.index_type, deserialized.index_type);
         assert_eq!(metadata.collection_id, deserialized.collection_id);
