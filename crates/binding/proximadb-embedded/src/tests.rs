@@ -1616,4 +1616,42 @@ mod tests {
         }
         out
     }
+
+    // ========================================================================
+    // ids/vectors count validation (redundancy pass 3)
+    // ========================================================================
+
+    #[test]
+    fn test_insert_rejects_ids_vectors_count_mismatch() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = EmbeddedConfig::for_low_memory(temp_dir.path().to_string_lossy().as_ref());
+        let db = EmbeddedProximaDB::new(config).expect("create embedded db");
+
+        db.execute_sql(
+            "CREATE TABLE IF NOT EXISTS \"insert_mismatch_t\" (
+                \"record_id\" TEXT NOT NULL,
+                \"embedding\" VECTOR(4),
+                PRIMARY KEY (\"record_id\")
+            ) WITH (storage_engine = 'SST');",
+            None,
+            None,
+        )
+        .expect("create table");
+
+        // 2 ids, 1 vector: must be rejected, not silently zip-truncated to 1
+        let result = db.insert(
+            "insert_mismatch_t",
+            vec!["a".to_string(), "b".to_string()],
+            vec![vec![0.0, 0.1, 0.2, 0.3]],
+            None,
+        );
+
+        let err = result.expect_err("mismatched ids/vectors must fail, not truncate");
+        assert!(
+            err.to_string()
+                .contains("IDs count (2) must match vectors count (1)"),
+            "unexpected error: {err}"
+        );
+        db.close();
+    }
 }

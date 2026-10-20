@@ -428,6 +428,33 @@ fn py_dict_to_properties(
     Ok(map)
 }
 
+/// Convert one Python dict into a JSON metadata map.
+fn py_dict_to_json_map(dict: &Bound<'_, PyDict>) -> PyResult<HashMap<String, serde_json::Value>> {
+    let mut map = HashMap::new();
+    for (k, v) in dict.iter() {
+        map.insert(k.extract::<String>()?, python_to_json(&v)?);
+    }
+    Ok(map)
+}
+
+/// Convert a Python list-of-dicts into the per-record metadata shape that
+/// insert/upsert take. Replaces the conversion loop that was pasted into
+/// each binding method (redundancy pass 3).
+fn py_metadata_to_vec(
+    metadata: Option<&Bound<'_, PyList>>,
+) -> PyResult<Option<Vec<HashMap<String, serde_json::Value>>>> {
+    match metadata {
+        Some(meta_list) => {
+            let mut result = Vec::with_capacity(meta_list.len());
+            for item in meta_list.iter() {
+                result.push(py_dict_to_json_map(&item.cast::<PyDict>()?)?);
+            }
+            Ok(Some(result))
+        }
+        None => Ok(None),
+    }
+}
+
 #[pyclass(name = "GraphNode", from_py_object)]
 #[derive(Clone)]
 pub struct PyGraphNode {
@@ -1451,24 +1478,17 @@ impl PyProximaDB {
             vectors.extract()?
         };
 
-        // Convert metadata
-        let rust_metadata: Option<Vec<HashMap<String, serde_json::Value>>> =
-            if let Some(meta_list) = metadata {
-                let mut result = Vec::with_capacity(meta_list.len());
-                for item in meta_list.iter() {
-                    let dict = item.cast::<PyDict>()?;
-                    let mut map = HashMap::new();
-                    for (k, v) in dict.iter() {
-                        let key: String = k.extract()?;
-                        let value = python_to_json(&v)?;
-                        map.insert(key, value);
-                    }
-                    result.push(map);
-                }
-                Some(result)
-            } else {
-                None
-            };
+        // Validate dimensions (parity with insert_numpy: reject instead of
+        // letting the builder silently zip-truncate)
+        if ids.len() != rust_vectors.len() {
+            return Err(PyValueError::new_err(format!(
+                "Number of IDs ({}) doesn't match number of vectors ({})",
+                ids.len(),
+                rust_vectors.len()
+            )));
+        }
+
+        let rust_metadata = py_metadata_to_vec(metadata)?;
 
         let inner = self.db()?;
         py.detach(move || inner.insert(collection, ids, rust_vectors, rust_metadata))
@@ -1598,23 +1618,7 @@ impl PyProximaDB {
         };
 
         // Convert metadata (same as before)
-        let rust_metadata: Option<Vec<HashMap<String, serde_json::Value>>> =
-            if let Some(meta_list) = metadata {
-                let mut result = Vec::with_capacity(meta_list.len());
-                for item in meta_list.iter() {
-                    let dict = item.cast::<PyDict>()?;
-                    let mut map = HashMap::new();
-                    for (k, v) in dict.iter() {
-                        let key: String = k.extract()?;
-                        let value = python_to_json(&v)?;
-                        map.insert(key, value);
-                    }
-                    result.push(map);
-                }
-                Some(result)
-            } else {
-                None
-            };
+        let rust_metadata = py_metadata_to_vec(metadata)?;
 
         let inner = self.db()?;
         py.detach(move || inner.insert(collection, ids, rust_vectors, rust_metadata))
@@ -2260,24 +2264,16 @@ impl PyProximaDB {
             vectors.extract()?
         };
 
-        // Convert metadata (same pattern as insert)
-        let rust_metadata: Option<Vec<HashMap<String, serde_json::Value>>> =
-            if let Some(meta_list) = metadata {
-                let mut result = Vec::with_capacity(meta_list.len());
-                for item in meta_list.iter() {
-                    let dict = item.cast::<PyDict>()?;
-                    let mut map = HashMap::new();
-                    for (k, v) in dict.iter() {
-                        let key: String = k.extract()?;
-                        let value = python_to_json(&v)?;
-                        map.insert(key, value);
-                    }
-                    result.push(map);
-                }
-                Some(result)
-            } else {
-                None
-            };
+        // Validate dimensions (parity with insert_numpy)
+        if ids.len() != rust_vectors.len() {
+            return Err(PyValueError::new_err(format!(
+                "Number of IDs ({}) doesn't match number of vectors ({})",
+                ids.len(),
+                rust_vectors.len()
+            )));
+        }
+
+        let rust_metadata = py_metadata_to_vec(metadata)?;
 
         let inner = self.db()?;
         py.detach(move || inner.upsert(collection, ids, rust_vectors, rust_metadata))
@@ -2315,6 +2311,17 @@ impl PyProximaDB {
     ) -> PyResult<(usize, usize)> {
         // Zero-copy access to numpy buffer
         let array = vectors.as_array();
+        let n_vectors = array.shape()[0];
+
+        // Validate dimensions (parity with insert_numpy)
+        if ids.len() != n_vectors {
+            return Err(PyValueError::new_err(format!(
+                "Number of IDs ({}) doesn't match number of vectors ({})",
+                ids.len(),
+                n_vectors
+            )));
+        }
+
         let rust_vectors: Vec<Vec<f32>> = if let Some(slice) = array.as_slice() {
             let dimension = array.shape()[1];
             slice
@@ -2326,23 +2333,7 @@ impl PyProximaDB {
         };
 
         // Convert metadata (same pattern as insert_numpy)
-        let rust_metadata: Option<Vec<HashMap<String, serde_json::Value>>> =
-            if let Some(meta_list) = metadata {
-                let mut result = Vec::with_capacity(meta_list.len());
-                for item in meta_list.iter() {
-                    let dict = item.cast::<PyDict>()?;
-                    let mut map = HashMap::new();
-                    for (k, v) in dict.iter() {
-                        let key: String = k.extract()?;
-                        let value = python_to_json(&v)?;
-                        map.insert(key, value);
-                    }
-                    result.push(map);
-                }
-                Some(result)
-            } else {
-                None
-            };
+        let rust_metadata = py_metadata_to_vec(metadata)?;
 
         let inner = self.db()?;
         py.detach(move || inner.upsert(collection, ids, rust_vectors, rust_metadata))
@@ -3197,12 +3188,7 @@ impl PyProximaDB {
         doc_id: &str,
         updates: &Bound<'_, PyDict>,
     ) -> PyResult<()> {
-        let mut rust_updates = HashMap::new();
-        for (k, v) in updates.iter() {
-            let key: String = k.extract()?;
-            let value = python_to_json(&v)?;
-            rust_updates.insert(key, value);
-        }
+        let rust_updates = py_dict_to_json_map(updates)?;
 
         self.db()?
             .update_document(collection, doc_id, rust_updates)
@@ -3318,16 +3304,13 @@ impl PyProximaDB {
                 .and_then(|v| v.extract::<String>().ok())
                 .filter(|s| !s.is_empty());
 
-            let mut fields = std::collections::HashMap::new();
-            if let Some(fields_dict) = dict.get_item("fields")? {
-                if let Ok(d) = fields_dict.cast::<PyDict>() {
-                    for (k, v) in d.iter() {
-                        let key: String = k.extract()?;
-                        let value = python_to_json(&v)?;
-                        fields.insert(key, value);
-                    }
-                }
-            }
+            let fields = match dict.get_item("fields")? {
+                Some(fields_dict) => match fields_dict.cast::<PyDict>() {
+                    Ok(d) => py_dict_to_json_map(&d)?,
+                    Err(_) => std::collections::HashMap::new(),
+                },
+                None => std::collections::HashMap::new(),
+            };
 
             rust_logs.push(EmbeddedLogEntry {
                 timestamp_ns,

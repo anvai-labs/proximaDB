@@ -1,0 +1,65 @@
+// Copyright (C) 2025 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-CODEC-1: SIMD and baseline PForDelta encoders write divergent wire formats
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (filed 2026-10-20).** Divergence pinned by tripwire tests in `proximadb-codec/src/tests.rs`; no persisted-path exposure found (reachability analysis below).
+| Component | `crates/horizontal/proximadb-codec`: `simd/simd.rs` (`simd_pfor_delta_encode_f32` @1112, `simd_pfor_delta_decode_f32` @1342), `baseline/functions/pfor_delta.rs`
+| Relates to | Found by the 2026-10 duplication census (jscpd family #13, REAL-DRIFTED); storage-format mandate (mixed-read-safe, default-OFF)
+|===
+
+== Problem
+
+The SIMD and baseline PForDelta encoders produce **different bytes for the same input**:
+
+* **Baseline (canonical):** patches serialized as `position:4B + i64 value:8B` (12B/patch);
+  regular values bit-packed from the i64 domain (`functions/pfor_delta.rs`).
+* **SIMD:** patches serialized as `position:4B + i32 value:4B` (8B/patch); regular values
+  bit-packed from the i32 domain (`simd/simd.rs`). The SIMD encoder also *ignores* its
+  `majority_bits` argument (underscore parameter) and picks its own width.
+
+Compounding this, `simd_pfor_delta_decode_f32` **delegates header+patch parsing to the baseline
+parser** (`parse_header_and_patches_f32`). Consequences:
+
+1. SIMD-encoded PForDelta bytes are undecodable by the baseline decoder.
+2. SIMD-encode → SIMD-decode is **not a faithful round-trip whenever at least one patch
+   exists** (the decoder applies the baseline patch layout to SIMD bytes).
+
+== Reachability (why nothing is corrupt on disk today)
+
+`ImplementationRegistry` registers SimdEncoder above BaselineEncoder on x86_64/aarch64 by
+default (`codec.rs:68-74`), so the hazard is live the moment any write path passes
+`ProximaScheme::PForDelta` through the registry. Verified 2026-10-20 that none does:
+
+* `engine-core/proximablocks/block_structures.rs` — all 5 `codec.encode(...)` sites override the
+  scheme first: detected PForDelta is replaced by `Delta` under lossless enforcement (~@3736)
+  or upgraded to `PForDoubleDelta` (~@3969/@4135/@4311/@4472).
+* `proximadb-block-format/src/writer.rs:2479` — calls the baseline
+  `functions::pfor_delta::encode_i64` **directly**, bypassing the registry.
+* Raptor — `rowgroup_manager.rs:567` maps PForDelta to `Delta`; its `ProximaCodec::global()`
+  uses (engine.rs @1592/@1717/@1758) are decode-only.
+
+Decode side is safe in-process: baseline-encoded PForDelta parses fine under the SimdDecoder
+(it delegates to the baseline parser anyway).
+
+== Tripwires (added with this TD)
+
+Three tests in `crates/horizontal/proximadb-codec/src/tests.rs` pin current behavior; any of
+them going red means the wire format moved and this TD must be revisited:
+
+* `test_pfor_delta_baseline_round_trips_with_patches` — the canonical wire stays faithful.
+* `test_pfor_delta_simd_baseline_wire_divergence_is_pinned` — the two encoders' bytes differ.
+* `test_pfor_delta_simd_self_round_trip_divergence_is_pinned` — SIMD self-consistency is absent
+  while patches exist.
+
+== Required fix (when PForDelta is next needed on a persisted path)
+
+Do NOT simply "fix" one side: bytes already written by the other side must stay readable
+(mixed-read-safe mandate). Preferred shape: make `simd_pfor_delta_encode_f32` write the
+baseline wire format for the patch/header sections (keeping SIMD only for delta computation
+and regular-value bit-packing — its own decoder already assumes that layout), behind a
+round-trip + cross-decoder conformance test (simd bytes → baseline decoder == original).
+Alternatively, registry-select Baseline for PForDelta until the encoder is aligned. Either
+way, the fix ships with recall/round-trip gates, not compile-only checks.

@@ -253,10 +253,17 @@ impl AuditLogger {
                     Ok(Arc::new(storage))
                 }
             }
-            AuditStorageBackend::Database { connection_string } => {
-                let storage =
-                    super::storage::DatabaseAuditStorage::new(connection_string.clone()).await?;
-                Ok(Arc::new(storage))
+            AuditStorageBackend::Database { .. } => {
+                // Fail closed: no database audit backend exists. The former
+                // placeholder silently discarded every audit event
+                // (store_audit_event was `Ok(())`), violating the audit
+                // contract. Refuse to start rather than drop compliance data
+                // — same policy as the Combined arm below and the
+                // feature-gated S3 backend.
+                Err(anyhow!(
+                    "Database audit backend is not implemented; use the File \
+                     storage_backend (local directory or object-store URL) or S3"
+                ))
             }
             AuditStorageBackend::S3 { bucket, region: _ } => {
                 // Route through the same object-store implementation as
@@ -1061,7 +1068,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_audit_logger_creation_with_database_backend() {
+    async fn test_audit_logger_creation_with_database_backend_fails_closed() {
         let config = AuditConfig {
             enable_audit_logging: true,
             storage_backend: AuditStorageBackend::Database {
@@ -1075,8 +1082,16 @@ mod tests {
             compliance_frameworks: vec![],
         };
 
-        let logger = AuditLogger::new(config).await;
-        assert!(logger.is_ok());
+        // Fail closed: no database audit backend exists, and the previous
+        // placeholder silently discarded every audit event. Selecting it
+        // must abort startup with an actionable message (same policy as the
+        // Combined arm and the feature-gated S3 backend).
+        let result = AuditLogger::new(config).await;
+        let message = result.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("Database audit backend is not implemented"),
+            "database backend must fail closed at construction, got: {message}"
+        );
     }
 
     #[tokio::test]

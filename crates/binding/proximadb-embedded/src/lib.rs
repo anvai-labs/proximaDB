@@ -1613,7 +1613,7 @@ impl EmbeddedProximaDB {
         let start = std::time::Instant::now();
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
-        let records = Self::build_embedded_vector_records(ids, vectors, metadata, now_ns);
+        let records = Self::build_embedded_vector_records(ids, vectors, metadata, now_ns)?;
 
         let count = records.len();
 
@@ -1666,8 +1666,24 @@ impl EmbeddedProximaDB {
         vectors: Vec<Vec<f32>>,
         metadata: Option<Vec<std::collections::HashMap<String, serde_json::Value>>>,
         now_ns: i64,
-    ) -> Vec<proximadb_records::ProximaRecord> {
-        ids.into_iter()
+    ) -> Result<Vec<proximadb_records::ProximaRecord>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        // Reject length mismatches instead of silently zip-truncating to the
+        // shorter side. `insert` previously dropped the tail records; the
+        // same message as upsert's early check keeps the two errors
+        // indistinguishable to callers (redundancy pass 3).
+        if ids.len() != vectors.len() {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "IDs count ({}) must match vectors count ({})",
+                    ids.len(),
+                    vectors.len()
+                ),
+            )) as Box<dyn std::error::Error + Send + Sync>);
+        }
+        Ok(ids
+            .into_iter()
             .zip(vectors)
             .enumerate()
             .map(|(i, (oid, values))| {
@@ -1699,7 +1715,7 @@ impl EmbeddedProximaDB {
                     ..Default::default()
                 }
             })
-            .collect()
+            .collect())
     }
 
     /// Insert canonical records into a collection without lowering through
@@ -2874,7 +2890,7 @@ impl EmbeddedProximaDB {
                 self.delete_vectors(collection, ids.clone())?;
                 let count = ids.len();
                 let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                let records = Self::build_embedded_vector_records(ids, vectors, metadata, now_ns);
+                let records = Self::build_embedded_vector_records(ids, vectors, metadata, now_ns)?;
 
                 self.runtime.block_on(async {
                     self.shared_services
