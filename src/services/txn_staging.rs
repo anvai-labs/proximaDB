@@ -527,6 +527,13 @@ impl TableRecordStore for StagingTableRecordStore {
             .read_changes_since_scoped(collection_id, tenant, since_lsn)
             .await
     }
+
+    async fn capture_snapshot_lsn(
+        &self,
+        collection_id: &str,
+    ) -> Result<crate::services::record_store::SnapshotLsn> {
+        self.base.capture_snapshot_lsn(collection_id).await
+    }
 }
 
 #[cfg(test)]
