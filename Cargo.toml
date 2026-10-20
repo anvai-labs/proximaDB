@@ -724,7 +724,6 @@ x509-parser = "0.18"             # Certificate parsing and validation
 rustls.workspace = true          # TLS implementation (unified with axum-server 0.7)
 rustls-pemfile = "2.0"           # PEM file parsing (CertificateDer/PrivateKeyDer)
 tokio-rustls = "0.26"            # Async TLS streams (rustls 0.23)
-webpki-roots = "0.25"            # Mozilla root certificates
 axum-server = { version = "0.7", features = ["tls-rustls"] }  # Axum TLS support (hyper 1.0)
 time = { version = "0.3", features = ["std"] }  # Time handling for certificates
 
