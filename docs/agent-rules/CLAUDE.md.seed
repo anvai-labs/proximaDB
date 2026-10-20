@@ -7,6 +7,8 @@ ProximaDB is a SQL-first context engine on object storage, built in Rust (ADR-09
 
 **Product direction (ADR-096, 2026-10-17):** ProximaDB is a SQL-first context engine on object storage — pgwire is the front door, vectors/JSON/graph are first-class inside SQL, every data model is a projection of one canonical record (ADR-094). Take direction from `docs/12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc` and sequencing only from the release-based `docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc`; the 2026-06-04 course correction below is the engineering mandate, not the product framing.
 
+**In-flight architecture work (ADR-097 lakehouse seams):** before starting or resuming any P0–P6 slice, read `docs/12-design/LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc` — the resumable status of record (merged / open PR / pushed branch per slice, next-work queue, working conventions, decisions log). Update it in the same PR that lands, opens or re-plans a slice.
+
 [WARNING]
 ====
 **🚨 ENGINEERING MANDATE — 2026-06-04 course correction (direction: ADR-096) 🚨**

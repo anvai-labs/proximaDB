@@ -8,7 +8,7 @@
 
 [cols="1,3"]
 |===
-| Status | **Accepted direction (owner decision 2026-10-18); implementation Open.** The decisions are recorded in link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097]. Each phase below is tracked by a `TD-SEAM-*` item (§6).
+| Status | **Accepted direction (owner decision 2026-10-18); implementation In Progress.** The decisions are recorded in link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097]. Each phase below is tracked by a `TD-SEAM-*` item (§6); live per-slice status, in-flight branches and the next-work queue are in link:LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc[LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER].
 | Date | 2026-10-18
 | Deciders | Vijaykumar Singh
 | Evidence base | Code survey of `develop` @ `1db3a05` (three parallel explorations). File:line citations are to that commit; line numbers drift, so re-verify before implementing (link:HOW_TO_FILE_TD_AND_ADR.adoc[HOW_TO_FILE_TD_AND_ADR] "Premise verification").

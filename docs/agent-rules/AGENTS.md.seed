@@ -5,6 +5,8 @@ This document acts as the index and unified trajectory guide for all Autonomous 
 ## Product Direction
 ProximaDB is a SQL-first context engine on object storage (ADR-096): pgwire is the front door, vectors/JSON/graph are first-class inside SQL, and every data model is a projection of one canonical record. Take direction from `docs/12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc` and pick work from the current release in `docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc`.
 
+**In-flight architecture work (ADR-097 lakehouse seams):** before starting or resuming any P0–P6 slice, read `docs/12-design/LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc` — the resumable status of record (merged / open PR / pushed branch per slice, next-work queue, working conventions, decisions log). Update it in the same PR that lands, opens or re-plans a slice.
+
 ## Primary Instructions
 Depending on your identity, read the corresponding mandate file first:
 *   **Gemini Models:** Read `GEMINI.md`
