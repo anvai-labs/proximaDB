@@ -9,7 +9,7 @@
 [cols="1,3"]
 |===
 | Purpose | The resumable status of record for executing link:LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] (the plan: Parts A–D, phases P0–P6) under link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097]. Any engineer or agent session picks up from here **and nothing else**: what is merged, what is in flight, what is next, and how the work is done.
-| Updated | 2026-10-20, against `develop` @ `7db68ea4d`.
+| Updated | 2026-10-20, against `develop` @ `29b3dc523` (#2095 merged).
 | Rule | Update this file in the same PR that lands, opens or re-plans a slice. A slice is **done** only when merged to `develop` with its gate green. Detail lives in the TD files; this file holds status, links and order.
 |===
 
@@ -70,7 +70,7 @@
  P2  S1/S2/S3 one write path                     [########....]  65%
      P2.1 segmented WAL + per-segment index      [############] 100%  #2079
      P2.2 Layer A (spill) in production          [########....]  70%
-     P2.3 WAL truncation                         [##########..]  85%  #2089 #2090 #2095
+     P2.3 WAL truncation                         [##########..]  90%  #2089 #2090 #2095
      P2.4 streaming MATERIALIZE (SF1, no OOM)    [............]   0%
  P3  S5/S6/S9 format-independent SQL, ANN op     [#...........]   5%
  P4  Modalities onto the seams                   [............]   0%
@@ -113,8 +113,8 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | Untenanted (`""`) partitions spill via `SpillRecordStorage::untenanted()` | Done | #2092 | `an_untenanted_partition_persists_its_deletes`, `an_empty_tenant_partition_spills_and_persists_deletes`.
 | P2.2a truncation primitives: durable floor marker, `truncate_below`, reader retry, in-flight reservations | Done | #2089 | `tests/wal_truncation_test.rs`. TD-SEAM-12.
 | P2.2b rank-profile and SQL-function WAL checkpoints; change feed 410 Gone; reader starvation fix | Done | #2090 | `tests/wal_system_catalog_checkpoint_test.rs`.
-| P2.2c scheduled truncator (`src/services/wal_truncator.rs`) + MATERIALIZE snapshot-LSN pin | **Open PR** | #2095 | `tests/wal_truncator_test.rs` (7). Off by default (`PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS`).
-| Spill segments written with `ParquetWritePolicy`, oid-sorted | **Open PR** | `spill-write-policy` | `segments_are_written_with_the_warehouse_layout_policy`; `record_spill::` + `record_store::tests::` 93/93 locally.
+| P2.2c scheduled truncator (`src/services/wal_truncator.rs`) + MATERIALIZE snapshot-LSN pin | Done | #2095 | `tests/wal_truncator_test.rs` (7). Off by default (`PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS`).
+| Spill segments written with `ParquetWritePolicy`, oid-sorted | **Open PR** | #2097 | `segments_are_written_with_the_warehouse_layout_policy`; `record_spill::` + `record_store::tests::` 93/93 locally.
 | Spill encoder uses the catalog schema | **Next** | — | See §5.1.
 | Durable branch merge-base | Open | — | Until it lands, branch-tagged WAL entries block truncation. TD-SEAM-12 hazard 2.
 | Catalog prefix registration (object-store placement of spill segments) | Open | — | TD-SEAM-3.
@@ -144,8 +144,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 [cols="2,1,3",options="header"]
 |===
 | Branch | PR | State and next action
-| `p2-2c-wal-truncator` | #2095 | Rebased on `7db68ea4d`; 23/23 WAL tests pass locally. Merge when CI is green on a current head.
-| `spill-write-policy` | open | Lib tests 93/93 and clippy clean locally. Merge when CI is green on a current head; next slice is §5.1.
+| `spill-write-policy` | #2097 | Lib tests 93/93 and clippy clean locally. Merge when CI is green on a current head; next slice is §5.1.
 |===
 
 == 5. Next-work queue (in order)
