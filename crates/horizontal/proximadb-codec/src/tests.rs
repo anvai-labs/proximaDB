@@ -271,3 +271,104 @@ fn test_f32_special_values() {
         assert_eq!(original.to_bits(), decoded_val.to_bits());
     }
 }
+
+// ============================================================================
+// PForDelta SIMD/baseline wire divergence pins (TD-CODEC-1)
+//
+// The SIMD and baseline PForDelta encoders write DIFFERENT wire formats:
+//   - baseline (canonical): patches as pos:4B + i64 value:8B; regular values
+//     bit-packed from the i64 domain (`functions/pfor_delta.rs`)
+//   - simd: patches as pos:4B + i32 value:4B; regular values bit-packed from
+//     the i32 domain (`simd/simd.rs`), and `simd_pfor_delta_decode_f32`
+//     delegates header+patch parsing to the BASELINE parser.
+//
+// Consequences pinned below: the bytes differ, the baseline wire round-trips
+// (it is the canonical format), and simd-encode → simd-decode is NOT a
+// faithful round-trip once any patch exists. Today no persisted path routes
+// PForDelta through the SIMD encoder (every PAX writer overrides the scheme
+// first — see TD-CODEC-1 for the reachability analysis), so this is a
+// tripwire, not a data-loss repro. If a change makes these tests fail, the
+// wire format moved: update TD-CODEC-1 and add mixed-read-safe handling.
+// ============================================================================
+
+/// Input that forces PForDelta patches on both implementations. The
+/// encoders work on BIT-CAST deltas (f32::to_bits as int, minus base), not
+/// arithmetic ones: the 32 alternating 0.0/1.0 values give deltas of
+/// {0, 0x3F800000 ≈ 1.07e9}, so the p90-driven majority width lands at 30
+/// bits on both sides, while the two 1e30 outliers (0x7149F2C9 ≈ 1.9e9)
+/// exceed 2^30 − 1 and must be patched (baseline: 12B/patch; simd: 8B/patch
+/// — 161B vs 153B total). Keep this mechanism in mind when editing the
+/// fixture: an outlier whose BIT PATTERN is small (e.g. 1e-30) would NOT
+/// patch. The SIMD encoder also IGNORES its majority_bits argument
+/// (underscore param) and picks its own width.
+fn pfor_patch_forcing_values() -> Vec<f32> {
+    let mut values = Vec::with_capacity(66);
+    for i in 0..32 {
+        values.push(i as f32 % 2.0); // deltas of ±1
+    }
+    values.push(1e30); // outlier delta far beyond any majority width
+    values.push(1e30);
+    values
+}
+
+/// Baseline PForDelta must round-trip exactly, patches included — it is the
+/// canonical wire format that persisted bytes must keep matching.
+#[test]
+fn test_pfor_delta_baseline_round_trips_with_patches() {
+    let values = pfor_patch_forcing_values();
+    let encoded = crate::baseline::functions::pfor_delta::encode_f32(&values, 0).expect("encode");
+    let decoded =
+        crate::baseline::functions::pfor_delta::decode_f32(&encoded, values.len()).expect("decode");
+
+    assert_eq!(decoded.len(), values.len());
+    for (original, decoded_val) in values.iter().zip(decoded.iter()) {
+        assert_eq!(original.to_bits(), decoded_val.to_bits());
+    }
+}
+
+/// The two PForDelta encoders must not silently converge: their outputs
+/// differ (12B i64 patches vs 8B i32 patches among other layout differences),
+/// and any change to that fact is a wire-format change requiring TD-CODEC-1
+/// to be revisited.
+#[test]
+fn test_pfor_delta_simd_baseline_wire_divergence_is_pinned() {
+    let values = pfor_patch_forcing_values();
+
+    let baseline_bytes =
+        crate::baseline::functions::pfor_delta::encode_f32(&values, 0).expect("baseline encode");
+    let simd_bytes = crate::simd::simd_pfor_delta_encode_f32(&values, 8, 0).expect("simd encode");
+
+    assert_ne!(
+        baseline_bytes.len(),
+        simd_bytes.len(),
+        "PForDelta wires converged (baseline {}B vs simd {}B) — wire format changed, \
+         revisit TD-CODEC-1",
+        baseline_bytes.len(),
+        simd_bytes.len()
+    );
+    assert_ne!(baseline_bytes, simd_bytes);
+}
+
+/// simd-encode → simd-decode is NOT a faithful round-trip today when patches
+/// exist (the simd decoder parses the baseline patch layout). Pinned so that
+/// a fix to either side surfaces here instead of silently changing bytes.
+#[test]
+fn test_pfor_delta_simd_self_round_trip_divergence_is_pinned() {
+    let values = pfor_patch_forcing_values();
+    let simd_bytes = crate::simd::simd_pfor_delta_encode_f32(&values, 8, 0).expect("simd encode");
+    let decoded = crate::simd::simd_pfor_delta_decode_f32(&simd_bytes, 8, 0, values.len());
+
+    let faithful = decoded
+        .map(|v| {
+            v.len() == values.len()
+                && v.iter()
+                    .zip(values.iter())
+                    .all(|(d, o)| d.to_bits() == o.to_bits())
+        })
+        .unwrap_or(false);
+
+    assert!(
+        !faithful,
+        "simd PForDelta became self-consistent — wire format changed, revisit TD-CODEC-1"
+    );
+}
