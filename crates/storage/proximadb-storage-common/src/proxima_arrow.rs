@@ -327,6 +327,38 @@ fn build_column(records: &[ProximaRecord], col: &ProximaColumn) -> Result<ArrayR
     }
 }
 
+/// Whether [`build_column`] can materialize a column of this type at all.
+///
+/// Mirrors [`build_column`]'s `ProximaType` match arm for arm: `true` exactly
+/// where the match has a dedicated arm, `false` where it falls to the
+/// `other =>` serialization-error arm — including with zero rows. The spill
+/// encoder's schema gate relies on this staying in sync; the unit test below
+/// enumerates every [`ProximaType`] variant to keep the two honest.
+pub fn column_materializable(ty: &ProximaType) -> bool {
+    matches!(
+        ty,
+        ProximaType::Boolean
+            | ProximaType::Int8
+            | ProximaType::Int16
+            | ProximaType::Int32
+            | ProximaType::Int64
+            | ProximaType::UInt8
+            | ProximaType::UInt16
+            | ProximaType::UInt32
+            | ProximaType::UInt64
+            | ProximaType::Float32
+            | ProximaType::Float64
+            | ProximaType::Decimal { .. }
+            | ProximaType::String
+            | ProximaType::Json
+            | ProximaType::Binary
+            | ProximaType::Date
+            | ProximaType::Timestamp(_)
+            | ProximaType::TimestampTz(_)
+            | ProximaType::DenseVector { .. }
+    )
+}
+
 /// Build the dense-vector column as `FixedSizeBinary(dimension * 4)`, encoding each record's
 /// first embedding as little-endian fp32 bytes (the layout `to_arrow_type` declares for
 /// [`ProximaType::DenseVector`]). Absent embedding → null; length mismatch → hard error.
@@ -650,6 +682,115 @@ fn pv_as_date32(v: &ProximaValue) -> Option<i32> {
     }
 }
 
+/// Whether the batch builders write `v` into a column of type `ty` without loss.
+///
+/// Mirrors [`build_column`] arm by arm: `false` exactly where the builder would
+/// emit NULL (an extractor returns `None`), wrap (an out-of-range integer cast),
+/// fail (a DECIMAL needing more digits than declared), or silently change the
+/// value (an integer whose magnitude does not survive the declared float's
+/// mantissa). `Null` always fits.
+///
+/// Two residuals remain by declaration, each visible to the reader as a type
+/// change rather than a value change: floats narrowed into a declared `Float32`
+/// column, and DECIMAL encoded as text. `Null` always fits.
+pub fn value_fits_column(v: &ProximaValue, ty: &ProximaType) -> bool {
+    if matches!(v, ProximaValue::Null) {
+        return true;
+    }
+    // An integer survives a float column only if the float round-trips it:
+    // f64 carries 53 bits of mantissa, f32 only 24, so `9007199254740993`
+    // spilled into a DOUBLE PRECISION column would read back as
+    // `9007199254740992.0` — a silent value change this check refuses.
+    fn int_round_trips(int: i64, through: f64) -> bool {
+        (through as i64) == int
+    }
+    match ty {
+        ProximaType::Boolean => pv_as_bool(v).is_some(),
+        ProximaType::Int8 => pv_as_i64(v).is_some_and(|x| i8::try_from(x).is_ok()),
+        ProximaType::Int16 => pv_as_i64(v).is_some_and(|x| i16::try_from(x).is_ok()),
+        ProximaType::Int32 => pv_as_i64(v).is_some_and(|x| i32::try_from(x).is_ok()),
+        // `pv_as_i64` reinterprets a `UInt64` above `i64::MAX`; that is a wrap.
+        ProximaType::Int64 => match v {
+            ProximaValue::UInt64(x) => i64::try_from(*x).is_ok(),
+            _ => pv_as_i64(v).is_some(),
+        },
+        ProximaType::UInt8 => pv_as_u64(v).is_some_and(|x| u8::try_from(x).is_ok()),
+        ProximaType::UInt16 => pv_as_u64(v).is_some_and(|x| u16::try_from(x).is_ok()),
+        ProximaType::UInt32 => pv_as_u64(v).is_some_and(|x| u32::try_from(x).is_ok()),
+        ProximaType::UInt64 => pv_as_u64(v).is_some(),
+        ProximaType::Float32 => match v {
+            // f32→f64 is exact, so this is the f32 round-trip expressed in f64.
+            ProximaValue::Int64(x) => int_round_trips(*x, (*x as f32) as f64),
+            ProximaValue::Int32(x) => {
+                let f = *x as f32;
+                (f as i32) == *x
+            }
+            _ => pv_as_f64(v).is_some(),
+        },
+        ProximaType::Float64 => match v {
+            ProximaValue::Int64(x) => int_round_trips(*x, *x as f64),
+            ProximaValue::UInt64(x) => {
+                let f = *x as f64;
+                (f as u64) == *x
+            }
+            _ => pv_as_f64(v).is_some(),
+        },
+        ProximaType::Date => pv_as_date32(v).is_some(),
+        ProximaType::Timestamp(_) | ProximaType::TimestampTz(_) => matches!(
+            v,
+            ProximaValue::Timestamp(..) | ProximaValue::TimestampTz(..) | ProximaValue::Int64(_)
+        ),
+        ProximaType::String | ProximaType::Json => pv_as_string(v).is_some(),
+        ProximaType::Binary => pv_as_binary(v).is_some(),
+        ProximaType::Decimal { precision, scale } => {
+            *precision >= 1
+                && *precision <= MAX_DECIMAL128_PRECISION
+                && scale <= precision
+                && pv_as_decimal_unscaled(v, *scale)
+                    .is_some_and(|u| u.unsigned_abs() < 10u128.pow(*precision as u32))
+        }
+        // A vector column is filled from `embeddings`, never from a prop.
+        _ => false,
+    }
+}
+
+/// What of `record` the batch builders would NOT preserve under `schema`: each
+/// non-null top-level prop that has no live column, is nested (props are not
+/// flattened), or does not fit its column ([`value_fits_column`]); plus
+/// `"<embeddings>"` when the embeddings would not round-trip (only the first is
+/// written, into a dense-vector column of exactly its dimension).
+///
+/// Empty means the record encodes losslessly. A durable writer must not write
+/// a record for which this is non-empty: the builders turn each listed value
+/// into NULL silently.
+pub fn props_not_preserved(record: &ProximaRecord, schema: &ProximaSchema) -> Vec<String> {
+    let live = || schema.columns.iter().filter(|c| !c.is_deleted);
+    let mut lost: Vec<String> = Vec::new();
+    for (key, node) in &record.props {
+        let fits = match node {
+            ProximaTreeNode::Value(ProximaValue::Null) => true,
+            ProximaTreeNode::Value(v) => live()
+                .find(|c| &c.name == key)
+                .is_some_and(|c| value_fits_column(v, &c.data_type)),
+            _ => false,
+        };
+        if !fits {
+            lost.push(key.clone());
+        }
+    }
+    let embeddings_fit = match record.embeddings.as_slice() {
+        [] => true,
+        [only] => live().any(|c| {
+            matches!(c.data_type, ProximaType::DenseVector { dim, .. } if dim == only.values.len())
+        }),
+        _ => false,
+    };
+    if !embeddings_fit {
+        lost.push("<embeddings>".to_string());
+    }
+    lost
+}
+
 // ---------------------------------------------------------------------------
 // Schema inference (for schema-less write paths, e.g. ObjectStoreBridge)
 // ---------------------------------------------------------------------------
@@ -935,10 +1076,34 @@ pub fn arrow_cell_to_proxima_value(array: &ArrayRef, row: usize) -> Option<Proxi
     } else if let Some(a) = any.downcast_ref::<Decimal128Array>() {
         // Exact decimal text at the column's scale (`12.50`), the same form INSERT stores.
         Some(ProximaValue::Decimal(a.value_as_string(row)))
+    } else if let Some((ticks, unit, zoned)) = timestamp_cell(array.as_ref(), row) {
+        // The column's own unit, and `TimestampTz` when the column carries a
+        // zone — the inverse of `build_timestamp_column`.
+        Some(if zoned {
+            ProximaValue::TimestampTz(ticks, unit)
+        } else {
+            ProximaValue::Timestamp(ticks, unit)
+        })
     } else {
         any.downcast_ref::<BinaryArray>()
             .map(|a| ProximaValue::Binary(a.value(row).to_vec()))
     }
+}
+
+/// `(ticks, unit, has_zone)` of a timestamp cell, for any of the four units.
+fn timestamp_cell(array: &dyn Array, row: usize) -> Option<(i64, DmTimeUnit, bool)> {
+    let any = array.as_any();
+    let (ticks, unit, zone) = if let Some(a) = any.downcast_ref::<TimestampSecondArray>() {
+        (a.value(row), DmTimeUnit::Second, a.timezone())
+    } else if let Some(a) = any.downcast_ref::<TimestampMillisecondArray>() {
+        (a.value(row), DmTimeUnit::Millisecond, a.timezone())
+    } else if let Some(a) = any.downcast_ref::<TimestampMicrosecondArray>() {
+        (a.value(row), DmTimeUnit::Microsecond, a.timezone())
+    } else {
+        let a = any.downcast_ref::<TimestampNanosecondArray>()?;
+        (a.value(row), DmTimeUnit::Nanosecond, a.timezone())
+    };
+    Some((ticks, unit, zone.is_some()))
 }
 
 /// Reverse of [`proxima_records_to_record_batch`]: materialize the rows of an
@@ -1076,6 +1241,221 @@ mod tests {
             r.props.insert(k.to_string(), leaf(v));
         }
         r
+    }
+
+    // --- Lossless-encoding predicates (spill catalog schema) -----------------
+
+    #[test]
+    fn value_fits_column_mirrors_what_the_builders_keep() {
+        use ProximaValue as V;
+        assert!(value_fits_column(&V::Null, &ProximaType::Int8));
+        assert!(value_fits_column(&V::Int64(127), &ProximaType::Int8));
+        assert!(
+            !value_fits_column(&V::Int64(300), &ProximaType::Int8),
+            "would wrap"
+        );
+        assert!(
+            !value_fits_column(&V::UInt64(u64::MAX), &ProximaType::Int64),
+            "would reinterpret"
+        );
+        assert!(
+            !value_fits_column(&V::String("x".into()), &ProximaType::Int64),
+            "would be NULL"
+        );
+        let money = ProximaType::Decimal {
+            precision: 4,
+            scale: 2,
+        };
+        assert!(value_fits_column(&V::Decimal("12.34".into()), &money));
+        assert!(
+            !value_fits_column(&V::Decimal("123.45".into()), &money),
+            "needs five digits"
+        );
+        assert!(value_fits_column(
+            &V::Timestamp(1, DmTimeUnit::Millisecond),
+            &ProximaType::Timestamp(DmTimeUnit::Microsecond)
+        ));
+        assert!(!value_fits_column(
+            &V::Boolean(true),
+            &ProximaType::Timestamp(DmTimeUnit::Microsecond)
+        ));
+    }
+
+    /// The spill encoder's schema gate trusts `column_materializable` to
+    /// mirror `build_column` exactly: a type the predicate accepts must build
+    /// (even with zero rows), a type it rejects must error. Enumerating every
+    /// [`ProximaType`] variant without a wildcard makes adding one force this
+    /// test to decide which side it belongs on.
+    #[test]
+    fn column_materializable_mirrors_build_column() {
+        use ProximaValue as V;
+
+        // A wide integer does not survive a float column's mantissa — the
+        // value_fits_column round-trip guard holds it instead of letting the
+        // builder silently round it.
+        assert!(!value_fits_column(
+            &V::Int64(9_007_199_254_740_993),
+            &ProximaType::Float64
+        ));
+        assert!(!value_fits_column(
+            &V::Int64(16_777_217),
+            &ProximaType::Float32
+        ));
+
+        for (ty, expected) in [
+            (ProximaType::Boolean, true),
+            (ProximaType::Int8, true),
+            (ProximaType::Int16, true),
+            (ProximaType::Int32, true),
+            (ProximaType::Int64, true),
+            (ProximaType::UInt8, true),
+            (ProximaType::UInt16, true),
+            (ProximaType::UInt32, true),
+            (ProximaType::UInt64, true),
+            (ProximaType::Float32, true),
+            (ProximaType::Float64, true),
+            (
+                ProximaType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                true,
+            ),
+            (ProximaType::String, true),
+            (ProximaType::Json, true),
+            (ProximaType::Binary, true),
+            (ProximaType::Date, true),
+            (ProximaType::Time(DmTimeUnit::Microsecond), false),
+            (ProximaType::Timestamp(DmTimeUnit::Microsecond), true),
+            (ProximaType::TimestampTz(DmTimeUnit::Microsecond), true),
+            (ProximaType::Interval(DmTimeUnit::Nanosecond), false),
+            (ProximaType::Duration(DmTimeUnit::Millisecond), false),
+            (ProximaType::Uuid, false),
+            (ProximaType::ULID, false),
+            (ProximaType::Symbol, false),
+            (ProximaType::Jsonb, false),
+            (ProximaType::Array(Box::new(ProximaType::Int64)), false),
+            (
+                ProximaType::Map {
+                    key: Box::new(ProximaType::String),
+                    value: Box::new(ProximaType::Int64),
+                },
+                false,
+            ),
+            (
+                ProximaType::Struct {
+                    fields: vec![("f".to_string(), ProximaType::Int64)],
+                },
+                false,
+            ),
+            (
+                ProximaType::DenseVector {
+                    element: DmVectorElement::Float32,
+                    dim: 3,
+                },
+                true,
+            ),
+            (
+                ProximaType::SparseVector {
+                    element: DmVectorElement::Float32,
+                },
+                false,
+            ),
+        ] {
+            let column = col(1, "c", ty.clone(), true);
+            let built = build_column(&[], &column);
+            assert_eq!(
+                built.is_ok(),
+                expected,
+                "{ty:?}: build_column vs column_materializable disagree"
+            );
+            assert_eq!(
+                column_materializable(&ty),
+                expected,
+                "{ty:?}: predicate out of sync with build_column"
+            );
+        }
+    }
+
+    #[test]
+    fn props_not_preserved_names_every_value_the_encoding_would_drop() {
+        let schema = ProximaSchema::from_columns(
+            "t".to_string(),
+            vec![col(1, "n", ProximaType::Int32, true)],
+            vec![1],
+        );
+        let fine = record_with_props("a", vec![("n", ProximaValue::Int64(7))]);
+        assert!(props_not_preserved(&fine, &schema).is_empty());
+        let null_elsewhere = record_with_props("b", vec![("gone", ProximaValue::Null)]);
+        assert!(
+            props_not_preserved(&null_elsewhere, &schema).is_empty(),
+            "a null has nothing to lose"
+        );
+
+        let mut lossy = record_with_props(
+            "c",
+            vec![
+                ("n", ProximaValue::Int64(i64::MAX)),
+                ("extra", ProximaValue::String("x".into())),
+            ],
+        );
+        lossy.props.insert(
+            "nested".to_string(),
+            ProximaTreeNode::Object(HashMap::new()),
+        );
+        let mut lost = props_not_preserved(&lossy, &schema);
+        lost.sort();
+        assert_eq!(lost, ["extra", "n", "nested"]);
+    }
+
+    #[test]
+    fn timestamp_columns_decode_in_their_own_unit() {
+        let schema = ProximaSchema::from_columns(
+            "t".to_string(),
+            vec![
+                col(
+                    1,
+                    "at",
+                    ProximaType::Timestamp(DmTimeUnit::Microsecond),
+                    true,
+                ),
+                col(
+                    2,
+                    "at_tz",
+                    ProximaType::TimestampTz(DmTimeUnit::Millisecond),
+                    true,
+                ),
+            ],
+            vec![1],
+        );
+        let rec = record_with_props(
+            "o",
+            vec![
+                ("at", ProximaValue::Timestamp(5, DmTimeUnit::Millisecond)),
+                (
+                    "at_tz",
+                    ProximaValue::TimestampTz(9, DmTimeUnit::Millisecond),
+                ),
+            ],
+        );
+        let batch = proxima_records_to_record_batch_with_system_columns(
+            std::slice::from_ref(&rec),
+            &schema,
+        )
+        .expect("encode");
+        let back = record_batch_to_proxima_records(&batch);
+        assert_eq!(
+            back[0].props.get("at"),
+            Some(&leaf(ProximaValue::Timestamp(
+                5_000,
+                DmTimeUnit::Microsecond
+            ))),
+            "same instant, the column's unit"
+        );
+        assert_eq!(
+            back[0].props.get("at_tz"),
+            Some(&leaf(ProximaValue::TimestampTz(9, DmTimeUnit::Millisecond)))
+        );
     }
 
     // --- TD-USUB-11: faithful canonical-record round trip -------------------

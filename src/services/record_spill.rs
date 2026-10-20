@@ -69,9 +69,11 @@ use proximadb_records::{
 };
 use proximadb_storage_common::parquet_write_policy::{ParquetLayoutHints, ParquetWritePolicy};
 use proximadb_storage_common::proxima_arrow::{
-    SYS_COL_OID, infer_proxima_schema, proxima_records_to_record_batch_with_system_columns,
+    SYS_COL_OID, column_materializable, infer_proxima_schema, props_not_preserved,
+    proxima_records_to_record_batch_with_system_columns,
 };
 use proximadb_storage_common::proxima_parquet::record_batches_to_parquet_bytes;
+use proximadb_storage_common::proxima_schema::ProximaSchema;
 use proximadb_storage_filesystem_types::FileSystem;
 
 use crate::storage::engines::sst::segment_format::read_segment_records;
@@ -130,6 +132,24 @@ struct Resident {
     record: ProximaRecord,
     generation: u64,
     lsn: Option<u64>,
+}
+
+/// The table's current catalog schema, asked for at each flush (so an
+/// `ALTER TABLE` is picked up by the next segment). `None` when the store does
+/// not know it yet — a partition created by WAL replay before any write.
+#[derive(Clone)]
+pub struct SpillSchemaSource(Arc<dyn Fn() -> Option<ProximaSchema> + Send + Sync>);
+
+impl SpillSchemaSource {
+    pub fn new(source: impl Fn() -> Option<ProximaSchema> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(source))
+    }
+}
+
+impl std::fmt::Debug for SpillSchemaSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpillSchemaSource")
+    }
 }
 
 /// A relational record store that keeps recent rows resident and flushes older
@@ -294,6 +314,8 @@ pub struct SpillRecordStorage {
     /// rather than an Arrow-default blob. Read from the environment at
     /// construction; see [`Self::with_write_policy`].
     write_policy: ParquetWritePolicy,
+    /// Where the catalog schema comes from; see [`Self::encode_schema`].
+    schema_source: Option<SpillSchemaSource>,
 }
 
 impl SpillRecordStorage {
@@ -329,7 +351,47 @@ impl SpillRecordStorage {
             discovered: tokio::sync::OnceCell::new(),
             tenant_id: None,
             write_policy: ParquetWritePolicy::from_env(),
+            schema_source: None,
         }
+    }
+
+    /// Encode segments with the table's catalog schema (see
+    /// [`Self::encode_schema`]).
+    pub fn with_schema_source(mut self, source: SpillSchemaSource) -> Self {
+        self.schema_source = Some(source);
+        self
+    }
+
+    /// The schema a segment is encoded with: the catalog schema when known —
+    /// its declared types (DECIMAL, TIMESTAMP, …) are ones inference cannot
+    /// produce — with every prop the catalog lacks appended as inferred, so a
+    /// column the catalog does not (yet) list is still written. Without a
+    /// catalog schema, inference alone.
+    ///
+    /// Catalog columns whose type has no Arrow materialization (`Uuid`,
+    /// `Jsonb`, `Symbol`, …) are DROPPED here rather than passed through:
+    /// `build_column` errors on them unconditionally, and that error would
+    /// brick the flush — the memtable would never shrink and every
+    /// subsequent write to the partition would fail (the exact "worse than
+    /// having no heap bound" shape). Rows carrying props on a dropped
+    /// column fail `props_not_preserved` and are HELD instead. Known
+    /// resurrection (documented, accepted): props on a *deleted* catalog
+    /// column are re-added by the inferred loop under an inferred type —
+    /// the write succeeds, so no data is lost.
+    fn encode_schema(&self, records: &[ProximaRecord]) -> ProximaSchema {
+        let inferred = infer_proxima_schema(records);
+        let Some(mut schema) = self.schema_source.as_ref().and_then(|source| (source.0)()) else {
+            return inferred;
+        };
+        schema
+            .columns
+            .retain(|c| !c.is_deleted && column_materializable(&c.data_type));
+        for column in inferred.columns {
+            if !schema.columns.iter().any(|c| c.name == column.name) {
+                schema.columns.push(column);
+            }
+        }
+        schema
     }
 
     /// Override the Parquet layout policy (tests, A/B measurement).
@@ -803,6 +865,35 @@ impl SpillRecordStorage {
             .filter(|r| !ambiguous.contains(&r.record.oid))
             .cloned()
             .collect();
+
+        // A row this segment's schema cannot carry is HELD: not written, not
+        // evicted. The batch builders turn a value that does not fit its column
+        // into NULL without error, so writing such a row and evicting it would
+        // lose the value durably (inference, for one, has no column type for
+        // DECIMAL / TIMESTAMP / UUID props). Held rows stay resident with their
+        // LSN, so `min_unflushed_lsn` keeps the WAL entry that rebuilds them; a
+        // later flush writes them once the schema can (e.g. after a write
+        // supplies the catalog schema). Tombstones carry no props and always fit.
+        let schema = self.encode_schema(
+            &evicting
+                .iter()
+                .map(|r| r.record.clone())
+                .collect::<Vec<_>>(),
+        );
+        let (evicting, held): (Vec<Resident>, Vec<Resident>) = evicting
+            .into_iter()
+            .partition(|r| props_not_preserved(&r.record, &schema).is_empty());
+        if let Some(example) = held.first() {
+            tracing::warn!(
+                rows = held.len(),
+                example_oid = %example.record.oid,
+                example_props = ?props_not_preserved(&example.record, &schema),
+                path = %self.base_path.trim_end_matches('/'),
+                "spill: holding row(s) resident — the segment schema cannot carry some of \
+                 their values, and writing them would store NULL. They keep \
+                 `min_unflushed_lsn` pinned until a flush whose schema fits them."
+            );
+        }
         let persisting: Vec<&String> = tombstoned
             .iter()
             .filter(|oid| !ambiguous.contains(*oid))
@@ -882,9 +973,8 @@ impl SpillRecordStorage {
         // read-back needs no catalog lookup. `with_system_columns` is what keeps
         // identity and `valid_to_ns` intact (TD-USUB-11).
         // `written`, not `residents`: the segment carries the synthesised
-        // tombstones too. `infer_proxima_schema` unions props across records, so
-        // a propless tombstone mixed with full rows is fine — its columns are
-        // simply null.
+        // tombstones too, under the `schema` chosen above. A propless tombstone
+        // mixed with full rows is fine — its columns are simply null.
         //
         // Ordered by oid: a flush writes ONE row per oid (residents are a map;
         // a tombstone is persisted only for an oid with no resident row — the
@@ -892,7 +982,6 @@ impl SpillRecordStorage {
         // nothing. It makes the oid column's row-group and page min/max exact,
         // which the declared sort below tells every reader.
         written.sort_unstable_by(|a, b| a.oid.cmp(&b.oid));
-        let schema = infer_proxima_schema(&written);
         let batch = proxima_records_to_record_batch_with_system_columns(&written, &schema)
             .context("spill: encode resident records and tombstones to Arrow")?;
         let writer_properties = self.write_policy.writer_properties(
@@ -3415,6 +3504,101 @@ mod tests {
                 "a marker this store cannot trust must refuse service"
             );
             assert_eq!(segment_files_on_disk(&base), 1, "and delete nothing");
+        }
+        Ok(())
+    }
+
+    /// A value the segment schema cannot carry holds its row resident; it is
+    /// never written as NULL. Inference has no column type for a DECIMAL prop,
+    /// so without a catalog schema that row must stay in memory, still served,
+    /// still pinning the WAL floor.
+    #[tokio::test]
+    async fn a_row_the_segment_schema_cannot_carry_is_held_not_written_as_null() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let store =
+            SpillRecordStorage::with_flush_threshold(fs, base, None).with_tenant("tenant-a");
+        let price = ProximaTreeNode::Value(proximadb_data_model::ProximaValue::Decimal(
+            "12.50".to_string(),
+        ));
+        let mut priced = record("priced", "open");
+        priced.props.insert("price".to_string(), price.clone());
+        RecordStore::upsert_record_at_lsn(&store, record("plain", "open"), 1).await?;
+        RecordStore::upsert_record_at_lsn(&store, priced, 2).await?;
+
+        store.flush().await?.expect("the plain row publishes");
+        assert_eq!(store.resident_len(), 1, "the DECIMAL row stays resident");
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(&store).await.ok(),
+            Some(Some(2)),
+            "the held row keeps its WAL entry"
+        );
+        let served = store
+            .get_record(&RecordKey::new("priced".to_string()))
+            .await?
+            .expect("served from memory");
+        assert_eq!(served.props.get("price"), Some(&price));
+        Ok(())
+    }
+
+    /// With the catalog schema the declared types are written — DECIMAL and
+    /// TIMESTAMP, which inference cannot produce — and read back exactly, and a
+    /// prop the catalog does not list is still written, inferred.
+    #[tokio::test]
+    async fn a_catalog_schema_writes_typed_columns_and_keeps_unlisted_props() -> Result<()> {
+        use proximadb_data_model::{ProximaType, ProximaValue, TimeUnit};
+        use proximadb_storage_common::proxima_schema::ProximaColumn;
+
+        let (fs, base) = fs_and_base().await;
+        let catalog = ProximaSchema::from_columns(
+            "orders".to_string(),
+            vec![
+                ProximaColumn::new(1, "status", ProximaType::String),
+                ProximaColumn::new(
+                    2,
+                    "price",
+                    ProximaType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                ),
+                ProximaColumn::new(3, "at", ProximaType::Timestamp(TimeUnit::Millisecond)),
+            ],
+            vec![1],
+        );
+        let store = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None)
+            .with_tenant("tenant-a")
+            .with_schema_source(SpillSchemaSource::new(move || Some(catalog.clone())));
+        let mut row = record("o1", "open");
+        for (key, value) in [
+            ("price", ProximaValue::Decimal("12.50".to_string())),
+            (
+                "at",
+                ProximaValue::Timestamp(1_700_000_000_000, TimeUnit::Millisecond),
+            ),
+            (
+                "note",
+                ProximaValue::String("not in the catalog".to_string()),
+            ),
+        ] {
+            row.props
+                .insert(key.to_string(), ProximaTreeNode::Value(value));
+        }
+        RecordStore::upsert_record_at_lsn(&store, row.clone(), 1).await?;
+        store.flush().await?.expect("publishes");
+        assert_eq!(store.resident_len(), 0, "nothing held back");
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(&store).await.ok(),
+            Some(None)
+        );
+
+        // A fresh instance (no schema source) reads the segment back exactly.
+        let fresh = SpillRecordStorage::with_flush_threshold(fs, base, None);
+        let back = fresh
+            .get_record(&RecordKey::new("o1".to_string()))
+            .await?
+            .expect("flushed row");
+        for key in ["status", "price", "at", "note"] {
+            assert_eq!(back.props.get(key), row.props.get(key), "prop `{key}`");
         }
         Ok(())
     }

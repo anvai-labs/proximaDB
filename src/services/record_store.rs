@@ -1937,6 +1937,45 @@ impl TableSecondaryIndex {
     }
 }
 
+/// Catalog schemas the spill partitions encode with, keyed like the partitions
+/// (`(tenant, collection key)`). Filled by `partitions_for` on every write —
+/// the one place the schema is in hand — and read by a partition at each flush
+/// through its [`SpillSchemaSource`](crate::services::record_spill::SpillSchemaSource).
+#[derive(Default)]
+struct SchemaHints(
+    parking_lot::RwLock<std::collections::HashMap<(String, String), Arc<CatalogTableSchema>>>,
+);
+
+impl SchemaHints {
+    /// Record `schema` for the partition, replacing a stale one (an `ALTER
+    /// TABLE`); an unchanged schema costs a read-lock and a column compare.
+    fn note(&self, tenant_id: &str, collection: &str, schema: &CatalogTableSchema) {
+        let key = (tenant_id.to_string(), collection.to_string());
+        let same_columns = |held: &CatalogTableSchema| {
+            held.columns.len() == schema.columns.len()
+                && held.columns.iter().zip(&schema.columns).all(|(a, b)| {
+                    a.name == b.name && a.data_type == b.data_type && a.is_deleted == b.is_deleted
+                })
+        };
+        if self
+            .0
+            .read()
+            .get(&key)
+            .is_some_and(|held| same_columns(held))
+        {
+            return;
+        }
+        self.0.write().insert(key, Arc::new(schema.clone()));
+    }
+
+    fn get(&self, tenant_id: &str, collection: &str) -> Option<CatalogTableSchema> {
+        self.0
+            .read()
+            .get(&(tenant_id.to_string(), collection.to_string()))
+            .map(|schema| (**schema).clone())
+    }
+}
+
 pub struct DirectWalTableRecordStore {
     /// Per-(tenant_id, collection) record partitions, created on demand via
     /// `storage_factory`. TD-064: tenant + collection isolation is STRUCTURAL —
@@ -1983,6 +2022,9 @@ pub struct DirectWalTableRecordStore {
     /// transaction, so every read and write is refused until a restart replays
     /// the WAL — never serve a half-applied commit.
     poisoned: std::sync::atomic::AtomicBool,
+    /// Set by [`Self::new_spilling`]: the catalog schemas its spill partitions
+    /// encode with. `None` for stores whose partitions never encode a segment.
+    schema_hints: Option<Arc<SchemaHints>>,
 }
 
 impl DirectWalTableRecordStore {
@@ -2132,23 +2174,21 @@ impl DirectWalTableRecordStore {
         filesystem: Arc<dyn crate::storage::persistence::filesystem::FileSystem>,
         segment_base: Arc<dyn Fn(&str, &str) -> String + Send + Sync>,
     ) -> Self {
-        Self::with_storage_factory(
+        let hints = Arc::new(SchemaHints::default());
+        let factory_hints = hints.clone();
+        let mut store = Self::with_storage_factory(
             wal_appender,
             Arc::new(move |tenant_id, collection| {
+                // Each spill partition encodes with its table's catalog schema,
+                // looked up at flush time so a later `ALTER TABLE` applies.
+                let schema_source = {
+                    let hints = factory_hints.clone();
+                    let (tenant_id, collection) = (tenant_id.to_string(), collection.to_string());
+                    crate::services::record_spill::SpillSchemaSource::new(move || {
+                        hints.get(&tenant_id, &collection)
+                    })
+                };
                 match crate::services::record_spill::configured_flush_threshold() {
-                    // An EMPTY tenant is not a spillable partition. `tenant_key`
-                    // and the replay path are both `unwrap_or_default()`, so `""`
-                    // is a real input here — and a spill store that cannot stamp a
-                    // tenant cannot persist a tombstone, so its `tombstones` set
-                    // would grow monotonically (nothing but a purge clears it) and
-                    // `min_unflushed_lsn` would refuse FOREVER. That is a worse
-                    // failure than having no heap bound: unbounded state *plus*
-                    // permanently unachievable truncation.
-                    //
-                    // So the unusable shape is made unconstructible instead of
-                    // tolerated. The untenanted partition keeps today's behaviour
-                    // (an unbounded memtable — the defect TD-USUB-1 exists to fix,
-                    // unchanged for this case and recorded there as an open item).
                     // The untenanted partition (`tenant_key(None)`, the normal
                     // key on a single-tenant server) spills too: it persists its
                     // deletes stamped `""`, like its own rows, so its heap is
@@ -2161,7 +2201,8 @@ impl DirectWalTableRecordStore {
                             segment_base(tenant_id, collection),
                             Some(threshold),
                         )
-                        .untenanted(),
+                        .untenanted()
+                        .with_schema_source(schema_source),
                     )
                         as Arc<dyn RecordStorage>,
                     Some(threshold) => {
@@ -2174,14 +2215,17 @@ impl DirectWalTableRecordStore {
                             // Required for a tombstone-only flush to stamp its
                             // synthesised record; the store refuses to persist a
                             // tombstone without it.
-                            .with_tenant(tenant_id),
+                            .with_tenant(tenant_id)
+                            .with_schema_source(schema_source),
                         ) as Arc<dyn RecordStorage>
                     }
                     None => Arc::new(crate::services::MemtableRecordStorage::new())
                         as Arc<dyn RecordStorage>,
                 }
             }),
-        )
+        );
+        store.schema_hints = Some(hints);
+        store
     }
 
     /// Create a direct writer with a custom per-partition storage factory. The
@@ -2224,6 +2268,7 @@ impl DirectWalTableRecordStore {
             unique_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
             secondary_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
             poisoned: std::sync::atomic::AtomicBool::new(false),
+            schema_hints: None,
         }
     }
 
@@ -2468,6 +2513,12 @@ impl DirectWalTableRecordStore {
         table_schema: &CatalogTableSchema,
     ) -> (Arc<dyn RecordStorage>, Option<Arc<dyn RecordStorage>>) {
         let (primary, legacy) = memtable_partition_keys(table_schema);
+        if let Some(hints) = &self.schema_hints {
+            hints.note(tenant_id, &primary, table_schema);
+            if let Some(legacy) = &legacy {
+                hints.note(tenant_id, legacy, table_schema);
+            }
+        }
         let primary_partition = self.partition(tenant_id, &primary);
         let legacy_partition = legacy
             .map(|key| self.partition(tenant_id, &key))
@@ -5541,6 +5592,74 @@ mod tests {
     /// flush nothing constrains WAL truncation.
     ///
     /// Process-isolated under nextest, so the env gate does not leak.
+    /// The production factory encodes with the table's catalog schema: the
+    /// schema `partitions_for` sees on a write reaches the spill partition, so a
+    /// DECIMAL column — which inference cannot type — is flushed rather than
+    /// held resident.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn the_spilling_factory_encodes_with_the_catalog_schema() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "2");
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let fs = Arc::new(
+            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
+                crate::storage::persistence::filesystem::local::LocalConfig::default(),
+            )
+            .await
+            .expect("local filesystem"),
+        );
+        let store = DirectWalTableRecordStore::new_spilling(
+            Arc::new(RecordingWalAppender::default()),
+            fs,
+            Arc::new(move |tenant_id: &str, collection: &str| {
+                format!("{base}/{tenant_id}/{collection}")
+            }),
+        );
+        let schema =
+            CatalogTableSchema::new("orders").with_column(proximadb_catalog::CatalogColumn::new(
+                1,
+                "price",
+                ProximaType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+            ));
+
+        let (partition, _) = store.partitions_for("tenant-a", &schema);
+        for i in 0..3u64 {
+            let mut row = ProximaRecord {
+                oid: format!("o{i}"),
+                tenant_id: "tenant-a".to_string(),
+                ..Default::default()
+            };
+            row.props.insert(
+                "price".to_string(),
+                proximadb_records::ProximaTreeNode::Value(ProximaValue::Decimal(format!("{i}.50"))),
+            );
+            partition
+                .upsert_record_at_lsn(row, i + 1)
+                .await
+                .expect("upsert");
+        }
+        RecordStore::flush(partition.as_ref()).await.expect("flush");
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(partition.as_ref())
+                .await
+                .ok(),
+            Some(None),
+            "every DECIMAL row was written — none held for want of a schema"
+        );
+
+        unsafe {
+            std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV);
+        }
+    }
+
     #[tokio::test]
     async fn an_empty_tenant_partition_spills_and_persists_deletes() {
         unsafe {
