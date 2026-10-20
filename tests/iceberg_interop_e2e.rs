@@ -10,96 +10,16 @@
 //! are not installed are skipped unless listed in `PROXIMADB_ICEBERG_READBACK_REQUIRE`
 //! (CI sets it), so a missing reader fails CI instead of silently passing.
 
-use std::net::TcpListener;
 use std::path::{Path as FsPath, PathBuf};
-use std::time::Duration;
 
-use proximadb::core::Config;
-use proximadb::database::ProximaDB;
+use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::sleep;
 
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let p = l.local_addr().expect("addr").port();
-    drop(l);
-    p
-}
+#[path = "common/pg_server.rs"]
+mod pg_server;
 
-struct PgServer {
-    pg_port: u16,
-    rest_port: u16,
-    data_dir: PathBuf,
-    db: Option<ProximaDB>,
-    _tmp: TempDir,
-}
-
-impl PgServer {
-    async fn start() -> anyhow::Result<Self> {
-        let pg_port = free_port();
-        let rest_port = free_port();
-        let grpc_port = free_port();
-        let tmp = TempDir::new()?;
-        let data_dir = tmp.path().to_path_buf();
-        let mut config = Config::default();
-        config.server.bind_address = "127.0.0.1".to_string();
-        config.server.port = rest_port;
-        config.server.data_dir = data_dir.clone();
-        config.api.rest_port = rest_port;
-        config.api.grpc_port = grpc_port;
-        config.api.unified_mode = false;
-        config.api.pg_port = Some(pg_port);
-        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
-            url: format!("file://{}", data_dir.display()),
-            ..Default::default()
-        }];
-        config.storage.wal_config.write_buffer_directory =
-            format!("file://{}/wal", data_dir.display());
-        // TD-CONV-1: anchor the system catalog in this server's temp dir, not the
-        // shared CWD-relative `file://./metadata` default (cross-run DDL replay).
-        config.storage.metadata_url = format!("file://{}", data_dir.join("metadata").display());
-        let mut db = ProximaDB::new(config).await?;
-        db.start().await?;
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .no_proxy()
-            .build()?;
-        let health = format!("http://127.0.0.1:{rest_port}/health");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match http.get(&health).send().await {
-                Ok(r) if r.status().is_success() => break,
-                _ if std::time::Instant::now() > deadline => anyhow::bail!("REST not ready"),
-                _ => sleep(Duration::from_millis(100)).await,
-            }
-        }
-        sleep(Duration::from_millis(200)).await;
-        Ok(Self {
-            pg_port,
-            rest_port,
-            data_dir,
-            db: Some(db),
-            _tmp: tmp,
-        })
-    }
-    fn conn_str(&self) -> String {
-        format!(
-            "host=127.0.0.1 port={} user=postgres dbname=proximadb sslmode=disable",
-            self.pg_port
-        )
-    }
-}
-
-impl Drop for PgServer {
-    fn drop(&mut self) {
-        if let Some(mut db) = self.db.take() {
-            tokio::spawn(async move {
-                let _ = db.shutdown().await;
-            });
-        }
-    }
-}
-
+use pg_server::TestPgServer;
 /// Recursively collect every file path under `dir`.
 fn walk(dir: &FsPath, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -117,7 +37,7 @@ fn walk(dir: &FsPath, out: &mut Vec<PathBuf>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn materialize_emits_readable_iceberg_table() {
-    let server = PgServer::start().await.expect("server start");
+    let server = TestPgServer::start().await.expect("server start");
     let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
         .await
         .expect("connect");
@@ -144,7 +64,7 @@ async fn materialize_emits_readable_iceberg_table() {
     sleep(Duration::from_millis(300)).await;
 
     // Walk the warehouse tree and classify the Iceberg artifacts.
-    let warehouse = server.data_dir.join("warehouse");
+    let warehouse = server.data_dir().join("warehouse");
     let mut files = Vec::new();
     walk(&warehouse, &mut files);
     let names: Vec<String> = files
@@ -306,7 +226,7 @@ fn external_readback(
 /// chains onto the first, and the read-back still matches.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn materialized_table_reads_back_in_external_iceberg_engines() {
-    let server = PgServer::start().await.expect("server start");
+    let server = TestPgServer::start().await.expect("server start");
     let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
         .await
         .expect("connect");

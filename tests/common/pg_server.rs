@@ -39,6 +39,7 @@ pub fn free_port() -> u16 {
 /// Shutdown on drop is fire-and-forget (matches the harnesses this replaces).
 pub struct TestPgServer {
     pub pg_port: u16,
+    pub rest_port: u16,
     db: Option<ProximaDB>,
     _tmp: TempDir,
 }
@@ -85,6 +86,7 @@ impl TestPgServer {
         sleep(Duration::from_millis(200)).await;
         Ok(Self {
             pg_port,
+            rest_port,
             db: Some(db),
             _tmp: tmp,
         })
@@ -95,6 +97,26 @@ impl TestPgServer {
             "host=127.0.0.1 port={} user=postgres dbname=proximadb sslmode=disable",
             self.pg_port
         )
+    }
+
+    /// The server's temp data dir (also the single storage location's root).
+    pub fn data_dir(&self) -> &std::path::Path {
+        self._tmp.path()
+    }
+
+    /// The running server handle, for tests that inspect shared services.
+    pub fn db(&self) -> &ProximaDB {
+        self.db.as_ref().expect("db alive until drop")
+    }
+
+    /// Awaited shutdown, for harnesses that sequence server generations in one
+    /// process (start → benchmark → shutdown → start) and need the shutdown to
+    /// complete before proceeding. Consumes the server; the `Drop` impl then
+    /// no-ops.
+    pub async fn shutdown(mut self) {
+        if let Some(mut db) = self.db.take() {
+            let _ = db.shutdown().await;
+        }
     }
 }
 
