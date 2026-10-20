@@ -108,6 +108,16 @@ impl TestPgServer {
     pub fn db(&self) -> &ProximaDB {
         self.db.as_ref().expect("db alive until drop")
     }
+
+    /// Awaited shutdown, for harnesses that sequence server generations in one
+    /// process (start → benchmark → shutdown → start) and need the shutdown to
+    /// complete before proceeding. Consumes the server; the `Drop` impl then
+    /// no-ops.
+    pub async fn shutdown(mut self) {
+        if let Some(mut db) = self.db.take() {
+            let _ = db.shutdown().await;
+        }
+    }
 }
 
 impl Drop for TestPgServer {

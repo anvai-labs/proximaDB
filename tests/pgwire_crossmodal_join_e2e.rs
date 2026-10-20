@@ -19,103 +19,31 @@
 //!   cargo test --features datafusion-integration --test pgwire_crossmodal_join_e2e -- --nocapture
 #![cfg(feature = "datafusion-integration")]
 
-use std::net::TcpListener;
 use std::time::Duration;
 
-use proximadb::core::Config;
-use proximadb::database::ProximaDB;
-use tempfile::TempDir;
-use tokio::time::sleep;
+#[path = "common/pg_server.rs"]
+mod pg_server;
 
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let p = l.local_addr().expect("addr").port();
-    drop(l);
-    p
+use pg_server::TestPgServer;
+/// A connection string whose `dbname` is the tenant/catalog boundary
+/// (`pgwire_resolve_read_tenant` → `catalog_tenant()` = the startup database). Used to read
+/// under the SAME tenant a REST write used (TD-XMODAL-6).
+fn conn_str_db(server: &TestPgServer, db: &str) -> String {
+    format!(
+        "host=127.0.0.1 port={} user=postgres dbname={db} sslmode=disable",
+        server.pg_port
+    )
 }
 
-struct PgServer {
-    pg_port: u16,
-    rest_port: u16,
-    db: Option<ProximaDB>,
-    _tmp: TempDir,
-}
-
-impl PgServer {
-    async fn start() -> anyhow::Result<Self> {
-        let pg_port = free_port();
-        let rest_port = free_port();
-        let grpc_port = free_port();
-        let tmp = TempDir::new()?;
-        let mut config = Config::default();
-        config.server.bind_address = "127.0.0.1".to_string();
-        config.server.port = rest_port;
-        config.server.data_dir = tmp.path().to_path_buf();
-        config.api.rest_port = rest_port;
-        config.api.grpc_port = grpc_port;
-        config.api.unified_mode = false;
-        config.api.pg_port = Some(pg_port);
-        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
-            url: format!("file://{}", tmp.path().display()),
-            ..Default::default()
-        }];
-        config.storage.wal_config.write_buffer_directory =
-            format!("file://{}/wal", tmp.path().display());
-        let mut db = ProximaDB::new(config).await?;
-        db.start().await?;
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .no_proxy()
-            .build()?;
-        let health = format!("http://127.0.0.1:{rest_port}/health");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match http.get(&health).send().await {
-                Ok(r) if r.status().is_success() => break,
-                _ if std::time::Instant::now() > deadline => anyhow::bail!("REST not ready"),
-                _ => sleep(Duration::from_millis(100)).await,
-            }
-        }
-        sleep(Duration::from_millis(200)).await;
-        Ok(Self {
-            pg_port,
-            rest_port,
-            db: Some(db),
-            _tmp: tmp,
-        })
-    }
-    fn conn_str(&self) -> String {
-        self.conn_str_db("proximadb")
-    }
-    /// A connection string whose `dbname` is the tenant/catalog boundary
-    /// (`pgwire_resolve_read_tenant` → `catalog_tenant()` = the startup database). Used to read
-    /// under the SAME tenant a REST write used (TD-XMODAL-6).
-    fn conn_str_db(&self, db: &str) -> String {
-        format!(
-            "host=127.0.0.1 port={} user=postgres dbname={db} sslmode=disable",
-            self.pg_port
-        )
-    }
-}
-
-impl Drop for PgServer {
-    fn drop(&mut self) {
-        if let Some(mut db) = self.db.take() {
-            tokio::spawn(async move {
-                let _ = db.shutdown().await;
-            });
-        }
-    }
-}
-
-async fn connect(server: &PgServer) -> tokio_postgres::Client {
+async fn connect(server: &TestPgServer) -> tokio_postgres::Client {
     connect_db(server, "proximadb").await
 }
 
-async fn connect_db(server: &PgServer, db: &str) -> tokio_postgres::Client {
-    let (client, conn) = tokio_postgres::connect(&server.conn_str_db(db), tokio_postgres::NoTls)
-        .await
-        .expect("connect");
+async fn connect_db(server: &TestPgServer, db: &str) -> tokio_postgres::Client {
+    let (client, conn) =
+        tokio_postgres::connect(conn_str_db(server, db).as_str(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -149,7 +77,7 @@ async fn count(client: &tokio_postgres::Client, sql: &str) -> i64 {
 /// "column does not exist" decline.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crossmodal_udtf_join_reaches_datafusion_over_pgwire() {
-    let server = PgServer::start().await.expect("server start");
+    let server = TestPgServer::start().await.expect("server start");
     let client = connect(&server).await;
 
     // Unique per run — the native catalog persists table DDL outside the per-test
@@ -230,7 +158,7 @@ async fn crossmodal_udtf_join_reaches_datafusion_over_pgwire() {
 /// (unscoped) name and returned 0 rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crossmodal_timeseries_join_returns_rest_seeded_rows() {
-    let server = PgServer::start().await.expect("server start");
+    let server = TestPgServer::start().await.expect("server start");
     // Unique per run: the tenant (pgwire catalog + REST header) and the collection/table names,
     // so parallel runs and the persisted native catalog never collide.
     let tenant = format!("xmt{}", server.pg_port);

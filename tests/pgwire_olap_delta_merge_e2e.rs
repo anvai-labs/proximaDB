@@ -16,91 +16,10 @@
 //!   cargo test --features datafusion-integration --test pgwire_olap_delta_merge_e2e -- --nocapture
 #![cfg(feature = "datafusion-integration")]
 
-use std::net::TcpListener;
-use std::time::Duration;
+#[path = "common/pg_server.rs"]
+mod pg_server;
 
-use proximadb::core::Config;
-use proximadb::database::ProximaDB;
-use tempfile::TempDir;
-use tokio::time::sleep;
-
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let p = l.local_addr().expect("addr").port();
-    drop(l);
-    p
-}
-
-struct PgServer {
-    pg_port: u16,
-    db: Option<ProximaDB>,
-    _tmp: TempDir,
-}
-
-impl PgServer {
-    async fn start() -> anyhow::Result<Self> {
-        let pg_port = free_port();
-        let rest_port = free_port();
-        let grpc_port = free_port();
-        let tmp = TempDir::new()?;
-        let mut config = Config::default();
-        config.server.bind_address = "127.0.0.1".to_string();
-        config.server.port = rest_port;
-        config.server.data_dir = tmp.path().to_path_buf();
-        config.api.rest_port = rest_port;
-        config.api.grpc_port = grpc_port;
-        config.api.unified_mode = false;
-        config.api.pg_port = Some(pg_port);
-        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
-            url: format!("file://{}", tmp.path().display()),
-            ..Default::default()
-        }];
-        config.storage.wal_config.write_buffer_directory =
-            format!("file://{}/wal", tmp.path().display());
-        let mut db = ProximaDB::new(config).await?;
-        db.start().await?;
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .no_proxy()
-            .build()?;
-        let health = format!("http://127.0.0.1:{rest_port}/health");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match http.get(&health).send().await {
-                Ok(r) if r.status().is_success() => break,
-                _ if std::time::Instant::now() > deadline => anyhow::bail!("REST not ready"),
-                _ => sleep(Duration::from_millis(100)).await,
-            }
-        }
-        sleep(Duration::from_millis(200)).await;
-        Ok(Self {
-            pg_port,
-            db: Some(db),
-            _tmp: tmp,
-        })
-    }
-    fn conn_str(&self) -> String {
-        self.conn_str_for("proximadb")
-    }
-    /// Connection string scoped to a tenant (the startup `dbname` = tenant/catalog).
-    fn conn_str_for(&self, dbname: &str) -> String {
-        format!(
-            "host=127.0.0.1 port={} user=postgres dbname={dbname} sslmode=disable",
-            self.pg_port
-        )
-    }
-}
-
-impl Drop for PgServer {
-    fn drop(&mut self) {
-        if let Some(mut db) = self.db.take() {
-            tokio::spawn(async move {
-                let _ = db.shutdown().await;
-            });
-        }
-    }
-}
-
+use pg_server::TestPgServer;
 fn explain_err(e: &tokio_postgres::Error) -> String {
     if let Some(db) = e.as_db_error() {
         format!("[{}] {}", db.code().code(), db.message())
@@ -144,9 +63,17 @@ async fn one_i64(client: &tokio_postgres::Client, sql: &str) -> i64 {
 }
 
 /// Connect a client scoped to a tenant (startup `dbname` = tenant/catalog).
-async fn connect(server: &PgServer, dbname: &str) -> tokio_postgres::Client {
+/// Connection string scoped to a tenant (the startup `dbname` = tenant/catalog).
+fn conn_str_for(server: &TestPgServer, dbname: &str) -> String {
+    format!(
+        "host=127.0.0.1 port={} user=postgres dbname={dbname} sslmode=disable",
+        server.pg_port
+    )
+}
+
+async fn connect(server: &TestPgServer, dbname: &str) -> tokio_postgres::Client {
     let (client, conn) =
-        tokio_postgres::connect(&server.conn_str_for(dbname), tokio_postgres::NoTls)
+        tokio_postgres::connect(conn_str_for(server, dbname).as_str(), tokio_postgres::NoTls)
             .await
             .expect("connect");
     tokio::spawn(async move {
@@ -161,7 +88,7 @@ async fn connect(server: &PgServer, dbname: &str) -> tokio_postgres::Client {
 /// cardinality (not the Parquet footer count).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn olap_delta_merge_gate_off_stale_then_on_corrects() {
-    let server = PgServer::start().await.expect("server start");
+    let server = TestPgServer::start().await.expect("server start");
     let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
         .await
         .expect("connect");
@@ -264,7 +191,7 @@ async fn olap_delta_merge_is_tenant_isolated() {
     // SAFETY: set before the server starts; never mutated while a request is in
     // flight. nextest process isolation (CLAUDE.md §11).
     unsafe { std::env::set_var("PROXIMADB_OLAP_DELTA_MERGE", "1") };
-    let server = PgServer::start().await.expect("server start");
+    let server = TestPgServer::start().await.expect("server start");
     let tenant_a = format!("tenant_a_{}", server.pg_port);
     let tenant_b = format!("tenant_b_{}", server.pg_port);
     let a = connect(&server, &tenant_a).await;
@@ -324,7 +251,7 @@ async fn olap_delta_merge_is_tenant_isolated() {
 async fn olap_delta_merge_reconciles_mixed_name_and_object_id_keyed_wal() {
     unsafe { std::env::set_var("PROXIMADB_OLAP_DELTA_MERGE", "1") };
     unsafe { std::env::remove_var("PROXIMADB_WAL_OBJECT_ID_KEY") };
-    let server = PgServer::start().await.expect("server start");
+    let server = TestPgServer::start().await.expect("server start");
     let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
         .await
         .expect("connect");
@@ -415,7 +342,7 @@ async fn text_i64_pairs(client: &tokio_postgres::Client, sql: &str) -> Vec<(Stri
 /// while `txn` is merged — exercising both registration paths in one query).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn olap_delta_merge_correct_aggregates_through_join() {
-    let server = PgServer::start().await.expect("server start");
+    let server = TestPgServer::start().await.expect("server start");
     let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
         .await
         .expect("connect");
