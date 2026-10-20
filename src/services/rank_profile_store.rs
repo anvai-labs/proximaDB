@@ -73,6 +73,12 @@ pub trait RankProfileStore: Send + Sync {
 
     /// Remove a profile by name. Returns `true` if a profile was present.
     async fn remove(&self, name: &str) -> Result<bool>;
+
+    /// Re-append every live profile to the head of the canonical WAL and return
+    /// the sequence of the first re-appended entry: this store no longer needs
+    /// any WAL entry below it (TD-SEAM-12). `None` when no profile is live, so
+    /// nothing constrains truncation on this store's account.
+    async fn checkpoint(&self) -> Result<Option<u64>>;
 }
 
 /// Canonical-WAL-backed `RankProfileStore`.
@@ -84,6 +90,11 @@ pub trait RankProfileStore: Send + Sync {
 pub struct CanonicalWalRankProfileStore {
     appender: Arc<dyn TableWalAppender>,
     state: RwLock<HashMap<String, StoredRankProfile>>,
+    /// Serializes installs, removes and [`RankProfileStore::checkpoint`].
+    /// Replay is last-write-wins by name, so a checkpoint snapshot re-appended
+    /// AFTER a concurrent install would replay the older value over the newer
+    /// one; holding this across "read state → append" rules that out.
+    write_gate: tokio::sync::Mutex<()>,
 }
 
 impl CanonicalWalRankProfileStore {
@@ -93,6 +104,7 @@ impl CanonicalWalRankProfileStore {
         Self {
             appender,
             state: RwLock::new(HashMap::new()),
+            write_gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -201,6 +213,7 @@ impl RankProfileStore for CanonicalWalRankProfileStore {
         tenant: Option<String>,
         explicit_version: Option<u32>,
     ) -> Result<StoredRankProfile> {
+        let _gate = self.write_gate.lock().await;
         let profile = {
             let state = self.state.read();
             let version = explicit_version
@@ -252,6 +265,7 @@ impl RankProfileStore for CanonicalWalRankProfileStore {
     }
 
     async fn remove(&self, name: &str) -> Result<bool> {
+        let _gate = self.write_gate.lock().await;
         let prior = self.state.read().get(name).cloned();
         let Some(prior) = prior else {
             return Ok(false);
@@ -271,6 +285,32 @@ impl RankProfileStore for CanonicalWalRankProfileStore {
 
         self.state.write().remove(name);
         Ok(true)
+    }
+
+    async fn checkpoint(&self) -> Result<Option<u64>> {
+        let _gate = self.write_gate.lock().await;
+        let mut live: Vec<StoredRankProfile> = self.state.read().values().cloned().collect();
+        // Deterministic order, so a checkpoint is reproducible in tests and logs.
+        live.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut first: Option<u64> = None;
+        for profile in &live {
+            let entries = self
+                .appender
+                .append_operations(
+                    vec![CanonicalOperation::RecordUpsert {
+                        collection_id: RANK_PROFILES_COLLECTION_ID.to_string(),
+                        record: Box::new(profile_to_record(profile)),
+                        projections: Vec::new(),
+                    }],
+                    profile.tenant.clone(),
+                )
+                .await
+                .context("re-appending a rank profile for a WAL checkpoint")?;
+            if first.is_none() {
+                first = entries.first().map(|e| e.sequence_number);
+            }
+        }
+        Ok(first)
     }
 }
 

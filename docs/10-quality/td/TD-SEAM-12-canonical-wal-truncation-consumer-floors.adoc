@@ -102,3 +102,26 @@ Still open before any production truncation:
 * MATERIALIZE's LSN capture (`read_changes_since(table, 0)` should use the per-collection
   high-water instead);
 * the truncator itself, which composes the floor and calls `truncate_below` on a schedule.
+
+== Landed (P2.2b part 1, 2026-10-20)
+
+* **Hazard 1, rank profiles and SQL functions.** `RankProfileStore::checkpoint` and
+  `FunctionStore::checkpoint` re-append the live set to the WAL head and return the first
+  re-appended sequence. That sequence is the store's floor; `None` when the store is empty.
+** Installs, puts, removes and checkpoints are serialized by a per-store async gate. Without it,
+   a checkpoint's older copy could be re-appended after a concurrent install, and replay
+   (last-write-wins by name) would bring it back.
+** Gate: `tests/wal_system_catalog_checkpoint_test.rs`. Truncating everything below the floors,
+   then rebuilding from the retained WAL, yields identical stores.
+* **Hazard 3, REST.** `GET /api/v2/collections/{id}/changes` returns **410 Gone** when the cursor
+  is older than the retained history. The response names the oldest retained LSN and the resume
+  cursor.
+
+Remaining:
+
+* **Hazard 2, branch merge.** It needs base records that may predate any floor. The first truncator
+  will refuse to truncate while the WAL holds branch-tagged entries, until a durable merge-base
+  snapshot exists.
+* The snapshot-LSN enumerator for the OLAP delta merge.
+* MATERIALIZE's LSN capture.
+* The truncator itself.

@@ -55,12 +55,21 @@ pub trait FunctionStore: Send + Sync {
     async fn list_all(&self) -> Result<Vec<StoredFunction>>;
     /// Remove a function by name. Returns `true` if one was present.
     async fn remove(&self, name: &str) -> Result<bool>;
+    /// Re-append every live definition to the head of the canonical WAL and
+    /// return the sequence of the first re-appended entry: this store no
+    /// longer needs any WAL entry below it (TD-SEAM-12). `None` when no
+    /// function is defined.
+    async fn checkpoint(&self) -> Result<Option<u64>>;
 }
 
 /// Canonical-WAL-backed [`FunctionStore`].
 pub struct CanonicalWalFunctionStore {
     appender: Arc<dyn TableWalAppender>,
     state: RwLock<HashMap<String, StoredFunction>>,
+    /// Serializes puts, removes and [`FunctionStore::checkpoint`], so a
+    /// checkpoint never re-appends a definition older than one already
+    /// written after it (replay is last-write-wins by name).
+    write_gate: tokio::sync::Mutex<()>,
 }
 
 impl CanonicalWalFunctionStore {
@@ -69,6 +78,7 @@ impl CanonicalWalFunctionStore {
         Self {
             appender,
             state: RwLock::new(HashMap::new()),
+            write_gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -157,6 +167,7 @@ fn record_to_function(record: &ProximaRecord) -> Option<StoredFunction> {
 #[async_trait]
 impl FunctionStore for CanonicalWalFunctionStore {
     async fn put(&self, function: StoredFunction) -> Result<()> {
+        let _gate = self.write_gate.lock().await;
         let record = function_to_record(&function);
         self.appender
             .append_operations(
@@ -178,6 +189,7 @@ impl FunctionStore for CanonicalWalFunctionStore {
     }
 
     async fn remove(&self, name: &str) -> Result<bool> {
+        let _gate = self.write_gate.lock().await;
         if self.state.read().get(name).is_none() {
             return Ok(false);
         }
@@ -194,6 +206,29 @@ impl FunctionStore for CanonicalWalFunctionStore {
             .context("appending DROP FUNCTION to canonical WAL")?;
         self.state.write().remove(name);
         Ok(true)
+    }
+
+    async fn checkpoint(&self) -> Result<Option<u64>> {
+        let _gate = self.write_gate.lock().await;
+        let mut live: Vec<StoredFunction> = self.state.read().values().cloned().collect();
+        live.sort_by(|a, b| a.name.cmp(&b.name));
+        if live.is_empty() {
+            return Ok(None);
+        }
+        let operations = live
+            .iter()
+            .map(|f| CanonicalOperation::RecordUpsert {
+                collection_id: FUNCTIONS_COLLECTION_ID.to_string(),
+                record: Box::new(function_to_record(f)),
+                projections: Vec::new(),
+            })
+            .collect();
+        let entries = self
+            .appender
+            .append_operations(operations, None)
+            .await
+            .context("re-appending function definitions for a WAL checkpoint")?;
+        Ok(entries.first().map(|e| e.sequence_number))
     }
 }
 
