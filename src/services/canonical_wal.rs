@@ -706,7 +706,12 @@ impl FramedTableWalAppender {
             // so a failure — typically a segment deleted mid-read — is retried
             // rather than reported.
         }
-        bail!("canonical WAL kept rotating during a range read; retry later")
+        // Starvation guard: under a sustained rotation/truncation storm the
+        // optimistic reads can keep losing. Both run under the append lock, so
+        // one read taken under it is stable — guaranteed progress, at the cost
+        // of holding appends for one read.
+        let _stable = self.append_lock.lock().await;
+        self.read_entries_since_once(collection_id, since).await
     }
 
     async fn read_entries_since_once(
@@ -943,7 +948,15 @@ impl FramedTableWalAppender {
     /// Read all complete entries currently present in the WAL: every sealed
     /// segment, oldest first, then the active file.
     pub async fn read_entries(&self) -> Result<Vec<CanonicalWalEntry>> {
-        read_entries_from_path(&self.path).await
+        if let Some(entries) = try_read_entries_from_path(&self.path, MAX_ROTATION_RETRIES).await? {
+            return Ok(entries);
+        }
+        // Same starvation guard as `read_entries_since`: rotation and
+        // truncation hold the append lock, so this attempt cannot race them.
+        let _stable = self.append_lock.lock().await;
+        try_read_entries_from_path(&self.path, 1)
+            .await?
+            .context("canonical WAL changed under the append lock")
     }
 
     /// Read all complete entries from a framed WAL path.
@@ -1219,10 +1232,32 @@ async fn recover_wal_state(path: &Path) -> Result<WalRecoveryState> {
 /// Every complete entry of the WAL at `path`: sealed segments oldest first, then
 /// the active file (P2.1). A WAL that never rotated is just its active file.
 async fn read_entries_from_path(path: &Path) -> Result<Vec<CanonicalWalEntry>> {
+    // No appender here to lock, so back off between attempts instead: a
+    // reader racing a rotation/truncation storm sleeps a little longer each
+    // time, until it lands in a quiet window.
+    for attempt in 0..MAX_ROTATION_RETRIES {
+        if let Some(entries) = try_read_entries_from_path(path, 1).await? {
+            return Ok(entries);
+        }
+        let backoff = (attempt as u64 + 1).min(20);
+        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+    }
+    bail!(
+        "canonical WAL {} kept rotating during a read; retry later",
+        path.display()
+    )
+}
+
+/// Up to `attempts` optimistic reads of the WAL at `path`; `None` when every
+/// attempt overlapped a change of the segment set.
+async fn try_read_entries_from_path(
+    path: &Path,
+    attempts: usize,
+) -> Result<Option<Vec<CanonicalWalEntry>>> {
     // A rotation between listing the segments and reading the active file would
     // move entries out of the file we are about to read; the segment list then
     // differs on the second look, and we re-read.
-    'attempt: for _ in 0..MAX_ROTATION_RETRIES {
+    'attempt: for _ in 0..attempts {
         let truncated_through = read_floor_marker(path).await?;
         let segments = discover_sealed_segments(path).await?;
         let mut out = Vec::new();
@@ -1247,13 +1282,10 @@ async fn read_entries_from_path(path: &Path) -> Result<Vec<CanonicalWalEntry>> {
             // A segment whose delete failed after its floor was recorded is no
             // longer history.
             out.retain(|e| e.sequence_number > truncated_through);
-            return Ok(out);
+            return Ok(Some(out));
         }
     }
-    bail!(
-        "canonical WAL {} kept rotating during a read; retry later",
-        path.display()
-    )
+    Ok(None)
 }
 
 /// Complete entries of the active WAL file (a missing file reads as empty).
