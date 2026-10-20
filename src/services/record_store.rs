@@ -222,6 +222,65 @@ pub trait TableWalAppender: Send + Sync {
     fn tracks_collection_high_water(&self) -> bool {
         false
     }
+
+    /// Highest sequence number assigned so far, when the appender knows it.
+    /// `None` (default) ⇒ unknown, and an in-flight write reservation then
+    /// blocks WAL truncation entirely (TD-SEAM-12).
+    fn last_sequence(&self) -> Option<u64> {
+        None
+    }
+
+    /// First sequence still readable after WAL truncation; `0` (default) when
+    /// nothing was ever truncated. A change-feed read asking for history below
+    /// it fails with [`WalHistoryTruncated`] instead of returning a gap.
+    ///
+    /// [`WalHistoryTruncated`]: crate::services::canonical_wal::WalHistoryTruncated
+    fn retained_from(&self) -> u64 {
+        0
+    }
+}
+
+/// Writes whose WAL entries are durable but not yet applied to their partition
+/// (TD-SEAM-12). Each holds a reservation at the lowest sequence it can carry
+/// — the appender's `last_sequence() + 1` read BEFORE its append — so a
+/// truncation floor taken while it is in flight can never pass it, even though
+/// no partition shows its rows yet.
+#[derive(Debug, Default)]
+struct InflightWrites {
+    reservations: parking_lot::Mutex<std::collections::BTreeMap<u64, usize>>,
+}
+
+/// Releases its reservation on drop, so every exit path — success, error,
+/// cancellation — clears it.
+struct InflightReservation<'a> {
+    writes: &'a InflightWrites,
+    floor: u64,
+}
+
+impl InflightWrites {
+    fn reserve(&self, floor: u64) -> InflightReservation<'_> {
+        *self.reservations.lock().entry(floor).or_insert(0) += 1;
+        InflightReservation {
+            writes: self,
+            floor,
+        }
+    }
+
+    fn floor(&self) -> Option<u64> {
+        self.reservations.lock().keys().next().copied()
+    }
+}
+
+impl Drop for InflightReservation<'_> {
+    fn drop(&mut self) {
+        let mut reservations = self.writes.reservations.lock();
+        if let Some(count) = reservations.get_mut(&self.floor) {
+            *count -= 1;
+            if *count == 0 {
+                reservations.remove(&self.floor);
+            }
+        }
+    }
 }
 
 /// Physical writer route selected from xCatalog table metadata.
@@ -1855,6 +1914,8 @@ pub struct DirectWalTableRecordStore {
     /// speculatively to throw the result away is no longer merely wasteful.
     shared_storage: bool,
     wal_appender: Arc<dyn TableWalAppender>,
+    /// Appended-but-not-yet-applied writes (TD-SEAM-12); see [`InflightWrites`].
+    inflight: InflightWrites,
     /// TD-110 Slice C: UNIQUE/PK index keyed by `(tenant_id, collection)` so a
     /// table's UNIQUE/PK enforcement is per-tenant. Presence of a key == "index
     /// built". Lazily built on first `check_unique_conflict`, then maintained on
@@ -2111,10 +2172,43 @@ impl DirectWalTableRecordStore {
             storage_factory,
             shared_storage,
             wal_appender,
+            inflight: InflightWrites::default(),
             unique_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
             secondary_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
             poisoned: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Reserve the lowest sequence the next append can be assigned, for the
+    /// whole append-then-apply span (TD-SEAM-12). An appender that cannot say
+    /// its last sequence reserves `0`, which blocks truncation outright.
+    fn reserve_inflight(&self) -> InflightReservation<'_> {
+        let floor = self
+            .wal_appender
+            .last_sequence()
+            .map_or(0, |last| last.saturating_add(1));
+        self.inflight.reserve(floor)
+    }
+
+    /// The lowest sequence any in-flight write (appended, not yet applied) may
+    /// hold; `None` when no write is in flight. One input to the WAL
+    /// truncation floor, alongside [`Self::min_unflushed_lsn`] (TD-SEAM-12).
+    pub fn inflight_floor(&self) -> Option<u64> {
+        self.inflight.floor()
+    }
+
+    /// Fail loudly when the change feed is asked for history the WAL no longer
+    /// holds, instead of returning the retained suffix as if it were complete.
+    fn ensure_history_retained(&self, since_lsn: u64) -> Result<()> {
+        let retained_from = self.wal_appender.retained_from();
+        if retained_from > since_lsn.saturating_add(1) {
+            return Err(crate::services::canonical_wal::WalHistoryTruncated {
+                since: since_lsn,
+                retained_from,
+            }
+            .into());
+        }
+        Ok(())
     }
 
     /// Refuse when a durable commit could not be applied (see `poisoned`).
@@ -2589,6 +2683,8 @@ impl TableRecordStore for DirectWalTableRecordStore {
                 collection_id: legacy.clone(),
             });
         }
+        // Held until the purge and state drop below have run (TD-SEAM-12).
+        let _inflight = self.reserve_inflight();
         self.wal_appender
             .append_operations(operations, tenant_id)
             .await?;
@@ -2656,6 +2752,7 @@ impl TableRecordStore for DirectWalTableRecordStore {
         // TD-OLAP-17 fast-path: skip the O(WAL) scan when the collection's
         // high-water hasn't advanced past `since_lsn` (no entry can satisfy
         // `sequence_number > since_lsn`). `None` ⇒ appender doesn't track ⇒ scan.
+        self.ensure_history_retained(since_lsn)?;
         if self.change_feed_is_empty(collection_id, since_lsn) {
             return Ok(Vec::new());
         }
@@ -2685,6 +2782,7 @@ impl TableRecordStore for DirectWalTableRecordStore {
         // TD-OLAP-17 fast-path (tenant-agnostic): the collection high-water is a
         // sufficient condition for emptiness across ALL tenants — if no entry for
         // this collection exceeds `since_lsn`, the tenant filter cannot add any.
+        self.ensure_history_retained(since_lsn)?;
         if self.change_feed_is_empty(collection_id, since_lsn) {
             return Ok(Vec::new());
         }
@@ -2816,6 +2914,8 @@ impl TableRecordStore for DirectWalTableRecordStore {
         // lockstep below, and `append_operations` returns its entries in input
         // order (built by `map`/`collect` over the input, after `sync_data`), so
         // index i of this vec is the LSN for `storage_actions[i]`.
+        // Held until the entries are applied to their partitions (TD-SEAM-12).
+        let _inflight = self.reserve_inflight();
         let wal_entries = self
             .wal_appender
             .append_operations(operations, tenant_id)
@@ -2970,6 +3070,8 @@ impl TableRecordStore for DirectWalTableRecordStore {
         }
 
         let expected = operations.len();
+        // Held until the batch is applied (TD-SEAM-12).
+        let _inflight = self.reserve_inflight();
         let entries = match self.wal_appender.append_operations_atomic(operations).await {
             Ok(entries) => entries,
             Err(err)
