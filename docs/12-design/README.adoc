@@ -187,7 +187,9 @@ Active blueprints, continuing the reading order:
    TE-1..TE-9, the foundational seams S1–S9 (identity, durable WAL, Layer A landing, one Iceberg
    writer, streaming scan providers, one logical IR, index projections, cost, governance), the
    vector-tier comparison against turbopuffer / memory HNSW / AXIS IVF with the round-trip-depth
-   plan, and phases P0–P6 with gates. Decisions in ADR-097; tracked by TD-SEAM-1..11.
+   plan, and phases P0–P6 with gates. Decisions in ADR-097; tracked by TD-SEAM-1..13.
+   Execution status, in-flight work and the resume protocol:
+   link:LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc[LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER].
 
 == Stable Reference Docs
 

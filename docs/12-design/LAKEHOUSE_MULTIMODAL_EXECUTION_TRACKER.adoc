@@ -1,0 +1,202 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= Lakehouse-native multimodal: execution tracker
+:toc: left
+:toclevels: 2
+:icons: font
+// status-as-of: 2026-10-20
+
+[cols="1,3"]
+|===
+| Purpose | The resumable status of record for executing link:LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] (the plan: Parts A–D, phases P0–P6) under link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097]. Any engineer or agent session picks up from here **and nothing else**: what is merged, what is in flight, what is next, and how the work is done.
+| Updated | 2026-10-20, against `develop` @ `7db68ea4d`.
+| Rule | Update this file in the same PR that lands, opens or re-plans a slice. A slice is **done** only when merged to `develop` with its gate green. Detail lives in the TD files; this file holds status, links and order.
+|===
+
+== 1. Resume protocol (read first in a new session)
+
+. Read, in order:
+.. this file, §2–§4;
+.. the plan: link:LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] §6 (Part D);
+.. the TD file of the slice you pick up (§3 links it).
+. Check what changed since the date above:
+** `git log --oneline origin/develop`;
+** open PRs (`gh api repos/anvai-labs/proximadb/pulls`);
+** in-flight branches (§4).
+. Reconcile this file first if it disagrees with git.
+. Resume an in-flight branch rather than redo it. Rebase it on `origin/develop` before any further work.
+
+=== Working conventions (owner directives)
+
+* **Foundational items first,** in dependency order (P2 before P3 before P4). Where there is a choice, take the performant and robust approach rather than the expedient one.
+* **Commit and merge continuously; always build on the current baseline.**
+** Rebase every branch on `origin/develop` before building, pushing, or merging.
+** Merge a PR with a **merge commit** once CI is green on a head that is current with `develop`.
+** Start the next slice while CI runs.
+* **PRs.**
+** One slice per PR.
+** Body follows `.github/PULL_REQUEST_TEMPLATE.md`.
+** Check the body with `python3 scripts/check_no_agent_attribution.py --stdin < body.md` before creating it.
+* **Before pushing,** run:
+** `cargo fmt --check`;
+** clippy on the touched targets;
+** the touched test suites;
+** the doc guards: `scripts/check_td_adr_unique.py`, `check_td_cited_tests.py`, `check_td_status_consistency.py`, `check_env_gates.py`, `check_status_as_of.py`.
+* **TD bookkeeping.**
+** A TD id lives either as a row in `docs/10-quality/TECHNICAL_DEBT.adoc` or as its own file under `docs/10-quality/td/`, never both. `check_td_adr_unique` fails otherwise.
+** Every new env gate is registered in `docs/12-design/ENV_GATE_REGISTRY.adoc`.
+* **Progress reports:** an ASCII roadmap with per-phase percentages (format in §2).
+
+=== Build and CI notes (small dev boxes)
+
+* **Memory and disk.** The root crate's lib and test builds need roughly 10 GB or more of RAM.
+** Use swap plus `CARGO_BUILD_JOBS=2` and `CARGO_INCREMENTAL=0`.
+** Share one `CARGO_TARGET_DIR` across worktrees.
+** Prune stale `libproximadb*` rlib/rmeta files and old test binaries when the disk fills.
+** Run one large build at a time.
+* **Lib unit tests.** These run in CI under nextest, which is process-per-test, so env-gate tests do not leak between tests.
+** Locally, filter and serialise: `cargo test --lib -- record_spill:: record_store::tests:: --test-threads=1`.
+* **Integration tests:** `cargo test --test <name> -- --test-threads=1`. The CI storage lane runs `tests/*sst*.rs`, `tests/*storage*.rs` and `tests/*wal*.rs` this way.
+* **When the CI job-log blob host is unreachable:**
+** read check-run annotations and failing step names through the REST API (`gh api .../check-runs/<id>/annotations`, `.../actions/jobs/<id>`);
+** reproduce locally;
+** GraphQL `gh pr` commands may be blocked; use `gh api` REST.
+
+== 2. Dashboard
+
+----
+ P0  Decisions (seams doc, ADR-097, doc fixes)   [############] 100%  merged #2075
+ P1  S4 Iceberg single writer + ext. read-back   [############] 100%  merged #2075
+ P2  S1/S2/S3 one write path                     [########....]  65%
+     P2.1 segmented WAL + per-segment index      [############] 100%  #2079
+     P2.2 Layer A (spill) in production          [########....]  70%
+     P2.3 WAL truncation                         [##########..]  85%  #2089 #2090 #2095
+     P2.4 streaming MATERIALIZE (SF1, no OOM)    [............]   0%
+ P3  S5/S6/S9 format-independent SQL, ANN op     [#...........]   5%
+ P4  Modalities onto the seams                   [............]   0%
+ P5  Vector tier economics                       [####........]  30%
+     P5a defaults                                [############] 100%  #2078
+     P5b centroid directory + cluster compaction [............]   0%
+     P5c HNSW as persisted PAX projection        [##..........]  15%  design #2088
+ P6  Proof (TPC-DS SF1/10, multimodal bench)     [#...........]  10%
+ OVERALL                                         [#####.......] ~45%
+----
+
+Percentages are effort estimates, not test counts.
+
+== 3. Slices by phase
+
+Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no PR) · **Next** · **Open**.
+
+=== P0–P1 (done)
+
+[cols="3,1,1,3",options="header"]
+|===
+| Slice | Status | PR | Gate / notes
+| Seams doc, ADR-097, doc-contradiction fixes | Done | #2075 | Docs only.
+| One Iceberg writer; REST serves the engine's `metadata.json`; DECIMAL end to end | Done | #2075 | `tests/iceberg_external_readback_e2e.rs` (pyiceberg + DuckDB values equal pgwire across two snapshots). TD-SEAM-1.
+| Spec Parquet layout (`ParquetWritePolicy`: page index, SBBF, sorting) for MATERIALIZE; WAL change-feed fast path | Done | #2069 | DataFusion TPC-DS 11.8 s → 33 ms median. TD-OLAPFMT-2/3/6.
+|===
+
+=== P2 — one write path
+
+[cols="3,1,1,3",options="header"]
+|===
+| Slice | Status | PR | Gate / notes
+| P2.1 Segmented canonical WAL: rotation, per-segment LSN summary, range reads | Done | #2079 | `tests/canonical_wal_segments_test.rs`. Rotation is opt-in (`PROXIMADB_CANONICAL_WAL_SEGMENT_BYTES`). TD-SEAM-2.
+| One appender per WAL file (`open_shared`); branch merge no longer reissues sequences | Done | #2086 | `graph_branch_merge_integration_test`.
+| TD-USUB-15 generation-checked spill eviction | Done | #2081 | `record_spill` lib tests.
+| TD-USUB-20 replayed DROP purges spill objects | Done | #2082 | `record_store` lib tests.
+| Record-tier truncation floor (`min_unflushed_lsn` aggregator; non-spill stores refuse) | Done | #2083 | TD-SEAM-2.
+| PAX retirement ledger fail-closed | Done | #2084 | TD-COMPACT-13.
+| Layer A production wiring (`open_for_server`, shutdown `flush_partitions`) + DROP purge-obligation drain | Done | #2085 | Spill gate `PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT`, default OFF. TD-SEAM-3, TD-USUB-1.
+| Untenanted (`""`) partitions spill via `SpillRecordStorage::untenanted()` | Done | #2092 | `an_untenanted_partition_persists_its_deletes`, `an_empty_tenant_partition_spills_and_persists_deletes`.
+| P2.2a truncation primitives: durable floor marker, `truncate_below`, reader retry, in-flight reservations | Done | #2089 | `tests/wal_truncation_test.rs`. TD-SEAM-12.
+| P2.2b rank-profile and SQL-function WAL checkpoints; change feed 410 Gone; reader starvation fix | Done | #2090 | `tests/wal_system_catalog_checkpoint_test.rs`.
+| P2.2c scheduled truncator (`src/services/wal_truncator.rs`) + MATERIALIZE snapshot-LSN pin | **Open PR** | #2095 | `tests/wal_truncator_test.rs` (7). Off by default (`PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS`).
+| Spill segments written with `ParquetWritePolicy`, oid-sorted | **Branch** `spill-write-policy` | — | `segments_are_written_with_the_warehouse_layout_policy`. Local lib tests pending, then PR.
+| Spill encoder uses the catalog schema | **Next** | — | See §5.1.
+| Durable branch merge-base | Open | — | Until it lands, branch-tagged WAL entries block truncation. TD-SEAM-12 hazard 2.
+| Catalog prefix registration (object-store placement of spill segments) | Open | — | TD-SEAM-3.
+| MATERIALIZE LSN capture via the per-collection high-water | Done in #2095 | #2095 | Superseded by `capture_snapshot_lsn` with a WAL pin.
+| P2.4 streaming / incremental MATERIALIZE publisher | Open | — | Gate: TPC-DS SF1 on a release build loads with no OOM and peak RSS recorded. TD-USUB-10, TD-OLAPFMT-3.
+| Turn rotation and truncation on by default | Open | — | After a soak, with the spill gate on. Also add the first `serde(default)` field on `CanonicalWalEntry`.
+|===
+
+=== P3–P6
+
+[cols="3,1,1,3",options="header"]
+|===
+| Slice | Status | PR | Gate / notes
+| P3.1 `LayerATableProvider`: streaming, pushdown, ABAC, WAL-tail union (replaces `MemTable` and the 1M-row cap) | Open | — | `native_table_capability_parity_e2e`.
+| P3.2 Register `PaxTableProvider`; UDTF-only queries go to DataFusion | Open | — |
+| P3.3 `FilteredAnnExec` (filter/limit/dynamic-filter pushdown, emits `oid`) | Open | — | `filtered_ann_recall_bands` ≥ 0.95 in every band.
+| P3.4 SBBF probe for join runtime filters; P3.5 facade passes `vector_ops`/`graph_ops` | Open | — |
+| P4 observability / graph / documents / TE-4 delete onto the seams | Open | — | Gates in the plan §6 P4.
+| P5a SST default for unspecified vector collections; PAX exact-gate footer facts | Done | #2078 | TD-ENGSEL-1, TD-PAXMETA-1.
+| P5b collection-global centroid directory + cluster-contiguous compaction | Open | — | SIFT1M on MinIO with injected latency: ≤ 3 waves, ≤ 20 GET/q, recall ≥ 0.98.
+| P5c HNSW (AXIS) as a persisted, stamped, rebuildable projection of PAX | Design done | #2088 | TD-SEAM-13. Prerequisite: TD-PAXPREC-1 (fp16 exact tier).
+| P6 TPC-DS SF1/SF10 cross-engine; multimodal benchmark (TE-1/TE-3/TE-6) | Open | — | No pricing claims before the P5b gates pass.
+|===
+
+== 4. In flight
+
+[cols="2,1,3",options="header"]
+|===
+| Branch | PR | State and next action
+| `p2-2c-wal-truncator` | #2095 | Rebased on `7db68ea4d`; 23/23 WAL tests pass locally. Merge when CI is green on a current head.
+| `spill-write-policy` | — | WIP commit pushed. Run `cargo test --lib -- record_spill:: record_store::tests:: --test-threads=1`, then clippy, rebase, PR (TD-SEAM-3 row already updated).
+|===
+
+== 5. Next-work queue (in order)
+
+=== 5.1 Spill encoder uses the catalog schema (P2.2)
+
+Facts from a code survey on 2026-10-20:
+
+* `flush` builds its schema with `infer_proxima_schema(&written)`. The batch comes from `proxima_records_to_record_batch_with_system_columns`.
+* `ProximaSchema` *is* `CatalogTableSchema` (`proximadb-storage-common/src/proxima_schema.rs`), so no conversion is needed.
+* The partition factory receives only `(tenant_id, collection)`. The schema is available at `DirectWalTableRecordStore::partitions_for(tenant, &CatalogTableSchema)` and on every write and scan path, but not during WAL replay.
+
+Plan:
+
+. Add a schema hint to the partition: a `RecordStorage` method with a no-op default, overridden by `SpillRecordStorage` and set from `partitions_for`.
+. Encode with the catalog column types and **append** any inferred prop the catalog lacks, so no prop is ever dropped (a column added after the hint must survive).
+. Partitions created by replay fall back to inference until a write sets the hint.
+. Gate: a round-trip with typed columns (DECIMAL, INT, DATE) reads back exactly, and an unknown prop survives.
+
+=== 5.2 Durable branch merge-base (TD-SEAM-12 hazard 2)
+
+Persist the merge base so that truncation no longer has to refuse while branch-tagged entries exist.
+
+=== 5.3 P2.4 streaming MATERIALIZE
+
+* Bounded memory and multi-part.
+* Fenced snapshot advance.
+* Keep the real `oid`.
+* Classify insert vs update by probing published key stats/SBBF, not WAL history.
+* Gate: TPC-DS SF1 with no OOM.
+
+=== 5.4 P3.1 `LayerATableProvider`
+
+Once Layer A segments are spec-layout files (5.1 plus the write-policy branch), a provider can prune them with the page index and SBBF.
+
+=== Prerequisites tracked elsewhere
+
+* TD-PAXPREC-1 (fp16 exact tier) before P5c.
+* TD-USUB-11 projection hygiene.
+* There is no `__proxima_lsn` system column yet. The LSN lives only in the spill `Resident` struct; add the column and its decoder in one change if a consumer needs it.
+
+== 6. Decisions log
+
+[cols="1,4",options="header"]
+|===
+| Date | Decision
+| 2026-10-18 | DataFusion `LogicalPlan` is the single logical IR; native and fused operators are `ExecutionPlan` adapters. PAX-first vectors; HNSW is a hot projection; the AXIS IVF disk tier is retired in favour of the PAX centroid directory. First slice: P0 + P1 (ADR-097).
+| 2026-10-19 | WAL truncation only below the minimum of every consumer floor. Any consumer that cannot answer refuses (fail closed). Twelve consumers are surveyed in TD-SEAM-12.
+| 2026-10-19 | HNSW: keep the AXIS HNSW engine, but as a persisted, stamped projection of PAX. Load when the stamp matches, apply the delta for new segments, rebuild in the background otherwise (TD-SEAM-13).
+| 2026-10-20 | WAL readers: bounded optimistic retries, then one read under the append lock. The path-level reader backs off 1–20 ms (performant and robust over unbounded retry).
+| 2026-10-20 | The single-tenant `""` partition spills through an explicit `untenanted()` opt-in. `with_tenant("")` still refuses tombstones, so an accidental empty tenant cannot write a match-any tombstone.
+| 2026-10-20 | The truncator is off by default and needs rotation plus the spill gate. MATERIALIZE pins WAL history from its snapshot-LSN capture until the catalog records it. The snapshot LSN is the WAL head lowered below in-flight writes, not the table's last change.
+| 2026-10-20 | Spill segments use the warehouse `ParquetWritePolicy`, sorted by `__proxima_oid`. Layer A files are lakehouse files, not Arrow-default blobs.
+|===
