@@ -162,6 +162,11 @@ proto-check:
 # memory and fails if it drifts from the committed docs/openapi/proximadb-openapi.yaml.
 # Mirrors the proto-sync generated-artifact gate. Regenerate with:
 #   UPDATE_OPENAPI_SPEC=1 cargo test -p proximadb --test openapi_spec_gen
+.PHONY: dup-report
+dup-report: ## Copy/paste duplication census (jscpd) — report lands in target/jscpd-report/
+	@echo " replaying the duplication census (config: .jscpd.json; see docs/10-quality/DUPLICATION_CENSUS_2026_10_20.md)"
+	npx --yes jscpd .
+
 verify-openapi-spec:
 	@echo "🧬 Validating OpenAPI spec ↔ handler drift (spec-from-code)..."
 	cargo test -p proximadb --test openapi_spec_gen
