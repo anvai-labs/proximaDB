@@ -24,13 +24,6 @@
 //!   RUST_LOG=proximadb=debug cargo nextest run \
 //!     --test pgwire_relational_native_read_after_write_e2e -- --nocapture
 
-use std::net::TcpListener;
-use std::time::Duration;
-
-use proximadb::core::Config;
-use proximadb::database::ProximaDB;
-use tempfile::TempDir;
-use tokio::time::sleep;
 use tokio_postgres::{Client, SimpleQueryMessage};
 
 #[path = "common/pg_server.rs"]

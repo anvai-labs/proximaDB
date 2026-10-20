@@ -29,8 +29,6 @@
 //!
 //!   RUST_LOG=proximadb=debug cargo test --test document_json_pgwire_e2e -- --nocapture
 
-use tokio::time::sleep;
-
 /// All 11 document queries are verified CORRECT (anchored + differential cross-engine).
 /// The TD-183 saga is closed across ADR-043: routing (#480), DataFusion alias (#486),
 /// fail-loud predicates (Inv 1, #502), typed JSON functions + Json coercion (Inv 3), and
