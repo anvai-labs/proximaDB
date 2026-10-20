@@ -67,8 +67,9 @@ use proximadb_records::{
     ProximaRecord, RecordKey, RecordScan, RecordScanOptions, RecordScanPredicate, RecordStore,
     RecordStoreResult,
 };
+use proximadb_storage_common::parquet_write_policy::{ParquetLayoutHints, ParquetWritePolicy};
 use proximadb_storage_common::proxima_arrow::{
-    infer_proxima_schema, proxima_records_to_record_batch_with_system_columns,
+    SYS_COL_OID, infer_proxima_schema, proxima_records_to_record_batch_with_system_columns,
 };
 use proximadb_storage_common::proxima_parquet::record_batches_to_parquet_bytes;
 use proximadb_storage_filesystem_types::FileSystem;
@@ -287,6 +288,12 @@ pub struct SpillRecordStorage {
     /// `with_tenant("")` still normalises to `None`: an accidental empty tenant
     /// stays the refusing shape; only the explicit opt-in is not.
     tenant_id: Option<String>,
+    /// The warehouse Parquet layout every segment is written with (ADR-097 S3):
+    /// row-group cap, page index, declared sort, Bloom filters — the same policy
+    /// MATERIALIZE uses, so a Layer A segment is a spec-layout lakehouse file
+    /// rather than an Arrow-default blob. Read from the environment at
+    /// construction; see [`Self::with_write_policy`].
+    write_policy: ParquetWritePolicy,
 }
 
 impl SpillRecordStorage {
@@ -321,7 +328,14 @@ impl SpillRecordStorage {
             next_segment: AtomicU64::new(0),
             discovered: tokio::sync::OnceCell::new(),
             tenant_id: None,
+            write_policy: ParquetWritePolicy::from_env(),
         }
+    }
+
+    /// Override the Parquet layout policy (tests, A/B measurement).
+    pub fn with_write_policy(mut self, write_policy: ParquetWritePolicy) -> Self {
+        self.write_policy = write_policy;
+        self
     }
 
     /// Attach the tenant this partition belongs to, so a tombstone-only flush
@@ -871,15 +885,28 @@ impl SpillRecordStorage {
         // tombstones too. `infer_proxima_schema` unions props across records, so
         // a propless tombstone mixed with full rows is fine — its columns are
         // simply null.
+        //
+        // Ordered by oid: a flush writes ONE row per oid (residents are a map;
+        // a tombstone is persisted only for an oid with no resident row — the
+        // ambiguity block), so the order carries no meaning and sorting loses
+        // nothing. It makes the oid column's row-group and page min/max exact,
+        // which the declared sort below tells every reader.
+        written.sort_unstable_by(|a, b| a.oid.cmp(&b.oid));
         let schema = infer_proxima_schema(&written);
         let batch = proxima_records_to_record_batch_with_system_columns(&written, &schema)
             .context("spill: encode resident records and tombstones to Arrow")?;
+        let writer_properties = self.write_policy.writer_properties(
+            &batch,
+            &ParquetLayoutHints {
+                sort_columns: vec![SYS_COL_OID.to_string()],
+            },
+        );
         // The file schema MUST be the batch's own schema, not `schema`: the batch
         // carries the reserved system columns on top of the user columns, and
         // writing it under the bare user schema silently drops them — which is
         // exactly the identity/tombstone loss this store depends on not happening.
         let file_schema = batch.schema();
-        let bytes = record_batches_to_parquet_bytes(&[batch], file_schema, None)
+        let bytes = record_batches_to_parquet_bytes(&[batch], file_schema, Some(writer_properties))
             .context("spill: encode Arrow batch to parquet bytes")?;
 
         // `next_segment` was resumed past every durable segment by
@@ -3389,6 +3416,85 @@ mod tests {
             );
             assert_eq!(segment_files_on_disk(&base), 1, "and delete nothing");
         }
+        Ok(())
+    }
+
+    /// A segment is a warehouse-layout Parquet file (ADR-097 S3): written with
+    /// `ParquetWritePolicy` — row-group cap, page index, declared sort — and
+    /// ordered by oid, so the oid column's row-group min/max is exact. The
+    /// policy changes the layout only: every row reads back unchanged.
+    #[tokio::test]
+    async fn segments_are_written_with_the_warehouse_layout_policy() -> Result<()> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use parquet::file::serialized_reader::ReadOptionsBuilder;
+
+        let (fs, base) = fs_and_base().await;
+        let store = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None)
+            .with_tenant("tenant-a")
+            .with_write_policy(ParquetWritePolicy {
+                row_group_rows: 4,
+                data_page_rows: 2,
+                ..ParquetWritePolicy::default()
+            });
+        // Inserted out of order; the segment must come out sorted.
+        let oids = ["k5", "k1", "k9", "k3", "k7", "k2", "k8", "k4", "k6", "k0"];
+        for oid in oids {
+            RecordStore::upsert_record(&store, record(oid, "open")).await?;
+        }
+        store.flush().await?.expect("publishes");
+
+        let path = std::fs::read_dir(&base)?
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| is_spill_segment(&p.file_name().unwrap_or_default().to_string_lossy()))
+            .expect("one segment on disk");
+
+        let reader = SerializedFileReader::new_with_options(
+            std::fs::File::open(&path)?,
+            ReadOptionsBuilder::new().with_page_index().build(),
+        )?;
+        let meta = reader.metadata();
+        assert_eq!(meta.num_row_groups(), 3, "10 rows at 4 per row group");
+        assert!(meta.column_index().is_some(), "page index written");
+        let oid_column = meta
+            .file_metadata()
+            .schema_descr()
+            .columns()
+            .iter()
+            .position(|c| c.name() == SYS_COL_OID)
+            .expect("oid system column");
+        for row_group in meta.row_groups() {
+            let sorting = row_group.sorting_columns().expect("sort declared");
+            assert_eq!(sorting[0].column_idx as usize, oid_column);
+            assert!(!sorting[0].descending);
+        }
+
+        let mut written = Vec::new();
+        for batch in
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path)?)?.build()?
+        {
+            let batch = batch?;
+            let column = batch
+                .column_by_name(SYS_COL_OID)
+                .expect("oid column")
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("utf8 oids");
+            written.extend(column.iter().flatten().map(str::to_string));
+        }
+        let mut sorted = written.clone();
+        sorted.sort();
+        assert_eq!(written, sorted, "rows are ordered by oid");
+
+        let fresh = SpillRecordStorage::with_flush_threshold(fs, base, None);
+        let mut served: Vec<String> = RecordScan::scan_records(&fresh, 100)
+            .await?
+            .into_iter()
+            .map(|r| r.oid)
+            .collect();
+        served.sort();
+        assert_eq!(served, sorted, "every row reads back");
         Ok(())
     }
 

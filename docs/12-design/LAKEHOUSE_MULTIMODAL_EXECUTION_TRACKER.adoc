@@ -114,7 +114,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | P2.2a truncation primitives: durable floor marker, `truncate_below`, reader retry, in-flight reservations | Done | #2089 | `tests/wal_truncation_test.rs`. TD-SEAM-12.
 | P2.2b rank-profile and SQL-function WAL checkpoints; change feed 410 Gone; reader starvation fix | Done | #2090 | `tests/wal_system_catalog_checkpoint_test.rs`.
 | P2.2c scheduled truncator (`src/services/wal_truncator.rs`) + MATERIALIZE snapshot-LSN pin | **Open PR** | #2095 | `tests/wal_truncator_test.rs` (7). Off by default (`PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS`).
-| Spill segments written with `ParquetWritePolicy`, oid-sorted | **Branch** `spill-write-policy` | — | `segments_are_written_with_the_warehouse_layout_policy`. Local lib tests pending, then PR.
+| Spill segments written with `ParquetWritePolicy`, oid-sorted | **Open PR** | `spill-write-policy` | `segments_are_written_with_the_warehouse_layout_policy`; `record_spill::` + `record_store::tests::` 93/93 locally.
 | Spill encoder uses the catalog schema | **Next** | — | See §5.1.
 | Durable branch merge-base | Open | — | Until it lands, branch-tagged WAL entries block truncation. TD-SEAM-12 hazard 2.
 | Catalog prefix registration (object-store placement of spill segments) | Open | — | TD-SEAM-3.
@@ -145,7 +145,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 |===
 | Branch | PR | State and next action
 | `p2-2c-wal-truncator` | #2095 | Rebased on `7db68ea4d`; 23/23 WAL tests pass locally. Merge when CI is green on a current head.
-| `spill-write-policy` | — | WIP commit pushed. Run `cargo test --lib -- record_spill:: record_store::tests:: --test-threads=1`, then clippy, rebase, PR (TD-SEAM-3 row already updated).
+| `spill-write-policy` | open | Lib tests 93/93 and clippy clean locally. Merge when CI is green on a current head; next slice is §5.1.
 |===
 
 == 5. Next-work queue (in order)
