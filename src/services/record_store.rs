@@ -238,6 +238,19 @@ pub trait TableWalAppender: Send + Sync {
     fn retained_from(&self) -> u64 {
         0
     }
+
+    /// Pin the history after a snapshot LSN chosen from the head (see
+    /// [`FramedTableWalAppender::pin_history`]). `None` (default): the
+    /// appender never truncates, so there is nothing to pin.
+    ///
+    /// [`FramedTableWalAppender::pin_history`]: crate::services::FramedTableWalAppender::pin_history
+    async fn pin_history(
+        &self,
+        snapshot_lsn: &(dyn Fn(u64) -> u64 + Send + Sync),
+    ) -> Result<Option<(u64, crate::services::canonical_wal::WalHistoryPin)>> {
+        let _ = snapshot_lsn;
+        Ok(None)
+    }
 }
 
 /// Writes whose WAL entries are durable but not yet applied to their partition
@@ -628,6 +641,31 @@ pub struct ChangeRow {
     pub props: Option<serde_json::Value>,
 }
 
+/// A table snapshot's position in the canonical WAL (ADR-025): every change
+/// at or below `lsn` is visible to a scan started after the capture, and the
+/// OLAP read-merge replays every change above it. While `pin` is held the WAL
+/// keeps every entry above `lsn` (TD-SEAM-12); drop it once `lsn` is recorded
+/// in the catalog, whose published snapshots then hold the truncation floor.
+#[derive(Debug)]
+pub struct SnapshotLsn {
+    pub lsn: u64,
+    pub pin: Option<crate::services::canonical_wal::WalHistoryPin>,
+}
+
+/// The pre-truncation snapshot LSN: the table's newest change, or `0`. Sound
+/// only for a store whose WAL never truncates.
+async fn snapshot_lsn_from_change_feed<S: TableRecordStore + ?Sized>(
+    store: &S,
+    collection_id: &str,
+) -> SnapshotLsn {
+    let lsn = store
+        .read_changes_since(collection_id, 0)
+        .await
+        .map(|changes| changes.iter().map(|c| c.lsn).max().unwrap_or(0))
+        .unwrap_or(0);
+    SnapshotLsn { lsn, pin: None }
+}
+
 /// Build a [`ChangeRow`] for `collection_id` from a canonical WAL entry, or `None`
 /// if the entry is not an upsert/delete for that collection. Shared by the
 /// tenant-agnostic and tenant-scoped change-feeds so they stay in lock-step.
@@ -930,6 +968,14 @@ pub trait TableRecordStore: Send + Sync {
     ) -> Result<Vec<ChangeRow>> {
         let _ = (collection_id, tenant, since_lsn);
         Ok(Vec::new())
+    }
+
+    /// Capture the snapshot LSN for MATERIALIZE before it scans the table
+    /// (ADR-025). The default reads the table's newest change, which is sound
+    /// only when the WAL never truncates; the WAL-backed store pins history
+    /// instead, and every store that routes to it forwards this.
+    async fn capture_snapshot_lsn(&self, collection_id: &str) -> Result<SnapshotLsn> {
+        Ok(snapshot_lsn_from_change_feed(self, collection_id).await)
     }
 }
 
@@ -1430,6 +1476,10 @@ impl TableRecordStore for CatalogRoutingTableRecordStore {
         self.iceberg_store
             .read_changes_since_scoped(collection_id, tenant, since_lsn)
             .await
+    }
+
+    async fn capture_snapshot_lsn(&self, collection_id: &str) -> Result<SnapshotLsn> {
+        self.iceberg_store.capture_snapshot_lsn(collection_id).await
     }
 }
 
@@ -2736,6 +2786,27 @@ impl TableRecordStore for DirectWalTableRecordStore {
             "🗑️ dropped record partition (+ WAL marker) for table"
         );
         Ok(())
+    }
+
+    /// The snapshot LSN is the WAL head, lowered below any write that is
+    /// appended but not yet applied (a scan could miss it, so the read-merge
+    /// must replay it). Chosen under the WAL's append lock and pinned there,
+    /// so no truncation can slip between the capture and the pin. Falls back
+    /// to the table's newest change for an appender that never truncates.
+    async fn capture_snapshot_lsn(&self, collection_id: &str) -> Result<SnapshotLsn> {
+        let inflight = &self.inflight;
+        let below_inflight = |head: u64| {
+            inflight
+                .floor()
+                .map_or(head, |floor| head.min(floor.saturating_sub(1)))
+        };
+        match self.wal_appender.pin_history(&below_inflight).await? {
+            Some((lsn, pin)) => Ok(SnapshotLsn {
+                lsn,
+                pin: Some(pin),
+            }),
+            None => Ok(snapshot_lsn_from_change_feed(self, collection_id).await),
+        }
     }
 
     /// CDC change-feed over the canonical WAL: surface every RecordUpsert/RecordDelete for

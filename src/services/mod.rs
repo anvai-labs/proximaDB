@@ -204,6 +204,7 @@ pub mod record_memtable;
 pub mod record_spill;
 pub mod record_store;
 pub mod txn_staging;
+pub mod wal_truncator;
 pub mod writer_fence;
 pub use proximadb_scan_cursor::scan_cursor;
 pub mod schema;

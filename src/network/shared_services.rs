@@ -2582,6 +2582,33 @@ impl SharedServices {
         // `DdlService` (pgwire) so new `CREATE FUNCTION` statements persist here.
         let function_store = build_function_store(canonical_wal_appender.clone()).await;
 
+        // P2.2c (TD-SEAM-2 / TD-SEAM-12): canonical-WAL truncation, off unless
+        // PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS is set. Every WAL
+        // consumer is a floor source; any refusal skips the run. Read-only
+        // sources first, the appending catalog checkpoints last.
+        if let (Some(interval), Some(wal), Some(record_store)) = (
+            crate::services::wal_truncator::configured_interval(),
+            canonical_wal_appender.clone(),
+            canonical_record_store.clone(),
+        ) {
+            use crate::services::wal_truncator as truncator;
+            let sources: Vec<Arc<dyn truncator::WalFloorSource>> = vec![
+                Arc::new(truncator::BranchEntriesGuard(wal.clone())),
+                Arc::new(truncator::RecordTierFloor(record_store)),
+                Arc::new(truncator::ChangeFeedRetention(
+                    truncator::configured_retain_entries(),
+                )),
+                Arc::new(truncator::PublishedSnapshotFloor(catalog_manager.clone())),
+                Arc::new(truncator::RankProfileCheckpoint(rank_profile_store.clone())),
+                Arc::new(truncator::FunctionCheckpoint(function_store.clone())),
+            ];
+            truncator::spawn(wal, sources, interval);
+            info!(
+                interval_secs = interval.as_secs(),
+                "SharedServices: canonical WAL truncator scheduled"
+            );
+        }
+
         // Backfill collection owner (non-fatal, background): record an owner on
         // collections created before ownership was recorded, so each resolves
         // within its tenant. Until it runs (or if it fails) such a collection

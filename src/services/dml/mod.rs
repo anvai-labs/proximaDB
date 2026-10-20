@@ -2369,17 +2369,13 @@ impl DmlService {
         table_name: &str,
         tenant_context: Option<&TenantContext>,
     ) -> Result<String> {
-        // ADR-025: capture this table's WAL high-water LSN BEFORE snapshotting, so any
-        // write landing during/after the scan has a strictly greater LSN and is caught
-        // by the OLAP read-merge delta (`read_changes_since(.., snapshot_lsn)`). Sequence
-        // numbers are globally monotonic, so the table's own latest change LSN is a safe
-        // floor; a table with no changes yet snapshots at 0.
-        let snapshot_lsn = self
-            .record_store
-            .read_changes_since(table_name, 0)
-            .await
-            .map(|changes| changes.iter().map(|c| c.lsn).max().unwrap_or(0))
-            .unwrap_or(0);
+        // ADR-025: capture the snapshot LSN BEFORE scanning, so any write landing
+        // during/after the scan has a strictly greater LSN and is caught by the OLAP
+        // read-merge delta (`read_changes_since(.., snapshot_lsn)`). The capture also
+        // pins the WAL above that LSN until the catalog records it below (TD-SEAM-12):
+        // until then nothing else stops truncation from removing that delta.
+        let snapshot = self.record_store.capture_snapshot_lsn(table_name).await?;
+        let snapshot_lsn = snapshot.lsn;
 
         // 1. Snapshot the table's current rows (all columns, no predicate/limit).
         let (schema, rows) = self
@@ -2514,6 +2510,9 @@ impl DmlService {
             .unwrap_or_default();
         let layouts = upsert_storage_layout(existing_layouts, layout);
         catalog.set_storage_layouts(&table_id, layouts).await?;
+        // The catalog now records `snapshot_lsn`; published snapshots hold the WAL
+        // truncation floor from here on.
+        drop(snapshot);
 
         // 5b. TD-OLAP-2 (A2): publish per-column NDV sketches (HLL) from the
         //     just-written records to the ADR-037 resident statistics registry,

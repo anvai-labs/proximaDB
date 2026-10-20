@@ -12,7 +12,8 @@
 //! * readers racing truncation (and rotation) never error;
 //! * the change feed reports truncated history instead of returning a gap;
 //! * a write that is appended but not yet applied holds an in-flight
-//!   reservation the truncation floor must respect.
+//!   reservation the truncation floor must respect, and a snapshot LSN
+//!   captured meanwhile stays below it.
 //!
 //!   cargo test --test wal_truncation_test
 
@@ -256,6 +257,12 @@ impl TableWalAppender for ParkedWal {
     fn last_sequence(&self) -> Option<u64> {
         Some(self.inner.last_sequence())
     }
+    async fn pin_history(
+        &self,
+        snapshot_lsn: &(dyn Fn(u64) -> u64 + Send + Sync),
+    ) -> Result<Option<(u64, proximadb::services::canonical_wal::WalHistoryPin)>> {
+        self.inner.pin_history(snapshot_lsn).await.map(Some)
+    }
 }
 
 #[tokio::test]
@@ -284,6 +291,10 @@ async fn an_in_flight_write_holds_the_truncation_floor() -> Result<()> {
     wal.reached.notified().await;
     // Appended (seq 2) but not yet applied: the floor must not pass it.
     assert_eq!(store.inflight_floor(), Some(2));
+    // A snapshot taken now must not claim seq 2: a scan cannot see it yet.
+    let snapshot = store.capture_snapshot_lsn("t").await?;
+    assert_eq!(snapshot.lsn, 1, "lowered below the in-flight write");
+    drop(snapshot);
     wal.release.notify_one();
     writer.await??;
     assert_eq!(store.inflight_floor(), None, "released on completion");

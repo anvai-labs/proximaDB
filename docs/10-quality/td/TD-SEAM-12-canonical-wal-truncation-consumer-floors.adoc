@@ -5,8 +5,8 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In Progress.** P2.2a primitives landed 2026-10-19 (see "Landed"); the consumer gaps under "Hazards" items 1–3 remain, so nothing calls truncation in production yet. Filed 2026-10-19 from a survey of every reader of the shared canonical WAL (`data_dir/pgwire/canonical-records.wal`), done before implementing truncation (TD-SEAM-2 / P2.2).
-| Priority | **HIGH as a gate on P2.2.** Zero today: nothing truncates the WAL.
+| Status | **In Progress.** P2.2a primitives landed 2026-10-19; P2.2b checkpoints and the REST 410 on 2026-10-20; the P2.2c truncator on 2026-10-20 (see "Landed"). It is **off by default** (`PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS`) and refuses while the WAL holds branch-tagged entries; the durable branch merge-base is the open item. Filed 2026-10-19 from a survey of every reader of the shared canonical WAL (`data_dir/pgwire/canonical-records.wal`), done before implementing truncation (TD-SEAM-2 / P2.2).
+| Priority | **MEDIUM.** Truncation runs only when an operator opts in; the remaining gap (branch merge) refuses rather than risks history.
 | Component | `src/services/canonical_wal.rs`, `src/services/record_store.rs`, `src/services/{rank_profile_store,function_store}.rs`, `src/graph/merge.rs`, `src/network/rest/v2/records.rs` (change feed), `src/network/postgres/relational_pipeline.rs` (OLAP delta merge)
 | Relates to | TD-SEAM-2, TD-USUB-1 (slice 2b), TD-OLAPFMT-3, ADR-012 (branch merge), ADR-097 S2
 | Blocked by | Nothing.
@@ -125,3 +125,44 @@ Remaining:
 * The snapshot-LSN enumerator for the OLAP delta merge.
 * MATERIALIZE's LSN capture.
 * The truncator itself.
+
+== Landed (P2.2c, 2026-10-20): the truncator
+
+`src/services/wal_truncator.rs`, the first production caller of `truncate_below`.
+
+* **Composition.** Each consumer is a `WalFloorSource`. `run_once` reads the head `W` first, so
+  `floor = min(W + 1, every source)`. One `Err` refuses the whole run and deletes nothing.
+* **Sources, in order** (readers before the checkpoints that append):
+** `branch-merge`: refuses while any retained segment holds a branch-tagged record (hazard 2).
+   Each segment summary carries `has_branch_entries`, rebuilt on open.
+** `change-feed-retention`: keeps the newest `PROXIMADB_CANONICAL_WAL_RETAIN_ENTRIES` sequences
+   (default 1,000,000). A client further behind gets 410.
+** `record-tier`: `min(inflight_floor, min_unflushed_lsn)`. Any memtable partition refuses, so
+   truncation needs the spill gate as well.
+** `published-snapshots`: walks every catalog and keeps everything after the lowest
+   `snapshot_lsn`. A catalog that cannot be listed refuses. This is the snapshot-LSN enumerator.
+** `rank-profiles` and `sql-functions`: their checkpoints.
+* **MATERIALIZE's LSN capture.** It used `read_changes_since(table, 0).unwrap_or(0)`. After a
+  truncation that call fails, so the snapshot would have been recorded at LSN 0, which no
+  retained history can serve. It also left the window between capture and catalog publication
+  unprotected.
+** Now `TableRecordStore::capture_snapshot_lsn` returns `SnapshotLsn { lsn, pin }`. The WAL-backed
+   store takes the head, lowered below any appended-but-unapplied write, and pins every entry
+   above it (`FramedTableWalAppender::pin_history`).
+** The pin is taken under the append lock, and `truncate_below` honours the lowest pin under the
+   same lock, so no truncation can fall between the capture and the pin.
+** MATERIALIZE drops the pin after the catalog records `snapshot_lsn`. From then on the
+   `published-snapshots` source holds the floor.
+* **Scheduling.** `spawn` runs every `PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS` (unset or
+  `0` means off) and logs every outcome. A refusal or error is not fatal; the next run starts from
+  scratch. Truncation removes only sealed segments, so it also needs
+  `PROXIMADB_CANONICAL_WAL_SEGMENT_BYTES`.
+* **Gates:** `tests/wal_truncator_test.rs` and `tests/wal_truncation_test.rs` (an in-flight write
+  lowers the snapshot LSN).
+
+Still open:
+
+* **Hazard 2: a durable branch-merge base.** Until it exists, any branch-tagged entry blocks
+  truncation.
+* Orion's checkpoint correlation degrades to `None` once its checkpoint entry is truncated; it is
+  metrics only.

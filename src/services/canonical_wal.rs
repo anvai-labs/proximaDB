@@ -207,6 +207,40 @@ pub struct FramedTableWalAppender {
     /// restart nor an empty active file can reuse a sequence or present a
     /// truncated history as complete.
     retained_from: AtomicU64,
+    /// Snapshot pins ([`Self::pin_history`]): floor → holder count. Truncation
+    /// never passes the lowest; both sides decide under `append_lock`.
+    pins: Arc<HistoryPins>,
+}
+
+type HistoryPins = parking_lot::Mutex<std::collections::BTreeMap<u64, usize>>;
+
+/// Keeps every canonical-WAL entry at or above [`Self::floor`] from being
+/// truncated until dropped. Taken by [`FramedTableWalAppender::pin_history`]
+/// for the span between capturing a snapshot LSN and publishing it, during
+/// which no catalog record yet protects the entries after it (TD-SEAM-12).
+#[derive(Debug)]
+pub struct WalHistoryPin {
+    pins: Arc<HistoryPins>,
+    floor: u64,
+}
+
+impl WalHistoryPin {
+    /// The lowest sequence this pin keeps.
+    pub fn floor(&self) -> u64 {
+        self.floor
+    }
+}
+
+impl Drop for WalHistoryPin {
+    fn drop(&mut self) {
+        let mut pins = self.pins.lock();
+        if let Some(count) = pins.get_mut(&self.floor) {
+            *count -= 1;
+            if *count == 0 {
+                pins.remove(&self.floor);
+            }
+        }
+    }
 }
 
 /// What [`FramedTableWalAppender::truncate_below`] removed.
@@ -300,6 +334,10 @@ struct SegmentSummary {
     /// Whether any entry carries no collection (catalog/checkpoint ops), which
     /// a collection-scoped read never needs.
     has_uncollected: bool,
+    /// Whether any entry is a branch-tagged record (ADR-012). Branch merge
+    /// reads base records that may predate any truncation floor, so the
+    /// truncator refuses while the retained WAL holds one (TD-SEAM-12 hazard 2).
+    has_branch_entries: bool,
 }
 
 impl SegmentSummary {
@@ -320,6 +358,11 @@ impl SegmentSummary {
                 *cur = (*cur).max(seq);
             }
             None => self.has_uncollected = true,
+        }
+        if let CanonicalOperation::RecordUpsert { record, .. } = &entry.operation
+            && record.branch_id.is_some()
+        {
+            self.has_branch_entries = true;
         }
     }
 
@@ -556,6 +599,7 @@ impl FramedTableWalAppender {
             } else {
                 0
             }),
+            pins: Arc::default(),
         })
     }
 
@@ -564,9 +608,47 @@ impl FramedTableWalAppender {
         self.next_sequence.load(Ordering::SeqCst)
     }
 
+    /// Whether any retained entry (sealed or active) is a branch-tagged record.
+    /// See [`SegmentSummary::has_branch_entries`].
+    pub fn has_branch_entries(&self) -> bool {
+        self.active.lock().has_branch_entries
+            || self.sealed.read().iter().any(|s| s.has_branch_entries)
+    }
+
     /// First sequence still readable; `0` when nothing was ever truncated.
     pub fn retained_from(&self) -> u64 {
         self.retained_from.load(Ordering::SeqCst)
+    }
+
+    /// Pin the history after a snapshot LSN (TD-SEAM-12). Under the append
+    /// lock — so no append and no truncation interleaves — `snapshot_lsn`
+    /// maps the WAL head to the snapshot's LSN `L` (clamped to the head), and
+    /// every entry above `L` is kept until the pin drops. Fails with
+    /// [`WalHistoryTruncated`] when entries above `L` are already gone.
+    pub async fn pin_history(
+        &self,
+        snapshot_lsn: &(dyn Fn(u64) -> u64 + Send + Sync),
+    ) -> Result<(u64, WalHistoryPin)> {
+        let _guard = self.append_lock.lock().await;
+        let head = self.last_sequence();
+        let lsn = snapshot_lsn(head).min(head);
+        let retained_from = self.retained_from();
+        if retained_from > lsn.saturating_add(1) {
+            return Err(WalHistoryTruncated {
+                since: lsn,
+                retained_from,
+            }
+            .into());
+        }
+        let floor = lsn.saturating_add(1);
+        *self.pins.lock().entry(floor).or_insert(0) += 1;
+        Ok((
+            lsn,
+            WalHistoryPin {
+                pins: self.pins.clone(),
+                floor,
+            },
+        ))
     }
 
     /// P2.2 (TD-SEAM-2 / TD-SEAM-12): delete every sealed segment whose
@@ -582,11 +664,19 @@ impl FramedTableWalAppender {
     ///   is gone and the active file is empty;
     /// * readers overlapping it re-read (the rotation generation is odd while
     ///   the segment list and the files disagree).
+    /// * `floor` is lowered to the lowest [`WalHistoryPin`], decided under the
+    ///   same lock that takes pins.
     ///
     /// Serialized with appends (and so with rotation), which keeps the sealed
     /// list stable while victims are chosen.
     pub async fn truncate_below(&self, floor: u64) -> Result<WalTruncation> {
         let _guard = self.append_lock.lock().await;
+        let floor = self
+            .pins
+            .lock()
+            .keys()
+            .next()
+            .map_or(floor, |&pinned| floor.min(pinned));
         let victims: Vec<SegmentSummary> = self
             .sealed
             .read()
@@ -1029,6 +1119,15 @@ impl TableWalAppender for FramedTableWalAppender {
 
     fn retained_from(&self) -> u64 {
         FramedTableWalAppender::retained_from(self)
+    }
+
+    async fn pin_history(
+        &self,
+        snapshot_lsn: &(dyn Fn(u64) -> u64 + Send + Sync),
+    ) -> Result<Option<(u64, WalHistoryPin)>> {
+        FramedTableWalAppender::pin_history(self, snapshot_lsn)
+            .await
+            .map(Some)
     }
 }
 
