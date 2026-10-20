@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** Filed 2026-10-19 from a survey of every reader of the shared canonical WAL (`data_dir/pgwire/canonical-records.wal`), done before implementing truncation (TD-SEAM-2 / P2.2).
+| Status | **In Progress.** P2.2a primitives landed 2026-10-19 (see "Landed"); the consumer gaps under "Hazards" items 1–3 remain, so nothing calls truncation in production yet. Filed 2026-10-19 from a survey of every reader of the shared canonical WAL (`data_dir/pgwire/canonical-records.wal`), done before implementing truncation (TD-SEAM-2 / P2.2).
 | Priority | **HIGH as a gate on P2.2.** Zero today: nothing truncates the WAL.
 | Component | `src/services/canonical_wal.rs`, `src/services/record_store.rs`, `src/services/{rank_profile_store,function_store}.rs`, `src/graph/merge.rs`, `src/network/rest/v2/records.rs` (change feed), `src/network/postgres/relational_pipeline.rs` (OLAP delta merge)
 | Relates to | TD-SEAM-2, TD-USUB-1 (slice 2b), TD-OLAPFMT-3, ADR-012 (branch merge), ADR-097 S2
@@ -67,3 +67,38 @@ New APIs:
 . **No sequence reuse after restart.** If truncation removes every sealed segment while the active
   file is empty, reopening derives `last_sequence = 0`. Persist a floor marker, or always keep the
   newest sealed segment.
+
+== Landed (P2.2a, 2026-10-19)
+
+The mechanism only. There is no production caller.
+
+* **`TableWalAppender::last_sequence`** and **`retained_from`**, implemented by the framed and
+  in-memory appenders.
+* **`FramedTableWalAppender::truncate_below(floor)`**, which deletes a contiguous oldest prefix of
+  sealed segments wholly below `floor` and never touches the active file.
+** It first writes `{wal}.floor` durably (temp file, sync, rename, then sync the directory).
+** Reopening removes segments left at or below the floor, and continues the sequence past it even
+   when no segment remains. That closes hazard 5.
+** A damaged marker fails the open.
+* **Readers survive truncation** (hazard 4).
+** The rotation generation goes odd while the segment list and the disk disagree.
+** `read_entries_since` retries a failure that overlapped a change in the segment set.
+** The path-level reader retries a segment that vanished, and drops entries below the floor.
+* **In-flight reservations** in `DirectWalTableRecordStore` cover `write_mutations`,
+  `commit_atomic` and `drop_table_records`.
+** Each reserves `last_sequence() + 1` before its append and releases it through a drop guard.
+** `inflight_floor()` exposes the lowest reservation.
+** An appender that cannot report its last sequence reserves `0`, which blocks truncation.
+* **The change feed fails loudly.** `read_changes_since{,_scoped}` return a typed
+  `WalHistoryTruncated` error when `since + 1 < retained_from`. Hazard 3's engine half is done;
+  the REST mapping to HTTP 410 is still open.
+* **Gate:** `tests/wal_truncation_test.rs`.
+
+Still open before any production truncation:
+
+* hazards 1 and 2: rank-profile and SQL-function snapshots, and the branch-merge base;
+* the REST 410 mapping;
+* the snapshot-LSN enumerator for the OLAP delta merge;
+* MATERIALIZE's LSN capture (`read_changes_since(table, 0)` should use the per-collection
+  high-water instead);
+* the truncator itself, which composes the floor and calls `truncate_below` on a schedule.
