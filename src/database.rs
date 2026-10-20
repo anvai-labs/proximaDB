@@ -1210,11 +1210,33 @@ impl ProximaDB {
         }
 
         // 3. Shutdown servers
+        // Held across `stop` so the relational record store can be flushed
+        // once no surface can write to it any more (TD-SEAM-3).
+        let record_store = self.canonical_record_store();
         if let Some(mut multi_server) = self.multi_server.take() {
             multi_server
                 .stop()
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to stop multi-server: {}", e))?;
+        }
+
+        // 3a. Make spill-backed relational partitions' resident rows durable.
+        // A no-op for memtable partitions (the default). Best-effort with a
+        // timeout: a failure loses nothing — the canonical WAL is never
+        // truncated past an unflushed row, so replay recovers it.
+        if let Some(record_store) = record_store {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                record_store.flush_partitions(),
+            )
+            .await
+            {
+                Ok(Ok(partitions)) => {
+                    tracing::debug!(partitions, "relational record partitions flushed")
+                }
+                Ok(Err(e)) => tracing::warn!("relational record partition flush failed: {e:#}"),
+                Err(_) => tracing::warn!("relational record partition flush timed out"),
+            }
         }
 
         // 4. Stop storage engine with timeout
@@ -1307,9 +1329,10 @@ impl ProximaDB {
             return Ok(());
         }
 
-        let policy_path = rl_config.log_path.clone().unwrap_or_else(|| {
-            format!("{}/rl_policy.json", self._config.server.data_dir.display())
-        });
+        // TD-RLNAN-1: the policy has its own file. `rl_config.log_path` is the
+        // execution logger's JSONL file; using it here wrote policy JSON into the
+        // log, so the policy never parsed back.
+        let policy_path = format!("{}/rl_policy.json", self._config.server.data_dir.display());
         self.rl_policy_path = Some(policy_path.clone());
 
         query::rl_planner::init_rl_planner(rl_config.clone());
@@ -1317,8 +1340,31 @@ impl ProximaDB {
 
         if let Some(planner) = query::rl_planner::get_rl_planner() {
             if std::path::Path::new(&policy_path).exists() {
-                planner.load_policy(&policy_path).await?;
-                tracing::info!("✅ RL policy loaded from {}", policy_path);
+                // A learned policy is a cache: an unreadable one never blocks startup.
+                match planner.load_policy(&policy_path).await {
+                    Ok(true) => tracing::info!("✅ RL policy loaded from {}", policy_path),
+                    // Already reported (and reset) by the loader.
+                    Ok(false) => {}
+                    // TD-RLNAN-1: on a hard read error, move the unreadable file
+                    // aside so a bad policy never lingers; still never block boot.
+                    Err(error) => {
+                        match query::rl_planner::set_aside_unreadable_policy(&policy_path).await {
+                            Ok(aside) => tracing::warn!(
+                                "RL policy at {} could not be loaded ({error}); moved to {} and \
+                                 starting with a fresh policy",
+                                policy_path,
+                                aside
+                            ),
+                            // Even moving it aside must not stop the server (read-only
+                            // data dir, cross-device path): learn afresh in memory.
+                            Err(rename_error) => tracing::warn!(
+                                "RL policy at {} could not be loaded ({error}) or moved aside \
+                                 ({rename_error}); starting with a fresh in-memory policy",
+                                policy_path
+                            ),
+                        }
+                    }
+                }
             }
 
             let checkpoint_path = policy_path.clone();

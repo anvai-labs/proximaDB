@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
-use super::types::{ExternalCollection, now_ms};
+use super::types::ExternalCollection;
+use proximadb_kernel::time::now_unix_ms;
 
 const REGISTRY_SCHEMA_VERSION: u32 = 1;
 
@@ -77,7 +78,7 @@ impl ExternalCollectionRegistry {
 
     /// Insert or replace a record, bumping its `updated_at_ms`.
     pub fn upsert(&self, mut ec: ExternalCollection) {
-        ec.updated_at_ms = now_ms();
+        ec.updated_at_ms = now_unix_ms();
         self.collections.insert(ec.id.clone(), ec);
         self.persist_if_configured();
     }

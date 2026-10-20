@@ -205,6 +205,10 @@ pub async fn hybrid_search(
             {
                 return Err(RestError::InvalidArgument(message));
             }
+            if let Some(missing) = proximadb_search_types::client_argument::collection_not_found(&e)
+            {
+                return Err(RestError::CollectionNotFound(missing.identifier.clone()));
+            }
             // Server fault: log the cause chain, return a stable message (the
             // response envelope carries the request id for correlation).
             error!("hybrid_search error: {:#}", e);
@@ -320,6 +324,7 @@ fn json_to_prost_value(value: serde_json::Value) -> prost_types::Value {
 /// returns 501 otherwise.
 pub async fn hybrid_index(
     State(state): State<HybridRestState>,
+    tenant: Option<Extension<TenantContext>>,
     Json(request): Json<HybridIndexRestRequest>,
 ) -> RestResult<Json<HybridIndexRestResponse>> {
     if request.collection.is_empty() {
@@ -346,7 +351,14 @@ pub async fn hybrid_index(
         })
         .collect();
 
-    match bm25.index_documents(request.collection, docs).await {
+    // Indexed within the request tenant (absent ⇒ the default tenant).
+    let request_tenant = tenant
+        .map(|Extension(t)| t.tenant_id)
+        .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
+    match bm25
+        .index_documents_for_tenant(request.collection, docs, &request_tenant)
+        .await
+    {
         Ok(result) => Ok(Json(HybridIndexRestResponse {
             success: true,
             collection: result.collection,
@@ -354,6 +366,10 @@ pub async fn hybrid_index(
             total_documents: result.total_documents,
         })),
         Err(e) => {
+            if let Some(missing) = proximadb_search_types::client_argument::collection_not_found(&e)
+            {
+                return Err(RestError::CollectionNotFound(missing.identifier.clone()));
+            }
             error!("hybrid_index error: {}", e);
             Err(RestError::Internal(e.to_string()))
         }

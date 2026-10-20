@@ -167,6 +167,7 @@ impl CatalogBulkWriteService {
     pub async fn prepare_bulk_write(
         &self,
         table_fqn: &str,
+        tenant: &str,
         batches: &[RecordBatch],
         _write_mode: BulkWriteMode,
     ) -> Result<(Vec<ProximaRecord>, CatalogBulkWriteResult)> {
@@ -186,8 +187,11 @@ impl CatalogBulkWriteService {
             return Ok((Vec::new(), result));
         }
 
-        // Parse table identifier
-        let (catalog, table_id) = self.catalog_manager.resolve_table(table_fqn).await?;
+        // Parse table identifier, within the writing tenant's namespace.
+        let (catalog, table_id) = self
+            .catalog_manager
+            .resolve_table_scoped(table_fqn, Some(tenant))
+            .await?;
         let catalog_start = std::time::Instant::now();
 
         // Get or create table schema
@@ -204,6 +208,15 @@ impl CatalogBulkWriteService {
                     "Auto-creating table from Arrow schema"
                 );
 
+                if !catalog.namespace_exists(&table_id.namespace).await? {
+                    catalog
+                        .create_namespace_for_tenant(
+                            &table_id.namespace,
+                            HashMap::new(),
+                            Some(tenant),
+                        )
+                        .await?;
+                }
                 let created = catalog.create_table(&table_id, inferred).await?;
                 result.table_created = true;
                 created
@@ -314,10 +327,14 @@ impl CatalogBulkWriteService {
     pub async fn begin_transaction(
         &self,
         table_fqn: &str,
+        tenant: &str,
         write_mode: BulkWriteMode,
     ) -> Result<String> {
         let txn_id = uuid::Uuid::new_v4().to_string();
-        let (_, table_id) = self.catalog_manager.resolve_table(table_fqn).await?;
+        let (_, table_id) = self
+            .catalog_manager
+            .resolve_table_scoped(table_fqn, Some(tenant))
+            .await?;
 
         let txn = BulkWriteTransaction {
             txn_id: txn_id.clone(),

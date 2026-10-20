@@ -128,7 +128,14 @@ def main() -> int:
     t0 = time.monotonic()
     print(f"ProximaDB agent-memory demo → {BASE}")
 
-    api("POST", "/api/v2/collections", {"name": COLL, "dimension": EMBED_DIM, "distance_metric": "cosine"})
+    # Idempotent: a persisted collection (./data volume) returns
+    # 500 COLLECTION_EXISTS on re-create — that is the re-run path working.
+    try:
+        api("POST", "/api/v2/collections", {"name": COLL, "dimension": EMBED_DIM, "distance_metric": "cosine"})
+    except urllib.error.HTTPError as exc:
+        if exc.code != 500:
+            raise
+        print(f"collection '{COLL}' already exists (persisted) — re-seeding into it")
     r = ingest([to_record(i) for i in INCIDENTS])
     n = len((r.get("embedded") or {}).get("records", [])) or len(INCIDENTS)
     print(f"seeded {n} incidents (server-side BGE embeddings, dim {EMBED_DIM}) into '{COLL}'")
@@ -144,7 +151,10 @@ def main() -> int:
         top = hits[0]["id"] if hits else None
         checks.append((f"search '{q[:30]}' → {expect}", top == expect))
 
-    mem_id = f"MEM-{int(time.time())}"
+    # Deterministic id: re-runs UPSERT the same memory (both in the document
+    # store and the id-idempotent BM25 feed) instead of accumulating
+    # timestamped duplicates that make the read-back race its predecessors.
+    mem_id = "MEM-DEMO-DELTA-VACUUM"
     memory = dict(
         id=mem_id,
         title="Delta writes stalled by concurrent vacuum + auto-compact",

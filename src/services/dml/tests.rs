@@ -132,11 +132,21 @@ fn publish_ndv_statistics_feeds_distinct_count_overlay() {
         records.push(r);
     }
 
-    publish_ndv_statistics(table, &schema, &records);
+    publish_ndv_statistics(table, Some("acme"), &schema, &records);
+    let key = crate::core::statistics::table_statistics_key(Some("acme"), table);
+    // Another tenant's same-named table has no statistics from this one.
+    assert!(
+        statistics_registry()
+            .envelope(&crate::core::statistics::table_statistics_key(
+                Some("globex"),
+                table
+            ))
+            .is_none()
+    );
 
     // Write side: the registry envelope carries per-column distinct_estimate.
     let env = statistics_registry()
-        .envelope(table)
+        .envelope(&key)
         .expect("summary published by materialize");
     assert_eq!(env.record_count, 100);
     let ndv = |name: &str| {
@@ -161,7 +171,7 @@ fn publish_ndv_statistics_feeds_distinct_count_overlay() {
     let stats = statistics_from_splits(
         &[],
         arrow.as_ref(),
-        Some(table),
+        Some(&key),
         false,
         proximadb_data_model::StatsTrust::Trusted,
     );
@@ -177,7 +187,7 @@ fn publish_ndv_statistics_feeds_distinct_count_overlay() {
     assert!((col_ndv("created") as i64 - 10).abs() <= 2);
 
     // Cleanup the process-global registry so this test is order-independent.
-    statistics_registry().remove(table);
+    statistics_registry().remove(&key);
 }
 
 #[test]
@@ -1309,11 +1319,23 @@ async fn cdc_change_feed_reports_ops_since_lsn() {
     .expect("create namespace");
 
     let parser = crate::query::sql_frontend::SqlFrontendParser::new();
-    let ddl_stmt = parser
-        .parse_ddl("CREATE TABLE acct (id TEXT NOT NULL, bal INT, PRIMARY KEY (id));")
-        .expect("parse create")
-        .expect("ddl");
-    ddl.execute(ddl_stmt).await.expect("create table");
+    // The default tenant and acme each own a table named `acct`; only globex
+    // owns `gxonly`.
+    for (tenant, table) in [
+        (proximadb_tenant::DEFAULT_TENANT, "acct"),
+        ("acme", "acct"),
+        ("globex", "gxonly"),
+    ] {
+        let ddl_stmt = parser
+            .parse_ddl(&format!(
+                "CREATE TABLE {table} (id TEXT NOT NULL, bal INT, PRIMARY KEY (id));"
+            ))
+            .expect("parse create")
+            .expect("ddl");
+        ddl.execute_scoped(ddl_stmt, Some(tenant))
+            .await
+            .expect("create table");
+    }
 
     let wal_appender = Arc::new(
         FramedTableWalAppender::open(&wal_path)
@@ -1330,21 +1352,30 @@ async fn cdc_change_feed_reports_ops_since_lsn() {
         Arc::new(PlannedOnlyTableWriteExecutor::new()),
     );
 
-    let run = |sql: &str| {
+    let run = |sql: &str, tenant: &str| {
         let parser = &parser;
         let dml = &dml;
         let sql = sql.to_string();
+        let ctx = TenantContext::for_tenant_id(tenant);
         async move {
             let stmt = parser.parse_dml(&sql).expect("parse dml").expect("dml");
-            dml.execute(stmt).await.expect("execute dml")
+            dml.execute_scoped(stmt, Some(&ctx))
+                .await
+                .expect("execute dml")
         }
     };
-    run("INSERT INTO acct (id, bal) VALUES ('a', 100);").await;
-    run("UPDATE acct SET bal = 150 WHERE id = 'a';").await;
-    run("DELETE FROM acct WHERE id = 'a';").await;
+    let default = proximadb_tenant::DEFAULT_TENANT;
+    run("INSERT INTO acct (id, bal) VALUES ('a', 100);", default).await;
+    run("INSERT INTO acct (id, bal) VALUES ('z', 1);", "acme").await;
+    run("UPDATE acct SET bal = 150 WHERE id = 'a';", default).await;
+    run("DELETE FROM acct WHERE id = 'a';", default).await;
 
     // Full feed from the beginning: upsert, upsert (update), delete — lsn-ordered.
-    let changes = dml.changes_since("acct", 0).await.expect("changes");
+    let changes = dml
+        .changes_since_for_tenant("acct", proximadb_tenant::DEFAULT_TENANT, 0)
+        .await
+        .expect("changes")
+        .expect("table visible to the default tenant");
     assert_eq!(changes.len(), 3, "three changes: insert, update, delete");
     assert_eq!(changes[0].op, "upsert");
     assert_eq!(changes[1].op, "upsert");
@@ -1357,17 +1388,52 @@ async fn cdc_change_feed_reports_ops_since_lsn() {
 
     // Incremental: only changes after the first lsn (the two later ops).
     let tail = dml
-        .changes_since("acct", changes[0].lsn)
+        .changes_since_for_tenant("acct", proximadb_tenant::DEFAULT_TENANT, changes[0].lsn)
         .await
-        .expect("tail");
+        .expect("tail")
+        .expect("visible");
     assert_eq!(tail.len(), 2, "since first lsn → update + delete only");
 
-    // A different table sees nothing.
+    // A table that does not exist is not visible.
     assert!(
-        dml.changes_since("other", 0)
+        dml.changes_since_for_tenant("other", proximadb_tenant::DEFAULT_TENANT, 0)
             .await
             .expect("other")
-            .is_empty()
+            .is_none()
+    );
+
+    // Each tenant's feed of its own `acct` carries only its own writes, and a
+    // tenant with no such table sees it as missing.
+    let acme = dml
+        .changes_since_for_tenant("acct", "acme", 0)
+        .await
+        .expect("acme")
+        .expect("acme's own table");
+    assert_eq!(
+        acme.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(),
+        vec!["z"]
+    );
+    assert!(changes.iter().all(|c| c.key == "a"), "{changes:?}");
+    assert!(
+        dml.changes_since_for_tenant("acct", "globex", 0)
+            .await
+            .expect("globex")
+            .is_none()
+    );
+    for tenant in [proximadb_tenant::DEFAULT_TENANT, "acme"] {
+        assert!(
+            dml.changes_since_for_tenant("gxonly", tenant, 0)
+                .await
+                .expect("gxonly")
+                .is_none(),
+            "{tenant} must not resolve globex's table"
+        );
+    }
+    assert!(
+        dml.changes_since_for_tenant("acct", "", 0)
+            .await
+            .expect("empty tenant")
+            .is_none()
     );
 }
 
@@ -5386,7 +5452,7 @@ async fn fast_lane_schema_validation_rejects_null_for_not_null_column() {
         ]),
         ..Default::default()
     };
-    dml.validate_record_batch_against_schema("fast_lane_tbl", &[ok_record])
+    dml.validate_record_batch_against_schema("fast_lane_tbl", None, &[ok_record])
         .await
         .expect("conforming record must pass schema validation");
 
@@ -5406,7 +5472,7 @@ async fn fast_lane_schema_validation_rejects_null_for_not_null_column() {
         ..Default::default()
     };
     let err = dml
-        .validate_record_batch_against_schema("fast_lane_tbl", &[bad_record])
+        .validate_record_batch_against_schema("fast_lane_tbl", None, &[bad_record])
         .await;
     assert!(
         err.is_err(),
@@ -5462,7 +5528,7 @@ async fn fast_lane_schema_validation_skips_non_relational_collections() {
         )]),
         ..Default::default()
     };
-    dml.validate_record_batch_against_schema("unknown_collection", &[any_record])
+    dml.validate_record_batch_against_schema("unknown_collection", None, &[any_record])
         .await
         .expect("non-relational collection must skip schema validation");
 }
@@ -5795,7 +5861,7 @@ async fn dml_and_fast_lane_agree_on_not_null_constraint() {
         props: ok_props,
         ..Default::default()
     };
-    dml.validate_record_batch_against_schema("conf_tbl", &[ok_record])
+    dml.validate_record_batch_against_schema("conf_tbl", None, &[ok_record])
         .await
         .expect("fast-lane must accept conforming row");
 
@@ -5824,7 +5890,7 @@ async fn dml_and_fast_lane_agree_on_not_null_constraint() {
         ..Default::default()
     };
     let fast_lane_err = dml
-        .validate_record_batch_against_schema("conf_tbl", &[bad_record])
+        .validate_record_batch_against_schema("conf_tbl", None, &[bad_record])
         .await
         .expect_err("fast-lane must reject NULL for NOT NULL column");
 
@@ -5927,7 +5993,7 @@ async fn dml_and_fast_lane_agree_on_type_mismatch() {
         ..Default::default()
     };
     let fast_lane_err = dml
-        .validate_record_batch_against_schema("type_tbl", &[bad_record])
+        .validate_record_batch_against_schema("type_tbl", None, &[bad_record])
         .await
         .expect_err("fast-lane must reject ProximaValue::String for INTEGER column");
 

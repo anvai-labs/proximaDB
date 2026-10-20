@@ -20,6 +20,9 @@ On create, unknown fields are ignored (`"hnsw"` instead of `"hnsw_config"` creat
 no parameters) and an invalid quantization `strategy` (for example `"scalar"`) is silently
 replaced by `smart_defaults`. Both reproduced against the 0.4.1 image.
 
+A schema update the server rejects for a client reason (a column conflicting with the collection,
+for example an `embedding` of the wrong dimension) is reported as `500 internal_error`, not 400.
+
 == Fix
 
 Return 404 with a specific error code; reject unknown fields and invalid enum values with 400;

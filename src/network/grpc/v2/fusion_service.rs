@@ -166,6 +166,9 @@ impl ProximaFusionService for ProximaFusionServiceImpl {
 
         let (items, stats) = self.fusion.graph_fusion_search(params).await.map_err(|e| {
             // Same mapping as the REST fusion-search handler (TD-SECSCAN-1 §5).
+            if let Some(missing) = crate::services::operations::vectors::collection_not_found(&e) {
+                return Status::not_found(format!("Collection not found: {}", missing.identifier));
+            }
             match crate::services::operations::vectors::client_argument_message(&e) {
                 Some(message) => Status::invalid_argument(format!("fusion search: {message}")),
                 // Server fault: log the cause chain, return a stable message.

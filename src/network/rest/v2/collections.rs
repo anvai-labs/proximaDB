@@ -1024,8 +1024,11 @@ pub async fn get_collection_v2(
         .await
     {
         Ok(resp) => {
-            // Extract collection info from response
-            let collection = resp.collection.unwrap_or_default();
+            // A collection that does not resolve for this request (missing, or
+            // not resolvable by its tenant) is 404, never a defaulted body.
+            let Some(collection) = resp.collection else {
+                return Err(ApiError::CollectionNotFound(collection_id));
+            };
             let config = collection.config.unwrap_or_default();
             // Read the count off the Option *before* unwrapping: an absent stats
             // block means "unknown", and `unwrap_or_default()` below would turn
@@ -1393,7 +1396,7 @@ pub async fn delete_collection_v2(
         migration_config: Default::default(),
     };
 
-    state
+    let response = state
         .api_handlers
         .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
         .await
@@ -1404,6 +1407,11 @@ pub async fn delete_collection_v2(
                 ApiError::Internal(format!("Failed to delete collection: {}", e))
             }
         })?;
+    // Nothing deleted: the collection is not one this tenant can resolve
+    // (missing, or another tenant's) — answered identically.
+    if !response.success {
+        return Err(ApiError::CollectionNotFound(collection_id));
+    }
 
     Ok(Json(DeleteCollectionV2Response {
         success: true,
@@ -2312,14 +2320,15 @@ pub async fn get_collection_statistics_v2(
             }
         })?;
 
-    let collection = resp.collection.unwrap_or_default();
+    // A collection this tenant cannot resolve reads exactly as a missing one;
+    // statistics are only ever read or written under its canonical id.
+    let collection = resp
+        .collection
+        .filter(|collection| !collection.id.is_empty())
+        .ok_or_else(|| ApiError::CollectionNotFound(collection_id.clone()))?;
     let config = collection.config.unwrap_or_default();
     let stats = collection.stats.unwrap_or_default();
-    let canonical_id = if collection.id.is_empty() {
-        collection_id.clone()
-    } else {
-        collection.id.clone()
-    };
+    let canonical_id = collection.id.clone();
 
     // TD-175: best-effort graph modality block from the engine's maintained
     // graph counters (the `get_stats` accessor); skipped when the collection has
@@ -2419,7 +2428,10 @@ pub async fn get_collection_route_health_v2(
             }
         })?;
 
-    let collection = resp.collection.unwrap_or_default();
+    let collection = resp
+        .collection
+        .filter(|collection| !collection.id.is_empty())
+        .ok_or_else(|| ApiError::CollectionNotFound(collection_id.clone()))?;
     let config = collection.config.unwrap_or_default();
     let stats = collection.stats.unwrap_or_default();
 
@@ -2784,7 +2796,10 @@ pub async fn post_collection_recall_tune_v2(
             }
         })?;
 
-    let collection = resp.collection.unwrap_or_default();
+    let collection = resp
+        .collection
+        .filter(|collection| !collection.id.is_empty())
+        .ok_or_else(|| ApiError::CollectionNotFound(collection_id.clone()))?;
     let config = collection.config.unwrap_or_default();
     let stats = collection.stats.unwrap_or_default();
 
@@ -3265,7 +3280,10 @@ pub async fn post_collection_recluster_v2(
                 }
             })?;
 
-        let collection = resp.collection.unwrap_or_default();
+        let collection = resp
+            .collection
+            .filter(|collection| !collection.id.is_empty())
+            .ok_or_else(|| ApiError::CollectionNotFound(collection_id.clone()))?;
         let config = collection.config.unwrap_or_default();
 
         let Some(recall_target) =

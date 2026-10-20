@@ -133,8 +133,8 @@ pub(crate) fn validate_records_for_insert(
 // so the API crate's handlers (which cannot see this crate) classify them the
 // same way (TD-SECSCAN-1 §5).
 pub use proximadb_search_types::client_argument::{
-    InvalidQueryVector, QueryVectorProblem, client_argument_message, is_client_argument_error,
-    label_client_collection,
+    CollectionNotFound, InvalidQueryVector, QueryVectorProblem, client_argument_message,
+    collection_not_found, is_client_argument_error, label_client_collection,
 };
 
 /// The collection label a client-facing message may carry: ONLY the

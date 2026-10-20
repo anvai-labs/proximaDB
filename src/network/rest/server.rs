@@ -721,6 +721,10 @@ impl RestServer {
             }
         };
 
+        // Query request scope from the resolved tenant (inside the tenant layer).
+        router = router.layer(middleware::from_fn(
+            crate::network::middleware::request_scope::rest_request_scope,
+        ));
         // Apply tenant layer (runs after auth to access JWT claims)
         router = router.layer(tenant_layer);
         tracing::info!(
@@ -1050,7 +1054,11 @@ impl RestServer {
         // Axum applies layers in reverse order, so auth runs first on
         // the request path, then tenant, then handler.
         use tower_http::trace::TraceLayer;
-        let mut router = base_router.layer(tenant_layer);
+        let mut router = base_router
+            .layer(middleware::from_fn(
+                crate::network::middleware::request_scope::rest_request_scope,
+            ))
+            .layer(tenant_layer);
         if let Some(auth) = auth_layer {
             router = router.layer(auth);
             tracing::info!("🔒 Unified-port REST auth: ENABLED (auth_middleware_unified attached)");

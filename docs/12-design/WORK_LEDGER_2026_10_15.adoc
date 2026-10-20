@@ -66,6 +66,9 @@ so it no longer duplicates the roadmap (ADR-096 D5).
 | God-crate decomposition program | P2_GOD_CRATE_TEST_DECOMPOSITION (rationale + lessons) | TD-DECOMP-*, ROOT_CRATE_* plans
 | MLflow / model registry | XCATALOG_MLOPS_MODEL_REGISTRY | TD-MLOPS-*, MODEL_INPUT_CONTRACT
 | Product direction | ADR-096, stated in 00-product/VISION | PRD (requirements only), course correction (history plus engineering mandates)
+| Logical IR and multimodal operators | ADR-097 D1 (DataFusion `LogicalPlan`; native operators as `ExecutionPlan` adapters) | ADR-054 §6 logical scope, TD-OLAP-13 premise, `LogicalNode` / `MultiModelPlan` / UQL
+| Vector tier authority | ADR-097 D2 (PAX-first; HNSW hot projection) + ADR-026 | AXIS IVF disk tier (retired), TD-112, TD-087
+| Iceberg publication | ADR-097 D3 (one writer, `proximadb-iceberg-engine`) + ADR-007 | REST `_manifests` tree, TD-119, TD-USUB-10, TD-OLAPFMT-3
 | Roadmap (release-based) | STRATEGIC_ROADMAP | VISION horizon, PRD release table and numbered phases (all removed 2026-10-17)
 |===
 
@@ -97,3 +100,33 @@ drift items.
 ** `sst/flush/mod.rs` documents two defaults as "off" that are now on (PAX row-group layout, compaction arming).
 ** `Cargo.toml` calls `otlp-metering` default-OFF, yet it is a default feature.
 ** `BENCHMARK_EVIDENCE.toml`'s rdstrat12 ladder claim is stale.
+
+== 6. Lakehouse seams programme (ADR-097, filed 2026-10-18)
+
+Owner decision 2026-10-18: link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097] and
+link:LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10]. Rows live in
+link:../10-quality/TECHNICAL_DEBT.adoc[TECHNICAL_DEBT.adoc] §C2; the design doc holds the gates.
+P1 and P5a can start now; P2 → P3 → P4; P6 (benchmarks) runs throughout.
+
+[cols="1,1,4,1", options="header"]
+|===
+| TD | Phase | Scope | Status
+| TD-SEAM-1 | P1 | Iceberg single writer (`proximadb-iceberg-engine`) + external read-back CI gate | In Progress
+| TD-SEAM-2 | P2 | Segmented canonical WAL, per-collection index, truncation at `min_unflushed_lsn` | In Progress (P2.1 rotation + range reads landed; P2.2 truncation open)
+| TD-SEAM-3 | P2 | Layer A production wiring with `ParquetWritePolicy` + `__proxima_*` system columns | Open
+| TD-SEAM-4 | P2 | Streaming MATERIALIZE / incremental publisher (TD-OLAPFMT-3, TD-USUB-10) | Open
+| TD-SEAM-5 | P3 | Streaming `LayerATableProvider` + `PaxTableProvider` wiring | Open
+| TD-SEAM-6 | P3 | `FilteredAnnExec` with filter/limit/dynamic-filter pushdown, returns `oid` | Open
+| TD-SEAM-7 | P4 | Observability onto the canonical WAL + time-partitioned Layer A | Open
+| TD-SEAM-8 | P4 | Graph `RecordUpsert` emission + edges table; ORION as a projection | Open
+| TD-SEAM-9 | P4 | Cross-modal subject delete | Open
+| TD-SEAM-10 | P5b | PAX collection-global centroid directory + cluster-contiguous compaction | Open
+| TD-SEAM-11 | P5a | TD-ENGSEL-1 default, `.pax` `segment_vector_count`, L2 cache default | In Progress (default + `.pax` facts landed #2078; L2 cache default open)
+| TD-SEAM-12 | P2.2 gate | Canonical-WAL truncation floor across all twelve consumers (four have no low-water mark) | Open
+| TD-SEAM-13 | P5c | HNSW on AXIS as a persisted, stamped projection of PAX; ground-up rebuild = repair; needs TD-PAXPREC-1 | Open (design decided 2026-10-19)
+|===
+
+Corrections made with this filing (premise verification): TD-OLAPFMT-2's "row-identical across
+63 × 3 engines" (row counts only; native 40/63) and its reuse of the 13.7 GB MATERIALIZE OOM figure
+for a rustc OOM; TD-OLAPFMT-3's "WAL is truncated behind manifest durability" (it is not); and the
+stale default-OFF comment for `PROXIMADB_PAX_FILTERED_CASCADE` in `sst/search/mod.rs`.

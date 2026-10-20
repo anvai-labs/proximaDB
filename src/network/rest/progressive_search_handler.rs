@@ -55,6 +55,9 @@ pub async fn progressive_search_handler(
             {
                 return ApiError::InvalidArgument(message);
             }
+            if crate::services::operations::vectors::collection_not_found(&e).is_some() {
+                return ApiError::CollectionNotFound(collection_id.clone());
+            }
             error!(
                 "Progressive search failed for collection {}: {}",
                 collection_id, e

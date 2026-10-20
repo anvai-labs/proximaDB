@@ -7312,7 +7312,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -7593,7 +7593,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-abac"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-catalog",
  "proximadb-filter-expression",
@@ -7605,14 +7605,14 @@ dependencies = [
 
 [[package]]
 name = "proximadb-admin-ui"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "axum",
 ]
 
 [[package]]
 name = "proximadb-ann-bench"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "proximadb",
@@ -7620,7 +7620,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-api"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "arrow-flight",
@@ -7654,7 +7654,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-arrow-block-index"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bincode",
  "bytes",
@@ -7663,7 +7663,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-audit"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7677,7 +7677,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-automl"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7690,18 +7690,18 @@ dependencies = [
 
 [[package]]
 name = "proximadb-axis-tunnel"
-version = "0.4.1"
+version = "0.4.2"
 
 [[package]]
 name = "proximadb-batch-group-cache"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "proximadb-bench"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -7716,7 +7716,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-block-format"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -7734,7 +7734,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-bloom"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "bincode",
@@ -7747,7 +7747,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-cache"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "crc32fast",
@@ -7762,7 +7762,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-catalog"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "arrow-array 59.3.0",
@@ -7807,12 +7807,13 @@ dependencies = [
 
 [[package]]
 name = "proximadb-catalog-introspection"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "proximadb",
  "proximadb-catalog",
  "proximadb-data-model",
+ "proximadb-tenant",
  "serde",
  "sqlparser",
  "tempfile",
@@ -7821,7 +7822,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-catalog-schema"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "arrow-array 59.3.0",
@@ -7844,14 +7845,14 @@ dependencies = [
 
 [[package]]
 name = "proximadb-catapult"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "proximadb-cdc"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7872,7 +7873,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-cks-local"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7882,7 +7883,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-cks-objectstore"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7898,7 +7899,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-clustering-kernel"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "rand 0.8.6",
@@ -7906,7 +7907,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-codec"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "metal",
@@ -7922,7 +7923,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-compression"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "brotli 6.0.0",
@@ -7938,7 +7939,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-compression-types"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -7947,7 +7948,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-concurrent"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "bincode",
@@ -7957,7 +7958,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-config"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7970,7 +7971,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-connectors-types"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow 59.3.0",
  "serde",
@@ -7978,11 +7979,11 @@ dependencies = [
 
 [[package]]
 name = "proximadb-cross-modal-fusion"
-version = "0.4.1"
+version = "0.4.2"
 
 [[package]]
 name = "proximadb-data-model"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "arrow-schema 59.3.0",
@@ -7996,7 +7997,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-distance-kernel"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8012,7 +8013,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-distance-types"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -8021,7 +8022,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-document"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "arrow 59.3.0",
@@ -8040,7 +8041,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-document-compression"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "lz4_flex 0.11.6",
@@ -8048,14 +8049,14 @@ dependencies = [
 
 [[package]]
 name = "proximadb-document-geo-index"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "proximadb-document-query"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "proximadb-kernel",
@@ -8065,7 +8066,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-embedded"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "arrow 59.3.0",
@@ -8105,7 +8106,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-embedded-common"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-data-model",
  "proximadb-records",
@@ -8114,7 +8115,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-embedding"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8139,7 +8140,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-encoding-types"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -8148,7 +8149,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-engine-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "arrow 59.3.0",
@@ -8201,7 +8202,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-execution-contracts"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow 59.3.0",
  "arrow-array 59.3.0",
@@ -8213,7 +8214,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-filter-expression"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "regex",
@@ -8223,7 +8224,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-filterable-metadata"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "dashmap",
@@ -8235,7 +8236,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-functions"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "dashmap",
  "proximadb-data-model",
@@ -8245,7 +8246,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-geo-queries"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-geo-types",
  "serde",
@@ -8253,7 +8254,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-geo-spatial-index"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-geo-queries",
  "proximadb-geo-types",
@@ -8262,21 +8263,21 @@ dependencies = [
 
 [[package]]
 name = "proximadb-geo-types"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "proximadb-geohash"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-geo-types",
 ]
 
 [[package]]
 name = "proximadb-graph"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -8299,7 +8300,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-graph-arrow"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow 59.3.0",
  "async-trait",
@@ -8311,7 +8312,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-graph-engine-traits"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "proximadb-compression-types",
@@ -8321,7 +8322,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-graph-model"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-proto",
  "serde",
@@ -8329,7 +8330,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-graph-query"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "nom 7.1.3",
@@ -8342,7 +8343,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-graph-subset"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-query",
  "tokio",
@@ -8350,7 +8351,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-hardware"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "num_cpus",
  "sysinfo",
@@ -8358,7 +8359,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-hardware-caps"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "num_cpus",
@@ -8371,7 +8372,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-iceberg-engine"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "apache-avro",
  "arrow-array 59.3.0",
@@ -8399,14 +8400,14 @@ dependencies = [
 
 [[package]]
 name = "proximadb-implicit-id-generator"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "proximadb-index-storage"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -8415,7 +8416,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-index-traits"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8428,7 +8429,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-index-types"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -8436,7 +8437,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-interner"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "dashmap",
  "proximadb-kernel",
@@ -8444,7 +8445,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-kafka-config"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -8452,7 +8453,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-kafka-deserializer"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-kafka-config",
  "serde",
@@ -8461,7 +8462,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-kernel"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8475,7 +8476,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-ledger"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bincode",
  "serde",
@@ -8484,14 +8485,14 @@ dependencies = [
 
 [[package]]
 name = "proximadb-llm-config"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-config",
 ]
 
 [[package]]
 name = "proximadb-mcp"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "serde",
@@ -8501,7 +8502,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-memory-pool"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "parking_lot",
  "tracing",
@@ -8509,7 +8510,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-metrics"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8533,7 +8534,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-migrate"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -8545,7 +8546,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-mongodb-parser"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "nom 7.1.3",
@@ -8555,7 +8556,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-montecarlo"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "rand 0.8.6",
  "rayon",
@@ -8563,7 +8564,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-multimodel-codec"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow-schema 59.3.0",
  "proximadb-catalog-schema",
@@ -8572,7 +8573,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-multimodel-plan"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8587,7 +8588,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-multimodel-query"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-data-model",
  "proximadb-document-query",
@@ -8601,7 +8602,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-mvcc-resolution"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-records",
  "tracing",
@@ -8609,7 +8610,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-network-middleware"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "axum",
  "ipnet",
@@ -8626,7 +8627,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-object-store"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -8641,7 +8642,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-observability"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "arrow 59.3.0",
@@ -8660,7 +8661,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-observability-engine"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8699,7 +8700,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-observability-query"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "proximadb-kernel",
@@ -8707,7 +8708,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-orion-engine"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8740,7 +8741,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-pgwire-translator"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "hex",
@@ -8751,7 +8752,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-pipeline-operator"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-filter-expression",
  "serde_json",
@@ -8759,7 +8760,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-proto"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "prost",
  "prost-types",
@@ -8774,7 +8775,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-pushdown"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "hex",
  "serde",
@@ -8782,7 +8783,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-quantization-contracts"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8792,7 +8793,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-quantization-kernel"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8814,7 +8815,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-quantization-model"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-distance-kernel",
  "proximadb-quantization-types",
@@ -8823,7 +8824,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-quantization-types"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -8832,7 +8833,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-query"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8865,7 +8866,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-query-cache"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arrow 59.3.0",
  "dashmap",
@@ -8878,25 +8879,25 @@ dependencies = [
 
 [[package]]
 name = "proximadb-query-capability"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "proximadb-query-clauses"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-query-filter",
 ]
 
 [[package]]
 name = "proximadb-query-filter"
-version = "0.4.1"
+version = "0.4.2"
 
 [[package]]
 name = "proximadb-query-fusion"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "arrow 59.3.0",
@@ -8907,7 +8908,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-queue"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8930,7 +8931,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-rank-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8948,7 +8949,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-rank-expr"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-kernel",
  "proximadb-rank-core",
@@ -8958,7 +8959,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-rank-features"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-kernel",
  "proximadb-rank-core",
@@ -8968,7 +8969,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-rank-onnx"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -8986,11 +8987,12 @@ dependencies = [
 
 [[package]]
 name = "proximadb-rank-profile"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arc-swap",
  "async-trait",
  "dashmap",
+ "proximadb-kernel",
  "proximadb-rank-core",
  "proximadb-rank-expr",
  "proximadb-rank-features",
@@ -9004,7 +9006,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-raptor-common"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "proximadb-bloom",
@@ -9019,7 +9021,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-raptor-engine"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "arrow-array 59.3.0",
@@ -9051,7 +9053,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-recall-bench"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "half",
  "proximadb-catalog",
@@ -9063,14 +9065,14 @@ dependencies = [
 
 [[package]]
 name = "proximadb-record-buffer-pool"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "proximadb-records"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9087,7 +9089,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-relational-algebra"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-data-model",
  "proximadb-relational-types",
@@ -9097,7 +9099,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-relational-engine"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -9115,7 +9117,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-relational-executor"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "proximadb-data-model",
@@ -9132,7 +9134,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-relational-frontend"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-data-model",
  "proximadb-functions",
@@ -9145,7 +9147,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-relational-planner"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-data-model",
  "proximadb-relational-algebra",
@@ -9158,7 +9160,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-relational-reader"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -9171,7 +9173,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-relational-types"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "proximadb-data-model",
@@ -9182,7 +9184,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-resilience"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "parking_lot",
@@ -9195,7 +9197,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-rl-reward"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "tracing",
@@ -9203,7 +9205,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-runtime"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9235,7 +9237,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-runtime-common"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "bincode",
@@ -9253,7 +9255,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-scan-cursor"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "base64 0.22.1",
  "proximadb-records",
@@ -9264,7 +9266,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-sdk"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "httpmock",
@@ -9280,7 +9282,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-search-types"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "proximadb-data-model",
@@ -9296,7 +9298,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-security"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9311,7 +9313,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-serialization"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "bincode",
@@ -9335,7 +9337,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-server"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -9344,6 +9346,7 @@ dependencies = [
  "openssl",
  "proximadb",
  "proximadb-embedding",
+ "proximadb-kernel",
  "proximadb-queue",
  "proximadb-runtime-common",
  "reqwest 0.11.27",
@@ -9362,7 +9365,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-spark-jni"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "jni 0.21.1",
  "proximadb",
@@ -9372,7 +9375,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-sst-engine"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9402,7 +9405,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-common"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "arrow 59.3.0",
@@ -9450,7 +9453,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-encryption"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -9469,7 +9472,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-filesystem-types"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -9484,7 +9487,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-kv"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9494,7 +9497,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-operations"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9511,7 +9514,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-optimization"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "proximadb-data-model",
@@ -9522,7 +9525,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-ports"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9541,7 +9544,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-strategy"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-proto",
  "serde_json",
@@ -9549,7 +9552,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-tenant"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -9565,7 +9568,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-traits"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9588,7 +9591,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-storage-transaction"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "parking_lot",
  "proximadb-kernel",
@@ -9601,7 +9604,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-subscription"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "tokio",
@@ -9609,7 +9612,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-tcp-multiplexer"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "tokio",
  "tracing",
@@ -9617,7 +9620,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-telemetry"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "proximadb-kernel",
  "tracing",
@@ -9625,7 +9628,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-tenant"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9641,7 +9644,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-tls"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -9662,7 +9665,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-type-validators"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "regex",
@@ -9672,7 +9675,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-uql"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "proximadb-document-query",
@@ -9689,7 +9692,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-usage-event"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "sandhi-core",
@@ -9700,11 +9703,11 @@ dependencies = [
 
 [[package]]
 name = "proximadb-utility-scorer"
-version = "0.4.1"
+version = "0.4.2"
 
 [[package]]
 name = "proximadb-vector"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "arrow 59.3.0",
@@ -9734,7 +9737,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-vector-query"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "proximadb-distance-types",
@@ -9746,7 +9749,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-wal-segment-header"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "proximadb-records",
@@ -9755,7 +9758,7 @@ dependencies = [
 
 [[package]]
 name = "proximadb-write-intent"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "serde",

@@ -542,6 +542,14 @@ impl ProximaEntityService for ProximaEntityServiceImpl {
                 .await
                 .map_err(|e| {
                     // The fusion seed leg's client-argument error (TD-SECSCAN-1 §5).
+                    if let Some(missing) =
+                        crate::services::operations::vectors::collection_not_found(&e)
+                    {
+                        return Status::not_found(format!(
+                            "Collection not found: {}",
+                            missing.identifier
+                        ));
+                    }
                     match crate::services::operations::vectors::client_argument_message(&e) {
                         Some(message) => Status::invalid_argument(message),
                         None => entity_status("search entities (fusion)", e),

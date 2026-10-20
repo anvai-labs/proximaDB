@@ -398,6 +398,41 @@ fn dml_error_sqlstate(err: &anyhow::Error, fallback: &'static str) -> &'static s
         .unwrap_or(fallback)
 }
 
+/// Table names of a `TRUNCATE [TABLE] [ONLY] t[, ...] [RESTART IDENTITY |
+/// CONTINUE IDENTITY] [CASCADE | RESTRICT]` statement, or `None` when `query`
+/// is not a TRUNCATE.
+fn parse_truncate_tables(query: &str) -> Option<Vec<String>> {
+    let trimmed = query.trim().trim_end_matches(';').trim();
+    let mut words = trimmed.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("TRUNCATE") {
+        return None;
+    }
+    let rest: Vec<&str> = words.collect();
+    let mut joined = rest.join(" ");
+    for prefix in ["TABLE ", "ONLY "] {
+        if joined.len() >= prefix.len() && joined[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            joined = joined[prefix.len()..].to_string();
+        }
+    }
+    let upper = joined.to_ascii_uppercase();
+    let cut = [
+        " RESTART IDENTITY",
+        " CONTINUE IDENTITY",
+        " CASCADE",
+        " RESTRICT",
+    ]
+    .iter()
+    .filter_map(|option| upper.find(option))
+    .min()
+    .unwrap_or(joined.len());
+    let tables: Vec<String> = joined[..cut]
+        .split(',')
+        .map(|table| table.trim().trim_matches('"').to_string())
+        .filter(|table| !table.is_empty())
+        .collect();
+    Some(tables).filter(|tables| !tables.is_empty())
+}
+
 /// Buffer-time CommandComplete summary for a DML statement: (kind, row hint,
 /// approximate serialized size for the buffer bound).
 fn dml_summary(
@@ -2970,6 +3005,10 @@ impl PostgresProtocol {
             return self.execute_explain(query).await;
         }
 
+        if let Some(tables) = parse_truncate_tables(query) {
+            return self.execute_truncate(&tables).await;
+        }
+
         if crate::services::CatalogIntrospectionService::is_catalog_query(query) {
             return self.execute_catalog_introspection_query(query).await;
         }
@@ -3303,7 +3342,9 @@ impl PostgresProtocol {
             return self.send_empty_result().await;
         };
 
+        let tenant = self.pgwire_resolve_read_tenant().await;
         let result = crate::services::CatalogIntrospectionService::new(catalog_manager)
+            .for_tenant(tenant)
             .execute_select(query)
             .await?;
         let Some(result) = result else {
@@ -3372,7 +3413,7 @@ impl PostgresProtocol {
         for row in &result.rows {
             let cells: Vec<Option<String>> = row
                 .iter()
-                .map(super::relational_pipeline::text_encode)
+                .map(super::relational_pipeline::wire_text)
                 .collect();
             self.send_data_row_nullable(&cells).await?;
         }
@@ -4769,7 +4810,7 @@ impl PostgresProtocol {
             // legacy simple-query encoder.
             let values = row
                 .iter()
-                .map(super::relational_pipeline::text_encode)
+                .map(super::relational_pipeline::wire_text)
                 .collect::<Vec<_>>();
             self.send_data_row_nullable(&values).await?;
             rows_sent += 1;
@@ -5023,6 +5064,19 @@ impl PostgresProtocol {
         } else {
             namespace
         };
+        // Observability namespaces are tenant-qualified (the same key the REST
+        // surface uses): the session reads only its own tenant's namespaces.
+        let session_tenant = self.pgwire_resolve_read_tenant().await;
+        let scoped_namespace =
+            match proximadb_tenant::tenant_qualified_key(&session_tenant, namespace) {
+                Ok(key) => key,
+                Err(error) => {
+                    return self
+                        .send_error("ERROR", "42602", &format!("invalid namespace: {error}"))
+                        .await;
+                }
+            };
+        let namespace = scoped_namespace.as_str();
 
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let one_hour_ns = 3_600_000_000_000_i64;
@@ -5114,6 +5168,19 @@ impl PostgresProtocol {
         } else {
             namespace
         };
+        // Observability namespaces are tenant-qualified (the same key the REST
+        // surface uses): the session reads only its own tenant's namespaces.
+        let session_tenant = self.pgwire_resolve_read_tenant().await;
+        let scoped_namespace =
+            match proximadb_tenant::tenant_qualified_key(&session_tenant, namespace) {
+                Ok(key) => key,
+                Err(error) => {
+                    return self
+                        .send_error("ERROR", "42602", &format!("invalid namespace: {error}"))
+                        .await;
+                }
+            };
+        let namespace = scoped_namespace.as_str();
 
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let one_hour_ns = 3_600_000_000_000_i64;
@@ -5478,7 +5545,13 @@ impl PostgresProtocol {
             ..Default::default()
         };
 
-        match self.collection_port.create_collection(config, None).await {
+        // The connection's tenant (startup `database`) owns the collection.
+        let tenant = self.pgwire_resolve_write_tenant().await;
+        match self
+            .collection_port
+            .create_collection(config, Some(&tenant))
+            .await
+        {
             Ok(_) => {
                 info!("Created vector collection '{}' via PostgreSQL", table_name);
                 self.send_command_complete("CREATE TABLE").await
@@ -5549,9 +5622,10 @@ impl PostgresProtocol {
             ..Default::default()
         };
 
+        let tenant = self.pgwire_resolve_write_tenant().await;
         match self
             .collection_port
-            .create_collection(vector_config, None)
+            .create_collection(vector_config, Some(&tenant))
             .await
         {
             Ok(_) => {
@@ -5690,6 +5764,52 @@ impl PostgresProtocol {
             "Catalog-backed DML service is required for INSERT",
         )
         .await
+    }
+
+    /// `TRUNCATE [TABLE] t[, ...]`: delete every row of each table, resolved
+    /// within the connection tenant. A table the tenant cannot resolve is
+    /// reported exactly as a missing one, and nothing is changed.
+    async fn execute_truncate(&mut self, tables: &[String]) -> Result<()> {
+        let Some(dml_service) = self.dml_service.clone() else {
+            return self
+                .send_error("ERROR", "0A000", "TRUNCATE is not supported on this server")
+                .await;
+        };
+        if self.transaction_in_progress().await {
+            return self
+                .send_error(
+                    "ERROR",
+                    "0A000",
+                    "TRUNCATE inside a transaction block is not supported",
+                )
+                .await;
+        }
+        let tenant = self.pgwire_resolve_write_tenant().await;
+        // Every table must resolve before any is emptied.
+        for table in tables {
+            if !dml_service
+                .table_visible_for_tenant(table, Some(tenant.as_str()))
+                .await
+                .unwrap_or(false)
+            {
+                return self
+                    .send_error(
+                        "ERROR",
+                        "42P01",
+                        &format!("relation \"{table}\" does not exist"),
+                    )
+                    .await;
+            }
+        }
+        let tenant_ctx = crate::storage::tenant::context::TenantContext::for_tenant_id(&tenant);
+        for table in tables {
+            if let Err(error) = dml_service.truncate_table(table, Some(&tenant_ctx)).await {
+                return self
+                    .send_error("ERROR", "XX000", &format!("TRUNCATE failed: {error}"))
+                    .await;
+            }
+        }
+        self.send_command_complete("TRUNCATE TABLE").await
     }
 
     /// Execute INSERT using the proper SQL parser and DmlService
@@ -6228,9 +6348,11 @@ impl PostgresProtocol {
 
         debug!("Dropping collection '{}'", table_name);
 
+        // Scoped to the connection's tenant (startup `database`).
+        let tenant = self.pgwire_resolve_write_tenant().await;
         match self
             .collection_port
-            .delete_collection(&table_name, None)
+            .delete_collection(&table_name, Some(&tenant))
             .await
         {
             Ok(_) => {
@@ -7120,7 +7242,7 @@ impl PostgresProtocol {
             let mut offsets: Vec<usize> = Vec::with_capacity(end - start + 1);
             offsets.push(0);
             for row in &state.result.rows[start..end] {
-                page.extend(row.iter().map(super::relational_pipeline::text_encode));
+                page.extend(row.iter().map(super::relational_pipeline::wire_text));
                 offsets.push(page.len());
             }
             state.next_row = end;

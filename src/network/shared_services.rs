@@ -1978,17 +1978,27 @@ impl SharedServices {
                 // record; serving without it (the legacy warn-and-continue) would
                 // silently drop committed rows, so failures are fatal.
                 let atomic_commit = crate::services::oltp_gate::atomic_commit_enabled();
-                match crate::services::FramedTableWalAppender::open(&wal_path).await {
+                match crate::services::FramedTableWalAppender::open_shared(&wal_path).await {
                     Ok(appender) => {
                         if atomic_commit {
                             appender.enable_atomic_groups();
                         }
+                        // P2.1 (ADR-097 S2): opt-in segment rotation of the shared
+                        // canonical WAL. Off until P2.2 truncation lands and a
+                        // soak passes: an older binary would not read sealed
+                        // segments (downgrade safety, same stance as ADR-095).
+                        let segment_bytes =
+                            crate::services::canonical_wal::canonical_wal_segment_bytes();
+                        if segment_bytes > 0 {
+                            appender.enable_segment_rotation(segment_bytes);
+                        }
                         info!(
                             atomic_commit,
+                            segment_bytes,
                             "✅ SharedServices: canonical WAL appender opened at {} (shared by graph checkpoint emission + pgwire direct writes)",
                             wal_path.display()
                         );
-                        Some(Arc::new(appender))
+                        Some(appender)
                     }
                     Err(e) if atomic_commit => {
                         anyhow::bail!(
@@ -2019,12 +2029,38 @@ impl SharedServices {
         let canonical_record_store: Option<
             Arc<crate::services::record_store::DirectWalTableRecordStore>,
         > = if let Some(appender) = canonical_wal_appender.clone() {
-            let store = Arc::new(
-                crate::services::record_store::DirectWalTableRecordStore::new_partitioned(
-                    appender.clone(),
-                ),
-            );
             let atomic_commit = crate::services::oltp_gate::atomic_commit_enabled();
+            // TD-SEAM-3: spill-backed partitions when the spill gate is set
+            // (default unset ⇒ exactly the legacy partitioned memtable), with
+            // segments beside the WAL they recover with.
+            let spill_root = opt_config
+                .map(|cfg| cfg.server.data_dir.join("pgwire").join("record-spill"))
+                .unwrap_or_default();
+            let store =
+                match crate::services::record_store::DirectWalTableRecordStore::open_for_server(
+                    appender.clone(),
+                    spill_root,
+                )
+                .await
+                {
+                    Ok(store) => Arc::new(store),
+                    Err(e) if atomic_commit => {
+                        anyhow::bail!(
+                            "opening the spill-backed record store failed with [oltp] atomic_commit on: {e:#}"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "SharedServices: spill-backed record store unavailable ({e:#}); \
+                         falling back to in-memory partitions"
+                        );
+                        Arc::new(
+                        crate::services::record_store::DirectWalTableRecordStore::new_partitioned(
+                            appender.clone(),
+                        ),
+                    )
+                    }
+                };
             match appender.read_entries().await {
                 Ok(entries) => {
                     if let Err(e) = store.replay_wal_entries(entries).await {
@@ -2527,6 +2563,7 @@ impl SharedServices {
         // singleton `RankServices` that REST / gRPC / Arrow Flight share.
         let (rank_services, rank_profile_store) = build_rank_services(
             vector_operations_service.clone() as Arc<dyn proximadb_runtime::VectorOpsPort>,
+            Some(collection_service.clone() as Arc<dyn proximadb_runtime::CollectionPort>),
             fulltext_indexes.clone(),
             canonical_wal_appender.clone(),
             opt_config,
@@ -2544,6 +2581,25 @@ impl SharedServices {
         // restart on both engines. Threaded into every per-connection
         // `DdlService` (pgwire) so new `CREATE FUNCTION` statements persist here.
         let function_store = build_function_store(canonical_wal_appender.clone()).await;
+
+        // Backfill collection owner (non-fatal, background): record an owner on
+        // collections created before ownership was recorded, so each resolves
+        // within its tenant. Until it runs (or if it fails) such a collection
+        // belongs to the default tenant.
+        {
+            let store = collection_service.clone();
+            let sampler = vector_operations_service.clone();
+            tokio::spawn(async move {
+                let report =
+                    crate::services::collection::owner_backfill::backfill_collection_owners(
+                        store.as_ref(),
+                        sampler.as_ref(),
+                        crate::services::collection::owner_backfill::DEFAULT_SAMPLE_CAP,
+                    )
+                    .await;
+                info!(?report, "collection owner backfill finished");
+            });
+        }
 
         // Create FederatedQueryContext for SQL with multi-model extensions
         debug!("🔧 SharedServices::new - Creating FederatedQueryContext...");
@@ -3384,6 +3440,7 @@ impl SharedServices {
 /// the server down.
 async fn build_rank_services(
     vector_ops: Arc<dyn proximadb_runtime::VectorOpsPort>,
+    collection_port: Option<Arc<dyn proximadb_runtime::CollectionPort>>,
     fulltext_indexes: crate::network::hybrid_search::HybridFullTextIndexMap,
     canonical_wal_appender: Option<Arc<crate::services::FramedTableWalAppender>>,
     opt_config: Option<&crate::core::config::Config>,
@@ -3423,6 +3480,7 @@ async fn build_rank_services(
 
     build_rank_services_with_appender(
         vector_ops,
+        collection_port,
         fulltext_indexes,
         store_appender,
         &recovered_entries,
@@ -3517,6 +3575,7 @@ async fn build_function_store(
 /// round-trip.
 async fn build_rank_services_with_appender(
     vector_ops: Arc<dyn proximadb_runtime::VectorOpsPort>,
+    collection_port: Option<Arc<dyn proximadb_runtime::CollectionPort>>,
     fulltext_indexes: crate::network::hybrid_search::HybridFullTextIndexMap,
     store_appender: Arc<dyn crate::services::record_store::TableWalAppender>,
     recovered_entries: &[proximadb_storage_common::CanonicalWalEntry],
@@ -3538,7 +3597,11 @@ async fn build_rank_services_with_appender(
     // Build the production hybrid backend over the shared vector port + the
     // shared per-collection BM25 index map. Both surfaces are already
     // SharedServices fields.
-    let backend = Arc::new(ProductionHybridBackend::new(vector_ops, fulltext_indexes));
+    let mut backend = ProductionHybridBackend::new(vector_ops, fulltext_indexes);
+    if let Some(collection_port) = collection_port {
+        backend = backend.with_collection_port(collection_port);
+    }
+    let backend = Arc::new(backend);
     let adapter = Arc::new(HybridCoordinatorAdapter::new(
         FusionStrategy::ReciprocalRank { k: 60 },
         backend,
@@ -3703,6 +3766,7 @@ heap_size = 50
         let appender: Arc<dyn TableWalAppender> = Arc::new(MemoryTableWalAppender::new());
         let (services, store) = build_rank_services_with_appender(
             Arc::new(NoopVectorPort),
+            None,
             empty_indexes(),
             appender,
             &[],
@@ -3738,6 +3802,7 @@ heap_size = 50
         let builder_appender: Arc<dyn TableWalAppender> = memory_appender.clone();
         let (services, store) = build_rank_services_with_appender(
             Arc::new(NoopVectorPort),
+            None,
             empty_indexes(),
             builder_appender,
             &entries,
@@ -3772,6 +3837,7 @@ heap_size = 50
         let builder_appender: Arc<dyn TableWalAppender> = memory_appender.clone();
         let (services, store) = build_rank_services_with_appender(
             Arc::new(NoopVectorPort),
+            None,
             empty_indexes(),
             builder_appender,
             &entries,

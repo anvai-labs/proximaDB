@@ -1,0 +1,81 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-20: WAL replay flushes a dropped table into spill segments, so a re-created table serves the dropped rows
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved 2026-10-19** (replay purges like the live DROP; see Resolution). Filed the same day while mapping the Layer A production wiring (TD-SEAM-3).
+| Priority | **HIGH as a gate on wiring `new_spilling` in production**, zero today: no production site builds a spill partition, so replay never flushes.
+| Component | `src/services/record_store.rs` (`replay_wal_entries`, its `RecordPartitionDrop` arm; `drop_table_records`), `src/services/record_spill.rs` (`upsert_record_at_lsn` → threshold flush, `purge_durable_objects`, `ensure_discovered`)
+| Relates to | TD-USUB-1 (items i and iii), TD-SEAM-3, TD-SEAM-2 (truncation), mandate #16a
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+The live DROP path and the replay path disagree on what a drop does to durable state.
+
+* **Live DROP** (`drop_table_records`) appends `RecordPartitionDrop`, then calls
+  `purge_durable_objects` (deletes the partition's spill prefix), then `drop_partition_state`.
+* **Replay** of the same entry calls only `drop_partition_state`. That removes the in-memory map
+  entry and leaves objects on disk alone.
+
+With the spill gate set, replay goes through `upsert_record_at_lsn`, which flushes once
+`PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT` is crossed. Take a WAL holding
+`insert × N (table t) → RecordPartitionDrop(t) → CREATE t again`:
+
+1. Replay re-inserts the N pre-drop rows and flushes them into `…/t/spill-…` segments.
+2. The drop arm removes the map entry. The segments stay.
+3. The next access to `t` builds a fresh store over the same prefix. `ensure_discovered` lists the
+   prefix and adopts those segments, so the re-created table serves the dropped rows.
+
+No failure is needed. Every restart re-runs the replay, so it also re-writes those segments each
+time, and storage grows per boot until truncation (TD-SEAM-2) or compaction exists.
+
+A secondary effect: a flush error during replay aborts `replay_wal_entries`. On the
+`multi_server.rs` custom-path store that fails the boot.
+
+== How to apply
+
+1. **Purge in the replay drop arm,** exactly as the live path does, before `drop_partition_state`.
+   This stays safe under WAL truncation. Truncation discards only entries below
+   `T = min_unflushed_lsn`, so a drop at `L` that replay still sees has `L ≥ T`. Every row a purge
+   at `L` could delete is then either:
+   * pre-drop, which should die; or
+   * post-drop, at an LSN above `L`, which is retained and replays back.
+2. Optionally, suppress threshold flushes during replay and flush once at the end. That bounds the
+   per-boot rewrite to one segment per partition rather than one per threshold crossing. It costs
+   replay-time memory, so measure before choosing it.
+3. **Test.** Build a WAL that inserts past the threshold, then drops, then re-creates and inserts one
+   row. Replay it into a spilling store and assert that:
+   * the re-created table holds exactly the one post-drop row;
+   * no pre-drop segment remains under the prefix.
++
+Mutation check: removing the purge from the replay arm must fail it.
+
+A complementary option, not yet checked: with `PROXIMADB_WAL_OBJECT_ID_KEY` on, the partition key
+is the table's object id, and each incarnation would get its own prefix. That holds only if the id
+is unique per incarnation.
+
+== Resolution (2026-10-19)
+
+Step 1 of "How to apply". The replay `RecordPartitionDrop` arm in `replay_wal_entries` now calls
+`purge_durable_objects` on the partition before `drop_partition_state`, as the live
+`drop_table_records` does.
+
+* It is skipped in shared-storage mode, where the live path also declines.
+* A purge failure propagates. Serving dropped rows would be silently wrong (mandate #1).
+
+Step 2 (suppressing threshold flushes during replay) was not taken. With the purge in place, the
+per-boot rewrite affects only tables that are *not* dropped. That is bounded by truncation
+(TD-SEAM-2) and compaction, not by this TD.
+
+The test `replayed_drop_purges_segments_written_earlier_in_the_replay`
+(`src/services/record_store.rs`) replays `8 × insert → drop → insert` at threshold 4 into a
+spilling store, twice over the same prefix (two boots). After each replay it asserts that:
+
+* the re-created table holds exactly `new0`;
+* no `spill-*` object remains.
+
+Mutation check: removing the purge fails both assertions.

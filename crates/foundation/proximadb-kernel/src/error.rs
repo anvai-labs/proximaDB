@@ -136,10 +136,6 @@ pub enum StorageError {
     #[error("WAL error: {0}")]
     WalError(String),
 
-    /// Serialization format error (alternative variant).
-    #[error("Serialization error: {0}")]
-    SerializationError(String),
-
     /// Metadata catalog error.
     #[error("Metadata error: {0}")]
     MetadataError(#[from] anyhow::Error),
@@ -436,7 +432,6 @@ mod tests {
             StorageError::KeyNotFound("key".to_string()).to_string(),
             StorageError::IndexError("hnsw".to_string()).to_string(),
             StorageError::WalError("wal".to_string()).to_string(),
-            StorageError::SerializationError("codec".to_string()).to_string(),
             StorageError::MetadataError(anyhow::anyhow!("catalog")).to_string(),
             StorageError::CollectionNotFound("docs".to_string()).to_string(),
             StorageError::InvalidDimension {

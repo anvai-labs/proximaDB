@@ -934,9 +934,11 @@ impl EmbeddedProximaDB {
             {
                 runtime.block_on(async {
                     match planner.load_policy(&policy_path).await {
-                        Ok(()) => {
+                        Ok(true) => {
                             tracing::info!("🎯 EMBEDDED: RL policy loaded from {}", policy_path);
                         }
+                        // Already reported (and reset) by the loader.
+                        Ok(false) => {}
                         Err(e) => {
                             tracing::debug!(
                                 "EMBEDDED: No existing RL policy (starting fresh): {}",
@@ -997,7 +999,7 @@ impl EmbeddedProximaDB {
         // One-shot, best-effort, log-only diagnostic on open: never blocks
         // startup or fails construction.
         runtime.block_on(async {
-            let Ok(collections) = collection_port.list_collections(None).await else {
+            let Ok(collections) = collection_port.list_collections_internal().await else {
                 return;
             };
             for collection in collections {
@@ -1359,15 +1361,28 @@ impl EmbeddedProximaDB {
             ..Default::default()
         };
 
+        // When a tenant is configured, the creating tenant owns the collection
+        // (the same stamping the networked create path applies), so the
+        // tenant-scoped insert/get below resolve it.
+        let tenant_ctx = self.embedded_tenant_context();
         self.runtime.block_on(async {
-            let response = self
-                .shared_services
-                .collection_service
-                .create_collection(&collection_config)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    Box::new(std::io::Error::other(e.to_string()))
-                })?;
+            let response = match tenant_ctx.as_ref() {
+                Some(ctx) => {
+                    self.shared_services
+                        .collection_service
+                        .create_collection_with_tenant_context(&collection_config, Some(ctx))
+                        .await
+                }
+                None => {
+                    self.shared_services
+                        .collection_service
+                        .create_collection(&collection_config)
+                        .await
+                }
+            }
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(std::io::Error::other(e.to_string()))
+            })?;
 
             // Check if the collection service returned an error in the response
             if !response.success {
@@ -1831,11 +1846,12 @@ impl EmbeddedProximaDB {
                     search_optimization: None,
                 };
 
-                let response = self
-                    .shared_services
-                    .query_adapter()
-                    .vector_search(request)
-                    .await
+                // Embedded single-process use: no request tenant exists.
+                let response = proximadb::query::request_scope::with_internal_scope(
+                    "embedded library",
+                    self.shared_services.query_adapter().vector_search(request),
+                )
+                .await
                     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                         Box::new(std::io::Error::other(e.to_string()))
                     })?;
@@ -2074,7 +2090,7 @@ impl EmbeddedProximaDB {
         self.runtime.block_on(async {
             let collection = self
                 .collection_port
-                .get_collection(name, None)
+                .get_collection_internal(name)
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                     Box::new(std::io::Error::other(e.to_string()))
@@ -2108,11 +2124,13 @@ impl EmbeddedProximaDB {
         &self,
     ) -> Result<Vec<EmbeddedCollectionInfo>, Box<dyn std::error::Error + Send + Sync>> {
         self.runtime.block_on(async {
-            let collections = self.collection_port.list_collections(None).await.map_err(
-                |e| -> Box<dyn std::error::Error + Send + Sync> {
+            let collections = self
+                .collection_port
+                .list_collections_internal()
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                     Box::new(std::io::Error::other(e.to_string()))
-                },
-            )?;
+                })?;
 
             Ok(collections
                 .into_iter()
@@ -2154,7 +2172,7 @@ impl EmbeddedProximaDB {
         self.runtime.block_on(async {
             let opt = self
                 .collection_port
-                .get_collection(collection, None)
+                .get_collection_internal(collection)
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                     Box::new(std::io::Error::other(e.to_string()))
@@ -2219,19 +2237,29 @@ impl EmbeddedProximaDB {
                 .tenant_id
                 .as_deref()
                 .filter(|tenant| !tenant.is_empty());
-            let collection_record = self
-                .collection_port
-                .get_collection(collection, tenant_id)
-                .await
-                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
-                    Box::new(std::io::Error::other(error.to_string()))
-                })?
-                .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("Collection '{collection}' not found"),
-                    ))
-                })?;
+            // Embedded single-process use: a configured tenant scopes the
+            // lookup; without one the library acts internally.
+            let collection_record = match tenant_id {
+                Some(tenant) => {
+                    self.collection_port
+                        .get_collection(collection, Some(tenant))
+                        .await
+                }
+                None => {
+                    self.collection_port
+                        .get_collection_internal(collection)
+                        .await
+                }
+            }
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(std::io::Error::other(error.to_string()))
+            })?
+            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Collection '{collection}' not found"),
+                ))
+            })?;
             let canonical_collection_id = collection_record.id;
             let revision_tenant =
                 tenant_id.unwrap_or(proximadb::catalog::DEFAULT_CORPUS_VERSION_TENANT);
@@ -2406,7 +2434,7 @@ impl EmbeddedProximaDB {
                     // a path would retire WAL without publishing readable data.
                     let collection_metadata = match self
                         .collection_port
-                        .get_collection(collection_id, None)
+                        .get_collection_internal(collection_id)
                         .await
                     {
                         Ok(Some(metadata)) => metadata,
@@ -2866,7 +2894,7 @@ impl EmbeddedProximaDB {
     /// Get storage statistics
     pub fn stats(&self) -> Result<EmbeddedStorageStats, Box<dyn std::error::Error + Send + Sync>> {
         self.runtime.block_on(async {
-            let collections = self.collection_port.list_collections(None).await.ok();
+            let collections = self.collection_port.list_collections_internal().await.ok();
             let total_collections = collections.as_ref().map_or(0, |c| c.len() as u64);
             let total_vectors: u64 = collections.map_or(0, |c| {
                 c.iter()
@@ -3163,11 +3191,13 @@ impl EmbeddedProximaDB {
                 };
 
             // Gather collection states
-            let collections = self.collection_port.list_collections(None).await.map_err(
-                |e| -> Box<dyn std::error::Error + Send + Sync> {
+            let collections = self
+                .collection_port
+                .list_collections_internal()
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                     Box::new(std::io::Error::other(e.to_string()))
-                },
-            )?;
+                })?;
 
             let collection_states: Vec<CollectionCheckpointState> = collections
                 .into_iter()
@@ -4543,10 +4573,11 @@ impl EmbeddedProximaDB {
                         .collect()
                 });
 
-            let response = self
-                .shared_services
-                .api_handlers
-                .execute_sql_v1(
+            // Embedded single-process use: no request tenant exists, so the
+            // statement runs as explicit internal execution.
+            let response = proximadb::query::request_scope::with_internal_scope(
+                "embedded library",
+                self.shared_services.api_handlers.execute_sql_v1(
                     query.to_string(),
                     proto_params.as_ref().map(|values| {
                         values
@@ -4556,11 +4587,12 @@ impl EmbeddedProximaDB {
                     }),
                     collection.map(str::to_string),
                     proximadb_runtime::PortIdentity::anonymous(),
-                )
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    Box::new(std::io::Error::other(e.to_string()))
-                })?;
+                ),
+            )
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                Box::new(std::io::Error::other(e.to_string()))
+            })?;
 
             Ok(Self::sql_response_to_embedded(response))
         })
@@ -4737,7 +4769,7 @@ impl EmbeddedProximaDB {
 
         let exists = self
             .runtime
-            .block_on(self.collection_port.get_collection(&table_id.name, None))
+            .block_on(self.collection_port.get_collection_internal(&table_id.name))
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 Box::new(std::io::Error::other(e.to_string()))
             })?

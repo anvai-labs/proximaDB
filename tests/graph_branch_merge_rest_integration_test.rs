@@ -61,7 +61,7 @@ async fn test_merge_handler(
     AxumPath((collection, branch)): AxumPath<(String, String)>,
     Json(request): Json<GraphBranchMergeRequest>,
 ) -> ApiResult<JsonResponse<serde_json::Value>> {
-    merge_graph_branch_inner(&data_dir, &collection, &branch, request).await
+    merge_graph_branch_inner(&data_dir, "default", &collection, &branch, request).await
 }
 
 /// Returns (TempDir guard, data_dir path). The TempDir must be held for the

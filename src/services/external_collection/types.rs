@@ -5,6 +5,7 @@
 //! (`CatalogAuthorityMode::FederatedRead`) while ProximaDB owns and serves a
 //! vector index built over it. These are the durable registry records.
 
+use proximadb_kernel::time::now_unix_ms;
 use serde::{Deserialize, Serialize};
 
 /// Open-table format of the external source. Parquet is the only format wired
@@ -118,12 +119,16 @@ pub struct ExternalCollection {
     pub updated_at_ms: i64,
     /// Failure detail when `status == Failed`.
     pub error: Option<String>,
+    /// The tenant that registered it (`None` = the default tenant). Only that
+    /// tenant sees or operates on it.
+    #[serde(default)]
+    pub tenant: Option<String>,
 }
 
 impl ExternalCollection {
     /// Create a freshly `Registered` external collection for `spec`.
     pub fn new(spec: ExternalCollectionSpec, snapshot_id: impl Into<String>) -> Self {
-        let now = now_ms();
+        let now = now_unix_ms();
         Self {
             id: format!("ext_{}", uuid::Uuid::new_v4().simple()),
             spec,
@@ -133,18 +138,19 @@ impl ExternalCollection {
             created_at_ms: now,
             updated_at_ms: now,
             error: None,
+            tenant: None,
         }
+    }
+
+    /// Whether a request acting as `tenant` may see this collection.
+    pub fn visible_to(&self, tenant: &str) -> bool {
+        proximadb_tenant::resolve_request_tenant(self.tenant.as_deref()) == tenant
     }
 
     /// Whether the collection has a built, queryable index.
     pub fn is_ready(&self) -> bool {
         self.status == ExternalCollectionStatus::Ready
     }
-}
-
-/// Current epoch milliseconds.
-pub(crate) fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
 }
 
 #[cfg(test)]

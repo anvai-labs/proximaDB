@@ -41,13 +41,22 @@
 
 * Run and green: storage-common (`parquet_write_policy`, `parquet_page_prune`, 11 tests),
   iceberg-engine (35 tests incl. manifest metrics), `tests/wal_change_feed_fast_path_e2e.rs`, and the
-  TPC-DS ledger A/B (row-identical across all 63 queries × 3 engines × 2 layouts).
+  TPC-DS ledger A/B. *Corrected 2026-10-18 (was: "row-identical across all 63 queries × 3 engines
+  × 2 layouts"):* per the evidence doc, every query that succeeded in both arms returned identical
+  **row counts** (values were not compared). Coverage differs by engine: DataFusion 63/63, DuckDB
+  63/63 only after the empty-result fix in the same change (56/63 before), native 40/63 (17
+  comma-joined `FROM` lists, 4 derived tables, 2 plan/scan expression errors — the same failures
+  in both arms). Value comparison across engines is P6 work in
+  link:../../12-design/LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10].
 * Written but **not run here**: the root-crate unit tests
   (`object_store_parquet_reader` SBBF INT32 probe + page pruning through `scan()`,
   `native_parquet_scan` row-group/page pruning). Compiling the root crate's `--lib` test
-  binary is OOM-killed at ~13.7 GB RSS in rustc's frontend (codegen-units=64, jobs=1 did not
-  help) — another data point for the root-crate decomposition (TD-DECOMP). CI with more
-  memory must run them before merge.
+  binary is OOM-killed by the container's memory limit in rustc's frontend (codegen-units=64,
+  jobs=1 did not help) — another data point for the root-crate decomposition (TD-DECOMP). CI with
+  more memory must run them before merge. *Corrected 2026-10-18:* this line previously gave
+  "~13.7 GB RSS"; that is the figure the evidence doc records for the SF 0.05 MATERIALIZE OOM
+  (`TPC_DS_SPEC_PRUNING_EVIDENCE_2026_10_18.adoc`, "SF 0.05 could not run"), and no separate
+  rustc peak was recorded. **Re-measure** the rustc peak RSS before citing a number.
 
 == Not done here
 

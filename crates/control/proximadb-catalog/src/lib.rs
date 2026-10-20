@@ -43,7 +43,10 @@ pub mod tenant_posture;
 // through the injected `CatalogFilesystemResolver` port (no catalog->storage
 // up-edge).
 pub mod manager;
-pub use manager::{CatalogFilesystemResolver, CatalogManager, TableOpLockRegistry};
+pub mod table_properties;
+pub use manager::{
+    CatalogFilesystemResolver, CatalogManager, TableNotVisible, TableOpLockRegistry,
+};
 /// Typed MLOps/model-registry facet for the unified xCatalog object model.
 pub mod mlops;
 /// Tenant-scoped model-registry lifecycle application service shared by API adapters.

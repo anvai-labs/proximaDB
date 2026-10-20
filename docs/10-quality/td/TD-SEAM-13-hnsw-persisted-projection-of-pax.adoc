@@ -1,0 +1,72 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SEAM-13: HNSW as a persisted, rebuildable projection of PAX (P5c)
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Design decided 2026-10-19 by owner direction ("use AXIS; PAX is the authority; ground-up rebuild is the repair path"). Implementation is sequenced after P2 (ADR-097 §Consequences).
+| Priority | MED. HNSW is the hot path only for small, latency-critical collections. PAX remains the tier at scale.
+| Component | `src/index/axis/indexes/hnsw_index.rs`, `src/index/axis/storage/{serialization,recovery}.rs`, `src/index/axis/management/manager.rs` (`handle_flushed_vectors`), the S8 route-cost spine
+| Relates to | ADR-097 D2 (amended 2026-10-19), TD-112 (index-on-flush, landed), TD-PAXPREC-1 (exact tier: **prerequisite**), TD-SEAM-10 (P5b centroid directory), TD-SEAM-2 (LSN watermarks)
+| Blocked by | TD-PAXPREC-1 for collections without an exact tier (see "Prerequisite").
+|===
+
+== Decision
+
+Keep AXIS's HNSW engine; do not write a second one. Change its role from **authority** to a
+**projection** of the PAX segments named by the catalog snapshot.
+
+What AXIS already provides, and this design reuses:
+
+* the graph builder (m / ef_construction configurable);
+* index-on-flush (`handle_flushed_vectors`, TD-112);
+* a versioned serializer, `SerializableHnswState` (v2). It holds the config, the id map, the graph
+  layers, the entry point, raw and quantized vectors, and filterable metadata;
+* load paths `load_index_to_memory` and `load_index_from_disk`.
+
+== Lifecycle
+
+. **Definition.** The graph for a collection is the HNSW built over the PAX segment set `S`
+  published at LSN `L`.
+** A full rebuild from the ground up is that definition, executed. It is the **repair** path.
+** Index-on-flush is the **maintenance** path: it keeps the graph current between rebuilds without
+   being the source of truth.
+. **Persistence.** The serialized state is written as an S7 index projection beside the collection's
+  segments. It is stamped with the segment set it covers (segment ids plus a digest) and with
+  `L`. It is never the only copy of anything: dropping it loses no data.
+. **Boot.**
+** Stamp matches the catalog: load it. Cold start then costs roughly one file read, not a build.
+** Segments were added since: insert only those vectors (a delta).
+** Stamp is unreadable, the version is unknown, or compaction rewrote stamped inputs: rebuild from
+   PAX in the background, and serve from the PAX cascade until the rebuild finishes. Correct
+   answers are never blocked on the projection.
+. **Deletes.** HNSW deletion is O(E), so a delete marks a tombstone that query-time filtering
+  honours. A rebuild is scheduled when tombstones exceed a set ratio (initially 20 %) of the graph.
+. **Scope (S8).** The cost spine routes to HNSW only for collections whose graph and vectors fit a
+  per-node memory budget. At ~620 B/vector of graph plus fp32 vectors, 100M × 768d is about 370 GB,
+  so such a collection stays on PAX (and P5b's centroid directory). Small, latency-critical
+  namespaces get HNSW. Everything else gets PAX.
+
+== Prerequisite: exact vectors
+
+A ground-up rebuild needs exact vectors. Default PAX collections today store only RaBitQ codes plus
+the SQ8 rerank, with no exact copy (TD-PAXPREC-1). A graph built from decoded SQ8 vectors loses
+recall. So:
+
+* **Preferred:** land TD-PAXPREC-1 (an fp16 exact tier by default, gated on experiment E10)
+  before P5c. Every collection is then rebuildable.
+* **Until then:** allow HNSW only on collections that declare an exact tier (fp32/fp16), and refuse
+  it elsewhere with an explicit reason rather than building a lossy graph.
+
+== Acceptance
+
+* Cold start of a 1M × 768d HNSW collection with a valid stamp serves its first query without a
+  rebuild. Its recall@10 equals the pre-restart recall.
+* Deleting the projection file, then restarting, triggers a background rebuild. Queries are
+  served by PAX meanwhile, and recall returns to the band once the rebuild completes.
+* After compaction rewrites stamped segments, the stamp check fails and the graph is rebuilt. It
+  never serves vectors from retired segments.
+* A collection without an exact tier is refused HNSW with a named reason, until TD-PAXPREC-1 lands.
+* The AXIS IVF disk/cloud posting-list path is retired in favour of P5b (TD-SEAM-10), per ADR-097
+  D2.

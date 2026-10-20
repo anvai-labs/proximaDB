@@ -102,6 +102,8 @@ impl AqlSource for ObservabilityAqlSource {
 
     async fn execute(&self, query: &AqlQuery, ctx: &mut AuditContext) -> Result<AqlResult> {
         let namespace = self.extract_obs_params(query);
+        // Fail closed when the execution was never given a scope.
+        ctx.resolution_tenant(&namespace)?;
         let start = Instant::now();
 
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);

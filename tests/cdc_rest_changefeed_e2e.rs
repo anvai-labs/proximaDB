@@ -4,6 +4,9 @@
 //! reflects writes made on a DIFFERENT protocol (pgwire), because every surface now shares one
 //! canonical record store. Also exercises the `since_lsn` cursor.
 //!
+//! The pgwire database names the tenant (`proximadb` here), and the feed is
+//! tenant-scoped, so the REST reads act as that same tenant.
+//!
 //!   cargo test --test cdc_rest_changefeed_e2e -- --nocapture
 
 use std::net::TcpListener;
@@ -47,6 +50,9 @@ impl Server {
             url: format!("file://{}", tmp.path().display()),
             ..Default::default()
         }];
+        // Anchor the system catalog to this test's directory (a CWD-relative
+        // default would share it with other runs).
+        config.storage.metadata_url = format!("file://{}/metadata", tmp.path().display());
         config.storage.wal_config.write_buffer_directory =
             format!("file://{}/wal", tmp.path().display());
         let mut db = ProximaDB::new(config).await?;
@@ -134,6 +140,7 @@ async fn pgwire_writes_are_visible_on_the_rest_change_feed() {
             "{}/api/v2/collections/crfeed/changes?since_lsn=0",
             server.base()
         ))
+        .header("X-Tenant-ID", "proximadb")
         .send()
         .await
         .expect("changes GET");
@@ -175,6 +182,7 @@ async fn pgwire_writes_are_visible_on_the_rest_change_feed() {
             server.base(),
             lsns[0]
         ))
+        .header("X-Tenant-ID", "proximadb")
         .send()
         .await
         .expect("changes GET 2");

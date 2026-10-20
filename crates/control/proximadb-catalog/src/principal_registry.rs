@@ -195,7 +195,7 @@ impl FileSystemPrincipalRegistry {
             subject: subject.clone(),
             tenant_id: tenant_id.to_string(),
             display_name,
-            created_at_ms: now_ms(),
+            created_at_ms: proximadb_kernel::time::now_unix_ms(),
             disabled: false,
         };
         {
@@ -268,7 +268,7 @@ impl FileSystemPrincipalRegistry {
             subject: SubjectId(subject.to_string()),
             tenant_id: tenant_id.to_string(),
             secret_hash_hex: sha256_hex(secret_hex.as_bytes()),
-            created_at_ms: now_ms(),
+            created_at_ms: proximadb_kernel::time::now_unix_ms(),
             expires_at_ms,
             revoked_at_ms: None,
         };
@@ -285,7 +285,7 @@ impl FileSystemPrincipalRegistry {
     pub fn revoke_key(&self, key_id: &str) -> Result<(), RegistryError> {
         let mut state = write_lock(&self.state);
         match state.keys.get_mut(key_id) {
-            Some(k) => k.revoked_at_ms = Some(now_ms()),
+            Some(k) => k.revoked_at_ms = Some(proximadb_kernel::time::now_unix_ms()),
             None => {
                 return Err(RegistryError::UnknownKey {
                     key_id: key_id.to_string(),
@@ -316,7 +316,7 @@ impl FileSystemPrincipalRegistry {
             return None;
         }
         if let Some(exp) = record.expires_at_ms
-            && now_ms() >= exp
+            && proximadb_kernel::time::now_unix_ms() >= exp
         {
             return None;
         }
@@ -392,10 +392,6 @@ fn store_json_atomic<T: Serialize>(dir: &Path, file: &str, value: &T) -> Result<
     }
     fs::rename(&tmp, dir.join(file)).map_err(|e| RegistryError::Io(e.to_string()))?;
     Ok(())
-}
-
-fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -511,7 +507,11 @@ mod tests {
 
         // Expired -> None (mint with an expiry already in the past).
         let expired = reg
-            .mint_key("tenant-a", "alice", Some(now_ms() - 1_000))
+            .mint_key(
+                "tenant-a",
+                "alice",
+                Some(proximadb_kernel::time::now_unix_ms() - 1_000),
+            )
             .expect("mint expired");
         assert!(
             reg.resolve_key(&expired.key).is_none(),

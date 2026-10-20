@@ -10,7 +10,6 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use proximadb_rank_core::{RankError, RankResult};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[async_trait]
 pub trait ModelRegistry: Send + Sync {
@@ -49,13 +48,6 @@ impl Default for InMemoryModelRegistry {
     }
 }
 
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 #[async_trait]
 impl ModelRegistry for InMemoryModelRegistry {
     async fn register(&self, mut desc: ModelDescriptor) -> RankResult<u64> {
@@ -67,7 +59,7 @@ impl ModelRegistry for InMemoryModelRegistry {
         }
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         desc.seq = seq;
-        desc.created_at_ms = now_ms();
+        desc.created_at_ms = proximadb_kernel::time::now_unix_ms();
         self.inner.insert(desc.key.clone(), desc);
         Ok(seq)
     }

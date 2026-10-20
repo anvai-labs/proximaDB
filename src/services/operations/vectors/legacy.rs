@@ -893,31 +893,23 @@ impl VectorOperationsService {
         collection_id: &str,
         tenant_context: Option<&crate::storage::tenant::context::TenantContext>,
     ) -> Result<crate::core::stable_id::CollectionObjectId> {
-        let collection = if self.tenant_manager.is_some() {
-            let tenant_ctx = tenant_context.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Tenant context is required for collection '{}' in multi-tenant mode",
-                    collection_id
-                )
-            })?;
-            let collection = self
+        if self.tenant_manager.is_some() && tenant_context.is_none() {
+            return Err(anyhow::anyhow!(
+                "Tenant context is required for collection '{}' in multi-tenant mode",
+                collection_id
+            ));
+        }
+        // A request (tenant context present) resolves the collection within its
+        // tenant: the collection port applies the one ownership rule and
+        // answers a collection this tenant may not resolve exactly like a
+        // missing one. No tenant context ⇒ internal/system lookup.
+        let collection = match tenant_context {
+            Some(tenant_ctx) => self
                 .collection_port
                 .get_collection(collection_id, Some(&tenant_ctx.tenant_id))
-                .await?;
-            let Some(collection) = collection else {
-                warn!(
-                    "🚨 Tenant '{}' attempted to access collection '{}' without authorization",
-                    tenant_ctx.tenant_id, collection_id
-                );
-                return Err(anyhow::anyhow!(
-                    "Collection '{}' is not accessible for tenant '{}'",
-                    collection_id,
-                    tenant_ctx.tenant_id
-                ));
-            };
-            collection
-        } else {
-            (*self.get_or_load_collection(collection_id).await?).clone()
+                .await?
+                .ok_or_else(|| super::input_validation::CollectionNotFound::new(collection_id))?,
+            None => (*self.get_or_load_collection(collection_id).await?).clone(),
         };
 
         if self.rbac_enforcer.is_some()
@@ -1256,6 +1248,47 @@ impl VectorOperationsService {
             });
         }
         Ok(records)
+    }
+
+    /// Internal (system) sample: up to `cap` unflushed (WAL/memtable) records of
+    /// `collection_id`, unscoped. For the owner backfill.
+    pub async fn sample_unflushed_records_internal(
+        &self,
+        collection_id: &str,
+        cap: usize,
+    ) -> Result<Vec<ProximaRecord>> {
+        let collection_id = self
+            .validate_tenant_collection_access(collection_id, None)
+            .await?
+            .to_string();
+        let mut records = self
+            .wal_manager
+            .get_collection_vectors_raw(&collection_id)
+            .await?;
+        records.truncate(cap);
+        Ok(records)
+    }
+
+    /// Internal (system): the collection's recorded record count, if known.
+    pub async fn recorded_collection_size_internal(
+        &self,
+        collection_id: &str,
+    ) -> Result<Option<i64>> {
+        Ok(self
+            .collection_port
+            .get_collection_internal(collection_id)
+            .await?
+            .and_then(|collection| collection.stats.map(|stats| stats.vector_count)))
+    }
+
+    /// Internal (system): every record of `collection_id` (WAL + flushed
+    /// storage), unscoped. Callers bound the collection size first.
+    pub async fn list_all_records_internal(
+        &self,
+        collection_id: &str,
+    ) -> Result<Vec<ProximaRecord>> {
+        self.list_all_records_with_tenant_context(collection_id, None)
+            .await
     }
 
     /// Paginated storage-inclusive record scan. Returns up to `limit` records
@@ -1800,7 +1833,7 @@ impl VectorOperationsService {
         // collection metadata that this service already has access to.
         if let Ok(Some(collection)) = self
             .collection_port
-            .get_collection(&collection_id, None)
+            .get_collection_internal(&collection_id)
             .await
             && let Some(cfg) = collection.config.as_ref()
             && let Some(precision_value) = cfg.canonical_embedding_precision
@@ -3055,6 +3088,52 @@ impl VectorOperationsService {
         Ok(results)
     }
 
+    /// [`Self::unified_search_v1`] for a request acting as `request_tenant`:
+    /// the collection is resolved within that tenant first (a collection the
+    /// tenant may not resolve is answered exactly like a missing one), then
+    /// searched by its canonical id. `None` = internal, unscoped.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn unified_search_v1_for_tenant(
+        &self,
+        collection_id: &str,
+        request_tenant: Option<&str>,
+        query_vector: Vec<f32>,
+        k: usize,
+        filter: Option<FilterExpression>,
+        config: Option<UnifiedSearchConfig>,
+        subject: Option<&str>,
+        tenant_stable_id: Option<u64>,
+        auth_class: proximadb_tenant::AuthClass,
+    ) -> Result<Vec<crate::proto::proximadb_v1::SearchResult>> {
+        // No tenant: the scope in force decides (internal ⇒ unscoped; a request
+        // scope ⇒ its tenant; no scope ⇒ not found).
+        let scope_tenant = match request_tenant.filter(|t| !t.is_empty()) {
+            Some(tenant) => Some(tenant.to_string()),
+            None => crate::query::request_scope::resolution_tenant(collection_id)?,
+        };
+        let resolved = match scope_tenant {
+            Some(tenant) => self
+                .collection_port
+                .get_collection(collection_id, Some(&tenant))
+                .await?
+                .map(|collection| collection.id)
+                .ok_or_else(|| super::input_validation::CollectionNotFound::new(collection_id))?,
+            None => collection_id.to_string(),
+        };
+        self.unified_search_v1(
+            &resolved,
+            query_vector,
+            k,
+            filter,
+            config,
+            subject,
+            tenant_stable_id,
+            auth_class,
+        )
+        .await
+        .map_err(|e| super::input_validation::label_client_collection(e, collection_id))
+    }
+
     /// Shared implementation for the v1 path and its hints-aware
     /// sibling. Returns the v1 result envelope plus the Phase 5
     /// VectorObjectEconomyExplain populated by the shared delta-merge
@@ -3341,11 +3420,7 @@ impl VectorOperationsService {
                     .await?
                     .map(|collection| collection.id)
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Collection '{}' is not accessible for tenant '{}'",
-                            collection_id,
-                            context.tenant_id
-                        )
+                        super::input_validation::CollectionNotFound::new(collection_id)
                     })?
             }
             _ => collection_id.to_string(),
@@ -6854,12 +6929,23 @@ impl proximadb_runtime::VectorOpsPort for VectorOperationsService {
         // The identifier as the caller supplied it: the only collection
         // reference a client-facing error may echo (TD-SECSCAN-1 §5).
         let requested_collection = request.collection_id.clone();
-        if let Some(tid) = tenant_id.filter(|t| !t.is_empty())
-            && let Ok(Some(collection)) = self
+        // A request resolves the collection within its tenant; a collection
+        // this tenant may not resolve is answered exactly like a missing one
+        // (no fallback to an unscoped lookup).
+        // A tenant-less identity takes the scope in force: internal ⇒ unscoped,
+        // a request scope ⇒ its tenant, no scope ⇒ not found.
+        let scope_tenant = match tenant_id.filter(|t| !t.is_empty()) {
+            Some(tid) => Some(tid.to_string()),
+            None => crate::query::request_scope::resolution_tenant(&requested_collection)?,
+        };
+        if let Some(tid) = scope_tenant.as_deref() {
+            let collection = self
                 .collection_port
                 .get_collection(&request.collection_id, Some(tid))
-                .await
-        {
+                .await?
+                .ok_or_else(|| {
+                    super::input_validation::CollectionNotFound::new(requested_collection.as_str())
+                })?;
             request.collection_id = collection.id;
         }
         self.search_v1(request, identity)
@@ -6897,9 +6983,13 @@ impl proximadb_runtime::VectorOpsPort for VectorOperationsService {
             "{}",
             route.explain_line()
         );
-        let tenant_ctx = identity
-            .tenant_id
-            .filter(|t| !t.is_empty())
+        // A tenant-less identity takes the scope in force (see `search`).
+        let scope_tenant = match identity.tenant_id.filter(|t| !t.is_empty()) {
+            Some(tid) => Some(tid.to_string()),
+            None => crate::query::request_scope::resolution_tenant(&search.collection)?,
+        };
+        let tenant_ctx = scope_tenant
+            .as_deref()
             .map(crate::storage::tenant::context::TenantContext::for_tenant_id);
 
         #[cfg(feature = "abac-policy")]
@@ -6934,9 +7024,22 @@ impl proximadb_runtime::VectorOpsPort for VectorOperationsService {
 
     async fn batch_upsert(
         &self,
-        request: crate::proto::proximadb_v1::VectorBatchRequest,
+        mut request: crate::proto::proximadb_v1::VectorBatchRequest,
         tenant_id: Option<&str>,
     ) -> anyhow::Result<crate::proto::proximadb_v1::VectorOperationResponse> {
+        // Resolved within the request tenant (absent ⇒ the default tenant): a
+        // collection the tenant may not resolve is answered as missing.
+        let request_tenant = tenant_id
+            .filter(|t| !t.is_empty())
+            .unwrap_or(proximadb_tenant::DEFAULT_TENANT);
+        let collection = self
+            .collection_port
+            .get_collection(&request.collection_id, Some(request_tenant))
+            .await?
+            .ok_or_else(|| {
+                super::input_validation::CollectionNotFound::new(request.collection_id.as_str())
+            })?;
+        request.collection_id = collection.id;
         // Was `_tenant_id` — the caller's tenant was plumbed the whole way down this
         // port and then discarded here, so every record inserted through it landed with
         // an empty `tenant_id`, which the read filters treat as matching every tenant.
@@ -6949,10 +7052,19 @@ impl proximadb_runtime::VectorOpsPort for VectorOperationsService {
         vector_id: &str,
         include_vector: bool,
         include_metadata: bool,
-        _tenant_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> anyhow::Result<crate::proto::proximadb_v1::VectorOperationResponse> {
+        // Resolved within the request tenant (absent ⇒ the default tenant).
+        let request_tenant = tenant_id
+            .filter(|t| !t.is_empty())
+            .unwrap_or(proximadb_tenant::DEFAULT_TENANT);
+        let collection = self
+            .collection_port
+            .get_collection(collection_id, Some(request_tenant))
+            .await?
+            .ok_or_else(|| super::input_validation::CollectionNotFound::new(collection_id))?;
         let req = crate::proto::proximadb_v1::VectorGetRequest {
-            collection_id: collection_id.to_string(),
+            collection_id: collection.id,
             vector_id: vector_id.to_string(),
             include_vector: Some(include_vector),
             include_metadata: Some(include_metadata),

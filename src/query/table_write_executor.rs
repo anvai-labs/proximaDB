@@ -287,6 +287,7 @@ pub trait ParentTableResolver: Send + Sync {
     async fn resolve_parent_table(
         &self,
         references_table: &str,
+        tenant: Option<&str>,
     ) -> Result<Option<ResolvedParentTable>>;
 }
 
@@ -389,6 +390,7 @@ impl TableWriteExecutor for NativeTableWriteExecutor {
                     &self.record_store,
                     request.target_schema,
                     &batch,
+                    request.tenant_context,
                 )
                 .await?;
             }
@@ -456,6 +458,7 @@ async fn enforce_foreign_keys_for_batch(
     record_store: &Arc<dyn TableRecordStore>,
     target_schema: &CatalogTableSchema,
     batch: &[ProximaRecord],
+    tenant_context: Option<&crate::storage::tenant::context::TenantContext>,
 ) -> Result<()> {
     let child_primary_key = crate::services::record_store::schema_primary_key_column(target_schema);
     for constraint in &target_schema.relational_capabilities.constraints {
@@ -478,7 +481,13 @@ async fn enforce_foreign_keys_for_batch(
         let fk_column = &columns[0];
         let referenced_column = &references_columns[0];
 
-        let Some(parent) = resolver.resolve_parent_table(references_table).await? else {
+        let Some(parent) = resolver
+            .resolve_parent_table(
+                references_table,
+                tenant_context.map(|tc| tc.tenant_id.as_str()),
+            )
+            .await?
+        else {
             return Err(anyhow!(
                 "FOREIGN KEY ({}) on table '{}' references missing table '{}'",
                 fk_column,
@@ -516,7 +525,8 @@ async fn enforce_foreign_keys_for_batch(
                         include_vector: false,
                         include_props: false,
                     },
-                    None,
+                    // The parent row is looked up in the writing tenant's partition.
+                    tenant_context,
                     #[cfg(feature = "abac-policy")]
                     &ReadContext::system(
                         SystemReadReason::ForeignKeyResolution,
@@ -1338,6 +1348,7 @@ mod tests {
         async fn resolve_parent_table(
             &self,
             _references_table: &str,
+            _tenant: Option<&str>,
         ) -> Result<Option<ResolvedParentTable>> {
             Ok(Some(ResolvedParentTable {
                 schema: self.parent_schema.clone(),

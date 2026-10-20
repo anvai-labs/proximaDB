@@ -16,82 +16,18 @@
 //!   cargo test --features datafusion-integration --test external_table_pgwire_e2e -- --nocapture
 #![cfg(feature = "datafusion-integration")]
 
-use std::net::TcpListener;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arrow_array::{Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
-use proximadb::core::Config;
-use proximadb::database::ProximaDB;
 use tempfile::TempDir;
-use tokio::time::sleep;
 use tokio_postgres::NoTls;
 
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let p = l.local_addr().expect("addr").port();
-    drop(l);
-    p
-}
+#[path = "common/pg_server.rs"]
+mod pg_server;
 
-struct PgServer {
-    pg_port: u16,
-    _db: ProximaDB,
-    _tmp: TempDir,
-}
-
-impl PgServer {
-    async fn start(tmp: TempDir) -> anyhow::Result<Self> {
-        let pg_port = free_port();
-        let rest_port = free_port();
-        let grpc_port = free_port();
-        let mut config = Config::default();
-        config.server.bind_address = "127.0.0.1".to_string();
-        config.server.port = rest_port;
-        config.server.data_dir = tmp.path().to_path_buf();
-        config.api.rest_port = rest_port;
-        config.api.grpc_port = grpc_port;
-        config.api.unified_mode = false;
-        config.api.pg_port = Some(pg_port);
-        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
-            url: format!("file://{}", tmp.path().display()),
-            ..Default::default()
-        }];
-        config.storage.wal_config.write_buffer_directory =
-            format!("file://{}/wal", tmp.path().display());
-        let mut db = ProximaDB::new(config).await?;
-        db.start().await?;
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .no_proxy()
-            .build()?;
-        let health = format!("http://127.0.0.1:{rest_port}/health");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match http.get(&health).send().await {
-                Ok(r) if r.status().is_success() => break,
-                _ if std::time::Instant::now() > deadline => anyhow::bail!("REST not ready"),
-                _ => sleep(Duration::from_millis(100)).await,
-            }
-        }
-        sleep(Duration::from_millis(200)).await;
-        Ok(Self {
-            pg_port,
-            _db: db,
-            _tmp: tmp,
-        })
-    }
-
-    fn conn_str(&self) -> String {
-        format!(
-            "host=127.0.0.1 port={} user=postgres dbname=proximadb sslmode=disable",
-            self.pg_port
-        )
-    }
-}
-
+use pg_server::TestPgServer;
 /// Write a tiny two-column Parquet object and return its `file://` URI.
 fn write_parquet(dir: &std::path::Path) -> String {
     let schema = Arc::new(Schema::new(vec![
@@ -114,7 +50,7 @@ fn write_parquet(dir: &std::path::Path) -> String {
     format!("file://{}", path.display())
 }
 
-async fn connect(server: &PgServer) -> tokio_postgres::Client {
+async fn connect(server: &TestPgServer) -> tokio_postgres::Client {
     let (client, conn) = tokio_postgres::connect(&server.conn_str(), NoTls)
         .await
         .expect("connect");
@@ -127,7 +63,7 @@ async fn connect(server: &PgServer) -> tokio_postgres::Client {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn external_parquet_table_registers_and_reads_via_datafusion() {
     let tmp = TempDir::new().expect("tmp");
-    // Allowlist the server data dir (which holds the external object).
+    // Allowlist this run's temp dir (which holds the external object).
     let root = format!("file://{}", tmp.path().display());
     unsafe { std::env::set_var("PROXIMADB_EXTERNAL_TABLE_ROOTS", &root) };
 
@@ -135,7 +71,7 @@ async fn external_parquet_table_registers_and_reads_via_datafusion() {
     std::fs::create_dir_all(&ext_dir).expect("mkdir");
     let location = write_parquet(&ext_dir);
 
-    let server = PgServer::start(tmp).await.expect("server");
+    let server = TestPgServer::start().await.expect("server");
     let client = connect(&server).await;
 
     // The native catalog persists outside this test's tempdir, so clear any
@@ -191,14 +127,14 @@ async fn external_parquet_table_registers_and_reads_via_datafusion() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn external_location_outside_allowlist_is_rejected() {
     let tmp = TempDir::new().expect("tmp");
-    // Allowlist ONLY the server dir; the table below points outside it.
+    // Allowlist ONLY this run's dir; the table below points outside it.
     unsafe {
         std::env::set_var(
             "PROXIMADB_EXTERNAL_TABLE_ROOTS",
             format!("file://{}", tmp.path().display()),
         )
     };
-    let server = PgServer::start(tmp).await.expect("server");
+    let server = TestPgServer::start().await.expect("server");
     let client = connect(&server).await;
     client.simple_query("DROP TABLE IF EXISTS bad").await.ok();
 

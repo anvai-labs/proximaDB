@@ -37,7 +37,7 @@
 use std::sync::Arc;
 
 use axum::{
-    Router,
+    Extension, Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
@@ -52,6 +52,7 @@ use crate::catalog::iceberg_rest_service::{
     IcebergErrorResponse, IcebergRegisterTableRequest, IcebergRestService,
     IcebergUpdateNamespacePropertiesRequest,
 };
+use crate::network::middleware::tenant::TenantContext;
 
 /// Shared state for the Iceberg REST catalog server
 #[derive(Clone)]
@@ -191,6 +192,13 @@ fn parse_namespace(raw: &str) -> Vec<String> {
 /// Convert an `anyhow::Error` to an appropriate Iceberg JSON error response.
 fn err_to_response(err: anyhow::Error) -> Response {
     let msg = err.to_string();
+    if msg.starts_with("Bad request:") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(IcebergErrorResponse::bad_request(msg)),
+        )
+            .into_response();
+    }
     if msg.contains("not found") || msg.contains("NoSuch") || msg.contains("does not exist") {
         (
             StatusCode::NOT_FOUND,
@@ -241,12 +249,13 @@ async fn oauth_tokens() -> impl IntoResponse {
 /// GET /namespaces — list namespaces
 async fn list_namespaces(
     State(state): State<IcebergRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Query(params): Query<ListNamespacesParams>,
 ) -> Response {
     debug!("Iceberg REST: list_namespaces parent={:?}", params.parent);
     match state
         .service
-        .list_namespaces(params.parent.as_deref())
+        .list_namespaces(&tenant.tenant_id, params.parent.as_deref())
         .await
     {
         Ok(resp) => Json(resp).into_response(),
@@ -257,10 +266,11 @@ async fn list_namespaces(
 /// POST /namespaces — create namespace
 async fn create_namespace(
     State(state): State<IcebergRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Json(req): Json<IcebergCreateNamespaceRequest>,
 ) -> Response {
     info!("Iceberg REST: create_namespace {:?}", req.namespace);
-    match state.service.create_namespace(req).await {
+    match state.service.create_namespace(&tenant.tenant_id, req).await {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => err_to_response(e),
     }
@@ -269,11 +279,16 @@ async fn create_namespace(
 /// GET /namespaces/:namespace — load namespace properties
 async fn get_namespace(
     State(state): State<IcebergRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(namespace_raw): Path<String>,
 ) -> Response {
     let namespace = parse_namespace(&namespace_raw);
     debug!("Iceberg REST: get_namespace {:?}", namespace);
-    match state.service.get_namespace(namespace).await {
+    match state
+        .service
+        .get_namespace(&tenant.tenant_id, namespace)
+        .await
+    {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => err_to_response(e),
     }
@@ -282,10 +297,15 @@ async fn get_namespace(
 /// HEAD /namespaces/:namespace — check namespace existence
 async fn namespace_exists(
     State(state): State<IcebergRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(namespace_raw): Path<String>,
 ) -> StatusCode {
     let namespace = parse_namespace(&namespace_raw);
-    match state.service.namespace_exists(namespace).await {
+    match state
+        .service
+        .namespace_exists(&tenant.tenant_id, namespace)
+        .await
+    {
         Ok(true) => StatusCode::NO_CONTENT,
         Ok(false) => StatusCode::NOT_FOUND,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -295,11 +315,16 @@ async fn namespace_exists(
 /// DELETE /namespaces/:namespace — drop namespace
 async fn drop_namespace(
     State(state): State<IcebergRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(namespace_raw): Path<String>,
 ) -> Response {
     let namespace = parse_namespace(&namespace_raw);
     info!("Iceberg REST: drop_namespace {:?}", namespace);
-    match state.service.drop_namespace(namespace).await {
+    match state
+        .service
+        .drop_namespace(&tenant.tenant_id, namespace)
+        .await
+    {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
@@ -313,13 +338,14 @@ async fn drop_namespace(
 /// POST /namespaces/:namespace/properties — update namespace properties
 async fn update_namespace_properties(
     State(state): State<IcebergRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(namespace_raw): Path<String>,
     Json(req): Json<IcebergUpdateNamespacePropertiesRequest>,
 ) -> Response {
     let namespace = parse_namespace(&namespace_raw);
     match state
         .service
-        .update_namespace_properties(namespace, req)
+        .update_namespace_properties(&tenant.tenant_id, namespace, req)
         .await
     {
         Ok(resp) => Json(resp).into_response(),
@@ -330,11 +356,16 @@ async fn update_namespace_properties(
 /// GET /namespaces/:namespace/tables — list tables
 async fn list_tables(
     State(state): State<IcebergRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(namespace_raw): Path<String>,
 ) -> Response {
     let namespace = parse_namespace(&namespace_raw);
     debug!("Iceberg REST: list_tables {:?}", namespace);
-    match state.service.list_tables(namespace).await {
+    match state
+        .service
+        .list_tables(&tenant.tenant_id, namespace)
+        .await
+    {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => err_to_response(e),
     }
@@ -343,6 +374,7 @@ async fn list_tables(
 /// POST /namespaces/:namespace/tables — create table
 async fn create_table(
     State(state): State<IcebergRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(namespace_raw): Path<String>,
     Json(req): Json<IcebergCreateTableRequest>,
 ) -> Response {
@@ -352,7 +384,11 @@ async fn create_table(
         namespace.join("."),
         req.name
     );
-    match state.service.create_table(namespace, req).await {
+    match state
+        .service
+        .create_table(&tenant.tenant_id, namespace, req)
+        .await
+    {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => err_to_response(e),
     }
@@ -361,11 +397,16 @@ async fn create_table(
 /// GET /namespaces/:namespace/tables/:table — load table metadata
 async fn load_table(
     State(state): State<IcebergRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path((namespace_raw, table)): Path<(String, String)>,
 ) -> Response {
     let namespace = parse_namespace(&namespace_raw);
     debug!("Iceberg REST: load_table {}.{}", namespace.join("."), table);
-    match state.service.load_table(namespace, table).await {
+    match state
+        .service
+        .load_table(&tenant.tenant_id, namespace, table)
+        .await
+    {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => err_to_response(e),
     }
@@ -375,6 +416,7 @@ async fn load_table(
 /// `metadata.json` so the `metadata-location` returned by load_table resolves (TD-119).
 async fn load_table_metadata_file(
     State(state): State<IcebergRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path((namespace_raw, table, file)): Path<(String, String, String)>,
 ) -> Response {
     let namespace = parse_namespace(&namespace_raw);
@@ -394,7 +436,7 @@ async fn load_table_metadata_file(
     };
     match state
         .service
-        .read_table_metadata_file(namespace, table, version)
+        .read_table_metadata_file(&tenant.tenant_id, namespace, table, version)
         .await
     {
         Ok(bytes) => (
@@ -410,10 +452,15 @@ async fn load_table_metadata_file(
 /// HEAD /namespaces/:namespace/tables/:table — check table existence
 async fn table_exists(
     State(state): State<IcebergRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path((namespace_raw, table)): Path<(String, String)>,
 ) -> StatusCode {
     let namespace = parse_namespace(&namespace_raw);
-    match state.service.table_exists(namespace, table).await {
+    match state
+        .service
+        .table_exists(&tenant.tenant_id, namespace, table)
+        .await
+    {
         Ok(true) => StatusCode::NO_CONTENT,
         Ok(false) => StatusCode::NOT_FOUND,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -423,6 +470,7 @@ async fn table_exists(
 /// DELETE /namespaces/:namespace/tables/:table — drop table
 async fn drop_table(
     State(state): State<IcebergRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path((namespace_raw, table)): Path<(String, String)>,
     Query(params): Query<DropTableParams>,
 ) -> Response {
@@ -434,7 +482,11 @@ async fn drop_table(
         table,
         purge
     );
-    match state.service.drop_table(namespace, table, purge).await {
+    match state
+        .service
+        .drop_table(&tenant.tenant_id, namespace, table, purge)
+        .await
+    {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
@@ -448,6 +500,7 @@ async fn drop_table(
 /// POST /namespaces/:namespace/tables/:table — commit table changes
 async fn commit_table(
     State(state): State<IcebergRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path((namespace_raw, table)): Path<(String, String)>,
     Json(req): Json<IcebergCommitTableRequest>,
 ) -> Response {
@@ -457,7 +510,11 @@ async fn commit_table(
         namespace.join("."),
         table
     );
-    match state.service.commit_table(namespace, table, req).await {
+    match state
+        .service
+        .commit_table(&tenant.tenant_id, namespace, table, req)
+        .await
+    {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => err_to_response(e),
     }
@@ -466,6 +523,7 @@ async fn commit_table(
 /// POST /namespaces/:namespace/register — register an existing table
 async fn register_table(
     State(state): State<IcebergRestState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(namespace_raw): Path<String>,
     Json(req): Json<IcebergRegisterTableRequest>,
 ) -> Response {
@@ -475,7 +533,11 @@ async fn register_table(
         namespace.join("."),
         req.name
     );
-    match state.service.register_table(namespace, req).await {
+    match state
+        .service
+        .register_table(&tenant.tenant_id, namespace, req)
+        .await
+    {
         Ok(resp) => (StatusCode::OK, Json(resp)).into_response(),
         Err(e) => err_to_response(e),
     }

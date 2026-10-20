@@ -606,66 +606,70 @@ mod tests {
 
     #[tokio::test]
     async fn test_router_context_resolves_cataloged_uql_source() {
-        let manager = Arc::new(CatalogManager::new());
-        let catalog = manager
-            .create_native_catalog(
-                "default",
-                &format!(
-                    "file://{}",
-                    std::env::temp_dir()
-                        .join(format!("proximadb-router-catalog-{}", uuid::Uuid::new_v4()))
-                        .display()
-                ),
-            )
-            .await
-            .expect("native catalog should be created");
-        catalog
-            .create_namespace(&["default".to_string()], HashMap::new())
-            .await
-            .expect("namespace should be created");
+        crate::query::request_scope::with_internal_scope("test", async move {
+            let manager = Arc::new(CatalogManager::new());
+            let catalog = manager
+                .create_native_catalog(
+                    "default",
+                    &format!(
+                        "file://{}",
+                        std::env::temp_dir()
+                            .join(format!("proximadb-router-catalog-{}", uuid::Uuid::new_v4()))
+                            .display()
+                    ),
+                )
+                .await
+                .expect("native catalog should be created");
+            catalog
+                .create_namespace(&["default".to_string()], HashMap::new())
+                .await
+                .expect("namespace should be created");
 
-        let table_id = TableIdentifier::new(vec!["default".to_string()], "vectors".to_string());
-        let mut schema = CatalogTableSchema::new("vectors")
-            .with_column(CatalogColumn::new(1, "id", ProximaType::String).nullable(false))
-            .with_projection(CatalogProjection::rebuildable(
-                "vectors_hnsw",
-                CatalogProjectionKind::VectorAnn,
+            let table_id = TableIdentifier::new(vec!["default".to_string()], "vectors".to_string());
+            let mut schema = CatalogTableSchema::new("vectors")
+                .with_column(CatalogColumn::new(1, "id", ProximaType::String).nullable(false))
+                .with_projection(CatalogProjection::rebuildable(
+                    "vectors_hnsw",
+                    CatalogProjectionKind::VectorAnn,
+                    "pax_hot",
+                ));
+            schema.storage_layouts = vec![CatalogStorageLayout::internal(
                 "pax_hot",
-            ));
-        schema.storage_layouts = vec![CatalogStorageLayout::internal(
-            "pax_hot",
-            CatalogStorageLayoutKind::Pax,
-        )];
-        catalog
-            .create_table(&table_id, schema)
-            .await
-            .expect("table should be created");
+                CatalogStorageLayoutKind::Pax,
+            )];
+            catalog
+                .create_table(&table_id, schema)
+                .await
+                .expect("table should be created");
 
-        let router = UnifiedQueryRouter::new(PlanContext::default()).with_catalog_manager(manager);
-        let statement = UQLStatement::Select(SelectStatement {
-            columns: vec!["id".to_string()],
-            from: DataSource {
-                model: DataModel::Vector,
-                collection: "vectors".to_string(),
-                alias: None,
-            },
-            joins: Vec::new(),
-            where_clause: None,
-            order_by: None,
-            limit: Some(10),
-            offset: None,
-            fusion: None,
-        });
+            let router =
+                UnifiedQueryRouter::new(PlanContext::default()).with_catalog_manager(manager);
+            let statement = UQLStatement::Select(SelectStatement {
+                columns: vec!["id".to_string()],
+                from: DataSource {
+                    model: DataModel::Vector,
+                    collection: "vectors".to_string(),
+                    alias: None,
+                },
+                joins: Vec::new(),
+                where_clause: None,
+                order_by: None,
+                limit: Some(10),
+                offset: None,
+                fusion: None,
+            });
 
-        let context = router.context_for_statement(&statement).await;
+            let context = router.context_for_statement(&statement).await;
 
-        assert_eq!(context.resolved_objects.len(), 1);
-        assert_eq!(context.resolved_objects[0].source, "vectors");
-        assert_eq!(
-            context.resolved_objects[0].storage_layouts[0].layout_kind,
-            "Pax"
-        );
-        assert_eq!(context.resolved_objects[0].projections[0].kind, "VectorAnn");
+            assert_eq!(context.resolved_objects.len(), 1);
+            assert_eq!(context.resolved_objects[0].source, "vectors");
+            assert_eq!(
+                context.resolved_objects[0].storage_layouts[0].layout_kind,
+                "Pax"
+            );
+            assert_eq!(context.resolved_objects[0].projections[0].kind, "VectorAnn");
+        })
+        .await
     }
 
     #[tokio::test]

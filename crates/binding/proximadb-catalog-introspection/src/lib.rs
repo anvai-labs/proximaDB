@@ -88,11 +88,43 @@ impl CatalogIntrospectionResult {
 #[derive(Clone)]
 pub struct CatalogIntrospectionService {
     catalog_manager: Arc<CatalogManager>,
+    /// The tenant the request acts as; listings show only what it may see.
+    /// `None` = internal (embedded) use, unfiltered.
+    tenant: Option<String>,
 }
 
 impl CatalogIntrospectionService {
     pub fn new(catalog_manager: Arc<CatalogManager>) -> Self {
-        Self { catalog_manager }
+        Self {
+            catalog_manager,
+            tenant: None,
+        }
+    }
+
+    /// Introspection for a request acting as `tenant`: only tables in the
+    /// tenant's namespace, and collections visible to it, are listed.
+    pub fn for_tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = Some(tenant.into());
+        self
+    }
+
+    /// Whether the request tenant may see a cataloged table.
+    fn visible_to_tenant(&self, table_id: &TableIdentifier, schema: &CatalogTableSchema) -> bool {
+        let Some(tenant) = self.tenant.as_deref() else {
+            return true;
+        };
+        let tenant = proximadb_tenant::resolve_request_tenant(Some(tenant));
+        if schema.properties.contains_key("collection.id") {
+            return proximadb_tenant::collection_entry_visible_to(
+                schema.properties.get("owner").map(String::as_str),
+                schema.properties.get("tags").map(String::as_str),
+                Some(&tenant),
+            );
+        }
+        table_id
+            .namespace
+            .first()
+            .is_some_and(|first| *first == tenant)
     }
 
     pub fn is_catalog_query(sql: &str) -> bool {
@@ -343,6 +375,13 @@ impl CatalogIntrospectionService {
                 Err(_) => continue,
             };
             for ns in listed {
+                // A request sees only its own tenant's namespaces.
+                if let Some(tenant) = self.tenant.as_deref() {
+                    let tenant = proximadb_tenant::resolve_request_tenant(Some(tenant));
+                    if ns.levels.first() != Some(&tenant) {
+                        continue;
+                    }
+                }
                 rows.push(vec![
                     catalog_name.clone(),
                     ns.levels.join("."),
@@ -1261,6 +1300,9 @@ impl CatalogIntrospectionService {
             for namespace in catalog.list_namespaces(None).await? {
                 for table_id in catalog.list_tables(&namespace.levels).await? {
                     let schema = catalog.get_table(&table_id).await?;
+                    if !self.visible_to_tenant(&table_id, &schema) {
+                        continue;
+                    }
                     tables.push((catalog_name.clone(), table_id, schema));
                 }
             }

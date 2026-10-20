@@ -522,8 +522,22 @@ impl StorageEngine {
         // Recover each collection
         let mut total_vectors_recovered = 0u64;
         let mut recovery_failures = Vec::new();
+        let mut quarantined = Vec::new();
         for collection in collections {
             tracing::debug!("Recovering collection: {}", collection.id);
+
+            // A catalog entry with no storage assignment has nothing to recover
+            // into; it is quarantined (logged, skipped) so one bad entry never
+            // prevents startup. Recovery still fails closed on real recovery
+            // errors below (ADR-063 D3).
+            if collection.storage_assignment.is_none() {
+                error!(
+                    "STORAGE_ENGINE: collection {} has no storage assignment in its catalog entry; quarantined (not recovered)",
+                    collection.id
+                );
+                quarantined.push(collection.id.clone());
+                continue;
+            }
 
             match recovery_manager.recover_collection(&collection.id).await {
                 Ok(stats) => {
@@ -555,8 +569,13 @@ impl StorageEngine {
         }
 
         info!(
-            "🎉 STORAGE_ENGINE: WAL recovery complete: {} total vectors recovered",
-            total_vectors_recovered
+            "🎉 STORAGE_ENGINE: WAL recovery complete: {} total vectors recovered{}",
+            total_vectors_recovered,
+            if quarantined.is_empty() {
+                String::new()
+            } else {
+                format!(", {} collection(s) quarantined", quarantined.len())
+            }
         );
         Ok(())
     }

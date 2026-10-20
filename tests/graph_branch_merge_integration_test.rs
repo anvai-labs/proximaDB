@@ -340,3 +340,57 @@ async fn full_branch_merge_cycle_sequences_monotonic_after_write_back() -> Resul
 
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Write-back shares the server's live appender (one appender per WAL file).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The REST merge handler writes back to the SAME file the server's shared
+/// canonical appender owns. It used to open a second appender with its own
+/// sequence counter, so the server's next write reissued the merge's
+/// sequence numbers. Through `open_shared` both resolve to one appender:
+/// every sequence in the file is unique and the live appender continues past
+/// the merge.
+#[tokio::test]
+async fn write_back_shares_the_live_appender_so_sequences_never_repeat() -> Result<()> {
+    let (_tmp, wal_path) = fresh_wal()?;
+    // The server's long-lived appender (SharedServices holds it for the
+    // process lifetime).
+    let live = FramedTableWalAppender::open_shared(&wal_path).await?;
+
+    live.append_operations(vec![upsert_op("shared", None)], None)
+        .await?;
+    sleep(Duration::from_millis(8)).await;
+    live.append_operations(vec![upsert_op("shared", Some(BRANCH_A))], None)
+        .await?;
+    sleep(Duration::from_millis(8)).await;
+    live.append_operations(vec![upsert_op("shared", Some(BRANCH_B))], None)
+        .await?;
+
+    let pre = live.read_entries().await?;
+    let report = merge_branches(&pre, BRANCH_A, BRANCH_B).expect("mergeable seed");
+    let result = write_back_merge(
+        &pre, &report, &wal_path, COLLECTION, BRANCH_A, BRANCH_B, None,
+    )
+    .await?
+    .expect("the merge writes back");
+
+    let next = live
+        .append_operations(vec![upsert_op("after", None)], None)
+        .await?;
+    assert!(
+        next[0].sequence_number > result.last_lsn,
+        "the live appender must continue past the merge: {} <= {}",
+        next[0].sequence_number,
+        result.last_lsn
+    );
+    let seqs: Vec<u64> = live
+        .read_entries()
+        .await?
+        .iter()
+        .map(|e| e.sequence_number)
+        .collect();
+    let unique: std::collections::HashSet<&u64> = seqs.iter().collect();
+    assert_eq!(unique.len(), seqs.len(), "duplicate sequences: {seqs:?}");
+    Ok(())
+}

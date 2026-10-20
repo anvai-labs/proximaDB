@@ -14,6 +14,7 @@ name = "proximadb_rank_profile"
 path = "src/lib.rs"
 
 [dependencies]
+proximadb-kernel = { workspace = true }
 proximadb-rank-core = { workspace = true }
 proximadb-rank-expr = { workspace = true }
 arc-swap = "1.7"

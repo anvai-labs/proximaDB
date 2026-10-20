@@ -226,6 +226,10 @@ pub struct IcebergSnapshot {
     pub summary: IcebergSnapshotSummary,
     #[serde(rename = "schema-id", skip_serializing_if = "Option::is_none")]
     pub schema_id: Option<i32>,
+    /// Fields this struct does not model (e.g. v3 `first-row-id`, `added-rows`),
+    /// kept so writer-produced metadata is served verbatim.
+    #[serde(flatten, default)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// A named snapshot reference (`refs` map entry): a branch or tag pointing at a snapshot.
@@ -300,6 +304,11 @@ pub struct IcebergTableMetadata {
     /// snapshot; this is the substrate for git-style agent branching (TD-117).
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub refs: HashMap<String, IcebergSnapshotRef>,
+    /// Fields this struct does not model — `last-sequence-number` (required from
+    /// v2), v3 `next-row-id`, … — kept so metadata written by the Iceberg engine is
+    /// served verbatim (ADR-097 D3).
+    #[serde(flatten, default)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Response for loading a table (GET /v1/namespaces/{ns}/tables/{table})
@@ -576,81 +585,180 @@ impl IcebergRestService {
         }
     }
 
+    // ---- Request-tenant scoping ----
+    //
+    // Every request acts as a tenant. A client namespace is resolved into the
+    // tenant's own namespace exactly as SQL resolution does (prefixed with the
+    // tenant unless it already starts with it), listings show only the tenant's
+    // own namespaces and tables, and an entry the tenant may not see answers
+    // exactly like one that does not exist.
+
+    /// The catalog namespace a client namespace names for `tenant`.
+    fn scoped_namespace(tenant: &str, namespace: &[String]) -> Vec<String> {
+        if namespace.first().is_some_and(|first| first == tenant) {
+            return namespace.to_vec();
+        }
+        let mut scoped = Vec::with_capacity(namespace.len() + 1);
+        scoped.push(tenant.to_string());
+        scoped.extend(namespace.iter().cloned());
+        scoped
+    }
+
+    /// The client view of a catalog namespace, or `None` when it is not
+    /// `tenant`'s.
+    fn client_namespace(tenant: &str, levels: &[String]) -> Option<Vec<String>> {
+        if levels.first().map(String::as_str) != Some(tenant) {
+            return None;
+        }
+        Some(if levels.len() > 1 {
+            levels[1..].to_vec()
+        } else {
+            levels.to_vec()
+        })
+    }
+
+    fn records_collection(schema: &CatalogTableSchema) -> bool {
+        schema.properties.contains_key("collection.id")
+    }
+
+    /// The entry at `identifier` when it exists and `tenant` may see it (a
+    /// collection entry only when the collection is visible to the tenant).
+    async fn visible_entry(
+        catalog: &dyn crate::Catalog,
+        identifier: &TableIdentifier,
+        tenant: &str,
+    ) -> Result<Option<CatalogTableSchema>> {
+        if !catalog.table_exists(identifier).await? {
+            return Ok(None);
+        }
+        let schema = catalog.get_table(identifier).await?;
+        if Self::records_collection(&schema)
+            && !proximadb_tenant::collection_entry_visible_to(
+                schema.properties.get("owner").map(String::as_str),
+                schema.properties.get("tags").map(String::as_str),
+                Some(tenant),
+            )
+        {
+            return Ok(None);
+        }
+        Ok(Some(schema))
+    }
+
+    fn missing_table(table: &str) -> anyhow::Error {
+        anyhow::anyhow!("Table '{table}' does not exist")
+    }
+
+    fn missing_namespace(namespace: &[String]) -> anyhow::Error {
+        anyhow::anyhow!("Namespace '{}' does not exist", namespace.join("."))
+    }
+
+    /// Collections are managed through the collections API only.
+    fn refuse_collection(table: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "Bad request: '{table}' is a collection; manage it through the collections API"
+        )
+    }
+
     // ---- Namespaces ----
 
     pub async fn list_namespaces(
         &self,
-        parent: Option<&str>,
+        tenant: &str,
+        _parent: Option<&str>,
     ) -> Result<IcebergListNamespacesResponse> {
         let catalog = self.catalog_manager.default_catalog().await?;
-        let parent_levels = parent
-            .map(|p| p.split('\x1f').map(String::from).collect::<Vec<_>>())
-            .as_deref()
-            .map(|sl: &[String]| sl)
-            .map(|_| vec![])
-            .unwrap_or_default();
-
-        let namespaces = catalog
-            .list_namespaces(if parent_levels.is_empty() {
-                None
-            } else {
-                Some(parent_levels.as_slice())
-            })
-            .await?;
-
+        let namespaces = catalog.list_namespaces(None).await?;
+        let mut visible: Vec<Vec<String>> = namespaces
+            .into_iter()
+            .filter_map(|ns| Self::client_namespace(tenant, &ns.levels))
+            .collect();
+        visible.sort();
+        visible.dedup();
         Ok(IcebergListNamespacesResponse {
-            namespaces: namespaces.into_iter().map(|ns| ns.levels).collect(),
+            namespaces: visible,
         })
     }
 
     pub async fn create_namespace(
         &self,
+        tenant: &str,
         req: IcebergCreateNamespaceRequest,
     ) -> Result<IcebergNamespaceResponse> {
         let catalog = self.catalog_manager.default_catalog().await?;
-
-        let ns = catalog
-            .create_namespace(&req.namespace, req.properties.clone())
+        let scoped = Self::scoped_namespace(tenant, &req.namespace);
+        catalog
+            .create_namespace_for_tenant(&scoped, req.properties.clone(), Some(tenant))
             .await?;
-
+        let ns = catalog.get_namespace(&scoped).await?;
         Ok(IcebergNamespaceResponse {
-            namespace: ns.levels,
+            namespace: req.namespace,
             properties: ns.properties,
         })
     }
 
-    pub async fn get_namespace(&self, namespace: Vec<String>) -> Result<IcebergNamespaceResponse> {
+    pub async fn get_namespace(
+        &self,
+        tenant: &str,
+        namespace: Vec<String>,
+    ) -> Result<IcebergNamespaceResponse> {
         let catalog = self.catalog_manager.default_catalog().await?;
-        let ns = catalog.get_namespace(&namespace).await?;
-
+        let scoped = Self::scoped_namespace(tenant, &namespace);
+        if !catalog.namespace_exists(&scoped).await? {
+            return Err(Self::missing_namespace(&namespace));
+        }
+        let ns = catalog.get_namespace(&scoped).await?;
         Ok(IcebergNamespaceResponse {
-            namespace: ns.levels,
+            namespace,
             properties: ns.properties,
         })
     }
 
-    pub async fn namespace_exists(&self, namespace: Vec<String>) -> Result<bool> {
+    pub async fn namespace_exists(&self, tenant: &str, namespace: Vec<String>) -> Result<bool> {
         let catalog = self.catalog_manager.default_catalog().await?;
-        catalog.namespace_exists(&namespace).await
+        catalog
+            .namespace_exists(&Self::scoped_namespace(tenant, &namespace))
+            .await
     }
 
-    pub async fn drop_namespace(&self, namespace: Vec<String>) -> Result<bool> {
+    pub async fn drop_namespace(&self, tenant: &str, namespace: Vec<String>) -> Result<bool> {
         let catalog = self.catalog_manager.default_catalog().await?;
-        catalog.drop_namespace(&namespace, false).await
+        let scoped = Self::scoped_namespace(tenant, &namespace);
+        if !catalog.namespace_exists(&scoped).await? {
+            return Ok(false);
+        }
+        catalog.drop_namespace(&scoped, false).await
     }
 
     pub async fn update_namespace_properties(
         &self,
+        tenant: &str,
         namespace: Vec<String>,
         req: IcebergUpdateNamespacePropertiesRequest,
     ) -> Result<IcebergUpdateNamespacePropertiesResponse> {
         let catalog = self.catalog_manager.default_catalog().await?;
+        let scoped = Self::scoped_namespace(tenant, &namespace);
+        if !catalog.namespace_exists(&scoped).await? {
+            return Err(Self::missing_namespace(&namespace));
+        }
+        // A namespace that also holds entries this tenant cannot see is not the
+        // tenant's to configure.
+        for id in catalog.list_tables(&scoped).await? {
+            if Self::visible_entry(catalog.as_ref(), &id, tenant)
+                .await?
+                .is_none()
+            {
+                return Err(anyhow::anyhow!(
+                    "Bad request: namespace '{}' properties cannot be changed by this caller",
+                    namespace.join(".")
+                ));
+            }
+        }
 
         let updated_keys: Vec<String> = req.updates.keys().cloned().collect();
         let removed_keys = req.removals.clone();
 
         catalog
-            .update_namespace_properties(&namespace, req.updates, req.removals)
+            .update_namespace_properties(&scoped, req.updates, req.removals)
             .await?;
 
         Ok(IcebergUpdateNamespacePropertiesResponse {
@@ -662,29 +770,44 @@ impl IcebergRestService {
 
     // ---- Tables ----
 
-    pub async fn list_tables(&self, namespace: Vec<String>) -> Result<IcebergListTablesResponse> {
+    pub async fn list_tables(
+        &self,
+        tenant: &str,
+        namespace: Vec<String>,
+    ) -> Result<IcebergListTablesResponse> {
         let catalog = self.catalog_manager.default_catalog().await?;
-        let identifiers = catalog.list_tables(&namespace).await?;
-
-        Ok(IcebergListTablesResponse {
-            identifiers: identifiers
-                .into_iter()
-                .map(|id| IcebergTableIdentifier {
-                    namespace: id.namespace,
+        let scoped = Self::scoped_namespace(tenant, &namespace);
+        if !catalog.namespace_exists(&scoped).await? {
+            return Err(Self::missing_namespace(&namespace));
+        }
+        let mut identifiers = Vec::new();
+        for id in catalog.list_tables(&scoped).await? {
+            if Self::visible_entry(catalog.as_ref(), &id, tenant)
+                .await?
+                .is_some()
+            {
+                identifiers.push(IcebergTableIdentifier {
+                    namespace: namespace.clone(),
                     name: id.name,
-                })
-                .collect(),
-        })
+                });
+            }
+        }
+        Ok(IcebergListTablesResponse { identifiers })
     }
 
     pub async fn create_table(
         &self,
+        tenant: &str,
         namespace: Vec<String>,
         req: IcebergCreateTableRequest,
     ) -> Result<IcebergLoadTableResponse> {
         let catalog = self.catalog_manager.default_catalog().await?;
 
-        let identifier = TableIdentifier::new(namespace.clone(), req.name.clone());
+        let identifier =
+            TableIdentifier::new(Self::scoped_namespace(tenant, &namespace), req.name.clone());
+        if catalog.table_exists(&identifier).await? {
+            return Err(anyhow::anyhow!("Table '{}' already exists", req.name));
+        }
         let schema = self.iceberg_schema_to_catalog(&req.schema, &req.name, req.properties.clone());
 
         let created = catalog.create_table(&identifier, schema).await?;
@@ -700,13 +823,17 @@ impl IcebergRestService {
 
     pub async fn load_table(
         &self,
+        tenant: &str,
         namespace: Vec<String>,
         table: String,
     ) -> Result<IcebergLoadTableResponse> {
         let catalog = self.catalog_manager.default_catalog().await?;
-        let identifier = TableIdentifier::new(namespace.clone(), table.clone());
+        let identifier =
+            TableIdentifier::new(Self::scoped_namespace(tenant, &namespace), table.clone());
 
-        let schema = catalog.get_table(&identifier).await?;
+        let schema = Self::visible_entry(catalog.as_ref(), &identifier, tenant)
+            .await?
+            .ok_or_else(|| Self::missing_table(&table))?;
         let (metadata, metadata_location) =
             self.ensure_table_metadata(&identifier, &schema).await?;
 
@@ -736,6 +863,11 @@ impl IcebergRestService {
         identifier: &TableIdentifier,
         schema: &CatalogTableSchema,
     ) -> Result<(IcebergTableMetadata, String)> {
+        // ADR-097 D3: a table published by the Iceberg engine (MATERIALIZE) is served
+        // from the engine's own `metadata.json`, verbatim — one writer, one tree.
+        if let Some(published) = engine_published_metadata(schema).await {
+            return Ok(published);
+        }
         let mut md = self.catalog_schema_to_iceberg_metadata(identifier, schema);
         let ns = identifier.namespace.join("\x1f");
         let default_location = format!(
@@ -751,7 +883,7 @@ impl IcebergRestService {
         };
 
         let manifest_prefix = format!("{base}/_manifests");
-        let metadata_prefix = format!("{base}/_metadata");
+        let metadata_prefix = table_metadata_prefix(&base, identifier);
         let manifest_base_url = format!(
             "{}/namespaces/{}/tables/{}/manifests",
             self.server_base_url, ns, identifier.name
@@ -803,6 +935,10 @@ impl IcebergRestService {
                 md.current_snapshot_id = current;
                 md.snapshots = snaps;
                 md.snapshot_log = log;
+                md.extra.insert(
+                    "last-sequence-number".to_string(),
+                    serde_json::json!(latest + 1),
+                );
             }
         }
 
@@ -819,6 +955,9 @@ impl IcebergRestService {
             && let Ok(bytes) = bridge.read_table_metadata(&metadata_prefix, mv).await
             && let Ok(existing) = serde_json::from_slice::<IcebergTableMetadata>(&bytes)
             && existing.snapshots.len() == expected_snapshots
+            // Only ever this table's own metadata.
+            && existing.table_uuid == md.table_uuid
+            && existing.location == md.location
         {
             let loc = format!(
                 "{}/namespaces/{}/tables/{}/metadata/v{}.metadata.json",
@@ -864,13 +1003,17 @@ impl IcebergRestService {
     /// Read the raw bytes of a persisted `metadata.json` version (for the REST GET route).
     pub async fn read_table_metadata_file(
         &self,
+        tenant: &str,
         namespace: Vec<String>,
         table: String,
         version: u64,
     ) -> Result<Vec<u8>> {
         let catalog = self.catalog_manager.default_catalog().await?;
-        let identifier = TableIdentifier::new(namespace, table);
-        let schema = catalog.get_table(&identifier).await?;
+        let identifier =
+            TableIdentifier::new(Self::scoped_namespace(tenant, &namespace), table.clone());
+        let schema = Self::visible_entry(catalog.as_ref(), &identifier, tenant)
+            .await?
+            .ok_or_else(|| Self::missing_table(&table))?;
         let base = table_base_path(&schema)
             .ok_or_else(|| anyhow::anyhow!("table has no object-store location"))?;
         let bridge = self
@@ -878,35 +1021,60 @@ impl IcebergRestService {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("iceberg metadata persistence is not configured"))?;
         Ok(bridge
-            .read_table_metadata(&format!("{base}/_metadata"), version)
+            .read_table_metadata(&table_metadata_prefix(&base, &identifier), version)
             .await?)
     }
 
-    pub async fn table_exists(&self, namespace: Vec<String>, table: String) -> Result<bool> {
+    pub async fn table_exists(
+        &self,
+        tenant: &str,
+        namespace: Vec<String>,
+        table: String,
+    ) -> Result<bool> {
         let catalog = self.catalog_manager.default_catalog().await?;
-        let identifier = TableIdentifier::new(namespace, table);
-        catalog.table_exists(&identifier).await
+        let identifier = TableIdentifier::new(Self::scoped_namespace(tenant, &namespace), table);
+        Ok(Self::visible_entry(catalog.as_ref(), &identifier, tenant)
+            .await?
+            .is_some())
     }
 
+    /// Drop a table the tenant can see. A collection's catalog entry is never
+    /// dropped here (the collections API owns it).
     pub async fn drop_table(
         &self,
+        tenant: &str,
         namespace: Vec<String>,
         table: String,
         purge: bool,
     ) -> Result<bool> {
         let catalog = self.catalog_manager.default_catalog().await?;
-        let identifier = TableIdentifier::new(namespace, table);
+        let identifier =
+            TableIdentifier::new(Self::scoped_namespace(tenant, &namespace), table.clone());
+        let Some(schema) = Self::visible_entry(catalog.as_ref(), &identifier, tenant).await? else {
+            return Ok(false);
+        };
+        if Self::records_collection(&schema) {
+            return Err(Self::refuse_collection(&table));
+        }
         catalog.drop_table(&identifier, purge).await
     }
 
     pub async fn commit_table(
         &self,
+        tenant: &str,
         namespace: Vec<String>,
         table: String,
         req: IcebergCommitTableRequest,
     ) -> Result<IcebergCommitTableResponse> {
         let catalog = self.catalog_manager.default_catalog().await?;
-        let identifier = TableIdentifier::new(namespace.clone(), table.clone());
+        let identifier =
+            TableIdentifier::new(Self::scoped_namespace(tenant, &namespace), table.clone());
+        let schema = Self::visible_entry(catalog.as_ref(), &identifier, tenant)
+            .await?
+            .ok_or_else(|| Self::missing_table(&table))?;
+        if Self::records_collection(&schema) {
+            return Err(Self::refuse_collection(&table));
+        }
 
         // Apply updates: handle SetProperties and AddSchema
         for update in &req.updates {
@@ -934,13 +1102,12 @@ impl IcebergRestService {
             }
         }
 
-        let schema = catalog.get_table(&identifier).await?;
         let metadata = self.catalog_schema_to_iceberg_metadata(&identifier, &schema);
 
         let metadata_location = format!(
             "{}/namespaces/{}/tables/{}/metadata/v2.metadata.json",
             self.server_base_url,
-            namespace.join("\x1f"),
+            identifier.namespace.join("\x1f"),
             table
         );
 
@@ -952,13 +1119,18 @@ impl IcebergRestService {
 
     pub async fn register_table(
         &self,
+        tenant: &str,
         namespace: Vec<String>,
         req: IcebergRegisterTableRequest,
     ) -> Result<IcebergLoadTableResponse> {
         // For ProximaDB-native tables, registration creates a catalog entry pointing to the
         // external metadata location. We create a minimal schema from the name.
         let catalog = self.catalog_manager.default_catalog().await?;
-        let identifier = TableIdentifier::new(namespace.clone(), req.name.clone());
+        let identifier =
+            TableIdentifier::new(Self::scoped_namespace(tenant, &namespace), req.name.clone());
+        if catalog.table_exists(&identifier).await? {
+            return Err(anyhow::anyhow!("Table '{}' already exists", req.name));
+        }
 
         let mut properties = HashMap::new();
         properties.insert(
@@ -1133,6 +1305,7 @@ impl IcebergRestService {
                 },
             },
             schema_id: Some(schema.schema_version),
+            extra: HashMap::new(),
         };
 
         // Default partition spec: partition by tenant_id (field id=2)
@@ -1185,6 +1358,7 @@ impl IcebergRestService {
             ])],
             metadata_log: vec![],
             refs: HashMap::from([("main".to_string(), IcebergSnapshotRef::branch(snapshot_id))]),
+            extra: HashMap::from([("last-sequence-number".to_string(), serde_json::json!(1))]),
         }
     }
 
@@ -1196,7 +1370,8 @@ impl IcebergRestService {
         properties: HashMap<String, String>,
     ) -> CatalogTableSchema {
         let mut schema = CatalogTableSchema::new(table_name);
-        schema.properties = properties;
+        // System-written properties are never taken from a client request.
+        schema.properties = crate::table_properties::without_reserved_table_properties(properties);
 
         for (i, f) in iceberg_schema.fields.iter().enumerate() {
             let data_type = iceberg_type_to_catalog(&f.field_type);
@@ -1306,6 +1481,43 @@ fn uuid_from_name(name: &str) -> String {
     )
 }
 
+/// Iceberg metadata written by the engine's single writer
+/// (`IcebergObjectStoreBridge::publish_iceberg_snapshot`) for a table with a
+/// published Parquet layout: `(metadata, metadata-location)` of the latest
+/// `{table root}/metadata/v*.metadata.json`, or `None` when the table has no
+/// URL-addressed published layout or nothing has been published there yet.
+///
+/// The layout `location` is the directory of the parquet files
+/// (`{table root}/data`); the engine writes metadata to its sibling.
+async fn engine_published_metadata(
+    schema: &CatalogTableSchema,
+) -> Option<(IcebergTableMetadata, String)> {
+    const METADATA_DIR: &str = "metadata";
+    let location = schema.storage_layouts.iter().rev().find_map(|l| {
+        (l.authority == crate::CatalogAuthorityMode::ProjectionPublication
+            && l.physical_format == crate::CatalogPhysicalFormat::Parquet)
+            .then_some(l.location.as_deref())
+            .flatten()
+    })?;
+    if !location.contains("://") {
+        return None;
+    }
+    let table_root = location.trim_end_matches('/').strip_suffix("/data")?;
+    let bridge = proximadb_iceberg_engine::IcebergObjectStoreBridge::from_url(table_root).ok()?;
+    let version = bridge.latest_metadata_version(METADATA_DIR).await.ok()??;
+    let bytes = bridge
+        .read_table_metadata(METADATA_DIR, version)
+        .await
+        .ok()?;
+    match serde_json::from_slice::<IcebergTableMetadata>(&bytes) {
+        Ok(md) => Some((md, bridge.metadata_file_uri(METADATA_DIR, version))),
+        Err(err) => {
+            debug!("iceberg: engine metadata under {table_root} is unreadable: {err}");
+            None
+        }
+    }
+}
+
 /// Derive a materialized table's object-store base prefix from its catalog schema,
 /// mirroring the write path's `object_write_base_path` (explicit-location branch). Returns
 /// `None` for tables without an object-store location (not yet materialized), for which
@@ -1327,6 +1539,20 @@ fn table_base_path(schema: &CatalogTableSchema) -> Option<String> {
         .or(schema.location.as_deref())?;
     let normalized = normalize_object_path_prefix(location);
     (!normalized.is_empty()).then_some(normalized)
+}
+
+/// Where a table's persisted `metadata.json` versions live. Keyed by the table
+/// identity under the table's location, because several catalog entries can
+/// share one location; a shared prefix would serve one table's metadata for
+/// another.
+fn table_metadata_prefix(base: &str, identifier: &TableIdentifier) -> String {
+    let key: Vec<&str> = identifier
+        .namespace
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(identifier.name.as_str()))
+        .collect();
+    format!("{base}/_metadata/{}", key.join("."))
 }
 
 fn normalize_object_path_prefix(location: &str) -> String {
@@ -1385,6 +1611,7 @@ fn build_snapshot_chain(
                 extra,
             },
             schema_id: Some(schema_id),
+            extra: HashMap::new(),
         });
         log.push(HashMap::from([
             ("timestamp-ms".to_string(), serde_json::json!(now_ms)),

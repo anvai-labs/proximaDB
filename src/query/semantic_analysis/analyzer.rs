@@ -103,7 +103,7 @@ impl Analyzer {
         if let Some(table_name) = &table_ref.name {
             let collection = self
                 .collection_port
-                .get_collection(table_name, None)
+                .get_collection_internal(table_name)
                 .await?;
             if let Some(collection) = collection {
                 let mut columns = HashMap::new();

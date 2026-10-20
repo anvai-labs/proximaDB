@@ -1,0 +1,559 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= Lakehouse-native multimodal: thought experiments, foundational seams, vector-tier economics
+:toc: left
+:toclevels: 2
+:icons: font
+// status-as-of: 2026-10-18
+
+[cols="1,3"]
+|===
+| Status | **Accepted direction (owner decision 2026-10-18); implementation Open.** The decisions are recorded in link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097]. Each phase below is tracked by a `TD-SEAM-*` item (§6).
+| Date | 2026-10-18
+| Deciders | Vijaykumar Singh
+| Evidence base | Code survey of `develop` @ `1db3a05` (three parallel explorations). File:line citations are to that commit; line numbers drift, so re-verify before implementing (link:HOW_TO_FILE_TD_AND_ADR.adoc[HOW_TO_FILE_TD_AND_ADR] "Premise verification").
+| Relates to | link:adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096] (product direction), link:adr/ADR-094-unified-storage-substrate-and-compute-seam.adoc[ADR-094] (one substrate, format follows modality), link:adr/ADR-054-native-execution-engine-progressive-cutover.adoc[ADR-054] (native operator plane), link:adr/ADR-052-analytics-execution-competitiveness-codesign.adoc[ADR-052] (DataFusion OLAP), link:adr/ADR-020-canonical-wal-authority.adoc[ADR-020] (canonical WAL authority), link:adr/ADR-055-document-canonical-format-declaration-and-legacy-retirement.adoc[ADR-055] (document canonical format), link:adr/ADR-026-pax-canonical-vector-path.adoc[ADR-026] (PAX canonical vector path), link:adr/ADR-007-iceberg-rest-catalog-server.adoc[ADR-007] (Iceberg REST catalog), link:RELATIONAL_DOCUMENT_GRAPH_CONVERGENCE_2026_05_14.adoc[RELATIONAL_DOCUMENT_GRAPH_CONVERGENCE_2026_05_14] (stacked durability, projections)
+|===
+
+== 1. Positioning this document executes
+
+ProximaDB is the **lakehouse system of record for AI context**. Every modality lands as an open
+table on object storage under one catalog, one record identity and one snapshot. Analytics is
+the proof, not the product: TPC-DS and the multimodal benchmark show the claim holds; they are
+not a warehouse race. This sharpens ADR-096 D1 ("SQL-first context engine on object storage");
+it does not change it.
+
+== 2. Where the vision is ahead of the code
+
+The survey found five gaps. Each is a premise for a phase in §6.
+
+. **Two disjoint Iceberg metadata trees.**
+** The REST tree has dangling manifest URLs, a synthetic schema, a `commit_table` stub, and is
+   hard-coded to format v2.
+** The MATERIALIZE tree is v3-labelled but lacks parent snapshot ids and row lineage, writes
+   relative paths, and has no Avro header metadata.
+** No test reads a table back with an external reader.
+. **The write path is not a lakehouse write path.**
+** The canonical WAL is one local file with an O(WAL) decode, no rotation and no truncation.
+** Layer A (`SpillRecordStorage`) has no production caller.
+** MATERIALIZE buffers the whole table (3–4 copies) into one `part-0.parquet` and drops `oid`
+   and the system columns.
+. **SQL depends on format because of a registration gap, not a storage limit.**
+** Only `ObjectStoreParquetTable` is registered with DataFusion.
+** The native path is a `MemTable` capped at 1M rows.
+** `PaxTableProvider` has no production caller.
+** Cross-modal UDTFs are eager `MemTable`s with literal-only arguments and string ids (no
+   `oid`), and push down neither filters nor limits.
+. **Modalities are not canonical-WAL-authoritative.**
+** Observability has its own WAL and no tiering at all; `tier_down` has no caller.
+** Graph mirrors into a cold store via `upsert_record`, not a WAL `RecordUpsert`.
+** `oid` is namespaced per modality, so there is no shared identity.
+. **The vector tiers are split.**
+** The default PAX cascade is turbopuffer-shaped but costs 20–80 GET/query cold, against
+   turbopuffer's 3–4 round trips.
+** AXIS HNSW is memory-only and rebuilt on cold start.
+** AXIS IVF on disk/cloud is a placeholder
+   (`src/index/axis/storage/ivf_posting_list_storage.rs:339`).
+** A vector collection created without an index defaults to HELIX, which measured 2% recall
+   (link:../10-quality/td/TD-ENGSEL-1-auto-selected-engine-is-beta-helix.adoc[TD-ENGSEL-1],
+   link:../10-quality/td/TD-HELIX-3-multi-engine-benchmark-low-recall-helix-swift.adoc[TD-HELIX-3]).
+
+== 3. Part A — Thought experiments (each one decides a seam)
+
+[cols="1,3,5,5", options="header"]
+|===
+| # | Experiment | What breaks today (evidence) | Decision it forces
+
+| TE-1
+| **Analyst's join:** "tickets semantically like X, from customers who churned last quarter,
+with their agent-session error logs, grouped by plan"
+| `vector_search` runs eagerly into a `MemTable`. Its arguments are literals only, its filter
+is post-hoc, and it returns a string `id` (`src/datafusion/cross_modal.rs:150-267`). A
+UDTF-only query never reaches DataFusion (empty `tables` map). Logs are not in SQL.
+| **S5/S6:** modalities are lazy `ExecutionPlan`s under one logical IR, with filter, limit and
+dynamic-filter pushdown, and they return `oid`.
+
+| TE-2
+| **Spark/Trino/DuckDB reads our table** through `/iceberg/v1`
+| REST serves `_manifests` (empty for MATERIALIZE tables). Manifest-list URLs 404, the schema
+includes columns the files don't have, and `file_path` values are not URIs.
+| **S4:** one Iceberg writer is authoritative, REST serves its `metadata.json` verbatim, and
+CI reads tables back with an external reader.
+
+| TE-3
+| **Firehose:** OTLP logs/metrics at 50k rows/s, query freshness ≤ 2 s, 30-day retention
+| The canonical WAL is a single file and `read_changes_since` decodes all of it.
+Observability has its own WAL and no tiering. Layer A has no time partitioning.
+| **S2/S3:** segmented WAL with a per-collection index and truncation; time-partitioned
+Layer A for append-only modalities; retention = `RecordPartitionDrop` + snapshot expiry.
+
+| TE-4
+| **Forget a user (GDPR)** across rows, vectors, graph edges, documents and logs, including
+published snapshots
+| `oid` namespaces differ per modality. MATERIALIZE sets `oid` to the row index
+(`src/services/dml/mod.rs:2317`). Iceberg has no deletes. HNSW delete is O(E).
+| **S1:** one identity scheme plus an entity/subject key system column. **S4:** position
+deletes (v2), then deletion vectors (v3).
+
+| TE-5
+| **Cold start at 100M × 768d**
+| HNSW at ~620 B/vector plus fp32 vectors is about 370 GB of RAM, with a full rebuild on
+restart. AXIS IVF disk is a placeholder. The PAX cascade at 10M already costs 52.9 GET/query
+and p50 417 ms
+(link:../_internal/status/BIGANN_NPROBE_GEOMETRY_COMPLETE_2026_08_06.adoc[BIGANN_NPROBE_GEOMETRY_COMPLETE]:67-75).
+| **S7:** the object-store centroid tier is the scale answer. HNSW is an optional hot
+projection rebuilt from it, never the authority.
+
+| TE-6
+| **Graph + aggregate:** "average citations per year of papers ≤ 2 hops from X that are
+semantically near Y"
+| `graph_traverse` runs one Cypher query per depth into a `MemTable`, returns a string
+`node_id`, and its pgwire reachability is unverified
+(link:../10-quality/td/TD-XMODAL-10-graph-traverse-udtf-pgwire-reachability-unverified.adoc[TD-XMODAL-10]).
+ORION is not WAL-authoritative.
+| **S3/S7:** edges are a Layer A table sorted `(src, label, dst)`, with ORION CSR as a
+rebuildable index. Traversal ≤ 3 hops = recursive join; deeper = `GraphExpandExec` over CSR.
+
+| TE-7
+| **Documents with drifting nested JSON**, faceted aggregate
+| A document read fetches the whole 329 KB segment (`range_gets=0`, ADR-055). Parquet export
+fails closed on type drift (USCHEMA review).
+| **S3:** shredded typed columns plus a variant/JSON residual column. Publish as Iceberg v3
+`variant` when external readers support it, JSON string until then.
+
+| TE-8
+| **Write at t, SQL at t+1 s** on a 50M-row table
+| The WAL-delta merge is `MemTable`-based (`register_merged_olap_table`,
+`src/query/execution/datafusion_engine.rs:925`) and does not stream.
+| **S5:** a streaming union of the published snapshot and the WAL tail (the same pattern
+turbopuffer uses for its unindexed WAL tail).
+
+| TE-9
+| **Double the data:** TPC-DS SF 0.05
+| MATERIALIZE runs out of memory (whole-table batch): OOM-killed at 13.7 GB RSS on a 15 GB host
+(link:../_internal/status/TPC_DS_SPEC_PRUNING_EVIDENCE_2026_10_18.adoc[TPC_DS_SPEC_PRUNING_EVIDENCE]:32-33).
+The same figure was also quoted for an unrelated rustc OOM in TD-OLAPFMT-2; that attribution
+is corrected (§7) and the peak should be re-measured.
+| **S3/S4:** streaming, multi-part, bounded-memory publication.
+|===
+
+== 4. Part B — Foundational seams (the contracts every modality plugs into)
+
+----
+ facades: pgwire · REST/gRPC · Flight · Iceberg REST · OTLP · Cypher/PGQ · SDK
+                                   │
+ S6 PLAN   one logical IR = DataFusion LogicalPlan (Expr, TableScan, Join, Agg, Window, RecursiveQuery)
+           modality ops = ExecutionPlan nodes: FilteredAnnExec · GraphExpandExec · TextMatchExec · TimeBucketExec
+           native (ADR-054) ops = PhysicalOptimizerRule substitutions, chosen by S8
+                                   │
+ S5 SCAN   TableProvider per physical layout, all with projection/filter/limit pushdown + ABAC + WAL-tail union
+           ObjectStoreParquetTable · PaxTableProvider · LayerATableProvider(streaming) · DocumentPax · ObsTimeTable
+                                   │
+ S7 INDEX  catalog projections, rebuildable from S3, invalidated by LSN:
+           VectorAnn(PAX centroid | HNSW hot) · Inverted/BM25 · EdgeCSR(ORION) · Bloom/PageIndex · TimeIndex
+                                   │
+ S4 PUBLISH one Iceberg writer (proximadb-iceberg-engine): snapshots, manifests, deletes; REST serves it verbatim
+                                   │
+ S3 LAND   Layer A: relational/edges/docs → Parquet (ParquetWritePolicy, catalog schema, __proxima_* cols)
+           vector tables → PAX (PXH1/PBLK); append-only (logs/metrics/events) → time-partitioned Layer A
+                                   │
+ S2 DURABLE canonical WAL: segmented, rotated, per-collection index, truncation at min_unflushed_lsn
+                                   │
+ S1 IDENTITY ProximaRecord.oid + __proxima_{oid,lsn,tenant,valid_to,subject} in every physical file
+ S8 COST   one ADR-033 cost spine (DEPTH ≫ WIDTH ≫ BYTES ≫ CPU) for engine, exact/ANN/prefilter, tier choice
+ S9 GOVERN ABAC row/column filters enforced per S5 provider (no UDTF bypass)
+----
+
+[cols="1,4,4,4", options="header"]
+|===
+| Seam | Contract (what must be true) | Existing code to reuse | Gap to close
+
+| S1 Identity
+| Every record has a stable `oid`, `lsn`, `tenant`, `valid_to`, and an optional `subject`
+(entity key for TE-4). The same `oid` is visible in every file and every operator output.
+| `ProximaRecord.oid` (`crates/foundation/proximadb-records/src/lib.rs:776`); mappers
+`canonical_oid` in `crates/modalities/proximadb-graph/src/record.rs:55`,
+`crates/modalities/proximadb-document/src/record.rs:46`,
+`crates/modalities/proximadb-observability/src/lib.rs:92`; TD-USUB-11 system columns
+| MATERIALIZE writes `oid` = row index (`src/services/dml/mod.rs:2317`); UDTFs return string
+ids; cross-modal alias resolution (TD-142) is Partial
+
+| S2 Durable
+| All modality writes append `RecordUpsert` / `RecordDelete` / `RecordPartitionDrop` via
+`TableWalAppender` *before* the engine applies them. The WAL is segmented with a
+per-collection index; truncation happens only at `min_unflushed_lsn`.
+| `FramedTableWalAppender` (`src/services/canonical_wal.rs:138`); `CanonicalOperation`
+(`crates/storage/proximadb-storage-common/src/wal_entry.rs:68`); ORION's segment-truncation
+pattern (`truncate_through_canonical_marker`,
+`crates/modalities/proximadb-orion-engine/src/persistence.rs:862`)
+| Single file; O(WAL) `read_changes_since`; no `serde(default)` field yet; observability and
+graph bypass it
+
+| S3 Land
+| Layer A writes catalog-schema Parquet with the spec layout. PAX for vector tables (ADR-094
+D1). Append-only collections are time-partitioned.
+| `SpillRecordStorage` (`src/services/record_spill.rs:101`); `new_spilling`
+(`src/services/record_store.rs:1893`); `ParquetWritePolicy`
+(`crates/storage/proximadb-storage-common/src/parquet_write_policy.rs:68`)
+| Production sites call `new_partitioned` (`src/network/shared_services.rs:2023`,
+`src/network/multi_server.rs:436`); the spill encoder ignores the policy and infers its
+schema; the `""` tenant never spills; no obligation drain
+
+| S4 Publish
+| One writer produces spec-valid Iceberg (v2 now; v3 deletion vectors / variant / row lineage
+when external readers support them). REST `load_table` returns the writer's latest
+`metadata.json`. Publication is incremental and fenced.
+| `publish_iceberg_snapshot` (`crates/storage/proximadb-iceberg-engine/src/lib.rs:158`);
+`write_manifest*` / `build_table_metadata` (`crates/storage/proximadb-iceberg-engine/src/iceberg.rs:296-512`);
+TD-USUB-10 slice 0; reference `p2-publisher.patch` (needs rework)
+| Disjoint `_manifests` tree (`crates/control/proximadb-catalog/src/iceberg_rest_service.rs:734,989,1356`;
+`src/query/table_write_executor.rs:849`); spec defects listed in §2 item 1; no deletes
+
+| S5 Scan
+| Every layout has a streaming `TableProvider` with pushdown, ABAC and a WAL-tail union. No
+`MemTable` on hot paths.
+| `ObjectStoreParquetTable` (`src/datafusion/engine_adapters/object_store_parquet_reader.rs:1494`);
+`PaxTableProvider` (`src/datafusion/engine_adapters/pax_table_provider.rs:101`);
+`DocumentPaxPushdownProvider`; `ProximaScanExec` dynamic filters
+(`src/datafusion/proxima_scan_exec.rs:591`)
+| `NativeTableSource` → `MemTable` + 1M cap (`src/query/execution/datafusion_engine.rs:163-205`);
+PAX provider unregistered; runtime filters do not probe SBBF
+
+| S6 Plan
+| DataFusion `LogicalPlan` is the single logical IR. `LogicalNode`, `MultiModelPlan`, UQL and
+the federated path lower into it or retire.
+| `prepare_dataframe` (`src/query/execution/datafusion_engine.rs:72`); `route_select_inner`
+(`src/query/compute_scheduler.rs:732`); `lower_vector_filter`
+(`src/network/postgres/relational_pipeline.rs:410`)
+| Six IRs; `UnifiedQueryRouter::execute_plan` has no callers; the facade passes `None` for the
+vector/graph operator arguments (`src/query/facade/adapter.rs:804`); **conflicted with
+ADR-054 / TD-OLAP-13's "DataFusion cannot host fused ANN" — resolved by ADR-097 D1**
+
+| S7 Index
+| Indexes are catalog projections, rebuildable from S3 and invalidated by LSN or snapshot.
+| `VectorAnn` projection (`src/storage/trait_components/path_resolver.rs:608-633`);
+`index_location_resolver.rs`; ORION snapshot + `checkpoint_lsn`
+| HNSW not persisted (TD-112); AXIS IVF disk placeholder; no time or inverted index projection
+for logs
+
+| S8 Cost
+| One spine routes engine choice, exact vs ANN vs prefilter (ADR-011 thresholds), and tier
+choice.
+| `route_cost_model.rs` (`per_get=20…`); `route_vector_search`
+(`src/query/compute_scheduler.rs:685`)
+| Static rules; PAX `segment_vector_count` returns 0, so Adaptive never picks exact for `.pax`
+(`src/storage/engines/sst/search/mod.rs:318-353`)
+
+| S9 Govern
+| ABAC is applied in every S5 provider.
+| `scan_table_relational` ABAC; TD-USUB-3
+| The Parquet arm cannot apply row filters; UDTFs bypass them (`query_has_table_function`
+guard)
+|===
+
+=== Resolving the S6 vs ADR-054 conflict
+
+Fused operators stay in native crates, which keeps ADR-039's no-leakage rule. They plug in as
+DataFusion `ExecutionPlan` adapters living in `src/datafusion/`. The logical IR is DataFusion;
+the physical operators can be native. This supersedes TD-OLAP-13's premise ("DataFusion
+structurally cannot host a fused ANN+filter+aggregate"), not its operators: DataFusion's
+`TableProvider::supports_filters_pushdown`, `limit` and dynamic-filter pushdown carry the
+predicate *into* the search, which is the property TD-OLAP-13 needed. See ADR-097 D1.
+
+== 5. Part C — Vector tiers vs turbopuffer, memory HNSW and large IVF
+
+[cols="1,2,2,2,2", options="header"]
+|===
+| | **turbopuffer** (published reference figures, link:../_internal/status/OBJECT_ECONOMY_BENCH_REPORT_2026_05_28.adoc[OBJECT_ECONOMY_BENCH_REPORT]:182-190) | **Memory HNSW** (AXIS) | **Large IVF** (AXIS `UnifiedIvfIndex`) | **ProximaDB PAX cascade (today)**
+
+| Authority
+| Object store (WAL + index on S3/GCS)
+| Heap; not persisted (TD-112)
+| Centroids in heap; posting lists tiered (disk/cloud `get` is a placeholder)
+| Object store; the segment *is* the index
+
+| Structure
+| Centroid clustering (SPFresh-style), NVMe and memory cache
+| Home-grown HNSW, DashMap adjacency, m=16, ef=50
+| k-means, nlist = √N, PQ partly wired
+| Per-segment IVF cells (A0) → RaBitQ (A) → SQ8 rerank (B) → rows (D)
+
+| Cold query
+| 3–4 sequential round trips; ~400–500 ms at 1M documents
+| Full rebuild from segments
+| n/a
+| 20–80 GET/query; p50 17 ms (`file://`) → 417 ms (10M, Azurite); 3–9 s at 100 ms RTT
+
+| Warm query
+| ~14 ms p50 at 1M documents
+| sub-ms to ms
+| ms
+| 19 GET warm; p50 3.8 ms; 0.4 ms on a result-cache hit
+
+| Recall
+| High (tunable)
+| ≥ 0.95 at ef ≈ 409 (100K calibration only)
+| Ceiling ~0.74 (0.95 with PQ rerank is a target; `docs/04-operations/recall-aware-axis.adoc`)
+| 0.985–0.99 at 1M; 0.98 at 10M
+
+| Cost driver
+| $/GB-month object store + cache
+| RAM (~620 B/vector graph + vectors)
+| RAM for centroids + I/O
+| GET count (DEPTH) per ADR-033
+
+| Filtering
+| Native filtered search
+| ACORN-style skip-through (TD-064)
+| 2× oversample, then post-filter
+| ADR-089 stage-F row allow-set, default ON
+
+| Lakehouse alignment
+| Proprietary format
+| None (opaque heap)
+| None
+| **Same object store, catalog and snapshot as the tables**
+|===
+
+NOTE: turbopuffer figures are the vendor's published architecture numbers as recorded in the
+bench report, for orientation only. They are not a positioning or pricing claim; see §6 P6.
+
+=== Verdict
+
+* The PAX cascade is the right architecture. It is the only tier aligned with the lakehouse
+  seams (S2–S4, S7).
+* Its gap to turbopuffer is **round-trip depth, not recall**. Today's per-segment cells mean
+  one query touches many segments, each with its own A0 → A → B ranged reads.
+* HNSW stays a *hot projection* for small, latency-critical namespaces, built from PAX and
+  dropped without data loss.
+* AXIS IVF folds into PAX as a **collection-level centroid directory** rather than growing its
+  own disk posting lists. The AXIS IVF disk/cloud posting-list path is retired (ADR-097 D2).
+
+=== Closing the depth gap
+
+Target: cold ≤ 3 sequential waves and ≤ 20 GET/query at 1M; warm 0–1 wave.
+
+. **Collection-global centroid directory (wave 0, cached).** Compaction emits a small
+  `centroids.pax` per collection snapshot, published as an S7 projection. Queries pick nprobe
+  clusters globally instead of probing every segment's A0.
+. **Cluster-contiguous compaction.** Compaction rewrites segments so each cluster's region A+B
+  bytes sit together. nprobe clusters then cost about nprobe coalesced ranged GETs issued in
+  **one parallel wave**. This reuses `block_cluster.rs` (k-means/PCA) and the existing
+  coalescer.
+. **Co-locate SQ8 (B) next to RaBitQ (A) per cluster.** Rerank then needs no extra wave; only
+  top-k row rehydration (D) remains as a second wave.
+. **Local-disk L2 cache on by default** when a scratch volume exists (ADR-085
+  `PersistentByteStore`). Turn cache-affinity routing on (VOE Phase 7); its registries already
+  exist.
+. **Unindexed WAL tail = exact scan,** merged with ANN results (same as TE-8).
+
+=== Correctness fixes
+
+* TD-ENGSEL-1: default to SST/PAX, not HELIX.
+* `segment_vector_count` for `.pax`, so the Adaptive exact arm works.
+* Deletion vectors on the cascade (`cold-deletion-vectors`) default ON together with S4
+  deletes.
+
+=== Lakehouse publication of vectors
+
+An optional Parquet projection (ADR-094 D1, cost-justified) with `FixedSizeList<Float32>` for
+external readers. RaBitQ and SQ8 codes stay PAX-only.
+
+=== Other modalities on the same seams
+
+[cols="1,2,3,2,3", options="header"]
+|===
+| Modality | S2 durable | S3 land / S4 publish | S7 index | S5/S6 operator
+
+| Relational / OLTP
+| Canonical WAL (already)
+| Layer A Parquet → Iceberg
+| Page index, SBBF, sort keys, PK point index
+| Parquet / Layer A providers; native Volcano for point lookups as a physical choice
+
+| Vector
+| Canonical WAL
+| PAX; optional Parquet projection
+| PAX centroid directory; HNSW hot projection
+| `FilteredAnnExec` (prefilter or allow-set, limit, dynamic filters)
+
+| Document
+| Canonical WAL; retire `document_wal` (TD-DOC-RETIRE-1)
+| PAX today; shredded typed columns + JSON/variant residual in Layer A
+| JSON-path / inverted projections
+| `DocumentPaxPushdownProvider` with ranged reads (beats the 329 KB whole-segment fetch)
+
+| Graph
+| Emit `RecordUpsert` for nodes/edges before ORION apply; ORION WAL becomes a buffer (TD-066)
+| Edges table sorted `(src, label, dst)`; nodes table
+| ORION CSR rebuilt from edges at `checkpoint_lsn`
+| Recursive join ≤ 3 hops; `GraphExpandExec` over CSR deeper; returns `oid`
+
+| Logs / metrics / traces
+| Route `ObservabilityStorage` writes through `TableWalAppender`
+| Time-partitioned Layer A; Iceberg `day(ts)` / `hour(ts)` partition, sort `(service, ts)`;
+retention = `RecordPartitionDrop` + snapshot expiry
+| SBBF on `trace_id`; BM25/inverted for log body; rollup MVs (TD-OLAP-8) for metrics
+| `ObsTimeTable` provider; `TimeBucketExec`; replaces the separate `LOGS`/`METRICS` federated
+path
+|===
+
+== 6. Part D — Phased implementation (PR-sized slices, each with a gate)
+
+Dependencies: P1 ∥ P5a can start now. P2 → P3 → P4. P6 runs throughout.
+
+[cols="1,2,1", options="header"]
+|===
+| Phase | Scope | Tracked by
+| P0 | Decisions on record (this document, ADR-097, doc fixes in §7) | this PR
+| P1 | S4 lakehouse correctness: single Iceberg writer + external read-back gate | TD-SEAM-1
+| P2 | S1/S2/S3 one write path | TD-SEAM-2, TD-SEAM-3, TD-SEAM-4
+| P3 | S5/S6/S9 format-independent SQL and the multimodal operator | TD-SEAM-5, TD-SEAM-6
+| P4 | Modalities onto the seams | TD-SEAM-7, TD-SEAM-8, TD-SEAM-9
+| P5 | Vector tier economics | TD-SEAM-11 (P5a), TD-SEAM-10 (P5b), TD-SEAM-13 + TD-112 (P5c; TD-PAXPREC-1 first)
+| P6 | Proof | TPC ratchet (TD-OLAP-4), multimodal benchmark
+|===
+
+=== P0 — Decisions on record (docs only)
+
+* This document (Parts A–D).
+* link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097] "Seams S1–S9 + single
+  logical IR (DataFusion) with native physical operators". It supersedes the TD-OLAP-13
+  premise and amends the ADR-052 niche statement.
+* ADR-096 amended with the positioning line.
+* The doc contradictions in §7 fixed.
+* `WORK_LEDGER_2026_10_15.adoc` and `TECHNICAL_DEBT.adoc` updated with the `TD-SEAM-*` items.
+
+=== P1 — S4 lakehouse correctness (first code slice)
+
+. **Make `proximadb-iceberg-engine` the single writer.**
+** Fix spec defects in `iceberg.rs`: absolute `s3://` / `file://` URIs in `file_path`; Avro
+   header metadata (`schema`, `partition-spec`, `format-version`, `content`);
+   `parent-snapshot-id`; non-zero sequence numbers; operation `overwrite` vs `append`.
+** Emit **format v2** until external v3 readers are verified.
+. **Point REST at the writer's metadata.**
+** `IcebergRestService::ensure_table_metadata` resolves the table root (not `…/data`) and
+   serves the latest `v{N}.metadata.json` written by the engine.
+** Drop the synthetic schema and the `tenant_id` partition.
+** Re-point or retire the `_manifests` path: `table_write_executor.rs:849` calls
+   `publish_iceberg_snapshot` instead.
+** Remove the dangling `manifests/snap-*.avro` URLs.
+. **External read-back gate.** `tests/iceberg_interop_e2e.rs` plus
+  `scripts/iceberg_readback.py`, run in CI:
+** Create a table over pgwire, insert, MATERIALIZE.
+** pyiceberg (REST catalog) and DuckDB `iceberg_scan` read it.
+** Values must equal the pgwire `SELECT` result; repeat after a second MATERIALIZE (snapshot
+   chain).
+
+*Gate:* the read-back test is green in CI; the `tests/tpc_perf_ledger_e2e.rs` DataFusion arm
+stays 63/63.
+
+=== P2 — S1/S2/S3 one write path
+
+. **WAL segmentation.** Rotation and a per-collection sparse index in
+  `FramedTableWalAppender`; `read_changes_since` range-reads. Introduce the first
+  `serde(default)` field on `CanonicalWalEntry`.
+. **Layer A in production.**
+** `new_spilling` at both construction sites.
+** The spill encoder uses `ParquetWritePolicy` + the catalog schema + `__proxima_*` columns.
+** Obligation drain via `retirement_ledger.rs`.
+** Shutdown `flush_partitions()`.
+** The `""` tenant spills.
+. **WAL truncation (slice 2b)** only at `min_unflushed_lsn`. A non-spill store's `Ok(None)`
+  counts as refuse. Crash matrix copied from TD-066.
+. **Streaming MATERIALIZE / incremental publisher** (TD-USUB-10 slices 1–3, TD-OLAPFMT-3).
+** Multi-part, bounded-memory writes with fenced snapshot advance.
+** Rework `p2-publisher.patch`: classify insert vs update by probing published key
+   stats/SBBF, not WAL history.
+** Keep the real `oid`.
+
+*Gate:* TPC-DS SF1 on a release build loads without OOM, with peak RSS recorded.
+
+=== P3 — S5/S6/S9 format-independent SQL and the multimodal operator
+
+. `LayerATableProvider`: a streaming `TableProvider` over `scan_table_relational` with
+  pushdown, ABAC and a WAL-tail union. Replaces the `MemTable` + 1M cap.
+** Fix the `lag()` wrong answer (TD-USUB-2).
+** Allow mixed Parquet + native tables.
+. Wire `PaxTableProvider` into `prepare_dataframe` with an arm in `route_select_inner`. Send
+  UDTF-only queries to DataFusion.
+. `FilteredAnnExec` replaces the eager `VectorSearchTableProvider`:
+** `supports_filters_pushdown` (reuse `lower_vector_filter` → `FilterExpression`), `limit`,
+   and `DynamicFilterPhysicalExpr` absorb (pattern: `proxima_scan_exec.rs:591`).
+** Emits `oid`, metric and score. A `Sort(distance) + Limit → ANN` optimizer rule handles the
+   pgvector shape.
+. SBBF probe for join runtime filters in `read_split_with_predicates`.
+. The facade passes vector and graph operators. Federated `VECTOR_SEARCH` / `LOGS` / `METRICS`
+  lower onto the same providers.
+
+*Gates:* `native_table_capability_parity_e2e` all green; `filtered_ann_recall_bands` ≥ 0.95 at
+every selectivity band; the TE-1 query runs over pgwire with `EXPLAIN` showing pushed filters.
+
+=== P4 — Modalities onto the seams
+
+* **Observability:** route writes through `TableWalAppender`, store in time-partitioned
+  Layer A, publish to Iceberg, add `ObsTimeTable`.
+  *Gate:* TE-3 at 50k rows/s on a release build with freshness ≤ 2 s.
+* **Graph:**
+** `RecordUpsert` emission before ORION apply; edges table.
+** ORION rebuilt from the edges table at `checkpoint_lsn`.
+** `graph_traverse` → `GraphExpandExec` returning `oid`.
+** *Gate:* TD-XMODAL-10 pgwire reachability test.
+* **Documents:** retire `document_wal`; shredded columns + JSON residual (TD-USUB-6); ranged
+  reads.
+* **TE-4 delete:** add a `subject` system column; position deletes in Iceberg v2; deletion
+  vectors on the PAX cascade.
+  *Gate:* an end-to-end test where a delete removes the subject from every modality and from
+  the next published snapshot.
+
+=== P5 — Vector tier economics (independent track)
+
+* **P5a (now):**
+** TD-ENGSEL-1 default → SST/PAX.
+** `segment_vector_count` for `.pax`.
+** Local-disk L2 cache on by default when configured.
+* **P5b:**
+** Collection-global centroid directory as an S7 projection.
+** Cluster-contiguous compaction with A+B co-located.
+** *Gate:* SIFT1M on MinIO with injected latency reaches ≤ 3 sequential waves, ≤ 20 GET/query,
+   recall ≥ 0.98; BIGANN 10M is re-measured.
+* **P5c:** HNSW as a persisted hot projection (TD-112) built from PAX, on the AXIS engine — lifecycle in TD-SEAM-13 (stamped projection, delta on boot, ground-up rebuild as repair, exact-tier prerequisite TD-PAXPREC-1); AXIS IVF disk path
+  retired in favour of P5b.
+
+=== P6 — Proof
+
+* TPC-DS SF1/SF10 on a release build, value-compared across engines, with the ratchet raised
+  from 18.
+* Publish a **multimodal analytics benchmark** (TE-1 / TE-6 / TE-3 query set) against
+  DuckDB + pgvector, LanceDB, and the turbopuffer reference numbers.
+* No pricing claims until the P5b gates pass, per
+  link:SIFT1M_ADMISSION_FIRST_GET_REDUCTION_BLUEPRINT_2026_07_29.adoc[SIFT1M_ADMISSION_FIRST_GET_REDUCTION_BLUEPRINT]:715-725.
+
+== 7. Documentation corrections made with this document (P0)
+
+[cols="2,3,3", options="header"]
+|===
+| Document | Claimed | What is true (verified 2026-10-18)
+
+| link:../10-quality/td/TD-OLAPFMT-2-spec-parquet-layout-and-pruning.adoc[TD-OLAPFMT-2]
+| TPC-DS A/B "row-identical across all 63 queries × 3 engines"
+| Per the evidence doc: DataFusion 63/63, DuckDB 63/63 only after the empty-result fix
+(56/63 before), native 40/63. The comparison was of row counts, not values.
+
+| link:../10-quality/td/TD-OLAPFMT-2-spec-parquet-layout-and-pruning.adoc[TD-OLAPFMT-2]
+| The rustc `--lib` test build is OOM-killed "at ~13.7 GB RSS"
+| 13.7 GB is the figure the evidence doc records for the SF 0.05 MATERIALIZE OOM. The rustc
+peak was not separately measured; marked "re-measure".
+
+| link:../10-quality/td/TD-OLAPFMT-3-incremental-parquet-publication.adoc[TD-OLAPFMT-3]
+| "On develop the WAL is truncated behind manifest durability (TD-USUB-1)"
+| Not built. The table record WAL is never truncated: slice 2b does not exist,
+`SpillRecordStorage::min_unflushed_lsn` (`src/services/record_spill.rs:1055`) has no
+production caller, and the only WAL rewrite is the system catalog compacting its own WAL
+(`src/services/system_catalog.rs:610`).
+
+| `src/storage/engines/sst/search/mod.rs` (comment near line 473)
+| `PROXIMADB_PAX_FILTERED_CASCADE` is default-OFF
+| Default ON since 2026-08-31; `0`, `off`, `false` or `no` is the kill-switch
+(`src/storage/engines/sst/segment_format.rs:1160-1183`).
+|===

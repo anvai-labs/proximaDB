@@ -58,13 +58,12 @@ use proximadb_records::{ProximaTree, ProximaTreeNode, tree_get};
 /// AND the record's `collection_id` must be composed from this — they key the same canonical OID
 /// (`document/{collection_id}/{doc_id}`), so a scoped write and its recovery/read agree
 /// (TD-DOC-TENANT-1); scoping only one side mis-keys the live read immediately.
+///
+/// The collection name is validated too (no `/`), so a client-supplied name can never
+/// address another tenant's `{tenant}/{collection}` key.
 pub fn scoped_document_collection(tenant: &str, collection: &str) -> anyhow::Result<String> {
-    proximadb_tenant::validate_request_tenant(tenant)
-        .map_err(|e| anyhow::anyhow!("invalid tenant '{tenant}': {e}"))?;
-    if tenant == proximadb_tenant::DEFAULT_TENANT {
-        return Ok(collection.to_string());
-    }
-    Ok(format!("{tenant}/{collection}"))
+    proximadb_tenant::scoped_resource_key(tenant, collection)
+        .map_err(|e| anyhow::anyhow!("invalid document collection key: {e}"))
 }
 
 /// Inverse of [`scoped_document_collection`]: recover `(tenant, clean_collection)` from a

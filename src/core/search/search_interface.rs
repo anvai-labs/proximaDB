@@ -279,7 +279,7 @@ impl IntegratedSearchOptimizer {
         // Get collection from port
         let collection = self
             .collection_port
-            .get_collection(collection_id, None)
+            .get_collection_internal(collection_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Collection not found: {}", collection_id))?;
 

@@ -514,8 +514,7 @@ impl From<proximadb_kernel::error::StorageError> for StorageError {
             KernelStorageError::DiskIO(io_err) => {
                 StorageError::with_source(StorageErrorKind::Io, io_err.to_string(), io_err)
             }
-            KernelStorageError::Serialization(msg)
-            | KernelStorageError::SerializationError(msg) => StorageError::new(
+            KernelStorageError::Serialization(msg) => StorageError::new(
                 StorageErrorKind::Internal,
                 format!("Serialization: {}", msg),
             ),
@@ -863,11 +862,6 @@ mod tests {
                 proximadb_kernel::error::StorageError::Serialization("ser".to_string()),
                 StorageErrorKind::Internal,
                 "Serialization: ser".to_string(),
-            ),
-            (
-                proximadb_kernel::error::StorageError::SerializationError("ser2".to_string()),
-                StorageErrorKind::Internal,
-                "Serialization: ser2".to_string(),
             ),
             (
                 proximadb_kernel::error::StorageError::Corruption("bad".to_string()),

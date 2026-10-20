@@ -1,0 +1,40 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-CATREPLACE-1: replacing a collection's catalog table is not atomic
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-18).
+| Priority | **MEDIUM** — narrower after TD-GRPCCREATE-1 (an invalid schema can no longer cause the drop), but an I/O failure in the window still loses the table.
+| Component | `src/services/collection/manager.rs` (`set_collection_schema_columns`, `upsert_collection_catalog_asset`); catalog `drop_table` / `create_table`
+| Relates to | TD-GRPCCREATE-1
+|===
+
+== Problem
+
+* Both functions replace a collection's catalog table by `drop_table` followed by `create_table`.
+  Since TD-GRPCCREATE-1 the new schema is validated first, but a failure while saving the new
+  table (`save_table`, index upsert) after the drop still leaves the collection with no table, and
+  a concurrent `get_collection` sees "not found" during the window.
+* A schema update that the catalog write rejects can be half applied: `update_collection` has
+  already persisted the narrow config (for example `text_columns`, `record_schema`) before the
+  canonical write fails. Observed on 0.4.1: a schema update that the catalog rejects can still
+  change a column's stored type and filterability, as a later GET shows, and a filterable column
+  cannot be retyped or removed afterwards, because `update_collection` replaces
+  `filterable_columns` only when the new list is non-empty.
+
+== Also here
+
+Two near-duplicate ProximaType→filterable mappings exist and disagree on the intersection:
+`filterable_data_type` (`src/storage/metadata/collection_mapping.rs`, total, String/Binary arms)
+and `proxima_type_to_filterable_type`
+(`crates/platform/proximadb-runtime/src/handlers.rs`, partial). The merge rule uses the partial one
+plus an explicit String allowance. Derive one from the other with a test asserting they agree, and
+move the shared mapping to a foundation crate (it currently lives in a module named `handlers`).
+
+== Fix
+
+Give the catalog an atomic replace (write the new table version, then swap), and order the schema
+update so the narrow config is persisted only after the catalog write succeeds, or rolled back when
+it fails. Test both with an injected save failure.

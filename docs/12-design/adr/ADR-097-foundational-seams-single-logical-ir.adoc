@@ -1,0 +1,187 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= ADR-097: Foundational seams S1–S9 and a single logical IR (DataFusion) with native physical operators
+:toc: left
+:toclevels: 2
+:last-updated: 2026-10-19
+
+[cols="1,3"]
+|===
+| Status | **Accepted (owner decision 2026-10-18).** Implementation Open; tracked by TD-SEAM-1 … TD-SEAM-11.
+| Date | 2026-10-18
+| Deciders | Vijaykumar Singh
+| Design document | link:../LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] (thought experiments TE-1..TE-9, seam table, vector-tier comparison, phases P0–P6)
+| Supersedes (in part) | The *premise* of link:../../10-quality/td/TD-OLAP-13-fused-multimodal-operators.adoc[TD-OLAP-13] that "DataFusion structurally cannot host" a fused ANN+filter+aggregate (its operators survive, re-homed as `ExecutionPlan` adapters).
+| Amends | link:ADR-052-analytics-execution-competitiveness-codesign.adoc[ADR-052] (non-goal "defensible niche is vector + OLAP + lakehouse (3-mode) co-design; graph/document are stretch modes"); link:ADR-054-native-execution-engine-progressive-cutover.adoc[ADR-054] (logical-IR scope: native operators are physical substitutions under the DataFusion logical plan, not a separate per-query plane for multimodal shapes); link:ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096] (positioning line added; decisions unchanged).
+| Relates to | ADR-094 (one substrate, format follows modality), ADR-020 (canonical WAL authority), ADR-026 (PAX canonical vector path), ADR-055 (document canonical format), ADR-007 (Iceberg REST catalog), ADR-039 (engine boundary, no DataFusion leakage), ADR-033 (cost spine), ADR-011 (filtered-ANN routing), ADR-089 (filter-aware PAX cascade), `RELATIONAL_DOCUMENT_GRAPH_CONVERGENCE_2026_05_14.adoc`
+| Tracked under | TD-SEAM-1 … TD-SEAM-11 (`docs/10-quality/TECHNICAL_DEBT.adoc` §C, `WORK_LEDGER_2026_10_15.adoc` §6)
+|===
+
+== Context
+
+ADR-096 made ProximaDB a SQL-first context engine on object storage and ADR-094 settled that
+every modality is a projection of one canonical record, with format following modality. A code
+survey of `develop` @ `1db3a05` (design document §2) found that the vision is ahead of the code
+in five places, and that each gap is a missing *contract between layers*, not a missing feature:
+
+. **Publication:** two disjoint Iceberg metadata trees (the REST service's `_manifests` tree and
+  the MATERIALIZE tree), neither spec-valid, and no external reader test.
+. **Write path:** one local canonical WAL file with an O(WAL) decode and no truncation; Layer A
+  (`SpillRecordStorage`) without a production caller; MATERIALIZE buffering whole tables and
+  dropping `oid`.
+. **SQL:** capability depends on which `TableProvider` is registered, not on storage. Cross-modal
+  UDTFs are eager `MemTable`s with string ids and no pushdown.
+. **Modalities:** observability and graph do not write through the canonical WAL; `oid` is
+  namespaced per modality.
+. **Vector tiers:** the PAX cascade is lakehouse-aligned but round-trip-deep; AXIS HNSW is
+  memory-only; AXIS IVF on disk is a placeholder.
+
+The survey also found a design conflict. ADR-054 §6 and TD-OLAP-13 argue that a fused
+`ANN+filter+aggregate` *must* live in a native operator plane because "DataFusion has no ANN
+operator and cannot express pre-filter-inside-search". The seam design needs one logical IR
+that every modality operator composes under, and six IRs exist today (`LogicalNode`,
+`MultiModelPlan`, UQL, the federated path, DataFusion `LogicalPlan`, and the native contracts).
+Something has to be the one.
+
+== Decision
+
+=== D0 — The seams S1–S9 are the contracts every modality plugs into
+
+[cols="1,5", options="header"]
+|===
+| Seam | Contract
+| S1 Identity | Every record carries `oid`, `lsn`, `tenant`, `valid_to` and an optional `subject` (entity key). The same `oid` appears in every physical file (`__proxima_*` system columns) and every operator output.
+| S2 Durable | Every modality write appends `RecordUpsert` / `RecordDelete` / `RecordPartitionDrop` through `TableWalAppender` before the engine applies it. The canonical WAL is segmented with a per-collection index; truncation happens only at `min_unflushed_lsn`.
+| S3 Land | Layer A writes catalog-schema Parquet with `ParquetWritePolicy` for relational, edge and document tables; vector tables land in PAX (ADR-094 D1); append-only collections are time-partitioned.
+| S4 Publish | One Iceberg writer (D3) produces spec-valid snapshots, manifests and deletes; publication is incremental and fenced.
+| S5 Scan | Every physical layout has a streaming `TableProvider` with projection, filter and limit pushdown, ABAC, and a WAL-tail union. No `MemTable` on a hot path.
+| S6 Plan | One logical IR (D1).
+| S7 Index | Indexes are catalog projections, rebuildable from object storage and invalidated by LSN or snapshot.
+| S8 Cost | One ADR-033 cost spine (DEPTH ≫ WIDTH ≫ BYTES ≫ CPU) chooses engine, exact vs ANN vs prefilter (ADR-011 thresholds), and tier.
+| S9 Govern | ABAC row and column filters are enforced in every S5 provider; no UDTF path bypasses them.
+|===
+
+A new modality, operator or format is admitted by naming which seam it implements and showing
+that it honours that seam's contract. Code that writes around a seam (its own WAL, its own
+metadata tree, its own identity) is a defect against this ADR.
+
+=== D1 — Single logical IR: DataFusion `LogicalPlan`, with native physical operators via adapters
+
+* DataFusion `LogicalPlan` (`Expr`, `TableScan`, `Join`, `Aggregate`, `Window`,
+  `RecursiveQuery`) is the single logical IR. `LogicalNode`, `MultiModelPlan`, UQL and the
+  federated path lower into it or retire.
+* Modality operators are DataFusion `ExecutionPlan` nodes: `FilteredAnnExec`,
+  `GraphExpandExec`, `TextMatchExec`, `TimeBucketExec`. Predicates reach the search through
+  `TableProvider::supports_filters_pushdown`, `limit` and dynamic-filter pushdown, which is the
+  "pre-filter inside the search" property TD-OLAP-13 required.
+* ADR-054's native and fused operators stay in native crates and plug in as `ExecutionPlan`
+  adapters under `src/datafusion/`, substituted by `PhysicalOptimizerRule`s that S8 chooses.
+  The native crates keep zero DataFusion dependency, so ADR-039's no-leakage rule holds.
+* The logical IR is DataFusion; the physical operators can be native.
+
+=== D2 — PAX-first vector authority; HNSW is a hot projection; the AXIS IVF disk tier is retired
+
+* The PAX cascade on object storage is the authority for vectors. It is the only tier that
+  shares the object store, catalog and snapshot with the tables.
+* HNSW becomes a **persisted hot projection** (TD-112) built from PAX, for small,
+  latency-critical namespaces. Dropping it loses no data.
+* The AXIS IVF disk/cloud posting-list path
+  (`src/index/axis/storage/ivf_posting_list_storage.rs`, a placeholder) is retired in favour of
+  a **PAX collection-global centroid directory** with cluster-contiguous compaction
+  (TD-SEAM-10). The gap to object-store-native peers is round-trip depth, not recall; the
+  target is cold ≤ 3 sequential waves and ≤ 20 GET/query at 1M.
+
+=== D3 — One Iceberg writer is authoritative
+
+* `proximadb-iceberg-engine` is the single Iceberg writer. The REST catalog
+  (`/iceberg/v1`, ADR-007) serves that writer's latest `metadata.json` verbatim; it does not
+  synthesise schemas, partitions or manifests of its own.
+* The writer emits **format v2** until external v3 readers (pyiceberg, DuckDB, Spark/Trino) are
+  verified against our output. v3 features (deletion vectors, `variant`, row lineage) are
+  adopted per feature once read back by an external reader in CI. The one exception is a
+  table whose columns need a v3-only type (nanosecond timestamps): v2 cannot represent it, so
+  it is published as v3 (`iceberg_needs_v3` in `src/services/dml/mod.rs`).
+* CI reads published tables back with an external reader and compares values with pgwire
+  (TD-SEAM-1).
+
+=== D4 — Positioning
+
+ProximaDB is the **lakehouse system of record for AI context — analytics is the proof, not the
+product.** Every modality lands as an open table on object storage under one catalog, one record
+identity and one snapshot. This refines ADR-096 D1; it does not change ADR-096's decisions.
+
+=== D2 amendment (2026-10-19) — HNSW projection lifecycle on AXIS
+
+Owner direction: keep AXIS's HNSW engine and change its role, not its implementation.
+
+* The graph is *defined* as the HNSW over the PAX segment set the catalog snapshot names.
+  A ground-up rebuild from PAX is that definition, executed: it is the repair path.
+  Index-on-flush (TD-112) maintains the graph between rebuilds.
+* AXIS's versioned `SerializableHnswState` is persisted as an S7 projection. It is stamped with
+  the segment set and LSN it covers.
+* Boot cases:
+** **Stamp matches:** load the projection.
+** **Segments added since:** apply only the delta.
+** **Stamp invalid, or inputs compacted away:** rebuild in the background, serving from PAX
+   meanwhile.
+* Deletes are tombstones until a set ratio triggers a rebuild.
+* The S8 cost spine routes to HNSW only within a per-node memory budget.
+* **Prerequisite:** exact vectors.
+** Default PAX keeps no exact copy, so TD-PAXPREC-1 (an fp16 exact tier) lands first.
+** Until then, HNSW is refused for collections without a declared exact tier.
+
+Tracked as TD-SEAM-13.
+
+== Alternatives considered
+
+=== Keep the native operator plane separate (status quo of ADR-054 §6 / TD-OLAP-13)
+
+Rejected. A per-query choice between DataFusion and a native multimodal plane means every
+multimodal query must be expressible end-to-end in the native plane, which then needs its own
+joins, windows, recursive queries, CTEs and optimizer, duplicating DataFusion. The premise that
+DataFusion cannot host a filtered ANN does not hold: filter, limit and dynamic-filter pushdown
+into a custom `ExecutionPlan` are first-class in DataFusion, and the pattern already exists in
+`ProximaScanExec` (`src/datafusion/proxima_scan_exec.rs:591`). Keeping two planes also keeps
+the cross-modal UDTFs as eager, unpushed `MemTable`s, which is what TE-1 shows is broken today.
+
+=== Make AXIS (HNSW + IVF) the first-class vector tier
+
+Rejected. HNSW at ~620 B/vector of graph plus fp32 vectors is about 370 GB of RAM at
+100M × 768d, with a full rebuild on restart; its authority is an opaque heap outside the
+catalog and snapshot. AXIS IVF's measured recall ceiling is ~0.74 without PQ rerank, and its
+disk path is unbuilt. Neither aligns with S2–S4 or S7. HNSW keeps a role as a hot projection
+(D2).
+
+=== Keep two Iceberg metadata trees and reconcile them
+
+Rejected. Both trees are spec-invalid in different ways (design document §2) and neither is
+read back by an external reader. Two writers mean two sets of snapshot ids for one table.
+
+== Consequences
+
+* **TD-OLAP-13**: its premise is superseded; its operators (`VectorSearchOperator`,
+  `FusedAnnFilterAggregate`, `GraphTraversalOperator`, `DocumentProjectionOperator`) are
+  re-scoped as `ExecutionPlan` adapters (TD-SEAM-6 for the vector operator).
+* **ADR-054**: its native relational operators (TD-OLAP-10/11/12/14) are unchanged as
+  physical operators; their reach widens from "a per-query native route" to "physical
+  substitutions inside any DataFusion plan", chosen by S8. Its §6 claim that the wedge is
+  "structurally unserveable by a borrowed engine" is withdrawn.
+* **ADR-052**: the niche statement "vector + OLAP + lakehouse (3-mode) co-design; graph/document
+  are stretch modes" is amended: the niche is the lakehouse system of record across all
+  modalities (D4), with graph, document and observability landing on the same seams (P4).
+  ADR-052's executor decision (DataFusion) is reinforced, not changed.
+* **ADR-096**: gains the D4 positioning line as an amendment; D1–D5 are unchanged.
+* **AXIS**: IVF disk/cloud tier code is retired once TD-SEAM-10 lands; HNSW persistence moves
+  under TD-112 as a projection.
+* **Iceberg REST**: the `_manifests` tree, its synthetic schema and the `tenant_id` partition
+  go away (TD-SEAM-1).
+* Work is sequenced P0 (this ADR and the design document) → P1 (TD-SEAM-1) ∥ P5a
+  (TD-SEAM-11) → P2 → P3 → P4, with P6 (benchmarks) throughout. No pricing claims until the
+  P5b gates pass.
+
+== Not decided here
+
+* When to switch the Iceberg writer to format v3 (gated on external readers, per D3).
+* The exact shape of the `subject` system column and the cross-modal delete protocol
+  (TD-SEAM-9).
+* Whether `MultiModelPlan` and UQL are lowered or deleted; each is decided in its P3 slice.

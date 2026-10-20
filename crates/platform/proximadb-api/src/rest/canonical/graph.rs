@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    extract::{Path, State},
+    extract::Path,
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Json, Response},
     routing::{delete, get, post, put},
@@ -54,6 +54,8 @@ use proximadb_proto::v1::{
 };
 use proximadb_runtime::GraphPort;
 use serde::{Deserialize, Serialize};
+
+use super::graph_tenant_scope::TenantGraph;
 use tracing::{debug, error, info, warn};
 
 // ── State ────────────────────────────────────────────────────────────────────
@@ -682,6 +684,17 @@ fn is_not_found(err: &anyhow::Error) -> bool {
 }
 
 fn err_response<T: Serialize>(err: anyhow::Error) -> Response {
+    if err
+        .chain()
+        .any(|cause| cause.is::<proximadb_tenant::ScopedKeyError>())
+    {
+        let graph_error = GraphError::new(ErrorCode::InvalidArgument, err.to_string());
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(GraphResponse::<T>::error(graph_error)),
+        )
+            .into_response();
+    }
     if is_not_found(&err) {
         let graph_error = GraphError::new(ErrorCode::NotFound, err.to_string());
         (
@@ -782,7 +795,7 @@ async fn not_implemented_handler() -> impl IntoResponse {
 // ── Node handlers ─────────────────────────────────────────────────────────────
 
 async fn create_node(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
     Json(body): Json<CreateNodeBody>,
 ) -> impl IntoResponse {
@@ -812,7 +825,7 @@ async fn create_node(
 }
 
 async fn get_node(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path((graph_id, node_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     debug!("Getting node {} from graph {}", node_id, graph_id);
@@ -843,7 +856,7 @@ async fn get_node(
 }
 
 async fn update_node(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path((graph_id, node_id)): Path<(String, String)>,
     Json(mut input): Json<RestNodeInput>,
 ) -> impl IntoResponse {
@@ -867,7 +880,7 @@ async fn update_node(
 }
 
 async fn delete_node(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path((graph_id, node_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     debug!("Deleting node {} from graph {}", node_id, graph_id);
@@ -898,7 +911,7 @@ async fn delete_node(
 }
 
 async fn get_node_neighbors(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path((graph_id, node_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     debug!(
@@ -929,7 +942,7 @@ async fn get_node_neighbors(
 // ── Edge handlers ─────────────────────────────────────────────────────────────
 
 async fn create_edge(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
     Json(body): Json<CreateEdgeBody>,
 ) -> impl IntoResponse {
@@ -959,7 +972,7 @@ async fn create_edge(
 }
 
 async fn get_edge(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path((graph_id, edge_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     debug!("Getting edge {} from graph {}", edge_id, graph_id);
@@ -990,7 +1003,7 @@ async fn get_edge(
 }
 
 async fn update_edge(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path((graph_id, edge_id)): Path<(String, String)>,
     Json(mut input): Json<RestEdgeInput>,
 ) -> impl IntoResponse {
@@ -1014,7 +1027,7 @@ async fn update_edge(
 }
 
 async fn delete_edge(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path((graph_id, edge_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     debug!("Deleting edge {} from graph {}", edge_id, graph_id);
@@ -1047,7 +1060,7 @@ async fn delete_edge(
 // ── Query handlers ────────────────────────────────────────────────────────────
 
 async fn query_nodes(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
     Json(mut q): Json<RestNodeQuery>,
 ) -> impl IntoResponse {
@@ -1090,7 +1103,7 @@ async fn query_nodes(
 }
 
 async fn query_edges(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
     Json(mut q): Json<RestEdgeQuery>,
 ) -> impl IntoResponse {
@@ -1138,7 +1151,7 @@ async fn query_edges(
 }
 
 async fn execute_graph_query(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
     Json(req): Json<RestGraphQueryRequest>,
 ) -> impl IntoResponse {
@@ -1169,7 +1182,7 @@ async fn execute_graph_query(
 // ── Traversal handlers ────────────────────────────────────────────────────────
 
 async fn traverse_graph(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
     Json(req): Json<RestTraversalRequest>,
 ) -> impl IntoResponse {
@@ -1228,7 +1241,7 @@ async fn traverse_graph(
 /// BFS walk up to `limit` nodes within `max_depth` hops — implements `walk_graph`
 /// via `GraphPort::traverse_graph` with BFS algorithm.
 async fn walk_graph(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
     Json(req): Json<WalkRequest>,
 ) -> impl IntoResponse {
@@ -1274,7 +1287,7 @@ async fn walk_graph(
 /// Single-step navigation — returns the neighbors of one node via
 /// `GraphPort::get_neighbors`. Implements `step_graph`.
 async fn step_graph(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
     Json(req): Json<WalkStepRequest>,
 ) -> impl IntoResponse {
@@ -1313,7 +1326,7 @@ async fn step_graph(
 // ── Analytics handlers ────────────────────────────────────────────────────────
 
 async fn get_graph_stats(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
 ) -> impl IntoResponse {
     debug!("Getting graph stats for {}", graph_id);
@@ -1366,7 +1379,7 @@ async fn get_graph_stats(
 }
 
 async fn shortest_path(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
     _headers: HeaderMap,
     Json(req): Json<RestShortestPathRequest>,
@@ -1401,7 +1414,7 @@ async fn shortest_path(
 }
 
 async fn get_connected_components(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
 ) -> impl IntoResponse {
     match s
@@ -1426,7 +1439,7 @@ async fn get_connected_components(
 }
 
 async fn check_cycles(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
 ) -> impl IntoResponse {
     match s.graph_port.has_cycle(GetStatsRequest { graph_id }).await {
@@ -1450,7 +1463,7 @@ async fn check_cycles(
 // ── Constraint handlers ───────────────────────────────────────────────────────
 
 async fn add_unique_constraint(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
     Json(req): Json<RestUniqueConstraintRequest>,
 ) -> impl IntoResponse {
@@ -1481,7 +1494,7 @@ async fn add_unique_constraint(
 }
 
 async fn remove_unique_constraint(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
     Json(req): Json<RestUniqueConstraintRequest>,
 ) -> impl IntoResponse {
@@ -1514,7 +1527,7 @@ async fn remove_unique_constraint(
 // ── Batch handlers ────────────────────────────────────────────────────────────
 
 async fn batch_create_nodes(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
     Json(req): Json<BatchCreateNodesRequest>,
 ) -> impl IntoResponse {
@@ -1543,7 +1556,7 @@ async fn batch_create_nodes(
 }
 
 async fn batch_create_edges(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
     Json(req): Json<BatchCreateEdgesRequest>,
 ) -> impl IntoResponse {
@@ -1600,7 +1613,7 @@ struct UpdateGraphSchemaBody {
 }
 
 async fn create_graph_collection(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Json(body): Json<CreateGraphCollectionBody>,
 ) -> impl IntoResponse {
     info!("Creating graph collection: {}", body.graph_id);
@@ -1625,7 +1638,7 @@ async fn create_graph_collection(
     }
 }
 
-async fn list_graph_collections(State(s): State<GraphRestState>) -> impl IntoResponse {
+async fn list_graph_collections(TenantGraph(s): TenantGraph) -> impl IntoResponse {
     debug!("Listing graph collections");
     match s.graph_port.list_graph_collections().await {
         Ok(cols) => {
@@ -1643,7 +1656,7 @@ async fn list_graph_collections(State(s): State<GraphRestState>) -> impl IntoRes
 }
 
 async fn get_graph_collection(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
 ) -> impl IntoResponse {
     debug!("Getting graph collection: {graph_id}");
@@ -1667,7 +1680,7 @@ async fn get_graph_collection(
 }
 
 async fn delete_graph_collection(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
 ) -> impl IntoResponse {
     info!("Deleting graph collection: {graph_id}");
@@ -1688,7 +1701,7 @@ async fn delete_graph_collection(
 }
 
 async fn update_graph_schema(
-    State(s): State<GraphRestState>,
+    TenantGraph(s): TenantGraph,
     Path(graph_id): Path<String>,
     Json(body): Json<UpdateGraphSchemaBody>,
 ) -> impl IntoResponse {
@@ -1803,10 +1816,13 @@ mod tests {
     }
 
     impl MockGraphPort {
-        fn state(mode: MockMode) -> State<GraphRestState> {
-            State(GraphRestState {
-                graph_port: Arc::new(Self { mode }),
-            })
+        fn state(mode: MockMode) -> TenantGraph {
+            TenantGraph::for_tenant(
+                &GraphRestState {
+                    graph_port: Arc::new(Self { mode }),
+                },
+                proximadb_tenant::DEFAULT_TENANT,
+            )
         }
 
         fn ok_or_fail<T>(&self, value: T) -> Result<T> {

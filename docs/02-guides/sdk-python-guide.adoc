@@ -97,8 +97,8 @@ results = db.search("vectors", query=[0.1, 0.2, 0.3, 0.4], top_k=5)
 == Storage Engine Selection
 
 Choose the storage engine per collection with the `storage_engine` argument. The Python SDK sends
-`storage_engine=SST` when you omit it, so SDK users get the Supported engine by default. (A REST or
-gRPC create that omits the engine is auto-routed to Beta HELIX until v0.5, TD-ENGSEL-1.) Note that
+`storage_engine=SST` when you omit it, so SDK users get the Supported engine by default. REST and gRPC
+creates that omit the engine also get SST (TD-ENGSEL-1); HELIX is an explicit opt-in. Note that
 `create_collection` silently ignores an unknown `engine=` keyword (TD-SDKENG-1): use
 `storage_engine=`.
 

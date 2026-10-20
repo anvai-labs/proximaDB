@@ -989,7 +989,7 @@ async fn probe_pax_input_tiers(
 /// mirror, as `pax_filtered_row_allow` uses it), then the footer body. No HEAD
 /// and no tail read. `Ok(None)` when the object is not a coalesced segment
 /// (legacy block layout, too small), so the caller falls back to a whole read.
-async fn read_coalesced_segment_footer(
+pub(crate) async fn read_coalesced_segment_footer(
     port: &std::sync::Arc<dyn proximadb_storage_ports::FilesystemPort>,
     url: &str,
 ) -> anyhow::Result<Option<proximadb_storage_common::segment_layout::SegmentFooterIndex>> {

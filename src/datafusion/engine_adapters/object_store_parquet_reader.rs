@@ -1830,10 +1830,13 @@ pub async fn register_object_store_parquet_location(
     // and rebuild the table from cached metadata + a fresh per-query traced store.
     // Gated default-OFF; the cache is a pure function of the immutable snapshot,
     // invalidated on re-MATERIALIZE.
+    // Statistics are looked up under the tenant-qualified key MATERIALIZE
+    // publishes them under.
+    let stats_key = crate::core::statistics::table_statistics_key(tenant, name);
     if let Some(disc) = super::table_open_cache::get(tenant, location) {
         let table = Arc::new(
             ObjectStoreParquetTable::from_cached(&disc, location)?
-                .with_table_name(name)
+                .with_table_name(stats_key.clone())
                 .with_stats_trust(stats_trust),
         );
         ctx.register_table(name, table.clone())?;
@@ -1844,7 +1847,7 @@ pub async fn register_object_store_parquet_location(
     let table = Arc::new(
         ObjectStoreParquetTable::open(location)
             .await?
-            .with_table_name(name)
+            .with_table_name(stats_key)
             .with_stats_trust(stats_trust),
     );
     super::table_open_cache::insert(tenant, location, table.discovery());

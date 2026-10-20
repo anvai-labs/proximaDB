@@ -46,16 +46,12 @@
 //! (`tests/tpch_pgwire_e2e.rs`, `tests/tpcds_pgwire_e2e.rs`) — the repo's
 //! integration tests are self-contained by convention; keep them in sync.
 
-use std::net::TcpListener;
 #[cfg(not(feature = "duckdb"))]
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use proximadb::core::Config;
-use proximadb::database::ProximaDB;
 use proximadb::observability::io_trace::{self, IoTraceSnapshot};
-use tempfile::TempDir;
 use tokio::time::sleep;
 use tokio_postgres::{Client, SimpleQueryMessage};
 
@@ -63,97 +59,10 @@ use tokio_postgres::{Client, SimpleQueryMessage};
 /// io_trace scope close (pgwire wraps each statement in its own scope).
 static CAPTURE: Mutex<Vec<IoTraceSnapshot>> = Mutex::new(Vec::new());
 
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let p = l.local_addr().expect("addr").port();
-    drop(l);
-    p
-}
+#[path = "common/pg_server.rs"]
+mod pg_server;
 
-struct PgServer {
-    pg_port: u16,
-    db: Option<ProximaDB>,
-    _tmp: TempDir,
-}
-
-impl PgServer {
-    async fn start() -> anyhow::Result<Self> {
-        let pg_port = free_port();
-        let rest_port = free_port();
-        let grpc_port = free_port();
-        let tmp = TempDir::new()?;
-        let mut config = Config::default();
-        config.server.bind_address = "127.0.0.1".to_string();
-        config.server.port = rest_port;
-        config.server.data_dir = tmp.path().to_path_buf();
-        // ADR-059: the catalog metadata_url MUST be per-tempdir — the default
-        // ("file://./metadata") is a FIXED relative path that persists across
-        // test runs, carrying stale table locations from previous tempdirs.
-        config.storage.metadata_url = format!("file://{}/metadata", tmp.path().display());
-        config.api.rest_port = rest_port;
-        config.api.grpc_port = grpc_port;
-        config.api.unified_mode = false;
-        config.api.pg_port = Some(pg_port);
-        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
-            url: format!("file://{}", tmp.path().display()),
-            ..Default::default()
-        }];
-        config.storage.wal_config.write_buffer_directory =
-            format!("file://{}/wal", tmp.path().display());
-        let mut db = ProximaDB::new(config).await?;
-        db.start().await?;
-
-        // Override the process billing observer (installed by db.start()) with
-        // a collector that captures each query's snapshot for this harness.
-        io_trace::set_billing_observer(Some(Box::new(|snap: &IoTraceSnapshot, _tenant| {
-            CAPTURE.lock().expect("capture lock").push(snap.clone());
-        })));
-
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .no_proxy()
-            .build()?;
-        let health = format!("http://127.0.0.1:{rest_port}/health");
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            match http.get(&health).send().await {
-                Ok(r) if r.status().is_success() => break,
-                _ if Instant::now() > deadline => anyhow::bail!("REST not ready"),
-                _ => sleep(Duration::from_millis(100)).await,
-            }
-        }
-        sleep(Duration::from_millis(200)).await;
-        Ok(Self {
-            pg_port,
-            db: Some(db),
-            _tmp: tmp,
-        })
-    }
-
-    fn conn_str(&self) -> String {
-        format!(
-            "host=127.0.0.1 port={} user=postgres dbname=proximadb sslmode=disable",
-            self.pg_port
-        )
-    }
-
-    async fn shutdown(mut self) {
-        if let Some(mut db) = self.db.take() {
-            let _ = db.shutdown().await;
-        }
-    }
-}
-
-impl Drop for PgServer {
-    fn drop(&mut self) {
-        if let Some(mut db) = self.db.take() {
-            tokio::spawn(async move {
-                let _ = db.shutdown().await;
-            });
-        }
-    }
-}
-
+use pg_server::TestPgServer;
 fn explain_err(e: &tokio_postgres::Error) -> String {
     if let Some(db) = e.as_db_error() {
         format!("[{}] {}", db.code().code(), db.message())
@@ -1936,7 +1845,7 @@ async fn run_benchmark(
     stats
 }
 
-async fn connect(server: &PgServer) -> Client {
+async fn connect(server: &TestPgServer) -> Client {
     let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
         .await
         .expect("connect");
@@ -2003,7 +1912,12 @@ async fn tpc_perf_ledger_inner() {
 
     // Fresh server per benchmark: TPC-H and TPC-DS both define `customer`.
     if benchmark_filter.as_deref().is_none_or(|b| b == "tpch") {
-        let server = PgServer::start().await.expect("server start (tpch)");
+        let server = TestPgServer::start().await.expect("server start (tpch)");
+        // Override the process billing observer (installed by db.start()) with
+        // a collector that captures each query's snapshot for this harness.
+        io_trace::set_billing_observer(Some(Box::new(|snap: &IoTraceSnapshot, _tenant| {
+            CAPTURE.lock().expect("capture lock").push(snap.clone());
+        })));
         let client = connect(&server).await;
         let tpch_stats = run_benchmark(
             &client,
@@ -2029,7 +1943,12 @@ async fn tpc_perf_ledger_inner() {
         }
     }
     if benchmark_filter.as_deref().is_none_or(|b| b == "tpcds") {
-        let server = PgServer::start().await.expect("server start (tpcds)");
+        let server = TestPgServer::start().await.expect("server start (tpcds)");
+        // Override the process billing observer (installed by db.start()) with
+        // a collector that captures each query's snapshot for this harness.
+        io_trace::set_billing_observer(Some(Box::new(|snap: &IoTraceSnapshot, _tenant| {
+            CAPTURE.lock().expect("capture lock").push(snap.clone());
+        })));
         let client = connect(&server).await;
         let tpcds_stats = run_benchmark(
             &client,
@@ -2226,7 +2145,12 @@ async fn materialize_publishes_clustered_row_groups() {
     // Safe under nextest's process-per-test isolation.
     unsafe { std::env::set_var("PROXIMADB_MATERIALIZE_ROW_GROUP_ROWS", "4096") };
 
-    let server = PgServer::start().await.expect("server start");
+    let server = TestPgServer::start().await.expect("server start");
+    // Override the process billing observer (installed by db.start()) with
+    // a collector that captures each query's snapshot for this harness.
+    io_trace::set_billing_observer(Some(Box::new(|snap: &IoTraceSnapshot, _tenant| {
+        CAPTURE.lock().expect("capture lock").push(snap.clone());
+    })));
     let client = connect(&server).await;
 
     let _ = client.simple_query("DROP TABLE IF EXISTS diag").await;
@@ -2255,7 +2179,7 @@ async fn materialize_publishes_clustered_row_groups() {
     // near-disjoint windows — NOT the whole-domain span the unsorted snapshot
     // produced before sort-on-materialize.
     let mut found = 0;
-    for entry in walk(server._tmp.path()) {
+    for entry in walk(server.data_dir()) {
         if entry.extension().and_then(|e| e.to_str()) != Some("parquet") {
             continue;
         }

@@ -20,6 +20,7 @@ pub mod service_error;
 pub mod sketches;
 pub mod stable_id;
 pub mod stream_error;
+pub mod time;
 pub mod uuid;
 
 pub use base62::*;

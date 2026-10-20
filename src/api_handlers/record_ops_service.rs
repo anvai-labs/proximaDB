@@ -413,21 +413,27 @@ impl RecordOpsService {
         debug!("Collection ID cache cleared");
     }
 
+    /// Resolve a client identifier to the canonical collection id for a request
+    /// acting as `request_tenant`: a collection that tenant may not resolve is
+    /// `None`, exactly like a missing one (the one ownership rule). `None`
+    /// tenant (and no tenant context) is an internal lookup.
     pub(crate) async fn resolve_collection_id_internal(
         &self,
         collection_identifier: &str,
         tenant_context: Option<&crate::storage::tenant::TenantContext>,
+        request_tenant: Option<&str>,
     ) -> Result<Option<String>> {
-        if let Some(tenant_ctx) = tenant_context {
-            Ok(self
-                .collection_service
-                .get_collection_with_tenant_context(collection_identifier, Some(tenant_ctx))
-                .await?
-                .map(|collection| collection.id))
-        } else {
-            self.resolve_collection_id_cached(collection_identifier)
-                .await
-        }
+        // Always resolved within a tenant: the context's, else the request's,
+        // else the default tenant — never unscoped.
+        let scope = tenant_context
+            .map(|ctx| ctx.tenant_id.as_str())
+            .or(request_tenant)
+            .unwrap_or(proximadb_tenant::DEFAULT_TENANT);
+        Ok(self
+            .collection_service
+            .collection_for_tenant(collection_identifier, Some(scope))
+            .await?
+            .map(|collection| collection.id))
     }
 
     /// Resolve BOTH the canonical collection id AND its display name from a
@@ -442,26 +448,25 @@ impl RecordOpsService {
         &self,
         collection_identifier: &str,
         tenant_context: Option<&crate::storage::tenant::TenantContext>,
+        request_tenant: Option<&str>,
     ) -> Result<Option<(String, String)>> {
-        if let Some(tenant_ctx) = tenant_context {
-            Ok(self
-                .collection_service
-                .get_collection_with_tenant_context(collection_identifier, Some(tenant_ctx))
-                .await?
-                .map(|collection| {
-                    let name = collection
-                        .config
-                        .as_ref()
-                        .map(|c| c.name.clone())
-                        .unwrap_or_else(|| collection_identifier.to_string());
-                    (collection.id, name)
-                }))
-        } else {
-            Ok(self
-                .resolve_collection_id_cached(collection_identifier)
-                .await?
-                .map(|id| (id, collection_identifier.to_string())))
-        }
+        // Always resolved within a tenant (see `resolve_collection_id_internal`).
+        let scope = tenant_context
+            .map(|ctx| ctx.tenant_id.as_str())
+            .or(request_tenant)
+            .unwrap_or(proximadb_tenant::DEFAULT_TENANT);
+        Ok(self
+            .collection_service
+            .collection_for_tenant(collection_identifier, Some(scope))
+            .await?
+            .map(|collection| {
+                let name = collection
+                    .config
+                    .as_ref()
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| collection_identifier.to_string());
+                (collection.id, name)
+            }))
     }
 
     /// Resolve name or object id to one canonical identity for protocol
@@ -472,8 +477,12 @@ impl RecordOpsService {
         tenant_id: Option<&str>,
     ) -> Result<Option<(String, String)>> {
         let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
-        self.resolve_collection_id_and_name(collection_identifier, tenant_context.as_ref())
-            .await
+        self.resolve_collection_id_and_name(
+            collection_identifier,
+            tenant_context.as_ref(),
+            tenant_id,
+        )
+        .await
     }
 
     // ---- precision coercion (TD-080/TD-082) ----
@@ -555,7 +564,11 @@ impl RecordOpsService {
     ) -> Result<BatchOperationResult> {
         let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
         let (collection_id, collection_name) = match self
-            .resolve_collection_id_and_name(&request.collection_id, tenant_context.as_ref())
+            .resolve_collection_id_and_name(
+                &request.collection_id,
+                tenant_context.as_ref(),
+                tenant_id,
+            )
             .await?
         {
             Some((id, name)) => (id, name),
@@ -596,7 +609,13 @@ impl RecordOpsService {
             if n > 0
                 && let Some(dml_svc) = self.get_dml_service()
             {
-                dml_svc.bump_row_count_stats(&collection_name, -n).await;
+                dml_svc
+                    .bump_row_count_stats(
+                        &collection_name,
+                        Some(&proximadb_tenant::resolve_request_tenant(tenant_id)),
+                        -n,
+                    )
+                    .await;
             }
         }
         Ok(result)
@@ -610,7 +629,11 @@ impl RecordOpsService {
     ) -> Result<BatchOperationResult> {
         let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
         let (collection_id, collection_name) = match self
-            .resolve_collection_id_and_name(&request.collection_id, tenant_context.as_ref())
+            .resolve_collection_id_and_name(
+                &request.collection_id,
+                tenant_context.as_ref(),
+                tenant_id,
+            )
             .await?
         {
             Some((id, name)) => (id, name),
@@ -623,7 +646,11 @@ impl RecordOpsService {
         };
         if let Some(dml_svc) = self.get_dml_service()
             && let Err(e) = dml_svc
-                .validate_record_batch_against_schema(&collection_name, &request.records)
+                .validate_record_batch_against_schema(
+                    &collection_name,
+                    Some(&proximadb_tenant::resolve_request_tenant(tenant_id)),
+                    &request.records,
+                )
                 .await
         {
             return Ok(BatchOperationResult::failure(
@@ -665,7 +692,13 @@ impl RecordOpsService {
                 if result.success {
                     let n = result.vector_ids.len() as i64;
                     if let Some(dml_svc) = self.get_dml_service() {
-                        dml_svc.bump_row_count_stats(&collection_name, n).await;
+                        dml_svc
+                            .bump_row_count_stats(
+                                &collection_name,
+                                Some(&proximadb_tenant::resolve_request_tenant(tenant_id)),
+                                n,
+                            )
+                            .await;
                     }
                 }
                 Ok(result)
@@ -693,7 +726,11 @@ impl RecordOpsService {
     ) -> Result<BatchOperationResult> {
         let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
         let (collection_id, collection_name) = match self
-            .resolve_collection_id_and_name(&request.collection_id, tenant_context.as_ref())
+            .resolve_collection_id_and_name(
+                &request.collection_id,
+                tenant_context.as_ref(),
+                tenant_id,
+            )
             .await?
         {
             Some((id, name)) => (id, name),
@@ -706,7 +743,11 @@ impl RecordOpsService {
         };
         if let Some(dml_svc) = self.get_dml_service()
             && let Err(e) = dml_svc
-                .validate_record_batch_against_schema(&collection_name, &request.records)
+                .validate_record_batch_against_schema(
+                    &collection_name,
+                    Some(&proximadb_tenant::resolve_request_tenant(tenant_id)),
+                    &request.records,
+                )
                 .await
         {
             return Ok(BatchOperationResult::failure(
@@ -750,7 +791,13 @@ impl RecordOpsService {
                 if result.success {
                     let n = result.vector_ids.len() as i64;
                     if let Some(dml_svc) = self.get_dml_service() {
-                        dml_svc.bump_row_count_stats(&collection_name, n).await;
+                        dml_svc
+                            .bump_row_count_stats(
+                                &collection_name,
+                                Some(&proximadb_tenant::resolve_request_tenant(tenant_id)),
+                                n,
+                            )
+                            .await;
                     }
                 }
                 Ok(result)
@@ -803,7 +850,11 @@ impl RecordOpsService {
         let requested_collection = request.collection_id.clone();
         let request = RichSearchRequest {
             collection_id: match self
-                .resolve_collection_id_internal(&request.collection_id, tenant_context.as_ref())
+                .resolve_collection_id_internal(
+                    &request.collection_id,
+                    tenant_context.as_ref(),
+                    identity.tenant_id,
+                )
                 .await?
             {
                 Some(id) => id,
@@ -842,7 +893,11 @@ impl RecordOpsService {
             .load_tenant_context(identity.tenant_id)?;
         let request = RichRecordGetRequest {
             collection_id: match self
-                .resolve_collection_id_internal(&request.collection_id, tenant_context.as_ref())
+                .resolve_collection_id_internal(
+                    &request.collection_id,
+                    tenant_context.as_ref(),
+                    identity.tenant_id,
+                )
                 .await?
             {
                 Some(id) => id,
@@ -870,7 +925,7 @@ impl RecordOpsService {
     ) -> Result<Option<proximadb_records::ProximaRecord>> {
         let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
         let resolved = match self
-            .resolve_collection_id_internal(collection_id, tenant_context.as_ref())
+            .resolve_collection_id_internal(collection_id, tenant_context.as_ref(), tenant_id)
             .await?
         {
             Some(id) => id,
@@ -898,7 +953,7 @@ impl RecordOpsService {
     ) -> Result<(Vec<ProximaRecord>, Option<ScanCursor>)> {
         let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
         let resolved_id = match self
-            .resolve_collection_id_internal(collection_id, tenant_context.as_ref())
+            .resolve_collection_id_internal(collection_id, tenant_context.as_ref(), tenant_id)
             .await?
         {
             Some(id) => id,
@@ -924,11 +979,17 @@ impl RecordOpsService {
             .await
     }
 
-    /// Change feed: rows changed since `since_lsn` (delegates to the DML service).
-    pub async fn table_changes(&self, table: &str, since_lsn: u64) -> Result<Vec<ChangeRow>> {
+    /// Change feed: rows of `tenant`'s table changed since `since_lsn` (delegates to
+    /// the DML service). `Ok(None)` when the table is not visible to `tenant`.
+    pub async fn table_changes_for_tenant(
+        &self,
+        table: &str,
+        tenant: &str,
+        since_lsn: u64,
+    ) -> Result<Option<Vec<ChangeRow>>> {
         match self.get_dml_service() {
-            Some(dml) => dml.changes_since(table, since_lsn).await,
-            None => Ok(Vec::new()),
+            Some(dml) => dml.changes_since_for_tenant(table, tenant, since_lsn).await,
+            None => Ok(None),
         }
     }
 }
@@ -1084,7 +1145,7 @@ impl proximadb_runtime::RecordRoutePort for RecordOpsService {
             Err(_) => return false,
         };
         matches!(
-            self.resolve_collection_id_internal(collection_id, tenant_context.as_ref())
+            self.resolve_collection_id_internal(collection_id, tenant_context.as_ref(), tenant)
                 .await,
             Ok(Some(_))
         )
@@ -1108,6 +1169,7 @@ impl proximadb_runtime::RecordRoutePort for RecordOpsService {
                 collection_id,
                 dimension,
                 tenant_context.as_ref(),
+                tenant,
                 promote_keys,
             )
             .await
@@ -1163,7 +1225,7 @@ impl proximadb_runtime::RecordRoutePort for RecordOpsService {
         let tenant_context = self.collection_service.load_tenant_context(tenant)?;
         // Unknown collection ⇒ empty (mixed-safe: the caller falls back / merges nothing).
         let Some(resolved_id) = self
-            .resolve_collection_id_internal(collection_id, tenant_context.as_ref())
+            .resolve_collection_id_internal(collection_id, tenant_context.as_ref(), tenant)
             .await?
         else {
             return Ok(Vec::new());
