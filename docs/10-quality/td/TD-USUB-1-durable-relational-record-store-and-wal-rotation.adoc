@@ -125,7 +125,10 @@ every open slice.
    tenant; the `Err` failed every later write and aborted WAL replay into a crash loop). Now the
    residents persist and the tombstone stays pending; and an empty tenant gets a plain
    `MemtableRecordStorage` (`an_empty_tenant_gets_no_spill_partition`), making the unbounded
-   tombstone-set shape unconstructible.
+   tombstone-set shape unconstructible. *Superseded 2026-10-20:* the `""` partition now spills
+   through an explicit `SpillRecordStorage::untenanted()` mode that persists its tombstones with an
+   empty tenant (`Some("")`), so it is both bounded and durable; `with_tenant("")` and `None` keep
+   the refuse-the-tombstone behaviour above.
 ** Lesson — TD-USUB-18's orphan flag became an **unresolved-PUT counter**: raised before the write,
    lowered only on success, so a flush future dropped mid-PUT (cancellation, timeout) leaves it
    raised; saturating `fetch_update`, never `fetch_add` (atomics bypass `overflow-checks`).
@@ -149,7 +152,9 @@ every open slice.
    `an_upsert_of_a_tombstoned_oid_after_the_snapshot_is_not_evicted`,
    `an_oid_both_resident_and_tombstoned_is_not_flushed_and_stays_fail_closed`; in
    `record_store.rs` (production factory): `spilling_partition_persists_a_tombstone_through_the_production_wiring`,
-   `an_empty_tenant_gets_no_spill_partition`.
+   `an_empty_tenant_partition_spills_and_persists_deletes` (replaced
+   `an_empty_tenant_gets_no_spill_partition`, 2026-10-20); and
+   `an_untenanted_partition_persists_its_deletes` in `record_spill.rs`.
 
 == Open
 
@@ -508,7 +513,8 @@ than a data-loss one, since the pre-change behaviour was a uniformly-absent lost
   unconditional refusal, not as `Ok(None)`** — otherwise "respect every store's answer" is
   satisfied by a store that has no answer. Recorded here as a 2b prerequisite; the fallback also
   now logs, since `""` is the normal tenant key for a single-tenant server today and a silent
-  fallback would leave an operator who set the gate with no spill partitions and no signal.
+  fallback would leave an operator who set the gate with no spill partitions and no signal. (The memtable fallback itself was removed 2026-10-20 — the `""` partition spills via
+  `untenanted()` — and the record-tier floor refuses on any remaining memtable partition.)
 
 * **The trait `flush` override has no production caller, so the defect it addresses is still open.**
   `DirectWalTableRecordStore` has no flush/shutdown/checkpoint method and never iterates

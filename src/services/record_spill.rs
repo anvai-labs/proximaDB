@@ -277,9 +277,15 @@ pub struct SpillRecordStorage {
     /// keeps refusing. It does not fail the flush — that would propagate through
     /// `upsert_record`'s `?` and abort WAL replay (see `flush`).
     ///
-    /// Production does not reach that arm: `new_spilling`'s factory hands back a
-    /// plain memtable when the tenant is empty, so a spill partition always has
-    /// one. The arm is defence-in-depth for a directly-constructed store.
+    /// The one deliberate `Some("")` is [`Self::untenanted`]: the partition
+    /// that holds untenanted rows (`tenant_key(None)`, the normal key on a
+    /// single-tenant server). Its live rows already carry `""`, so a
+    /// `""`-stamped tombstone adds no exposure the rows did not already have —
+    /// and suppression works by oid plus `is_dead`, not by tenant. Without it
+    /// that partition could never persist a delete, so the factory had to hand
+    /// it an unbounded memtable and single-tenant servers got no heap bound.
+    /// `with_tenant("")` still normalises to `None`: an accidental empty tenant
+    /// stays the refusing shape; only the explicit opt-in is not.
     tenant_id: Option<String>,
 }
 
@@ -329,6 +335,14 @@ impl SpillRecordStorage {
         // matching ANY tenant. Keeping the two unusable shapes as one value
         // means every consumer has one case to handle, not two.
         self.tenant_id = Some(tenant_id.into()).filter(|t| !t.is_empty());
+        self
+    }
+
+    /// Mark this store as the UNTENANTED partition: tombstones are persisted
+    /// stamped `""`, like the partition's own rows. See the `tenant_id` field
+    /// for why this is safe for exactly that partition and nowhere else.
+    pub fn untenanted(mut self) -> Self {
+        self.tenant_id = Some(String::new());
         self
     }
 
@@ -665,13 +679,13 @@ impl SpillRecordStorage {
 
         // Whether this flush may persist those tombstones.
         //
-        // No `filter(!is_empty)` here: `tenant_id` is private with exactly two
-        // write sites (the constructor's `None` and `with_tenant`'s normalisation),
-        // so `Some("")` is already unrepresentable, and a second copy of that
-        // predicate would be dead logic arguing an invariant it does not enforce.
-        // The normalisation — and its reason, that `ProximaRecord::matches_tenant`
-        // treats an EMPTY `tenant_id` as matching ANY tenant — lives in
-        // `with_tenant`, which is its one home (mandate #12).
+        // No `filter(!is_empty)` here: `tenant_id` is private, `with_tenant`
+        // normalises an accidental `""` to `None`, and the only `Some("")` is
+        // the explicit `untenanted()` opt-in, which must persist. The reasons —
+        // `ProximaRecord::matches_tenant` treats an EMPTY `tenant_id` as
+        // matching ANY tenant, which is harmless only for the partition whose
+        // rows are themselves untenanted — live on the `tenant_id` field
+        // (mandate #12).
         //
         // An unusable tenant must NOT fail the flush. The production factory
         // derives the tenant from `tenant_key`/the WAL entry, both of which are
@@ -3375,6 +3389,51 @@ mod tests {
             );
             assert_eq!(segment_files_on_disk(&base), 1, "and delete nothing");
         }
+        Ok(())
+    }
+
+    /// The explicit untenanted partition persists its deletes, so its
+    /// tombstones leave memory and truncation is no longer blocked forever —
+    /// while an accidental empty tenant (`with_tenant("")`) still refuses.
+    #[tokio::test]
+    async fn an_untenanted_partition_persists_its_deletes() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let store =
+            SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None).untenanted();
+        let untenanted_record = |oid: &str| ProximaRecord {
+            tenant_id: String::new(),
+            ..record(oid, "open")
+        };
+        RecordStore::upsert_record_at_lsn(&store, untenanted_record("k"), 1).await?;
+        store.flush().await?;
+        store
+            .delete_record(&RecordKey::new("k".to_string()))
+            .await?;
+        RecordStore::upsert_record_at_lsn(&store, untenanted_record("live"), 3).await?;
+        store.flush().await?.expect("publishes");
+
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(&store).await.ok(),
+            Some(None),
+            "the delete is durable, so nothing constrains truncation"
+        );
+        drop(store);
+
+        // A fresh instance over the prefix serves the delete from the segment.
+        let fresh = SpillRecordStorage::with_flush_threshold(fs, base, None).untenanted();
+        assert!(
+            fresh
+                .get_record(&RecordKey::new("k".to_string()))
+                .await?
+                .is_none(),
+            "the persisted tombstone suppresses the flushed row"
+        );
+        assert!(
+            fresh
+                .get_record(&RecordKey::new("live".to_string()))
+                .await?
+                .is_some()
+        );
         Ok(())
     }
 

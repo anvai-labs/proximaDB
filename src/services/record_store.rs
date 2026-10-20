@@ -2099,23 +2099,21 @@ impl DirectWalTableRecordStore {
                     // tolerated. The untenanted partition keeps today's behaviour
                     // (an unbounded memtable — the defect TD-USUB-1 exists to fix,
                     // unchanged for this case and recorded there as an open item).
-                    Some(_) if tenant_id.is_empty() => {
-                        // Say so. The in-store arm at least `warn!`s; a silent
-                        // fallback here would mean an operator who set the spill
-                        // gate to bound the heap gets no spill partitions and no
-                        // signal — and `""` is the NORMAL key for a single-tenant
-                        // server today, not an edge case (pgwire auth is still an
-                        // open item, and the relational pipeline maps an empty
-                        // tenant to `None`).
-                        tracing::warn!(
-                            collection = %collection,
-                            "spill gate is set but this partition has no tenant, so it \
-                             falls back to an unbounded memtable: a spill store cannot \
-                             stamp a tombstone without a tenant. See TD-USUB-1."
-                        );
-                        Arc::new(crate::services::MemtableRecordStorage::new())
-                            as Arc<dyn RecordStorage>
-                    }
+                    // The untenanted partition (`tenant_key(None)`, the normal
+                    // key on a single-tenant server) spills too: it persists its
+                    // deletes stamped `""`, like its own rows, so its heap is
+                    // bounded and its tombstones leave memory. See
+                    // `SpillRecordStorage::untenanted` for why that is safe for
+                    // exactly this partition.
+                    Some(threshold) if tenant_id.is_empty() => Arc::new(
+                        crate::services::SpillRecordStorage::with_flush_threshold(
+                            filesystem.clone(),
+                            segment_base(tenant_id, collection),
+                            Some(threshold),
+                        )
+                        .untenanted(),
+                    )
+                        as Arc<dyn RecordStorage>,
                     Some(threshold) => {
                         Arc::new(
                             crate::services::SpillRecordStorage::with_flush_threshold(
@@ -5458,23 +5456,22 @@ mod tests {
         );
     }
 
-    /// An EMPTY tenant must NOT get a spill partition, even with the gate on.
+    /// The UNTENANTED partition spills too, and persists its deletes.
     ///
     /// `tenant_key` and the replay path are both `unwrap_or_default()`, so `""`
-    /// reaches the factory. A spill store with no tenant cannot persist a
-    /// tombstone, and nothing but a purge clears one — so its `tombstones` set
-    /// would grow monotonically while `min_unflushed_lsn` refused forever.
-    /// Unbounded state plus permanently unachievable truncation is strictly worse
-    /// than the unbounded memtable this slice is trying to replace, so the shape
-    /// is made unconstructible.
+    /// reaches the factory — and it is the normal key on a single-tenant
+    /// server. It used to get an unbounded memtable, because a spill store
+    /// without a tenant could not persist a tombstone. The factory now builds it
+    /// `untenanted()`: its rows and its tombstones both carry `""`, so the heap
+    /// is bounded and a delete leaves memory like any other.
     ///
-    /// Asserted by OBSERVABLE effect: with the gate on and well past the
-    /// threshold, an untenanted partition writes no segment anywhere under the
-    /// root — and still serves its rows.
+    /// Asserted by OBSERVABLE effect: past the threshold a segment exists under
+    /// the root, every row is still served, a delete is suppressed, and after a
+    /// flush nothing constrains WAL truncation.
     ///
     /// Process-isolated under nextest, so the env gate does not leak.
     #[tokio::test]
-    async fn an_empty_tenant_gets_no_spill_partition() {
+    async fn an_empty_tenant_partition_spills_and_persists_deletes() {
         unsafe {
             std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "2");
         }
@@ -5495,42 +5492,52 @@ mod tests {
             wal,
             fs,
             Arc::new(move |tenant_id: &str, collection: &str| {
-                format!("{base}/{tenant_id}/{collection}")
+                format!("{base}/untenanted{tenant_id}/{collection}")
             }),
         );
 
         // No tenant context at all — this is what `tenant_key(None)` produces.
         let partition = store.partition("", "orders");
-        for i in 0..8 {
+        for i in 0..8u64 {
             partition
-                .upsert_record(ProximaRecord {
-                    oid: format!("o{i}"),
-                    tenant_id: String::new(),
-                    ..Default::default()
-                })
+                .upsert_record_at_lsn(
+                    ProximaRecord {
+                        oid: format!("o{i}"),
+                        tenant_id: String::new(),
+                        ..Default::default()
+                    },
+                    i + 1,
+                )
                 .await
                 .expect("upsert must succeed for an untenanted partition");
         }
-
-        // Same shape as the gate-unset test above, including `expect` rather
-        // than `unwrap_or(false)`: an unreadable root must FAIL the test, not read
-        // as "wrote nothing" and pass it.
-        let wrote_anything = std::fs::read_dir(&root)
-            .expect("read spill root")
-            .next()
-            .is_some();
         assert!(
-            !wrote_anything,
-            "an untenanted partition must not spill; found entries under {}",
-            root.display()
+            std::fs::read_dir(root.join("untenanted").join("orders"))
+                .expect("the untenanted partition spilled")
+                .next()
+                .is_some(),
+            "past the threshold the untenanted partition must write a segment"
         );
+
+        partition
+            .delete_record(&RecordKey::new("o0".to_string()))
+            .await
+            .expect("delete");
+        RecordStore::flush(partition.as_ref()).await.expect("flush");
         assert_eq!(
             RecordScan::scan_records(partition.as_ref(), 100)
                 .await
                 .expect("scan")
                 .len(),
-            8,
-            "and it must still serve every row"
+            7,
+            "every row but the deleted one is served"
+        );
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(partition.as_ref())
+                .await
+                .ok(),
+            Some(None),
+            "the delete is durable: nothing constrains truncation"
         );
 
         unsafe {
@@ -5836,9 +5843,9 @@ mod tests {
     }
 
     /// With the spill gate on, the tier floor is the minimum over spill
-    /// partitions' resident LSNs — and ONE refusing partition (here the
-    /// untenanted one, which falls back to a memtable) makes the whole tier
-    /// refuse.
+    /// partitions' resident LSNs — the untenanted (`""`) partition included,
+    /// since it spills too — and ONE refusing partition (a memtable) makes the
+    /// whole tier refuse.
     ///
     /// Process-isolated under nextest, so the env gate does not leak.
     #[tokio::test]
@@ -5856,6 +5863,8 @@ mod tests {
             .await
             .expect("local filesystem"),
         );
+        let store_fs = fs.clone();
+        let refusing_base = format!("{base}/mixed");
         let store = DirectWalTableRecordStore::new_spilling(
             Arc::new(RecordingWalAppender::default()),
             fs,
@@ -5891,14 +5900,49 @@ mod tests {
             "the minimum resident LSN across spill partitions"
         );
 
-        // An untenanted partition is a memtable (no tombstone stamp possible),
-        // so it refuses — and so does the tier.
+        // The untenanted partition spills like any other, so it reports its
+        // resident LSN instead of refusing; the minimum is unchanged.
         store
             .replay_wal_entries(vec![upsert(9, "", "orders")])
             .await
             .expect("replay");
+        assert_eq!(
+            store.min_unflushed_lsn().await.ok(),
+            Some(Some(5)),
+            "an untenanted spill partition answers, it does not refuse"
+        );
+
+        // A memtable partition has no durable copy of its rows, so it refuses —
+        // and one refusal makes the whole tier refuse.
+        let spill_fs = store_fs.clone();
+        let spill_base = refusing_base.clone();
+        let mixed = DirectWalTableRecordStore::with_storage_factory(
+            Arc::new(RecordingWalAppender::default()),
+            Arc::new(move |tenant_id: &str, collection: &str| {
+                if collection == "legacy" {
+                    Arc::new(crate::services::MemtableRecordStorage::new())
+                        as Arc<dyn RecordStorage>
+                } else {
+                    Arc::new(
+                        crate::services::SpillRecordStorage::with_flush_threshold(
+                            spill_fs.clone(),
+                            format!("{spill_base}/{tenant_id}/{collection}"),
+                            Some(4),
+                        )
+                        .with_tenant(tenant_id),
+                    ) as Arc<dyn RecordStorage>
+                }
+            }),
+        );
+        mixed
+            .replay_wal_entries(vec![
+                upsert(1, "tenant-a", "orders"),
+                upsert(2, "tenant-a", "legacy"),
+            ])
+            .await
+            .expect("replay");
         assert!(
-            store.min_unflushed_lsn().await.is_err(),
+            mixed.min_unflushed_lsn().await.is_err(),
             "one refusing partition makes the whole tier refuse"
         );
 
