@@ -21,55 +21,13 @@ const TPCDS_ACCURATE_RATCHET: usize = 10;
 
 #[path = "common/pg_server.rs"]
 mod pg_server;
+#[path = "common/tpc_anchor.rs"]
+mod tpc_anchor;
 
 use pg_server::TestPgServer;
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    if let Some(db) = e.as_db_error() {
-        format!("[{}] {}", db.code().code(), db.message())
-    } else {
-        e.to_string()
-    }
-}
-
-/// Normalize a result cell for value comparison: numeric cells are rounded to 2
-/// decimals (collapsing f64 decimal-accumulation error on `DOUBLE PRECISION` price
-/// sums, e.g. 69.4799… → "69.48") and rendered minimally (whole numbers without a
-/// decimal); SQL NULL → "NULL"; other text passes through.
-fn norm_cell(s: &str) -> String {
-    match s.parse::<f64>() {
-        Ok(f) => {
-            let r = (f * 100.0).round() / 100.0;
-            if r.fract() == 0.0 {
-                format!("{}", r as i64)
-            } else {
-                format!("{r}")
-            }
-        }
-        Err(_) => s.to_string(),
-    }
-}
-
-/// Run a query and return its rows as normalized text cells, **sorted** for
-/// order-independent set comparison (ADR-040 `canon()` style; row order across
-/// routes is a separate concern — see TD-185).
-async fn canon_rows(client: &tokio_postgres::Client, sql: &str) -> Vec<Vec<String>> {
-    let mut rows: Vec<Vec<String>> = client
-        .simple_query(sql)
-        .await
-        .unwrap_or_else(|e| panic!("query `{sql}`: {}", explain_err(&e)))
-        .into_iter()
-        .filter_map(|m| match m {
-            tokio_postgres::SimpleQueryMessage::Row(r) => Some(
-                (0..r.len())
-                    .map(|i| norm_cell(r.get(i).unwrap_or("NULL")))
-                    .collect(),
-            ),
-            _ => None,
-        })
-        .collect();
-    rows.sort();
-    rows
-}
+use tpc_anchor::{
+    AnchorSpec, canon_rows, explain_err, reseed_for_accuracy_phase, run_anchored_phase,
+};
 
 /// Core TPC-DS star-schema subset (standard column names, subset of columns).
 const SCHEMA: &[(&str, &str)] = &[
@@ -473,31 +431,10 @@ fn tpcds_expected() -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
 /// process-wide set-once; a second boot in the same process silently
 /// reuses the first's manifest pointed at a deleted tempdir).
 async fn tpcds_accuracy_anchored_phase(client: &tokio_postgres::Client) {
-    for (name, ddl) in SCHEMA {
-        // Phase boundary (ported from tpch_pgwire_e2e, #2080): the
-        // conformance phase's queries + this shared boot leave catalog/WAL
-        // state where a best-effort `DROP TABLE IF EXISTS` can ERROR
-        // (swallowed, historically) instead of no-op'ing — the subsequent
-        // CREATE then hit "already exists" and panicked. Surface the drop
-        // error, and if CREATE still collides, retry once via a hard DROP
-        // before failing loudly. A true CREATE regression still panics;
-        // only the stale-state race is absorbed.
-        if let Err(e) = client
-            .simple_query(&format!("DROP TABLE IF EXISTS {name}"))
-            .await
-        {
-            eprintln!(
-                "DROP IF EXISTS {name} errored (retrying create): {}",
-                explain_err(&e)
-            );
-        }
-        if client.simple_query(ddl).await.is_err() {
-            let _ = client.simple_query(&format!("DROP TABLE {name}")).await;
-            client.simple_query(ddl).await.unwrap_or_else(|e| {
-                panic!("CREATE {name} after stale-state retry: {}", explain_err(&e))
-            });
-        }
-    }
+    // Phase boundary (ported from tpch_pgwire_e2e, #2080): drop + recreate
+    // every table in place on the SAME boot (the stale-state DROP/CREATE race
+    // this absorbs is documented on `reseed_for_accuracy_phase`).
+    reseed_for_accuracy_phase(client, SCHEMA).await;
     for sql in DATA {
         client
             .simple_query(sql)
@@ -513,56 +450,28 @@ async fn tpcds_accuracy_anchored_phase(client: &tokio_postgres::Client) {
 
     let expected = tpcds_expected();
     let by_id: std::collections::HashMap<&str, String> = tpcds_queries().into_iter().collect();
-    let mut accurate = 0;
-    let mut failures = Vec::new();
-    for (id, want) in &expected {
-        let is_known_bad = id.ends_with("-KNOWN-BAD");
-        let lookup_id = id.strip_suffix("-KNOWN-BAD").unwrap_or(id);
-        let sql = by_id
-            .get(lookup_id)
-            .unwrap_or_else(|| panic!("{lookup_id} missing from tpcds_queries()"));
-        let got = canon_rows(client, sql).await;
-        let want: Vec<Vec<String>> = want
-            .iter()
-            .map(|row| row.iter().map(|c| c.to_string()).collect())
-            .collect();
-        if is_known_bad {
-            if got == *want {
-                // Still returns the pinned wrong answer — known-bad holds.
-                eprintln!("  ✓ {id} still KNOWN-BAD (pinned wrong answer)");
-                continue;
+    let specs: Vec<_> = expected
+        .into_iter()
+        .map(|(id, rows)| {
+            let lookup_id = id.strip_suffix("-KNOWN-BAD").unwrap_or(id);
+            let sql = by_id
+                .get(lookup_id)
+                .unwrap_or_else(|| panic!("{lookup_id} missing from tpcds_queries()"))
+                .as_str();
+            AnchorSpec {
+                id,
+                sql,
+                expected: rows,
             }
-            panic!(
-                "{id}: KNOWN-BAD anchor tripped — the engine's answer CHANGED (got \\
-                 {got:?}, pinned {want:?}). If the result is now the CORRECT \\
-                 {{Books 91.95, Electronics 89.47}} set, update the anchor, move \\
-                 {lookup_id} into the anchored set, and close TD-185a on this branch."
-            );
-        }
-        if got == want {
-            accurate += 1;
-            eprintln!("  ✓ {id} accurate ({} rows)", got.len());
-        } else {
-            failures.push(format!("{id}: want {want:?}, got {got:?}"));
-        }
-    }
-
-    eprintln!(
-        "\n=== TPC-DS accuracy: {}/{} anchored queries accurate (ratchet {}) ===",
-        accurate,
-        expected.len(),
-        TPCDS_ACCURATE_RATCHET
-    );
-    for f in &failures {
-        eprintln!("  ✗ {f}");
-    }
-    assert!(
-        failures.is_empty(),
-        "TPC-DS anchored accuracy failures: {}",
-        failures.join("; ")
-    );
-    assert!(
-        accurate >= TPCDS_ACCURATE_RATCHET,
-        "TPC-DS accuracy regressed: {accurate} < ratchet {TPCDS_ACCURATE_RATCHET}"
-    );
+        })
+        .collect();
+    let _ = run_anchored_phase(
+        client,
+        &specs,
+        "TPC-DS",
+        "{Books 91.95, Electronics 89.47} set, update the anchor",
+        "TD-185a on this branch.",
+        TPCDS_ACCURATE_RATCHET,
+    )
+    .await;
 }
