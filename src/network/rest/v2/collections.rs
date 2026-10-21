@@ -82,6 +82,31 @@ fn record_count_for_wire(
     stats.map(|s| non_negative_stat(s.vector_count))
 }
 
+/// Map a canonical-collection operation error onto its REST v2 wire shape.
+/// "not found" anywhere in the error text reads as 404 CollectionNotFound;
+/// anything else is a 500 carrying the operation context (`op` — "get",
+/// "delete", …). The text match is the current canonical-layer contract
+/// (errors surface as anyhow text, not typed variants); consolidating it in
+/// this one choke point means the eventual typed-error fix is a single-site
+/// change instead of an edit per handler.
+fn collection_op_error(op: &str, collection_id: &str, e: impl std::fmt::Display) -> ApiError {
+    if e.to_string().contains("not found") {
+        ApiError::CollectionNotFound(collection_id.to_string())
+    } else {
+        ApiError::Internal(format!("Failed to {op} collection: {e}"))
+    }
+}
+
+/// Map a collection-create error: a name collision reads as 409
+/// AlreadyExists, anything else a 500 with context.
+fn collection_create_error(collection_name: &str, e: impl std::fmt::Display) -> ApiError {
+    if e.to_string().contains("already exists") {
+        ApiError::AlreadyExists(format!("Collection '{collection_name}' already exists"))
+    } else {
+        ApiError::Internal(format!("Failed to create collection: {e}"))
+    }
+}
+
 fn collection_create_failure_error(collection_name: &str, error_code: Option<&str>) -> ApiError {
     let code = error_code.unwrap_or_default();
     let lower_code = code.to_ascii_lowercase();
@@ -853,19 +878,7 @@ pub async fn create_collection_v2(
 
             Ok(Json(response))
         }
-        Err(e) => {
-            if e.to_string().contains("already exists") {
-                Err(ApiError::AlreadyExists(format!(
-                    "Collection '{}' already exists",
-                    request.name
-                )))
-            } else {
-                Err(ApiError::Internal(format!(
-                    "Failed to create collection: {}",
-                    e
-                )))
-            }
-        }
+        Err(e) => Err(collection_create_error(&request.name, e)),
     }
 }
 
@@ -1170,16 +1183,7 @@ pub async fn get_collection_v2(
 
             Ok(Json(response))
         }
-        Err(e) => {
-            if e.to_string().contains("not found") {
-                Err(ApiError::CollectionNotFound(collection_id))
-            } else {
-                Err(ApiError::Internal(format!(
-                    "Failed to get collection: {}",
-                    e
-                )))
-            }
-        }
+        Err(e) => Err(collection_op_error("get", &collection_id, e)),
     }
 }
 
@@ -1400,13 +1404,7 @@ pub async fn delete_collection_v2(
         .api_handlers
         .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
         .await
-        .map_err(|e| {
-            if e.to_string().contains("not found") {
-                ApiError::CollectionNotFound(collection_id.clone())
-            } else {
-                ApiError::Internal(format!("Failed to delete collection: {}", e))
-            }
-        })?;
+        .map_err(|e| collection_op_error("delete", &collection_id, e))?;
     // Nothing deleted: the collection is not one this tenant can resolve
     // (missing, or another tenant's) — answered identically.
     if !response.success {
@@ -2312,13 +2310,7 @@ pub async fn get_collection_statistics_v2(
         .api_handlers
         .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
         .await
-        .map_err(|e| {
-            if e.to_string().contains("not found") {
-                ApiError::CollectionNotFound(collection_id.clone())
-            } else {
-                ApiError::Internal(format!("Failed to get collection: {}", e))
-            }
-        })?;
+        .map_err(|e| collection_op_error("get", &collection_id, e))?;
 
     // A collection this tenant cannot resolve reads exactly as a missing one;
     // statistics are only ever read or written under its canonical id.
@@ -2420,13 +2412,7 @@ pub async fn get_collection_route_health_v2(
         .api_handlers
         .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
         .await
-        .map_err(|e| {
-            if e.to_string().contains("not found") {
-                ApiError::CollectionNotFound(collection_id.clone())
-            } else {
-                ApiError::Internal(format!("Failed to get collection: {}", e))
-            }
-        })?;
+        .map_err(|e| collection_op_error("get", &collection_id, e))?;
 
     let collection = resp
         .collection
@@ -2788,13 +2774,7 @@ pub async fn post_collection_recall_tune_v2(
         .api_handlers
         .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
         .await
-        .map_err(|e| {
-            if e.to_string().contains("not found") {
-                ApiError::CollectionNotFound(collection_id.clone())
-            } else {
-                ApiError::Internal(format!("Failed to get collection: {}", e))
-            }
-        })?;
+        .map_err(|e| collection_op_error("get", &collection_id, e))?;
 
     let collection = resp
         .collection
@@ -3121,13 +3101,7 @@ async fn ensure_collection_exists(
         .api_handlers
         .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
         .await
-        .map_err(|e| {
-            if e.to_string().contains("not found") {
-                ApiError::CollectionNotFound(collection_id.to_string())
-            } else {
-                ApiError::Internal(format!("Failed to get collection: {e}"))
-            }
-        })?;
+        .map_err(|e| collection_op_error("get", collection_id, e))?;
     Ok(())
 }
 
@@ -3272,13 +3246,7 @@ pub async fn post_collection_recluster_v2(
             .api_handlers
             .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
             .await
-            .map_err(|e| {
-                if e.to_string().contains("not found") {
-                    ApiError::CollectionNotFound(collection_id.clone())
-                } else {
-                    ApiError::Internal(format!("Failed to get collection: {}", e))
-                }
-            })?;
+            .map_err(|e| collection_op_error("get", &collection_id, e))?;
 
         let collection = resp
             .collection
