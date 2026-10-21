@@ -739,42 +739,35 @@ impl Catalog for PolarisCatalog {
     }
 
     async fn get_table(&self, identifier: &TableIdentifier) -> Result<CatalogTableSchema> {
-        // Check cache first
-        if let Some(schema) = self.cache.get_table(&self.name, identifier) {
-            return Ok(schema);
-        }
+        crate::cached_table(&self.cache, &self.name, identifier, async {
+            let encoded_ns = Self::encode_namespace(&identifier.namespace);
+            let path = format!("/namespaces/{}/tables/{}", encoded_ns, identifier.name);
 
-        let encoded_ns = Self::encode_namespace(&identifier.namespace);
-        let path = format!("/namespaces/{}/tables/{}", encoded_ns, identifier.name);
+            let response: IcebergLoadTableResponse =
+                self.api_request(reqwest::Method::GET, &path, None).await?;
 
-        let response: IcebergLoadTableResponse =
-            self.api_request(reqwest::Method::GET, &path, None).await?;
+            let columns: Vec<CatalogColumn> = response
+                .metadata
+                .schema
+                .fields
+                .iter()
+                .map(Self::iceberg_field_to_column)
+                .collect();
 
-        let columns: Vec<CatalogColumn> = response
-            .metadata
-            .schema
-            .fields
-            .iter()
-            .map(Self::iceberg_field_to_column)
-            .collect();
-
-        let schema = CatalogTableSchema {
-            name: identifier.name.clone(),
-            columns,
-            primary_key: vec![],
-            indexes: vec![],
-            schema_version: response.metadata.current_schema_id,
-            properties: response.metadata.properties.unwrap_or_default(),
-            location: Some(response.metadata.location.clone()),
-            created_at_ms: 0,
-            updated_at_ms: response.metadata.last_updated_ms,
-            ..Default::default()
-        };
-
-        // Update cache
-        self.cache.put_table(&self.name, identifier, schema.clone());
-
-        Ok(schema)
+            Ok(CatalogTableSchema {
+                name: identifier.name.clone(),
+                columns,
+                primary_key: vec![],
+                indexes: vec![],
+                schema_version: response.metadata.current_schema_id,
+                properties: response.metadata.properties.unwrap_or_default(),
+                location: Some(response.metadata.location.clone()),
+                created_at_ms: 0,
+                updated_at_ms: response.metadata.last_updated_ms,
+                ..Default::default()
+            })
+        })
+        .await
     }
 
     async fn rename_table(&self, from: &TableIdentifier, to: &TableIdentifier) -> Result<()> {

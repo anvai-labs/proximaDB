@@ -11,6 +11,7 @@
 use proximadb_data_model::ProximaType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::OnceLock;
 
 // Proto re-export so modules extracted from the root `src/catalog` keep their
@@ -2730,6 +2731,53 @@ pub trait Catalog: Send + Sync {
     async fn close(&self) -> anyhow::Result<()> {
         Ok(())
     }
+}
+
+// =============================================================================
+// Shared cache-first table lookup used by the format-backend catalogs
+// (Iceberg / Delta / Glue / Polaris / Unity). Each backend's `get_table` is
+// the same cache-check / cache-fill sandwich around a backend-specific fetch
+// (local metadata map or remote API) that converts the loaded table into a
+// `CatalogTableSchema`.
+// =============================================================================
+
+/// Cache-first `get_table` skeleton shared by the format-backend catalogs.
+///
+/// Returns the cached schema when present; otherwise awaits `fetch`, fills
+/// the cache with its result, and returns it. `fetch` errors propagate
+/// untouched — each backend's not-found wording is its own contract.
+pub(crate) async fn cached_table(
+    cache: &cache::CatalogCache,
+    catalog_name: &str,
+    identifier: &TableIdentifier,
+    fetch: impl Future<Output = anyhow::Result<CatalogTableSchema>>,
+) -> anyhow::Result<CatalogTableSchema> {
+    if let Some(schema) = cache.get_table(catalog_name, identifier) {
+        return Ok(schema);
+    }
+    let schema = fetch.await?;
+    cache.put_table(catalog_name, identifier, schema.clone());
+    Ok(schema)
+}
+
+/// List identifiers from an in-memory `{key: metadata}` table map (the
+/// Iceberg/Delta `list_tables` twins). `id_of` reads the embedded
+/// identifier's `(namespace, name)` off the backend's own metadata type
+/// (each backend keeps its own serde identifier struct).
+pub(crate) async fn list_tables_from_map<M>(
+    tables: &tokio::sync::RwLock<HashMap<String, M>>,
+    namespace_key: &str,
+    id_of: impl Fn(&M) -> (&[String], &str),
+) -> anyhow::Result<Vec<TableIdentifier>> {
+    let tables = tables.read().await;
+    Ok(tables
+        .values()
+        .filter(|t| id_of(t).0.join(".") == namespace_key)
+        .map(|t| {
+            let (namespace, name) = id_of(t);
+            TableIdentifier::new(namespace.to_vec(), name.to_string())
+        })
+        .collect())
 }
 
 // =============================================================================
