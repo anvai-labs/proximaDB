@@ -40,13 +40,9 @@ async fn test_compression_sparse_data() -> anyhow::Result<()> {
             );
             proximadb_records::ProximaRecord {
                 oid: format!("sparse_{}", i),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    dim: 1024,
-                    values: proximadb_records::EmbeddingValues::Fp32(values),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default", "vector", 1024, values,
+                )],
                 props,
                 record_version: 1,
                 created_at_ns: (1000 + i) as i64 * 1_000_000_000,
@@ -175,13 +171,9 @@ async fn test_compression_dense_data() -> anyhow::Result<()> {
             );
             proximadb_records::ProximaRecord {
                 oid: format!("dense_{}", i),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    dim: 1024,
-                    values: proximadb_records::EmbeddingValues::Fp32(values),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default", "vector", 1024, values,
+                )],
                 props,
                 record_version: 1,
                 created_at_ns: (1000 + i) as i64 * 1_000_000_000,

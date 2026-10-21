@@ -192,13 +192,12 @@ async fn flight_bulk_search(
 ) -> Result<usize, tonic::Status> {
     let query = ProximaRecord {
         oid: "q0".to_string(),
-        embeddings: vec![EmbeddingCell {
-            model_id: "q".to_string(),
-            modality: "dense_vector".to_string(),
-            dim: DIM as u32,
-            values: EmbeddingValues::Fp32(query_vector()),
-            ..Default::default()
-        }],
+        embeddings: vec![EmbeddingCell::new_fp32(
+            "q",
+            "dense_vector",
+            DIM as u32,
+            query_vector(),
+        )],
         ..ProximaRecord::default()
     };
     let batch = ArrowProtoCodec::vector_records_to_batch(vec![query], DIM).expect("query batch");

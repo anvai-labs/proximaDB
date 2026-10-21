@@ -395,13 +395,12 @@ mod tests {
             embeddings: if values.is_empty() {
                 vec![]
             } else {
-                vec![EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "dense_vector".to_string(),
-                    dim: values.len() as u32,
-                    values: proximadb_records::EmbeddingValues::Fp32(values),
-                    ..Default::default()
-                }]
+                vec![EmbeddingCell::new_fp32(
+                    "default",
+                    "dense_vector",
+                    values.len() as u32,
+                    values,
+                )]
             },
             sequence: None,
             labels: LabelSet::new(),

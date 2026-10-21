@@ -1393,14 +1393,7 @@ mod tests {
         // Simulate the round-trip: cell stores fp32 (after the
         // VectorRecord intermediate), then gets coerced back to fp16.
         let promoted_fp32: Vec<f32> = original_fp16.iter().map(|x| x.to_f32()).collect();
-        let mut cell = EmbeddingCell {
-            model_id: "m".to_string(),
-            modality: "dense_vector".to_string(),
-            dim: 8,
-            values: EmbeddingValues::Fp32(promoted_fp32),
-            precision: EmbeddingScalarType::Fp32,
-            precision_epoch: None,
-        };
+        let mut cell = EmbeddingCell::new_fp32("m", "dense_vector", 8, promoted_fp32);
         cell.coerce_to_precision(EmbeddingScalarType::Fp16);
 
         match cell.values {
@@ -1579,14 +1572,7 @@ mod tests {
     /// `EXPECTED_BYTES` below.
     #[test]
     fn embedding_cell_bincode_fixture_locks_pre_2_5b_layout() {
-        let cell = EmbeddingCell {
-            model_id: "fixture-model".to_string(),
-            modality: "text".to_string(),
-            values: EmbeddingValues::Fp32(vec![0.1, 0.2, 0.3, 0.4]),
-            dim: 4,
-            precision: EmbeddingScalarType::Fp32,
-            precision_epoch: None,
-        };
+        let cell = EmbeddingCell::new_fp32("fixture-model", "text", 4, vec![0.1, 0.2, 0.3, 0.4]);
         let bytes = bincode::serialize(&cell).unwrap();
         let hex: String = bytes.iter().map(|b| format!("\\x{:02x}", b)).collect();
 

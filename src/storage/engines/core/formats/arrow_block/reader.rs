@@ -348,15 +348,12 @@ mod tests {
             created_at_ns: timestamp_ns,
             updated_at_ns: timestamp_ns,
             record_version: 1,
-            embeddings: vec![EmbeddingCell {
-                model_id: "test".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: dim as u32,
-                values: proximadb_records::EmbeddingValues::Fp32(
-                    (0..dim).map(|i| i as f32 * 0.1).collect(),
-                ),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "test",
+                "dense_vector",
+                dim as u32,
+                (0..dim).map(|i| i as f32 * 0.1).collect(),
+            )],
             ..ProximaRecord::default()
         }
     }

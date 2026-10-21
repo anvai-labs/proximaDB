@@ -446,13 +446,12 @@ fn test_project_select_rows_uses_catalog_primary_key_props_and_vectors() {
                 ProximaTreeNode::Value(ProximaValue::Boolean(true)),
             ),
         ]),
-        embeddings: vec![EmbeddingCell {
-            model_id: "default".to_string(),
-            modality: "vector".to_string(),
-            dim: 2,
-            values: proximadb_records::EmbeddingValues::Fp32(vec![0.1, 0.2]),
-            ..Default::default()
-        }],
+        embeddings: vec![EmbeddingCell::new_fp32(
+            "default",
+            "vector",
+            2,
+            vec![0.1, 0.2],
+        )],
         ..Default::default()
     };
 

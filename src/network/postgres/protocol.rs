@@ -6705,13 +6705,9 @@ impl PostgresProtocol {
             let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
             records.push(proximadb_records::ProximaRecord {
                 oid: id.to_string(),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    dim,
-                    values: proximadb_records::EmbeddingValues::Fp32(vector),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default", "vector", dim, vector,
+                )],
                 created_at_ns: now_ns,
                 updated_at_ns: now_ns,
                 record_version: 1,
@@ -6768,13 +6764,9 @@ impl PostgresProtocol {
                 let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
                 records.push(proximadb_records::ProximaRecord {
                     oid: id.to_string(),
-                    embeddings: vec![proximadb_records::EmbeddingCell {
-                        model_id: "default".to_string(),
-                        modality: "vector".to_string(),
-                        dim,
-                        values: proximadb_records::EmbeddingValues::Fp32(vector),
-                        ..Default::default()
-                    }],
+                    embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                        "default", "vector", dim, vector,
+                    )],
                     created_at_ns: now_ns,
                     updated_at_ns: now_ns,
                     record_version: 1,
@@ -6863,13 +6855,9 @@ impl PostgresProtocol {
             let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
             records.push(proximadb_records::ProximaRecord {
                 oid: id,
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    dim,
-                    values: proximadb_records::EmbeddingValues::Fp32(vector),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default", "vector", dim, vector,
+                )],
                 created_at_ns: now_ns,
                 updated_at_ns: now_ns,
                 record_version: 1,

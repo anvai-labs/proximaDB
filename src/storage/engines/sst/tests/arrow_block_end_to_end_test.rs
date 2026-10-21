@@ -34,13 +34,12 @@ mod tests {
             created_at_ns: timestamp_ns,
             updated_at_ns: timestamp_ns,
             record_version: 1,
-            embeddings: vec![EmbeddingCell {
-                model_id: "test".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: vector.len() as u32,
-                values: vector,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_typed(
+                "test",
+                "dense_vector",
+                vector.len() as u32,
+                vector,
+            )],
             ..ProximaRecord::default()
         }
     }

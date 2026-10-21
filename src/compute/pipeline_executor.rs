@@ -668,13 +668,12 @@ impl PipelineExecutor {
             records.push(ProximaRecord {
                 oid: id.clone(),
                 local_id: Some(id),
-                embeddings: vec![EmbeddingCell {
-                    model_id: "pipeline".to_string(),
-                    modality: "dense_vector".to_string(),
-                    dim: vector.len() as u32,
-                    values: proximadb_records::EmbeddingValues::Fp32(vector),
-                    ..Default::default()
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "pipeline",
+                    "dense_vector",
+                    vector.len() as u32,
+                    vector,
+                )],
                 ..Default::default()
             });
         }
@@ -743,24 +742,22 @@ mod tests {
         let records = vec![
             ProximaRecord {
                 oid: "1".to_string(),
-                embeddings: vec![EmbeddingCell {
-                    model_id: "test".to_string(),
-                    modality: "dense_vector".to_string(),
-                    dim: 384,
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![0.1; 384]),
-                    ..Default::default()
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "test",
+                    "dense_vector",
+                    384,
+                    vec![0.1; 384],
+                )],
                 ..Default::default()
             },
             ProximaRecord {
                 oid: "2".to_string(),
-                embeddings: vec![EmbeddingCell {
-                    model_id: "test".to_string(),
-                    modality: "dense_vector".to_string(),
-                    dim: 384,
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![0.2; 384]),
-                    ..Default::default()
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "test",
+                    "dense_vector",
+                    384,
+                    vec![0.2; 384],
+                )],
                 ..Default::default()
             },
         ];

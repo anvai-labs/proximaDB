@@ -13,13 +13,12 @@ mod tests {
             record_version: 1,
             created_at_ns: 123_456_789_000_000,
             updated_at_ns: 123_456_789_000_000,
-            embeddings: vec![EmbeddingCell {
-                model_id: "test".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: vector.len() as u32,
-                values: proximadb_records::EmbeddingValues::Fp32(vector),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "test",
+                "dense_vector",
+                vector.len() as u32,
+                vector,
+            )],
             ..ProximaRecord::default()
         }
     }

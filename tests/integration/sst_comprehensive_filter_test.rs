@@ -130,13 +130,12 @@ fn create_test_vectors(collection_id: &str, count: usize) -> Vec<proximadb_recor
 
             proximadb_records::ProximaRecord {
                 oid: format!("{}_{}", collection_id, i),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    dim: 128,
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![0.1; 128]),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default",
+                    "vector",
+                    128,
+                    vec![0.1; 128],
+                )],
                 props,
                 record_version: 1,
                 created_at_ns: i as i64 * 1_000_000_000,

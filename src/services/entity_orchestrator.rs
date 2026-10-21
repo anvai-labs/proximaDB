@@ -33,10 +33,7 @@ use crate::graph::{
 use crate::services::fusion_service::{FusionOidKey, FusionService, GraphFusionParams, GraphGrain};
 use crate::services::operations::vectors::VectorOperationsService;
 use crate::storage::document::{DocumentRecord, DocumentService};
-use proximadb_records::{
-    EmbeddingCell, EmbeddingScalarType, EmbeddingValues, ProximaRecord, ProximaTree,
-    ProximaTreeNode, ProximaValue,
-};
+use proximadb_records::{EmbeddingCell, ProximaRecord, ProximaTree, ProximaTreeNode, ProximaValue};
 
 /// A neutral embedding input (wire-agnostic).
 pub struct EntityEmbedding {
@@ -204,14 +201,12 @@ impl EntityOrchestrator {
                 oid: vector_id.clone(),
                 tenant_id: tenant_id.to_string(),
                 local_id: Some(format!("{}:{}", entity_id, emb.model_id)),
-                embeddings: vec![EmbeddingCell {
-                    model_id: emb.model_id.clone(),
-                    modality: emb.modality,
-                    values: EmbeddingValues::Fp32(emb.vector),
-                    dim: emb.dimension,
-                    precision: EmbeddingScalarType::Fp32,
-                    precision_epoch: None,
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    emb.model_id.clone(),
+                    emb.modality,
+                    emb.dimension,
+                    emb.vector,
+                )],
                 props,
                 ..Default::default()
             };

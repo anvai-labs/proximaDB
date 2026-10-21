@@ -103,13 +103,12 @@ mod tests {
             oid: "test_id".to_string(),
             created_at_ns: 12_345_000_000,
             updated_at_ns: 12_345_000_000,
-            embeddings: vec![EmbeddingCell {
-                model_id: "test".to_string(),
-                modality: "vector".to_string(),
-                values: vec![1.0, 2.0, 3.0],
-                dim: 3,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_typed(
+                "test",
+                "vector",
+                3,
+                vec![1.0, 2.0, 3.0],
+            )],
             ..Default::default()
         };
 

@@ -483,13 +483,9 @@ impl ParquetReader {
                 ..Default::default()
             };
             if !values.is_empty() {
-                record.embeddings.push(EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    values: proximadb_records::EmbeddingValues::Fp32(values),
-                    dim,
-                    ..Default::default()
-                });
+                record
+                    .embeddings
+                    .push(EmbeddingCell::new_fp32("default", "vector", dim, values));
             }
 
             if row < 3 || record.oid.contains("_A_") || record.oid.contains("_B_") && row < 25 {

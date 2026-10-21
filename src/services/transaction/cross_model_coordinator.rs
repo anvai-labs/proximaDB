@@ -54,9 +54,7 @@ use crate::services::record_store::{
 };
 use crate::storage::tenant::context::TenantContext;
 use proximadb_data_model::MemoryType;
-use proximadb_records::{
-    EmbeddingCell, EmbeddingScalarType, EmbeddingValues, ProximaRecord, ProximaTree,
-};
+use proximadb_records::{EmbeddingCell, ProximaRecord, ProximaTree};
 
 /// Environment variable flag for cross-model transaction support.
 /// When unset or set to "false", the coordinator is disabled.
@@ -383,14 +381,12 @@ impl CrossModelTransactionCoordinator {
             props: ProximaTree::default(),
             refs: vec![],
             edge: None,
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "generic".to_string(),
-                values: EmbeddingValues::Fp32(embedding.clone()),
-                dim: embedding.len() as u32,
-                precision: EmbeddingScalarType::Fp32,
-                precision_epoch: None,
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "generic",
+                embedding.len() as u32,
+                embedding.clone(),
+            )],
             sequence: None,
             labels: Default::default(),
         };

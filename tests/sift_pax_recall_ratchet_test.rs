@@ -1341,13 +1341,12 @@ fn ivf2_record(row: usize, vector: &[f32]) -> ProximaRecord {
         created_at_ns: 1_000 + row as i64,
         updated_at_ns: 1_000 + row as i64,
         record_version: 1,
-        embeddings: vec![EmbeddingCell {
-            model_id: "sift1m".into(),
-            modality: "dense_vector".into(),
-            dim: vector.len() as u32,
-            values: EmbeddingValues::Fp32(vector.to_vec()),
-            ..Default::default()
-        }],
+        embeddings: vec![EmbeddingCell::new_fp32(
+            "sift1m",
+            "dense_vector",
+            vector.len() as u32,
+            vector.to_vec(),
+        )],
         ..Default::default()
     }
 }

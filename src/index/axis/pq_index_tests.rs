@@ -21,13 +21,7 @@ mod tests {
         let dim = dimension as u32;
         ProximaRecord {
             oid: id.to_string(),
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(values),
-                dim,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32("default", "vector", dim, values)],
             ..Default::default()
         }
     }

@@ -334,13 +334,9 @@ mod helix_integration_tests {
             );
             all_vectors.push(proximadb_records::ProximaRecord {
                 oid: format!("cluster1_vec_{}", i),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    dim: 128,
-                    values: proximadb_records::EmbeddingValues::Fp32(values),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default", "vector", 128, values,
+                )],
                 props,
                 record_version: 1,
                 created_at_ns: i as i64 * 1_000_000_000,
@@ -362,13 +358,9 @@ mod helix_integration_tests {
             );
             all_vectors.push(proximadb_records::ProximaRecord {
                 oid: format!("cluster2_vec_{}", i),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    dim: 128,
-                    values: proximadb_records::EmbeddingValues::Fp32(values),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default", "vector", 128, values,
+                )],
                 props,
                 record_version: 1,
                 created_at_ns: (50 + i) as i64 * 1_000_000_000,
@@ -509,13 +501,12 @@ mod helix_integration_tests {
             );
             vectors.push(proximadb_records::ProximaRecord {
                 oid: format!("vec_{}", i),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    dim: 128,
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![i as f32 / 100.0; 128]),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default",
+                    "vector",
+                    128,
+                    vec![i as f32 / 100.0; 128],
+                )],
                 props,
                 record_version: 1,
                 created_at_ns: i as i64 * 1_000_000_000,
@@ -715,13 +706,12 @@ mod helix_integration_tests {
             );
             vectors.push(proximadb_records::ProximaRecord {
                 oid: format!("vec_{}", i),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    dim: 128,
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![i as f32 / 100.0; 128]),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default",
+                    "vector",
+                    128,
+                    vec![i as f32 / 100.0; 128],
+                )],
                 props,
                 record_version: 1,
                 created_at_ns: i as i64 * 1_000_000_000,
@@ -832,13 +822,12 @@ mod helix_integration_tests {
             );
             vectors.push(proximadb_records::ProximaRecord {
                 oid: format!("vec_{}", i),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    dim: 128,
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![i as f32 / 100.0; 128]),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default",
+                    "vector",
+                    128,
+                    vec![i as f32 / 100.0; 128],
+                )],
                 props,
                 record_version: 1,
                 created_at_ns: i as i64 * 1_000_000_000,

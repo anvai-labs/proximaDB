@@ -38,10 +38,7 @@ use crate::proto::proximadb_v2::proxima_entity_service_server::{
 use crate::services::fusion_service::{FusionOidKey, FusionService, GraphFusionParams, GraphGrain};
 use crate::services::operations::vectors::VectorOperationsService;
 use crate::storage::document::{DocumentRecord, DocumentService};
-use proximadb_records::{
-    EmbeddingCell, EmbeddingScalarType, EmbeddingValues, ProximaRecord, ProximaTree,
-    ProximaTreeNode, ProximaValue,
-};
+use proximadb_records::{EmbeddingCell, ProximaRecord, ProximaTree, ProximaTreeNode, ProximaValue};
 
 /// gRPC V2 native entity service — orchestration layer over graph + vector + document.
 pub struct ProximaEntityServiceImpl {
@@ -246,14 +243,12 @@ impl ProximaEntityService for ProximaEntityServiceImpl {
                 oid: vector_id.clone(),
                 tenant_id: tenant.clone(),
                 local_id: Some(format!("{entity_id}:{}", embedding.model_id)),
-                embeddings: vec![EmbeddingCell {
-                    model_id: embedding.model_id.clone(),
-                    modality: modality_to_string(embedding.modality),
-                    values: EmbeddingValues::Fp32(embedding.vector.clone()),
-                    dim: embedding.dimension,
-                    precision: EmbeddingScalarType::Fp32,
-                    precision_epoch: None,
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    embedding.model_id.clone(),
+                    modality_to_string(embedding.modality),
+                    embedding.dimension,
+                    embedding.vector.clone(),
+                )],
                 props,
                 ..Default::default()
             };

@@ -218,13 +218,12 @@ impl IvfClusterPostingListStorage {
                             created_at_ns: now_ns,
                             updated_at_ns: now_ns,
                             props,
-                            embeddings: vec![proximadb_records::EmbeddingCell {
-                                model_id: "ivf_posting_distance".to_string(),
-                                modality: "dense_vector".to_string(),
-                                dim: vector.len() as u32,
-                                values: proximadb_records::EmbeddingValues::Fp32(vector),
-                                ..Default::default()
-                            }],
+                            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                                "ivf_posting_distance",
+                                "dense_vector",
+                                vector.len() as u32,
+                                vector,
+                            )],
                             ..proximadb_records::ProximaRecord::default()
                         },
                     );

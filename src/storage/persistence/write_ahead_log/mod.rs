@@ -3677,13 +3677,12 @@ mod wal_manager_infra_tests {
         let records: Vec<ProximaRecord> = (0..4)
             .map(|i| ProximaRecord {
                 oid: format!("wlp8-rec-{i}"),
-                embeddings: vec![EmbeddingCell {
-                    model_id: "wlp8".to_string(),
-                    modality: "dense_vector".to_string(),
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "wlp8",
+                    "dense_vector",
                     dim,
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![i as f32; dim as usize]),
-                    ..Default::default()
-                }],
+                    vec![i as f32; dim as usize],
+                )],
                 ..Default::default()
             })
             .collect();

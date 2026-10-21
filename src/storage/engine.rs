@@ -1426,13 +1426,9 @@ impl StorageEngine {
                                 valid_to_ns: v.expires_at.map(|ms| ms * 1_000_000),
                                 record_version: v.version.map(|v| v as u64).unwrap_or(0),
                                 embeddings: if !v.vector.is_empty() {
-                                    vec![EmbeddingCell {
-                                        model_id: "default".to_string(),
-                                        modality: "vector".to_string(),
-                                        values: proximadb_records::EmbeddingValues::Fp32(v.vector),
-                                        dim,
-                                        ..Default::default()
-                                    }]
+                                    vec![EmbeddingCell::new_fp32(
+                                        "default", "vector", dim, v.vector,
+                                    )]
                                 } else {
                                     vec![]
                                 },

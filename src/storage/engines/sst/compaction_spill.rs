@@ -884,12 +884,12 @@ async fn read_coalesced_segment_into_builder(
                     let start = row_in_block.saturating_mul(dim);
                     let end = start.saturating_add(dim);
                     let vector = sq8_decode_codes(&codes[start..end], params);
-                    record.embeddings.push(EmbeddingCell {
-                        modality: "dense".to_string(),
-                        dim: footer.embed_dim,
-                        values: EmbeddingValues::Fp32(vector),
-                        ..EmbeddingCell::default()
-                    });
+                    record.embeddings.push(EmbeddingCell::new_fp32(
+                        "",
+                        "dense",
+                        footer.embed_dim,
+                        vector,
+                    ));
                 }
             }
         }
@@ -1677,13 +1677,12 @@ mod tests {
             oid: oid.to_string(),
             created_at_ns: seed as i64 + 1,
             updated_at_ns: seed as i64 + 1,
-            embeddings: vec![EmbeddingCell {
-                model_id: "model_0".to_string(),
-                modality: "dense".to_string(),
-                dim: values.len() as u32,
-                values: EmbeddingValues::Fp32(values),
-                ..EmbeddingCell::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "model_0",
+                "dense",
+                values.len() as u32,
+                values,
+            )],
             ..ProximaRecord::default()
         }
     }

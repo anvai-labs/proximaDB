@@ -57,9 +57,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use proximadb_kernel::error::StorageError;
-use proximadb_records::{
-    EmbeddingCell, EmbeddingValues, ProximaRecord, ProximaTreeNode, ProximaValue, tree_get,
-};
+use proximadb_records::{EmbeddingCell, ProximaRecord, ProximaTreeNode, ProximaValue, tree_get};
 
 use proximadb_data_model::{ProximaType, TimeUnit as DmTimeUnit, VectorElement as DmVectorElement};
 
@@ -1146,11 +1144,9 @@ pub fn record_batch_to_proxima_records(batch: &RecordBatch) -> Vec<ProximaRecord
                     .map(|c| f32::from_le_bytes(*c))
                     .collect();
                 let dim = values.len() as u32;
-                record.embeddings.push(EmbeddingCell {
-                    values: EmbeddingValues::Fp32(values),
-                    dim,
-                    ..Default::default()
-                });
+                record
+                    .embeddings
+                    .push(EmbeddingCell::new_fp32("", "", dim, values));
             }
             continue;
         }
@@ -1211,6 +1207,7 @@ pub fn record_batch_to_proxima_records(batch: &RecordBatch) -> Vec<ProximaRecord
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proximadb_records::EmbeddingValues;
     use std::collections::HashMap;
 
     fn col(id: i32, name: &str, dt: ProximaType, nullable: bool) -> ProximaColumn {
@@ -1804,10 +1801,8 @@ mod tests {
         );
 
         let mut r0 = record_with_props("r0", vec![("id", ProximaValue::String("r0".into()))]);
-        r0.embeddings.push(EmbeddingCell {
-            values: EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-            ..Default::default()
-        });
+        r0.embeddings
+            .push(EmbeddingCell::new_fp32("", "", 0, vec![1.0, 2.0, 3.0]));
         // r1 has NO embedding -> null vector row.
         let r1 = record_with_props("r1", vec![("id", ProximaValue::String("r1".into()))]);
 
@@ -1888,10 +1883,8 @@ mod tests {
                 ("tags", ProximaValue::Null),
             ],
         );
-        r0.embeddings.push(EmbeddingCell {
-            values: EmbeddingValues::Fp32(vec![0.0, 1.0]),
-            ..Default::default()
-        });
+        r0.embeddings
+            .push(EmbeddingCell::new_fp32("", "", 0, vec![0.0, 1.0]));
         let r1 = record_with_props(
             "r1",
             vec![
@@ -1926,10 +1919,8 @@ mod tests {
         // The inferred schema must round-trip the records through the canonical converter.
         let r0b = {
             let mut r = record_with_props("r0", vec![("name", ProximaValue::String("a".into()))]);
-            r.embeddings.push(EmbeddingCell {
-                values: EmbeddingValues::Fp32(vec![0.0, 1.0]),
-                ..Default::default()
-            });
+            r.embeddings
+                .push(EmbeddingCell::new_fp32("", "", 0, vec![0.0, 1.0]));
             r
         };
         let batch = proxima_records_to_record_batch(&[r0b], &schema).unwrap();
@@ -1982,11 +1973,8 @@ mod tests {
                 ("age", ProximaValue::Int64(30)),
             ],
         );
-        r0.embeddings.push(EmbeddingCell {
-            values: EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-            dim: 3,
-            ..Default::default()
-        });
+        r0.embeddings
+            .push(EmbeddingCell::new_fp32("", "", 3, vec![1.0, 2.0, 3.0]));
         let r1 = record_with_props(
             "r1",
             vec![

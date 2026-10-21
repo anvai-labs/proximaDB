@@ -760,13 +760,12 @@ async fn embed_text_only_records_skips_records_with_existing_vector() {
         oid: "doc-prevector".to_string(),
         local_id: Some("doc-prevector".to_string()),
         tenant_id: "tenant-b".to_string(),
-        embeddings: vec![EmbeddingCell {
-            model_id: "client-provided".to_string(),
-            modality: "dense_vector".to_string(),
-            dim: 1536,
-            values: proximadb_records::EmbeddingValues::Fp32(vec![0.1_f32; 1536]),
-            ..Default::default()
-        }],
+        embeddings: vec![EmbeddingCell::new_fp32(
+            "client-provided",
+            "dense_vector",
+            1536,
+            vec![0.1_f32; 1536],
+        )],
         ..ProximaRecord::default()
     }];
 

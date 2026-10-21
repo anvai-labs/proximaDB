@@ -538,13 +538,12 @@ mod tests {
     fn create_test_record(id: &str, metadata: HashMap<String, ProximaValue>) -> ProximaRecord {
         ProximaRecord {
             oid: id.to_string(),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "test".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: 3,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "test",
+                "dense_vector",
+                3,
+                vec![1.0, 2.0, 3.0],
+            )],
             props: metadata
                 .into_iter()
                 .map(|(key, value)| (key, ProximaTreeNode::Value(value)))

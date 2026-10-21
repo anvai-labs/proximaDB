@@ -217,13 +217,12 @@ async fn test_memtable_semantic_search() {
     // Create test vectors
     let make_record = |oid: &str, values: Vec<f32>| ProximaRecord {
         oid: oid.to_string(),
-        embeddings: vec![proximadb_records::EmbeddingCell {
-            model_id: "default".to_string(),
-            modality: "vector".to_string(),
-            dim: values.len() as u32,
-            values: proximadb_records::EmbeddingValues::Fp32(values),
-            ..Default::default()
-        }],
+        embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+            "default",
+            "vector",
+            values.len() as u32,
+            values,
+        )],
         record_version: 1,
         created_at_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
         updated_at_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),

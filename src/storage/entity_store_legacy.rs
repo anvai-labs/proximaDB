@@ -274,13 +274,12 @@ impl ProximaEntityStore {
                         oid: id.clone(),
                         local_id: Some(id),
                         props,
-                        embeddings: vec![proximadb_records::EmbeddingCell {
-                            model_id: e.model_id.clone(),
-                            modality: format!("{:?}", e.modality),
-                            dim: e.dimension,
-                            values: proximadb_records::EmbeddingValues::Fp32(e.vector.clone()),
-                            ..Default::default()
-                        }],
+                        embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                            e.model_id.clone(),
+                            format!("{:?}", e.modality),
+                            e.dimension,
+                            e.vector.clone(),
+                        )],
                         record_version: 1,
                         ..Default::default()
                     }

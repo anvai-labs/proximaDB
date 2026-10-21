@@ -71,13 +71,7 @@ async fn insert_symbol(svc: &VectorOperationsService, oid: &str, vector: Vec<f32
     let record = ProximaRecord {
         oid: oid.to_string(),
         record_version: 1,
-        embeddings: vec![EmbeddingCell {
-            model_id: "test".to_string(),
-            modality: "dense_vector".to_string(),
-            dim: DIM,
-            values: EmbeddingValues::Fp32(vector),
-            ..Default::default()
-        }],
+        embeddings: vec![EmbeddingCell::new_fp32("test", "dense_vector", DIM, vector)],
         ..Default::default()
     };
     svc.insert_vectors_direct(COLLECTION, Arc::new(vec![record]))

@@ -419,13 +419,7 @@ fn batch_to_vector_records(batch: &RecordBatch) -> Result<Vec<ProximaRecord>> {
             ..ProximaRecord::default()
         };
         if !values.is_empty() {
-            record.embeddings.push(EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values,
-                dim,
-                ..Default::default()
-            });
+            record.embeddings.push(EmbeddingCell::new_typed("default", "vector", dim, values));
         }
         records.push(record);
     }

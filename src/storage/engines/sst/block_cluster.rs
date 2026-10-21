@@ -1403,12 +1403,8 @@ mod tests {
             oid: oid.into(),
             ..Default::default()
         };
-        r.embeddings.push(EmbeddingCell {
-            modality: "dense".into(),
-            dim,
-            values: EmbeddingValues::Fp32(vec),
-            ..Default::default()
-        });
+        r.embeddings
+            .push(EmbeddingCell::new_fp32("", "dense", dim, vec));
         r
     }
 

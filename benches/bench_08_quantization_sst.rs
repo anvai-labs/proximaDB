@@ -23,6 +23,7 @@ fn init_hardware() {
 
 use proximadb::compute::quantization::{StorageQuantizationConfig, StorageQuantizationEngine};
 use proximadb::core::memory::pool::VectorMemoryPool;
+use proximadb_distance_kernel::DistanceMetric;
 
 /// Generate random vectors for benchmarking
 fn generate_vectors(count: usize, dim: usize) -> Vec<Vec<f32>> {

@@ -35,13 +35,12 @@ pub fn proto_results_to_vector_records(
                 updated_at_ns: now_ns,
                 origin: Some("search_result".to_string()),
                 embeddings: if !result.vector.is_empty() {
-                    vec![proximadb_records::EmbeddingCell {
-                        model_id: "default".to_string(),
-                        modality: "vector".to_string(),
-                        values: proximadb_records::EmbeddingValues::Fp32(result.vector),
+                    vec![proximadb_records::EmbeddingCell::new_fp32(
+                        "default",
+                        "vector",
                         dim,
-                        ..Default::default()
-                    }]
+                        result.vector,
+                    )]
                 } else {
                     vec![]
                 },

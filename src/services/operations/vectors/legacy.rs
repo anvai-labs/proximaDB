@@ -5819,13 +5819,12 @@ mod tenant_tests {
 
         let rich = vector_record_to_rich_result(ProximaRecord {
             oid: "doc_2".to_string(),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.3, 0.4]),
-                dim: 2,
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                2,
+                vec![0.3, 0.4],
+            )],
             props,
             created_at_ns: 456_000_000,
             updated_at_ns: 456_000_000,
@@ -5879,13 +5878,12 @@ mod pseudo_query_tests {
         }
         ProximaRecord {
             oid: id.to_string(),
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-                dim: 3,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                3,
+                vec![1.0, 2.0, 3.0],
+            )],
             props: tree,
             ..Default::default()
         }
@@ -6115,13 +6113,12 @@ mod index_first_search_tests {
     fn record_with_vector(id: &str, values: Vec<f32>) -> ProximaRecord {
         ProximaRecord {
             oid: id.to_string(),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                dim: values.len() as u32,
-                values: proximadb_records::EmbeddingValues::Fp32(values),
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                values.len() as u32,
+                values,
+            )],
             ..Default::default()
         }
     }
@@ -6639,13 +6636,12 @@ mod index_first_search_tests {
 
         let record = ProximaRecord {
             oid: "vec1".to_string(),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-                dim: 3,
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                3,
+                vec![1.0, 2.0, 3.0],
+            )],
             props,
             record_version: 1,
             ..Default::default()
@@ -6768,17 +6764,12 @@ mod index_first_search_tests {
 
             let record = ProximaRecord {
                 oid: format!("vec_{}", i),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![
-                        i as f32,
-                        (i * 2) as f32,
-                        (i * 3) as f32,
-                    ]),
-                    dim: 3,
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default",
+                    "vector",
+                    3,
+                    vec![i as f32, (i * 2) as f32, (i * 3) as f32],
+                )],
                 props,
                 record_version: 1,
                 ..Default::default()

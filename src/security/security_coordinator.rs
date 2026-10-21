@@ -84,8 +84,9 @@ pub struct TenantTrustConfig {
 }
 
 /// Security mode for different deployment scenarios
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub enum SecurityMode {
+    #[default]
     #[serde(rename = "development")]
     Development,
     #[serde(rename = "production")]

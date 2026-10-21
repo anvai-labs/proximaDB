@@ -2467,13 +2467,12 @@ mod tests {
             refs: Vec::new(),
             edge: None,
             embeddings: if !vector.is_empty() {
-                vec![EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "dense_vector".to_string(),
+                vec![EmbeddingCell::new_fp32(
+                    "default",
+                    "dense_vector",
                     dim,
-                    values: proximadb_records::EmbeddingValues::Fp32(vector),
-                    ..Default::default()
-                }]
+                    vector,
+                )]
             } else {
                 vec![]
             },

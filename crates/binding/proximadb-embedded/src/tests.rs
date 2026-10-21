@@ -1135,14 +1135,12 @@ mod tests {
             oid: oid.to_string(),
             local_id: Some(oid.to_string()),
             updated_at_ns,
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "test-model".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: 4,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.1, 0.2, 0.3, 0.4]),
-                precision: proximadb_records::EmbeddingScalarType::Fp32,
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "test-model",
+                "dense_vector",
+                4,
+                vec![0.1, 0.2, 0.3, 0.4],
+            )],
             ..proximadb_records::ProximaRecord::default()
         }
     }

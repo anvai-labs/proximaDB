@@ -260,13 +260,12 @@ mod tests {
     fn create_test_record(id: &str, dimension: usize) -> ProximaRecord {
         let mut record = ProximaRecord {
             oid: id.to_string(),
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: dimension as u32,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.0; dimension]),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "dense_vector",
+                dimension as u32,
+                vec![0.0; dimension],
+            )],
             ..ProximaRecord::default()
         };
         record.props.insert(

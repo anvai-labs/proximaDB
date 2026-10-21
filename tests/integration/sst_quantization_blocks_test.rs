@@ -307,13 +307,9 @@ fn generate_clustered_vectors(count: usize, dim: usize) -> Vec<ProximaRecord> {
             let global_idx = cluster_id * vectors_per_cluster + i;
             vectors.push(ProximaRecord {
                 oid: format!("vec_{}", global_idx),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    dim: dim as u32,
-                    values: proximadb_records::EmbeddingValues::Fp32(values),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default", "vector", dim as u32, values,
+                )],
                 record_version: 1,
                 ..Default::default()
             });
@@ -337,13 +333,9 @@ fn generate_clustered_vectors(count: usize, dim: usize) -> Vec<ProximaRecord> {
 
         vectors.push(ProximaRecord {
             oid: format!("vec_{}", i),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                dim: dim as u32,
-                values: proximadb_records::EmbeddingValues::Fp32(values),
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "default", "vector", dim as u32, values,
+            )],
             record_version: 1,
             ..Default::default()
         });

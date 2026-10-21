@@ -702,13 +702,12 @@ mod tests {
             updated_at_ns: timestamp_ms * 1_000_000,
             ..Default::default()
         };
-        record.embeddings.push(EmbeddingCell {
-            model_id: "default".to_string(),
-            modality: "vector".to_string(),
-            dim: values.len() as u32,
-            values: proximadb_records::EmbeddingValues::Fp32(values),
-            ..Default::default()
-        });
+        record.embeddings.push(EmbeddingCell::new_fp32(
+            "default",
+            "vector",
+            values.len() as u32,
+            values,
+        ));
         record
     }
 

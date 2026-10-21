@@ -43,13 +43,12 @@ fn create_test_vectors(count: usize, start_id: usize, dimension: usize) -> Vec<P
     (0..count)
         .map(|i| ProximaRecord {
             oid: format!("vec_{}", start_id + i),
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "dense_vector".to_string(),
-                values: EmbeddingValues::Fp32(vec![0.1 * (i as f32); dimension]),
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "dense_vector",
                 dim,
-                ..Default::default()
-            }],
+                vec![0.1 * (i as f32); dimension],
+            )],
             ..Default::default()
         })
         .collect()
