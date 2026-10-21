@@ -172,45 +172,17 @@ impl WalFloorSource for PublishedSnapshotFloor {
         "published-snapshots"
     }
     async fn floor(&self, _head: u64) -> Result<Option<u64>> {
-        let mut floor: Option<u64> = None;
-        for catalog_name in self.0.list_catalogs().await {
-            let catalog = self.0.get_catalog(&catalog_name).await?;
-            let mut pending: Vec<Option<Vec<String>>> = vec![None];
-            let mut seen = std::collections::HashSet::new();
-            while let Some(parent) = pending.pop() {
-                let namespaces = catalog
-                    .list_namespaces(parent.as_deref())
-                    .await
-                    .with_context(|| format!("listing namespaces of catalog '{catalog_name}'"))?;
-                for namespace in namespaces {
-                    if !seen.insert(namespace.levels.clone()) {
-                        continue;
-                    }
-                    for table in
-                        catalog
-                            .list_tables(&namespace.levels)
-                            .await
-                            .with_context(|| {
-                                format!("listing tables of '{catalog_name}.{:?}'", namespace.levels)
-                            })?
-                    {
-                        let schema = catalog.get_table(&table).await?;
-                        for layout in &schema.storage_layouts {
-                            if let Some(lsn) = layout
-                                .properties
-                                .get("snapshot_lsn")
-                                .and_then(|v| v.parse::<u64>().ok())
-                            {
-                                let needed = lsn.saturating_add(1);
-                                floor = Some(floor.map_or(needed, |f| f.min(needed)));
-                            }
-                        }
-                    }
-                    pending.push(Some(namespace.levels.clone()));
-                }
-            }
-        }
-        Ok(floor)
+        let schemas = self
+            .0
+            .table_schemas(|_| true)
+            .await
+            .context("walking the catalogs for published snapshot LSNs")?;
+        Ok(schemas
+            .iter()
+            .flat_map(|schema| &schema.storage_layouts)
+            .filter_map(|layout| layout.properties.get("snapshot_lsn")?.parse::<u64>().ok())
+            .map(|lsn| lsn.saturating_add(1))
+            .min())
     }
 }
 

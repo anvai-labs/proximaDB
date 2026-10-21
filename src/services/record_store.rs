@@ -1941,37 +1941,77 @@ impl TableSecondaryIndex {
 /// (`(tenant, collection key)`). Filled by `partitions_for` on every write —
 /// the one place the schema is in hand — and read by a partition at each flush
 /// through its [`SpillSchemaSource`](crate::services::record_spill::SpillSchemaSource).
+///
+/// Boot seeding fills a second, per-collection map from the catalog before WAL
+/// replay, so a partition replay creates encodes with its schema before any
+/// write arrives. The catalog does not record which tenant wrote a table, and
+/// two tenants may share a table name, so a collection key that maps to
+/// different schemas is recorded as ambiguous and gets no fallback.
 #[derive(Default)]
-struct SchemaHints(
-    parking_lot::RwLock<std::collections::HashMap<(String, String), Arc<CatalogTableSchema>>>,
-);
+struct SchemaHints {
+    by_partition:
+        parking_lot::RwLock<std::collections::HashMap<(String, String), Arc<CatalogTableSchema>>>,
+    /// Seeded at boot; `None` = ambiguous (several distinct schemas).
+    by_collection:
+        parking_lot::RwLock<std::collections::HashMap<String, Option<Arc<CatalogTableSchema>>>>,
+}
+
+fn same_columns(a: &CatalogTableSchema, b: &CatalogTableSchema) -> bool {
+    a.columns.len() == b.columns.len()
+        && a.columns.iter().zip(&b.columns).all(|(x, y)| {
+            x.name == y.name && x.data_type == y.data_type && x.is_deleted == y.is_deleted
+        })
+}
 
 impl SchemaHints {
     /// Record `schema` for the partition, replacing a stale one (an `ALTER
     /// TABLE`); an unchanged schema costs a read-lock and a column compare.
     fn note(&self, tenant_id: &str, collection: &str, schema: &CatalogTableSchema) {
         let key = (tenant_id.to_string(), collection.to_string());
-        let same_columns = |held: &CatalogTableSchema| {
-            held.columns.len() == schema.columns.len()
-                && held.columns.iter().zip(&schema.columns).all(|(a, b)| {
-                    a.name == b.name && a.data_type == b.data_type && a.is_deleted == b.is_deleted
-                })
-        };
         if self
-            .0
+            .by_partition
             .read()
             .get(&key)
-            .is_some_and(|held| same_columns(held))
+            .is_some_and(|held| same_columns(held, schema))
         {
             return;
         }
-        self.0.write().insert(key, Arc::new(schema.clone()));
+        self.by_partition
+            .write()
+            .insert(key, Arc::new(schema.clone()));
+    }
+
+    /// Boot seeding: record `schema` as the fallback for `collection`, or mark
+    /// the key ambiguous if a different schema already claims it.
+    fn seed(&self, collection: &str, schema: &CatalogTableSchema) {
+        let mut by_collection = self.by_collection.write();
+        match by_collection.get_mut(collection) {
+            None => {
+                by_collection.insert(collection.to_string(), Some(Arc::new(schema.clone())));
+            }
+            Some(slot) => {
+                if slot
+                    .as_ref()
+                    .is_some_and(|held| !same_columns(held, schema))
+                {
+                    *slot = None;
+                }
+            }
+        }
     }
 
     fn get(&self, tenant_id: &str, collection: &str) -> Option<CatalogTableSchema> {
-        self.0
+        if let Some(schema) = self
+            .by_partition
             .read()
             .get(&(tenant_id.to_string(), collection.to_string()))
+        {
+            return Some((**schema).clone());
+        }
+        self.by_collection
+            .read()
+            .get(collection)
+            .and_then(|slot| slot.as_ref())
             .map(|schema| (**schema).clone())
     }
 }
@@ -2288,6 +2328,29 @@ impl DirectWalTableRecordStore {
     /// truncation floor, alongside [`Self::min_unflushed_lsn`] (TD-SEAM-12).
     pub fn inflight_floor(&self) -> Option<u64> {
         self.inflight.floor()
+    }
+
+    /// Seed the spill partitions' catalog schemas before WAL replay (see
+    /// `SchemaHints`), so a partition replay creates encodes typed columns
+    /// instead of holding those rows resident until the first write. Returns
+    /// how many collection keys were seeded; a no-op for stores whose
+    /// partitions never encode a segment.
+    pub fn seed_schema_hints<'a>(
+        &self,
+        schemas: impl IntoIterator<Item = &'a CatalogTableSchema>,
+    ) -> usize {
+        let Some(hints) = &self.schema_hints else {
+            return 0;
+        };
+        let mut seeded = 0;
+        for schema in schemas {
+            let (primary, legacy) = memtable_partition_keys(schema);
+            for key in std::iter::once(primary).chain(legacy) {
+                hints.seed(&key, schema);
+                seeded += 1;
+            }
+        }
+        seeded
     }
 
     /// Fail loudly when the change feed is asked for history the WAL no longer
@@ -5588,6 +5651,95 @@ mod tests {
     /// flush nothing constrains WAL truncation.
     ///
     /// Process-isolated under nextest, so the env gate does not leak.
+    /// Boot seeding reaches a partition WAL replay creates, before any write:
+    /// its DECIMAL rows flush instead of being held for want of a schema. A
+    /// collection key two different schemas claim gets no fallback (the
+    /// catalog cannot say which tenant owns which), so its rows are held —
+    /// never encoded under a guessed schema.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn boot_seeded_schemas_reach_replayed_partitions_unless_ambiguous() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "100");
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let fs = Arc::new(
+            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
+                crate::storage::persistence::filesystem::local::LocalConfig::default(),
+            )
+            .await
+            .expect("local filesystem"),
+        );
+        let store = DirectWalTableRecordStore::new_spilling(
+            Arc::new(RecordingWalAppender::default()),
+            fs,
+            Arc::new(move |tenant_id: &str, collection: &str| {
+                format!("{base}/{tenant_id}/{collection}")
+            }),
+        );
+        let decimal = |table: &str| {
+            CatalogTableSchema::new(table).with_column(proximadb_catalog::CatalogColumn::new(
+                1,
+                "price",
+                ProximaType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+            ))
+        };
+        let other_shape = CatalogTableSchema::new("shared").with_column(
+            proximadb_catalog::CatalogColumn::new(1, "price", ProximaType::String),
+        );
+        let schemas = [decimal("orders"), decimal("shared"), other_shape];
+        assert!(store.seed_schema_hints(&schemas) >= 3);
+
+        let priced = |lsn: u64, table: &str| {
+            let mut record = ProximaRecord {
+                oid: format!("{table}-{lsn}"),
+                tenant_id: "tenant-a".to_string(),
+                ..Default::default()
+            };
+            record.props.insert(
+                "price".to_string(),
+                proximadb_records::ProximaTreeNode::Value(ProximaValue::Decimal("1.50".into())),
+            );
+            CanonicalWalEntry::new(
+                lsn,
+                CanonicalOperation::RecordUpsert {
+                    collection_id: table.to_string(),
+                    record: Box::new(record),
+                    projections: vec![],
+                },
+                Some("tenant-a".to_string()),
+            )
+        };
+        store
+            .replay_wal_entries(vec![priced(1, "orders"), priced(2, "shared")])
+            .await
+            .expect("replay");
+        store.flush_partitions().await.expect("flush");
+
+        let orders = store.partition("tenant-a", "orders");
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(orders.as_ref()).await.ok(),
+            Some(None),
+            "the seeded schema typed the replayed DECIMAL rows, so they flushed"
+        );
+        let shared = store.partition("tenant-a", "shared");
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(shared.as_ref()).await.ok(),
+            Some(Some(2)),
+            "an ambiguous key gets no fallback: its DECIMAL row is held, not guessed"
+        );
+
+        unsafe {
+            std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV);
+        }
+    }
+
     /// The production factory encodes with the table's catalog schema: the
     /// schema `partitions_for` sees on a write reaches the spill partition, so a
     /// DECIMAL column — which inference cannot type — is flushed rather than
