@@ -24,39 +24,14 @@
 //! `ObjectProvider` variants, ~10 outcome strings, ~5 reason strings.
 //! Total per-family cardinality is single-digit thousands worst case.
 
+use crate::{register_counter_vec_safe, register_gauge_vec_safe};
 use lazy_static::lazy_static;
-use prometheus::{CounterVec, GaugeVec, Opts, register_counter_vec, register_gauge_vec};
+use prometheus::{CounterVec, GaugeVec};
 use proximadb_catalog::collection_dr_policy::ObjectProvider;
 use proximadb_catalog::dr_reconciler::{
     BlockReason, DrMetrics, DriftReason, IdleReason, PolicyLabels, ReconcileOutcome,
     ShardPauseReason, TickOutcome,
 };
-use tracing::error;
-
-fn register_counter_vec_safe(name: &str, help: &str, labels: &[&str]) -> CounterVec {
-    match register_counter_vec!(name, help, labels) {
-        Ok(metric) => metric,
-        Err(reg_err) => {
-            // Already registered (or registration failed): fall back
-            // to a local CounterVec so `with_metrics` still works in
-            // tests where the global registry persists across runs.
-            error!("Failed to register {}: {}", name, reg_err);
-            CounterVec::new(Opts::new(name, help), labels)
-                .unwrap_or_else(|_| unreachable!("valid counter descriptor"))
-        }
-    }
-}
-
-fn register_gauge_vec_safe(name: &str, help: &str, labels: &[&str]) -> GaugeVec {
-    match register_gauge_vec!(name, help, labels) {
-        Ok(metric) => metric,
-        Err(reg_err) => {
-            error!("Failed to register {}: {}", name, reg_err);
-            GaugeVec::new(Opts::new(name, help), labels)
-                .unwrap_or_else(|_| unreachable!("valid gauge descriptor"))
-        }
-    }
-}
 
 lazy_static! {
     /// Per-tick outcome counter. The `outcome` label captures every

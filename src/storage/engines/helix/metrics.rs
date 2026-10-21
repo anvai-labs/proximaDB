@@ -22,23 +22,12 @@ fn register_histogram_vec_safe(name: &str, help: &str, labels: &[&str]) -> Optio
 }
 
 fn register_counter_vec_safe(name: &str, help: &str, labels: &[&str]) -> Option<CounterVec> {
-    match register_counter_vec!(name, help, labels) {
-        Ok(metric) => Some(metric),
-        Err(error) => {
-            warn!(metric = name, error = %error, "HELIX counter metric disabled");
-            None
-        }
-    }
+    // Disable-on-clash semantics preserved via the shared or_none helper.
+    proximadb_metrics::register_counter_vec_or_none(name, help, labels)
 }
 
 fn register_gauge_vec_safe(name: &str, help: &str, labels: &[&str]) -> Option<GaugeVec> {
-    match register_gauge_vec!(name, help, labels) {
-        Ok(metric) => Some(metric),
-        Err(error) => {
-            warn!(metric = name, error = %error, "HELIX gauge metric disabled");
-            None
-        }
-    }
+    proximadb_metrics::register_gauge_vec_or_none(name, help, labels)
 }
 
 lazy_static! {
