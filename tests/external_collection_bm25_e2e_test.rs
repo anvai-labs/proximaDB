@@ -14,108 +14,30 @@
 //! ExternalCollectionService::hybrid_search → HybridFusionEngine), not just the
 //! service API.
 
-use std::net::TcpListener;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, StringBuilder};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use serde_json::json;
-use tempfile::TempDir;
-use tokio::time::sleep;
 
-use proximadb::core::Config;
-use proximadb::database::ProximaDB;
+#[path = "common/pg_server.rs"]
+mod pg_server;
 
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    let p = l.local_addr().expect("local_addr").port();
-    drop(l);
-    p
-}
+use pg_server::TestPgServer;
 
-fn nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
-}
-
-struct Server {
-    rest_port: u16,
-    db: Option<ProximaDB>,
-    _tmp: TempDir,
-}
-
-impl Server {
-    async fn start() -> anyhow::Result<Self> {
-        let rest_port = free_port();
-        let tmp = TempDir::new()?;
-
-        let mut config = Config::default();
-        config.server.bind_address = "127.0.0.1".to_string();
-        config.server.port = rest_port;
-        config.server.data_dir = tmp.path().to_path_buf();
-        config.api.rest_port = rest_port;
-        config.api.grpc_port = free_port();
-        config.api.arrow_flight_port = free_port();
-        config.api.pg_port = Some(free_port());
-        config.api.unified_mode = false;
-        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
-            url: format!("file://{}", tmp.path().display()),
-            ..Default::default()
-        }];
-        config.storage.wal_config.write_buffer_directory =
-            format!("file://{}/wal", tmp.path().display());
+/// Shared harness boot with the one config this suite needs beyond the defaults.
+async fn start() -> anyhow::Result<TestPgServer> {
+    TestPgServer::start_with(|config| {
         // Required for `POST /external-collections/:id/build`: external vector
         // indexes are refused unless AXIS indexes are enabled, and the default
         // is false (proximadb-config asserts that default). Without this the
         // build step 500s and this test never reached its own assertions --
         // pre-existing, found while adding the path-confinement gate opt-in.
         config.storage.optimization.enable_axis_indexes = true;
-
-        let mut db = ProximaDB::new(config).await?;
-        db.start().await?;
-
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .no_proxy()
-            .build()?;
-        let health = format!("http://127.0.0.1:{rest_port}/health");
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            match client.get(&health).send().await {
-                Ok(r) if r.status().is_success() => break,
-                _ => {
-                    if Instant::now() > deadline {
-                        anyhow::bail!("REST didn't become ready in 15s");
-                    }
-                    sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-        Ok(Self {
-            rest_port,
-            db: Some(db),
-            _tmp: tmp,
-        })
-    }
-
-    fn base(&self) -> String {
-        format!("http://127.0.0.1:{}", self.rest_port)
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        if let Some(mut db) = self.db.take() {
-            tokio::spawn(async move {
-                let _ = db.shutdown().await;
-            });
-        }
-    }
+    })
+    .await
 }
 
 /// Write `n` rows: `id="doc-i"`, `title="title-i"` (unique lexical token per
@@ -163,16 +85,14 @@ fn write_parquet(path: &std::path::Path, n: usize, dim: usize) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_collection_bm25_hybrid_e2e_over_http() {
-    let server = Server::start().await.expect("server start");
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .no_proxy()
-        .build()
-        .unwrap();
-    let base = server.base();
+    let server = start().await.expect("server start");
+    let (http, base) = server.rest_client().expect("rest client");
 
     let dim = 48usize;
-    let parquet = std::env::temp_dir().join(format!("proximadb_bm25_e2e_{}.parquet", nanos()));
+    let parquet = std::env::temp_dir().join(format!(
+        "{}.parquet",
+        server.unique_name("proximadb_bm25_e2e")
+    ));
     write_parquet(&parquet, 40, dim);
     allowlist_parent_of(&parquet);
 
@@ -180,7 +100,7 @@ async fn external_collection_bm25_hybrid_e2e_over_http() {
     let reg = http
         .post(format!("{base}/api/v2/external-collections"))
         .json(&json!({
-            "name": format!("ext_bm25_{}", nanos()),
+            "name": server.unique_name("ext_bm25"),
             "location": parquet.to_str().unwrap(),
             "id_column": "id",
             "vector_column": "vector",

@@ -40,15 +40,32 @@ pub fn free_port() -> u16 {
 pub struct TestPgServer {
     pub pg_port: u16,
     pub rest_port: u16,
+    pub grpc_port: u16,
+    pub flight_port: u16,
     db: Option<ProximaDB>,
     _tmp: TempDir,
 }
 
 impl TestPgServer {
     pub async fn start() -> anyhow::Result<Self> {
+        Self::start_with(|_| {}).await
+    }
+
+    /// [`start`] with a config hook run after the defaults (ports, temp
+    /// dirs, TD-CONV-1 metadata anchor) and before the server boots —
+    /// the seam for per-test security/auth/feature toggles. The closure
+    /// can rely on every randomized port already being assigned, and
+    /// must NOT reassign the ports: the health poll and the returned
+    /// struct fields keep the pre-hook values, so a reassigned port
+    /// would health-check a dead port and leave `conn_str()` stale.
+    pub async fn start_with(customize: impl FnOnce(&mut Config)) -> anyhow::Result<Self> {
         let pg_port = free_port();
         let rest_port = free_port();
         let grpc_port = free_port();
+        // The config default is a FIXED port (5680); randomize it so
+        // concurrent nextest processes can each boot a server without
+        // colliding on the Flight listener.
+        let flight_port = free_port();
         let tmp = TempDir::new()?;
         let mut config = Config::default();
         config.server.bind_address = "127.0.0.1".to_string();
@@ -58,6 +75,7 @@ impl TestPgServer {
         config.api.grpc_port = grpc_port;
         config.api.unified_mode = false;
         config.api.pg_port = Some(pg_port);
+        config.api.arrow_flight_port = flight_port;
         config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
             url: format!("file://{}", tmp.path().display()),
             ..Default::default()
@@ -68,6 +86,7 @@ impl TestPgServer {
         // default shares one catalog across concurrently running nextest
         // processes, racing same-named DDL (TD-CONV-1).
         config.storage.metadata_url = format!("file://{}/metadata", tmp.path().display());
+        customize(&mut config);
         let mut db = ProximaDB::new(config).await?;
         db.start().await?;
         let http = reqwest::Client::builder()
@@ -87,6 +106,8 @@ impl TestPgServer {
         Ok(Self {
             pg_port,
             rest_port,
+            grpc_port,
+            flight_port,
             db: Some(db),
             _tmp: tmp,
         })
@@ -96,6 +117,40 @@ impl TestPgServer {
         format!(
             "host=127.0.0.1 port={} user=postgres dbname=proximadb sslmode=disable",
             self.pg_port
+        )
+    }
+
+    /// Connect a pgwire client (`tokio_postgres`) to this server.
+    pub async fn connect(&self) -> anyhow::Result<tokio_postgres::Client, tokio_postgres::Error> {
+        let (client, connection) =
+            tokio_postgres::connect(&self.conn_str(), tokio_postgres::NoTls).await?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(client)
+    }
+
+    /// A no-proxy REST client pointed at this server's base URL, for the
+    /// REST-surface e2e waves.
+    pub fn rest_client(&self) -> anyhow::Result<(reqwest::Client, String)> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .no_proxy()
+            .build()?;
+        Ok((client, format!("http://127.0.0.1:{}", self.rest_port)))
+    }
+
+    /// Collision-free per-test object name: `{prefix}_{port}_{counter}`.
+    /// Concurrent processes get distinct ports, so no cross-process
+    /// coordination is needed.
+    pub fn unique_name(&self, prefix: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "{}_{}_{}",
+            prefix,
+            self.pg_port,
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         )
     }
 

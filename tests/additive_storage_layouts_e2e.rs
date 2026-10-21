@@ -19,17 +19,11 @@
 mod pg_server;
 
 use pg_server::TestPgServer;
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    e.as_db_error()
-        .map(|d| format!("[{}] {}", d.code().code(), d.message()))
-        .unwrap_or_else(|| e.to_string())
-}
-
 async fn scalar(client: &tokio_postgres::Client, sql: &str) -> String {
     let msgs = client
         .simple_query(sql)
         .await
-        .unwrap_or_else(|e| panic!("`{sql}`: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("`{sql}`: {}", pg_server::db_err(&e)));
     for m in msgs {
         if let tokio_postgres::SimpleQueryMessage::Row(r) = m {
             return r.get(0).unwrap_or("NULL").trim().to_string();

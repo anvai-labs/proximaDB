@@ -35,14 +35,6 @@ static CAPTURE: Mutex<Vec<IoTraceSnapshot>> = Mutex::new(Vec::new());
 mod pg_server;
 
 use pg_server::TestPgServer;
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    if let Some(db) = e.as_db_error() {
-        format!("[{}] {}", db.code().code(), db.message())
-    } else {
-        e.to_string()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Scale-parameterized generators (deterministic — no RNG, reproducible).
 // Batched multi-row INSERTs (chunked) to keep seeding fast.
@@ -306,7 +298,7 @@ async fn measure(
             }
             Ok((rows, wall_ms, snap))
         }
-        Err(e) => Err((wall_ms, explain_err(&e))),
+        Err(e) => Err((wall_ms, pg_server::db_err(&e))),
     }
 }
 
@@ -350,13 +342,13 @@ async fn seed(client: &Client, schema: &[(&str, &str)], inserts: Vec<String>) {
         client
             .simple_query(ddl)
             .await
-            .unwrap_or_else(|e| panic!("CREATE {name}: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("CREATE {name}: {}", pg_server::db_err(&e)));
     }
     for sql in &inserts {
         client
             .simple_query(sql)
             .await
-            .unwrap_or_else(|e| panic!("INSERT: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("INSERT: {}", pg_server::db_err(&e)));
     }
 }
 
@@ -387,7 +379,10 @@ async fn run_modality(
             .simple_query(&format!("ALTER TABLE {name} MATERIALIZE"))
             .await
         {
-            eprintln!("[{modality}] · MATERIALIZE {name}: {}", explain_err(&e));
+            eprintln!(
+                "[{modality}] · MATERIALIZE {name}: {}",
+                pg_server::db_err(&e)
+            );
         }
     }
 

@@ -20,21 +20,13 @@
 mod pg_server;
 
 use pg_server::TestPgServer;
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    if let Some(db) = e.as_db_error() {
-        format!("[{}] {}", db.code().code(), db.message())
-    } else {
-        e.to_string()
-    }
-}
-
 /// Run a 2-column query and parse the rows into `(i64, i64)` pairs (pgwire simple
 /// query renders every cell as text).
 async fn pairs(client: &tokio_postgres::Client, sql: &str) -> Vec<(i64, i64)> {
     client
         .simple_query(sql)
         .await
-        .unwrap_or_else(|e| panic!("query `{sql}`: {}", explain_err(&e)))
+        .unwrap_or_else(|e| panic!("query `{sql}`: {}", pg_server::db_err(&e)))
         .into_iter()
         .filter_map(|m| match m {
             tokio_postgres::SimpleQueryMessage::Row(r) => Some((
@@ -51,7 +43,7 @@ async fn one_i64(client: &tokio_postgres::Client, sql: &str) -> i64 {
     client
         .simple_query(sql)
         .await
-        .unwrap_or_else(|e| panic!("query `{sql}`: {}", explain_err(&e)))
+        .unwrap_or_else(|e| panic!("query `{sql}`: {}", pg_server::db_err(&e)))
         .into_iter()
         .find_map(|m| match m {
             tokio_postgres::SimpleQueryMessage::Row(r) => {
@@ -101,7 +93,7 @@ async fn olap_delta_merge_gate_off_stale_then_on_corrects() {
     client
         .simple_query("CREATE TABLE dvm (id INT PRIMARY KEY, v INT)")
         .await
-        .unwrap_or_else(|e| panic!("create: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("create: {}", pg_server::db_err(&e)));
     for sql in [
         "INSERT INTO dvm (id, v) VALUES (1, 10)",
         "INSERT INTO dvm (id, v) VALUES (2, 20)",
@@ -110,28 +102,28 @@ async fn olap_delta_merge_gate_off_stale_then_on_corrects() {
         client
             .simple_query(sql)
             .await
-            .unwrap_or_else(|e| panic!("insert `{sql}`: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("insert `{sql}`: {}", pg_server::db_err(&e)));
     }
 
     // Freeze the cold Parquet snapshot at this LSN, then route SELECTs to OLAP.
     client
         .simple_query("ALTER TABLE dvm MATERIALIZE")
         .await
-        .unwrap_or_else(|e| panic!("materialize: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("materialize: {}", pg_server::db_err(&e)));
 
     // Post-snapshot mutations: delete a row, update another, insert a new one.
     client
         .simple_query("DELETE FROM dvm WHERE id = 2")
         .await
-        .unwrap_or_else(|e| panic!("delete: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("delete: {}", pg_server::db_err(&e)));
     client
         .simple_query("UPDATE dvm SET v = 99 WHERE id = 3")
         .await
-        .unwrap_or_else(|e| panic!("update: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("update: {}", pg_server::db_err(&e)));
     client
         .simple_query("INSERT INTO dvm (id, v) VALUES (4, 40)")
         .await
-        .unwrap_or_else(|e| panic!("insert4: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("insert4: {}", pg_server::db_err(&e)));
 
     // GROUP BY / aggregate engages the relational engine → DataFusion over the
     // materialized Parquet base (never the legacy single-table path).
@@ -202,7 +194,7 @@ async fn olap_delta_merge_is_tenant_isolated() {
     for c in [&a, &b] {
         c.simple_query("CREATE TABLE shared (id INT PRIMARY KEY, v INT)")
             .await
-            .unwrap_or_else(|e| panic!("create: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("create: {}", pg_server::db_err(&e)));
         for sql in [
             "INSERT INTO shared (id, v) VALUES (1, 10)",
             "INSERT INTO shared (id, v) VALUES (2, 20)",
@@ -210,20 +202,20 @@ async fn olap_delta_merge_is_tenant_isolated() {
         ] {
             c.simple_query(sql)
                 .await
-                .unwrap_or_else(|e| panic!("insert `{sql}`: {}", explain_err(&e)));
+                .unwrap_or_else(|e| panic!("insert `{sql}`: {}", pg_server::db_err(&e)));
         }
         c.simple_query("ALTER TABLE shared MATERIALIZE")
             .await
-            .unwrap_or_else(|e| panic!("materialize: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("materialize: {}", pg_server::db_err(&e)));
     }
 
     // Only tenant A mutates after its snapshot.
     a.simple_query("DELETE FROM shared WHERE id = 2")
         .await
-        .unwrap_or_else(|e| panic!("A delete: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("A delete: {}", pg_server::db_err(&e)));
     a.simple_query("UPDATE shared SET v = 99 WHERE id = 3")
         .await
-        .unwrap_or_else(|e| panic!("A update: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("A update: {}", pg_server::db_err(&e)));
 
     let q = "SELECT id, v FROM shared GROUP BY id, v ORDER BY id";
     assert_eq!(
@@ -266,7 +258,7 @@ async fn olap_delta_merge_reconciles_mixed_name_and_object_id_keyed_wal() {
     client
         .simple_query("CREATE TABLE dvm_oid (id INT PRIMARY KEY, v INT)")
         .await
-        .unwrap_or_else(|e| panic!("create: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("create: {}", pg_server::db_err(&e)));
     for sql in [
         "INSERT INTO dvm_oid (id, v) VALUES (1, 10)",
         "INSERT INTO dvm_oid (id, v) VALUES (2, 20)",
@@ -275,29 +267,29 @@ async fn olap_delta_merge_reconciles_mixed_name_and_object_id_keyed_wal() {
         client
             .simple_query(sql)
             .await
-            .unwrap_or_else(|e| panic!("insert `{sql}`: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("insert `{sql}`: {}", pg_server::db_err(&e)));
     }
     client
         .simple_query("ALTER TABLE dvm_oid MATERIALIZE")
         .await
-        .unwrap_or_else(|e| panic!("materialize: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("materialize: {}", pg_server::db_err(&e)));
 
     // Name-keyed delete (object_id WAL keying OFF).
     client
         .simple_query("DELETE FROM dvm_oid WHERE id = 2")
         .await
-        .unwrap_or_else(|e| panic!("delete: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("delete: {}", pg_server::db_err(&e)));
 
     // Flip to object_id-keyed WAL for the subsequent writes.
     unsafe { std::env::set_var("PROXIMADB_WAL_OBJECT_ID_KEY", "1") };
     client
         .simple_query("UPDATE dvm_oid SET v = 99 WHERE id = 3")
         .await
-        .unwrap_or_else(|e| panic!("update: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("update: {}", pg_server::db_err(&e)));
     client
         .simple_query("INSERT INTO dvm_oid (id, v) VALUES (4, 40)")
         .await
-        .unwrap_or_else(|e| panic!("insert4: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("insert4: {}", pg_server::db_err(&e)));
 
     assert_eq!(
         pairs(
@@ -319,7 +311,7 @@ async fn text_i64_pairs(client: &tokio_postgres::Client, sql: &str) -> Vec<(Stri
     client
         .simple_query(sql)
         .await
-        .unwrap_or_else(|e| panic!("query `{sql}`: {}", explain_err(&e)))
+        .unwrap_or_else(|e| panic!("query `{sql}`: {}", pg_server::db_err(&e)))
         .into_iter()
         .filter_map(|m| match m {
             tokio_postgres::SimpleQueryMessage::Row(r) => Some((
@@ -357,11 +349,11 @@ async fn olap_delta_merge_correct_aggregates_through_join() {
     client
         .simple_query("CREATE TABLE acct (id INT PRIMARY KEY, region VARCHAR)")
         .await
-        .unwrap_or_else(|e| panic!("create acct: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("create acct: {}", pg_server::db_err(&e)));
     client
         .simple_query("CREATE TABLE txn (id INT PRIMARY KEY, acct_id INT, amount INT)")
         .await
-        .unwrap_or_else(|e| panic!("create txn: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("create txn: {}", pg_server::db_err(&e)));
     for sql in [
         "INSERT INTO acct (id, region) VALUES (1, 'US')",
         "INSERT INTO acct (id, region) VALUES (2, 'EU')",
@@ -372,13 +364,13 @@ async fn olap_delta_merge_correct_aggregates_through_join() {
         client
             .simple_query(sql)
             .await
-            .unwrap_or_else(|e| panic!("seed `{sql}`: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("seed `{sql}`: {}", pg_server::db_err(&e)));
     }
     for t in ["acct", "txn"] {
         client
             .simple_query(&format!("ALTER TABLE {t} MATERIALIZE"))
             .await
-            .unwrap_or_else(|e| panic!("materialize {t}: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("materialize {t}: {}", pg_server::db_err(&e)));
     }
 
     // Post-snapshot mutations on the FACT only: delete(2) drops 20 from US,
@@ -386,15 +378,15 @@ async fn olap_delta_merge_correct_aggregates_through_join() {
     client
         .simple_query("DELETE FROM txn WHERE id = 2")
         .await
-        .unwrap_or_else(|e| panic!("delete: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("delete: {}", pg_server::db_err(&e)));
     client
         .simple_query("UPDATE txn SET amount = 99 WHERE id = 3")
         .await
-        .unwrap_or_else(|e| panic!("update: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("update: {}", pg_server::db_err(&e)));
     client
         .simple_query("INSERT INTO txn (id, acct_id, amount) VALUES (4, 1, 40)")
         .await
-        .unwrap_or_else(|e| panic!("insert: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("insert: {}", pg_server::db_err(&e)));
 
     let q = "SELECT a.region, SUM(t.amount) AS s FROM txn t \
              JOIN acct a ON t.acct_id = a.id GROUP BY a.region ORDER BY a.region";
