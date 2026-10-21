@@ -79,6 +79,12 @@ impl VectorExtractor for RaptorExtractor {
             return Ok(ExtractionResult::empty());
         }
 
+        // ID filter as a set, built once per extraction (was: a linear
+        // `ids.contains` per record — TD-DSEFF-1 parity with sst/nova/swift).
+        let id_filter = crate::storage::trait_components::extractor::build_id_filter(
+            request.vector_ids.as_ref(),
+        );
+
         let mut all_vectors = Vec::new();
         let mut total_bytes_read = 0usize;
         let mut files_processed = 0usize;
@@ -142,8 +148,7 @@ impl VectorExtractor for RaptorExtractor {
                     None
                 };
 
-                // Apply ID filter if selective extraction
-                let should_include = match &request.vector_ids {
+                let should_include = match &id_filter {
                     Some(ids) => ids.contains(&record.id),
                     None => true,
                 };

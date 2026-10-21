@@ -2978,61 +2978,10 @@ impl RaptorEngine {
     fn convert_filter_to_index(
         filter_expression: Option<&proximadb_filter_expression::FilterExpression>,
     ) -> Vec<proximadb_index_traits::IndexMetadataFilter> {
-        use proximadb_filter_expression::{ComparisonOperator, FilterExpression};
-        use proximadb_index_traits::{IndexFilterOperator, IndexMetadataFilter};
-
-        let Some(filter) = filter_expression else {
-            return Vec::new();
-        };
-
-        // Convert filter expressions to index metadata filters
-        let mut index_filters = Vec::new();
-
-        match filter {
-            FilterExpression::Comparison {
-                field,
-                operator,
-                value,
-            } => {
-                // Convert ComparisonOperator to IndexFilterOperator
-                let index_operator = match operator {
-                    ComparisonOperator::Equals => IndexFilterOperator::Equals,
-                    ComparisonOperator::NotEquals => IndexFilterOperator::NotEquals,
-                    ComparisonOperator::GreaterThan => IndexFilterOperator::GreaterThan,
-                    ComparisonOperator::GreaterThanOrEqual => {
-                        IndexFilterOperator::GreaterThanOrEqual
-                    }
-                    ComparisonOperator::LessThan => IndexFilterOperator::LessThan,
-                    ComparisonOperator::LessThanOrEqual => IndexFilterOperator::LessThanOrEqual,
-                    ComparisonOperator::In => IndexFilterOperator::In,
-                    ComparisonOperator::NotIn => IndexFilterOperator::NotIn,
-                    _ => {
-                        tracing::debug!(
-                            "Operator {:?} not directly supported by index, will use post-filtering",
-                            operator
-                        );
-                        return index_filters;
-                    }
-                };
-
-                index_filters.push(IndexMetadataFilter {
-                    field: field.clone(),
-                    operator: index_operator,
-                    value: value.clone(),
-                });
-            }
-            FilterExpression::And(filters) => {
-                for f in filters {
-                    index_filters.extend(Self::convert_filter_to_index(Some(f)));
-                }
-            }
-            FilterExpression::Or(_) | FilterExpression::Not(_) => {
-                // OR and NOT are not directly supported by index, will use post-filtering
-                tracing::debug!("OR/NOT filters not supported by index, will use post-filtering");
-            }
-        }
-
-        index_filters
+        // Canonical converter (redundancy pass 3): the six per-engine copies
+        // had drifted — only SST mapped Contains/StartsWith/EndsWith/Like/
+        // Between. See proximadb_filter_expression::to_index_metadata_filters.
+        proximadb_filter_expression::to_index_metadata_filters(filter_expression)
     }
 }
 

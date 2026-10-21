@@ -60,6 +60,19 @@ pub trait VectorExtractor: Send + Sync {
 }
 
 /// Request parameters for vector extraction.
+/// Build the O(1) selective-extraction filter (TD-DSEFF-1 pattern): a set
+/// built once per extraction, consulted BEFORE fp32/metadata materialization
+/// so excluded records skip the conversion cost. Previously each engine
+/// hand-rolled this — sst/nova/swift used the set, helix/viper/raptor did a
+/// linear `ids.contains` per record, and tst ignored `vector_ids` entirely
+/// (redundancy pass 3 harmonization).
+pub fn build_id_filter(
+    vector_ids: Option<&Vec<String>>,
+) -> Option<std::collections::HashSet<&String>> {
+    vector_ids.map(|ids| ids.iter().collect())
+}
+
+/// Request parameters for vector extraction.
 #[derive(Debug, Clone)]
 pub struct ExtractionRequest {
     /// Files to extract from (SST files, Parquet files, etc.)

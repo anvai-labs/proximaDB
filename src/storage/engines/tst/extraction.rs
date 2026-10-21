@@ -144,6 +144,13 @@ impl VectorExtractor for TstExtractor {
             return Ok(ExtractionResult::empty());
         }
 
+        // TST previously ignored `vector_ids` entirely (selective
+        // extraction returned everything) — apply the same O(1) filter the
+        // other engines use (redundancy pass 3 correctness fix).
+        let id_filter = crate::storage::trait_components::extractor::build_id_filter(
+            request.vector_ids.as_ref(),
+        );
+
         let mut all_vectors = Vec::new();
         let mut total_bytes_read = 0;
 
@@ -152,6 +159,9 @@ impl VectorExtractor for TstExtractor {
             match self.extract_from_file(file_path, &request).await {
                 Ok(mut vectors) => {
                     total_bytes_read += vectors.stats.bytes_read;
+                    if let Some(ids) = &id_filter {
+                        vectors.vectors.retain(|v| ids.contains(&v.id));
+                    }
                     all_vectors.append(&mut vectors.vectors);
                 }
                 Err(e) => {

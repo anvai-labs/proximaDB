@@ -84,6 +84,12 @@ impl VectorExtractor for ViperExtractor {
                 .map_err(|e| ExtractionError::IoError(e.to_string()))?,
         );
 
+        // ID filter as a set, built once per extraction (was: a linear
+        // `ids.contains` per record — TD-DSEFF-1 parity with sst/nova/swift).
+        let id_filter = crate::storage::trait_components::extractor::build_id_filter(
+            request.vector_ids.as_ref(),
+        );
+
         let mut all_vectors = Vec::new();
         let mut total_bytes_read = 0usize;
         let mut files_processed = 0usize;
@@ -161,8 +167,7 @@ impl VectorExtractor for ViperExtractor {
                     None
                 };
 
-                // Apply ID filter if selective extraction
-                let should_include = match &request.vector_ids {
+                let should_include = match &id_filter {
                     Some(ids) => ids.contains(&record_id),
                     None => true,
                 };
