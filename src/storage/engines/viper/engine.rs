@@ -1988,70 +1988,23 @@ impl UnifiedStorageFormat for ViperEngine {
         base_path: &str,
         records: Vec<proximadb_records::ProximaRecord>,
     ) -> Result<crate::storage::traits::SegmentIngestResult> {
-        use crate::proto::proximadb_v1::{Collection, StorageAssignment};
+        use crate::storage::engines::core::ops::bulk_ingest::{
+            build_bulk_flush_parameters, empty_segment_result, segment_result_from_flush,
+        };
 
         let count = records.len();
         if count == 0 {
-            return Ok(crate::storage::traits::SegmentIngestResult {
-                collection_id: collection_id.to_string(),
-                record_count: 0,
-                synthetic_segment_id: "empty".to_string(),
-                used_engine_specific_path: true,
-            });
+            return Ok(empty_segment_result(collection_id));
         }
 
-        let collection_config = Some(Collection {
-            id: collection_id.to_string(),
-            config: None,
-            stats: None,
-            created_at: 0,
-            updated_at: 0,
-            storage_assignment: Some(StorageAssignment {
-                primary_path: base_path.to_string(),
-                backup_paths: vec![],
-                engine: 0,
-                engine_config: std::collections::HashMap::new(),
-                base_location: base_path.to_string(),
-                assigned_at: 0,
-                ..Default::default()
-            }),
-        });
-
-        let params = crate::storage::traits::FlushParameters {
-            collection_id: Some(
-                collection_id
-                    .parse::<u64>()
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "VIPER bulk ingest requires a numeric catalog object id, got {collection_id:?}: {error}"
-                        )
-                    })?
-                    .to_string(),
-            ),
-            force: true,
-            synchronous: true,
-            hints: std::collections::HashMap::new(),
-            timeout_ms: None,
-            vector_records: records,
-            trigger_compaction: false,
-            batch_ids: vec![],
-            collection_config,
-            estimated_size: 0,
-        };
-
+        let params = build_bulk_flush_parameters(collection_id, base_path, records, "VIPER")?;
         let flush_result = self.do_flush(&params).await?;
-        let synthetic_segment_id = flush_result
-            .file_paths
-            .first()
-            .cloned()
-            .unwrap_or_else(|| format!("viper-bulkload-{collection_id}-{count}"));
-
-        Ok(crate::storage::traits::SegmentIngestResult {
-            collection_id: collection_id.to_string(),
-            record_count: count,
-            synthetic_segment_id,
-            used_engine_specific_path: true,
-        })
+        Ok(segment_result_from_flush(
+            collection_id,
+            count,
+            &flush_result,
+            "viper",
+        ))
     }
 
     async fn do_compact(
