@@ -69,8 +69,8 @@ use proximadb_records::{
 };
 use proximadb_storage_common::parquet_write_policy::{ParquetLayoutHints, ParquetWritePolicy};
 use proximadb_storage_common::proxima_arrow::{
-    SYS_COL_OID, column_materializable, infer_proxima_schema, props_not_preserved,
-    proxima_records_to_record_batch_with_system_columns,
+    SYS_COL_OID, column_materializable, infer_proxima_schema,
+    proxima_records_to_record_batch_with_residual, records_not_round_tripping,
 };
 use proximadb_storage_common::proxima_parquet::record_batches_to_parquet_bytes;
 use proximadb_storage_common::proxima_schema::ProximaSchema;
@@ -96,6 +96,24 @@ pub(crate) fn configured_flush_threshold() -> Option<usize> {
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
+}
+
+/// Rows a flush held back because they did not read back identically through
+/// the segment encoding. Expected to stay 0; anything else is a codec defect.
+fn spill_rows_held_counter() -> prometheus::IntCounter {
+    static COUNTER: std::sync::OnceLock<prometheus::IntCounter> = std::sync::OnceLock::new();
+    COUNTER
+        .get_or_init(|| {
+            prometheus::register_int_counter!(
+                "proximadb_spill_rows_held_total",
+                "Spill rows held resident because they did not round-trip through the segment encoding"
+            )
+            .unwrap_or_else(|_| {
+                prometheus::IntCounter::new("proximadb_spill_rows_held_total_fallback", "fallback")
+                    .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
+            })
+        })
+        .clone()
 }
 
 /// One resident row: the value, the write that produced it, and that write's
@@ -373,11 +391,10 @@ impl SpillRecordStorage {
     /// `build_column` errors on them unconditionally, and that error would
     /// brick the flush — the memtable would never shrink and every
     /// subsequent write to the partition would fail (the exact "worse than
-    /// having no heap bound" shape). Rows carrying props on a dropped
-    /// column fail `props_not_preserved` and are HELD instead. Known
-    /// resurrection (documented, accepted): props on a *deleted* catalog
-    /// column are re-added by the inferred loop under an inferred type —
-    /// the write succeeds, so no data is lost.
+    /// having no heap bound" shape). Props on a dropped column are carried
+    /// by the segment's residual column instead (see `flush`). Props on a
+    /// *deleted* catalog column are re-added by the inferred loop under an
+    /// inferred type; the residual keeps them exact either way.
     fn encode_schema(&self, records: &[ProximaRecord]) -> ProximaSchema {
         let inferred = infer_proxima_schema(records);
         let Some(mut schema) = self.schema_source.as_ref().and_then(|source| (source.0)()) else {
@@ -866,32 +883,35 @@ impl SpillRecordStorage {
             .cloned()
             .collect();
 
-        // A row this segment's schema cannot carry is HELD: not written, not
-        // evicted. The batch builders turn a value that does not fit its column
-        // into NULL without error, so writing such a row and evicting it would
-        // lose the value durably (inference, for one, has no column type for
-        // DECIMAL / TIMESTAMP / UUID props). Held rows stay resident with their
-        // LSN, so `min_unflushed_lsn` keeps the WAL entry that rebuilds them; a
-        // later flush writes them once the schema can (e.g. after a write
-        // supplies the catalog schema). Tombstones carry no props and always fit.
-        let schema = self.encode_schema(
-            &evicting
-                .iter()
-                .map(|r| r.record.clone())
-                .collect::<Vec<_>>(),
-        );
-        let (evicting, held): (Vec<Resident>, Vec<Resident>) = evicting
+        // Every value the typed columns cannot reproduce exactly — a nested
+        // object, an integer in a float column, a second embedding, a value of
+        // a type with no Arrow column — goes into the segment's residual column
+        // (TD-USUB-6's rule), so every row is writable. What is still checked
+        // is the codec itself: each row is encoded and decoded, and one that
+        // does not come back identical is HELD — not written, not evicted, its
+        // LSN still pinning the WAL entry that rebuilds it — and counted, since
+        // that is a defect to fix, not a data shape to live with.
+        let candidates: Vec<ProximaRecord> = evicting.iter().map(|r| r.record.clone()).collect();
+        let schema = self.encode_schema(&candidates);
+        let lossy: std::collections::HashSet<usize> =
+            records_not_round_tripping(&candidates, &schema)
+                .context("spill: verify the segment encoding round-trips")?
+                .into_iter()
+                .collect();
+        let (evicting, held): (Vec<(usize, Resident)>, Vec<(usize, Resident)>) = evicting
             .into_iter()
-            .partition(|r| props_not_preserved(&r.record, &schema).is_empty());
-        if let Some(example) = held.first() {
-            tracing::warn!(
+            .enumerate()
+            .partition(|(i, _)| !lossy.contains(i));
+        let evicting: Vec<Resident> = evicting.into_iter().map(|(_, r)| r).collect();
+        if let Some((_, example)) = held.first() {
+            spill_rows_held_counter().inc_by(held.len() as u64);
+            tracing::error!(
                 rows = held.len(),
                 example_oid = %example.record.oid,
-                example_props = ?props_not_preserved(&example.record, &schema),
                 path = %self.base_path.trim_end_matches('/'),
-                "spill: holding row(s) resident — the segment schema cannot carry some of \
-                 their values, and writing them would store NULL. They keep \
-                 `min_unflushed_lsn` pinned until a flush whose schema fits them."
+                "spill: holding row(s) resident — they do not read back identically \
+                 through the segment encoding (a codec defect). They keep \
+                 `min_unflushed_lsn` pinned."
             );
         }
         let persisting: Vec<&String> = tombstoned
@@ -982,7 +1002,7 @@ impl SpillRecordStorage {
         // nothing. It makes the oid column's row-group and page min/max exact,
         // which the declared sort below tells every reader.
         written.sort_unstable_by(|a, b| a.oid.cmp(&b.oid));
-        let batch = proxima_records_to_record_batch_with_system_columns(&written, &schema)
+        let batch = proxima_records_to_record_batch_with_residual(&written, &schema)
             .context("spill: encode resident records and tombstones to Arrow")?;
         let writer_properties = self.write_policy.writer_properties(
             &batch,
@@ -3508,15 +3528,15 @@ mod tests {
         Ok(())
     }
 
-    /// A value the segment schema cannot carry holds its row resident; it is
-    /// never written as NULL. Inference has no column type for a DECIMAL prop,
-    /// so without a catalog schema that row must stay in memory, still served,
-    /// still pinning the WAL floor.
+    /// A value the segment schema has no column for is written exactly through
+    /// the residual — never as NULL, and no longer held. Inference has no
+    /// column type for a DECIMAL prop, so without a catalog schema this row
+    /// used to stay in memory pinning the WAL floor until a write supplied one.
     #[tokio::test]
-    async fn a_row_the_segment_schema_cannot_carry_is_held_not_written_as_null() -> Result<()> {
+    async fn a_value_inference_cannot_type_is_written_exactly_through_the_residual() -> Result<()> {
         let (fs, base) = fs_and_base().await;
-        let store =
-            SpillRecordStorage::with_flush_threshold(fs, base, None).with_tenant("tenant-a");
+        let store = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None)
+            .with_tenant("tenant-a");
         let price = ProximaTreeNode::Value(proximadb_data_model::ProximaValue::Decimal(
             "12.50".to_string(),
         ));
@@ -3525,18 +3545,19 @@ mod tests {
         RecordStore::upsert_record_at_lsn(&store, record("plain", "open"), 1).await?;
         RecordStore::upsert_record_at_lsn(&store, priced, 2).await?;
 
-        store.flush().await?.expect("the plain row publishes");
-        assert_eq!(store.resident_len(), 1, "the DECIMAL row stays resident");
+        store.flush().await?.expect("both rows publish");
+        assert_eq!(store.resident_len(), 0, "nothing held");
         assert_eq!(
             RecordStore::min_unflushed_lsn(&store).await.ok(),
-            Some(Some(2)),
-            "the held row keeps its WAL entry"
+            Some(None),
+            "both rows are durable"
         );
-        let served = store
+        let fresh = SpillRecordStorage::with_flush_threshold(fs, base, None);
+        let served = fresh
             .get_record(&RecordKey::new("priced".to_string()))
             .await?
-            .expect("served from memory");
-        assert_eq!(served.props.get("price"), Some(&price));
+            .expect("read back from the segment");
+        assert_eq!(served.props.get("price"), Some(&price), "exact, not NULL");
         Ok(())
     }
 
