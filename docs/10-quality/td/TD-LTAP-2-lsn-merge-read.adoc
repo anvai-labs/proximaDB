@@ -45,6 +45,8 @@ ADR-046. A defined materialization cadence (config). Benefits from TD-LTAP-1's c
 
 == Verification
 
-* **Correctness ratchet:** analytics read at LSN ≡ tx read at LSN (differential), across LSNs
-  straddling materialization boundaries.
-* Freshness bench: analytical-query freshness vs materialization cadence.
+Two gates, defined once in the ADR (they are ADR-046's decision, not this TD's): a
+**differential correctness ratchet** (analytics read at LSN ≡ tx read at LSN, across LSNs
+straddling materialization boundaries) and a **freshness bench** (analytical-query freshness
+vs materialization cadence). See
+link:../../12-design/adr/ADR-046-lsn-coherent-merge-read.adoc[ADR-046] § _Verification_.

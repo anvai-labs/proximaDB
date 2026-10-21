@@ -370,43 +370,12 @@ Scan.planInputPartitions()` with zero custom connector code.
 
 === ProximaRecord → Iceberg Canonical Column Mapping (ADR-ICE-001)
 
-Every ProximaDB collection projected as an Iceberg table exposes this fixed column prefix.
-This mapping is the compatibility contract between ProximaDB and any external compute engine.
-
-[cols="3,3,2,4"]
-|===
-| ProximaRecord field | Iceberg column | Iceberg type | Notes
-
-| `id` / `oid` | `id` | `string` required | partition candidate
-| internal tenant context | `tenant_id` | `string` optional/required by policy | exposed projection of xCatalog/session tenant context; partition/RLS pushdown when policy requires it
-| `created_at_ns` | `created_at` | `timestamptz` | nanoseconds ÷ 1000 → microseconds
-| `updated_at_ns` | `updated_at` | `timestamptz` |
-| `valid_from_ns` | `valid_from` | `timestamptz` optional | bi-temporal lower bound
-| `valid_to_ns` | `valid_to` | `timestamptz` optional | bi-temporal upper bound; AS OF queries
-| `actor` | `actor` | `string` optional | write provenance
-| `origin` | `origin` | `string` optional | source system
-| `props` | `props` | `map<string, binary>` | msgpack-encoded `ProximaValue`s; opaque to external engines
-| `labels` | `labels` | `list<string>` | filterable; push `labels` IN predicate through Iceberg
-| `embeddings[i].values` | `embedding_{model_id}` | `list<float>` | one column per registered model; dimension in table properties
-| `edge.source_id` | `edge_source_id` | `string` optional | graph edge; null for non-graph records
-| `edge.target_id` | `edge_target_id` | `string` optional |
-| `edge.edge_type` | `edge_type` | `string` optional |
-| `edge.weight` | `edge_weight` | `float` optional |
-|===
-
-Table properties for HNSW discovery (external engines read these to plan vector operations):
-
-[source,json]
-----
-{
-  "proximadb.collection": "my_collection",
-  "proximadb.flight.endpoint": "grpc://localhost:5680",
-  "proximadb.index.embedding_model_a.type": "hnsw",
-  "proximadb.index.embedding_model_a.dim": "768",
-  "proximadb.index.embedding_model_a.ef_construction": "200",
-  "proximadb.record.envelope": "ProximaRecord/v1"
-}
-----
+The fixed column prefix every ProximaDB collection projected as an Iceberg table exposes —
+the compatibility contract with external compute engines — is defined once in the ADR:
+link:adr/ADR-007-iceberg-rest-catalog-server.adoc[ADR-007] § _ProximaRecord → Iceberg
+Canonical Schema (ADR-ICE-001)_ carries the authoritative field/column/type table (including
+the `tenant_id` policy note and the `labels` IN-predicate pushdown) and the HNSW-discovery
+table-properties block. Do not restate it here; a second copy would drift from the contract.
 
 == OLTP Catalog Backends (ADR-008)
 

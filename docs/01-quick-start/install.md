@@ -325,21 +325,16 @@ curl http://localhost:5678/health
 
 ### Test Collection
 
-```bash
-# Create a canonical record collection
-curl -X POST http://localhost:5678/api/v2/collections \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "test",
-    "dimension": 128,
-    "distance_metric": "cosine",
-    "engine": "sst",
-    "enable_proxima_record": true
-  }'
+A healthy `/health` response is the install's own verification. As a last check you can list
+the (empty) collection set:
 
-# List collections
+```bash
 curl http://localhost:5678/api/v2/collections
 ```
+
+Creating a collection and running your first insert and search is the
+[First Query tutorial](./first-query.md)'s job — it is the canonical walkthrough (REST, Python
+SDK and SQL variants), kept in one place so the steps cannot drift apart between guides.
 
 ---
 

@@ -618,8 +618,9 @@ let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
 [source,rust]
 ----
-// Before (unsafe)
-let items = obj.get("items").unwrap().as_array().unwrap();
+// Before (unsafe — an unwrap on the array AND one per element)
+let items = obj.get("items").unwrap().as_array().unwrap().iter()
+    .map(|v| v.as_str().unwrap()).collect::<Vec<_>>();
 
 // After (safe)
 // TD-007: unwrap_or_default with safe default - empty vector for missing items
@@ -859,57 +860,17 @@ The remaining ~3,000 unwrap/expect calls are primarily in:
 
 === 9.2 TD-007 Fix Patterns
 
-==== Pattern 1: Simple Default
+The fix patterns are defined once in the main body; this appendix pointed at them with
+condensed re-statements, which drifted into a second copy of the same examples. The
+canonical instances:
 
-[source,rust]
-----
-// Before
-let value = obj.get("key").unwrap().as_str().unwrap();
-
-// After
-// TD-007: unwrap_or with safe default - empty string for missing key
-let value = obj.get("key").and_then(|v| v.as_str()).unwrap_or("");
-----
-
-==== Pattern 2: Collection Default
-
-[source,rust]
-----
-// Before
-let items = obj.get("items").unwrap().as_array().unwrap().iter()
-    .map(|v| v.as_str().unwrap()).collect::<Vec<_>>();
-
-// After
-// TD-007: unwrap_or_default with safe default - empty vector for missing items
-let items = obj.get("items").and_then(|v| v.as_array())
-    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-    .unwrap_or_default();
-----
-
-==== Pattern 3: Numeric Default
-
-[source,rust]
-----
-// Before
-let count = obj.get("count").unwrap().as_u64().unwrap();
-
-// After
-// TD-007: unwrap_or with safe default - 10 is reasonable default for count
-let count = obj.get("count").and_then(|v| v.as_u64()).unwrap_or(10);
-----
-
-==== Pattern 4: Error Propagation
-
-[source,rust]
-----
-// Before
-let config = load_config(path).unwrap();
-let result = process(config).unwrap();
-
-// After
-let config = load_config(path)?;
-let result = process(config)?;
-----
+* **Simple default** (`unwrap_or("")`), **collection default** (`unwrap_or_default()` on the
+  mapped collection, including the per-element `unwrap` the unsafe idiom carries) and
+  **numeric default** (`unwrap_or(<sensible limit>)`): see
+  <<_5_3_common_patterns,Section 5.3 Common Patterns>>.
+* **Error propagation** (`?` on fallible calls instead of `unwrap()`): see
+  <<_4_5_error_propagation_patterns,Section 4.5 Error Propagation Patterns>>, which shows the
+  early-return, chained and context-adding forms.
 
 === 9.3 Testimonial
 

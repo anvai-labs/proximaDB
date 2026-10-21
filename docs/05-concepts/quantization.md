@@ -96,7 +96,9 @@ collection = client.create_collection(
     quantization={
         "type": "product",
         "bits": 8,          # 256 centroids per sub-vector
-        "subvectors": 8     # Split into 8 parts
+        # Split into 8 parts. More sub-vectors = more compression:
+        # 16 gives 32 bytes/vector (48x compression)
+        "subvectors": 8
     }
 )
 ```
@@ -382,49 +384,17 @@ flowchart TB
 
 ## Configuration Examples
 
-### Memory-Constrained
+The per-method `Configuration` blocks above (PQ, Binary, Scalar) are the reference settings.
+Pick between them by what you are optimizing for:
 
-```python
-collection = client.create_collection(
-    name="products",
-    dimension=384,
-    quantization={
-        "type": "product",
-        "bits": 8,
-        "subvectors": 16  # More compression
-    }
-)
-# Memory: 32 bytes/vector (48x compression)
-```
+| Scenario | Method and knobs | Outcome (384 dims) |
+|----------|------------------|--------------------|
+| Memory-constrained | PQ, `bits: 8`, `subvectors: 16` | 32 bytes/vector (48x compression) |
+| Accuracy-critical | Scalar INT8, `bits: 8` | 384 bytes/vector (4x), 98-99% recall |
+| Speed-critical | Binary | 6 bytes/vector (256x), ~2ms queries |
 
-### Accuracy-Critical
-
-```python
-collection = client.create_collection(
-    name="products",
-    dimension=384,
-    quantization={
-        "type": "scalar",
-        "bits": 8
-    }
-)
-# Memory: 384 bytes/vector (4x compression)
-# Recall: 98-99%
-```
-
-### Speed-Critical
-
-```python
-collection = client.create_collection(
-    name="products",
-    dimension=384,
-    quantization={
-        "type": "binary"
-    }
-)
-# Memory: 6 bytes/vector (256x compression)
-# Query: 2ms (fastest!)
-```
+The numbers come from the per-method **Performance** tables above; only the memory-constrained
+row is new information — it is the PQ configuration with `subvectors` raised from 8 to 16.
 
 ---
 

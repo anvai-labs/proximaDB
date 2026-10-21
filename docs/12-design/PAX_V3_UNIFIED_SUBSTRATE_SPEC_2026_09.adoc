@@ -124,6 +124,8 @@ dictionary, FSST, zstd). Structure is selected **per column**, by value width:
 A 768-dimension `f32` embedding is ~3 KB and therefore lands in full-zip: **a 1-IOP
 random vector fetch**, which is precisely the ANN rerank access pattern. This replaces
 the ad-hoc pairing of `coalesced_rabitq.rs` / `coalesced_sq8.rs` with a derived rule.
+The reported effect on the search cache is large — Parquet's ~20 GiB per billion-row
+vector column versus ~1.28 GiB — because large values no longer force one page per value.
 
 `BlockMode` is retained in the header for v2 compatibility but becomes advisory in v3;
 the per-column structure marker in `ColumnMeta` is authoritative.
@@ -179,7 +181,8 @@ with no catalog present, for:
   independently.
 
 Catalog is the fast path. The object remains the truthful one. On divergence, the object
-wins and the catalog entry is rebuilt.
+wins and the catalog entry is rebuilt — sound precisely because Layer B is rebuildable by
+definition.
 
 === 3.4 Invariants preserved
 

@@ -316,18 +316,10 @@ for i, v in zip(ids, vectors):
 
 ## Common Patterns
 
+### Exclusions: deduplication and collaborative filtering
 
-### Recommendation Engine
-
-```bash
-# User-based collaborative filtering: exclude purchased items
-curl -X POST http://localhost:5678/api/v2/collections/products/search \
-  -H "Content-Type: application/json" \
-  -d '{"vector": [0.1, 0.2, 0.3], "top_k": 20,
-       "filters": [{"field": "category", "op": "neq", "value": "purchased"}]}'
-```
-
-### Deduplication
+The `neq` operator excludes the subject item from its own result set. For near-duplicate
+detection, exclude the document's own checksum:
 
 ```bash
 # Find near-duplicates of a document, excluding the document itself
@@ -337,6 +329,11 @@ curl -X POST http://localhost:5678/api/v2/collections/documents/search \
        "filters": [{"field": "checksum", "op": "neq", "value": "<doc checksum>"}]}'
 # A score above about 0.95 suggests a duplicate
 ```
+
+User-based collaborative filtering uses the same shape — neighbors of a user vector with
+already-purchased items excluded — by swapping the collection and filter, e.g.
+`{"field": "category", "op": "neq", "value": "purchased"}` over `products` with a larger
+`top_k` (fetch 20, rank client-side).
 
 ### Face Recognition
 

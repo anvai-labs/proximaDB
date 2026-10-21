@@ -42,17 +42,12 @@ segment layer, where ProximaDB already owns a catalog and does not need to inven
 
 === The object must stay self-describing
 
-The in-object footer copy is **retained, not replaced**. An object must remain readable with
-no catalog present, for:
-
-* disaster recovery and catalog rebuild;
-* external tools reading the bucket directly;
-* **BYOB storage** (ADR-090), where the customer owns the bucket and may read it independently
-  of ProximaDB.
-
-Catalog is the fast path; the object remains the truthful one. **On divergence the object
-wins** and the catalog entry is rebuilt — which is sound precisely because Layer B is
-rebuildable by definition.
+The in-object footer copy is **retained, not replaced** — an object must stay readable with
+no catalog present (disaster recovery, external tools, BYOB), and on divergence the object
+wins. That invariant and its rationale (sound precisely because Layer B is rebuildable by
+definition) are stated once in the spec:
+link:../../12-design/PAX_V3_UNIFIED_SUBSTRATE_SPEC_2026_09.adoc[PAX v3 unified substrate
+spec] § _3.3 The object stays self-describing_.
 
 === Constraints
 
