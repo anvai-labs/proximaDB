@@ -115,7 +115,9 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | P2.2b rank-profile and SQL-function WAL checkpoints; change feed 410 Gone; reader starvation fix | Done | #2090 | `tests/wal_system_catalog_checkpoint_test.rs`.
 | P2.2c scheduled truncator (`src/services/wal_truncator.rs`) + MATERIALIZE snapshot-LSN pin | Done | #2095 | `tests/wal_truncator_test.rs` (7). Off by default (`PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS`).
 | Spill segments written with `ParquetWritePolicy`, oid-sorted | **Open PR** | #2097 | `segments_are_written_with_the_warehouse_layout_policy`; `record_spill::` + `record_store::tests::` 93/93 locally.
-| Spill encoder uses the catalog schema | **Next** | — | See §5.1.
+| Spill encoder uses the catalog schema; non-fitting rows held resident (no silent NULL); timestamp decode | **Branch** `spill-catalog-schema` | — | §5.1. Stacked on #2097. Tests listed in the TD-SEAM-3 row.
+| Seed spill schema hints at boot (before WAL replay) | **Next** | — | Without it a replay-created partition holds DECIMAL/TIMESTAMP rows resident until the first write supplies the schema (no loss; memory unbounded for those rows until then).
+| Hold metric + escape hatch for permanent-hold rows | **Next** | — | Rows with nested `Object`/`Array` props, >1 embedding, props on a dropped/un-materializable column, or an integer too wide for a declared float column can never be spilled by any schema — they hold memory and pin `min_unflushed_lsn` forever (no loss; strictly better than the old silent NULL on eviction). Needs a hold-size metric and an escape hatch (quarantine segment). |
 | Durable branch merge-base | Open | — | Until it lands, branch-tagged WAL entries block truncation. TD-SEAM-12 hazard 2.
 | Catalog prefix registration (object-store placement of spill segments) | Open | — | TD-SEAM-3.
 | MATERIALIZE LSN capture via the per-collection high-water | Done in #2095 | #2095 | Superseded by `capture_snapshot_lsn` with a WAL pin.
@@ -144,6 +146,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 [cols="2,1,3",options="header"]
 |===
 | Branch | PR | State and next action
+| `spill-catalog-schema` | — | Stacked on `spill-write-policy`; rebase onto `develop` once #2097 merges, run `cargo test --lib -- record_spill:: record_store::tests:: --test-threads=1` and `cargo test -p proximadb-storage-common --lib proxima_arrow`, then PR.
 | `spill-write-policy` | #2097 | Lib tests 93/93 and clippy clean locally. Merge when CI is green on a current head; next slice is §5.1.
 |===
 
