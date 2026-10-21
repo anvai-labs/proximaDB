@@ -8216,9 +8216,11 @@ name = "proximadb-filter-expression"
 version = "0.4.2"
 dependencies = [
  "anyhow",
+ "proximadb-index-traits",
  "regex",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
