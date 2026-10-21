@@ -165,9 +165,13 @@ proto-check:
 .PHONY: dup-report dup-ratchet-report dup-ratchet-check dup-ratchet-baseline
 dup-report: ## Copy/paste duplication census (jscpd) — report lands in target/jscpd-report/
 	@echo " replaying the duplication census (flags inline — census config lives here; see docs/10-quality/DUPLICATION_CENSUS_2026_10_20.md)"
-	npx --yes jscpd . --format rust,python --min-tokens 50 --similarity \
+	npx --yes jscpd . --format rust,python,markdown,asciidoc --min-tokens 50 --similarity \
 		--reporters silent,json,markdown --output target/jscpd-report \
-		--ignore "**/target/**,**/node_modules/**,**/_generated/**,**/*_pb2*.py,third_party/**,docs/**,crates/foundation/proximadb-proto/src/proto/**,data/**,bench-data/**,artifacts/**,metadata/**,log/**,**/.git/**,ui/**,roadmap/**"
+		--ignore "**/target/**,**/node_modules/**,**/_generated/**,**/*_pb2*.py,third_party/**,crates/foundation/proximadb-proto/src/proto/**,data/**,bench-data/**,artifacts/**,metadata/**,log/**,**/.git/**,ui/**,roadmap/**"
+
+docs-semantics-report: ## Near-duplicate docs sections (advisory; tier-2 semantic report)
+	@echo "📄 docs semantic near-duplicate report (deterministic TF-IDF; advisory only)..."
+	python3 scripts/docs_semantic_report.py --top 20
 
 dup-ratchet-report: ## Current duplication numbers (non-blocking)
 	@echo "🧹 duplication ratchet report..."

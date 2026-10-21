@@ -55,6 +55,27 @@ class DupRatchetContract(unittest.TestCase):
         )
         self.assertIn("OK", result.stdout)
 
+    def test_ratchet_fails_on_absolute_lines_even_with_generous_pct(self):
+        # The line metric must fire even when percentage is comfortably
+        # under (the dilution case: a big clean import shrinks pct).
+        self._write_baseline(99.0)
+        doc = json.loads(BASELINE.read_text())
+        doc["duplicated_lines"] = 1000
+        BASELINE.write_text(json.dumps(doc, indent=2) + "\n")
+        result = run_check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicated lines", result.stderr + result.stdout)
+
+    def test_old_format_baseline_without_lines_key_passes(self):
+        # Baselines predating the dual metric (no duplicated_lines) fall
+        # back to percentage-only.
+        self._write_baseline(99.0)
+        doc = json.loads(BASELINE.read_text())
+        doc.pop("duplicated_lines", None)
+        BASELINE.write_text(json.dumps(doc, indent=2) + "\n")
+        result = run_check()
+        self.assertEqual(result.returncode, 0)
+
     def test_missing_baseline_fails_closed(self):
         BASELINE.unlink()
         result = run_check()

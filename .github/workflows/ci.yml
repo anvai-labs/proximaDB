@@ -374,6 +374,9 @@ jobs:
               - 'scripts/dup_ratchet.py'
               - 'docs/10-quality/DUP_RATCHET_BASELINE.json'
               - 'Makefile'
+              - 'docs/**'
+              - '*.md'
+              - '*.adoc'
             v1_proto_usage:
               - 'src/**'
               - 'crates/**'
@@ -1992,6 +1995,14 @@ jobs:
       # ADR-031 files, or a new per-file TD reusing a legacy id). Fires on rebase
       # so a number that collides with freshly-merged develop is caught before
       # merge. Convention: docs/12-design/HOW_TO_FILE_TD_AND_ADR.adoc.
+      # Advisory tier-2 semantic report: near-duplicate docs sections
+      # (paraphrased restatements token-CPD cannot see). Deterministic
+      # TF-IDF; prints the top pairs for the reviewer, never fails.
+      - name: Docs semantic near-duplicate report (advisory)
+        continue-on-error: true  # advisory: a pip/PyPI flake must not redden a gating job
+        run: |
+          pip install --quiet scikit-learn
+          python3 scripts/docs_semantic_report.py --top 10
       - name: Check TD/ADR id uniqueness
         run: python3 scripts/check_td_adr_unique.py
       - name: Check ADR/TD status coverage and index agreement

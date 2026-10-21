@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Duplication ratchet guard (redundancy pass 3 follow-up).
 
-Runs the jscpd census (config: .jscpd.json — the same one `make dup-report`
+Runs the jscpd census (flags inline in the Makefile `dup-report` target
 uses) and compares the duplication percentage against a committed baseline.
 Fails when duplication rises above baseline + tolerance, so the number can
 only go down (or the baseline must be deliberately refreshed with a
@@ -20,8 +20,11 @@ import sys
 from pathlib import Path
 
 # Clone counts can wobble by a handful on trivial diffs (comment moves,
-# renames); require a real regression before failing.
+# renames); require a real regression before failing. Percentage alone is
+# dilution-prone (a big clean import shrinks it); dup-lines alone is
+# growth-prone (a big clean feature grows it) — gate on BOTH.
 TOLERANCE_PERCENTAGE_POINTS = 0.05
+TOLERANCE_DUP_LINES = 150
 
 REPORT = Path("target/jscpd-report/jscpd-report.json")
 BASELINE = Path("docs/10-quality/DUP_RATCHET_BASELINE.json")
@@ -80,17 +83,29 @@ def main() -> None:
     if not BASELINE.exists():
         sys.exit(f"missing baseline {BASELINE}; run `make dup-ratchet-baseline` first")
 
-    baseline_pct = json.loads(BASELINE.read_text())["percentage"]
+    baseline_doc = json.loads(BASELINE.read_text())
+    baseline_pct = baseline_doc["percentage"]
+    baseline_lines = baseline_doc.get("duplicated_lines")
     limit = baseline_pct + TOLERANCE_PERCENTAGE_POINTS
-    print(f"baseline {baseline_pct:.3f}%  limit {limit:.3f}%  current {summary}")
+    line_limit = (baseline_lines + TOLERANCE_DUP_LINES) if baseline_lines else None
+    print(
+        f"baseline {baseline_pct:.3f}%  limit {limit:.3f}%  current {summary}"
+        + (f"  (line limit {line_limit})" if line_limit else "")
+    )
 
-    if args.mode == "check" and pct > limit:
+    def fail(metric, current, cap):
         sys.exit(
-            f"duplication ratchet: {pct:.3f}% exceeds the baseline limit {limit:.3f}%.\n"
+            f"duplication ratchet: {metric} {current} exceeds the baseline cap {cap}.\n"
             "Refactor the introduced duplication, or (if the increase is deliberate "
             "and justified) refresh the baseline via `make dup-ratchet-baseline` "
             "in the same PR."
         )
+
+    if args.mode == "check":
+        if pct > limit:
+            fail("duplication percentage", f"{pct:.3f}%", f"{limit:.3f}%")
+        if line_limit and total["duplicatedLines"] > line_limit:
+            fail("duplicated lines", total["duplicatedLines"], line_limit)
     print("OK" if args.mode == "check" else "(report-only)")
 
 
