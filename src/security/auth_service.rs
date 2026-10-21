@@ -138,10 +138,11 @@ pub static AUDIT_WRITE_FAILURES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Authentication methods supported
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub enum AuthenticationMethod {
     #[serde(rename = "sso")]
     SSO,
+    #[default]
     #[serde(rename = "jwt")]
     JWT,
     #[serde(rename = "api_key")]
