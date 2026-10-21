@@ -289,4 +289,45 @@ mod tests {
         assert_eq!(cost.estimated_vectors, 2000);
         assert_eq!(cost.estimated_bytes, 1024000);
     }
+
+    /// TST previously ignored `vector_ids` entirely — selective extraction
+    /// returned every record. The harmonization applies the same O(1) filter
+    /// the other engines use; pin the three semantics extract_vectors'
+    /// retain step must deliver (subset / zero / all).
+    #[test]
+    fn test_tst_vector_id_filter_semantics() {
+        use crate::storage::trait_components::extractor::build_id_filter;
+
+        let ids = vec!["v1".to_string(), "v3".to_string()];
+        let mut vectors: Vec<(String, &'static str)> = vec![
+            ("v1".to_string(), "a"),
+            ("v2".to_string(), "b"),
+            ("v3".to_string(), "c"),
+        ];
+
+        // Some(ids) → only the selected records survive.
+        if let Some(filter) = build_id_filter(Some(&ids)) {
+            vectors.retain(|(id, _)| filter.contains(id));
+        }
+        assert_eq!(
+            vectors
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["v1", "v3"]
+        );
+
+        // Some(empty) → zero records (matches every other engine: a
+        // selective request that names nothing extracts nothing).
+        let empty = Vec::new();
+        let mut all: Vec<(String, &'static str)> =
+            vec![("v1".to_string(), "a"), ("v2".to_string(), "b")];
+        if let Some(filter) = build_id_filter(Some(&empty)) {
+            all.retain(|(id, _)| filter.contains(id));
+        }
+        assert!(all.is_empty(), "Some(empty) must extract nothing");
+
+        // None → no filter, all records.
+        assert!(build_id_filter(None).is_none());
+    }
 }

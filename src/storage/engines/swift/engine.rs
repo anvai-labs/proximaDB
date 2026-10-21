@@ -2078,7 +2078,7 @@ mod tests {
     #[test]
     fn test_swift_filter_evaluation() {
         use proximadb_data_model::ProximaValue;
-        use proximadb_filter_expression::FilterExpression;
+        use proximadb_filter_expression::{ComparisonOperator, FilterExpression};
         use proximadb_records::{ProximaTree, ProximaTreeNode};
 
         // Create test records with metadata

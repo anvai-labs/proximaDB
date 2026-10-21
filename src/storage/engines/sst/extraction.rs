@@ -126,8 +126,9 @@ impl VectorExtractor for SstExtractor {
 
         // ID filter as a set, built once per extraction (was: a linear scan
         // of the requested-id Vec for EVERY record in every block).
-        let id_filter: Option<std::collections::HashSet<&String>> =
-            request.vector_ids.as_ref().map(|ids| ids.iter().collect());
+        let id_filter = crate::storage::trait_components::extractor::build_id_filter(
+            request.vector_ids.as_ref(),
+        );
 
         for record in records {
             let record_id = record
