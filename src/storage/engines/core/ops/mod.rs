@@ -31,8 +31,9 @@
 // NOTE: quantization modules removed - use compute module directly
 pub use proximadb_engine_core::ops_compression::compression_adapter; // extracted TD-DECOMP-81
 pub use proximadb_engine_core::ops_compression::compression_common; // extracted TD-DECOMP-81
+pub mod bulk_ingest;
 /// Universal performance optimization module for all storage engines
-pub mod performance_optimization;
+pub mod performance_optimization; // shared ingest_sorted_segment plumbing (redundancy pass 3)
 
 // Import common types used across the module
 

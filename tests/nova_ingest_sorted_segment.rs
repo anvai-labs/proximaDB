@@ -68,7 +68,7 @@ fn synthetic_batch(count: usize, dim: u32) -> Vec<ProximaRecord> {
 async fn nova_ingest_sorted_segment_writes_parquet_and_reports_engine_path() {
     let temp = tempfile::tempdir().expect("tempdir");
     let base_path = format!("file://{}", temp.path().display());
-    let collection_id = "phase_2f_b_test_collection";
+    let collection_id = "42";
     let records = synthetic_batch(8, 4);
 
     let engine = NovaEngine::new()
