@@ -785,6 +785,37 @@ pub trait UniversallyOptimized {
     }
 }
 
+/// Insert the standard `universal_*` optimizer metrics into a stats map.
+///
+/// Shared implementation for the `UniversallyOptimized` engines'
+/// `collect_performance_metrics` overrides (NOVA/RAPTOR/SWIFT/VIPER) — each
+/// engine keeps its own prefixed keys at the call site and appends this block
+/// for the optimizer's configuration surface.
+pub fn insert_universal_optimizer_metrics(
+    metrics: &mut HashMap<String, serde_json::Value>,
+    optimizer: &UniversalPerformanceOptimizer,
+) {
+    let strategy = optimizer.get_strategy();
+    metrics.insert(
+        "universal_optimization_strategy".to_string(),
+        serde_json::Value::String(format!("{:?}", strategy)),
+    );
+
+    let config = optimizer.get_config();
+    metrics.insert(
+        "universal_cache_size_mb".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(config.cache_size_mb)),
+    );
+    metrics.insert(
+        "universal_parallel_operations".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(config.parallel_operations)),
+    );
+    metrics.insert(
+        "universal_prefetching_enabled".to_string(),
+        serde_json::Value::Bool(config.enable_prefetching),
+    );
+}
+
 // Include comprehensive tests module
 // #[cfg(test)]
 // mod performance_optimization_tests;

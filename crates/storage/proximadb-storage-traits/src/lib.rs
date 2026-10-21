@@ -1425,6 +1425,39 @@ pub trait UnifiedStorageFormat: Send + Sync {
     }
 }
 
+/// Build the engine-level RLS predicate from a query context (spec §8).
+///
+/// Prefers the explicit tenant context's `tenant_id`, falling back to the
+/// user context's tenant; the principal is the user id. Returns `None` when
+/// neither is present (passthrough — no filtering).
+///
+/// This is the shared implementation behind the engine overrides of
+/// [`UnifiedStorageFormat::rls_record_filter`] (SST/NOVA/VIPER/HELIX); the
+/// trait default stays `None` for engines that do not override it.
+pub fn rls_predicate_from_ctx(ctx: &StorageQueryContext) -> Option<RlsRecordPredicate> {
+    // Prefer explicit tenant context (String); fall back to user context (Option<String>)
+    let tenant_id = ctx
+        .tenant_context
+        .as_ref()
+        .map(|tc| tc.tenant_id.as_str())
+        .or_else(|| {
+            ctx.user_context
+                .as_ref()
+                .and_then(|uc| uc.tenant_id.as_deref())
+        });
+
+    let principal = ctx.user_context.as_ref().map(|uc| uc.user_id.as_str());
+
+    if tenant_id.is_none() && principal.is_none() {
+        return None;
+    }
+
+    Some(RlsRecordPredicate {
+        required_tenant_id: tenant_id.map(str::to_string),
+        required_principal: principal.map(str::to_string),
+    })
+}
+
 /// Legacy alias for [`UnifiedStorageFormat`] (engines → formats convergence).
 /// ProximaDB's storage "engines" (SST/VIPER/HELIX/NOVA/…) are format/layout
 /// specializations; `UnifiedStorageFormat` is now the canonical name, aligned
@@ -1498,5 +1531,73 @@ mod rls_tests {
         assert!(!pred.is_passthrough());
         assert_eq!(pred.required_tenant_id.as_deref(), Some("acme"));
         assert_eq!(pred.required_principal.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn test_rls_predicate_from_ctx_prefers_tenant_context() {
+        use super::{StorageQueryContext, rls_predicate_from_ctx};
+        use proximadb_tenant::{RbacTenantContext, UnifiedUserContext};
+        use std::sync::Arc;
+
+        let ctx = StorageQueryContext::new(
+            Arc::new(proximadb_search_types::search_params::SearchParams::default()),
+            Arc::new(proximadb_proto::proximadb_v1::Collection::default()),
+        )
+        .with_tenant_context(Some(RbacTenantContext {
+            tenant_id: "tenant-ctx".to_string(),
+            tenant_name: "Tenant Context".to_string(),
+            security_policy: "default".to_string(),
+            compliance_frameworks: Vec::new(),
+        }));
+        let ctx = StorageQueryContext {
+            user_context: Some(UnifiedUserContext {
+                user_id: "alice".to_string(),
+                tenant_id: Some("user-ctx".to_string()),
+                ..UnifiedUserContext::anonymous()
+            }),
+            ..ctx
+        };
+
+        let pred = rls_predicate_from_ctx(&ctx).expect("tenant + principal present");
+        // Explicit tenant context wins over the user context's tenant.
+        assert_eq!(pred.required_tenant_id.as_deref(), Some("tenant-ctx"));
+        assert_eq!(pred.required_principal.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn test_rls_predicate_from_ctx_falls_back_to_user_tenant() {
+        use super::{StorageQueryContext, rls_predicate_from_ctx};
+        use proximadb_tenant::UnifiedUserContext;
+        use std::sync::Arc;
+
+        let ctx = StorageQueryContext::new(
+            Arc::new(proximadb_search_types::search_params::SearchParams::default()),
+            Arc::new(proximadb_proto::proximadb_v1::Collection::default()),
+        );
+        let ctx = StorageQueryContext {
+            user_context: Some(UnifiedUserContext {
+                user_id: "bob".to_string(),
+                tenant_id: Some("user-ctx".to_string()),
+                ..UnifiedUserContext::anonymous()
+            }),
+            ..ctx
+        };
+
+        let pred = rls_predicate_from_ctx(&ctx).expect("fallback tenant present");
+        assert_eq!(pred.required_tenant_id.as_deref(), Some("user-ctx"));
+        assert_eq!(pred.required_principal.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn test_rls_predicate_from_ctx_none_when_context_absent() {
+        use super::{StorageQueryContext, rls_predicate_from_ctx};
+        use std::sync::Arc;
+
+        let ctx = StorageQueryContext::new(
+            Arc::new(proximadb_search_types::search_params::SearchParams::default()),
+            Arc::new(proximadb_proto::proximadb_v1::Collection::default()),
+        );
+
+        assert!(rls_predicate_from_ctx(&ctx).is_none());
     }
 }
