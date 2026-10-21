@@ -42,13 +42,12 @@ async fn test_sst_collection_with_proper_routing() -> anyhow::Result<()> {
         );
         proximadb_records::ProximaRecord {
             oid,
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                dim: values.len() as u32,
-                values: proximadb_records::EmbeddingValues::Fp32(values),
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                values.len() as u32,
+                values,
+            )],
             props,
             record_version: 1,
             created_at_ns: ts * 1_000_000_000,

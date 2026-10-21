@@ -447,16 +447,15 @@ impl FlatRow {
                 let dim = values.len() as u32;
                 // INT-2.5b: FlatRow stores fp32, wrap in the typed
                 // variant on the way out.
-                EmbeddingCell {
-                    model_id: embedding_model_ids
+                EmbeddingCell::new_fp32(
+                    embedding_model_ids
                         .get(i)
                         .cloned()
                         .unwrap_or_else(|| format!("model_{i}")),
-                    modality: "dense".into(),
-                    values: proximadb_records::EmbeddingValues::Fp32(values),
+                    "dense",
                     dim,
-                    ..Default::default()
-                }
+                    values,
+                )
             })
             .collect();
 
@@ -766,13 +765,12 @@ mod tests {
                 edge_type: "knows".into(),
                 weight: Some(0.75),
             }),
-            embeddings: vec![EmbeddingCell {
-                model_id: "text-embed-v1".into(),
-                modality: "text".into(),
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.1, 0.2, 0.3, 0.4]),
-                dim: 4,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "text-embed-v1",
+                "text",
+                4,
+                vec![0.1, 0.2, 0.3, 0.4],
+            )],
             ..Default::default()
         }
     }

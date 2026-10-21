@@ -969,13 +969,12 @@ mod tests {
     fn record(oid: &str) -> proximadb_records::ProximaRecord {
         proximadb_records::ProximaRecord {
             oid: oid.to_string(),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "test".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: 2,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![1.0, 2.0]),
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "test",
+                "dense_vector",
+                2,
+                vec![1.0, 2.0],
+            )],
             ..Default::default()
         }
     }
@@ -1425,13 +1424,12 @@ mod tests {
             created_at_ns: 1_000 + seed as i64,
             updated_at_ns: 1_000 + seed as i64,
             record_version: 1,
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "test".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: 4,
-                values: proximadb_records::EmbeddingValues::Fp32(values),
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "test",
+                "dense_vector",
+                4,
+                values,
+            )],
             ..Default::default()
         }
     }

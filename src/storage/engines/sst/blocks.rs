@@ -165,13 +165,12 @@ mod tests {
         ProximaRecord {
             oid: "row-1".to_string(),
             created_at_ns: 12_345_000_000,
-            embeddings: vec![EmbeddingCell {
-                model_id: "model-a".to_string(),
-                modality: "text".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-                dim: 3,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "model-a",
+                "text",
+                3,
+                vec![1.0, 2.0, 3.0],
+            )],
             props: [
                 (
                     "category".to_string(),

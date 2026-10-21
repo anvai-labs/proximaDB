@@ -33,13 +33,12 @@ async fn test_end_to_end_streaming() {
         let records: Vec<proximadb_records::ProximaRecord> = (0..100)
             .map(|i| proximadb_records::ProximaRecord {
                 oid: format!("vec_{}_{}", batch, i),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    dim: 128,
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![0.1 * (i as f32); 128]),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default",
+                    "vector",
+                    128,
+                    vec![0.1 * (i as f32); 128],
+                )],
                 record_version: 1,
                 ..Default::default()
             })
@@ -89,13 +88,12 @@ async fn test_backpressure_signaling() {
     let records: Vec<proximadb_records::ProximaRecord> = (0..128)
         .map(|i| proximadb_records::ProximaRecord {
             oid: format!("vec_{}", i),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                dim: 128,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.1; 128]),
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                128,
+                vec![0.1; 128],
+            )],
             record_version: 1,
             ..Default::default()
         })
@@ -130,13 +128,12 @@ async fn test_concurrent_sessions() {
                 let records: Vec<proximadb_records::ProximaRecord> = (0..50)
                     .map(|j| proximadb_records::ProximaRecord {
                         oid: format!("vec_{}_{}", i, j),
-                        embeddings: vec![proximadb_records::EmbeddingCell {
-                            model_id: "default".to_string(),
-                            modality: "vector".to_string(),
-                            dim: 64,
-                            values: proximadb_records::EmbeddingValues::Fp32(vec![0.1; 64]),
-                            ..Default::default()
-                        }],
+                        embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                            "default",
+                            "vector",
+                            64,
+                            vec![0.1; 64],
+                        )],
                         record_version: 1,
                         ..Default::default()
                     })
@@ -178,13 +175,12 @@ async fn test_session_stats() {
     let records: Vec<proximadb_records::ProximaRecord> = (0..100)
         .map(|i| proximadb_records::ProximaRecord {
             oid: format!("vec_{}", i),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                dim: 64,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.1; 64]),
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                64,
+                vec![0.1; 64],
+            )],
             record_version: 1,
             ..Default::default()
         })
@@ -286,13 +282,12 @@ async fn test_rate_limiter_integration() {
     let records: Vec<proximadb_records::ProximaRecord> = (0..100)
         .map(|i| proximadb_records::ProximaRecord {
             oid: format!("vec_{}", i),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                dim: 64,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.1; 64]),
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                64,
+                vec![0.1; 64],
+            )],
             record_version: 1,
             ..Default::default()
         })
@@ -305,13 +300,12 @@ async fn test_rate_limiter_integration() {
     let records: Vec<proximadb_records::ProximaRecord> = (100..200)
         .map(|i| proximadb_records::ProximaRecord {
             oid: format!("vec_{}", i),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                dim: 64,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.1; 64]),
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                64,
+                vec![0.1; 64],
+            )],
             record_version: 1,
             ..Default::default()
         })

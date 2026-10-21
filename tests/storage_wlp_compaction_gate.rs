@@ -27,13 +27,12 @@ fn record(id: &str) -> ProximaRecord {
         created_at_ns: 12_345_000_000,
         updated_at_ns: 12_345_000_000,
         record_version: 1,
-        embeddings: vec![EmbeddingCell {
-            model_id: "test".to_string(),
-            modality: "dense_vector".to_string(),
-            dim: 4,
-            values: EmbeddingValues::Fp32(vec![1.0, 0.0, 0.0, 0.0]),
-            ..Default::default()
-        }],
+        embeddings: vec![EmbeddingCell::new_fp32(
+            "test",
+            "dense_vector",
+            4,
+            vec![1.0, 0.0, 0.0, 0.0],
+        )],
         ..ProximaRecord::default()
     }
 }

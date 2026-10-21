@@ -858,13 +858,12 @@ mod tests {
     fn record_with_cell(oid: &str, values: EmbeddingValues) -> ProximaRecord {
         ProximaRecord {
             oid: oid.to_string(),
-            embeddings: vec![EmbeddingCell {
-                model_id: "test".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: values.len() as u32,
+            embeddings: vec![EmbeddingCell::new_typed(
+                "test",
+                "dense_vector",
+                values.len() as u32,
                 values,
-                ..Default::default()
-            }],
+            )],
             ..Default::default()
         }
     }
@@ -947,40 +946,26 @@ mod tests {
             ProximaRecord {
                 oid: "r0".into(),
                 embeddings: vec![
-                    EmbeddingCell {
-                        model_id: "fp32-col".into(),
-                        modality: "v".into(),
-                        values: EmbeddingValues::Fp32(vec![1.0, 2.0]),
-                        dim: 2,
-                        ..Default::default()
-                    },
-                    EmbeddingCell {
-                        model_id: "fp16-col".into(),
-                        modality: "v".into(),
-                        values: EmbeddingValues::Fp16(vec![half::f16::from_f32(7.0)]),
-                        dim: 1,
-                        ..Default::default()
-                    },
+                    EmbeddingCell::new_fp32("fp32-col", "v", 2, vec![1.0, 2.0]),
+                    EmbeddingCell::new_typed(
+                        "fp16-col",
+                        "v",
+                        1,
+                        EmbeddingValues::Fp16(vec![half::f16::from_f32(7.0)]),
+                    ),
                 ],
                 ..Default::default()
             },
             ProximaRecord {
                 oid: "r1".into(),
                 embeddings: vec![
-                    EmbeddingCell {
-                        model_id: "fp32-col".into(),
-                        modality: "v".into(),
-                        values: EmbeddingValues::Fp32(vec![3.0, 4.0]),
-                        dim: 2,
-                        ..Default::default()
-                    },
-                    EmbeddingCell {
-                        model_id: "fp16-col".into(),
-                        modality: "v".into(),
-                        values: EmbeddingValues::Fp16(vec![half::f16::from_f32(8.0)]),
-                        dim: 1,
-                        ..Default::default()
-                    },
+                    EmbeddingCell::new_fp32("fp32-col", "v", 2, vec![3.0, 4.0]),
+                    EmbeddingCell::new_typed(
+                        "fp16-col",
+                        "v",
+                        1,
+                        EmbeddingValues::Fp16(vec![half::f16::from_f32(8.0)]),
+                    ),
                 ],
                 ..Default::default()
             },

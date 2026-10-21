@@ -24,13 +24,9 @@ fn create_test_vector(id: &str, vector: Vec<f32>) -> ProximaRecord {
         ProximaTreeNode::Value(ProximaValue::String("test_value".to_string())),
     );
     if !vector.is_empty() {
-        record.embeddings.push(EmbeddingCell {
-            model_id: "default".to_string(),
-            modality: "vector".to_string(),
-            values: proximadb_records::EmbeddingValues::Fp32(vector),
-            dim,
-            ..Default::default()
-        });
+        record
+            .embeddings
+            .push(EmbeddingCell::new_fp32("default", "vector", dim, vector));
     }
     record
 }

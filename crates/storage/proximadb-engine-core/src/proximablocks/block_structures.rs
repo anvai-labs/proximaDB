@@ -4731,13 +4731,8 @@ impl ProximaDataBlock {
                     ..Default::default()
                 };
                 if !vector.is_empty() {
-                    r.embeddings.push(EmbeddingCell {
-                        model_id: "default".to_string(),
-                        modality: "vector".to_string(),
-                        values: proximadb_records::EmbeddingValues::Fp32(vector),
-                        dim,
-                        ..Default::default()
-                    });
+                    r.embeddings
+                        .push(EmbeddingCell::new_fp32("default", "vector", dim, vector));
                 }
                 records.push(r);
             }
@@ -4761,13 +4756,8 @@ impl ProximaDataBlock {
                     ..Default::default()
                 };
                 if !vector.is_empty() {
-                    r.embeddings.push(EmbeddingCell {
-                        model_id: "default".to_string(),
-                        modality: "vector".to_string(),
-                        values: proximadb_records::EmbeddingValues::Fp32(vector),
-                        dim,
-                        ..Default::default()
-                    });
+                    r.embeddings
+                        .push(EmbeddingCell::new_fp32("default", "vector", dim, vector));
                 }
                 records.push(r);
             }
@@ -4997,13 +4987,9 @@ impl ProximaDataBlock {
                 oid: format!("gv_vec_{:06}", i), // Generated ID for GroupedFieldEncodedAndCompressed
                 ..Default::default()
             };
-            record.embeddings.push(EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vector),
-                dim,
-                ..Default::default()
-            });
+            record
+                .embeddings
+                .push(EmbeddingCell::new_fp32("default", "vector", dim, vector));
             records.push(record);
         }
 
@@ -5144,13 +5130,9 @@ impl ProximaDataBlock {
                 oid: format!("tv_vec_{:06}", i), // Generated ID for TransposeFieldEncodedAndCompressed
                 ..Default::default()
             };
-            record.embeddings.push(EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vector),
-                dim,
-                ..Default::default()
-            });
+            record
+                .embeddings
+                .push(EmbeddingCell::new_fp32("default", "vector", dim, vector));
             records.push(record);
         }
 
@@ -5213,13 +5195,9 @@ impl ProximaDataBlock {
                 oid: format!("tv_vec_{:06}", row_idx), // Generated ID for TransposeFieldEncodedAndCompressed
                 ..Default::default()
             };
-            record.embeddings.push(EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vector),
-                dim,
-                ..Default::default()
-            });
+            record
+                .embeddings
+                .push(EmbeddingCell::new_fp32("default", "vector", dim, vector));
             records.push(record);
         }
 
@@ -5385,13 +5363,9 @@ impl ProximaDataBlock {
                 oid: format!("gb_vec_{:06}", row_idx), // Generated ID for GroupedBlockCompressed
                 ..Default::default()
             };
-            record.embeddings.push(EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vector),
-                dim,
-                ..Default::default()
-            });
+            record
+                .embeddings
+                .push(EmbeddingCell::new_fp32("default", "vector", dim, vector));
             records.push(record);
         }
 
@@ -5533,13 +5507,9 @@ impl ProximaDataBlock {
                 oid: format!("tb_vec_{:06}", row_idx), // Generated ID for TransposeBlockCompressed
                 ..Default::default()
             };
-            record.embeddings.push(EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vector),
-                dim,
-                ..Default::default()
-            });
+            record
+                .embeddings
+                .push(EmbeddingCell::new_fp32("default", "vector", dim, vector));
             records.push(record);
         }
 

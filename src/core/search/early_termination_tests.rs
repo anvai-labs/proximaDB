@@ -30,13 +30,12 @@ mod tests {
             props: ProximaTree::new(),
             refs: Vec::new(),
             edge: None,
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "dense_vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-                dim: 3,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "dense_vector",
+                3,
+                vec![1.0, 2.0, 3.0],
+            )],
             sequence: None,
             labels: LabelSet::new(),
             ..Default::default()

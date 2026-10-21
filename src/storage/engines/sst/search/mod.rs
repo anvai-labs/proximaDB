@@ -3014,17 +3014,14 @@ mod tests {
                 created_at_ns: ts_ns,
                 updated_at_ns: ts_ns,
                 record_version: 1,
-                embeddings: vec![EmbeddingCell {
-                    model_id: "test".to_string(),
-                    modality: "dense_vector".to_string(),
-                    dim: dim as u32,
-                    values: EmbeddingValues::Fp32(
-                        (0..dim)
-                            .map(|j| ((idx as f32) * 0.1 + (j as f32) * 0.01).sin())
-                            .collect(),
-                    ),
-                    ..Default::default()
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "test",
+                    "dense_vector",
+                    dim as u32,
+                    (0..dim)
+                        .map(|j| ((idx as f32) * 0.1 + (j as f32) * 0.01).sin())
+                        .collect(),
+                )],
                 ..ProximaRecord::default()
             }
         };
@@ -3179,12 +3176,8 @@ mod tests {
                 tenant_id: "t".into(),
                 ..Default::default()
             };
-            r.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim: v.len() as u32,
-                values: EmbeddingValues::Fp32(v),
-                ..Default::default()
-            });
+            r.embeddings
+                .push(EmbeddingCell::new_fp32("", "dense", v.len() as u32, v));
             r
         };
         let records: Vec<_> = (0..5)

@@ -3561,13 +3561,12 @@ impl DmlService {
         let embeddings = if result.vector.is_empty() {
             Vec::new()
         } else {
-            vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                dim: result.vector.len() as u32,
-                values: proximadb_records::EmbeddingValues::Fp32(result.vector),
-                ..Default::default()
-            }]
+            vec![EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                result.vector.len() as u32,
+                result.vector,
+            )]
         };
 
         ProximaRecord {

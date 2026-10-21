@@ -1311,13 +1311,12 @@ mod tests {
     ) -> ProximaRecord {
         let dim = values.len() as u32;
         let mut record = make_record(oid, tenant, ts);
-        record.embeddings = vec![EmbeddingCell {
-            model_id: "text-embed-v1".into(),
-            modality: "dense".into(),
-            values: proximadb_records::EmbeddingValues::Fp32(values),
+        record.embeddings = vec![EmbeddingCell::new_fp32(
+            "text-embed-v1",
+            "dense",
             dim,
-            ..Default::default()
-        }];
+            values,
+        )];
         record
     }
 

@@ -123,13 +123,12 @@ fn unit_with_first(first: f32, dim: usize) -> Vec<f32> {
 fn query_record(oid: &str, vec: Vec<f32>) -> ProximaRecord {
     ProximaRecord {
         oid: oid.to_string(),
-        embeddings: vec![EmbeddingCell {
-            model_id: "q".to_string(),
-            modality: "dense_vector".to_string(),
-            dim: vec.len() as u32,
-            values: EmbeddingValues::Fp32(vec),
-            ..Default::default()
-        }],
+        embeddings: vec![EmbeddingCell::new_fp32(
+            "q",
+            "dense_vector",
+            vec.len() as u32,
+            vec,
+        )],
         ..ProximaRecord::default()
     }
 }

@@ -1280,12 +1280,12 @@ mod tests {
                 props,
                 ..Default::default()
             };
-            r.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim: 8,
-                values: EmbeddingValues::Fp32(vec![i as f32 * 0.001; 8]),
-                ..Default::default()
-            });
+            r.embeddings.push(EmbeddingCell::new_fp32(
+                "",
+                "dense",
+                8,
+                vec![i as f32 * 0.001; 8],
+            ));
             writer.add_record(&r).expect("add record");
         }
         let meta = writer.finish().expect("finish segment");

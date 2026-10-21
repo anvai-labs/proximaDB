@@ -296,13 +296,12 @@ mod tests {
             oid: id.to_string(),
             created_at_ns: 12_345_000_000,
             updated_at_ns: 12_345_000_000,
-            embeddings: vec![EmbeddingCell {
-                model_id: "test".to_string(),
-                modality: "vector".to_string(),
-                dim: vector.len() as u32,
-                values: proximadb_records::EmbeddingValues::Fp32(vector),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "test",
+                "vector",
+                vector.len() as u32,
+                vector,
+            )],
             ..Default::default()
         }
     }

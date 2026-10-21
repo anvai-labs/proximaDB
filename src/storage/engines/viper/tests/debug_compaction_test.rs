@@ -160,13 +160,12 @@ fn create_test_vector(id: &str, dimension: usize) -> ProximaRecord {
         .collect();
     ProximaRecord {
         oid: id.to_string(),
-        embeddings: vec![EmbeddingCell {
-            model_id: "default".to_string(),
-            modality: "vector".to_string(),
-            dim: dimension as u32,
-            values: proximadb_records::EmbeddingValues::Fp32(values),
-            ..Default::default()
-        }],
+        embeddings: vec![EmbeddingCell::new_fp32(
+            "default",
+            "vector",
+            dimension as u32,
+            values,
+        )],
         props,
         record_version: 1,
         created_at_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),

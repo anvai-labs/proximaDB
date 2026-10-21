@@ -4855,13 +4855,12 @@ mod tests {
         let record = ProximaRecord {
             oid: "p1".to_string(),
             variation_id: Some("products".to_string()),
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: 4,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.1, 0.2, 0.3, 0.4]),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "dense_vector",
+                4,
+                vec![0.1, 0.2, 0.3, 0.4],
+            )],
             ..Default::default()
         };
 
@@ -5103,11 +5102,8 @@ mod tests {
                 ("amount", ProximaValue::Int64(30)),
             ],
         );
-        r0.embeddings.push(EmbeddingCell {
-            values: EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-            dim: 3,
-            ..Default::default()
-        });
+        r0.embeddings
+            .push(EmbeddingCell::new_fp32("", "", 3, vec![1.0, 2.0, 3.0]));
         let r1 = props_record(
             "o2",
             "orders",
@@ -5208,12 +5204,12 @@ mod tests {
             variation_id: Some("vectors".to_string()),
             created_at_ns: 1_700_000_000_000_000_000,
             props,
-            embeddings: vec![EmbeddingCell {
-                modality: "dense".into(),
-                dim: 4,
-                values: EmbeddingValues::Fp32(vec![0.1, 0.2, 0.3, 0.4]),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "",
+                "dense",
+                4,
+                vec![0.1, 0.2, 0.3, 0.4],
+            )],
             ..Default::default()
         };
 
@@ -5358,12 +5354,12 @@ mod tests {
                 variation_id: Some("docs".to_string()),
                 created_at_ns: 1_700_000_000_000_000_000 + i as i64,
                 props,
-                embeddings: vec![EmbeddingCell {
-                    modality: "dense".into(),
-                    dim: 8,
-                    values: EmbeddingValues::Fp32((0..8).map(|d| ((i + d) as f32).sin()).collect()),
-                    ..Default::default()
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "",
+                    "dense",
+                    8,
+                    (0..8).map(|d| ((i + d) as f32).sin()).collect(),
+                )],
                 ..Default::default()
             };
             muts.push(TableRecordMutation::new(

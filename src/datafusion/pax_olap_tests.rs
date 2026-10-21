@@ -1081,12 +1081,9 @@ mod tests {
                 updated_at_ns: ts,
                 ..Default::default()
             };
-            record.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim: 32,
-                values: EmbeddingValues::Fp32(vec![0.5; 32]),
-                ..Default::default()
-            });
+            record
+                .embeddings
+                .push(EmbeddingCell::new_fp32("", "dense", 32, vec![0.5; 32]));
             writer.add_record(&record).expect("add record");
         }
         writer.finish().expect("finish v4 segment");
@@ -1261,12 +1258,8 @@ mod tests {
                 tenant_id: tenant.into(),
                 ..Default::default()
             };
-            r.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim: 32,
-                values: EmbeddingValues::Fp32(vec![0.5; 32]),
-                ..Default::default()
-            });
+            r.embeddings
+                .push(EmbeddingCell::new_fp32("", "dense", 32, vec![0.5; 32]));
             r
         };
         let records = vec![
@@ -1428,12 +1421,8 @@ mod tests {
                     updated_at_ns: ts,
                     ..Default::default()
                 };
-                r.embeddings.push(EmbeddingCell {
-                    modality: "dense".into(),
-                    dim: 32,
-                    values: EmbeddingValues::Fp32(vec![0.5; 32]),
-                    ..Default::default()
-                });
+                r.embeddings
+                    .push(EmbeddingCell::new_fp32("", "dense", 32, vec![0.5; 32]));
                 writer.add_record(&r).expect("add record");
             }
             writer.finish().expect("finish v3 baseline");
@@ -1469,12 +1458,8 @@ mod tests {
                     updated_at_ns: ts,
                     ..Default::default()
                 };
-                r.embeddings.push(EmbeddingCell {
-                    modality: "dense".into(),
-                    dim: 32,
-                    values: EmbeddingValues::Fp32(vec![0.5; 32]),
-                    ..Default::default()
-                });
+                r.embeddings
+                    .push(EmbeddingCell::new_fp32("", "dense", 32, vec![0.5; 32]));
                 writer.add_record(&r).expect("add record");
             }
             writer.finish().expect("finish v4");
@@ -1594,12 +1579,13 @@ mod tests {
                 updated_at_ns: ts,
                 ..Default::default()
             };
-            r.embeddings.push(proximadb_records::EmbeddingCell {
-                modality: "dense".into(),
-                dim: 32,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.5; 32]),
-                ..Default::default()
-            });
+            r.embeddings
+                .push(proximadb_records::EmbeddingCell::new_fp32(
+                    "",
+                    "dense",
+                    32,
+                    vec![0.5; 32],
+                ));
             writer.add_record(&r).expect("add record");
         }
         writer.finish().expect("finish");

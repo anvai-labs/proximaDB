@@ -4204,13 +4204,9 @@ fn proxima_record_from_batch_parts(
     let modality = proxima_record_modality(&props);
     proximadb_records::ProximaRecord {
         oid,
-        embeddings: vec![proximadb_records::EmbeddingCell {
-            model_id: "default".to_string(),
-            modality,
-            dim,
-            values: proximadb_records::EmbeddingValues::Fp32(values),
-            ..Default::default()
-        }],
+        embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+            "default", modality, dim, values,
+        )],
         props,
         created_at_ns: now_ns,
         updated_at_ns: now_ns,
@@ -4243,13 +4239,9 @@ fn python_to_proxima_record(
 
     Ok(proximadb_records::ProximaRecord {
         oid,
-        embeddings: vec![proximadb_records::EmbeddingCell {
-            model_id: "default".to_string(),
-            modality,
-            dim,
-            values: proximadb_records::EmbeddingValues::Fp32(values),
-            ..Default::default()
-        }],
+        embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+            "default", modality, dim, values,
+        )],
         props,
         created_at_ns: now_ns,
         updated_at_ns: now_ns,

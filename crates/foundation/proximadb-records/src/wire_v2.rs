@@ -238,14 +238,7 @@ mod tests {
 
     #[test]
     fn fp32_cell_round_trips_through_v2_bincode_bit_exact() {
-        let original = EmbeddingCell {
-            model_id: "test".to_string(),
-            modality: "dense_vector".to_string(),
-            dim: 4,
-            values: EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0, 4.0]),
-            precision: EmbeddingScalarType::Fp32,
-            ..Default::default()
-        };
+        let original = EmbeddingCell::new_fp32("test", "dense_vector", 4, vec![1.0, 2.0, 3.0, 4.0]);
         let v2: EmbeddingCellV2 = (&original).into();
         let bytes = bincode::serialize(&v2).expect("v2 bincode serialize");
         let decoded: EmbeddingCellV2 = bincode::deserialize(&bytes).expect("decode");
@@ -296,12 +289,7 @@ mod tests {
         let recs = [
             ProximaRecord {
                 oid: "fp32-rec".to_string(),
-                embeddings: vec![EmbeddingCell {
-                    values: EmbeddingValues::Fp32(vec![1.0, 2.0]),
-                    precision: EmbeddingScalarType::Fp32,
-                    dim: 2,
-                    ..Default::default()
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32("", "", 2, vec![1.0, 2.0])],
                 ..ProximaRecord::default()
             },
             ProximaRecord {

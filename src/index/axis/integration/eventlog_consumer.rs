@@ -783,13 +783,9 @@ impl AxisEventLogConsumer {
                         created_at_ns: now_ns,
                         updated_at_ns: now_ns,
                         props,
-                        embeddings: vec![proximadb_records::EmbeddingCell {
-                            model_id: "default".to_string(),
-                            modality: "vector".to_string(),
-                            values: proximadb_records::EmbeddingValues::Fp32(fp32_vec),
-                            dim,
-                            ..Default::default()
-                        }],
+                        embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                            "default", "vector", dim, fp32_vec,
+                        )],
                         ..Default::default()
                     }
                 })

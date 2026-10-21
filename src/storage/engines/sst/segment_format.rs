@@ -5190,12 +5190,9 @@ mod tests {
                 updated_at_ns: 1_000 + row as i64,
                 ..Default::default()
             };
-            record.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim: 16,
-                values: EmbeddingValues::Fp32(vec![0.5; 16]),
-                ..Default::default()
-            });
+            record
+                .embeddings
+                .push(EmbeddingCell::new_fp32("", "dense", 16, vec![0.5; 16]));
             writer.add_record(&record).expect("add record");
         }
         writer.finish().expect("finish v4+C segment");
@@ -5871,12 +5868,8 @@ mod tests {
         .with_two_level(model);
         for row in 0..4usize {
             let mut record = rec(&format!("row-{row}"), row as i64, vec![row as f32; DIM]);
-            record.embeddings[0] = EmbeddingCell {
-                modality: "dense".to_string(),
-                dim: DIM as u32,
-                values: EmbeddingValues::Fp32(vec![row as f32; DIM]),
-                ..EmbeddingCell::default()
-            };
+            record.embeddings[0] =
+                EmbeddingCell::new_fp32("", "dense", DIM as u32, vec![row as f32; DIM]);
             writer.add_record(&record).expect("append record");
         }
         writer.finish().expect("finish PAX");
@@ -6230,12 +6223,8 @@ mod tests {
             ..Default::default()
         };
         let dim = vec.len();
-        r.embeddings.push(EmbeddingCell {
-            modality: "dense".into(),
-            dim: dim as u32,
-            values: EmbeddingValues::Fp32(vec),
-            ..Default::default()
-        });
+        r.embeddings
+            .push(EmbeddingCell::new_fp32("", "dense", dim as u32, vec));
         r
     }
 

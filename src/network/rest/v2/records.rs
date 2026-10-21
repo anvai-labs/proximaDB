@@ -1203,13 +1203,12 @@ pub async fn insert_records(
             updated_at_ns: now_ns,
             origin: Some("v2_api".to_string()),
             props,
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "dense_vector".to_string(),
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "dense_vector",
                 dim,
-                values: proximadb_records::EmbeddingValues::Fp32(vector),
-                ..Default::default()
-            }],
+                vector,
+            )],
             ..ProximaRecord::default()
         };
 
