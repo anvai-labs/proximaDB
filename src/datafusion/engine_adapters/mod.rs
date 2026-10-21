@@ -70,6 +70,46 @@ pub use pax_table_provider::{PaxTableProvider, register_pax_location};
 pub use sst_adapter::{SstSplitReader, SstTableProvider};
 pub use viper_adapter::{ViperSplitReader, ViperTableProvider};
 
+use std::sync::Arc;
+
+use arrow_schema::SchemaRef;
+use datafusion::error::Result as DFResult;
+use datafusion::logical_expr::Expr;
+use datafusion::physical_plan::ExecutionPlan;
+
+use crate::datafusion::proxima_scan_exec::{ProximaScanExec, SplitReader};
+use crate::storage::formats::FileSplit;
+
+/// Shared body of the engine-adapter `TableProvider::scan` implementations
+/// (SST / VIPER / HELIX): feed the discovered `splits` and the per-engine
+/// `reader` into the `ProximaScanExec` builder seam (ADR-052).
+///
+/// The engine-specific part — constructing the `SplitReader` — stays at the
+/// call site; everything from `.schema(...)` to `.build()` is identical
+/// across adapters.
+pub(crate) fn build_scan_exec(
+    schema: SchemaRef,
+    collection_name: String,
+    splits: Vec<FileSplit>,
+    reader: Arc<dyn SplitReader>,
+    projection: Option<&Vec<usize>>,
+    filters: &[Expr],
+    limit: Option<usize>,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    let exec = ProximaScanExec::builder()
+        .schema(schema)
+        .splits(splits)
+        .reader(reader)
+        .projection(projection.cloned())
+        .filters(filters.to_vec())
+        .limit(limit)
+        .collection_name(collection_name)
+        .batch_size(8192)
+        .build()?;
+
+    Ok(Arc::new(exec))
+}
+
 /// Common schema/utility helpers shared across the engine adapters.
 pub mod common {
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
