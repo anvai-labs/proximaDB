@@ -53,7 +53,7 @@
 // Re-exported below for backward compatibility
 
 // ### 4. Schema & Metadata Management
-// - **ColumnarSchema**: Unified schema creation and validation
+// - **ColumnarSchemaBuilder**: unified schema creation and validation (storage-common)
 // - **NativeMetadataHandler**: Efficient metadata filtering and projection
 // - **FilterableColumnSpec**: Define filterable columns with proper types
 // - **Schema Evolution**: Support for schema versioning and migration
@@ -197,9 +197,7 @@ pub use self::metadata_filter_strategy::{
     FilterPerformanceMetrics, MetadataFilterAnalyzer, MetadataFilterStrategy,
 };
 pub use batch_operations::ColumnarBatchOperations;
-pub use columnar_schema::ColumnarSchema;
 pub use footer_cache::{FooterCacheConfig, FooterCacheStats, ParquetFooterCache, WarmingStrategy};
-pub use proximadb_engine_core::proximablocks::columnar_schema_types as columnar_schema; // extracted TD-DECOMP-77
 pub use utilities::ColumnarUtilities;
 
 pub use config_builder::{

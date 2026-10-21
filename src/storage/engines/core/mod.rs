@@ -16,7 +16,6 @@ pub mod metadata_serializer; // Shared metadata serializer helpers (DRY across e
 pub mod ops; // Common operations: compression, encoding, optimization
 pub mod parquet_format_serializer; // Parquet format (VIPER) metadata serializer
 pub mod pca; // PCA model management for spatial clustering
-pub mod progressive; // ISP-compliant progressive search stages
 pub mod proximablocks_compact_serializer; // ProximaBlocks compact (SWIFT) metadata serializer
 pub mod proximablocks_format_serializer; // ProximaBlocks format (HELIX) metadata serializer
 pub mod read_strategy; // Unified read access strategy for all engines
@@ -29,15 +28,10 @@ pub use filter_evaluator::{
     evaluate_filter_strings,
 };
 pub use formats::{
-    columnar::{ColumnarSchema, ParquetIOLayer, ParquetQueryEngine},
+    columnar::{ParquetIOLayer, ParquetQueryEngine},
     proximablocks::{ProximaBlockMetadata, ProximaDataBlock, RowBasedUtilities},
 };
 pub use io::zero_copy::ZeroCopyIOSystem;
 pub use pca::{EnhancedPCAModel, PCAConfig, PCAManagerConfig, PCAModelManager};
-pub use progressive::{
-    BinaryStage, CoordinatorConfig, Fp32Stage, Int8Stage, PqStage, ProgressiveSearchCoordinator,
-    ProgressiveSearchStage, QuantizationLevel as ProgressiveQuantizationLevel, ScoredCandidate,
-    StageStats,
-};
 pub use search::{ProgressiveSearchEngine, SearchContext};
 // Common operations exports available from ops module directly

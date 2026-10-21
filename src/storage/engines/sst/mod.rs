@@ -293,7 +293,6 @@ pub mod oid_resolve; // TD-DELVEC-1 WI-3c-1c: resolve_oid_positions + read_resol
 #[cfg(feature = "cold-deletion-vectors")]
 pub use proximadb_storage_common::oid_resolver_cache;
 pub mod pca_manager; // PCA caching for Z-Order spatial encoding
-pub mod progressive_stages; // ISP-compliant progressive search stages
 pub mod search;
 pub mod segment_format; // P3 Phase A: mixed-format (ProximaBlocks/PAX) read primitives
 

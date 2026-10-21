@@ -186,8 +186,6 @@ pub mod pca_manager; // PCA caching for spatial encoding
 pub mod batch_operations;
 pub mod optimized_operations;
 pub mod progressive_search;
-pub mod progressive_stages; // ISP-compliant progressive search stages
-pub mod stages;
 pub mod superblock_cache;
 pub mod unified_metadata_serializer {
     pub use crate::storage::engines::core::proximablocks_compact_serializer::*;
@@ -203,11 +201,6 @@ pub use proximablocks_compact_strategy_reader::{
 };
 pub use superblock_cache::{
     CachedSuperBlockMetadata, OptimalTreePath, SwiftSuperBlockCache, TreeNavigationHints,
-};
-
-// Re-export SOLID progressive search stages
-pub use stages::{
-    SwiftBinaryStage, SwiftFp32Stage, SwiftInt8Stage, SwiftProgressivePipelineBuilder,
 };
 
 use anyhow::{Result, anyhow};

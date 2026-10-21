@@ -9,8 +9,6 @@
 // DEPRECATED: unified_parquet_reader.rs - functionality moved to columnar module
 // pub mod unified_parquet_reader; // Deferred: Remove this file after migration complete
 
-pub mod test_data_generator;
-
 // Supporting modules
 pub mod parquet_reconstructor;
 
@@ -37,4 +35,3 @@ pub use crate::storage::engines::core::formats::columnar::{
 
 // Supporting types
 pub use parquet_reconstructor::{ParquetReconstructor, ReconstructedParquetData};
-pub use test_data_generator::{ParquetTestDataGenerator, QuantizationType, TestDataConfig};

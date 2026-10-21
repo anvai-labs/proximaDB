@@ -42,6 +42,8 @@ use crate::storage::engines::core::ops::performance_optimization::{
     UniversalOptimizationStrategy, UniversalPerformanceOptimizer, UniversallyOptimized,
 };
 // VectorMemoryPool now managed by universal optimizer
+use super::compaction::ViperCompactionService;
+use super::flush::Flush;
 use super::types::*;
 use crate::core::String;
 use crate::core::search::SearchMode;
@@ -52,9 +54,6 @@ use crate::storage::persistence::filesystem::FileStorageTier;
 use crate::storage::persistence::filesystem::FilesystemFactory;
 use crate::storage::traits::{FlushResult, UnifiedStorageFormat};
 use proximadb_records::conversions::proxima_record_to_vector;
-// Schema now uses shared ColumnarSchema from columnar module
-use super::compaction::ViperCompactionService;
-use super::flush::Flush;
 // use super::ml_clustering::MLClusteringEngine; // Moved to AXIS
 use super::utilities::ViperUtilities;
 // Unified search engine removed - using IntegratedSearchOptimizer
@@ -174,17 +173,6 @@ pub struct ViperEngine {
     ///
     /// Used by components that need direct filesystem access
     filesystem_factory: Arc<FilesystemFactory>,
-
-    /// **Columnar Schema** (Shared with NOVA)
-    ///
-    /// Defines Parquet table structure:
-    /// - Column definitions (id, vector, metadata, timestamps)
-    /// - Data types and encoding (dictionary, RLE, delta)
-    /// - Compression per column (ZSTD for vectors, Snappy for strings)
-    /// - Nested schema for complex metadata
-    ///
-    /// Shared between VIPER and NOVA for format compatibility
-    _schema: crate::storage::engines::core::formats::columnar::columnar_schema::ColumnarSchema,
 
     /// **Compaction Service**
     ///
@@ -584,7 +572,6 @@ impl ViperEngine {
             collection_service: collection_service.clone(),
             filesystem: filesystem.clone(),
             filesystem_factory,
-            _schema: crate::storage::engines::core::formats::columnar::columnar_schema::ColumnarSchema::new(),
             compaction,
             flush_manager,
             // ml_clustering_engine, // Moved to AXIS

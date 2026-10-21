@@ -109,7 +109,6 @@ pub mod liquid_clustering;
 pub mod pca_impl;
 pub mod pca_manager;
 pub mod progressive_search;
-pub mod progressive_stages; // ISP-compliant progressive search stages
 pub mod proxima;
 pub mod query_optimization;
 pub mod readers;

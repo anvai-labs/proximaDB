@@ -105,7 +105,7 @@
 //! - **Footer Cache**: Leverages `ParquetFooterCache` for 70-90% cloud API reduction
 //! - **ID Index**: Uses `ColumnarIdIndex` for O(log n) ID lookups
 //! - **Bloom Filters**: Shared bloom filter implementation for existence checks
-//! - **Schema Management**: Uses `ColumnarSchema` for consistent schemas
+//! - **Schema Management**: Uses the shared Arrow schema builders (storage-common) for consistent schemas
 //! - **Optimization**: Leverages `ColumnarOptimizer` for query planning
 //!
 //! ### 2. Universal Adapter Integration (`universal::`)
@@ -145,7 +145,6 @@ pub mod operations;
 pub mod hierarchical_cache;
 pub mod hierarchical_stats;
 pub mod progressive_search;
-pub mod progressive_stages; // ISP-compliant progressive search stages
 pub mod streaming_processor;
 pub mod streaming_search;
 pub mod zone_maps;
