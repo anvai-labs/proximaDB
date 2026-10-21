@@ -40,6 +40,7 @@ use crate::storage::engines::core::formats::columnar::{
 // Universal performance optimization imports
 use crate::storage::engines::core::ops::performance_optimization::{
     UniversalOptimizationStrategy, UniversalPerformanceOptimizer, UniversallyOptimized,
+    insert_universal_optimizer_metrics,
 };
 // VectorMemoryPool now managed by universal optimizer
 use super::compaction::ViperCompactionService;
@@ -2985,26 +2986,7 @@ impl UnifiedStorageFormat for ViperEngine {
         &self,
         ctx: &crate::storage::traits::StorageQueryContext,
     ) -> Option<crate::storage::traits::RlsRecordPredicate> {
-        let tenant_id = ctx
-            .tenant_context
-            .as_ref()
-            .map(|tc| tc.tenant_id.as_str())
-            .or_else(|| {
-                ctx.user_context
-                    .as_ref()
-                    .and_then(|uc| uc.tenant_id.as_deref())
-            });
-
-        let principal = ctx.user_context.as_ref().map(|uc| uc.user_id.as_str());
-
-        if tenant_id.is_none() && principal.is_none() {
-            return None;
-        }
-
-        Some(crate::storage::traits::RlsRecordPredicate {
-            required_tenant_id: tenant_id.map(str::to_string),
-            required_principal: principal.map(str::to_string),
-        })
+        crate::storage::traits::rls_predicate_from_ctx(ctx)
     }
 } // End of impl UnifiedStorageFormat for ViperEngine
 
@@ -3081,25 +3063,7 @@ impl UniversallyOptimized for ViperEngine {
         );
 
         // Universal optimizer metrics
-        let strategy = self.universal_optimizer.get_strategy();
-        metrics.insert(
-            "universal_optimization_strategy".to_string(),
-            serde_json::Value::String(format!("{:?}", strategy)),
-        );
-
-        let config = self.universal_optimizer.get_config();
-        metrics.insert(
-            "universal_cache_size_mb".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(config.cache_size_mb)),
-        );
-        metrics.insert(
-            "universal_parallel_operations".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(config.parallel_operations)),
-        );
-        metrics.insert(
-            "universal_prefetching_enabled".to_string(),
-            serde_json::Value::Bool(config.enable_prefetching),
-        );
+        insert_universal_optimizer_metrics(&mut metrics, &self.universal_optimizer);
 
         Ok(metrics)
     }

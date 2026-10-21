@@ -168,7 +168,7 @@ pub use compression_common::{
 // Universal performance optimization exports
 pub use performance_optimization::{
     AccessStats, UniversalIOConfig, UniversalOptimizationStrategy, UniversalPerformanceOptimizer,
-    UniversallyOptimized,
+    UniversallyOptimized, insert_universal_optimizer_metrics,
 };
 
 // Duplicate zero-copy I/O system export removed - see consolidated version above

@@ -1,3 +1,4 @@
+use crate::metrics::cache::TierMetrics;
 use crate::storage::cache::backend::CacheTier;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -332,6 +333,23 @@ impl StorageCacheMetrics {
     pub fn tier_size_bytes(&self, _tier: CacheTier) -> usize {
         // Return total bytes divided by 3 as an estimate per tier
         self.total_bytes.load(Ordering::Relaxed) / 3
+    }
+
+    /// Build the framework-facing [`TierMetrics`] snapshot for one tier.
+    ///
+    /// Single source of the per-tier field mapping used by the cache health
+    /// monitor and the performance optimizer when assembling
+    /// `CacheMetricsSnapshot` (dedup: was 12 hand-rolled literals).
+    pub(crate) fn tier_metrics(&self, tier: CacheTier) -> TierMetrics {
+        TierMetrics {
+            hits: self.tier_hits(tier),
+            misses: self.tier_misses(tier),
+            hit_rate: self.tier_hit_rate(tier),
+            avg_latency_ms: self.avg_latency_ms(tier),
+            p99_latency_ms: self.p99_latency_ms(tier),
+            entries: self.tier_entries(tier),
+            size_bytes: self.tier_size_bytes(tier),
+        }
     }
 
     pub fn total_allocated_bytes(&self) -> usize {

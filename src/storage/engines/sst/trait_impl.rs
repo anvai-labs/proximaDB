@@ -510,27 +510,7 @@ impl UnifiedStorageFormat for SstEngine {
         &self,
         ctx: &crate::storage::traits::StorageQueryContext,
     ) -> Option<crate::storage::traits::RlsRecordPredicate> {
-        // Prefer explicit tenant context (String); fall back to user context (Option<String>)
-        let tenant_id = ctx
-            .tenant_context
-            .as_ref()
-            .map(|tc| tc.tenant_id.as_str())
-            .or_else(|| {
-                ctx.user_context
-                    .as_ref()
-                    .and_then(|uc| uc.tenant_id.as_deref())
-            });
-
-        let principal = ctx.user_context.as_ref().map(|uc| uc.user_id.as_str());
-
-        if tenant_id.is_none() && principal.is_none() {
-            return None;
-        }
-
-        Some(crate::storage::traits::RlsRecordPredicate {
-            required_tenant_id: tenant_id.map(str::to_string),
-            required_principal: principal.map(str::to_string),
-        })
+        crate::storage::traits::rls_predicate_from_ctx(ctx)
     }
 }
 

@@ -170,50 +170,12 @@ impl CacheOptimizer {
     pub async fn analyze(&self) -> OptimizationReport {
         // Convert from CacheMetrics to CacheMetricsSnapshot for analysis
         let cache_metrics = self.orchestrator.metrics();
-        use crate::metrics::cache::{
-            CoordinationMetrics, EvictionMetrics, MemoryMetrics, TierMetrics,
-        };
+        use crate::metrics::cache::{CoordinationMetrics, EvictionMetrics, MemoryMetrics};
         let metrics = CacheMetricsSnapshot {
             overall_hit_rate: cache_metrics.hit_rate() * 100.0,
-            l1_metrics: TierMetrics {
-                hits: cache_metrics.tier_hits(crate::storage::cache::backend::CacheTier::L1),
-                misses: cache_metrics.tier_misses(crate::storage::cache::backend::CacheTier::L1),
-                hit_rate: cache_metrics
-                    .tier_hit_rate(crate::storage::cache::backend::CacheTier::L1),
-                avg_latency_ms: cache_metrics
-                    .avg_latency_ms(crate::storage::cache::backend::CacheTier::L1),
-                p99_latency_ms: cache_metrics
-                    .p99_latency_ms(crate::storage::cache::backend::CacheTier::L1),
-                entries: cache_metrics.tier_entries(crate::storage::cache::backend::CacheTier::L1),
-                size_bytes: cache_metrics
-                    .tier_size_bytes(crate::storage::cache::backend::CacheTier::L1),
-            },
-            l2_metrics: TierMetrics {
-                hits: cache_metrics.tier_hits(crate::storage::cache::backend::CacheTier::L2),
-                misses: cache_metrics.tier_misses(crate::storage::cache::backend::CacheTier::L2),
-                hit_rate: cache_metrics
-                    .tier_hit_rate(crate::storage::cache::backend::CacheTier::L2),
-                avg_latency_ms: cache_metrics
-                    .avg_latency_ms(crate::storage::cache::backend::CacheTier::L2),
-                p99_latency_ms: cache_metrics
-                    .p99_latency_ms(crate::storage::cache::backend::CacheTier::L2),
-                entries: cache_metrics.tier_entries(crate::storage::cache::backend::CacheTier::L2),
-                size_bytes: cache_metrics
-                    .tier_size_bytes(crate::storage::cache::backend::CacheTier::L2),
-            },
-            l3_metrics: TierMetrics {
-                hits: cache_metrics.tier_hits(crate::storage::cache::backend::CacheTier::L3),
-                misses: cache_metrics.tier_misses(crate::storage::cache::backend::CacheTier::L3),
-                hit_rate: cache_metrics
-                    .tier_hit_rate(crate::storage::cache::backend::CacheTier::L3),
-                avg_latency_ms: cache_metrics
-                    .avg_latency_ms(crate::storage::cache::backend::CacheTier::L3),
-                p99_latency_ms: cache_metrics
-                    .p99_latency_ms(crate::storage::cache::backend::CacheTier::L3),
-                entries: cache_metrics.tier_entries(crate::storage::cache::backend::CacheTier::L3),
-                size_bytes: cache_metrics
-                    .tier_size_bytes(crate::storage::cache::backend::CacheTier::L3),
-            },
+            l1_metrics: cache_metrics.tier_metrics(crate::storage::cache::backend::CacheTier::L1),
+            l2_metrics: cache_metrics.tier_metrics(crate::storage::cache::backend::CacheTier::L2),
+            l3_metrics: cache_metrics.tier_metrics(crate::storage::cache::backend::CacheTier::L3),
             memory_usage: MemoryMetrics {
                 total_allocated_bytes: cache_metrics.total_allocated_bytes(),
                 used_bytes: cache_metrics.used_bytes(),
@@ -385,50 +347,12 @@ impl CacheOptimizer {
     pub async fn apply_optimization(&self, action: OptimizationAction) -> Result<()> {
         // Get metrics before optimization
         let cache_metrics = self.orchestrator.metrics();
-        use crate::metrics::cache::{
-            CoordinationMetrics, EvictionMetrics, MemoryMetrics, TierMetrics,
-        };
+        use crate::metrics::cache::{CoordinationMetrics, EvictionMetrics, MemoryMetrics};
         let metrics_before = CacheMetricsSnapshot {
             overall_hit_rate: cache_metrics.hit_rate() * 100.0,
-            l1_metrics: TierMetrics {
-                hits: cache_metrics.tier_hits(crate::storage::cache::backend::CacheTier::L1),
-                misses: cache_metrics.tier_misses(crate::storage::cache::backend::CacheTier::L1),
-                hit_rate: cache_metrics
-                    .tier_hit_rate(crate::storage::cache::backend::CacheTier::L1),
-                avg_latency_ms: cache_metrics
-                    .avg_latency_ms(crate::storage::cache::backend::CacheTier::L1),
-                p99_latency_ms: cache_metrics
-                    .p99_latency_ms(crate::storage::cache::backend::CacheTier::L1),
-                entries: cache_metrics.tier_entries(crate::storage::cache::backend::CacheTier::L1),
-                size_bytes: cache_metrics
-                    .tier_size_bytes(crate::storage::cache::backend::CacheTier::L1),
-            },
-            l2_metrics: TierMetrics {
-                hits: cache_metrics.tier_hits(crate::storage::cache::backend::CacheTier::L2),
-                misses: cache_metrics.tier_misses(crate::storage::cache::backend::CacheTier::L2),
-                hit_rate: cache_metrics
-                    .tier_hit_rate(crate::storage::cache::backend::CacheTier::L2),
-                avg_latency_ms: cache_metrics
-                    .avg_latency_ms(crate::storage::cache::backend::CacheTier::L2),
-                p99_latency_ms: cache_metrics
-                    .p99_latency_ms(crate::storage::cache::backend::CacheTier::L2),
-                entries: cache_metrics.tier_entries(crate::storage::cache::backend::CacheTier::L2),
-                size_bytes: cache_metrics
-                    .tier_size_bytes(crate::storage::cache::backend::CacheTier::L2),
-            },
-            l3_metrics: TierMetrics {
-                hits: cache_metrics.tier_hits(crate::storage::cache::backend::CacheTier::L3),
-                misses: cache_metrics.tier_misses(crate::storage::cache::backend::CacheTier::L3),
-                hit_rate: cache_metrics
-                    .tier_hit_rate(crate::storage::cache::backend::CacheTier::L3),
-                avg_latency_ms: cache_metrics
-                    .avg_latency_ms(crate::storage::cache::backend::CacheTier::L3),
-                p99_latency_ms: cache_metrics
-                    .p99_latency_ms(crate::storage::cache::backend::CacheTier::L3),
-                entries: cache_metrics.tier_entries(crate::storage::cache::backend::CacheTier::L3),
-                size_bytes: cache_metrics
-                    .tier_size_bytes(crate::storage::cache::backend::CacheTier::L3),
-            },
+            l1_metrics: cache_metrics.tier_metrics(crate::storage::cache::backend::CacheTier::L1),
+            l2_metrics: cache_metrics.tier_metrics(crate::storage::cache::backend::CacheTier::L2),
+            l3_metrics: cache_metrics.tier_metrics(crate::storage::cache::backend::CacheTier::L3),
             memory_usage: MemoryMetrics {
                 total_allocated_bytes: cache_metrics.total_allocated_bytes(),
                 used_bytes: cache_metrics.used_bytes(),
