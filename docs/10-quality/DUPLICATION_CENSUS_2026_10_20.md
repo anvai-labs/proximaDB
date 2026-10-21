@@ -12,12 +12,22 @@
 
 ## Scan configuration
 
+The census flags live inline in the Makefile `dup-report` target (the
+single source of truth; an earlier `.jscpd.json` approach was never
+committed — the blanket `*.json` gitignore dropped it — so b0b0b7696
+moved the flags inline). `make dup-report` runs:
+
 ```
-npx jscpd <repo> --format rust,python --min-tokens 50 --similarity \
-  --ignore **/target/**,**/node_modules/**,**/_generated/**,third_party/**,docs/**,
+npx --yes jscpd . --format rust,python --min-tokens 50 --similarity \
+  --reporters silent,json,markdown --output target/jscpd-report \
+  --ignore **/target/**,**/node_modules/**,**/_generated/**,**/*_pb2*.py,third_party/**,docs/**,
             crates/foundation/proximadb-proto/src/proto/**,data/**,bench-data/**,
             artifacts/**,metadata/**,log/**,**/.git/**,ui/**,roadmap/**
 ```
+
+(The original pass-3 scan filtered the `*_pb2*.py` protobuf stubs at the
+clustering step rather than in the scan; the flags now exclude them at
+scan time — same effective methodology, one place.)
 
 Generated code excluded: prost proto (`*.v*.rs`), OpenAPI-generated SDK (`**/_generated/**`),
 protobuf python stubs (`*_pb2*.py`, filtered at clustering). License-header clone pairs filtered (411).
@@ -104,7 +114,7 @@ tests/api_consistency_* POST to removed /api/v1 endpoints and pass because nothi
 
 ## Follow-on program (meaty, cohesive PRs per PR-sizing mandate)
 
-0. **Repeat the census cheaply**: check in `.jscpd.json` + a `make dup-report` target (this pass's
+0. **Repeat the census cheaply**: `make dup-report` (flags inline in the Makefile target; this pass's
    exact config); re-run per release train. Two guard ideas from findings: (a) orphaned-test-file
    reachability guard (three dead files found), (b) optional `scripts/check_license_headers.py`
    (headers do drift — one has a typo).
@@ -136,7 +146,7 @@ independently mergeable and touches disjoint file sets (no >2-PR overlap per SOL
 
 ## Repeatability
 
-`make dup-report` replays this census (config: `.jscpd.json`, committed with this document;
+`make dup-report` replays this census (flags inline in the Makefile target;
 reports land in `target/jscpd-report/`, gitignored). Re-run per release train and compare the
 `total.percentage` figure — the hygiene ratchet. Method note: jscpd kind labels are file-level;
 verify `#[cfg(test)]` span placement before counting a family as production duplication (half

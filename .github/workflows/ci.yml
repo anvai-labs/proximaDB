@@ -370,6 +370,10 @@ jobs:
               - 'src/**'
               - 'scripts/count_panic_patterns.sh'
               - 'docs/_internal/roadmap/PANIC_POLICY_BASELINE.json'
+            dup_ratchet:
+              - 'scripts/dup_ratchet.py'
+              - 'docs/10-quality/DUP_RATCHET_BASELINE.json'
+              - 'Makefile'
             v1_proto_usage:
               - 'src/**'
               - 'crates/**'
@@ -760,7 +764,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.dup_ratchet == 'true'
     steps:
       - uses: actions/checkout@v7
       - name: Check for tracked artifact files
@@ -779,6 +783,12 @@ jobs:
       # docs-validation job would not see them.
       - name: Check env gates are registered
         run: python3 scripts/check_env_gates.py
+      # Duplication ratchet (redundancy pass 3): the jscpd census percentage
+      # may not rise above the committed baseline + tolerance. Refresh the
+      # baseline via `make dup-ratchet-baseline` only with justification.
+      # ~40s: npx fetch + 4s scan.
+      - name: Duplication ratchet
+        run: make dup-ratchet-check
 
   deterministic-commit-contract:
     name: Deterministic Commit Contract
@@ -795,6 +805,8 @@ jobs:
         run: python3 -m unittest discover -s tests/scripts -p 'test_cloud_emulator_harness.py'
       - name: Test trusted branch-route workflow contract
         run: python3 -m unittest discover -s tests/scripts -p 'test_branch_promotion_policy.py'
+      - name: Test duplication ratchet contract
+        run: python3 -m unittest discover -s tests/scripts -p 'test_dup_ratchet.py'
       - name: Test promotion tree-reuse gate (TD-CITIER-2)
         run: python3 -m unittest discover -s tests/scripts -p 'test_ci_tree_reuse.py'
       - name: Test Flake Rerun infra-kill matcher (fixture job logs)

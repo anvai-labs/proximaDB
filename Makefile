@@ -162,11 +162,24 @@ proto-check:
 # memory and fails if it drifts from the committed docs/openapi/proximadb-openapi.yaml.
 # Mirrors the proto-sync generated-artifact gate. Regenerate with:
 #   UPDATE_OPENAPI_SPEC=1 cargo test -p proximadb --test openapi_spec_gen
-.PHONY: dup-report
+.PHONY: dup-report dup-ratchet-report dup-ratchet-check dup-ratchet-baseline
 dup-report: ## Copy/paste duplication census (jscpd) — report lands in target/jscpd-report/
 	@echo " replaying the duplication census (flags inline — census config lives here; see docs/10-quality/DUPLICATION_CENSUS_2026_10_20.md)"
 	npx --yes jscpd . --format rust,python --min-tokens 50 --similarity \
-		--ignore "**/target/**,**/node_modules/**,**/_generated/**,third_party/**,docs/**,crates/foundation/proximadb-proto/src/proto/**,data/**,bench-data/**,artifacts/**,metadata/**,log/**,**/.git/**,ui/**,roadmap/**"
+		--reporters silent,json,markdown --output target/jscpd-report \
+		--ignore "**/target/**,**/node_modules/**,**/_generated/**,**/*_pb2*.py,third_party/**,docs/**,crates/foundation/proximadb-proto/src/proto/**,data/**,bench-data/**,artifacts/**,metadata/**,log/**,**/.git/**,ui/**,roadmap/**"
+
+dup-ratchet-report: ## Current duplication numbers (non-blocking)
+	@echo "🧹 duplication ratchet report..."
+	python3 scripts/dup_ratchet.py --mode report
+
+dup-ratchet-check: ## Fail if duplication rose above baseline + tolerance
+	@echo "🧹 duplication ratchet check..."
+	python3 scripts/dup_ratchet.py --mode check
+
+dup-ratchet-baseline: ## Refresh the duplication baseline (with justification, same PR)
+	@echo "🧹 refreshing duplication baseline..."
+	python3 scripts/dup_ratchet.py --mode update-baseline
 
 verify-openapi-spec:
 	@echo "🧬 Validating OpenAPI spec ↔ handler drift (spec-from-code)..."
@@ -235,7 +248,7 @@ tenant-ingress-check:
 	@echo "Validating deployment-aware tenant ingress..."
 	python3 scripts/check_tenant_ingress_contract.py
 
-work-commit-check: fmt-check deterministic-commit-contract-check branch-promotion-policy-check docs-claim-check design-status-check status-asof-check capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check panic-policy-module-guard silent-failure-no-regression hygiene-check env-gate-check release-build-features-check release-evidence-contract-check orphan-rust-files-check
+work-commit-check: fmt-check deterministic-commit-contract-check branch-promotion-policy-check docs-claim-check design-status-check status-asof-check capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check panic-policy-module-guard silent-failure-no-regression hygiene-check env-gate-check dup-ratchet-check release-build-features-check release-evidence-contract-check orphan-rust-files-check
 	@echo "✅ work-commit-check: deterministic architecture and commit guardrails passed"
 
 validated-commit-check: work-commit-check
