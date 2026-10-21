@@ -678,45 +678,15 @@ impl RunStore for SubstrateRunStore {
         key: &str,
     ) -> Result<Vec<MetricPoint>, RunStoreError> {
         self.get_run(run_id).await?;
-        let filter = filter_of(&[
-            eq_cond("kind", "metric"),
-            eq_cond("run_id", run_id),
-            eq_cond("key", key),
-        ]);
-        let params = crate::storage::document::DocumentQueryParams {
-            filter: Some(filter),
-            ..Default::default()
-        };
-        let result = self
-            .document
-            .query_documents(&self.collection, params)
-            .await
-            .map_err(Self::err)?;
-        let mut points: Vec<(u64, MetricPoint)> = Vec::new();
-        for doc in result.documents {
-            let seq = match doc.props.get("seq") {
-                Some(ProximaTreeNode::Value(ProximaValue::Int64(s))) => *s as u64,
-                other => {
-                    return Err(Self::err(anyhow::anyhow!(
-                        "metric doc '{}' missing its seq field ({other:?}) — cannot order history",
-                        doc.id
-                    )));
-                }
-            };
-            let Some(ProximaTreeNode::Value(ProximaValue::String(json))) = doc.props.get("payload")
-            else {
-                return Err(Self::err(anyhow::anyhow!(
-                    "metric doc '{}' has no payload",
-                    doc.id
-                )));
-            };
-            let point: MetricPoint = serde_json::from_str(json)
-                .with_context(|| format!("corrupt metric doc '{}'", doc.id))
-                .map_err(Self::err)?;
-            points.push((seq, point));
-        }
-        points.sort_by_key(|(seq, _)| *seq);
-        Ok(points.into_iter().map(|(_, p)| p).collect())
+        self.ordered_payloads(
+            vec![
+                ("kind".into(), "metric".into()),
+                ("run_id".into(), run_id.into()),
+                ("key".into(), key.into()),
+            ],
+            "metric",
+        )
+        .await
     }
 
     async fn set_tag(&self, run_id: &str, key: &str, value: &str) -> Result<(), RunStoreError> {
@@ -1170,87 +1140,27 @@ impl RunStore for SubstrateRunStore {
         key: &str,
     ) -> Result<Vec<ModelMetricPoint>, RunStoreError> {
         self.get_logged_model(model_id, true).await?;
-        let filter = filter_of(&[
-            eq_cond("kind", "model_metric"),
-            eq_cond("model_id", model_id),
-            eq_cond("key", key),
-        ]);
-        let params = crate::storage::document::DocumentQueryParams {
-            filter: Some(filter),
-            ..Default::default()
-        };
-        let result = self
-            .document
-            .query_documents(&self.collection, params)
-            .await
-            .map_err(Self::err)?;
-        let mut points: Vec<(u64, ModelMetricPoint)> = Vec::new();
-        for doc in result.documents {
-            let seq = match doc.props.get("seq") {
-                Some(ProximaTreeNode::Value(ProximaValue::Int64(s))) => *s as u64,
-                other => {
-                    return Err(Self::err(anyhow::anyhow!(
-                        "model metric doc '{}' missing its seq field ({other:?})",
-                        doc.id
-                    )));
-                }
-            };
-            let Some(ProximaTreeNode::Value(ProximaValue::String(json))) = doc.props.get("payload")
-            else {
-                return Err(Self::err(anyhow::anyhow!(
-                    "model metric doc '{}' has no payload",
-                    doc.id
-                )));
-            };
-            let sample: ModelMetricPoint = serde_json::from_str(json)
-                .with_context(|| format!("corrupt model metric doc '{}'", doc.id))
-                .map_err(Self::err)?;
-            points.push((seq, sample));
-        }
-        points.sort_by_key(|(seq, _)| *seq);
-        Ok(points.into_iter().map(|(_, s)| s).collect())
+        self.ordered_payloads(
+            vec![
+                ("kind".into(), "model_metric".into()),
+                ("model_id".into(), model_id.into()),
+                ("key".into(), key.into()),
+            ],
+            "model metric",
+        )
+        .await
     }
 
     async fn model_metrics(&self, model_id: &str) -> Result<Vec<ModelMetricPoint>, RunStoreError> {
         self.get_logged_model(model_id, true).await?;
-        let filter = filter_of(&[
-            eq_cond("kind", "model_metric"),
-            eq_cond("model_id", model_id),
-        ]);
-        let params = crate::storage::document::DocumentQueryParams {
-            filter: Some(filter),
-            ..Default::default()
-        };
-        let result = self
-            .document
-            .query_documents(&self.collection, params)
-            .await
-            .map_err(Self::err)?;
-        let mut points: Vec<(u64, ModelMetricPoint)> = Vec::new();
-        for doc in result.documents {
-            let seq = match doc.props.get("seq") {
-                Some(ProximaTreeNode::Value(ProximaValue::Int64(s))) => *s as u64,
-                other => {
-                    return Err(Self::err(anyhow::anyhow!(
-                        "model metric doc '{}' missing its seq field ({other:?})",
-                        doc.id
-                    )));
-                }
-            };
-            let Some(ProximaTreeNode::Value(ProximaValue::String(json))) = doc.props.get("payload")
-            else {
-                return Err(Self::err(anyhow::anyhow!(
-                    "model metric doc '{}' has no payload",
-                    doc.id
-                )));
-            };
-            let sample: ModelMetricPoint = serde_json::from_str(json)
-                .with_context(|| format!("corrupt model metric doc '{}'", doc.id))
-                .map_err(Self::err)?;
-            points.push((seq, sample));
-        }
-        points.sort_by_key(|(seq, _)| *seq);
-        Ok(points.into_iter().map(|(_, s)| s).collect())
+        self.ordered_payloads(
+            vec![
+                ("kind".into(), "model_metric".into()),
+                ("model_id".into(), model_id.into()),
+            ],
+            "model metric",
+        )
+        .await
     }
 
     // --- Run <-> model links (TD-MLOPS-2) ---
@@ -1279,6 +1189,54 @@ impl RunStore for SubstrateRunStore {
 }
 
 impl SubstrateRunStore {
+    /// Query seq-ordered payloads: fetch documents matching `conds`, decode
+    /// each doc's `payload` JSON as `T`, return them sorted by `seq`. The
+    /// single reader for what used to be three line-for-line copies
+    /// (metric_history / model_metric_history / model_metrics) that had
+    /// drifted error strings (redundancy pass 3).
+    async fn ordered_payloads<T: serde::de::DeserializeOwned>(
+        &self,
+        conds: Vec<(String, String)>,
+        doc_label: &str,
+    ) -> Result<Vec<T>, RunStoreError> {
+        let eq_conds: Vec<_> = conds.iter().map(|(k, v)| eq_cond(k, v)).collect();
+        let filter = filter_of(&eq_conds);
+        let params = crate::storage::document::DocumentQueryParams {
+            filter: Some(filter),
+            ..Default::default()
+        };
+        let result = self
+            .document
+            .query_documents(&self.collection, params)
+            .await
+            .map_err(Self::err)?;
+        let mut points: Vec<(u64, T)> = Vec::new();
+        for doc in result.documents {
+            let seq = match doc.props.get("seq") {
+                Some(ProximaTreeNode::Value(ProximaValue::Int64(s))) => *s as u64,
+                other => {
+                    return Err(Self::err(anyhow::anyhow!(
+                        "{doc_label} doc '{}' missing its seq field ({other:?}) — cannot order history",
+                        doc.id
+                    )));
+                }
+            };
+            let Some(ProximaTreeNode::Value(ProximaValue::String(json))) = doc.props.get("payload")
+            else {
+                return Err(Self::err(anyhow::anyhow!(
+                    "{doc_label} doc '{}' has no payload",
+                    doc.id
+                )));
+            };
+            let point: T = serde_json::from_str(json)
+                .with_context(|| format!("corrupt {doc_label} doc '{}'", doc.id))
+                .map_err(Self::err)?;
+            points.push((seq, point));
+        }
+        points.sort_by_key(|(seq, _)| *seq);
+        Ok(points.into_iter().map(|(_, p)| p).collect())
+    }
+
     /// Persist a run plus its append counters as SEPARATE document fields
     /// (`ctr_<name>`). Counters must never ride the user-writable tags map:
     /// a client `delete_tag`/`set_tag` on a counter-looking key must not be
