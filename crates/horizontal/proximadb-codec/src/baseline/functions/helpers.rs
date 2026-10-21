@@ -45,6 +45,11 @@ pub trait WirePrim: Copy + Default + std::fmt::Debug + PartialEq + Eq + std::has
     /// Bit length of `self.unsigned_abs()` in the native width
     /// (`BITS - leading_zeros`), so 0 maps to 0.
     fn abs_bit_len(self) -> u8;
+    /// Widen to i64 (identity for i64). Lets a narrow base share the i64
+    /// delta arithmetic of the delta/patched/pfor family.
+    fn widen(self) -> i64;
+    /// Narrow an i64 back (wrapping truncation for i32).
+    fn from_wide(w: i64) -> Self;
     /// Signed bit-pack at `bits` width (delegates to `bitpack`).
     fn pack_signed(values: &[Self], bits: u8) -> Result<Vec<u8>>;
     /// Signed bit-unpack with sign extension (delegates to `bitpack`).
@@ -81,6 +86,14 @@ impl WirePrim for i32 {
 
     fn abs_bit_len(self) -> u8 {
         32 - self.unsigned_abs().leading_zeros() as u8
+    }
+
+    fn widen(self) -> i64 {
+        self as i64
+    }
+
+    fn from_wide(w: i64) -> Self {
+        w as i32
     }
 
     fn pack_signed(values: &[Self], bits: u8) -> Result<Vec<u8>> {
@@ -122,6 +135,14 @@ impl WirePrim for i64 {
 
     fn abs_bit_len(self) -> u8 {
         64 - self.unsigned_abs().leading_zeros() as u8
+    }
+
+    fn widen(self) -> i64 {
+        self
+    }
+
+    fn from_wide(w: i64) -> Self {
+        w
     }
 
     fn pack_signed(values: &[Self], bits: u8) -> Result<Vec<u8>> {
