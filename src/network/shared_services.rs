@@ -2061,6 +2061,30 @@ impl SharedServices {
                     )
                     }
                 };
+            // Seed the spill partitions' catalog schemas before replay, so the
+            // partitions replay creates encode typed columns at once. Only the
+            // local catalogs hold the tables this store replays; a failure only
+            // means typed rows stay resident until their table's first write.
+            match catalog_manager
+                .table_schemas(|catalog| {
+                    let kind = catalog.catalog_type();
+                    kind == "native" || kind.starts_with("oltp")
+                })
+                .await
+            {
+                Ok(schemas) => {
+                    if store.seed_schema_hints(&schemas) > 0 {
+                        info!(
+                            tables = schemas.len(),
+                            "SharedServices: seeded spill schema hints before WAL replay"
+                        );
+                    }
+                }
+                Err(e) => warn!(
+                    "SharedServices: could not seed spill schema hints ({e:#}); typed rows of \
+                     replayed tables stay resident until each table's first write"
+                ),
+            }
             match appender.read_entries().await {
                 Ok(entries) => {
                     if let Err(e) = store.replay_wal_entries(entries).await {
