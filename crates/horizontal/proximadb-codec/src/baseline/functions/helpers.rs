@@ -9,6 +9,61 @@
 
 use anyhow::Result;
 
+/// Fixed-width wire integer primitive (i32 or i64).
+///
+/// Redundancy pass 4 (following the `PackPrim` precedent in `bitpack.rs`):
+/// every codec's `_i32_wire`/`_i64_wire` twin cores differed only in the
+/// integer width of their wire slots, base values, and packed payloads. This
+/// trait factors out that width so each codec keeps ONE generic core; the
+/// golden-byte tests in each codec pin the layout the cores must preserve.
+///
+/// `ToWireFormat` (below) maps application types onto these primitives
+/// (f32 -> i32, f64 -> i64); `WirePrim` parameterizes the core over which of
+/// the two widths it operates on. Width operations are added to the trait
+/// incrementally, alongside the codec whose consolidation needs them.
+pub trait WirePrim: Copy + Default + std::fmt::Debug + PartialEq + Eq + std::hash::Hash {
+    /// Wire slot size in bytes (4 for i32, 8 for i64).
+    const WIRE_BYTES: usize;
+
+    /// Append `self` little-endian to `out`.
+    fn write_le(self, out: &mut Vec<u8>);
+    /// Read `self` little-endian from the first `WIRE_BYTES` bytes of `data`.
+    /// Errors (never panics) when `data` is too short.
+    fn read_le(data: &[u8]) -> Result<Self>;
+}
+
+impl WirePrim for i32 {
+    const WIRE_BYTES: usize = 4;
+
+    fn write_le(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.to_le_bytes());
+    }
+
+    fn read_le(data: &[u8]) -> Result<Self> {
+        let bytes: [u8; 4] = data
+            .get(..4)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| anyhow::anyhow!("wire read: need 4 bytes, got {}", data.len()))?;
+        Ok(Self::from_le_bytes(bytes))
+    }
+}
+
+impl WirePrim for i64 {
+    const WIRE_BYTES: usize = 8;
+
+    fn write_le(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.to_le_bytes());
+    }
+
+    fn read_le(data: &[u8]) -> Result<Self> {
+        let bytes: [u8; 8] = data
+            .get(..8)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| anyhow::anyhow!("wire read: need 8 bytes, got {}", data.len()))?;
+        Ok(Self::from_le_bytes(bytes))
+    }
+}
+
 /// Generic type conversion trait for wire format serialization
 ///
 /// Converts application types (f32, f64, i32, i64) to wire representation types
@@ -215,6 +270,29 @@ pub fn reconstruct_i64_from_i64(deltas: &[i64], base: i64) -> Vec<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_wire_prim_le_roundtrip_both_widths() {
+        let mut buf = Vec::new();
+        (-5i32).write_le(&mut buf);
+        assert_eq!(buf, (-5i32).to_le_bytes().to_vec());
+        assert_eq!(
+            i32::read_le(&[1, 2, 3, 4]).unwrap(),
+            i32::from_le_bytes([1, 2, 3, 4])
+        );
+
+        let mut buf = Vec::new();
+        (-7i64).write_le(&mut buf);
+        assert_eq!(buf, (-7i64).to_le_bytes().to_vec());
+        assert_eq!(
+            i64::read_le(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap(),
+            i64::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8])
+        );
+
+        // Short buffers error instead of panicking.
+        assert!(i32::read_le(&[1, 2, 3]).is_err());
+        assert!(i64::read_le(&[1, 2, 3]).is_err());
+    }
 
     #[test]
     fn test_to_wire_format_f32() {
