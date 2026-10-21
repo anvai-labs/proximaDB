@@ -433,6 +433,60 @@ fn parse_truncate_tables(query: &str) -> Option<Vec<String>> {
     Some(tables).filter(|tables| !tables.is_empty())
 }
 
+/// The three canonical pgwire DML verbs (INSERT/DELETE/UPDATE) that share
+/// one pgwire execution body (`execute_dml_via_dml_service`). Carries the
+/// per-verb wire differences: the misdirected-write phrase, the
+/// CommandComplete tag shape, and the statement-failure mapping.
+#[derive(Clone, Copy, Debug)]
+enum DmlVerb {
+    Insert,
+    Delete,
+    Update,
+}
+
+impl DmlVerb {
+    fn as_str(self) -> &'static str {
+        match self {
+            DmlVerb::Insert => "INSERT",
+            DmlVerb::Delete => "DELETE",
+            DmlVerb::Update => "UPDATE",
+        }
+    }
+
+    /// Phrase completing the misdirected-write message:
+    /// `misdirected_write: <phrase> table '<t>' must go to pod ...`.
+    fn gate_phrase(self) -> &'static str {
+        match self {
+            DmlVerb::Insert => "INSERT for",
+            DmlVerb::Delete => "DELETE for",
+            DmlVerb::Update => "UPDATE for",
+        }
+    }
+
+    /// Label for the statement-failure message `"<label> failed: {e}"`.
+    /// INSERT/DELETE historically rendered title-case there ("Insert
+    /// failed:", "Delete failed:") — distinct from the all-caps verb used
+    /// in logs and the misdirected-write gate phrase.
+    fn failure_label(self) -> &'static str {
+        match self {
+            DmlVerb::Insert => "Insert",
+            DmlVerb::Delete => "Delete",
+            DmlVerb::Update => "Update",
+        }
+    }
+
+    /// CommandComplete tag. INSERT follows the PostgreSQL row-count
+    /// convention `INSERT 0 <rows>` (status string with a leading OID
+    /// column, always 0); DELETE/UPDATE report `<VERB> <rows>`.
+    fn command_tag(self, rows: u64) -> String {
+        match self {
+            DmlVerb::Insert => format!("INSERT 0 {rows}"),
+            DmlVerb::Delete => format!("DELETE {rows}"),
+            DmlVerb::Update => format!("UPDATE {rows}"),
+        }
+    }
+}
+
 /// Buffer-time CommandComplete summary for a DML statement: (kind, row hint,
 /// approximate serialized size for the buffer bound).
 fn dml_summary(
@@ -5812,11 +5866,63 @@ impl PostgresProtocol {
         self.send_command_complete("TRUNCATE TABLE").await
     }
 
-    /// Execute INSERT using the proper SQL parser and DmlService
+    /// TD-PGWIRE-COPY-1 shared write gate: resolve the write tenant (startup
+    /// `database` first, then the session var), then enforce the primary-pod
+    /// gate for a write to `table`. `verb_phrase` completes the
+    /// misdirected-write message — `"INSERT for"`, `"COPY into"`, … Returns
+    /// `Ok(Some(tenant))`, `Ok(None)` once the 57P03 error has been sent
+    /// (the caller must stop processing the statement), or `Err` if the
+    /// error frame itself could not be written.
+    async fn resolve_write_tenant_gated(
+        &mut self,
+        verb_phrase: &str,
+        table: &str,
+    ) -> Result<Option<String>> {
+        let write_tenant = self.pgwire_resolve_write_tenant().await;
+        if let PgwireGateOutcome::Misrouted { target_pod } =
+            check_pgwire_primary_pod_gate(&self.primary_pod_gate, &write_tenant, table)
+        {
+            self.send_error(
+                "ERROR",
+                "57P03",
+                &format!(
+                    "misdirected_write: {verb_phrase} table '{}' must go to pod '{target_pod}' (reconnect to that pod and retry)",
+                    table
+                ),
+            )
+            .await?;
+            return Ok(None);
+        }
+        Ok(Some(write_tenant))
+    }
+
+    /// Execute INSERT through canonical catalog-backed DML (shared body —
+    /// see `execute_dml_via_dml_service`).
     async fn execute_insert_via_dml_service(
         &mut self,
         query: &str,
         dml_service: &Arc<DmlService>,
+    ) -> Result<()> {
+        self.execute_dml_via_dml_service(query, dml_service, DmlVerb::Insert)
+            .await
+    }
+
+    /// Shared body of the three canonical pgwire DML paths (INSERT/DELETE/
+    /// UPDATE): parse → primary-pod gate (TD-PGWIRE-COPY-1) → tenant
+    /// visibility gate (TD-064 write-half) → buffer inside an explicit
+    /// transaction (ADR-018 P2.D) or autocommit-execute → mandate-#16b OLAP
+    /// result-cache invalidation → CommandComplete tag.
+    ///
+    /// Per-verb wire differences live in `DmlVerb`: the tag shape
+    /// (`INSERT 0 <n>` vs `<VERB> <n>`) and the statement-failure arm
+    /// (UPDATE is not yet implemented in DmlService → 0A000 with the bare
+    /// message; INSERT/DELETE map catalog/integrity errors via
+    /// `dml_error_sqlstate` with a 42P01 fallback, TD-DML-1).
+    async fn execute_dml_via_dml_service(
+        &mut self,
+        query: &str,
+        dml_service: &Arc<DmlService>,
+        verb: DmlVerb,
     ) -> Result<()> {
         let parser = SqlFrontendParser::new();
 
@@ -5830,23 +5936,14 @@ impl PostgresProtocol {
                 // as (startup `database` first, then the session var). Gating on
                 // the session var alone checked `default` for a `database=acme`
                 // client whose write then landed in acme's partition.
-                let write_tenant = self.pgwire_resolve_write_tenant().await;
                 let table = statement.target_table_name().to_string();
-                match check_pgwire_primary_pod_gate(&self.primary_pod_gate, &write_tenant, &table) {
-                    PgwireGateOutcome::Allow => {}
-                    PgwireGateOutcome::Misrouted { target_pod } => {
-                        return self
-                            .send_error(
-                                "ERROR",
-                                "57P03",
-                                &format!(
-                                    "misdirected_write: INSERT for table '{}' must go to pod '{}' (reconnect to that pod and retry)",
-                                    table, target_pod
-                                ),
-                            )
-                            .await;
-                    }
-                }
+                let write_tenant = match self
+                    .resolve_write_tenant_gated(verb.gate_phrase(), &table)
+                    .await?
+                {
+                    Some(tenant) => tenant,
+                    None => return Ok(()),
+                };
 
                 // TD-064 write-half: resolve the tenant scope (catalog/database
                 // binding) and authorize the target table within it. A
@@ -5923,7 +6020,8 @@ impl PostgresProtocol {
                     Ok(result) => {
                         info!(
                             rows_affected = result.rows_affected,
-                            "INSERT executed via DmlService"
+                            "{} executed via DmlService",
+                            verb.as_str()
                         );
                         // Mandate #16b: invalidate the tenant-scoped OLAP result
                         // cache for the written table (default-OFF no-op).
@@ -5932,7 +6030,7 @@ impl PostgresProtocol {
                             &table,
                         )
                         .await;
-                        self.send_command_complete(&format!("INSERT 0 {}", result.rows_affected))
+                        self.send_command_complete(&verb.command_tag(result.rows_affected))
                             .await
                     }
                     Err(AutocommitFailure::Atomic(error)) => {
@@ -5950,26 +6048,47 @@ impl PostgresProtocol {
                                 }
                                 None => format!("lock not available on {resource}"),
                             };
-                            warn!("DmlService INSERT blocked by DML lock: {msg}");
+                            warn!("DmlService {} blocked by DML lock: {msg}", verb.as_str());
                             return self.send_error("ERROR", "55P03", &msg).await;
                         }
-                        warn!("DmlService INSERT failed: {}", e);
-                        // TD-DML-1: an integrity violation (INSERT or any UPSERT
-                        // spelling) carries its own SQLSTATE (23505/23503/23514/
-                        // 21000) so drivers can key on it.
-                        let code = dml_error_sqlstate(&e, "42P01");
-                        self.send_error("ERROR", code, &format!("Insert failed: {}", e))
-                            .await
+                        match verb {
+                            DmlVerb::Update => {
+                                // DmlService UPDATE returns error for
+                                // not-implemented. This is expected — UPDATE
+                                // requires a delete + insert pattern.
+                                warn!("DmlService UPDATE: {}", e);
+                                let code = dml_error_sqlstate(&e, "0A000");
+                                self.send_error("ERROR", code, &format!("{}", e)).await
+                            }
+                            other => {
+                                warn!("DmlService {} failed: {}", other.as_str(), e);
+                                // TD-DML-1: an integrity violation (INSERT or any
+                                // UPSERT spelling) carries its own SQLSTATE
+                                // (23505/23503/23514/21000) so drivers can key
+                                // on it.
+                                let code = dml_error_sqlstate(&e, "42P01");
+                                self.send_error(
+                                    "ERROR",
+                                    code,
+                                    &format!("{} failed: {}", other.failure_label(), e),
+                                )
+                                .await
+                            }
+                        }
                     }
                 }
             }
             Ok(None) => {
-                // Not a DML statement (shouldn't happen for INSERT)
-                self.send_error("ERROR", "42601", "Invalid INSERT statement")
-                    .await
+                // Not a DML statement (shouldn't happen for this verb)
+                self.send_error(
+                    "ERROR",
+                    "42601",
+                    &format!("Invalid {} statement", verb.as_str()),
+                )
+                .await
             }
             Err(e) => {
-                warn!("Failed to parse INSERT: {}", e);
+                warn!("Failed to parse {}: {}", verb.as_str(), e);
                 self.send_error("ERROR", "42601", &format!("Parse error: {}", e))
                     .await
             }
@@ -5997,157 +6116,15 @@ impl PostgresProtocol {
         .await
     }
 
-    /// Execute DELETE using the proper SQL parser and DmlService
+    /// Execute DELETE using the proper SQL parser and DmlService (shared
+    /// body — see `execute_dml_via_dml_service`).
     async fn execute_delete_via_dml_service(
         &mut self,
         query: &str,
         dml_service: &Arc<DmlService>,
     ) -> Result<()> {
-        let parser = SqlFrontendParser::new();
-
-        match parser.parse_dml(query) {
-            Ok(Some(statement)) => {
-                // Slice 6.3: gate before DELETE — symmetric with INSERT.
-                // TD-PGWIRE-COPY-1: gate on the SAME tenant the write executes
-                // as (startup `database` first, then the session var). Gating on
-                // the session var alone checked `default` for a `database=acme`
-                // client whose write then landed in acme's partition.
-                let write_tenant = self.pgwire_resolve_write_tenant().await;
-                let table = statement.target_table_name().to_string();
-                match check_pgwire_primary_pod_gate(&self.primary_pod_gate, &write_tenant, &table) {
-                    PgwireGateOutcome::Allow => {}
-                    PgwireGateOutcome::Misrouted { target_pod } => {
-                        return self
-                            .send_error(
-                                "ERROR",
-                                "57P03",
-                                &format!(
-                                    "misdirected_write: DELETE for table '{}' must go to pod '{}' (reconnect to that pod and retry)",
-                                    table, target_pod
-                                ),
-                            )
-                            .await;
-                    }
-                }
-
-                // TD-064 write-half: tenant scope + cross-tenant 42P01 gate (see INSERT).
-                // `write_tenant` resolved once above, before the gate.
-                let tenant_scope = (!write_tenant.is_empty()).then(|| write_tenant.clone());
-                if let Some(ref tenant) = tenant_scope
-                    && !dml_service
-                        .table_visible_for_tenant(&table, Some(tenant.as_str()))
-                        .await
-                        .unwrap_or(false)
-                {
-                    return self
-                        .send_error(
-                            "ERROR",
-                            "42P01",
-                            &format!("relation \"{}\" does not exist", table),
-                        )
-                        .await;
-                }
-                let tenant_ctx = tenant_scope.as_ref().map(|tenant| {
-                    crate::storage::tenant::context::TenantContext::for_tenant_id(tenant)
-                });
-
-                // ADR-018 P2.D: inside an explicit transaction the write
-                // BUFFERS (the primary-pod + tenant-visibility gates above
-                // already ran at statement time) and replays sequentially at
-                // COMMIT. Read-only transactions reject writes here (25006).
-                if self.transaction_in_progress().await {
-                    if self.transaction_is_read_only().await {
-                        return self
-                            .send_error(
-                                "ERROR",
-                                "25006",
-                                &format!(
-                                    "cannot execute {} in a read-only transaction (ADR-018 P2.D)",
-                                    dml_summary(&statement).0
-                                ),
-                            )
-                            .await;
-                    }
-                    let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
-                    if let Err((sqlstate, reason)) = self
-                        .transaction_push(
-                            statement,
-                            tenant_ctx,
-                            approx_bytes.max(query.len()),
-                            table.clone(),
-                            write_tenant.clone(),
-                        )
-                        .await
-                    {
-                        return self.send_error("ERROR", sqlstate, &reason).await;
-                    }
-                    let tag = if kind == "INSERT" {
-                        format!("INSERT 0 {}", tag_rows.unwrap_or(0))
-                    } else {
-                        format!("{kind} 0")
-                    };
-                    return self.send_command_complete(&tag).await;
-                }
-                match self
-                    .execute_autocommit_dml(
-                        dml_service,
-                        statement,
-                        tenant_ctx.as_ref(),
-                        &table,
-                        &write_tenant,
-                    )
-                    .await
-                {
-                    Ok(result) => {
-                        info!(
-                            rows_affected = result.rows_affected,
-                            "DELETE executed via DmlService"
-                        );
-                        // Mandate #16b: invalidate the tenant-scoped OLAP result
-                        // cache for the written table (default-OFF no-op).
-                        super::relational_pipeline::invalidate_olap_result_cache_for(
-                            &write_tenant,
-                            &table,
-                        )
-                        .await;
-                        self.send_command_complete(&format!("DELETE {}", result.rows_affected))
-                            .await
-                    }
-                    Err(AutocommitFailure::Atomic(error)) => {
-                        return self
-                            .send_autocommit_atomic_failure(error, &write_tenant, &table)
-                            .await;
-                    }
-                    Err(AutocommitFailure::Statement(e)) => {
-                        if let Some((resource, holder)) =
-                            crate::errors::extract_dml_lock_conflict(&e)
-                        {
-                            let msg = match holder {
-                                Some(h) => {
-                                    format!("lock not available on {resource} (held by {h})")
-                                }
-                                None => format!("lock not available on {resource}"),
-                            };
-                            warn!("DmlService DELETE blocked by DML lock: {msg}");
-                            return self.send_error("ERROR", "55P03", &msg).await;
-                        }
-                        warn!("DmlService DELETE failed: {}", e);
-                        let code = dml_error_sqlstate(&e, "42P01");
-                        self.send_error("ERROR", code, &format!("Delete failed: {}", e))
-                            .await
-                    }
-                }
-            }
-            Ok(None) => {
-                self.send_error("ERROR", "42601", "Invalid DELETE statement")
-                    .await
-            }
-            Err(e) => {
-                warn!("Failed to parse DELETE: {}", e);
-                self.send_error("ERROR", "42601", &format!("Parse error: {}", e))
-                    .await
-            }
-        }
+        self.execute_dml_via_dml_service(query, dml_service, DmlVerb::Delete)
+            .await
     }
 
     /// Execute UPDATE through canonical catalog-backed DML.
@@ -6166,158 +6143,15 @@ impl PostgresProtocol {
         .await
     }
 
-    /// Execute UPDATE using the proper SQL parser and DmlService
+    /// Execute UPDATE using the proper SQL parser and DmlService (shared
+    /// body — see `execute_dml_via_dml_service`).
     async fn execute_update_via_dml_service(
         &mut self,
         query: &str,
         dml_service: &Arc<DmlService>,
     ) -> Result<()> {
-        let parser = SqlFrontendParser::new();
-
-        match parser.parse_dml(query) {
-            Ok(Some(statement)) => {
-                // Slice 6.3: gate before UPDATE — symmetric with INSERT/DELETE.
-                // TD-PGWIRE-COPY-1: gate on the SAME tenant the write executes
-                // as (startup `database` first, then the session var). Gating on
-                // the session var alone checked `default` for a `database=acme`
-                // client whose write then landed in acme's partition.
-                let write_tenant = self.pgwire_resolve_write_tenant().await;
-                let table = statement.target_table_name().to_string();
-                match check_pgwire_primary_pod_gate(&self.primary_pod_gate, &write_tenant, &table) {
-                    PgwireGateOutcome::Allow => {}
-                    PgwireGateOutcome::Misrouted { target_pod } => {
-                        return self
-                            .send_error(
-                                "ERROR",
-                                "57P03",
-                                &format!(
-                                    "misdirected_write: UPDATE for table '{}' must go to pod '{}' (reconnect to that pod and retry)",
-                                    table, target_pod
-                                ),
-                            )
-                            .await;
-                    }
-                }
-
-                // TD-064 write-half: tenant scope + cross-tenant 42P01 gate (see INSERT).
-                // `write_tenant` resolved once above, before the gate.
-                let tenant_scope = (!write_tenant.is_empty()).then(|| write_tenant.clone());
-                if let Some(ref tenant) = tenant_scope
-                    && !dml_service
-                        .table_visible_for_tenant(&table, Some(tenant.as_str()))
-                        .await
-                        .unwrap_or(false)
-                {
-                    return self
-                        .send_error(
-                            "ERROR",
-                            "42P01",
-                            &format!("relation \"{}\" does not exist", table),
-                        )
-                        .await;
-                }
-                let tenant_ctx = tenant_scope.as_ref().map(|tenant| {
-                    crate::storage::tenant::context::TenantContext::for_tenant_id(tenant)
-                });
-
-                // ADR-018 P2.D: inside an explicit transaction the write
-                // BUFFERS (the primary-pod + tenant-visibility gates above
-                // already ran at statement time) and replays sequentially at
-                // COMMIT. Read-only transactions reject writes here (25006).
-                if self.transaction_in_progress().await {
-                    if self.transaction_is_read_only().await {
-                        return self
-                            .send_error(
-                                "ERROR",
-                                "25006",
-                                &format!(
-                                    "cannot execute {} in a read-only transaction (ADR-018 P2.D)",
-                                    dml_summary(&statement).0
-                                ),
-                            )
-                            .await;
-                    }
-                    let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
-                    if let Err((sqlstate, reason)) = self
-                        .transaction_push(
-                            statement,
-                            tenant_ctx,
-                            approx_bytes.max(query.len()),
-                            table.clone(),
-                            write_tenant.clone(),
-                        )
-                        .await
-                    {
-                        return self.send_error("ERROR", sqlstate, &reason).await;
-                    }
-                    let tag = if kind == "INSERT" {
-                        format!("INSERT 0 {}", tag_rows.unwrap_or(0))
-                    } else {
-                        format!("{kind} 0")
-                    };
-                    return self.send_command_complete(&tag).await;
-                }
-                match self
-                    .execute_autocommit_dml(
-                        dml_service,
-                        statement,
-                        tenant_ctx.as_ref(),
-                        &table,
-                        &write_tenant,
-                    )
-                    .await
-                {
-                    Ok(result) => {
-                        info!(
-                            rows_affected = result.rows_affected,
-                            "UPDATE executed via DmlService"
-                        );
-                        // Mandate #16b: invalidate the tenant-scoped OLAP result
-                        // cache for the written table (default-OFF no-op).
-                        super::relational_pipeline::invalidate_olap_result_cache_for(
-                            &write_tenant,
-                            &table,
-                        )
-                        .await;
-                        self.send_command_complete(&format!("UPDATE {}", result.rows_affected))
-                            .await
-                    }
-                    Err(AutocommitFailure::Atomic(error)) => {
-                        return self
-                            .send_autocommit_atomic_failure(error, &write_tenant, &table)
-                            .await;
-                    }
-                    Err(AutocommitFailure::Statement(e)) => {
-                        if let Some((resource, holder)) =
-                            crate::errors::extract_dml_lock_conflict(&e)
-                        {
-                            let msg = match holder {
-                                Some(h) => {
-                                    format!("lock not available on {resource} (held by {h})")
-                                }
-                                None => format!("lock not available on {resource}"),
-                            };
-                            warn!("DmlService UPDATE blocked by DML lock: {msg}");
-                            return self.send_error("ERROR", "55P03", &msg).await;
-                        }
-                        // DmlService UPDATE returns error for not-implemented
-                        // This is expected - UPDATE requires delete + insert pattern
-                        warn!("DmlService UPDATE: {}", e);
-                        let code = dml_error_sqlstate(&e, "0A000");
-                        self.send_error("ERROR", code, &format!("{}", e)).await
-                    }
-                }
-            }
-            Ok(None) => {
-                self.send_error("ERROR", "42601", "Invalid UPDATE statement")
-                    .await
-            }
-            Err(e) => {
-                warn!("Failed to parse UPDATE: {}", e);
-                self.send_error("ERROR", "42601", &format!("Parse error: {}", e))
-                    .await
-            }
-        }
+        self.execute_dml_via_dml_service(query, dml_service, DmlVerb::Update)
+            .await
     }
 
     /// Execute DROP TABLE - deletes a ProximaDB collection
@@ -6429,22 +6263,13 @@ impl PostgresProtocol {
         // tenant-scoped insert-only path (`copy_insert`) instead of the unscoped
         // `insert_batch`. Gate BEFORE CopyInResponse so
         // a misrouted client never streams its payload to the wrong pod.
-        let write_tenant = self.pgwire_resolve_write_tenant().await;
-        match check_pgwire_primary_pod_gate(&self.primary_pod_gate, &write_tenant, &table_name) {
-            PgwireGateOutcome::Allow => {}
-            PgwireGateOutcome::Misrouted { target_pod } => {
-                return self
-                    .send_error(
-                        "ERROR",
-                        "57P03",
-                        &format!(
-                            "misdirected_write: COPY into table '{}' must go to pod '{}' (reconnect to that pod and retry)",
-                            table_name, target_pod
-                        ),
-                    )
-                    .await;
-            }
-        }
+        let write_tenant = match self
+            .resolve_write_tenant_gated("COPY into", &table_name)
+            .await?
+        {
+            Some(write_tenant) => write_tenant,
+            None => return Ok(()),
+        };
         let tenant_ctx =
             crate::storage::tenant::context::TenantContext::for_tenant_id(write_tenant.clone());
 
