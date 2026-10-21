@@ -764,7 +764,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.dup_ratchet == 'true'
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dup_ratchet == 'true'
     steps:
       - uses: actions/checkout@v7
       - name: Check for tracked artifact files
