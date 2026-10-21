@@ -321,31 +321,6 @@ pub fn reconstruct_f32_from_i64(deltas: &[i64], base: i32) -> Vec<f32> {
         .collect()
 }
 
-/// Reconstruction helper for i32 from i64 deltas
-///
-/// Converts i64 deltas to i32 values, handling potential overflow.
-#[inline]
-pub fn reconstruct_i32_from_i64(deltas: &[i64], base: i32) -> Vec<i32> {
-    deltas
-        .iter()
-        .map(|&delta| {
-            let val_i64 = (base as i64) + delta;
-            val_i64 as i32 // Truncate to i32
-        })
-        .collect()
-}
-
-/// Reconstruction helper for i64 from i64 deltas
-///
-/// Direct addition with wrapping semantics for signed integers.
-#[inline]
-pub fn reconstruct_i64_from_i64(deltas: &[i64], base: i64) -> Vec<i64> {
-    deltas
-        .iter()
-        .map(|&delta| base.wrapping_add(delta))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,14 +457,5 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], 1.0f32);
         assert_eq!(result[1], 2.0f32);
-    }
-
-    #[test]
-    fn test_reconstruct_i64_from_i64() {
-        let base = 1000i64;
-        let deltas = vec![0, 500, -250];
-        let result = reconstruct_i64_from_i64(&deltas, base);
-
-        assert_eq!(result, vec![1000, 1500, 750]);
     }
 }
