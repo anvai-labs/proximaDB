@@ -149,6 +149,20 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(common: cli::CommonArgs, serve: cli::ServeArgs) -> anyhow::Result<()> {
+    // Install the OS signal handlers BEFORE any server boots. A `Signal`
+    // created here registers its handler immediately and buffers a
+    // pending receipt, whereas `tokio::signal::ctrl_c()` only registers
+    // when first polled — i.e. when the shutdown select arms, AFTER the
+    // listeners are already serving. A SIGINT/SIGTERM landing in that
+    // boot/serving window previously hit the default disposition and
+    // killed the process with no shutdown flush (seen as the
+    // cold_backup_restore "unclean exit during graceful stop: signal 2"
+    // CI flake; the same window would drop an early `docker stop`).
+    #[cfg(unix)]
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
     // Initialize tracing with rolling file appender
     use tracing_appender::rolling::{RollingFileAppender, Rotation};
     use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -429,10 +443,8 @@ async fn run(common: cli::CommonArgs, serve: cli::ServeArgs) -> anyhow::Result<(
     };
     #[cfg(unix)]
     let critical_drainer_stopped = {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = sigint.recv() => {
                 info!("Received SIGINT, stopping server...");
                 false
             },
