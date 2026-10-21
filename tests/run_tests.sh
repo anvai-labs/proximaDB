@@ -146,10 +146,10 @@ if [[ "$RUN_INTEGRATION_TESTS" == "true" ]]; then
     
     # Run each integration test file individually for better error reporting
     INTEGRATION_TEST_FILES=(
-        "tests/integration/grpc/test_grpc_integration.rs"
-        "tests/integration/rest/test_rest_api_integration.rs"
-        "tests/integration/storage/test_storage_integration.rs"
-        "tests/integration/vector/test_vector_search_integration.rs"
+        "tests/integration/grpc/test_grpc_vector_operations.rs"
+        "tests/integration/rest/test_rest_api_operations.rs"
+        "tests/integration/rest/test_rest_vector_search_proto.rs"
+        "tests/integration/vector/test_direct_vector_operations.rs"
     )
     
     INTEGRATION_FAILURES=0

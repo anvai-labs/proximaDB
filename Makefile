@@ -164,8 +164,9 @@ proto-check:
 #   UPDATE_OPENAPI_SPEC=1 cargo test -p proximadb --test openapi_spec_gen
 .PHONY: dup-report
 dup-report: ## Copy/paste duplication census (jscpd) — report lands in target/jscpd-report/
-	@echo " replaying the duplication census (config: .jscpd.json; see docs/10-quality/DUPLICATION_CENSUS_2026_10_20.md)"
-	npx --yes jscpd .
+	@echo " replaying the duplication census (flags inline — census config lives here; see docs/10-quality/DUPLICATION_CENSUS_2026_10_20.md)"
+	npx --yes jscpd . --format rust,python --min-tokens 50 --similarity \
+		--ignore "**/target/**,**/node_modules/**,**/_generated/**,third_party/**,docs/**,crates/foundation/proximadb-proto/src/proto/**,data/**,bench-data/**,artifacts/**,metadata/**,log/**,**/.git/**,ui/**,roadmap/**"
 
 verify-openapi-spec:
 	@echo "🧬 Validating OpenAPI spec ↔ handler drift (spec-from-code)..."
