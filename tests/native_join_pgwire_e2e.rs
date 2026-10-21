@@ -48,15 +48,6 @@ use tokio_postgres::{SimpleQueryMessage, SimpleQueryRow};
 mod pg_server;
 
 use pg_server::TestPgServer;
-/// Render a tokio_postgres error including the real server-side DbError cause.
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    if let Some(db) = e.as_db_error() {
-        format!("[{}] {}", db.code().code(), db.message())
-    } else {
-        e.to_string()
-    }
-}
-
 /// One cell as text; a SQL NULL renders as the literal `NULL` (so NULL-extended
 /// join rows are compared explicitly rather than silently dropped).
 fn cell(row: &SimpleQueryRow, col: &str) -> String {
@@ -109,13 +100,13 @@ async fn native_hash_join_over_pgwire_matches_expected() {
             "CREATE TABLE {dept} (id BIGINT PRIMARY KEY, dname VARCHAR)"
         ))
         .await
-        .unwrap_or_else(|e| panic!("CREATE dept: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("CREATE dept: {}", pg_server::db_err(&e)));
     client
         .simple_query(&format!(
             "CREATE TABLE {emp} (id BIGINT PRIMARY KEY, dept_id BIGINT, ename VARCHAR)"
         ))
         .await
-        .unwrap_or_else(|e| panic!("CREATE emp: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("CREATE emp: {}", pg_server::db_err(&e)));
 
     // dept 3 (hr) has no employee → unmatched RIGHT row for RIGHT/FULL.
     for (id, dname) in [(1, "eng"), (2, "sales"), (3, "hr")] {
@@ -124,7 +115,7 @@ async fn native_hash_join_over_pgwire_matches_expected() {
                 "INSERT INTO {dept} (id, dname) VALUES ({id}, '{dname}')"
             ))
             .await
-            .unwrap_or_else(|e| panic!("INSERT dept: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("INSERT dept: {}", pg_server::db_err(&e)));
     }
     // emp 13 (dan) has dept_id 99 (no such dept) → unmatched LEFT row for LEFT/FULL.
     for (id, dept_id, ename) in [
@@ -138,7 +129,7 @@ async fn native_hash_join_over_pgwire_matches_expected() {
                 "INSERT INTO {emp} (id, dept_id, ename) VALUES ({id}, {dept_id}, '{ename}')"
             ))
             .await
-            .unwrap_or_else(|e| panic!("INSERT emp: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("INSERT emp: {}", pg_server::db_err(&e)));
     }
 
     sleep(Duration::from_millis(500)).await;
@@ -149,7 +140,7 @@ async fn native_hash_join_over_pgwire_matches_expected() {
             "SELECT ename, dname FROM {emp} JOIN {dept} ON {emp}.dept_id = {dept}.id"
         ))
         .await
-        .unwrap_or_else(|e| panic!("INNER JOIN: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("INNER JOIN: {}", pg_server::db_err(&e)));
     assert_eq!(
         pairs(&rows, "ename", "dname"),
         expected(&[("ann", "eng"), ("bob", "eng"), ("cas", "sales")]),
@@ -162,7 +153,7 @@ async fn native_hash_join_over_pgwire_matches_expected() {
             "SELECT ename, dname FROM {emp} LEFT JOIN {dept} ON {emp}.dept_id = {dept}.id"
         ))
         .await
-        .unwrap_or_else(|e| panic!("LEFT JOIN: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("LEFT JOIN: {}", pg_server::db_err(&e)));
     assert_eq!(
         pairs(&rows, "ename", "dname"),
         expected(&[
@@ -180,7 +171,7 @@ async fn native_hash_join_over_pgwire_matches_expected() {
             "SELECT ename, dname FROM {emp} RIGHT JOIN {dept} ON {emp}.dept_id = {dept}.id"
         ))
         .await
-        .unwrap_or_else(|e| panic!("RIGHT JOIN: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("RIGHT JOIN: {}", pg_server::db_err(&e)));
     assert_eq!(
         pairs(&rows, "ename", "dname"),
         expected(&[
@@ -198,7 +189,7 @@ async fn native_hash_join_over_pgwire_matches_expected() {
             "SELECT ename, dname FROM {emp} FULL JOIN {dept} ON {emp}.dept_id = {dept}.id"
         ))
         .await
-        .unwrap_or_else(|e| panic!("FULL JOIN: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("FULL JOIN: {}", pg_server::db_err(&e)));
     assert_eq!(
         pairs(&rows, "ename", "dname"),
         expected(&[

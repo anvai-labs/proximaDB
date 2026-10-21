@@ -9,105 +9,20 @@
 //!
 //!   cargo test --test cdc_rest_changefeed_e2e -- --nocapture
 
-use std::net::TcpListener;
 use std::time::Duration;
 
-use proximadb::core::Config;
-use proximadb::database::ProximaDB;
 use serde_json::Value;
-use tempfile::TempDir;
 use tokio::time::sleep;
 
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let p = l.local_addr().expect("addr").port();
-    drop(l);
-    p
-}
+#[path = "common/pg_server.rs"]
+mod pg_server;
 
-struct Server {
-    pg_port: u16,
-    rest_port: u16,
-    db: Option<ProximaDB>,
-    _tmp: TempDir,
-}
-
-impl Server {
-    async fn start() -> anyhow::Result<Self> {
-        let pg_port = free_port();
-        let rest_port = free_port();
-        let grpc_port = free_port();
-        let tmp = TempDir::new()?;
-        let mut config = Config::default();
-        config.server.bind_address = "127.0.0.1".to_string();
-        config.server.port = rest_port;
-        config.server.data_dir = tmp.path().to_path_buf();
-        config.api.rest_port = rest_port;
-        config.api.grpc_port = grpc_port;
-        config.api.unified_mode = false;
-        config.api.pg_port = Some(pg_port);
-        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
-            url: format!("file://{}", tmp.path().display()),
-            ..Default::default()
-        }];
-        // Anchor the system catalog to this test's directory (a CWD-relative
-        // default would share it with other runs).
-        config.storage.metadata_url = format!("file://{}/metadata", tmp.path().display());
-        config.storage.wal_config.write_buffer_directory =
-            format!("file://{}/wal", tmp.path().display());
-        let mut db = ProximaDB::new(config).await?;
-        db.start().await?;
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .no_proxy()
-            .build()?;
-        let health = format!("http://127.0.0.1:{rest_port}/health");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match http.get(&health).send().await {
-                Ok(r) if r.status().is_success() => break,
-                _ if std::time::Instant::now() > deadline => anyhow::bail!("REST not ready"),
-                _ => sleep(Duration::from_millis(100)).await,
-            }
-        }
-        sleep(Duration::from_millis(200)).await;
-        Ok(Self {
-            pg_port,
-            rest_port,
-            db: Some(db),
-            _tmp: tmp,
-        })
-    }
-    fn conn_str(&self) -> String {
-        format!(
-            "host=127.0.0.1 port={} user=postgres dbname=proximadb sslmode=disable",
-            self.pg_port
-        )
-    }
-    fn base(&self) -> String {
-        format!("http://127.0.0.1:{}", self.rest_port)
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        if let Some(mut db) = self.db.take() {
-            tokio::spawn(async move {
-                let _ = db.shutdown().await;
-            });
-        }
-    }
-}
+use pg_server::TestPgServer;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pgwire_writes_are_visible_on_the_rest_change_feed() {
-    let server = Server::start().await.expect("server start");
-    let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-        .await
-        .expect("connect");
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
+    let server = TestPgServer::start().await.expect("server start");
+    let client = server.connect().await.expect("connect");
 
     // Write over pgwire.
     let _ = client.simple_query("DROP TABLE IF EXISTS crfeed").await;
@@ -130,15 +45,10 @@ async fn pgwire_writes_are_visible_on_the_rest_change_feed() {
     sleep(Duration::from_millis(200)).await;
 
     // Read the change-feed over REST — a DIFFERENT protocol than the writes.
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .no_proxy()
-        .build()
-        .unwrap();
+    let (http, base) = server.rest_client().expect("rest client");
     let resp = http
         .get(format!(
-            "{}/api/v2/collections/crfeed/changes?since_lsn=0",
-            server.base()
+            "{base}/api/v2/collections/crfeed/changes?since_lsn=0"
         ))
         .header("X-Tenant-ID", "proximadb")
         .send()
@@ -178,8 +88,7 @@ async fn pgwire_writes_are_visible_on_the_rest_change_feed() {
     // Cursor: since_lsn = first change's lsn → only the 3 later changes.
     let resp2 = http
         .get(format!(
-            "{}/api/v2/collections/crfeed/changes?since_lsn={}",
-            server.base(),
+            "{base}/api/v2/collections/crfeed/changes?since_lsn={}",
             lsns[0]
         ))
         .header("X-Tenant-ID", "proximadb")

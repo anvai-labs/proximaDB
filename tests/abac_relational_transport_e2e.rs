@@ -29,7 +29,6 @@
 #![cfg(feature = "abac-policy")]
 
 use std::collections::HashMap;
-use std::net::TcpListener;
 use std::time::Duration;
 
 use arrow_array::{Array, RecordBatch, StringArray};
@@ -38,8 +37,6 @@ use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use futures::TryStreamExt;
-use proximadb::core::Config;
-use proximadb::database::ProximaDB;
 use proximadb::proto::proximadb_v2::proxima_record_service_client::ProximaRecordServiceClient;
 use proximadb::proto::proximadb_v2::{
     GetRecordRequest, TypedSearchRequest, V2QueryRequest, V2QueryResponse,
@@ -54,8 +51,12 @@ use proximadb::security::security_coordinator::{ComplianceConfig, TlsConfig};
 use proximadb::security::{AuditConfig, EncryptionConfig, KeyStoreConfig, SecurityConfig};
 use reqwest::{Client as HttpClient, StatusCode};
 use serde_json::{Value, json};
-use tempfile::TempDir;
 use tokio::time::sleep;
+
+#[path = "common/pg_server.rs"]
+mod pg_server;
+
+use pg_server::TestPgServer;
 
 // The composition root mints this catalog tenant before listeners start, so the
 // authenticated request can resolve the same stable tenant id.
@@ -63,13 +64,6 @@ const TENANT: &str = proximadb_tenant::DEFAULT_TENANT;
 const OPERATOR_KEY: &str = "abac-operator-key";
 const ALICE_KEY: &str = "abac-alice-key";
 const BOB_KEY: &str = "abac-bob-key";
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
-}
 
 fn transport_security_config() -> SecurityConfig {
     let mut api_keys = HashMap::new();
@@ -159,69 +153,15 @@ fn transport_security_config() -> SecurityConfig {
     }
 }
 
-struct LiveServer {
-    rest_port: u16,
-    grpc_port: u16,
-    flight_port: u16,
-    pg_port: u16,
-    db: Option<ProximaDB>,
-    _tmp: TempDir,
+/// URL helpers this suite layers over the shared-harness server.
+trait LiveServerUrls {
+    fn pg_conn_str(&self, subject: &str) -> String;
+    fn admin_url(&self, path: &str) -> String;
+    fn grpc_url(&self) -> String;
+    fn flight_url(&self) -> String;
 }
 
-impl LiveServer {
-    async fn start() -> anyhow::Result<Self> {
-        let rest_port = free_port();
-        let grpc_port = free_port();
-        let flight_port = free_port();
-        let pg_port = free_port();
-        let tmp = TempDir::new()?;
-        let mut config = Config::default();
-        config.server.bind_address = "127.0.0.1".to_string();
-        config.server.port = rest_port;
-        config.server.data_dir = tmp.path().to_path_buf();
-        config.api.unified_mode = false;
-        config.api.rest_port = rest_port;
-        config.api.grpc_port = grpc_port;
-        config.api.arrow_flight_port = flight_port;
-        config.api.pg_port = Some(pg_port);
-        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
-            url: format!("file://{}", tmp.path().display()),
-            ..Default::default()
-        }];
-        config.storage.metadata_url = format!("file://{}/metadata", tmp.path().display());
-        config.storage.wal_config.write_buffer_directory =
-            format!("file://{}/wal", tmp.path().display());
-        config.security = Some(transport_security_config());
-        config.api.enable_pgwire = false;
-
-        let mut db = ProximaDB::new(config).await?;
-        db.start().await?;
-        let http = HttpClient::builder()
-            .timeout(Duration::from_secs(3))
-            .no_proxy()
-            .build()?;
-        let health = format!("http://127.0.0.1:{rest_port}/health");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match http.get(&health).send().await {
-                Ok(response) if response.status().is_success() => break,
-                _ if std::time::Instant::now() > deadline => {
-                    anyhow::bail!("REST server did not become ready")
-                }
-                _ => sleep(Duration::from_millis(100)).await,
-            }
-        }
-        sleep(Duration::from_millis(200)).await;
-        Ok(Self {
-            rest_port,
-            grpc_port,
-            flight_port,
-            pg_port,
-            db: Some(db),
-            _tmp: tmp,
-        })
-    }
-
+impl LiveServerUrls for TestPgServer {
     fn pg_conn_str(&self, subject: &str) -> String {
         format!(
             "host=127.0.0.1 port={} user={subject} password=policy-e2e dbname={TENANT} sslmode=disable",
@@ -242,14 +182,13 @@ impl LiveServer {
     }
 }
 
-impl Drop for LiveServer {
-    fn drop(&mut self) {
-        if let Some(mut db) = self.db.take() {
-            tokio::spawn(async move {
-                let _ = db.shutdown().await;
-            });
-        }
-    }
+/// Shared-harness boot carrying this suite's security posture.
+async fn start_live_server() -> anyhow::Result<TestPgServer> {
+    TestPgServer::start_with(|config| {
+        config.security = Some(transport_security_config());
+        config.api.enable_pgwire = false;
+    })
+    .await
 }
 
 struct AuthenticatedSqlClient {
@@ -259,22 +198,19 @@ struct AuthenticatedSqlClient {
     catalog_wal: std::path::PathBuf,
 }
 
-async fn connect(server: &LiveServer, subject: &str) -> AuthenticatedSqlClient {
+async fn connect(server: &TestPgServer, subject: &str) -> AuthenticatedSqlClient {
     let key = match subject {
         "alice" => ALICE_KEY,
         "bob" => BOB_KEY,
         "setup-operator" => OPERATOR_KEY,
         _ => panic!("unknown fixture subject"),
     };
+    let (http, base) = server.rest_client().expect("HTTP client");
     AuthenticatedSqlClient {
-        http: HttpClient::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap(),
-        url: server.admin_url("/api/v2/sql"),
+        http,
+        url: format!("{base}/api/v2/sql"),
         key,
-        catalog_wal: server._tmp.path().join("metadata/system-catalog.wal"),
+        catalog_wal: server.data_dir().join("metadata/system-catalog.wal"),
     }
 }
 
@@ -356,7 +292,7 @@ async fn assert_admin_success(response: reqwest::Response, operation: &str) -> V
 
 type GrpcClient = ProximaRecordServiceClient<tonic::transport::Channel>;
 
-async fn connect_grpc(server: &LiveServer) -> GrpcClient {
+async fn connect_grpc(server: &TestPgServer) -> GrpcClient {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         match ProximaRecordServiceClient::connect(server.grpc_url()).await {
@@ -406,7 +342,7 @@ async fn grpc_row_count(client: &mut GrpcClient, api_key: &str, sql: &str) -> us
 
 async fn rest_sql_row_count(
     client: &HttpClient,
-    server: &LiveServer,
+    server: &TestPgServer,
     api_key: &str,
     sql: &str,
 ) -> usize {
@@ -434,7 +370,7 @@ async fn rest_sql_row_count(
 
 async fn rest_record_search_ids(
     client: &HttpClient,
-    server: &LiveServer,
+    server: &TestPgServer,
     api_key: &str,
     collection: &str,
 ) -> Vec<String> {
@@ -469,7 +405,7 @@ async fn rest_record_search_ids(
 
 async fn rest_record_get_status(
     client: &HttpClient,
-    server: &LiveServer,
+    server: &TestPgServer,
     api_key: &str,
     collection: &str,
     record_id: &str,
@@ -562,7 +498,7 @@ async fn grpc_record_found(
         .found
 }
 
-async fn connect_flight(server: &LiveServer) -> FlightServiceClient<tonic::transport::Channel> {
+async fn connect_flight(server: &TestPgServer) -> FlightServiceClient<tonic::transport::Channel> {
     let channel = tonic::transport::Endpoint::from_shared(server.flight_url())
         .expect("Flight endpoint")
         .connect()
@@ -621,15 +557,11 @@ struct LiveRecordFixture {
 
 async fn create_live_record_fixture(
     client: &HttpClient,
-    server: &LiveServer,
+    server: &TestPgServer,
     name_prefix: &str,
 ) -> LiveRecordFixture {
-    let suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
     let fixture = LiveRecordFixture {
-        collection: format!("{name_prefix}_{suffix}"),
+        collection: server.unique_name(name_prefix),
         eng_id: "record-eng",
         hr_id: "record-hr",
     };
@@ -679,7 +611,7 @@ async fn create_live_record_fixture(
 
 async fn provision_live_record_policy(
     client: &HttpClient,
-    server: &LiveServer,
+    server: &TestPgServer,
     predicate_object_id: u64,
 ) -> String {
     let operator_auth = format!("Api-Key {OPERATOR_KEY}");
@@ -747,7 +679,7 @@ async fn provision_live_record_policy(
 /// test could tell us that.
 async fn provision_live_subject_parameterized_policy(
     client: &HttpClient,
-    server: &LiveServer,
+    server: &TestPgServer,
     predicate_object_id: u64,
 ) -> String {
     let operator_auth = format!("Api-Key {OPERATOR_KEY}");
@@ -820,12 +752,8 @@ fn rest_records_follow_a_subject_parameterized_predicate() {
 }
 
 async fn rest_records_follow_a_subject_parameterized_predicate_inner() {
-    let server = LiveServer::start().await.expect("start live server");
-    let http = HttpClient::builder()
-        .timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("HTTP client");
+    let server = start_live_server().await.expect("start live server");
+    let (http, _) = server.rest_client().expect("HTTP client");
     let fixture = create_live_record_fixture(&http, &server, "abac_subject_param").await;
 
     let policy_path =
@@ -858,7 +786,7 @@ async fn rest_records_follow_a_subject_parameterized_predicate_inner() {
     );
 }
 
-async fn revoke_live_policy(client: &HttpClient, server: &LiveServer, policy_path: &str) {
+async fn revoke_live_policy(client: &HttpClient, server: &TestPgServer, policy_path: &str) {
     let response = client
         .delete(server.admin_url(policy_path))
         .header(
@@ -887,7 +815,7 @@ fn authenticated_sql_counts_follow_live_policy_provision_and_revoke() {
 }
 
 async fn authenticated_sql_counts_follow_live_policy_provision_and_revoke_inner() {
-    let server = LiveServer::start().await.expect("start live server");
+    let server = start_live_server().await.expect("start live server");
     assert!(
         tokio_postgres::connect(&server.pg_conn_str("alice"), tokio_postgres::NoTls)
             .await
@@ -895,11 +823,7 @@ async fn authenticated_sql_counts_follow_live_policy_provision_and_revoke_inner(
         "authenticated fixture must not expose trust pgwire"
     );
     let alice = connect(&server, "alice").await;
-    let suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let table = format!("abac_live_{suffix}");
+    let table = server.unique_name("abac_live");
     exec(
         &alice,
         &format!("CREATE TABLE {table} (id INT PRIMARY KEY, value INT)"),
@@ -920,11 +844,7 @@ async fn authenticated_sql_counts_follow_live_policy_provision_and_revoke_inner(
         "unprovisioned governed reads must fail closed"
     );
 
-    let http = HttpClient::builder()
-        .timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("HTTP client");
+    let (http, _) = server.rest_client().expect("HTTP client");
     let auth = format!("Api-Key {OPERATOR_KEY}");
 
     let response = http
@@ -1009,16 +929,12 @@ fn grpc_reads_follow_live_rest_policy_provision_and_revoke() {
 }
 
 async fn grpc_reads_follow_live_rest_policy_provision_and_revoke_inner() {
-    let server = LiveServer::start().await.expect("start live server");
+    let server = start_live_server().await.expect("start live server");
 
     // Use authenticated REST SQL as the setup/operator surface. The assertions below
     // all cross the independently authenticated gRPC transport.
     let setup = connect(&server, "setup-operator").await;
-    let suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let table = format!("abac_grpc_live_{suffix}");
+    let table = server.unique_name("abac_grpc_live");
     exec(
         &setup,
         &format!("CREATE TABLE {table} (id INT PRIMARY KEY, value INT)"),
@@ -1039,11 +955,7 @@ async fn grpc_reads_follow_live_rest_policy_provision_and_revoke_inner() {
         "an authenticated but unprovisioned gRPC subject must fail closed"
     );
 
-    let http = HttpClient::builder()
-        .timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("HTTP client");
+    let (http, _) = server.rest_client().expect("HTTP client");
     let auth = format!("Api-Key {OPERATOR_KEY}");
     let response = http
         .post(server.admin_url("/api/v2/abac/attribute-bindings"))
@@ -1134,13 +1046,9 @@ fn rest_sql_reads_follow_live_policy_provision_and_revoke() {
 }
 
 async fn rest_sql_reads_follow_live_policy_provision_and_revoke_inner() {
-    let server = LiveServer::start().await.expect("start live server");
+    let server = start_live_server().await.expect("start live server");
     let setup = connect(&server, "setup-operator").await;
-    let suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let table = format!("abac_rest_sql_live_{suffix}");
+    let table = server.unique_name("abac_rest_sql_live");
     exec(
         &setup,
         &format!("CREATE TABLE {table} (id INT PRIMARY KEY, value INT)"),
@@ -1152,11 +1060,7 @@ async fn rest_sql_reads_follow_live_policy_provision_and_revoke_inner() {
     let object_id = table_object_id(&setup, &table).await;
     let table_scope = u32::try_from(object_id).expect("ABAC table scope is u32");
     let sql = format!("SELECT id FROM {table}");
-    let http = HttpClient::builder()
-        .timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("HTTP client");
+    let (http, _) = server.rest_client().expect("HTTP client");
 
     assert_eq!(
         rest_sql_row_count(&http, &server, ALICE_KEY, &sql).await,
@@ -1236,12 +1140,8 @@ fn rest_records_follow_live_row_policy_provision_and_revoke() {
 }
 
 async fn rest_records_follow_live_row_policy_provision_and_revoke_inner() {
-    let server = LiveServer::start().await.expect("start live server");
-    let http = HttpClient::builder()
-        .timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("HTTP client");
+    let server = start_live_server().await.expect("start live server");
+    let (http, _) = server.rest_client().expect("HTTP client");
     let fixture = create_live_record_fixture(&http, &server, "abac_rest_records").await;
 
     assert!(
@@ -1332,12 +1232,8 @@ fn grpc_records_follow_live_row_policy_provision_and_revoke() {
 }
 
 async fn grpc_records_follow_live_row_policy_provision_and_revoke_inner() {
-    let server = LiveServer::start().await.expect("start live server");
-    let http = HttpClient::builder()
-        .timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("HTTP client");
+    let server = start_live_server().await.expect("start live server");
+    let (http, _) = server.rest_client().expect("HTTP client");
     let fixture = create_live_record_fixture(&http, &server, "abac_grpc_records").await;
     let mut alice = connect_grpc(&server).await;
     let mut bob = connect_grpc(&server).await;
@@ -1413,12 +1309,8 @@ fn flight_records_follow_live_row_policy_provision_and_revoke() {
 }
 
 async fn flight_records_follow_live_row_policy_provision_and_revoke_inner() {
-    let server = LiveServer::start().await.expect("start live server");
-    let http = HttpClient::builder()
-        .timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("HTTP client");
+    let server = start_live_server().await.expect("start live server");
+    let (http, _) = server.rest_client().expect("HTTP client");
     let fixture = create_live_record_fixture(&http, &server, "abac_flight_records").await;
     let mut alice = connect_flight(&server).await;
     let mut bob = connect_flight(&server).await;
@@ -1473,7 +1365,7 @@ async fn flight_records_follow_live_row_policy_provision_and_revoke_inner() {
 
 /// Set a tenant's grant-enforcement posture through the live admin API
 /// (TD-SEC-2 Slice C). Returns once the write is durable and hot-visible.
-async fn set_tenant_posture(client: &HttpClient, server: &LiveServer, tenant: &str, mode: &str) {
+async fn set_tenant_posture(client: &HttpClient, server: &TestPgServer, tenant: &str, mode: &str) {
     let response = client
         .put(server.admin_url(&format!("/api/v2/abac/tenant-posture/{tenant}")))
         .header(
@@ -1491,7 +1383,7 @@ async fn set_tenant_posture(client: &HttpClient, server: &LiveServer, tenant: &s
 /// Returns the grant id, so the revoke half of the ratchet can name it.
 async fn provision_read_grant(
     client: &HttpClient,
-    server: &LiveServer,
+    server: &TestPgServer,
     tenant: &str,
     subject: &str,
     table_object_id: u64,
@@ -1518,7 +1410,7 @@ async fn provision_read_grant(
         .to_string()
 }
 
-async fn revoke_grant(client: &HttpClient, server: &LiveServer, tenant: &str, grant_id: &str) {
+async fn revoke_grant(client: &HttpClient, server: &TestPgServer, tenant: &str, grant_id: &str) {
     let response = client
         .delete(server.admin_url(&format!("/api/v2/abac/grants/{tenant}/{grant_id}")))
         .header(
@@ -1547,12 +1439,8 @@ fn grant_enforcement_follows_live_provision_permit_deny_revoke() {
 }
 
 async fn grant_ratchet_inner() {
-    let server = LiveServer::start().await.expect("start live server");
-    let http = HttpClient::builder()
-        .timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("HTTP client");
+    let server = start_live_server().await.expect("start live server");
+    let (http, _) = server.rest_client().expect("HTTP client");
     let fixture = create_live_record_fixture(&http, &server, "authz_grant_ratchet").await;
 
     // ABAC is fail-closed, so an unprovisioned principal reads nothing even
@@ -1651,13 +1539,9 @@ async fn governed_subject_gets_full_sql_surface_with_rows_still_filtered_inner()
     // via `std::env::var`, which is exactly how an operator enables the feature.
     unsafe { std::env::set_var("PROXIMADB_NATIVE_TABLE_PROVIDER", "1") };
 
-    let server = LiveServer::start().await.expect("start live server");
+    let server = start_live_server().await.expect("start live server");
     let alice = connect(&server, "alice").await;
-    let suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let table = format!("usub3_{suffix}");
+    let table = server.unique_name("usub3");
 
     exec(
         &alice,
@@ -1678,11 +1562,7 @@ async fn governed_subject_gets_full_sql_surface_with_rows_still_filtered_inner()
         "unprovisioned governed reads must fail closed"
     );
 
-    let http = HttpClient::builder()
-        .timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("HTTP client");
+    let (http, _) = server.rest_client().expect("HTTP client");
     let auth = format!("Api-Key {OPERATOR_KEY}");
 
     let response = http

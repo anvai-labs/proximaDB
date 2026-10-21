@@ -41,12 +41,6 @@ const CAPABILITY_SHAPES: &[(&str, &str)] = &[
     ),
 ];
 
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    e.as_db_error()
-        .map(|d| format!("[{}] {}", d.code().code(), d.message()))
-        .unwrap_or_else(|| e.to_string())
-}
-
 #[test]
 fn native_table_capability_parity() {
     std::thread::Builder::new()
@@ -182,7 +176,7 @@ async fn body() {
         let rows = client.simple_query(sql).await.unwrap_or_else(|e| {
             panic!(
                 "`{label}` must serve on a NATIVE table: {}",
-                explain_err(&e)
+                pg_server::db_err(&e)
             )
         });
         let n = rows

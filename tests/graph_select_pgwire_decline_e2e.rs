@@ -10,12 +10,6 @@
 mod pg_server;
 
 use pg_server::TestPgServer;
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    e.as_db_error()
-        .map(|d| format!("[{}] {}", d.code().code(), d.message()))
-        .unwrap_or_else(|| e.to_string())
-}
-
 #[test]
 fn graph_select_over_pgwire_declines_honestly() {
     std::thread::Builder::new()
@@ -54,7 +48,7 @@ async fn body() {
         .simple_query("SELECT * FROM graph_social")
         .await
         .expect_err("SELECT over a graph collection must be declined, not served");
-    let msg = explain_err(&err);
+    let msg = pg_server::db_err(&err);
     assert!(msg.starts_with("[0A000]"), "unexpected error: {msg}");
     assert!(
         msg.contains("not supported over pgwire"),
@@ -73,7 +67,7 @@ async fn body() {
         .simple_query("SELECT * FROM graph_never_created_xyz")
         .await
         .expect_err("SELECT over a nonexistent graph-shaped table must also decline");
-    let msg2 = explain_err(&err2);
+    let msg2 = pg_server::db_err(&err2);
     assert!(msg2.starts_with("[0A000]"), "unexpected error: {msg2}");
 
     // Confirm no phantom collection was silently provisioned as a side
@@ -83,7 +77,7 @@ async fn body() {
         .simple_query("DROP TABLE graph_never_created_xyz")
         .await
         .expect_err("a declined SELECT must not have created a phantom collection");
-    let drop_msg = explain_err(&drop_err);
+    let drop_msg = pg_server::db_err(&drop_err);
     assert!(
         drop_msg.contains("does not exist") || drop_msg.contains("42P01"),
         "unexpected DROP outcome (phantom collection?): {drop_msg}"

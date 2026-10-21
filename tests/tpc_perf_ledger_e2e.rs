@@ -63,14 +63,6 @@ static CAPTURE: Mutex<Vec<IoTraceSnapshot>> = Mutex::new(Vec::new());
 mod pg_server;
 
 use pg_server::TestPgServer;
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    if let Some(db) = e.as_db_error() {
-        format!("[{}] {}", db.code().code(), db.message())
-    } else {
-        e.to_string()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Deterministic seeded generator — synthetic-tpc-shaped (NOT dbgen/dsdgen).
 // SplitMix64 keeps every run reproducible; key skew is power-law-ish so join
@@ -1347,7 +1339,7 @@ async fn measure(
             }
             Ok((rows, wall_ms, snap))
         }
-        Err(e) => Err((wall_ms, explain_err(&e))),
+        Err(e) => Err((wall_ms, pg_server::db_err(&e))),
     }
 }
 
@@ -1678,7 +1670,7 @@ async fn seed(
         client
             .simple_query(ddl)
             .await
-            .unwrap_or_else(|e| panic!("CREATE {name}: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("CREATE {name}: {}", pg_server::db_err(&e)));
     }
 
     // Insert lane: sequential on the calling client by default (the CI shape);
@@ -1700,7 +1692,7 @@ async fn seed(
             client
                 .simple_query(sql)
                 .await
-                .unwrap_or_else(|e| panic!("INSERT: {}", explain_err(&e)));
+                .unwrap_or_else(|e| panic!("INSERT: {}", pg_server::db_err(&e)));
         }
     } else {
         let mut set = tokio::task::JoinSet::new();
@@ -1722,7 +1714,7 @@ async fn seed(
                 for sql in stmts {
                     c.simple_query(&sql).await.map_err(|e| {
                         let head = &sql[..sql.len().min(120)];
-                        format!("INSERT: {} :: {}", explain_err(&e), head)
+                        format!("INSERT: {} :: {}", pg_server::db_err(&e), head)
                     })?;
                 }
                 Ok(())
@@ -1801,7 +1793,10 @@ async fn run_benchmark(
             .await
         {
             Ok(_) => materialize_ok += 1,
-            Err(e) => eprintln!("[{benchmark}] · MATERIALIZE {name}: {}", explain_err(&e)),
+            Err(e) => eprintln!(
+                "[{benchmark}] · MATERIALIZE {name}: {}",
+                pg_server::db_err(&e)
+            ),
         }
     }
     stats.materialize_ok = materialize_ok;

@@ -13,20 +13,11 @@ use tokio_postgres::{Client, SimpleQueryMessage};
 mod pg_server;
 
 use pg_server::TestPgServer;
-/// Render a tokio_postgres error including the real server-side DbError cause.
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    if let Some(db) = e.as_db_error() {
-        format!("[{}] {}", db.code().code(), db.message())
-    } else {
-        e.to_string()
-    }
-}
-
 async fn exec(client: &Client, sql: &str) {
     client
         .simple_query(sql)
         .await
-        .unwrap_or_else(|e| panic!("exec `{sql}`: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("exec `{sql}`: {}", pg_server::db_err(&e)));
 }
 
 /// The first column of every returned row, as text.
@@ -34,7 +25,7 @@ async fn column(client: &Client, sql: &str) -> Vec<String> {
     let messages = client
         .simple_query(sql)
         .await
-        .unwrap_or_else(|e| panic!("query `{sql}`: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("query `{sql}`: {}", pg_server::db_err(&e)));
     messages
         .iter()
         .filter_map(|m| match m {
@@ -49,7 +40,7 @@ async fn affected(client: &Client, sql: &str) -> u64 {
     let messages = client
         .simple_query(sql)
         .await
-        .unwrap_or_else(|e| panic!("exec `{sql}`: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("exec `{sql}`: {}", pg_server::db_err(&e)));
     messages
         .iter()
         .find_map(|m| match m {

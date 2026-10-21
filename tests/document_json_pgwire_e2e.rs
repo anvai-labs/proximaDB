@@ -40,14 +40,6 @@ const DOC_ACCURACY_RATCHET: usize = 11;
 mod pg_server;
 
 use pg_server::TestPgServer;
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    if let Some(db) = e.as_db_error() {
-        format!("[{}] {}", db.code().code(), db.message())
-    } else {
-        e.to_string()
-    }
-}
-
 const SCHEMA: &[(&str, &str)] = &[(
     "docs",
     "CREATE TABLE docs (doc_id INT PRIMARY KEY, kind VARCHAR, doc JSON)",
@@ -128,7 +120,7 @@ async fn collect(client: &tokio_postgres::Client, sql: &str) -> Result<Rows, Str
                 _ => None,
             })
             .collect()),
-        Err(e) => Err(explain_err(&e)),
+        Err(e) => Err(pg_server::db_err(&e)),
     }
 }
 
@@ -205,7 +197,7 @@ async fn document_json_pgwire_accuracy() {
         client
             .simple_query(ddl)
             .await
-            .unwrap_or_else(|e| panic!("CREATE {name}: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("CREATE {name}: {}", pg_server::db_err(&e)));
     }
     eprintln!("✓ schema: {} tables created", SCHEMA.len());
 
@@ -213,7 +205,7 @@ async fn document_json_pgwire_accuracy() {
         client
             .simple_query(sql)
             .await
-            .unwrap_or_else(|e| panic!("INSERT failed: {}\n  sql: {sql}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("INSERT failed: {}\n  sql: {sql}", pg_server::db_err(&e)));
     }
     eprintln!("✓ data: {} documents loaded", DATA.len());
 
@@ -233,7 +225,7 @@ async fn document_json_pgwire_accuracy() {
             .await
         {
             Ok(_) => materialized += 1,
-            Err(e) => eprintln!("  · MATERIALIZE {name}: {}", explain_err(&e)),
+            Err(e) => eprintln!("  · MATERIALIZE {name}: {}", pg_server::db_err(&e)),
         }
     }
     eprintln!("✓ materialize: {materialized}/{} tables", SCHEMA.len());

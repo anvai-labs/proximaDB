@@ -16,14 +16,6 @@ const TSBS_RATCHET: usize = 10;
 mod pg_server;
 
 use pg_server::TestPgServer;
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    if let Some(db) = e.as_db_error() {
-        format!("[{}] {}", db.code().code(), db.message())
-    } else {
-        e.to_string()
-    }
-}
-
 /// Normalize a result cell for value comparison: numeric cells are reparsed to a
 /// canonical form (whole numbers without a decimal, fractions minimal) so engine
 /// rendering (`95` vs `95.0` vs `95.000`) doesn't matter; other text passes through.
@@ -42,7 +34,7 @@ async fn canon_rows(client: &tokio_postgres::Client, sql: &str) -> Vec<Vec<Strin
     let mut rows: Vec<Vec<String>> = client
         .simple_query(sql)
         .await
-        .unwrap_or_else(|e| panic!("query `{sql}`: {}", explain_err(&e)))
+        .unwrap_or_else(|e| panic!("query `{sql}`: {}", pg_server::db_err(&e)))
         .into_iter()
         .filter_map(|m| match m {
             tokio_postgres::SimpleQueryMessage::Row(r) => Some(
@@ -193,7 +185,7 @@ async fn events_tsbs_pgwire_conformance() {
         client
             .simple_query(ddl)
             .await
-            .unwrap_or_else(|e| panic!("CREATE {name}: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("CREATE {name}: {}", pg_server::db_err(&e)));
     }
     eprintln!("✓ schema: {} tables created", SCHEMA.len());
 
@@ -201,7 +193,7 @@ async fn events_tsbs_pgwire_conformance() {
         client
             .simple_query(&sql)
             .await
-            .unwrap_or_else(|e| panic!("INSERT failed: {}\n  sql: {sql}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("INSERT failed: {}\n  sql: {sql}", pg_server::db_err(&e)));
     }
     eprintln!("✓ data: metrics loaded");
 
@@ -212,7 +204,7 @@ async fn events_tsbs_pgwire_conformance() {
             .await
         {
             Ok(_) => materialized += 1,
-            Err(e) => eprintln!("  · MATERIALIZE {name}: {}", explain_err(&e)),
+            Err(e) => eprintln!("  · MATERIALIZE {name}: {}", pg_server::db_err(&e)),
         }
     }
     eprintln!("✓ materialize: {materialized}/{} tables", SCHEMA.len());
@@ -227,8 +219,8 @@ async fn events_tsbs_pgwire_conformance() {
                 passed.push(*id);
             }
             Err(e) => {
-                eprintln!("  ✗ {id}: {}", explain_err(&e));
-                failed.push((*id, explain_err(&e)));
+                eprintln!("  ✗ {id}: {}", pg_server::db_err(&e));
+                failed.push((*id, pg_server::db_err(&e)));
             }
         }
     }

@@ -15,11 +15,10 @@
 //! One ProximaDB boot per process (the WAL manifest is a set-once singleton); nextest runs
 //! each test in its own process, so the per-test env gate + boot are isolated.
 
-use std::net::TcpListener;
+use std::path::Path;
 use std::time::Duration;
 
 use proximadb::core::Config;
-use proximadb::database::ProximaDB;
 use proximadb::proto::proximadb_v2::proxima_document_service_client::ProximaDocumentServiceClient;
 use proximadb::proto::proximadb_v2::{
     CreateDocumentRequest, GetDocumentRequest, QueryDocumentsRequest, TypedValue, typed_value,
@@ -28,132 +27,38 @@ use serde_json::json;
 use tempfile::TempDir;
 use tokio::time::sleep;
 
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
+#[path = "common/pg_server.rs"]
+mod pg_server;
+
+use pg_server::TestPgServer;
+
+/// Boot via the shared harness, keeping this file's original 300ms post-health
+/// settle (the shared harness settles 200ms — do not silently tighten).
+async fn start_server() -> anyhow::Result<TestPgServer> {
+    let server = TestPgServer::start().await?;
+    sleep(Duration::from_millis(100)).await;
+    Ok(server)
 }
 
-struct TestServer {
-    rest_port: u16,
-    grpc_port: u16,
-    db: Option<ProximaDB>,
-    _tmp_data: TempDir,
+/// Point a shared-harness server at an externally owned data dir. The restart
+/// test needs the dir to outlive the first server generation (the harness's own
+/// tempdir is dropped with it), and the catalog/WAL must stay anchored to that
+/// same dir across generations so the restarted server rediscovers the collection.
+fn anchor_to(config: &mut Config, data: &Path) {
+    config.server.data_dir = data.to_path_buf();
+    config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
+        url: format!("file://{}", data.display()),
+        ..Default::default()
+    }];
+    config.storage.metadata_url = format!("file://{}/metadata", data.display());
+    config.storage.wal_config.write_buffer_directory = format!("file://{}/wal", data.display());
 }
 
-impl TestServer {
-    fn build_config(
-        data_path: &std::path::Path,
-        rest_port: u16,
-        grpc_port: u16,
-        pg_port: u16,
-    ) -> Config {
-        let mut config = Config::default();
-        config.server.bind_address = "127.0.0.1".to_string();
-        config.server.port = rest_port;
-        config.server.data_dir = data_path.to_path_buf();
-        config.api.rest_port = rest_port;
-        config.api.grpc_port = grpc_port;
-        config.api.unified_mode = false;
-        config.api.pg_port = Some(pg_port);
-        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
-            url: format!("file://{}", data_path.display()),
-            ..Default::default()
-        }];
-        config.storage.wal_config.write_buffer_directory =
-            format!("file://{}/wal", data_path.display());
-        config
-    }
-
-    async fn wait_ready(rest_port: u16) -> anyhow::Result<()> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(3))
-            .no_proxy()
-            .build()?;
-        let health_url = format!("http://127.0.0.1:{rest_port}/health");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match http.get(&health_url).send().await {
-                Ok(resp) if resp.status().is_success() => break,
-                _ => {
-                    if std::time::Instant::now() > deadline {
-                        anyhow::bail!("REST server didn't become ready within 20s");
-                    }
-                    sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-        sleep(Duration::from_millis(300)).await;
-        Ok(())
-    }
-
-    async fn start() -> anyhow::Result<Self> {
-        let rest_port = free_port();
-        let grpc_port = free_port();
-        let pg_port = free_port();
-        let tmp_data = TempDir::new()?;
-
-        let mut db = ProximaDB::new(Self::build_config(
-            tmp_data.path(),
-            rest_port,
-            grpc_port,
-            pg_port,
-        ))
-        .await?;
-        db.start().await?;
-        Self::wait_ready(rest_port).await?;
-
-        Ok(Self {
-            rest_port,
-            grpc_port,
-            db: Some(db),
-            _tmp_data: tmp_data,
-        })
-    }
-
-    /// Shut down and restart on the SAME `data_dir` (fresh ports) to prove durability: data
-    /// written before the restart must be recovered from the on-disk WAL. The `TempDir` stays
-    /// owned by `self`, so the data directory survives the restart.
-    async fn restart(&mut self) -> anyhow::Result<()> {
-        if let Some(mut db) = self.db.take() {
-            db.shutdown().await?;
-        }
-        // Let the OS release the ports + WAL file handles before rebinding/reopening.
-        sleep(Duration::from_millis(750)).await;
-
-        let rest_port = free_port();
-        let grpc_port = free_port();
-        let pg_port = free_port();
-        let mut db = ProximaDB::new(Self::build_config(
-            self._tmp_data.path(),
-            rest_port,
-            grpc_port,
-            pg_port,
-        ))
-        .await?;
-        db.start().await?;
-        Self::wait_ready(rest_port).await?;
-
-        self.rest_port = rest_port;
-        self.grpc_port = grpc_port;
-        self.db = Some(db);
-        Ok(())
-    }
-
-    fn rest(&self) -> String {
-        format!("http://127.0.0.1:{}", self.rest_port)
-    }
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        if let Some(mut db) = self.db.take() {
-            tokio::spawn(async move {
-                let _ = db.shutdown().await;
-            });
-        }
-    }
+/// One server generation on the externally owned `data` dir (same 300ms settle).
+async fn start_on(data: &Path) -> anyhow::Result<TestPgServer> {
+    let server = TestPgServer::start_with(|config| anchor_to(config, data)).await?;
+    sleep(Duration::from_millis(100)).await;
+    Ok(server)
 }
 
 /// Scope the process-global gate to `collection` for the test; removes it on drop.
@@ -176,21 +81,16 @@ impl Drop for GateGuard {
 /// cross-surface (the headline convergence claim).
 #[tokio::test]
 async fn rest_ingested_document_is_visible_via_grpc_when_gate_on() {
-    let server = TestServer::start().await.expect("server start");
-    // Port-unique collection name so the shared in-process catalog never collides across runs
-    // (the convention used by grpc_td*_e2e). The gate is read per-call, so setting it after
-    // start — once the port is known — is fine.
-    let collection = format!("convdocs{}", server.grpc_port);
+    let server = start_server().await.expect("server start");
+    // Collision-free collection name; the gate is read per-call, so setting it
+    // after start is fine.
+    let collection = server.unique_name("convdocs");
     let _gate = GateGuard::on(&collection);
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("http client");
+    let (http, base) = server.rest_client().expect("http client");
 
     // Create the vector collection the document route resolves against.
     let create = http
-        .post(format!("{}/api/v2/collections", server.rest()))
+        .post(format!("{base}/api/v2/collections"))
         .json(&json!({"name": collection, "dimension": 8, "engine": "sst"}))
         .send()
         .await
@@ -203,10 +103,7 @@ async fn rest_ingested_document_is_visible_via_grpc_when_gate_on() {
 
     // Ingest a document via REST v2 with an SDK-provided vector (no embedding backend needed).
     let ingest = http
-        .post(format!(
-            "{}/api/v2/collections/{collection}/documents",
-            server.rest()
-        ))
+        .post(format!("{base}/api/v2/collections/{collection}/documents"))
         .header("X-Embed-Source", "sdk-vector")
         .header("X-Ingest-Mode", "sync")
         .json(&json!({
@@ -249,8 +146,8 @@ async fn rest_ingested_document_is_visible_via_grpc_when_gate_on() {
 /// default-ON does not hard-fail pure-document collections.
 #[tokio::test]
 async fn grpc_document_round_trips_on_legacy_path_for_non_canonical_collection() {
-    let server = TestServer::start().await.expect("server start");
-    let collection = format!("legacydocs{}", server.grpc_port);
+    let server = start_server().await.expect("server start");
+    let collection = server.unique_name("legacydocs");
     let mut client =
         ProximaDocumentServiceClient::connect(format!("http://127.0.0.1:{}", server.grpc_port))
             .await
@@ -283,21 +180,17 @@ async fn grpc_document_round_trips_on_legacy_path_for_non_canonical_collection()
 /// (vector *search* won't surface them, but get/scan/query do).
 #[tokio::test]
 async fn pure_metadata_grpc_document_round_trips_on_canonical_route_when_gate_on() {
-    let server = TestServer::start().await.expect("server start");
-    let collection = format!("metadocs{}", server.grpc_port);
+    let server = start_server().await.expect("server start");
+    let collection = server.unique_name("metadocs");
     let _gate = GateGuard::on(&collection);
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("http client");
+    let (http, base) = server.rest_client().expect("http client");
 
     // The canonical route resolves against a real vector collection. A metadata-only document
     // carries no embedding (dim 0); the vector-insert validation accepts vectorless records in
     // any collection (they're excluded from the ANN index/search but stored + served by id/scan),
     // so it converges on the shared store alongside embedded documents.
     let create = http
-        .post(format!("{}/api/v2/collections", server.rest()))
+        .post(format!("{base}/api/v2/collections"))
         .json(&json!({"name": collection, "dimension": 8, "engine": "sst"}))
         .send()
         .await
@@ -374,19 +267,18 @@ async fn pure_metadata_grpc_document_round_trips_on_canonical_route_when_gate_on
 /// restart (the plan's "restart → docs survive via the vector WAL" verification point).
 #[tokio::test]
 async fn canonical_document_survives_restart_via_vector_wal() {
-    let mut server = TestServer::start().await.expect("server start");
-    // Name is fixed for the whole test (from the initial port) so it stays stable across the
-    // restart, which rebinds fresh ports. The gate stays ON throughout.
-    let collection = format!("recdocs{}", server.grpc_port);
+    // Externally owned data dir: it must survive the first server generation
+    // (the shared harness drops its own tempdir with the server).
+    let data = TempDir::new().expect("restart data dir");
+    let server = start_on(data.path()).await.expect("server start");
+    // Name is fixed for the whole test so it stays stable across the restart,
+    // which rebinds fresh ports. The gate stays ON throughout.
+    let collection = server.unique_name("recdocs");
     let _gate = GateGuard::on(&collection);
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("http client");
+    let (http, base) = server.rest_client().expect("http client");
 
     let create = http
-        .post(format!("{}/api/v2/collections", server.rest()))
+        .post(format!("{base}/api/v2/collections"))
         .json(&json!({"name": collection, "dimension": 8, "engine": "sst"}))
         .send()
         .await
@@ -394,10 +286,7 @@ async fn canonical_document_survives_restart_via_vector_wal() {
     assert!(create.status().is_success(), "create: {}", create.status());
 
     let ingest = http
-        .post(format!(
-            "{}/api/v2/collections/{collection}/documents",
-            server.rest()
-        ))
+        .post(format!("{base}/api/v2/collections/{collection}/documents"))
         .header("X-Embed-Source", "sdk-vector")
         .header("X-Ingest-Mode", "sync")
         .json(&json!({
@@ -432,8 +321,13 @@ async fn canonical_document_survives_restart_via_vector_wal() {
         .into_inner();
     assert_eq!(pre.document.expect("present before restart").id, "r1");
 
-    // Full shutdown + restart on the SAME data_dir.
-    server.restart().await.expect("restart on same data_dir");
+    // Full shutdown + restart on the SAME data_dir (fresh ports; the 750ms pause
+    // lets the OS release the ports + WAL file handles before rebinding).
+    server.shutdown().await;
+    sleep(Duration::from_millis(750)).await;
+    let server = start_on(data.path())
+        .await
+        .expect("restart on same data_dir");
 
     // The document must be recovered from the vector WAL and served on the canonical route.
     let mut client2 =
@@ -467,17 +361,13 @@ async fn canonical_document_survives_restart_via_vector_wal() {
 /// test guards that documents ride that metered path and the endpoint is wired.
 #[tokio::test]
 async fn canonical_document_write_rides_the_metered_path() {
-    let server = TestServer::start().await.expect("server start");
-    let collection = format!("metdocs{}", server.grpc_port);
+    let server = start_server().await.expect("server start");
+    let collection = server.unique_name("metdocs");
     let _gate = GateGuard::on(&collection);
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("http client");
+    let (http, base) = server.rest_client().expect("http client");
 
     let create = http
-        .post(format!("{}/api/v2/collections", server.rest()))
+        .post(format!("{base}/api/v2/collections"))
         .json(&json!({"name": collection, "dimension": 8, "engine": "sst"}))
         .send()
         .await
@@ -500,7 +390,7 @@ async fn canonical_document_write_rides_the_metered_path() {
     // The metered write completed (above). The consumption telemetry surface must be live and
     // serving after it — the per-tenant consumption metric family is registered and exported.
     let scrape = http
-        .get(format!("{}/metrics/prometheus", server.rest()))
+        .get(format!("{base}/metrics/prometheus"))
         .send()
         .await
         .expect("scrape /metrics/prometheus")
