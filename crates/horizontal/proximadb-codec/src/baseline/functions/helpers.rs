@@ -30,6 +30,8 @@ pub trait WirePrim: Copy + Default + std::fmt::Debug + PartialEq + Eq + std::has
     /// Read `self` little-endian from the first `WIRE_BYTES` bytes of `data`.
     /// Errors (never panics) when `data` is too short.
     fn read_le(data: &[u8]) -> Result<Self>;
+    /// `self == 0` (sparse codecs' non-zero test).
+    fn is_zero(self) -> bool;
 }
 
 impl WirePrim for i32 {
@@ -46,6 +48,10 @@ impl WirePrim for i32 {
             .ok_or_else(|| anyhow::anyhow!("wire read: need 4 bytes, got {}", data.len()))?;
         Ok(Self::from_le_bytes(bytes))
     }
+
+    fn is_zero(self) -> bool {
+        self == 0
+    }
 }
 
 impl WirePrim for i64 {
@@ -61,6 +67,10 @@ impl WirePrim for i64 {
             .and_then(|s| s.try_into().ok())
             .ok_or_else(|| anyhow::anyhow!("wire read: need 8 bytes, got {}", data.len()))?;
         Ok(Self::from_le_bytes(bytes))
+    }
+
+    fn is_zero(self) -> bool {
+        self == 0
     }
 }
 
