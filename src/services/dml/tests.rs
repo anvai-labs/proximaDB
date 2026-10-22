@@ -3838,6 +3838,129 @@ fn materialize_publishes_multi_part_generations_and_collects_old_ones() {
     });
 }
 
+/// A publish fence that refuses.
+struct RefusingFence;
+
+#[async_trait::async_trait]
+impl crate::services::ddl::PublishFence for RefusingFence {
+    async fn check(&self) -> Result<()> {
+        Err(anyhow!("lease moved to pod-elsewhere"))
+    }
+}
+
+/// P2.4 fenced advance: a refused fence publishes nothing (no metadata version,
+/// no data file left, no catalog flip), and two concurrent MATERIALIZEs of one
+/// table in one process both succeed — serialized by the publish lock — instead
+/// of the second losing the metadata CAS.
+#[tokio::test]
+async fn materialize_is_fenced_and_serialized_per_table() {
+    use crate::services::record_store::DirectWalTableRecordStore;
+    use crate::services::{FramedTableWalAppender, MemtableRecordStorage};
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let manager = Arc::new(CatalogManager::new());
+    manager
+        .create_native_catalog("native", temp_dir.path().to_string_lossy().as_ref())
+        .await
+        .expect("native catalog");
+    let ddl = DdlService::new(manager.clone());
+    ddl.execute(DdlStatement::CreateNamespace {
+        namespace: vec!["default".to_string()],
+        if_not_exists: true,
+        properties: HashMap::new(),
+    })
+    .await
+    .expect("create namespace");
+    let parser = crate::query::sql_frontend::SqlFrontendParser::new();
+    let create = parser
+        .parse_ddl("CREATE TABLE inv (id TEXT NOT NULL, qty INT, PRIMARY KEY (id));")
+        .expect("parse ddl")
+        .expect("ddl stmt");
+    ddl.execute(create).await.expect("create table");
+    let dml = DmlService::with_record_store_and_table_write_executor(
+        manager.clone(),
+        Arc::new(DirectWalTableRecordStore::new(
+            Arc::new(MemtableRecordStorage::new()),
+            Arc::new(
+                FramedTableWalAppender::open(&temp_dir.path().join("inv.wal"))
+                    .await
+                    .expect("open WAL"),
+            ),
+        )),
+        Arc::new(PlannedOnlyTableWriteExecutor::new()),
+    );
+    let insert = parser
+        .parse_dml("INSERT INTO inv (id, qty) VALUES ('i1', 5);")
+        .expect("parse insert")
+        .expect("insert stmt");
+    dml.execute(insert).await.expect("insert");
+    let bridge = Arc::new(IcebergObjectStoreBridge::from_url("memory:///fenced").unwrap());
+
+    let err = dml
+        .materialize_table_to_parquet_fenced(
+            &*bridge,
+            "memory:///fenced",
+            "inv",
+            None,
+            &RefusingFence,
+        )
+        .await
+        .expect_err("a refused fence fails the publication");
+    assert!(format!("{err:#}").contains("pod-elsewhere"), "{err:#}");
+    let all: Vec<object_store::path::Path> = bridge
+        .list_objects(&object_store::path::Path::from("data"))
+        .await
+        .expect("list");
+    assert!(
+        all.iter()
+            .all(|p| !p.as_ref().ends_with(".parquet") && !p.as_ref().ends_with(".metadata.json")),
+        "nothing published or left behind: {all:?}"
+    );
+    let (catalog, id) = manager.resolve_table("inv").await.expect("resolve");
+    assert!(
+        catalog
+            .get_table(&id)
+            .await
+            .expect("table")
+            .storage_layouts
+            .iter()
+            .all(|l| l.name != "parquet-snapshot"),
+        "the catalog was not flipped"
+    );
+
+    let (a, b) = futures::join!(
+        dml.materialize_table_to_parquet(&*bridge, "memory:///fenced", "inv", None),
+        dml.materialize_table_to_parquet(&*bridge, "memory:///fenced", "inv", None),
+    );
+    let location = a.expect("first publication");
+    assert_eq!(b.expect("second publication"), location);
+    let prefix = location.strip_prefix("memory:///fenced/").expect("prefix");
+    let metadata_prefix = format!("{}/metadata", prefix.strip_suffix("/data").unwrap());
+    assert_eq!(
+        bridge
+            .latest_metadata_version(&metadata_prefix)
+            .await
+            .expect("metadata"),
+        Some(1),
+        "two serialized commits: versions 0 and 1"
+    );
+    let layout = catalog
+        .get_table(&id)
+        .await
+        .expect("table")
+        .storage_layouts
+        .into_iter()
+        .find(|l| l.name == "parquet-snapshot")
+        .expect("published layout");
+    assert_eq!(
+        layout
+            .properties
+            .get("iceberg_metadata_version")
+            .map(String::as_str),
+        Some("1")
+    );
+}
+
 /// `point_lookup_relational` (PATH B PkLookup backend) returns the full row by
 /// primary key in `schema.columns` order, and `None` for a missing key.
 #[tokio::test]
