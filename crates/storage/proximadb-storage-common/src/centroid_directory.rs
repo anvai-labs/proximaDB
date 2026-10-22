@@ -180,6 +180,17 @@ pub struct ScoredCell {
     pub score: f32,
 }
 
+/// A query's use of the directory: for every usable segment (by object
+/// name), the Region A0 cells to probe, in rank order. An empty list means the
+/// segment holds none of the globally nearest cells and is skipped. Segments
+/// absent from the map are not usable and keep the per-segment path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbePlan {
+    pub cells_by_segment: HashMap<String, Vec<u32>>,
+    /// Usable non-empty cells the ranking chose from.
+    pub usable_cells: usize,
+}
+
 /// The parsed collection directory.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaxCentroidDirectory {
@@ -468,6 +479,17 @@ impl PaxCentroidDirectory {
     /// that keeps recall when cells are small). `None` on a dimension
     /// mismatch.
     pub fn select_cells(&self, query: &[f32], nprobe: usize, min_rows: u64) -> Option<Vec<usize>> {
+        self.select_usable_cells(query, nprobe, min_rows, |_| true)
+    }
+
+    /// [`Self::select_cells`] restricted to cells of segments `usable` accepts.
+    fn select_usable_cells(
+        &self,
+        query: &[f32],
+        nprobe: usize,
+        min_rows: u64,
+        usable: impl Fn(u32) -> bool,
+    ) -> Option<Vec<usize>> {
         let ranked = self.rank_cells(query)?;
         let mut selected = Vec::new();
         let mut rows = 0u64;
@@ -475,14 +497,81 @@ impl PaxCentroidDirectory {
             if selected.len() >= nprobe && rows >= min_rows {
                 break;
             }
-            let cell_rows = self.cells[scored.cell].rows();
-            if cell_rows == 0 {
+            let cell = &self.cells[scored.cell];
+            let cell_rows = cell.rows();
+            if cell_rows == 0 || !usable(cell.segment_idx) {
                 continue;
             }
             selected.push(scored.cell);
             rows += cell_rows;
         }
         Some(selected)
+    }
+
+    /// Plan a query against the live segment set (TD-PAXDIR-1 D2).
+    ///
+    /// Only entries for segments that are live **with the recorded size** are
+    /// usable; every other live segment is absent from the plan and the
+    /// caller scans it per segment. `nprobe` and `min_rows` are computed from
+    /// the usable totals (cells, covered rows), so a partly stale directory
+    /// probes proportionally. `None` on a dimension mismatch or when nothing
+    /// is usable.
+    pub fn plan_probe(
+        &self,
+        query: &[f32],
+        live: &[LiveSegment],
+        nprobe_for_cells: impl Fn(usize) -> usize,
+        min_rows_for_rows: impl Fn(u64) -> u64,
+    ) -> Option<ProbePlan> {
+        let live_sizes: HashMap<&str, u64> = live
+            .iter()
+            .map(|s| (s.name.as_str(), s.size_bytes))
+            .collect();
+        let usable: Vec<bool> = self
+            .segments
+            .iter()
+            .map(|s| s.is_covered() && live_sizes.get(s.name.as_str()) == Some(&s.size_bytes))
+            .collect();
+        let usable_cells = self
+            .cells
+            .iter()
+            .filter(|c| usable[c.segment_idx as usize] && c.rows() > 0)
+            .count();
+        if usable_cells == 0 {
+            return None;
+        }
+        let usable_rows: u64 = self
+            .segments
+            .iter()
+            .zip(&usable)
+            .filter(|(_, u)| **u)
+            .map(|(s, _)| s.rows_covered)
+            .sum();
+        let selected = self.select_usable_cells(
+            query,
+            nprobe_for_cells(usable_cells),
+            min_rows_for_rows(usable_rows),
+            |segment_idx| usable[segment_idx as usize],
+        )?;
+        let mut cells_by_segment: HashMap<String, Vec<u32>> = self
+            .segments
+            .iter()
+            .zip(&usable)
+            .filter(|(_, u)| **u)
+            .map(|(s, _)| (s.name.clone(), Vec::new()))
+            .collect();
+        for cell in selected {
+            let cell = &self.cells[cell];
+            if let Some(cells) =
+                cells_by_segment.get_mut(&self.segments[cell.segment_idx as usize].name)
+            {
+                cells.push(cell.a0_cell);
+            }
+        }
+        Some(ProbePlan {
+            cells_by_segment,
+            usable_cells,
+        })
     }
 
     /// Start a builder that keeps the segments `keep` accepts, carrying their
@@ -1207,6 +1296,74 @@ mod tests {
                 .iter()
                 .all(|s| s.score.is_finite()),
             "only the poisoned cell may sit at +inf"
+        );
+    }
+
+    #[test]
+    fn a_probe_plan_uses_only_live_unchanged_segments() {
+        let dir = two_model_directory();
+        let query = [1.0f32, -1.0, 1.0, 1.0];
+        let live = |items: &[(&str, u64)]| -> Vec<LiveSegment> {
+            items
+                .iter()
+                .map(|(n, s)| LiveSegment {
+                    name: (*n).to_owned(),
+                    size_bytes: *s,
+                })
+                .collect()
+        };
+        // Every usable segment appears; the uncovered one never does.
+        let all = dir
+            .plan_probe(
+                &query,
+                &live(&[("a.pax", 100), ("b.pax", 200), ("l0.pax", 50)]),
+                |_| 99,
+                |_| 0,
+            )
+            .unwrap();
+        assert_eq!(all.usable_cells, 4);
+        assert_eq!(all.cells_by_segment.len(), 2);
+        assert_eq!(
+            all.cells_by_segment["a.pax"].len(),
+            2,
+            "the empty A0 cell is never probed"
+        );
+        assert_eq!(all.cells_by_segment["b.pax"].len(), 2);
+
+        // One probe: one segment gets the nearest cell, the other is skipped.
+        let one = dir
+            .plan_probe(
+                &query,
+                &live(&[("a.pax", 100), ("b.pax", 200)]),
+                |_| 1,
+                |_| 0,
+            )
+            .unwrap();
+        let mut sizes: Vec<usize> = one.cells_by_segment.values().map(Vec::len).collect();
+        sizes.sort();
+        assert_eq!(sizes, [0, 1]);
+
+        // A rewritten (size changed) segment is unusable; a retired one too.
+        let stale = dir.plan_probe(
+            &query,
+            &live(&[("a.pax", 101), ("c.pax", 9)]),
+            |_| 99,
+            |_| 0,
+        );
+        assert_eq!(stale, None, "nothing usable");
+        let partial = dir
+            .plan_probe(
+                &query,
+                &live(&[("a.pax", 101), ("b.pax", 200)]),
+                |n| n,
+                |_| 0,
+            )
+            .unwrap();
+        assert_eq!(partial.usable_cells, 2);
+        assert!(!partial.cells_by_segment.contains_key("a.pax"));
+        assert_eq!(
+            dir.plan_probe(&[0.0; 3], &live(&[("b.pax", 200)]), |n| n, |_| 0),
+            None
         );
     }
 }

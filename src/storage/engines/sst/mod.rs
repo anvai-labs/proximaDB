@@ -251,6 +251,7 @@ pub mod block_cluster; // TD-RDSTRAT-5 S1: sort-by-code block clustering at PAX 
 pub mod block_format;
 pub mod blocks;
 pub mod centroid_directory_publisher; // TD-PAXDIR-1 D1: collection-global centroid directory
+pub mod centroid_directory_reader; // TD-PAXDIR-1 D2: query-side global cell selection
 pub mod codebook_integration;
 pub mod collections;
 pub mod core;
@@ -287,6 +288,12 @@ mod cold_recovery_reconcile_test;
 #[cfg(all(test, feature = "cold-deletion-vectors"))]
 #[path = "tests/cold_compaction_dv_test.rs"]
 mod cold_compaction_dv_test;
+// TD-PAXDIR-1 D2: the collection centroid directory on a multi-segment
+// collection (recall vs brute force, reads vs the per-segment path). In-crate
+// (#[path]) to drive the pub(crate) fan-out and the directory publisher.
+#[cfg(test)]
+#[path = "tests/centroid_directory_search_test.rs"]
+mod centroid_directory_search_test;
 pub mod flush;
 pub mod manifest;
 #[cfg(feature = "cold-deletion-vectors")]
