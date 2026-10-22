@@ -333,6 +333,61 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, RwLock};
 
+    /// Node fixture: single `label`, no properties, no embedding. Only the id,
+    /// label, and timestamps vary across these tests — pass each test's exact
+    /// values ((1,1) seed loops, (0,0) CSR rebuild, (7,9) cold-tier payloads).
+    fn mk_node(id: &str, label: &str, created_at_ms: i64, updated_at_ms: i64) -> Node {
+        Node {
+            id: id.to_string(),
+            labels: vec![label.to_string()],
+            properties: HashMap::new(),
+            embedding: None,
+            created_at_ms,
+            updated_at_ms,
+        }
+    }
+
+    /// Edge fixture: no properties, unweighted. Only the endpoints, type, and
+    /// timestamps vary — pass each test's exact values.
+    fn mk_edge(
+        id: &str,
+        from: &str,
+        to: &str,
+        edge_type: &str,
+        created_at_ms: i64,
+        updated_at_ms: i64,
+    ) -> Edge {
+        Edge {
+            id: id.to_string(),
+            from_node_id: from.to_string(),
+            to_node_id: to.to_string(),
+            edge_type: edge_type.to_string(),
+            properties: HashMap::new(),
+            weight: None,
+            created_at_ms,
+            updated_at_ms,
+        }
+    }
+
+    /// Create the graph collection under the unique per-test id
+    /// `{prefix}_{pid}` (the process suffix keeps concurrent runs isolated).
+    async fn seed_graph(service: &GraphOperationsService, prefix: &str) -> String {
+        let graph_id = format!("{prefix}_{}", std::process::id());
+        service
+            .create_graph_collection(CreateGraphRequest {
+                graph_id: graph_id.clone(),
+                name: None,
+                description: None,
+                schema: None,
+                storage_config: None,
+                engine_config: None,
+                access_control: None,
+            })
+            .await
+            .expect("create graph");
+        graph_id
+    }
+
     #[derive(Default)]
     struct MemoryRecordStore {
         records: RwLock<HashMap<String, ProximaRecord>>,
@@ -369,53 +424,19 @@ mod tests {
 
     #[tokio::test]
     async fn edge_crud_maintains_adjacency_projection() {
-        let graph_id = format!("adjacency_service_test_{}", std::process::id());
-        let graph_id = graph_id.as_str();
         let service = GraphOperationsService::new();
-        service
-            .create_graph_collection(CreateGraphRequest {
-                graph_id: graph_id.to_string(),
-                name: None,
-                description: None,
-                schema: None,
-                storage_config: None,
-                engine_config: None,
-                access_control: None,
-            })
-            .await
-            .expect("create graph");
+        let graph_id = seed_graph(&service, "adjacency_service_test").await;
+        let graph_id = graph_id.as_str();
 
         for node_id in ["n1", "n2", "n3"] {
             service
-                .create_node(
-                    graph_id,
-                    Node {
-                        id: node_id.to_string(),
-                        labels: vec!["Person".to_string()],
-                        properties: HashMap::new(),
-                        embedding: None,
-                        created_at_ms: 1,
-                        updated_at_ms: 1,
-                    },
-                )
+                .create_node(graph_id, mk_node(node_id, "Person", 1, 1))
                 .await
                 .expect("create node");
         }
 
         service
-            .create_edge(
-                graph_id,
-                Edge {
-                    id: "e1".to_string(),
-                    from_node_id: "n1".to_string(),
-                    to_node_id: "n2".to_string(),
-                    edge_type: "KNOWS".to_string(),
-                    properties: HashMap::new(),
-                    weight: None,
-                    created_at_ms: 1,
-                    updated_at_ms: 1,
-                },
-            )
+            .create_edge(graph_id, mk_edge("e1", "n1", "n2", "KNOWS", 1, 1))
             .await
             .expect("create edge");
         assert_eq!(
@@ -426,19 +447,7 @@ mod tests {
         );
 
         service
-            .update_edge(
-                graph_id,
-                Edge {
-                    id: "e1".to_string(),
-                    from_node_id: "n1".to_string(),
-                    to_node_id: "n3".to_string(),
-                    edge_type: "KNOWS".to_string(),
-                    properties: HashMap::new(),
-                    weight: None,
-                    created_at_ms: 1,
-                    updated_at_ms: 2,
-                },
-            )
+            .update_edge(graph_id, mk_edge("e1", "n1", "n3", "KNOWS", 1, 2))
             .await
             .expect("update edge");
         assert_eq!(
@@ -472,26 +481,8 @@ mod tests {
             .batch_create_edges(
                 graph_id,
                 vec![
-                    Edge {
-                        id: "e2".to_string(),
-                        from_node_id: "n1".to_string(),
-                        to_node_id: "n2".to_string(),
-                        edge_type: "KNOWS".to_string(),
-                        properties: HashMap::new(),
-                        weight: None,
-                        created_at_ms: 3,
-                        updated_at_ms: 3,
-                    },
-                    Edge {
-                        id: "e3".to_string(),
-                        from_node_id: "n1".to_string(),
-                        to_node_id: "n3".to_string(),
-                        edge_type: "KNOWS".to_string(),
-                        properties: HashMap::new(),
-                        weight: None,
-                        created_at_ms: 3,
-                        updated_at_ms: 3,
-                    },
+                    mk_edge("e2", "n1", "n2", "KNOWS", 3, 3),
+                    mk_edge("e3", "n1", "n3", "KNOWS", 3, 3),
                 ],
             )
             .await
@@ -511,62 +502,29 @@ mod tests {
     /// engine, the adjacency projection, and the counters.
     #[tokio::test]
     async fn batch_create_edges_skips_bad_edges_and_lands_the_rest() {
-        let graph_id = format!("batch_partial_test_{}", std::process::id());
-        let graph_id = graph_id.as_str();
         let service = GraphOperationsService::new();
-        service
-            .create_graph_collection(CreateGraphRequest {
-                graph_id: graph_id.to_string(),
-                name: None,
-                description: None,
-                schema: None,
-                storage_config: None,
-                engine_config: None,
-                access_control: None,
-            })
-            .await
-            .expect("create graph");
+        let graph_id = seed_graph(&service, "batch_partial_test").await;
+        let graph_id = graph_id.as_str();
 
         for node_id in ["n1", "n2", "n3"] {
             service
-                .create_node(
-                    graph_id,
-                    Node {
-                        id: node_id.to_string(),
-                        labels: vec!["Sym".to_string()],
-                        properties: HashMap::new(),
-                        embedding: None,
-                        created_at_ms: 1,
-                        updated_at_ms: 1,
-                    },
-                )
+                .create_node(graph_id, mk_node(node_id, "Sym", 1, 1))
                 .await
                 .expect("create node");
         }
-
-        let mk = |id: &str, from: &str, to: &str| Edge {
-            id: id.to_string(),
-            from_node_id: from.to_string(),
-            to_node_id: to.to_string(),
-            edge_type: "CALLS".to_string(),
-            properties: HashMap::new(),
-            weight: None,
-            created_at_ms: 1,
-            updated_at_ms: 1,
-        };
 
         let outcome = service
             .batch_create_edges(
                 graph_id,
                 vec![
-                    mk("e1", "n1", "n2"),
+                    mk_edge("e1", "n1", "n2", "CALLS", 1, 1),
                     // Dangling source — must reject only itself.
-                    mk("e_bad", "ghost", "n2"),
-                    mk("e2", "n2", "n3"),
+                    mk_edge("e_bad", "ghost", "n2", "CALLS", 1, 1),
+                    mk_edge("e2", "n2", "n3", "CALLS", 1, 1),
                     // Dangling target — must reject only itself.
-                    mk("e_bad2", "n1", "ghost"),
+                    mk_edge("e_bad2", "n1", "ghost", "CALLS", 1, 1),
                     // Duplicate composite of e1 within the batch.
-                    mk("e_dup", "n1", "n2"),
+                    mk_edge("e_dup", "n1", "n2", "CALLS", 1, 1),
                 ],
             )
             .await
@@ -602,69 +560,23 @@ mod tests {
     async fn endpoint_bound_query_served_from_adjacency_projection() {
         use crate::graph::EdgeQuery;
 
-        let graph_id = format!("adj_query_test_{}", std::process::id());
-        let graph_id = graph_id.as_str();
         let service = GraphOperationsService::new();
-        service
-            .create_graph_collection(CreateGraphRequest {
-                graph_id: graph_id.to_string(),
-                name: None,
-                description: None,
-                schema: None,
-                storage_config: None,
-                engine_config: None,
-                access_control: None,
-            })
-            .await
-            .expect("create graph");
+        let graph_id = seed_graph(&service, "adj_query_test").await;
+        let graph_id = graph_id.as_str();
 
         for node_id in ["n1", "n2", "n3"] {
             service
-                .create_node(
-                    graph_id,
-                    Node {
-                        id: node_id.to_string(),
-                        labels: vec!["P".to_string()],
-                        properties: HashMap::new(),
-                        embedding: None,
-                        created_at_ms: 1,
-                        updated_at_ms: 1,
-                    },
-                )
+                .create_node(graph_id, mk_node(node_id, "P", 1, 1))
                 .await
                 .expect("create node");
         }
 
         service
-            .create_edge(
-                graph_id,
-                Edge {
-                    id: "e1".to_string(),
-                    from_node_id: "n1".to_string(),
-                    to_node_id: "n2".to_string(),
-                    edge_type: "KNOWS".to_string(),
-                    properties: HashMap::new(),
-                    weight: None,
-                    created_at_ms: 1,
-                    updated_at_ms: 1,
-                },
-            )
+            .create_edge(graph_id, mk_edge("e1", "n1", "n2", "KNOWS", 1, 1))
             .await
             .expect("create e1");
         service
-            .create_edge(
-                graph_id,
-                Edge {
-                    id: "e2".to_string(),
-                    from_node_id: "n1".to_string(),
-                    to_node_id: "n3".to_string(),
-                    edge_type: "KNOWS".to_string(),
-                    properties: HashMap::new(),
-                    weight: None,
-                    created_at_ms: 1,
-                    updated_at_ms: 1,
-                },
-            )
+            .create_edge(graph_id, mk_edge("e2", "n1", "n3", "KNOWS", 1, 1))
             .await
             .expect("create e2");
 
@@ -712,54 +624,20 @@ mod tests {
     async fn endpoint_bound_query_uses_fresh_csr_and_falls_back_when_stale() {
         use crate::graph::EdgeQuery;
 
-        let graph_id = format!("csr_query_test_{}", std::process::id());
-        let graph_id = graph_id.as_str();
         let service = GraphOperationsService::new();
-        service
-            .create_graph_collection(CreateGraphRequest {
-                graph_id: graph_id.to_string(),
-                name: None,
-                description: None,
-                schema: None,
-                storage_config: None,
-                engine_config: None,
-                access_control: None,
-            })
-            .await
-            .expect("create graph");
+        let graph_id = seed_graph(&service, "csr_query_test").await;
+        let graph_id = graph_id.as_str();
 
         for node_id in ["n1", "n2", "n3", "n4"] {
             service
-                .create_node(
-                    graph_id,
-                    Node {
-                        id: node_id.to_string(),
-                        labels: vec!["P".to_string()],
-                        properties: HashMap::new(),
-                        embedding: None,
-                        created_at_ms: 1,
-                        updated_at_ms: 1,
-                    },
-                )
+                .create_node(graph_id, mk_node(node_id, "P", 1, 1))
                 .await
                 .expect("create node");
         }
 
         for (id, to) in [("e1", "n2"), ("e2", "n3")] {
             service
-                .create_edge(
-                    graph_id,
-                    Edge {
-                        id: id.to_string(),
-                        from_node_id: "n1".to_string(),
-                        to_node_id: to.to_string(),
-                        edge_type: "KNOWS".to_string(),
-                        properties: HashMap::new(),
-                        weight: None,
-                        created_at_ms: 1,
-                        updated_at_ms: 1,
-                    },
-                )
+                .create_edge(graph_id, mk_edge(id, "n1", to, "KNOWS", 1, 1))
                 .await
                 .expect("create edge");
         }
@@ -813,19 +691,7 @@ mod tests {
         assert_eq!(query_ids, vec!["e1".to_string(), "e2".to_string()]);
 
         service
-            .create_edge(
-                graph_id,
-                Edge {
-                    id: "e3".to_string(),
-                    from_node_id: "n1".to_string(),
-                    to_node_id: "n4".to_string(),
-                    edge_type: "KNOWS".to_string(),
-                    properties: HashMap::new(),
-                    weight: None,
-                    created_at_ms: 2,
-                    updated_at_ms: 2,
-                },
-            )
+            .create_edge(graph_id, mk_edge("e3", "n1", "n4", "KNOWS", 2, 2))
             .await
             .expect("create stale edge");
 
@@ -846,67 +712,22 @@ mod tests {
 
     #[tokio::test]
     async fn canonical_record_store_receives_graph_writes() {
-        let graph_id = format!("canonical_graph_store_test_{}", std::process::id());
-        let graph_id = graph_id.as_str();
         let record_store = Arc::new(MemoryRecordStore::default());
         let service =
             GraphOperationsService::new().with_canonical_record_store(record_store.clone());
+        let graph_id = seed_graph(&service, "canonical_graph_store_test").await;
+        let graph_id = graph_id.as_str();
 
         service
-            .create_graph_collection(CreateGraphRequest {
-                graph_id: graph_id.to_string(),
-                name: None,
-                description: None,
-                schema: None,
-                storage_config: None,
-                engine_config: None,
-                access_control: None,
-            })
-            .await
-            .expect("create graph");
-
-        service
-            .create_node(
-                graph_id,
-                Node {
-                    id: "n1".to_string(),
-                    labels: vec!["Person".to_string()],
-                    properties: HashMap::new(),
-                    embedding: None,
-                    created_at_ms: 1,
-                    updated_at_ms: 1,
-                },
-            )
+            .create_node(graph_id, mk_node("n1", "Person", 1, 1))
             .await
             .expect("create n1");
         service
-            .create_node(
-                graph_id,
-                Node {
-                    id: "n2".to_string(),
-                    labels: vec!["Person".to_string()],
-                    properties: HashMap::new(),
-                    embedding: None,
-                    created_at_ms: 1,
-                    updated_at_ms: 1,
-                },
-            )
+            .create_node(graph_id, mk_node("n2", "Person", 1, 1))
             .await
             .expect("create n2");
         service
-            .create_edge(
-                graph_id,
-                Edge {
-                    id: "e1".to_string(),
-                    from_node_id: "n1".to_string(),
-                    to_node_id: "n2".to_string(),
-                    edge_type: "KNOWS".to_string(),
-                    properties: HashMap::new(),
-                    weight: None,
-                    created_at_ms: 1,
-                    updated_at_ms: 1,
-                },
-            )
+            .create_edge(graph_id, mk_edge("e1", "n1", "n2", "KNOWS", 1, 1))
             .await
             .expect("create edge");
 
@@ -957,55 +778,20 @@ mod tests {
     /// engine state — the data-loss fix that unblocks wiring `ColdGraphSegmentStore`.
     #[tokio::test]
     async fn recovery_repopulates_canonical_store_from_engine() {
-        let graph_id = format!("canonical_recovery_test_{}", std::process::id());
-        let graph_id = graph_id.as_str();
         let record_store = Arc::new(MemoryRecordStore::default());
         let service =
             GraphOperationsService::new().with_canonical_record_store(record_store.clone());
-
-        service
-            .create_graph_collection(CreateGraphRequest {
-                graph_id: graph_id.to_string(),
-                name: None,
-                description: None,
-                schema: None,
-                storage_config: None,
-                engine_config: None,
-                access_control: None,
-            })
-            .await
-            .expect("create graph");
+        let graph_id = seed_graph(&service, "canonical_recovery_test").await;
+        let graph_id = graph_id.as_str();
 
         for node_id in ["n1", "n2", "n3"] {
             service
-                .create_node(
-                    graph_id,
-                    Node {
-                        id: node_id.to_string(),
-                        labels: vec!["Person".to_string()],
-                        properties: HashMap::new(),
-                        embedding: None,
-                        created_at_ms: 1,
-                        updated_at_ms: 1,
-                    },
-                )
+                .create_node(graph_id, mk_node(node_id, "Person", 1, 1))
                 .await
                 .expect("create node");
         }
         service
-            .create_edge(
-                graph_id,
-                Edge {
-                    id: "e1".to_string(),
-                    from_node_id: "n1".to_string(),
-                    to_node_id: "n2".to_string(),
-                    edge_type: "KNOWS".to_string(),
-                    properties: HashMap::new(),
-                    weight: None,
-                    created_at_ms: 1,
-                    updated_at_ms: 1,
-                },
-            )
+            .create_edge(graph_id, mk_edge("e1", "n1", "n2", "KNOWS", 1, 1))
             .await
             .expect("create edge");
 
@@ -1053,30 +839,16 @@ mod tests {
     /// under nextest, so the env gate does not leak across tests.
     #[tokio::test]
     async fn cold_payload_tier_serves_node_and_edge_on_engine_miss() {
-        let graph_id = format!("cold_payload_test_{}", std::process::id());
-        let graph_id = graph_id.as_str();
         let record_store = Arc::new(MemoryRecordStore::default());
+        let service =
+            GraphOperationsService::new().with_canonical_record_store(record_store.clone());
+        let graph_id = seed_graph(&service, "cold_payload_test").await;
+        let graph_id = graph_id.as_str();
 
         // Seed canonical records directly — the engine never sees these, so a hit
         // can only come from the cold record-store path.
-        let node = Node {
-            id: "cold_n1".to_string(),
-            labels: vec!["Person".to_string()],
-            properties: HashMap::new(),
-            embedding: None,
-            created_at_ms: 7,
-            updated_at_ms: 9,
-        };
-        let edge = Edge {
-            id: "cold_e1".to_string(),
-            from_node_id: "cold_n1".to_string(),
-            to_node_id: "cold_n2".to_string(),
-            edge_type: "KNOWS".to_string(),
-            properties: HashMap::new(),
-            weight: None,
-            created_at_ms: 7,
-            updated_at_ms: 9,
-        };
+        let node = mk_node("cold_n1", "Person", 7, 9);
+        let edge = mk_edge("cold_e1", "cold_n1", "cold_n2", "KNOWS", 7, 9);
         record_store
             .upsert_record(
                 crate::graph::adjacency_projection::node_to_canonical_record(graph_id, &node),
@@ -1089,21 +861,6 @@ mod tests {
             )
             .await
             .expect("seed edge record");
-
-        let service =
-            GraphOperationsService::new().with_canonical_record_store(record_store.clone());
-        service
-            .create_graph_collection(CreateGraphRequest {
-                graph_id: graph_id.to_string(),
-                name: None,
-                description: None,
-                schema: None,
-                storage_config: None,
-                engine_config: None,
-                access_control: None,
-            })
-            .await
-            .expect("create graph");
 
         // Gate OFF (default): engine miss → None, no cold-fetch.
         unsafe { std::env::remove_var("PROXIMADB_GRAPH_COLD_PAYLOADS") };
@@ -1165,8 +922,6 @@ mod tests {
     /// graph records survive the `ProximaRecordV2` bincode round-trip intact.
     #[tokio::test]
     async fn cold_graph_record_store_serves_payloads_end_to_end() {
-        let graph_id = format!("cold_store_e2e_{}", std::process::id());
-        let graph_id = graph_id.as_str();
         let record_store = Arc::new(
             crate::graph::ColdGraphRecordStore::from_storage_root(
                 "memory://",
@@ -1174,27 +929,15 @@ mod tests {
             )
             .expect("open memory cold store"),
         );
+        let service =
+            GraphOperationsService::new().with_canonical_record_store(record_store.clone());
+        let graph_id = seed_graph(&service, "cold_store_e2e").await;
+        let graph_id = graph_id.as_str();
 
-        let node = Node {
-            id: "cold_n1".to_string(),
-            labels: vec!["Person".to_string()],
-            properties: HashMap::new(),
-            embedding: None,
-            created_at_ms: 7,
-            updated_at_ms: 9,
-        };
-        let edge = Edge {
-            id: "cold_e1".to_string(),
-            from_node_id: "cold_n1".to_string(),
-            to_node_id: "cold_n2".to_string(),
-            edge_type: "KNOWS".to_string(),
-            properties: HashMap::new(),
-            weight: None,
-            created_at_ms: 7,
-            updated_at_ms: 9,
-        };
         // Seed the cold store directly — the engine never sees these, so a hit can
         // only come from `ColdGraphRecordStore` via the cold-fetch path.
+        let node = mk_node("cold_n1", "Person", 7, 9);
+        let edge = mk_edge("cold_e1", "cold_n1", "cold_n2", "KNOWS", 7, 9);
         record_store
             .upsert_record(
                 crate::graph::adjacency_projection::node_to_canonical_record(graph_id, &node),
@@ -1207,21 +950,6 @@ mod tests {
             )
             .await
             .expect("seed edge into cold store");
-
-        let service =
-            GraphOperationsService::new().with_canonical_record_store(record_store.clone());
-        service
-            .create_graph_collection(CreateGraphRequest {
-                graph_id: graph_id.to_string(),
-                name: None,
-                description: None,
-                schema: None,
-                storage_config: None,
-                engine_config: None,
-                access_control: None,
-            })
-            .await
-            .expect("create graph");
 
         unsafe { std::env::set_var("PROXIMADB_GRAPH_COLD_PAYLOADS", "1") };
         let got_node = service
@@ -1250,8 +978,6 @@ mod tests {
     /// (present/absent/present), served via the batched cold-fetch path.
     #[tokio::test]
     async fn get_nodes_batches_cold_misses_in_order() {
-        let graph_id = format!("cold_batch_{}", std::process::id());
-        let graph_id = graph_id.as_str();
         let record_store = Arc::new(
             crate::graph::ColdGraphRecordStore::from_storage_root(
                 "memory://",
@@ -1259,16 +985,14 @@ mod tests {
             )
             .expect("open memory cold store"),
         );
+        let service =
+            GraphOperationsService::new().with_canonical_record_store(record_store.clone());
+        let graph_id = seed_graph(&service, "cold_batch").await;
+        let graph_id = graph_id.as_str();
+
         // Seed n1 and n3 directly (engine never sees them); n2 is absent.
         for id in ["n1", "n3"] {
-            let node = Node {
-                id: id.to_string(),
-                labels: vec!["Person".to_string()],
-                properties: HashMap::new(),
-                embedding: None,
-                created_at_ms: 1,
-                updated_at_ms: 1,
-            };
+            let node = mk_node(id, "Person", 1, 1);
             record_store
                 .upsert_record(
                     crate::graph::adjacency_projection::node_to_canonical_record(graph_id, &node),
@@ -1276,21 +1000,6 @@ mod tests {
                 .await
                 .expect("seed node");
         }
-
-        let service =
-            GraphOperationsService::new().with_canonical_record_store(record_store.clone());
-        service
-            .create_graph_collection(CreateGraphRequest {
-                graph_id: graph_id.to_string(),
-                name: None,
-                description: None,
-                schema: None,
-                storage_config: None,
-                engine_config: None,
-                access_control: None,
-            })
-            .await
-            .expect("create graph");
 
         unsafe { std::env::set_var("PROXIMADB_GRAPH_COLD_PAYLOADS", "1") };
         let ids = vec!["n1".to_string(), "n2".to_string(), "n3".to_string()];
@@ -1310,71 +1019,24 @@ mod tests {
     #[tokio::test]
     async fn orion_csr_rebuild_from_adjacency_projection() {
         use crate::graph::engines::GraphEngineImpl;
-        use crate::proto::proximadb_v1::CreateGraphRequest;
 
-        let graph_id = format!("csr_rebuild_test_{}", std::process::id());
-        let graph_id = graph_id.as_str();
         let service = GraphOperationsService::new();
-        service
-            .create_graph_collection(CreateGraphRequest {
-                graph_id: graph_id.to_string(),
-                name: None,
-                description: None,
-                schema: None,
-                storage_config: None,
-                engine_config: None,
-                access_control: None,
-            })
-            .await
-            .expect("create graph");
+        let graph_id = seed_graph(&service, "csr_rebuild_test").await;
+        let graph_id = graph_id.as_str();
 
         for nid in ["a", "b", "c"] {
             service
-                .create_node(
-                    graph_id,
-                    Node {
-                        id: nid.to_string(),
-                        labels: vec!["V".to_string()],
-                        properties: HashMap::new(),
-                        embedding: None,
-                        created_at_ms: 0,
-                        updated_at_ms: 0,
-                    },
-                )
+                .create_node(graph_id, mk_node(nid, "V", 0, 0))
                 .await
                 .expect("create node");
         }
 
         service
-            .create_edge(
-                graph_id,
-                Edge {
-                    id: "ea".to_string(),
-                    from_node_id: "a".to_string(),
-                    to_node_id: "b".to_string(),
-                    edge_type: "E".to_string(),
-                    properties: HashMap::new(),
-                    weight: None,
-                    created_at_ms: 0,
-                    updated_at_ms: 0,
-                },
-            )
+            .create_edge(graph_id, mk_edge("ea", "a", "b", "E", 0, 0))
             .await
             .expect("create ea");
         service
-            .create_edge(
-                graph_id,
-                Edge {
-                    id: "eb".to_string(),
-                    from_node_id: "a".to_string(),
-                    to_node_id: "c".to_string(),
-                    edge_type: "E".to_string(),
-                    properties: HashMap::new(),
-                    weight: None,
-                    created_at_ms: 0,
-                    updated_at_ms: 0,
-                },
-            )
+            .create_edge(graph_id, mk_edge("eb", "a", "c", "E", 0, 0))
             .await
             .expect("create eb");
 
@@ -1495,52 +1157,18 @@ mod tests {
             ColdGraphSegmentStore::new(backing.clone(), ObjectAccessTier::Cool)
                 .with_flush_thresholds(u64::MAX, usize::MAX),
         );
-        let graph_id = format!("seg_crash_recover_{}", std::process::id());
-        let graph_id = graph_id.as_str();
         let service = GraphOperationsService::new().with_canonical_record_store(cold.clone());
+        let graph_id = seed_graph(&service, "seg_crash_recover").await;
+        let graph_id = graph_id.as_str();
 
-        service
-            .create_graph_collection(CreateGraphRequest {
-                graph_id: graph_id.to_string(),
-                name: None,
-                description: None,
-                schema: None,
-                storage_config: None,
-                engine_config: None,
-                access_control: None,
-            })
-            .await
-            .expect("create graph");
         for node_id in ["n1", "n2", "n3"] {
             service
-                .create_node(
-                    graph_id,
-                    Node {
-                        id: node_id.to_string(),
-                        labels: vec!["Person".to_string()],
-                        properties: HashMap::new(),
-                        embedding: None,
-                        created_at_ms: 1,
-                        updated_at_ms: 1,
-                    },
-                )
+                .create_node(graph_id, mk_node(node_id, "Person", 1, 1))
                 .await
                 .expect("create node");
         }
         service
-            .create_edge(
-                graph_id,
-                Edge {
-                    id: "e1".to_string(),
-                    from_node_id: "n1".to_string(),
-                    to_node_id: "n2".to_string(),
-                    edge_type: "KNOWS".to_string(),
-                    properties: HashMap::new(),
-                    weight: None,
-                    created_at_ms: 1,
-                    updated_at_ms: 1,
-                },
-            )
+            .create_edge(graph_id, mk_edge("e1", "n1", "n2", "KNOWS", 1, 1))
             .await
             .expect("create edge");
 
