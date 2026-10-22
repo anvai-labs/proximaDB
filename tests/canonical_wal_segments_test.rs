@@ -17,7 +17,7 @@
 
 use anyhow::Result;
 use proximadb::services::FramedTableWalAppender;
-use proximadb::services::canonical_wal::BranchedCollection;
+use proximadb::services::canonical_wal::{BranchFenceRefused, TenantCollection};
 use proximadb::services::record_store::TableWalAppender;
 use proximadb_records::ProximaRecord;
 use proximadb_storage_common::{CanonicalOperation, CanonicalWalEntry};
@@ -332,6 +332,14 @@ async fn branched_wal(path: &Path) -> Result<FramedTableWalAppender> {
     Ok(wal)
 }
 
+fn tc(tenant: Option<&str>, collection: &str) -> TenantCollection {
+    TenantCollection::new(tenant, collection)
+}
+
+fn below(wal: &FramedTableWalAppender, floor: u64) -> Vec<(TenantCollection, u64)> {
+    wal.collections_below(floor).into_iter().collect()
+}
+
 #[tokio::test]
 async fn branch_summary_and_collections_below_survive_reopen() -> Result<()> {
     let dir = TempDir::new()?;
@@ -342,28 +350,28 @@ async fn branch_summary_and_collections_below_survive_reopen() -> Result<()> {
     assert_eq!(summary.oldest_branch_seq, Some(3));
     assert_eq!(
         summary.collections.iter().cloned().collect::<Vec<_>>(),
-        vec![
-            BranchedCollection::new(None, "b"),
-            BranchedCollection::new(Some("t1"), "a"),
-        ]
+        vec![tc(None, "b"), tc(Some("t1"), "a")]
     );
-    let below = wal.collections_below(4);
+    let below_4 = vec![
+        (tc(None, "a"), 1),
+        (tc(None, "b"), 2),
+        (tc(Some("t1"), "a"), 3),
+    ];
     assert_eq!(
-        below.into_iter().collect::<Vec<_>>(),
-        vec![("a".to_string(), 1), ("b".to_string(), 2)],
-        "seq 1..=3 sit in segments wholly below 4; each collection maps to its oldest one"
+        below(&wal, 4),
+        below_4,
+        "seq 1..=3 sit in segments wholly below 4; each (tenant, collection) maps to its oldest"
     );
     assert!(wal.collections_below(1).is_empty());
+    // The active file (seq 5) counts once the floor passes it: a rotation can
+    // seal it before the truncation runs.
+    assert_eq!(below(&wal, 6).len(), 4);
+    assert_eq!(wal.collections_below(6)[&tc(None, "c")], 4);
     drop(wal);
 
     let reopened = FramedTableWalAppender::open(&path).await?;
     assert_eq!(reopened.branch_summary(), summary);
-    assert_eq!(reopened.collections_below(4), {
-        let mut m = std::collections::BTreeMap::new();
-        m.insert("a".to_string(), 1);
-        m.insert("b".to_string(), 2);
-        m
-    });
+    assert_eq!(below(&reopened, 4), below_4);
 
     // Truncating the main-line prefix keeps every branch entry.
     reopened.truncate_below(3).await?;
@@ -372,13 +380,29 @@ async fn branch_summary_and_collections_below_survive_reopen() -> Result<()> {
     let reopened = FramedTableWalAppender::open(&path).await?;
     assert_eq!(reopened.branch_summary(), summary);
     assert_eq!(
+        below(&reopened, 5),
+        vec![(tc(None, "c"), 4), (tc(Some("t1"), "a"), 3)]
+    );
+
+    // Truncating the oldest branch entry moves the summary up.
+    reopened.truncate_below(4).await?;
+    assert_eq!(reopened.branch_summary().oldest_branch_seq, Some(5));
+    assert_eq!(
         reopened
-            .collections_below(5)
+            .branch_summary()
+            .collections
             .into_iter()
             .collect::<Vec<_>>(),
-        vec![("a".to_string(), 3), ("c".to_string(), 4)]
+        vec![tc(None, "b")]
     );
     Ok(())
+}
+
+fn fence_refusal(error: &anyhow::Error) -> &str {
+    &error
+        .downcast_ref::<BranchFenceRefused>()
+        .expect("a typed fence refusal")
+        .0
 }
 
 #[tokio::test]
@@ -392,17 +416,15 @@ async fn a_branch_fence_refuses_stripping_a_collection_branched_since() -> Resul
     wal.append_operations(vec![branch_upsert("a", "r3", "x")], None)
         .await?;
 
-    // The image covers `a`; `b` branches before the truncation runs.
-    let covered: std::collections::BTreeSet<_> =
-        [BranchedCollection::new(None, "a")].into_iter().collect();
-    wal.fence_branches(covered.clone());
+    // The image covers `a`, every victim is marked; `b` branches before the
+    // truncation runs.
+    let covered: std::collections::BTreeSet<_> = [tc(None, "a")].into_iter().collect();
+    let marked = wal.collections_below(3).into_keys().collect();
+    wal.fence_branches(covered.clone(), marked);
     wal.append_operations(vec![branch_upsert("b", "r4", "y")], None)
         .await?;
     let refused = wal.truncate_below(3).await.unwrap_err();
-    assert!(
-        format!("{refused:#}").contains("/b"),
-        "the refusal names the uncovered collection: {refused:#}"
-    );
+    assert!(fence_refusal(&refused).contains("default/b"), "{refused:#}");
     assert_eq!(
         wal.retained_from(),
         0,
@@ -412,11 +434,54 @@ async fn a_branch_fence_refuses_stripping_a_collection_branched_since() -> Resul
     // The fence is consumed: an unfenced run truncates.
     assert_eq!(wal.truncate_below(3).await?.truncated_through, 2);
 
+    // A victim whose loss the checkpoint did not record is refused too.
+    wal.fence_branches(
+        [tc(None, "a"), tc(None, "b")].into_iter().collect(),
+        Default::default(),
+    );
+    let refused = wal.truncate_below(4).await.unwrap_err();
+    assert!(
+        fence_refusal(&refused).contains("unrecorded"),
+        "{refused:#}"
+    );
+
     // A collection branched since with no history below the floor does not
     // trip the fence.
-    wal.fence_branches(covered);
+    let marked = wal.collections_below(4).into_keys().collect();
+    wal.fence_branches(covered, marked);
     wal.append_operations(vec![branch_upsert("d", "r5", "z")], None)
         .await?;
     assert_eq!(wal.truncate_below(4).await?.truncated_through, 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_branch_fence_is_per_tenant_and_consumed_without_victims() -> Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("canonical-records.wal");
+    let wal = FramedTableWalAppender::open(&path).await?;
+    wal.enable_segment_rotation(1);
+    wal.append_operations(vec![upsert("a", "r1")], Some("t2".into()))
+        .await?;
+    wal.append_operations(vec![branch_upsert("a", "r2", "x")], Some("t1".into()))
+        .await?;
+
+    // Nothing below the floor: the fence is consumed anyway.
+    wal.fence_branches(Default::default(), Default::default());
+    assert_eq!(wal.truncate_below(1).await?.segments, 0);
+    assert_eq!(wal.truncate_below(2).await?.truncated_through, 1);
+
+    // t1's `a` branched and is not covered, but only t2's `a` loses history.
+    let wal = FramedTableWalAppender::open(dir.path().join("second.wal")).await?;
+    wal.enable_segment_rotation(1);
+    wal.append_operations(vec![upsert("a", "r1")], Some("t2".into()))
+        .await?;
+    wal.append_operations(vec![branch_upsert("a", "r2", "x")], Some("t1".into()))
+        .await?;
+    wal.fence_branches(
+        Default::default(),
+        [tc(Some("t2"), "a")].into_iter().collect(),
+    );
+    assert_eq!(wal.truncate_below(2).await?.truncated_through, 1);
     Ok(())
 }

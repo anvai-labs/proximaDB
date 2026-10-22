@@ -290,3 +290,22 @@ async fn a_snapshot_capture_after_truncation_is_the_head_not_zero() -> Result<()
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_branch_fence_refusal_is_reported_as_a_refusal() -> Result<()> {
+    let dir = TempDir::new()?;
+    let wal = rotating_wal(&dir).await?;
+    wal.append_operations(vec![upsert("r1", None)], None)
+        .await?;
+    wal.append_operations(vec![upsert("r2", None)], None)
+        .await?;
+    // Armed with nothing recorded: every victim's loss would go unrecorded.
+    wal.fence_branches(Default::default(), Default::default());
+    let run = wal_truncator::run_once(&wal, &[Arc::new(ChangeFeedRetention(0))]).await?;
+    assert!(
+        matches!(&run, TruncationRun::Refused { source, .. } if source == "branch-fence"),
+        "{run:?}"
+    );
+    assert_eq!(wal.retained_from(), 0, "nothing deleted");
+    Ok(())
+}
