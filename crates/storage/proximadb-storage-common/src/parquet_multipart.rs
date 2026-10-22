@@ -15,14 +15,19 @@
 //! [`finish`]: MultipartParquetWriter::finish
 //! [`abort`]: MultipartParquetWriter::abort
 
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
+use bytes::Bytes;
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::AsyncArrowWriter;
+use parquet::arrow::async_writer::AsyncFileWriter;
 use proximadb_kernel::error::StorageError;
 
 use crate::object_store_bridge::ObjectStoreBridge;
@@ -57,8 +62,55 @@ pub struct WrittenPart {
 
 struct OpenPart {
     key: Path,
-    writer: AsyncArrowWriter<BufWriter>,
+    writer: AsyncArrowWriter<PartUpload>,
     rows: usize,
+}
+
+/// A part's upload. Once `complete` reaches `shutdown`, the `BufWriter` has either
+/// finished or failed with its upload already gone (a failed multipart completion
+/// aborts itself); `BufWriter::abort` would then panic, so [`abort`](Self::abort)
+/// becomes a no-op.
+struct PartUpload {
+    inner: BufWriter,
+    shutting_down: bool,
+}
+
+impl PartUpload {
+    fn new(inner: BufWriter) -> Self {
+        Self {
+            inner,
+            shutting_down: false,
+        }
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        if self.shutting_down {
+            return Ok(());
+        }
+        self.inner.abort().await
+    }
+}
+
+impl AsyncFileWriter for PartUpload {
+    fn write(&mut self, bs: Bytes) -> BoxFuture<'_, parquet::errors::Result<()>> {
+        AsyncFileWriter::write(&mut self.inner, bs)
+    }
+
+    fn complete(&mut self) -> BoxFuture<'_, parquet::errors::Result<()>> {
+        async move {
+            std::future::poll_fn(|cx| {
+                tokio::io::AsyncWrite::poll_flush(Pin::new(&mut self.inner), cx)
+            })
+            .await?;
+            self.shutting_down = true;
+            std::future::poll_fn(|cx| {
+                tokio::io::AsyncWrite::poll_shutdown(Pin::new(&mut self.inner), cx)
+            })
+            .await?;
+            Ok(())
+        }
+        .boxed()
+    }
 }
 
 /// Streams batches into size-capped Parquet parts under one directory. See the
@@ -262,7 +314,7 @@ impl MultipartParquetWriter {
             self.stem,
             self.done.len()
         ));
-        let upload = BufWriter::new(self.store.clone(), self.store_path(&key));
+        let upload = PartUpload::new(BufWriter::new(self.store.clone(), self.store_path(&key)));
         let props = self.policy.writer_properties(sample, &self.hints);
         let writer = AsyncArrowWriter::try_new(upload, self.schema.clone(), Some(props))
             .map_err(|e| write_err("open part", e))?;
@@ -570,6 +622,107 @@ mod tests {
         w.abort().await.unwrap();
         let left: Vec<_> = b.store.list(None).collect().await;
         assert!(left.is_empty(), "no part survives an abort: {left:?}");
+    }
+
+    /// Fails the PUT of any object whose key ends with `suffix`.
+    #[derive(Debug)]
+    struct FailingPut {
+        inner: InMemory,
+        suffix: &'static str,
+    }
+
+    impl std::fmt::Display for FailingPut {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("FailingPut")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FailingPut {
+        async fn put_opts(
+            &self,
+            path: &Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if path.as_ref().ends_with(self.suffix) {
+                return Err(object_store::Error::Generic {
+                    store: "FailingPut",
+                    source: "injected PUT failure".into(),
+                });
+            }
+            self.inner.put_opts(path, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            path: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(path, opts).await
+        }
+        async fn get_opts(
+            &self,
+            path: &Path,
+            opts: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(path, opts).await
+        }
+        fn delete_stream(
+            &self,
+            paths: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(paths)
+        }
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            opts: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    /// A part whose final PUT fails is an error, not a panic (the upload is past
+    /// the point where `BufWriter::abort` is allowed), and its finished sibling is
+    /// deleted.
+    #[tokio::test]
+    async fn a_failed_part_close_is_an_error_and_removes_the_siblings() {
+        let b = TestBridge {
+            store: Arc::new(FailingPut {
+                inner: InMemory::new(),
+                suffix: "-00001.parquet",
+            }),
+        };
+        let mut w = MultipartParquetWriter::new(
+            &b,
+            "t/data",
+            "g3",
+            schema(),
+            policy(100, usize::MAX),
+            ParquetLayoutHints::default(),
+        );
+        w.write(&batch(0..150)).await.unwrap();
+        assert_eq!(w.completed_parts().len(), 1);
+        let err = w.finish().await.unwrap_err().to_string();
+        assert!(err.contains("finish part"), "{err}");
+        let left: Vec<_> = b.store.list(None).collect().await;
+        assert!(
+            left.is_empty(),
+            "no part survives a failed finish: {left:?}"
+        );
     }
 
     /// A batch whose columns do not fit the writer's schema is an error, not a
