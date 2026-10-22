@@ -7,9 +7,12 @@
 //! A memory-only tombstone holds the floor at its delete's LSN until a flush
 //! persists it.
 //!
+//! The seeded soak below interleaves the same operations at random and checks
+//! every restart against a reference model.
+//!
 //!   cargo test --test wal_truncation_recovery_test
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use proximadb::services::FramedTableWalAppender;
 use proximadb::services::record_store::{
     DirectWalTableRecordStore, TableRecordScanRequest, TableRecordStore, TableWalAppender,
@@ -22,9 +25,11 @@ use proximadb_catalog::CatalogTableSchema;
 use proximadb_data_model::ProximaValue;
 use proximadb_records::{ProximaRecord, ProximaTreeNode};
 use proximadb_storage_common::CanonicalOperation;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use tempfile::TempDir;
 
 const TABLE: &str = "orders";
@@ -106,6 +111,29 @@ async fn rows(store: &DirectWalTableRecordStore, tenant: &str) -> Result<BTreeMa
         .collect())
 }
 
+/// Turn the spill gate on once for the whole binary. A threshold well above
+/// any partition's row count, so only explicit flushes spill and each test
+/// controls exactly which rows are durable in segments. Set once and never
+/// removed: `cargo test` runs these tests concurrently in one process.
+fn spill_gate() {
+    static GATE: Once = Once::new();
+    // SAFETY: inside `call_once`, before any test reads the variable.
+    GATE.call_once(|| unsafe {
+        std::env::set_var("PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT", "1000")
+    });
+}
+
+fn truncator_sources(
+    wal: &Arc<FramedTableWalAppender>,
+    store: &Arc<DirectWalTableRecordStore>,
+) -> Vec<Arc<dyn WalFloorSource>> {
+    vec![
+        Arc::new(BranchEntriesGuard(wal.clone())),
+        Arc::new(ChangeFeedRetention(0)),
+        Arc::new(RecordTierFloor(store.clone())),
+    ]
+}
+
 async fn open(dir: &Path) -> Result<(Arc<FramedTableWalAppender>, DirectWalTableRecordStore)> {
     let wal = Arc::new(FramedTableWalAppender::open(dir.join("canonical-records.wal")).await?);
     // Every append seals its own segment, so truncation can drop any prefix.
@@ -121,10 +149,7 @@ async fn open(dir: &Path) -> Result<(Arc<FramedTableWalAppender>, DirectWalTable
 #[tokio::test]
 async fn a_crash_after_truncation_recovers_every_row_from_segments_and_the_wal_tail() -> Result<()>
 {
-    // A threshold well above the row count: only the explicit flush spills, so
-    // the test controls exactly which rows are durable in segments.
-    // SAFETY: the only test in this binary; nothing reads the env concurrently.
-    unsafe { std::env::set_var("PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT", "1000") };
+    spill_gate();
     let dir = TempDir::new()?;
     let (wal, store) = open(dir.path()).await?;
     let store = Arc::new(store);
@@ -138,11 +163,7 @@ async fn a_crash_after_truncation_recovers_every_row_from_segments_and_the_wal_t
     }
     store.flush_partitions().await?;
 
-    let sources: Vec<Arc<dyn WalFloorSource>> = vec![
-        Arc::new(BranchEntriesGuard(wal.clone())),
-        Arc::new(ChangeFeedRetention(0)),
-        Arc::new(RecordTierFloor(store.clone())),
-    ];
+    let sources = truncator_sources(&wal, &store);
 
     // Phase 2: a delete of a flushed row, still memory-only. Its tombstone
     // keeps the delete's LSN, so the record tier retains the WAL from there —
@@ -239,7 +260,97 @@ async fn a_crash_after_truncation_recovers_every_row_from_segments_and_the_wal_t
             "segments alone, tenant {tenant:?}"
         );
     }
+    Ok(())
+}
 
-    unsafe { std::env::remove_var("PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT") };
+/// Seeded interleavings of upserts, deletes (of resident, flushed and absent
+/// rows), flushes, truncator runs and crash-restarts over both partitions. Each
+/// restart replays the retained WAL over the segments and must reproduce the
+/// reference model exactly. Every write carries its LSN, so the record tier
+/// must never refuse a run.
+#[tokio::test]
+async fn seeded_crash_truncate_interleavings_match_a_reference_model() -> Result<()> {
+    spill_gate();
+    for seed in 0..8 {
+        soak(seed, 300)
+            .await
+            .with_context(|| format!("soak seed {seed}"))?;
+    }
+    Ok(())
+}
+
+async fn soak(seed: u64, steps: usize) -> Result<()> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let dir = TempDir::new()?;
+    let (mut wal, store) = open(dir.path()).await?;
+    let mut store = Arc::new(store);
+    let mut model: BTreeMap<&str, BTreeMap<String, i64>> = TENANTS
+        .iter()
+        .map(|tenant| (*tenant, BTreeMap::new()))
+        .collect();
+    let mut version = 0;
+    let (mut truncations, mut restarts) = (0, 0);
+
+    for step in 0..=steps {
+        let tenant = TENANTS[rng.gen_range(0..TENANTS.len())];
+        let oid = format!("r{}", rng.gen_range(0..16));
+        // The last step is always a restart, so every seed ends verified.
+        let roll = if step == steps {
+            99
+        } else {
+            rng.gen_range(0..100)
+        };
+        match roll {
+            0..=54 => {
+                version += 1;
+                write(&wal, &store, tenant, upsert(&oid, tenant, version)).await?;
+                model.get_mut(tenant).expect("tenant").insert(oid, version);
+            }
+            55..=74 => {
+                write(&wal, &store, tenant, delete(&oid)).await?;
+                model.get_mut(tenant).expect("tenant").remove(&oid);
+            }
+            75..=84 => {
+                store.flush_partitions().await?;
+            }
+            85..=94 => {
+                let run = wal_truncator::run_once(&wal, &truncator_sources(&wal, &store)).await?;
+                assert!(
+                    !matches!(run, TruncationRun::Refused { .. }),
+                    "seed {seed} step {step}: every write is LSN-tracked: {run:?}"
+                );
+                truncations += matches!(run, TruncationRun::Truncated { .. }) as usize;
+            }
+            _ => {
+                for tenant in TENANTS {
+                    assert_eq!(
+                        rows(&store, tenant).await?,
+                        model[tenant],
+                        "seed {seed} step {step}: live state, tenant {tenant:?}"
+                    );
+                }
+                // Crash: no shutdown flush.
+                drop(store);
+                drop(wal);
+                let (reopened_wal, reopened) = open(dir.path()).await?;
+                reopened
+                    .replay_wal_entries(reopened_wal.read_entries().await?)
+                    .await?;
+                (wal, store) = (reopened_wal, Arc::new(reopened));
+                restarts += 1;
+                for tenant in TENANTS {
+                    assert_eq!(
+                        rows(&store, tenant).await?,
+                        model[tenant],
+                        "seed {seed} step {step}: after restart {restarts}, tenant {tenant:?}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        truncations > 0 && restarts > 1,
+        "seed {seed} exercised too little: {truncations} truncation(s), {restarts} restart(s)"
+    );
     Ok(())
 }
