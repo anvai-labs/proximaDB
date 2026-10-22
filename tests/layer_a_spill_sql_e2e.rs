@@ -164,7 +164,7 @@ async fn body() {
     assert_eq!(cells(&cte, 1), [Some(big.iter().sum::<i64>().to_string())]);
 
     drop(client);
-    drop(server);
+    server.shutdown().await;
 
     // Kill switch, on a fresh server: the capped MemTable path cannot register a
     // table past the cap, so the same window query must decline — never be
@@ -183,13 +183,13 @@ async fn body() {
         .simple_query(window)
         .await
         .expect_err("with the kill switch the over-cap table must decline");
+    let message = pg_server::db_err(&err);
     assert!(
-        pg_server::db_err(&err).contains("spill_t"),
-        "the decline must be the unregistered over-cap table, got: {}",
-        pg_server::db_err(&err)
+        message.contains("spill_t") && message.to_ascii_lowercase().contains("not found"),
+        "the decline must be the unregistered over-cap table, got: {message}"
     );
     drop(client);
-    drop(server);
+    server.shutdown().await;
     // SAFETY: see above — no server is running.
     unsafe { std::env::remove_var("PROXIMADB_NATIVE_TABLE_LAYER_A") };
 }

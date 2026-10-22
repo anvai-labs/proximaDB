@@ -61,11 +61,13 @@ pub(crate) struct ConformContext {
     /// which also holds rows that are never emitted (a persisted tombstone has
     /// no props, so it is NULL even in a NOT NULL column).
     internal: SchemaRef,
-    /// The primary-key columns. Always read: a row whose key column is absent
-    /// or NULL takes its key from the oid, which fails for composite and
-    /// non-integer keys — and a failed projection drops the row on the
-    /// materialized path, so it must be decided on the same full key here.
-    pk_names: Vec<String>,
+    /// The (first) primary-key column, as the column is spelled. Always read:
+    /// a row with it absent or NULL takes its key from the oid, which fails for
+    /// composite and non-integer keys — and a failed projection drops the row
+    /// on the materialized path, so it must be decided on the stored key here.
+    /// Only the first key column falls back to the oid (`project_one_record`);
+    /// a NULL in a later one is NULL on both paths.
+    pk_name: Option<String>,
     /// Every row goes through records — see the module note.
     pub records_only: bool,
     access: Arc<LayerARowAccess>,
@@ -115,7 +117,13 @@ impl ConformContext {
         Ok(Self {
             col_names: schema.columns.iter().map(|c| c.name.clone()).collect(),
             table_name,
-            pk_names: schema.primary_key.clone(),
+            pk_name: schema.primary_key.first().map(|pk| {
+                schema
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(pk))
+                    .map_or_else(|| pk.clone(), |c| c.name.clone())
+            }),
             encode_schema: {
                 let mut nullable = schema.clone();
                 for column in &mut nullable.columns {
@@ -135,7 +143,7 @@ impl ConformContext {
 
     /// Columns a segment read must fetch: every column when rows go through
     /// records, else the projected ones present in `segment`, the primary key
-    /// (see `pk_names`) and the system columns. Names, matched exactly as the
+    /// (see `pk_name`) and the system columns. Names, matched exactly as the
     /// record decoder keys `props`.
     pub fn segment_columns(&self, segment: &Schema) -> Option<Vec<usize>> {
         if self.records_only {
@@ -146,7 +154,7 @@ impl ConformContext {
             .fields()
             .iter()
             .map(|f| f.name().as_str())
-            .chain(self.pk_names.iter().map(String::as_str))
+            .chain(self.pk_name.as_deref())
             .chain([
                 SYS_COL_OID,
                 SYS_COL_VARIATION_ID,
@@ -258,9 +266,9 @@ pub(crate) struct SegmentShape {
     residual: Option<usize>,
     /// Per output column: the segment column holding it under the identical type.
     columns: Vec<Option<usize>>,
-    /// The primary-key columns; a row NULL in any of them takes the record
-    /// route (its key is its oid — see `ConformContext::pk_names`).
-    pk: Vec<usize>,
+    /// The key column; a row NULL in it takes the record route (its key is its
+    /// oid — see `ConformContext::pk_name`).
+    pk: Option<usize>,
     /// Every row goes through records (the context says so, a projected
     /// column is stored under another type, or a key column is missing).
     records_only: bool,
@@ -285,8 +293,8 @@ impl SegmentShape {
                 None => None,
             })
             .collect();
-        let pk: Vec<usize> = ctx.pk_names.iter().filter_map(|name| find(name)).collect();
-        if pk.len() != ctx.pk_names.len() {
+        let pk = ctx.pk_name.as_deref().and_then(|name| find(name));
+        if ctx.pk_name.is_some() && pk.is_none() {
             records_only = true;
         }
         let i64_col = |name: &str| -> Result<Option<usize>> {
@@ -337,12 +345,14 @@ pub(crate) fn conform_segment_batch(
 
     // Which rows need the record route.
     let residual = shape.residual.map(|i| batch.column(i));
-    let pk: Vec<&ArrayRef> = shape.pk.iter().map(|&i| batch.column(i)).collect();
+    let pk = shape.pk.map(|i| batch.column(i));
     let slow: Vec<u32> = if shape.records_only {
         (0..n as u32).collect()
     } else {
         (0..n)
-            .filter(|&r| residual.is_some_and(|a| a.is_valid(r)) || pk.iter().any(|a| a.is_null(r)))
+            .filter(|&r| {
+                residual.is_some_and(|a| a.is_valid(r)) || pk.is_some_and(|a| a.is_null(r))
+            })
             .map(|r| r as u32)
             .collect()
     };
