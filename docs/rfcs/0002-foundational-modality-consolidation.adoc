@@ -356,26 +356,20 @@ system of record).
 
 === Research bibliography
 
-- [[biblio-cornus]] **Cornus** — Atomic Commit for a Cloud DBMS with Storage Disaggregation. https://arxiv.org/abs/2102.10185
-- [[biblio-batchweave]] **BatchWeave** — A Consistent Object-Store-Native Data Plane. https://arxiv.org/abs/2605.09994
-- [[biblio-m2]] **M2** — An Analytic System with Specialized Storage Engines for Multi-Model Workloads. https://arxiv.org/abs/2508.02508
-- [[biblio-bigdawg]] **BigDAWG** — The BigDAWG Polystore System and Architecture. https://arxiv.org/abs/1609.07548
-- [[biblio-scalardb]] **ScalarDB** — Breaking the Barriers of Database-Agnostic Transactions. https://arxiv.org/abs/2602.19440
-- [[biblio-ccaas]] **CCaaS** — Concurrency Control as a Service. https://arxiv.org/abs/2603.13897
-- [[biblio-dsql]] **Aurora DSQL** — Scalable, Multi-Region OLTP. https://arxiv.org/abs/2607.13276
-- [[biblio-cmvbt]] **cMVBT** — Multiversion Concurrency Control for Multiversion B-Trees. https://arxiv.org/abs/2606.09133
-- [[biblio-uschema]] **U-Schema** — A Unified Metamodel for NoSQL and Relational Databases. https://arxiv.org/abs/2105.06494
-- [[biblio-spanner]] **Spanner columnar engine** — uniting OLTP and analytics. https://cloud.google.com/blog/products/databases/spanners-columnar-engine-unites-oltp-and-analytics
-- [[biblio-cambridge]] **The Cambridge Report on Database Research** — field-direction report. https://arxiv.org/abs/2504.11259
-- [[biblio-graphcol]] **GraphflowDB** — Columnar Storage and List-based Processing for Graph DBMSs. https://arxiv.org/abs/2103.02284
-- [[biblio-compass]] **Compass** — General Filtered Search across Vector and Structured Data. https://arxiv.org/abs/2510.27141
-- [[biblio-vecpolicy]] **Policy-aware Vector Search** — Fine-Grained Access Control. https://arxiv.org/abs/2606.19803
-- [[biblio-pgvector]] **Filter-Agnostic Vector Search on a PostgreSQL Database** (SIGMOD 2026). https://arxiv.org/abs/2603.23710
-- [[biblio-icebergdv]] **Apache Iceberg v3** — deletion vectors (Puffin, roaring bitmap; merge-on-read). https://iceberg.apache.org/spec/#deletion-vectors
-- [[biblio-deltadv]] **Delta Lake** — deletion vectors / merge-on-read. https://docs.delta.io/latest/delta-deletion-vectors.html
-- [[biblio-lance]] **Lance / LanceDB** — columnar ML format + object-store storage⊥compute. arXiv:2504.15247 · https://lance.org/format/
-- [[biblio-vespa]] **Vespa** — serving engine (content/container nodes, tensors, constrained ANN). https://docs.vespa.ai/en/overview.html
-- [[biblio-weaviate]] **Weaviate** — vector-native DB (shard-per-tenant, pre-filter allow-list→HNSW). https://docs.weaviate.io/weaviate/concepts/storage
+The full bibliography — titles, arXiv ids and per-system links — lives once in the decision
+record: link:../12-design/adr/ADR-072-foundational-contract-consolidation.adoc[ADR-072] §
+_Research bibliography_. It is not restated here; the citations below are the anchor targets
+this RFC's calibration sections reference (`<<biblio-…>>`), each resolving to the full entry
+in the ADR:
+
+* [[biblio-cornus]] Cornus · [[biblio-batchweave]] BatchWeave · [[biblio-m2]] M2 ·
+  [[biblio-bigdawg]] BigDAWG · [[biblio-scalardb]] ScalarDB · [[biblio-ccaas]] CCaaS
+* [[biblio-dsql]] Aurora DSQL · [[biblio-cmvbt]] cMVBT · [[biblio-uschema]] U-Schema ·
+  [[biblio-spanner]] Spanner columnar engine · [[biblio-cambridge]] Cambridge Report
+* [[biblio-graphcol]] GraphflowDB · [[biblio-compass]] Compass · [[biblio-vecpolicy]]
+  Policy-aware Vector Search · [[biblio-pgvector]] pgvector (SIGMOD 2026)
+* [[biblio-icebergdv]] Iceberg v3 deletion vectors · [[biblio-deltadv]] Delta Lake deletion
+  vectors · [[biblio-lance]] Lance/LanceDB · [[biblio-vespa]] Vespa · [[biblio-weaviate]] Weaviate
 
 == Migration Path
 

@@ -400,81 +400,53 @@ embedding_precision_policy:
     require_explain_visibility: true
 ----
 
-=== Example Policy: Business / Pro Tier
+=== Tier comparison: Business / Pro and Cold / Cost-Optimized
 
-[source,yaml]
-----
-embedding_precision_policy:
-  mode: adaptive
-  source: tenant_tier
-  canonical:
-    default_precision: fp16
-    allowed_precisions: [fp32, fp16]
-    ingest_mismatch: convert_once_at_boundary
-    retain_fp32_shadow: false
-    migration: new_epoch_background_rewrite
-  derived:
-    enabled: true
-    levels:
-      - binary_sketch
-      - scalar_int8:
-          per: per_block
-      - product_quantization:
-          bits: 8
-          subvectors: 64
-    materialization: storage_and_index
-    max_storage_overhead_ratio: 1.55
-    rebuildable: true
-  query:
-    default_search_level: fp32_promoted
-    allowed_query_hints: [canonical, fp16_native, int8_approx, pq_approx]
-    rerank_with: fp32_promoted
-    reject_when_recall_slo_unknown: true
-  gates:
-    min_recall_at_10: 0.99
-    min_recall_at_100: 0.995
-    max_latency_regression_pct: 5
-    max_storage_overhead_ratio: 1.55
-    require_hardware_capability: true
-    require_explain_visibility: true
-----
+The Standard tier above is the full YAML skeleton — every tier sets the same keys, so the
+other two tiers are shown here as deltas from it rather than as two more near-identical
+blocks (the shared boilerplate — `source`, `ingest_mismatch`, `retain_fp32_shadow`,
+`migration`, `derived.enabled`, `rebuildable`, `reject_when_recall_slo_unknown`,
+`require_explain_visibility` — is unchanged in all three):
 
-=== Example Policy: Cold / Cost-Optimized Tier
+[cols="2,2,2", options="header"]
+|===
+| Knob | Business / Pro Tier | Cold / Cost-Optimized Tier
 
-[source,yaml]
-----
-embedding_precision_policy:
-  mode: adaptive
-  source: tenant_tier
-  canonical:
-    default_precision: fp16
-    allowed_precisions: [fp16]
-    ingest_mismatch: convert_once_at_boundary
-    retain_fp32_shadow: false
-    migration: new_epoch_background_rewrite
-  derived:
-    enabled: true
-    levels:
-      - product_quantization:
-          bits: 8
-          subvectors: 64
-      - binary_sketch
-    materialization: storage_auxiliary
-    max_storage_overhead_ratio: 1.20
-    rebuildable: true
-  query:
-    default_search_level: pq_approx
-    allowed_query_hints: [pq_approx, canonical]
-    rerank_with: canonical
-    reject_when_recall_slo_unknown: true
-  gates:
-    min_recall_at_10: 0.97
-    min_recall_at_100: 0.99
-    max_latency_regression_pct: 15
-    max_storage_overhead_ratio: 1.20
-    require_hardware_capability: false
-    require_explain_visibility: true
-----
+| `mode`
+| `adaptive`
+| `adaptive`
+
+| `canonical.default_precision` / `allowed_precisions`
+| `fp16` / `[fp32, fp16]`
+| `fp16` / `[fp16]` (fp32 not retained)
+
+| `derived.levels`
+| `binary_sketch` + `scalar_int8` **per_block** + `product_quantization` (bits 8, subvectors 64)
+| `product_quantization` (bits 8, subvectors 64) first, then `binary_sketch`
+
+| `derived.materialization` / `max_storage_overhead_ratio`
+| `storage_and_index` / `1.55`
+| `storage_auxiliary` / `1.20`
+
+| `query.default_search_level` / `allowed_query_hints`
+| `fp32_promoted` / `[canonical, fp16_native, int8_approx, pq_approx]`
+| `pq_approx` / `[pq_approx, canonical]`
+
+| `query.rerank_with`
+| `fp32_promoted`
+| `canonical`
+
+| `gates` (recall@10 / recall@100 / latency regression / storage overhead / hardware)
+| `0.99` / `0.995` / `5%` / `1.55` / **required**
+| `0.97` / `0.99` / `15%` / `1.20` / not required
+|===
+
+The shape of the progression: Standard serves canonical fp32 with cheap derived hints; Pro
+pays storage (`storage_and_index`, 1.55x) to make fp16-native and PQApprox first-class query
+levels under a 5% latency gate and a hardware-capability requirement; Cold drops fp32
+entirely (`allowed_precisions: [fp16]`), serves straight from PQ with only canonical as the
+escape hatch, and relaxes recall/latency gates (0.97/15%) in exchange for the tightest
+storage bound (1.20x).
 
 == Dynamic Resolution Rules
 

@@ -44,46 +44,10 @@ wget "$BASE/proximadb-$VERSION-1.el8.x86_64.rpm"
 # Install the package
 sudo rpm -ivh "proximadb-$VERSION-1.el8.x86_64.rpm"
 
-# Start the service
+# Start the service and enable it on boot (fails until the TD-PKG-1 workaround;
+# see the note at the top of this guide)
 sudo systemctl start proximadb
-
-# Enable the service to start on boot
 sudo systemctl enable proximadb
-```
-
-### What Gets Installed
-
-- **Binaries**: `/usr/bin/` (proximadb-server, proximadb-bench, proximadb-migrate)
-- **Configuration**: `/etc/proximadb/config.toml`
-- **Service**: `/usr/lib/systemd/system/proximadb.service`
-- **Data**: `/var/lib/proximadb/` (after the TD-PKG-1 workaround in the installation guide; the shipped config uses `/tmp`)
-- **Logs**: `/var/log/proximadb/`
-
-### Verification
-
-```bash
-# Check service status
-sudo systemctl status proximadb
-
-# Check version
-proximadb-server --version
-
-# Check if server is running
-curl http://localhost:5678/health
-```
-
-### Uninstallation
-
-```bash
-# Stop and disable the service
-sudo systemctl stop proximadb
-sudo systemctl disable proximadb
-
-# Remove the package
-sudo rpm -e proximadb
-
-# Optionally remove data and logs
-sudo rm -rf /var/lib/proximadb /var/log/proximadb
 ```
 
 ---
@@ -98,53 +62,15 @@ See [Linux requirements](../01-quick-start/install.md#linux-requirements-archive
 ### Installation
 
 ```bash
-# Download the DEB package
+# Download and install the DEB package, then start/enable the service
+# exactly as for the RPM above (sudo systemctl start/enable proximadb)
 wget "$BASE/proximadb_${VERSION}_amd64.deb"
-
-# Install the package
 sudo dpkg -i "proximadb_${VERSION}_amd64.deb"
-
-# Start the service
-sudo systemctl start proximadb
-
-# Enable the service to start on boot
-sudo systemctl enable proximadb
 ```
 
-### What Gets Installed
-
-- **Binaries**: `/usr/bin/` (proximadb-server, proximadb-bench, proximadb-migrate)
-- **Configuration**: `/etc/proximadb/config.toml`
-- **Service**: `/lib/systemd/system/proximadb.service`
-- **Data**: `/var/lib/proximadb/` (after the TD-PKG-1 workaround in the installation guide; the shipped config uses `/tmp`)
-- **Logs**: `/var/log/proximadb/`
-
-### Verification
-
-```bash
-# Check service status
-sudo systemctl status proximadb
-
-# Check version
-proximadb-server --version
-
-# Check if server is running
-curl http://localhost:5678/health
-```
-
-### Uninstallation
-
-```bash
-# Stop and disable the service
-sudo systemctl stop proximadb
-sudo systemctl disable proximadb
-
-# Remove the package
-sudo dpkg -r proximadb
-
-# Optionally remove data and logs
-sudo rm -rf /var/lib/proximadb /var/log/proximadb
-```
+Both Linux packages install the same file layout and are verified the same way — see
+[Post-Installation](#post-installation) below for what gets installed, verification and
+uninstallation (only the package-manager command differs: `rpm` vs `dpkg`).
 
 ---
 
@@ -210,6 +136,43 @@ msiexec /x proximadb-<version>-x64.msi
 ---
 
 ## Post-Installation
+
+### What Gets Installed (Linux packages)
+
+The RPM and DEB packages install the same layout:
+
+- **Binaries**: `/usr/bin/` (proximadb-server, proximadb-bench, proximadb-migrate)
+- **Configuration**: `/etc/proximadb/config.toml`
+- **Service**: `/usr/lib/systemd/system/proximadb.service` (`/lib/systemd/system/` on Debian — the same file)
+- **Data**: `/var/lib/proximadb/` (after the TD-PKG-1 workaround in the installation guide; the shipped config uses `/tmp`)
+- **Logs**: `/var/log/proximadb/`
+
+### Verification
+
+```bash
+# Check service status
+sudo systemctl status proximadb
+
+# Check version
+proximadb-server --version
+
+# Check if server is running
+curl http://localhost:5678/health
+```
+
+### Uninstallation (Linux packages)
+
+```bash
+# Stop and disable the service
+sudo systemctl stop proximadb
+sudo systemctl disable proximadb
+
+# Remove the package (RPM on the left, DEB on the right)
+sudo rpm -e proximadb        # sudo dpkg -r proximadb
+
+# Optionally remove data and logs
+sudo rm -rf /var/lib/proximadb /var/log/proximadb
+```
 
 ### Default Configuration
 

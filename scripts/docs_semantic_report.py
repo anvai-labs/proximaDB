@@ -13,7 +13,10 @@ headings) are vectorized with TF-IDF over character 3-5-grams (char_wb,
 sklearn + numpy — no model download, no version drift, same output every
 run). An optional embedding backend can be plugged in later behind the
 same cosine threshold; it must be pinned in-repo before any of this
-becomes a blocking gate.
+becomes a blocking gate. The default operating point (cosine >= 0.80,
+min-chunk-chars 300) was validated by threshold sweep on 2026-10-21:
+17 pairs with near-perfect precision — a 200-char floor admits short
+template/header noise, a 400-char floor over-prunes.
 
 Output: top-N similar chunk pairs (cosine >= threshold) with file, heading,
 and line span — as a table (stdout/markdown) or JSON. Advisory only: exits
@@ -21,8 +24,8 @@ and line span — as a table (stdout/markdown) or JSON. Advisory only: exits
 threshold proves stable on real history).
 
 Usage:
-    python3 scripts/docs_semantic_report.py [--threshold 0.85] [--top 20]
-        [--min-chunk-chars 200] [--json] [--docs-root docs]
+    python3 scripts/docs_semantic_report.py [--threshold 0.80] [--top 20]
+        [--min-chunk-chars 300] [--json] [--docs-root docs]
 """
 
 import argparse
@@ -83,9 +86,9 @@ def vectorize(chunks):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--threshold", type=float, default=0.85)
+    parser.add_argument("--threshold", type=float, default=0.80)
     parser.add_argument("--top", type=int, default=20)
-    parser.add_argument("--min-chunk-chars", type=int, default=200)
+    parser.add_argument("--min-chunk-chars", type=int, default=300)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--docs-root", default="docs")
     args = parser.parse_args()
