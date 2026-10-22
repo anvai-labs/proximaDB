@@ -293,7 +293,7 @@ impl SegmentShape {
                 None => None,
             })
             .collect();
-        let pk = ctx.pk_name.as_deref().and_then(|name| find(name));
+        let pk = ctx.pk_name.as_deref().and_then(find);
         if ctx.pk_name.is_some() && pk.is_none() {
             records_only = true;
         }
