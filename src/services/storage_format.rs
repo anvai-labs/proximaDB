@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn default_on_gates_parse_off_values_and_keep_the_default_on_typos() {
-        const ENV: &str = "PROXIMADB_TEST_DEFAULT_ON_GATE";
+        const ENV: &str = "STORAGE_FORMAT_TEST_DEFAULT_ON_GATE";
         // SAFETY: a variable no other test reads.
         unsafe { std::env::remove_var(ENV) };
         assert_eq!(default_on_gate(ENV, 7), Some(7), "unset");
