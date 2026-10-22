@@ -615,6 +615,14 @@ impl FramedTableWalAppender {
             || self.sealed.read().iter().any(|s| s.has_branch_entries)
     }
 
+    /// Highest sequence ever truncated from the WAL at `path` (`0` = its
+    /// history is complete), read from the durable floor marker. For readers
+    /// that open the WAL by path and must know whether what they read starts
+    /// at the beginning (TD-SEAM-12). A damaged marker is an error.
+    pub async fn truncated_through_at(path: &Path) -> Result<u64> {
+        read_floor_marker(path).await
+    }
+
     /// First sequence still readable; `0` when nothing was ever truncated.
     pub fn retained_from(&self) -> u64 {
         self.retained_from.load(Ordering::SeqCst)

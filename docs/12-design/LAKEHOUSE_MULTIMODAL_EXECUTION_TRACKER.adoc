@@ -9,7 +9,7 @@
 [cols="1,3"]
 |===
 | Purpose | The resumable status of record for executing link:LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] (the plan: Parts A–D, phases P0–P6) under link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097]. Any engineer or agent session picks up from here **and nothing else**: what is merged, what is in flight, what is next, and how the work is done.
-| Updated | 2026-10-21, against `develop` @ `46ff77312` (#2114 merged).
+| Updated | 2026-10-22, against `develop` @ `0bb84fc14` (#2117 merged).
 | Rule | Update this file in the same PR that lands, opens or re-plans a slice. A slice is **done** only when merged to `develop` with its gate green. Detail lives in the TD files; this file holds status, links and order.
 |===
 
@@ -117,9 +117,9 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | Spill segments written with `ParquetWritePolicy`, oid-sorted | Done | #2097 | `segments_are_written_with_the_warehouse_layout_policy`.
 | Spill encoder uses the catalog schema; non-fitting rows held resident (no silent NULL); timestamp decode | Done | #2099 | Tests listed in the TD-SEAM-3 row. Hardened before merge: un-materializable catalog types are dropped from the encode schema (rows on them held), int→float mantissa check.
 | Seed spill schema hints at boot (before WAL replay) | Done | #2114 | `CatalogManager::table_schemas` (native + OLTP catalogs; also backs the truncator's snapshot floor); per-collection fallback, none for an ambiguous key. `boot_seeded_schemas_reach_replayed_partitions_unless_ambiguous`, `table_schemas_walks_nested_namespaces_of_selected_catalogs`.
-| Permanent-hold classes → exact residual column (`__proxima_residual`, TD-USUB-6 rule); codec-verified hold + `proximadb_spill_rows_held_total` | **Branch** `spill-props-residual` | — | `the_residual_makes_every_row_round_trip_exactly`; spill tests updated (rows formerly held now flush exactly).
+| Permanent-hold classes → exact residual column (`__proxima_residual`, TD-USUB-6 rule); codec-verified hold + `proximadb_spill_rows_held_total` | Done | #2117 | `the_residual_makes_every_row_round_trip_exactly`; spill tests updated (rows formerly held now flush exactly).
 | Hold metric + escape hatch for permanent-hold rows | **Next** | — | Rows with nested `Object`/`Array` props, >1 embedding, props on a dropped/un-materializable column, or an integer too wide for a declared float column can never be spilled by any schema — they hold memory and pin `min_unflushed_lsn` forever (no loss; strictly better than the old silent NULL on eviction). Needs a hold-size metric and an escape hatch (quarantine segment). |
-| Durable branch merge-base | Open | — | Until it lands, branch-tagged WAL entries block truncation. TD-SEAM-12 hazard 2.
+| Durable branch merge-base | **Next** (design §5.2) | — | Until it lands: merge refuses (410) once any WAL history is truncated (correction 2026-10-21, `merge_endpoint_refuses_when_wal_history_was_truncated`).
 | Catalog prefix registration (object-store placement of spill segments) | Open | — | TD-SEAM-3.
 | MATERIALIZE LSN capture via the per-collection high-water | Done in #2095 | #2095 | Superseded by `capture_snapshot_lsn` with a WAL pin.
 | P2.4 streaming / incremental MATERIALIZE publisher | Open | — | Gate: TPC-DS SF1 on a release build loads with no OOM and peak RSS recorded. TD-USUB-10, TD-OLAPFMT-3.
@@ -147,7 +147,10 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 [cols="2,1,3",options="header"]
 |===
 | Branch | PR | State and next action
-| `spill-props-residual` | — | On `46ff77312`. Run `cargo test -p proximadb-storage-common --lib proxima_arrow`, `cargo test --lib -- record_spill:: record_store::tests:: --test-threads=1`, clippy, `python3 scripts/dup_ratchet.py --mode check`, then PR.
+| `fix/branch-merge-refuses-truncated-history` | #2119 | Branch merge 410 once WAL history is truncated; designs §5.2–5.4.
+| `fix/spill-scan-view` | — | Flush-consistent spill scan snapshot (P3.1 PR 1, race fix); lib tests running.
+| `fix/native-window-fn-declines` | — | Agent-written (P3.1 PR 0, `lag()` fail-closed); compile + `native_table_capability_parity_e2e` pending.
+| `p24-readers-fail-closed` | — | Agent-written (P2.4 #1); compile + reader / duckdb tests pending.
 |===
 
 == 5. Next-work queue (in order)
@@ -167,21 +170,103 @@ Plan:
 . Partitions created by replay fall back to inference until a write sets the hint.
 . Gate: a round-trip with typed columns (DECIMAL, INT, DATE) reads back exactly, and an unknown prop survives.
 
-=== 5.2 Durable branch merge-base (TD-SEAM-12 hazard 2)
+=== 5.2 Durable branch merge-base (TD-SEAM-12 hazard 2) — design 2026-10-21
 
-Persist the merge base so that truncation no longer has to refuse while branch-tagged entries exist.
+Today: branch merge reads the whole retained WAL; the merge base is an LSN
+(`find_merge_base_lsn` = first branch write − 1), never stored; base records =
+latest untagged upsert ≤ base per oid (`latest_base_records`, `src/graph/merge.rs`).
+Since 2026-10-21 the merge refuses (410) once any history is truncated.
 
-=== 5.3 P2.4 streaming MATERIALIZE
+Chosen design (option D): a main-line **base image** per branched
+`(tenant, collection)`, kept in the WAL by checkpoint-style appends (the
+`RankProfileStore::checkpoint` pattern). Rejected: flooring at the oldest branch entry
+(deletes the base), reading the base from the record tier (replay ignores `branch_id`;
+no as-of reads), per-branch snapshots of touched oids (future first touches unknown).
 
-* Bounded memory and multi-part.
-* Fenced snapshot advance.
-* Keep the real `oid`.
-* Classify insert vs update by probing published key stats/SBBF, not WAL history.
-* Gate: TPC-DS SF1 with no OOM.
+* `T = min(oldest retained branch entry, head+1) − 1`; the image holds latest
+  untagged upsert per oid as of `through = T`; base at M = image(T) + retained
+  untagged upserts in (T, M] — identical to today's result.
+* New `WalFloorSource` `BranchMergeBase` replaces `BranchEntriesGuard`: floor =
+  oldest retained branch entry; refuses on read/append failure or a broken
+  `through + 1 < retained_from` invariant. Appends, so it runs after the read-only
+  sources.
+* Commits: (1) `canonical_wal` per-segment `first_branch_seq` + branched collection
+  set, `branch_summary()`, `collections_below()`; (2) `graph/merge`
+  `MergeBaseImage` + `merge_branches_with_base`; (3) `services/branch_base_store`
+  (rows in `__proxima_branch_bases__`: image rows, a header written last, truncated
+  marks; replay ignores image rows newer than the header); (4) truncator source swap +
+  ordering; (5) REST: pin history above the image during a merge, `MergeBaseTruncated`
+  → 410, `tests/wal_branch_merge_base_test.rs` (truncate below a branch point, merge
+  identical to the untruncated result); (6) docs.
+* Follow-ups found in review: write-back keeps the source `branch_id` (no branch ever
+  closes → floor never advances); default `target_branch = "main"` never matches
+  untagged main records; `latest_base_records` ignores main-line deletes; a branch
+  first created after its collection's history was truncated needs explicit branch
+  registration (`BranchRef`).
 
-=== 5.4 P3.1 `LayerATableProvider`
+=== 5.3 P2.4 streaming MATERIALIZE — design 2026-10-21
 
-Once Layer A segments are spec-layout files (5.1 plus the write-policy branch), a provider can prune them with the page index and SBBF.
+Findings that shape it: `publish_iceberg_snapshot` *lists* the data prefix into the
+manifest (multi-part output would mix generations); the DuckDB route reads the whole
+directory; the DataFusion reader falls back to listing on any manifest error; the
+Iceberg publish runs after the catalog flip and treats `Conflict` as success; spill
+`merged_records` loads every segment; and the TPC harness cannot generate SF1 (it
+builds the whole statement `Vec`; preflight ~87 GiB), so the gate needs harness work.
+
+Ordered PRs:
+
+. Readers fail closed: `manifest_selected_files` → `Result` (list only when no
+  metadata log exists); DuckDB view reads the manifest's file list.
+. `publish_iceberg_files(files, parent, …)` with an explicit file list,
+  generation-unique Avro paths written `put_if_absent`, `Conflict` is an error.
+. `ParquetWritePolicy` `target_file_rows` / `target_file_bytes`;
+  `MultipartParquetWriter` (`AsyncArrowWriter` over object_store; `finish`/`abort`).
+. Streaming scan: `RecordScan::scan_record_chunks` (memtable by key snapshot; spill
+  k-way merge over oid-sorted segments with ranged row-group reads),
+  `TableRecordStore::scan_records_chunked` (primary-over-legacy),
+  `DmlService::scan_table_records_chunked`.
+. MATERIALIZE rewrite: chunked scan → DataFusion `SortExec` under a memory-limited
+  pool with spill → part writer; real oids; streaming NDV accumulator; generation
+  names; GC of files older than V−1.
+. Fenced advance: per-table publish lock, `PublishFence` re-checked before commit,
+  Iceberg `put_if_absent` commit **before** the catalog flip, forward-only layout.
+. Harness: streaming `gen_tpcds`, `TPC_PERF_LOAD_ONLY`, VmHWM / cgroup
+  `memory.peak` per phase; run the SF1 gate (spill gate on) and record peak RSS.
+. Slice 2: hidden `__proxima_oid` in published files, explicit key SBBF,
+  insert-only incremental append classified by manifest bounds + SBBF, full-rewrite
+  fallback. Slice 3: Iceberg v2 position deletes, writer and readers together.
+
+Layer A segments are **not** reused as Iceberg data files in P2.4: local disk,
+overlapping versions, persisted tombstones, per-segment schemas, no field ids.
+
+=== 5.4 P3.1 `LayerATableProvider` — design 2026-10-21
+
+Today native SQL goes `try_run_select` → `route_select_inner` (`DataFusionLocal`, gate
+`PROXIMADB_NATIVE_TABLE_PROVIDER`, default OFF) → `prepare_dataframe`
+(`src/query/execution/datafusion_engine.rs:165-206`): `full_table_records` →
+`scan_table_relational(limit=cap+1)` → one `MemTable` (1M-row cap; `None` over it).
+
+Design: a flush-consistent snapshot port (`RecordScan::scan_view` → resident rows,
+tombstones, segment paths oldest→newest, taken under the segment lock), a
+`TableRecordStore::layer_a_snapshot` / `NativeTableSource::layer_a_snapshot` (identity +
+ABAC prelude shared with `scan_table_relational`), and `LayerAScanExec`: k-way merge of
+oid-sorted segments (newest wins, masks per batch, O(k × batch) memory), memory shadow
+(resident oids + tombstones drop segment rows), liveness/tenant/variation filters
+vectorized on system columns, catalog-schema conformance (cast / NULL-fill; slow path
+through `record_batch_to_proxima_records` for residual / vector / null-PK rows), ABAC
+before the limit, resident rows last. Filters are pushed down **Inexact**. Pruning (PR B)
+must respect newest-wins (key spine for overlapping row groups), the residual (never prune
+a row group with residual rows), type mismatch and PK nulls.
+
+Ordered PRs: (0) legacy path declines a bare window function on a native table (fixes the
+silent `lag()` wrong answer, TD-USUB-2); (1) `scan_view` + `merged_records` rebuilt on it —
+**fixes a likely live race**: today a flush between the segment-list clone and the
+memtable read can lose rows from a scan (also used by unique-index builds); (2) snapshot
+port; (3) `FileSystemParquetReader` (`AsyncFileReader` over `read_range`); (4) provider +
+exec behind a MemTable kill switch, gate `native_table_capability_parity_e2e` + a new spill
+e2e; (5) pruning; (6) residual-aware pruning; (7) dynamic filters, oid-range partitions,
+`pk = lit` → oid lookup; (8) mixed Parquet + native; (9) port the OLAP read-merge onto the
+exec (retire the second MemTable); (10) default-ON flip after a soak.
 
 === Prerequisites tracked elsewhere
 
