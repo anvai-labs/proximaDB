@@ -432,14 +432,139 @@ pub fn merge_branches(
     branch_b: &str,
 ) -> Option<MergeReport> {
     let merge_base_lsn = proximadb_storage_common::find_merge_base_lsn(wal, branch_a, branch_b)?;
+    let base_records = latest_base_records(wal, ..=merge_base_lsn);
+    Some(merge_from_base(
+        wal,
+        merge_base_lsn,
+        base_records,
+        branch_a,
+        branch_b,
+    ))
+}
+
+/// The main-line base of one branched `(tenant, collection)` as of WAL
+/// sequence [`Self::through`]: the latest untagged upsert per oid at or below
+/// it (TD-SEAM-12 hazard 2). Kept so a merge still has its base once the
+/// history below `through` is truncated: the base at a merge base `M >=
+/// through` is this image plus the untagged upserts in `(through, M]`, which
+/// is what [`merge_branches`] computes from the full history.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MergeBaseImage {
+    /// Highest sequence folded in.
+    pub through: u64,
+    /// oid → latest untagged upsert at or below `through`.
+    pub records: HashMap<String, proximadb_records::ProximaRecord>,
+}
+
+impl MergeBaseImage {
+    /// Fold the untagged upserts of `entries` in `(self.through, through]`
+    /// into the image and advance it to `through` (never backwards).
+    /// `entries` are one tenant's entries of one collection, in any order.
+    pub fn advance(
+        &mut self,
+        entries: &[proximadb_storage_common::CanonicalWalEntry],
+        through: u64,
+    ) {
+        if through < self.through {
+            return;
+        }
+        for (oid, record) in latest_base_records(entries, after_through(self.through, through)) {
+            self.records.insert(oid, record.clone());
+        }
+        self.through = through;
+    }
+}
+
+/// [`merge_branches_with_base`] cannot use the image it was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeBaseError {
+    /// The image folds in main-line writes after the branches diverged, so the
+    /// base they diverged from cannot be recovered from it.
+    ImageAboveMergeBase { through: u64, merge_base_lsn: u64 },
+}
+
+impl std::fmt::Display for MergeBaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ImageAboveMergeBase {
+                through,
+                merge_base_lsn,
+            } => write!(
+                f,
+                "the merge-base image runs through sequence {through}, past the merge base \
+                 {merge_base_lsn}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MergeBaseError {}
+
+/// [`merge_branches`] over a WAL whose history at or below `base.through` may
+/// be gone: the main-line base comes from `base`, plus the untagged upserts
+/// of `wal` in `(base.through, merge base]`. Entries of `wal` at or below
+/// `base.through` are ignored. With the image of the truncated prefix, the
+/// report equals [`merge_branches`] over the untruncated history.
+pub fn merge_branches_with_base(
+    wal: &[proximadb_storage_common::CanonicalWalEntry],
+    base: &MergeBaseImage,
+    branch_a: &str,
+    branch_b: &str,
+) -> std::result::Result<Option<MergeReport>, MergeBaseError> {
+    let Some(merge_base_lsn) =
+        proximadb_storage_common::find_merge_base_lsn(wal, branch_a, branch_b)
+    else {
+        return Ok(None);
+    };
+    if base.through > merge_base_lsn {
+        return Err(MergeBaseError::ImageAboveMergeBase {
+            through: base.through,
+            merge_base_lsn,
+        });
+    }
+    let mut base_records: HashMap<String, &proximadb_records::ProximaRecord> = base
+        .records
+        .iter()
+        .map(|(oid, record)| (oid.clone(), record))
+        .collect();
+    base_records.extend(latest_base_records(
+        wal,
+        after_through(base.through, merge_base_lsn),
+    ));
+    Ok(Some(merge_from_base(
+        wal,
+        merge_base_lsn,
+        base_records,
+        branch_a,
+        branch_b,
+    )))
+}
+
+/// Sequences above an image's `through` up to `upto`. An image through `0`
+/// has folded nothing yet, so the range then starts unbounded.
+fn after_through(through: u64, upto: u64) -> (std::ops::Bound<u64>, std::ops::Bound<u64>) {
+    let start = if through == 0 {
+        std::ops::Bound::Unbounded
+    } else {
+        std::ops::Bound::Excluded(through)
+    };
+    (start, std::ops::Bound::Included(upto))
+}
+
+/// Steps 2–5 of the merge protocol, given the merge base and its records.
+fn merge_from_base(
+    wal: &[proximadb_storage_common::CanonicalWalEntry],
+    merge_base_lsn: u64,
+    base_records: HashMap<String, &proximadb_records::ProximaRecord>,
+    branch_a: &str,
+    branch_b: &str,
+) -> MergeReport {
     let diff_range = merge_base_lsn.saturating_add(1)..;
 
     let left_entries =
         proximadb_storage_common::filter_wal_by_branch_lsn(wal, branch_a, diff_range.clone());
     let right_entries =
         proximadb_storage_common::filter_wal_by_branch_lsn(wal, branch_b, diff_range);
-
-    let base_records = latest_base_records(wal, merge_base_lsn);
 
     let left_events: Vec<MutationEvent> = left_entries
         .iter()
@@ -459,13 +584,13 @@ pub fn merge_branches(
     );
     let resolutions = resolve_batch(conflicts.clone());
 
-    Some(MergeReport {
+    MergeReport {
         merge_base_lsn,
         left_events,
         right_events,
         conflicts,
         resolutions,
-    })
+    }
 }
 
 /// Per-entry heuristic classification: takes a single canonical WAL entry
@@ -504,16 +629,18 @@ fn entry_to_mutation_event_with_base(
     }
 }
 
+/// Latest untagged (main-line) upsert per oid among the entries whose
+/// sequence lies in `seqs`.
 fn latest_base_records(
     wal: &[proximadb_storage_common::CanonicalWalEntry],
-    merge_base_lsn: u64,
+    seqs: impl std::ops::RangeBounds<u64>,
 ) -> std::collections::HashMap<String, &proximadb_records::ProximaRecord> {
     use proximadb_storage_common::CanonicalOperation;
 
     let mut latest: std::collections::HashMap<String, (u64, &proximadb_records::ProximaRecord)> =
         std::collections::HashMap::new();
     for entry in wal {
-        if entry.sequence_number > merge_base_lsn {
+        if !seqs.contains(&entry.sequence_number) {
             continue;
         }
         if let CanonicalOperation::RecordUpsert { record, .. } = &entry.operation {
@@ -1593,5 +1720,127 @@ mod tests {
         .unwrap();
 
         assert!(result.is_none());
+    }
+
+    // ── TD-SEAM-12 hazard 2 — merge-base images ────────────────────────────
+
+    /// Main-line history that the base classification depends on (props,
+    /// labels and embeddings change on main before the branches diverge), a
+    /// main write after the divergence, and both branches touching every oid.
+    fn diverging_history() -> Vec<proximadb_storage_common::CanonicalWalEntry> {
+        use proximadb_data_model::ProximaValue;
+        use proximadb_records::ProximaTreeNode;
+        let named = |oid: &str, branch: Option<&str>, name: &str| {
+            let mut record = branch_record(oid, branch);
+            record.props.insert(
+                "name".to_string(),
+                ProximaTreeNode::Value(ProximaValue::String(name.to_string())),
+            );
+            record
+        };
+        let labelled = |oid: &str, branch: Option<&str>, labels: &[&str]| {
+            let mut record = branch_record(oid, branch);
+            record.labels = proximadb_records::LabelSet::from(
+                labels.iter().map(|l| l.to_string()).collect::<Vec<_>>(),
+            );
+            record
+        };
+        let mut embedded = named("s1", None, "v1");
+        embedded.embeddings = vec![fp32_embedding(&[0.0, 1.0])];
+        let mut s2_embedded = labelled("s2", Some("b"), &["x", "y"]);
+        s2_embedded.embeddings = vec![fp32_embedding(&[1.0, 1.0])];
+        vec![
+            upsert_record_canonical_entry(1, 10, named("s1", None, "v0")),
+            upsert_record_canonical_entry(2, 20, labelled("s2", None, &["x"])),
+            upsert_record_canonical_entry(3, 30, embedded),
+            upsert_record_canonical_entry(4, 40, named("s3", None, "v0")),
+            upsert_record_canonical_entry(5, 50, labelled("s2", None, &["x", "y"])),
+            upsert_record_canonical_entry(6, 60, named("s1", Some("a"), "left")),
+            upsert_record_canonical_entry(7, 70, named("s3", None, "main-after")),
+            upsert_record_canonical_entry(8, 80, named("s1", Some("b"), "right")),
+            upsert_record_canonical_entry(9, 90, labelled("s2", Some("a"), &["x", "y", "z"])),
+            upsert_record_canonical_entry(10, 100, s2_embedded),
+            upsert_record_canonical_entry(11, 110, named("s3", Some("b"), "v0")),
+            upsert_record_canonical_entry(12, 120, named("s3", Some("a"), "v2")),
+        ]
+    }
+
+    fn above(
+        wal: &[proximadb_storage_common::CanonicalWalEntry],
+        through: u64,
+    ) -> Vec<proximadb_storage_common::CanonicalWalEntry> {
+        wal.iter()
+            .filter(|e| e.sequence_number > through)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn base_image_plus_suffix_equals_full_history() {
+        let wal = diverging_history();
+        let full = merge_branches(&wal, "a", "b").expect("both branches present");
+        assert_eq!(full.merge_base_lsn, 5);
+        assert!(!full.conflicts.is_empty());
+
+        for through in 0..=full.merge_base_lsn {
+            let mut image = MergeBaseImage::default();
+            image.advance(&wal, through);
+            // Truncate everything the image covers.
+            let retained = above(&wal, through);
+            let from_image = merge_branches_with_base(&retained, &image, "a", "b")
+                .expect("image at or below the merge base")
+                .expect("both branches retained");
+            assert_eq!(
+                format!("{from_image:?}"),
+                format!("{full:?}"),
+                "image through {through} + retained suffix must equal the full history"
+            );
+            // Entries the image already covers are ignored, not double-counted.
+            let untruncated = merge_branches_with_base(&wal, &image, "a", "b")
+                .unwrap()
+                .unwrap();
+            assert_eq!(format!("{untruncated:?}"), format!("{full:?}"));
+        }
+
+        // Without the image, the truncated history merges against the wrong base.
+        let truncated_only = merge_branches(&above(&wal, 5), "a", "b").unwrap();
+        assert_ne!(format!("{truncated_only:?}"), format!("{full:?}"));
+    }
+
+    #[test]
+    fn base_image_advances_incrementally() {
+        let wal = diverging_history();
+        let mut stepped = MergeBaseImage::default();
+        stepped.advance(&wal, 2);
+        // Only the history the image has not folded is needed to advance it.
+        stepped.advance(&above(&wal, 2), 5);
+        stepped.advance(&wal, 3); // never backwards
+        let mut direct = MergeBaseImage::default();
+        direct.advance(&wal, 5);
+        assert_eq!(stepped, direct);
+        assert_eq!(
+            direct.records.len(),
+            3,
+            "s1, s2, s3 — branch writes excluded"
+        );
+    }
+
+    #[test]
+    fn base_image_past_the_merge_base_is_refused() {
+        let wal = diverging_history();
+        let mut image = MergeBaseImage::default();
+        image.advance(&wal, 6);
+        assert_eq!(
+            merge_branches_with_base(&wal, &image, "a", "b").unwrap_err(),
+            MergeBaseError::ImageAboveMergeBase {
+                through: 6,
+                merge_base_lsn: 5
+            }
+        );
+        assert!(
+            merge_branches_with_base(&wal, &image, "a", "missing")
+                .unwrap()
+                .is_none()
+        );
     }
 }
