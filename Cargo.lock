@@ -3568,7 +3568,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5103,7 +5103,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6264,7 +6264,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6634,12 +6634,8 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "opentelemetry 0.32.0",
- "percent-encoding",
  "portable-atomic",
- "rand 0.9.4",
  "thiserror 2.0.21",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]
@@ -6656,6 +6652,8 @@ dependencies = [
  "portable-atomic",
  "rand 0.9.4",
  "thiserror 2.0.21",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -7387,7 +7385,7 @@ dependencies = [
  "once_cell",
  "opentelemetry 0.32.0",
  "opentelemetry-otlp",
- "opentelemetry_sdk 0.32.1",
+ "opentelemetry_sdk 0.33.1",
  "parking_lot",
  "parquet",
  "pgwire",
@@ -8677,7 +8675,7 @@ dependencies = [
  "object_store",
  "opentelemetry 0.32.0",
  "opentelemetry-otlp",
- "opentelemetry_sdk 0.32.1",
+ "opentelemetry_sdk 0.33.1",
  "prometheus",
  "proximadb-data-model",
  "proximadb-kernel",
@@ -9923,7 +9921,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -9962,7 +9960,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -10524,7 +10522,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10611,7 +10609,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -11851,7 +11849,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
