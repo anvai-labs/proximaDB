@@ -782,24 +782,10 @@ pub async fn merge_graph_branch_inner(
     // base can be incomplete — a branch created after a truncation, or one
     // whose first write raced a truncation run, would merge against a base
     // missing the main records it needs, and nothing would say so. Refuse
-    // loudly instead, until a durable merge-base snapshot exists.
-    let truncated_through =
-        crate::services::FramedTableWalAppender::truncated_through_at(&wal_path)
-            .await
-            .map_err(|err| {
-                ApiError::Internal(format!(
-                    "reading the truncation floor of canonical WAL {} failed: {err:#}",
-                    wal_path.display()
-                ))
-            })?;
-    if truncated_through > 0 {
-        return Err(ApiError::Gone(format!(
-            "branch merge needs the complete main-line history, but canonical WAL entries \
-             through {truncated_through} were truncated; the merge base cannot be computed \
-             (TD-SEAM-12 hazard 2)"
-        )));
-    }
-
+    // loudly instead. Checked again AFTER the read: the truncator records its
+    // floor before deleting anything, so a truncation that overlapped the
+    // read shows up in the second check.
+    refuse_if_wal_truncated(&wal_path).await?;
     let entries = crate::services::FramedTableWalAppender::read_entries_from_path(&wal_path)
         .await
         .map_err(|err| {
@@ -809,6 +795,7 @@ pub async fn merge_graph_branch_inner(
                 err
             ))
         })?;
+    refuse_if_wal_truncated(&wal_path).await?;
     // Only this tenant's entries (entries without a tenant are the default
     // tenant's).
     let collection_entries: Vec<_> = filter_canonical_wal_for_collection(entries, collection)
@@ -878,6 +865,28 @@ pub async fn merge_graph_branch_inner(
             None => serde_json::json!(null)
         }
     })))
+}
+
+/// 410 when any of the canonical WAL at `wal_path` was ever truncated (its
+/// durable floor marker is past 0): branch merge needs the whole main-line
+/// history (TD-SEAM-12 hazard 2).
+async fn refuse_if_wal_truncated(wal_path: &std::path::Path) -> ApiResult<()> {
+    let truncated_through = crate::services::FramedTableWalAppender::truncated_through_at(wal_path)
+        .await
+        .map_err(|err| {
+            ApiError::Internal(format!(
+                "reading the truncation floor of canonical WAL {} failed: {err:#}",
+                wal_path.display()
+            ))
+        })?;
+    if truncated_through > 0 {
+        return Err(ApiError::Gone(format!(
+            "branch merge needs the complete main-line history, but canonical WAL entries \
+             through {truncated_through} were truncated; the merge base cannot be computed \
+             (TD-SEAM-12 hazard 2)"
+        )));
+    }
+    Ok(())
 }
 
 fn graph_branch_merge_wal_path(data_dir: &std::path::Path) -> std::path::PathBuf {
