@@ -304,6 +304,41 @@ pub trait ObjectStoreBridge: Send + Sync {
         ))
     }
 
+    /// Publish exactly `files` (keys of parquet objects the caller wrote) as a spec-shaped
+    /// Iceberg snapshot committed as the successor of metadata version `parent` (`None` ⇒
+    /// the first). Returns the committed version. Nothing is listed, so a data prefix
+    /// holding several generations publishes only this one. Losing the race for the
+    /// successor slot is an `Err(StorageError::AlreadyExists)`, never success.
+    /// Default: unsupported.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_iceberg_files(
+        &self,
+        files: &[Path],
+        parent: Option<u64>,
+        metadata_prefix: &str,
+        table_uuid: &str,
+        table_location: &str,
+        fields: &[IcebergSnapshotField],
+        snapshot_id: i64,
+        timestamp_ms: i64,
+        v3: bool,
+    ) -> Result<u64, StorageError> {
+        let _ = (
+            files,
+            parent,
+            metadata_prefix,
+            table_uuid,
+            table_location,
+            fields,
+            snapshot_id,
+            timestamp_ms,
+            v3,
+        );
+        Err(StorageError::Serialization(
+            "publish_iceberg_files not supported".into(),
+        ))
+    }
+
     /// Resolve the current snapshot's data-file paths from the Iceberg metadata log at
     /// `metadata_prefix` (decodes `TableMetadata` → manifest list → manifests). Default: empty.
     async fn read_iceberg_table(

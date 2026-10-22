@@ -2618,25 +2618,31 @@ impl DmlService {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let table_uuid = deterministic_table_uuid(&prefix);
-        let data_prefix = object_store::path::Path::from(format!("{prefix}/data"));
         let metadata_prefix = format!("{prefix}/metadata");
         // The Iceberg table `location` is the table ROOT (`data/` and `metadata/` are
         // its children), unlike the catalog layout location above, which is the
         // directory of immediate parquet files.
         let table_root = format!("{}/{prefix}", warehouse_root_url.trim_end_matches('/'));
-        if let Err(e) = bridge
-            .publish_iceberg_table(
-                &data_prefix,
-                &metadata_prefix,
-                &table_uuid,
-                &table_root,
-                &iceberg_fields,
-                now_ms, // snapshot id (unique per materialize)
-                now_ms, // timestamp ms
-                iceberg_needs_v3(&iceberg_fields),
-            )
-            .await
-        {
+        // Publish exactly the file this materialize wrote (never a listing of `data/`,
+        // which may hold other generations), on top of the latest metadata version.
+        // Losing that slot to a concurrent publisher is an error, not a silent success.
+        let publish = async {
+            let parent = bridge.latest_metadata_version(&metadata_prefix).await?;
+            bridge
+                .publish_iceberg_files(
+                    std::slice::from_ref(&data_object),
+                    parent,
+                    &metadata_prefix,
+                    &table_uuid,
+                    &table_root,
+                    &iceberg_fields,
+                    now_ms, // snapshot id (unique per materialize)
+                    now_ms, // timestamp ms
+                    iceberg_needs_v3(&iceberg_fields),
+                )
+                .await
+        };
+        if let Err(e) = publish.await {
             // TD-USUB-9: this failure used to exist ONLY as a `warn!` line, so a
             // MATERIALIZE that returned success could leave the Iceberg manifest
             // absent or stale with nothing to alert on — an external reader

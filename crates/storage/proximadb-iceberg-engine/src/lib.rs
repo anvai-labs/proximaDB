@@ -111,6 +111,49 @@ fn read_err(context: &str, e: impl std::fmt::Display) -> StorageError {
     StorageError::Serialization(format!("iceberg-engine: {context}: {e}"))
 }
 
+/// How a snapshot commit treats a data file whose Parquet footer cannot be read.
+#[derive(Clone, Copy)]
+enum FooterPolicy {
+    /// A listed object of unknown provenance: record count 0, no column metrics.
+    DegradeToEmpty,
+    /// A file the publisher wrote: the commit fails.
+    Required,
+}
+
+/// The table-level inputs of one Iceberg snapshot commit.
+#[derive(Clone, Copy)]
+struct SnapshotTarget<'a> {
+    metadata_prefix: &'a str,
+    table_uuid: &'a str,
+    table_location: &'a str,
+    fields: &'a [iceberg::IcebergField],
+    snapshot_id: i64,
+    timestamp_ms: i64,
+    format_version: iceberg::FormatVersion,
+}
+
+/// Map storage-common Iceberg field descriptors (and the `v3` flag) to the engine's own.
+fn iceberg_fields_of(
+    fields: &[proximadb_storage_common::object_store_bridge::IcebergSnapshotField],
+    v3: bool,
+) -> (Vec<iceberg::IcebergField>, iceberg::FormatVersion) {
+    let mapped = fields
+        .iter()
+        .map(|f| iceberg::IcebergField {
+            id: f.id,
+            name: f.name.clone(),
+            type_name: f.type_name.clone(),
+            required: f.required,
+        })
+        .collect();
+    let format_version = if v3 {
+        iceberg::FormatVersion::V3
+    } else {
+        iceberg::FormatVersion::V2
+    };
+    (mapped, format_version)
+}
+
 /// An [`ObjectStoreBridge`] backed by a [`ProximaObjectStore`] (any `object_store` backend:
 /// local `file://`, `memory://`, or cloud `s3://`/`gs://`/`az://` when the F1 crate's cloud
 /// features are enabled). One bridge serves an entire store/bucket; paths select the object.
@@ -244,12 +287,13 @@ impl IcebergObjectStoreBridge {
         Ok(builder.metadata().clone())
     }
 
-    /// Publish a snapshot as **spec-shaped Iceberg** (v3 by default): write an Avro manifest
-    /// for the `*.parquet` data files under `data_prefix`, an Avro manifest list, and a
-    /// `TableMetadata` JSON referencing it, committed atomically through the metadata log at
-    /// `metadata_prefix`. External Iceberg engines can then read the table. `snapshot_id` and
-    /// `timestamp_ms` are caller-supplied (no wall-clock here, for determinism). Returns the
-    /// committed metadata version (or a `Conflict` to rebase onto).
+    /// Publish a snapshot as **spec-shaped Iceberg** (v3 by default) of every `*.parquet`
+    /// object under `data_prefix`, as the successor of the latest committed metadata
+    /// version. Returns the committed metadata version (or a `Conflict` to rebase onto).
+    ///
+    /// Listing selects whatever parquet is present, so this is only correct for a prefix
+    /// that holds exactly one generation. Publishers that write generation-named parts
+    /// use [`publish_iceberg_files`](Self::publish_iceberg_files) with the explicit list.
     #[allow(clippy::too_many_arguments)]
     pub async fn publish_iceberg_snapshot(
         &self,
@@ -262,23 +306,113 @@ impl IcebergObjectStoreBridge {
         timestamp_ms: i64,
         format_version: iceberg::FormatVersion,
     ) -> Result<CommitOutcome, StorageError> {
-        // 1. Enumerate data files with size (HEAD) + record count (footer).
-        let mut keys: Vec<Path> = self.list_objects(data_prefix).await?;
+        let mut keys: Vec<Path> = self
+            .list_objects(data_prefix)
+            .await?
+            .into_iter()
+            .filter(|k| k.as_ref().ends_with(".parquet"))
+            .collect();
         keys.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
-        let mut data_files = Vec::new();
-        for key in &keys {
-            if !key.as_ref().ends_with(".parquet") {
-                continue;
-            }
+        let committer = metadata::MetadataCommitter::new(self.store.clone(), metadata_prefix);
+        let parent = committer.latest_version().await?;
+        self.commit_iceberg_snapshot(
+            &keys,
+            parent,
+            FooterPolicy::DegradeToEmpty,
+            &SnapshotTarget {
+                metadata_prefix,
+                table_uuid,
+                table_location,
+                fields,
+                snapshot_id,
+                timestamp_ms,
+                format_version,
+            },
+        )
+        .await
+    }
+
+    /// Publish exactly `files` (bridge-relative keys of parquet objects the caller
+    /// wrote) as a spec-shaped Iceberg snapshot committed as the successor of metadata
+    /// version `parent` (`None` ⇒ the first version). Returns the committed version.
+    ///
+    /// Unlike [`publish_iceberg_snapshot`](Self::publish_iceberg_snapshot) nothing is
+    /// listed: a multi-part, multi-generation data prefix publishes only the generation
+    /// named here. The Avro manifest and manifest list are generation-unique and written
+    /// create-only, and every footer must be readable (the caller just wrote the files).
+    /// Losing the race for the successor slot — another publisher committed after
+    /// `parent`, or claimed its Avro paths — is an `Err(AlreadyExists)`, never success:
+    /// the caller decides whether to rebase.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_iceberg_files(
+        &self,
+        files: &[Path],
+        parent: Option<u64>,
+        metadata_prefix: &str,
+        table_uuid: &str,
+        table_location: &str,
+        fields: &[iceberg::IcebergField],
+        snapshot_id: i64,
+        timestamp_ms: i64,
+        format_version: iceberg::FormatVersion,
+    ) -> Result<u64, StorageError> {
+        if files.is_empty() {
+            return Err(StorageError::Serialization(
+                "iceberg-engine: publish_iceberg_files needs at least one data file".into(),
+            ));
+        }
+        let target = SnapshotTarget {
+            metadata_prefix,
+            table_uuid,
+            table_location,
+            fields,
+            snapshot_id,
+            timestamp_ms,
+            format_version,
+        };
+        match self
+            .commit_iceberg_snapshot(files, parent, FooterPolicy::Required, &target)
+            .await?
+        {
+            CommitOutcome::Committed(version) => Ok(version),
+            CommitOutcome::Conflict { latest } => Err(StorageError::AlreadyExists(format!(
+                "iceberg-engine: metadata under {metadata_prefix} moved past parent \
+                 {parent:?} (latest {latest:?}); snapshot {snapshot_id} not published"
+            ))),
+        }
+    }
+
+    /// The shared commit: data-file metadata from the footers, lineage from `parent`,
+    /// generation-unique Avro manifest + list written create-only, then the metadata CAS.
+    async fn commit_iceberg_snapshot(
+        &self,
+        files: &[Path],
+        parent: Option<u64>,
+        footers: FooterPolicy,
+        target: &SnapshotTarget<'_>,
+    ) -> Result<CommitOutcome, StorageError> {
+        let SnapshotTarget {
+            metadata_prefix,
+            table_uuid,
+            table_location,
+            fields,
+            snapshot_id,
+            timestamp_ms,
+            format_version,
+        } = *target;
+        // 1. Data files with size (HEAD) + record count and column metrics (footer).
+        let mut data_files = Vec::with_capacity(files.len());
+        for key in files {
             let size = self.store.object_size(key).await?;
-            // Record count + Iceberg column metrics from the footer (one read);
-            // an unreadable footer degrades to count 0 / no metrics (never wrong).
-            let (record_count, column_stats) = match self.parquet_footer(key).await {
-                Ok(meta) => (
+            let (record_count, column_stats) = match (self.parquet_footer(key).await, footers) {
+                (Ok(meta), _) => (
                     meta.file_metadata().num_rows(),
                     stats::iceberg_column_stats(&meta, fields),
                 ),
-                Err(_) => (0, Vec::new()),
+                // A listed object of unknown provenance degrades to count 0 / no
+                // metrics (never wrong); a file the caller wrote must be readable.
+                (Err(_), FooterPolicy::DegradeToEmpty) => (0, Vec::new()),
+                (Err(e), FooterPolicy::Required) => return Err(e),
             };
             data_files.push(iceberg::DataFileMeta {
                 file_path: self.object_uri(key.as_ref()),
@@ -290,9 +424,9 @@ impl IcebergObjectStoreBridge {
         let added_records: i64 = data_files.iter().map(|f| f.record_count).sum();
         let added_files = data_files.len() as i64;
 
-        // 2. Lineage from the previous metadata document, if any.
+        // 2. Lineage from the parent metadata document, if any.
         let committer = metadata::MetadataCommitter::new(self.store.clone(), metadata_prefix);
-        let parent = committer.latest_version().await?;
+        let version = metadata::MetadataCommitter::successor(parent)?;
         let parent_json = match parent {
             Some(v) => Some(
                 String::from_utf8(committer.read_metadata(v).await?.to_vec())
@@ -304,7 +438,11 @@ impl IcebergObjectStoreBridge {
         let lineage =
             iceberg::Lineage::from_parent(parent_json.as_deref(), parent_location.as_deref())?;
 
-        // 3. Write the Avro manifest + manifest list.
+        // 3. The Avro manifest + manifest list, named by the metadata version they are
+        //    committed under, so two generations (or two publishers racing for one slot)
+        //    never overwrite each other's files. Create-only: the loser of a race sees
+        //    `AlreadyExists` here and reports a conflict instead of clobbering the
+        //    winner's manifest out from under its committed metadata.
         let schema_json = iceberg::schema_json(fields).to_string();
         let manifest_bytes = iceberg::write_manifest(
             &data_files,
@@ -314,13 +452,19 @@ impl IcebergObjectStoreBridge {
                 format_version,
             }),
         )?;
-        let manifest_path = Path::from(format!("{metadata_prefix}/{snapshot_id}-m0.avro"));
-        self.store
-            .put(&manifest_path, Bytes::from(manifest_bytes.clone()))
-            .await?;
+        let manifest_path = Path::from(format!(
+            "{metadata_prefix}/v{version:020}-{snapshot_id}-m0.avro"
+        ));
+        let manifest_length = manifest_bytes.len() as i64;
+        if let Some(conflict) = self
+            .put_generation_object(&committer, &manifest_path, manifest_bytes)
+            .await?
+        {
+            return Ok(conflict);
+        }
         let manifest_list = vec![iceberg::ManifestFileMeta {
             manifest_path: self.object_uri(manifest_path.as_ref()),
-            manifest_length: manifest_bytes.len() as i64,
+            manifest_length,
             added_files_count: added_files as i32,
             added_rows_count: added_records,
             added_snapshot_id: snapshot_id,
@@ -329,8 +473,15 @@ impl IcebergObjectStoreBridge {
                 .then_some(lineage.first_row_id),
         }];
         let list_bytes = iceberg::write_manifest_list(&manifest_list)?;
-        let list_path = Path::from(format!("{metadata_prefix}/snap-{snapshot_id}-list.avro"));
-        self.store.put(&list_path, Bytes::from(list_bytes)).await?;
+        let list_path = Path::from(format!(
+            "{metadata_prefix}/snap-{snapshot_id}-v{version:020}-list.avro"
+        ));
+        if let Some(conflict) = self
+            .put_generation_object(&committer, &list_path, list_bytes)
+            .await?
+        {
+            return Ok(conflict);
+        }
 
         // 4. Build + atomically commit the TableMetadata.
         let list_uri = self.object_uri(list_path.as_ref());
@@ -349,6 +500,23 @@ impl IcebergObjectStoreBridge {
             &lineage,
         )?;
         committer.commit(parent, Bytes::from(json)).await
+    }
+
+    /// Create-only write of one generation-named metadata object. `Some(Conflict)` when
+    /// another publisher already claimed the name (it is racing for the same version).
+    async fn put_generation_object(
+        &self,
+        committer: &metadata::MetadataCommitter,
+        path: &Path,
+        bytes: Vec<u8>,
+    ) -> Result<Option<CommitOutcome>, StorageError> {
+        match self.store.put_if_absent(path, Bytes::from(bytes)).await {
+            Ok(()) => Ok(None),
+            Err(StorageError::AlreadyExists(_)) => Ok(Some(CommitOutcome::Conflict {
+                latest: committer.latest_version().await?,
+            })),
+            Err(e) => Err(e),
+        }
     }
 
     /// Absolute location of metadata `version` under `metadata_prefix` — what an
@@ -671,22 +839,37 @@ impl ObjectStoreBridge for IcebergObjectStoreBridge {
         timestamp_ms: i64,
         v3: bool,
     ) -> Result<CommitOutcome, StorageError> {
-        let mapped: Vec<iceberg::IcebergField> = fields
-            .iter()
-            .map(|f| iceberg::IcebergField {
-                id: f.id,
-                name: f.name.clone(),
-                type_name: f.type_name.clone(),
-                required: f.required,
-            })
-            .collect();
-        let format_version = if v3 {
-            iceberg::FormatVersion::V3
-        } else {
-            iceberg::FormatVersion::V2
-        };
+        let (mapped, format_version) = iceberg_fields_of(fields, v3);
         self.publish_iceberg_snapshot(
             data_prefix,
+            metadata_prefix,
+            table_uuid,
+            table_location,
+            &mapped,
+            snapshot_id,
+            timestamp_ms,
+            format_version,
+        )
+        .await
+    }
+
+    async fn publish_iceberg_files(
+        &self,
+        files: &[Path],
+        parent: Option<u64>,
+        metadata_prefix: &str,
+        table_uuid: &str,
+        table_location: &str,
+        fields: &[proximadb_storage_common::object_store_bridge::IcebergSnapshotField],
+        snapshot_id: i64,
+        timestamp_ms: i64,
+        v3: bool,
+    ) -> Result<u64, StorageError> {
+        let (mapped, format_version) = iceberg_fields_of(fields, v3);
+        IcebergObjectStoreBridge::publish_iceberg_files(
+            self,
+            files,
+            parent,
             metadata_prefix,
             table_uuid,
             table_location,
@@ -920,6 +1103,140 @@ mod tests {
                 .as_ref(),
             "t/ns/tbl/data/x.parquet"
         );
+    }
+
+    fn age_field() -> Vec<iceberg::IcebergField> {
+        vec![iceberg::IcebergField {
+            id: 1,
+            name: "age".into(),
+            type_name: "long".into(),
+            required: false,
+        }]
+    }
+
+    async fn write_age_part(b: &IcebergObjectStoreBridge, key: &str, ages: &[i64]) -> Path {
+        let records: Vec<ProximaRecord> = ages
+            .iter()
+            .map(|a| record(&format!("r{a}"), vec![("age", ProximaValue::Int64(*a))]))
+            .collect();
+        let path = Path::from(key);
+        b.write_records_to_parquet(&path, &records, None)
+            .await
+            .unwrap();
+        path
+    }
+
+    async fn publish_files(
+        b: &IcebergObjectStoreBridge,
+        files: &[Path],
+        parent: Option<u64>,
+        snapshot_id: i64,
+    ) -> Result<u64, StorageError> {
+        b.publish_iceberg_files(
+            files,
+            parent,
+            "t/metadata",
+            "uuid-files",
+            "memory:///t",
+            &age_field(),
+            snapshot_id,
+            1_700_000_000_000 + snapshot_id,
+            iceberg::FormatVersion::V2,
+        )
+        .await
+    }
+
+    /// P2.4: an explicit file list publishes exactly that generation, whatever else
+    /// sits in the data prefix — listing would union the other generation's parts.
+    #[tokio::test]
+    async fn publish_iceberg_files_publishes_only_the_named_generation() {
+        let b = bridge();
+        let g1 = write_age_part(&b, "t/data/g1-part-0.parquet", &[1, 2]).await;
+        let v0 = publish_files(&b, std::slice::from_ref(&g1), None, 1)
+            .await
+            .unwrap();
+        assert_eq!(v0, 0);
+
+        let g2a = write_age_part(&b, "t/data/g2-part-0.parquet", &[3]).await;
+        let g2b = write_age_part(&b, "t/data/g2-part-1.parquet", &[4, 5, 6]).await;
+        let v1 = publish_files(&b, &[g2a.clone(), g2b.clone()], Some(v0), 2)
+            .await
+            .unwrap();
+        assert_eq!(v1, 1);
+
+        assert_eq!(
+            b.read_iceberg_snapshot("t/metadata", 1).await.unwrap(),
+            vec![g2a, g2b],
+            "generation 2 only, though g1's part is still in t/data"
+        );
+        assert_eq!(
+            b.read_iceberg_snapshot("t/metadata", 0).await.unwrap(),
+            vec![g1],
+            "the previous version's manifest is untouched"
+        );
+        let meta = b.read_table_metadata("t/metadata", 1).await.unwrap();
+        let mj: serde_json::Value = serde_json::from_slice(&meta).unwrap();
+        let current = mj["snapshots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|snap| snap["snapshot-id"] == mj["current-snapshot-id"])
+            .unwrap();
+        assert_eq!(current["summary"]["added-records"], "4");
+    }
+
+    /// P2.4: a publish whose parent is stale loses to the publisher that took the
+    /// slot. It is an error (the old `publish_iceberg_table` caller treated the
+    /// `Conflict` as success), and it must not overwrite the winner's Avro files.
+    #[tokio::test]
+    async fn publish_iceberg_files_on_a_stale_parent_is_an_error() {
+        let b = bridge();
+        let first = write_age_part(&b, "t/data/a.parquet", &[1]).await;
+        publish_files(&b, std::slice::from_ref(&first), None, 10)
+            .await
+            .unwrap();
+        let winner = write_age_part(&b, "t/data/b.parquet", &[2]).await;
+        assert_eq!(
+            publish_files(&b, std::slice::from_ref(&winner), Some(0), 11)
+                .await
+                .unwrap(),
+            1
+        );
+
+        // Same parent, different snapshot: the metadata slot v1 is taken.
+        let loser = write_age_part(&b, "t/data/c.parquet", &[3]).await;
+        let err = publish_files(&b, std::slice::from_ref(&loser), Some(0), 12)
+            .await
+            .expect_err("a stale parent must not report success");
+        assert!(matches!(err, StorageError::AlreadyExists(_)), "{err:?}");
+
+        // Same parent AND same snapshot id: the generation's Avro names collide and
+        // the create-only write refuses before anything of the winner is replaced.
+        let err = publish_files(&b, std::slice::from_ref(&loser), Some(0), 11)
+            .await
+            .expect_err("colliding Avro names must not overwrite the winner");
+        assert!(matches!(err, StorageError::AlreadyExists(_)), "{err:?}");
+        assert_eq!(
+            b.read_iceberg_snapshot("t/metadata", 1).await.unwrap(),
+            vec![winner]
+        );
+    }
+
+    /// A file the publisher names must be a readable parquet: no silent count-0 entry.
+    #[tokio::test]
+    async fn publish_iceberg_files_requires_readable_footers() {
+        let b = bridge();
+        let bogus = Path::from("t/data/not-parquet.parquet");
+        b.object_store()
+            .put(&bogus, Bytes::from_static(b"not parquet"))
+            .await
+            .unwrap();
+        assert!(
+            publish_files(&b, &[bogus], None, 1).await.is_err(),
+            "an unreadable footer fails the publish"
+        );
+        assert_eq!(b.latest_metadata_version("t/metadata").await.unwrap(), None);
+        assert!(publish_files(&b, &[], None, 2).await.is_err(), "empty list");
     }
 
     /// End-to-end Iceberg publish: write a Parquet data file, publish a v3 snapshot
