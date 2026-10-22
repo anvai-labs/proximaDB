@@ -25,16 +25,18 @@
 //!   is inside a finite cgroup that leaves at least 16 GiB for the host. Use
 //!   `scripts/run_tpc_perf_ledger.sh`; never launch SF-sized runs directly.
 //!   `TPC_PERF_LOAD_PARALLELISM` (default 1) spreads bulk-load INSERTs across
-//!   N pgwire connections to cut load wall-time; it does NOT reduce peak RSS
-//!   (the generated `Vec<String>` is fully resident either way), so it changes
-//!   nothing about the preflight ceiling above. Load + materialize wall times
-//!   land in `ledger.load_stats`. **True SF1 remains blocked**: at scale=1.0
-//!   the estimated peak (~132 GiB) exceeds any cgroup cap this harness's host
-//!   can safely offer alongside the required 16 GiB headroom — the generator
-//!   materializes the whole row set as text before any INSERT runs, so no
-//!   isolation setting fixes it. Closing that needs a streaming/chunked
-//!   generate-and-load path (a distinct, larger TD-172 slice; not attempted
-//!   here).
+//!   N pgwire connections to cut load wall-time. The generators stream their
+//!   statements to the loader over a bounded channel (fact tables are emitted
+//!   date-ordered by replaying recorded generator states, ~16 bytes a row), so
+//!   the harness never holds the data set as text. Load + materialize wall
+//!   times and per-phase memory peaks (VmHWM and the cgroup peak, cgroup v2 or
+//!   v1) land in `ledger.load_stats`.
+//! - `TPC_PERF_LOAD_ONLY=1`: load + MATERIALIZE only, no query routes — the
+//!   P2.4 gate (TPC-DS SF1 loads and publishes in bounded memory). Run it with
+//!   the relational spill gate on (`PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT`).
+//! - `TPC_PERF_HOST_HEADROOM_MIB` lowers the 16 GiB host headroom the large-run
+//!   preflight requires, for a dedicated small host; the cgroup limit still
+//!   bounds the run.
 //!
 //! `#[ignore]` — advisory, never a merge gate. Run on demand:
 //!
@@ -112,6 +114,58 @@ fn chunked_inserts(table: &str, cols: &str, values: Vec<String>, chunk: usize) -
         .collect()
 }
 
+/// Statement sink for the streaming generators; `extend` keeps the batch call
+/// sites (`out.extend(chunked_inserts(..))`) unchanged.
+struct StatementSink<'a>(&'a mut dyn FnMut(String));
+
+impl Extend<String> for StatementSink<'_> {
+    fn extend<I: IntoIterator<Item = String>>(&mut self, statements: I) {
+        for sql in statements {
+            (self.0)(sql);
+        }
+    }
+}
+
+/// Rows per generated INSERT statement.
+const INSERT_CHUNK_ROWS: usize = 200;
+
+/// Emit a fact table's `n` rows (`t` in `1..=n`) as INSERTs ordered by their
+/// date key, exactly as generating every row, stable-sorting by date and
+/// chunking would — without holding the rows. Pass one runs `row` for each one
+/// and keeps only the generator state it started from, bucketed by the row's
+/// date (16 bytes a row); pass two replays each bucket in date order. `row` must
+/// draw all its randomness from the `Rng` it is given. `rng` ends where a
+/// single generating pass would leave it.
+fn emit_date_sorted(
+    out: &mut StatementSink<'_>,
+    rng: &mut Rng,
+    table: &str,
+    cols: &str,
+    n: u64,
+    (first_sk, n_dates): (u64, u64),
+    mut row: impl FnMut(&mut Rng, u64) -> (u64, String),
+) {
+    let mut buckets: Vec<Vec<(u64, u64)>> = vec![Vec::new(); n_dates as usize];
+    for t in 1..=n {
+        let start = rng.0;
+        let (date_sk, _) = row(rng, t);
+        buckets[(date_sk - first_sk) as usize].push((start, t));
+    }
+    let mut rows = Vec::with_capacity(INSERT_CHUNK_ROWS);
+    for (start, t) in buckets.into_iter().flatten() {
+        rows.push(row(&mut Rng(start), t).1);
+        if rows.len() == INSERT_CHUNK_ROWS {
+            out.extend(chunked_inserts(
+                table,
+                cols,
+                std::mem::take(&mut rows),
+                INSERT_CHUNK_ROWS,
+            ));
+        }
+    }
+    out.extend(chunked_inserts(table, cols, rows, INSERT_CHUNK_ROWS));
+}
+
 /// Scale a canonical TPC row count, with a floor so every table joins.
 fn scaled(base: u64, scale: f64, floor: u64) -> u64 {
     ((base as f64 * scale) as u64).max(floor)
@@ -120,6 +174,17 @@ fn scaled(base: u64, scale: f64, floor: u64) -> u64 {
 const SAFE_ESTIMATED_PEAK_MIB: u64 = 8 * 1024;
 const REQUIRED_HOST_HEADROOM_MIB: u64 = 16 * 1024;
 const LARGE_SCALE_ACK: &str = "I_ACCEPT_ISOLATED_OOM";
+
+/// The host headroom a large run's cgroup must leave free:
+/// `TPC_PERF_HOST_HEADROOM_MIB`, default [`REQUIRED_HOST_HEADROOM_MIB`]. A
+/// dedicated small box (the 15 GiB SF1 gate host) lowers it; the cgroup limit
+/// still bounds the run.
+fn required_host_headroom_mib() -> u64 {
+    std::env::var("TPC_PERF_HOST_HEADROOM_MIB")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(REQUIRED_HOST_HEADROOM_MIB)
+}
 // Calibrated conservatively from the 2026-09-15 SF1 incident. The generator,
 // pgwire load path, native tables, and materialized parquet can coexist during
 // a run, so source-row text size alone substantially understates peak RSS.
@@ -150,6 +215,7 @@ fn validate_perf_run(
     acknowledgement: Option<&str>,
     cgroup_limit_mib: Option<u64>,
     host_total_mib: Option<u64>,
+    required_headroom_mib: u64,
 ) -> Result<PerfRunPreflight, String> {
     if !scale.is_finite() || scale <= 0.0 {
         return Err("TPC_PERF_SCALE must be a finite number greater than zero".to_string());
@@ -178,26 +244,17 @@ fn validate_perf_run(
         "large-scale TPC runs require readable host memory capacity for the headroom check"
             .to_string()
     })?;
-    if limit >= host_total || host_total - limit < REQUIRED_HOST_HEADROOM_MIB {
+    if limit >= host_total || host_total - limit < required_headroom_mib {
         return Err(format!(
-            "cgroup limit {limit} MiB leaves less than {REQUIRED_HOST_HEADROOM_MIB} MiB host headroom (host {host_total} MiB)"
+            "cgroup limit {limit} MiB leaves less than {required_headroom_mib} MiB host headroom (host {host_total} MiB)"
         ));
     }
     Ok(preflight)
 }
 
 fn current_cgroup_memory_limit_mib() -> Option<u64> {
-    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let relative = cgroup
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))?
-        .trim_start_matches('/');
-    let path = std::path::Path::new("/sys/fs/cgroup")
-        .join(relative)
-        .join("memory.max");
-    let raw = std::fs::read_to_string(path).ok()?;
-    let bytes = raw.trim().parse::<u64>().ok()?;
-    Some(bytes / (1024 * 1024))
+    // An unlimited cgroup reports `max` (v2) or a near-u64::MAX byte count (v1).
+    read_bytes_mib(&cgroup_memory_files()?.1).filter(|&mib| mib < (1 << 40))
 }
 
 fn host_total_memory_mib() -> Option<u64> {
@@ -573,7 +630,19 @@ const TPCDS_SCHEMA: &[(&str, &str)] = &[
     ),
 ];
 
+/// Every TPC-DS INSERT statement, collected (the out-of-process DuckDB baseline
+/// loads from this; the server load streams [`gen_tpcds_into`]).
 fn gen_tpcds(scale: f64) -> Vec<String> {
+    let mut out = Vec::new();
+    gen_tpcds_into(scale, &mut |sql| out.push(sql));
+    out
+}
+
+/// The TPC-DS INSERT statements, handed to `emit` one at a time and in the same
+/// order [`gen_tpcds`] collects them. Fact tables stream through
+/// [`emit_date_sorted`], so memory is a dimension table plus a few bytes per
+/// fact row, not the row text (P2.4: the SF1 gate needs a bounded loader).
+fn gen_tpcds_into(scale: f64, emit: &mut dyn FnMut(String)) {
     let mut rng = Rng::new(0x0D50_FFEE_5EED);
     let n_item = scaled(18_000, scale, 20);
     let n_cust = scaled(100_000, scale, 10);
@@ -629,7 +698,7 @@ fn gen_tpcds(scale: f64) -> Vec<String> {
         "Orange County",
     ];
 
-    let mut out = Vec::new();
+    let mut out = StatementSink(emit);
     out.extend(chunked_inserts(
         "date_dim",
         "d_date_sk, d_date, d_year, d_moy, d_qoy, d_dom, d_dow, d_month_seq, d_week_seq, d_day_name, d_quarter_name",
@@ -853,8 +922,14 @@ fn gen_tpcds(scale: f64) -> Vec<String> {
     ));
     // store_sales — clustered by ss_sold_date_sk. The generator produces a
     // fully-populated fact row so every TPC-DS query has its columns.
-    let mut sales: Vec<(u64, String)> = (1..=n_sales)
-        .map(|t| {
+    emit_date_sorted(
+        &mut out,
+        &mut rng,
+        "store_sales",
+        "ss_sold_date_sk, ss_sold_time_sk, ss_item_sk, ss_store_sk, ss_customer_sk, ss_addr_sk, ss_cdemo_sk, ss_hdemo_sk, ss_promo_sk, ss_ticket_number, ss_quantity, ss_wholesale_cost, ss_list_price, ss_sales_price, ss_coupon_amt, ss_ext_sales_price, ss_ext_wholesale_cost, ss_ext_list_price, ss_ext_discount_amt, ss_ext_tax, ss_net_paid, ss_net_paid_inc_tax, ss_net_profit",
+        n_sales,
+        (first_sk, n_dates),
+        |rng, t| {
             let qty = 1 + rng.below(100);
             let price = 1 + rng.below(100);
             let wcost = rng.money(80);
@@ -882,19 +957,18 @@ fn gen_tpcds(scale: f64) -> Vec<String> {
                 net_paid + tax,
             );
             (date_sk, row)
-        })
-        .collect();
-    sales.sort_by_key(|(sk, _)| *sk);
-    out.extend(chunked_inserts(
-        "store_sales",
-        "ss_sold_date_sk, ss_sold_time_sk, ss_item_sk, ss_store_sk, ss_customer_sk, ss_addr_sk, ss_cdemo_sk, ss_hdemo_sk, ss_promo_sk, ss_ticket_number, ss_quantity, ss_wholesale_cost, ss_list_price, ss_sales_price, ss_coupon_amt, ss_ext_sales_price, ss_ext_wholesale_cost, ss_ext_list_price, ss_ext_discount_amt, ss_ext_tax, ss_net_paid, ss_net_paid_inc_tax, ss_net_profit",
-        sales.into_iter().map(|(_, row)| row).collect(),
-        200,
-    ));
+        },
+    );
     // store_returns — a fraction of store_sales get returned.
     let n_sr = scaled(288_000, scale, 30);
-    let mut sreturns: Vec<(u64, String)> = (1..=n_sr)
-        .map(|t| {
+    emit_date_sorted(
+        &mut out,
+        &mut rng,
+        "store_returns",
+        "sr_returned_date_sk, sr_item_sk, sr_customer_sk, sr_store_sk, sr_ticket_number, sr_return_quantity, sr_return_amt, sr_net_loss, sr_reason_sk",
+        n_sr,
+        (first_sk, n_dates),
+        |rng, t| {
             let date_sk = first_sk + rng.below(n_dates);
             let row = format!(
                 "({date_sk}, {}, {}, {}, {t}, {}, {}.00, {}.00, {})",
@@ -907,19 +981,18 @@ fn gen_tpcds(scale: f64) -> Vec<String> {
                 1 + rng.below(35),
             );
             (date_sk, row)
-        })
-        .collect();
-    sreturns.sort_by_key(|(sk, _)| *sk);
-    out.extend(chunked_inserts(
-        "store_returns",
-        "sr_returned_date_sk, sr_item_sk, sr_customer_sk, sr_store_sk, sr_ticket_number, sr_return_quantity, sr_return_amt, sr_net_loss, sr_reason_sk",
-        sreturns.into_iter().map(|(_, row)| row).collect(),
-        200,
-    ));
+        },
+    );
     // catalog_sales — similar structure to store_sales but with shipping.
     let n_cs = scaled(1_440_000, scale, 150);
-    let mut csales: Vec<(u64, String)> = (1..=n_cs)
-        .map(|t| {
+    emit_date_sorted(
+        &mut out,
+        &mut rng,
+        "catalog_sales",
+        "cs_sold_date_sk, cs_sold_time_sk, cs_ship_date_sk, cs_item_sk, cs_call_center_sk, cs_warehouse_sk, cs_catalog_page_sk, cs_bill_customer_sk, cs_ship_customer_sk, cs_bill_addr_sk, cs_ship_addr_sk, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_promo_sk, cs_order_number, cs_quantity, cs_wholesale_cost, cs_list_price, cs_sales_price, cs_coupon_amt, cs_ext_sales_price, cs_ext_wholesale_cost, cs_ext_list_price, cs_ext_discount_amt, cs_ext_ship_cost, cs_net_paid, cs_net_paid_inc_tax, cs_net_profit, cs_ship_mode_sk",
+        n_cs,
+        (first_sk, n_dates),
+        |rng, t| {
             let qty = 1 + rng.below(100);
             let price = 1 + rng.below(100);
             let date_sk = first_sk + rng.below(n_dates);
@@ -947,19 +1020,18 @@ fn gen_tpcds(scale: f64) -> Vec<String> {
                 "({date_sk}, {time_sk}, {ship_sk}, {item}, {cc}, {wh}, {page}, {bc}, {sc}, {ba}, {sa}, {cd}, {hd}, {promo}, {t}, {qty}, {wcost}, {list_p}.00, {price}.00, 0.00, {ext_sales}.00, 0.00, {ext_sales}.00, 0.00, {ship_cost}.00, {ext_sales}.00, {paid_tax}.00, {profit}.00, {sm})"
             );
             (date_sk, row)
-        })
-        .collect();
-    csales.sort_by_key(|(sk, _)| *sk);
-    out.extend(chunked_inserts(
-        "catalog_sales",
-        "cs_sold_date_sk, cs_sold_time_sk, cs_ship_date_sk, cs_item_sk, cs_call_center_sk, cs_warehouse_sk, cs_catalog_page_sk, cs_bill_customer_sk, cs_ship_customer_sk, cs_bill_addr_sk, cs_ship_addr_sk, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_promo_sk, cs_order_number, cs_quantity, cs_wholesale_cost, cs_list_price, cs_sales_price, cs_coupon_amt, cs_ext_sales_price, cs_ext_wholesale_cost, cs_ext_list_price, cs_ext_discount_amt, cs_ext_ship_cost, cs_net_paid, cs_net_paid_inc_tax, cs_net_profit, cs_ship_mode_sk",
-        csales.into_iter().map(|(_, row)| row).collect(),
-        200,
-    ));
+        },
+    );
     // catalog_returns
     let n_cr = scaled(144_000, scale, 15);
-    let mut creturns: Vec<(u64, String)> = (1..=n_cr)
-        .map(|t| {
+    emit_date_sorted(
+        &mut out,
+        &mut rng,
+        "catalog_returns",
+        "cr_returned_date_sk, cr_item_sk, cr_order_number, cr_call_center_sk, cr_returning_customer_sk, cr_returning_addr_sk, cr_return_quantity, cr_return_amount, cr_refunded_cash, cr_reversed_charge, cr_store_credit, cr_net_loss, cr_return_amt_inc_tax",
+        n_cr,
+        (first_sk, n_dates),
+        |rng, t| {
             let date_sk = first_sk + rng.below(n_dates);
             let row = format!(
                 "({date_sk}, {}, {t}, {}, {}, {}, {}, {}.00, {}.00, {}.00, {}.00, {}.00, {}.00)",
@@ -976,19 +1048,18 @@ fn gen_tpcds(scale: f64) -> Vec<String> {
                 rng.below(100),
             );
             (date_sk, row)
-        })
-        .collect();
-    creturns.sort_by_key(|(sk, _)| *sk);
-    out.extend(chunked_inserts(
-        "catalog_returns",
-        "cr_returned_date_sk, cr_item_sk, cr_order_number, cr_call_center_sk, cr_returning_customer_sk, cr_returning_addr_sk, cr_return_quantity, cr_return_amount, cr_refunded_cash, cr_reversed_charge, cr_store_credit, cr_net_loss, cr_return_amt_inc_tax",
-        creturns.into_iter().map(|(_, row)| row).collect(),
-        200,
-    ));
+        },
+    );
     // web_sales
     let n_ws = scaled(720_000, scale, 75);
-    let mut wsales: Vec<(u64, String)> = (1..=n_ws)
-        .map(|t| {
+    emit_date_sorted(
+        &mut out,
+        &mut rng,
+        "web_sales",
+        "ws_sold_date_sk, ws_sold_time_sk, ws_ship_date_sk, ws_item_sk, ws_web_site_sk, ws_web_page_sk, ws_warehouse_sk, ws_bill_customer_sk, ws_ship_customer_sk, ws_bill_addr_sk, ws_ship_addr_sk, ws_bill_cdemo_sk, ws_ship_hdemo_sk, ws_order_number, ws_quantity, ws_wholesale_cost, ws_list_price, ws_sales_price, ws_coupon_amt, ws_ext_sales_price, ws_ext_wholesale_cost, ws_ext_list_price, ws_ext_discount_amt, ws_ext_ship_cost, ws_net_paid, ws_net_paid_inc_tax, ws_net_profit, ws_promo_sk, ws_ship_mode_sk",
+        n_ws,
+        (first_sk, n_dates),
+        |rng, t| {
             let qty = 1 + rng.below(100);
             let price = 1 + rng.below(100);
             let date_sk = first_sk + rng.below(n_dates);
@@ -1016,19 +1087,18 @@ fn gen_tpcds(scale: f64) -> Vec<String> {
                 "({date_sk}, {time_sk}, {ship_sk}, {item}, {ws_site}, {wp}, {wh}, {bc}, {sc}, {ba}, {sa}, {cd}, {hd}, {t}, {qty}, {wcost}, {list_p}.00, {price}.00, 0.00, {ext_sales}.00, 0.00, {ext_sales}.00, 0.00, {ship_cost}.00, {ext_sales}.00, {paid_tax}.00, {profit}.00, {promo}, {sm})"
             );
             (date_sk, row)
-        })
-        .collect();
-    wsales.sort_by_key(|(sk, _)| *sk);
-    out.extend(chunked_inserts(
-        "web_sales",
-        "ws_sold_date_sk, ws_sold_time_sk, ws_ship_date_sk, ws_item_sk, ws_web_site_sk, ws_web_page_sk, ws_warehouse_sk, ws_bill_customer_sk, ws_ship_customer_sk, ws_bill_addr_sk, ws_ship_addr_sk, ws_bill_cdemo_sk, ws_ship_hdemo_sk, ws_order_number, ws_quantity, ws_wholesale_cost, ws_list_price, ws_sales_price, ws_coupon_amt, ws_ext_sales_price, ws_ext_wholesale_cost, ws_ext_list_price, ws_ext_discount_amt, ws_ext_ship_cost, ws_net_paid, ws_net_paid_inc_tax, ws_net_profit, ws_promo_sk, ws_ship_mode_sk",
-        wsales.into_iter().map(|(_, row)| row).collect(),
-        200,
-    ));
+        },
+    );
     // web_returns
     let n_wr = scaled(72_000, scale, 8);
-    let mut wreturns: Vec<(u64, String)> = (1..=n_wr)
-        .map(|t| {
+    emit_date_sorted(
+        &mut out,
+        &mut rng,
+        "web_returns",
+        "wr_returned_date_sk, wr_item_sk, ws_order_number, wr_order_number, wr_web_page_sk, wr_returning_customer_sk, wr_returning_addr_sk, wr_refunded_cdemo_sk, wr_returning_cdemo_sk, wr_refunded_addr_sk, wr_reason_sk, wr_return_quantity, wr_return_amt, wr_refunded_cash, cr_reversed_charge, wr_fee, wr_net_loss",
+        n_wr,
+        (first_sk, n_dates),
+        |rng, t| {
             let date_sk = first_sk + rng.below(n_dates);
             let item = rng.skewed_key(n_item);
             let wp = 1 + rng.below(100);
@@ -1048,19 +1118,18 @@ fn gen_tpcds(scale: f64) -> Vec<String> {
                 "({date_sk}, {item}, {t}, {t}, {wp}, {cust}, {addr}, {cd1}, {cd2}, {raddr}, {reason}, {qty}, {amt}.00, {cash}.00, {reversed}.00, {fee}.00, {loss}.00)"
             );
             (date_sk, row)
-        })
-        .collect();
-    wreturns.sort_by_key(|(sk, _)| *sk);
-    out.extend(chunked_inserts(
-        "web_returns",
-        "wr_returned_date_sk, wr_item_sk, ws_order_number, wr_order_number, wr_web_page_sk, wr_returning_customer_sk, wr_returning_addr_sk, wr_refunded_cdemo_sk, wr_returning_cdemo_sk, wr_refunded_addr_sk, wr_reason_sk, wr_return_quantity, wr_return_amt, wr_refunded_cash, cr_reversed_charge, wr_fee, wr_net_loss",
-        wreturns.into_iter().map(|(_, row)| row).collect(),
-        200,
-    ));
+        },
+    );
     // inventory
     let n_inv = scaled(78_000, scale, 100);
-    let mut inv: Vec<(u64, String)> = (1..=n_inv)
-        .map(|_| {
+    emit_date_sorted(
+        &mut out,
+        &mut rng,
+        "inventory",
+        "inv_date_sk, inv_item_sk, inv_warehouse_sk, inv_quantity_on_hand",
+        n_inv,
+        (first_sk, n_dates),
+        |rng, _| {
             let date_sk = first_sk + rng.below(n_dates);
             let row = format!(
                 "({date_sk}, {}, {}, {})",
@@ -1069,16 +1138,8 @@ fn gen_tpcds(scale: f64) -> Vec<String> {
                 rng.below(1000),
             );
             (date_sk, row)
-        })
-        .collect();
-    inv.sort_by_key(|(sk, _)| *sk);
-    out.extend(chunked_inserts(
-        "inventory",
-        "inv_date_sk, inv_item_sk, inv_warehouse_sk, inv_quantity_on_hand",
-        inv.into_iter().map(|(_, row)| row).collect(),
-        200,
-    ));
-    out
+        },
+    );
 }
 
 // --- Queries (copied verbatim from the conformance suites) -----------------
@@ -1284,6 +1345,97 @@ struct LoadStats {
     load_wall_ms: u128,
     materialize_ok: usize,
     materialize_wall_ms: u128,
+    /// Peak memory per phase (`load`, `materialize`, `queries`).
+    memory: Vec<PhaseMemory>,
+}
+
+/// Peak memory of one harness phase. `peak_rss_mib` is this process's VmHWM,
+/// reset at the phase start where the kernel allows (`/proc/self/clear_refs`);
+/// `cgroup_peak_mib` is the enclosing cgroup's peak (v2 `memory.peak`, v1
+/// `memory.max_usage_in_bytes`), reset likewise where writable. The server runs
+/// in this process, so both cover generator + server.
+#[derive(serde::Serialize, Debug)]
+struct PhaseMemory {
+    phase: &'static str,
+    peak_rss_mib: Option<u64>,
+    peak_rss_reset: bool,
+    cgroup_peak_mib: Option<u64>,
+    cgroup_peak_reset: bool,
+}
+
+/// The memory files of this process's cgroup: v2 (`memory.peak`) or the v1
+/// memory controller (`memory.max_usage_in_bytes`), with the limit file.
+fn cgroup_memory_files() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let v2 = std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
+    for line in cgroup.lines() {
+        let mut parts = line.splitn(3, ':');
+        let (_, controllers, path) = (parts.next()?, parts.next()?, parts.next()?);
+        let path = path.trim_start_matches('/');
+        if v2 && controllers.is_empty() {
+            let dir = std::path::Path::new("/sys/fs/cgroup").join(path);
+            return Some((dir.join("memory.peak"), dir.join("memory.max")));
+        }
+        if controllers.split(',').any(|c| c == "memory") {
+            let dir = std::path::Path::new("/sys/fs/cgroup/memory").join(path);
+            return Some((
+                dir.join("memory.max_usage_in_bytes"),
+                dir.join("memory.limit_in_bytes"),
+            ));
+        }
+    }
+    None
+}
+
+fn read_bytes_mib(path: &std::path::Path) -> Option<u64> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    raw.trim().parse::<u64>().ok().map(|b| b / (1024 * 1024))
+}
+
+fn vm_hwm_mib() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kib = status.lines().find_map(|line| {
+        line.strip_prefix("VmHWM:")?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+    })?;
+    Some(kib / 1024)
+}
+
+/// Measures one phase's memory peak: construct at the phase start, `finish`
+/// at its end.
+struct PhaseMeter {
+    phase: &'static str,
+    peak_rss_reset: bool,
+    cgroup_peak_reset: bool,
+}
+
+impl PhaseMeter {
+    fn start(phase: &'static str) -> Self {
+        // "5" resets the peak RSS (VmHWM) to the current RSS.
+        let peak_rss_reset = std::fs::write("/proc/self/clear_refs", "5").is_ok();
+        let cgroup_peak_reset =
+            cgroup_memory_files().is_some_and(|(peak, _)| std::fs::write(peak, "0").is_ok());
+        Self {
+            phase,
+            peak_rss_reset,
+            cgroup_peak_reset,
+        }
+    }
+
+    fn finish(self, benchmark: &str) -> PhaseMemory {
+        let memory = PhaseMemory {
+            phase: self.phase,
+            peak_rss_mib: vm_hwm_mib(),
+            peak_rss_reset: self.peak_rss_reset,
+            cgroup_peak_mib: cgroup_memory_files().and_then(|(peak, _)| read_bytes_mib(&peak)),
+            cgroup_peak_reset: self.cgroup_peak_reset,
+        };
+        eprintln!("[{benchmark}] memory {memory:?}");
+        memory
+    }
 }
 
 /// Run one query: clear the capture, time the client round-trip, drain the
@@ -1661,7 +1813,7 @@ async fn seed(
     conn_str: &str,
     benchmark: &str,
     schema: &[(&str, &str)],
-    inserts: Vec<String>,
+    inserts: tokio::sync::mpsc::Receiver<String>,
 ) -> LoadStats {
     for (name, ddl) in schema {
         let _ = client
@@ -1677,33 +1829,32 @@ async fn seed(
     // `TPC_PERF_LOAD_PARALLELISM=N` spreads statements across N pgwire
     // connections. INSERTs are mutually independent (DDL already committed), so
     // cross-connection execution order is irrelevant to correctness. This
-    // shortens WALL time only — it does not reduce peak RSS (the full
-    // `inserts` Vec<String> is already resident regardless of load fan-out),
-    // so it does NOT change the #1905 preflight math and must still go
-    // through `scripts/run_tpc_perf_ledger.sh` at any scale that trips it.
+    // shortens WALL time only. The statements arrive from the streaming
+    // generator over a bounded channel, so the harness holds a few statements,
+    // never the data set.
     let parallelism: usize = std::env::var("TPC_PERF_LOAD_PARALLELISM")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(1);
     let t0 = Instant::now();
+    let batches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     if parallelism == 1 {
-        for sql in &inserts {
+        let mut inserts = inserts;
+        while let Some(sql) = inserts.recv().await {
             client
-                .simple_query(sql)
+                .simple_query(&sql)
                 .await
                 .unwrap_or_else(|e| panic!("INSERT: {}", pg_server::db_err(&e)));
+            batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     } else {
+        let inserts = std::sync::Arc::new(tokio::sync::Mutex::new(inserts));
         let mut set = tokio::task::JoinSet::new();
-        for k in 0..parallelism {
-            let stmts: Vec<String> = inserts
-                .iter()
-                .skip(k)
-                .step_by(parallelism)
-                .cloned()
-                .collect();
+        for _ in 0..parallelism {
             let cs = conn_str.to_string();
+            let inserts = inserts.clone();
+            let batches = batches.clone();
             set.spawn(async move {
                 let (c, conn) = tokio_postgres::connect(&cs, tokio_postgres::NoTls)
                     .await
@@ -1711,13 +1862,16 @@ async fn seed(
                 tokio::spawn(async move {
                     let _ = conn.await;
                 });
-                for sql in stmts {
+                loop {
+                    let Some(sql) = inserts.lock().await.recv().await else {
+                        return Ok(());
+                    };
                     c.simple_query(&sql).await.map_err(|e| {
                         let head = &sql[..sql.len().min(120)];
                         format!("INSERT: {} :: {}", pg_server::db_err(&e), head)
                     })?;
+                    batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                Ok(())
             });
         }
         let mut first_err: Option<String> = None;
@@ -1733,18 +1887,19 @@ async fn seed(
         }
     }
     let load_wall_ms = t0.elapsed().as_millis();
+    let insert_batches = batches.load(std::sync::atomic::Ordering::Relaxed);
     eprintln!(
-        "[{benchmark}] loaded {} insert batches (parallelism {parallelism}) in {load_wall_ms} ms",
-        inserts.len()
+        "[{benchmark}] loaded {insert_batches} insert batches (parallelism {parallelism}) in {load_wall_ms} ms"
     );
 
     LoadStats {
         benchmark: benchmark.to_string(),
-        insert_batches: inserts.len(),
+        insert_batches,
         load_parallelism: parallelism,
         load_wall_ms,
         materialize_ok: 0,
         materialize_wall_ms: 0,
+        memory: Vec::new(),
     }
 }
 
@@ -1755,23 +1910,28 @@ async fn run_benchmark(
     conn_str: &str,
     benchmark: &str,
     schema: &[(&str, &str)],
-    inserts: Vec<String>,
+    inserts: tokio::sync::mpsc::Receiver<String>,
     queries: Vec<(&'static str, String)>,
     out: &mut Vec<LedgerRecord>,
 ) -> LoadStats {
-    let n_inserts = inserts.len();
+    let meter = PhaseMeter::start("load");
     let mut stats = seed(client, conn_str, benchmark, schema, inserts).await;
+    stats.memory.push(meter.finish(benchmark));
     eprintln!(
-        "[{benchmark}] seeded ({n_inserts} insert batches across {} tables)",
+        "[{benchmark}] seeded ({} insert batches across {} tables)",
+        stats.insert_batches,
         schema.len()
     );
+    // `TPC_PERF_LOAD_ONLY=1`: load + MATERIALIZE only, no query routes — the
+    // P2.4 memory gate (bounded load and publication at SF1).
+    let load_only = load_only();
 
     // Native/Volcano route (pre-MATERIALIZE).
     // `TPC_PERF_SKIP_NATIVE=1` skips this route — useful when iterating on the
     // DataFusion (post-MATERIALIZE) or DuckDB routes in isolation, since the
     // row-at-a-time Volcano path is the slow floor (pathological on
     // subquery-heavy shapes like TPC-H Q2). Default: run it (full comparison).
-    let skip_native = std::env::var("TPC_PERF_SKIP_NATIVE").is_ok();
+    let skip_native = load_only || std::env::var("TPC_PERF_SKIP_NATIVE").is_ok();
     if !skip_native {
         for (id, sql) in &queries {
             for temperature in ["first", "repeat"] {
@@ -1785,6 +1945,7 @@ async fn run_benchmark(
 
     // Flip to parquet-backed → DataFusion route. Timed: the materialize cost
     // is part of the load-path evidence (TD-172), not free scaffolding.
+    let meter = PhaseMeter::start("materialize");
     let t_mat = Instant::now();
     let mut materialize_ok = 0usize;
     for (name, _) in schema {
@@ -1801,13 +1962,19 @@ async fn run_benchmark(
     }
     stats.materialize_ok = materialize_ok;
     stats.materialize_wall_ms = t_mat.elapsed().as_millis();
+    stats.memory.push(meter.finish(benchmark));
     eprintln!(
         "[{benchmark}] materialized {materialize_ok}/{} tables in {} ms",
         schema.len(),
         stats.materialize_wall_ms
     );
 
+    if load_only {
+        return stats;
+    }
+
     // DataFusion route (post-MATERIALIZE).
+    let meter = PhaseMeter::start("queries");
     for (id, sql) in &queries {
         for temperature in ["first", "repeat"] {
             let r = measure(client, sql).await;
@@ -1836,8 +2003,31 @@ async fn run_benchmark(
             }
         }
     }
+    stats.memory.push(meter.finish(benchmark));
 
     stats
+}
+
+fn load_only() -> bool {
+    std::env::var("TPC_PERF_LOAD_ONLY").is_ok_and(|v| v == "1")
+}
+
+/// Run a generator on its own thread, handing its statements over a bounded
+/// channel: the loader holds a few statements, never the data set.
+fn stream_statements(
+    generate: impl FnOnce(&mut dyn FnMut(String)) + Send + 'static,
+) -> tokio::sync::mpsc::Receiver<String> {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    std::thread::spawn(move || {
+        // A send fails only once the loader stopped (it panicked); stop too.
+        let mut open = true;
+        generate(&mut |sql| {
+            if open {
+                open = tx.blocking_send(sql).is_ok();
+            }
+        });
+    });
+    rx
 }
 
 async fn connect(server: &TestPgServer) -> Client {
@@ -1878,12 +2068,13 @@ async fn tpc_perf_ledger_inner() {
         std::env::var("TPC_PERF_ALLOW_LARGE_SCALE").ok().as_deref(),
         current_cgroup_memory_limit_mib(),
         host_total_memory_mib(),
+        required_host_headroom_mib(),
     )
     .unwrap_or_else(|message| panic!("TPC performance preflight rejected the run: {message}"));
     let query_filter: Option<Vec<String>> = std::env::var("TPC_PERF_QUERIES")
         .ok()
         .map(|s| s.split(',').map(|q| q.trim().to_string()).collect());
-    let filtered = benchmark_filter.is_some() || query_filter.is_some();
+    let filtered = benchmark_filter.is_some() || query_filter.is_some() || load_only();
     let keep_queries = |queries: Vec<(&'static str, String)>| -> Vec<(&'static str, String)> {
         match &query_filter {
             Some(ids) => queries
@@ -1919,7 +2110,7 @@ async fn tpc_perf_ledger_inner() {
             &server.conn_str(),
             "tpch",
             TPCH_SCHEMA,
-            gen_tpch(scale),
+            stream_statements(move |emit| gen_tpch(scale).into_iter().for_each(emit)),
             keep_queries(tpch_queries()),
             &mut records,
         )
@@ -1927,7 +2118,7 @@ async fn tpc_perf_ledger_inner() {
         load_stats.push(tpch_stats);
         server.shutdown().await;
         #[cfg(not(feature = "duckdb"))]
-        {
+        if !load_only() {
             run_duckdb_baseline(
                 "tpch",
                 TPCH_SCHEMA,
@@ -1950,7 +2141,7 @@ async fn tpc_perf_ledger_inner() {
             &server.conn_str(),
             "tpcds",
             TPCDS_SCHEMA,
-            gen_tpcds(scale),
+            stream_statements(move |emit| gen_tpcds_into(scale, emit)),
             keep_queries(tpcds_queries()),
             &mut records,
         )
@@ -1958,7 +2149,7 @@ async fn tpc_perf_ledger_inner() {
         load_stats.push(tpcds_stats);
         server.shutdown().await;
         #[cfg(not(feature = "duckdb"))]
-        {
+        if !load_only() {
             run_duckdb_baseline(
                 "tpcds",
                 TPCDS_SCHEMA,
@@ -2066,17 +2257,79 @@ async fn tpc_perf_ledger_inner() {
     }
 }
 
+/// The streaming fact emitter yields exactly the statements of the old
+/// collect → stable-sort-by-date → chunk path, and leaves the generator where
+/// one generating pass would.
+#[test]
+fn emit_date_sorted_matches_a_stable_sort_of_the_generated_rows() {
+    let make_row = |rng: &mut Rng, t: u64| {
+        let date_sk = 100 + rng.below(7);
+        let row = format!(
+            "({date_sk}, {t}, {}, '{}')",
+            rng.below(1000),
+            rng.pick(&["a", "b"])
+        );
+        (date_sk, row)
+    };
+    let mut reference_rng = Rng::new(42);
+    let mut rows: Vec<(u64, String)> = (1..=1_000)
+        .map(|t| make_row(&mut reference_rng, t))
+        .collect();
+    rows.sort_by_key(|(sk, _)| *sk);
+    let expected = chunked_inserts(
+        "f",
+        "a, b, c, d",
+        rows.into_iter().map(|(_, row)| row).collect(),
+        INSERT_CHUNK_ROWS,
+    );
+
+    let mut streamed = Vec::new();
+    let mut rng = Rng::new(42);
+    {
+        let mut emit = |sql: String| streamed.push(sql);
+        let mut out = StatementSink(&mut emit);
+        emit_date_sorted(
+            &mut out,
+            &mut rng,
+            "f",
+            "a, b, c, d",
+            1_000,
+            (100, 7),
+            make_row,
+        );
+    }
+    assert_eq!(streamed, expected);
+    assert_eq!(
+        rng.0, reference_rng.0,
+        "the generator continues identically"
+    );
+}
+
 #[test]
 fn perf_preflight_accepts_default_scale_without_cgroup() {
-    let result = validate_perf_run(0.001, Some("tpch"), None, None, Some(128 * 1024))
-        .expect("the default diagnostic scale must remain easy to run");
+    let result = validate_perf_run(
+        0.001,
+        Some("tpch"),
+        None,
+        None,
+        Some(128 * 1024),
+        REQUIRED_HOST_HEADROOM_MIB,
+    )
+    .expect("the default diagnostic scale must remain easy to run");
     assert!(result.estimated_peak_mib < SAFE_ESTIMATED_PEAK_MIB);
 }
 
 #[test]
 fn perf_preflight_rejects_sf1_without_explicit_acknowledgement() {
-    let error = validate_perf_run(1.0, Some("tpch"), None, Some(64 * 1024), Some(128 * 1024))
-        .expect_err("SF1 must fail closed without the exact acknowledgement");
+    let error = validate_perf_run(
+        1.0,
+        Some("tpch"),
+        None,
+        Some(64 * 1024),
+        Some(128 * 1024),
+        REQUIRED_HOST_HEADROOM_MIB,
+    )
+    .expect_err("SF1 must fail closed without the exact acknowledgement");
     assert!(error.contains("TPC_PERF_ALLOW_LARGE_SCALE"));
 }
 
@@ -2088,6 +2341,7 @@ fn perf_preflight_rejects_large_run_in_unbounded_cgroup() {
         Some(LARGE_SCALE_ACK),
         None,
         Some(128 * 1024),
+        REQUIRED_HOST_HEADROOM_MIB,
     )
     .expect_err("an acknowledgement alone must never bypass resource isolation");
     assert!(error.contains("finite cgroup memory.max"));
@@ -2101,6 +2355,7 @@ fn perf_preflight_rejects_limit_that_starves_host() {
         Some(LARGE_SCALE_ACK),
         Some(120 * 1024),
         Some(128 * 1024),
+        REQUIRED_HOST_HEADROOM_MIB,
     )
     .expect_err("the benchmark cgroup must reserve memory for CI and the host");
     assert!(error.contains("host headroom"));
@@ -2114,6 +2369,7 @@ fn perf_preflight_accepts_isolated_large_run_with_headroom() {
         Some(LARGE_SCALE_ACK),
         Some(64 * 1024),
         Some(128 * 1024),
+        REQUIRED_HOST_HEADROOM_MIB,
     )
     .expect("a bounded SF1 run with substantial host headroom is allowed");
     assert!(result.estimated_peak_mib > SAFE_ESTIMATED_PEAK_MIB);
@@ -2122,7 +2378,9 @@ fn perf_preflight_accepts_isolated_large_run_with_headroom() {
 #[test]
 fn perf_preflight_rejects_non_finite_or_non_positive_scale() {
     for scale in [0.0, -0.1, f64::INFINITY, f64::NAN] {
-        assert!(validate_perf_run(scale, None, None, None, None).is_err());
+        assert!(
+            validate_perf_run(scale, None, None, None, None, REQUIRED_HOST_HEADROOM_MIB).is_err()
+        );
     }
 }
 
