@@ -68,11 +68,11 @@
 ----
  P0  Decisions (seams doc, ADR-097, doc fixes)   [############] 100%  merged #2075
  P1  S4 Iceberg single writer + ext. read-back   [############] 100%  merged #2075
- P2  S1/S2/S3 one write path                     [########....]  70%
+ P2  S1/S2/S3 one write path                     [#########...]  75%
      P2.1 segmented WAL + per-segment index      [############] 100%  #2079
-     P2.2 Layer A (spill) in production          [##########..]  85%  #2085…#2122
-     P2.3 WAL truncation                         [##########..]  90%  #2089 #2090 #2095
-     P2.4 streaming MATERIALIZE (SF1, no OOM)    [............]   0%
+     P2.2 Layer A (spill) in production          [###########.]  90%  #2085…#2132
+     P2.3 WAL truncation                         [###########.]  92%  #2089…#2132; merge-base 1/6 #2124
+     P2.4 streaming MATERIALIZE (SF1, no OOM)    [#...........]  10%  slice 1 #2126
  P3  S5/S6/S9 format-independent SQL, ANN op     [#...........]   5%
  P4  Modalities onto the seams                   [............]   0%
  P5  Vector tier economics                       [####........]  30%
@@ -80,7 +80,7 @@
      P5b centroid directory + cluster compaction [#...........]  10%  design #2120
      P5c HNSW as persisted PAX projection        [##..........]  15%  design #2088
  P6  Proof (TPC-DS SF1/10, multimodal bench)     [#...........]  10%
- OVERALL                                         [#####.......] ~45%
+ OVERALL                                         [#####.......] ~47%
 ----
 
 Percentages are effort estimates, not test counts.
@@ -122,12 +122,12 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | Hold metric + escape hatch for permanent-hold rows | Superseded by #2117 | #2117 | The residual column makes every former permanent-hold class round-trip exactly; the only remaining hold is a codec defect (encode→decode mismatch), counted by `proximadb_spill_rows_held_total` (expected 0). An alert on that counter replaces the escape hatch.
 | Spill scan snapshot taken under the segments lock (no lost rows, no resurrected deletes during a racing flush) | Done | #2122 | `a_scan_racing_a_flush_loses_no_row_and_resurrects_no_delete`. Also P3.1 PR 1.
 | Crash-after-truncation recovery gate (spill + rotation + truncator, restart, replay) | Done | #2129 | `tests/wal_truncation_recovery_test.rs`: two partitions (untenanted and tenanted); flushed rows come back from segments, the WAL tail from replay; deletes and updates kept across two truncations and two restarts; an unflushed tombstone holds the floor at its delete (since the LSN-tracked tombstone slice). Prerequisite for default-on.
-| LSN-tracked tombstones: a memory-only tombstone yields a floor instead of refusing | Open PR (lead) | — | `RecordStore::delete_record_at_lsn` (default: `delete_record`); the spill keeps `oid → Option<lsn>` per tombstone, a repeat delete keeps the earliest; `min_unflushed_lsn` = min over resident rows and tombstones, refusing only for an untracked tombstone; tombstones count toward the flush threshold (where the store can persist them), the flush running after the delete's answer. Write path and replay pass the delete's LSN; the legacy-partition cutover delete stays untracked. Gates: `a_tracked_tombstone_is_a_floor_not_a_refusal`, `tombstones_count_toward_the_flush_threshold`, recovery test phase 2.
-| Durable branch merge-base | **Track A** (design §5.2) | — | Until it lands: merge refuses (410) once any WAL history is truncated (correction 2026-10-21, `merge_endpoint_refuses_when_wal_history_was_truncated`).
+| LSN-tracked tombstones: a memory-only tombstone yields a floor instead of refusing | Done | #2132 | `RecordStore::delete_record_at_lsn` (default: `delete_record`); the spill keeps `oid → Option<lsn>` per tombstone, a repeat delete keeps the earliest; `min_unflushed_lsn` = min over resident rows and tombstones, refusing only for an untracked tombstone; tombstones count toward the flush threshold (where the store can persist them), the flush running after the delete's answer. Write path and replay pass the delete's LSN; the legacy-partition cutover delete stays untracked. Gates: `a_tracked_tombstone_is_a_floor_not_a_refusal`, `tombstones_count_toward_the_flush_threshold`, recovery test phase 2.
+| Durable branch merge-base | **Track A** (design §5.2); slice 1/6 Done | #2124 | Slice 1: per-segment branch summary, tenant-keyed truncation marks, `collections_below`, branch fence (re-checked under the append lock; refusal reported as `Refused`). Slice 2 (#2125) held on review: merge base wrong once branch entries below the image are truncated. Until the merge-base lands: merge refuses (410) once any WAL history is truncated (correction 2026-10-21, `merge_endpoint_refuses_when_wal_history_was_truncated`).
 | Catalog prefix registration (object-store placement of spill segments) | Open | — | TD-SEAM-3.
 | MATERIALIZE LSN capture via the per-collection high-water | Done in #2095 | #2095 | Superseded by `capture_snapshot_lsn` with a WAL pin.
-| P2.4 streaming / incremental MATERIALIZE publisher | Open | — | Gate: TPC-DS SF1 on a release build loads with no OOM and peak RSS recorded. TD-USUB-10, TD-OLAPFMT-3.
-| Turn rotation and truncation on by default | Open | — | After a soak, with the spill gate on. Also add the first `serde(default)` field on `CanonicalWalEntry`.
+| P2.4 streaming / incremental MATERIALIZE publisher | **Track B**; slice 1 Done | #2126 | Slice 1: Parquet readers (DuckDB, DataFusion, native-over-Parquet) read only the snapshot manifest's files and fail closed on any manifest error (no directory listing beside a metadata log). Gate: TPC-DS SF1 on a release build loads with no OOM and peak RSS recorded. TD-USUB-10, TD-OLAPFMT-3.
+| Turn rotation and truncation on by default | **Next** (lead) | — | Soak: `seeded_crash_truncate_interleavings_match_a_reference_model` (8 seeds × 300 random upserts/deletes/flushes/truncations/crash-restarts vs a reference model; the record tier must never refuse). Then flip the defaults, with the spill gate on. Also add the first `serde(default)` field on `CanonicalWalEntry`.
 |===
 
 === P3–P6
@@ -141,7 +141,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | P3.4 SBBF probe for join runtime filters; P3.5 facade passes `vector_ops`/`graph_ops` | Open | — |
 | P4 observability / graph / documents / TE-4 delete onto the seams | Open | — | Gates in the plan §6 P4.
 | P5a SST default for unspecified vector collections; PAX exact-gate footer facts | Done | #2078 | TD-ENGSEL-1, TD-PAXMETA-1.
-| P5b collection-global centroid directory + cluster-contiguous compaction | **Track D**; design merged #2120 (TD-PAXDIR-1) | #2120 | SIFT1M on MinIO with injected latency: ≤ 3 waves, ≤ 20 GET/q, recall ≥ 0.98.
+| P5b collection-global centroid directory + cluster-contiguous compaction | **Track D**; D1 Done (write gate default OFF) | #2120 #2127 | SIFT1M on MinIO with injected latency: ≤ 3 waves, ≤ 20 GET/q, recall ≥ 0.98. **Open before D2 or enabling the write gate** (review of #2127, merged unaddressed): (1) `retain_into_builder` inherits `dim = 0` from a directory that covered nothing, after which every trained segment is rejected — coverage silently off for good; inherit `dim` only from a base with a model. (2) `rank_cells` sorts with `total_cmp` and nothing rejects non-finite model/centroid values — a negative NaN sorts first and can evict the true nearest cells from nprobe; reject non-finite values at parse/build. (3) `parse` ignores the flags/reserved bytes and the format drops the design's `metric` byte — reject unknown flags; restore `metric` so D2 can check the score suits the collection.
 | P5c HNSW (AXIS) as a persisted, stamped, rebuildable projection of PAX | Design done | #2088 | TD-SEAM-13. Prerequisite: TD-PAXPREC-1 (fp16 exact tier).
 | P6 TPC-DS SF1/SF10 cross-engine; multimodal benchmark (TE-1/TE-3/TE-6) | Open | — | No pricing claims before the P5b gates pass.
 |===
@@ -151,7 +151,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 [cols="2,1,3",options="header"]
 |===
 | Branch | PR | State and next action
-| `lead/tombstone-lsn` | (lead) | LSN-tracked spill tombstones; then the default-on soak plan.
+| `lead/wal-soak` | (lead) | Seeded crash/truncate soak + tracker refresh; then the default flips.
 |===
 
 === 4.1 Parallel tracks (since 2026-10-22)
@@ -163,11 +163,11 @@ tracks report through a "Tracker update" paragraph in each PR body.
 [cols="1,3,2",options="header"]
 |===
 | Track | Scope | First PRs
-| Lead | Coordination, this tracker, P2.2 recovery gate and default-on | #2119, #2122 merged
-| A | Durable branch merge-base, §5.2 (6 commits) | —
-| B | P2.4 streaming MATERIALIZE, §5.3 PRs 1–7 incl. the SF1 no-OOM gate; owns `p24-readers-fail-closed` | —
-| C | P3.1 LayerATableProvider, §5.4 PRs 0 and 2–5; owns `fix/native-window-fn-declines` | —
-| D | P5b PAX centroid directory + cluster-contiguous compaction: design, then 2 slices | #2120 (design, TD-PAXDIR-1)
+| Lead | Coordination, this tracker, P2.2 recovery gate and default-on; independent adversarial review of every track PR (posted as a PR comment) before merge | #2119, #2122, #2129, #2132 merged
+| A | Durable branch merge-base, §5.2 (6 commits) | #2124 merged; #2125 in review
+| B | P2.4 streaming MATERIALIZE, §5.3 PRs 1–7 incl. the SF1 no-OOM gate | #2126 merged
+| C | P3.1 LayerATableProvider, §5.4 PRs 0 and 2–5 | #2128, #2133 in review
+| D | P5b PAX centroid directory + cluster-contiguous compaction: design, then 2 slices | #2120 (design, TD-PAXDIR-1); #2127 merged (D1) with review should-fixes open — see the P5b row
 |===
 
 == 5. Next-work queue (in order)
