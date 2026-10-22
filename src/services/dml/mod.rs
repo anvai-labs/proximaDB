@@ -2420,6 +2420,30 @@ impl DmlService {
     /// materializer's record shape). Shared by `MATERIALIZE` (cold base) and the
     /// ADR-025 OLAP read-merge (live appends) so both encode identically through
     /// `proxima_records_to_record_batch`.
+    /// ADR-097 P3.1: `record` as the relational row native SQL serves — every
+    /// catalog column materialized in `props` (the shape
+    /// `proxima_records_to_record_batch` expects), built exactly as
+    /// [`NativeTableSource::full_table_records`] builds it, so the streaming
+    /// Layer A provider and the materialized path cannot disagree on a value.
+    ///
+    /// `None` when the row cannot be projected (an unparsable primary-key oid),
+    /// which `scan_table_relational`'s predicate likewise treats as no match.
+    /// `col_names` is `schema`'s column names, in order.
+    ///
+    /// [`NativeTableSource::full_table_records`]: crate::query::execution::native_table_provider::NativeTableSource::full_table_records
+    pub(crate) fn relational_record_for(
+        record: &ProximaRecord,
+        schema: &CatalogTableSchema,
+        col_names: &[String],
+    ) -> Option<ProximaRecord> {
+        let row = Self::project_one_record(record, schema, &schema.columns).ok()?;
+        Some(Self::value_row_to_relational_record(
+            &record.oid,
+            col_names,
+            row,
+        ))
+    }
+
     pub(crate) fn value_row_to_relational_record(
         oid: &str,
         col_names: &[String],

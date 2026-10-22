@@ -12,6 +12,8 @@ pub mod duckdb_engine;
 pub mod engine;
 
 pub mod executor;
+#[cfg(feature = "datafusion-integration")]
+pub mod layer_a;
 pub mod low_latency_executor;
 pub mod morsel_scheduler;
 pub mod native_engine;
