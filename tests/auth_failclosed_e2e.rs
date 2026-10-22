@@ -22,13 +22,9 @@ use std::time::Duration;
 use proximadb::core::Config;
 use proximadb::database::ProximaDB;
 use proximadb::security::auth_service::{
-    ApiKeyInfo, AuthenticationConfig, AuthenticationMethod, JwtConfig, MtlsConfig, SSOConfig,
+    ApiKeyInfo, AuthenticationConfig, AuthenticationMethod, JwtConfig, SSOConfig,
 };
-use proximadb::security::rbac_service::RBACConfig;
-use proximadb::security::security_coordinator::{
-    ComplianceConfig, PgwireSecurityConfig, SecurityConfig, SecurityMode, TlsConfig,
-};
-use proximadb_security::AuditConfig;
+use proximadb::security::security_coordinator::SecurityConfig;
 use tempfile::TempDir;
 use tokio::time::sleep;
 
@@ -105,59 +101,29 @@ impl AuthTestServer {
             );
             let authentication = AuthenticationConfig {
                 // THE posture-B crux: the authentication FLAG is off — before
-                // TD-AUTH-FC this made every surface fail open.
+                // TD-AUTH-FC this made every surface fail open. (Kept explicit
+                // even though it equals the Default — the crux must stay
+                // visible in a fail-closed test.)
                 enabled: false,
                 methods: vec![AuthenticationMethod::ApiKey],
-                require_authentication: false,
                 default_session_timeout_minutes: 30,
                 api_keys,
                 jwt: JwtConfig {
-                    enabled: false,
-                    secret: String::new(),
                     access_token_expiration_minutes: 15,
                     refresh_token_expiration_days: 7,
-                    issuer: String::new(),
-                    audience: String::new(),
                     algorithm: "HS256".to_string(),
+                    ..Default::default()
                 },
                 sso: SSOConfig {
-                    enabled: false,
-                    providers: Vec::new(),
                     token_cache_ttl_minutes: 5,
+                    ..Default::default()
                 },
-                mtls: MtlsConfig {
-                    enabled: false,
-                    ca_cert_path: None,
-                    require_client_cert: false,
-                    cn_role_mapping: std::collections::HashMap::new(),
-                },
-                audit_fail_closed: false,
-                oidc: None,
-                scram_users: std::collections::HashMap::new(),
+                ..Default::default()
             };
             config.security = Some(SecurityConfig {
                 enabled: true,
-                mode: SecurityMode::Development,
                 authentication,
-                rbac: RBACConfig::default(),
-                audit: AuditConfig::default(),
-                tls: TlsConfig {
-                    enabled: false,
-                    require_client_certificates: false,
-                    cert_file: None,
-                    key_file: None,
-                    ca_file: None,
-                },
-                compliance: ComplianceConfig {
-                    frameworks: Vec::new(),
-                    data_residency: None,
-                    encryption_at_rest: false,
-                    encryption_in_transit: false,
-                },
-                encryption: Default::default(),
-                key_store: Default::default(),
-                tenant: Default::default(),
-                pgwire: PgwireSecurityConfig { auth: None },
+                ..Default::default()
             });
         }
 

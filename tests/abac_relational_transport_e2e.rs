@@ -41,14 +41,11 @@ use proximadb::proto::proximadb_v2::proxima_record_service_client::ProximaRecord
 use proximadb::proto::proximadb_v2::{
     GetRecordRequest, TypedSearchRequest, V2QueryRequest, V2QueryResponse,
 };
-use proximadb::security::SecurityMode;
+use proximadb::security::SecurityConfig;
 use proximadb::security::auth_service::ScramUserConfig;
 use proximadb::security::auth_service::{
-    ApiKeyInfo, AuthenticationConfig, AuthenticationMethod, JwtConfig, MtlsConfig, SSOConfig,
+    ApiKeyInfo, AuthenticationConfig, AuthenticationMethod, JwtConfig, SSOConfig,
 };
-use proximadb::security::rbac_service::RBACConfig;
-use proximadb::security::security_coordinator::{ComplianceConfig, TlsConfig};
-use proximadb::security::{AuditConfig, EncryptionConfig, KeyStoreConfig, SecurityConfig};
 use reqwest::{Client as HttpClient, StatusCode};
 use serde_json::{Value, json};
 use tokio::time::sleep;
@@ -88,7 +85,6 @@ fn transport_security_config() -> SecurityConfig {
     }
     SecurityConfig {
         enabled: true,
-        mode: SecurityMode::Development,
         authentication: AuthenticationConfig {
             enabled: true,
             methods: vec![AuthenticationMethod::ApiKey],
@@ -114,42 +110,21 @@ fn transport_security_config() -> SecurityConfig {
                 })
                 .collect(),
             jwt: JwtConfig {
-                enabled: false,
                 secret: "test-secret".to_string(),
                 access_token_expiration_minutes: 15,
                 refresh_token_expiration_days: 7,
                 issuer: "test".to_string(),
                 audience: "test".to_string(),
                 algorithm: "HS256".to_string(),
+                ..Default::default()
             },
             sso: SSOConfig {
-                enabled: false,
-                providers: vec![],
                 token_cache_ttl_minutes: 5,
+                ..Default::default()
             },
-            mtls: MtlsConfig::default(),
-            oidc: None,
-            audit_fail_closed: false,
+            ..Default::default()
         },
-        rbac: RBACConfig::default(),
-        audit: AuditConfig::default(),
-        tls: TlsConfig {
-            enabled: false,
-            require_client_certificates: false,
-            cert_file: None,
-            key_file: None,
-            ca_file: None,
-        },
-        compliance: ComplianceConfig {
-            frameworks: vec![],
-            data_residency: None,
-            encryption_at_rest: false,
-            encryption_in_transit: false,
-        },
-        encryption: EncryptionConfig::default(),
-        key_store: KeyStoreConfig::default(),
-        tenant: Default::default(),
-        pgwire: proximadb::security::security_coordinator::PgwireSecurityConfig::default(),
+        ..Default::default()
     }
 }
 

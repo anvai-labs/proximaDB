@@ -23,7 +23,12 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Security coordinator configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` is the least-privileged posture: security disabled, Development
+/// mode, empty authentication. Enabling any of it is an explicit act — the
+/// derive exists so callers (tests, config seeds) can spread over the defaults
+/// instead of enumerating every field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecurityConfig {
     pub enabled: bool,
     pub mode: SecurityMode,
@@ -96,7 +101,9 @@ pub enum SecurityMode {
 }
 
 /// TLS configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` = TLS fully off (no cert/key/CA paths).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsConfig {
     pub enabled: bool,
     pub require_client_certificates: bool,
@@ -106,7 +113,10 @@ pub struct TlsConfig {
 }
 
 /// Compliance configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` = no frameworks claimed, no residency constraint, no mandated
+/// encryption.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ComplianceConfig {
     pub frameworks: Vec<String>,
     pub data_residency: Option<String>,
@@ -660,58 +670,32 @@ fn create_authorization_failure_event(
 mod tests {
     use super::*;
     use crate::security::AuthenticationMethod;
-    use crate::security::auth_service::{JwtConfig, MtlsConfig, SSOConfig};
-    use std::collections::HashMap;
+    use crate::security::auth_service::{JwtConfig, SSOConfig};
     use tracing::{debug, info, warn};
 
     fn create_test_config() -> SecurityConfig {
         SecurityConfig {
             enabled: true,
-            mode: SecurityMode::Development,
             authentication: AuthenticationConfig {
                 enabled: true,
                 methods: vec![AuthenticationMethod::ApiKey],
-                require_authentication: false,
                 default_session_timeout_minutes: 480,
-                api_keys: HashMap::new(),
-                scram_users: HashMap::new(),
                 jwt: JwtConfig {
-                    enabled: false,
                     secret: "test-secret".to_string(),
                     access_token_expiration_minutes: 15,
                     refresh_token_expiration_days: 7,
                     issuer: "test".to_string(),
                     audience: "test".to_string(),
                     algorithm: "HS256".to_string(),
+                    ..Default::default()
                 },
                 sso: SSOConfig {
-                    enabled: false,
-                    providers: vec![],
                     token_cache_ttl_minutes: 5,
+                    ..Default::default()
                 },
-                mtls: MtlsConfig::default(),
-                oidc: None,
-                audit_fail_closed: false,
+                ..Default::default()
             },
-            rbac: RBACConfig::default(),
-            audit: AuditConfig::default(),
-            tls: TlsConfig {
-                enabled: false,
-                require_client_certificates: false,
-                cert_file: None,
-                key_file: None,
-                ca_file: None,
-            },
-            compliance: ComplianceConfig {
-                frameworks: vec![],
-                data_residency: None,
-                encryption_at_rest: false,
-                encryption_in_transit: false,
-            },
-            encryption: EncryptionConfig::default(),
-            key_store: KeyStoreConfig::default(),
-            tenant: Default::default(),
-            pgwire: PgwireSecurityConfig::default(),
+            ..Default::default()
         }
     }
 
