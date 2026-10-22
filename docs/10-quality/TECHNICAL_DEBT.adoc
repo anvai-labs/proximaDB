@@ -273,7 +273,7 @@ Filed 2026-10-18 as one row each; the design doc holds the detail, gates and fil
 | `subject` system column; Iceberg v2 position deletes; deletion vectors on the PAX cascade. Gate: one delete removes the subject from every modality and from the next published snapshot (TE-4). Seams doc §6 P4.
 
 | TD-SEAM-10 | PAX collection-global centroid directory + cluster-contiguous compaction (S7, P5b) | MED | Open | D1,D3 | COST
-| `centroids.pax` per collection snapshot as an S7 projection; compaction co-locates each cluster's RaBitQ (A) + SQ8 (B) bytes so nprobe costs one parallel wave. Retires the AXIS IVF disk path (ADR-097 D2). Gate: SIFT1M on MinIO with injected latency ≤ 3 waves, ≤ 20 GET/q, recall ≥ 0.98; BIGANN 10M re-measured. Seams doc §5, §6 P5.
+| `centroids.pax` per collection snapshot as an S7 projection; compaction co-locates each cluster's RaBitQ (A) + SQ8 (B) bytes so nprobe costs one parallel wave. Retires the AXIS IVF disk path (ADR-097 D2). Gate: SIFT1M on MinIO with injected latency ≤ 3 waves, ≤ 20 GET/q, recall ≥ 0.98; BIGANN 10M re-measured. Seams doc §5, §6 P5. Design and slices D1–D8: link:../12-design/P5B_PAX_CENTROID_DIRECTORY_DESIGN.adoc[P5B_PAX_CENTROID_DIRECTORY_DESIGN]; implementation tracked in TD-PAXDIR-1.
 
 | TD-SEAM-11 | P5a vector quick fixes: engine default, `.pax` vector count, L2 cache default (S8, P5a) | HIGH | In Progress | D4,D3 | PERF
 | *Landed (#2078):* engine default → SST/PAX, not HELIX (TD-ENGSEL-1); `.pax` segments counted from their footers (`row_count`, `has_f32_tier`), so Adaptive picks exact only when every segment holds exact vectors. *Open:* local-disk L2 cache on by default when a scratch volume is configured (ADR-085). Seams doc §5, §6 P5.

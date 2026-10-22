@@ -332,6 +332,7 @@ bench report, for orientation only. They are not a positioning or pricing claim;
 === Closing the depth gap
 
 Target: cold ≤ 3 sequential waves and ≤ 20 GET/query at 1M; warm 0–1 wave.
+The design, gates and PR slices are in link:P5B_PAX_CENTROID_DIRECTORY_DESIGN.adoc[P5B_PAX_CENTROID_DIRECTORY_DESIGN] (TD-PAXDIR-1).
 
 . **Collection-global centroid directory (wave 0, cached).** Compaction emits a small
   `centroids.pax` per collection snapshot, published as an S7 projection. Queries pick nprobe
@@ -515,6 +516,7 @@ every selectivity band; the TE-1 query runs over pgwire with `EXPLAIN` showing p
 * **P5b:**
 ** Collection-global centroid directory as an S7 projection.
 ** Cluster-contiguous compaction with A+B co-located.
+** Design and slices: link:P5B_PAX_CENTROID_DIRECTORY_DESIGN.adoc[P5B_PAX_CENTROID_DIRECTORY_DESIGN].
 ** *Gate:* SIFT1M on MinIO with injected latency reaches ≤ 3 sequential waves, ≤ 20 GET/query,
    recall ≥ 0.98; BIGANN 10M is re-measured.
 * **P5c:** HNSW as a persisted hot projection (TD-112) built from PAX, on the AXIS engine — lifecycle in TD-SEAM-13 (stamped projection, delta on boot, ground-up rebuild as repair, exact-tier prerequisite TD-PAXPREC-1); AXIS IVF disk path

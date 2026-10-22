@@ -1,0 +1,354 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= P5b: PAX collection-global centroid directory and cluster-contiguous compaction
+:toc: left
+:toclevels: 2
+:icons: font
+
+[cols="1,3"]
+|===
+| Status | **Proposed (design, 2026-10-22); implementation tracked in link:../10-quality/td/TD-PAXDIR-1-collection-global-centroid-directory.adoc[TD-PAXDIR-1].** No code ships with this document.
+| Date | 2026-10-22
+| Parent | link:LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] Part C "Closing the depth gap" and §6 P5b; TD-SEAM-10 (legacy row in link:../10-quality/TECHNICAL_DEBT.adoc[TECHNICAL_DEBT]).
+| Evidence base | Code survey of `develop` @ `d628f3cd`. File:line citations drift; re-verify before implementing.
+| Relates to | link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097] D2 (PAX is the vector authority; the AXIS IVF disk path retires in favour of this directory), link:adr/ADR-026-pax-canonical-vector-path.adoc[ADR-026] (RaBitQ → SQ8 → rows cascade, range coalescing), link:adr/ADR-094-unified-storage-substrate-and-compute-seam.adoc[ADR-094] D4 (promote rebuildable serving metadata to collapse the cold GET chain), TD-RDSTRAT-8 (per-segment Region A0), TD-FPRUNE-1 (partitioned layout), TD-PAXMETA-1 (collection-level segment facts), TD-SEAM-13 (HNSW projection; same stamp discipline), TD-PAXPREC-1
+|===
+
+== 1. Problem
+
+The PAX cascade has the right shape (coarse cells → RaBitQ → SQ8 rerank → rows), but its
+coarse level is **per segment**. A cold query today, per segment and with segments run in
+parallel (`src/storage/engines/sst/search/mod.rs` `fallback_to_direct_search_arc`):
+
+[cols="1,4",options="header"]
+|===
+| Wave | Read
+| 1 | Header prefix (`PROXIMADB_PAX_PREFIX_PREFETCH_BYTES`, default 1 MiB; usually also covers A0 and the Region-A header).
+| 2 | Region-A cells of this segment's `nprobe` nearest A0 cells, plus the footer (`coarse_probe_survivors`, `segment_format.rs`).
+| 3 | Region-B survivor ranges (SQ8 rerank).
+| 4 | Region-D OID chunks for the per-segment top-k.
+| 5 | Rehydrate blocks (`read_records_by_positions`).
+|===
+
+Plus the discovery LIST before wave 1, and the stage-F pass for filtered queries. Three
+structural costs follow:
+
+. **GETs scale with segments, not with the answer.** Every segment pays its own header,
+  cell, rerank and row waves; `nprobe` is chosen per segment (`geometric_nprobe`,
+  `ceil(sqrt(k_c) × 2)`), so `S` segments probe `S × nprobe` cells.
+. **Depth is 5 sequential waves**, not 3, because A and B are separate regions (B can only
+  be addressed after A ranks survivors) and the per-segment header must precede any cell read.
+. **Every compaction retrains** PCA + k-means for its output (`cluster_plan_ivf_probe`,
+  `block_cluster.rs`). There is no shared cell space, so nothing can be ranked across
+  segments in one place.
+
+Recorded reference figures: 20–80 GET/query cold, 3–9 s at 100 ms RTT (seams doc §5).
+Target (seams doc §6 P5b): **cold ≤ 3 sequential waves, ≤ 20 GET/query at 1M, recall ≥ 0.98;
+warm 0–1 wave.**
+
+== 2. What already exists and is reused
+
+[cols="2,3",options="header"]
+|===
+| Piece | Where
+| Per-segment IVF directory (Region A0: PCA model, centroids, radii, per-cell **absolute** A/B/C byte extents, D block range); rows already cell-contiguous; blocks never straddle a cell | `crates/storage/proximadb-storage-common/src/coarse_directory.rs`, `PaxSegmentWriter::with_two_level` (`pax_block.rs`)
+| Shared f32 projection kernel used by writer and reader | `coarse_directory::project_with_model`
+| Training: IOP-derived `k`, strided sample, `IncrementalPCA`, seeded k-means, Hilbert cell order; classifier split from training | `block_cluster.rs`: `ivf_training_shape`, `IvfPcaProjection`, `finish_ivf_probe_classifier`, `IvfProbeClassifier::{classify, classify_coords, finish_model}`
+| Range coalescer and parallel range reads | `plan_probe_cell_ranges`, `plan_coalesced_row_ranges`, `IopsBudget`, `FileSystem::read_ranges_prefetch` (`PROXIMADB_READ_RANGES_INFLIGHT`)
+| Segment invariants cache (header, A0, Region-A header, footer) | `SegmentInvariantsCache` (`segment_format.rs`)
+| GET meters | `record_get_physical` / `CacheTier`, `proximadb_object_store_gets_total`, `CountingFileSystem` (`PROXIMADB_COUNT_FS_IO`)
+| SIFT1M harness with object-cold phase and GET gate | `scripts/bench/sift1m_get_reduction.py` (`--object-cold-max-gets`, `--min-recall`, `--s3-endpoint`), `scripts/bench/nprobe_sweep.py`
+| Create-only publish primitive | `ConditionalKeyStore::put_if_absent` (`proximadb-storage-ports`)
+|===
+
+There is **no** collection manifest: the live segment set is the directory LIST minus the
+TD-COMPACT-13 pending-retirement set (`discover_sstable_files`). The design must work with
+that and must not depend on TD-PAXMETA-1 landing first.
+
+== 3. Design
+
+=== 3.1 (a) The collection centroid directory
+
+==== Object and placement
+
+One immutable object per directory generation, in the collection's data directory beside the
+segments:
+
+----
+<collection data dir>/centroids-<generation:016x>.pxcd
+----
+
+The seams doc names it `centroids.pax`. The extension is deliberately **not** `.pax`:
+discovery treats every `*.pax` in the directory as a segment. Placing it in the same
+directory means the LIST that discovery already issues returns it, so locating the directory
+costs **no extra round trip**.
+
+The directory is an **S7 projection** (ADR-097): derived only from segment bytes, rebuildable
+from them at any time, never authoritative, and validated against the live segment set
+through its stamp. Losing or corrupting it degrades a query to today's per-segment path; it
+can never change a result set's correctness, only its cost.
+
+==== Contents
+
+[source]
+----
+[magic "PXCD"][version u8][flags u8][reserved u16]
+[generation u64][built_at_unix_ms u64]
+[dim u32][metric u8][pad 3]
+[models:   n_models × { model_id u64, n_comp u16, pca_mean dim×f32,
+                         pca_components n_comp×dim×f32 }]
+[segments: n_segments × { name (len-prefixed UTF-8), size_bytes u64, row_count u64,
+                          model_idx u32, decode_key (§3.4, slice D6) }]
+[cells:    n_cells × { model_idx u32, segment_idx u32, centroid n_comp×f32, radius f32,
+                       row_begin u64, row_end u64, a_off u64, a_len u64,
+                       b_off u64, b_len u64, d_block_begin u32, d_block_end u32 }]
+[checksum u64]   (FNV-1a over all preceding bytes, as A0)
+----
+
+* **Models are a table, not a single model.** Today every segment carries its own PCA model
+  (one model per segment). After slice D3 (shared model) every compacted segment references
+  the same model, and the table holds one entry plus whatever L0/legacy segments remain. One
+  format covers the migration and the steady state.
+* `model_id` is the FNV-1a of the model's serialized PCA bytes, so two segments written with
+  the same model are recognised as sharing a cell space.
+* Cell entries copy A0's `CoarseCellEntry` extents verbatim. The directory never derives
+  offsets; the writer of the segment owns its layout (the A0 rule).
+* The **stamp** is the `segments` table: the exact set of segment names (and sizes) whose cells
+  the directory covers.
+
+Size: SIFT1M at the settled geometry (`k_c = 30` per segment, `dim = 128`, `n_comp ≈ 16`)
+costs ≈ 8.7 KiB per model and ≈ 140 B per cell, so four segments come to ≈ 52 KiB. At the A0
+worst corner (`k_c = 4096`, `dim = 3072`), each segment is bounded by the A0 budget test
+(`a0_size_budget_tests`), times the segment count. With the shared model (D3) the model term
+is paid once.
+
+==== Build and publish (at compaction)
+
+. **Incremental build** at the end of a successful compaction, after the inputs are retired
+  (`retire_inputs_with_retry`): start from the newest valid directory, drop entries for the
+  retired inputs, add the output segment's A0 (the writer holds it in memory; no read-back).
+. **Full rebuild** when no valid directory exists or the incremental base fails validation:
+  list the live set and read each segment's A0 from its header prefix (one ranged GET per
+  segment, off the query path). Segments without A0 are simply not covered.
+. **Publish** `centroids-<g+1>.pxcd` **create-only** (`put_if_absent`; `O_EXCL` on local
+  disk). If the key exists, another compaction published first: reload the newest directory
+  and retry the incremental step (bounded retries, then skip; the next compaction repairs).
+. **GC:** keep the newest two generations; delete older ones best-effort. A reader holding an
+  older generation still answers correctly (stamp rule below).
+
+Write gate: `PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY` (default **OFF** until the P5b gate passes).
+
+==== Query use (global cell selection)
+
+. Discovery returns the live segment set `L` and the newest directory key from the same LIST.
+  The directory is fetched once per generation and cached (wave 0; warm it is free).
+. **Coverage.** Covered segments are `C = L ∩ stamp`. Segments in `L \ C` (new flushes, A0-less
+  or legacy segments) run today's per-segment cascade unchanged. Directory entries for segments
+  not in `L` (retired since publish) are ignored; their rows live in a newer segment that is
+  either covered by a newer generation or in `L \ C`. Correctness never depends on the
+  directory being current.
+. **Global ranking across cell spaces.** Project the query once per model. For a cell `c` of
+  model `m` with PCA mean `μ_m` and orthonormal components `P_m`, rank by the squared distance
+  from the query to the centroid's reconstruction `μ_m + P_mᵀ c` in the **original** space:
++
+----
+score(q, c) = ‖P_m(q − μ_m) − c‖²  +  (‖q − μ_m‖² − ‖P_m(q − μ_m)‖²)
+              └ today's in-segment PCA distance ┘  └ per-model residual, one value per model ┘
+----
++
+Within one model the residual is a constant, so the order equals today's A0 order exactly.
+Across models the scores are commensurable, so one sorted list serves all segments. With one
+shared model (D3) the residual term vanishes from the comparison.
+. **Selection.** Walk cells in score order; take a cell if non-empty (and, under a filter, if
+  its row range intersects the allow-set, as `coarse_probe_survivors` does today). Stop when
+  at least `nprobe_global` cells **and** at least the survivor-pool rows
+  (`pax_rabitq_pool_for_top_k(k, rows_covered)`) are selected.
+  `nprobe_global = ceil(sqrt(total_cells) × multiplier)` reuses `geometric_nprobe` and the
+  `[storage.sst_config.coarse_probe]` settings; `PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE`
+  overrides it for sweeps.
+. Each covered segment receives its **preselected cell list**; a covered segment with no
+  selected cell is **skipped with zero reads**. The per-segment cascade then runs from the
+  Region-A wave with that list instead of ranking its own A0.
+
+Read gate: `PROXIMADB_PAX_READ_CENTROID_DIRECTORY` (default **OFF**). Fail-safe: a missing,
+corrupt, or dimension-mismatched directory means "no coverage" and the query runs exactly as
+today.
+
+=== 3.2 (b) Cluster-contiguous compaction
+
+The directory alone removes per-segment ranking and skips segments, but with `S` segments that
+all span every cell a probed cell still costs up to `S` ranged reads. Two compaction changes
+make a cell cost one read:
+
+. **Shared collection model (D3).** Compaction classifies its output with the directory's
+  model (`IvfProbeClassifier` built from the persisted PCA and centroids) instead of training a
+  new one, provided `dim` matches and the model is not stale. The classifier/training split
+  already exists (`finish_ivf_probe_classifier` vs `classify_coords`), so this is a new
+  constructor, not a new algorithm. Retraining is triggered when either:
+  ** rows covered by the model exceed `4 ×` the rows it was trained over, or
+  ** the mean assignment distance of the output exceeds `1.5 ×` the training-time mean
+     (cells drifted).
++
+A retrain produces a new model; segments keep their own model id until rewritten, which the
+model table already handles. `k` for the collection model is sized on the **collection's**
+covered rows, so each cell's A+B bytes approach the coalescer's target range on the storage
+class: `k_G = clamp(N · (a_row + b_row) / (IopsBudget.target / 2), 16, 4096)`.
+For SIFT1M on S3 (8 MiB target; A+B ≈ 152 B/row once co-located) that is ≈ 36 cells, and
+geometric `nprobe = ceil(sqrt(36) × 2) = 12` probed cells. This matches the settled one-segment
+geometry (30 cells, 11 probed, recall@10 ≥ 0.98) and fits the §3.5 budget. The D7 nprobe sweep
+calibrates the constant, and the directory records the chosen `k_G`.
+. **Cell-range partitioned outputs (D4).** A major compaction writes its outputs partitioned
+  by **contiguous ranges of global cells in Hilbert order**, each output bounded by the existing
+  segment size target. Every cell then lives in exactly one compacted segment (plus the
+  uncompacted L0 tail), so `nprobe` probed cells cost `nprobe` ranged reads, and
+  Hilbert-adjacent probed cells usually fall in the same segment and coalesce into fewer
+  reads. Minor compactions that only fold L0 into the tail keep today's behaviour; the
+  partitioned rewrite runs when the tail exceeds a fraction of the collection (or on explicit
+  `OPTIMIZE`).
+
+The tag-partitioned layout (TD-FPRUNE-1, `cluster_plan_ivf_probe_partitioned`) composes:
+partition-by-tag then cell within, under one shared PCA; the directory treats each
+(partition, cell) as a cell.
+
+=== 3.3 (c) RaBitQ and SQ8 co-located per cell (D5)
+
+Today Region A holds all cells' RaBitQ codes and Region B all cells' SQ8 codes, so a cell's
+SQ8 bytes are a second, dependent wave after RaBitQ ranks survivors. The co-located layout
+interleaves per cell:
+
+----
+[prefix][A0][ cell_0: A codes | B codes ][ cell_1: A codes | B codes ] ... [D][footer]
+----
+
+* A header-prefix flag selects it; A0 extents stay absolute, so the probe code does not
+  change. The whole-region fallback (used on a probe miss) walks cells instead of assuming one
+  stride; that is the one reader change.
+* A probed cell is then **one** ranged GET for A+B. RaBitQ ranks and SQ8 reranks from the same
+  bytes: the rerank wave disappears.
+* Cost: B is read for every row of a probed cell, not only for survivors. For SIFT
+  (`dim = 128`): A ≈ 24 B/row, B = 128 B/row, so a cell's bytes grow ≈ 6×. On object storage a
+  GET of a few MiB costs about the same latency as a small one, so this is the right trade
+  there; on local disk survivor-only B remains better. The writer emits the co-located layout
+  when the destination's `IopsBudget` profile is an object store (S3, Azure, GCS) and keeps
+  separate regions on local disk. Both layouts are readable everywhere.
+
+=== 3.4 Collapsing the per-segment metadata waves (D6)
+
+The remaining per-segment reads before a cell read are the header prefix, A0 and the
+Region-A header (RaBitQ centroid and seed), and the footer (SQ8 dequant key, block/row-group
+table for row rehydration). Per ADR-094 D4, the directory carries a **decode key** per covered
+segment: the Region-A header bytes, `sq8_min/sq8_scale`, and the footer's block and row-group
+OID-chunk tables. The segment keeps its self-describing copy. A covered segment then needs no
+header, A0 or footer read on the query path.
+
+=== 3.5 The resulting cold query
+
+[cols="1,3,2",options="header"]
+|===
+| Wave | Reads | GETs at 1M (budget)
+| 0 | LIST (already issued by discovery) + directory GET (cached by generation) | 2
+| 1 | All probed cells' co-located A+B extents across covered segments, coalesced, issued in parallel; uncovered L0 tail scanned exactly (WAL-tail rule, seams doc) | ≤ 12
+| 2 | Top-k row rehydration: OID chunks and row-group blocks of the global top-k, coalesced, in parallel | ≤ 6
+|===
+
+**3 waves, ≤ 20 requests.** Warm: wave 0 is cached, and wave 1 hits the L2/survivor caches,
+so 0–1 waves. Reads within a wave must actually run in parallel:
+`PROXIMADB_READ_RANGES_INFLIGHT` defaults to sequential today, and D6 sets a parallel default
+for object-store profiles.
+
+== 4. (d) Measurement harness and gates
+
+=== 4.1 Instruments
+
+* **GETs per query:** delta of `proximadb_object_store_gets_total` across the query phase divided
+  by queries, already reported as `gets_per_query` by `sift1m_get_reduction.py`. LIST and HEAD
+  are counted as requests too. D7 adds a `requests_per_query` column that includes them, and the
+  gate uses that column.
+* **Waves per query (new, D7):** a query-scoped wave counter. Each object read records
+  `(issue_t, done_t)`; waves are the number of maximal groups of overlapping intervals along the
+  query's critical path. It is reported as `proximadb_pax_query_waves` (histogram) and as a
+  harness column. A test-only `LatencyFileSystem` wrapper (fixed injected delay per read; there
+  is no in-process latency wrapper today) makes the count deterministic in CI: with delay `L`
+  and parallel reads inside a wave, `query latency ÷ L` must equal the reported waves.
+* **Injected latency for the gate:** MinIO behind Toxiproxy 2.12.0 adding fixed latency in
+  each direction, the bed already recorded in `BENCHMARK_EVIDENCE.toml` (SIFT1M ladder) and
+  `docs/_internal/status/RDSTRAT12_SIFT1M_HIGHRTT_2026_08_29.adoc`.
+
+=== 4.2 Gates
+
+[cols="2,3",options="header"]
+|===
+| Gate | Exact condition
+| G1 recall (SIFT1M) | recall@10 ≥ **0.98** over the standard 10,000 SIFT1M queries (sampled 1,000 for the latency arms), `top_k = 10`, against the shipped ground truth; directory on, default nprobe.
+| G2 depth (SIFT1M, MinIO + Toxiproxy 50 ms RTT) | object-cold phase (fresh process, empty caches): p50 waves ≤ **3**; warm phase: p50 waves ≤ **1**.
+| G3 requests (same run) | object-cold `requests_per_query` p50 ≤ **20** (LIST + HEAD + GET).
+| G4 no regression | the same harness with the directory **off** stays within its current ledger figures, so the gate is additive and the off path is unchanged.
+| G5 scale (BIGANN 10M) | re-measured and recorded in the ledger: recall@10, waves, requests per query and p50 at the same injected RTT. Recorded, not gated (seams doc §6 P5b).
+| CI proxies (every slice) | synthetic clustered data (§5): recall vs brute force within 0.01 of the directory-off path; requests strictly fewer than the directory-off path on a multi-segment collection; deterministic wave count under `LatencyFileSystem`.
+|===
+
+Run command (gate run, D7):
+
+----
+python3 scripts/bench/sift1m_get_reduction.py --root <root> --binary <aws-release-server> \
+  --rows 1000000 --queries 1000 --top-k 10 --min-recall 0.98 --object-cold-max-gets 20 \
+  --s3-endpoint <toxiproxy-endpoint> --storage-url s3://<bucket>/p5b-<arm> \
+  --read-ranges-inflight 16 --centroid-directory on   # D7 adds --centroid-directory
+----
+
+No performance or pricing claim is made until G1–G3 pass and the result is recorded in the
+evidence ledger (seams doc §6 P6).
+
+== 5. (e) Implementation slices (PR-sized, in order)
+
+Each slice is one PR, behind default-off gates until D8. Every slice adds tests on a small
+synthetic dataset: Gaussian clusters, `dim = 32`, about 20k rows written as 3–4 segments. That
+is enough for `MIN_ROWS_FOR_IVF` and multi-cell A0s and runs in seconds.
+
+[cols="1,4,3",options="header"]
+|===
+| Slice | Change | Tests
+| **D1** directory format + compaction build/publish
+| `centroid_directory.rs` in `proximadb-storage-common`: `PaxCentroidDirectory` (§3.1 layout, minus decode keys), deterministic `to_bytes`/`parse` (fail-closed), `build_from_a0s`, incremental `apply_compaction(retired, added)`, global `rank_cells` with the cross-model score. Compaction publishes `centroids-<gen>.pxcd` create-only after retiring inputs, behind `PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY` (default OFF); GC keeps two generations.
+| Round-trip and byte determinism; corruption, truncation and version are rejected; the cross-model score equals the full-space reconstruction distance, and its order equals A0 order within one model; incremental build equals full rebuild; create-only conflict path; a compaction with the gate on publishes a directory that covers exactly the live set; with the gate off, nothing is written.
+| **D2** query-side global cell selection
+| Discovery returns the newest directory key; a per-generation directory cache; coverage split `L ∩ stamp` / `L \ stamp`; each covered segment gets a preselected cell list (the per-segment cascade accepts an optional cell list in place of its own A0 ranking); segments with no selected cell are skipped. Behind `PROXIMADB_PAX_READ_CENTROID_DIRECTORY` (default OFF) and `…_NPROBE`.
+| Multi-segment synthetic collection: recall@10 vs brute force within 0.01 of directory-off; physical reads (`CountingFileSystem`) strictly fewer; a stale directory (a segment added and another retired after publish) still returns exactly the directory-off result at nprobe = all; a corrupt directory falls back.
+| **D3** shared collection model
+| `IvfProbeClassifier::from_directory_model`; compaction classifies with the collection model, with the retrain triggers in §3.2; `k_G` sized on collection rows.
+| Two compactions share `model_id`; the retrain trigger fires on drift; recall is unchanged vs the per-segment model.
+| **D4** cell-range partitioned major compaction
+| Outputs split on Hilbert-contiguous global cell ranges under the size target; minor compaction unchanged; composes with the TD-FPRUNE-1 partitioned plan.
+| Each global cell appears in at most one compacted segment; reads per probed cell equal 1; recall is unchanged.
+| **D5** co-located A+B per cell
+| Header-prefix layout flag; the writer interleaves per cell on object-store profiles; the reader reranks from the A+B bytes; the whole-region fallback walks cells.
+| Both layouts produce identical top-k on the same data; the rerank wave is gone (`LatencyFileSystem` waves drop by one); mixed-layout collections read correctly.
+| **D6** decode keys in the directory; parallel wave default
+| §3.4 decode keys; covered segments skip header, A0 and footer reads; `PROXIMADB_READ_RANGES_INFLIGHT` defaults to parallel on object-store profiles.
+| Covered-segment cold query = 3 waves under `LatencyFileSystem`; requests are within the §3.5 budget at synthetic scale.
+| **D7** measurement
+| Wave counter and `proximadb_pax_query_waves`; harness `--centroid-directory` and `requests_per_query`; SIFT1M MinIO + Toxiproxy gate run (G1–G4); BIGANN 10M re-measure (G5); ledger entries.
+| The harness self-test; ledger validation (`validate_benchmark_evidence.py`).
+| **D8** defaults and retirement
+| Flip both gates ON after G1–G4 pass; retire the AXIS IVF disk posting-list path (ADR-097 D2).
+| The full vector test lanes with the defaults on.
+|===
+
+== 6. Risks and open questions
+
+* **Cross-model ranking quality.** Before D3, cells from differently trained models are ranked
+  through their reconstructions. The score is exact for the reconstruction, but a
+  reconstruction is a coarser stand-in for a cell than the in-segment PCA distance. The pool
+  floor in §3.1 (select until the survivor pool rows are covered) guards recall; D2's test
+  measures it.
+* **Directory staleness under heavy ingest.** Uncovered L0 segments fall back to the
+  per-segment path. If the tail grows faster than compaction, GETs regress toward today's
+  figures but never below today's correctness. The tail-exact-scan rule and the D4 major
+  compaction trigger bound it.
+* **Concurrent compactions.** Create-only publish serialises generations. A loser retries
+  incrementally; a skipped publish only delays coverage.
+* **Object-store LIST consistency.** S3 and GCS are strongly consistent for LIST after PUT.
+  Readers never require the newest generation, only a valid one.
+* **TD-PAXMETA-1 interaction.** When the collection segment manifest lands, the directory's
+  stamp becomes a manifest snapshot id and publication can ride the same CAS commit. The
+  format reserves `flags` for that; nothing here blocks it.

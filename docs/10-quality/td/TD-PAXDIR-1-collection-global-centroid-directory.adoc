@@ -1,0 +1,50 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PAXDIR-1: PAX collection-global centroid directory and cluster-contiguous compaction (P5b)
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Design: link:../../12-design/P5B_PAX_CENTROID_DIRECTORY_DESIGN.adoc[P5B_PAX_CENTROID_DIRECTORY_DESIGN] (2026-10-22). No slice merged yet.
+| Priority | MED. Vector cost and latency on object storage. It is the precondition for any P6 pricing claim.
+| Component | `crates/storage/proximadb-storage-common/src/coarse_directory.rs` (Region A0), new `centroid_directory.rs`; `src/storage/engines/sst/{block_cluster,segment_format,compaction}.rs`; `src/storage/engines/sst/search/mod.rs`
+| Relates to | TD-SEAM-10 (parent row; this file holds the implementation slices), TD-RDSTRAT-8 (per-segment A0), TD-FPRUNE-1, TD-PAXMETA-1, TD-SEAM-13, ADR-097 D2, ADR-094 D4, ADR-026
+|===
+
+== Problem
+
+The coarse IVF level of the PAX cascade is per segment. A cold query pays every segment's
+header, cell, rerank and row waves: 5 sequential waves and 20–80 GETs at 1M rows. Every
+compaction retrains its own model, so no cell space is shared across segments.
+
+== Plan
+
+Slices D1–D8 are defined in the design document (§5). Slices D1–D2 work on today's segments,
+with one model per segment, ranked across models by reconstruction distance. Slices D3–D6
+converge on one shared model, cell-partitioned outputs, A+B co-located per cell, and decode keys
+in the directory.
+
+[cols="1,3,1",options="header"]
+|===
+| Slice | Scope | State
+| D1 | Directory format; build and publish at compaction (`PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY`, default OFF) | Open
+| D2 | Query-side global cell selection (`PROXIMADB_PAX_READ_CENTROID_DIRECTORY`, default OFF) | Open
+| D3 | Shared collection model; retrain triggers | Open
+| D4 | Cell-range partitioned major compaction | Open
+| D5 | RaBitQ + SQ8 co-located per cell | Open
+| D6 | Decode keys in the directory; parallel wave default on object stores | Open
+| D7 | Wave counter, harness arm, SIFT1M MinIO + Toxiproxy gate, BIGANN 10M re-measure | Open
+| D8 | Default ON; retire the AXIS IVF disk path | Open
+|===
+
+== Acceptance
+
+SIFT1M on MinIO with injected latency (Toxiproxy, 50 ms RTT):
+
+* recall@10 ≥ 0.98;
+* object-cold p50 ≤ 3 sequential waves;
+* object-cold p50 ≤ 20 requests per query (LIST + HEAD + GET);
+* warm p50 ≤ 1 wave.
+
+The directory-off path must not regress. BIGANN 10M is re-measured and recorded in the
+evidence ledger. Exact gate definitions are in the design document, §4.2.
