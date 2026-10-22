@@ -70,6 +70,7 @@ use crate::query::table_write_plan::{
     LogicalTableRef, ReadSource, RoutedExecutionPlan, TableWriteRouteExplanation,
     WriteIntentOverrides, WriteMode,
 };
+use crate::services::layer_a_snapshot::LayerARowAccess;
 use crate::services::operations::VectorOps;
 use crate::services::operations::vectors::RichSearchResult;
 use crate::services::record_store::{
@@ -1079,6 +1080,44 @@ impl crate::query::execution::native_table_provider::NativeTableSource for DmlSe
             .collect();
         Ok(Some((schema, records)))
     }
+
+    async fn layer_a_snapshot(
+        &self,
+        table: &str,
+        tenant: Option<&str>,
+        identity: PortIdentity<'_>,
+    ) -> anyhow::Result<Option<crate::services::layer_a_snapshot::NativeLayerASnapshot>> {
+        use crate::services::layer_a_snapshot::NativeLayerASnapshot;
+        let tenant_ctx = tenant.map(TenantContext::for_tenant_id);
+        let (schema, _table_id, access) = self
+            .relational_read_prelude(table, tenant_ctx.as_ref(), identity)
+            .await?;
+        // Denied: the table is empty for this caller, and no partition is read.
+        let Some(access) = access else {
+            return Ok(Some(NativeLayerASnapshot {
+                schema,
+                snapshot: None,
+                access: LayerARowAccess::Unrestricted,
+            }));
+        };
+        let Some(snapshot) = self
+            .record_store
+            .layer_a_snapshot(
+                &schema,
+                tenant_ctx.as_ref(),
+                #[cfg(feature = "abac-policy")]
+                &ReadContext::system(SystemReadReason::Statistics, "dml [CLIENT-PLACEHOLDER]"),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(NativeLayerASnapshot {
+            schema,
+            snapshot: Some(snapshot),
+            access,
+        }))
+    }
 }
 
 impl DmlService {
@@ -1925,27 +1964,21 @@ impl DmlService {
         Some(enforcer.predicate_for(&subject, tenant, target))
     }
 
-    /// Scan a catalog table for the relational pipeline (PATH B), pushing the
-    /// caller's row predicate + limit into the record-store scan and projecting
-    /// matching records into `output_columns` order (or all columns when `None`).
+    /// The governed-read prelude every relational read of a catalog table runs
+    /// before touching rows: the identity/storage tenant cross-check, table
+    /// resolution, and the ABAC row filter (FA-c Phase 2).
     ///
-    /// The predicate is `Expr`-agnostic: callers pass a closure over a FULL row
-    /// (all columns in `schema.columns` order — matching how the relational
-    /// `Expr` binds its column ordinals), so the relational reader can supply
-    /// `|row| expr.eval(row) == true` without coupling DmlService to the algebra
-    /// crate. `MemtableRecordStorage::scan_records_filtered` iterate-filters and
-    /// early-stops at `limit`, so only matching rows are cloned/materialized.
-    pub async fn scan_table_relational(
+    /// Returns the schema, the resolved table id, and the caller's row access —
+    /// `None` when the subject is denied every row. Shared by
+    /// [`Self::scan_table_relational`] and the Layer A snapshot, so the
+    /// streaming provider cannot drift from the materialized scan on who may
+    /// see what.
+    async fn relational_read_prelude(
         &self,
         table_name: &str,
-        output_columns: Option<&[String]>,
-        full_row_predicate: Option<
-            &(dyn Fn(&[ProximaValue]) -> Result<bool, ExprError> + Send + Sync),
-        >,
-        limit: Option<usize>,
         tenant_context: Option<&TenantContext>,
         identity: PortIdentity<'_>,
-    ) -> Result<(CatalogTableSchema, Vec<Vec<ProximaValue>>)> {
+    ) -> Result<(CatalogTableSchema, String, Option<LayerARowAccess>)> {
         if identity.subject.is_some() {
             let identity_tenant = identity.tenant_id.ok_or_else(|| {
                 anyhow!("governed relational identity is missing its tenant string")
@@ -1972,6 +2005,48 @@ impl DmlService {
         let (table_schema, table_id_name) = self
             .resolve_select_table(table_name, tenant_context.map(|t| t.tenant_id.as_str()))
             .await?;
+        #[cfg(feature = "abac-policy")]
+        let access = match self.abac_row_filter(identity, &table_schema) {
+            None | Some(crate::security::rls::AbacScanResult::Unrestricted) => {
+                Some(LayerARowAccess::Unrestricted)
+            }
+            Some(crate::security::rls::AbacScanResult::Restricted(p)) => {
+                Some(LayerARowAccess::Restricted(p))
+            }
+            Some(crate::security::rls::AbacScanResult::Denied(_)) => None,
+        };
+        #[cfg(not(feature = "abac-policy"))]
+        let access = {
+            let _ = identity;
+            Some(LayerARowAccess::Unrestricted)
+        };
+        Ok((table_schema, table_id_name, access))
+    }
+
+    /// Scan a catalog table for the relational pipeline (PATH B), pushing the
+    /// caller's row predicate + limit into the record-store scan and projecting
+    /// matching records into `output_columns` order (or all columns when `None`).
+    ///
+    /// The predicate is `Expr`-agnostic: callers pass a closure over a FULL row
+    /// (all columns in `schema.columns` order — matching how the relational
+    /// `Expr` binds its column ordinals), so the relational reader can supply
+    /// `|row| expr.eval(row) == true` without coupling DmlService to the algebra
+    /// crate. `MemtableRecordStorage::scan_records_filtered` iterate-filters and
+    /// early-stops at `limit`, so only matching rows are cloned/materialized.
+    pub async fn scan_table_relational(
+        &self,
+        table_name: &str,
+        output_columns: Option<&[String]>,
+        full_row_predicate: Option<
+            &(dyn Fn(&[ProximaValue]) -> Result<bool, ExprError> + Send + Sync),
+        >,
+        limit: Option<usize>,
+        tenant_context: Option<&TenantContext>,
+        identity: PortIdentity<'_>,
+    ) -> Result<(CatalogTableSchema, Vec<Vec<ProximaValue>>)> {
+        let (table_schema, table_id_name, access) = self
+            .relational_read_prelude(table_name, tenant_context, identity)
+            .await?;
         // Full column set — predicates are evaluated against a complete row.
         let all_columns: Vec<String> = table_schema
             .columns
@@ -1985,21 +2060,12 @@ impl DmlService {
             None => full_selected.clone(),
         };
 
-        // FA-c Phase 2: resolve the ABAC row filter EARLY (before the predicate
-        // borrow, so the deny short-circuit can move `table_schema`). A denied
-        // (or fail-closed) subject sees zero rows.
-        #[cfg(feature = "abac-policy")]
-        let abac_pred: Option<Box<dyn Fn(&ProximaRecord) -> bool + Send + Sync>> =
-            match self.abac_row_filter(identity, &table_schema) {
-                None => None,
-                Some(crate::security::rls::AbacScanResult::Denied(_)) => {
-                    return Ok((table_schema, Vec::new()));
-                }
-                Some(crate::security::rls::AbacScanResult::Restricted(p)) => Some(p),
-                Some(crate::security::rls::AbacScanResult::Unrestricted) => None,
-            };
-        #[cfg(not(feature = "abac-policy"))]
-        let _ = identity;
+        // FA-c Phase 2: a denied (or fail-closed) subject sees zero rows.
+        let abac_pred = match access {
+            None => return Ok((table_schema, Vec::new())),
+            Some(LayerARowAccess::Unrestricted) => None,
+            Some(LayerARowAccess::Restricted(p)) => Some(p),
+        };
 
         // Push the predicate INTO the store scan: project each record to a full
         // row and apply the caller's full-row predicate. The scan-predicate API is
@@ -2028,14 +2094,10 @@ impl DmlService {
             }
         };
         // FA-c Phase 2: AND-combine the ABAC row filter with the user predicate.
-        #[cfg(feature = "abac-policy")]
         let combined_pred = move |record: &ProximaRecord| -> bool {
             record_pred(record) && abac_pred.as_ref().is_none_or(|p| p(record))
         };
-        #[cfg(feature = "abac-policy")]
         let predicate: Option<&proximadb_records::RecordScanPredicate<'_>> = Some(&combined_pred);
-        #[cfg(not(feature = "abac-policy"))]
-        let predicate: Option<&proximadb_records::RecordScanPredicate<'_>> = Some(&record_pred);
 
         let records = self
             .record_store

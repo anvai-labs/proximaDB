@@ -815,6 +815,25 @@ pub trait TableRecordStore: Send + Sync {
         ))
     }
 
+    /// A flush-consistent snapshot of the table's partition for the streaming
+    /// Layer A provider (ADR-097 P3.1), or `Ok(None)` when this store cannot
+    /// offer one — the caller then keeps its materialized scan. Taking it
+    /// reads no segment.
+    ///
+    /// Rows are NOT filtered: the reader applies table membership, liveness
+    /// and the caller's row access after resolving newest-wins.
+    async fn layer_a_snapshot(
+        &self,
+        table_schema: &CatalogTableSchema,
+        tenant_context: Option<&TenantContext>,
+        #[cfg(feature = "abac-policy")] read_context: &ReadContext,
+    ) -> Result<Option<crate::services::layer_a_snapshot::LayerASnapshot>> {
+        #[cfg(feature = "abac-policy")]
+        let _ = read_context;
+        let _ = (table_schema, tenant_context);
+        Ok(None)
+    }
+
     /// Scan with a row `predicate` pushed into the store (relational `WHERE`
     /// push-down). Returns up to `request.limit` records matching `predicate`;
     /// the store applies it, so callers must NOT re-filter afterward. This lets
@@ -1411,6 +1430,22 @@ impl TableRecordStore for CatalogRoutingTableRecordStore {
                 tenant_context,
                 #[cfg(feature = "abac-policy")]
                 _read_context,
+            )
+            .await
+    }
+
+    async fn layer_a_snapshot(
+        &self,
+        table_schema: &CatalogTableSchema,
+        tenant_context: Option<&TenantContext>,
+        #[cfg(feature = "abac-policy")] read_context: &ReadContext,
+    ) -> Result<Option<crate::services::layer_a_snapshot::LayerASnapshot>> {
+        self.store_for_schema(table_schema)
+            .layer_a_snapshot(
+                table_schema,
+                tenant_context,
+                #[cfg(feature = "abac-policy")]
+                read_context,
             )
             .await
     }
@@ -2065,6 +2100,10 @@ pub struct DirectWalTableRecordStore {
     /// Set by [`Self::new_spilling`]: the catalog schemas its spill partitions
     /// encode with. `None` for stores whose partitions never encode a segment.
     schema_hints: Option<Arc<SchemaHints>>,
+    /// Set by [`Self::new_spilling`]: the filesystem its spill partitions write
+    /// segments with, which a [`Self::layer_a_snapshot`] reader must read them
+    /// through. `None` for stores whose partitions never write a segment.
+    segment_filesystem: Option<Arc<dyn crate::storage::persistence::filesystem::FileSystem>>,
 }
 
 impl DirectWalTableRecordStore {
@@ -2216,6 +2255,7 @@ impl DirectWalTableRecordStore {
     ) -> Self {
         let hints = Arc::new(SchemaHints::default());
         let factory_hints = hints.clone();
+        let segment_filesystem = filesystem.clone();
         let mut store = Self::with_storage_factory(
             wal_appender,
             Arc::new(move |tenant_id, collection| {
@@ -2265,6 +2305,7 @@ impl DirectWalTableRecordStore {
             }),
         );
         store.schema_hints = Some(hints);
+        store.segment_filesystem = Some(segment_filesystem);
         store
     }
 
@@ -2309,6 +2350,7 @@ impl DirectWalTableRecordStore {
             secondary_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
             poisoned: std::sync::atomic::AtomicBool::new(false),
             schema_hints: None,
+            segment_filesystem: None,
         }
     }
 
@@ -3405,6 +3447,39 @@ impl TableRecordStore for DirectWalTableRecordStore {
             )
             .await?;
         Ok(merge_scan_primary_wins(primary_recs, legacy_recs, limit))
+    }
+
+    /// The primary partition's [`RecordScanView`] and the filesystem its
+    /// segments were written with.
+    ///
+    /// Declines (`Ok(None)`) while the pre-flip legacy partition still holds a
+    /// live row: the materialized scan merges it primary-wins over LIVE rows,
+    /// which is not a layer order a snapshot can express. Also declines when
+    /// there are segments but no filesystem to read them through (a custom
+    /// storage factory) — never a snapshot that silently omits them.
+    async fn layer_a_snapshot(
+        &self,
+        table_schema: &CatalogTableSchema,
+        tenant_context: Option<&TenantContext>,
+        #[cfg(feature = "abac-policy")] _read_context: &ReadContext,
+    ) -> Result<Option<crate::services::layer_a_snapshot::LayerASnapshot>> {
+        self.ensure_healthy()?;
+        let tenant = Self::tenant_key(tenant_context);
+        let (primary, legacy) = self.partitions_for(&tenant, table_schema);
+        if let Some(legacy) = legacy
+            && !legacy.scan_records(1).await?.is_empty()
+        {
+            return Ok(None);
+        }
+        let view = primary.scan_view().await?;
+        if !view.segments.is_empty() && self.segment_filesystem.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(crate::services::layer_a_snapshot::LayerASnapshot {
+            view,
+            filesystem: self.segment_filesystem.clone(),
+            table_name: table_schema.name.clone(),
+        }))
     }
 
     async fn scan_records_filtered(
@@ -5640,6 +5715,95 @@ mod tests {
             "gate unset must write no segments; found entries under {}",
             root.display()
         );
+    }
+
+    /// ADR-097 P3.1: a spilling store's Layer A snapshot names the segments its
+    /// partition flushed and the filesystem that wrote them, with the unflushed
+    /// rows resident — and together they hold every row, none read twice.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn layer_a_snapshot_lists_flushed_segments_and_resident_rows() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let fs = Arc::new(
+            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
+                crate::storage::persistence::filesystem::local::LocalConfig::default(),
+            )
+            .await
+            .expect("local filesystem"),
+        );
+        let store = DirectWalTableRecordStore::new_spilling(
+            Arc::new(RecordingWalAppender::default()),
+            fs,
+            Arc::new(move |tenant_id: &str, collection: &str| {
+                format!("{base}/{tenant_id}/{collection}")
+            }),
+        );
+        let entries: Vec<CanonicalWalEntry> = (0..6)
+            .map(|i| {
+                CanonicalWalEntry::new(
+                    i + 1,
+                    CanonicalOperation::RecordUpsert {
+                        collection_id: "orders".to_string(),
+                        record: Box::new(ProximaRecord {
+                            oid: format!("r{i}"),
+                            tenant_id: "tenant-a".to_string(),
+                            variation_id: Some("orders".to_string()),
+                            ..Default::default()
+                        }),
+                        projections: vec![],
+                    },
+                    Some("tenant-a".to_string()),
+                )
+            })
+            .collect();
+        store.replay_wal_entries(entries).await.expect("replay");
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+
+        let snapshot = store
+            .layer_a_snapshot(
+                &CatalogTableSchema::new("orders"),
+                Some(&TenantContext::for_tenant_id("tenant-a")),
+                #[cfg(feature = "abac-policy")]
+                &ReadContext::system(SystemReadReason::Statistics, "record_store::tests"),
+            )
+            .await
+            .expect("snapshot")
+            .expect("a spilling store offers a snapshot");
+        assert_eq!(snapshot.table_name, "orders");
+        assert!(
+            !snapshot.view.segments.is_empty(),
+            "rows past the threshold flushed"
+        );
+        let filesystem = snapshot
+            .filesystem
+            .clone()
+            .expect("segments come with their filesystem");
+
+        let mut oids: Vec<String> = snapshot
+            .view
+            .resident
+            .iter()
+            .map(|r| r.oid.clone())
+            .collect();
+        for path in &snapshot.view.segments {
+            let bytes = filesystem.read(path).await.expect("segment");
+            let rows = crate::storage::engines::sst::segment_format::read_segment_records(
+                &bytes,
+                &[],
+                &[],
+                None,
+            )
+            .expect("decode");
+            oids.extend(rows.into_iter().map(|r| r.oid));
+        }
+        oids.sort();
+        assert_eq!(oids, ["r0", "r1", "r2", "r3", "r4", "r5"]);
     }
 
     /// The UNTENANTED partition spills too, and persists its deletes.
