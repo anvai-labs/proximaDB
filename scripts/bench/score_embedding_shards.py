@@ -9,50 +9,31 @@ product over the cached passage- and query-role embeddings.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+# corpus_io is a sibling module in scripts/bench/. Inject that directory so the
+# import works both when run as a script and when loaded via importlib in tests.
+_BENCH_DIR = str(Path(__file__).resolve().parent)
+if _BENCH_DIR not in sys.path:
+    sys.path.insert(0, _BENCH_DIR)
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+from corpus_io import (  # noqa: E402  — path-injected sibling bench module
+    atomic_json_write as _atomic_json,
+    required_text as _required_text,
+    sha256_file as _sha256,
+)
 
 
 def _json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _atomic_json(value: Any, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f"{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    os.close(descriptor)
-    temporary = Path(temporary_name)
-    try:
-        with temporary.open("w", encoding="utf-8") as output:
-            json.dump(value, output, indent=2, sort_keys=True)
-            output.write("\n")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _required_text(record: dict[str, Any], name: str, context: str) -> str:
-    value = record.get(name)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{context}: {name} is required")
-    return value
 
 
 def _load_chunk_ids(path: Path) -> tuple[str, ...]:
