@@ -307,7 +307,7 @@ impl AqlSource for MemoryAqlSource {
                 row.insert("score".to_string(), AqlValue::Float(res.score));
                 for (k, v) in &res.metadata {
                     if let Some(val) = &v.value {
-                        row.insert(k.clone(), VectorAqlSource::sql_data_to_aql(val));
+                        row.insert(k.clone(), super::sql_value_to_aql(val));
                     }
                 }
                 semantic_records.push(UnifiedRecord {

@@ -1185,6 +1185,53 @@ mod barrier_tests {
     use crate::storage::persistence::write_ahead_log::manifest::types::WalEntryStatus;
     use crate::storage::persistence::write_ahead_log::serialization::SerializationFormat;
 
+    /// Stamped prologue: fresh tempdir-backed local WAL directory + a
+    /// filesystem factory over it. Keep the `TempDir` alive for the test's
+    /// length.
+    async fn tempdir_wal_dir() -> (Arc<FilesystemFactory>, String, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let wal_url = format!("file://{}", temp_dir.path().display());
+        let fs_factory = Arc::new(
+            FilesystemFactory::create(FilesystemConfig::default())
+                .await
+                .expect("fs factory"),
+        );
+        (fs_factory, wal_url, temp_dir)
+    }
+
+    /// A service over [`tempdir_wal_dir`]'s directory (fresh instance per
+    /// call — the restart test opens a second one over the same dir).
+    async fn service_for(
+        fs_factory: &Arc<FilesystemFactory>,
+        wal_url: &str,
+    ) -> Arc<GlobalManifestService> {
+        GlobalManifestService::new(
+            GlobalManifestServiceConfig::default(),
+            fs_factory.clone(),
+            wal_url.to_string(),
+        )
+        .await
+        .expect("service")
+    }
+
+    /// Stamped active-entry fixture for collection `c1`.
+    fn active_entry(batch_id: &str, wal_url: &str) -> GlobalManifestEntry {
+        GlobalManifestEntry {
+            global_lsn: 0, // allocated by append_async
+            collection_id: "c1".to_string(),
+            batch_id: batch_id.to_string(),
+            file_path: format!("c1/wal/{batch_id}.bcwal"),
+            storage_url: wal_url.to_string(),
+            size_bytes: 42,
+            checksum_crc32: 0,
+            timestamp_ms: 1,
+            format: SerializationFormat::Bincode,
+            vector_count: 1,
+            status: WalEntryStatus::Active,
+            checkpoint_id: None,
+        }
+    }
+
     /// Issue #1126 L1 regression: an entry appended via the WRITE-BEHIND path
     /// must be visible to `mark_flushed_and_delete_files` immediately — the
     /// drain barrier makes append happen-before the flush-time lookup. Without
@@ -1193,35 +1240,10 @@ mod barrier_tests {
     /// trigger (leftover WAL → duplicate L0_recovery segments on next boot).
     #[tokio::test]
     async fn write_behind_append_visible_to_flush_lookup_without_sleep() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let wal_url = format!("file://{}", temp_dir.path().display());
-        let fs_factory = Arc::new(
-            FilesystemFactory::create(FilesystemConfig::default())
-                .await
-                .expect("fs factory"),
-        );
-        let service = GlobalManifestService::new(
-            GlobalManifestServiceConfig::default(),
-            fs_factory,
-            wal_url.clone(),
-        )
-        .await
-        .expect("service");
+        let (fs_factory, wal_url, _dir) = tempdir_wal_dir().await;
+        let service = service_for(&fs_factory, &wal_url).await;
 
-        let entry = GlobalManifestEntry {
-            global_lsn: 0, // allocated by append_async
-            collection_id: "c1".to_string(),
-            batch_id: "b1126".to_string(),
-            file_path: "c1/wal/b1126.bcwal".to_string(),
-            storage_url: wal_url.clone(),
-            size_bytes: 42,
-            checksum_crc32: 0,
-            timestamp_ms: 1,
-            format: SerializationFormat::Bincode,
-            vector_count: 1,
-            status: WalEntryStatus::Active,
-            checkpoint_id: None,
-        };
+        let entry = active_entry("b1126", &wal_url);
 
         // Async (write-behind) append, then IMMEDIATELY mark — no sleep.
         service.append_async(entry).await.expect("append");
@@ -1246,35 +1268,10 @@ mod barrier_tests {
     /// across appends, and matches `current_lsn`.
     #[tokio::test]
     async fn append_async_returns_durable_global_lsn() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let wal_url = format!("file://{}", temp_dir.path().display());
-        let fs_factory = Arc::new(
-            FilesystemFactory::create(FilesystemConfig::default())
-                .await
-                .expect("fs factory"),
-        );
-        let service = GlobalManifestService::new(
-            GlobalManifestServiceConfig::default(),
-            fs_factory,
-            wal_url.clone(),
-        )
-        .await
-        .expect("service");
+        let (fs_factory, wal_url, _dir) = tempdir_wal_dir().await;
+        let service = service_for(&fs_factory, &wal_url).await;
 
-        let mk_entry = |batch_id: &str| GlobalManifestEntry {
-            global_lsn: 0, // allocated by append_async
-            collection_id: "c1".to_string(),
-            batch_id: batch_id.to_string(),
-            file_path: format!("c1/wal/{batch_id}.bcwal"),
-            storage_url: wal_url.clone(),
-            size_bytes: 42,
-            checksum_crc32: 0,
-            timestamp_ms: 1,
-            format: SerializationFormat::Bincode,
-            vector_count: 1,
-            status: WalEntryStatus::Active,
-            checkpoint_id: None,
-        };
+        let mk_entry = |batch_id: &str| active_entry(batch_id, &wal_url);
 
         let lsn1 = service
             .append_async(mk_entry("b1"))
@@ -1308,13 +1305,7 @@ mod barrier_tests {
     /// a surviving segment.
     #[tokio::test]
     async fn reaper_reclaims_segments_and_restart_dedups() {
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let wal_url = format!("file://{}", temp_dir.path().display());
-        let fs_factory = Arc::new(
-            FilesystemFactory::create(FilesystemConfig::default())
-                .await
-                .expect("fs factory"),
-        );
+        let (fs_factory, wal_url, temp_dir) = tempdir_wal_dir().await;
         let count_segments = |dir: &std::path::Path| -> usize {
             std::fs::read_dir(dir)
                 .map(|entries| {
@@ -1330,29 +1321,10 @@ mod barrier_tests {
                 .unwrap_or(0)
         };
 
-        let mk_entry = |batch_id: &str| GlobalManifestEntry {
-            global_lsn: 0,
-            collection_id: "c1".to_string(),
-            batch_id: batch_id.to_string(),
-            file_path: format!("c1/wal/{batch_id}.bcwal"),
-            storage_url: wal_url.clone(),
-            size_bytes: 42,
-            checksum_crc32: 0,
-            timestamp_ms: 1,
-            format: SerializationFormat::Bincode,
-            vector_count: 1,
-            status: WalEntryStatus::Active,
-            checkpoint_id: None,
-        };
+        let mk_entry = |batch_id: &str| active_entry(batch_id, &wal_url);
 
         {
-            let service = GlobalManifestService::new(
-                GlobalManifestServiceConfig::default(),
-                fs_factory.clone(),
-                wal_url.clone(),
-            )
-            .await
-            .expect("service");
+            let service = service_for(&fs_factory, &wal_url).await;
             // append_sync: one durable segment per append, so the segments
             // land with distinct LSN ranges and the watermark can strand the
             // oldest one (append_async may coalesce all three into a single
@@ -1397,10 +1369,7 @@ mod barrier_tests {
 
         // Restart: a fresh service over the same dir must see exactly the one
         // still-active entry — never a duplicate or a resurrected flushed one.
-        let reopened =
-            GlobalManifestService::new(GlobalManifestServiceConfig::default(), fs_factory, wal_url)
-                .await
-                .expect("reopen");
+        let reopened = service_for(&fs_factory, &wal_url).await;
         let entries = reopened.get_collection_entries("c1").await;
         let active: Vec<_> = entries
             .iter()
