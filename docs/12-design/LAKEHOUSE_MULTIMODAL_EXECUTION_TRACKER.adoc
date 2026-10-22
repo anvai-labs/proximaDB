@@ -9,7 +9,7 @@
 [cols="1,3"]
 |===
 | Purpose | The resumable status of record for executing link:LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] (the plan: Parts A–D, phases P0–P6) under link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097]. Any engineer or agent session picks up from here **and nothing else**: what is merged, what is in flight, what is next, and how the work is done.
-| Updated | 2026-10-22, against `develop` @ `0bb84fc14` (#2117 merged).
+| Updated | 2026-10-22, against `develop` @ `ef69e68da` (#2119, #2120 merged).
 | Rule | Update this file in the same PR that lands, opens or re-plans a slice. A slice is **done** only when merged to `develop` with its gate green. Detail lives in the TD files; this file holds status, links and order.
 |===
 
@@ -32,6 +32,7 @@
 * **Commit and merge continuously; always build on the current baseline.**
 ** Rebase every branch on `origin/develop` before building, pushing, or merging.
 ** Merge a PR with a **merge commit** once CI is green on a head that is current with `develop`.
+** With several lanes merging (see §4.1), "current" means: re-run CI after a rebase only when `develop`'s new commits touch files the PR touches, or GitHub reports the PR not cleanly mergeable. Otherwise a green PR merges directly — re-running CI after every unrelated merge would livelock the lanes; the merge commit's own CI on `develop` is the backstop.
 ** Start the next slice while CI runs.
 * **PRs.**
 ** One slice per PR.
@@ -119,7 +120,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | Seed spill schema hints at boot (before WAL replay) | Done | #2114 | `CatalogManager::table_schemas` (native + OLTP catalogs; also backs the truncator's snapshot floor); per-collection fallback, none for an ambiguous key. `boot_seeded_schemas_reach_replayed_partitions_unless_ambiguous`, `table_schemas_walks_nested_namespaces_of_selected_catalogs`.
 | Permanent-hold classes → exact residual column (`__proxima_residual`, TD-USUB-6 rule); codec-verified hold + `proximadb_spill_rows_held_total` | Done | #2117 | `the_residual_makes_every_row_round_trip_exactly`; spill tests updated (rows formerly held now flush exactly).
 | Hold metric + escape hatch for permanent-hold rows | **Next** | — | Rows with nested `Object`/`Array` props, >1 embedding, props on a dropped/un-materializable column, or an integer too wide for a declared float column can never be spilled by any schema — they hold memory and pin `min_unflushed_lsn` forever (no loss; strictly better than the old silent NULL on eviction). Needs a hold-size metric and an escape hatch (quarantine segment). |
-| Durable branch merge-base | **Next** (design §5.2) | — | Until it lands: merge refuses (410) once any WAL history is truncated (correction 2026-10-21, `merge_endpoint_refuses_when_wal_history_was_truncated`).
+| Durable branch merge-base | **Track A** (design §5.2) | — | Until it lands: merge refuses (410) once any WAL history is truncated (correction 2026-10-21, `merge_endpoint_refuses_when_wal_history_was_truncated`).
 | Catalog prefix registration (object-store placement of spill segments) | Open | — | TD-SEAM-3.
 | MATERIALIZE LSN capture via the per-collection high-water | Done in #2095 | #2095 | Superseded by `capture_snapshot_lsn` with a WAL pin.
 | P2.4 streaming / incremental MATERIALIZE publisher | Open | — | Gate: TPC-DS SF1 on a release build loads with no OOM and peak RSS recorded. TD-USUB-10, TD-OLAPFMT-3.
@@ -137,7 +138,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | P3.4 SBBF probe for join runtime filters; P3.5 facade passes `vector_ops`/`graph_ops` | Open | — |
 | P4 observability / graph / documents / TE-4 delete onto the seams | Open | — | Gates in the plan §6 P4.
 | P5a SST default for unspecified vector collections; PAX exact-gate footer facts | Done | #2078 | TD-ENGSEL-1, TD-PAXMETA-1.
-| P5b collection-global centroid directory + cluster-contiguous compaction | Open | — | SIFT1M on MinIO with injected latency: ≤ 3 waves, ≤ 20 GET/q, recall ≥ 0.98.
+| P5b collection-global centroid directory + cluster-contiguous compaction | **Track D**; design merged #2120 (TD-PAXDIR-1) | #2120 | SIFT1M on MinIO with injected latency: ≤ 3 waves, ≤ 20 GET/q, recall ≥ 0.98.
 | P5c HNSW (AXIS) as a persisted, stamped, rebuildable projection of PAX | Design done | #2088 | TD-SEAM-13. Prerequisite: TD-PAXPREC-1 (fp16 exact tier).
 | P6 TPC-DS SF1/SF10 cross-engine; multimodal benchmark (TE-1/TE-3/TE-6) | Open | — | No pricing claims before the P5b gates pass.
 |===
@@ -147,10 +148,23 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 [cols="2,1,3",options="header"]
 |===
 | Branch | PR | State and next action
-| `fix/branch-merge-refuses-truncated-history` | #2119 | Branch merge 410 once WAL history is truncated; designs §5.2–5.4.
-| `fix/spill-scan-view` | — | Flush-consistent spill scan snapshot (P3.1 PR 1, race fix); lib tests running.
-| `fix/native-window-fn-declines` | — | Agent-written (P3.1 PR 0, `lag()` fail-closed); compile + `native_table_capability_parity_e2e` pending.
-| `p24-readers-fail-closed` | — | Agent-written (P2.4 #1); compile + reader / duckdb tests pending.
+| `fix/spill-scan-view` | (lead) | Flush-consistent spill scan snapshot (P3.1 PR 1, race fix); 98/98 lib tests; PR next.
+|===
+
+=== 4.1 Parallel tracks (since 2026-10-22)
+
+Each track is a separate cloud session that owns its milestone end to end (implement →
+build → test → PR → merge) under the conventions above. Only the lead edits this file;
+tracks report through a "Tracker update" paragraph in each PR body.
+
+[cols="1,3,2",options="header"]
+|===
+| Track | Scope | First PRs
+| Lead | Coordination, this tracker, `fix/spill-scan-view` | #2119 merged (branch merge 410)
+| A | Durable branch merge-base, §5.2 (6 commits) | —
+| B | P2.4 streaming MATERIALIZE, §5.3 PRs 1–7 incl. the SF1 no-OOM gate; owns `p24-readers-fail-closed` | —
+| C | P3.1 LayerATableProvider, §5.4 PRs 0 and 2–5; owns `fix/native-window-fn-declines` | —
+| D | P5b PAX centroid directory + cluster-contiguous compaction: design, then 2 slices | #2120 (design, TD-PAXDIR-1)
 |===
 
 == 5. Next-work queue (in order)

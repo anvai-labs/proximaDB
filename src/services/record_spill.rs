@@ -1297,7 +1297,29 @@ impl SpillRecordStorage {
     /// It is acceptable here only because the path is default-OFF.
     async fn merged_records(&self) -> Result<Vec<ProximaRecord>> {
         self.ensure_discovered().await?;
-        let paths = self.segments.read().clone();
+        // The segment list, the resident rows and the tombstones are taken
+        // TOGETHER under the segments read lock. `flush` pushes its segment
+        // under the write lock and only afterwards evicts the rows and clears
+        // the tombstones it wrote, so with the lock held every row is in a
+        // listed segment or in the resident snapshot, and every delete is in a
+        // listed segment or in the tombstone snapshot. Snapshotting the
+        // memtable after the (awaited) segment reads instead let a flush land
+        // in between: its rows were in neither, and its persisted deletes in
+        // neither — a scan lost rows and could resurrect deleted ones.
+        let (paths, resident, tombstoned) = {
+            let segments = self.segments.read();
+            (
+                segments.clone(),
+                self.memtable
+                    .iter()
+                    .map(|entry| entry.value().record.clone())
+                    .collect::<Vec<_>>(),
+                self.tombstones
+                    .iter()
+                    .map(|oid| oid.key().clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
         let mut merged: std::collections::HashMap<String, ProximaRecord> =
             std::collections::HashMap::new();
 
@@ -1306,11 +1328,11 @@ impl SpillRecordStorage {
                 merged.insert(record.oid.clone(), record);
             }
         }
-        for entry in self.memtable.iter() {
-            merged.insert(entry.key().clone(), entry.value().record.clone());
+        for record in resident {
+            merged.insert(record.oid.clone(), record);
         }
-        for oid in self.tombstones.iter() {
-            merged.remove(oid.key());
+        for oid in &tombstoned {
+            merged.remove(oid);
         }
         // Mandate #16a: apply the canonical dead-record predicate at this read
         // boundary. `ProximaRecord::is_dead` covers both the `Some(0)` tombstone
@@ -2246,6 +2268,62 @@ mod tests {
     /// Asserts the OBSERVABLE property — the row is gone from both `get_record`
     /// and a scan — not the presence of a tombstone, so a different fix (an
     /// in-flight oid set, say) still satisfies it.
+    /// A scan racing a flush loses no row and resurrects no delete. The scan
+    /// parks inside its first segment read; a flush then lands — pushing a
+    /// segment with a resident row and a persisted delete, evicting the row
+    /// and clearing the tombstone. Snapshotting the memtable and tombstones
+    /// only after the segment reads (the pre-fix order) returned the deleted
+    /// row and missed the flushed one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scan_racing_a_flush_loses_no_row_and_resurrects_no_delete() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let fs = Arc::new(BarrierFs {
+            inner: LocalFileSystem::new(LocalConfig::default())
+                .await
+                .expect("local filesystem"),
+            reached: reached.clone(),
+            release: release.clone(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            fail_writes: std::sync::atomic::AtomicBool::new(false),
+            park_reads: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store = Arc::new(
+            SpillRecordStorage::with_flush_threshold(fs.clone(), base, None)
+                .with_tenant("tenant-a"),
+        );
+        RecordStore::upsert_record_at_lsn(store.as_ref(), record("old", "open"), 1).await?;
+        RecordStore::upsert_record_at_lsn(store.as_ref(), record("gone", "open"), 2).await?;
+        store.flush().await?.expect("segment 1");
+        store
+            .delete_record(&RecordKey::new("gone".to_string()))
+            .await?;
+        RecordStore::upsert_record_at_lsn(store.as_ref(), record("fresh", "open"), 4).await?;
+
+        fs.park_reads
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let scan = {
+            let store = store.clone();
+            tokio::spawn(async move { RecordScan::scan_records(store.as_ref(), 100).await })
+        };
+        reached.notified().await;
+        store.flush().await?.expect("segment 2 lands mid-scan");
+        release.notify_one();
+
+        let mut oids: Vec<String> = scan
+            .await
+            .expect("scan task")?
+            .into_iter()
+            .map(|r| r.oid)
+            .collect();
+        oids.sort();
+        assert_eq!(oids, ["fresh", "old"], "no row lost, no delete resurrected");
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delete_during_a_flush_does_not_resurrect_the_row() -> Result<()> {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2262,6 +2340,7 @@ mod tests {
             release: release.clone(),
             armed: std::sync::atomic::AtomicBool::new(true),
             fail_writes: std::sync::atomic::AtomicBool::new(false),
+            park_reads: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Threshold 2: the second insert triggers the flush that parks.
@@ -2357,6 +2436,9 @@ mod tests {
         /// `write_if_absent` and delegates everything else, and a third copy of
         /// that delegation block would be mandate-#12 duplication.
         fail_writes: std::sync::atomic::AtomicBool,
+        /// Park the FIRST `read` (same `reached`/`release` handshake) — the
+        /// window inside a scan between its snapshot and its segment reads.
+        park_reads: std::sync::atomic::AtomicBool,
     }
 
     impl BarrierFs {
@@ -2370,6 +2452,7 @@ mod tests {
                 release: Arc::new(tokio::sync::Notify::new()),
                 armed: std::sync::atomic::AtomicBool::new(false),
                 fail_writes: std::sync::atomic::AtomicBool::new(true),
+                park_reads: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -2400,6 +2483,13 @@ mod tests {
             self
         }
         async fn read(&self, path: &str) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
+            if self
+                .park_reads
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.reached.notify_one();
+                self.release.notified().await;
+            }
             self.inner.read(path).await
         }
         async fn write(
@@ -3050,6 +3140,7 @@ mod tests {
             release: release.clone(),
             armed: std::sync::atomic::AtomicBool::new(true),
             fail_writes: std::sync::atomic::AtomicBool::new(false),
+            park_reads: std::sync::atomic::AtomicBool::new(false),
         });
         let store = Arc::new(
             SpillRecordStorage::with_flush_threshold(fs, base, None).with_tenant("tenant-a"),
@@ -3269,6 +3360,7 @@ mod tests {
             release: release.clone(),
             armed: std::sync::atomic::AtomicBool::new(false),
             fail_writes: std::sync::atomic::AtomicBool::new(false),
+            park_reads: std::sync::atomic::AtomicBool::new(false),
         });
         let store = Arc::new(
             SpillRecordStorage::with_flush_threshold(fs.clone(), base, None)
@@ -3337,6 +3429,7 @@ mod tests {
             release: release.clone(),
             armed: std::sync::atomic::AtomicBool::new(false),
             fail_writes: std::sync::atomic::AtomicBool::new(false),
+            park_reads: std::sync::atomic::AtomicBool::new(false),
         });
         let store = Arc::new(
             SpillRecordStorage::with_flush_threshold(fs.clone(), base, None)
