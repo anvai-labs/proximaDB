@@ -428,6 +428,11 @@ impl BranchBaseStore {
                 state.tracked_from
             };
             let generation = state.max_generation + 1;
+            // Claimed before writing: a write that fails part-way leaves rows
+            // of `generation` without a header, and the retry must not reuse
+            // the number (replay would count both attempts' rows against one
+            // header and refuse every later replay).
+            state.max_generation = generation;
             let first_row_seq = self
                 .write_generation(generation, through, tracked_from, &truncated, &images)
                 .await?;
@@ -535,11 +540,13 @@ impl BranchBaseStore {
     }
 }
 
-/// Whether `entry` is a record operation of `collection`.
+/// Whether `entry` is a record operation of `collection` — upserts, deletes
+/// and partition drops all shape its main-line state.
 fn is_entry_of(entry: &CanonicalWalEntry, collection: &TenantCollection) -> bool {
     let entry_collection = match &entry.operation {
         CanonicalOperation::RecordUpsert { collection_id, .. }
-        | CanonicalOperation::RecordDelete { collection_id, .. } => collection_id,
+        | CanonicalOperation::RecordDelete { collection_id, .. }
+        | CanonicalOperation::RecordPartitionDrop { collection_id } => collection_id,
         _ => return false,
     };
     *entry_collection == collection.collection
@@ -806,6 +813,65 @@ mod tests {
             bases.base_for(&TenantCollection::new(Some("t3"), "c"), wal.retained_from()),
             Ok(MergeBase::Retained)
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_partition_drop_reaches_the_image() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = Arc::new(FramedTableWalAppender::open(dir.path().join("c.wal")).await?);
+        wal.enable_segment_rotation(1);
+        append(&wal, upsert("c", "n1", None, "v0")).await?;
+        // The drop sits alone in its segment: the segment summary must still
+        // index it under `c`, or the image read skips it.
+        append(
+            &wal,
+            CanonicalOperation::RecordPartitionDrop {
+                collection_id: "c".to_string(),
+            },
+        )
+        .await?;
+        append(&wal, upsert("c", "n2", None, "v0")).await?;
+        append(&wal, upsert("c", "n1", Some("x"), "left")).await?;
+        let store = BranchBaseStore::new(wal.clone());
+        assert_eq!(store.checkpoint(wal.last_sequence()).await?, Some(4));
+        wal.truncate_below(4).await?;
+
+        let bases = replayed(&wal).await?;
+        let image = bases.image(&key("c")).expect("c is branched");
+        assert_eq!(
+            image.records.keys().collect::<Vec<_>>(),
+            vec!["n2"],
+            "n1 was dropped before the branch point"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_checkpoint_never_reuses_its_generation() -> Result<()> {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("c.wal");
+        drop(branched_wal(&dir).await?);
+        let fence = Arc::new(crate::services::writer_fence::WriterFence::default());
+        let wal = Arc::new(
+            FramedTableWalAppender::open(&path)
+                .await?
+                .with_writer_fence(fence.clone()),
+        );
+        let store = BranchBaseStore::new(wal.clone());
+
+        // An expired lease fails the write.
+        fence.enforce_lease(Instant::now(), Duration::ZERO);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(store.checkpoint(wal.last_sequence()).await.is_err());
+
+        // The retry writes the next generation, and replay stays sound.
+        fence.renew_lease(Instant::now(), Duration::from_secs(600));
+        store.checkpoint(wal.last_sequence()).await?;
+        let bases = replayed(&wal).await?;
+        assert_eq!(bases.generation, 2);
+        assert!(bases.image(&key("c")).is_some());
         Ok(())
     }
 }

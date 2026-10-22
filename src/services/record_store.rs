@@ -2675,6 +2675,14 @@ impl DirectWalTableRecordStore {
     {
         let mut summary = proximadb_records::RecordRecoverySummary::default();
         for entry in entries {
+            // TD-SEAM-12: merge-base rows belong to the branch merge-base store,
+            // not to a table; replayed here they would sit unflushed in a
+            // partition of their own and cap the truncation floor.
+            if let CanonicalOperation::RecordUpsert { collection_id, .. } = &entry.operation
+                && collection_id == crate::services::branch_base_store::BRANCH_BASES_COLLECTION_ID
+            {
+                continue;
+            }
             let tenant_id = entry.tenant_id.clone().unwrap_or_default();
             // The replayed entry carries its own LSN, and it is the SAME LSN the
             // live write path recorded. Passing it keeps a spill-backed partition
