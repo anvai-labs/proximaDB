@@ -13,7 +13,8 @@ use crate::storage::persistence::filesystem::FilesystemFactory;
 use crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingFilesystem;
 use crate::storage::trait_components::extractor::{
     ExtractedVector, ExtractionCapabilities, ExtractionCost, ExtractionError, ExtractionMode,
-    ExtractionRequest, ExtractionResult, ExtractionStats, VectorExtractor,
+    ExtractionRequest, ExtractionResult, VectorExtractor, filter_existing_files,
+    finalize_extraction, id_filter_allows, mode_wants_fp32,
 };
 
 use super::proximablocks_compact_reader::{
@@ -50,30 +51,7 @@ impl VectorExtractor for SwiftExtractor {
 
         // Filter out non-existent files to handle race conditions gracefully
         // (e.g., temp directories cleaned up before AXIS consumer processes events)
-        let mut existing_files = Vec::with_capacity(request.file_paths.len());
-        let mut missing_count = 0;
-        for path in &request.file_paths {
-            // Strip file:// prefix if present
-            let local_path = if path.starts_with("file://") {
-                path.strip_prefix("file://").unwrap_or(path)
-            } else {
-                path.as_str()
-            };
-            if std::path::Path::new(local_path).exists() {
-                existing_files.push(path.clone());
-            } else {
-                missing_count += 1;
-                debug!("[SWIFT Extractor] File not found (skipping): {}", path);
-            }
-        }
-
-        if missing_count > 0 {
-            tracing::warn!(
-                "[SWIFT Extractor] {} of {} files not found (temp dir cleanup race?)",
-                missing_count,
-                request.file_paths.len()
-            );
-        }
+        let existing_files = filter_existing_files("SWIFT", &request.file_paths);
 
         if existing_files.is_empty() {
             debug!("[SWIFT Extractor] No existing files to process, returning empty result");
@@ -90,6 +68,12 @@ impl VectorExtractor for SwiftExtractor {
         let mut all_vectors = Vec::new();
         let mut total_bytes_read = 0u64;
         let mut files_processed = 0usize;
+
+        // ID filter as a set, built once per extraction call (was: a
+        // linear scan of the requested-id Vec for every record).
+        let id_filter = crate::storage::trait_components::extractor::build_id_filter(
+            request.vector_ids.as_ref(),
+        );
 
         for file_path in &existing_files {
             let config = SwiftReaderConfig {
@@ -126,32 +110,23 @@ impl VectorExtractor for SwiftExtractor {
             );
 
             // Convert legacy VectorRecord reader output to ExtractedVector
-            // ID filter as a set, built once per extraction call (was: a
-            // linear scan of the requested-id Vec for every record).
-            let id_filter = crate::storage::trait_components::extractor::build_id_filter(
-                request.vector_ids.as_ref(),
-            );
             for record in read_result.records {
                 let record_id = record.id.clone();
                 // Apply the ID filter BEFORE any materialization (was: after
                 // the fp32 copy and metadata conversion).
-                let should_include = match &id_filter {
-                    Some(ids) => ids.contains(&record_id),
-                    None => true,
-                };
+                let should_include = id_filter_allows(&id_filter, &record_id);
                 if !should_include {
                     continue;
                 }
                 // Handle vector filtering based on mode
-                let fp32_vector = match request.mode {
-                    ExtractionMode::Fp32Only | ExtractionMode::Both | ExtractionMode::Auto => {
-                        if record.vector.is_empty() {
-                            None
-                        } else {
-                            Some(record.vector.clone())
-                        }
+                let fp32_vector = if mode_wants_fp32(request.mode) {
+                    if record.vector.is_empty() {
+                        None
+                    } else {
+                        Some(record.vector.clone())
                     }
-                    ExtractionMode::QuantizedOnly => None,
+                } else {
+                    None
                 };
 
                 // SWIFT doesn't store quantized vectors inline in VectorRecord
@@ -187,39 +162,25 @@ impl VectorExtractor for SwiftExtractor {
             }
         }
 
-        // Apply limit and offset if specified
-        let total_before_pagination = all_vectors.len();
-        if let Some(offset) = request.offset {
-            if offset < all_vectors.len() {
-                all_vectors = all_vectors.into_iter().skip(offset).collect();
-            } else {
-                all_vectors.clear();
-            }
-        }
-        if let Some(limit) = request.limit {
-            all_vectors.truncate(limit);
-        }
-
-        let duration_ms = start.elapsed().as_millis() as u64;
+        // bytes_read is the reader-reported actual I/O byte count (u64),
+        // not a per-record estimate like the other engines.
+        let result = finalize_extraction(
+            all_vectors,
+            request.offset,
+            request.limit,
+            total_bytes_read as usize,
+            files_processed,
+            start,
+        );
 
         debug!(
             "[SWIFT Extractor] Extracted {} vectors from {} files in {}ms",
-            all_vectors.len(),
+            result.vectors.len(),
             files_processed,
-            duration_ms
+            result.stats.duration_ms
         );
 
-        Ok(ExtractionResult {
-            vectors: all_vectors,
-            stats: ExtractionStats {
-                vectors_extracted: total_before_pagination,
-                bytes_read: total_bytes_read as usize,
-                files_processed,
-                duration_ms,
-                vectors_skipped: 0,
-            },
-            continuation_token: None,
-        })
+        Ok(result)
     }
 
     fn extraction_capabilities(&self) -> ExtractionCapabilities {

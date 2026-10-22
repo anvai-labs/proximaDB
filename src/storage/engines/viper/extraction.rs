@@ -14,7 +14,8 @@ use crate::storage::persistence::filesystem::FilesystemFactory;
 use crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingFilesystem;
 use crate::storage::trait_components::extractor::{
     ExtractedVector, ExtractionCapabilities, ExtractionCost, ExtractionError, ExtractionMode,
-    ExtractionRequest, ExtractionResult, ExtractionStats, VectorExtractor,
+    ExtractionRequest, ExtractionResult, VectorExtractor, filter_existing_files,
+    finalize_extraction, id_filter_allows, mode_wants_fp32,
 };
 
 /// VIPER Vector Extractor
@@ -47,30 +48,7 @@ impl VectorExtractor for ViperExtractor {
 
         // Filter out non-existent files to handle race conditions gracefully
         // (e.g., temp directories cleaned up before AXIS consumer processes events)
-        let mut existing_files = Vec::with_capacity(request.file_paths.len());
-        let mut missing_count = 0;
-        for path in &request.file_paths {
-            // Strip file:// prefix if present
-            let local_path = if path.starts_with("file://") {
-                path.strip_prefix("file://").unwrap_or(path)
-            } else {
-                path.as_str()
-            };
-            if std::path::Path::new(local_path).exists() {
-                existing_files.push(path.clone());
-            } else {
-                missing_count += 1;
-                debug!("[VIPER Extractor] File not found (skipping): {}", path);
-            }
-        }
-
-        if missing_count > 0 {
-            tracing::warn!(
-                "[VIPER Extractor] {} of {} files not found (temp dir cleanup race?)",
-                missing_count,
-                request.file_paths.len()
-            );
-        }
+        let existing_files = filter_existing_files("VIPER", &request.file_paths);
 
         if existing_files.is_empty() {
             debug!("[VIPER Extractor] No existing files to process, returning empty result");
@@ -136,15 +114,14 @@ impl VectorExtractor for ViperExtractor {
             for record in records {
                 let record_id = record.oid.clone();
                 // Handle vector filtering based on mode
-                let fp32_vector = match request.mode {
-                    ExtractionMode::Fp32Only | ExtractionMode::Both | ExtractionMode::Auto => {
-                        record
-                            .embeddings
-                            .first()
-                            .map(|embedding| embedding.values.to_fp32_owned())
-                            .filter(|values| !values.is_empty())
-                    }
-                    ExtractionMode::QuantizedOnly => None,
+                let fp32_vector = if mode_wants_fp32(request.mode) {
+                    record
+                        .embeddings
+                        .first()
+                        .map(|embedding| embedding.values.to_fp32_owned())
+                        .filter(|values| !values.is_empty())
+                } else {
+                    None
                 };
 
                 // VIPER doesn't store quantized vectors inline in VectorRecord
@@ -167,10 +144,7 @@ impl VectorExtractor for ViperExtractor {
                     None
                 };
 
-                let should_include = match &id_filter {
-                    Some(ids) => ids.contains(&record_id),
-                    None => true,
-                };
+                let should_include = id_filter_allows(&id_filter, &record_id);
 
                 if should_include && fp32_vector.is_some() {
                     all_vectors.push(ExtractedVector {
@@ -183,39 +157,23 @@ impl VectorExtractor for ViperExtractor {
             }
         }
 
-        // Apply limit and offset if specified
-        let total_before_pagination = all_vectors.len();
-        if let Some(offset) = request.offset {
-            if offset < all_vectors.len() {
-                all_vectors = all_vectors.into_iter().skip(offset).collect();
-            } else {
-                all_vectors.clear();
-            }
-        }
-        if let Some(limit) = request.limit {
-            all_vectors.truncate(limit);
-        }
-
-        let duration_ms = start.elapsed().as_millis() as u64;
+        let result = finalize_extraction(
+            all_vectors,
+            request.offset,
+            request.limit,
+            total_bytes_read,
+            files_processed,
+            start,
+        );
 
         debug!(
             "[VIPER Extractor] Extracted {} vectors from {} files in {}ms",
-            all_vectors.len(),
+            result.vectors.len(),
             files_processed,
-            duration_ms
+            result.stats.duration_ms
         );
 
-        Ok(ExtractionResult {
-            vectors: all_vectors,
-            stats: ExtractionStats {
-                vectors_extracted: total_before_pagination,
-                bytes_read: total_bytes_read,
-                files_processed,
-                duration_ms,
-                vectors_skipped: 0,
-            },
-            continuation_token: None,
-        })
+        Ok(result)
     }
 
     fn extraction_capabilities(&self) -> ExtractionCapabilities {

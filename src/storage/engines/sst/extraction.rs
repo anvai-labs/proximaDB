@@ -13,7 +13,8 @@ use crate::storage::persistence::filesystem::FilesystemFactory;
 use crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingFilesystem;
 use crate::storage::trait_components::extractor::{
     ExtractedVector, ExtractionCapabilities, ExtractionCost, ExtractionError, ExtractionMode,
-    ExtractionRequest, ExtractionResult, ExtractionStats, VectorExtractor,
+    ExtractionRequest, ExtractionResult, VectorExtractor, filter_existing_files,
+    finalize_extraction, id_filter_allows, mode_wants_fp32, strip_file_url,
 };
 
 use super::readers::sst_query_engine::UnifiedSstableReader;
@@ -46,18 +47,13 @@ impl VectorExtractor for SstExtractor {
             return Ok(ExtractionResult::empty());
         }
 
-        // Convert file:// URLs to local paths if needed
+        // Convert file:// URLs to local paths if needed. SST strips upfront
+        // (unlike nova/viper/raptor/swift, which strip only for the existence
+        // check) because UnifiedSstableReader wants local paths.
         let file_paths: Vec<String> = request
             .file_paths
             .iter()
-            .map(|p| {
-                if p.starts_with("file://") {
-                    // Strip file:// prefix to get local path
-                    p.strip_prefix("file://").unwrap_or(p).to_string()
-                } else {
-                    p.clone()
-                }
-            })
+            .map(|p| strip_file_url(p).to_string())
             .collect();
 
         debug!(
@@ -68,24 +64,7 @@ impl VectorExtractor for SstExtractor {
 
         // Filter out non-existent files to handle race conditions gracefully
         // (e.g., temp directories cleaned up before AXIS consumer processes events)
-        let mut existing_files = Vec::with_capacity(file_paths.len());
-        let mut missing_count = 0;
-        for path in &file_paths {
-            if std::path::Path::new(path).exists() {
-                existing_files.push(path.clone());
-            } else {
-                missing_count += 1;
-                debug!("[SST Extractor] File not found (skipping): {}", path);
-            }
-        }
-
-        if missing_count > 0 {
-            tracing::warn!(
-                "[SST Extractor] {} of {} files not found (temp dir cleanup race?)",
-                missing_count,
-                file_paths.len()
-            );
-        }
+        let existing_files = filter_existing_files("SST", &file_paths);
 
         if existing_files.is_empty() {
             debug!("[SST Extractor] No existing files to process, returning empty result");
@@ -139,30 +118,26 @@ impl VectorExtractor for SstExtractor {
             // props→JSON conversion and the fp32 copy, so excluded records
             // paid the full conversion cost). `bytes_read` below still
             // accounts every scanned vector's fp32 bytes exactly as before.
-            let should_include = match &id_filter {
-                Some(ids) => ids.contains(&record_id),
-                None => true,
-            };
+            let should_include = id_filter_allows(&id_filter, &record_id);
             // Handle vector filtering based on mode
-            let fp32_vector = match request.mode {
-                ExtractionMode::Fp32Only | ExtractionMode::Both | ExtractionMode::Auto => {
-                    let vector = record
-                        .embeddings
-                        .first()
-                        .map(|embedding| embedding.as_fp32_slice())
-                        .unwrap_or(&[]);
-                    if vector.is_empty() {
-                        None
+            let fp32_vector = if mode_wants_fp32(request.mode) {
+                let vector = record
+                    .embeddings
+                    .first()
+                    .map(|embedding| embedding.as_fp32_slice())
+                    .unwrap_or(&[]);
+                if vector.is_empty() {
+                    None
+                } else {
+                    bytes_read += vector.len() * 4;
+                    if should_include {
+                        Some(vector.to_vec())
                     } else {
-                        bytes_read += vector.len() * 4;
-                        if should_include {
-                            Some(vector.to_vec())
-                        } else {
-                            None
-                        }
+                        None
                     }
                 }
-                ExtractionMode::QuantizedOnly => None,
+            } else {
+                None
             };
             if !should_include {
                 continue;
@@ -226,38 +201,24 @@ impl VectorExtractor for SstExtractor {
             }
         }
 
-        // Apply limit and offset if specified
-        let total_before_pagination = vectors.len();
-        if let Some(offset) = request.offset {
-            if offset < vectors.len() {
-                vectors = vectors.into_iter().skip(offset).collect();
-            } else {
-                vectors.clear();
-            }
-        }
-        if let Some(limit) = request.limit {
-            vectors.truncate(limit);
-        }
-
-        let duration_ms = start.elapsed().as_millis() as u64;
+        // files_processed deliberately reports the ORIGINAL request's file
+        // count (missing files included) — preserved quirk of the SST stats.
+        let result = finalize_extraction(
+            vectors,
+            request.offset,
+            request.limit,
+            bytes_read,
+            request.file_paths.len(),
+            start,
+        );
 
         debug!(
             "[SST Extractor] Extracted {} vectors in {}ms",
-            vectors.len(),
-            duration_ms
+            result.vectors.len(),
+            result.stats.duration_ms
         );
 
-        Ok(ExtractionResult {
-            vectors,
-            stats: ExtractionStats {
-                vectors_extracted: total_before_pagination,
-                bytes_read,
-                files_processed: request.file_paths.len(),
-                duration_ms,
-                vectors_skipped: 0,
-            },
-            continuation_token: None,
-        })
+        Ok(result)
     }
 
     fn extraction_capabilities(&self) -> ExtractionCapabilities {
