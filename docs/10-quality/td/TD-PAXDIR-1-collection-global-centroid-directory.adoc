@@ -48,3 +48,22 @@ SIFT1M on MinIO with injected latency (Toxiproxy, 50 ms RTT):
 
 The directory-off path must not regress. BIGANN 10M is re-measured and recorded in the
 evidence ledger. Exact gate definitions are in the design document, §4.2.
+
+== D1 wire-format note: departure from the §3.1 design draft
+
+The shipped D1 format (`PXCD` v1, `centroid_directory.rs`) drops two fields the
+§3.1 design draft carried: `built_at_unix_ms` and the per-table `metric u8`.
+
+* Staleness is carried by the segment-table stamp `(name, size)` plus the
+  generation counter; a snapshot id arrives with TD-PAXMETA-1 (the draft's
+  `built_at` was neither monotonic nor a correctness input, only diagnostic).
+* The distance metric is a collection-level property the caller already holds;
+  D2 will re-check that the score family suits the metric against the
+  collection config, not against a byte in the directory.
+
+`flags` (1 byte) and `reserved` (u16) are written as zero in v1 and `parse`
+REJECTS non-zero values, so any later revision that gives them meaning must
+bump the format version rather than silently reinterpret v1 bytes. Non-finite
+model/centroid/radius values are likewise rejected at parse (and clamped to
++inf at rank time for directories written before that check existed), so a
+single poisoned model can no longer occupy every nprobe slot.
