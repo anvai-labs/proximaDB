@@ -323,6 +323,10 @@ fn encode_row(kind: &str, generation: u64, index: usize, payload: Vec<u8>) -> Ca
 
 /// Keeps the branch merge-base images and truncation marks for the shared
 /// canonical WAL; [`Self::checkpoint`] is the truncator's floor source.
+///
+/// Exactly one per WAL (the truncator's): generation numbers are serialized
+/// by this store's gate only, so two stores on one WAL could write the same
+/// generation and break replay.
 pub struct BranchBaseStore {
     wal: Arc<FramedTableWalAppender>,
     /// `None` until the first checkpoint replays the store's rows. The mutex
