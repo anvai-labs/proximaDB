@@ -120,6 +120,74 @@ async fn the_floor_is_the_minimum_and_one_refusal_stops_the_run() -> Result<()> 
     Ok(())
 }
 
+/// An appending source (a checkpoint) that counts how often it is asked.
+struct CountingCheckpoint(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl WalFloorSource for CountingCheckpoint {
+    fn name(&self) -> &str {
+        "counting-checkpoint"
+    }
+    async fn floor(&self, head: u64) -> Result<Option<u64>> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some(head.saturating_add(1)))
+    }
+    fn appends(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn an_appending_source_is_asked_only_when_the_run_can_truncate() -> Result<()> {
+    let dir = TempDir::new()?;
+    let wal = rotating_wal(&dir).await?;
+    for i in 1..=4 {
+        wal.append_operations(vec![upsert(&format!("r{i}"), None)], None)
+            .await?;
+    }
+    let checkpoint = Arc::new(CountingCheckpoint(Default::default()));
+    let asked = || checkpoint.0.load(std::sync::atomic::Ordering::SeqCst);
+
+    // The readers keep everything (an idle server below its retention): the
+    // checkpoint must not run, or every scheduled run would grow the WAL.
+    // Listed FIRST, to show order in the slice does not matter.
+    let run = wal_truncator::run_once(
+        &wal,
+        &[
+            checkpoint.clone() as Arc<dyn WalFloorSource>,
+            Arc::new(ChangeFeedRetention(100)),
+        ],
+    )
+    .await?;
+    assert!(matches!(run, TruncationRun::NothingToDo { .. }), "{run:?}");
+    assert_eq!(asked(), 0);
+
+    // A reader refusal stops the run before it too.
+    let run = wal_truncator::run_once(
+        &wal,
+        &[
+            checkpoint.clone() as Arc<dyn WalFloorSource>,
+            Arc::new(Fixed("blocker", Err("not yet"))),
+        ],
+    )
+    .await?;
+    assert!(matches!(run, TruncationRun::Refused { .. }), "{run:?}");
+    assert_eq!(asked(), 0);
+
+    // Once the readers would drop something, it runs.
+    let run = wal_truncator::run_once(
+        &wal,
+        &[
+            checkpoint.clone() as Arc<dyn WalFloorSource>,
+            Arc::new(ChangeFeedRetention(1)),
+        ],
+    )
+    .await?;
+    assert!(matches!(run, TruncationRun::Truncated { .. }), "{run:?}");
+    assert_eq!(asked(), 1);
+    Ok(())
+}
+
 #[tokio::test]
 async fn branch_tagged_records_block_truncation() -> Result<()> {
     let dir = TempDir::new()?;

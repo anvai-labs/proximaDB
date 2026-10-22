@@ -13,10 +13,15 @@
 //! * Sources that only READ run before the catalog checkpoints, which APPEND:
 //!   a run that some reader refuses costs no WAL growth.
 //!
-//! Off by default: the scheduler starts only when
-//! `PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS` is set, and truncation only
-//! ever removes SEALED segments, so it also needs segment rotation
-//! (`PROXIMADB_CANONICAL_WAL_SEGMENT_BYTES`).
+//! On by default (`PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS`, `0`/`off`
+//! disables it). Truncation only ever removes SEALED segments, so the server
+//! schedules it only with segment rotation on
+//! (`PROXIMADB_CANONICAL_WAL_SEGMENT_BYTES`), and only after a complete WAL
+//! recovery.
+//!
+//! A source that APPENDS ([`WalFloorSource::appends`]) is asked only once the
+//! read-only sources' floor would truncate something, so an idle server's runs
+//! add nothing to the WAL.
 
 use std::sync::Arc;
 
@@ -27,7 +32,9 @@ use crate::services::canonical_wal::{BranchFenceRefused, FramedTableWalAppender,
 use crate::services::record_store::DirectWalTableRecordStore;
 use crate::services::{FunctionStore, RankProfileStore};
 
-/// Env gate: seconds between truncation runs. Unset, `0` or unparsable = off.
+/// Env gate: seconds between truncation runs. Default ON
+/// ([`DEFAULT_TRUNCATE_INTERVAL_SECS`](crate::services::storage_format::DEFAULT_TRUNCATE_INTERVAL_SECS));
+/// `0` or `off` disables it. See [`crate::services::storage_format`].
 pub const TRUNCATE_INTERVAL_ENV: &str = "PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS";
 
 /// How many of the newest WAL sequences are always kept for change-feed
@@ -40,11 +47,11 @@ pub const DEFAULT_RETAIN_ENTRIES: u64 = 1_000_000;
 
 /// The configured run interval, or `None` when the truncator is off.
 pub fn configured_interval() -> Option<std::time::Duration> {
-    std::env::var(TRUNCATE_INTERVAL_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
-        .map(std::time::Duration::from_secs)
+    crate::services::storage_format::default_on_gate(
+        TRUNCATE_INTERVAL_ENV,
+        crate::services::storage_format::DEFAULT_TRUNCATE_INTERVAL_SECS,
+    )
+    .map(std::time::Duration::from_secs)
 }
 
 /// The configured change-feed retention ([`RETAIN_ENTRIES_ENV`]).
@@ -64,6 +71,11 @@ pub trait WalFloorSource: Send + Sync {
     /// `Err`: do not truncate. `head` is the WAL's last sequence, read before
     /// any source is asked.
     async fn floor(&self, head: u64) -> Result<Option<u64>>;
+    /// `true` for a source whose `floor` appends to the WAL (a checkpoint).
+    /// Such sources run last, and only when the run can truncate something.
+    fn appends(&self) -> bool {
+        false
+    }
 }
 
 /// Outcome of one run.
@@ -84,15 +96,24 @@ pub async fn run_once(
 ) -> Result<TruncationRun> {
     let head = wal.last_sequence();
     let mut floor = head.saturating_add(1);
-    for source in sources {
-        match source.floor(head).await {
-            Ok(Some(source_floor)) => floor = floor.min(source_floor),
-            Ok(None) => {}
-            Err(error) => {
-                return Ok(TruncationRun::Refused {
-                    source: source.name().to_string(),
-                    reason: format!("{error:#}"),
-                });
+    let (readers, appenders): (Vec<_>, Vec<_>) =
+        sources.iter().partition(|source| !source.appends());
+    for (pass, sources) in [readers, appenders].into_iter().enumerate() {
+        // Nothing to drop on the readers' answer alone: stop before any
+        // appending source grows the WAL for nothing.
+        if pass == 1 && floor <= wal.retained_from().max(1) {
+            return Ok(TruncationRun::NothingToDo { floor });
+        }
+        for source in sources {
+            match source.floor(head).await {
+                Ok(Some(source_floor)) => floor = floor.min(source_floor),
+                Ok(None) => {}
+                Err(error) => {
+                    return Ok(TruncationRun::Refused {
+                        source: source.name().to_string(),
+                        reason: format!("{error:#}"),
+                    });
+                }
             }
         }
     }
@@ -205,6 +226,9 @@ impl WalFloorSource for RankProfileCheckpoint {
     fn name(&self) -> &str {
         "rank-profiles"
     }
+    fn appends(&self) -> bool {
+        true
+    }
     async fn floor(&self, _head: u64) -> Result<Option<u64>> {
         self.0.checkpoint().await
     }
@@ -217,6 +241,9 @@ pub struct FunctionCheckpoint(pub Arc<dyn FunctionStore>);
 impl WalFloorSource for FunctionCheckpoint {
     fn name(&self) -> &str {
         "sql-functions"
+    }
+    fn appends(&self) -> bool {
+        true
     }
     async fn floor(&self, _head: u64) -> Result<Option<u64>> {
         self.0.checkpoint().await

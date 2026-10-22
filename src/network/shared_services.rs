@@ -1978,15 +1978,23 @@ impl SharedServices {
                 // record; serving without it (the legacy warn-and-continue) would
                 // silently drop committed rows, so failures are fatal.
                 let atomic_commit = crate::services::oltp_gate::atomic_commit_enabled();
+                // ADR-097: record (or check) the data format before anything in
+                // this directory is opened. A directory written by a newer
+                // binary refuses here, whatever the other settings: serving it
+                // could silently drop data.
+                if let Some(dir) = wal_path.parent() {
+                    crate::services::storage_format::ensure_data_format(dir)?;
+                }
                 match crate::services::FramedTableWalAppender::open_shared(&wal_path).await {
                     Ok(appender) => {
                         if atomic_commit {
                             appender.enable_atomic_groups();
                         }
-                        // P2.1 (ADR-097 S2): opt-in segment rotation of the shared
-                        // canonical WAL. Off until P2.2 truncation lands and a
-                        // soak passes: an older binary would not read sealed
-                        // segments (downgrade safety, same stance as ADR-095).
+                        // P2.1 (ADR-097 S2): segment rotation of the shared
+                        // canonical WAL, on by default since the P2.2 soak. An
+                        // older binary would not read sealed segments; the data
+                        // format marker above is what refuses that downgrade
+                        // from now on (`services::storage_format`).
                         let segment_bytes =
                             crate::services::canonical_wal::canonical_wal_segment_bytes();
                         if segment_bytes > 0 {
@@ -2026,20 +2034,28 @@ impl SharedServices {
         // WAL-recover it here, then share it across every surface (REST/gRPC DmlService below
         // + pgwire direct-write path). One store ⇒ one authoritative relational state and one
         // CDC change-feed, regardless of which protocol wrote the data.
+        // Only a COMPLETE recovery may feed the truncator: the record tier's
+        // floor sees only what replay applied, so after a failed or partial
+        // replay it would let truncation drop rows that were never applied.
+        let mut record_store_recovered = false;
         let canonical_record_store: Option<
             Arc<crate::services::record_store::DirectWalTableRecordStore>,
         > = if let Some(appender) = canonical_wal_appender.clone() {
             let atomic_commit = crate::services::oltp_gate::atomic_commit_enabled();
-            // TD-SEAM-3: spill-backed partitions when the spill gate is set
-            // (default unset ⇒ exactly the legacy partitioned memtable), with
-            // segments beside the WAL they recover with.
+            // TD-SEAM-3: spill-backed partitions (default on; `0` ⇒ the legacy
+            // partitioned memtable), with segments beside the WAL they recover
+            // with.
             let spill_root = opt_config
                 .map(|cfg| cfg.server.data_dir.join("pgwire").join("record-spill"))
                 .unwrap_or_default();
+            // Spilled rows the truncated WAL no longer holds: these must never
+            // be served from an in-memory fallback.
+            let spill_holds_only_copy = appender.retained_from() > 1
+                && crate::services::storage_format::spill_root_has_state(&spill_root);
             let store =
                 match crate::services::record_store::DirectWalTableRecordStore::open_for_server(
                     appender.clone(),
-                    spill_root,
+                    spill_root.clone(),
                 )
                 .await
                 {
@@ -2047,6 +2063,15 @@ impl SharedServices {
                     Err(e) if atomic_commit => {
                         anyhow::bail!(
                             "opening the spill-backed record store failed with [oltp] atomic_commit on: {e:#}"
+                        );
+                    }
+                    // Rows an earlier run spilled are in no retained WAL entry:
+                    // an in-memory fallback would serve a silent subset.
+                    Err(e) if spill_holds_only_copy => {
+                        anyhow::bail!(
+                            "opening the spill-backed record store failed and {} holds spilled \
+                             rows; refusing to serve without them: {e:#}",
+                            spill_root.display()
                         );
                     }
                     Err(e) => {
@@ -2086,8 +2111,9 @@ impl SharedServices {
                 ),
             }
             match appender.read_entries().await {
-                Ok(entries) => {
-                    if let Err(e) = store.replay_wal_entries(entries).await {
+                Ok(entries) => match store.replay_wal_entries(entries).await {
+                    Ok(_) => record_store_recovered = true,
+                    Err(e) => {
                         if atomic_commit {
                             anyhow::bail!(
                                 "canonical record-store WAL replay failed with [oltp] atomic_commit on; refusing to serve partial state: {e:#}"
@@ -2095,7 +2121,7 @@ impl SharedServices {
                         }
                         warn!("SharedServices: canonical record-store WAL replay failed: {e}");
                     }
-                }
+                },
                 Err(e) if atomic_commit => {
                     anyhow::bail!(
                         "reading the canonical WAL failed with [oltp] atomic_commit on; refusing to serve: {e:#}"
@@ -2606,14 +2632,30 @@ impl SharedServices {
         // `DdlService` (pgwire) so new `CREATE FUNCTION` statements persist here.
         let function_store = build_function_store(canonical_wal_appender.clone()).await;
 
-        // P2.2c (TD-SEAM-2 / TD-SEAM-12): canonical-WAL truncation, off unless
-        // PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS is set. Every WAL
+        // P2.2c (TD-SEAM-2 / TD-SEAM-12): canonical-WAL truncation, on by
+        // default (PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS=0 disables it). Every WAL
         // consumer is a floor source; any refusal skips the run. Read-only
         // sources first, the appending catalog checkpoints last.
-        if let (Some(interval), Some(wal), Some(record_store)) = (
+        // Truncation only removes sealed segments, so without rotation a run
+        // could only append checkpoints; and after an incomplete recovery the
+        // record tier's floor cannot be trusted (see `record_store_recovered`).
+        let truncation_possible = crate::services::canonical_wal::canonical_wal_segment_bytes() > 0;
+        if crate::services::wal_truncator::configured_interval().is_some()
+            && canonical_record_store.is_some()
+            && !(truncation_possible && record_store_recovered)
+        {
+            warn!(
+                rotation = truncation_possible,
+                recovered = record_store_recovered,
+                "SharedServices: canonical WAL truncator NOT scheduled (needs segment rotation \
+                 and a complete WAL recovery); the WAL is retained in full"
+            );
+        }
+        if let (Some(interval), Some(wal), Some(record_store), true) = (
             crate::services::wal_truncator::configured_interval(),
             canonical_wal_appender.clone(),
             canonical_record_store.clone(),
+            truncation_possible && record_store_recovered,
         ) {
             use crate::services::wal_truncator as truncator;
             let sources: Vec<Arc<dyn truncator::WalFloorSource>> = vec![
