@@ -65,24 +65,9 @@ fn spill_segments_under(dir: &std::path::Path) -> usize {
     n
 }
 
-async fn body() {
-    // SAFETY: this test is its own process and single-threaded here; every gate
-    // below is read per partition or per query.
-    unsafe {
-        std::env::set_var("PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT", "8");
-        std::env::set_var("PROXIMADB_NATIVE_TABLE_PROVIDER", "1");
-        std::env::set_var("PROXIMADB_NATIVE_TABLE_ROW_CAP", "10");
-        std::env::remove_var("PROXIMADB_NATIVE_TABLE_LAYER_A");
-    }
-
-    let server = TestPgServer::start().await.expect("server");
-    let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-        .await
-        .expect("connect");
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-
+/// Create and fill `spill_t` — inserts, then updates and deletes of rows already
+/// in segments — returning the live `id -> val` it must hold.
+async fn load(client: &tokio_postgres::Client) -> std::collections::BTreeMap<i64, i64> {
     client
         .simple_query("CREATE TABLE spill_t (id BIGINT PRIMARY KEY, val BIGINT)")
         .await
@@ -117,6 +102,29 @@ async fn body() {
             .expect("delete");
         expected.remove(&id);
     }
+    expected
+}
+
+async fn body() {
+    // SAFETY: this test is its own process, and every env change happens while
+    // no server is running (servers start after, and are dropped before, each
+    // change), so no other thread reads the environment concurrently.
+    unsafe {
+        std::env::set_var("PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT", "8");
+        std::env::set_var("PROXIMADB_NATIVE_TABLE_PROVIDER", "1");
+        std::env::set_var("PROXIMADB_NATIVE_TABLE_ROW_CAP", "10");
+        std::env::remove_var("PROXIMADB_NATIVE_TABLE_LAYER_A");
+    }
+
+    let server = TestPgServer::start().await.expect("server");
+    let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let expected = load(&client).await;
     assert!(
         spill_segments_under(server.data_dir()) >= 2,
         "the fixture must actually spill to segments, or this test proves nothing"
@@ -155,16 +163,33 @@ async fn body() {
     assert_eq!(cells(&cte, 0), [Some(big.len().to_string())]);
     assert_eq!(cells(&cte, 1), [Some(big.iter().sum::<i64>().to_string())]);
 
-    // Kill switch: the capped MemTable path cannot register a table past the
-    // cap, so the same window query no longer serves.
-    // SAFETY: see above.
-    unsafe { std::env::set_var("PROXIMADB_NATIVE_TABLE_LAYER_A", "0") };
-    assert!(
-        client.simple_query(window).await.is_err(),
-        "with the kill switch the over-cap table must decline, not be served truncated"
-    );
-    unsafe { std::env::remove_var("PROXIMADB_NATIVE_TABLE_LAYER_A") };
-
     drop(client);
     drop(server);
+
+    // Kill switch, on a fresh server: the capped MemTable path cannot register a
+    // table past the cap, so the same window query must decline — never be
+    // served truncated.
+    // SAFETY: see above — no server is running.
+    unsafe { std::env::set_var("PROXIMADB_NATIVE_TABLE_LAYER_A", "0") };
+    let server = TestPgServer::start().await.expect("server 2");
+    let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
+        .await
+        .expect("connect 2");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    load(&client).await;
+    let err = client
+        .simple_query(window)
+        .await
+        .expect_err("with the kill switch the over-cap table must decline");
+    assert!(
+        pg_server::db_err(&err).contains("spill_t"),
+        "the decline must be the unregistered over-cap table, got: {}",
+        pg_server::db_err(&err)
+    );
+    drop(client);
+    drop(server);
+    // SAFETY: see above — no server is running.
+    unsafe { std::env::remove_var("PROXIMADB_NATIVE_TABLE_LAYER_A") };
 }

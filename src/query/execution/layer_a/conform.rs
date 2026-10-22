@@ -61,8 +61,11 @@ pub(crate) struct ConformContext {
     /// which also holds rows that are never emitted (a persisted tombstone has
     /// no props, so it is NULL even in a NOT NULL column).
     internal: SchemaRef,
-    /// Position of the primary-key column in `projection`, if projected.
-    projected_pk: Option<usize>,
+    /// The primary-key columns. Always read: a row whose key column is absent
+    /// or NULL takes its key from the oid, which fails for composite and
+    /// non-integer keys — and a failed projection drops the row on the
+    /// materialized path, so it must be decided on the same full key here.
+    pk_names: Vec<String>,
     /// Every row goes through records — see the module note.
     pub records_only: bool,
     access: Arc<LayerARowAccess>,
@@ -75,6 +78,7 @@ pub(crate) struct ConformContext {
 impl ConformContext {
     pub fn new(
         schema: CatalogTableSchema,
+        table_name: String,
         projection: Option<&[usize]>,
         access: Arc<LayerARowAccess>,
         now_ns: i64,
@@ -99,12 +103,6 @@ impl ConformContext {
                 .collect::<Vec<_>>(),
         ));
         let live: Vec<_> = schema.columns.iter().filter(|c| !c.is_deleted).collect();
-        let pk = schema.primary_key.first();
-        let projected_pk = pk.and_then(|pk| {
-            projection
-                .iter()
-                .position(|&i| live[i].name.eq_ignore_ascii_case(pk))
-        });
         let projects_vector = projection.iter().any(|&i| {
             matches!(
                 live[i].data_type,
@@ -116,7 +114,8 @@ impl ConformContext {
         let records_only = projects_vector || matches!(*access, LayerARowAccess::Restricted(_));
         Ok(Self {
             col_names: schema.columns.iter().map(|c| c.name.clone()).collect(),
-            table_name: schema.name.clone(),
+            table_name,
+            pk_names: schema.primary_key.clone(),
             encode_schema: {
                 let mut nullable = schema.clone();
                 for column in &mut nullable.columns {
@@ -128,7 +127,6 @@ impl ConformContext {
             projection,
             output,
             internal,
-            projected_pk,
             records_only,
             access,
             now_ns,
@@ -136,8 +134,9 @@ impl ConformContext {
     }
 
     /// Columns a segment read must fetch: every column when rows go through
-    /// records, else the projected ones present in `segment`, plus the system
-    /// columns. Names, matched exactly as the record decoder keys `props`.
+    /// records, else the projected ones present in `segment`, the primary key
+    /// (see `pk_names`) and the system columns. Names, matched exactly as the
+    /// record decoder keys `props`.
     pub fn segment_columns(&self, segment: &Schema) -> Option<Vec<usize>> {
         if self.records_only {
             return None;
@@ -147,6 +146,7 @@ impl ConformContext {
             .fields()
             .iter()
             .map(|f| f.name().as_str())
+            .chain(self.pk_names.iter().map(String::as_str))
             .chain([
                 SYS_COL_OID,
                 SYS_COL_VARIATION_ID,
@@ -258,9 +258,11 @@ pub(crate) struct SegmentShape {
     residual: Option<usize>,
     /// Per output column: the segment column holding it under the identical type.
     columns: Vec<Option<usize>>,
-    /// Every row goes through records (the context says so, or a projected
-    /// column — the primary key included — is stored under another type, or
-    /// the projected primary key has no column at all).
+    /// The primary-key columns; a row NULL in any of them takes the record
+    /// route (its key is its oid — see `ConformContext::pk_names`).
+    pk: Vec<usize>,
+    /// Every row goes through records (the context says so, a projected
+    /// column is stored under another type, or a key column is missing).
     records_only: bool,
 }
 
@@ -283,9 +285,8 @@ impl SegmentShape {
                 None => None,
             })
             .collect();
-        if let Some(pk) = ctx.projected_pk
-            && columns[pk].is_none()
-        {
+        let pk: Vec<usize> = ctx.pk_names.iter().filter_map(|name| find(name)).collect();
+        if pk.len() != ctx.pk_names.len() {
             records_only = true;
         }
         let i64_col = |name: &str| -> Result<Option<usize>> {
@@ -304,6 +305,7 @@ impl SegmentShape {
             valid_to: i64_col(SYS_COL_VALID_TO_NS)?,
             residual: find(SYS_COL_RESIDUAL),
             columns,
+            pk,
             records_only,
         })
     }
@@ -335,17 +337,12 @@ pub(crate) fn conform_segment_batch(
 
     // Which rows need the record route.
     let residual = shape.residual.map(|i| batch.column(i));
-    let pk = ctx
-        .projected_pk
-        .and_then(|p| shape.columns[p])
-        .map(|i| batch.column(i));
+    let pk: Vec<&ArrayRef> = shape.pk.iter().map(|&i| batch.column(i)).collect();
     let slow: Vec<u32> = if shape.records_only {
         (0..n as u32).collect()
     } else {
         (0..n)
-            .filter(|&r| {
-                residual.is_some_and(|a| a.is_valid(r)) || pk.is_some_and(|a| a.is_null(r))
-            })
+            .filter(|&r| residual.is_some_and(|a| a.is_valid(r)) || pk.iter().any(|a| a.is_null(r)))
             .map(|r| r as u32)
             .collect()
     };

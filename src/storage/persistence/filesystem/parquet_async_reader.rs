@@ -145,8 +145,16 @@ impl FileSystemParquetReader {
     }
 }
 
+/// A filesystem failure, as `ParquetError::External` — distinct from a decode
+/// error, so a caller can tell "this object could not be read" from "this
+/// object is not what I expected" (see [`is_io_error`]).
 fn fs_error(path: &str, op: &str, error: impl std::fmt::Display) -> ParquetError {
-    ParquetError::General(format!("filesystem {op} of '{path}' failed: {error}"))
+    ParquetError::External(format!("filesystem {op} of '{path}' failed: {error}").into())
+}
+
+/// Did reading fail at the filesystem (rather than in decoding)?
+pub fn is_io_error(error: &ParquetError) -> bool {
+    matches!(error, ParquetError::External(_))
 }
 
 /// The bytes for `range`, or an error if the backend returned a short buffer.

@@ -352,7 +352,14 @@ async fn drain(mut merge: LayerAMerge) -> anyhow::Result<Vec<RecordBatch>> {
 #[tokio::test]
 async fn merge_is_newest_wins_and_verifies_order() {
     let ctx = Arc::new(
-        ConformContext::new(schema(), None, Arc::new(LayerARowAccess::Unrestricted), 0).unwrap(),
+        ConformContext::new(
+            schema(),
+            TABLE.to_string(),
+            None,
+            Arc::new(LayerARowAccess::Unrestricted),
+            0,
+        )
+        .unwrap(),
     );
     // Oids compare as strings: "1" < "10" < "2".
     let older = futures::stream::iter(vec![
@@ -391,4 +398,66 @@ async fn merge_is_newest_wins_and_verifies_order() {
     );
     let err = drain(merge).await.expect_err("out of order");
     assert!(err.to_string().contains("not strictly ordered"), "{err}");
+}
+
+/// A composite primary key cannot be served from the oid: a row taking the
+/// record route must be decoded with its key columns even when the query does
+/// not project them, or its projection fails and the row is lost (review of
+/// #2153). `count(*)` and a key-less projection must match the materialized
+/// path row for row.
+#[tokio::test]
+async fn a_record_route_row_keeps_a_composite_key_it_does_not_project() {
+    let schema = CatalogTableSchema::new(TABLE)
+        .with_column(CatalogColumn::new(1, "a", ProximaType::Int64))
+        .with_column(CatalogColumn::new(2, "b", ProximaType::Int64))
+        .with_column(CatalogColumn::new(3, "c", ProximaType::Float64))
+        .with_primary_key(vec!["a".to_string(), "b".to_string()]);
+    let (fs, base) = fixture().await;
+    let encode = schema.clone();
+    let store = SpillRecordStorage::with_flush_threshold(fs.clone(), base, None)
+        .with_tenant("tenant-a")
+        .with_schema_source(SpillSchemaSource::new(move || Some(encode.clone())));
+    for (a, b) in [(1_i64, 1_i64), (1, 2), (2, 1)] {
+        let mut r = ProximaRecord {
+            oid: format!("{a}\u{1f}{b}"),
+            tenant_id: "tenant-a".to_string(),
+            variation_id: Some(TABLE.to_string()),
+            ..Default::default()
+        };
+        r.props
+            .insert("a".into(), ProximaTreeNode::Value(ProximaValue::Int64(a)));
+        r.props
+            .insert("b".into(), ProximaTreeNode::Value(ProximaValue::Int64(b)));
+        // (1, 2) carries an integer in the float column: a residual row.
+        let c = if (a, b) == (1, 2) {
+            ProximaValue::Int64(12)
+        } else {
+            ProximaValue::Float64((a * 10 + b) as f64)
+        };
+        r.props.insert("c".into(), ProximaTreeNode::Value(c));
+        store.upsert_record(r).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment");
+
+    let table = || async {
+        NativeLayerASnapshot {
+            schema: schema.clone(),
+            snapshot: Some(snapshot_of(&store, &fs).await),
+            access: LayerARowAccess::Unrestricted,
+        }
+    };
+    let count = query(table().await, "select count(*) as n from orders").await;
+    let n = count
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(n.value(0), 3, "no row lost");
+    let got = query(table().await, "select c from orders order by c").await;
+    let c = got
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    assert_eq!(c.values().to_vec(), vec![11.0, 12.0, 21.0]);
 }

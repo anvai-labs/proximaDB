@@ -156,6 +156,19 @@ impl LayerAMerge {
             for i in 0..self.cursors.len() {
                 self.refill(i).await?;
             }
+            // Batches walked past with nothing served (superseded copies, dead
+            // or filtered rows) would otherwise stay referenced until the next
+            // output batch — the whole table, when few rows are served.
+            // With rows pending, emit them early instead: a few sparse rows
+            // must not pin a batch each. Either way at most ~2k batches stay
+            // referenced — memory is O(segments × batch).
+            if self.slots.len() > 2 * self.cursors.len() {
+                if self.pending.is_empty() {
+                    self.release_unreferenced()?;
+                } else {
+                    return self.flush();
+                }
+            }
             // `(cursor, (slot, row))` of every cursor still holding a row.
             let active: Vec<(usize, (usize, usize))> = self
                 .cursors
@@ -219,7 +232,13 @@ impl LayerAMerge {
             .collect::<Result<Vec<_>, _>>()?;
         let batch = self.emit(columns, n)?;
         self.pending.clear();
+        self.release_unreferenced()?;
+        Ok(Some(batch))
+    }
 
+    /// Drop every batch no cursor is walking. Only valid with nothing pending
+    /// (pending rows refer to slots by index).
+    fn release_unreferenced(&mut self) -> Result<()> {
         let mut old: Vec<Option<Conformed>> = std::mem::take(&mut self.slots)
             .into_iter()
             .map(Some)
@@ -233,7 +252,7 @@ impl LayerAMerge {
                 c.slot = Some(self.slots.len() - 1);
             }
         }
-        Ok(Some(batch))
+        Ok(())
     }
 
     /// Rows that won the merge and are visible, under the scan's declared

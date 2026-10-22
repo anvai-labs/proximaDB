@@ -34,7 +34,9 @@ use super::merge::{ConformedStream, LayerAMerge};
 use crate::services::layer_a_snapshot::{LayerARowAccess, LayerASnapshot, NativeLayerASnapshot};
 use crate::storage::engines::sst::segment_format::read_segment_records;
 use crate::storage::persistence::filesystem::FileSystem;
-use crate::storage::persistence::filesystem::parquet_async_reader::FileSystemParquetReader;
+use crate::storage::persistence::filesystem::parquet_async_reader::{
+    FileSystemParquetReader, is_io_error,
+};
 
 /// A native table served by streaming its record tier: spill segments merged
 /// newest-wins under the resident rows. Rows are exactly those the materialized
@@ -104,8 +106,16 @@ impl TableProvider for LayerATableProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Table membership is the snapshot's (`LayerASnapshot::table_name`);
+        // a denied caller has no snapshot and no rows to test.
+        let table_name = self
+            .table
+            .snapshot
+            .as_ref()
+            .map_or_else(|| self.table.schema.name.clone(), |s| s.table_name.clone());
         let ctx = ConformContext::new(
             self.table.schema.clone(),
+            table_name,
             projection.map(Vec::as_slice),
             self.table.access.clone(),
             now_ns(),
@@ -326,7 +336,15 @@ async fn open_segment(
     batch_size: usize,
 ) -> Result<ConformedStream> {
     let mut reader = FileSystemParquetReader::new(filesystem.clone(), path.clone());
-    let metadata = reader.load_metadata(None).await.ok();
+    // An I/O failure fails the scan. Only an object that is not Parquet, or
+    // does not declare oid order, takes the whole-object fallback below.
+    let metadata = match reader.load_metadata(None).await {
+        Ok(metadata) => Some(metadata),
+        Err(e) if is_io_error(&e) => {
+            return Err(anyhow::anyhow!("layer A: read segment '{path}': {e}"));
+        }
+        Err(_) => None,
+    };
     if let Some(metadata) = metadata.filter(|m| declares_oid_order(m)) {
         let arrow = ArrowReaderMetadata::try_new(metadata.clone(), ArrowReaderOptions::new())
             .with_context(|| format!("layer A: read schema of segment '{path}'"))?;
