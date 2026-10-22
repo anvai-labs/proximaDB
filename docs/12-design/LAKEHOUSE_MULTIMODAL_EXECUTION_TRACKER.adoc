@@ -127,7 +127,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | Catalog prefix registration (object-store placement of spill segments) | Open | — | TD-SEAM-3.
 | MATERIALIZE LSN capture via the per-collection high-water | Done in #2095 | #2095 | Superseded by `capture_snapshot_lsn` with a WAL pin.
 | P2.4 streaming / incremental MATERIALIZE publisher | **Track B**; slice 1 Done | #2126 | Slice 1: Parquet readers (DuckDB, DataFusion, native-over-Parquet) read only the snapshot manifest's files and fail closed on any manifest error (no directory listing beside a metadata log). Gate: TPC-DS SF1 on a release build loads with no OOM and peak RSS recorded. TD-USUB-10, TD-OLAPFMT-3.
-| Turn rotation and truncation on by default | **Next** (lead) | — | Soak: `seeded_crash_truncate_interleavings_match_a_reference_model` (8 seeds × 300 random upserts/deletes/flushes/truncations/crash-restarts vs a reference model; the record tier must never refuse). Then flip the defaults, with the spill gate on. Also add the first `serde(default)` field on `CanonicalWalEntry`.
+| Turn rotation, truncation and the spill on by default, with a data-format guard | Open PR (lead) | — | Gate: the soak (#2145). Defaults: 64 MiB segments, truncator every 300 s (newest 1M entries kept), spill at 65 536 resident rows; `0`/`off` disables each (`services::storage_format::default_on_gate`). `{data_dir}/pgwire/DATA_FORMAT` records format 2 before anything is opened; a newer marker or an unreadable one refuses boot. Turning the spill off over existing spill state, or failing to open it, refuses boot instead of serving from memory. Rolling back across format 1 → 2 is unsupported (older binaries cannot read the marker). Still open: the first `serde(default)` field on `CanonicalWalEntry`.
 |===
 
 === P3–P6
@@ -151,7 +151,8 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 [cols="2,1,3",options="header"]
 |===
 | Branch | PR | State and next action
-| `lead/wal-soak` | (lead) | Seeded crash/truncate soak + tracker refresh; then the default flips.
+| `lead/wal-soak` | #2145 | Seeded crash/truncate soak + tracker refresh.
+| `lead/default-on` | (lead) | Default-on rotation/truncation/spill + data-format guard (stacked on #2145).
 |===
 
 === 4.1 Parallel tracks (since 2026-10-22)
@@ -303,4 +304,6 @@ exec (retire the second MemTable); (10) default-ON flip after a soak.
 | 2026-10-20 | The single-tenant `""` partition spills through an explicit `untenanted()` opt-in. `with_tenant("")` still refuses tombstones, so an accidental empty tenant cannot write a match-any tombstone.
 | 2026-10-20 | The truncator is off by default and needs rotation plus the spill gate. MATERIALIZE pins WAL history from its snapshot-LSN capture until the catalog records it. The snapshot LSN is the WAL head lowered below in-flight writes, not the table's last change.
 | 2026-10-20 | Spill segments use the warehouse `ParquetWritePolicy`, sorted by `__proxima_oid`. Layer A files are lakehouse files, not Arrow-default blobs.
+| 2026-10-22 | Every track PR gets an independent, diff-only adversarial review from the lead, posted as a PR comment, before merge. Merges need green CI, a clean review (or its should-fixes answered) and the owning lane's go-ahead.
+| 2026-10-22 | (Owner decision) Rotation, truncation and the spill default ON, shipped with a durable data-format marker so this and later binaries refuse a newer-format directory. The format 1 → 2 transition itself cannot be rolled back and is release-noted.
 |===

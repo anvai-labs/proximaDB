@@ -67,15 +67,18 @@ lazy_static! {
 }
 
 /// Env gate for P2.1 segment rotation of the shared canonical WAL: rotate the
-/// active file once it reaches this many bytes. Unset, `0` or unparsable = off.
+/// active file once it reaches this many bytes. Default ON
+/// ([`DEFAULT_WAL_SEGMENT_BYTES`](crate::services::storage_format::DEFAULT_WAL_SEGMENT_BYTES));
+/// `0` or `off` disables it. See [`crate::services::storage_format`].
 pub const SEGMENT_BYTES_ENV: &str = "PROXIMADB_CANONICAL_WAL_SEGMENT_BYTES";
 
 /// The configured rotation size for the shared canonical WAL (`0` = off).
 pub fn canonical_wal_segment_bytes() -> u64 {
-    std::env::var(SEGMENT_BYTES_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(0)
+    crate::services::storage_format::default_on_gate(
+        SEGMENT_BYTES_ENV,
+        crate::services::storage_format::DEFAULT_WAL_SEGMENT_BYTES,
+    )
+    .unwrap_or(0)
 }
 
 /// A reader racing a rotation re-reads (or waits 1 ms while one is mid-rename);

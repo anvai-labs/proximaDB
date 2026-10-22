@@ -79,23 +79,26 @@ use proximadb_storage_filesystem_types::FileSystem;
 use crate::storage::engines::sst::segment_format::read_segment_records;
 
 /// Flush threshold: resident records after which the memtable is written to a
-/// segment. Unset ⇒ **never flush** (the shipped default — behaviourally
-/// identical to the plain memtable).
+/// segment. Default ON
+/// ([`DEFAULT_SPILL_MAX_RESIDENT`](crate::services::storage_format::DEFAULT_SPILL_MAX_RESIDENT));
+/// `0` or `off` ⇒ **never flush** (the plain memtable). See
+/// [`crate::services::storage_format`].
 pub const SPILL_MAX_RESIDENT_ENV: &str = "PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT";
 
 /// Read the configured flush threshold. `None` ⇒ never flush.
 ///
-/// A zero or unparsable value reads as unset rather than "flush on every write" —
-/// a typo must not turn every insert into an object write.
+/// An unparsable value keeps the default rather than reading as "flush on
+/// every write" — a typo must not turn every insert into an object write.
 ///
 /// Read at every partition construction rather than cached in a `OnceLock`: the
 /// gate must be observable per store, and a process-lifetime cache is what made
 /// the TD-USUB-6 residual-tail benchmark measure the same mode twice.
 pub(crate) fn configured_flush_threshold() -> Option<usize> {
-    std::env::var(SPILL_MAX_RESIDENT_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
+    crate::services::storage_format::default_on_gate(
+        SPILL_MAX_RESIDENT_ENV,
+        crate::services::storage_format::DEFAULT_SPILL_MAX_RESIDENT,
+    )
+    .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
 }
 
 /// Rows a flush held back because they did not read back identically through
@@ -4344,22 +4347,25 @@ mod tests {
         Ok(())
     }
 
-    /// An invalid threshold reads as unset, never as "flush on every write".
+    /// Default ON; `0`/`off` disables; an invalid threshold keeps the default,
+    /// never "flush on every write".
     #[test]
-    fn invalid_threshold_reads_as_never_flush() {
-        for bad in ["0", "-1", "abc", ""] {
-            // SAFETY: single-threaded unit test mutating process env, cleared below.
+    fn the_threshold_defaults_on_and_never_reads_a_typo_as_flush_every_write() {
+        let default = crate::services::storage_format::DEFAULT_SPILL_MAX_RESIDENT as usize;
+        // SAFETY: single-threaded unit test mutating process env, cleared below.
+        unsafe { std::env::remove_var(SPILL_MAX_RESIDENT_ENV) };
+        assert_eq!(configured_flush_threshold(), Some(default), "unset");
+        for off in ["0", "off"] {
+            unsafe { std::env::set_var(SPILL_MAX_RESIDENT_ENV, off) };
+            assert_eq!(configured_flush_threshold(), None, "{off:?}");
+        }
+        for bad in ["-1", "abc", ""] {
             unsafe { std::env::set_var(SPILL_MAX_RESIDENT_ENV, bad) };
-            assert_eq!(
-                configured_flush_threshold(),
-                None,
-                "invalid threshold {bad:?}"
-            );
+            assert_eq!(configured_flush_threshold(), Some(default), "{bad:?}");
         }
         unsafe { std::env::set_var(SPILL_MAX_RESIDENT_ENV, "256") };
         assert_eq!(configured_flush_threshold(), Some(256));
         unsafe { std::env::remove_var(SPILL_MAX_RESIDENT_ENV) };
-        assert_eq!(configured_flush_threshold(), None);
     }
     /// Pins the NAME FORMAT: a lexicographic sort of segment names equals their
     /// numeric order.

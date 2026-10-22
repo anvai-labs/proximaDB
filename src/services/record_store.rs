@@ -2180,6 +2180,17 @@ impl DirectWalTableRecordStore {
         spill_root: std::path::PathBuf,
     ) -> Result<Self> {
         if crate::services::record_spill::configured_flush_threshold().is_none() {
+            // Spill turned off over a root an earlier run spilled into: rows
+            // flushed there may be in no retained WAL entry, so a memtable
+            // store would serve a silent subset. Refuse instead.
+            if crate::services::storage_format::spill_root_has_state(&spill_root) {
+                anyhow::bail!(
+                    "record spill is off ({}=0) but {} holds spill segments from an earlier \
+                     run, whose rows may be in no retained WAL entry; turn the spill back on",
+                    crate::services::record_spill::SPILL_MAX_RESIDENT_ENV,
+                    spill_root.display()
+                );
+            }
             return Ok(Self::new_partitioned(wal_appender));
         }
         // An empty root would put segments at `/{tenant}/{collection}`.
@@ -5661,8 +5672,8 @@ mod tests {
     /// absent precisely so the default path runs the same code it always did,
     /// rather than different code that currently behaves the same.
     #[tokio::test]
-    async fn spilling_store_writes_no_segments_when_the_gate_is_unset() {
-        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+    async fn spilling_store_writes_no_segments_when_the_gate_is_off() {
+        unsafe { std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "0") };
 
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
@@ -6496,11 +6507,11 @@ mod tests {
         assert_eq!(spill_path_segment("orders-2026.v1"), "orders-2026.v1");
     }
 
-    /// With the gate unset the production constructor is the legacy memtable
-    /// store and writes nothing under the spill root.
+    /// With the gate off (`0`) the production constructor is the legacy
+    /// memtable store and writes nothing under the spill root.
     #[tokio::test]
-    async fn open_for_server_without_the_gate_is_the_partitioned_memtable() {
-        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+    async fn open_for_server_with_the_gate_off_is_the_partitioned_memtable() {
+        unsafe { std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "0") };
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("record-spill");
         let store = DirectWalTableRecordStore::open_for_server(
@@ -6529,8 +6540,31 @@ mod tests {
         assert_eq!(store.flush_partitions().await.expect("flush"), 1);
         assert!(
             !root.exists(),
-            "no spill object may be written with the gate unset"
+            "no spill object may be written with the gate off"
         );
+    }
+
+    /// Turning the spill off over a root an earlier run spilled into refuses:
+    /// those rows may be in no retained WAL entry, so a memtable store would
+    /// serve a silent subset.
+    #[tokio::test]
+    async fn open_for_server_refuses_to_turn_the_spill_off_over_spilled_state() {
+        unsafe { std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "0") };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("record-spill");
+        std::fs::create_dir_all(root.join("tenant-a").join("orders")).expect("spill dir");
+        let err = DirectWalTableRecordStore::open_for_server(
+            Arc::new(RecordingWalAppender::default()),
+            root,
+        )
+        .await
+        .err()
+        .expect("spilled state with the gate off must refuse");
+        assert!(
+            format!("{err:#}").contains("turn the spill back on"),
+            "{err:#}"
+        );
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
     }
 
     /// With the gate set, the production constructor spills under
