@@ -2144,8 +2144,8 @@ impl DirectWalTableRecordStore {
     /// to durable Parquet segments once resident rows exceed the configured bound
     /// (TD-USUB-1 slice 2a).
     ///
-    /// **Default-OFF by construction, and off means the legacy TYPE.** With
-    /// `PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT` unset this builds
+    /// **Off means the legacy TYPE.** With
+    /// `PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT` off (`0`) this builds
     /// [`MemtableRecordStorage`] — the same store [`Self::new_partitioned`] builds —
     /// rather than a spill store configured never to flush. Mandate #8: with the
     /// marker absent, the shipped path is byte-identical to the legacy one, not
@@ -2165,8 +2165,8 @@ impl DirectWalTableRecordStore {
     /// segments first: truncation may only reference a segment whose location is
     /// recorded somewhere recovery can read it. See TD-USUB-1.
     /// The production constructor (TD-SEAM-3 / TD-USUB-1 item iii): with the
-    /// spill gate (`PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT`) unset this is
-    /// exactly [`Self::new_partitioned`]; with it set, partitions spill to
+    /// spill gate (`PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT`) off (`0`) this is
+    /// exactly [`Self::new_partitioned`]; on (the default), partitions spill to
     /// local Parquet segments under `spill_root`, beside the canonical WAL they
     /// recover with — `{spill_root}/{tenant}/{collection}`, each component
     /// encoded injectively ([`spill_path_segment`]).
@@ -2180,13 +2180,18 @@ impl DirectWalTableRecordStore {
         spill_root: std::path::PathBuf,
     ) -> Result<Self> {
         if crate::services::record_spill::configured_flush_threshold().is_none() {
-            // Spill turned off over a root an earlier run spilled into: rows
-            // flushed there may be in no retained WAL entry, so a memtable
-            // store would serve a silent subset. Refuse instead.
-            if crate::services::storage_format::spill_root_has_state(&spill_root) {
+            // Spill turned off over a root an earlier run spilled into, AFTER
+            // the WAL was truncated: rows flushed there may be in no retained
+            // WAL entry, so a memtable store would serve a silent subset.
+            // Refuse. With the history intact, replay rebuilds every row in
+            // memory and turning the spill off is safe.
+            if wal_appender.retained_from() > 1
+                && crate::services::storage_format::spill_root_has_state(&spill_root)
+            {
                 anyhow::bail!(
                     "record spill is off ({}=0) but {} holds spill segments from an earlier \
-                     run, whose rows may be in no retained WAL entry; turn the spill back on",
+                     run and the WAL below them was truncated, so their rows are in no \
+                     retained WAL entry; turn the spill back on",
                     crate::services::record_spill::SPILL_MAX_RESIDENT_ENV,
                     spill_root.display()
                 );
@@ -2461,7 +2466,7 @@ impl DirectWalTableRecordStore {
     ///   tier's account.
     /// * `Err`: do not truncate. Any partition refusing makes the whole tier
     ///   refuse; there is no partial answer. A plain memtable partition refuses
-    ///   (the trait default), so with the spill gate unset — every partition a
+    ///   (the trait default), so with the spill gate off — every partition a
     ///   memtable — this always refuses unless no partition exists.
     ///
     /// Shared-storage mode ([`Self::new`]) refuses unconditionally: its one
@@ -5664,7 +5669,7 @@ mod tests {
         );
     }
 
-    /// Mandate #8: with the gate unset the shipped path must be the LEGACY one.
+    /// Mandate #8: with the gate off the path must be the LEGACY one.
     ///
     /// The observable form of that claim is that nothing is written to object
     /// storage at all — not that a spill store was constructed with flushing
@@ -5723,9 +5728,10 @@ mod tests {
             .is_some();
         assert!(
             !wrote_anything,
-            "gate unset must write no segments; found entries under {}",
+            "gate off must write no segments; found entries under {}",
             root.display()
         );
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
     }
 
     /// ADR-097 P3.1: a spilling store's Layer A snapshot names the segments its
@@ -6542,6 +6548,7 @@ mod tests {
             !root.exists(),
             "no spill object may be written with the gate off"
         );
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
     }
 
     /// Turning the spill off over a root an earlier run spilled into refuses:
@@ -6552,14 +6559,42 @@ mod tests {
         unsafe { std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "0") };
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("record-spill");
-        std::fs::create_dir_all(root.join("tenant-a").join("orders")).expect("spill dir");
-        let err = DirectWalTableRecordStore::open_for_server(
-            Arc::new(RecordingWalAppender::default()),
-            root,
-        )
-        .await
-        .err()
-        .expect("spilled state with the gate off must refuse");
+        let partition = root.join("tenant-a").join("orders");
+        std::fs::create_dir_all(&partition).expect("spill dir");
+        std::fs::write(partition.join("spill-0000000000000001.parquet"), b"x").expect("segment");
+        let wal = Arc::new(
+            crate::services::FramedTableWalAppender::open(dir.path().join("canonical-records.wal"))
+                .await
+                .expect("wal"),
+        );
+        wal.enable_segment_rotation(1);
+        for i in 0..3 {
+            wal.append_operations(
+                vec![CanonicalOperation::RecordUpsert {
+                    collection_id: "orders".to_string(),
+                    record: Box::new(ProximaRecord {
+                        oid: format!("r{i}"),
+                        ..Default::default()
+                    }),
+                    projections: vec![],
+                }],
+                None,
+            )
+            .await
+            .expect("append");
+        }
+
+        // History intact: replay rebuilds every row in memory, so off is safe.
+        DirectWalTableRecordStore::open_for_server(wal.clone(), root.clone())
+            .await
+            .expect("an untruncated WAL may turn the spill off");
+
+        // History truncated: the segments may hold the only copy. Refuse.
+        wal.truncate_below(u64::MAX).await.expect("truncate");
+        let err = DirectWalTableRecordStore::open_for_server(wal, root)
+            .await
+            .err()
+            .expect("spilled state over a truncated WAL with the gate off must refuse");
         assert!(
             format!("{err:#}").contains("turn the spill back on"),
             "{err:#}"

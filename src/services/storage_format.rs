@@ -32,7 +32,8 @@ pub const DEFAULT_TRUNCATE_INTERVAL_SECS: u64 = 300;
 pub const DEFAULT_SPILL_MAX_RESIDENT: u64 = 65_536;
 
 /// A positive-integer gate that defaults ON: unset or empty ⇒ `default`;
-/// `0`, `off`, `false` or `no` ⇒ `None` (off); a positive integer ⇒ that value.
+/// `0` (in any spelling), `off`, `false`, `no`, `none` or `disabled` ⇒ `None`
+/// (off); a positive integer ⇒ that value.
 /// Anything else keeps the default and warns — a typo must neither disable
 /// durability features silently nor pick an absurd value.
 pub fn default_on_gate(env: &str, default: u64) -> Option<u64> {
@@ -45,12 +46,13 @@ pub fn default_on_gate(env: &str, default: u64) -> Option<u64> {
     }
     if matches!(
         value.to_ascii_lowercase().as_str(),
-        "0" | "off" | "false" | "no"
+        "off" | "false" | "no" | "none" | "disabled"
     ) {
         return None;
     }
     match value.parse::<u64>() {
-        Ok(n) if n > 0 => Some(n),
+        Ok(0) => None,
+        Ok(n) => Some(n),
         _ => {
             tracing::warn!(
                 env,
@@ -129,7 +131,9 @@ fn write_marker(dir: &Path, path: &Path) -> Result<()> {
         format: CURRENT_FORMAT,
         written_by: crate::version::PROXIMADB_VERSION.to_string(),
     })?;
-    let tmp: PathBuf = dir.join(format!("{FORMAT_MARKER}.tmp"));
+    // Per-process temp name: two processes booting on one directory must not
+    // rename each other's file out from under them.
+    let tmp: PathBuf = dir.join(format!("{FORMAT_MARKER}.{}.tmp", std::process::id()));
     {
         use std::io::Write;
         let mut file =
@@ -143,11 +147,22 @@ fn write_marker(dir: &Path, path: &Path) -> Result<()> {
         .with_context(|| format!("syncing {}", dir.display()))
 }
 
-/// Whether `spill_root` already holds spill state from an earlier run. With
-/// the spill gate off, such a directory must not be served from memory: rows
-/// flushed there may be in no retained WAL entry.
+/// Whether `spill_root` holds any file from an earlier run (a segment, or a
+/// purge obligation still owed). Empty directories — what a DROP purge leaves
+/// — are not state. An unreadable directory counts as state: when unsure,
+/// keep the data reachable.
 pub fn spill_root_has_state(spill_root: &Path) -> bool {
-    std::fs::read_dir(spill_root).is_ok_and(|mut entries| entries.next().is_some())
+    match std::fs::read_dir(spill_root) {
+        Ok(entries) => entries.into_iter().any(|entry| match entry {
+            Ok(entry) => match entry.file_type() {
+                Ok(kind) if kind.is_dir() => spill_root_has_state(&entry.path()),
+                Ok(_) => true,
+                Err(_) => true,
+            },
+            Err(_) => true,
+        }),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 #[cfg(test)]
@@ -163,6 +178,9 @@ mod tests {
         for (raw, want) in [
             ("", Some(7)),
             ("0", None),
+            ("00", None),
+            ("none", None),
+            ("disabled", None),
             ("off", None),
             ("OFF", None),
             ("false", None),
@@ -188,7 +206,11 @@ mod tests {
             CURRENT_FORMAT,
             "idempotent"
         );
-        assert!(!dir.path().join(format!("{FORMAT_MARKER}.tmp")).exists());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp file left behind");
 
         // An explicit older marker is upgraded.
         std::fs::write(
@@ -220,13 +242,19 @@ mod tests {
     }
 
     #[test]
-    fn spill_state_is_any_entry_under_the_root() -> Result<()> {
+    fn spill_state_is_any_file_under_the_root_not_an_empty_directory() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let root = dir.path().join("record-spill");
         assert!(!spill_root_has_state(&root), "missing root");
-        std::fs::create_dir_all(&root)?;
-        assert!(!spill_root_has_state(&root), "empty root");
-        std::fs::create_dir_all(root.join("tenant"))?;
+        std::fs::create_dir_all(root.join("tenant").join("orders"))?;
+        assert!(
+            !spill_root_has_state(&root),
+            "empty directories (what a DROP purge leaves) are not state"
+        );
+        std::fs::write(
+            root.join("tenant").join("orders").join("spill-1.parquet"),
+            b"x",
+        )?;
         assert!(spill_root_has_state(&root));
         Ok(())
     }
