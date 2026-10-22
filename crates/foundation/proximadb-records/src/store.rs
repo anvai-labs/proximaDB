@@ -308,10 +308,18 @@ pub trait RecordStore: Send + Sync {
 /// layers themselves instead of asking the store for a merged result (the
 /// streaming Layer A table provider, ADR-097 P3.1).
 ///
-/// Consistency is the whole contract: every live row is either in `resident`
-/// or in a listed segment, and every delete is either in `tombstones` or
-/// persisted in a listed segment — none falls between the parts because a
-/// flush landed while the view was taken.
+/// Consistency with respect to **flushes** is the contract: every live row is
+/// either in `resident` or in a listed segment, and every delete is either in
+/// `tombstones` or persisted in a listed segment — none falls between the
+/// parts because a flush landed while the view was taken.
+///
+/// It is NOT a per-write linearization point. A single upsert or delete
+/// updates the resident map and the tombstone set in two steps, and a view
+/// taken between them can serve the older segment copy of that one oid — the
+/// same exposure `scan_records` has always had. Closing it needs the write
+/// order TD-USUB-16 tracks (an LSN-ordered tombstone/resident pair), not a
+/// reordering of the two steps: either order makes the concurrent
+/// upsert-vs-delete race end with neither, resurrecting a stale copy.
 ///
 /// The reader resolves it newest-wins: segments oldest→newest, a later one
 /// shadowing an earlier copy of the same oid; then `resident` on top of every
