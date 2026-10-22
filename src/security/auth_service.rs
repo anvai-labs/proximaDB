@@ -23,7 +23,11 @@ use tracing::{info, warn};
 use x509_parser::prelude::*;
 
 /// Unified authentication service configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` is the least-privileged posture: authentication disabled, no
+/// methods, no credentials, an inert JWT/SSO/mTLS configuration. Enabling
+/// anything is an explicit act.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthenticationConfig {
     pub enabled: bool,
     pub methods: Vec<AuthenticationMethod>,
@@ -175,7 +179,10 @@ pub struct ApiKeyInfo {
 }
 
 /// JWT configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` = JWT disabled with an empty secret and zero-length expirations
+/// — deliberately unusable; any real deployment overrides every field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JwtConfig {
     pub enabled: bool,
     pub secret: String,
@@ -187,7 +194,9 @@ pub struct JwtConfig {
 }
 
 /// SSO configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` = SSO disabled, no providers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SSOConfig {
     pub enabled: bool,
     pub providers: Vec<String>,
@@ -1879,27 +1888,22 @@ ip_restrictions = []
         AuthenticationConfig {
             enabled: true,
             methods: vec![AuthenticationMethod::ApiKey],
-            require_authentication: false,
             default_session_timeout_minutes: 480,
             api_keys,
-            scram_users: HashMap::new(),
             jwt: JwtConfig {
-                enabled: false,
                 secret: "test-secret".to_string(),
                 access_token_expiration_minutes: 15,
                 refresh_token_expiration_days: 7,
                 issuer: "test".to_string(),
                 audience: "test".to_string(),
                 algorithm: "HS256".to_string(),
+                ..Default::default()
             },
             sso: SSOConfig {
-                enabled: false,
-                providers: vec![],
                 token_cache_ttl_minutes: 5,
+                ..Default::default()
             },
-            mtls: MtlsConfig::default(),
-            oidc: None,
-            audit_fail_closed: false,
+            ..Default::default()
         }
     }
 
@@ -2079,24 +2083,20 @@ ip_restrictions = []
             require_authentication: true,
             default_session_timeout_minutes: 60,
             api_keys,
-            scram_users: HashMap::new(),
             jwt: JwtConfig {
-                enabled: false,
                 secret: "t".to_string(),
                 access_token_expiration_minutes: 15,
                 refresh_token_expiration_days: 7,
                 issuer: "t".to_string(),
                 audience: "t".to_string(),
                 algorithm: "HS256".to_string(),
+                ..Default::default()
             },
             sso: SSOConfig {
-                enabled: false,
-                providers: vec![],
                 token_cache_ttl_minutes: 5,
+                ..Default::default()
             },
-            mtls: MtlsConfig::default(),
-            oidc: None,
-            audit_fail_closed: false,
+            ..Default::default()
         }
     }
 

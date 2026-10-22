@@ -997,11 +997,9 @@ mod tests {
     use crate::network::auth::config::JwtAlgorithm;
     use crate::network::auth::jwt::JwtService;
     use crate::security::auth_service::{
-        ApiKeyInfo, AuthenticationConfig, AuthenticationMethod, JwtConfig, MtlsConfig, SSOConfig,
+        ApiKeyInfo, AuthenticationConfig, AuthenticationMethod, JwtConfig, SSOConfig,
     };
-    use crate::security::rbac_service::RBACConfig;
-    use crate::security::security_coordinator::{ComplianceConfig, TlsConfig};
-    use crate::security::{AuditConfig, SecurityConfig, SecurityCoordinator, SecurityMode};
+    use crate::security::{SecurityConfig, SecurityCoordinator};
 
     #[test]
     fn test_should_skip_auth() {
@@ -1094,65 +1092,39 @@ mod tests {
 
         SecurityConfig {
             enabled: true,
-            mode: SecurityMode::Development,
             authentication: AuthenticationConfig {
                 enabled: true,
                 methods: vec![AuthenticationMethod::ApiKey],
                 require_authentication: true,
                 default_session_timeout_minutes: 60,
                 api_keys,
-                scram_users: HashMap::new(),
                 jwt: JwtConfig {
-                    enabled: false,
                     secret: "dev-secret".to_string(),
                     access_token_expiration_minutes: 15,
                     refresh_token_expiration_days: 7,
                     issuer: "test".to_string(),
                     audience: "test".to_string(),
                     algorithm: "HS256".to_string(),
+                    ..Default::default()
                 },
                 sso: SSOConfig {
-                    enabled: false,
-                    providers: vec![],
                     token_cache_ttl_minutes: 5,
+                    ..Default::default()
                 },
-                mtls: MtlsConfig::default(),
-                oidc: None,
-                audit_fail_closed: false,
+                ..Default::default()
             },
-            rbac: RBACConfig::default(),
-            audit: AuditConfig::default(),
-            tls: TlsConfig {
-                enabled: false,
-                require_client_certificates: false,
-                cert_file: None,
-                key_file: None,
-                ca_file: None,
-            },
-            compliance: ComplianceConfig {
-                frameworks: vec![],
-                data_residency: None,
-                encryption_at_rest: false,
-                encryption_in_transit: false,
-            },
-            encryption: crate::security::EncryptionConfig::default(),
-            key_store: crate::security::KeyStoreConfig::default(),
-            tenant: Default::default(),
-            pgwire: crate::security::security_coordinator::PgwireSecurityConfig::default(),
+            ..Default::default()
         }
     }
 
     fn build_security_config_with_jwt() -> SecurityConfig {
         SecurityConfig {
             enabled: true,
-            mode: SecurityMode::Development,
             authentication: AuthenticationConfig {
                 enabled: true,
                 methods: vec![AuthenticationMethod::JWT],
                 require_authentication: true,
                 default_session_timeout_minutes: 60,
-                api_keys: HashMap::new(),
-                scram_users: std::collections::HashMap::new(),
                 jwt: JwtConfig {
                     enabled: true,
                     secret: "dev-jwt-secret".to_string(),
@@ -1163,33 +1135,12 @@ mod tests {
                     algorithm: "HS256".to_string(),
                 },
                 sso: SSOConfig {
-                    enabled: false,
-                    providers: vec![],
                     token_cache_ttl_minutes: 5,
+                    ..Default::default()
                 },
-                mtls: MtlsConfig::default(),
-                oidc: None,
-                audit_fail_closed: false,
+                ..Default::default()
             },
-            rbac: RBACConfig::default(),
-            audit: AuditConfig::default(),
-            tls: TlsConfig {
-                enabled: false,
-                require_client_certificates: false,
-                cert_file: None,
-                key_file: None,
-                ca_file: None,
-            },
-            compliance: ComplianceConfig {
-                frameworks: vec![],
-                data_residency: None,
-                encryption_at_rest: false,
-                encryption_in_transit: false,
-            },
-            encryption: crate::security::EncryptionConfig::default(),
-            key_store: crate::security::KeyStoreConfig::default(),
-            tenant: Default::default(),
-            pgwire: crate::security::security_coordinator::PgwireSecurityConfig::default(),
+            ..Default::default()
         }
     }
 
