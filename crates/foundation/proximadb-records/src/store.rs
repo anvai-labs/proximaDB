@@ -399,6 +399,30 @@ pub trait RecordScan: Send + Sync {
         });
         Ok(all)
     }
+
+    /// Every live record matching `options` (its `limit` is ignored) as a
+    /// [`RecordChunkStream`](crate::chunked::RecordChunkStream): chunks of at most
+    /// `chunk_rows`, strictly ascending by `oid`, each oid once. Bounded-memory
+    /// consumers (MATERIALIZE) rely on stores overriding this. Takes the store's
+    /// `Arc` so the stream owns what it reads and can outlive the caller's frame.
+    ///
+    /// Default: correct but not bounded — materializes the scan, then sorts and
+    /// chunks it.
+    fn scan_record_chunks(
+        self: std::sync::Arc<Self>,
+        options: RecordScanOptions,
+        chunk_rows: usize,
+    ) -> crate::chunked::RecordChunkStream<'static>
+    where
+        Self: 'static,
+    {
+        let mut options = options;
+        options.limit = None;
+        crate::chunked::once_then_chunks(
+            async move { self.scan_records_with_options(options).await },
+            chunk_rows,
+        )
+    }
 }
 
 /// Composite canonical storage contract for services that need both point

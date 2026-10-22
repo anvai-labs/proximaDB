@@ -1964,6 +1964,50 @@ impl DmlService {
         Some(enforcer.predicate_for(&subject, tenant, target))
     }
 
+    /// Every visible record of a relational table as a bounded-memory, ordered
+    /// chunk stream (P2.4): strictly ascending `oid`, each once, chunks of at
+    /// most `chunk_rows`, the caller's ABAC row access applied per chunk. Returns
+    /// the resolved catalog schema with it. Records keep their real `oid`;
+    /// project them with [`Self::project_one_record`] for column-ordered values.
+    pub async fn scan_table_records_chunked(
+        &self,
+        table_name: &str,
+        chunk_rows: usize,
+        tenant_context: Option<&TenantContext>,
+        identity: PortIdentity<'_>,
+    ) -> Result<(
+        CatalogTableSchema,
+        proximadb_records::chunked::RecordChunkStream<'static>,
+    )> {
+        let (table_schema, table_id_name, access) = self
+            .relational_read_prelude(table_name, tenant_context, identity)
+            .await?;
+        let Some(access) = access else {
+            let empty: proximadb_records::chunked::RecordChunkStream<'static> =
+                Box::pin(futures::stream::empty());
+            return Ok((table_schema, empty));
+        };
+        let chunks = self.record_store.clone().scan_records_chunked(
+            table_schema.clone(),
+            TableRecordScanRequest {
+                filter: None,
+                table_id: table_id_name,
+                limit: None,
+                include_vector: true,
+                include_props: true,
+            },
+            chunk_rows,
+            tenant_context.cloned(),
+        );
+        let chunks = match access {
+            LayerARowAccess::Unrestricted => chunks,
+            LayerARowAccess::Restricted(keep) => {
+                proximadb_records::chunked::filter_chunks(chunks, move |r| keep(r))
+            }
+        };
+        Ok((table_schema, chunks))
+    }
+
     /// The governed-read prelude every relational read of a catalog table runs
     /// before touching rows: the identity/storage tenant cross-check, table
     /// resolution, and the ABAC row filter (FA-c Phase 2).

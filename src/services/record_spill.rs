@@ -78,6 +78,8 @@ use proximadb_storage_filesystem_types::FileSystem;
 
 use crate::storage::engines::sst::segment_format::read_segment_records;
 
+mod chunked_scan;
+
 /// Flush threshold: resident records after which the memtable is written to a
 /// segment. Default ON
 /// ([`DEFAULT_SPILL_MAX_RESIDENT`](crate::services::storage_format::DEFAULT_SPILL_MAX_RESIDENT));
@@ -1990,6 +1992,16 @@ impl RecordScan for SpillRecordStorage {
             .filter(|record| options.matches_record(record) && predicate.is_none_or(|p| p(record)))
             .take(limit)
             .collect())
+    }
+
+    /// Bounded-memory k-way merge over the oid-sorted segments; see
+    /// `chunked_scan`.
+    fn scan_record_chunks(
+        self: Arc<Self>,
+        options: RecordScanOptions,
+        chunk_rows: usize,
+    ) -> proximadb_records::chunked::RecordChunkStream<'static> {
+        self.chunked_scan(options, chunk_rows)
     }
 }
 

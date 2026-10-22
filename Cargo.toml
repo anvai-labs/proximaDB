@@ -635,7 +635,7 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "tls-native-tls", "json",
 tempfile = "3.0"
 rayon = "1.10"  # Parallel processing for search optimization
 # Parquet and Arrow dependencies - using v57+ for improved performance and tonic 0.14 compatibility
-parquet = { version = "59", default-features = false, features = ["arrow", "zstd", "lz4", "snap", "brotli", "flate2", "flate2-rust_backened"] }
+parquet = { version = "59", default-features = false, features = ["arrow", "async", "zstd", "lz4", "snap", "brotli", "flate2", "flate2-rust_backened"] }
 # Arrow dependencies matching parquet v57
 arrow = { version = "59", features = ["prettyprint", "ffi"] }
 arrow-array = { version = "59", default-features = false }

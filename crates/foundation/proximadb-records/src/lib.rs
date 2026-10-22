@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 /// data-model types.
 pub use proximadb_data_model::ProximaValue;
 
+pub mod chunked;
 pub mod conversions;
 pub mod proto_v2;
 pub mod store;
