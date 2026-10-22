@@ -2468,7 +2468,42 @@ impl DmlService {
         table_name: &str,
         tenant_context: Option<&TenantContext>,
     ) -> Result<String> {
+        self.materialize_table_to_parquet_fenced(
+            bridge,
+            warehouse_root_url,
+            table_name,
+            tenant_context,
+            &crate::services::ddl::NoPublishFence,
+        )
+        .await
+    }
+
+    /// [`Self::materialize_table_to_parquet`] with a fenced advance (P2.4):
+    ///
+    /// * one publication per table at a time in this process (a per-table
+    ///   publish lock held from before the snapshot LSN is captured to after the
+    ///   catalog flip);
+    /// * the Iceberg parent version is read before the scan, so a publication
+    ///   that another process committed meanwhile makes this commit's
+    ///   create-only CAS lose (an error, never a silent overwrite);
+    /// * `fence` is re-checked immediately before that commit;
+    /// * the catalog flip is forward-only: it never replaces a layout that
+    ///   already records a newer Iceberg metadata version.
+    pub async fn materialize_table_to_parquet_fenced(
+        &self,
+        bridge: &dyn ObjectStoreBridge,
+        warehouse_root_url: &str,
+        table_name: &str,
+        tenant_context: Option<&TenantContext>,
+        fence: &dyn crate::services::ddl::PublishFence,
+    ) -> Result<String> {
         use futures::{SinkExt, StreamExt};
+
+        let _publishing = materialize_stream::publish_lock(
+            tenant_context.map(|t| t.tenant_id.as_str()),
+            table_name,
+        )
+        .await;
 
         // ADR-025: capture the snapshot LSN BEFORE scanning, so any write landing
         // during/after the scan has a strictly greater LSN and is caught by the OLAP
@@ -2651,6 +2686,14 @@ impl DmlService {
         // its children), unlike the catalog layout location below, which is the
         // directory of the data files.
         let table_root = format!("{}/{prefix}", warehouse_root_url.trim_end_matches('/'));
+        // Fenced advance: the authority to publish is re-checked right before the
+        // commit, which is the point after which the new snapshot is visible.
+        if let Err(e) = fence.check().await {
+            Self::delete_parts(bridge, &part_keys).await;
+            return Err(e.context(format!(
+                "MATERIALIZE {table_name}: publish fence refused the commit"
+            )));
+        }
         let committed = bridge
             .publish_iceberg_files(
                 &part_keys,
@@ -2713,10 +2756,14 @@ impl DmlService {
             location: Some(location.clone()),
             // ADR-025: record the snapshot LSN so the OLAP read-merge can reconcile
             // this cold base against post-snapshot writes (`read_changes_since`).
-            properties: std::collections::HashMap::from([(
-                "snapshot_lsn".to_string(),
-                snapshot_lsn.to_string(),
-            )]),
+            properties: std::collections::HashMap::from([
+                ("snapshot_lsn".to_string(), snapshot_lsn.to_string()),
+                // Forward-only flips compare this (see `layout_is_newer`).
+                (
+                    materialize_stream::METADATA_VERSION_PROPERTY.to_string(),
+                    version.to_string(),
+                ),
+            ]),
             ..Default::default()
         };
         // TD-USUB-4: additive publication. Read the table's current layouts and upsert
@@ -2733,8 +2780,21 @@ impl DmlService {
             .await
             .map(|s| s.storage_layouts)
             .unwrap_or_default();
-        let layouts = upsert_storage_layout(existing_layouts, layout);
-        catalog.set_storage_layouts(&table_id, layouts).await?;
+        //
+        // Forward-only (P2.4): a publication whose commit was overtaken — another
+        // publisher committed a later metadata version and already flipped the
+        // catalog to it — must not move the layout (and its `snapshot_lsn`) back.
+        let overtaken = materialize_stream::layout_is_newer(&existing_layouts, &layout);
+        if overtaken {
+            info!(
+                table = %table_name,
+                version,
+                "MATERIALIZE: a newer publication already flipped the catalog; keeping it"
+            );
+        } else {
+            let layouts = upsert_storage_layout(existing_layouts, layout);
+            catalog.set_storage_layouts(&table_id, layouts).await?;
+        }
         // The catalog now records `snapshot_lsn`; published snapshots hold the WAL
         // truncation floor from here on.
         drop(snapshot);
@@ -2744,8 +2804,12 @@ impl DmlService {
         //     keyed by table name. The DF reader's `statistics()` overlays
         //     `distinct_count` from this registry, so `EnforceDistribution` can
         //     pick a partitioned (multi-core) join build. Only after the commit +
-        //     catalog flip, so stats describe data that actually landed.
-        ndv.publish();
+        //     catalog flip, so stats describe data that actually landed — and not
+        //     when the flip was overtaken, so they never replace the newer
+        //     publication's.
+        if !overtaken {
+            ndv.publish();
+        }
 
         // 7. Garbage-collect generations older than the previous version. Best
         //    effort: a leftover file is unreferenced (readers select from the
@@ -7372,7 +7436,12 @@ impl DmlTableMaterializer {
 
 #[async_trait::async_trait]
 impl crate::services::ddl::TableMaterializer for DmlTableMaterializer {
-    async fn materialize(&self, table_name: &str, tenant: Option<&str>) -> Result<String> {
+    async fn materialize(
+        &self,
+        table_name: &str,
+        tenant: Option<&str>,
+        fence: &dyn crate::services::ddl::PublishFence,
+    ) -> Result<String> {
         // Thread the request/connection tenant (TD-113) so the snapshot is scoped
         // and the object prefix is tenant-isolated instead of landing under the
         // DEFAULT_TENANT_PLACEHOLDER. Empty tenant ⇒ None (single-tenant/embedded).
@@ -7380,11 +7449,12 @@ impl crate::services::ddl::TableMaterializer for DmlTableMaterializer {
             .filter(|t| !t.is_empty())
             .map(TenantContext::for_tenant_id);
         self.dml
-            .materialize_table_to_parquet(
+            .materialize_table_to_parquet_fenced(
                 &*self.bridge,
                 &self.warehouse_root_url,
                 table_name,
                 tenant_ctx.as_ref(),
+                fence,
             )
             .await
     }

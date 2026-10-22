@@ -480,7 +480,51 @@ pub trait TableMaterializer: Send + Sync {
     /// snapshot and the tenant-isolated object prefix; `None` means single-tenant
     /// / embedded mode. Threading it (vs the old hardcoded `None`) is what makes
     /// warehouse materialization tenant-isolated (TD-113).
-    async fn materialize(&self, table_name: &str, tenant: Option<&str>) -> Result<String>;
+    ///
+    /// `fence` is re-checked immediately before the publication commits (P2.4): a
+    /// MATERIALIZE can outlive the write lease it started under, and a displaced
+    /// pod must not advance the published snapshot.
+    async fn materialize(
+        &self,
+        table_name: &str,
+        tenant: Option<&str>,
+        fence: &dyn PublishFence,
+    ) -> Result<String>;
+}
+
+/// The authority a publisher re-checks immediately before it commits a new
+/// snapshot (P2.4 fenced advance). `Err` means this process may no longer
+/// publish the table — typically its write lease moved to another pod.
+#[async_trait::async_trait]
+pub trait PublishFence: Send + Sync {
+    async fn check(&self) -> Result<()>;
+}
+
+/// No fence: embedded and single-pod deployments, where no other process
+/// publishes the table.
+pub struct NoPublishFence;
+
+#[async_trait::async_trait]
+impl PublishFence for NoPublishFence {
+    async fn check(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The DDL write-lease check as a [`PublishFence`].
+struct LeasePublishFence<'a> {
+    ddl: &'a DdlService,
+    tenant: Option<&'a str>,
+    table: &'a str,
+}
+
+#[async_trait::async_trait]
+impl PublishFence for LeasePublishFence<'_> {
+    async fn check(&self) -> Result<()> {
+        self.ddl
+            .check_lease_for_write(self.tenant, self.table)
+            .await
+    }
 }
 
 pub struct DdlService {
@@ -730,9 +774,16 @@ impl DdlService {
                          store (no table materializer is wired)"
                     )
                 })?;
-                let location = materializer.materialize(&name, tenant).await?;
-                // MATERIALIZE can outlive a lease TTL. Revalidate before
-                // publishing success so a displaced pod cannot bless stale work.
+                // MATERIALIZE can outlive a lease TTL. The fence is re-checked
+                // just before the snapshot commits, so a displaced pod cannot
+                // advance it; revalidating after also keeps a takeover during
+                // the catalog flip from reporting success.
+                let fence = LeasePublishFence {
+                    ddl: self,
+                    tenant,
+                    table: &name,
+                };
+                let location = materializer.materialize(&name, tenant, &fence).await?;
                 self.check_lease_for_write(tenant, &name).await?;
                 // TD-OLAP-4: a re-MATERIALIZE republishes the base at this
                 // location, so any cached table-OPEN discovery (schema/splits/
@@ -2550,7 +2601,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TableMaterializer for LeaseTakeoverMaterializer {
-        async fn materialize(&self, table_name: &str, tenant: Option<&str>) -> Result<String> {
+        async fn materialize(
+            &self,
+            table_name: &str,
+            tenant: Option<&str>,
+            fence: &dyn PublishFence,
+        ) -> Result<String> {
             let future_ms = chrono::Utc::now().timestamp_millis() + 100;
             assert!(
                 self.contender
@@ -2558,6 +2614,9 @@ mod tests {
                     .await?,
                 "the second pod should acquire after the first lease expires"
             );
+            // The publisher's pre-commit check sees the takeover, so nothing is
+            // published by the displaced pod.
+            fence.check().await?;
             Ok("file:///tmp/materialized".to_string())
         }
     }
@@ -2601,7 +2660,7 @@ mod tests {
                 Some("tenant-a"),
             )
             .await
-            .expect_err("post-operation lease validation must detect takeover");
+            .expect_err("the pre-commit publish fence must detect the takeover");
         assert!(err.to_string().contains("pod-b"), "{err}");
     }
 

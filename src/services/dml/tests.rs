@@ -3657,6 +3657,50 @@ impl Drop for EnvGuard {
 /// via the manifest) see one generation, the parts are cluster-sorted across part
 /// boundaries, and a third publication garbage-collects the first generation while
 /// the previous version's files stay for readers that opened it.
+/// A native catalog in `dir` with namespace `default` and the table
+/// `create_table_sql` creates, behind a DML service whose rows live in a
+/// memtable over the WAL `dir/{wal}`.
+async fn dml_over_wal_table(
+    dir: &std::path::Path,
+    create_table_sql: &str,
+    wal: &str,
+) -> (Arc<CatalogManager>, DmlService) {
+    use crate::services::record_store::DirectWalTableRecordStore;
+    use crate::services::{FramedTableWalAppender, MemtableRecordStorage};
+
+    let manager = Arc::new(CatalogManager::new());
+    manager
+        .create_native_catalog("native", dir.to_string_lossy().as_ref())
+        .await
+        .expect("native catalog");
+    let ddl = DdlService::new(manager.clone());
+    ddl.execute(DdlStatement::CreateNamespace {
+        namespace: vec!["default".to_string()],
+        if_not_exists: true,
+        properties: HashMap::new(),
+    })
+    .await
+    .expect("create namespace");
+    let create = crate::query::sql_frontend::SqlFrontendParser::new()
+        .parse_ddl(create_table_sql)
+        .expect("parse ddl")
+        .expect("ddl stmt");
+    ddl.execute(create).await.expect("create table");
+    let dml = DmlService::with_record_store_and_table_write_executor(
+        manager.clone(),
+        Arc::new(DirectWalTableRecordStore::new(
+            Arc::new(MemtableRecordStorage::new()),
+            Arc::new(
+                FramedTableWalAppender::open(&dir.join(wal))
+                    .await
+                    .expect("open WAL"),
+            ),
+        )),
+        Arc::new(PlannedOnlyTableWriteExecutor::new()),
+    );
+    (manager, dml)
+}
+
 #[cfg(feature = "datafusion-integration")]
 #[test]
 fn materialize_publishes_multi_part_generations_and_collects_old_ones() {
@@ -3666,41 +3710,14 @@ fn materialize_publishes_multi_part_generations_and_collects_old_ones() {
     crate::query::execution::test_runtime::run_with_timeout(30, async {
         use crate::datafusion::create_session_context;
         use crate::datafusion::engine_adapters::register_object_store_parquet_location;
-        use crate::services::record_store::DirectWalTableRecordStore;
-        use crate::services::{FramedTableWalAppender, MemtableRecordStorage};
-
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let manager = Arc::new(CatalogManager::new());
-        manager
-            .create_native_catalog("native", temp_dir.path().to_string_lossy().as_ref())
-            .await
-            .expect("native catalog");
-        let ddl = DdlService::new(manager.clone());
-        ddl.execute(DdlStatement::CreateNamespace {
-            namespace: vec!["default".to_string()],
-            if_not_exists: true,
-            properties: HashMap::new(),
-        })
-        .await
-        .expect("create namespace");
+        let (_manager, dml) = dml_over_wal_table(
+            temp_dir.path(),
+            "CREATE TABLE ev (id TEXT NOT NULL, d DATE, qty INT, PRIMARY KEY (id));",
+            "ev.wal",
+        )
+        .await;
         let parser = crate::query::sql_frontend::SqlFrontendParser::new();
-        let create = parser
-            .parse_ddl("CREATE TABLE ev (id TEXT NOT NULL, d DATE, qty INT, PRIMARY KEY (id));")
-            .expect("parse ddl")
-            .expect("ddl stmt");
-        ddl.execute(create).await.expect("create table");
-        let dml = DmlService::with_record_store_and_table_write_executor(
-            manager.clone(),
-            Arc::new(DirectWalTableRecordStore::new(
-                Arc::new(MemtableRecordStorage::new()),
-                Arc::new(
-                    FramedTableWalAppender::open(&temp_dir.path().join("ev.wal"))
-                        .await
-                        .expect("open WAL"),
-                ),
-            )),
-            Arc::new(PlannedOnlyTableWriteExecutor::new()),
-        );
         let insert = |i: u32| {
             // Dates descend as ids ascend, so the oid order is NOT the cluster order.
             parser
@@ -3836,6 +3853,102 @@ fn materialize_publishes_multi_part_generations_and_collects_old_ones() {
             "no version 3"
         );
     });
+}
+
+/// A publish fence that refuses.
+struct RefusingFence;
+
+#[async_trait::async_trait]
+impl crate::services::ddl::PublishFence for RefusingFence {
+    async fn check(&self) -> Result<()> {
+        Err(anyhow!("lease moved to pod-elsewhere"))
+    }
+}
+
+/// P2.4 fenced advance: a refused fence publishes nothing (no metadata version,
+/// no data file left, no catalog flip), and two concurrent MATERIALIZEs of one
+/// table in one process both succeed — serialized by the publish lock — instead
+/// of the second losing the metadata CAS.
+#[tokio::test]
+async fn materialize_is_fenced_and_serialized_per_table() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (manager, dml) = dml_over_wal_table(
+        temp_dir.path(),
+        "CREATE TABLE inv (id TEXT NOT NULL, qty INT, PRIMARY KEY (id));",
+        "inv.wal",
+    )
+    .await;
+    let parser = crate::query::sql_frontend::SqlFrontendParser::new();
+    let insert = parser
+        .parse_dml("INSERT INTO inv (id, qty) VALUES ('i1', 5);")
+        .expect("parse insert")
+        .expect("insert stmt");
+    dml.execute(insert).await.expect("insert");
+    let bridge = Arc::new(IcebergObjectStoreBridge::from_url("memory:///fenced").unwrap());
+
+    let err = dml
+        .materialize_table_to_parquet_fenced(
+            &*bridge,
+            "memory:///fenced",
+            "inv",
+            None,
+            &RefusingFence,
+        )
+        .await
+        .expect_err("a refused fence fails the publication");
+    assert!(format!("{err:#}").contains("pod-elsewhere"), "{err:#}");
+    let all: Vec<object_store::path::Path> = bridge
+        .list_objects(&object_store::path::Path::from("data"))
+        .await
+        .expect("list");
+    assert!(
+        all.iter()
+            .all(|p| !p.as_ref().ends_with(".parquet") && !p.as_ref().ends_with(".metadata.json")),
+        "nothing published or left behind: {all:?}"
+    );
+    let (catalog, id) = manager.resolve_table("inv").await.expect("resolve");
+    assert!(
+        catalog
+            .get_table(&id)
+            .await
+            .expect("table")
+            .storage_layouts
+            .iter()
+            .all(|l| l.name != "parquet-snapshot"),
+        "the catalog was not flipped"
+    );
+
+    let (a, b) = futures::join!(
+        dml.materialize_table_to_parquet(&*bridge, "memory:///fenced", "inv", None),
+        dml.materialize_table_to_parquet(&*bridge, "memory:///fenced", "inv", None),
+    );
+    let location = a.expect("first publication");
+    assert_eq!(b.expect("second publication"), location);
+    let prefix = location.strip_prefix("memory:///fenced/").expect("prefix");
+    let metadata_prefix = format!("{}/metadata", prefix.strip_suffix("/data").unwrap());
+    assert_eq!(
+        bridge
+            .latest_metadata_version(&metadata_prefix)
+            .await
+            .expect("metadata"),
+        Some(1),
+        "two serialized commits: versions 0 and 1"
+    );
+    let layout = catalog
+        .get_table(&id)
+        .await
+        .expect("table")
+        .storage_layouts
+        .into_iter()
+        .find(|l| l.name == "parquet-snapshot")
+        .expect("published layout");
+    assert_eq!(
+        layout
+            .properties
+            .get("iceberg_metadata_version")
+            .map(String::as_str),
+        Some("1")
+    );
 }
 
 /// `point_lookup_relational` (PATH B PkLookup backend) returns the full row by

@@ -189,7 +189,7 @@ fn sort_batches_with_budget(
         .build_arc()?;
     // The merge phase reserves its buffers up front; keep that reservation a
     // fraction of the budget so a small budget spills instead of failing.
-    let config = datafusion::execution::config::SessionConfig::new()
+    let config = datafusion::prelude::SessionConfig::new()
         .with_sort_spill_reservation_bytes((memory_bytes / 8).min(10 * 1024 * 1024));
     let ctx = Arc::new(
         TaskContext::default()
@@ -274,9 +274,97 @@ pub(super) async fn gc_older_generations(
     first_err.map_or(Ok(deleted), Err)
 }
 
+/// Layout property recording the Iceberg metadata version a publication
+/// committed; versions only grow (create-only CAS), so it orders publications.
+pub(super) const METADATA_VERSION_PROPERTY: &str = "iceberg_metadata_version";
+
+fn metadata_version_of(layout: &proximadb_catalog::CatalogStorageLayout) -> Option<u64> {
+    layout
+        .properties
+        .get(METADATA_VERSION_PROPERTY)
+        .and_then(|v| v.parse().ok())
+}
+
+/// Whether `existing` already holds a layout of `incoming`'s name that records
+/// a NEWER metadata version than `incoming` — then flipping to `incoming` would
+/// move the catalog backwards. A layout without a recorded version (published
+/// before versions were recorded) is never newer.
+pub(super) fn layout_is_newer(
+    existing: &[proximadb_catalog::CatalogStorageLayout],
+    incoming: &proximadb_catalog::CatalogStorageLayout,
+) -> bool {
+    let Some(ours) = metadata_version_of(incoming) else {
+        return false;
+    };
+    existing
+        .iter()
+        .filter(|l| l.name == incoming.name)
+        .filter_map(metadata_version_of)
+        .any(|theirs| theirs > ours)
+}
+
+/// Held for a whole publication of one table in this process.
+pub(super) type PublishGuard = tokio::sync::OwnedMutexGuard<()>;
+
+/// Serialize publications of `(tenant, table)` in this process: concurrent
+/// MATERIALIZEs of one table queue instead of racing for the same metadata
+/// version (the loser would fail its CAS and redo the whole rewrite).
+pub(super) async fn publish_lock(tenant: Option<&str>, table: &str) -> PublishGuard {
+    static LOCKS: std::sync::LazyLock<
+        dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    > = std::sync::LazyLock::new(dashmap::DashMap::new);
+    let key = format!("{}\u{0}{table}", tenant.unwrap_or_default());
+    let lock = LOCKS.entry(key).or_default().clone();
+    lock.lock_owned().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layout(version: Option<u64>) -> proximadb_catalog::CatalogStorageLayout {
+        proximadb_catalog::CatalogStorageLayout {
+            name: "parquet-snapshot".to_string(),
+            properties: version
+                .map(|v| (METADATA_VERSION_PROPERTY.to_string(), v.to_string()))
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_catalog_flip_is_forward_only() {
+        let other = proximadb_catalog::CatalogStorageLayout {
+            name: "other".to_string(),
+            ..layout(Some(99))
+        };
+        assert!(layout_is_newer(&[layout(Some(5))], &layout(Some(4))));
+        assert!(!layout_is_newer(&[layout(Some(5))], &layout(Some(5))));
+        assert!(!layout_is_newer(&[layout(Some(5))], &layout(Some(6))));
+        assert!(
+            !layout_is_newer(&[layout(None)], &layout(Some(0))),
+            "legacy"
+        );
+        assert!(
+            !layout_is_newer(&[other], &layout(Some(1))),
+            "other layouts"
+        );
+        assert!(!layout_is_newer(&[], &layout(Some(0))));
+    }
+
+    #[tokio::test]
+    async fn the_publish_lock_serializes_one_table_only() {
+        let held = publish_lock(Some("t"), "a").await;
+        // Another table, or the same name under another tenant, is not blocked.
+        drop(publish_lock(Some("t"), "b").await);
+        drop(publish_lock(Some("u"), "a").await);
+        let waiter = tokio::spawn(async { publish_lock(Some("t"), "a").await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "the same table waits");
+        drop(held);
+        drop(waiter.await.unwrap());
+    }
 
     #[test]
     fn generation_stems_order_by_snapshot_and_parse_back() {
