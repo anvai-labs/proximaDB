@@ -8,12 +8,16 @@
 //! * a range read opens only segments whose LSN summary can contain a match;
 //! * a corrupt sealed segment fails closed, while the active file's torn tail is
 //!   still repaired;
-//! * rewrite-compaction refuses a WAL that has sealed segments.
+//! * rewrite-compaction refuses a WAL that has sealed segments;
+//! * the per-segment branch summary (TD-SEAM-12) is rebuilt on reopen, and an
+//!   armed branch fence refuses a truncation that would strip a collection
+//!   branched after the merge-base image was taken.
 //!
 //!   cargo test --test canonical_wal_segments_test
 
 use anyhow::Result;
 use proximadb::services::FramedTableWalAppender;
+use proximadb::services::canonical_wal::BranchedCollection;
 use proximadb::services::record_store::TableWalAppender;
 use proximadb_records::ProximaRecord;
 use proximadb_storage_common::{CanonicalOperation, CanonicalWalEntry};
@@ -296,5 +300,123 @@ async fn open_shared_returns_one_appender_per_file() -> Result<()> {
         .append_operations(vec![upsert("a", "a3")], None)
         .await?;
     assert_eq!(c[0].sequence_number, 3);
+    Ok(())
+}
+
+fn branch_upsert(collection_id: &str, oid: &str, branch: &str) -> CanonicalOperation {
+    CanonicalOperation::RecordUpsert {
+        collection_id: collection_id.to_string(),
+        record: Box::new(ProximaRecord {
+            oid: oid.to_string(),
+            branch_id: Some(branch.to_string()),
+            ..ProximaRecord::default()
+        }),
+        projections: Vec::new(),
+    }
+}
+
+/// seq 1 `a` main, seq 2 `b` main, seq 3 `a` on branch `x` (tenant `t1`), seq 4
+/// `c` main — each sealed alone — then seq 5 `b` on branch `y` in the active file.
+async fn branched_wal(path: &Path) -> Result<FramedTableWalAppender> {
+    let wal = FramedTableWalAppender::open(path).await?;
+    wal.enable_segment_rotation(1);
+    wal.append_operations(vec![upsert("a", "r1")], None).await?;
+    wal.append_operations(vec![upsert("b", "r2")], None).await?;
+    wal.append_operations(vec![branch_upsert("a", "r3", "x")], Some("t1".into()))
+        .await?;
+    wal.append_operations(vec![upsert("c", "r4")], None).await?;
+    wal.enable_segment_rotation(0);
+    wal.append_operations(vec![branch_upsert("b", "r5", "y")], None)
+        .await?;
+    assert_eq!(sealed_segments(path).len(), 4);
+    Ok(wal)
+}
+
+#[tokio::test]
+async fn branch_summary_and_collections_below_survive_reopen() -> Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("canonical-records.wal");
+    let wal = branched_wal(&path).await?;
+
+    let summary = wal.branch_summary();
+    assert_eq!(summary.oldest_branch_seq, Some(3));
+    assert_eq!(
+        summary.collections.iter().cloned().collect::<Vec<_>>(),
+        vec![
+            BranchedCollection::new(None, "b"),
+            BranchedCollection::new(Some("t1"), "a"),
+        ]
+    );
+    let below = wal.collections_below(4);
+    assert_eq!(
+        below.into_iter().collect::<Vec<_>>(),
+        vec![("a".to_string(), 1), ("b".to_string(), 2)],
+        "seq 1..=3 sit in segments wholly below 4; each collection maps to its oldest one"
+    );
+    assert!(wal.collections_below(1).is_empty());
+    drop(wal);
+
+    let reopened = FramedTableWalAppender::open(&path).await?;
+    assert_eq!(reopened.branch_summary(), summary);
+    assert_eq!(reopened.collections_below(4), {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("a".to_string(), 1);
+        m.insert("b".to_string(), 2);
+        m
+    });
+
+    // Truncating the main-line prefix keeps every branch entry.
+    reopened.truncate_below(3).await?;
+    assert_eq!(reopened.retained_from(), 3);
+    drop(reopened);
+    let reopened = FramedTableWalAppender::open(&path).await?;
+    assert_eq!(reopened.branch_summary(), summary);
+    assert_eq!(
+        reopened
+            .collections_below(5)
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec![("a".to_string(), 3), ("c".to_string(), 4)]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_branch_fence_refuses_stripping_a_collection_branched_since() -> Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("canonical-records.wal");
+    let wal = FramedTableWalAppender::open(&path).await?;
+    wal.enable_segment_rotation(1);
+    wal.append_operations(vec![upsert("a", "r1")], None).await?;
+    wal.append_operations(vec![upsert("b", "r2")], None).await?;
+    wal.append_operations(vec![branch_upsert("a", "r3", "x")], None)
+        .await?;
+
+    // The image covers `a`; `b` branches before the truncation runs.
+    let covered: std::collections::BTreeSet<_> =
+        [BranchedCollection::new(None, "a")].into_iter().collect();
+    wal.fence_branches(covered.clone());
+    wal.append_operations(vec![branch_upsert("b", "r4", "y")], None)
+        .await?;
+    let refused = wal.truncate_below(3).await.unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("/b"),
+        "the refusal names the uncovered collection: {refused:#}"
+    );
+    assert_eq!(
+        wal.retained_from(),
+        0,
+        "a refused truncation removes nothing"
+    );
+
+    // The fence is consumed: an unfenced run truncates.
+    assert_eq!(wal.truncate_below(3).await?.truncated_through, 2);
+
+    // A collection branched since with no history below the floor does not
+    // trip the fence.
+    wal.fence_branches(covered);
+    wal.append_operations(vec![branch_upsert("d", "r5", "z")], None)
+        .await?;
+    assert_eq!(wal.truncate_below(4).await?.truncated_through, 3);
     Ok(())
 }
