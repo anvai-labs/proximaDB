@@ -65,12 +65,19 @@ async fn delete(wal: &FramedTableWalAppender, oid: &str) -> Result<()> {
     Ok(())
 }
 
-/// Main-line history (with a delete) the base classification depends on,
+/// Main-line history (with a partition drop and a delete) the base
+/// classification depends on,
 /// then two branches touching the same oids, with a main write in between.
 /// Every append seals its own segment, so truncation can remove any prefix.
 /// Returns the first branch write's sequence.
 async fn seed(wal: &FramedTableWalAppender) -> Result<u64> {
     wal.enable_segment_rotation(1);
+    put(wal, COLLECTION, record("n0", None, "gone", &[])).await?;
+    put(wal, COLLECTION, record("n1", None, "dropped", &[])).await?;
+    let drop = CanonicalOperation::RecordPartitionDrop {
+        collection_id: COLLECTION.to_string(),
+    };
+    wal.append_operations(vec![drop], None).await?;
     put(wal, COLLECTION, record("n1", None, "v0", &["x"])).await?;
     put(wal, COLLECTION, record("n2", None, "v0", &[])).await?;
     put(wal, COLLECTION, record("n1", None, "v1", &["x", "y"])).await?;
@@ -158,7 +165,14 @@ async fn a_collection_branched_after_its_history_was_truncated_refuses() -> Resu
     seed(&wal).await?;
     wal_truncator::run_once(&wal, &sources(&wal)).await?;
 
-    // `other` lost its main-line history (seq 6) while unbranched.
+    // A collection whose history was truncated but that has nothing to merge
+    // is a 404, not a 410.
+    assert!(matches!(
+        merge(&data_dir, "other").await,
+        Err(ApiError::NotFound(_))
+    ));
+
+    // `other` lost its main-line history while unbranched.
     put(&wal, "other", record("o1", Some("a"), "left", &[])).await?;
     put(&wal, "other", record("o1", Some("b"), "right", &[])).await?;
     match merge(&data_dir, "other").await {
@@ -167,5 +181,6 @@ async fn a_collection_branched_after_its_history_was_truncated_refuses() -> Resu
     }
     // The imaged collection still merges.
     assert!(merge(&data_dir, COLLECTION).await.is_ok());
+
     Ok(())
 }

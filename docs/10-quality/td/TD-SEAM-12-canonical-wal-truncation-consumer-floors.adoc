@@ -210,6 +210,7 @@ PRs #2124, #2125 and the slice-3–5 follow-ups.
 * **Merge** (`graph/merge.rs`). `MergeBaseImage { through, records, forks }` holds the main-line
   state at `through`.
 ** `advance` folds untagged upserts, `RecordDelete` and `RecordPartitionDrop` (`fold_main_line`).
+   The segment summaries index drops, so a segment holding only a drop is still read.
    An absent oid is a deleted one, so no tombstones are needed. The full-history merge uses the same
    fold, which also closes the "`latest_base_records` ignores main-line deletes" follow-up.
 ** `merge_branches_with_base` applies the main-line changes in `(through, M]` to the image.
@@ -219,6 +220,9 @@ PRs #2124, #2125 and the slice-3–5 follow-ups.
   generation per checkpoint: a marks row, image rows (256 records each), then a header written last.
 ** Replay uses the newest complete generation and ignores rows of a crashed one. A header whose
    rows are missing fails replay.
+** A checkpoint claims its generation number before writing, so a write that fails part-way is
+   never reused by the retry.
+** The record tier's boot replay skips these rows.
 ** `BranchBaseStore::checkpoint` runs under its write gate:
 *** the floor is the oldest retained branch-tagged entry;
 *** it marks what the truncation may strip;
@@ -258,5 +262,7 @@ Still open (follow-ups):
 * The default `target_branch = "main"` cannot match untagged main records.
 * A collection first branched after its history was truncated needs explicit branch registration
   (`BranchRef`). Until then its merges return 410.
-* At boot the record tier replays `__proxima_branch_bases__` rows into a partition of their own,
-  as it already does for the rank-profile and function rows.
+* A deployment whose WAL was truncated before merge bases were tracked (`tracked_from > 0`) can
+  never image a collection, so every unimaged merge there returns 410. This fails closed.
+* Truncation marks are never cleared, so a collection dropped and re-created under the same name
+  keeps returning 410 even when its post-recreate history is complete. This fails closed.

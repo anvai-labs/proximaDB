@@ -824,6 +824,23 @@ pub async fn merge_graph_branch_inner(
             proximadb_tenant::resolve_request_tenant(entry.tenant_id.as_deref()) == tenant
         })
         .collect();
+    let not_mergeable = || {
+        ApiError::NotFound(format!(
+            "no mergeable branch entries found for collection '{}' source '{}' target '{}'",
+            collection, branch, request.target_branch
+        ))
+    };
+    // Nothing to merge is a 404 whatever the history: checked before the base,
+    // so an unbranched collection with truncated history is not a 410.
+    if proximadb_storage_common::find_merge_base_lsn(
+        &collection_entries,
+        branch,
+        &request.target_branch,
+    )
+    .is_none()
+    {
+        return Err(not_mergeable());
+    }
     let gone = |err: &dyn std::fmt::Display| ApiError::Gone(format!("{err} (TD-SEAM-12 hazard 2)"));
     let base = match &bases {
         None => crate::services::branch_base_store::MergeBase::Retained,
@@ -848,12 +865,7 @@ pub async fn merge_graph_branch_inner(
             .map_err(|err| gone(&err))?
         }
     }
-    .ok_or_else(|| {
-        ApiError::NotFound(format!(
-            "no mergeable branch entries found for collection '{}' source '{}' target '{}'",
-            collection, branch, request.target_branch
-        ))
-    })?;
+    .ok_or_else(not_mergeable)?;
 
     // If not dry-run, write the merged records to WAL
     let write_back_result = if !request.dry_run {
