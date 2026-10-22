@@ -3,9 +3,10 @@ use super::*;
 use proximadb_abac::{ReadContext, SystemReadReason};
 
 /// TD-OLAP-6: explicit `cluster_key` property wins; else the first
-/// DATE/TIMESTAMP column; NULL-keyed rows sort last.
+/// DATE/TIMESTAMP column. (The NULLs-last order is the sort's:
+/// `materialize_stream::tests::the_sort_spills_past_its_budget_and_orders_nulls_last`.)
 #[test]
-fn cluster_key_resolution_and_sort_order() {
+fn cluster_key_resolution() {
     fn col(name: &str, ty: ProximaType) -> CatalogColumn {
         CatalogColumn {
             id: 0,
@@ -44,30 +45,9 @@ fn cluster_key_resolution_and_sort_order() {
         .properties
         .insert("cluster_key".to_string(), "nope".to_string());
     assert_eq!(resolve_cluster_key(&schema).as_deref(), Some("created"));
-
-    let rec = |d: Option<i32>| {
-        let mut r = ProximaRecord::default();
-        if let Some(days) = d {
-            r.props.insert(
-                "created".to_string(),
-                ProximaTreeNode::Value(ProximaValue::Date(days)),
-            );
-        }
-        r
-    };
-    let mut records = [rec(Some(30)), rec(None), rec(Some(10)), rec(Some(20))];
-    records.sort_by_cached_key(|r| cluster_sort_key(r, "created"));
-    let keys: Vec<Option<i32>> = records
-        .iter()
-        .map(|r| match r.props.get("created") {
-            Some(ProximaTreeNode::Value(ProximaValue::Date(d))) => Some(*d),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(keys, vec![Some(10), Some(20), Some(30), None], "NULLs last");
 }
 
-/// TD-OLAP-2 (A2): `publish_ndv_statistics` (the materialize write-boundary
+/// TD-OLAP-2 (A2): `NdvAccumulator` (the materialize write-boundary
 /// hook) folds `ProximaRecord`s into per-column HLL sketches and publishes them
 /// to the ADR-037 registry keyed by table name; `statistics_from_splits` (the
 /// DF reader's `statistics()`) then overlays `distinct_count = Inexact(ndv)`
@@ -82,7 +62,7 @@ fn cluster_key_resolution_and_sort_order() {
 /// block is skipped, but the registry overlay at schema_inference.rs:218 fires
 /// regardless of split coverage).
 #[test]
-fn publish_ndv_statistics_feeds_distinct_count_overlay() {
+fn ndv_accumulator_feeds_distinct_count_overlay() {
     use crate::core::statistics::statistics_registry;
     use crate::datafusion::schema_inference::statistics_from_splits;
     use datafusion_common::stats::Precision;
@@ -132,7 +112,12 @@ fn publish_ndv_statistics_feeds_distinct_count_overlay() {
         records.push(r);
     }
 
-    publish_ndv_statistics(table, Some("acme"), &schema, &records);
+    // Folded in two chunks, as MATERIALIZE's streaming scan feeds it.
+    let mut ndv = NdvAccumulator::new(table, Some("acme"), &schema);
+    let (first, second) = records.split_at(37);
+    ndv.observe(first);
+    ndv.observe(second);
+    ndv.publish();
     let key = crate::core::statistics::table_statistics_key(Some("acme"), table);
     // Another tenant's same-named table has no statistics from this one.
     assert!(
@@ -3026,6 +3011,25 @@ async fn scan_table_relational_pushes_projection_predicate_limit() {
     assert_eq!(rows.len(), 2, "limit caps the scan");
 }
 
+/// The data files the latest Iceberg snapshot of a published `{prefix}` (the
+/// catalog location without the root URL, ending in `/data`) names.
+async fn published_data_files(
+    bridge: &proximadb_iceberg_engine::IcebergObjectStoreBridge,
+    data_prefix: &str,
+) -> Vec<object_store::path::Path> {
+    let table_prefix = data_prefix.strip_suffix("/data").expect("data location");
+    let metadata_prefix = format!("{table_prefix}/metadata");
+    let version = bridge
+        .latest_metadata_version(&metadata_prefix)
+        .await
+        .expect("metadata log")
+        .expect("a committed snapshot");
+    bridge
+        .read_iceberg_snapshot(&metadata_prefix, version)
+        .await
+        .expect("read snapshot")
+}
+
 /// P3.2: `materialize_table_to_parquet` snapshots the table's rows to a Parquet
 /// object on the bridge AND flips the catalog layout to Parquet/ProjectionPublication
 /// at the published location, so the OLAP router will treat it as Parquet-backed.
@@ -3112,19 +3116,24 @@ async fn materialize_table_writes_parquet_and_flips_catalog_layout() {
     let prefix = location
         .strip_prefix("memory:///warehouse/")
         .expect("location under warehouse root");
-    let data_object = object_store::path::Path::from(format!("{prefix}/part-0.parquet"));
-    let mut stream = bridge
-        .read_parquet_batches(
-            &data_object,
-            Arc::new(arrow_schema::Schema::empty()),
-            1024,
-            None,
-        )
-        .await
-        .expect("read materialized parquet");
     let mut total = 0usize;
-    while let Some(batch) = stream.next().await {
-        total += batch.expect("batch").num_rows();
+    for data_object in published_data_files(&bridge, prefix).await {
+        assert!(
+            data_object.as_ref().starts_with(prefix),
+            "the snapshot names files under the published location: {data_object}"
+        );
+        let mut stream = bridge
+            .read_parquet_batches(
+                &data_object,
+                Arc::new(arrow_schema::Schema::empty()),
+                1024,
+                None,
+            )
+            .await
+            .expect("read materialized parquet");
+        while let Some(batch) = stream.next().await {
+            total += batch.expect("batch").num_rows();
+        }
     }
     assert_eq!(total, 3, "all rows materialized into the snapshot");
 
@@ -3617,6 +3626,180 @@ fn materialized_table_is_readable_through_datafusion_reader() {
             total, 3,
             "DataFusion reads all materialized rows from the published location"
         );
+    });
+}
+
+/// Restores an environment variable when dropped (lib tests run one per process
+/// under nextest; locally they run serialized).
+struct EnvGuard(&'static str, Option<String>);
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let old = std::env::var(key).ok();
+        // SAFETY: test-only; lib tests are process-isolated (nextest) or serial.
+        unsafe { std::env::set_var(key, value) };
+        Self(key, old)
+    }
+}
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: as in `set`.
+        unsafe {
+            match &self.1 {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+}
+
+/// P2.4: MATERIALIZE streams into multi-part, generation-named files. Each
+/// publication's Iceberg snapshot names exactly its own parts, readers (DataFusion,
+/// via the manifest) see one generation, the parts are cluster-sorted across part
+/// boundaries, and a third publication garbage-collects the first generation while
+/// the previous version's files stay for readers that opened it.
+#[cfg(feature = "datafusion-integration")]
+#[test]
+fn materialize_publishes_multi_part_generations_and_collects_old_ones() {
+    let _rows = EnvGuard::set("PROXIMADB_MATERIALIZE_TARGET_FILE_ROWS", "10");
+    let _rg = EnvGuard::set("PROXIMADB_MATERIALIZE_ROW_GROUP_ROWS", "4");
+    let _chunk = EnvGuard::set("PROXIMADB_MATERIALIZE_SCAN_CHUNK_ROWS", "7");
+    crate::query::execution::test_runtime::run_with_timeout(30, async {
+        use crate::datafusion::create_session_context;
+        use crate::datafusion::engine_adapters::register_object_store_parquet_location;
+        use crate::services::record_store::DirectWalTableRecordStore;
+        use crate::services::{FramedTableWalAppender, MemtableRecordStorage};
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let manager = Arc::new(CatalogManager::new());
+        manager
+            .create_native_catalog("native", temp_dir.path().to_string_lossy().as_ref())
+            .await
+            .expect("native catalog");
+        let ddl = DdlService::new(manager.clone());
+        ddl.execute(DdlStatement::CreateNamespace {
+            namespace: vec!["default".to_string()],
+            if_not_exists: true,
+            properties: HashMap::new(),
+        })
+        .await
+        .expect("create namespace");
+        let parser = crate::query::sql_frontend::SqlFrontendParser::new();
+        let create = parser
+            .parse_ddl("CREATE TABLE ev (id TEXT NOT NULL, d DATE, qty INT, PRIMARY KEY (id));")
+            .expect("parse ddl")
+            .expect("ddl stmt");
+        ddl.execute(create).await.expect("create table");
+        let dml = DmlService::with_record_store_and_table_write_executor(
+            manager.clone(),
+            Arc::new(DirectWalTableRecordStore::new(
+                Arc::new(MemtableRecordStorage::new()),
+                Arc::new(
+                    FramedTableWalAppender::open(&temp_dir.path().join("ev.wal"))
+                        .await
+                        .expect("open WAL"),
+                ),
+            )),
+            Arc::new(PlannedOnlyTableWriteExecutor::new()),
+        );
+        let insert = |i: u32| {
+            // Dates descend as ids ascend, so the oid order is NOT the cluster order.
+            parser
+                .parse_dml(&format!(
+                    "INSERT INTO ev (id, d, qty) VALUES ('e{i:03}', DATE '2020-{:02}-{:02}', {i});",
+                    12 - (i % 12),
+                    1 + (i % 28),
+                ))
+                .expect("parse insert")
+                .expect("insert stmt")
+        };
+        for i in 0..25 {
+            dml.execute(insert(i)).await.expect("insert");
+        }
+
+        let store_dir = tempfile::tempdir().expect("store tempdir");
+        let root_url = format!("file://{}", store_dir.path().display());
+        let bridge = Arc::new(IcebergObjectStoreBridge::from_url(&root_url).expect("bridge"));
+        let materialize = || dml.materialize_table_to_parquet(&*bridge, &root_url, "ev", None);
+        let read_rows = |location: String| async move {
+            let ctx = create_session_context().expect("session ctx");
+            register_object_store_parquet_location(
+                &ctx,
+                "ev_parquet",
+                &location,
+                None,
+                proximadb_data_model::StatsTrust::Trusted,
+            )
+            .await
+            .expect("register parquet location");
+            ctx.sql("SELECT d FROM ev_parquet")
+                .await
+                .expect("plan")
+                .collect()
+                .await
+                .expect("collect")
+                .iter()
+                .map(|b| b.num_rows())
+                .sum::<usize>()
+        };
+
+        let location = materialize().await.expect("materialize 1");
+        let prefix = location
+            .strip_prefix(&format!("{root_url}/"))
+            .expect("location under root")
+            .to_string();
+        let gen1 = published_data_files(&bridge, &prefix).await;
+        assert_eq!(gen1.len(), 3, "25 rows at 10 rows per part: {gen1:?}");
+        assert_eq!(read_rows(location.clone()).await, 25);
+
+        // Cluster order holds across the parts, in manifest order.
+        let mut dates = Vec::new();
+        for part in &gen1 {
+            let mut stream = bridge
+                .read_parquet_batches(part, Arc::new(arrow_schema::Schema::empty()), 1024, None)
+                .await
+                .expect("read part");
+            while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                let batch = batch.expect("batch");
+                let d = batch
+                    .column_by_name("d")
+                    .expect("d column")
+                    .as_any()
+                    .downcast_ref::<arrow_array::Date32Array>()
+                    .expect("date32")
+                    .clone();
+                dates.extend(d.values().iter().copied());
+            }
+        }
+        assert_eq!(dates.len(), 25);
+        assert!(
+            dates.windows(2).all(|w| w[0] <= w[1]),
+            "sorted by d: {dates:?}"
+        );
+
+        for i in 25..30 {
+            dml.execute(insert(i)).await.expect("insert");
+        }
+        assert_eq!(materialize().await.expect("materialize 2"), location);
+        let gen2 = published_data_files(&bridge, &prefix).await;
+        assert_eq!(gen2.len(), 3);
+        assert!(gen2.iter().all(|p| !gen1.contains(p)), "a new generation");
+        assert_eq!(read_rows(location.clone()).await, 30, "one generation only");
+
+        materialize().await.expect("materialize 3");
+        let gen3 = published_data_files(&bridge, &prefix).await;
+        let listed: Vec<object_store::path::Path> = bridge
+            .list_objects(&object_store::path::Path::from(prefix.as_str()))
+            .await
+            .expect("list data");
+        assert!(
+            gen1.iter().all(|p| !listed.contains(p)),
+            "generation 1 is collected once two newer versions exist"
+        );
+        assert!(
+            gen2.iter().chain(gen3.iter()).all(|p| listed.contains(p)),
+            "the current and previous versions' files stay"
+        );
+        assert_eq!(read_rows(location).await, 30);
     });
 }
 

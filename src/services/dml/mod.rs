@@ -87,6 +87,9 @@ use crate::storage::tenant::context::TenantContext;
 use crate::storage::trait_components::path_resolver::DrPathBuilder;
 use proximadb_catalog::TableIdentifier;
 use proximadb_storage_common::object_store_bridge::ObjectStoreBridge;
+use proximadb_storage_common::parquet_multipart::MultipartParquetWriter;
+use proximadb_storage_common::parquet_write_policy::{ParquetLayoutHints, ParquetWritePolicy};
+use proximadb_storage_common::proxima_arrow::proxima_records_to_record_batch;
 
 /// Count of Iceberg snapshot publishes that failed during `ALTER TABLE …
 /// MATERIALIZE` (TD-USUB-9).
@@ -188,33 +191,6 @@ pub(crate) fn resolve_cluster_key(schema: &CatalogTableSchema) -> Option<String>
         .map(|c| c.name.clone())
 }
 
-/// Total-order sort key over a record's cluster-key value: temporal and
-/// integer values order numerically, strings lexically; rows whose key is
-/// NULL/absent/unorderable sort LAST (the `(true, ..)` arm). Timestamps
-/// compare within one column, so raw ticks are a valid order (one column ⇒
-/// one unit).
-pub(crate) fn cluster_sort_key(rec: &ProximaRecord, column: &str) -> (bool, i128, String) {
-    let value = match rec.props.get(column) {
-        Some(ProximaTreeNode::Value(v)) => v,
-        _ => return (true, 0, String::new()),
-    };
-    match value {
-        ProximaValue::Date(d) => (false, *d as i128, String::new()),
-        ProximaValue::Timestamp(t, _) | ProximaValue::TimestampTz(t, _) => {
-            (false, *t as i128, String::new())
-        }
-        ProximaValue::Time(t, _) => (false, *t as i128, String::new()),
-        ProximaValue::Int8(v) => (false, *v as i128, String::new()),
-        ProximaValue::Int16(v) => (false, *v as i128, String::new()),
-        ProximaValue::Int32(v) => (false, *v as i128, String::new()),
-        ProximaValue::Int64(v) => (false, *v as i128, String::new()),
-        ProximaValue::UInt32(v) => (false, *v as i128, String::new()),
-        ProximaValue::UInt64(v) => (false, *v as i128, String::new()),
-        ProximaValue::String(s) | ProximaValue::Symbol(s) => (false, 0, s.clone()),
-        _ => (true, 0, String::new()),
-    }
-}
-
 /// TD-OLAP-2 (A2): fold the materialized records into per-column HLL sketches
 /// and publish them to the ADR-037 resident statistics registry, keyed by the
 /// table name — the SAME key `ObjectStoreParquetTable::statistics()` passes to
@@ -236,8 +212,8 @@ pub(crate) fn cluster_sort_key(rec: &ProximaRecord, column: &str) -> (bool, i128
 /// Co-design (TD-OLAP-2 / ADR-037): the dominant cost term moved here is
 /// COMPUTE (the single-threaded join build), and the lever is 1 core → N cores
 /// by feeding the optimizer its missing input — accurate NDV. The sketch is
-/// computed at the write boundary, where the records are already resident in
-/// memory for the Parquet write, so it adds ZERO scans: O(rows × cols) HLL
+/// computed at the write boundary, chunk by chunk as the rows stream to the
+/// Parquet writer, so it adds ZERO scans: O(rows × cols) HLL
 /// inserts (~1 s at SF=0.1 = 600 K rows × 16 cols), acceptable for a
 /// materialize DDL.
 ///
@@ -248,44 +224,58 @@ pub(crate) fn cluster_sort_key(rec: &ProximaRecord, column: &str) -> (bool, i128
 /// not survive. (The SST flush path for vector collections is a follow-on; the
 /// DF/OLAP join path only reads parquet-backed tables, which are always
 /// materialized, so this seam covers the join-parallelism goal.)
-pub(crate) fn publish_ndv_statistics(
-    table_name: &str,
-    tenant: Option<&str>,
-    schema: &CatalogTableSchema,
-    records: &[ProximaRecord],
-) {
-    use proximadb_search_types::sql_value_filter::proxima_value_to_filter_literal;
+///
+/// Streaming: the per-column HLL sketches fold one chunk at a time, so a
+/// bounded-memory MATERIALIZE never holds the table.
+pub(crate) struct NdvAccumulator {
+    summary: crate::core::statistics::StatisticsSummary,
+    /// `(name, type-name)` per column. The type name only feeds
+    /// `is_numeric_type` (quantile tracking); the HLL distinct count is type-
+    /// agnostic (`canonical_string` keys every value), so NDV is correct even
+    /// for types outside the numeric set.
+    cols: Vec<(String, serde_json::Value)>,
+    rows: u64,
+}
 
-    let mut summary = crate::core::statistics::StatisticsSummary::new(
-        crate::core::statistics::table_statistics_key(tenant, table_name),
-    );
-    summary.set_record_count(records.len() as u64);
-    // Pre-compute (name, type-name) once per column. The type name only feeds
-    // `is_numeric_type` (quantile tracking); the HLL distinct count is type-
-    // agnostic (`canonical_string` keys every value), so NDV is correct even
-    // for types outside the numeric set.
-    let cols: Vec<(&str, serde_json::Value)> = schema
-        .columns
-        .iter()
-        .map(|c| {
-            (
-                c.name.as_str(),
-                serde_json::Value::String(format!("{:?}", c.data_type)),
-            )
-        })
-        .collect();
-    for rec in records {
-        for (name, ty) in &cols {
-            // Same leaf extraction as `cluster_sort_key`: NULL/absent/object
-            // nodes observe as `None` (counted in the null rate, not the HLL).
-            let json_val = rec.props.get(*name).and_then(|node| match node {
-                ProximaTreeNode::Value(v) => Some(proxima_value_to_filter_literal(v)),
-                _ => None,
-            });
-            summary.observe_field(name, ty, json_val.as_ref());
+impl NdvAccumulator {
+    pub(crate) fn new(table_name: &str, tenant: Option<&str>, schema: &CatalogTableSchema) -> Self {
+        Self {
+            summary: crate::core::statistics::StatisticsSummary::new(
+                crate::core::statistics::table_statistics_key(tenant, table_name),
+            ),
+            cols: schema
+                .columns
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        serde_json::Value::String(format!("{:?}", c.data_type)),
+                    )
+                })
+                .collect(),
+            rows: 0,
         }
     }
-    crate::core::statistics::statistics_registry().put(summary);
+
+    pub(crate) fn observe(&mut self, records: &[ProximaRecord]) {
+        use proximadb_search_types::sql_value_filter::proxima_value_to_filter_literal;
+        self.rows += records.len() as u64;
+        for rec in records {
+            for (name, ty) in &self.cols {
+                // NULL/absent/object nodes observe as `None` (counted in the null rate, not the HLL).
+                let json_val = rec.props.get(name).and_then(|node| match node {
+                    ProximaTreeNode::Value(v) => Some(proxima_value_to_filter_literal(v)),
+                    _ => None,
+                });
+                self.summary.observe_field(name, ty, json_val.as_ref());
+            }
+        }
+    }
+
+    pub(crate) fn publish(mut self) {
+        self.summary.set_record_count(self.rows);
+        crate::core::statistics::statistics_registry().put(self.summary);
+    }
 }
 
 /// TD-USUB-4: merge `incoming` into `existing` by layout `name`, rather than
@@ -2425,26 +2415,6 @@ impl DmlService {
         Ok(Some(results))
     }
 
-    /// Materialize a relational table's current rows as a Parquet snapshot on object
-    /// storage and flip its catalog storage layout to `Parquet` /
-    /// `ProjectionPublication`, so the OLAP router's `catalog_table_is_parquet_backed`
-    /// check passes and SELECTs over the table route to DataFusion.
-    ///
-    /// This is the explicit-publish half of the dual-path design (course-correction
-    /// §6 P3): OLTP rows stay authoritative in RecordStorage; this publishes a
-    /// read-optimized Parquet projection of the current snapshot. It is triggered
-    /// explicitly (e.g. `ALTER TABLE … MATERIALIZE`), not on every write.
-    ///
-    /// `bridge` is the object store to write into; `warehouse_root_url` is the URL the
-    /// OLAP reader reopens that same physical store from, so the published
-    /// `location = {warehouse_root_url}/{tenant-isolated prefix}` resolves back to the
-    /// data the reader lists as `{location}/data/*.parquet`. Returns the published
-    /// `location`.
-    ///
-    /// MVP scope: a single Parquet object per materialization (full overwrite
-    /// snapshot), schema inferred from the rows. Incremental/atomic manifest
-    /// publication (`IcebergObjectStoreBridge::publish_snapshot`) and the
-    /// catalog-authoritative write schema are follow-ups.
     /// Build a relational `ProximaRecord` from a full column-ordered value row:
     /// every non-NULL column lands in `props` keyed by name (the warehouse
     /// materializer's record shape). Shared by `MATERIALIZE` (cold base) and the
@@ -2468,6 +2438,29 @@ impl DmlService {
         rec
     }
 
+    /// Materialize a relational table's current rows as a Parquet snapshot on object
+    /// storage and flip its catalog storage layout to `Parquet` /
+    /// `ProjectionPublication`, so the OLAP router's `catalog_table_is_parquet_backed`
+    /// check passes and SELECTs over the table route to DataFusion.
+    ///
+    /// This is the explicit-publish half of the dual-path design (course-correction
+    /// §6 P3): OLTP rows stay authoritative in RecordStorage; this publishes a
+    /// read-optimized Parquet projection of the current snapshot. It is triggered
+    /// explicitly (e.g. `ALTER TABLE … MATERIALIZE`), not on every write.
+    ///
+    /// `bridge` is the object store to write into; `warehouse_root_url` is the URL the
+    /// OLAP reader reopens that same physical store from, so the published
+    /// `location = {warehouse_root_url}/{tenant-isolated prefix}/data` resolves back to
+    /// the data files the snapshot's Iceberg manifest names. Returns the published
+    /// `location`.
+    ///
+    /// P2.4: a full rewrite in bounded memory. The rows stream from an ordered,
+    /// chunked scan; the cluster-key sort spills past its memory budget; the output
+    /// is multi-part (`{generation}-{nnnnn}.parquet`, sized by
+    /// `ParquetWritePolicy::target_file_*`); the Iceberg snapshot names exactly
+    /// those parts and is committed BEFORE the catalog layout flips, so no reader
+    /// is ever pointed at a generation without a manifest. Files of generations
+    /// older than the previous version are then deleted.
     pub async fn materialize_table_to_parquet(
         &self,
         bridge: &dyn ObjectStoreBridge,
@@ -2475,6 +2468,8 @@ impl DmlService {
         table_name: &str,
         tenant_context: Option<&TenantContext>,
     ) -> Result<String> {
+        use futures::{SinkExt, StreamExt};
+
         // ADR-025: capture the snapshot LSN BEFORE scanning, so any write landing
         // during/after the scan has a strictly greater LSN and is caught by the OLAP
         // read-merge delta (`read_changes_since(.., snapshot_lsn)`). The capture also
@@ -2483,43 +2478,26 @@ impl DmlService {
         let snapshot = self.record_store.capture_snapshot_lsn(table_name).await?;
         let snapshot_lsn = snapshot.lsn;
 
-        // 1. Snapshot the table's current rows (all columns, no predicate/limit).
-        let (schema, rows) = self
-            .scan_table_relational(
+        // 1. The table's current rows as an ordered, bounded chunk stream (P2.4):
+        //    nothing below holds more than a chunk of records at once.
+        let (schema, chunks) = self
+            .scan_table_records_chunked(
                 table_name,
-                None,
-                None,
-                None,
+                materialize_stream::scan_chunk_rows(),
                 tenant_context,
                 PortIdentity::anonymous(),
             )
             .await?;
 
-        // 2. Column-order ProximaValue rows → ProximaRecord envelopes (props keyed by
-        //    column name; relational tables carry no vectors). NULLs are omitted —
-        //    the schema-driven Arrow mapping null-fills any absent column. Reuses the
-        //    SAME builder as the OLAP read-merge appends so the cold base and the live
-        //    append rows encode identically (ADR-025).
-        let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-        let mut records: Vec<ProximaRecord> = rows
-            .into_iter()
-            .enumerate()
-            .map(|(i, row)| Self::value_row_to_relational_record(&i.to_string(), &col_names, row))
-            .collect();
-
-        // 2b. TD-OLAP-6: cluster the snapshot by the table's cluster key before
-        //     publication, so Parquet row groups carry tight min/max bounds and
-        //     zone-map / runtime-filter pruning can actually skip (the snapshot
-        //     scan otherwise discards row order — every row group spans the whole
-        //     domain, measured 0% skip in TPC_PERF_GATE_EVIDENCE_V2_2026_07_04).
-        //     Key resolution: explicit `cluster_key` table property, else the
-        //     first DATE/TIMESTAMP column (the dominant analytical access shape).
-        //     One sort at materialize time; ordering is reader-neutral
-        //     (mixed-read-safe) and NULL-keyed rows sort last.
+        // 2. TD-OLAP-6: cluster the snapshot by the table's cluster key before
+        //    publication, so Parquet row groups carry tight min/max bounds and
+        //    zone-map / runtime-filter pruning can actually skip (the snapshot
+        //    scan otherwise discards row order — every row group spans the whole
+        //    domain, measured 0% skip in TPC_PERF_GATE_EVIDENCE_V2_2026_07_04).
+        //    Key resolution: explicit `cluster_key` table property, else the
+        //    first DATE/TIMESTAMP column (the dominant analytical access shape).
+        //    Ordering is reader-neutral (mixed-read-safe); NULL keys sort last.
         let cluster_col = resolve_cluster_key(&schema);
-        if let Some(cluster_col) = &cluster_col {
-            records.sort_by_cached_key(|rec| cluster_sort_key(rec, cluster_col));
-        }
 
         // 3. Tenant-isolated object prefix (DrPathBuilder mandate: data/{tenant}/{ns}/{table}).
         //    NOTE (tracked tech-debt): this path does NOT yet route through
@@ -2559,34 +2537,151 @@ impl DmlService {
             schema.object_id,
         )?;
 
-        // 4. Write the snapshot under `{prefix}/data/` — exactly where the OLAP reader
-        //    lists `{location}/data/*.parquet`. Use the CATALOG-AUTHORITATIVE schema
-        //    (not record inference) so the file's columns/types/nullability match the
-        //    catalog exactly — including all-null columns inference would drop — and
-        //    `SELECT *` over the materialized table round-trips. The object `put` is
-        //    atomic, so a re-materialize swaps the snapshot without torn reads;
-        //    multi-file/versioned snapshots (via the atomic manifest committer) are a
-        //    follow-up that also needs manifest-aware reads.
-        let data_object = object_store::path::Path::from(format!("{prefix}/data/part-0.parquet"));
-        //    The cluster sort is declared as Parquet `sorting_columns`, and the
-        //    warehouse write policy adds the page index + spec SBBF Bloom filters.
-        let sort_columns: Vec<String> = cluster_col.into_iter().collect();
-        bridge
-            .write_records_to_parquet_with_layout(
-                &data_object,
-                &records,
-                &schema,
-                &sort_columns,
-                Some(tenant_id),
-            )
-            .await?;
+        // 4. Stream the rows into generation-named parts under `{prefix}/data/`, in
+        //    the CATALOG-AUTHORITATIVE schema (not record inference) so the files'
+        //    columns/types/nullability match the catalog exactly — including
+        //    all-null columns inference would drop. Each chunk is projected to the
+        //    full column set (a row that cannot be projected is skipped, as the
+        //    relational scan does), folded into the NDV sketches, encoded, and
+        //    handed to the sort/writer side over a bounded channel.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let stem = materialize_stream::generation_stem(now_ms);
+        let data_dir = format!("{prefix}/data");
+        let full_columns = Self::resolve_select_projection(&schema, &[])?;
+        let col_names: Vec<String> = full_columns.iter().map(|c| c.name.clone()).collect();
+        let arrow_schema = proxima_records_to_record_batch(&[], &schema)?.schema();
+        // The cluster sort is declared as Parquet `sorting_columns`, and the
+        // warehouse write policy adds the page index + spec SBBF Bloom filters.
+        let sort_columns: Vec<String> = cluster_col.iter().cloned().collect();
+        let mut writer = MultipartParquetWriter::new(
+            bridge,
+            data_dir.as_str(),
+            stem.as_str(),
+            arrow_schema.clone(),
+            ParquetWritePolicy::from_env(),
+            ParquetLayoutHints {
+                sort_columns: sort_columns.clone(),
+            },
+        );
+        let mut ndv = NdvAccumulator::new(
+            table_name,
+            tenant_context.map(|t| t.tenant_id.as_str()),
+            &schema,
+        );
+        let (tx, rx) = futures::channel::mpsc::channel::<Result<arrow_array::RecordBatch>>(2);
+        let produce = async {
+            let mut tx = tx;
+            let mut chunks = chunks;
+            while let Some(chunk) = chunks.next().await {
+                let records: Vec<ProximaRecord> = chunk?
+                    .iter()
+                    .filter_map(|record| {
+                        Self::project_one_record(record, &schema, &full_columns)
+                            .ok()
+                            .map(|row| {
+                                Self::value_row_to_relational_record(&record.oid, &col_names, row)
+                            })
+                    })
+                    .collect();
+                if records.is_empty() {
+                    continue;
+                }
+                ndv.observe(&records);
+                let batch = proxima_records_to_record_batch(&records, &schema)?;
+                if tx.send(Ok(batch)).await.is_err() {
+                    break; // the writer side failed; its error is reported
+                }
+            }
+            anyhow::Ok(())
+        };
+        let consume = async {
+            let mut batches = match &cluster_col {
+                Some(column) => {
+                    materialize_stream::sort_batches(rx.boxed(), arrow_schema.clone(), column)?
+                }
+                None => rx.boxed(),
+            };
+            while let Some(batch) = batches.next().await {
+                writer.write(&batch?).await?;
+            }
+            anyhow::Ok(())
+        };
+        if let Err(e) = futures::try_join!(produce, consume) {
+            let _ = writer.abort().await;
+            return Err(e);
+        }
+        let parts = writer.finish().await?;
+        let part_keys: Vec<object_store::path::Path> =
+            parts.iter().map(|p| p.path.clone()).collect();
 
-        // 5. Flip the catalog layout to a published Parquet projection at the location.
+        // 5. Commit the spec-shaped Iceberg snapshot (Avro manifest + manifest list +
+        //    TableMetadata under `{prefix}/metadata`) naming exactly these parts,
+        //    BEFORE the catalog flip. ProximaDB's own readers select files from this
+        //    manifest (they no longer list `data/`), and so do external Iceberg
+        //    engines, so a failure here fails the MATERIALIZE: the parts are
+        //    removed and the previous publication stays current.
+        let iceberg_fields: Vec<
+            proximadb_storage_common::object_store_bridge::IcebergSnapshotField,
+        > = schema
+            .to_arrow_schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .map(
+                |(i, f)| proximadb_storage_common::object_store_bridge::IcebergSnapshotField {
+                    id: (i + 1) as i32,
+                    name: f.name().clone(),
+                    type_name: iceberg_type_for(f.data_type()),
+                    required: !f.is_nullable(),
+                },
+            )
+            .collect();
+        let table_uuid = deterministic_table_uuid(&prefix);
+        let metadata_prefix = format!("{prefix}/metadata");
+        // The Iceberg table `location` is the table ROOT (`data/` and `metadata/` are
+        // its children), unlike the catalog layout location below, which is the
+        // directory of the data files.
+        let table_root = format!("{}/{prefix}", warehouse_root_url.trim_end_matches('/'));
+        let parent = bridge.latest_metadata_version(&metadata_prefix).await;
+        let committed = match parent {
+            Ok(parent) => bridge
+                .publish_iceberg_files(
+                    &part_keys,
+                    parent,
+                    &metadata_prefix,
+                    &table_uuid,
+                    &table_root,
+                    &iceberg_fields,
+                    now_ms, // snapshot id (unique per materialize)
+                    now_ms, // timestamp ms
+                    iceberg_needs_v3(&iceberg_fields),
+                )
+                .await
+                .map(|version| (parent, version)),
+            Err(e) => Err(e),
+        };
+        let (parent, version) = match committed {
+            Ok(committed) => committed,
+            Err(e) => {
+                if let Some(counter) = ICEBERG_PUBLISH_FAILURES.as_ref() {
+                    counter.inc();
+                }
+                Self::delete_parts(bridge, &part_keys).await;
+                return Err(anyhow!(
+                    "MATERIALIZE {table_name}: Iceberg snapshot commit failed; the \
+                     previous publication stays current: {e}"
+                ));
+            }
+        };
+
+        // 6. Flip the catalog layout to a published Parquet projection at the location.
         // ADR-059 first-principles: the `location` is the directory where the
-        // parquet files are IMMEDIATE children (Hive/Unity/Polaris model) — NOT the
-        // table base dir with a `data/` subpath. The parquet is written to
-        // `{prefix}/data/part-0.parquet`, so the location = `{root}/{prefix}/data`.
-        let location = format!("{}/{prefix}/data", warehouse_root_url.trim_end_matches('/'));
+        // data files are IMMEDIATE children (Hive/Unity/Polaris model) — NOT the
+        // table base dir with a `data/` subpath.
+        let location = format!("{}/{data_dir}", warehouse_root_url.trim_end_matches('/'));
         let layout = CatalogStorageLayout {
             name: "parquet-snapshot".to_string(),
             authority: proximadb_catalog::CatalogAuthorityMode::ProjectionPublication,
@@ -2620,104 +2715,56 @@ impl DmlService {
         // truncation floor from here on.
         drop(snapshot);
 
-        // 5b. TD-OLAP-2 (A2): publish per-column NDV sketches (HLL) from the
-        //     just-written records to the ADR-037 resident statistics registry,
+        // 6b. TD-OLAP-2 (A2): publish per-column NDV sketches (HLL), folded chunk by
+        //     chunk during the scan, to the ADR-037 resident statistics registry,
         //     keyed by table name. The DF reader's `statistics()` overlays
         //     `distinct_count` from this registry, so `EnforceDistribution` can
-        //     pick a partitioned (multi-core) join build. Best-effort + pure
-        //     compute (no scan): the records are already resident, and a miss
-        //     degrades to the pre-A2 `Absent` (never a wrong answer). Run only
-        //     after the write + catalog flip succeed so stats describe data
-        //     that actually landed. See `publish_ndv_statistics`.
-        publish_ndv_statistics(
-            table_name,
-            tenant_context.map(|t| t.tenant_id.as_str()),
-            &schema,
-            &records,
-        );
+        //     pick a partitioned (multi-core) join build. Only after the commit +
+        //     catalog flip, so stats describe data that actually landed.
+        ndv.publish();
 
-        // 6. Best-effort: also publish a spec-shaped Iceberg snapshot (v2) — Avro manifest
-        //    + manifest list + TableMetadata under `{prefix}/metadata` — so EXTERNAL Iceberg
-        //    engines (Spark/Trino/DuckDB/PyIceberg) can read the table. This is purely
-        //    additive interop: ProximaDB's own SELECT path reads via the catalog storage
-        //    layout above, not the manifest, so a failure here never breaks materialize.
-        let iceberg_fields: Vec<
-            proximadb_storage_common::object_store_bridge::IcebergSnapshotField,
-        > = schema
-            .to_arrow_schema()
-            .fields()
-            .iter()
-            .enumerate()
-            .map(
-                |(i, f)| proximadb_storage_common::object_store_bridge::IcebergSnapshotField {
-                    id: (i + 1) as i32,
-                    name: f.name().clone(),
-                    type_name: iceberg_type_for(f.data_type()),
-                    required: !f.is_nullable(),
-                },
-            )
-            .collect();
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let table_uuid = deterministic_table_uuid(&prefix);
-        let metadata_prefix = format!("{prefix}/metadata");
-        // The Iceberg table `location` is the table ROOT (`data/` and `metadata/` are
-        // its children), unlike the catalog layout location above, which is the
-        // directory of immediate parquet files.
-        let table_root = format!("{}/{prefix}", warehouse_root_url.trim_end_matches('/'));
-        // Publish exactly the file this materialize wrote (never a listing of `data/`,
-        // which may hold other generations), on top of the latest metadata version.
-        // Losing that slot to a concurrent publisher is an error, not a silent success.
-        let publish = async {
-            let parent = bridge.latest_metadata_version(&metadata_prefix).await?;
-            bridge
-                .publish_iceberg_files(
-                    std::slice::from_ref(&data_object),
-                    parent,
-                    &metadata_prefix,
-                    &table_uuid,
-                    &table_root,
-                    &iceberg_fields,
-                    now_ms, // snapshot id (unique per materialize)
-                    now_ms, // timestamp ms
-                    iceberg_needs_v3(&iceberg_fields),
-                )
-                .await
+        // 7. Garbage-collect generations older than the previous version. Best
+        //    effort: a leftover file is unreferenced (readers select from the
+        //    manifest), so a failure here only costs storage until the next run.
+        let keep_current: std::collections::HashSet<String> =
+            part_keys.iter().map(|p| p.to_string()).collect();
+        let keep_previous: std::collections::HashSet<String> = match parent {
+            Some(previous) => match bridge.read_iceberg_table(&metadata_prefix, previous).await {
+                Ok(files) => files.iter().map(|p| p.to_string()).collect(),
+                Err(e) => {
+                    warn!(table = %table_name, "MATERIALIZE GC skipped: {e}");
+                    return Ok(location);
+                }
+            },
+            None => Default::default(),
         };
-        if let Err(e) = publish.await {
-            // TD-USUB-9: this failure used to exist ONLY as a `warn!` line, so a
-            // MATERIALIZE that returned success could leave the Iceberg manifest
-            // absent or stale with nothing to alert on — an external reader
-            // (Spark/Trino) would see no table while ProximaDB reported OK.
-            //
-            // It is deliberately still NOT fatal, and that is the right call: the
-            // Parquet data IS published and the catalog layout IS correct, so
-            // ProximaDB-side reads are complete. Failing the whole statement would
-            // turn a transient interop write error into a failed publish whose
-            // O(table) rewrite the user must repeat, on top of state already
-            // committed. The catalog also does not claim Iceberg — the layout is
-            // `parquet-snapshot` / `CatalogPhysicalFormat::Parquet` — so nothing
-            // advertises a manifest that isn't there.
-            //
-            // What was wrong was the SILENCE. Make it countable so it can be
-            // alerted on, and log at error level so it is not lost in warn noise.
-            if let Some(counter) = ICEBERG_PUBLISH_FAILURES.as_ref() {
-                counter.inc();
-            }
-            tracing::error!(
-                target: "proximadb::warehouse::iceberg",
-                table = %table_name,
-                location = %location,
-                "Iceberg snapshot publish FAILED — parquet data and catalog layout are \
-                 published and ProximaDB reads are correct, but the Iceberg manifest at \
-                 this location is now absent or stale, so external Iceberg readers will \
-                 not see this materialization: {e}"
-            );
+        match materialize_stream::gc_older_generations(
+            bridge,
+            &object_store::path::Path::from(data_dir.as_str()),
+            &keep_current,
+            &keep_previous,
+            &stem,
+        )
+        .await
+        {
+            Ok(deleted) => debug!(table = %table_name, version, deleted, "MATERIALIZE GC"),
+            Err(e) => warn!(table = %table_name, "MATERIALIZE GC incomplete: {e}"),
         }
 
         Ok(location)
+    }
+
+    /// Remove the parts of a publication that failed to commit (best effort:
+    /// they are unreferenced either way).
+    async fn delete_parts(bridge: &dyn ObjectStoreBridge, parts: &[object_store::path::Path]) {
+        let store = bridge.inner_store();
+        for part in parts {
+            let _ = object_store::ObjectStoreExt::delete(
+                store.as_ref(),
+                &bridge.object_store_path(part),
+            )
+            .await;
+        }
     }
 
     /// Point-lookup a single relational row by primary key, projected into the
@@ -7318,6 +7365,8 @@ impl crate::services::ddl::TableMaterializer for DmlTableMaterializer {
             .await
     }
 }
+
+mod materialize_stream;
 
 #[cfg(test)]
 mod tests;
