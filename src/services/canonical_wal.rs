@@ -5,6 +5,7 @@
 //! `CanonicalWalEntry` records instead of vector-specific operation envelopes,
 //! matching the Layer 0 spine described by ADR-010.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -210,6 +211,67 @@ pub struct FramedTableWalAppender {
     /// Snapshot pins ([`Self::pin_history`]): floor → holder count. Truncation
     /// never passes the lowest; both sides decide under `append_lock`.
     pins: Arc<HistoryPins>,
+    /// Armed by [`Self::fence_branches`], consumed by the next
+    /// [`Self::truncate_below`].
+    branch_fence: parking_lot::Mutex<Option<BranchFence>>,
+}
+
+/// What a merge-base checkpoint made durable for the truncation that follows
+/// it ([`FramedTableWalAppender::fence_branches`]).
+#[derive(Debug, Clone, Default)]
+struct BranchFence {
+    /// Branched collections whose base is imaged (or already marked lost).
+    covered: BTreeSet<TenantCollection>,
+    /// Collections whose truncated history is recorded.
+    marked: BTreeSet<TenantCollection>,
+}
+
+/// A `(tenant, collection)` pair. The tenant is resolved as a request's is:
+/// an entry without one belongs to the default tenant.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TenantCollection {
+    pub tenant: String,
+    pub collection: String,
+}
+
+impl TenantCollection {
+    pub fn new(tenant: Option<&str>, collection: &str) -> Self {
+        Self {
+            tenant: proximadb_tenant::resolve_request_tenant(tenant),
+            collection: collection.to_string(),
+        }
+    }
+}
+
+/// [`FramedTableWalAppender::truncate_below`] refused because its branch
+/// fence would let history go unrecorded; nothing was removed. The truncator
+/// reports it as a refusal, not a failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchFenceRefused(pub String);
+
+impl std::fmt::Display for BranchFenceRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BranchFenceRefused {}
+
+/// The tenant of an entry, resolved without allocating (see
+/// [`proximadb_tenant::resolve_request_tenant`]).
+fn tenant_of(raw: Option<&str>) -> &str {
+    raw.map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or(proximadb_tenant::DEFAULT_TENANT)
+}
+
+/// Branch-tagged records in the retained WAL ([`FramedTableWalAppender::branch_summary`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BranchSummary {
+    /// Sequence of the oldest retained branch-tagged record.
+    pub oldest_branch_seq: Option<u64>,
+    /// Every `(tenant, collection)` with a retained branch-tagged record.
+    pub collections: BTreeSet<TenantCollection>,
 }
 
 type HistoryPins = parking_lot::Mutex<std::collections::BTreeMap<u64, usize>>;
@@ -334,10 +396,14 @@ struct SegmentSummary {
     /// Whether any entry carries no collection (catalog/checkpoint ops), which
     /// a collection-scoped read never needs.
     has_uncollected: bool,
-    /// Whether any entry is a branch-tagged record (ADR-012). Branch merge
-    /// reads base records that may predate any truncation floor, so the
-    /// truncator refuses while the retained WAL holds one (TD-SEAM-12 hazard 2).
-    has_branch_entries: bool,
+    /// Sequence of the first branch-tagged record (ADR-012). A branch merge
+    /// reads the main-line history before a branch's first write, so the
+    /// truncator keeps every entry from the oldest one up (TD-SEAM-12 hazard 2).
+    first_branch_seq: Option<u64>,
+    /// Every `(tenant, collection)` with a branch-tagged record here.
+    branched: BTreeSet<TenantCollection>,
+    /// collection id → every tenant with an entry of it here.
+    tenants: std::collections::HashMap<String, BTreeSet<String>>,
 }
 
 impl SegmentSummary {
@@ -356,14 +422,33 @@ impl SegmentSummary {
             Some(c) => {
                 let cur = self.collection_max.entry(c.to_string()).or_insert(0);
                 *cur = (*cur).max(seq);
+                let tenant = tenant_of(entry.tenant_id.as_deref());
+                let tenants = self.tenants.entry(c.to_string()).or_default();
+                if !tenants.contains(tenant) {
+                    tenants.insert(tenant.to_string());
+                }
             }
             None => self.has_uncollected = true,
         }
-        if let CanonicalOperation::RecordUpsert { record, .. } = &entry.operation
+        if let CanonicalOperation::RecordUpsert {
+            collection_id,
+            record,
+            ..
+        } = &entry.operation
             && record.branch_id.is_some()
         {
-            self.has_branch_entries = true;
+            self.first_branch_seq = Some(self.first_branch_seq.map_or(seq, |f| f.min(seq)));
+            self.branched.insert(TenantCollection::new(
+                entry.tenant_id.as_deref(),
+                collection_id,
+            ));
         }
+    }
+
+    /// Whether [`FramedTableWalAppender::truncate_below`] at `floor` removes
+    /// this (sealed) segment.
+    fn wholly_below(&self, floor: u64) -> bool {
+        self.first_seq.is_none() || self.last_seq < floor
     }
 
     /// Whether this segment can hold an entry for `collection_id` with
@@ -375,6 +460,29 @@ impl SegmentSummary {
                 .get(collection_id)
                 .is_some_and(|max| *max > since)
     }
+}
+
+/// Every `(tenant, collection)` in `segments` (oldest first) → the first
+/// sequence of the oldest segment holding it.
+fn collections_in<'a>(
+    segments: impl Iterator<Item = &'a SegmentSummary>,
+) -> BTreeMap<TenantCollection, u64> {
+    let mut out = BTreeMap::new();
+    for segment in segments {
+        let Some(first) = segment.first_seq else {
+            continue;
+        };
+        for (collection, tenants) in &segment.tenants {
+            for tenant in tenants {
+                out.entry(TenantCollection {
+                    tenant: tenant.clone(),
+                    collection: collection.clone(),
+                })
+                .or_insert(first);
+            }
+        }
+    }
+    out
 }
 
 /// Live appenders by absolute WAL path, for [`FramedTableWalAppender::open_shared`].
@@ -600,6 +708,7 @@ impl FramedTableWalAppender {
                 0
             }),
             pins: Arc::default(),
+            branch_fence: parking_lot::Mutex::new(None),
         })
     }
 
@@ -609,10 +718,70 @@ impl FramedTableWalAppender {
     }
 
     /// Whether any retained entry (sealed or active) is a branch-tagged record.
-    /// See [`SegmentSummary::has_branch_entries`].
     pub fn has_branch_entries(&self) -> bool {
-        self.active.lock().has_branch_entries
-            || self.sealed.read().iter().any(|s| s.has_branch_entries)
+        self.branch_summary().oldest_branch_seq.is_some()
+    }
+
+    /// The retained branch-tagged records: the oldest one's sequence and every
+    /// `(tenant, collection)` holding one (TD-SEAM-12 hazard 2). From the
+    /// segment summaries; no file is read.
+    pub fn branch_summary(&self) -> BranchSummary {
+        // Active first: a rotation publishes the sealed summary before it
+        // resets the active one, so a rotation between the two reads is seen
+        // twice (harmless) rather than missed.
+        let mut out = {
+            let active = self.active.lock();
+            BranchSummary {
+                oldest_branch_seq: active.first_branch_seq,
+                collections: active.branched.clone(),
+            }
+        };
+        for summary in self.sealed.read().iter() {
+            if let Some(seq) = summary.first_branch_seq {
+                out.oldest_branch_seq = Some(out.oldest_branch_seq.map_or(seq, |o| o.min(seq)));
+            }
+            out.collections.extend(summary.branched.iter().cloned());
+        }
+        out
+    }
+
+    /// Collections with entries that [`Self::truncate_below`] at `floor` would
+    /// remove, each mapped to the first sequence of the oldest such segment
+    /// (history from there on is gone once it runs). A pin may make the real
+    /// truncation remove less; never more.
+    ///
+    /// The active file counts too: it is not removable now, but a rotation
+    /// before the truncation runs can seal it, and everything in it is below
+    /// any floor up to `head + 1`. Read before the sealed list, for the same
+    /// reason as in [`Self::branch_summary`].
+    pub fn collections_below(&self, floor: u64) -> BTreeMap<TenantCollection, u64> {
+        let active = self.active.lock().clone();
+        let sealed = self.sealed.read();
+        collections_in(
+            sealed
+                .iter()
+                .chain(std::iter::once(&active))
+                .take_while(|s| s.wholly_below(floor)),
+        )
+    }
+
+    /// Arm the next [`Self::truncate_below`] (which consumes it) to refuse —
+    /// removing nothing, with [`BranchFenceRefused`] — when, by the time it
+    /// runs under the append lock, a victim segment holds history of a
+    /// `(tenant, collection)` that either
+    ///
+    /// * has branched but is outside `covered` (its merge base would go
+    ///   without an image: a first branch write raced the checkpoint), or
+    /// * is outside `marked` (its loss would go unrecorded).
+    ///
+    /// The merge-base checkpoint arms it with what it made durable
+    /// (TD-SEAM-12 hazard 2).
+    pub fn fence_branches(
+        &self,
+        covered: BTreeSet<TenantCollection>,
+        marked: BTreeSet<TenantCollection>,
+    ) {
+        *self.branch_fence.lock() = Some(BranchFence { covered, marked });
     }
 
     /// Highest sequence ever truncated from the WAL at `path` (`0` = its
@@ -673,7 +842,9 @@ impl FramedTableWalAppender {
     /// * readers overlapping it re-read (the rotation generation is odd while
     ///   the segment list and the files disagree).
     /// * `floor` is lowered to the lowest [`WalHistoryPin`], decided under the
-    ///   same lock that takes pins.
+    ///   same lock that takes pins;
+    /// * an armed branch fence ([`Self::fence_branches`]) refuses the whole
+    ///   truncation when a collection branched since would lose history.
     ///
     /// Serialized with appends (and so with rotation), which keeps the sealed
     /// list stable while victims are chosen.
@@ -685,16 +856,50 @@ impl FramedTableWalAppender {
             .keys()
             .next()
             .map_or(floor, |&pinned| floor.min(pinned));
+        let fence = self.branch_fence.lock().take();
         let victims: Vec<SegmentSummary> = self
             .sealed
             .read()
             .iter()
-            .take_while(|s| s.first_seq.is_none() || s.last_seq < floor)
+            .take_while(|s| s.wholly_below(floor))
             .cloned()
             .collect();
         let Some(through) = victims.iter().map(|s| s.last_seq).max() else {
             return Ok(WalTruncation::default());
         };
+        if let Some(fence) = fence {
+            let doomed = collections_in(victims.iter());
+            let branched = self.branch_summary().collections;
+            let name = |c: &TenantCollection| format!("{}/{}", c.tenant, c.collection);
+            let uncovered: Vec<String> = doomed
+                .keys()
+                .filter(|c| branched.contains(*c) && !fence.covered.contains(*c))
+                .map(name)
+                .collect();
+            if !uncovered.is_empty() {
+                return Err(BranchFenceRefused(format!(
+                    "canonical WAL truncation through {through} refused: {} gained a branch after \
+                     the merge-base image was taken, and its main-line history would go with no \
+                     image (TD-SEAM-12); the next run images it",
+                    uncovered.join(", ")
+                ))
+                .into());
+            }
+            let unmarked: Vec<String> = doomed
+                .keys()
+                .filter(|c| !fence.marked.contains(*c))
+                .map(name)
+                .collect();
+            if !unmarked.is_empty() {
+                return Err(BranchFenceRefused(format!(
+                    "canonical WAL truncation through {through} refused: the history of {} \
+                     would go unrecorded by the merge-base checkpoint (TD-SEAM-12); the next run \
+                     records it",
+                    unmarked.join(", ")
+                ))
+                .into());
+            }
+        }
         write_floor_marker(&self.path, through).await?;
 
         self.rotations.fetch_add(1, Ordering::SeqCst); // odd: list ≠ disk

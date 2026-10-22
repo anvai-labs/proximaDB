@@ -23,7 +23,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
-use crate::services::canonical_wal::{FramedTableWalAppender, WalTruncation};
+use crate::services::canonical_wal::{BranchFenceRefused, FramedTableWalAppender, WalTruncation};
 use crate::services::record_store::DirectWalTableRecordStore;
 use crate::services::{FunctionStore, RankProfileStore};
 
@@ -99,7 +99,18 @@ pub async fn run_once(
     if floor <= wal.retained_from().max(1) {
         return Ok(TruncationRun::NothingToDo { floor });
     }
-    let report = wal.truncate_below(floor).await?;
+    let report = match wal.truncate_below(floor).await {
+        Ok(report) => report,
+        Err(error) => {
+            if let Some(refused) = error.downcast_ref::<BranchFenceRefused>() {
+                return Ok(TruncationRun::Refused {
+                    source: "branch-fence".to_string(),
+                    reason: refused.0.clone(),
+                });
+            }
+            return Err(error);
+        }
+    };
     if report.segments == 0 {
         return Ok(TruncationRun::NothingToDo { floor });
     }
