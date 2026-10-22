@@ -23,7 +23,7 @@
 use anyhow::Result;
 use tracing::{debug, trace};
 
-use crate::utils::{GpuBatchConfig, GpuBuffer};
+use super::utils::GpuBatchConfig;
 use proximadb_hardware_caps::HardwareBackend;
 
 // Metal FFI imports
@@ -288,8 +288,8 @@ pub fn metal_delta_encode_f32(values: &[f32], base: f32) -> Result<Vec<i64>> {
 
     #[cfg(not(all(feature = "gpu", target_os = "macos", target_arch = "aarch64")))]
     {
-        // CPU fallback
-        let deltas: Vec<i64> = values.iter().map(|&v| (v - base) as i64).collect();
+        // CPU fallback (shared scalar core; see kernels/cpu_fallback.rs)
+        let deltas = super::cpu_fallback::delta_encode_f32(values, base);
         debug!(
             "✅ [Metal] Delta encoded {} values → {} deltas (CPU fallback)",
             values.len(),
@@ -354,7 +354,7 @@ pub fn metal_delta_decode_f32(deltas: &[i64], base: f32) -> Result<Vec<f32>> {
 
     #[cfg(not(all(feature = "gpu", target_os = "macos", target_arch = "aarch64")))]
     {
-        let values: Vec<f32> = deltas.iter().map(|&d| d as f32 + base).collect();
+        let values = super::cpu_fallback::delta_decode_f32(deltas, base);
         debug!(
             "✅ [Metal] Delta decoded {} deltas → {} values (CPU fallback)",
             deltas.len(),
@@ -451,29 +451,8 @@ pub fn metal_bitpack_encode_f32(values: &[f32], bits: u8) -> Result<Vec<u8>> {
 
     #[cfg(not(all(feature = "gpu", target_os = "macos", target_arch = "aarch64")))]
     {
-        // CPU fallback
-        let total_bits = values.len() * bits as usize;
-        let byte_count = (total_bits + 7) / 8;
-        let mut result = vec![0u8; byte_count];
-
-        let mask = if bits == 32 {
-            u32::MAX
-        } else {
-            (1u32 << bits) - 1
-        };
-
-        for (i, &value) in values.iter().enumerate() {
-            let bit_offset = i * bits as usize;
-            let byte_offset = bit_offset / 8;
-            let bit_in_byte = bit_offset % 8;
-
-            let masked_value = value.to_bits() & mask;
-            result[byte_offset] |= ((masked_value << bit_in_byte) & 0xFF) as u8;
-
-            if bit_in_byte + bits as usize > 8 && byte_offset + 1 < result.len() {
-                result[byte_offset + 1] |= (masked_value >> (8 - bit_in_byte)) as u8;
-            }
-        }
+        // CPU fallback (shared scalar core; see kernels/cpu_fallback.rs)
+        let result = super::cpu_fallback::bitpack_encode_f32(values, bits)?;
 
         debug!(
             "✅ [Metal] BitPacked encoded {} values → {} bytes (CPU fallback)",
@@ -535,32 +514,8 @@ pub fn metal_bitpack_decode_f32(packed: &[u8], bits: u8, count: usize) -> Result
 
     #[cfg(not(all(feature = "gpu", target_os = "macos", target_arch = "aarch64")))]
     {
-        // CPU fallback
-        let mask = if bits == 32 {
-            u32::MAX
-        } else {
-            (1u32 << bits) - 1
-        };
-        let mut result = Vec::with_capacity(count);
-
-        for i in 0..count {
-            let bit_offset = i * bits as usize;
-            let byte_offset = bit_offset / 8;
-            let bit_in_byte = bit_offset % 8;
-
-            if byte_offset >= packed.len() {
-                break;
-            }
-
-            let mut value = (packed[byte_offset] >> bit_in_byte) as u32;
-
-            if bit_in_byte + bits as usize > 8 && byte_offset + 1 < packed.len() {
-                let next_byte = packed[byte_offset + 1] as u32;
-                value |= next_byte << (8 - bit_in_byte);
-            }
-
-            result.push(f32::from_bits(value & mask));
-        }
+        // CPU fallback (shared scalar core; see kernels/cpu_fallback.rs)
+        let result = super::cpu_fallback::bitpack_decode_f32(packed, bits, count)?;
 
         debug!(
             "✅ [Metal] BitPacked decoded {} bytes → {} values (CPU fallback)",
@@ -646,32 +601,8 @@ pub fn metal_frame_of_reference_encode_f32(
 
     #[cfg(not(all(feature = "gpu", target_os = "macos", target_arch = "aarch64")))]
     {
-        // CPU fallback
-        let reference_f32 = reference as f32;
-        let offsets: Vec<i64> = values.iter().map(|&v| (v - reference_f32) as i64).collect();
-
-        let total_bits = offsets.len() * bits as usize;
-        let byte_count = (total_bits + 7) / 8;
-        let mut result = vec![0u8; byte_count];
-
-        let mask = if bits == 32 {
-            u32::MAX
-        } else {
-            (1u32 << bits) - 1
-        };
-
-        for (i, &offset) in offsets.iter().enumerate() {
-            let bit_offset = i * bits as usize;
-            let byte_offset = bit_offset / 8;
-            let bit_in_byte = bit_offset % 8;
-
-            let masked_value = (offset as u32) & mask;
-            result[byte_offset] |= ((masked_value << bit_in_byte) & 0xFF) as u8;
-
-            if bit_in_byte + bits as usize > 8 && byte_offset + 1 < result.len() {
-                result[byte_offset + 1] |= (masked_value >> (8 - bit_in_byte)) as u8;
-            }
-        }
+        // CPU fallback (shared scalar core; see kernels/cpu_fallback.rs)
+        let result = super::cpu_fallback::frame_of_reference_encode_f32(values, reference, bits)?;
 
         debug!(
             "✅ [Metal] FrameOfReference encoded {} values → {} bytes (CPU fallback)",
@@ -740,38 +671,9 @@ pub fn metal_frame_of_reference_decode_f32(
 
     #[cfg(not(all(feature = "gpu", target_os = "macos", target_arch = "aarch64")))]
     {
-        // CPU fallback
-        let mask = if bits == 32 {
-            u32::MAX
-        } else {
-            (1u32 << bits) - 1
-        };
-        let mut offsets = Vec::with_capacity(count);
-
-        for i in 0..count {
-            let bit_offset = i * bits as usize;
-            let byte_offset = bit_offset / 8;
-            let bit_in_byte = bit_offset % 8;
-
-            if byte_offset >= packed.len() {
-                break;
-            }
-
-            let mut value = (packed[byte_offset] >> bit_in_byte) as u32;
-
-            if bit_in_byte + bits as usize > 8 && byte_offset + 1 < packed.len() {
-                let next_byte = packed[byte_offset + 1] as u32;
-                value |= next_byte << (8 - bit_in_byte);
-            }
-
-            offsets.push((value & mask) as i32);
-        }
-
-        let reference_f32 = reference as f32;
-        let values: Vec<f32> = offsets
-            .iter()
-            .map(|&offset| offset as f32 + reference_f32)
-            .collect();
+        // CPU fallback (shared scalar core; see kernels/cpu_fallback.rs)
+        let values =
+            super::cpu_fallback::frame_of_reference_decode_f32(packed, reference, bits, count)?;
 
         debug!(
             "✅ [Metal] FrameOfReference decoded {} bytes → {} values (CPU fallback)",
@@ -886,39 +788,8 @@ pub fn metal_zigzag_encode_f32(values: &[f32], bits: u8) -> Result<Vec<u8>> {
 
     #[cfg(not(all(feature = "gpu", target_os = "macos", target_arch = "aarch64")))]
     {
-        // CPU fallback
-        let zigzag: Vec<i64> = values
-            .iter()
-            .map(|&v| {
-                let n = v.to_bits() as i32;
-                let zz = (n << 1) ^ (n >> 31);
-                zz as i64
-            })
-            .collect();
-
-        // Bit-pack zigzag values
-        let total_bits = zigzag.len() * bits as usize;
-        let byte_count = (total_bits + 7) / 8;
-        let mut result = vec![0u8; byte_count];
-
-        let mask = if bits == 32 {
-            u32::MAX
-        } else {
-            (1u32 << bits) - 1
-        };
-
-        for (i, &zz) in zigzag.iter().enumerate() {
-            let bit_offset = i * bits as usize;
-            let byte_offset = bit_offset / 8;
-            let bit_in_byte = bit_offset % 8;
-
-            let masked_value = (zz as u32) & mask;
-            result[byte_offset] |= ((masked_value << bit_in_byte) & 0xFF) as u8;
-
-            if bit_in_byte + bits as usize > 8 && byte_offset + 1 < result.len() {
-                result[byte_offset + 1] |= (masked_value >> (8 - bit_in_byte)) as u8;
-            }
-        }
+        // CPU fallback (shared scalar core; see kernels/cpu_fallback.rs)
+        let result = super::cpu_fallback::zigzag_encode_f32(values, bits)?;
 
         debug!(
             "✅ [Metal] Zigzag encoded {} values → {} bytes (CPU fallback)",
@@ -1009,41 +880,8 @@ pub fn metal_zigzag_decode_f32(packed: &[u8], bits: u8, count: usize) -> Result<
 
     #[cfg(not(all(feature = "gpu", target_os = "macos", target_arch = "aarch64")))]
     {
-        // CPU fallback: Step 1 - Bit-unpack
-        let mask = if bits == 32 {
-            u32::MAX
-        } else {
-            (1u32 << bits) - 1
-        };
-        let mut zigzag = Vec::with_capacity(count);
-
-        for i in 0..count {
-            let bit_offset = i * bits as usize;
-            let byte_offset = bit_offset / 8;
-            let bit_in_byte = bit_offset % 8;
-
-            if byte_offset >= packed.len() {
-                break;
-            }
-
-            let mut value = (packed[byte_offset] >> bit_in_byte) as u32;
-
-            if bit_in_byte + bits as usize > 8 && byte_offset + 1 < packed.len() {
-                let next_byte = packed[byte_offset + 1] as u32;
-                value |= next_byte << (8 - bit_in_byte);
-            }
-
-            zigzag.push((value & mask) as i32);
-        }
-
-        // Step 2: Reverse zigzag
-        let values: Vec<f32> = zigzag
-            .iter()
-            .map(|&zz| {
-                let n = ((zz as u32) >> 1) as i32 ^ -((zz & 1) as i32);
-                f32::from_bits(n as u32)
-            })
-            .collect();
+        // CPU fallback (shared scalar core; see kernels/cpu_fallback.rs)
+        let values = super::cpu_fallback::zigzag_decode_f32(packed, bits, count)?;
 
         debug!(
             "✅ [Metal CPU fallback] Zigzag decoded {} bytes → {} values",
@@ -1335,7 +1173,17 @@ mod tests {
 
         assert_eq!(values.len(), decoded.len());
         for (original, recovered) in values.iter().zip(decoded.iter()) {
-            assert!((original - recovered).abs() < 0.1);
+            // The deferred fallback stores deltas as integral i64
+            // (`(v - base) as i64`), so fractional parts are truncated and
+            // the recovery error is bounded by 1.0 — not 0.1. (This test had
+            // a 0.1 tolerance since inception but never ran: the module is
+            // macOS/aarch64 + `gpu`/`metal`-feature gated.)
+            assert!(
+                (original - recovered).abs() < 1.0,
+                "Original: {}, Recovered: {}",
+                original,
+                recovered
+            );
         }
     }
 
@@ -1438,8 +1286,12 @@ mod tests {
             .expect("Zigzag decoding should succeed");
 
         assert_eq!(values.len(), decoded.len());
-        // Zigzag encoding is designed for signed integers
-        assert!(decoded.iter().all(|v| !v.is_nan()));
+        // Zigzag operates on the IEEE word: ordinary floats like -10.0 zigzag
+        // to ~2^31 words, so at 16 bits the low-word round-trip can land on a
+        // NaN pattern (e.g. 0xFFFF -> 0xFFFF8000) by construction. Only the
+        // shape is guaranteed at narrow widths — this test had a `!is_nan`
+        // assert since inception but never ran (module is macOS/aarch64 +
+        // `gpu`/`metal`-feature gated).
     }
 
     #[test]
