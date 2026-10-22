@@ -28,7 +28,8 @@
 //!   N pgwire connections to cut load wall-time. The generators stream their
 //!   statements to the loader over a bounded channel (fact tables are emitted
 //!   date-ordered by replaying recorded generator states, ~16 bytes a row), so
-//!   the harness never holds the data set as text. Load + materialize wall
+//!   the TPC-DS server load never holds the data set as text (TPC-H, and the
+//!   DuckDB baseline, still collect theirs). Load + materialize wall
 //!   times and per-phase memory peaks (VmHWM and the cgroup peak, cgroup v2 or
 //!   v1) land in `ledger.load_stats`.
 //! - `TPC_PERF_LOAD_ONLY=1`: load + MATERIALIZE only, no query routes — the
@@ -1392,6 +1393,15 @@ fn read_bytes_mib(path: &std::path::Path) -> Option<u64> {
     raw.trim().parse::<u64>().ok().map(|b| b / (1024 * 1024))
 }
 
+/// [`read_bytes_mib`] through an already open file, from its start.
+fn read_open_bytes_mib(mut file: std::fs::File) -> Option<u64> {
+    use std::io::{Read, Seek};
+    file.rewind().ok()?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw).ok()?;
+    raw.trim().parse::<u64>().ok().map(|b| b / (1024 * 1024))
+}
+
 fn vm_hwm_mib() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let kib = status.lines().find_map(|line| {
@@ -1409,18 +1419,40 @@ fn vm_hwm_mib() -> Option<u64> {
 struct PhaseMeter {
     phase: &'static str,
     peak_rss_reset: bool,
+    /// The cgroup peak file, open for the whole phase: a cgroup v2
+    /// `memory.peak` reset applies only to reads through the descriptor that
+    /// wrote it (Linux 6.12+), so the reset and the final read share one.
+    cgroup_peak: Option<std::fs::File>,
     cgroup_peak_reset: bool,
 }
 
 impl PhaseMeter {
     fn start(phase: &'static str) -> Self {
+        use std::io::Write;
         // "5" resets the peak RSS (VmHWM) to the current RSS.
         let peak_rss_reset = std::fs::write("/proc/self/clear_refs", "5").is_ok();
-        let cgroup_peak_reset =
-            cgroup_memory_files().is_some_and(|(peak, _)| std::fs::write(peak, "0").is_ok());
+        let peak_path = cgroup_memory_files().map(|(peak, _)| peak);
+        let writable = peak_path.as_ref().and_then(|path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .ok()
+        });
+        let (cgroup_peak, cgroup_peak_reset) = match writable {
+            Some(mut file) => {
+                let reset = file.write_all(b"0").is_ok();
+                (Some(file), reset)
+            }
+            None => (
+                peak_path.and_then(|path| std::fs::File::open(path).ok()),
+                false,
+            ),
+        };
         Self {
             phase,
             peak_rss_reset,
+            cgroup_peak,
             cgroup_peak_reset,
         }
     }
@@ -1430,7 +1462,7 @@ impl PhaseMeter {
             phase: self.phase,
             peak_rss_mib: vm_hwm_mib(),
             peak_rss_reset: self.peak_rss_reset,
-            cgroup_peak_mib: cgroup_memory_files().and_then(|(peak, _)| read_bytes_mib(&peak)),
+            cgroup_peak_mib: self.cgroup_peak.and_then(read_open_bytes_mib),
             cgroup_peak_reset: self.cgroup_peak_reset,
         };
         eprintln!("[{benchmark}] memory {memory:?}");
@@ -1968,6 +2000,12 @@ async fn run_benchmark(
         schema.len(),
         stats.materialize_wall_ms
     );
+    // The load-only run is the P2.4 gate: it proves the tables load AND publish.
+    assert!(
+        !load_only || materialize_ok == schema.len(),
+        "[{benchmark}] load-only gate: {materialize_ok}/{} tables published",
+        schema.len()
+    );
 
     if load_only {
         return stats;
@@ -2021,11 +2059,19 @@ fn stream_statements(
     std::thread::spawn(move || {
         // A send fails only once the loader stopped (it panicked); stop too.
         let mut open = true;
-        generate(&mut |sql| {
-            if open {
-                open = tx.blocking_send(sql).is_ok();
-            }
-        });
+        let generated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            generate(&mut |sql| {
+                if open {
+                    open = tx.blocking_send(sql).is_ok();
+                }
+            })
+        }));
+        // A generator that panics would end the stream early and the load would
+        // look complete: a truncated load must never pass as a gate run.
+        if generated.is_err() {
+            eprintln!("statement generator panicked; aborting the run");
+            std::process::abort();
+        }
     });
     rx
 }
