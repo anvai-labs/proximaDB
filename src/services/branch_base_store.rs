@@ -235,6 +235,13 @@ impl BranchBases {
     /// sequence the WAL still holds (`0` = never truncated). Refuses when the
     /// history the base needs is gone and no image covers it, or when it
     /// cannot be told whether it is gone.
+    ///
+    /// `self` must be replayed from the same read as the merge's entries, and
+    /// `retained_from` must hold for that read: take a
+    /// [`FramedTableWalAppender::pin_history`] at the current floor, read
+    /// `retained_from`, then read the entries. Reading `retained_from` before
+    /// an unpinned read lets a truncation in between strip history that this
+    /// call would then report as complete.
     pub fn base_for(
         &self,
         collection: &TenantCollection,
@@ -333,6 +340,9 @@ pub struct BranchBaseStore {
     /// is the write gate: one checkpoint at a time, so a generation's rows
     /// never interleave with another's.
     state: tokio::sync::Mutex<Option<BranchBases>>,
+    /// Test hook: fail the next header append, after the rows are durable.
+    #[cfg(test)]
+    fail_next_header: std::sync::atomic::AtomicBool,
 }
 
 impl BranchBaseStore {
@@ -340,6 +350,8 @@ impl BranchBaseStore {
         Self {
             wal,
             state: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            fail_next_header: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -536,6 +548,13 @@ impl BranchBaseStore {
             first = first.or(written.first().map(|e| e.sequence_number));
         }
         // Last, and only once every row is durable.
+        #[cfg(test)]
+        if self
+            .fail_next_header
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            bail!("injected merge-base header failure");
+        }
         self.wal
             .append_operations(vec![header], None)
             .await
@@ -853,29 +872,27 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_checkpoint_never_reuses_its_generation() -> Result<()> {
-        use std::time::{Duration, Instant};
         let dir = tempfile::tempdir()?;
-        let path = dir.path().join("c.wal");
-        drop(branched_wal(&dir).await?);
-        let fence = Arc::new(crate::services::writer_fence::WriterFence::default());
-        let wal = Arc::new(
-            FramedTableWalAppender::open(&path)
-                .await?
-                .with_writer_fence(fence.clone()),
-        );
+        let wal = branched_wal(&dir).await?;
         let store = BranchBaseStore::new(wal.clone());
 
-        // An expired lease fails the write.
-        fence.enforce_lease(Instant::now(), Duration::ZERO);
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        // Generation 1's rows become durable, then its header append fails.
+        store
+            .fail_next_header
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(store.checkpoint(wal.last_sequence()).await.is_err());
+        let crashed = replayed(&wal).await?;
+        assert_eq!((crashed.generation, crashed.max_generation), (0, 1));
 
-        // The retry writes the next generation, and replay stays sound.
-        fence.renew_lease(Instant::now(), Duration::from_secs(600));
+        // The retry writes generation 2, and replay stays sound — in this
+        // store and in a restarted one.
         store.checkpoint(wal.last_sequence()).await?;
         let bases = replayed(&wal).await?;
         assert_eq!(bases.generation, 2);
         assert!(bases.image(&key("c")).is_some());
+        let restarted = BranchBaseStore::new(wal.clone());
+        restarted.checkpoint(wal.last_sequence()).await?;
+        assert_eq!(replayed(&wal).await?.generation, 2, "nothing changed");
         Ok(())
     }
 }
