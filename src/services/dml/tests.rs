@@ -3657,6 +3657,50 @@ impl Drop for EnvGuard {
 /// via the manifest) see one generation, the parts are cluster-sorted across part
 /// boundaries, and a third publication garbage-collects the first generation while
 /// the previous version's files stay for readers that opened it.
+/// A native catalog in `dir` with namespace `default` and the table
+/// `create_table_sql` creates, behind a DML service whose rows live in a
+/// memtable over the WAL `dir/{wal}`.
+async fn dml_over_wal_table(
+    dir: &std::path::Path,
+    create_table_sql: &str,
+    wal: &str,
+) -> (Arc<CatalogManager>, DmlService) {
+    use crate::services::record_store::DirectWalTableRecordStore;
+    use crate::services::{FramedTableWalAppender, MemtableRecordStorage};
+
+    let manager = Arc::new(CatalogManager::new());
+    manager
+        .create_native_catalog("native", dir.to_string_lossy().as_ref())
+        .await
+        .expect("native catalog");
+    let ddl = DdlService::new(manager.clone());
+    ddl.execute(DdlStatement::CreateNamespace {
+        namespace: vec!["default".to_string()],
+        if_not_exists: true,
+        properties: HashMap::new(),
+    })
+    .await
+    .expect("create namespace");
+    let create = crate::query::sql_frontend::SqlFrontendParser::new()
+        .parse_ddl(create_table_sql)
+        .expect("parse ddl")
+        .expect("ddl stmt");
+    ddl.execute(create).await.expect("create table");
+    let dml = DmlService::with_record_store_and_table_write_executor(
+        manager.clone(),
+        Arc::new(DirectWalTableRecordStore::new(
+            Arc::new(MemtableRecordStorage::new()),
+            Arc::new(
+                FramedTableWalAppender::open(&dir.join(wal))
+                    .await
+                    .expect("open WAL"),
+            ),
+        )),
+        Arc::new(PlannedOnlyTableWriteExecutor::new()),
+    );
+    (manager, dml)
+}
+
 #[cfg(feature = "datafusion-integration")]
 #[test]
 fn materialize_publishes_multi_part_generations_and_collects_old_ones() {
@@ -3666,41 +3710,14 @@ fn materialize_publishes_multi_part_generations_and_collects_old_ones() {
     crate::query::execution::test_runtime::run_with_timeout(30, async {
         use crate::datafusion::create_session_context;
         use crate::datafusion::engine_adapters::register_object_store_parquet_location;
-        use crate::services::record_store::DirectWalTableRecordStore;
-        use crate::services::{FramedTableWalAppender, MemtableRecordStorage};
-
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let manager = Arc::new(CatalogManager::new());
-        manager
-            .create_native_catalog("native", temp_dir.path().to_string_lossy().as_ref())
-            .await
-            .expect("native catalog");
-        let ddl = DdlService::new(manager.clone());
-        ddl.execute(DdlStatement::CreateNamespace {
-            namespace: vec!["default".to_string()],
-            if_not_exists: true,
-            properties: HashMap::new(),
-        })
-        .await
-        .expect("create namespace");
+        let (_manager, dml) = dml_over_wal_table(
+            temp_dir.path(),
+            "CREATE TABLE ev (id TEXT NOT NULL, d DATE, qty INT, PRIMARY KEY (id));",
+            "ev.wal",
+        )
+        .await;
         let parser = crate::query::sql_frontend::SqlFrontendParser::new();
-        let create = parser
-            .parse_ddl("CREATE TABLE ev (id TEXT NOT NULL, d DATE, qty INT, PRIMARY KEY (id));")
-            .expect("parse ddl")
-            .expect("ddl stmt");
-        ddl.execute(create).await.expect("create table");
-        let dml = DmlService::with_record_store_and_table_write_executor(
-            manager.clone(),
-            Arc::new(DirectWalTableRecordStore::new(
-                Arc::new(MemtableRecordStorage::new()),
-                Arc::new(
-                    FramedTableWalAppender::open(&temp_dir.path().join("ev.wal"))
-                        .await
-                        .expect("open WAL"),
-                ),
-            )),
-            Arc::new(PlannedOnlyTableWriteExecutor::new()),
-        );
         let insert = |i: u32| {
             // Dates descend as ids ascend, so the oid order is NOT the cluster order.
             parser
@@ -3854,41 +3871,14 @@ impl crate::services::ddl::PublishFence for RefusingFence {
 /// of the second losing the metadata CAS.
 #[tokio::test]
 async fn materialize_is_fenced_and_serialized_per_table() {
-    use crate::services::record_store::DirectWalTableRecordStore;
-    use crate::services::{FramedTableWalAppender, MemtableRecordStorage};
-
     let temp_dir = tempfile::tempdir().expect("tempdir");
-    let manager = Arc::new(CatalogManager::new());
-    manager
-        .create_native_catalog("native", temp_dir.path().to_string_lossy().as_ref())
-        .await
-        .expect("native catalog");
-    let ddl = DdlService::new(manager.clone());
-    ddl.execute(DdlStatement::CreateNamespace {
-        namespace: vec!["default".to_string()],
-        if_not_exists: true,
-        properties: HashMap::new(),
-    })
-    .await
-    .expect("create namespace");
+    let (manager, dml) = dml_over_wal_table(
+        temp_dir.path(),
+        "CREATE TABLE inv (id TEXT NOT NULL, qty INT, PRIMARY KEY (id));",
+        "inv.wal",
+    )
+    .await;
     let parser = crate::query::sql_frontend::SqlFrontendParser::new();
-    let create = parser
-        .parse_ddl("CREATE TABLE inv (id TEXT NOT NULL, qty INT, PRIMARY KEY (id));")
-        .expect("parse ddl")
-        .expect("ddl stmt");
-    ddl.execute(create).await.expect("create table");
-    let dml = DmlService::with_record_store_and_table_write_executor(
-        manager.clone(),
-        Arc::new(DirectWalTableRecordStore::new(
-            Arc::new(MemtableRecordStorage::new()),
-            Arc::new(
-                FramedTableWalAppender::open(&temp_dir.path().join("inv.wal"))
-                    .await
-                    .expect("open WAL"),
-            ),
-        )),
-        Arc::new(PlannedOnlyTableWriteExecutor::new()),
-    );
     let insert = parser
         .parse_dml("INSERT INTO inv (id, qty) VALUES ('i1', 5);")
         .expect("parse insert")
