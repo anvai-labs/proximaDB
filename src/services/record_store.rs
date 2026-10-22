@@ -2114,6 +2114,17 @@ pub struct DirectWalTableRecordStore {
     segment_filesystem: Option<Arc<dyn crate::storage::persistence::filesystem::FileSystem>>,
 }
 
+/// Synthetic collections whose rows a service store appends straight to the
+/// canonical WAL and replays itself: never table data.
+fn is_store_owned_collection(collection_id: &str) -> bool {
+    [
+        crate::services::branch_base_store::BRANCH_BASES_COLLECTION_ID,
+        crate::services::FUNCTIONS_COLLECTION_ID,
+        crate::services::RANK_PROFILES_COLLECTION_ID,
+    ]
+    .contains(&collection_id)
+}
+
 impl DirectWalTableRecordStore {
     /// TD-OLAP-17 fast path: no entry for `collection_id` can exceed `since_lsn`
     /// when its watermark is at/below it, or when the appender tracks every
@@ -2675,6 +2686,16 @@ impl DirectWalTableRecordStore {
     {
         let mut summary = proximadb_records::RecordRecoverySummary::default();
         for entry in entries {
+            // TD-SEAM-12: rows a service store keeps in the WAL itself belong
+            // to that store, not to a table; replayed here they would sit
+            // unflushed in a partition of their own and cap the truncation
+            // floor (the live path never puts them in a partition either).
+            if let CanonicalOperation::RecordUpsert { collection_id, .. }
+            | CanonicalOperation::RecordDelete { collection_id, .. } = &entry.operation
+                && is_store_owned_collection(collection_id)
+            {
+                continue;
+            }
             let tenant_id = entry.tenant_id.clone().unwrap_or_default();
             // The replayed entry carries its own LSN, and it is the SAME LSN the
             // live write path recorded. Passing it keeps a spill-backed partition

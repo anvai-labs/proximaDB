@@ -577,7 +577,8 @@ async fn read_sealed_segment(path: &Path) -> Result<Vec<CanonicalWalEntry>> {
 fn collection_id_of(op: &CanonicalOperation) -> Option<&str> {
     match op {
         CanonicalOperation::RecordUpsert { collection_id, .. }
-        | CanonicalOperation::RecordDelete { collection_id, .. } => Some(collection_id.as_str()),
+        | CanonicalOperation::RecordDelete { collection_id, .. }
+        | CanonicalOperation::RecordPartitionDrop { collection_id } => Some(collection_id.as_str()),
         _ => None,
     }
 }

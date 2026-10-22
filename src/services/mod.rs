@@ -173,6 +173,7 @@ pub mod agent_checkpoint;
 pub mod agent_memory;
 pub mod atomic_txn;
 pub mod audit_sink;
+pub mod branch_base_store;
 pub mod bulk_load;
 pub mod canonical_wal;
 pub mod catalog_backend_choice;
