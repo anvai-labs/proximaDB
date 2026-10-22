@@ -34,11 +34,15 @@
 //! # Module Structure
 //!
 //! - **traits.rs**: Core `SimdDecoder` trait and `DecoderFactory`
+//! - **common.rs**: Scalar fallbacks shared by every target (variable-bit
+//!   extraction, delta-header parsing, prefix sum, f32 reconstruction)
 //! - **bitpacked_scalar.rs**: Portable scalar fallback (reference implementation)
 //! - **bitpacked_avx2.rs**: AVX2 implementation for x86_64
 //! - **bitpacked_neon.rs**: NEON implementation for ARM64
 //! - **delta_simd.rs**: Delta encoding with SIMD prefix sum
 //! - **fused_quantization.rs**: Fused Binary/INT4/INT8 -> FP32 pipeline
+//! - **test_support.rs**: Golden-vector battery shared by all per-target tests
+//!   (test-only)
 //!
 //! # Usage
 //!
@@ -102,9 +106,13 @@
 
 // Sub-modules
 pub mod bitpacked_scalar;
+mod common;
 pub mod delta_simd;
 pub mod fused_quantization;
 mod traits;
+
+#[cfg(test)]
+pub mod test_support;
 
 // Platform-specific modules
 #[cfg(target_arch = "x86_64")]
@@ -193,72 +201,9 @@ mod tests {
 
     #[test]
     fn test_simd_vs_scalar_correctness() {
-        // Create test data
-        fn create_packed_data(values: &[u64], bits: u8) -> Vec<u8> {
-            let total_bits = values.len() * bits as usize;
-            let byte_count = total_bits.div_ceil(8);
-            let mut result = vec![0u8; byte_count];
-
-            let mask = if bits == 64 {
-                u64::MAX
-            } else {
-                (1u64 << bits) - 1
-            };
-
-            for (i, &value) in values.iter().enumerate() {
-                let bit_offset = i * bits as usize;
-                let byte_offset = bit_offset / 8;
-                let bit_in_byte = bit_offset % 8;
-
-                let masked_value = value & mask;
-
-                let mut remaining_bits = bits as usize;
-                let mut current_byte = byte_offset;
-                let mut current_bit = bit_in_byte;
-                let mut value_bits = masked_value;
-
-                while remaining_bits > 0 {
-                    let bits_in_byte = (8 - current_bit).min(remaining_bits);
-                    let byte_mask = ((1u64 << bits_in_byte) - 1) as u8;
-                    result[current_byte] |= ((value_bits as u8) & byte_mask) << current_bit;
-
-                    value_bits >>= bits_in_byte;
-                    remaining_bits -= bits_in_byte;
-                    current_byte += 1;
-                    current_bit = 0;
-                }
-            }
-
-            result
-        }
-
-        let simd_decoder = best_decoder();
-        let scalar_decoder = DecoderFactory::scalar();
-
-        // Test multiple bit widths
-        for bits in [4u8, 8, 12, 16, 20, 24, 32] {
-            let values: Vec<u64> = (0..100).map(|i| i as u64 % (1 << bits.min(63))).collect();
-            let packed = create_packed_data(&values, bits);
-
-            let mut simd_output = vec![0i64; values.len()];
-            let mut scalar_output = vec![0i64; values.len()];
-
-            let simd_count = simd_decoder
-                .decode_bitpacked_i64(&packed, bits, &mut simd_output)
-                .unwrap();
-            let scalar_count = scalar_decoder
-                .decode_bitpacked_i64(&packed, bits, &mut scalar_output)
-                .unwrap();
-
-            assert_eq!(simd_count, scalar_count, "Count mismatch for {} bits", bits);
-            assert_eq!(
-                simd_output,
-                scalar_output,
-                "Output mismatch for {} bits using {} vs Scalar",
-                bits,
-                simd_decoder.name()
-            );
-        }
+        // The best-available decoder must match the scalar reference on the
+        // shared golden bit-width sweep.
+        test_support::assert_matches_scalar_reference(best_decoder().as_ref());
     }
 
     #[test]
