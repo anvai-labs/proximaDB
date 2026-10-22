@@ -68,22 +68,22 @@
 ----
  P0  Decisions (seams doc, ADR-097, doc fixes)   [############] 100%  merged #2075
  P1  S4 Iceberg single writer + ext. read-back   [############] 100%  merged #2075
- P2  S1/S2/S3 one write path                     [##########..]  87%
+ P2  S1/S2/S3 one write path                     [##########..]  89%
      P2.1 segmented WAL + per-segment index      [############] 100%  #2079
      P2.2 Layer A (spill) in production          [############] 100%  #2085…#2146; default ON
-     P2.3 WAL truncation                         [############]  96%  default ON #2146; merge-base 3/6 #2124 #2125 #2144
-     P2.4 streaming MATERIALIZE (SF1, no OOM)    [######......]  50%  slice 1 #2126; slices 2–6 + SF1 harness in review
- P3  S5/S6/S9 format-independent SQL, ANN op     [###.........]  22%  P3.1 ~60% (#2122 #2128 #2133 #2136; #2153)
+     P2.3 WAL truncation                         [###########.]  96%  default ON #2146; merge-base 3/6 #2124 #2125 #2144; truncator wiring #2161 in review
+     P2.4 streaming MATERIALIZE (SF1, no OOM)    [#######.....]  60%  slices 1–3 + SF1 harness #2126 #2149 #2150 #2160; slices 4–6 in review
+ P3  S5/S6/S9 format-independent SQL, ANN op     [#...........]  12%  P3.1 60% (#2122 #2128 #2133 #2136 #2158; #2153), P3.2–P3.5 0%
  P4  Modalities onto the seams                   [............]   0%
- P5  Vector tier economics                       [######......]  50%
+ P5  Vector tier economics                       [######......]  58%
      P5a defaults                                [############] 100%  #2078
      P5b centroid directory + cluster compaction [#######.....]  60%  D1 #2127 #2148, D2 #2152
      P5c HNSW as persisted PAX projection        [##..........]  15%  design #2088
  P6  Proof (TPC-DS SF1/10, multimodal bench)     [#...........]  10%
- OVERALL                                         [#######.....] ~57%
+ OVERALL                                         [######......]  ~53%  (unweighted mean of P0–P6)
 ----
 
-Percentages are effort estimates, not test counts.
+Percentages are effort estimates, not test counts. A phase is the mean of its rows; OVERALL is the unweighted mean of P0–P6; bars show ⌊pct × 12 / 100⌋.
 
 == 3. Slices by phase
 
@@ -126,7 +126,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | Durable branch merge-base | **Track A** (design §5.2); slices 1–3/6 Done | #2124 #2125 #2144 | Slice 1: per-segment branch summary, tenant-keyed truncation marks, `collections_below`, branch fence (re-checked under the append lock; refusal reported as `Refused`). Slice 2 (#2125) merged after its review blocker was fixed (images record folded forks; main-line deletes and drops fold in). Slice 3 (#2144): durable merge-base images in the canonical WAL. Until the merge-base lands: merge refuses (410) once any WAL history is truncated (correction 2026-10-21, `merge_endpoint_refuses_when_wal_history_was_truncated`).
 | Catalog prefix registration (object-store placement of spill segments) | Open | — | TD-SEAM-3.
 | MATERIALIZE LSN capture via the per-collection high-water | Done in #2095 | #2095 | Superseded by `capture_snapshot_lsn` with a WAL pin.
-| P2.4 streaming / incremental MATERIALIZE publisher | **Track B**; slice 1 Done; slices 2–6 + SF1 harness in review | #2126; #2149 #2150 #2151 #2155 #2156 #2160 | Slice 1: Parquet readers (DuckDB, DataFusion, native-over-Parquet) read only the snapshot manifest's files and fail closed on any manifest error (no directory listing beside a metadata log). Gate: TPC-DS SF1 on a release build loads with no OOM and peak RSS recorded. TD-USUB-10, TD-OLAPFMT-3.
+| P2.4 streaming / incremental MATERIALIZE publisher | **Track B**; slices 1–3 + SF1 harness Done; slices 4–6 in review | #2126 #2149 #2150 #2160; #2151 #2155 #2156 | Slice 1: Parquet readers (DuckDB, DataFusion, native-over-Parquet) read only the snapshot manifest's files and fail closed on any manifest error (no directory listing beside a metadata log). Gate: TPC-DS SF1 on a release build loads with no OOM and peak RSS recorded. TD-USUB-10, TD-OLAPFMT-3.
 | Turn rotation, truncation and the spill on by default, with a data-format guard | Done | #2146 | Gate: the soak (#2145). Defaults: 64 MiB segments, truncator every 300 s (newest 1M entries kept), spill at 65 536 resident rows; `0`/`off` disables each (`services::storage_format::default_on_gate`). `{data_dir}/pgwire/DATA_FORMAT` records format 2 before anything is opened; a newer marker or an unreadable one refuses boot. Turning the spill off over existing spill state, or failing to open it, refuses boot instead of serving from memory. Rolling back across format 1 → 2 is unsupported (older binaries cannot read the marker). Independent review before merge: 1 blocker (truncation after an incomplete recovery) + 3 should-fixes, all fixed. Wire-format evolution rules frozen by `proximadb-storage-common/tests/wal_format_compat.rs` (golden format-2 bytes; add fields only with `serde(default)`), which replaces the planned "first `serde(default)` field" item.
 |===
 
@@ -135,7 +135,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 [cols="3,1,1,3",options="header"]
 |===
 | Slice | Status | PR | Gate / notes
-| P3.1 `LayerATableProvider`: streaming, pushdown, ABAC, WAL-tail union (replaces `MemTable` and the 1M-row cap) | **Track C**; PRs 0–2 Done, provider in review | #2122 #2128 #2133 #2136; #2153 #2158 #2159 | `native_table_capability_parity_e2e`.
+| P3.1 `LayerATableProvider`: streaming, pushdown, ABAC, WAL-tail union (replaces `MemTable` and the 1M-row cap) | **Track C**; PRs 0–2 + #2128 review fixes Done, provider in review | #2122 #2128 #2133 #2136 #2158; #2153 #2159 | `native_table_capability_parity_e2e`.
 | P3.2 Register `PaxTableProvider`; UDTF-only queries go to DataFusion | Open | — |
 | P3.3 `FilteredAnnExec` (filter/limit/dynamic-filter pushdown, emits `oid`) | Open | — | `filtered_ann_recall_bands` ≥ 0.95 in every band.
 | P3.4 SBBF probe for join runtime filters; P3.5 facade passes `vector_ops`/`graph_ops` | Open | — |
@@ -153,7 +153,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | Branch | PR | State and next action
 | `lead/wal-soak` | #2145 | Done.
 | `lead/default-on` | #2146 | Done.
-| `lead/next` | (lead) | WAL wire-format golden compatibility tests + this tracker refresh.
+| `lead/next` | (lead) | WAL wire-format golden compatibility tests + this tracker refresh (#2162). Follow-up: pin the frame header (`PXWAL001`, layout, CRC) in the root crate.
 |===
 
 === 4.1 Parallel tracks (since 2026-10-22)
@@ -166,9 +166,9 @@ tracks report through a "Tracker update" paragraph in each PR body.
 |===
 | Track | Scope | First PRs
 | Lead | Coordination, this tracker, P2.2 recovery gate and default-on; independent adversarial review of every track PR (posted as a PR comment) before merge | #2119, #2122, #2129, #2132, #2145, #2146 merged
-| A | Durable branch merge-base, §5.2 (6 commits) | #2124 #2125 #2144 merged (3/6)
-| B | P2.4 streaming MATERIALIZE, §5.3 PRs 1–7 incl. the SF1 no-OOM gate | #2126 merged; #2149–#2151, #2155, #2156, #2160 in review
-| C | P3.1 LayerATableProvider, §5.4 PRs 0 and 2–5 | #2128 #2133 #2136 merged; #2153 #2158 #2159 in review
+| A | Durable branch merge-base, §5.2 (6 commits) | #2124 #2125 #2144 merged (3/6); #2161 in review
+| B | P2.4 streaming MATERIALIZE, §5.3 PRs 1–7 incl. the SF1 no-OOM gate | #2126 #2149 #2150 #2160 merged; #2151 #2155 #2156 in review
+| C | P3.1 LayerATableProvider, §5.4 PRs 0 and 2–5 | #2128 #2133 #2136 #2158 merged; #2153 #2159 in review
 | D | P5b PAX centroid directory + cluster-contiguous compaction: design, then 2 slices | #2120 (design, TD-PAXDIR-1); #2127 #2148 (D1 + review fixes), #2152 (D2) merged
 |===
 
