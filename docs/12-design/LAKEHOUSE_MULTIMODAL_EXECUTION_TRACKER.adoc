@@ -68,16 +68,16 @@
 ----
  P0  Decisions (seams doc, ADR-097, doc fixes)   [############] 100%  merged #2075
  P1  S4 Iceberg single writer + ext. read-back   [############] 100%  merged #2075
- P2  S1/S2/S3 one write path                     [########....]  65%
+ P2  S1/S2/S3 one write path                     [########....]  70%
      P2.1 segmented WAL + per-segment index      [############] 100%  #2079
-     P2.2 Layer A (spill) in production          [########....]  70%
+     P2.2 Layer A (spill) in production          [##########..]  85%  #2085…#2122
      P2.3 WAL truncation                         [##########..]  90%  #2089 #2090 #2095
      P2.4 streaming MATERIALIZE (SF1, no OOM)    [............]   0%
  P3  S5/S6/S9 format-independent SQL, ANN op     [#...........]   5%
  P4  Modalities onto the seams                   [............]   0%
  P5  Vector tier economics                       [####........]  30%
      P5a defaults                                [############] 100%  #2078
-     P5b centroid directory + cluster compaction [............]   0%
+     P5b centroid directory + cluster compaction [#...........]  10%  design #2120
      P5c HNSW as persisted PAX projection        [##..........]  15%  design #2088
  P6  Proof (TPC-DS SF1/10, multimodal bench)     [#...........]  10%
  OVERALL                                         [#####.......] ~45%
@@ -119,7 +119,10 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | Spill encoder uses the catalog schema; non-fitting rows held resident (no silent NULL); timestamp decode | Done | #2099 | Tests listed in the TD-SEAM-3 row. Hardened before merge: un-materializable catalog types are dropped from the encode schema (rows on them held), int→float mantissa check.
 | Seed spill schema hints at boot (before WAL replay) | Done | #2114 | `CatalogManager::table_schemas` (native + OLTP catalogs; also backs the truncator's snapshot floor); per-collection fallback, none for an ambiguous key. `boot_seeded_schemas_reach_replayed_partitions_unless_ambiguous`, `table_schemas_walks_nested_namespaces_of_selected_catalogs`.
 | Permanent-hold classes → exact residual column (`__proxima_residual`, TD-USUB-6 rule); codec-verified hold + `proximadb_spill_rows_held_total` | Done | #2117 | `the_residual_makes_every_row_round_trip_exactly`; spill tests updated (rows formerly held now flush exactly).
-| Hold metric + escape hatch for permanent-hold rows | **Next** | — | Rows with nested `Object`/`Array` props, >1 embedding, props on a dropped/un-materializable column, or an integer too wide for a declared float column can never be spilled by any schema — they hold memory and pin `min_unflushed_lsn` forever (no loss; strictly better than the old silent NULL on eviction). Needs a hold-size metric and an escape hatch (quarantine segment). |
+| Hold metric + escape hatch for permanent-hold rows | Superseded by #2117 | #2117 | The residual column makes every former permanent-hold class round-trip exactly; the only remaining hold is a codec defect (encode→decode mismatch), counted by `proximadb_spill_rows_held_total` (expected 0). An alert on that counter replaces the escape hatch.
+| Spill scan snapshot taken under the segments lock (no lost rows, no resurrected deletes during a racing flush) | Done | #2122 | `a_scan_racing_a_flush_loses_no_row_and_resurrects_no_delete`. Also P3.1 PR 1.
+| Crash-after-truncation recovery gate (spill + rotation + truncator, restart, replay) | Open PR | — | `tests/wal_truncation_recovery_test.rs`: two partitions (untenanted and tenanted); flushed rows come back from segments, the WAL tail from replay; deletes and updates kept across two truncations and two restarts; an unflushed tombstone makes the record tier refuse (pinned). Prerequisite for default-on.
+| LSN-tracked tombstones: a memory-only tombstone yields a floor instead of refusing | **Next** (lead) | — | Today any unflushed DELETE makes `min_unflushed_lsn` refuse, so a steady-delete workload truncates only right after a flush. Track each tombstone's WAL LSN (a `delete_record_at_lsn` sibling of `upsert_record_at_lsn`, untracked ⇒ refuse as now) and count tombstones toward the flush threshold.
 | Durable branch merge-base | **Track A** (design §5.2) | — | Until it lands: merge refuses (410) once any WAL history is truncated (correction 2026-10-21, `merge_endpoint_refuses_when_wal_history_was_truncated`).
 | Catalog prefix registration (object-store placement of spill segments) | Open | — | TD-SEAM-3.
 | MATERIALIZE LSN capture via the per-collection high-water | Done in #2095 | #2095 | Superseded by `capture_snapshot_lsn` with a WAL pin.
@@ -148,7 +151,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 [cols="2,1,3",options="header"]
 |===
 | Branch | PR | State and next action
-| `fix/spill-scan-view` | (lead) | Flush-consistent spill scan snapshot (P3.1 PR 1, race fix); 98/98 lib tests; PR next.
+| `lead/truncation-recovery-gate` | (lead) | Crash-after-truncation recovery gate + this tracker refresh; then the default-on soak plan.
 |===
 
 === 4.1 Parallel tracks (since 2026-10-22)
@@ -160,7 +163,7 @@ tracks report through a "Tracker update" paragraph in each PR body.
 [cols="1,3,2",options="header"]
 |===
 | Track | Scope | First PRs
-| Lead | Coordination, this tracker, `fix/spill-scan-view` | #2119 merged (branch merge 410)
+| Lead | Coordination, this tracker, P2.2 recovery gate and default-on | #2119, #2122 merged
 | A | Durable branch merge-base, §5.2 (6 commits) | —
 | B | P2.4 streaming MATERIALIZE, §5.3 PRs 1–7 incl. the SF1 no-OOM gate; owns `p24-readers-fail-closed` | —
 | C | P3.1 LayerATableProvider, §5.4 PRs 0 and 2–5; owns `fix/native-window-fn-declines` | —
