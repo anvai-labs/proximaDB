@@ -7,7 +7,7 @@
     "@material-ui/icons": "^4.11.3",
     "@monaco-editor/react": "^4.6.0",
     "axios": "^1.11.0",
-    "cytoscape": "^3.34.3",
+    "cytoscape": "^3.34.4",
     "monaco-editor": "0.57.0",
     "react": "^17.0.0",
     "react-dom": "^17.0.0",
