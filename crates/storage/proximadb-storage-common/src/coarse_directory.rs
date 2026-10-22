@@ -157,7 +157,7 @@ pub struct CoarseCellEntry {
 }
 
 impl CoarseCellEntry {
-    fn write_to(&self, out: &mut Vec<u8>) {
+    pub(crate) fn write_to(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.row_begin.to_le_bytes());
         out.extend_from_slice(&self.row_end.to_le_bytes());
         out.extend_from_slice(&self.a_off.to_le_bytes());
@@ -170,7 +170,7 @@ impl CoarseCellEntry {
         out.extend_from_slice(&self.d_block_end.to_le_bytes());
     }
 
-    fn read_from(input: &[u8], p: &mut usize) -> Result<Self> {
+    pub(crate) fn read_from(input: &[u8], p: &mut usize) -> Result<Self> {
         Ok(Self {
             row_begin: read_u64(input, p)?,
             row_end: read_u64(input, p)?,
@@ -347,7 +347,7 @@ pub fn project_with_model(mean: &[f32], components: &[f32], n_comp: usize, v: &[
 }
 
 /// FNV-1a 64-bit over raw bytes (checksum — deterministic, dependency-free).
-fn fnv1a64(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for &b in bytes {
         h ^= b as u64;
@@ -366,28 +366,28 @@ fn ensure_remaining(input: &[u8], position: usize, len: usize) -> Result<()> {
     Ok(())
 }
 
-fn read_u16(input: &[u8], p: &mut usize) -> Result<u16> {
+pub(crate) fn read_u16(input: &[u8], p: &mut usize) -> Result<u16> {
     ensure_remaining(input, *p, 2)?;
     let v = u16::from_le_bytes(input[*p..*p + 2].try_into()?);
     *p += 2;
     Ok(v)
 }
 
-fn read_u32(input: &[u8], p: &mut usize) -> Result<u32> {
+pub(crate) fn read_u32(input: &[u8], p: &mut usize) -> Result<u32> {
     ensure_remaining(input, *p, 4)?;
     let v = u32::from_le_bytes(input[*p..*p + 4].try_into()?);
     *p += 4;
     Ok(v)
 }
 
-fn read_u64(input: &[u8], p: &mut usize) -> Result<u64> {
+pub(crate) fn read_u64(input: &[u8], p: &mut usize) -> Result<u64> {
     ensure_remaining(input, *p, 8)?;
     let v = u64::from_le_bytes(input[*p..*p + 8].try_into()?);
     *p += 8;
     Ok(v)
 }
 
-fn read_f32s(input: &[u8], p: &mut usize, count: usize) -> Result<Vec<f32>> {
+pub(crate) fn read_f32s(input: &[u8], p: &mut usize, count: usize) -> Result<Vec<f32>> {
     ensure_remaining(input, *p, count * 4)?;
     let mut out = Vec::with_capacity(count);
     for i in 0..count {

@@ -6,6 +6,7 @@
 pub mod auto_scheduler;
 pub mod bitmap;
 pub mod cache_config;
+pub mod centroid_directory;
 pub mod coarse_directory;
 pub mod collection_path;
 pub mod column_projector;
