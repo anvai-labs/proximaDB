@@ -160,3 +160,26 @@ and asserts the table opens with 2 splits, not 4 — listing would have unioned 
 `proximadb_warehouse_iceberg_publish_failures_total` load-bearing. A failed publish now means
 a stale-or-absent manifest, and reads either fall back to listing (absent) or serve the prior
 snapshot (stale) — so the counter USUB-9 added is the signal that the two have diverged.
+
+=== P2.4 slice 1: readers fail closed (2026-10-22)
+
+Slice 0's fallback listed the directory on *any* manifest failure, including an unreadable
+`metadata.json`. That was safe only while publication wrote one fixed-name object. Multi-part,
+generation-named publication (P2.4, tracker §5.3) leaves several generations in `data/`, and
+listing them would serve rows from several snapshots at once. The selection now fails closed:
+
+* `manifest_selected_files` returns `Ok(None)`, which means list the directory, **only when no
+  metadata log exists**. That covers a non-published layout, or a table published before
+  Iceberg metadata existed.
+* Once a `v*.metadata.json` exists, an unreadable log, or a snapshot that names no parquet
+  files, is an `Err` and the table open fails.
+* The DuckDB engine registers each view as `read_parquet([...])` over the same manifest
+  selection (`manifest_selected_uris`) instead of the directory. Both engines therefore read
+  one generation, and an unreadable log fails the DuckDB query too. The `duckdb` feature now
+  enables `datafusion-integration`, which owns the shared selection.
+
+**Evidence:** `unreadable_manifest_fails_closed` garbles the only `metadata.json` beside a stale
+part, then asserts that the open and `manifest_selected_uris` both error.
+`view_reads_manifest_files_only` (feature `duckdb`) asserts that the DuckDB view returns the
+snapshot's 4 rows, not 8. `without_a_manifest_selection_falls_back_to_listing` still pins the
+no-metadata case.

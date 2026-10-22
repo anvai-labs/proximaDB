@@ -1041,8 +1041,9 @@ graph-first-sks = []
 datafusion-integration = ["dep:datafusion", "dep:datafusion-common"]
 # ADR-059: in-process DuckDB OLAP engine (default OFF — adds the libduckdb C++
 # build). Enables the perf-ledger harnesses to run DuckDB in-process (io-traced,
-# same parquet/SQL) instead of the CLI subprocess.
-duckdb = ["dep:duckdb"]
+# same parquet/SQL) instead of the CLI subprocess. Needs the DataFusion
+# reader's snapshot-manifest file selection so both engines read one generation.
+duckdb = ["dep:duckdb", "datafusion-integration"]
 
 # Hardware acceleration features
 gpu = ["metal", "proximadb-codec/gpu", "proximadb-hardware-caps/gpu", "proximadb-distance-kernel/gpu"]  # GPU acceleration support (CUDA, ROCm, MPS, OpenCL)

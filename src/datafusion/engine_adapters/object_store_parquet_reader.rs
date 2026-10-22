@@ -801,37 +801,63 @@ impl ObjectStoreParquetTable {
     /// them into one answer. Reading the manifest is what makes those schemes
     /// expressible at all.
     ///
-    /// Returns `None` — falling back to listing — whenever the manifest cannot
-    /// be used: a non-published layout, no metadata yet, an unreadable or empty
-    /// snapshot. That fallback is what keeps this mixed-read-safe, and it is
-    /// also why enabling it changes nothing today: with a single fixed-name
-    /// object, the manifest lists exactly what listing would find.
+    /// `Ok(None)` — list the directory — ONLY when there is no metadata log to
+    /// consult: a non-published layout, or a table published before Iceberg
+    /// metadata existed. Once a `v*.metadata.json` exists, failing to read it
+    /// (or a snapshot naming no data files) is an `Err`: listing then could
+    /// silently mix generations, so the open fails closed instead.
     async fn manifest_selected_files(
         location: &str,
-    ) -> Option<(Arc<IcebergObjectStoreBridge>, Vec<Path>)> {
-        let base = Self::table_base_of(location)?;
-        let bridge = Arc::new(IcebergObjectStoreBridge::from_url(&base).ok()?);
-        let version = bridge
+    ) -> DFResult<Option<(Arc<IcebergObjectStoreBridge>, Vec<Path>)>> {
+        let Some(base) = Self::table_base_of(location) else {
+            return Ok(None);
+        };
+        let manifest_err = |e: proximadb_kernel::error::StorageError| {
+            df_err(&format!("read snapshot manifest under {base}"), e)
+        };
+        let bridge = Arc::new(IcebergObjectStoreBridge::from_url(&base).map_err(manifest_err)?);
+        let Some(version) = bridge
             .latest_metadata_version(METADATA_SUBPREFIX)
             .await
-            .ok()??;
+            .map_err(manifest_err)?
+        else {
+            return Ok(None);
+        };
         let mut paths: Vec<Path> = bridge
             .read_iceberg_snapshot(METADATA_SUBPREFIX, version)
             .await
-            .ok()?
+            .map_err(manifest_err)?
             .into_iter()
             .filter(|p| p.as_ref().ends_with(".parquet"))
             .collect();
         if paths.is_empty() {
-            return None;
+            return Err(df_err(
+                &format!("read snapshot manifest under {base}"),
+                format!("metadata v{version} selects no parquet data files"),
+            ));
         }
         paths.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
-        Some((bridge, paths))
+        Ok(Some((bridge, paths)))
+    }
+
+    /// The manifest-selected data files of `location` as absolute URIs, for
+    /// readers outside DataFusion (the DuckDB view) so every route reads the
+    /// same snapshot. Same `Ok(None)`/`Err` contract as `manifest_selected_files`.
+    pub async fn manifest_selected_uris(location: &str) -> DFResult<Option<Vec<String>>> {
+        Ok(Self::manifest_selected_files(location)
+            .await?
+            .map(|(bridge, paths)| {
+                paths
+                    .iter()
+                    .map(|p| bridge.object_uri(p.as_ref()))
+                    .collect()
+            }))
     }
 
     async fn open_bridge_base(location: &str) -> DFResult<Self> {
-        // Manifest first; listing is the fallback (see `manifest_selected_files`).
-        if let Some((bridge, paths)) = Self::manifest_selected_files(location).await {
+        // Manifest first; listing only when the table has no metadata log
+        // (see `manifest_selected_files`).
+        if let Some((bridge, paths)) = Self::manifest_selected_files(location).await? {
             return Self::open_relative(bridge, paths, location).await;
         }
 
@@ -1857,7 +1883,7 @@ pub async fn register_object_store_parquet_location(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use arrow_array::{Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -1951,17 +1977,36 @@ mod tests {
     /// the row set is simply from several generations at once.
     #[tokio::test]
     async fn manifest_selection_excludes_a_parquet_not_in_the_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_url = publish_snapshot_then_add_stale_part(tmp.path()).await;
+
+        let location = format!("{base_url}/data");
+        let table = ObjectStoreParquetTable::open(&location).await.unwrap();
+
+        // 2 row groups from part-0 ONLY. Listing would have produced 4.
+        assert_eq!(
+            table.split_count(),
+            2,
+            "manifest-driven selection must exclude the unreferenced parquet; \
+             a listing reader would union it and return two generations of rows"
+        );
+    }
+
+    /// A published table whose `data/` holds `part-0.parquet` (named by the
+    /// snapshot) plus `part-9-stale.parquet` (written after it, unreferenced).
+    /// Returns the table base URL. Shared with the DuckDB view test so both
+    /// routes are checked against the same layout.
+    pub(crate) async fn publish_snapshot_then_add_stale_part(root: &std::path::Path) -> String {
         use proximadb_storage_common::object_store_bridge::{
             IcebergSnapshotField, ObjectStoreBridge,
         };
 
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
+        let data_dir = root.join("data");
         std::fs::create_dir(&data_dir).unwrap();
         write_two_row_group_parquet(&data_dir.join("part-0.parquet"));
 
         // Publish a snapshot while ONLY part-0 exists, so the manifest names it alone.
-        let base_url = format!("file://{}", tmp.path().display());
+        let base_url = format!("file://{}", root.display());
         let bridge = IcebergObjectStoreBridge::from_url(&base_url).unwrap();
         let fields = vec![
             IcebergSnapshotField {
@@ -1994,17 +2039,39 @@ mod tests {
         // NOW add a stray object the snapshot does not reference — a stale part
         // from an earlier/later generation.
         write_two_row_group_parquet(&data_dir.join("part-9-stale.parquet"));
+        base_url
+    }
+
+    /// Fail closed: once a metadata log exists, an unreadable `metadata.json`
+    /// must fail the open. Falling back to listing here would read the stale
+    /// part beside the current one and return two generations of rows.
+    #[tokio::test]
+    async fn unreadable_manifest_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_url = publish_snapshot_then_add_stale_part(tmp.path()).await;
+        let metadata_dir = tmp.path().join(METADATA_SUBPREFIX);
+        let mut garbled = 0;
+        for entry in std::fs::read_dir(&metadata_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.to_string_lossy().ends_with(".metadata.json") {
+                std::fs::write(&path, b"{ not json").unwrap();
+                garbled += 1;
+            }
+        }
+        assert_eq!(garbled, 1, "fixture publishes exactly one metadata version");
 
         let location = format!("{base_url}/data");
-        let table = ObjectStoreParquetTable::open(&location).await.unwrap();
-
-        // 2 row groups from part-0 ONLY. Listing would have produced 4.
-        assert_eq!(
-            table.split_count(),
-            2,
-            "manifest-driven selection must exclude the unreferenced parquet; \
-             a listing reader would union it and return two generations of rows"
+        let err = ObjectStoreParquetTable::open(&location)
+            .await
+            .expect_err("an unreadable manifest must not fall back to listing");
+        assert!(
+            err.to_string().contains("snapshot manifest"),
+            "unexpected error: {err}"
         );
+        let err = ObjectStoreParquetTable::manifest_selected_uris(&location)
+            .await
+            .expect_err("the shared selection helper fails closed too");
+        assert!(err.to_string().contains("snapshot manifest"), "{err}");
     }
 
     /// Control: with no metadata present, selection falls back to listing —

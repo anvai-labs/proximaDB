@@ -52,10 +52,16 @@ impl ExecutionEngine for DuckDbLocalEngine {
         sql: &str,
         context: QueryExecutionContext,
     ) -> Result<ExecutionPipelineResult, ExecutionError> {
+        // File selection is async object-store I/O, so resolve each view's
+        // source here, before the blocking hop.
+        let mut views = Vec::with_capacity(context.parquet_tables.len());
+        for (name, location) in &context.parquet_tables {
+            views.push((name.clone(), read_parquet_source(location).await?));
+        }
         // DuckDB is synchronous + CPU-bound (CBO + vectorized joins). Run it on
         // the blocking pool so it never holds a tokio worker thread.
         let sql = sql.to_string();
-        let (result, compute_ms) = tokio::task::spawn_blocking(move || run_duckdb(&sql, &context))
+        let (result, compute_ms) = tokio::task::spawn_blocking(move || run_duckdb(&sql, &views))
             .await
             .map_err(|e| ExecutionError::Execution(format!("duckdb join/task: {e}")))??;
         // Record io-trace HERE (async context), not inside spawn_blocking — the
@@ -68,24 +74,51 @@ impl ExecutionEngine for DuckDbLocalEngine {
     }
 }
 
+/// The `read_parquet` argument for a table `location`: the files its published
+/// Iceberg snapshot selects, chosen by the SAME helper as the DataFusion reader
+/// so both engines read one generation. Only a table with no metadata log keeps
+/// the directory form; unreadable metadata fails the query instead of reading
+/// whatever parquet happens to be present.
+async fn read_parquet_source(location: &str) -> Result<String, ExecutionError> {
+    use crate::datafusion::engine_adapters::ObjectStoreParquetTable;
+    let selected = ObjectStoreParquetTable::manifest_selected_uris(location)
+        .await
+        .map_err(|e| ExecutionError::Execution(format!("duckdb select files {location}: {e}")))?;
+    Ok(match selected {
+        Some(files) => {
+            let quoted: Vec<String> = files
+                .iter()
+                .map(|f| sql_string_literal(f.as_str()))
+                .collect();
+            format!("[{}]", quoted.join(", "))
+        }
+        None => sql_string_literal(location.trim_end_matches('/')),
+    })
+}
+
+/// A SQL single-quoted string literal (`'` doubled), for object paths/URIs.
+fn sql_string_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 /// Open an in-memory DuckDB, register the parquet tables, run the SQL, and
 /// convert the Arrow result to [`ExecutionPipelineResult`]. Returns the result
 /// + the wall `compute_ms` (recorded by the caller in the async io-trace scope).
 fn run_duckdb(
     sql: &str,
-    context: &QueryExecutionContext,
+    views: &[(String, String)],
 ) -> Result<(ExecutionPipelineResult, u64), ExecutionError> {
     let conn = duckdb::Connection::open_in_memory()
         .map_err(|e| ExecutionError::Execution(format!("duckdb open: {e}")))?;
     // Register each parquet table as a view over `read_parquet` — DuckDB reads
     // the SAME materialized parquet ProximaDB wrote (same data; no re-load). The
-    // `location` is the table's base directory (the catalog API contract — like
+    // source is the snapshot's file list (`read_parquet_source`), or for a table
+    // with no metadata log its base directory (the catalog API contract — like
     // Hive/Unity/Polaris: the reader scans immediate parquet files in it,
     // skipping commit-style files `_`/`.` prefixed; partitioned layouts use
     // `colname=value/` subdirs). NOT a recursive glob.
-    for (name, location) in &context.parquet_tables {
-        let base = location.trim_end_matches('/');
-        let ddl = format!("CREATE VIEW \"{name}\" AS SELECT * FROM read_parquet('{base}')");
+    for (name, source) in views {
+        let ddl = format!("CREATE VIEW \"{name}\" AS SELECT * FROM read_parquet({source})");
         conn.execute_batch(&ddl)
             .map_err(|e| ExecutionError::Execution(format!("duckdb register {name}: {e}")))?;
     }
@@ -173,4 +206,36 @@ fn ffi_batch_58_to_59(
         .collect::<Result<Vec<_>, ExecutionError>>()?;
     arrow_array::RecordBatch::try_new(out_schema, columns)
         .map_err(|e| ExecutionError::Execution(format!("duckdb arrow batch FFI: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::datafusion::engine_adapters::object_store_parquet_reader::tests::publish_snapshot_then_add_stale_part;
+
+    /// The view must read the snapshot's files, not the directory: a stale
+    /// parquet beside the manifest-listed one would otherwise be unioned in.
+    #[tokio::test]
+    async fn view_reads_manifest_files_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_url = publish_snapshot_then_add_stale_part(tmp.path()).await;
+        let context = QueryExecutionContext {
+            parquet_tables: vec![("t".to_string(), format!("{base_url}/data"))],
+            ..Default::default()
+        };
+        let result = DuckDbLocalEngine
+            .execute_sql("SELECT x FROM t", context)
+            .await
+            .unwrap();
+        // part-0 holds 4 rows; reading the directory would add the stale part's 4.
+        assert_eq!(result.rows.len(), 4);
+    }
+
+    #[test]
+    fn sql_string_literal_doubles_single_quotes() {
+        assert_eq!(
+            sql_string_literal("file:///w/o'brien/part-0.parquet"),
+            "'file:///w/o''brien/part-0.parquet'"
+        );
+    }
 }
