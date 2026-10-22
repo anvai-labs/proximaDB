@@ -1480,9 +1480,26 @@ pub async fn try_run_select(
     // Lower + plan via the shared planning path (so EXPLAIN discloses exactly this
     // plan). `None` → lowering declined → fall through to legacy. From the planned
     // physical onward, errors are real and surface to the client.
-    let physical = match plan_over_snapshot(sql, &snapshot)? {
-        Ok(p) => p,
-        Err(e) => return Some(Err(e)),
+    //
+    // TD-USUB-2 fail-closed: the frontend always declines `OVER (…)` (TD-187), and a
+    // windowed query that reaches here had no DataFusion route (e.g. a native table
+    // with `PROXIMADB_NATIVE_TABLE_PROVIDER` off). pgwire's legacy single-table path
+    // (`require_engagement`) would drop the window and serve a silently wrong answer,
+    // so decline it explicitly instead. Off-pgwire callers keep their own fallback.
+    let physical = match plan_over_snapshot(sql, &snapshot) {
+        Some(Ok(p)) => p,
+        Some(Err(e)) => return Some(Err(e)),
+        None if !require_engagement => return None,
+        None => {
+            return query_window_function_name(query).map(|name| {
+                Err(format!(
+                    "0A000: window function {name}() OVER (...) is not supported on this \
+                     table without a DataFusion route; enable the native table provider \
+                     (PROXIMADB_NATIVE_TABLE_PROVIDER=1) or ALTER TABLE ... MATERIALIZE so \
+                     DataFusion serves it (TD-USUB-2)"
+                ))
+            });
+        }
     };
     crate::observability::io_trace::record_setup_ms(setup_start.elapsed().as_millis() as u64);
     match execute_physical(physical, &snapshot, controls).await {
@@ -4148,22 +4165,45 @@ fn geometry_subqueries_of_expr<'a>(expr: &'a SqlExpr, out: &mut Vec<&'a SqlQuery
 
 /// True if a projection item applies a window function (`… OVER (…)`).
 fn select_item_has_window(item: &SelectItem) -> bool {
-    let expr = match item {
-        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
-        _ => return false,
-    };
-    expr_has_window(expr)
+    select_item_window_function(item).is_some()
 }
 
-fn expr_has_window(expr: &SqlExpr) -> bool {
-    match expr {
-        SqlExpr::Function(f) => f.over.is_some(),
-        SqlExpr::BinaryOp { left, right, .. } => expr_has_window(left) || expr_has_window(right),
-        SqlExpr::UnaryOp { expr, .. } | SqlExpr::Nested(expr) | SqlExpr::Cast { expr, .. } => {
-            expr_has_window(expr)
+/// The first window function call (`… OVER (…)`) a projection item applies, if any.
+fn select_item_window_function(item: &SelectItem) -> Option<&sqlparser::ast::Function> {
+    match item {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+            expr_window_function(e)
         }
-        _ => false,
+        _ => None,
     }
+}
+
+fn expr_window_function(expr: &SqlExpr) -> Option<&sqlparser::ast::Function> {
+    match expr {
+        SqlExpr::Function(f) if f.over.is_some() => Some(f),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            expr_window_function(left).or_else(|| expr_window_function(right))
+        }
+        SqlExpr::UnaryOp { expr, .. } | SqlExpr::Nested(expr) | SqlExpr::Cast { expr, .. } => {
+            expr_window_function(expr)
+        }
+        _ => None,
+    }
+}
+
+/// TD-USUB-2: name of the first window function in the top-level SELECT projection —
+/// the shape `set_expr_engages` engages on (TD-187). When no DataFusion route serves
+/// such a query, the legacy single-table path would drop the `OVER (…)` and return a
+/// silently wrong answer, so `try_run_select` declines it with `0A000` instead.
+fn query_window_function_name(query: &SqlQuery) -> Option<String> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    select
+        .projection
+        .iter()
+        .find_map(select_item_window_function)
+        .map(|f| f.name.to_string())
 }
 
 fn set_expr_engages(body: &SetExpr) -> bool {
@@ -4756,6 +4796,29 @@ mod tests {
         // A plain single-table SELECT with no window function still does not
         // engage via this signal (unchanged default-safe behavior).
         assert!(!gate("SELECT hostname, usage_user FROM cpu"));
+    }
+
+    /// TD-USUB-2: the legacy-path decline must find (and name) the window function
+    /// inside a computed projection, and must not fire on a window-free query.
+    #[test]
+    fn window_function_name_is_found_for_the_legacy_decline() {
+        let window_name = |sql: &str| match Parser::parse_sql(&GenericDialect {}, sql)
+            .expect("parse")
+            .pop()
+        {
+            Some(Statement::Query(query)) => query_window_function_name(&query),
+            _ => panic!("expected a SELECT"),
+        };
+        assert_eq!(
+            window_name("SELECT id, val - lag(val) OVER (ORDER BY id) AS delta FROM t").as_deref(),
+            Some("lag")
+        );
+        assert_eq!(
+            window_name("SELECT id, rank() OVER (ORDER BY val DESC) AS r FROM t").as_deref(),
+            Some("rank")
+        );
+        assert_eq!(window_name("SELECT id, abs(val) FROM t"), None);
+        assert_eq!(window_name("SELECT count(*) FROM t"), None);
     }
 
     /// ADR-058 D5 / §9.A: the stats-trust derivation is the load-bearing security
