@@ -410,6 +410,15 @@ impl SpillRecordStorage {
                 schema.columns.push(column);
             }
         }
+        // Every segment column is nullable, whatever the catalog declares: a
+        // segment also carries the synthesised tombstones, which have no props,
+        // so a NOT NULL column (a primary key) would fail the whole batch — and
+        // with it the DELETE or INSERT whose write triggered the flush. A live
+        // row's value still round-trips (the flush verifies it), and a scan
+        // serves rows under the catalog schema, not the segment's.
+        for column in &mut schema.columns {
+            column.nullable = true;
+        }
         schema
     }
 
@@ -4197,6 +4206,38 @@ mod tests {
             newest.iter().any(|r| r.oid == "a" && r.is_dead(now_ns())),
             "the delete now lives in the newest segment"
         );
+        Ok(())
+    }
+
+    /// A tombstone has no props, so under a catalog schema with a NOT NULL
+    /// column (any primary key) its segment row is NULL there. The flush that
+    /// persists it must still succeed — it runs inside the DELETE or INSERT whose
+    /// write crossed the threshold, so failing it fails that statement.
+    #[tokio::test]
+    async fn a_tombstone_flushes_under_a_catalog_schema_with_a_not_null_column() -> Result<()> {
+        let mut status = proximadb_storage_common::proxima_schema::ProximaColumn::new(
+            1,
+            "status",
+            proximadb_data_model::ProximaType::String,
+        );
+        status.nullable = false;
+        let schema = ProximaSchema::from_columns("orders".to_string(), vec![status], vec![1]);
+        let s = store(None)
+            .await
+            .with_tenant("tenant-a")
+            .with_schema_source(SpillSchemaSource::new(move || Some(schema.clone())));
+        s.upsert_record(record("a", "open")).await?;
+        s.upsert_record(record("b", "open")).await?;
+        s.flush().await?.expect("rows flushed");
+        s.delete_record(&RecordKey::new("a".to_string())).await?;
+        s.flush().await?.expect("the tombstone flushes");
+        let oids: Vec<String> = s
+            .scan_records(usize::MAX)
+            .await?
+            .into_iter()
+            .map(|r| r.oid)
+            .collect();
+        assert_eq!(oids, ["b"]);
         Ok(())
     }
 
