@@ -3590,8 +3590,10 @@ impl TableRecordStore for DirectWalTableRecordStore {
     /// segments were written with.
     ///
     /// Declines (`Ok(None)`) while the pre-flip legacy partition still holds a
-    /// live row: the materialized scan merges it primary-wins over LIVE rows,
-    /// which is not a layer order a snapshot can express. Also declines when
+    /// segment or a live resident row: the materialized scan merges it
+    /// primary-wins over LIVE rows, which is not a layer order a snapshot can
+    /// express. Declines for a shared-storage store (every tenant in one
+    /// store; the snapshot carries no tenant filter). Also declines when
     /// there are segments but no filesystem to read them through (a custom
     /// storage factory) — never a snapshot that silently omits them.
     async fn layer_a_snapshot(
@@ -3601,12 +3603,26 @@ impl TableRecordStore for DirectWalTableRecordStore {
         #[cfg(feature = "abac-policy")] _read_context: &ReadContext,
     ) -> Result<Option<crate::services::layer_a_snapshot::LayerASnapshot>> {
         self.ensure_healthy()?;
+        // One store shared by every partition key (`Self::new`) holds every
+        // tenant's rows together; the snapshot has no tenant filter, because
+        // tenancy is otherwise structural (one partition per tenant).
+        if self.shared_storage {
+            return Ok(None);
+        }
         let tenant = Self::tenant_key(tenant_context);
         let (primary, legacy) = self.partitions_for(&tenant, table_schema);
-        if let Some(legacy) = legacy
-            && !legacy.scan_records(1).await?.is_empty()
-        {
-            return Ok(None);
+        if let Some(legacy) = legacy {
+            // Decided from the legacy partition's own view, so taking the
+            // snapshot still reads no segment: any segment, or any live
+            // resident row, declines.
+            let legacy = legacy.scan_view().await?;
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            if !legacy.segments.is_empty() || legacy.resident.iter().any(|r| !r.is_dead(now_ns)) {
+                return Ok(None);
+            }
         }
         let view = primary.scan_view().await?;
         if !view.segments.is_empty() && self.segment_filesystem.is_none() {
@@ -4596,6 +4612,27 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// A store shared by every partition key holds every tenant's rows in one
+    /// place; a Layer A snapshot of it would carry no tenant filter, so it
+    /// declines and the caller keeps the materialized path's behaviour.
+    #[tokio::test]
+    async fn a_shared_storage_store_offers_no_layer_a_snapshot() {
+        let store = DirectWalTableRecordStore::new(
+            Arc::new(MemoryRecordStorage::default()),
+            Arc::new(RecordingWalAppender::default()),
+        );
+        let snapshot = store
+            .layer_a_snapshot(
+                &CatalogTableSchema::new("orders"),
+                Some(&TenantContext::for_tenant_id("tenant-a")),
+                #[cfg(feature = "abac-policy")]
+                &ReadContext::system(SystemReadReason::Statistics, "record_store::tests"),
+            )
+            .await
+            .expect("snapshot call");
+        assert!(snapshot.is_none());
     }
 
     #[tokio::test]
