@@ -8,8 +8,7 @@ use std::time::Instant;
 
 use crate::proto::proximadb_v1::property_value::Value as PropValueData;
 use crate::query::aql::{
-    AqlFrom, AqlQuery, AqlResult, AqlSource, AqlValue, AuditContext, AuditFrame, AuditOp,
-    DataModel, Result,
+    AqlFrom, AqlQuery, AqlResult, AqlSource, AqlValue, AuditContext, AuditOp, DataModel, Result,
 };
 
 pub struct GraphAqlSource {
@@ -54,25 +53,13 @@ impl GraphAqlSource {
                     if let Some(inner_val) = &v.value {
                         map.insert(
                             k.clone(),
-                            Self::aql_to_json_value(&Self::prop_data_to_aql(inner_val)),
+                            super::aql_to_json_value(&Self::prop_data_to_aql(inner_val)),
                         );
                     }
                 }
                 AqlValue::Json(serde_json::Value::Object(map))
             }
             _ => AqlValue::Null,
-        }
-    }
-
-    fn aql_to_json_value(aql: &AqlValue) -> serde_json::Value {
-        match aql {
-            AqlValue::String(s) => serde_json::Value::String(s.clone()),
-            AqlValue::Int(i) => serde_json::json!(i),
-            AqlValue::Float(f) => serde_json::json!(f),
-            AqlValue::Bool(b) => serde_json::Value::Bool(*b),
-            AqlValue::Json(j) => j.clone(),
-            AqlValue::Jsonb(j) => j.clone(),
-            _ => serde_json::Value::Null,
         }
     }
 }
@@ -145,25 +132,17 @@ impl AqlSource for GraphAqlSource {
             rows.push(row);
         }
 
-        let frame = AuditFrame {
-            frame_id: 0,
-            source: self.model(),
-            op: AuditOp::GraphTraversal {
+        // Emit audit frame
+        Ok(super::audited_ok(
+            ctx,
+            self.model(),
+            AuditOp::GraphTraversal {
                 graph_id: graph_id.clone(),
                 depth,
                 algorithm: "BFS".to_string(),
             },
-            filters_pushed: Vec::new(),
-            filters_post: Vec::new(),
-            records_scanned: rows.len() as u64,
-            records_returned: rows.len() as u64,
+            rows,
             wall_time_us,
-            error: None,
-            redaction_count: 0,
-        };
-
-        let frame_id = ctx.push_frame(frame);
-
-        Ok(AqlResult { rows, frame_id })
+        ))
     }
 }
