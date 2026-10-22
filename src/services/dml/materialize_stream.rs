@@ -41,12 +41,15 @@ fn sort_memory_bytes() -> usize {
     env_positive("PROXIMADB_MATERIALIZE_SORT_MEMORY_BYTES").unwrap_or(DEFAULT_SORT_MEMORY_BYTES)
 }
 
-/// `g{snapshot_id:020}-{nonce}`: zero-padded so names order by publication time,
-/// with a random nonce so two publications in one millisecond never share a
-/// part name (a part is written with a plain multipart put).
-pub(super) fn generation_stem(snapshot_id: i64) -> String {
+/// `g{version:020}-{nonce}`, where `version` is the Iceberg metadata version the
+/// publication commits as (its parent's successor, fixed before the scan). The
+/// create-only commit makes that a total order across processes, so generation
+/// order never depends on a clock: a publisher that has not committed yet can
+/// only commit a later version than any committed one. The random nonce keeps
+/// two publishers racing for the same version from sharing a part name.
+pub(super) fn generation_stem(version: u64) -> String {
     let nonce = uuid::Uuid::new_v4().simple().to_string();
-    format!("g{:020}-{}", snapshot_id.max(0), &nonce[..8])
+    format!("g{version:020}-{}", &nonce[..8])
 }
 
 /// The generation-ordering prefix of a data file name (`g{020}`), if the name
@@ -55,6 +58,44 @@ fn generation_of(file_name: &str) -> Option<&str> {
     let generation = file_name.get(..21)?;
     (generation.starts_with('g') && generation[1..].bytes().all(|b| b.is_ascii_digit()))
         .then_some(generation)
+}
+
+/// What a failed `publish_iceberg_files` actually left behind.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CommitCheck {
+    /// The commit landed as this version (its error came after the write, e.g. a
+    /// lost response whose retry hit its own create-only precondition).
+    Landed(u64),
+    /// No version names the parts: they are safe to delete.
+    NotLanded,
+    /// The metadata could not be read: keep the parts (GC collects them later).
+    Unknown,
+}
+
+/// After `publish_iceberg_files` returned an error, decide whether the commit
+/// landed anyway. The publication can only have committed as `successor`, so
+/// that version, if it exists, decides by whether it names `parts`.
+pub(super) async fn check_commit(
+    bridge: &dyn ObjectStoreBridge,
+    metadata_prefix: &str,
+    successor: u64,
+    parts: &[Path],
+) -> CommitCheck {
+    let latest = match bridge.latest_metadata_version(metadata_prefix).await {
+        Ok(latest) => latest,
+        Err(_) => return CommitCheck::Unknown,
+    };
+    let Some(first) = parts.first() else {
+        return CommitCheck::NotLanded;
+    };
+    if latest.is_none_or(|latest| latest < successor) {
+        return CommitCheck::NotLanded;
+    }
+    match bridge.read_iceberg_table(metadata_prefix, successor).await {
+        Ok(files) if files.contains(first) => CommitCheck::Landed(successor),
+        Ok(_) => CommitCheck::NotLanded,
+        Err(_) => CommitCheck::Unknown,
+    }
 }
 
 /// Batches in ascending `column` order, NULLs last (TD-OLAP-6 clustering:
@@ -191,8 +232,9 @@ fn sort_batches_with_budget(
 /// Delete the data files under `data_prefix` that the just-committed version
 /// (`keep_current`) and its predecessor (`keep_previous`) do not reference and
 /// that are OLDER than this publication (`current_stem`): an older generation,
-/// or a pre-generation name. A newer generation — a concurrent publisher that
-/// has not committed yet — is never touched. Returns how many files were
+/// or a pre-generation name. This generation's other files (a publisher that
+/// lost the race for this version) and newer ones (a publisher that has not
+/// committed yet) are never touched; see [`generation_stem`]. Returns how many files were
 /// deleted. Best-effort per file: the first failure is returned after every
 /// candidate was attempted.
 pub(super) async fn gc_older_generations(

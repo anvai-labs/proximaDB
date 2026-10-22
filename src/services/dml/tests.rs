@@ -3800,6 +3800,41 @@ fn materialize_publishes_multi_part_generations_and_collects_old_ones() {
             "the current and previous versions' files stay"
         );
         assert_eq!(read_rows(location).await, 30);
+
+        // Parts are named for the metadata version they commit as (0, 1, 2), so
+        // generation order is commit order, whatever the clocks say.
+        for (version, parts) in [(0u64, &gen1), (1, &gen2), (2, &gen3)] {
+            let stem = format!("g{version:020}-");
+            assert!(
+                parts
+                    .iter()
+                    .all(|p| p.filename().is_some_and(|f| f.starts_with(&stem))),
+                "version {version}: {parts:?}"
+            );
+        }
+
+        // After a commit error, only the version a publication could commit as
+        // decides whether its parts are live.
+        use super::materialize_stream::{CommitCheck, check_commit};
+        let metadata_prefix = format!(
+            "{}/metadata",
+            prefix.strip_suffix("/data").expect("data location")
+        );
+        assert_eq!(
+            check_commit(&*bridge, &metadata_prefix, 2, &gen3).await,
+            CommitCheck::Landed(2),
+            "version 2 names these parts: the error came after the commit"
+        );
+        assert_eq!(
+            check_commit(&*bridge, &metadata_prefix, 2, &gen2).await,
+            CommitCheck::NotLanded,
+            "version 2 exists but names other parts"
+        );
+        assert_eq!(
+            check_commit(&*bridge, &metadata_prefix, 3, &gen3).await,
+            CommitCheck::NotLanded,
+            "no version 3"
+        );
     });
 }
 

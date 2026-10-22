@@ -2544,11 +2544,18 @@ impl DmlService {
         //    full column set (a row that cannot be projected is skipped, as the
         //    relational scan does), folded into the NDV sketches, encoded, and
         //    handed to the sort/writer side over a bounded channel.
+        //    The Iceberg parent is fixed BEFORE the rows are read, and the parts are
+        //    named for the version this publication commits as (see
+        //    `generation_stem`): if another publisher commits meanwhile, the commit
+        //    below loses its create-only CAS rather than racing GC.
+        let metadata_prefix = format!("{prefix}/metadata");
+        let parent = bridge.latest_metadata_version(&metadata_prefix).await?;
+        let successor = parent.map_or(0, |p| p.saturating_add(1));
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let stem = materialize_stream::generation_stem(now_ms);
+        let stem = materialize_stream::generation_stem(successor);
         let data_dir = format!("{prefix}/data");
         let full_columns = Self::resolve_select_projection(&schema, &[])?;
         let col_names: Vec<String> = full_columns.iter().map(|c| c.name.clone()).collect();
@@ -2640,40 +2647,57 @@ impl DmlService {
             )
             .collect();
         let table_uuid = deterministic_table_uuid(&prefix);
-        let metadata_prefix = format!("{prefix}/metadata");
         // The Iceberg table `location` is the table ROOT (`data/` and `metadata/` are
         // its children), unlike the catalog layout location below, which is the
         // directory of the data files.
         let table_root = format!("{}/{prefix}", warehouse_root_url.trim_end_matches('/'));
-        let parent = bridge.latest_metadata_version(&metadata_prefix).await;
-        let committed = match parent {
-            Ok(parent) => bridge
-                .publish_iceberg_files(
-                    &part_keys,
-                    parent,
-                    &metadata_prefix,
-                    &table_uuid,
-                    &table_root,
-                    &iceberg_fields,
-                    now_ms, // snapshot id (unique per materialize)
-                    now_ms, // timestamp ms
-                    iceberg_needs_v3(&iceberg_fields),
-                )
-                .await
-                .map(|version| (parent, version)),
-            Err(e) => Err(e),
-        };
-        let (parent, version) = match committed {
-            Ok(committed) => committed,
+        let committed = bridge
+            .publish_iceberg_files(
+                &part_keys,
+                parent,
+                &metadata_prefix,
+                &table_uuid,
+                &table_root,
+                &iceberg_fields,
+                now_ms, // snapshot id (unique per materialize)
+                now_ms, // timestamp ms
+                iceberg_needs_v3(&iceberg_fields),
+            )
+            .await;
+        let version = match committed {
+            Ok(version) => version,
             Err(e) => {
                 if let Some(counter) = ICEBERG_PUBLISH_FAILURES.as_ref() {
                     counter.inc();
                 }
-                Self::delete_parts(bridge, &part_keys).await;
-                return Err(anyhow!(
-                    "MATERIALIZE {table_name}: Iceberg snapshot commit failed; the \
-                     previous publication stays current: {e}"
-                ));
+                // The error may have come after the commit landed: only parts that
+                // no version names are deleted.
+                match materialize_stream::check_commit(
+                    bridge,
+                    &metadata_prefix,
+                    successor,
+                    &part_keys,
+                )
+                .await
+                {
+                    materialize_stream::CommitCheck::Landed(version) => {
+                        warn!(
+                            table = %table_name,
+                            version,
+                            "MATERIALIZE: the Iceberg commit reported an error but landed: {e}"
+                        );
+                        version
+                    }
+                    check => {
+                        if check == materialize_stream::CommitCheck::NotLanded {
+                            Self::delete_parts(bridge, &part_keys).await;
+                        }
+                        return Err(anyhow!(
+                            "MATERIALIZE {table_name}: Iceberg snapshot commit failed; the \
+                             previous publication stays current: {e}"
+                        ));
+                    }
+                }
             }
         };
 
