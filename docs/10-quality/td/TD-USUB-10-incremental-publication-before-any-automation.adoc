@@ -183,3 +183,21 @@ part, then asserts that the open and `manifest_selected_uris` both error.
 `view_reads_manifest_files_only` (feature `duckdb`) asserts that the DuckDB view returns the
 snapshot's 4 rows, not 8. `without_a_manifest_selection_falls_back_to_listing` still pins the
 no-metadata case.
+=== P2.4 slice 2: publish an explicit file list (2026-10-22)
+
+`publish_iceberg_snapshot` built the manifest by *listing* the data prefix, so it could not
+publish one generation out of several. `ObjectStoreBridge::publish_iceberg_files(files,
+parent, …)` publishes exactly the named files as the successor of metadata version `parent`:
+
+* the Avro manifest and manifest list are named by the metadata version they commit under
+  (`v{N:020}-{snapshot}-m0.avro`, `snap-{snapshot}-v{N:020}-list.avro`) and written
+  `put_if_absent`, so a racing publisher cannot overwrite the winner's manifest;
+* losing the slot is `Err(StorageError::AlreadyExists)`. The old MATERIALIZE caller treated
+  `CommitOutcome::Conflict` as success;
+* a named file whose footer cannot be read fails the publish, where a listed file used to
+  degrade to count 0.
+
+MATERIALIZE publishes its file through this API. Evidence:
+`publish_iceberg_files_publishes_only_the_named_generation`,
+`publish_iceberg_files_on_a_stale_parent_is_an_error`,
+`publish_iceberg_files_requires_readable_footers`.
