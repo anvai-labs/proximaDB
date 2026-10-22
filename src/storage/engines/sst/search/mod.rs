@@ -2031,6 +2031,36 @@ impl SstEngine {
         Ok(())
     }
 
+    /// TD-PAXDIR-1 D2: the collection centroid directory's per-segment A0
+    /// cell choice for this query, keyed by segment URL (empty map = unused:
+    /// read gate off, filtered or exact query, or no usable directory).
+    async fn centroid_directory_cells(
+        &self,
+        storage_url: &str,
+        files: &[DiscoveredSstFile],
+        query: &[f32],
+        k: usize,
+        filtered_or_exact: bool,
+    ) -> std::collections::HashMap<String, std::sync::Arc<[u32]>> {
+        use crate::storage::engines::sst::centroid_directory_reader as reader;
+        if filtered_or_exact || !reader::centroid_directory_read_enabled() {
+            return Default::default();
+        }
+        let Ok(fs) = self.filesystem().get_filesystem(storage_url) else {
+            return Default::default();
+        };
+        let Some(dir) = reader::load_directory(fs.as_ref(), storage_url).await else {
+            return Default::default();
+        };
+        reader::plan_segments(
+            &dir,
+            files.iter().map(|f| (f.url.as_str(), f.size_bytes)),
+            query,
+            k,
+        )
+        .unwrap_or_default()
+    }
+
     /// TD-SEARCH-2 S2: multi-core direct search. Same semantics as
     /// `fallback_to_direct_search` but each per-file scan runs on its own tokio
     /// worker via `tokio::spawn`, gated by a per-query `Semaphore(degree)`, so a
@@ -2051,6 +2081,7 @@ impl SstEngine {
         include_vectors: bool,
         include_metadata: bool,
     ) -> Result<Vec<OptimizedSearchRecord>> {
+        use crate::storage::engines::sst::segment_format::scope_directory_cells;
         // --- discover (mirrors fallback_to_direct_search) ---
         let search_mode = &ctx.search_params.search_mode;
         let prune_config_owned;
@@ -2066,7 +2097,7 @@ impl SstEngine {
             } else {
                 &ctx.search_params.block_prune
             };
-        let sstable_files = self
+        let mut sstable_files = self
             .discover_sstable_files_with_centroid_pruning(
                 storage_url,
                 query_vector,
@@ -2075,6 +2106,18 @@ impl SstEngine {
                 prune_config,
             )
             .await?;
+        // TD-PAXDIR-1 D2: segments the collection centroid directory plans
+        // carry their selected A0 cells; those that own none are skipped.
+        let directory_cells = self
+            .centroid_directory_cells(
+                storage_url,
+                &sstable_files,
+                query_vector,
+                k,
+                filter_expression.is_some() || prune_config.force_exact,
+            )
+            .await;
+        sstable_files.retain(|f| directory_cells.get(&f.url).is_none_or(|c| !c.is_empty()));
 
         let file_count = u16::try_from(sstable_files.len()).unwrap_or(u16::MAX);
         let degree = resolve_search_parallelism(self.config().search_parallel_files)
@@ -2128,6 +2171,7 @@ impl SstEngine {
                 let prune = prune_config.clone();
                 let trace = trace_handle.clone();
                 let scan_path = path.clone();
+                let cells = directory_cells.get(&path).cloned();
                 handles.push((
                     path,
                     tokio::spawn(async move {
@@ -2148,6 +2192,7 @@ impl SstEngine {
                             use_vectorized,
                             known_size,
                         );
+                        let scan = scope_directory_cells(cells, scan);
                         if let Some(trace) = trace {
                             crate::observability::io_trace::scope_with_handle(trace, scan).await
                         } else {
@@ -2176,24 +2221,23 @@ impl SstEngine {
         } else {
             // degree == 1 / single file: sequential, no spawn overhead.
             for discovered in &sstable_files {
-                match self
-                    .scan_single_file(
-                        &discovered.url,
-                        &collection,
-                        &query_arc[..],
-                        filter_owned.as_ref(),
-                        k,
-                        distance_metric,
-                        collection_id,
-                        storage_url,
-                        prune_config,
-                        use_pipeline,
-                        use_parallel_morsels,
-                        use_vectorized,
-                        discovered.size_bytes,
-                    )
-                    .await
-                {
+                let scan = self.scan_single_file(
+                    &discovered.url,
+                    &collection,
+                    &query_arc[..],
+                    filter_owned.as_ref(),
+                    k,
+                    distance_metric,
+                    collection_id,
+                    storage_url,
+                    prune_config,
+                    use_pipeline,
+                    use_parallel_morsels,
+                    use_vectorized,
+                    discovered.size_bytes,
+                );
+                let cells = directory_cells.get(&discovered.url).cloned();
+                match scope_directory_cells(cells, scan).await {
                     Ok(recs) => all_candidates.extend(recs),
                     Err(e) => Self::handle_per_file_scan_failure(
                         &discovered.url,
@@ -2613,6 +2657,13 @@ impl SstEngine {
             &std::path::PathBuf::from(data_url),
         );
         let pending = crate::storage::engines::sst::retirement_ledger::pending_paths();
+        // TD-PAXDIR-1 D2: the same LIST locates the newest centroid directory.
+        if crate::storage::engines::sst::centroid_directory_reader::centroid_directory_read_enabled(
+        ) {
+            crate::storage::engines::sst::centroid_directory_reader::note_listing(
+                data_url, &entries,
+            );
+        }
         for entry in entries {
             tracing::trace!(
                 "[SST] Examining entry: name={}, url={}, is_dir={}",

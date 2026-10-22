@@ -3150,6 +3150,42 @@ fn coarse_probe_nprobe(k_c: usize) -> usize {
         .min(k_c.max(1))
 }
 
+/// TD-PAXDIR-1 D2: cell count for a query planned on the collection-global
+/// centroid directory. Precedence: env
+/// `PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE` → else the same geometric
+/// default as the per-segment probe, applied to the **total** usable cells
+/// (`ceil(sqrt(cells) × multiplier)`), so S segments of k cells probe about
+/// `2·sqrt(S·k)` cells instead of `S · 2·sqrt(k)`.
+pub(crate) fn centroid_directory_nprobe(total_cells: usize) -> usize {
+    std::env::var("PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| geometric_nprobe(total_cells, coarse_probe_settings()))
+        .min(total_cells.max(1))
+}
+
+tokio::task_local! {
+    /// TD-PAXDIR-1 D2: the Region A0 cells the collection-global centroid
+    /// directory selected for the segment this task is scanning. Set by the
+    /// collection fan-out around one segment's scan; the coarse probe uses it
+    /// in place of its own per-segment nprobe ranking.
+    static DIRECTORY_CELLS: Arc<[u32]>;
+}
+
+/// Run `scan` with the directory-selected A0 cells for its segment (or, with
+/// `None`, unchanged). The probe runs inline in the scanning task, so the
+/// scope reaches it without widening the cascade's signatures.
+pub(crate) async fn scope_directory_cells<F: std::future::Future>(
+    cells: Option<Arc<[u32]>>,
+    scan: F,
+) -> F::Output {
+    match cells {
+        Some(cells) => DIRECTORY_CELLS.scope(cells, scan).await,
+        None => scan.await,
+    }
+}
+
 /// Outcome of a coarse probe: the global survivor rows plus the io_trace
 /// counters (`ivf_cells_total/probed`, `probed_rows`, `fetch_rounds`).
 struct CoarseProbeResult {
@@ -3289,6 +3325,19 @@ async fn coarse_probe_survivors(
         .collect();
     cell_dist.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     let nprobe = coarse_probe_nprobe(k_c);
+    // TD-PAXDIR-1 D2: the collection directory already ranked this segment's
+    // cells against every other segment's; probe exactly its choice (valid,
+    // non-empty cells only). Filtered queries never carry a directory choice.
+    let directory_cells: Option<Vec<usize>> = DIRECTORY_CELLS
+        .try_with(|cells| {
+            cells
+                .iter()
+                .map(|&c| c as usize)
+                .filter(|&c| c < k_c && dir.cells[c].row_end > dir.cells[c].row_begin)
+                .collect::<Vec<usize>>()
+        })
+        .ok()
+        .filter(|cells| row_allow.is_none() && !cells.is_empty());
     let mut probed: Vec<usize> = match row_allow {
         // TD-FPRUNE-1 M3: FILTERED ANN — walk cells nearest-first and accumulate
         // PREDICATE-MATCHING rows (allow ∩ cell row-range, computed in RAM from
@@ -3330,6 +3379,9 @@ async fn coarse_probe_survivors(
             .map(|(c, _)| *c)
             .collect(),
     };
+    if let Some(cells) = directory_cells {
+        probed = cells;
+    }
     if probed.is_empty() {
         return Ok(None);
     }
