@@ -4469,7 +4469,7 @@ mod tests {
 
     /// A store shared by every partition key holds every tenant's rows in one
     /// place; a Layer A snapshot of it would carry no tenant filter, so it
-    /// declines and the caller keeps the tenant-scoped materialized scan.
+    /// declines and the caller keeps the materialized path's behaviour.
     #[tokio::test]
     async fn a_shared_storage_store_offers_no_layer_a_snapshot() {
         let store = DirectWalTableRecordStore::new(

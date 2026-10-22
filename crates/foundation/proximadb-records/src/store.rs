@@ -318,8 +318,11 @@ pub trait RecordStore: Send + Sync {
 /// taken between them can serve the older segment copy of that one oid — the
 /// same exposure `scan_records` has always had. Closing it needs the write
 /// order TD-USUB-16 tracks (an LSN-ordered tombstone/resident pair), not a
-/// reordering of the two steps: either order makes the concurrent
-/// upsert-vs-delete race end with neither, resurrecting a stale copy.
+/// reordering of the two steps. The concurrent upsert-vs-delete race has two
+/// failure modes: with the current order it can at worst end with BOTH a
+/// resident row and a tombstone (the tombstone hides the new row — a lost
+/// upsert); any reordering lets it end with NEITHER (a resurrected stale
+/// segment copy), which is worse.
 ///
 /// The reader resolves it newest-wins: segments oldest→newest, a later one
 /// shadowing an earlier copy of the same oid; then `resident` on top of every
