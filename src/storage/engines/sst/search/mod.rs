@@ -2005,10 +2005,15 @@ impl SstEngine {
     ) -> bool {
         !prune_config.force_exact
             && sstable_path.ends_with(".pax")
-            && matches!(
-                distance_metric,
-                DistanceMetric::Euclidean | DistanceMetric::Cosine | DistanceMetric::DotProduct
-            )
+            && Self::is_pax_cascade_metric(distance_metric)
+    }
+
+    /// Metrics the PAX RaBitQ cascade ranks; every other metric scans exactly.
+    fn is_pax_cascade_metric(distance_metric: DistanceMetric) -> bool {
+        matches!(
+            distance_metric,
+            DistanceMetric::Euclidean | DistanceMetric::Cosine | DistanceMetric::DotProduct
+        )
     }
 
     /// Preserve the caller's completeness contract at the per-file boundary.
@@ -2032,18 +2037,31 @@ impl SstEngine {
     }
 
     /// TD-PAXDIR-1 D2: the collection centroid directory's per-segment A0
-    /// cell choice for this query, keyed by segment URL (empty map = unused:
-    /// read gate off, filtered or exact query, or no usable directory).
-    async fn centroid_directory_cells(
+    /// cell choice for this query, keyed by segment URL (empty map = unused).
+    ///
+    /// Skipping a segment is only sound when every planned segment really
+    /// runs the A0 coarse probe, so the directory is unused unless: the read
+    /// gate is on; the query is unfiltered and not exact; its metric takes the
+    /// PAX cascade (others scan exactly, and a skipped segment would lose
+    /// rows); the coarse probe is enabled (its kill-switch means "scan every
+    /// cell"); and no explicit `PROXIMADB_PAX_READ_COARSE_NPROBE` is set (an
+    /// operator's per-segment probe count, including exhaustive mode).
+    pub(crate) async fn centroid_directory_cells(
         &self,
         storage_url: &str,
         files: &[DiscoveredSstFile],
         query: &[f32],
         k: usize,
+        distance_metric: DistanceMetric,
         filtered_or_exact: bool,
     ) -> std::collections::HashMap<String, std::sync::Arc<[u32]>> {
         use crate::storage::engines::sst::centroid_directory_reader as reader;
-        if filtered_or_exact || !reader::centroid_directory_read_enabled() {
+        if filtered_or_exact
+            || !Self::is_pax_cascade_metric(distance_metric)
+            || !reader::centroid_directory_read_enabled()
+            || !crate::storage::engines::sst::segment_format::coarse_probe_enabled()
+            || std::env::var_os("PROXIMADB_PAX_READ_COARSE_NPROBE").is_some()
+        {
             return Default::default();
         }
         let Ok(fs) = self.filesystem().get_filesystem(storage_url) else {
@@ -2114,6 +2132,7 @@ impl SstEngine {
                 &sstable_files,
                 query_vector,
                 k,
+                distance_metric,
                 filter_expression.is_some() || prune_config.force_exact,
             )
             .await;

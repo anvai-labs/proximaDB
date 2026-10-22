@@ -22,7 +22,7 @@
 //! exact queries never use the directory.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use proximadb_storage_common::centroid_directory::{LiveSegment, PaxCentroidDirectory};
 use proximadb_storage_filesystem_types::{DirEntry, FileSystem};
@@ -38,17 +38,40 @@ pub fn centroid_directory_read_enabled() -> bool {
     env_gate_on("PROXIMADB_PAX_READ_CENTROID_DIRECTORY")
 }
 
-/// Newest directory object URL per collection data directory, as last listed.
-fn newest_listed() -> &'static Mutex<HashMap<String, String>> {
-    static MAP: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+/// Collection directories whose parsed centroid directory stays cached. Each
+/// entry is one collection's directory (a few KB to a few MB); past the bound
+/// an arbitrary entry is evicted, which costs that collection one re-read.
+const MAX_CACHED_DIRECTORIES: usize = 1024;
+
+/// A listed directory object: its URL and listed size. Generations restart at
+/// 1 if every directory object is deleted, so the URL alone cannot identify
+/// the bytes; the size makes a stale cache hit far less likely, and every
+/// entry is re-validated against the live set anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListedObject {
+    url: String,
+    size: u64,
+}
+
+/// Newest directory object per collection data directory, as last listed.
+fn newest_listed() -> &'static Mutex<HashMap<String, ListedObject>> {
+    static MAP: OnceLock<Mutex<HashMap<String, ListedObject>>> = OnceLock::new();
     MAP.get_or_init(Default::default)
 }
 
-/// Loaded directory per collection data directory: `(object url, directory)`.
-fn loaded() -> &'static Mutex<HashMap<String, (String, Arc<PaxCentroidDirectory>)>> {
-    static MAP: OnceLock<Mutex<HashMap<String, (String, Arc<PaxCentroidDirectory>)>>> =
+/// Loaded directory per collection data directory, with the object it was
+/// read from.
+fn loaded() -> &'static Mutex<HashMap<String, (ListedObject, Arc<PaxCentroidDirectory>)>> {
+    static MAP: OnceLock<Mutex<HashMap<String, (ListedObject, Arc<PaxCentroidDirectory>)>>> =
         OnceLock::new();
     MAP.get_or_init(Default::default)
+}
+
+/// Lock a cache map. The maps hold plain data with no cross-entry
+/// invariants, so a poisoned lock is recovered rather than turning the
+/// feature off for the rest of the process.
+fn lock<T>(map: &Mutex<T>) -> MutexGuard<'_, T> {
+    map.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn dir_key(dir_url: &str) -> String {
@@ -56,20 +79,23 @@ fn dir_key(dir_url: &str) -> String {
 }
 
 /// Record the newest directory object in a collection directory listing.
-/// Called by discovery with the entries it already listed.
+/// Called by discovery with the entries it already listed. A listing with no
+/// directory forgets the collection's cached one too.
 pub(crate) fn note_listing(dir_url: &str, entries: &[DirEntry]) {
     let newest = directory_objects_newest_first(entries)
         .first()
-        .map(|(_, entry)| entry.url.clone());
-    let Ok(mut map) = newest_listed().lock() else {
-        return;
-    };
+        .map(|(_, entry)| ListedObject {
+            url: entry.url.clone(),
+            size: entry.metadata.size,
+        });
+    let key = dir_key(dir_url);
     match newest {
-        Some(url) => {
-            map.insert(dir_key(dir_url), url);
+        Some(object) => {
+            lock(newest_listed()).insert(key, object);
         }
         None => {
-            map.remove(&dir_key(dir_url));
+            lock(newest_listed()).remove(&key);
+            lock(loaded()).remove(&key);
         }
     }
 }
@@ -82,13 +108,14 @@ pub(crate) async fn load_directory(
     dir_url: &str,
 ) -> Option<Arc<PaxCentroidDirectory>> {
     let key = dir_key(dir_url);
-    let url = newest_listed().lock().ok()?.get(&key).cloned()?;
-    if let Some((cached_url, dir)) = loaded().lock().ok()?.get(&key)
-        && *cached_url == url
+    let object = lock(newest_listed()).get(&key).cloned()?;
+    if let Some((cached, dir)) = lock(loaded()).get(&key)
+        && *cached == object
     {
         return Some(Arc::clone(dir));
     }
-    let bytes = match fs.read(&url).await {
+    let url = &object.url;
+    let bytes = match fs.read(url).await {
         Ok(bytes) => bytes,
         Err(error) => {
             tracing::debug!(%url, %error, "centroid directory unreadable; per-segment path");
@@ -102,9 +129,14 @@ pub(crate) async fn load_directory(
             return None;
         }
     };
-    if let Ok(mut map) = loaded().lock() {
-        map.insert(key, (url, Arc::clone(&dir)));
+    let mut cache = lock(loaded());
+    if cache.len() >= MAX_CACHED_DIRECTORIES
+        && !cache.contains_key(&key)
+        && let Some(evict) = cache.keys().next().cloned()
+    {
+        cache.remove(&evict);
     }
+    cache.insert(key, (object, Arc::clone(&dir)));
     Some(dir)
 }
 

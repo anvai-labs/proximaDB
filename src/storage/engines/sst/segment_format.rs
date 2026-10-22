@@ -3327,13 +3327,16 @@ async fn coarse_probe_survivors(
     let nprobe = coarse_probe_nprobe(k_c);
     // TD-PAXDIR-1 D2: the collection directory already ranked this segment's
     // cells against every other segment's; probe exactly its choice (valid,
-    // non-empty cells only). Filtered queries never carry a directory choice.
+    // non-empty, distinct cells only). Filtered queries never carry a
+    // directory choice.
     let directory_cells: Option<Vec<usize>> = DIRECTORY_CELLS
         .try_with(|cells| {
             cells
                 .iter()
                 .map(|&c| c as usize)
                 .filter(|&c| c < k_c && dir.cells[c].row_end > dir.cells[c].row_begin)
+                .collect::<std::collections::BTreeSet<usize>>()
+                .into_iter()
                 .collect::<Vec<usize>>()
         })
         .ok()

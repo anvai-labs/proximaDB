@@ -333,8 +333,12 @@ mod tests {
     async fn segments_owning_no_selected_cell_are_skipped() {
         const ROWS: usize = 3200;
         enable_env();
-        // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::set_var("PROXIMADB_IVF_K", "32") };
+        // SAFETY: nextest runs each test in its own process. Four parallel
+        // files: the spawned fan-out must carry each segment's cell scope.
+        unsafe {
+            std::env::set_var("PROXIMADB_IVF_K", "32");
+            std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", "4");
+        }
         let spread_rows = corpus_with(false, ROWS);
         let spread = arm("paxdir_spread", &spread_rows).await;
         let spread_probed = mean_segments_probed(&spread, &spread_rows);
@@ -359,6 +363,61 @@ mod tests {
             "{recall_on} vs {recall_off}"
         );
         assert!(reads_on < reads_off, "{reads_on} vs {reads_off}");
+    }
+
+    /// Skipping a segment is only sound when every planned segment runs the
+    /// A0 coarse probe. Metrics outside the PAX cascade, the coarse-probe
+    /// kill-switch and an explicit per-segment probe count all scan more than
+    /// the directory's cells, so the directory must stay unused for them.
+    #[tokio::test]
+    async fn the_directory_is_unused_when_planned_segments_would_not_probe() {
+        enable_env();
+        let rows = corpus();
+        let arm = arm("paxdir_preconditions", &rows).await;
+        set_directory_read(true);
+        let files = arm
+            .engine
+            .discover_sstable_files(&arm.storage_url)
+            .await
+            .unwrap();
+        let plan = |metric| {
+            let engine = Arc::clone(&arm.engine);
+            let files = &files;
+            let query = rows[3].clone();
+            let url = arm.storage_url.clone();
+            async move {
+                engine
+                    .centroid_directory_cells(&url, files, &query, TOP_K, metric, false)
+                    .await
+            }
+        };
+        assert_eq!(plan(DistanceMetric::Euclidean).await.len(), SEGMENTS);
+        assert!(plan(DistanceMetric::Manhattan).await.is_empty());
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "0") };
+        assert!(plan(DistanceMetric::Euclidean).await.is_empty());
+        unsafe {
+            std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "1");
+            std::env::set_var("PROXIMADB_PAX_READ_COARSE_NPROBE", "8");
+        }
+        assert!(plan(DistanceMetric::Euclidean).await.is_empty());
+        unsafe { std::env::remove_var("PROXIMADB_PAX_READ_COARSE_NPROBE") };
+        assert_eq!(plan(DistanceMetric::Euclidean).await.len(), SEGMENTS);
+        // Filtered or exact queries never plan.
+        let engine = Arc::clone(&arm.engine);
+        assert!(
+            engine
+                .centroid_directory_cells(
+                    &arm.storage_url,
+                    &files,
+                    &rows[3],
+                    TOP_K,
+                    DistanceMetric::Euclidean,
+                    true,
+                )
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
