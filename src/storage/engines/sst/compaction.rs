@@ -1673,6 +1673,34 @@ impl Compaction {
         Ok(failed)
     }
 
+    /// TD-PAXDIR-1 D1: bring the collection centroid directory up to date with
+    /// the live set once the output is published and the inputs retired. The
+    /// directory is a projection, so a failure is logged and never fails the
+    /// compaction.
+    async fn refresh_centroid_directory(&self, output: &Path) {
+        use super::centroid_directory_publisher::{
+            centroid_directory_write_enabled, publish_centroid_directory,
+        };
+        if !centroid_directory_write_enabled() {
+            return;
+        }
+        let Some(dir) = output.parent() else {
+            return;
+        };
+        let dir_url = dir.to_string_lossy();
+        let result = match self.filesystem_factory.get_filesystem(&dir_url) {
+            Ok(fs) => publish_centroid_directory(fs.as_ref(), &dir_url).await,
+            Err(error) => Err(error.into()),
+        };
+        match result {
+            Ok(Some(generation)) => {
+                debug!(dir = %dir_url, generation, "published PAX centroid directory")
+            }
+            Ok(None) => {}
+            Err(error) => warn!(dir = %dir_url, %error, "PAX centroid directory not published"),
+        }
+    }
+
     /// TD-COMPACT-13 reconciler sweep (debounced 30s): drain recorded
     /// obligations for every known collection dir.
     async fn sweep_pending_retirements_if_due(&self) {
@@ -1726,6 +1754,7 @@ impl Compaction {
         let failed = self
             .retire_inputs_with_retry(&task.output_file, &task.input_files)
             .await?;
+        self.refresh_centroid_directory(&task.output_file).await;
         if !failed.is_empty() {
             warn!(
                 output = %task.output_file.display(),
@@ -3005,6 +3034,7 @@ impl Compaction {
         let retirement_pending = self
             .retire_inputs_with_retry(&task.output_file, &task.input_files)
             .await?;
+        self.refresh_centroid_directory(&task.output_file).await;
         if !retirement_pending.is_empty() {
             warn!(
                 output = %task.output_file.display(),

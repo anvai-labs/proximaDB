@@ -250,6 +250,7 @@ pub mod writer;
 pub mod block_cluster; // TD-RDSTRAT-5 S1: sort-by-code block clustering at PAX write
 pub mod block_format;
 pub mod blocks;
+pub mod centroid_directory_publisher; // TD-PAXDIR-1 D1: collection-global centroid directory
 pub mod codebook_integration;
 pub mod collections;
 pub mod core;
