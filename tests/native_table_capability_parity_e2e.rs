@@ -139,6 +139,19 @@ async fn body() {
         db.message()
     );
 
+    // A window nested in another expression declines the same way (it used to
+    // escape detection and reach the legacy path).
+    let nested = client
+        .simple_query("select id, coalesce(lag(val) over (order by id), 0) as p from usub2_t")
+        .await
+        .expect_err("a nested window function must decline with the gate OFF");
+    assert_eq!(
+        nested.as_db_error().map(|e| e.code().code()),
+        Some("0A000"),
+        "nested window decline: {}",
+        pg_server::db_err(&nested)
+    );
+
     drop(client);
     drop(server);
 
