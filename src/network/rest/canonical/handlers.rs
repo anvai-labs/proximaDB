@@ -777,6 +777,29 @@ pub async fn merge_graph_branch_inner(
         )));
     }
 
+    // TD-SEAM-12 hazard 2: the merge base is the main-line history up to the
+    // branch point, read from the WAL. Once any of it has been truncated the
+    // base can be incomplete — a branch created after a truncation, or one
+    // whose first write raced a truncation run, would merge against a base
+    // missing the main records it needs, and nothing would say so. Refuse
+    // loudly instead, until a durable merge-base snapshot exists.
+    let truncated_through =
+        crate::services::FramedTableWalAppender::truncated_through_at(&wal_path)
+            .await
+            .map_err(|err| {
+                ApiError::Internal(format!(
+                    "reading the truncation floor of canonical WAL {} failed: {err:#}",
+                    wal_path.display()
+                ))
+            })?;
+    if truncated_through > 0 {
+        return Err(ApiError::Gone(format!(
+            "branch merge needs the complete main-line history, but canonical WAL entries \
+             through {truncated_through} were truncated; the merge base cannot be computed \
+             (TD-SEAM-12 hazard 2)"
+        )));
+    }
+
     let entries = crate::services::FramedTableWalAppender::read_entries_from_path(&wal_path)
         .await
         .map_err(|err| {

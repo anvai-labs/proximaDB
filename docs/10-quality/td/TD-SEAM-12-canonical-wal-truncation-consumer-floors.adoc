@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In Progress.** P2.2a primitives landed 2026-10-19; P2.2b checkpoints and the REST 410 on 2026-10-20; the P2.2c truncator on 2026-10-20 (see "Landed"). It is **off by default** (`PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS`) and refuses while the WAL holds branch-tagged entries; the durable branch merge-base is the open item. Filed 2026-10-19 from a survey of every reader of the shared canonical WAL (`data_dir/pgwire/canonical-records.wal`), done before implementing truncation (TD-SEAM-2 / P2.2).
+| Status | **In Progress.** P2.2a primitives landed 2026-10-19; P2.2b checkpoints and the REST 410 on 2026-10-20; the P2.2c truncator on 2026-10-20 (see "Landed"). It is **off by default** (`PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS`) and refuses while the WAL holds branch-tagged entries, and branch merge refuses (410) once any history is truncated (correction 2026-10-21); the durable branch merge-base is the open item. Filed 2026-10-19 from a survey of every reader of the shared canonical WAL (`data_dir/pgwire/canonical-records.wal`), done before implementing truncation (TD-SEAM-2 / P2.2).
 | Priority | **MEDIUM.** Truncation runs only when an operator opts in; the remaining gap (branch merge) refuses rather than risks history.
 | Component | `src/services/canonical_wal.rs`, `src/services/record_store.rs`, `src/services/{rank_profile_store,function_store}.rs`, `src/graph/merge.rs`, `src/network/rest/v2/records.rs` (change feed), `src/network/postgres/relational_pipeline.rs` (OLAP delta merge)
 | Relates to | TD-SEAM-2, TD-USUB-1 (slice 2b), TD-OLAPFMT-3, ADR-012 (branch merge), ADR-097 S2
@@ -166,3 +166,29 @@ Still open:
   truncation.
 * Orion's checkpoint correlation degrades to `None` once its checkpoint entry is truncated; it is
   metrics only.
+
+== Correction (2026-10-21): the branch guard alone was not fail-closed
+
+A design review of the durable merge-base found that `BranchEntriesGuard` did not
+make hazard 2 fail-closed, as the "Landed (P2.2c)" section implied:
+
+* it sees only *retained* segments, so a branch created after a truncation passes
+  it, and its merge then reads an incomplete main-line base without error;
+* it runs before the checkpoint sources, which await while appending, so a first
+  branch write landing in that window passes it and its base is truncated by the
+  same run.
+
+**Fix (fail-closed):** `merge_graph_branch_inner` now refuses with **410 Gone**
+whenever the WAL's durable floor marker shows any truncation
+(`FramedTableWalAppender::truncated_through_at`). Both bypasses turn into a loud
+refusal instead of a wrong merge. Branch merge and truncation are therefore
+mutually exclusive until the durable merge-base lands. Gate:
+`merge_endpoint_refuses_when_wal_history_was_truncated`.
+
+**Next (restores merge under truncation):** a main-line base image per branched
+collection, kept by checkpoint-style WAL appends before each truncation, with the
+branch floor at the oldest retained branch entry. The file-level plan is in the
+execution tracker §5.2. Related defects found in the same review, filed as
+follow-ups: write-back keeps the source `branch_id`, so no branch ever closes; the
+default `target_branch = "main"` cannot match untagged main records; and
+`latest_base_records` ignores main-line deletes.
