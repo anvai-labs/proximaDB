@@ -3127,15 +3127,12 @@ mod tests {
     use crate::proto::proximadb_v1::CollectionConfig;
     use crate::proto::proximadb_v1::{FilterableDataType, IndexingAlgorithm};
 
-    #[tokio::test]
-    async fn test_collection_validation() -> Result<()> {
-        let service = CollectionService::new(StorageConfig::default())
-            .await
-            .context("Failed to create collection service for test")?;
-
-        // Valid config
-        let valid_config = CollectionConfig {
-            name: "valid_collection".to_string(),
+    /// The standard valid-collection preamble (dimension 128, metric 1,
+    /// engine SST, primary index "default") — the exact values the
+    /// exhaustive literals used; tests override what they exercise.
+    fn collection_config(name: &str) -> CollectionConfig {
+        CollectionConfig {
+            name: name.to_string(),
             embedding_config: None,
             dimension: 128,
             distance_metric: Some(1),
@@ -3159,7 +3156,17 @@ mod tests {
             permitted_principals: vec![],
             index_policy: None,
             pax_vector_quant: None,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn test_collection_validation() -> Result<()> {
+        let service = CollectionService::new(StorageConfig::default())
+            .await
+            .context("Failed to create collection service for test")?;
+
+        // Valid config
+        let valid_config = collection_config("valid_collection");
 
         // Test create with valid config
         let result = service
@@ -3259,32 +3266,7 @@ mod tests {
         ];
 
         for (name, should_succeed, expected_error_code) in test_cases {
-            let config = CollectionConfig {
-                name: name.to_string(),
-                embedding_config: None,
-                dimension: 128,
-                distance_metric: Some(1),
-                storage_engine: Some(2), // SST — VIPER is no longer selectable for new collections (ADR-093 S2)
-                filterable_columns: vec![],
-                index_configs: vec![],
-                quantization: None,
-                primary_index: Some("default".to_string()),
-                auto_index_selection: Some(false),
-                description: Some("Test collection".to_string()),
-                tags: vec![],
-                owner: Some("test".to_string()),
-                embedding_models: vec![],
-                storage_config: None,
-                record_schema: None,
-                enable_proxima_record: None,
-                text_columns: vec![],
-                text_storage_configs: vec![],
-                enable_dual_use_embeddings: None,
-                canonical_embedding_precision: None,
-                permitted_principals: vec![],
-                index_policy: None,
-                pax_vector_quant: None,
-            };
+            let config = collection_config(name);
 
             let result = service
                 .create_collection(&config)
@@ -4043,30 +4025,10 @@ mod tests {
         // the old 8-char floor.
         let name = "part";
         let config = CollectionConfig {
-            name: name.to_string(),
-            embedding_config: None,
             dimension: 16,
-            distance_metric: Some(1),
-            storage_engine: Some(2), // SST — VIPER is no longer selectable for new collections (ADR-093 S2)
-            filterable_columns: vec![],
-            index_configs: vec![],
-            quantization: None,
-            primary_index: Some("default".to_string()),
-            auto_index_selection: Some(false),
             description: None,
-            tags: vec![],
             owner: None,
-            embedding_models: vec![],
-            storage_config: None,
-            record_schema: None,
-            enable_proxima_record: None,
-            text_columns: vec![],
-            text_storage_configs: vec![],
-            enable_dual_use_embeddings: None,
-            canonical_embedding_precision: None,
-            permitted_principals: vec![],
-            index_policy: None,
-            pax_vector_quant: None,
+            ..collection_config(name)
         };
         let created = service.create_collection(&config).await.context("create")?;
         assert!(
@@ -4112,30 +4074,10 @@ mod tests {
             .with_catalog_manager(catalog_manager.clone());
 
         let config = CollectionConfig {
-            name: "metric_default_test".to_string(),
-            embedding_config: None,
-            dimension: 128,
             distance_metric: None,
             storage_engine: Some(StorageEngine::Sst as i32), // VIPER is no longer selectable for new collections (ADR-093 S2)
-            filterable_columns: vec![],
-            index_configs: vec![],
-            quantization: None,
             primary_index: None,
-            auto_index_selection: Some(false),
-            storage_config: None,
-            description: Some("Test collection".to_string()),
-            tags: vec![],
-            owner: Some("test".to_string()),
-            embedding_models: vec![],
-            record_schema: None,
-            enable_proxima_record: None,
-            text_columns: vec![],
-            text_storage_configs: vec![],
-            enable_dual_use_embeddings: None,
-            canonical_embedding_precision: None,
-            permitted_principals: vec![],
-            index_policy: None,
-            pax_vector_quant: None,
+            ..collection_config("metric_default_test")
         };
 
         let result = service.create_collection(&config).await?;

@@ -1613,6 +1613,37 @@ mod executor_tests {
     use async_trait::async_trait;
     use proximadb_data_model::ProximaValue;
 
+    /// Row with the given fields and no score/distance/provenance.
+    fn qrow(fields: std::collections::HashMap<String, serde_json::Value>) -> QueryRow {
+        QueryRow {
+            fields,
+            similarity_score: None,
+            graph_distance: None,
+            provenance: None,
+        }
+    }
+
+    /// Row with the given fields and a similarity score.
+    fn scored_row(
+        fields: std::collections::HashMap<String, serde_json::Value>,
+        score: f64,
+    ) -> QueryRow {
+        QueryRow {
+            fields,
+            similarity_score: Some(score),
+            graph_distance: None,
+            provenance: None,
+        }
+    }
+
+    /// Row carrying only an `id` string field plus a similarity score - the
+    /// mock vector-result shape.
+    fn scored_id_row(id: &str, score: f64) -> QueryRow {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("id".to_string(), serde_json::Value::String(id.to_string()));
+        scored_row(fields, score)
+    }
+
     #[test]
     fn query_rows_preserve_jsonb_metadata_as_json() {
         let document = serde_json::json!({"memory": {"type": "fact"}});
@@ -1638,12 +1669,7 @@ mod executor_tests {
                     "id".to_string(),
                     serde_json::Value::String(format!("{}", i)),
                 );
-                QueryRow {
-                    fields: f,
-                    similarity_score: None,
-                    graph_distance: None,
-                    provenance: None,
-                }
+                qrow(f)
             })
             .collect();
 
@@ -1673,12 +1699,7 @@ mod executor_tests {
             "name".to_string(),
             serde_json::Value::String("Alice".to_string()),
         );
-        let left = vec![QueryRow {
-            fields: lfields,
-            similarity_score: None,
-            graph_distance: None,
-            provenance: None,
-        }];
+        let left = vec![qrow(lfields)];
 
         // right: b.entity_id
         let mut rfields = std::collections::HashMap::new();
@@ -1687,12 +1708,7 @@ mod executor_tests {
             serde_json::Value::String("x1".to_string()),
         );
         rfields.insert("score".to_string(), serde_json::json!(0.9));
-        let right = vec![QueryRow {
-            fields: rfields,
-            similarity_score: None,
-            graph_distance: None,
-            provenance: None,
-        }];
+        let right = vec![qrow(rfields)];
 
         let joined = exec
             .join_rows(
@@ -1744,20 +1760,7 @@ mod executor_tests {
             "type".to_string(),
             serde_json::Value::String("B".to_string()),
         );
-        let left = vec![
-            QueryRow {
-                fields: l1,
-                similarity_score: None,
-                graph_distance: None,
-                provenance: None,
-            },
-            QueryRow {
-                fields: l2,
-                similarity_score: None,
-                graph_distance: None,
-                provenance: None,
-            },
-        ];
+        let left = vec![qrow(l1), qrow(l2)];
 
         // right rows: (entity_id, type)
         let mut r1 = std::collections::HashMap::new();
@@ -1769,12 +1772,7 @@ mod executor_tests {
             "type".to_string(),
             serde_json::Value::String("A".to_string()),
         );
-        let right = vec![QueryRow {
-            fields: r1,
-            similarity_score: None,
-            graph_distance: None,
-            provenance: None,
-        }];
+        let right = vec![qrow(r1)];
 
         // Inner join on composite keys
         let inner = exec
@@ -2134,20 +2132,7 @@ mod executor_tests {
             "id".to_string(),
             serde_json::Value::String("vecA".to_string()),
         );
-        let mock_vector_rows = vec![
-            QueryRow {
-                fields: fields1,
-                similarity_score: Some(1.0),
-                graph_distance: None,
-                provenance: None,
-            },
-            QueryRow {
-                fields: fields2,
-                similarity_score: Some(0.99),
-                graph_distance: None,
-                provenance: None,
-            },
-        ];
+        let mock_vector_rows = vec![scored_row(fields1, 1.0), scored_row(fields2, 0.99)];
         set_test_vector_results("c1", mock_vector_rows);
         // Also set similar results for averaged embedding path
         let mut sim_fields = std::collections::HashMap::new();
@@ -2155,12 +2140,7 @@ mod executor_tests {
             "id".to_string(),
             serde_json::Value::String("vecA".to_string()),
         );
-        let mock_similar_rows = vec![QueryRow {
-            fields: sim_fields,
-            similarity_score: Some(0.99),
-            graph_distance: None,
-            provenance: None,
-        }];
+        let mock_similar_rows = vec![scored_row(sim_fields, 0.99)];
         let map = TEST_SIMILAR_RESULTS
             .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
         if let Ok(mut guard) = map.lock() {
@@ -2395,12 +2375,7 @@ mod executor_tests {
 
         // Test getting and returning query row vectors
         let mut vec1 = pool.get_query_row_vec();
-        vec1.push(QueryRow {
-            fields: std::collections::HashMap::new(),
-            similarity_score: Some(0.5),
-            graph_distance: None,
-            provenance: None,
-        });
+        vec1.push(scored_row(std::collections::HashMap::new(), 0.5));
 
         assert_eq!(vec1.len(), 1);
 
@@ -2466,51 +2441,9 @@ mod executor_tests {
     async fn test_set_operations_union() {
         let executor = create_test_executor().await;
 
-        let left_rows = vec![
-            QueryRow {
-                fields: {
-                    let mut fields = std::collections::HashMap::new();
-                    fields.insert("id".to_string(), serde_json::Value::String("1".to_string()));
-                    fields
-                },
-                similarity_score: Some(0.9),
-                graph_distance: None,
-                provenance: None,
-            },
-            QueryRow {
-                fields: {
-                    let mut fields = std::collections::HashMap::new();
-                    fields.insert("id".to_string(), serde_json::Value::String("2".to_string()));
-                    fields
-                },
-                similarity_score: Some(0.8),
-                graph_distance: None,
-                provenance: None,
-            },
-        ];
+        let left_rows = vec![scored_id_row("1", 0.9), scored_id_row("2", 0.8)];
 
-        let right_rows = vec![
-            QueryRow {
-                fields: {
-                    let mut fields = std::collections::HashMap::new();
-                    fields.insert("id".to_string(), serde_json::Value::String("2".to_string()));
-                    fields
-                },
-                similarity_score: Some(0.7),
-                graph_distance: None,
-                provenance: None,
-            },
-            QueryRow {
-                fields: {
-                    let mut fields = std::collections::HashMap::new();
-                    fields.insert("id".to_string(), serde_json::Value::String("3".to_string()));
-                    fields
-                },
-                similarity_score: Some(0.6),
-                graph_distance: None,
-                provenance: None,
-            },
-        ];
+        let right_rows = vec![scored_id_row("2", 0.7), scored_id_row("3", 0.6)];
 
         // Test UNION ALL (should include duplicates)
         let union_all_result = executor
@@ -2614,39 +2547,9 @@ mod executor_tests {
     async fn test_set_operations_except() {
         let executor = create_test_executor().await;
 
-        let left_rows = vec![
-            QueryRow {
-                fields: {
-                    let mut fields = std::collections::HashMap::new();
-                    fields.insert("id".to_string(), serde_json::Value::String("1".to_string()));
-                    fields
-                },
-                similarity_score: Some(0.9),
-                graph_distance: None,
-                provenance: None,
-            },
-            QueryRow {
-                fields: {
-                    let mut fields = std::collections::HashMap::new();
-                    fields.insert("id".to_string(), serde_json::Value::String("2".to_string()));
-                    fields
-                },
-                similarity_score: Some(0.8),
-                graph_distance: None,
-                provenance: None,
-            },
-        ];
+        let left_rows = vec![scored_id_row("1", 0.9), scored_id_row("2", 0.8)];
 
-        let right_rows = vec![QueryRow {
-            fields: {
-                let mut fields = std::collections::HashMap::new();
-                fields.insert("id".to_string(), serde_json::Value::String("2".to_string()));
-                fields
-            },
-            similarity_score: Some(0.7),
-            graph_distance: None,
-            provenance: None,
-        }];
+        let right_rows = vec![scored_id_row("2", 0.7)];
 
         // Test EXCEPT (should return left rows not in right)
         let except_result = executor

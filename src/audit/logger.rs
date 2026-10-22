@@ -730,7 +730,46 @@ impl AlertSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use tempfile::TempDir;
+
+    /// File-backend config over `dir` — the exact field values every inline
+    /// literal in this module used (all-else-defaults; `AuditConfig::default`
+    /// matches on every field except the directory).
+    fn file_config(dir: &Path) -> AuditConfig {
+        AuditConfig {
+            enable_audit_logging: true,
+            storage_backend: AuditStorageBackend::File {
+                directory: dir.to_string_lossy().to_string(),
+            },
+            encryption_enabled: false,
+            external_audit_endpoint: None,
+            retention_days: 30,
+            enable_real_time_alerts: false,
+            alert_webhook_url: None,
+            compliance_frameworks: vec![],
+        }
+    }
+
+    /// Successful `AuditEvent` of `event_type` on `resource` — the common
+    /// shape across the log_event tests (optional acting user).
+    fn mk_event(
+        event_type: AuditEventType,
+        resource: AuditResource,
+        action: &str,
+        user: Option<&str>,
+    ) -> AuditEvent {
+        let event = AuditEvent::new(
+            event_type,
+            resource,
+            action.to_string(),
+            AuditResult::Success,
+        );
+        match user {
+            Some(user) => event.with_user(user.to_string()),
+            None => event,
+        }
+    }
 
     // ==================== AuditConfig Tests ====================
 
@@ -1050,18 +1089,7 @@ mod tests {
     #[tokio::test]
     async fn test_audit_logger_creation_with_file_backend() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = AuditConfig {
-            enable_audit_logging: true,
-            storage_backend: AuditStorageBackend::File {
-                directory: temp_dir.path().to_string_lossy().to_string(),
-            },
-            encryption_enabled: false,
-            external_audit_endpoint: None,
-            retention_days: 30,
-            enable_real_time_alerts: false,
-            alert_webhook_url: None,
-            compliance_frameworks: vec![],
-        };
+        let config = file_config(temp_dir.path());
 
         let logger = AuditLogger::new(config).await;
         assert!(logger.is_ok());
@@ -1166,16 +1194,8 @@ mod tests {
     async fn test_audit_logger_creation_with_encryption() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let config = AuditConfig {
-            enable_audit_logging: true,
-            storage_backend: AuditStorageBackend::File {
-                directory: temp_dir.path().to_string_lossy().to_string(),
-            },
             encryption_enabled: true,
-            external_audit_endpoint: None,
-            retention_days: 30,
-            enable_real_time_alerts: false,
-            alert_webhook_url: None,
-            compliance_frameworks: vec![],
+            ..file_config(temp_dir.path())
         };
 
         let logger = AuditLogger::new(config).await;
@@ -1186,16 +1206,9 @@ mod tests {
     async fn test_audit_logger_creation_with_alerts() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let config = AuditConfig {
-            enable_audit_logging: true,
-            storage_backend: AuditStorageBackend::File {
-                directory: temp_dir.path().to_string_lossy().to_string(),
-            },
-            encryption_enabled: false,
-            external_audit_endpoint: None,
-            retention_days: 30,
             enable_real_time_alerts: true,
             alert_webhook_url: Some("https://webhook.example.com".to_string()),
-            compliance_frameworks: vec![],
+            ..file_config(temp_dir.path())
         };
 
         let logger = AuditLogger::new(config).await;
@@ -1205,31 +1218,19 @@ mod tests {
     #[tokio::test]
     async fn test_audit_logger_log_event() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = AuditConfig {
-            enable_audit_logging: true,
-            storage_backend: AuditStorageBackend::File {
-                directory: temp_dir.path().to_string_lossy().to_string(),
-            },
-            encryption_enabled: false,
-            external_audit_endpoint: None,
-            retention_days: 30,
-            enable_real_time_alerts: false,
-            alert_webhook_url: None,
-            compliance_frameworks: vec![],
-        };
+        let config = file_config(temp_dir.path());
 
         let logger = AuditLogger::new(config)
             .await
             .expect("Failed to create logger");
 
         let resource = AuditResource::new("collection".to_string(), "test-collection".to_string());
-        let event = AuditEvent::new(
+        let event = mk_event(
             AuditEventType::DataAccess,
             resource,
-            "read".to_string(),
-            AuditResult::Success,
-        )
-        .with_user("test-user".to_string());
+            "read",
+            Some("test-user"),
+        );
 
         let result = logger.log_event(event).await;
         assert!(result.is_ok());
@@ -1238,25 +1239,14 @@ mod tests {
     #[tokio::test]
     async fn test_audit_logger_log_event_validation_empty_event_id() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = AuditConfig {
-            enable_audit_logging: true,
-            storage_backend: AuditStorageBackend::File {
-                directory: temp_dir.path().to_string_lossy().to_string(),
-            },
-            ..AuditConfig::default()
-        };
+        let config = file_config(temp_dir.path());
 
         let logger = AuditLogger::new(config)
             .await
             .expect("Failed to create logger");
 
         let resource = AuditResource::new("test".to_string(), "test".to_string());
-        let mut event = AuditEvent::new(
-            AuditEventType::DataAccess,
-            resource,
-            "read".to_string(),
-            AuditResult::Success,
-        );
+        let mut event = mk_event(AuditEventType::DataAccess, resource, "read", None);
         event.event_id = String::new(); // Empty event ID
 
         let result = logger.log_event(event).await;
@@ -1267,25 +1257,14 @@ mod tests {
     #[tokio::test]
     async fn test_audit_logger_log_event_validation_empty_action() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = AuditConfig {
-            enable_audit_logging: true,
-            storage_backend: AuditStorageBackend::File {
-                directory: temp_dir.path().to_string_lossy().to_string(),
-            },
-            ..AuditConfig::default()
-        };
+        let config = file_config(temp_dir.path());
 
         let logger = AuditLogger::new(config)
             .await
             .expect("Failed to create logger");
 
         let resource = AuditResource::new("test".to_string(), "test".to_string());
-        let mut event = AuditEvent::new(
-            AuditEventType::DataAccess,
-            resource,
-            "read".to_string(),
-            AuditResult::Success,
-        );
+        let mut event = mk_event(AuditEventType::DataAccess, resource, "read", None);
         event.action = String::new(); // Empty action
 
         let result = logger.log_event(event).await;
@@ -1296,25 +1275,14 @@ mod tests {
     #[tokio::test]
     async fn test_audit_logger_log_event_validation_empty_resource() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = AuditConfig {
-            enable_audit_logging: true,
-            storage_backend: AuditStorageBackend::File {
-                directory: temp_dir.path().to_string_lossy().to_string(),
-            },
-            ..AuditConfig::default()
-        };
+        let config = file_config(temp_dir.path());
 
         let logger = AuditLogger::new(config)
             .await
             .expect("Failed to create logger");
 
         let resource = AuditResource::new(String::new(), String::new()); // Empty resource
-        let event = AuditEvent::new(
-            AuditEventType::DataAccess,
-            resource,
-            "read".to_string(),
-            AuditResult::Success,
-        );
+        let event = mk_event(AuditEventType::DataAccess, resource, "read", None);
 
         let result = logger.log_event(event).await;
         assert!(result.is_err());
@@ -1324,13 +1292,7 @@ mod tests {
     #[tokio::test]
     async fn test_audit_logger_log_authentication_event() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = AuditConfig {
-            enable_audit_logging: true,
-            storage_backend: AuditStorageBackend::File {
-                directory: temp_dir.path().to_string_lossy().to_string(),
-            },
-            ..AuditConfig::default()
-        };
+        let config = file_config(temp_dir.path());
 
         let logger = AuditLogger::new(config)
             .await
@@ -1352,13 +1314,7 @@ mod tests {
     #[tokio::test]
     async fn test_audit_logger_log_authentication_event_failure() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = AuditConfig {
-            enable_audit_logging: true,
-            storage_backend: AuditStorageBackend::File {
-                directory: temp_dir.path().to_string_lossy().to_string(),
-            },
-            ..AuditConfig::default()
-        };
+        let config = file_config(temp_dir.path());
 
         let logger = AuditLogger::new(config)
             .await
@@ -1383,13 +1339,7 @@ mod tests {
     #[tokio::test]
     async fn test_audit_logger_log_data_access_event() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = AuditConfig {
-            enable_audit_logging: true,
-            storage_backend: AuditStorageBackend::File {
-                directory: temp_dir.path().to_string_lossy().to_string(),
-            },
-            ..AuditConfig::default()
-        };
+        let config = file_config(temp_dir.path());
 
         let logger = AuditLogger::new(config)
             .await
@@ -1418,13 +1368,7 @@ mod tests {
     #[tokio::test]
     async fn test_audit_logger_is_sensitive_field() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = AuditConfig {
-            enable_audit_logging: true,
-            storage_backend: AuditStorageBackend::File {
-                directory: temp_dir.path().to_string_lossy().to_string(),
-            },
-            ..AuditConfig::default()
-        };
+        let config = file_config(temp_dir.path());
 
         let logger = AuditLogger::new(config)
             .await
@@ -1455,13 +1399,7 @@ mod tests {
     #[tokio::test]
     async fn test_audit_logger_debug() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = AuditConfig {
-            enable_audit_logging: true,
-            storage_backend: AuditStorageBackend::File {
-                directory: temp_dir.path().to_string_lossy().to_string(),
-            },
-            ..AuditConfig::default()
-        };
+        let config = file_config(temp_dir.path());
 
         let logger = AuditLogger::new(config)
             .await
@@ -1478,13 +1416,7 @@ mod tests {
     #[tokio::test]
     async fn test_audit_logger_calculate_data_access_risk_bulk_operations() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = AuditConfig {
-            enable_audit_logging: true,
-            storage_backend: AuditStorageBackend::File {
-                directory: temp_dir.path().to_string_lossy().to_string(),
-            },
-            ..AuditConfig::default()
-        };
+        let config = file_config(temp_dir.path());
 
         let logger = AuditLogger::new(config)
             .await
@@ -1506,13 +1438,7 @@ mod tests {
     #[tokio::test]
     async fn test_audit_logger_calculate_data_access_risk_admin_operations() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = AuditConfig {
-            enable_audit_logging: true,
-            storage_backend: AuditStorageBackend::File {
-                directory: temp_dir.path().to_string_lossy().to_string(),
-            },
-            ..AuditConfig::default()
-        };
+        let config = file_config(temp_dir.path());
 
         let logger = AuditLogger::new(config)
             .await
@@ -1529,13 +1455,7 @@ mod tests {
     #[tokio::test]
     async fn test_audit_logger_calculate_authentication_risk() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = AuditConfig {
-            enable_audit_logging: true,
-            storage_backend: AuditStorageBackend::File {
-                directory: temp_dir.path().to_string_lossy().to_string(),
-            },
-            ..AuditConfig::default()
-        };
+        let config = file_config(temp_dir.path());
 
         let logger = AuditLogger::new(config)
             .await
@@ -1557,16 +1477,8 @@ mod tests {
     async fn test_audit_logger_full_workflow() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let config = AuditConfig {
-            enable_audit_logging: true,
-            storage_backend: AuditStorageBackend::File {
-                directory: temp_dir.path().to_string_lossy().to_string(),
-            },
-            encryption_enabled: false,
-            external_audit_endpoint: None,
-            retention_days: 30,
-            enable_real_time_alerts: false,
-            alert_webhook_url: None,
             compliance_frameworks: vec!["SOC2".to_string()],
+            ..file_config(temp_dir.path())
         };
 
         let logger = AuditLogger::new(config)
@@ -1601,13 +1513,12 @@ mod tests {
 
         // Log generic event
         let generic_resource = AuditResource::new("system".to_string(), "config".to_string());
-        let event = AuditEvent::new(
+        let event = mk_event(
             AuditEventType::SystemConfiguration,
             generic_resource,
-            "update_settings".to_string(),
-            AuditResult::Success,
-        )
-        .with_user("admin".to_string());
+            "update_settings",
+            Some("admin"),
+        );
 
         logger
             .log_event(event)
@@ -1619,20 +1530,13 @@ mod tests {
     async fn test_audit_logger_with_compliance_frameworks() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let config = AuditConfig {
-            enable_audit_logging: true,
-            storage_backend: AuditStorageBackend::File {
-                directory: temp_dir.path().to_string_lossy().to_string(),
-            },
-            encryption_enabled: false,
-            external_audit_endpoint: None,
             retention_days: 90,
-            enable_real_time_alerts: false,
-            alert_webhook_url: None,
             compliance_frameworks: vec![
                 "SOC2".to_string(),
                 "GDPR".to_string(),
                 "HIPAA".to_string(),
             ],
+            ..file_config(temp_dir.path())
         };
 
         let logger = AuditLogger::new(config)
@@ -1640,13 +1544,12 @@ mod tests {
             .expect("Failed to create logger");
 
         let resource = AuditResource::new("pii_data".to_string(), "patient_records".to_string());
-        let event = AuditEvent::new(
+        let event = mk_event(
             AuditEventType::DataAccess,
             resource,
-            "read".to_string(),
-            AuditResult::Success,
+            "read",
+            Some("healthcare_worker"),
         )
-        .with_user("healthcare_worker".to_string())
         .with_tenant("hospital_a".to_string());
 
         let result = logger.log_event(event).await;
