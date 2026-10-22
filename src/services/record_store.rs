@@ -2536,8 +2536,13 @@ impl DirectWalTableRecordStore {
                     }
                 }
                 TableRecordMutationKind::Delete => {
-                    partition.delete_record(&key).await?;
-                    // Delete from BOTH partitions during the cutover window.
+                    match lsn {
+                        Some(lsn) => partition.delete_record_at_lsn(&key, lsn).await?,
+                        None => partition.delete_record(&key).await?,
+                    };
+                    // Delete from BOTH partitions during the cutover window. The
+                    // legacy copy's delete is not this WAL entry's (replay routes
+                    // it to the primary), so it stays untracked.
                     if let Some(legacy) = &legacy_partition {
                         legacy.delete_record(&key).await?;
                     }
@@ -2627,7 +2632,7 @@ impl DirectWalTableRecordStore {
                     collection_id, oid, ..
                 } => {
                     self.partition(&tenant_id, &collection_id)
-                        .delete_record(&RecordKey::new(oid))
+                        .delete_record_at_lsn(&RecordKey::new(oid), lsn)
                         .await?;
                     summary.deletes_replayed += 1;
                 }
@@ -5994,16 +5999,18 @@ mod tests {
         // silently invalidated the evidence, which went unnoticed for two rounds.)
         //
         // What does distinguish them is DURABILITY: with the tenant, the tombstone
-        // reaches the segment and is cleared post-commit, so this is `Ok(None)` —
-        // no constraint, nothing unflushed. Without it the tombstone is still in
-        // memory and this is `Err`. Asserted by VALUE rather than `is_ok()` so a
-        // different refusal arm cannot silently stand in for the right answer.
-        assert_eq!(
-            RecordStore::min_unflushed_lsn(store.partition("tenant-a", "orders").as_ref())
-                .await
-                .ok(),
-            Some(None),
-            "the tombstone must be DURABLE — i.e. the production factory supplied a tenant"
+        // reaches a segment and is cleared post-commit, so the floor lies above
+        // the delete's LSN (9) — only later upserts may still be resident.
+        // Without it the tombstone stays in memory at LSN 9 and pins the floor
+        // there. Asserted by VALUE rather than `is_ok()` so a refusal arm cannot
+        // silently stand in for the right answer.
+        let floor = RecordStore::min_unflushed_lsn(store.partition("tenant-a", "orders").as_ref())
+            .await
+            .expect("every replayed write carries its LSN");
+        assert!(
+            floor.is_none_or(|lsn| lsn > 9),
+            "the tombstone must be DURABLE — i.e. the production factory supplied a tenant; \
+             floor {floor:?}"
         );
 
         // And the deleted row stays gone through the read-merge.

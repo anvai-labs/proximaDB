@@ -121,8 +121,8 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | Permanent-hold classes → exact residual column (`__proxima_residual`, TD-USUB-6 rule); codec-verified hold + `proximadb_spill_rows_held_total` | Done | #2117 | `the_residual_makes_every_row_round_trip_exactly`; spill tests updated (rows formerly held now flush exactly).
 | Hold metric + escape hatch for permanent-hold rows | Superseded by #2117 | #2117 | The residual column makes every former permanent-hold class round-trip exactly; the only remaining hold is a codec defect (encode→decode mismatch), counted by `proximadb_spill_rows_held_total` (expected 0). An alert on that counter replaces the escape hatch.
 | Spill scan snapshot taken under the segments lock (no lost rows, no resurrected deletes during a racing flush) | Done | #2122 | `a_scan_racing_a_flush_loses_no_row_and_resurrects_no_delete`. Also P3.1 PR 1.
-| Crash-after-truncation recovery gate (spill + rotation + truncator, restart, replay) | Open PR | — | `tests/wal_truncation_recovery_test.rs`: two partitions (untenanted and tenanted); flushed rows come back from segments, the WAL tail from replay; deletes and updates kept across two truncations and two restarts; an unflushed tombstone makes the record tier refuse (pinned). Prerequisite for default-on.
-| LSN-tracked tombstones: a memory-only tombstone yields a floor instead of refusing | **Next** (lead) | — | Today any unflushed DELETE makes `min_unflushed_lsn` refuse, so a steady-delete workload truncates only right after a flush. Track each tombstone's WAL LSN (a `delete_record_at_lsn` sibling of `upsert_record_at_lsn`, untracked ⇒ refuse as now) and count tombstones toward the flush threshold.
+| Crash-after-truncation recovery gate (spill + rotation + truncator, restart, replay) | Done | #2129 | `tests/wal_truncation_recovery_test.rs`: two partitions (untenanted and tenanted); flushed rows come back from segments, the WAL tail from replay; deletes and updates kept across two truncations and two restarts; an unflushed tombstone holds the floor at its delete (since the LSN-tracked tombstone slice). Prerequisite for default-on.
+| LSN-tracked tombstones: a memory-only tombstone yields a floor instead of refusing | Open PR (lead) | — | `RecordStore::delete_record_at_lsn` (default: `delete_record`); the spill keeps `oid → Option<lsn>` per tombstone, a repeat delete keeps the earliest; `min_unflushed_lsn` = min over resident rows and tombstones, refusing only for an untracked tombstone; tombstones count toward the flush threshold (where the store can persist them), the flush running after the delete's answer. Write path and replay pass the delete's LSN; the legacy-partition cutover delete stays untracked. Gates: `a_tracked_tombstone_is_a_floor_not_a_refusal`, `tombstones_count_toward_the_flush_threshold`, recovery test phase 2.
 | Durable branch merge-base | **Track A** (design §5.2) | — | Until it lands: merge refuses (410) once any WAL history is truncated (correction 2026-10-21, `merge_endpoint_refuses_when_wal_history_was_truncated`).
 | Catalog prefix registration (object-store placement of spill segments) | Open | — | TD-SEAM-3.
 | MATERIALIZE LSN capture via the per-collection high-water | Done in #2095 | #2095 | Superseded by `capture_snapshot_lsn` with a WAL pin.
@@ -151,7 +151,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 [cols="2,1,3",options="header"]
 |===
 | Branch | PR | State and next action
-| `lead/truncation-recovery-gate` | (lead) | Crash-after-truncation recovery gate + this tracker refresh; then the default-on soak plan.
+| `lead/tombstone-lsn` | (lead) | LSN-tracked spill tombstones; then the default-on soak plan.
 |===
 
 === 4.1 Parallel tracks (since 2026-10-22)

@@ -4,8 +4,8 @@
 //! and no delete or update is lost or undone. This is the end-to-end check that
 //! must hold before rotation and truncation can default on.
 //!
-//! Pins today's conservative rule too: a memory-only tombstone has no LSN, so
-//! the record tier refuses until a flush persists it.
+//! A memory-only tombstone holds the floor at its delete's LSN until a flush
+//! persists it.
 //!
 //!   cargo test --test wal_truncation_recovery_test
 
@@ -145,17 +145,21 @@ async fn a_crash_after_truncation_recovers_every_row_from_segments_and_the_wal_t
     ];
 
     // Phase 2: a delete of a flushed row, still memory-only. Its tombstone
-    // carries no LSN, so the record tier refuses outright — truncating would
-    // resurrect the row on restart.
+    // keeps the delete's LSN, so the record tier retains the WAL from there —
+    // truncating that entry would resurrect the row on restart — and drops
+    // everything before it.
+    let mut first_delete = None;
     for tenant in TENANTS {
-        write(&wal, &store, tenant, delete("r2")).await?;
+        let lsn = write(&wal, &store, tenant, delete("r2")).await?;
+        first_delete.get_or_insert(lsn);
     }
+    let first_delete = first_delete.expect("phase 2 wrote");
     let run = wal_truncator::run_once(&wal, &sources).await?;
     assert!(
-        matches!(&run, TruncationRun::Refused { source, .. } if source == "record-tier"),
-        "an unpersisted tombstone blocks truncation: {run:?}"
+        matches!(run, TruncationRun::Truncated { floor, .. } if floor == first_delete),
+        "an unpersisted tombstone is a floor at its delete: {run:?}"
     );
-    assert_eq!(wal.retained_from(), 0, "nothing deleted");
+    assert_eq!(wal.retained_from(), first_delete);
     store.flush_partitions().await?;
 
     // Phase 3, only in the WAL and memory: an update and a new row.

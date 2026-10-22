@@ -62,7 +62,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use proximadb_records::{
     ProximaRecord, RecordKey, RecordScan, RecordScanOptions, RecordScanPredicate, RecordStore,
     RecordStoreResult,
@@ -176,9 +176,11 @@ impl std::fmt::Debug for SpillSchemaSource {
 pub struct SpillRecordStorage {
     /// Resident rows. Always strictly newer than any segment copy.
     memtable: DashMap<String, Resident>,
-    /// Oids deleted after having been flushed. Suppresses the segment copy on
-    /// read; cleared for an oid that is re-inserted.
-    tombstones: DashSet<String>,
+    /// Oids deleted after having been flushed, each with the LSN of the WAL
+    /// entry that deleted it (`None`: applied through plain `delete_record`,
+    /// untracked). Suppresses the segment copy on read; cleared for an oid that
+    /// is re-inserted, and once a flush persists it.
+    tombstones: DashMap<String, Option<u64>>,
     /// Source of [`Resident::generation`]: bumped by every write to the
     /// memtable, so two writes of one oid never share a generation.
     next_generation: AtomicU64,
@@ -357,7 +359,7 @@ impl SpillRecordStorage {
     ) -> Self {
         Self {
             memtable: DashMap::new(),
-            tombstones: DashSet::new(),
+            tombstones: DashMap::new(),
             next_generation: AtomicU64::new(0),
             segments: parking_lot::RwLock::new(Vec::new()),
             flush_guard: tokio::sync::Mutex::new(()),
@@ -1234,6 +1236,124 @@ impl SpillRecordStorage {
         Ok(())
     }
 
+    /// The one delete path: `lsn` is the deleting WAL entry's, kept with the
+    /// tombstone this may record (see [`RecordStore::delete_record_at_lsn`]).
+    ///
+    /// Tombstones count toward the flush threshold like resident rows, so a
+    /// delete-heavy workload flushes (and so lets truncation advance) too. The
+    /// flush runs only after the answer is known: a flush first would put this
+    /// delete's tombstone in the newest segment, and the segment probe would
+    /// then report a removed live row as absent.
+    async fn delete_tracked(&self, key: &RecordKey, lsn: Option<u64>) -> Result<bool> {
+        let removed = self.delete_unflushed(key, lsn).await?;
+        self.flush_if_over_threshold().await?;
+        Ok(removed)
+    }
+
+    async fn delete_unflushed(&self, key: &RecordKey, lsn: Option<u64>) -> Result<bool> {
+        // One instant for both liveness decisions below (the resident copy and
+        // the segment probe), so they cannot disagree about the same row — the
+        // same property `get_record` states for its two arms.
+        let now_ns = now_ns();
+        // BEFORE the guarded block below, for two reasons: `ensure_discovered`
+        // takes the same guard, and the `has_segments` decision it guards is
+        // only correct once discovery has run.
+        self.ensure_discovered().await?;
+        // Exclusive with `flush` (TD-USUB-13): `has_segments` below and the
+        // tombstone insert must not straddle a flush's `segments.push`, or a row
+        // that flush is mid-way through making durable gets no tombstone and
+        // comes back live. Scoped so the guard is released before the segment
+        // READS at the end of this method — those are idempotent and need no
+        // exclusion.
+        let (was_resident, resident_was_dead, has_segments) = {
+            let _exclusive = self.flush_guard.lock().await;
+
+            // Already suppressed: nothing live to remove, so report false even
+            // if a stale segment copy still exists on disk.
+            // Its tombstone keeps the LSN it already has: the earliest WAL
+            // entry that reconstructs this deletion (or `None`, untracked).
+            if self.tombstones.contains_key(&key.oid) {
+                self.memtable.remove(&key.oid);
+                return Ok(false);
+            }
+
+            // Remove unconditionally, and distinguish THREE states rather than
+            // two: absent, resident-and-live, resident-and-dead.
+            //
+            // Collapsing the last two into one `false` was a real defect: a dead
+            // resident copy then fell through to the segment probe below, where a
+            // stale LIVE copy of the same oid reported that this DELETE removed a
+            // row — while `get_record` and `merged_records`, on identical state,
+            // both report the row absent. Mandate #16a names affected-row counts.
+            let removed = self.memtable.remove(&key.oid);
+            let resident_was_dead = removed
+                .as_ref()
+                .is_some_and(|(_, resident)| resident.record.is_dead(now_ns));
+            let was_resident = removed.is_some() && !resident_was_dead;
+            let has_segments = !self.segments.read().is_empty();
+
+            // A row already written to an immutable segment cannot be removed,
+            // so it is suppressed instead. Inside the guard with the
+            // `has_segments` read: deciding and acting on that decision as one
+            // step is what makes the reasoning local, rather than depending on
+            // the separate argument that flush's snapshot could no longer
+            // contain this oid.
+            if has_segments {
+                self.tombstones.insert(key.oid.clone(), lsn);
+            }
+            // The `remove` above also dropped the row's LSN (it lives in the
+            // `Resident`), so its INSERT stops constraining truncation. The
+            // DELETE's own LSN is a separate matter: if the row had been
+            // flushed, the tombstone above is the only in-memory evidence of the
+            // deletion, so `min_unflushed_lsn` retains the WAL from its LSN —
+            // or refuses outright when the delete came without one.
+
+            (was_resident, resident_was_dead, has_segments)
+        };
+
+        // Report truthfully whether a live row went away. The segment read is
+        // paid ONLY when the answer is not already known from the memtable.
+        if was_resident {
+            return Ok(true);
+        }
+        // The memtable is strictly newer than any segment, so a dead resident
+        // copy means the row is dead: do not consult the segments, exactly as
+        // `get_record` does not. The tombstone inserted above is what keeps the
+        // older live segment copy suppressed, so returning here cannot resurrect
+        // it.
+        if resident_was_dead {
+            return Ok(false);
+        }
+        if !has_segments {
+            return Ok(false);
+        }
+        let paths = self.segments.read().clone();
+        for path in paths.iter().rev() {
+            // Newest segment first, and the FIRST hit is authoritative — the
+            // same rule `get_record` states and `merged_records` implements. A
+            // dead hit means the row is gone; it does NOT mean an older segment
+            // should be consulted for a live copy.
+            //
+            // Getting this wrong is subtle, and an earlier version of this
+            // commit did: it filtered dead rows *within* each segment and then
+            // CONTINUED to an older one, so a row dead in the newest segment and
+            // live in an older one reported that this DELETE removed it — while
+            // `get_record` and `merged_records`, on identical state, both
+            // reported it absent. Filtering per-segment answers "does this
+            // segment hold a live copy", which is the wrong question; the right
+            // one is "what does the newest segment holding this oid say".
+            if let Some(found) = self
+                .read_segment(path)
+                .await?
+                .into_iter()
+                .find(|r| r.oid == key.oid)
+            {
+                return Ok(!found.is_dead(now_ns));
+            }
+        }
+        Ok(false)
+    }
+
     /// The one memtable write path: value, fresh generation and LSN replace the
     /// resident entry in a single insert (see [`Resident`]).
     ///
@@ -1268,12 +1388,27 @@ impl SpillRecordStorage {
             }
         }
 
-        if let Some(threshold) = self.flush_threshold
-            && self.memtable.len() >= threshold
-        {
+        self.flush_if_over_threshold().await?;
+        Ok(record)
+    }
+
+    /// Flush once the buffered state — resident rows plus the tombstones a
+    /// flush can persist — reaches the threshold. A store with no tenant cannot
+    /// persist tombstones (see `flush`), so they do not count there: counting
+    /// state no flush can drain would flush on every write.
+    async fn flush_if_over_threshold(&self) -> Result<()> {
+        let Some(threshold) = self.flush_threshold else {
+            return Ok(());
+        };
+        let tombstones = if self.tenant_id.is_some() {
+            self.tombstones.len()
+        } else {
+            0
+        };
+        if self.memtable.len() + tombstones >= threshold {
             self.flush().await?;
         }
-        Ok(record)
+        Ok(())
     }
 
     /// Decode one segment back to records through the canonical mixed-format
@@ -1399,12 +1534,11 @@ impl RecordStore for SpillRecordStorage {
         // The converse does NOT hold, and the asymmetry is deliberate: a repeat
         // DELETE of an oid whose tombstone is already durable re-inserts one
         // here (`delete_record` inserts whenever segments exist, without
-        // checking that the oid is in any of them), so this can refuse for a
-        // delete that IS durable. That is conservative — it retains more WAL,
+        // checking that the oid is in any of them), so this can retain WAL for
+        // a delete that IS durable. That is conservative — it retains more WAL,
         // never less — which is the only direction that is safe. See TD-USUB-14.
         //
-        // Reporting a minimum while an unpersisted tombstone exists would be
-        // actively wrong:
+        // A minimum over resident rows ALONE would be actively wrong:
         //
         //   row inserted @10 -> flushed (association dropped)
         //   row deleted  @20 -> tombstone in memory only, nothing resident
@@ -1413,9 +1547,9 @@ impl RecordStore for SpillRecordStorage {
         //   -> restart: replay never sees the delete, the segment still holds the
         //      row live, and the DELETED ROW RESURRECTS (mandate #16a).
         //
-        // Persisting tombstones (the 2b precondition TD-USUB-1 names) has
-        // landed, which is what makes the clear above meaningful. An
-        // UNPERSISTED tombstone still makes the question unanswerable.
+        // So each tombstone carries its delete's LSN and joins the minimum
+        // (here: 20 stays). A tombstone without one — applied through plain
+        // `delete_record` — makes the question unanswerable, and this refuses.
         // A failed segment write may have left an orphan that `segments` does
         // not list, which silently disables tombstone recording (see the
         // `unresolved_segment_writes` field). Refuse first: while that count is
@@ -1432,17 +1566,23 @@ impl RecordStore for SpillRecordStorage {
                 self.base_path.trim_end_matches('/')
             ));
         }
-        if !self.tombstones.is_empty() {
+        // A memory-only tombstone is retained from its delete's LSN. One
+        // applied without an LSN leaves the floor unknowable: refuse.
+        let tombstone_lsns: Vec<u64> = self.tombstones.iter().filter_map(|e| *e.value()).collect();
+        if tombstone_lsns.len() < self.tombstones.len() {
             return Err(anyhow::anyhow!(
-                "spill: cannot compute a safe truncation point — {} tombstone(s) are not yet \
-                 persisted into a segment, so the WAL entries that reconstruct them must be \
-                 retained. Flush to persist them, then re-ask. Do not truncate.",
+                "spill: cannot compute a safe truncation point — {} of {} tombstone(s) not yet \
+                 persisted into a segment carry no WAL LSN (deleted through `delete_record` \
+                 instead of `delete_record_at_lsn`), so the WAL entries that reconstruct them \
+                 must be retained. Flush to persist them, then re-ask. Do not truncate.",
+                self.tombstones.len() - tombstone_lsns.len(),
                 self.tombstones.len()
             ));
         }
+        let tombstone_floor = tombstone_lsns.into_iter().min();
         let resident = self.memtable.len();
         if resident == 0 {
-            return Ok(None);
+            return Ok(tombstone_floor);
         }
         let lsns: Vec<u64> = self.memtable.iter().filter_map(|e| e.value().lsn).collect();
         let tracked = lsns.len();
@@ -1456,12 +1596,12 @@ impl RecordStore for SpillRecordStorage {
                 tracked
             ));
         }
-        Ok(lsns.into_iter().min())
+        Ok(lsns.into_iter().chain(tombstone_floor).min())
     }
 
     async fn get_record(&self, key: &RecordKey) -> RecordStoreResult<Option<ProximaRecord>> {
         self.ensure_discovered().await?;
-        if self.tombstones.contains(&key.oid) {
+        if self.tombstones.contains_key(&key.oid) {
             return Ok(None);
         }
         let now_ns = now_ns();
@@ -1500,105 +1640,11 @@ impl RecordStore for SpillRecordStorage {
     }
 
     async fn delete_record(&self, key: &RecordKey) -> RecordStoreResult<bool> {
-        // One instant for both liveness decisions below (the resident copy and
-        // the segment probe), so they cannot disagree about the same row — the
-        // same property `get_record` states for its two arms.
-        let now_ns = now_ns();
-        // BEFORE the guarded block below, for two reasons: `ensure_discovered`
-        // takes the same guard, and the `has_segments` decision it guards is
-        // only correct once discovery has run.
-        self.ensure_discovered().await?;
-        // Exclusive with `flush` (TD-USUB-13): `has_segments` below and the
-        // tombstone insert must not straddle a flush's `segments.push`, or a row
-        // that flush is mid-way through making durable gets no tombstone and
-        // comes back live. Scoped so the guard is released before the segment
-        // READS at the end of this method — those are idempotent and need no
-        // exclusion.
-        let (was_resident, resident_was_dead, has_segments) = {
-            let _exclusive = self.flush_guard.lock().await;
+        self.delete_tracked(key, None).await
+    }
 
-            // Already suppressed: nothing live to remove, so report false even
-            // if a stale segment copy still exists on disk.
-            if self.tombstones.contains(&key.oid) {
-                self.memtable.remove(&key.oid);
-                return Ok(false);
-            }
-
-            // Remove unconditionally, and distinguish THREE states rather than
-            // two: absent, resident-and-live, resident-and-dead.
-            //
-            // Collapsing the last two into one `false` was a real defect: a dead
-            // resident copy then fell through to the segment probe below, where a
-            // stale LIVE copy of the same oid reported that this DELETE removed a
-            // row — while `get_record` and `merged_records`, on identical state,
-            // both report the row absent. Mandate #16a names affected-row counts.
-            let removed = self.memtable.remove(&key.oid);
-            let resident_was_dead = removed
-                .as_ref()
-                .is_some_and(|(_, resident)| resident.record.is_dead(now_ns));
-            let was_resident = removed.is_some() && !resident_was_dead;
-            let has_segments = !self.segments.read().is_empty();
-
-            // A row already written to an immutable segment cannot be removed,
-            // so it is suppressed instead. Inside the guard with the
-            // `has_segments` read: deciding and acting on that decision as one
-            // step is what makes the reasoning local, rather than depending on
-            // the separate argument that flush's snapshot could no longer
-            // contain this oid.
-            if has_segments {
-                self.tombstones.insert(key.oid.clone());
-            }
-            // The `remove` above also dropped the row's LSN (it lives in the
-            // `Resident`), so its INSERT stops constraining truncation. The
-            // DELETE's own LSN is a separate matter: if the row had been
-            // flushed, the tombstone above is the only in-memory evidence of the
-            // deletion and `min_unflushed_lsn` fails closed on it — dropping the
-            // association does NOT release that obligation.
-
-            (was_resident, resident_was_dead, has_segments)
-        };
-
-        // Report truthfully whether a live row went away. The segment read is
-        // paid ONLY when the answer is not already known from the memtable.
-        if was_resident {
-            return Ok(true);
-        }
-        // The memtable is strictly newer than any segment, so a dead resident
-        // copy means the row is dead: do not consult the segments, exactly as
-        // `get_record` does not. The tombstone inserted above is what keeps the
-        // older live segment copy suppressed, so returning here cannot resurrect
-        // it.
-        if resident_was_dead {
-            return Ok(false);
-        }
-        if !has_segments {
-            return Ok(false);
-        }
-        let paths = self.segments.read().clone();
-        for path in paths.iter().rev() {
-            // Newest segment first, and the FIRST hit is authoritative — the
-            // same rule `get_record` states and `merged_records` implements. A
-            // dead hit means the row is gone; it does NOT mean an older segment
-            // should be consulted for a live copy.
-            //
-            // Getting this wrong is subtle, and an earlier version of this
-            // commit did: it filtered dead rows *within* each segment and then
-            // CONTINUED to an older one, so a row dead in the newest segment and
-            // live in an older one reported that this DELETE removed it — while
-            // `get_record` and `merged_records`, on identical state, both
-            // reported it absent. Filtering per-segment answers "does this
-            // segment hold a live copy", which is the wrong question; the right
-            // one is "what does the newest segment holding this oid say".
-            if let Some(found) = self
-                .read_segment(path)
-                .await?
-                .into_iter()
-                .find(|r| r.oid == key.oid)
-            {
-                return Ok(!found.is_dead(now_ns));
-            }
-        }
-        Ok(false)
+    async fn delete_record_at_lsn(&self, key: &RecordKey, lsn: u64) -> RecordStoreResult<bool> {
+        self.delete_tracked(key, Some(lsn)).await
     }
 
     /// Delete every spill segment under this partition's prefix.
@@ -2991,7 +3037,7 @@ mod tests {
                 lsn: None,
             },
         );
-        store.tombstones.insert("k".to_string());
+        store.tombstones.insert("k".to_string(), None);
 
         assert!(
             store.flush().await?.is_none(),
@@ -3055,7 +3101,7 @@ mod tests {
                 lsn: None,
             },
         );
-        store.tombstones.insert("k".to_string());
+        store.tombstones.insert("k".to_string(), None);
         RecordStore::upsert_record_at_lsn(&store, record("other", "open"), 9).await?;
 
         let path = store
@@ -3082,7 +3128,7 @@ mod tests {
             "the acknowledged INSERT must still exist — it is durable nowhere else"
         );
         assert!(
-            store.tombstones.contains("k"),
+            store.tombstones.contains_key("k"),
             "and the DELETE must still be pending — it reached no object"
         );
         let err = RecordStore::min_unflushed_lsn(&store)
@@ -3326,6 +3372,93 @@ mod tests {
             None,
             "once the tombstone is durable nothing constrains truncation"
         );
+        Ok(())
+    }
+
+    /// A delete applied at its WAL LSN retains the WAL from that LSN instead of
+    /// refusing: the floor joins the resident rows' minimum, and an untracked
+    /// tombstone beside it still refuses.
+    #[tokio::test]
+    async fn a_tracked_tombstone_is_a_floor_not_a_refusal() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let store =
+            SpillRecordStorage::with_flush_threshold(fs, base, None).with_tenant("tenant-a");
+        for (oid, lsn) in [("a", 10), ("b", 11), ("c", 12)] {
+            store.upsert_record_at_lsn(record(oid, "open"), lsn).await?;
+        }
+        store.flush().await?;
+
+        assert!(
+            store
+                .delete_record_at_lsn(&RecordKey::new("a".to_string()), 20)
+                .await?,
+            "a live flushed row went away"
+        );
+        assert_eq!(store.min_unflushed_lsn().await?, Some(20));
+        store.upsert_record_at_lsn(record("d", "open"), 30).await?;
+        assert_eq!(store.min_unflushed_lsn().await?, Some(20), "min of both");
+
+        // A repeat delete keeps the earliest LSN that reconstructs it.
+        store
+            .delete_record_at_lsn(&RecordKey::new("a".to_string()), 40)
+            .await?;
+        assert_eq!(store.min_unflushed_lsn().await?, Some(20));
+
+        store
+            .delete_record(&RecordKey::new("b".to_string()))
+            .await?;
+        assert!(
+            store.min_unflushed_lsn().await.is_err(),
+            "an untracked tombstone still refuses"
+        );
+
+        store.flush().await?.expect("tombstone segment");
+        assert_eq!(store.min_unflushed_lsn().await?, None);
+        let live: std::collections::BTreeSet<String> = RecordScan::scan_records(&store, 100)
+            .await?
+            .into_iter()
+            .map(|r| r.oid)
+            .collect();
+        assert_eq!(live, ["c".to_string(), "d".to_string()].into());
+        Ok(())
+    }
+
+    /// Tombstones count toward the flush threshold, so a delete-only workload
+    /// drains to segments too — and each delete still reports the live row it
+    /// removed, because the flush runs after the answer.
+    #[tokio::test]
+    async fn tombstones_count_toward_the_flush_threshold() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let store =
+            SpillRecordStorage::with_flush_threshold(fs, base, Some(3)).with_tenant("tenant-a");
+        for (oid, lsn) in [("a", 1), ("b", 2), ("c", 3)] {
+            store.upsert_record_at_lsn(record(oid, "open"), lsn).await?;
+        }
+        assert_eq!(store.segment_count(), 1, "three rows reached the threshold");
+
+        for (oid, lsn) in [("a", 4), ("b", 5)] {
+            assert!(
+                store
+                    .delete_record_at_lsn(&RecordKey::new(oid.to_string()), lsn)
+                    .await?
+            );
+        }
+        assert_eq!(
+            store.segment_count(),
+            1,
+            "two tombstones: under the threshold"
+        );
+        assert_eq!(store.min_unflushed_lsn().await?, Some(4));
+
+        assert!(
+            store
+                .delete_record_at_lsn(&RecordKey::new("c".to_string()), 6)
+                .await?,
+            "the third delete removed a live row, flush or not"
+        );
+        assert_eq!(store.segment_count(), 2, "the third tombstone flushed");
+        assert_eq!(store.min_unflushed_lsn().await?, None);
+        assert!(RecordScan::scan_records(&store, 100).await?.is_empty());
         Ok(())
     }
 

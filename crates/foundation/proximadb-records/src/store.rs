@@ -248,6 +248,16 @@ pub trait RecordStore: Send + Sync {
 
     async fn delete_record(&self, key: &RecordKey) -> RecordStoreResult<bool>;
 
+    /// [`Self::delete_record`], applied from the durable WAL entry at `lsn` —
+    /// the delete's counterpart of [`Self::upsert_record_at_lsn`], under the
+    /// same durability precondition. A store whose deletes leave in-memory
+    /// state the WAL must reconstruct (a spill tombstone) keeps `lsn` with it,
+    /// so [`Self::min_unflushed_lsn`] can answer a floor instead of refusing.
+    async fn delete_record_at_lsn(&self, key: &RecordKey, lsn: u64) -> RecordStoreResult<bool> {
+        let _ = lsn;
+        self.delete_record(key).await
+    }
+
     async fn upsert_records(
         &self,
         records: Vec<ProximaRecord>,
