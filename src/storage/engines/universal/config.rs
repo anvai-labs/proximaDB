@@ -273,6 +273,36 @@ impl Default for MemoryLimits {
 }
 
 impl StorageEngineConfig {
+    /// Default INT8 quantization descriptor advertised by every engine.
+    fn default_int8_format() -> super::conversion::StorageFormat {
+        super::conversion::StorageFormat::QuantizedINT8 {
+            scale: 1.0,
+            zero_point: 0,
+        }
+    }
+
+    /// Default PQ descriptor advertised by every engine.
+    fn default_pq_format() -> super::conversion::StorageFormat {
+        super::conversion::StorageFormat::QuantizedPQ {
+            segments: 8,
+            bits: 8,
+        }
+    }
+
+    /// The formats every engine supports (FP32 + INT8 + PQ), plus Binary for
+    /// the engines that keep a raw fast path.
+    fn supported_formats(with_binary: bool) -> Vec<super::conversion::StorageFormat> {
+        let mut formats = vec![
+            super::conversion::StorageFormat::FP32,
+            Self::default_int8_format(),
+            Self::default_pq_format(),
+        ];
+        if with_binary {
+            formats.push(super::conversion::StorageFormat::Binary);
+        }
+        formats
+    }
+
     /// Create default configuration for PRISM engine
     pub fn prism_default() -> Self {
         let mut settings = HashMap::new();
@@ -282,21 +312,8 @@ impl StorageEngineConfig {
         Self {
             engine_type: super::storage_integration::EngineType::PRISM,
             settings,
-            supported_formats: vec![
-                super::conversion::StorageFormat::FP32,
-                super::conversion::StorageFormat::QuantizedINT8 {
-                    scale: 1.0,
-                    zero_point: 0,
-                },
-                super::conversion::StorageFormat::QuantizedPQ {
-                    segments: 8,
-                    bits: 8,
-                },
-            ],
-            default_format: super::conversion::StorageFormat::QuantizedPQ {
-                segments: 8,
-                bits: 8,
-            },
+            supported_formats: Self::supported_formats(false),
+            default_format: Self::default_pq_format(),
             performance_preferences: PerformancePreferences {
                 prefer_speed: true,
                 target_latency_us: 500,
@@ -320,22 +337,8 @@ impl StorageEngineConfig {
         Self {
             engine_type: super::storage_integration::EngineType::NOVA,
             settings,
-            supported_formats: vec![
-                super::conversion::StorageFormat::FP32,
-                super::conversion::StorageFormat::QuantizedINT8 {
-                    scale: 1.0,
-                    zero_point: 0,
-                },
-                super::conversion::StorageFormat::QuantizedPQ {
-                    segments: 8,
-                    bits: 8,
-                },
-                super::conversion::StorageFormat::Binary,
-            ],
-            default_format: super::conversion::StorageFormat::QuantizedINT8 {
-                scale: 1.0,
-                zero_point: 0,
-            },
+            supported_formats: Self::supported_formats(true),
+            default_format: Self::default_int8_format(),
             performance_preferences: PerformancePreferences {
                 prefer_speed: false,
                 target_latency_us: 2000,
@@ -359,18 +362,7 @@ impl StorageEngineConfig {
         Self {
             engine_type: super::storage_integration::EngineType::SWIFT,
             settings,
-            supported_formats: vec![
-                super::conversion::StorageFormat::FP32,
-                super::conversion::StorageFormat::QuantizedINT8 {
-                    scale: 1.0,
-                    zero_point: 0,
-                },
-                super::conversion::StorageFormat::QuantizedPQ {
-                    segments: 8,
-                    bits: 8,
-                },
-                super::conversion::StorageFormat::Binary,
-            ],
+            supported_formats: Self::supported_formats(true),
             default_format: super::conversion::StorageFormat::FP32,
             performance_preferences: PerformancePreferences {
                 prefer_speed: true,
@@ -395,21 +387,8 @@ impl StorageEngineConfig {
         Self {
             engine_type: super::storage_integration::EngineType::VIPER,
             settings,
-            supported_formats: vec![
-                super::conversion::StorageFormat::FP32,
-                super::conversion::StorageFormat::QuantizedINT8 {
-                    scale: 1.0,
-                    zero_point: 0,
-                },
-                super::conversion::StorageFormat::QuantizedPQ {
-                    segments: 8,
-                    bits: 8,
-                },
-            ],
-            default_format: super::conversion::StorageFormat::QuantizedINT8 {
-                scale: 1.0,
-                zero_point: 0,
-            },
+            supported_formats: Self::supported_formats(false),
+            default_format: Self::default_int8_format(),
             performance_preferences: PerformancePreferences {
                 prefer_speed: false,
                 target_latency_us: 5000,
@@ -433,18 +412,7 @@ impl StorageEngineConfig {
         Self {
             engine_type: super::storage_integration::EngineType::SST,
             settings,
-            supported_formats: vec![
-                super::conversion::StorageFormat::FP32,
-                super::conversion::StorageFormat::QuantizedINT8 {
-                    scale: 1.0,
-                    zero_point: 0,
-                },
-                super::conversion::StorageFormat::QuantizedPQ {
-                    segments: 8,
-                    bits: 8,
-                },
-                super::conversion::StorageFormat::Binary,
-            ],
+            supported_formats: Self::supported_formats(true),
             default_format: super::conversion::StorageFormat::FP32,
             performance_preferences: PerformancePreferences {
                 prefer_speed: true,

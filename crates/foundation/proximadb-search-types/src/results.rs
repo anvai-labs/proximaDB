@@ -543,70 +543,10 @@ mod arc_slice_serde {
 // where both types are foreign. Moved during the search-types extraction.
 impl From<OptimizedSearchRecord> for SearchVectorRecord {
     fn from(native: OptimizedSearchRecord) -> Self {
-        SearchVectorRecord {
-            id: native.id,
-            score: native.score as f64,
-            vector: native
-                .vector
-                .as_ref()
-                .map(|v| (**v).clone())
-                .unwrap_or_default(),
-            metadata: proxima_map_to_sql(native.metadata),
-            version: native.version,
-            similarity: native.similarity,
-            timestamp: native.timestamp,
-            source: native.source.as_ref().map(|sc| match &sc.data {
-                Some(proximadb_proto::proximadb_v1::source_content::Data::TextContent(text)) => {
-                    text.clone()
-                }
-                Some(proximadb_proto::proximadb_v1::source_content::Data::ExternalReference(
-                    url,
-                )) => url.clone(),
-                Some(proximadb_proto::proximadb_v1::source_content::Data::BinaryContent(_)) => {
-                    "[Binary Content]".to_string()
-                }
-                None => "[Empty Content]".to_string(),
-            }),
-            expanded_context: native
-                .expanded_context
-                .iter()
-                .map(|sc| match &sc.data {
-                    Some(proximadb_proto::proximadb_v1::source_content::Data::TextContent(
-                        text,
-                    )) => text.clone(),
-                    Some(
-                        proximadb_proto::proximadb_v1::source_content::Data::ExternalReference(url),
-                    ) => url.clone(),
-                    Some(proximadb_proto::proximadb_v1::source_content::Data::BinaryContent(_)) => {
-                        "[Binary Content]".to_string()
-                    }
-                    None => "[Empty Content]".to_string(),
-                })
-                .collect(),
-            semantic_similarity: native
-                .semantic_similarity
-                .as_ref()
-                .map(|s| s.similarity_score),
-            quantization_info: native
-                .quantization_info
-                .as_ref()
-                .map(|q| format!("{:?}", q)),
-            engine_stats: native
-                .engine_stats
-                .as_ref()
-                .map(|stats| {
-                    std::collections::HashMap::from_iter([
-                        (
-                            "vectors_scanned".to_string(),
-                            stats.vectors_scanned.to_string(),
-                        ),
-                        ("io_operations".to_string(), stats.io_operations.to_string()),
-                        ("cache_hits".to_string(), stats.cache_hits.to_string()),
-                    ])
-                })
-                .unwrap_or_default(),
-            index_path: None,
-        }
+        // Delegate to the borrowed impl below (the field-by-field mapping):
+        // the only difference was moving `id`/`metadata` instead of cloning
+        // them, which this delegation trades for two small clones.
+        Self::from(&native)
     }
 }
 
