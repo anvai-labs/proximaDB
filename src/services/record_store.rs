@@ -31,6 +31,7 @@ use proximadb_catalog::{
     CatalogPhysicalFormat, CatalogStorageLayout, CatalogStorageSpecialization, CatalogTableSchema,
     CatalogWorkloadProfile,
 };
+use proximadb_records::chunked::{RecordChunkStream, merge_newest_wins, once_then_chunks};
 use proximadb_records::{
     ProximaRecord, ProximaTreeNode, RecordKey, RecordScanOptions, RecordScanPredicate,
     RecordStorage,
@@ -836,6 +837,42 @@ pub trait TableRecordStore: Send + Sync {
         Ok(None)
     }
 
+    /// Every visible record of the table as an ordered chunk stream
+    /// ([`RecordChunkStream`]: strictly ascending `oid`, each once, chunks of at
+    /// most `chunk_rows`). `request.limit` is ignored. The stream owns its inputs
+    /// (`'static`), so a bounded-memory consumer such as MATERIALIZE can drive it
+    /// while it writes. Authorization (ABAC) stays with the caller, which applies
+    /// its row filter per chunk.
+    ///
+    /// Default: correct but not bounded — `scan_records`, then sorted chunks.
+    fn scan_records_chunked(
+        self: Arc<Self>,
+        table_schema: CatalogTableSchema,
+        request: TableRecordScanRequest,
+        chunk_rows: usize,
+        tenant_context: Option<TenantContext>,
+    ) -> RecordChunkStream<'static>
+    where
+        Self: 'static,
+    {
+        once_then_chunks(
+            async move {
+                self.scan_records(
+                    &table_schema,
+                    TableRecordScanRequest {
+                        limit: None,
+                        ..request
+                    },
+                    tenant_context.as_ref(),
+                    #[cfg(feature = "abac-policy")]
+                    &ReadContext::system(SystemReadReason::Statistics, "scan_records_chunked"),
+                )
+                .await
+            },
+            chunk_rows,
+        )
+    }
+
     /// Scan with a row `predicate` pushed into the store (relational `WHERE`
     /// push-down). Returns up to `request.limit` records matching `predicate`;
     /// the store applies it, so callers must NOT re-filter afterward. This lets
@@ -1452,6 +1489,18 @@ impl TableRecordStore for CatalogRoutingTableRecordStore {
             .await
     }
 
+    fn scan_records_chunked(
+        self: Arc<Self>,
+        table_schema: CatalogTableSchema,
+        request: TableRecordScanRequest,
+        chunk_rows: usize,
+        tenant_context: Option<TenantContext>,
+    ) -> RecordChunkStream<'static> {
+        self.store_for_schema(&table_schema)
+            .clone()
+            .scan_records_chunked(table_schema, request, chunk_rows, tenant_context)
+    }
+
     async fn scan_records_filtered(
         &self,
         table_schema: &CatalogTableSchema,
@@ -1649,6 +1698,48 @@ impl RecordStorageTableRecordStore {
     pub fn new(storage: Arc<dyn RecordStorage>) -> Self {
         Self { storage }
     }
+
+    /// The ordered chunk scan of one record partition, with the same table
+    /// membership (`variation_id`) and vector/prop stripping as `scan_records`.
+    fn partition_chunks(
+        storage: Arc<dyn RecordStorage>,
+        table_name: String,
+        request: &TableRecordScanRequest,
+        chunk_rows: usize,
+        tenant_id: Option<String>,
+    ) -> RecordChunkStream<'static> {
+        let mut options = RecordScanOptions::unbounded();
+        if let Some(tenant_id) = tenant_id {
+            options = options.with_tenant_id(tenant_id);
+        }
+        let (include_vector, include_props) = (request.include_vector, request.include_props);
+        storage
+            .scan_record_chunks(options, chunk_rows)
+            .filter_map(move |chunk| {
+                let chunk = chunk.map(|mut records| {
+                    records.retain(|record| {
+                        record
+                            .variation_id
+                            .as_deref()
+                            .is_none_or(|variation| variation == table_name)
+                    });
+                    for record in &mut records {
+                        if !include_vector {
+                            record.embeddings.clear();
+                        }
+                        if !include_props {
+                            record.props.clear();
+                        }
+                    }
+                    records
+                });
+                futures::future::ready(match chunk {
+                    Ok(records) if records.is_empty() => None,
+                    other => Some(other),
+                })
+            })
+            .boxed()
+    }
 }
 
 #[async_trait]
@@ -1742,6 +1833,22 @@ impl TableRecordStore for RecordStorageTableRecordStore {
         });
         truncate_and_project_scan(&mut records, &request);
         Ok(records)
+    }
+
+    fn scan_records_chunked(
+        self: Arc<Self>,
+        table_schema: CatalogTableSchema,
+        request: TableRecordScanRequest,
+        chunk_rows: usize,
+        tenant_context: Option<TenantContext>,
+    ) -> RecordChunkStream<'static> {
+        Self::partition_chunks(
+            self.storage.clone(),
+            table_schema.name,
+            &request,
+            chunk_rows,
+            tenant_context.map(|t| t.tenant_id),
+        )
     }
 
     async fn scan_records_filtered(
@@ -3510,6 +3617,46 @@ impl TableRecordStore for DirectWalTableRecordStore {
             filesystem: self.segment_filesystem.clone(),
             table_name: table_schema.name.clone(),
         }))
+    }
+
+    /// Primary-over-legacy, like `scan_records`: during an oid-keying cutover the
+    /// legacy (name-keyed) partition is merged under the primary, and the primary
+    /// copy of an oid wins. Both partitions stream in oid order, so the merge holds
+    /// one chunk of each.
+    fn scan_records_chunked(
+        self: Arc<Self>,
+        table_schema: CatalogTableSchema,
+        request: TableRecordScanRequest,
+        chunk_rows: usize,
+        tenant_context: Option<TenantContext>,
+    ) -> RecordChunkStream<'static> {
+        if let Err(e) = self.ensure_healthy() {
+            return futures::stream::once(async move { Err(e) }).boxed();
+        }
+        let tenant = Self::tenant_key(tenant_context.as_ref());
+        let (primary, legacy) = self.partitions_for(&tenant, &table_schema);
+        let name = table_schema.name;
+        // The partition is already the tenant's: no per-record tenant filter, as in
+        // `scan_records` (which passes `None`).
+        let primary = RecordStorageTableRecordStore::partition_chunks(
+            primary,
+            name.clone(),
+            &request,
+            chunk_rows,
+            None,
+        );
+        match legacy {
+            None => primary,
+            Some(legacy) => merge_newest_wins(
+                vec![
+                    RecordStorageTableRecordStore::partition_chunks(
+                        legacy, name, &request, chunk_rows, None,
+                    ),
+                    primary,
+                ],
+                chunk_rows,
+            ),
+        }
     }
 
     async fn scan_records_filtered(

@@ -9078,6 +9078,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bincode",
+ "futures",
  "half",
  "proximadb-data-model",
  "proximadb-kernel",

@@ -201,3 +201,14 @@ MATERIALIZE publishes its file through this API. Evidence:
 `publish_iceberg_files_publishes_only_the_named_generation`,
 `publish_iceberg_files_on_a_stale_parent_is_an_error`,
 `publish_iceberg_files_requires_readable_footers`.
+
+=== P2.4 slice 4: bounded, oid-ordered chunked scan (2026-10-22)
+
+The MATERIALIZE input no longer has to be the whole table at once. `RecordScan::scan_record_chunks` yields a store's live records in strictly ascending oid order, in bounded chunks:
+
+* `SpillRecordStorage` k-way merges its oid-sorted segments under the resident rows of `view()`. It decodes one row-group batch per segment through `FileSystemParquetReader`.
+* `MemtableRecordStorage` serves a snapshot of its keys.
+
+`TableRecordStore::scan_records_chunked` adds table membership and the primary-over-legacy merge. `DmlService::scan_table_records_chunked` adds the governed-read prelude.
+
+Evidence: `chunked_scan_equals_the_merged_scan` builds several segments, updates, persisted and in-memory deletes, a re-insert and resident rows. It asserts strictly ascending oids, the chunk bound, and equality with `scan_records`.

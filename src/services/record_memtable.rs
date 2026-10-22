@@ -243,6 +243,22 @@ impl RecordScan for MemtableRecordStorage {
         }
         Ok(out)
     }
+
+    /// Ordered, bounded scan by a snapshot of the keys: only the oid set is copied
+    /// up front; each chunk's records are cloned as it is produced.
+    fn scan_record_chunks(
+        self: std::sync::Arc<Self>,
+        options: RecordScanOptions,
+        chunk_rows: usize,
+    ) -> proximadb_records::chunked::RecordChunkStream<'static> {
+        let keys: Vec<String> = self.records.iter().map(|e| e.key().clone()).collect();
+        proximadb_records::chunked::chunks_by_key_snapshot(keys, chunk_rows, move |oid| {
+            self.records
+                .get(oid)
+                .map(|r| r.value().clone())
+                .filter(|r| options.matches_record(r))
+        })
+    }
 }
 
 #[cfg(test)]
