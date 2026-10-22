@@ -145,11 +145,14 @@ async fn body() {
         .simple_query("select id, coalesce(lag(val) over (order by id), 0) as p from usub2_t")
         .await
         .expect_err("a nested window function must decline with the gate OFF");
-    assert_eq!(
-        nested.as_db_error().map(|e| e.code().code()),
-        Some("0A000"),
-        "nested window decline: {}",
-        pg_server::db_err(&nested)
+    let nested_db = nested
+        .as_db_error()
+        .unwrap_or_else(|| panic!("expected a server error, got {nested}"));
+    assert_eq!(nested_db.code().code(), "0A000");
+    assert!(
+        nested_db.message().contains("lag") && nested_db.message().contains("TD-USUB-2"),
+        "the nested window must be declined by the window decline: {}",
+        nested_db.message()
     );
 
     drop(client);

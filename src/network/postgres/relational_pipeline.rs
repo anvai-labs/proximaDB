@@ -1051,9 +1051,12 @@ pub async fn try_run_select(
                     target: "proximadb::pgwire::new_pipeline",
                     "relational schema resolve for `{raw}` failed: {e}; falling through to legacy"
                 );
-                // TD-USUB-2: the legacy path would drop a window function.
-                if require_engagement {
-                    return window_decline(query, relational_abac_required).map(Err);
+                // TD-USUB-2: the legacy path would drop a window function — but
+                // say why this table has no relational route (a typo, a vector
+                // collection) rather than suggest enabling one. System catalogs
+                // keep their legacy stubs.
+                if require_engagement && !is_system_catalog_relation(raw) {
+                    return unresolved_window_decline(query, raw, &e).map(Err);
                 }
                 return None;
             }
@@ -4201,10 +4204,32 @@ fn window_decline(query: &SqlQuery, abac_governed: bool) -> Option<String> {
         " or ALTER TABLE ... MATERIALIZE"
     };
     Some(format!(
-        "0A000: window function {name}() OVER (...) is not supported on this table without \
+        "0A000: window function {name} OVER (...) is not supported on this table without \
          a DataFusion route; enable the native table provider \
          (PROXIMADB_NATIVE_TABLE_PROVIDER=1){materialize} so DataFusion serves it (TD-USUB-2)"
     ))
+}
+
+/// TD-USUB-2: the decline for a windowed query naming a relation that does not
+/// resolve as a relational table — carrying the resolution error, since the
+/// remedy is the name or the object, not a gate.
+fn unresolved_window_decline(
+    query: &SqlQuery,
+    relation: &str,
+    error: &anyhow::Error,
+) -> Option<String> {
+    let name = query_window_function_name(query)?;
+    Some(format!(
+        "0A000: window function {name} OVER (...) needs a relational table, and `{relation}` \
+         did not resolve as one: {error} (TD-USUB-2)"
+    ))
+}
+
+/// `pg_catalog.*` / `information_schema.*` — served by pgwire's introspection
+/// stubs, never by the relational pipeline.
+fn is_system_catalog_relation(relation: &str) -> bool {
+    let lower = relation.trim().to_ascii_lowercase();
+    lower.starts_with("pg_catalog.") || lower.starts_with("information_schema.")
 }
 
 fn set_expr_engages(body: &SetExpr) -> bool {
@@ -4863,6 +4888,44 @@ mod tests {
             Some(Statement::Query(query)) => query_engages_relational_engine(&query),
             _ => panic!("expected a SELECT"),
         };
+        for (sql, name) in [
+            (
+                "SELECT rank() OVER w FROM t WINDOW w AS (ORDER BY val)",
+                "rank",
+            ),
+            (
+                "SELECT id FROM t QUALIFY row_number() OVER (ORDER BY id) = 1",
+                "row_number",
+            ),
+        ] {
+            assert_eq!(window_name(sql).as_deref(), Some(name), "{sql}");
+        }
+        // The hint offers MATERIALIZE only where the Parquet route could serve.
+        let query = match Parser::parse_sql(&GenericDialect {}, "SELECT lag(v) OVER () FROM t")
+            .expect("parse")
+            .pop()
+        {
+            Some(Statement::Query(query)) => query,
+            _ => panic!("expected a SELECT"),
+        };
+        let open = window_decline(&query, false).expect("windowed");
+        let governed = window_decline(&query, true).expect("windowed");
+        assert!(
+            open.starts_with("0A000: ") && open.contains("MATERIALIZE"),
+            "{open}"
+        );
+        assert!(!governed.contains("MATERIALIZE"), "{governed}");
+        // An unresolved relation says why, and system catalogs keep their stubs.
+        let unresolved = unresolved_window_decline(
+            &query,
+            "nosuch",
+            &anyhow::anyhow!("Table 'nosuch' does not exist"),
+        )
+        .expect("windowed");
+        assert!(unresolved.contains("nosuch") && unresolved.contains("does not exist"));
+        assert!(is_system_catalog_relation("PG_CATALOG.pg_proc"));
+        assert!(is_system_catalog_relation("information_schema.columns"));
+        assert!(!is_system_catalog_relation("public.t"));
         assert!(engages(
             "SELECT coalesce(lag(val) OVER (ORDER BY id), 0) FROM t"
         ));
