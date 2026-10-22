@@ -9443,6 +9443,7 @@ dependencies = [
  "proximadb-search-types",
  "proximadb-storage-filesystem-types",
  "regex",
+ "rmp-serde",
  "serde",
  "serde_json",
  "tempfile",

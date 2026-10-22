@@ -9,7 +9,7 @@
 [cols="1,3"]
 |===
 | Purpose | The resumable status of record for executing link:LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] (the plan: Parts A–D, phases P0–P6) under link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097]. Any engineer or agent session picks up from here **and nothing else**: what is merged, what is in flight, what is next, and how the work is done.
-| Updated | 2026-10-21, against `develop` @ `286dc3feb` (#2097, #2099 merged).
+| Updated | 2026-10-21, against `develop` @ `46ff77312` (#2114 merged).
 | Rule | Update this file in the same PR that lands, opens or re-plans a slice. A slice is **done** only when merged to `develop` with its gate green. Detail lives in the TD files; this file holds status, links and order.
 |===
 
@@ -116,8 +116,8 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | P2.2c scheduled truncator (`src/services/wal_truncator.rs`) + MATERIALIZE snapshot-LSN pin | Done | #2095 | `tests/wal_truncator_test.rs` (7). Off by default (`PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS`).
 | Spill segments written with `ParquetWritePolicy`, oid-sorted | Done | #2097 | `segments_are_written_with_the_warehouse_layout_policy`.
 | Spill encoder uses the catalog schema; non-fitting rows held resident (no silent NULL); timestamp decode | Done | #2099 | Tests listed in the TD-SEAM-3 row. Hardened before merge: un-materializable catalog types are dropped from the encode schema (rows on them held), int→float mantissa check.
-| Seed spill schema hints at boot (before WAL replay) | **Branch** `spill-schema-boot-seed` | — | `CatalogManager::table_schemas` (native + OLTP catalogs; also backs the truncator's snapshot floor); per-collection fallback, none for an ambiguous key. `boot_seeded_schemas_reach_replayed_partitions_unless_ambiguous`, `table_schemas_walks_nested_namespaces_of_selected_catalogs`.
-| Permanent-hold classes: hold metric + escape hatch | **Next** | — | Nested `Object`/`Array` props, >1 embedding, props on a dropped or un-materializable column, an integer too wide for a declared float: held forever today (no loss, but unbounded memory and a pinned WAL floor). Needs a gauge, and an encoding (e.g. a JSON residual column, TD-USUB-6) so they can flush.
+| Seed spill schema hints at boot (before WAL replay) | Done | #2114 | `CatalogManager::table_schemas` (native + OLTP catalogs; also backs the truncator's snapshot floor); per-collection fallback, none for an ambiguous key. `boot_seeded_schemas_reach_replayed_partitions_unless_ambiguous`, `table_schemas_walks_nested_namespaces_of_selected_catalogs`.
+| Permanent-hold classes → exact residual column (`__proxima_residual`, TD-USUB-6 rule); codec-verified hold + `proximadb_spill_rows_held_total` | **Branch** `spill-props-residual` | — | `the_residual_makes_every_row_round_trip_exactly`; spill tests updated (rows formerly held now flush exactly).
 | Hold metric + escape hatch for permanent-hold rows | **Next** | — | Rows with nested `Object`/`Array` props, >1 embedding, props on a dropped/un-materializable column, or an integer too wide for a declared float column can never be spilled by any schema — they hold memory and pin `min_unflushed_lsn` forever (no loss; strictly better than the old silent NULL on eviction). Needs a hold-size metric and an escape hatch (quarantine segment). |
 | Durable branch merge-base | Open | — | Until it lands, branch-tagged WAL entries block truncation. TD-SEAM-12 hazard 2.
 | Catalog prefix registration (object-store placement of spill segments) | Open | — | TD-SEAM-3.
@@ -147,7 +147,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 [cols="2,1,3",options="header"]
 |===
 | Branch | PR | State and next action
-| `spill-schema-boot-seed` | — | Rebased on `286dc3feb`. Run `cargo test --lib -- record_spill:: record_store::tests:: --test-threads=1` and `cargo test -p proximadb-catalog --lib table_schemas`, clippy, then PR.
+| `spill-props-residual` | — | On `46ff77312`. Run `cargo test -p proximadb-storage-common --lib proxima_arrow`, `cargo test --lib -- record_spill:: record_store::tests:: --test-threads=1`, clippy, `python3 scripts/dup_ratchet.py --mode check`, then PR.
 |===
 
 == 5. Next-work queue (in order)

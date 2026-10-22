@@ -5651,11 +5651,11 @@ mod tests {
     /// flush nothing constrains WAL truncation.
     ///
     /// Process-isolated under nextest, so the env gate does not leak.
-    /// Boot seeding reaches a partition WAL replay creates, before any write:
-    /// its DECIMAL rows flush instead of being held for want of a schema. A
-    /// collection key two different schemas claim gets no fallback (the
-    /// catalog cannot say which tenant owns which), so its rows are held —
-    /// never encoded under a guessed schema.
+    /// Boot seeding reaches a partition WAL replay creates, before any write,
+    /// so its DECIMAL column is typed from the catalog. A collection key two
+    /// different schemas claim gets no fallback (the catalog cannot say which
+    /// tenant owns which) — its rows are never encoded under a guessed schema;
+    /// they flush through inference plus the residual, still exact.
     ///
     /// Process-isolated under nextest, so the env gate does not leak.
     #[tokio::test]
@@ -5728,11 +5728,32 @@ mod tests {
             Some(None),
             "the seeded schema typed the replayed DECIMAL rows, so they flushed"
         );
+        let hints = store.schema_hints.as_ref().expect("spilling store");
+        assert!(
+            hints.get("tenant-a", "orders").is_some(),
+            "the unambiguous key has a fallback"
+        );
+        assert!(
+            hints.get("tenant-a", "shared").is_none(),
+            "an ambiguous key gets no fallback, so no schema is guessed"
+        );
         let shared = store.partition("tenant-a", "shared");
         assert_eq!(
             RecordStore::min_unflushed_lsn(shared.as_ref()).await.ok(),
-            Some(Some(2)),
-            "an ambiguous key gets no fallback: its DECIMAL row is held, not guessed"
+            Some(None),
+            "it still flushes, through inference plus the residual"
+        );
+        let back = shared
+            .get_record(&RecordKey::new("shared-2".to_string()))
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            back.props.get("price"),
+            Some(&proximadb_records::ProximaTreeNode::Value(
+                ProximaValue::Decimal("1.50".into())
+            )),
+            "exact"
         );
 
         unsafe {

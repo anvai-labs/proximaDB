@@ -58,6 +58,7 @@ proximadb-runtime-common.workspace = true
 moka.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rmp-serde.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
 toml.workspace = true
