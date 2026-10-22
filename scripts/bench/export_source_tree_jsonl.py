@@ -12,10 +12,19 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
+
+# corpus_io is a sibling module in scripts/bench/. Inject that directory so the
+# import works both when run as a script and when loaded via importlib in tests.
+_BENCH_DIR = str(Path(__file__).resolve().parent)
+if _BENCH_DIR not in sys.path:
+    sys.path.insert(0, _BENCH_DIR)
+
+from corpus_io import sha256_file as _sha256  # noqa: E402  — path-injected sibling bench module
 
 DEFAULT_EXTENSIONS = (
     ".adoc",
@@ -77,14 +86,6 @@ def repository_provenance(root: Path) -> dict[str, Any]:
         "dirty": bool(status_bytes.strip()),
         "status_sha256": hashlib.sha256(status_bytes).hexdigest(),
     }
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def iter_source_files(

@@ -10,100 +10,28 @@ Alias expansion is therefore an explicit diagnostic opt-in.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
-import os
-import tempfile
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+# corpus_io is a sibling module in scripts/bench/. Inject that directory so the
+# import works both when run as a script and when loaded via importlib in tests.
+_BENCH_DIR = str(Path(__file__).resolve().parent)
+if _BENCH_DIR not in sys.path:
+    sys.path.insert(0, _BENCH_DIR)
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _jsonl(path: Path):
-    with path.open("r", encoding="utf-8") as source:
-        for line_number, line in enumerate(source, 1):
-            if not line.strip():
-                continue
-            value = json.loads(line)
-            if not isinstance(value, dict):
-                raise ValueError(f"{path} line {line_number}: expected an object")
-            yield line_number, value
-
-
-def _required_text(record: dict[str, Any], name: str, context: str) -> str:
-    value = record.get(name)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{context}: {name} is required")
-    return value
-
-
-def _finite_number(record: dict[str, Any], name: str, context: str) -> float:
-    value = record.get(name)
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
-    ):
-        raise ValueError(f"{context}: {name} must be a finite number")
-    return float(value)
-
-
-def _percentile(values: list[int], fraction: float) -> int | None:
-    if not values:
-        return None
-    ordered = sorted(values)
-    return ordered[round((len(ordered) - 1) * fraction)]
-
-
-def _histogram(values: list[int]) -> dict[str, int | None]:
-    return {
-        "min": min(values) if values else None,
-        "p50": _percentile(values, 0.50),
-        "p90": _percentile(values, 0.90),
-        "p99": _percentile(values, 0.99),
-        "max": max(values) if values else None,
-    }
-
-
-def _atomic_json(value: Any, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f"{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    os.close(descriptor)
-    temporary = Path(temporary_name)
-    try:
-        with temporary.open("w", encoding="utf-8") as output:
-            json.dump(value, output, indent=2, sort_keys=True)
-            output.write("\n")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _atomic_jsonl(records: list[dict[str, Any]], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f"{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    os.close(descriptor)
-    temporary = Path(temporary_name)
-    try:
-        with temporary.open("w", encoding="utf-8") as output:
-            for record in records:
-                output.write(json.dumps(record, sort_keys=True) + "\n")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+from corpus_io import (  # noqa: E402  — path-injected sibling bench module
+    atomic_json_write as _atomic_json,
+    atomic_jsonl_write as _atomic_jsonl,
+    finite_number as _finite_number,
+    histogram as _histogram,
+    iter_jsonl as _jsonl,
+    required_text as _required_text,
+    sha256_file as _sha256,
+)
 
 
 def _load_occurrences(

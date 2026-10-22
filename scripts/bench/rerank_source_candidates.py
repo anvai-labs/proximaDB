@@ -12,13 +12,26 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
-import os
-import tempfile
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol, Sequence
+
+# corpus_io is a sibling module in scripts/bench/. Inject that directory so the
+# import works both when run as a script and when loaded via importlib in tests.
+_BENCH_DIR = str(Path(__file__).resolve().parent)
+if _BENCH_DIR not in sys.path:
+    sys.path.insert(0, _BENCH_DIR)
+
+from corpus_io import (  # noqa: E402  — path-injected sibling bench module
+    atomic_json_write as _atomic_json,
+    atomic_jsonl_write as _atomic_jsonl,
+    finite as _finite,
+    iter_jsonl as _jsonl,
+    required_text as _required_text,
+    sha256_file as _sha256,
+)
 
 
 @dataclass(frozen=True)
@@ -43,73 +56,6 @@ class PairScorer(Protocol):
     def predict(
         self, pairs: list[tuple[str, str]], *, batch_size: int
     ) -> list[float]: ...
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _atomic_json(value: Any, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f"{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    os.close(descriptor)
-    temporary = Path(temporary_name)
-    try:
-        with temporary.open("w", encoding="utf-8") as output:
-            json.dump(value, output, indent=2, sort_keys=True)
-            output.write("\n")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _atomic_jsonl(records: Sequence[dict[str, Any]], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f"{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    os.close(descriptor)
-    temporary = Path(temporary_name)
-    try:
-        with temporary.open("w", encoding="utf-8") as output:
-            for record in records:
-                output.write(json.dumps(record, sort_keys=True) + "\n")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _jsonl(path: Path):
-    with path.open("r", encoding="utf-8") as source:
-        for line_number, line in enumerate(source, 1):
-            if not line.strip():
-                continue
-            value = json.loads(line)
-            if not isinstance(value, dict):
-                raise ValueError(f"{path} line {line_number}: expected an object")
-            yield line_number, value
-
-
-def _required_text(record: dict[str, Any], key: str, context: str) -> str:
-    value = record.get(key)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{context}: {key} is required")
-    return value
-
-
-def _finite(value: Any, context: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{context}: expected a finite number")
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{context}: expected a finite number")
-    return result
 
 
 def _fingerprint(value: Any) -> str:

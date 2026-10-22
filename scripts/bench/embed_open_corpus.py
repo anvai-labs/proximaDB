@@ -9,12 +9,11 @@ chunking logic.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
 import re
-import tempfile
+import sys
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -26,27 +25,16 @@ from proximadb_sdk.embedding_providers.providers.local.open_weights import (
     create_open_model_provider,
 )
 
+# corpus_io is a sibling module in scripts/bench/. Inject that directory so the
+# import works both when run as a script and when loaded via importlib in tests.
+_BENCH_DIR = str(Path(__file__).resolve().parent)
+if _BENCH_DIR not in sys.path:
+    sys.path.insert(0, _BENCH_DIR)
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _atomic_json(value: Any, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
-    os.close(fd)
-    temporary = Path(name)
-    try:
-        with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(value, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+from corpus_io import (  # noqa: E402  — path-injected sibling bench module
+    atomic_json_write as _atomic_json,
+    sha256_file as _sha256,
+)
 
 
 def _contract_for_model(
