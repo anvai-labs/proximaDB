@@ -19,7 +19,8 @@ use futures::StreamExt;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
 use proximadb_records::chunked::{
-    RecordChunkStream, chunks_of_records, filter_chunks, flatten_setup, merge_newest_wins,
+    RecordChunkStream, chunks_of_records, effective_chunk_rows, filter_chunks, flatten_setup,
+    merge_newest_wins,
 };
 use proximadb_records::{RecordScanOptions, RecordScanView};
 use proximadb_storage_common::proxima_arrow::{SYS_COL_OID, record_batch_to_proxima_records};
@@ -96,6 +97,8 @@ impl SpillRecordStorage {
         options: RecordScanOptions,
         chunk_rows: usize,
     ) -> RecordChunkStream<'static> {
+        // Parquet reads a batch size of zero as end-of-file.
+        let chunk_rows = effective_chunk_rows(chunk_rows);
         flatten_setup(async move {
             let RecordScanView {
                 resident,
@@ -200,6 +203,9 @@ mod tests {
             "strictly ascending oids: {oids:?}"
         );
         assert_eq!(by_oid(flat), by_oid(s.scan_records(usize::MAX).await?));
+        // A chunk size of zero is one, not an empty segment read.
+        let ones: Vec<ProximaRecord> = chunked(&s, 0).await.into_iter().flatten().collect();
+        assert_eq!(by_oid(ones), by_oid(s.scan_records(usize::MAX).await?));
         Ok(())
     }
 
