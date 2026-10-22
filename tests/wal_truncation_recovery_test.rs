@@ -14,11 +14,12 @@
 
 use anyhow::{Context, Result};
 use proximadb::services::FramedTableWalAppender;
+use proximadb::services::branch_base_store::BranchBaseStore;
 use proximadb::services::record_store::{
     DirectWalTableRecordStore, TableRecordScanRequest, TableRecordStore, TableWalAppender,
 };
 use proximadb::services::wal_truncator::{
-    self, BranchEntriesGuard, ChangeFeedRetention, RecordTierFloor, TruncationRun, WalFloorSource,
+    self, BranchMergeBase, ChangeFeedRetention, RecordTierFloor, TruncationRun, WalFloorSource,
 };
 use proximadb::storage::tenant::context::StorageTenantContext;
 use proximadb_catalog::CatalogTableSchema;
@@ -128,9 +129,9 @@ fn truncator_sources(
     store: &Arc<DirectWalTableRecordStore>,
 ) -> Vec<Arc<dyn WalFloorSource>> {
     vec![
-        Arc::new(BranchEntriesGuard(wal.clone())),
         Arc::new(ChangeFeedRetention(0)),
         Arc::new(RecordTierFloor(store.clone())),
+        Arc::new(BranchMergeBase(Arc::new(BranchBaseStore::new(wal.clone())))),
     ]
 }
 

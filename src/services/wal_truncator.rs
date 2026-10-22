@@ -10,8 +10,9 @@
 //!
 //! * The WAL head `W` is read FIRST, and the floor never exceeds `W + 1`, so an
 //!   entry appended while the floor is being computed is never a candidate.
-//! * Sources that only READ run before the catalog checkpoints, which APPEND:
-//!   a run that some reader refuses costs no WAL growth.
+//! * Sources that only READ run before the checkpoints, which APPEND: a run
+//!   that some reader refuses costs no WAL growth. The branch merge-base runs
+//!   last, so the branch fence it arms covers the shortest window.
 //!
 //! On by default (`PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS`, `0`/`off`
 //! disables it). Truncation only ever removes SEALED segments, so the server
@@ -28,6 +29,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
+use crate::services::branch_base_store::BranchBaseStore;
 use crate::services::canonical_wal::{BranchFenceRefused, FramedTableWalAppender, WalTruncation};
 use crate::services::record_store::DirectWalTableRecordStore;
 use crate::services::{FunctionStore, RankProfileStore};
@@ -138,24 +140,23 @@ pub async fn run_once(
     Ok(TruncationRun::Truncated { floor, report })
 }
 
-/// Refuse while the WAL holds branch-tagged records (TD-SEAM-12 hazard 2):
-/// branch merge reads base records that may predate any floor, and no durable
-/// merge-base snapshot exists yet.
-pub struct BranchEntriesGuard(pub Arc<FramedTableWalAppender>);
+/// Branch merge (TD-SEAM-12 hazard 2): images the main-line base of every
+/// branched collection into the WAL, so only the history from the oldest
+/// branch-tagged record up must stay ([`BranchBaseStore::checkpoint`]).
+/// Refuses when the WAL cannot be read or appended, or an image no longer
+/// reaches the retained history.
+pub struct BranchMergeBase(pub Arc<BranchBaseStore>);
 
 #[async_trait]
-impl WalFloorSource for BranchEntriesGuard {
+impl WalFloorSource for BranchMergeBase {
     fn name(&self) -> &str {
-        "branch-merge"
+        "branch-merge-base"
     }
-    async fn floor(&self, _head: u64) -> Result<Option<u64>> {
-        if self.0.has_branch_entries() {
-            anyhow::bail!(
-                "the WAL holds branch-tagged records; branch merge needs base records that may \
-                 predate any floor until a durable merge-base snapshot exists"
-            );
-        }
-        Ok(None)
+    fn appends(&self) -> bool {
+        true
+    }
+    async fn floor(&self, head: u64) -> Result<Option<u64>> {
+        self.0.checkpoint(head).await
     }
 }
 

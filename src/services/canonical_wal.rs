@@ -721,11 +721,6 @@ impl FramedTableWalAppender {
         self.next_sequence.load(Ordering::SeqCst)
     }
 
-    /// Whether any retained entry (sealed or active) is a branch-tagged record.
-    pub fn has_branch_entries(&self) -> bool {
-        self.branch_summary().oldest_branch_seq.is_some()
-    }
-
     /// The retained branch-tagged records: the oldest one's sequence and every
     /// `(tenant, collection)` holding one (TD-SEAM-12 hazard 2). From the
     /// segment summaries; no file is read.

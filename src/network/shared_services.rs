@@ -2635,7 +2635,8 @@ impl SharedServices {
         // P2.2c (TD-SEAM-2 / TD-SEAM-12): canonical-WAL truncation, on by
         // default (PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS=0 disables it). Every WAL
         // consumer is a floor source; any refusal skips the run. Read-only
-        // sources first, the appending catalog checkpoints last.
+        // sources first, the appending checkpoints last, the branch
+        // merge-base (which arms the branch fence) very last.
         // Truncation only removes sealed segments, so without rotation a run
         // could only append checkpoints; and after an incomplete recovery the
         // record tier's floor cannot be trusted (see `record_store_recovered`).
@@ -2659,7 +2660,6 @@ impl SharedServices {
         ) {
             use crate::services::wal_truncator as truncator;
             let sources: Vec<Arc<dyn truncator::WalFloorSource>> = vec![
-                Arc::new(truncator::BranchEntriesGuard(wal.clone())),
                 Arc::new(truncator::RecordTierFloor(record_store)),
                 Arc::new(truncator::ChangeFeedRetention(
                     truncator::configured_retain_entries(),
@@ -2667,6 +2667,9 @@ impl SharedServices {
                 Arc::new(truncator::PublishedSnapshotFloor(catalog_manager.clone())),
                 Arc::new(truncator::RankProfileCheckpoint(rank_profile_store.clone())),
                 Arc::new(truncator::FunctionCheckpoint(function_store.clone())),
+                Arc::new(truncator::BranchMergeBase(Arc::new(
+                    crate::services::branch_base_store::BranchBaseStore::new(wal.clone()),
+                ))),
             ];
             truncator::spawn(wal, sources, interval);
             info!(
