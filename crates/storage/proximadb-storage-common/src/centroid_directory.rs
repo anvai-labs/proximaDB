@@ -39,6 +39,16 @@
 //!
 //! Segments are sorted by name and cells by `(segment, a0_cell)`, so identical
 //! inputs always serialize to identical bytes regardless of discovery order.
+//!
+//! ## Departure from the TD-PAXDIR-1 §3.1 wire draft
+//!
+//! The D1 format drops the draft's `built_at_unix_ms` field and the per-table
+//! `metric u8`: staleness is carried by the `(name, size)` stamp plus the
+//! generation (until TD-PAXMETA-1 adds a snapshot id), and the metric is a
+//! collection-level property the caller already holds. `flags` and `reserved`
+//! are therefore written as zero and `parse` REJECTS non-zero values there, so
+//! a future revision that gives them meaning must bump [`DIRECTORY_VERSION`]
+//! rather than silently reinterpret v1 bytes.
 
 #![forbid(unsafe_code)]
 
@@ -238,6 +248,19 @@ impl PaxCentroidDirectory {
         if bytes[4] != DIRECTORY_VERSION {
             bail!("unsupported centroid directory version {}", bytes[4]);
         }
+        // v1 assigns no meaning to flags or reserved: reject non-zero values
+        // so a later revision must bump the version instead of silently
+        // reinterpreting v1 bytes.
+        if bytes[5] != 0 {
+            bail!(
+                "unknown centroid directory flags 0x{:02x} (version {})",
+                bytes[5],
+                bytes[4]
+            );
+        }
+        if bytes[6] != 0 || bytes[7] != 0 {
+            bail!("centroid directory reserved bytes must be zero");
+        }
         let body_len = bytes.len() - CHECKSUM_LEN;
         let stored = u64::from_le_bytes(bytes[body_len..].try_into()?);
         if stored != fnv1a64(&bytes[..body_len]) {
@@ -332,6 +355,14 @@ impl PaxCentroidDirectory {
             {
                 bail!("centroid directory model length mismatch");
             }
+            // A single non-finite model value makes every cell score of the
+            // model non-finite, which would let one poisoned segment occupy
+            // all nprobe slots (fail closed instead).
+            if model.pca_mean.iter().any(|v| !v.is_finite())
+                || model.pca_components.iter().any(|v| !v.is_finite())
+            {
+                bail!("centroid directory model has a non-finite value");
+            }
         }
         let mut names = HashSet::with_capacity(self.segments.len());
         for segment in &self.segments {
@@ -350,6 +381,9 @@ impl PaxCentroidDirectory {
                 .ok_or_else(|| anyhow::anyhow!("centroid directory cell on uncovered segment"))?;
             if cell.centroid.len() != self.models[segment.model_idx as usize].n_comp as usize {
                 bail!("centroid directory cell centroid length mismatch");
+            }
+            if cell.centroid.iter().any(|v| !v.is_finite()) || !cell.radius.is_finite() {
+                bail!("centroid directory cell has a non-finite value");
             }
             if cell.entry.row_end < cell.entry.row_begin {
                 bail!("centroid directory cell has an inverted row range");
@@ -410,9 +444,18 @@ impl PaxCentroidDirectory {
                     .zip(&c.centroid)
                     .map(|(a, b)| (a - b) * (a - b))
                     .sum();
+                // A non-finite score must never win a nprobe slot: total_cmp
+                // ranks -NaN first, so clamp it to +inf (sorts last) instead.
+                // v1 files are rejected at parse for non-finite values; this
+                // guards directories written before that check existed.
+                let score = d + residual;
                 ScoredCell {
                     cell,
-                    score: d + residual,
+                    score: if score.is_finite() {
+                        score
+                    } else {
+                        f32::INFINITY
+                    },
                 }
             })
             .collect();
@@ -473,7 +516,12 @@ impl PaxCentroidDirectory {
                 pending.cells.push(cell.clone());
             }
         }
-        if !kept.is_empty() {
+        // Inherit the base dimension only from a kept segment that is actually
+        // covered (carries a model). A base directory of uncovered segments
+        // legitimately has dim 0; propagating that 0 would make every later
+        // add_covered bail on "dim differs from 0" and silently turn coverage
+        // off for the rest of the collection's life.
+        if builder.dim.is_none() && kept.values().any(|p| p.model.is_some()) {
             builder.dim = Some(self.dim);
         }
         for (_, pending) in kept {
@@ -991,6 +1039,174 @@ mod tests {
         assert_eq!(
             incremental.to_bytes().unwrap(),
             full.build(4).unwrap().to_bytes().unwrap()
+        );
+    }
+
+    #[test]
+    fn retain_from_uncovered_base_leaves_dim_unset() {
+        // A base directory of uncovered-only segments has dim 0; retaining it
+        // must not pin the builder's dim to 0 (which would make every later
+        // add_covered bail and silently turn coverage off for good).
+        let mut base_builder = DirectoryBuilder::default();
+        base_builder.add_uncovered("l0.pax", 50);
+        let base = base_builder.build(1).unwrap();
+        assert_eq!(base.dim, 0);
+        let mut builder = base.retain_into_builder(|_| true);
+        assert!(
+            builder.dim.is_none(),
+            "uncovered-only base must not set the builder's dim"
+        );
+        builder
+            .add_covered(
+                "c.pax",
+                9,
+                &a0(4, 2, 0.0, &[&[0.0, 0.0], &[5.0, 5.0]], &[10, 20]),
+            )
+            .expect("covered segment after uncovered-only base must be accepted");
+        let rebuilt = builder.build(4).unwrap();
+        assert_eq!(rebuilt.dim, 4);
+        assert_eq!(rebuilt.covered_segments().count(), 1);
+    }
+
+    #[test]
+    fn parse_rejects_non_finite_model_values() {
+        let dir = two_model_directory();
+        let mut bytes = dir.to_bytes().unwrap();
+        // Flip one pca_mean f32 inside the first model to a bit pattern for
+        // NaN, then re-stamp the checksum so ONLY the finite check can catch
+        // it (exercises a valid checksum over structurally bad values).
+        let model_mean_off = FIXED_HEAD_LEN
+            + 8 /* model_id */
+            + 2 /* n_comp */;
+        let f = f32::NAN.to_le_bytes();
+        for (i, b) in f.iter().enumerate() {
+            bytes[model_mean_off + i] = *b;
+        }
+        let body_len = bytes.len() - CHECKSUM_LEN;
+        let sum = fnv1a64(&bytes[..body_len]);
+        bytes[body_len..].copy_from_slice(&sum.to_le_bytes());
+        let err = PaxCentroidDirectory::parse(&bytes).unwrap_err().to_string();
+        assert!(
+            err.contains("non-finite"),
+            "expected the finite check to fire, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unknown_flags_and_nonzero_reserved() {
+        let bytes = two_model_directory().to_bytes().unwrap();
+
+        let mut flagged = bytes.clone();
+        flagged[5] = 0b0000_0001;
+        let body_len = flagged.len() - CHECKSUM_LEN;
+        let sum = fnv1a64(&flagged[..body_len]);
+        flagged[body_len..].copy_from_slice(&sum.to_le_bytes());
+        let err = PaxCentroidDirectory::parse(&flagged)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown centroid directory flags"),
+            "expected the flags check to fire, got: {err}"
+        );
+
+        let mut reserved = bytes;
+        reserved[6] = 0x7f;
+        let sum = fnv1a64(&reserved[..body_len]);
+        reserved[body_len..].copy_from_slice(&sum.to_le_bytes());
+        let err = PaxCentroidDirectory::parse(&reserved)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("reserved bytes must be zero"),
+            "expected the reserved check to fire, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rank_cells_clamps_non_finite_scores_to_infinity() {
+        // A directory written before the parse-time finite check (or poisoned
+        // in memory) must not let its NaN-scored cells win nprobe slots:
+        // total_cmp ranks -NaN FIRST, so the score is clamped to +inf.
+        // Assembled as a struct literal because build()/parse() now reject
+        // non-finite values outright.
+        let identity_2x4 = vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let models = vec![
+            DirectoryModel {
+                model_id: 1,
+                n_comp: 2,
+                pca_mean: vec![f32::NAN, 0.0, 0.0, 0.0],
+                pca_components: identity_2x4.clone(),
+            },
+            DirectoryModel {
+                model_id: 2,
+                n_comp: 2,
+                pca_mean: vec![0.0; 4],
+                pca_components: identity_2x4,
+            },
+        ];
+        let segments = vec![
+            DirectorySegment {
+                name: "bad.pax".to_string(),
+                size_bytes: 100,
+                rows_covered: 10,
+                model_idx: 0,
+            },
+            DirectorySegment {
+                name: "good.pax".to_string(),
+                size_bytes: 100,
+                rows_covered: 10,
+                model_idx: 1,
+            },
+        ];
+        let entry = CoarseCellEntry {
+            row_begin: 0,
+            row_end: 10,
+            a_off: 0,
+            a_len: 80,
+            b_off: 0,
+            b_len: 320,
+            c_off: 0,
+            c_len: 0,
+            d_block_begin: 0,
+            d_block_end: 1,
+        };
+        let cells = vec![
+            DirectoryCell {
+                segment_idx: 0,
+                a0_cell: 0,
+                centroid: vec![0.0, 0.0],
+                radius: 0.5,
+                entry,
+            },
+            DirectoryCell {
+                segment_idx: 1,
+                a0_cell: 0,
+                centroid: vec![0.0, 0.0],
+                radius: 0.5,
+                entry,
+            },
+        ];
+        let poisoned = PaxCentroidDirectory {
+            generation: 7,
+            dim: 4,
+            models,
+            segments,
+            cells,
+        };
+
+        let ranked = poisoned
+            .rank_cells(&[0.0, 0.0, 0.0, 0.0])
+            .expect("dimension matches");
+        assert_eq!(
+            ranked.last().expect("cells ranked").score,
+            f32::INFINITY,
+            "the NaN-model cell must be clamped to +inf"
+        );
+        assert!(
+            ranked[..ranked.len() - 1]
+                .iter()
+                .all(|s| s.score.is_finite()),
+            "only the poisoned cell may sit at +inf"
         );
     }
 }
