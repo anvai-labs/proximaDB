@@ -20,19 +20,15 @@ const ROWS: i64 = 60;
 
 #[test]
 fn layer_a_serves_spilled_tables_without_a_row_cap() {
-    std::thread::Builder::new()
-        .name("layer-a-spill-sql".into())
-        .stack_size(16 * 1024 * 1024)
-        .spawn(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("rt")
-                .block_on(body())
-        })
-        .expect("spawn")
-        .join()
-        .expect("panic");
+    // The pgwire stack needs more than a test thread's default stack.
+    let run = || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        rt.expect("rt").block_on(body())
+    };
+    let handle = std::thread::Builder::new().stack_size(16 << 20).spawn(run);
+    handle.expect("spawn").join().expect("panic");
 }
 
 fn cells(messages: &[SimpleQueryMessage], col: usize) -> Vec<Option<String>> {
@@ -117,12 +113,7 @@ async fn body() {
     }
 
     let server = TestPgServer::start().await.expect("server");
-    let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-        .await
-        .expect("connect");
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
+    let client = server.connect().await.expect("connect");
 
     let expected = load(&client).await;
     assert!(
@@ -172,12 +163,7 @@ async fn body() {
     // SAFETY: see above — no server is running.
     unsafe { std::env::set_var("PROXIMADB_NATIVE_TABLE_LAYER_A", "0") };
     let server = TestPgServer::start().await.expect("server 2");
-    let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-        .await
-        .expect("connect 2");
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
+    let client = server.connect().await.expect("connect 2");
     load(&client).await;
     let err = client
         .simple_query(window)
