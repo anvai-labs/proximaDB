@@ -64,8 +64,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use proximadb_records::{
-    ProximaRecord, RecordKey, RecordScan, RecordScanOptions, RecordScanPredicate, RecordStore,
-    RecordStoreResult,
+    ProximaRecord, RecordKey, RecordScan, RecordScanOptions, RecordScanPredicate, RecordScanView,
+    RecordStore, RecordStoreResult,
 };
 use proximadb_storage_common::parquet_write_policy::{ParquetLayoutHints, ParquetWritePolicy};
 use proximadb_storage_common::proxima_arrow::{
@@ -1424,49 +1424,54 @@ impl SpillRecordStorage {
             .with_context(|| format!("spill: decode segment '{path}'"))
     }
 
+    /// The segment list, the resident rows and the tombstones, taken TOGETHER
+    /// under the segments read lock.
+    ///
+    /// `flush` pushes its segment under the write lock and only afterwards
+    /// evicts the rows and clears the tombstones it wrote, so with the lock held
+    /// every row is in a listed segment or in the resident snapshot, and every
+    /// delete is in a listed segment or in the tombstone snapshot. Snapshotting
+    /// the memtable after the (awaited) segment reads instead let a flush land
+    /// in between: its rows were in neither, and its persisted deletes in
+    /// neither — a scan lost rows and could resurrect deleted ones.
+    async fn view(&self) -> Result<RecordScanView> {
+        self.ensure_discovered().await?;
+        let segments = self.segments.read();
+        Ok(RecordScanView {
+            resident: self
+                .memtable
+                .iter()
+                .map(|entry| entry.value().record.clone())
+                .collect(),
+            tombstones: self
+                .tombstones
+                .iter()
+                .map(|oid| oid.key().clone())
+                .collect(),
+            segments: segments.clone(),
+        })
+    }
+
     /// Every live row, newest-wins: segments oldest→newest, then the memtable on
-    /// top, with tombstoned oids removed.
+    /// top, with tombstoned oids removed — [`Self::view`] resolved in memory.
     ///
     /// Known cost, stated rather than hidden: this reads every segment on every
     /// scan. Bounding that is compaction plus a per-segment oid index — slice 2c.
     /// It is acceptable here only because the path is default-OFF.
     async fn merged_records(&self) -> Result<Vec<ProximaRecord>> {
-        self.ensure_discovered().await?;
-        // The segment list, the resident rows and the tombstones are taken
-        // TOGETHER under the segments read lock. `flush` pushes its segment
-        // under the write lock and only afterwards evicts the rows and clears
-        // the tombstones it wrote, so with the lock held every row is in a
-        // listed segment or in the resident snapshot, and every delete is in a
-        // listed segment or in the tombstone snapshot. Snapshotting the
-        // memtable after the (awaited) segment reads instead let a flush land
-        // in between: its rows were in neither, and its persisted deletes in
-        // neither — a scan lost rows and could resurrect deleted ones.
-        let (paths, resident, tombstoned) = {
-            let segments = self.segments.read();
-            (
-                segments.clone(),
-                self.memtable
-                    .iter()
-                    .map(|entry| entry.value().record.clone())
-                    .collect::<Vec<_>>(),
-                self.tombstones
-                    .iter()
-                    .map(|oid| oid.key().clone())
-                    .collect::<Vec<_>>(),
-            )
-        };
+        let view = self.view().await?;
         let mut merged: std::collections::HashMap<String, ProximaRecord> =
             std::collections::HashMap::new();
 
-        for path in &paths {
+        for path in &view.segments {
             for record in self.read_segment(path).await? {
                 merged.insert(record.oid.clone(), record);
             }
         }
-        for record in resident {
+        for record in view.resident {
             merged.insert(record.oid.clone(), record);
         }
-        for oid in &tombstoned {
+        for oid in &view.tombstones {
             merged.remove(oid);
         }
         // Mandate #16a: apply the canonical dead-record predicate at this read
@@ -1933,6 +1938,10 @@ fn is_spill_segment(name: &str) -> bool {
 
 #[async_trait]
 impl RecordScan for SpillRecordStorage {
+    async fn scan_view(&self) -> RecordStoreResult<RecordScanView> {
+        self.view().await
+    }
+
     async fn scan_records(&self, limit: usize) -> RecordStoreResult<Vec<ProximaRecord>> {
         Ok(self
             .merged_records()
@@ -4157,6 +4166,37 @@ mod tests {
 
         // Deleting again reports false — there is no longer a live row.
         assert!(!s.delete_record(&key).await?);
+        Ok(())
+    }
+
+    /// `scan_view` lists each part where a reader merging them itself needs it:
+    /// flushed rows behind a segment path, newer writes resident, and a delete of
+    /// a flushed row as a memory tombstone until a flush persists it — after
+    /// which it is only in the newest segment, as a dead row.
+    #[tokio::test]
+    async fn scan_view_exposes_segments_residents_and_tombstones() -> Result<()> {
+        let s = store(None).await.with_tenant("tenant-a");
+        s.upsert_record(record("a", "open")).await?;
+        s.upsert_record(record("b", "open")).await?;
+        let first = s.flush().await?.expect("segment 1");
+        s.delete_record(&RecordKey::new("a".to_string())).await?;
+        s.upsert_record(record("c", "open")).await?;
+
+        let view = RecordScan::scan_view(&s).await?;
+        assert_eq!(view.segments, vec![first.clone()]);
+        let resident: Vec<&str> = view.resident.iter().map(|r| r.oid.as_str()).collect();
+        assert_eq!(resident, ["c"]);
+        assert_eq!(view.tombstones, ["a"]);
+
+        let second = s.flush().await?.expect("segment 2");
+        let view = RecordScan::scan_view(&s).await?;
+        assert_eq!(view.segments, vec![first, second.clone()], "oldest first");
+        assert!(view.resident.is_empty() && view.tombstones.is_empty());
+        let newest = s.read_segment(&second).await?;
+        assert!(
+            newest.iter().any(|r| r.oid == "a" && r.is_dead(now_ns())),
+            "the delete now lives in the newest segment"
+        );
         Ok(())
     }
 

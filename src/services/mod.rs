@@ -190,6 +190,7 @@ pub mod external_collection;
 pub mod function_store;
 pub mod fusion_service;
 pub mod graph_collection;
+pub mod layer_a_snapshot;
 pub mod mlflow_artifact_s3;
 pub mod mlflow_run_store;
 pub mod oltp_gate;

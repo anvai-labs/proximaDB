@@ -304,6 +304,33 @@ pub trait RecordStore: Send + Sync {
     }
 }
 
+/// A flush-consistent view of a store's state, for readers that merge the
+/// layers themselves instead of asking the store for a merged result (the
+/// streaming Layer A table provider, ADR-097 P3.1).
+///
+/// Consistency is the whole contract: every live row is either in `resident`
+/// or in a listed segment, and every delete is either in `tombstones` or
+/// persisted in a listed segment — none falls between the parts because a
+/// flush landed while the view was taken.
+///
+/// The reader resolves it newest-wins: segments oldest→newest, a later one
+/// shadowing an earlier copy of the same oid; then `resident` on top of every
+/// segment; an oid in `tombstones` is absent whatever the layers hold (a
+/// resident copy too — the unresolvable upsert/delete race of TD-USUB-16 reads
+/// as deleted, as `get_record` serves it). Dead rows (a persisted
+/// tombstone, an expired `valid_to_ns`) can appear in any part and are the
+/// reader's to drop *after* resolution, so a dead newer copy still hides a live
+/// older one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RecordScanView {
+    /// Rows held in memory — the newest copy of their oid.
+    pub resident: Vec<ProximaRecord>,
+    /// Oids deleted after their row reached a segment, not yet persisted.
+    pub tombstones: Vec<String>,
+    /// Durable segment paths, oldest first. Each holds at most one row per oid.
+    pub segments: Vec<String>,
+}
+
 /// Optional scan contract for stores that can expose canonical record ranges.
 ///
 /// Keep this separate from `RecordStore` so point-write stores can implement
@@ -311,6 +338,18 @@ pub trait RecordStore: Send + Sync {
 #[async_trait]
 pub trait RecordScan: Send + Sync {
     async fn scan_records(&self, limit: usize) -> RecordStoreResult<Vec<ProximaRecord>>;
+
+    /// The store's state as a [`RecordScanView`], without reading any segment.
+    ///
+    /// Default: a store with no segments — every current row is resident.
+    /// A segmented store MUST override this, taking all three parts under the
+    /// lock its flush publishes with.
+    async fn scan_view(&self) -> RecordStoreResult<RecordScanView> {
+        Ok(RecordScanView {
+            resident: self.scan_records(usize::MAX).await?,
+            ..RecordScanView::default()
+        })
+    }
 
     async fn scan_records_with_options(
         &self,

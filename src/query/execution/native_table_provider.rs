@@ -100,6 +100,23 @@ pub trait NativeTableSource: Send + Sync {
         identity: PortIdentity<'_>,
         row_cap: usize,
     ) -> anyhow::Result<Option<(CatalogTableSchema, Vec<ProximaRecord>)>>;
+
+    /// A governed, flush-consistent snapshot of `table` for the streaming Layer A
+    /// provider (ADR-097 P3.1): the catalog schema, the partition's unmerged
+    /// layers, and the caller's row access — resolved by the same identity/ABAC
+    /// prelude as [`Self::full_table_records`].
+    ///
+    /// `Ok(None)` when the backing store cannot offer one; the caller keeps the
+    /// materialized path. The default is that answer.
+    async fn layer_a_snapshot(
+        &self,
+        table: &str,
+        tenant: Option<&str>,
+        identity: PortIdentity<'_>,
+    ) -> anyhow::Result<Option<crate::services::layer_a_snapshot::NativeLayerASnapshot>> {
+        let _ = (table, tenant, identity);
+        Ok(None)
+    }
 }
 
 /// Native tables eligible for registration on this query.
