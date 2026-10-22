@@ -1250,8 +1250,44 @@ async fn test_order_by_projection_alias_executes() {
     assert_eq!(ids.value(0), "doc-1");
 }
 
-#[tokio::test]
-async fn test_lateral_join_executes_for_function_backed_correlated_vector_search() {
+/// One embedding document record: a single `embedding` array field,
+/// `version` 1, wall timestamps = `ts` (what these tests key on).
+fn embedding_doc(id: &str, embedding: &[f64], ts: i64) -> DocumentRecord {
+    DocumentRecord {
+        id: id.to_string(),
+        document: SqlObject {
+            fields: HashMap::from([("embedding".to_string(), array_value(embedding))]),
+        },
+        version: 1,
+        created_at_ns: ts,
+        updated_at_ns: ts,
+    }
+}
+
+/// One embedding graph node: a single `Left`/`Right`-style label, an
+/// `embedding` property vector, no typed embedding, timestamps = `ts`.
+fn embedding_node(id: &str, label: &str, embedding: &[f32], ts: i64) -> Node {
+    Node {
+        id: id.to_string(),
+        labels: vec![label.to_string()],
+        properties: HashMap::from([(
+            "embedding".to_string(),
+            PropertyValue {
+                value: Some(property_value::Value::VectorValue(embedding.to_vec())),
+            },
+        )]),
+        embedding: None,
+        created_at_ms: ts,
+        updated_at_ms: ts,
+    }
+}
+
+/// Lateral-join document fixture: the single-hit vector mock (0.91 on
+/// "doc-1") wired with a document store exposing `collections`. Returns the
+/// context and the vector engine handle (tests assert on recorded queries).
+async fn document_lateral_ctx(
+    collections: Vec<(&'static str, Vec<DocumentRecord>)>,
+) -> (FederatedQueryContext, Arc<MockVectorEngine>) {
     let vector_engine = Arc::new(
         MockVectorEngine::new(vec![OptimizedSearchRecord::new("doc-1".to_string(), 0.91)]).await,
     );
@@ -1259,39 +1295,55 @@ async fn test_lateral_join_executes_for_function_backed_correlated_vector_search
         VectorStore::new(VectorStoreConfig::default())
             .with_sst_engine(vector_engine.clone() as Arc<dyn UnifiedStorageFormat>),
     );
-
-    let document_service = Arc::new(MockDocumentService::new(HashMap::from([(
-        "profiles".to_string(),
-        vec![
-            DocumentRecord {
-                id: "profile-1".to_string(),
-                document: SqlObject {
-                    fields: HashMap::from([("embedding".to_string(), array_value(&[0.1, 0.2]))]),
-                },
-                version: 1,
-                created_at_ns: 1,
-                updated_at_ns: 1,
-            },
-            DocumentRecord {
-                id: "profile-2".to_string(),
-                document: SqlObject {
-                    fields: HashMap::from([("embedding".to_string(), array_value(&[0.3, 0.4]))]),
-                },
-                version: 1,
-                created_at_ns: 2,
-                updated_at_ns: 2,
-            },
-        ],
-    )]))) as Arc<dyn DocumentStorageOperations>;
+    let document_service = Arc::new(MockDocumentService::new(
+        collections
+            .into_iter()
+            .map(|(name, records)| (name.to_string(), records))
+            .collect::<HashMap<_, _>>(),
+    )) as Arc<dyn DocumentStorageOperations>;
     let document_store =
         Arc::new(DocumentStore::new(DocumentStoreConfig::default()).with_service(document_service));
-
     let storage = Arc::new(
         MultiModelStorageFacade::new()
             .with_vector_store(vector_store)
             .with_document_store(document_store),
     );
-    let ctx = FederatedQueryContext::new(storage);
+    (FederatedQueryContext::new(storage), vector_engine)
+}
+
+/// Lateral-join graph fixture: the document twin — the same vector mock
+/// wired with a graph store holding `nodes` (tests partition them by
+/// label via GRAPH_QUERY).
+async fn graph_lateral_ctx(nodes: Vec<Node>) -> (FederatedQueryContext, Arc<MockVectorEngine>) {
+    let vector_engine = Arc::new(
+        MockVectorEngine::new(vec![OptimizedSearchRecord::new("doc-1".to_string(), 0.91)]).await,
+    );
+    let vector_store = Arc::new(
+        VectorStore::new(VectorStoreConfig::default())
+            .with_sst_engine(vector_engine.clone() as Arc<dyn UnifiedStorageFormat>),
+    );
+    let graph_store = Arc::new(
+        GraphStore::new(GraphStoreConfig::default())
+            .with_engine(Arc::new(MockGraphEngine::new(nodes)) as Arc<dyn GraphEngine>),
+    );
+    let storage = Arc::new(
+        MultiModelStorageFacade::new()
+            .with_vector_store(vector_store)
+            .with_graph_store(graph_store),
+    );
+    (FederatedQueryContext::new(storage), vector_engine)
+}
+
+#[tokio::test]
+async fn test_lateral_join_executes_for_function_backed_correlated_vector_search() {
+    let (ctx, vector_engine) = document_lateral_ctx(vec![(
+        "profiles",
+        vec![
+            embedding_doc("profile-1", &[0.1, 0.2], 1),
+            embedding_doc("profile-2", &[0.3, 0.4], 2),
+        ],
+    )])
+    .await;
 
     let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
@@ -1321,16 +1373,8 @@ async fn test_lateral_join_executes_for_function_backed_correlated_vector_search
 
 #[tokio::test]
 async fn test_lateral_join_executes_for_nested_document_vector_path() {
-    let vector_engine = Arc::new(
-        MockVectorEngine::new(vec![OptimizedSearchRecord::new("doc-1".to_string(), 0.91)]).await,
-    );
-    let vector_store = Arc::new(
-        VectorStore::new(VectorStoreConfig::default())
-            .with_sst_engine(vector_engine.clone() as Arc<dyn UnifiedStorageFormat>),
-    );
-
-    let document_service = Arc::new(MockDocumentService::new(HashMap::from([(
-        "profiles".to_string(),
+    let (ctx, vector_engine) = document_lateral_ctx(vec![(
+        "profiles",
         vec![
             DocumentRecord {
                 id: "profile-1".to_string(),
@@ -1357,16 +1401,8 @@ async fn test_lateral_join_executes_for_nested_document_vector_path() {
                 updated_at_ns: 2,
             },
         ],
-    )]))) as Arc<dyn DocumentStorageOperations>;
-    let document_store =
-        Arc::new(DocumentStore::new(DocumentStoreConfig::default()).with_service(document_service));
-
-    let storage = Arc::new(
-        MultiModelStorageFacade::new()
-            .with_vector_store(vector_store)
-            .with_document_store(document_store),
-    );
-    let ctx = FederatedQueryContext::new(storage);
+    )])
+    .await;
 
     let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
@@ -1400,53 +1436,11 @@ async fn test_lateral_join_executes_for_nested_document_vector_path() {
 
 #[tokio::test]
 async fn test_lateral_join_executes_for_graph_vector_property_path() {
-    let vector_engine = Arc::new(
-        MockVectorEngine::new(vec![OptimizedSearchRecord::new("doc-1".to_string(), 0.91)]).await,
-    );
-    let vector_store = Arc::new(
-        VectorStore::new(VectorStoreConfig::default())
-            .with_sst_engine(vector_engine.clone() as Arc<dyn UnifiedStorageFormat>),
-    );
-    let graph_store = Arc::new(
-        GraphStore::new(GraphStoreConfig::default()).with_engine(Arc::new(MockGraphEngine::new(
-            vec![
-                Node {
-                    id: "node-1".to_string(),
-                    labels: vec!["Entity".to_string()],
-                    properties: HashMap::from([(
-                        "embedding".to_string(),
-                        PropertyValue {
-                            value: Some(property_value::Value::VectorValue(vec![0.9, 0.1])),
-                        },
-                    )]),
-                    embedding: None,
-                    created_at_ms: 1,
-                    updated_at_ms: 1,
-                },
-                Node {
-                    id: "node-2".to_string(),
-                    labels: vec!["Entity".to_string()],
-                    properties: HashMap::from([(
-                        "embedding".to_string(),
-                        PropertyValue {
-                            value: Some(property_value::Value::VectorValue(vec![0.2, 0.8])),
-                        },
-                    )]),
-                    embedding: None,
-                    created_at_ms: 2,
-                    updated_at_ms: 2,
-                },
-            ],
-        ))
-            as Arc<dyn GraphEngine>),
-    );
-
-    let storage = Arc::new(
-        MultiModelStorageFacade::new()
-            .with_vector_store(vector_store)
-            .with_graph_store(graph_store),
-    );
-    let ctx = FederatedQueryContext::new(storage);
+    let (ctx, vector_engine) = graph_lateral_ctx(vec![
+        embedding_node("node-1", "Entity", &[0.9, 0.1], 1),
+        embedding_node("node-2", "Entity", &[0.2, 0.8], 2),
+    ])
+    .await;
 
     let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
@@ -1474,26 +1468,10 @@ async fn test_lateral_join_executes_for_graph_vector_property_path() {
 
 #[tokio::test]
 async fn test_lateral_join_skips_document_rows_without_correlated_vector() {
-    let vector_engine = Arc::new(
-        MockVectorEngine::new(vec![OptimizedSearchRecord::new("doc-1".to_string(), 0.91)]).await,
-    );
-    let vector_store = Arc::new(
-        VectorStore::new(VectorStoreConfig::default())
-            .with_sst_engine(vector_engine.clone() as Arc<dyn UnifiedStorageFormat>),
-    );
-
-    let document_service = Arc::new(MockDocumentService::new(HashMap::from([(
-        "profiles".to_string(),
+    let (ctx, vector_engine) = document_lateral_ctx(vec![(
+        "profiles",
         vec![
-            DocumentRecord {
-                id: "profile-1".to_string(),
-                document: SqlObject {
-                    fields: HashMap::from([("embedding".to_string(), array_value(&[0.1, 0.2]))]),
-                },
-                version: 1,
-                created_at_ns: 1,
-                updated_at_ns: 1,
-            },
+            embedding_doc("profile-1", &[0.1, 0.2], 1),
             DocumentRecord {
                 id: "profile-2".to_string(),
                 document: sql_object(&[("title", "No embedding")]),
@@ -1502,16 +1480,8 @@ async fn test_lateral_join_skips_document_rows_without_correlated_vector() {
                 updated_at_ns: 2,
             },
         ],
-    )]))) as Arc<dyn DocumentStorageOperations>;
-    let document_store =
-        Arc::new(DocumentStore::new(DocumentStoreConfig::default()).with_service(document_service));
-
-    let storage = Arc::new(
-        MultiModelStorageFacade::new()
-            .with_vector_store(vector_store)
-            .with_document_store(document_store),
-    );
-    let ctx = FederatedQueryContext::new(storage);
+    )])
+    .await;
 
     let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
@@ -1526,55 +1496,25 @@ async fn test_lateral_join_skips_document_rows_without_correlated_vector() {
 
 #[tokio::test]
 async fn test_lateral_join_skips_graph_rows_without_correlated_vector_property() {
-    let vector_engine = Arc::new(
-        MockVectorEngine::new(vec![OptimizedSearchRecord::new("doc-1".to_string(), 0.91)]).await,
-    );
-    let vector_store = Arc::new(
-        VectorStore::new(VectorStoreConfig::default())
-            .with_sst_engine(vector_engine.clone() as Arc<dyn UnifiedStorageFormat>),
-    );
-    let graph_store = Arc::new(
-        GraphStore::new(GraphStoreConfig::default()).with_engine(Arc::new(MockGraphEngine::new(
-            vec![
-                Node {
-                    id: "node-1".to_string(),
-                    labels: vec!["Entity".to_string()],
-                    properties: HashMap::from([(
-                        "embedding".to_string(),
-                        PropertyValue {
-                            value: Some(property_value::Value::VectorValue(vec![0.9, 0.1])),
-                        },
-                    )]),
-                    embedding: None,
-                    created_at_ms: 1,
-                    updated_at_ms: 1,
+    let (ctx, vector_engine) = graph_lateral_ctx(vec![
+        embedding_node("node-1", "Entity", &[0.9, 0.1], 1),
+        Node {
+            id: "node-2".to_string(),
+            labels: vec!["Entity".to_string()],
+            properties: HashMap::from([(
+                "title".to_string(),
+                PropertyValue {
+                    value: Some(property_value::Value::StringValue(
+                        "No embedding".to_string(),
+                    )),
                 },
-                Node {
-                    id: "node-2".to_string(),
-                    labels: vec!["Entity".to_string()],
-                    properties: HashMap::from([(
-                        "title".to_string(),
-                        PropertyValue {
-                            value: Some(property_value::Value::StringValue(
-                                "No embedding".to_string(),
-                            )),
-                        },
-                    )]),
-                    embedding: None,
-                    created_at_ms: 2,
-                    updated_at_ms: 2,
-                },
-            ],
-        ))
-            as Arc<dyn GraphEngine>),
-    );
-
-    let storage = Arc::new(
-        MultiModelStorageFacade::new()
-            .with_vector_store(vector_store)
-            .with_graph_store(graph_store),
-    );
-    let ctx = FederatedQueryContext::new(storage);
+            )]),
+            embedding: None,
+            created_at_ms: 2,
+            updated_at_ms: 2,
+        },
+    ])
+    .await;
 
     let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
@@ -1589,16 +1529,8 @@ async fn test_lateral_join_skips_graph_rows_without_correlated_vector_property()
 
 #[tokio::test]
 async fn test_lateral_join_rejects_malformed_document_correlated_vector() {
-    let vector_engine = Arc::new(
-        MockVectorEngine::new(vec![OptimizedSearchRecord::new("doc-1".to_string(), 0.91)]).await,
-    );
-    let vector_store = Arc::new(
-        VectorStore::new(VectorStoreConfig::default())
-            .with_sst_engine(vector_engine as Arc<dyn UnifiedStorageFormat>),
-    );
-
-    let document_service = Arc::new(MockDocumentService::new(HashMap::from([(
-        "profiles".to_string(),
+    let (ctx, _vector_engine) = document_lateral_ctx(vec![(
+        "profiles",
         vec![DocumentRecord {
             id: "profile-1".to_string(),
             document: sql_object(&[("embedding", "not-a-vector")]),
@@ -1606,16 +1538,8 @@ async fn test_lateral_join_rejects_malformed_document_correlated_vector() {
             created_at_ns: 1,
             updated_at_ns: 1,
         }],
-    )]))) as Arc<dyn DocumentStorageOperations>;
-    let document_store =
-        Arc::new(DocumentStore::new(DocumentStoreConfig::default()).with_service(document_service));
-
-    let storage = Arc::new(
-        MultiModelStorageFacade::new()
-            .with_vector_store(vector_store)
-            .with_document_store(document_store),
-    );
-    let ctx = FederatedQueryContext::new(storage);
+    )])
+    .await;
 
     let error = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
@@ -1631,29 +1555,13 @@ async fn test_lateral_join_rejects_malformed_document_correlated_vector() {
 
 #[tokio::test]
 async fn test_lateral_join_uses_right_document_alias_in_multi_document_outer_join() {
-    let vector_engine = Arc::new(
-        MockVectorEngine::new(vec![OptimizedSearchRecord::new("doc-1".to_string(), 0.91)]).await,
-    );
-    let vector_store = Arc::new(
-        VectorStore::new(VectorStoreConfig::default())
-            .with_sst_engine(vector_engine.clone() as Arc<dyn UnifiedStorageFormat>),
-    );
-
-    let document_service = Arc::new(MockDocumentService::new(HashMap::from([
+    let (ctx, vector_engine) = document_lateral_ctx(vec![
         (
-            "left_profiles".to_string(),
-            vec![DocumentRecord {
-                id: "left-1".to_string(),
-                document: SqlObject {
-                    fields: HashMap::from([("embedding".to_string(), array_value(&[9.0, 8.0]))]),
-                },
-                version: 1,
-                created_at_ns: 1,
-                updated_at_ns: 1,
-            }],
+            "left_profiles",
+            vec![embedding_doc("left-1", &[9.0, 8.0], 1)],
         ),
         (
-            "right_profiles".to_string(),
+            "right_profiles",
             vec![
                 DocumentRecord {
                     id: "right-1".to_string(),
@@ -1681,16 +1589,8 @@ async fn test_lateral_join_uses_right_document_alias_in_multi_document_outer_joi
                 },
             ],
         ),
-    ]))) as Arc<dyn DocumentStorageOperations>;
-    let document_store =
-        Arc::new(DocumentStore::new(DocumentStoreConfig::default()).with_service(document_service));
-
-    let storage = Arc::new(
-        MultiModelStorageFacade::new()
-            .with_vector_store(vector_store)
-            .with_document_store(document_store),
-    );
-    let ctx = FederatedQueryContext::new(storage);
+    ])
+    .await;
 
     let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
@@ -1708,29 +1608,13 @@ async fn test_lateral_join_uses_right_document_alias_in_multi_document_outer_joi
 
 #[tokio::test]
 async fn test_lateral_join_treats_document_aliases_case_insensitively() {
-    let vector_engine = Arc::new(
-        MockVectorEngine::new(vec![OptimizedSearchRecord::new("doc-1".to_string(), 0.91)]).await,
-    );
-    let vector_store = Arc::new(
-        VectorStore::new(VectorStoreConfig::default())
-            .with_sst_engine(vector_engine.clone() as Arc<dyn UnifiedStorageFormat>),
-    );
-
-    let document_service = Arc::new(MockDocumentService::new(HashMap::from([
+    let (ctx, vector_engine) = document_lateral_ctx(vec![
         (
-            "left_profiles".to_string(),
-            vec![DocumentRecord {
-                id: "left-1".to_string(),
-                document: SqlObject {
-                    fields: HashMap::from([("embedding".to_string(), array_value(&[9.0, 8.0]))]),
-                },
-                version: 1,
-                created_at_ns: 1,
-                updated_at_ns: 1,
-            }],
+            "left_profiles",
+            vec![embedding_doc("left-1", &[9.0, 8.0], 1)],
         ),
         (
-            "right_profiles".to_string(),
+            "right_profiles",
             vec![
                 DocumentRecord {
                     id: "right-1".to_string(),
@@ -1758,16 +1642,8 @@ async fn test_lateral_join_treats_document_aliases_case_insensitively() {
                 },
             ],
         ),
-    ]))) as Arc<dyn DocumentStorageOperations>;
-    let document_store =
-        Arc::new(DocumentStore::new(DocumentStoreConfig::default()).with_service(document_service));
-
-    let storage = Arc::new(
-        MultiModelStorageFacade::new()
-            .with_vector_store(vector_store)
-            .with_document_store(document_store),
-    );
-    let ctx = FederatedQueryContext::new(storage);
+    ])
+    .await;
 
     let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
@@ -1785,29 +1661,13 @@ async fn test_lateral_join_treats_document_aliases_case_insensitively() {
 
 #[tokio::test]
 async fn test_lateral_join_supports_quoted_document_aliases() {
-    let vector_engine = Arc::new(
-        MockVectorEngine::new(vec![OptimizedSearchRecord::new("doc-1".to_string(), 0.91)]).await,
-    );
-    let vector_store = Arc::new(
-        VectorStore::new(VectorStoreConfig::default())
-            .with_sst_engine(vector_engine.clone() as Arc<dyn UnifiedStorageFormat>),
-    );
-
-    let document_service = Arc::new(MockDocumentService::new(HashMap::from([
+    let (ctx, vector_engine) = document_lateral_ctx(vec![
         (
-            "left_profiles".to_string(),
-            vec![DocumentRecord {
-                id: "left-1".to_string(),
-                document: SqlObject {
-                    fields: HashMap::from([("embedding".to_string(), array_value(&[9.0, 8.0]))]),
-                },
-                version: 1,
-                created_at_ns: 1,
-                updated_at_ns: 1,
-            }],
+            "left_profiles",
+            vec![embedding_doc("left-1", &[9.0, 8.0], 1)],
         ),
         (
-            "right_profiles".to_string(),
+            "right_profiles",
             vec![
                 DocumentRecord {
                     id: "right-1".to_string(),
@@ -1835,16 +1695,8 @@ async fn test_lateral_join_supports_quoted_document_aliases() {
                 },
             ],
         ),
-    ]))) as Arc<dyn DocumentStorageOperations>;
-    let document_store =
-        Arc::new(DocumentStore::new(DocumentStoreConfig::default()).with_service(document_service));
-
-    let storage = Arc::new(
-        MultiModelStorageFacade::new()
-            .with_vector_store(vector_store)
-            .with_document_store(document_store),
-    );
-    let ctx = FederatedQueryContext::new(storage);
+    ])
+    .await;
 
     let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
@@ -1862,29 +1714,13 @@ async fn test_lateral_join_supports_quoted_document_aliases() {
 
 #[tokio::test]
 async fn test_lateral_join_supports_quoted_document_aliases_with_dots() {
-    let vector_engine = Arc::new(
-        MockVectorEngine::new(vec![OptimizedSearchRecord::new("doc-1".to_string(), 0.91)]).await,
-    );
-    let vector_store = Arc::new(
-        VectorStore::new(VectorStoreConfig::default())
-            .with_sst_engine(vector_engine.clone() as Arc<dyn UnifiedStorageFormat>),
-    );
-
-    let document_service = Arc::new(MockDocumentService::new(HashMap::from([
+    let (ctx, vector_engine) = document_lateral_ctx(vec![
         (
-            "left_profiles".to_string(),
-            vec![DocumentRecord {
-                id: "left-1".to_string(),
-                document: SqlObject {
-                    fields: HashMap::from([("embedding".to_string(), array_value(&[9.0, 8.0]))]),
-                },
-                version: 1,
-                created_at_ns: 1,
-                updated_at_ns: 1,
-            }],
+            "left_profiles",
+            vec![embedding_doc("left-1", &[9.0, 8.0], 1)],
         ),
         (
-            "right_profiles".to_string(),
+            "right_profiles",
             vec![
                 DocumentRecord {
                     id: "right-1".to_string(),
@@ -1912,16 +1748,8 @@ async fn test_lateral_join_supports_quoted_document_aliases_with_dots() {
                 },
             ],
         ),
-    ]))) as Arc<dyn DocumentStorageOperations>;
-    let document_store =
-        Arc::new(DocumentStore::new(DocumentStoreConfig::default()).with_service(document_service));
-
-    let storage = Arc::new(
-        MultiModelStorageFacade::new()
-            .with_vector_store(vector_store)
-            .with_document_store(document_store),
-    );
-    let ctx = FederatedQueryContext::new(storage);
+    ])
+    .await;
 
     let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
@@ -1939,49 +1767,17 @@ async fn test_lateral_join_supports_quoted_document_aliases_with_dots() {
 
 #[tokio::test]
 async fn test_lateral_join_rejects_mismatched_quoted_document_alias_case() {
-    let vector_engine = Arc::new(
-        MockVectorEngine::new(vec![OptimizedSearchRecord::new("doc-1".to_string(), 0.91)]).await,
-    );
-    let vector_store = Arc::new(
-        VectorStore::new(VectorStoreConfig::default())
-            .with_sst_engine(vector_engine.clone() as Arc<dyn UnifiedStorageFormat>),
-    );
-
-    let document_service = Arc::new(MockDocumentService::new(HashMap::from([
+    let (ctx, _vector_engine) = document_lateral_ctx(vec![
         (
-            "left_profiles".to_string(),
-            vec![DocumentRecord {
-                id: "left-1".to_string(),
-                document: SqlObject {
-                    fields: HashMap::from([("embedding".to_string(), array_value(&[9.0, 8.0]))]),
-                },
-                version: 1,
-                created_at_ns: 1,
-                updated_at_ns: 1,
-            }],
+            "left_profiles",
+            vec![embedding_doc("left-1", &[9.0, 8.0], 1)],
         ),
         (
-            "right_profiles".to_string(),
-            vec![DocumentRecord {
-                id: "right-1".to_string(),
-                document: SqlObject {
-                    fields: HashMap::from([("embedding".to_string(), array_value(&[0.1, 0.2]))]),
-                },
-                version: 1,
-                created_at_ns: 2,
-                updated_at_ns: 2,
-            }],
+            "right_profiles",
+            vec![embedding_doc("right-1", &[0.1, 0.2], 2)],
         ),
-    ]))) as Arc<dyn DocumentStorageOperations>;
-    let document_store =
-        Arc::new(DocumentStore::new(DocumentStoreConfig::default()).with_service(document_service));
-
-    let storage = Arc::new(
-        MultiModelStorageFacade::new()
-            .with_vector_store(vector_store)
-            .with_document_store(document_store),
-    );
-    let ctx = FederatedQueryContext::new(storage);
+    ])
+    .await;
 
     let error = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
@@ -1997,66 +1793,12 @@ async fn test_lateral_join_rejects_mismatched_quoted_document_alias_case() {
 
 #[tokio::test]
 async fn test_lateral_join_uses_right_graph_alias_in_multi_graph_outer_join() {
-    let vector_engine = Arc::new(
-        MockVectorEngine::new(vec![OptimizedSearchRecord::new("doc-1".to_string(), 0.91)]).await,
-    );
-    let vector_store = Arc::new(
-        VectorStore::new(VectorStoreConfig::default())
-            .with_sst_engine(vector_engine.clone() as Arc<dyn UnifiedStorageFormat>),
-    );
-    let graph_store = Arc::new(
-        GraphStore::new(GraphStoreConfig::default()).with_engine(Arc::new(MockGraphEngine::new(
-            vec![
-                Node {
-                    id: "left-1".to_string(),
-                    labels: vec!["Left".to_string()],
-                    properties: HashMap::from([(
-                        "embedding".to_string(),
-                        PropertyValue {
-                            value: Some(property_value::Value::VectorValue(vec![9.0, 8.0])),
-                        },
-                    )]),
-                    embedding: None,
-                    created_at_ms: 1,
-                    updated_at_ms: 1,
-                },
-                Node {
-                    id: "right-1".to_string(),
-                    labels: vec!["Right".to_string()],
-                    properties: HashMap::from([(
-                        "embedding".to_string(),
-                        PropertyValue {
-                            value: Some(property_value::Value::VectorValue(vec![0.1, 0.2])),
-                        },
-                    )]),
-                    embedding: None,
-                    created_at_ms: 2,
-                    updated_at_ms: 2,
-                },
-                Node {
-                    id: "right-2".to_string(),
-                    labels: vec!["Right".to_string()],
-                    properties: HashMap::from([(
-                        "embedding".to_string(),
-                        PropertyValue {
-                            value: Some(property_value::Value::VectorValue(vec![0.3, 0.4])),
-                        },
-                    )]),
-                    embedding: None,
-                    created_at_ms: 3,
-                    updated_at_ms: 3,
-                },
-            ],
-        ))
-            as Arc<dyn GraphEngine>),
-    );
-
-    let storage = Arc::new(
-        MultiModelStorageFacade::new()
-            .with_vector_store(vector_store)
-            .with_graph_store(graph_store),
-    );
-    let ctx = FederatedQueryContext::new(storage);
+    let (ctx, vector_engine) = graph_lateral_ctx(vec![
+        embedding_node("left-1", "Left", &[9.0, 8.0], 1),
+        embedding_node("right-1", "Right", &[0.1, 0.2], 2),
+        embedding_node("right-2", "Right", &[0.3, 0.4], 3),
+    ])
+    .await;
 
     let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
@@ -2074,66 +1816,12 @@ async fn test_lateral_join_uses_right_graph_alias_in_multi_graph_outer_join() {
 
 #[tokio::test]
 async fn test_lateral_join_supports_quoted_graph_aliases() {
-    let vector_engine = Arc::new(
-        MockVectorEngine::new(vec![OptimizedSearchRecord::new("doc-1".to_string(), 0.91)]).await,
-    );
-    let vector_store = Arc::new(
-        VectorStore::new(VectorStoreConfig::default())
-            .with_sst_engine(vector_engine.clone() as Arc<dyn UnifiedStorageFormat>),
-    );
-    let graph_store = Arc::new(
-        GraphStore::new(GraphStoreConfig::default()).with_engine(Arc::new(MockGraphEngine::new(
-            vec![
-                Node {
-                    id: "left-1".to_string(),
-                    labels: vec!["Left".to_string()],
-                    properties: HashMap::from([(
-                        "embedding".to_string(),
-                        PropertyValue {
-                            value: Some(property_value::Value::VectorValue(vec![9.0, 8.0])),
-                        },
-                    )]),
-                    embedding: None,
-                    created_at_ms: 1,
-                    updated_at_ms: 1,
-                },
-                Node {
-                    id: "right-1".to_string(),
-                    labels: vec!["Right".to_string()],
-                    properties: HashMap::from([(
-                        "embedding".to_string(),
-                        PropertyValue {
-                            value: Some(property_value::Value::VectorValue(vec![0.1, 0.2])),
-                        },
-                    )]),
-                    embedding: None,
-                    created_at_ms: 2,
-                    updated_at_ms: 2,
-                },
-                Node {
-                    id: "right-2".to_string(),
-                    labels: vec!["Right".to_string()],
-                    properties: HashMap::from([(
-                        "embedding".to_string(),
-                        PropertyValue {
-                            value: Some(property_value::Value::VectorValue(vec![0.3, 0.4])),
-                        },
-                    )]),
-                    embedding: None,
-                    created_at_ms: 3,
-                    updated_at_ms: 3,
-                },
-            ],
-        ))
-            as Arc<dyn GraphEngine>),
-    );
-
-    let storage = Arc::new(
-        MultiModelStorageFacade::new()
-            .with_vector_store(vector_store)
-            .with_graph_store(graph_store),
-    );
-    let ctx = FederatedQueryContext::new(storage);
+    let (ctx, vector_engine) = graph_lateral_ctx(vec![
+        embedding_node("left-1", "Left", &[9.0, 8.0], 1),
+        embedding_node("right-1", "Right", &[0.1, 0.2], 2),
+        embedding_node("right-2", "Right", &[0.3, 0.4], 3),
+    ])
+    .await;
 
     let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
@@ -2151,66 +1839,12 @@ async fn test_lateral_join_supports_quoted_graph_aliases() {
 
 #[tokio::test]
 async fn test_lateral_join_supports_quoted_graph_aliases_with_dots() {
-    let vector_engine = Arc::new(
-        MockVectorEngine::new(vec![OptimizedSearchRecord::new("doc-1".to_string(), 0.91)]).await,
-    );
-    let vector_store = Arc::new(
-        VectorStore::new(VectorStoreConfig::default())
-            .with_sst_engine(vector_engine.clone() as Arc<dyn UnifiedStorageFormat>),
-    );
-    let graph_store = Arc::new(
-        GraphStore::new(GraphStoreConfig::default()).with_engine(Arc::new(MockGraphEngine::new(
-            vec![
-                Node {
-                    id: "left-1".to_string(),
-                    labels: vec!["Left".to_string()],
-                    properties: HashMap::from([(
-                        "embedding".to_string(),
-                        PropertyValue {
-                            value: Some(property_value::Value::VectorValue(vec![9.0, 8.0])),
-                        },
-                    )]),
-                    embedding: None,
-                    created_at_ms: 1,
-                    updated_at_ms: 1,
-                },
-                Node {
-                    id: "right-1".to_string(),
-                    labels: vec!["Right".to_string()],
-                    properties: HashMap::from([(
-                        "embedding".to_string(),
-                        PropertyValue {
-                            value: Some(property_value::Value::VectorValue(vec![0.1, 0.2])),
-                        },
-                    )]),
-                    embedding: None,
-                    created_at_ms: 2,
-                    updated_at_ms: 2,
-                },
-                Node {
-                    id: "right-2".to_string(),
-                    labels: vec!["Right".to_string()],
-                    properties: HashMap::from([(
-                        "embedding".to_string(),
-                        PropertyValue {
-                            value: Some(property_value::Value::VectorValue(vec![0.3, 0.4])),
-                        },
-                    )]),
-                    embedding: None,
-                    created_at_ms: 3,
-                    updated_at_ms: 3,
-                },
-            ],
-        ))
-            as Arc<dyn GraphEngine>),
-    );
-
-    let storage = Arc::new(
-        MultiModelStorageFacade::new()
-            .with_vector_store(vector_store)
-            .with_graph_store(graph_store),
-    );
-    let ctx = FederatedQueryContext::new(storage);
+    let (ctx, vector_engine) = graph_lateral_ctx(vec![
+        embedding_node("left-1", "Left", &[9.0, 8.0], 1),
+        embedding_node("right-1", "Right", &[0.1, 0.2], 2),
+        embedding_node("right-2", "Right", &[0.3, 0.4], 3),
+    ])
+    .await;
 
     let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
@@ -2228,53 +1862,11 @@ async fn test_lateral_join_supports_quoted_graph_aliases_with_dots() {
 
 #[tokio::test]
 async fn test_lateral_join_rejects_mismatched_quoted_graph_alias_case() {
-    let vector_engine = Arc::new(
-        MockVectorEngine::new(vec![OptimizedSearchRecord::new("doc-1".to_string(), 0.91)]).await,
-    );
-    let vector_store = Arc::new(
-        VectorStore::new(VectorStoreConfig::default())
-            .with_sst_engine(vector_engine.clone() as Arc<dyn UnifiedStorageFormat>),
-    );
-    let graph_store = Arc::new(
-        GraphStore::new(GraphStoreConfig::default()).with_engine(Arc::new(MockGraphEngine::new(
-            vec![
-                Node {
-                    id: "left-1".to_string(),
-                    labels: vec!["Left".to_string()],
-                    properties: HashMap::from([(
-                        "embedding".to_string(),
-                        PropertyValue {
-                            value: Some(property_value::Value::VectorValue(vec![9.0, 8.0])),
-                        },
-                    )]),
-                    embedding: None,
-                    created_at_ms: 1,
-                    updated_at_ms: 1,
-                },
-                Node {
-                    id: "right-1".to_string(),
-                    labels: vec!["Right".to_string()],
-                    properties: HashMap::from([(
-                        "embedding".to_string(),
-                        PropertyValue {
-                            value: Some(property_value::Value::VectorValue(vec![0.1, 0.2])),
-                        },
-                    )]),
-                    embedding: None,
-                    created_at_ms: 2,
-                    updated_at_ms: 2,
-                },
-            ],
-        ))
-            as Arc<dyn GraphEngine>),
-    );
-
-    let storage = Arc::new(
-        MultiModelStorageFacade::new()
-            .with_vector_store(vector_store)
-            .with_graph_store(graph_store),
-    );
-    let ctx = FederatedQueryContext::new(storage);
+    let (ctx, _vector_engine) = graph_lateral_ctx(vec![
+        embedding_node("left-1", "Left", &[9.0, 8.0], 1),
+        embedding_node("right-1", "Right", &[0.1, 0.2], 2),
+    ])
+    .await;
 
     let error = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
@@ -2290,66 +1882,12 @@ async fn test_lateral_join_rejects_mismatched_quoted_graph_alias_case() {
 
 #[tokio::test]
 async fn test_lateral_join_treats_graph_aliases_case_insensitively() {
-    let vector_engine = Arc::new(
-        MockVectorEngine::new(vec![OptimizedSearchRecord::new("doc-1".to_string(), 0.91)]).await,
-    );
-    let vector_store = Arc::new(
-        VectorStore::new(VectorStoreConfig::default())
-            .with_sst_engine(vector_engine.clone() as Arc<dyn UnifiedStorageFormat>),
-    );
-    let graph_store = Arc::new(
-        GraphStore::new(GraphStoreConfig::default()).with_engine(Arc::new(MockGraphEngine::new(
-            vec![
-                Node {
-                    id: "left-1".to_string(),
-                    labels: vec!["Left".to_string()],
-                    properties: HashMap::from([(
-                        "embedding".to_string(),
-                        PropertyValue {
-                            value: Some(property_value::Value::VectorValue(vec![9.0, 8.0])),
-                        },
-                    )]),
-                    embedding: None,
-                    created_at_ms: 1,
-                    updated_at_ms: 1,
-                },
-                Node {
-                    id: "right-1".to_string(),
-                    labels: vec!["Right".to_string()],
-                    properties: HashMap::from([(
-                        "embedding".to_string(),
-                        PropertyValue {
-                            value: Some(property_value::Value::VectorValue(vec![0.1, 0.2])),
-                        },
-                    )]),
-                    embedding: None,
-                    created_at_ms: 2,
-                    updated_at_ms: 2,
-                },
-                Node {
-                    id: "right-2".to_string(),
-                    labels: vec!["Right".to_string()],
-                    properties: HashMap::from([(
-                        "embedding".to_string(),
-                        PropertyValue {
-                            value: Some(property_value::Value::VectorValue(vec![0.3, 0.4])),
-                        },
-                    )]),
-                    embedding: None,
-                    created_at_ms: 3,
-                    updated_at_ms: 3,
-                },
-            ],
-        ))
-            as Arc<dyn GraphEngine>),
-    );
-
-    let storage = Arc::new(
-        MultiModelStorageFacade::new()
-            .with_vector_store(vector_store)
-            .with_graph_store(graph_store),
-    );
-    let ctx = FederatedQueryContext::new(storage);
+    let (ctx, vector_engine) = graph_lateral_ctx(vec![
+        embedding_node("left-1", "Left", &[9.0, 8.0], 1),
+        embedding_node("right-1", "Right", &[0.1, 0.2], 2),
+        embedding_node("right-2", "Right", &[0.3, 0.4], 3),
+    ])
+    .await;
 
     let result = crate::query::request_scope::with_internal_scope("test", ctx
             .execute_uncached(
