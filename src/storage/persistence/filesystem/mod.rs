@@ -173,6 +173,7 @@ use url::Url;
 pub mod atomic_strategy;
 // intelligent_filesystem removed - using UnifiedCachingFilesystem instead
 pub mod local;
+pub mod parquet_async_reader;
 // Cloud object-store backends, built on the official SDKs (which handle signing,
 // custom endpoints, and path-style — incl. MinIO/Azurite/fake-gcs emulators) and
 // gated behind their features. These replace the deleted legacy s3.rs/azure.rs/
