@@ -157,6 +157,8 @@ the emergency off) · *config-mirror* (env overrides a config field) ·
 | `PROXIMADB_LEASE_MANIFEST_RETENTION` | Master switch for the lease-manifest prune loop | ON (kill-switch; set `0` to disable) | kill-switch; — | `src/network/shared_services.rs`
 | `PROXIMADB_MATERIALIZE_OBJECT_ID_PATHS` | Keys materialized table object path by stable object_id instead of table name | OFF | opt-in; ADR-031 | `src/services/dml/mod.rs`
 | `PROXIMADB_MATERIALIZE_ROW_GROUP_ROWS` | Warehouse Parquet writer max row-group row count | 65,536 | opt-in tuning; TD-OLAPFMT-2 | `crates/storage/proximadb-storage-common/src/parquet_write_policy.rs`
+| `PROXIMADB_MATERIALIZE_TARGET_FILE_BYTES` | Multi-part warehouse Parquet writer: start a new data file once the current one reaches about this many bytes | 268,435,456 (256 MiB) | opt-in tuning; TD-OLAPFMT-3 | `crates/storage/proximadb-storage-common/src/parquet_write_policy.rs`
+| `PROXIMADB_MATERIALIZE_TARGET_FILE_ROWS` | Multi-part warehouse Parquet writer: start a new data file once the current one holds this many rows (exact) | 16,777,216 | opt-in tuning; TD-OLAPFMT-3 | `crates/storage/proximadb-storage-common/src/parquet_write_policy.rs`
 | `PROXIMADB_MEMORY_POOL_SIZE_MB` | Global shared memory-pool size (MB) | smart default from system memory | opt-in tuning; — | `src/storage/engines/core/ops/performance_optimization.rs`
 | `PROXIMADB_METRICS_PORT` | **Not read by any code** (set only as a Dockerfile `ENV`); it was meant to override the Prometheus metrics port. Set the port in the config file. | config-file value | config-mirror; — | deploy/docker/Dockerfile
 | `PROXIMADB_MODE` | Container-plumbing deployment-mode selector. | config-file value | config-mirror; — | deploy/docker/Dockerfile

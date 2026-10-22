@@ -36,6 +36,13 @@ use std::collections::HashSet;
 pub const DEFAULT_ROW_GROUP_ROWS: usize = 65_536;
 /// Default rows per data page — the page-index skip granularity.
 pub const DEFAULT_DATA_PAGE_ROWS: usize = 8_192;
+/// Default row cap per data file of a multi-part publication
+/// (see [`ParquetWritePolicy::target_file_rows`]).
+pub const DEFAULT_TARGET_FILE_ROWS: usize = 16 * 1024 * 1024;
+/// Default byte target per data file of a multi-part publication — the Iceberg
+/// `write.target-file-size-bytes` order of magnitude, so parts stay parallel
+/// read units without degenerating into many small objects.
+pub const DEFAULT_TARGET_FILE_BYTES: usize = 256 * 1024 * 1024;
 /// Default Bloom false-positive probability (1%, ≈9.6 bits per distinct value).
 pub const DEFAULT_BLOOM_FPP: f64 = 0.01;
 
@@ -80,6 +87,15 @@ pub struct ParquetWritePolicy {
     /// `PROXIMADB_PARQUET_WRITE_SORTING_DISABLE=1` turns it off).
     pub declare_sorting: bool,
     pub bloom: BloomPolicy,
+    /// A multi-part writer starts a new data file once the current one holds this
+    /// many rows (`PROXIMADB_MATERIALIZE_TARGET_FILE_ROWS`). Exact: a batch that
+    /// crosses the cap is split.
+    pub target_file_rows: usize,
+    /// A multi-part writer starts a new data file once the current one reaches
+    /// about this many bytes, encoded plus buffered
+    /// (`PROXIMADB_MATERIALIZE_TARGET_FILE_BYTES`). Checked between batches, so a
+    /// part may overshoot by one batch.
+    pub target_file_bytes: usize,
 }
 
 impl Default for ParquetWritePolicy {
@@ -95,6 +111,8 @@ impl Default for ParquetWritePolicy {
                 columns: None,
                 min_rows: DEFAULT_DATA_PAGE_ROWS,
             },
+            target_file_rows: DEFAULT_TARGET_FILE_ROWS,
+            target_file_bytes: DEFAULT_TARGET_FILE_BYTES,
         }
     }
 }
@@ -123,14 +141,26 @@ impl ParquetWritePolicy {
     /// (row-group cap only) for A/B measurement.
     pub fn from_env() -> Self {
         let d = Self::default();
+        // File sizing is publication geometry, not page/row-group layout, so it
+        // applies under the legacy layout too.
+        let target_file_rows =
+            env_usize("PROXIMADB_MATERIALIZE_TARGET_FILE_ROWS").unwrap_or(d.target_file_rows);
+        let target_file_bytes =
+            env_usize("PROXIMADB_MATERIALIZE_TARGET_FILE_BYTES").unwrap_or(d.target_file_bytes);
         if std::env::var("PROXIMADB_PARQUET_WRITE_POLICY")
             .is_ok_and(|v| v.eq_ignore_ascii_case("legacy"))
         {
-            return Self::legacy(
-                env_usize("PROXIMADB_MATERIALIZE_ROW_GROUP_ROWS").unwrap_or(d.row_group_rows),
-            );
+            return Self {
+                target_file_rows,
+                target_file_bytes,
+                ..Self::legacy(
+                    env_usize("PROXIMADB_MATERIALIZE_ROW_GROUP_ROWS").unwrap_or(d.row_group_rows),
+                )
+            };
         }
         Self {
+            target_file_rows,
+            target_file_bytes,
             row_group_rows: env_usize("PROXIMADB_MATERIALIZE_ROW_GROUP_ROWS")
                 .unwrap_or(d.row_group_rows),
             data_page_rows: env_usize("PROXIMADB_PARQUET_WRITE_PAGE_ROWS")
@@ -172,6 +202,7 @@ impl ParquetWritePolicy {
                 enabled: false,
                 ..Self::default().bloom
             },
+            ..Self::default()
         }
     }
 

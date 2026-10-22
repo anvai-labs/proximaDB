@@ -77,22 +77,8 @@ fn warehouse_write_policy() -> ParquetWritePolicy {
 /// Iceberg readers resolve Parquet columns by field id; the table's
 /// `schema.name-mapping.default` covers files written before this.
 fn with_iceberg_field_ids(batch: RecordBatch) -> Result<RecordBatch, StorageError> {
-    const FIELD_ID: &str = "PARQUET:field_id";
-    let fields: Vec<arrow_schema::Field> = batch
-        .schema()
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(i, f)| {
-            let mut md = f.metadata().clone();
-            md.insert(FIELD_ID.to_string(), (i + 1).to_string());
-            f.as_ref().clone().with_metadata(md)
-        })
-        .collect();
-    let schema = Arc::new(ArrowSchema::new_with_metadata(
-        fields,
-        batch.schema().metadata().clone(),
-    ));
+    let schema =
+        proximadb_storage_common::parquet_multipart::iceberg_field_id_schema(&batch.schema());
     batch
         .with_schema(schema)
         .map_err(|e| StorageError::Serialization(format!("iceberg field ids: {e}")))
@@ -571,6 +557,10 @@ impl IcebergObjectStoreBridge {
 impl ObjectStoreBridge for IcebergObjectStoreBridge {
     fn inner_store(&self) -> Arc<dyn ObjectStore> {
         self.store.store()
+    }
+
+    fn object_store_path(&self, key: &Path) -> Path {
+        self.full_object_path(key)
     }
 
     /// Footer-driven, range-read, lazily-streamed Parquet read.
