@@ -1482,6 +1482,48 @@ mod tests {
         }
     }
 
+    /// RouteCostModel with the test fast-path tuning (1-sample minimum,
+    /// recompute on every observation).
+    fn min_sample_model() -> crate::query::route_cost_model::RouteCostModel {
+        crate::query::route_cost_model::RouteCostModel::new()
+            .with_min_samples(1)
+            .with_recompute_every(1)
+    }
+
+    /// Same, with per-observation exploration enabled.
+    fn exploring_model() -> crate::query::route_cost_model::RouteCostModel {
+        min_sample_model().with_exploration_interval(1)
+    }
+
+    /// Warm `class` with `rounds` of Native-far-cheaper vs DataFusion
+    /// observations — the shared evidence shape behind the override tests.
+    fn warm_native_cheaper(
+        model: &crate::query::route_cost_model::RouteCostModel,
+        class: &str,
+        rounds: usize,
+    ) {
+        for _ in 0..rounds {
+            model.observe(class, &ComputeBackend::Native, &io_snap(3, 16 << 20));
+            model.observe(
+                class,
+                &ComputeBackend::DataFusionLocal,
+                &io_snap(300, 16 << 20),
+            );
+        }
+    }
+
+    /// Warm `class` with `rounds` of small DataFusion observations (the
+    /// static-route-is-warm setup of the exploration tests).
+    fn warm_datafusion_small(
+        model: &crate::query::route_cost_model::RouteCostModel,
+        class: &str,
+        rounds: usize,
+    ) {
+        for _ in 0..rounds {
+            model.observe(class, &ComputeBackend::DataFusionLocal, &io_snap(4, 8192));
+        }
+    }
+
     #[test]
     fn advised_without_model_is_identical_to_static() {
         let shape = QueryShape {
@@ -1508,21 +1550,8 @@ mod tests {
             parquet_backed: true,
             ..Default::default()
         };
-        let model = RouteCostModel::new()
-            .with_min_samples(1)
-            .with_recompute_every(1);
-        for _ in 0..4 {
-            model.observe(
-                "olap/parquet",
-                &ComputeBackend::Native,
-                &io_snap(3, 16 << 20),
-            );
-            model.observe(
-                "olap/parquet",
-                &ComputeBackend::DataFusionLocal,
-                &io_snap(300, 16 << 20),
-            );
-        }
+        let model = min_sample_model();
+        warm_native_cheaper(&model, "olap/parquet", 4);
         let advised = ComputeScheduler::new().route_select_advised(
             shape,
             Some(&model),
@@ -1543,9 +1572,7 @@ mod tests {
             parquet_backed: false,
             ..Default::default()
         };
-        let model = RouteCostModel::new()
-            .with_min_samples(1)
-            .with_recompute_every(1);
+        let model = min_sample_model();
         // Only Native has history for this shape-class → it is the min, concurring
         // with the static OLTP→Native rule.
         for _ in 0..3 {
@@ -1568,21 +1595,8 @@ mod tests {
             parquet_backed: true,
             ..Default::default()
         }; // static => DataFusionLocal
-        let model = RouteCostModel::new()
-            .with_min_samples(1)
-            .with_recompute_every(1); // override OFF (default)
-        for _ in 0..5 {
-            model.observe(
-                "olap/parquet",
-                &ComputeBackend::Native,
-                &io_snap(3, 16 << 20),
-            );
-            model.observe(
-                "olap/parquet",
-                &ComputeBackend::DataFusionLocal,
-                &io_snap(300, 16 << 20),
-            );
-        }
+        let model = min_sample_model(); // override OFF (default)
+        warm_native_cheaper(&model, "olap/parquet", 5);
         let d = ComputeScheduler::new().route_select_advised(
             shape,
             Some(&model),
@@ -1608,22 +1622,9 @@ mod tests {
             operation_class: OperationClass::ScalarAggregate,
             ..Default::default()
         }; // static => DataFusionLocal
-        let model = RouteCostModel::new()
-            .with_min_samples(1)
-            .with_recompute_every(1);
+        let model = min_sample_model();
         model.set_override_enabled(true);
-        for _ in 0..5 {
-            model.observe(
-                "olap/parquet",
-                &ComputeBackend::Native,
-                &io_snap(3, 16 << 20),
-            );
-            model.observe(
-                "olap/parquet",
-                &ComputeBackend::DataFusionLocal,
-                &io_snap(300, 16 << 20),
-            );
-        }
+        warm_native_cheaper(&model, "olap/parquet", 5);
         let d = ComputeScheduler::new().route_select_advised(
             shape,
             Some(&model),
@@ -1654,19 +1655,10 @@ mod tests {
             operation_class: OperationClass::Grouped,
             ..scoped_in
         };
-        let model = RouteCostModel::new()
-            .with_min_samples(1)
-            .with_recompute_every(1);
+        let model = min_sample_model();
         for shape in [scoped_in, scoped_out] {
             let class = shape_class(&shape);
-            for _ in 0..5 {
-                model.observe(&class, &ComputeBackend::Native, &io_snap(3, 16 << 20));
-                model.observe(
-                    &class,
-                    &ComputeBackend::DataFusionLocal,
-                    &io_snap(300, 16 << 20),
-                );
-            }
+            warm_native_cheaper(&model, &class, 5);
         }
         model.set_override_scope(OverrideScope::Classes(vec![
             "olap/parquet/op=agg".to_string(),
@@ -1707,22 +1699,9 @@ mod tests {
             join_bearing: true,
             ..Default::default()
         }; // static => DataFusionLocal
-        let model = RouteCostModel::new()
-            .with_min_samples(1)
-            .with_recompute_every(1);
+        let model = min_sample_model();
         model.set_override_enabled(true);
-        for _ in 0..5 {
-            model.observe(
-                "olap/parquet",
-                &ComputeBackend::Native,
-                &io_snap(3, 16 << 20),
-            );
-            model.observe(
-                "olap/parquet",
-                &ComputeBackend::DataFusionLocal,
-                &io_snap(300, 16 << 20),
-            );
-        }
+        warm_native_cheaper(&model, "olap/parquet", 5);
         let d = ComputeScheduler::new().route_select_advised(
             shape,
             Some(&model),
@@ -1749,19 +1728,10 @@ mod tests {
             join_bearing: true,
             ..Default::default()
         }; // static => DataFusionLocal
-        let model = RouteCostModel::new()
-            .with_min_samples(1)
-            .with_exploration_interval(1)
-            .with_recompute_every(1);
+        let model = exploring_model();
         model.set_override_enabled(true);
         // DataFusion warm, Native cold — exploration would normally pick Native.
-        for _ in 0..5 {
-            model.observe(
-                "olap/parquet",
-                &ComputeBackend::DataFusionLocal,
-                &io_snap(4, 8192),
-            );
-        }
+        warm_datafusion_small(&model, "olap/parquet", 5);
         let d = ComputeScheduler::new().route_select_advised(
             shape,
             Some(&model),
@@ -1784,25 +1754,11 @@ mod tests {
             join_bearing: true,
             ..Default::default()
         }; // static => DataFusionLocal
-        let model = RouteCostModel::new()
-            .with_min_samples(1)
-            .with_recompute_every(1)
-            .with_rtt_budget(Some(10.0));
+        let model = min_sample_model().with_rtt_budget(Some(10.0));
         model.set_override_enabled(true);
         // Static (DataFusion) blows the RTT budget; Native is within it — but
         // the plan is join-bearing, so the hard gate must NOT flip to Native.
-        for _ in 0..5 {
-            model.observe(
-                "olap/parquet",
-                &ComputeBackend::Native,
-                &io_snap(3, 16 << 20),
-            );
-            model.observe(
-                "olap/parquet",
-                &ComputeBackend::DataFusionLocal,
-                &io_snap(300, 16 << 20),
-            );
-        }
+        warm_native_cheaper(&model, "olap/parquet", 5);
         let d = ComputeScheduler::new().route_select_advised(
             shape,
             Some(&model),
@@ -1827,19 +1783,10 @@ mod tests {
             operation_class: OperationClass::ScalarAggregate,
             ..Default::default()
         }; // static => DataFusionLocal
-        let model = RouteCostModel::new()
-            .with_min_samples(1)
-            .with_exploration_interval(1)
-            .with_recompute_every(1);
+        let model = exploring_model();
         model.set_override_enabled(true);
         // DataFusion (the static route) is warm; Native is unexplored → explore it.
-        for _ in 0..5 {
-            model.observe(
-                "olap/parquet",
-                &ComputeBackend::DataFusionLocal,
-                &io_snap(4, 8192),
-            );
-        }
+        warm_datafusion_small(&model, "olap/parquet", 5);
         let d = ComputeScheduler::new().route_select_advised(
             shape,
             Some(&model),
@@ -1861,10 +1808,7 @@ mod tests {
             parquet_backed: true,
             ..Default::default()
         }; // static => Native (OLTP)
-        let model = RouteCostModel::new()
-            .with_min_samples(1)
-            .with_exploration_interval(1)
-            .with_recompute_every(1);
+        let model = exploring_model();
         model.set_override_enabled(true);
         // Even with DataFusion history for this class, OLTP's freshness-safe set
         // is just [Native], so exploration has nothing to probe.
@@ -1894,9 +1838,7 @@ mod tests {
             parquet_backed: true,
             ..Default::default()
         };
-        let model = RouteCostModel::new()
-            .with_min_samples(1)
-            .with_recompute_every(1);
+        let model = min_sample_model();
         model.set_override_enabled(true);
         // Even if DataFusion looks absurdly cheap for this class, it is not a
         // freshness-safe candidate for OLTP, so it can never be chosen.
@@ -1974,22 +1916,9 @@ mod tests {
             operation_class: OperationClass::ScalarAggregate,
             ..Default::default()
         };
-        let model = RouteCostModel::new()
-            .with_min_samples(1)
-            .with_recompute_every(1);
+        let model = min_sample_model();
         model.set_override_enabled(true);
-        for _ in 0..5 {
-            model.observe(
-                "olap/parquet",
-                &ComputeBackend::Native,
-                &io_snap(3, 16 << 20),
-            );
-            model.observe(
-                "olap/parquet",
-                &ComputeBackend::DataFusionLocal,
-                &io_snap(300, 16 << 20),
-            );
-        }
+        warm_native_cheaper(&model, "olap/parquet", 5);
         let d = ComputeScheduler::new().route_select_advised(
             shape,
             Some(&model),

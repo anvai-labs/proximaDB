@@ -504,20 +504,27 @@ fn mutation_kind_label(kind: TableRecordMutationKind) -> &'static str {
     }
 }
 
+/// The shared name stem for an object-store mutation object:
+/// `{table}-{kind}-{nanos}` — the per-format path builders below add their
+/// directory prefix and extension.
+fn mutation_object_stem(schema: &CatalogTableSchema, kind: TableRecordMutationKind) -> String {
+    let table = sanitize_object_path_segment(&schema.name);
+    let sequence = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{table}-{}-{sequence}", mutation_kind_label(kind))
+}
+
 fn object_store_parquet_mutation_path(
     schema: &CatalogTableSchema,
     kind: TableRecordMutationKind,
     tenant_context: Option<&TenantContext>,
 ) -> ObjectPath {
     let base = object_store_write_base_path(schema, tenant_context);
-    let table = sanitize_object_path_segment(&schema.name);
-    let sequence = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
     ObjectPath::from(format!(
-        "{base}data/{table}-{}-{sequence}.parquet",
-        mutation_kind_label(kind)
+        "{base}data/{}.parquet",
+        mutation_object_stem(schema, kind)
     ))
 }
 
@@ -527,14 +534,9 @@ fn object_store_pax_segment_path(
     tenant_context: Option<&TenantContext>,
 ) -> ObjectPath {
     let base = object_store_write_base_path(schema, tenant_context);
-    let table = sanitize_object_path_segment(&schema.name);
-    let sequence = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
     ObjectPath::from(format!(
-        "{base}segments/{table}-{}-{sequence}{PAX_SEGMENT_EXT}",
-        mutation_kind_label(kind)
+        "{base}segments/{stem}{PAX_SEGMENT_EXT}",
+        stem = mutation_object_stem(schema, kind)
     ))
 }
 
@@ -1605,6 +1607,43 @@ pub struct RecordStorageTableRecordStore {
     storage: Arc<dyn RecordStorage>,
 }
 
+/// The scan options for a table scan request: the request's limit pushed
+/// down, and the tenant's partition selected when a tenant context is
+/// present — shared prologue of `RecordStorageTableRecordStore`'s scan
+/// methods.
+fn table_scan_options(
+    request: &TableRecordScanRequest,
+    tenant_context: Option<&TenantContext>,
+) -> RecordScanOptions {
+    let mut options = request
+        .limit
+        .map(RecordScanOptions::limit)
+        .unwrap_or_else(RecordScanOptions::unbounded);
+    if let Some(tenant_context) = tenant_context {
+        options = options.with_tenant_id(tenant_context.tenant_id.clone());
+    }
+    options
+}
+
+/// Apply a scan request's limit and include flags to already-materialized
+/// records — shared tail of the object-store `scan_records` impls (truncate
+/// to the limit, then strip vectors and/or props as requested).
+fn truncate_and_project_scan(records: &mut Vec<ProximaRecord>, request: &TableRecordScanRequest) {
+    if let Some(limit) = request.limit {
+        records.truncate(limit);
+    }
+    if !request.include_vector {
+        for record in records.iter_mut() {
+            record.embeddings.clear();
+        }
+    }
+    if !request.include_props {
+        for record in records.iter_mut() {
+            record.props.clear();
+        }
+    }
+}
+
 impl RecordStorageTableRecordStore {
     /// Wrap a canonical record storage implementation.
     pub fn new(storage: Arc<dyn RecordStorage>) -> Self {
@@ -1692,14 +1731,7 @@ impl TableRecordStore for RecordStorageTableRecordStore {
         tenant_context: Option<&TenantContext>,
         #[cfg(feature = "abac-policy")] _read_context: &ReadContext,
     ) -> Result<TableRecordScanResponse> {
-        let mut options = request
-            .limit
-            .map(RecordScanOptions::limit)
-            .unwrap_or_else(RecordScanOptions::unbounded);
-        if let Some(tenant_context) = tenant_context {
-            options = options.with_tenant_id(tenant_context.tenant_id.clone());
-        }
-
+        let options = table_scan_options(&request, tenant_context);
         let mut records = self.storage.scan_records_with_options(options).await?;
         records.retain(|record| {
             record
@@ -1708,16 +1740,7 @@ impl TableRecordStore for RecordStorageTableRecordStore {
                 .map(|variation| variation == table_schema.name)
                 .unwrap_or(true)
         });
-        if !request.include_vector {
-            for record in &mut records {
-                record.embeddings.clear();
-            }
-        }
-        if !request.include_props {
-            for record in &mut records {
-                record.props.clear();
-            }
-        }
+        truncate_and_project_scan(&mut records, &request);
         Ok(records)
     }
 
@@ -1729,13 +1752,7 @@ impl TableRecordStore for RecordStorageTableRecordStore {
         tenant_context: Option<&TenantContext>,
         #[cfg(feature = "abac-policy")] _read_context: &ReadContext,
     ) -> Result<TableRecordScanResponse> {
-        let mut options = request
-            .limit
-            .map(RecordScanOptions::limit)
-            .unwrap_or_else(RecordScanOptions::unbounded);
-        if let Some(tenant_context) = tenant_context {
-            options = options.with_tenant_id(tenant_context.tenant_id.clone());
-        }
+        let options = table_scan_options(&request, tenant_context);
 
         // Fold the table-membership (variation_id) check INTO the pushed-down
         // predicate so the store's early-stop counts only fully-matching rows —
@@ -1754,16 +1771,7 @@ impl TableRecordStore for RecordStorageTableRecordStore {
             .scan_records_filtered(options, Some(&combined))
             .await?;
 
-        if !request.include_vector {
-            for record in &mut records {
-                record.embeddings.clear();
-            }
-        }
-        if !request.include_props {
-            for record in &mut records {
-                record.props.clear();
-            }
-        }
+        truncate_and_project_scan(&mut records, &request);
         Ok(records)
     }
 }
@@ -2723,6 +2731,52 @@ impl DirectWalTableRecordStore {
 
     /// Build the UNIQUE/PK index for `(tenant_id, table_schema)` if not already
     /// built, by scanning the tenant's current visible state (WAL recovery has
+    /// Scan the table's visible records across BOTH the current partition
+    /// and (TD-127 O3) any pre-flip legacy name-keyed partition, the current
+    /// partition winning on conflict — shared by the unique/secondary index
+    /// builders below.
+    async fn scan_visible_records_for_index(
+        &self,
+        table_schema: &CatalogTableSchema,
+        tenant_id: &str,
+        collection_id: &str,
+        legacy_key: &Option<String>,
+    ) -> Result<Vec<ProximaRecord>> {
+        let scan_request = TableRecordScanRequest {
+            filter: None,
+            table_id: collection_id.to_string(),
+            limit: None,
+            include_vector: false,
+            include_props: true,
+        };
+        let mut existing =
+            RecordStorageTableRecordStore::new(self.partition(tenant_id, collection_id))
+                .scan_records(
+                    table_schema,
+                    scan_request.clone(),
+                    None,
+                    #[cfg(feature = "abac-policy")]
+                    &ReadContext::system(
+                        SystemReadReason::IndexBuild,
+                        "record_store::build_unique_index",
+                    ),
+                )
+                .await?;
+        if let Some(legacy) = legacy_key {
+            let legacy_recs = RecordStorageTableRecordStore::new(self.partition(tenant_id, legacy))
+                .scan_records(
+                    table_schema,
+                    scan_request,
+                    None,
+                    #[cfg(feature = "abac-policy")]
+                    &ReadContext::system(SystemReadReason::IndexBuild, "record_store::build_index"),
+                )
+                .await?;
+            existing = merge_scan_primary_wins(existing, legacy_recs, None);
+        }
+        Ok(existing)
+    }
+
     /// rebuilt it). A no-op when the table has no UNIQUE/PK sets.
     async fn ensure_unique_index_built(
         &self,
@@ -2739,40 +2793,9 @@ impl DirectWalTableRecordStore {
             return Ok(());
         }
         let primary_key = schema_primary_key_column(table_schema);
-        let scan_request = TableRecordScanRequest {
-            filter: None,
-            table_id: collection_id.clone(),
-            limit: None,
-            include_vector: false,
-            include_props: true,
-        };
-        let mut existing =
-            RecordStorageTableRecordStore::new(self.partition(tenant_id, &collection_id))
-                .scan_records(
-                    table_schema,
-                    scan_request.clone(),
-                    None,
-                    #[cfg(feature = "abac-policy")]
-                    &ReadContext::system(
-                        SystemReadReason::IndexBuild,
-                        "record_store::build_unique_index",
-                    ),
-                )
-                .await?;
-        // O3: include any pre-flip records still in the legacy name-keyed partition
-        // so the index reflects current visible state across the cutover window.
-        if let Some(legacy) = &legacy_key {
-            let legacy_recs = RecordStorageTableRecordStore::new(self.partition(tenant_id, legacy))
-                .scan_records(
-                    table_schema,
-                    scan_request,
-                    None,
-                    #[cfg(feature = "abac-policy")]
-                    &ReadContext::system(SystemReadReason::IndexBuild, "record_store::build_index"),
-                )
-                .await?;
-            existing = merge_scan_primary_wins(existing, legacy_recs, None);
-        }
+        let existing = self
+            .scan_visible_records_for_index(table_schema, tenant_id, &collection_id, &legacy_key)
+            .await?;
         let mut index = TableUniqueIndex::with_sets(&set_columns);
         for record in &existing {
             index.upsert(record, primary_key.as_deref());
@@ -2803,39 +2826,9 @@ impl DirectWalTableRecordStore {
         if columns.is_empty() {
             return Ok(());
         }
-        let scan_request = TableRecordScanRequest {
-            filter: None,
-            table_id: collection_id.clone(),
-            limit: None,
-            include_vector: false,
-            include_props: true,
-        };
-        let mut existing =
-            RecordStorageTableRecordStore::new(self.partition(tenant_id, &collection_id))
-                .scan_records(
-                    table_schema,
-                    scan_request.clone(),
-                    None,
-                    #[cfg(feature = "abac-policy")]
-                    &ReadContext::system(
-                        SystemReadReason::IndexBuild,
-                        "record_store::build_unique_index",
-                    ),
-                )
-                .await?;
-        // O3: include any pre-flip records still in the legacy name-keyed partition.
-        if let Some(legacy) = &legacy_key {
-            let legacy_recs = RecordStorageTableRecordStore::new(self.partition(tenant_id, legacy))
-                .scan_records(
-                    table_schema,
-                    scan_request,
-                    None,
-                    #[cfg(feature = "abac-policy")]
-                    &ReadContext::system(SystemReadReason::IndexBuild, "record_store::build_index"),
-                )
-                .await?;
-            existing = merge_scan_primary_wins(existing, legacy_recs, None);
-        }
+        let existing = self
+            .scan_visible_records_for_index(table_schema, tenant_id, &collection_id, &legacy_key)
+            .await?;
         let mut index = TableSecondaryIndex::with_columns(&columns);
         for record in &existing {
             index.upsert(record);
@@ -3729,6 +3722,58 @@ pub(crate) fn proxima_record_to_get_response(
 
 #[cfg(test)]
 mod tests {
+
+    /// Forgotten tempdir root for a spill test: `(root, base)` — the dir is
+    /// deliberately leaked (test-hygiene: unique per test, never shared), and
+    /// `base` is its string form for path closures.
+    fn spill_root() -> (std::path::PathBuf, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let base = root.to_string_lossy().to_string();
+        std::mem::forget(dir);
+        (root, base)
+    }
+
+    /// A default local filesystem handle for the spill harness.
+    async fn local_fs() -> Arc<crate::storage::persistence::filesystem::local::LocalFileSystem> {
+        Arc::new(
+            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
+                crate::storage::persistence::filesystem::local::LocalConfig::default(),
+            )
+            .await
+            .expect("local filesystem"),
+        )
+    }
+
+    /// `n` upsert WAL entries (`r{i}` oids, LSN 1..=n) for `collection`,
+    /// stamped `tenant` on the entry (the record stays unstamped — the
+    /// tenant-ingestion path derives it from the entry).
+    fn upsert_entries(n: u64, collection: &str, tenant: &str) -> Vec<CanonicalWalEntry> {
+        (0..n)
+            .map(|i| {
+                CanonicalWalEntry::new(
+                    i + 1,
+                    CanonicalOperation::RecordUpsert {
+                        collection_id: collection.to_string(),
+                        record: Box::new(ProximaRecord {
+                            oid: format!("r{i}"),
+                            variation_id: Some(collection.to_string()),
+                            ..Default::default()
+                        }),
+                        projections: vec![],
+                    },
+                    Some(tenant.to_string()),
+                )
+            })
+            .collect()
+    }
+
+    /// The standard spill-path resolver: `{base}/{tenant}/{collection}`.
+    fn tenant_path_resolver(base: String) -> Arc<dyn Fn(&str, &str) -> String + Send + Sync> {
+        Arc::new(move |tenant_id: &str, collection: &str| {
+            format!("{base}/{tenant_id}/{collection}")
+        })
+    }
     use super::*;
     use arrow_array::RecordBatch;
     use arrow_schema::Schema as ArrowSchema;
@@ -5664,44 +5709,13 @@ mod tests {
     async fn spilling_store_writes_no_segments_when_the_gate_is_unset() {
         unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().to_path_buf();
-        let base = root.to_string_lossy().to_string();
-        std::mem::forget(dir);
-        let fs = Arc::new(
-            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
-                crate::storage::persistence::filesystem::local::LocalConfig::default(),
-            )
-            .await
-            .expect("local filesystem"),
-        );
+        let (root, base) = spill_root();
+        let fs = local_fs().await;
 
         let wal = Arc::new(RecordingWalAppender::default());
-        let store = DirectWalTableRecordStore::new_spilling(
-            wal,
-            fs,
-            Arc::new(move |tenant_id: &str, collection: &str| {
-                format!("{base}/{tenant_id}/{collection}")
-            }),
-        );
+        let store = DirectWalTableRecordStore::new_spilling(wal, fs, tenant_path_resolver(base));
 
-        let entries: Vec<CanonicalWalEntry> = (0..32)
-            .map(|i| {
-                CanonicalWalEntry::new(
-                    i + 1,
-                    CanonicalOperation::RecordUpsert {
-                        collection_id: "orders".to_string(),
-                        record: Box::new(ProximaRecord {
-                            oid: format!("r{i}"),
-                            variation_id: Some("orders".to_string()),
-                            ..Default::default()
-                        }),
-                        projections: vec![],
-                    },
-                    Some("tenant-a".to_string()),
-                )
-            })
-            .collect();
+        let entries = upsert_entries(32, "orders", "tenant-a");
         store.replay_wal_entries(entries).await.expect("replay");
 
         // `expect`, not `unwrap_or(false)`: an unreadable root must fail the test,
@@ -5727,22 +5741,12 @@ mod tests {
         unsafe {
             std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
         }
-        let dir = tempfile::tempdir().expect("tempdir");
-        let base = dir.path().to_string_lossy().to_string();
-        std::mem::forget(dir);
-        let fs = Arc::new(
-            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
-                crate::storage::persistence::filesystem::local::LocalConfig::default(),
-            )
-            .await
-            .expect("local filesystem"),
-        );
+        let (_, base) = spill_root();
+        let fs = local_fs().await;
         let store = DirectWalTableRecordStore::new_spilling(
             Arc::new(RecordingWalAppender::default()),
             fs,
-            Arc::new(move |tenant_id: &str, collection: &str| {
-                format!("{base}/{tenant_id}/{collection}")
-            }),
+            tenant_path_resolver(base),
         );
         let entries: Vec<CanonicalWalEntry> = (0..6)
             .map(|i| {
@@ -5832,22 +5836,12 @@ mod tests {
         unsafe {
             std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "100");
         }
-        let dir = tempfile::tempdir().expect("tempdir");
-        let base = dir.path().to_string_lossy().to_string();
-        std::mem::forget(dir);
-        let fs = Arc::new(
-            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
-                crate::storage::persistence::filesystem::local::LocalConfig::default(),
-            )
-            .await
-            .expect("local filesystem"),
-        );
+        let (_, base) = spill_root();
+        let fs = local_fs().await;
         let store = DirectWalTableRecordStore::new_spilling(
             Arc::new(RecordingWalAppender::default()),
             fs,
-            Arc::new(move |tenant_id: &str, collection: &str| {
-                format!("{base}/{tenant_id}/{collection}")
-            }),
+            tenant_path_resolver(base),
         );
         let decimal = |table: &str| {
             CatalogTableSchema::new(table).with_column(proximadb_catalog::CatalogColumn::new(
@@ -5941,22 +5935,12 @@ mod tests {
         unsafe {
             std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "2");
         }
-        let dir = tempfile::tempdir().expect("tempdir");
-        let base = dir.path().to_string_lossy().to_string();
-        std::mem::forget(dir);
-        let fs = Arc::new(
-            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
-                crate::storage::persistence::filesystem::local::LocalConfig::default(),
-            )
-            .await
-            .expect("local filesystem"),
-        );
+        let (_, base) = spill_root();
+        let fs = local_fs().await;
         let store = DirectWalTableRecordStore::new_spilling(
             Arc::new(RecordingWalAppender::default()),
             fs,
-            Arc::new(move |tenant_id: &str, collection: &str| {
-                format!("{base}/{tenant_id}/{collection}")
-            }),
+            tenant_path_resolver(base),
         );
         let schema =
             CatalogTableSchema::new("orders").with_column(proximadb_catalog::CatalogColumn::new(
@@ -6004,17 +5988,8 @@ mod tests {
             std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "2");
         }
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().to_path_buf();
-        let base = root.to_string_lossy().to_string();
-        std::mem::forget(dir);
-        let fs = Arc::new(
-            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
-                crate::storage::persistence::filesystem::local::LocalConfig::default(),
-            )
-            .await
-            .expect("local filesystem"),
-        );
+        let (root, base) = spill_root();
+        let fs = local_fs().await;
         let wal = Arc::new(RecordingWalAppender::default());
         let store = DirectWalTableRecordStore::new_spilling(
             wal,
@@ -6094,26 +6069,11 @@ mod tests {
             std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
         }
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().to_path_buf();
-        let base = root.to_string_lossy().to_string();
-        std::mem::forget(dir);
-        let fs = Arc::new(
-            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
-                crate::storage::persistence::filesystem::local::LocalConfig::default(),
-            )
-            .await
-            .expect("local filesystem"),
-        );
+        let (root, base) = spill_root();
+        let fs = local_fs().await;
 
         let wal = Arc::new(RecordingWalAppender::default());
-        let store = DirectWalTableRecordStore::new_spilling(
-            wal,
-            fs,
-            Arc::new(move |tenant_id: &str, collection: &str| {
-                format!("{base}/{tenant_id}/{collection}")
-            }),
-        );
+        let store = DirectWalTableRecordStore::new_spilling(wal, fs, tenant_path_resolver(base));
 
         let upsert = |i: u64| {
             CanonicalWalEntry::new(
@@ -6222,17 +6182,8 @@ mod tests {
             std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
         }
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().to_path_buf();
-        let base = root.to_string_lossy().to_string();
-        std::mem::forget(dir);
-        let fs = Arc::new(
-            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
-                crate::storage::persistence::filesystem::local::LocalConfig::default(),
-            )
-            .await
-            .expect("local filesystem"),
-        );
+        let (root, base) = spill_root();
+        let fs = local_fs().await;
         let build = |fs: Arc<crate::storage::persistence::filesystem::local::LocalFileSystem>| {
             let base = base.clone();
             DirectWalTableRecordStore::new_spilling(
@@ -6383,24 +6334,14 @@ mod tests {
         unsafe {
             std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
         }
-        let dir = tempfile::tempdir().expect("tempdir");
-        let base = dir.path().to_string_lossy().to_string();
-        std::mem::forget(dir);
-        let fs = Arc::new(
-            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
-                crate::storage::persistence::filesystem::local::LocalConfig::default(),
-            )
-            .await
-            .expect("local filesystem"),
-        );
+        let (_, base) = spill_root();
+        let fs = local_fs().await;
         let store_fs = fs.clone();
         let refusing_base = format!("{base}/mixed");
         let store = DirectWalTableRecordStore::new_spilling(
             Arc::new(RecordingWalAppender::default()),
             fs,
-            Arc::new(move |tenant_id: &str, collection: &str| {
-                format!("{base}/{tenant_id}/{collection}")
-            }),
+            tenant_path_resolver(base),
         );
         let upsert = |lsn: u64, tenant: &str, collection: &str| {
             CanonicalWalEntry::new(
@@ -6611,45 +6552,14 @@ mod tests {
             std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
         }
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().to_path_buf();
-        let base = root.to_string_lossy().to_string();
-        std::mem::forget(dir);
-        let fs = Arc::new(
-            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
-                crate::storage::persistence::filesystem::local::LocalConfig::default(),
-            )
-            .await
-            .expect("local filesystem"),
-        );
+        let (root, base) = spill_root();
+        let fs = local_fs().await;
 
         let wal = Arc::new(RecordingWalAppender::default());
-        let store = DirectWalTableRecordStore::new_spilling(
-            wal,
-            fs,
-            Arc::new(move |tenant_id: &str, collection: &str| {
-                format!("{base}/{tenant_id}/{collection}")
-            }),
-        );
+        let store = DirectWalTableRecordStore::new_spilling(wal, fs, tenant_path_resolver(base));
 
         const ROWS: u64 = 20;
-        let entries: Vec<CanonicalWalEntry> = (0..ROWS)
-            .map(|i| {
-                CanonicalWalEntry::new(
-                    i + 1,
-                    CanonicalOperation::RecordUpsert {
-                        collection_id: "orders".to_string(),
-                        record: Box::new(ProximaRecord {
-                            oid: format!("r{i}"),
-                            variation_id: Some("orders".to_string()),
-                            ..Default::default()
-                        }),
-                        projections: vec![],
-                    },
-                    Some("tenant-a".to_string()),
-                )
-            })
-            .collect();
+        let entries = upsert_entries(ROWS, "orders", "tenant-a");
         store.replay_wal_entries(entries).await.expect("replay");
 
         // Half 1: rows above the threshold actually left memory for a segment.
@@ -6765,6 +6675,40 @@ pub struct ObjectStoreIcebergRecordStore {
     bridge: Arc<dyn ObjectStoreBridge>,
 }
 
+/// Unpack a mutation batch into (records, ids, kind), short-circuiting an
+/// empty batch to a successful no-op result — the shared opening of the
+/// object-store `write_mutations` impls.
+enum UnpackedMutations {
+    Empty(TableRecordWriteResult),
+    Batch {
+        records: Vec<ProximaRecord>,
+        record_ids: Vec<String>,
+        kind: TableRecordMutationKind,
+    },
+}
+
+fn unpack_mutations(mutations: &[TableRecordMutation]) -> UnpackedMutations {
+    let records = mutations
+        .iter()
+        .map(|mutation| mutation.record.clone())
+        .collect::<Vec<_>>();
+    let record_ids = records.iter().map(record_id).collect::<Vec<_>>();
+
+    if records.is_empty() {
+        return UnpackedMutations::Empty(TableRecordWriteResult::success(record_ids));
+    }
+
+    let kind = mutations
+        .first()
+        .map(|mutation| mutation.kind)
+        .unwrap_or(TableRecordMutationKind::Insert);
+    UnpackedMutations::Batch {
+        records,
+        record_ids,
+        kind,
+    }
+}
+
 impl ObjectStoreIcebergRecordStore {
     pub fn new(bridge: Arc<dyn ObjectStoreBridge>) -> Self {
         Self { bridge }
@@ -6832,20 +6776,14 @@ impl TableRecordStore for ObjectStoreIcebergRecordStore {
         mutations: Vec<TableRecordMutation>,
         _tenant_context: Option<&TenantContext>,
     ) -> Result<TableRecordWriteResult> {
-        let records = mutations
-            .iter()
-            .map(|mutation| mutation.record.clone())
-            .collect::<Vec<_>>();
-        let record_ids = records.iter().map(record_id).collect::<Vec<_>>();
-
-        if records.is_empty() {
-            return Ok(TableRecordWriteResult::success(record_ids));
-        }
-
-        let kind = mutations
-            .first()
-            .map(|mutation| mutation.kind)
-            .unwrap_or(TableRecordMutationKind::Insert);
+        let (records, record_ids, kind) = match unpack_mutations(&mutations) {
+            UnpackedMutations::Empty(result) => return Ok(result),
+            UnpackedMutations::Batch {
+                records,
+                record_ids,
+                kind,
+            } => (records, record_ids, kind),
+        };
         let path = object_store_parquet_mutation_path(schema, kind, _tenant_context);
         let tenant_id = _tenant_context.map(|tc| tc.tenant_id.as_str());
         record_object_store_op(tenant_id, "write_parquet");
@@ -6896,19 +6834,7 @@ impl TableRecordStore for ObjectStoreIcebergRecordStore {
         #[cfg(feature = "abac-policy")] _read_context: &ReadContext,
     ) -> Result<TableRecordScanResponse> {
         let mut records = self.read_all_records(table_schema, _tenant_context).await?;
-        if let Some(limit) = request.limit {
-            records.truncate(limit);
-        }
-        if !request.include_vector {
-            for record in &mut records {
-                record.embeddings.clear();
-            }
-        }
-        if !request.include_props {
-            for record in &mut records {
-                record.props.clear();
-            }
-        }
+        truncate_and_project_scan(&mut records, &request);
         Ok(records)
     }
 }
@@ -7251,20 +7177,14 @@ impl TableRecordStore for ObjectStoreVectorRecordStore {
         mutations: Vec<TableRecordMutation>,
         _tenant_context: Option<&TenantContext>,
     ) -> Result<TableRecordWriteResult> {
-        let records = mutations
-            .iter()
-            .map(|mutation| mutation.record.clone())
-            .collect::<Vec<_>>();
-        let record_ids = records.iter().map(record_id).collect::<Vec<_>>();
-
-        if records.is_empty() {
-            return Ok(TableRecordWriteResult::success(record_ids));
-        }
-
-        let kind = mutations
-            .first()
-            .map(|mutation| mutation.kind)
-            .unwrap_or(TableRecordMutationKind::Insert);
+        let (records, record_ids, kind) = match unpack_mutations(&mutations) {
+            UnpackedMutations::Empty(result) => return Ok(result),
+            UnpackedMutations::Batch {
+                records,
+                record_ids,
+                kind,
+            } => (records, record_ids, kind),
+        };
         let object_path = object_store_pax_segment_path(schema, kind, _tenant_context);
         let local_path = temp_pax_segment_path(schema, kind);
         // P-Shred (ADR-055): resolve the shred-list from the catalog's props-auto-promotion
@@ -7387,19 +7307,7 @@ impl TableRecordStore for ObjectStoreVectorRecordStore {
         #[cfg(feature = "abac-policy")] _read_context: &ReadContext,
     ) -> Result<TableRecordScanResponse> {
         let mut records = self.read_all_records(table_schema, _tenant_context).await?;
-        if let Some(limit) = request.limit {
-            records.truncate(limit);
-        }
-        if !request.include_vector {
-            for record in &mut records {
-                record.embeddings.clear();
-            }
-        }
-        if !request.include_props {
-            for record in &mut records {
-                record.props.clear();
-            }
-        }
+        truncate_and_project_scan(&mut records, &request);
         Ok(records)
     }
     /// Override: when a structured `request.filter` is present, read segments via

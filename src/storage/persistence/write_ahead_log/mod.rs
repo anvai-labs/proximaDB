@@ -719,15 +719,7 @@ impl WriteAheadLogManagerRegistry {
         for i in 0..self.pool_config.initial_pool_size {
             let manager_id = format!("write_buffer_manager_pool_{}", i + 1);
 
-            let manager = Arc::new(
-                WriteAheadLogManager::new_pool_manager(config.clone(), manager_id.clone()).await?,
-            );
-
-            let entry = WriteAheadLogManagerPoolEntry {
-                manager,
-                workload_metrics: WriteAheadLogManagerWorkload::default(),
-                last_rebalance: std::time::Instant::now(),
-            };
+            let entry = self.new_pool_entry(config, &manager_id).await?;
 
             pool.insert(manager_id.clone(), entry);
             tracing::debug!("➕ Created pool WriteAheadLogManager: {}", manager_id);
@@ -833,6 +825,24 @@ impl WriteAheadLogManagerRegistry {
         Ok(should_create)
     }
 
+    /// Build a pool entry wrapping a freshly constructed pool manager — shared
+    /// by the initial-pool bootstrap and dynamic scaling below.
+    async fn new_pool_entry(
+        &self,
+        config: &WALConfig,
+        manager_id: &str,
+    ) -> Result<WriteAheadLogManagerPoolEntry> {
+        let manager = Arc::new(
+            WriteAheadLogManager::new_pool_manager(config.clone(), manager_id.to_string()).await?,
+        );
+
+        Ok(WriteAheadLogManagerPoolEntry {
+            manager,
+            workload_metrics: WriteAheadLogManagerWorkload::default(),
+            last_rebalance: std::time::Instant::now(),
+        })
+    }
+
     /// Create an additional manager for dynamic scaling
     async fn create_additional_manager(&self) -> Result<String> {
         let mut next_id = self.next_manager_id.lock().await;
@@ -846,16 +856,7 @@ impl WriteAheadLogManagerRegistry {
         );
 
         // Use registry-level config for dynamic managers
-        let config = &self.wal_config;
-        let manager = Arc::new(
-            WriteAheadLogManager::new_pool_manager(config.clone(), manager_id.clone()).await?,
-        );
-
-        let entry = WriteAheadLogManagerPoolEntry {
-            manager,
-            workload_metrics: WriteAheadLogManagerWorkload::default(),
-            last_rebalance: std::time::Instant::now(),
-        };
+        let entry = self.new_pool_entry(&self.wal_config, &manager_id).await?;
 
         // Add to pool
         {
@@ -1405,6 +1406,85 @@ pub struct WriteAheadLogManagerPoolStats {
 }
 
 impl WriteAheadLogManager {
+    /// Memtable tuning derived from the WAL config — the single source for
+    /// every `GLOBAL_WRITE_BUFFER_BEHAVIOR` initialization site (constructors
+    /// and read seams alike).
+    fn configured_memtable_config(
+        config: &WALConfig,
+    ) -> crate::storage::memtable::core::MemtableConfig {
+        crate::storage::memtable::core::MemtableConfig {
+            max_size_bytes: config.memtable.global_memory_limit,
+            flush_threshold_bytes: config.memtable.global_memory_limit / 2,
+            enable_mvcc: config.enable_mvcc,
+            mvcc_cleanup_interval_secs: config.performance.mvcc_cleanup_interval_secs,
+            max_versions_per_key: config.memtable.mvcc_versions_retained,
+        }
+    }
+
+    /// Initialize the global write-buffer singleton from `config` and hand
+    /// back a fresh zeroed stats handle — the shared first half of every
+    /// constructor below.
+    fn init_shared_behavior_and_stats(config: &WALConfig) -> Arc<tokio::sync::RwLock<WALStats>> {
+        // Initialize singleton WALBehaviorWrapper (thread-safe, only happens once globally)
+        let memtable_config = Self::configured_memtable_config(config);
+        let _shared_wal_behavior = GLOBAL_WRITE_BUFFER_BEHAVIOR.get_or_init(&memtable_config);
+
+        Arc::new(tokio::sync::RwLock::new(WALStats {
+            total_entries: 0,
+            memory_entries: 0,
+            disk_segments: 0,
+            total_disk_size_bytes: 0,
+            memory_size_bytes: 0,
+            collections_count: 0,
+            last_flush_time: None,
+            write_throughput_entries_per_sec: 0.0,
+            read_throughput_entries_per_sec: 0.0,
+            compression_ratio: 1.0,
+        }))
+    }
+
+    /// The global write-buffer behavior initialized with default memtable
+    /// tuning — the shared accessor behind the read/scan seams below.
+    fn default_wal_behavior(
+        &self,
+    ) -> Arc<crate::storage::memtable::specialized::wal_behavior::WALBehaviorWrapper> {
+        let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
+        self.shared_wal_behavior.get_or_init(&memtable_config)
+    }
+
+    /// Assemble a manager around an empty collection map and a freshly created
+    /// per-collection filesystem factory — the shared second half of every
+    /// constructor below. `path_resolver` selects between an injected DIP
+    /// resolver (`Some`) and the global-xCatalog fallback (`None`).
+    async fn assemble_with_resolver(
+        config: WALConfig,
+        stats: Arc<tokio::sync::RwLock<WALStats>>,
+        path_resolver: Option<Arc<dyn CollectionPathResolver>>,
+    ) -> Result<Self> {
+        // Initialize with empty collection map - collections will be added with their metadata
+        let assigned_collections = std::collections::HashMap::new();
+
+        // Extract strategy type for routing
+        let strategy_type = config.strategy_type;
+
+        // Create filesystem factory for per-collection disk managers
+        // Disk managers will be created at write time using collection's base_location from assigned_collections
+        let _filesystem_factory = Arc::new(
+            crate::storage::persistence::filesystem::FilesystemFactory::create_default().await?,
+        );
+
+        Ok(Self {
+            config,
+            stats,
+            distance_compute: UnifiedDistanceCompute::default(),
+            assigned_collections: Arc::new(tokio::sync::RwLock::new(assigned_collections)),
+            shared_wal_behavior: &GLOBAL_WRITE_BUFFER_BEHAVIOR,
+            strategy_type,
+            recovery_manager_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            path_resolver,
+        })
+    }
+
     /// Create new WriteAheadLogManager
     pub async fn new(config: WALConfig) -> Result<Self> {
         // Use new_pool_manager with a default manager ID for backwards compatibility
@@ -1424,57 +1504,14 @@ impl WriteAheadLogManager {
             config.memtable.memtable_type
         );
 
-        // Initialize singleton WALBehaviorWrapper (thread-safe, only happens once globally)
-        let memtable_config = crate::storage::memtable::core::MemtableConfig {
-            max_size_bytes: config.memtable.global_memory_limit,
-            flush_threshold_bytes: config.memtable.global_memory_limit / 2,
-            enable_mvcc: config.enable_mvcc,
-            mvcc_cleanup_interval_secs: config.performance.mvcc_cleanup_interval_secs,
-            max_versions_per_key: config.memtable.mvcc_versions_retained,
-        };
-        let _shared_wal_behavior = GLOBAL_WRITE_BUFFER_BEHAVIOR.get_or_init(&memtable_config);
-
-        let stats = Arc::new(tokio::sync::RwLock::new(WALStats {
-            total_entries: 0,
-            memory_entries: 0,
-            disk_segments: 0,
-            total_disk_size_bytes: 0,
-            memory_size_bytes: 0,
-            collections_count: 0,
-            last_flush_time: None,
-            write_throughput_entries_per_sec: 0.0,
-            read_throughput_entries_per_sec: 0.0,
-            compression_ratio: 1.0,
-        }));
-
-        // Initialize with empty collection map - collections will be added with their metadata
-        let assigned_collections = std::collections::HashMap::new();
+        let stats = Self::init_shared_behavior_and_stats(&config);
 
         tracing::info!(
             "✅ WriteAheadLogManager created for collection {} - per-collection scaling with shared memtable",
             collection_id
         );
 
-        // Extract strategy type for routing
-        let strategy_type = config.strategy_type;
-
-        // Create filesystem factory for per-collection disk managers
-        // Disk managers will be created at write time using collection's base_location from assigned_collections
-        let _filesystem_factory = Arc::new(
-            crate::storage::persistence::filesystem::FilesystemFactory::create_default().await?,
-        );
-
-        Ok(Self {
-            config,
-            stats,
-            distance_compute: UnifiedDistanceCompute::default(),
-            assigned_collections: Arc::new(tokio::sync::RwLock::new(assigned_collections)),
-            shared_wal_behavior: &GLOBAL_WRITE_BUFFER_BEHAVIOR,
-            strategy_type,
-            recovery_manager_cache: Arc::new(tokio::sync::RwLock::new(None)),
-            // DIP: No path resolver by default, falls back to the global xCatalog
-            path_resolver: None,
-        })
+        Self::assemble_with_resolver(config, stats, None).await
     }
 
     /// Create new WriteAheadLogManager with an injected path resolver (DIP-compliant)
@@ -1516,31 +1553,7 @@ impl WriteAheadLogManager {
             path_resolver.name()
         );
 
-        // Initialize singleton WALBehaviorWrapper (thread-safe, only happens once globally)
-        let memtable_config = crate::storage::memtable::core::MemtableConfig {
-            max_size_bytes: config.memtable.global_memory_limit,
-            flush_threshold_bytes: config.memtable.global_memory_limit / 2,
-            enable_mvcc: config.enable_mvcc,
-            mvcc_cleanup_interval_secs: config.performance.mvcc_cleanup_interval_secs,
-            max_versions_per_key: config.memtable.mvcc_versions_retained,
-        };
-        let _shared_wal_behavior = GLOBAL_WRITE_BUFFER_BEHAVIOR.get_or_init(&memtable_config);
-
-        let stats = Arc::new(tokio::sync::RwLock::new(WALStats {
-            total_entries: 0,
-            memory_entries: 0,
-            disk_segments: 0,
-            total_disk_size_bytes: 0,
-            memory_size_bytes: 0,
-            collections_count: 0,
-            last_flush_time: None,
-            write_throughput_entries_per_sec: 0.0,
-            read_throughput_entries_per_sec: 0.0,
-            compression_ratio: 1.0,
-        }));
-
-        // Initialize with empty collection map - collections will be added with their metadata
-        let assigned_collections = std::collections::HashMap::new();
+        let stats = Self::init_shared_behavior_and_stats(&config);
 
         tracing::info!(
             "✅ WriteAheadLogManager created for collection {} with DIP resolver '{}' - zero-wait path resolution",
@@ -1548,25 +1561,7 @@ impl WriteAheadLogManager {
             path_resolver.name()
         );
 
-        // Extract strategy type for routing
-        let strategy_type = config.strategy_type;
-
-        // Create filesystem factory for per-collection disk managers
-        let _filesystem_factory = Arc::new(
-            crate::storage::persistence::filesystem::FilesystemFactory::create_default().await?,
-        );
-
-        Ok(Self {
-            config,
-            stats,
-            distance_compute: UnifiedDistanceCompute::default(),
-            assigned_collections: Arc::new(tokio::sync::RwLock::new(assigned_collections)),
-            shared_wal_behavior: &GLOBAL_WRITE_BUFFER_BEHAVIOR,
-            strategy_type,
-            recovery_manager_cache: Arc::new(tokio::sync::RwLock::new(None)),
-            // DIP: Use injected path resolver (no 100ms wait needed)
-            path_resolver: Some(path_resolver),
-        })
+        Self::assemble_with_resolver(config, stats, Some(path_resolver)).await
     }
 
     /// Create new WriteAheadLogManager for pool with empty collection set
@@ -1576,57 +1571,14 @@ impl WriteAheadLogManager {
             manager_id
         );
 
-        // Initialize singleton WALBehaviorWrapper (thread-safe, only happens once globally)
-        let memtable_config = crate::storage::memtable::core::MemtableConfig {
-            max_size_bytes: config.memtable.global_memory_limit,
-            flush_threshold_bytes: config.memtable.global_memory_limit / 2,
-            enable_mvcc: config.enable_mvcc,
-            mvcc_cleanup_interval_secs: config.performance.mvcc_cleanup_interval_secs,
-            max_versions_per_key: config.memtable.mvcc_versions_retained,
-        };
-        let _shared_wal_behavior = GLOBAL_WRITE_BUFFER_BEHAVIOR.get_or_init(&memtable_config);
-
-        let stats = Arc::new(tokio::sync::RwLock::new(WALStats {
-            total_entries: 0,
-            memory_entries: 0,
-            disk_segments: 0,
-            total_disk_size_bytes: 0,
-            memory_size_bytes: 0,
-            collections_count: 0,
-            last_flush_time: None,
-            write_throughput_entries_per_sec: 0.0,
-            read_throughput_entries_per_sec: 0.0,
-            compression_ratio: 1.0,
-        }));
-
-        // Start with empty collection set (will be assigned dynamically)
-        let assigned_collections = std::collections::HashMap::new();
+        let stats = Self::init_shared_behavior_and_stats(&config);
 
         tracing::debug!(
             "✅ Pool WriteAheadLogManager {} created - ready for adaptive collection assignment",
             manager_id
         );
 
-        // Extract strategy type for routing
-        let strategy_type = config.strategy_type;
-
-        // Create filesystem factory for per-collection disk managers
-        // Disk managers will be created at write time using collection's base_location from assigned_collections
-        let _filesystem_factory = Arc::new(
-            crate::storage::persistence::filesystem::FilesystemFactory::create_default().await?,
-        );
-
-        Ok(Self {
-            config,
-            stats,
-            distance_compute: UnifiedDistanceCompute::default(),
-            assigned_collections: Arc::new(tokio::sync::RwLock::new(assigned_collections)),
-            shared_wal_behavior: &GLOBAL_WRITE_BUFFER_BEHAVIOR,
-            strategy_type,
-            recovery_manager_cache: Arc::new(tokio::sync::RwLock::new(None)),
-            // DIP: No path resolver by default, falls back to the global xCatalog
-            path_resolver: None,
-        })
+        Self::assemble_with_resolver(config, stats, None).await
     }
 
     /// Create new WAL manager using the factory (recommended)
@@ -1841,8 +1793,7 @@ impl WriteAheadLogManager {
         if policy.capacity_budget_bytes == 0 {
             return Ok(());
         }
-        let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
-        let wal_behavior = self.shared_wal_behavior.get_or_init(&memtable_config);
+        let wal_behavior = self.default_wal_behavior();
         let mem_bytes: u64 = wal_behavior
             .get_unflushed_batches(collection_id)
             .await
@@ -1899,8 +1850,7 @@ impl WriteAheadLogManager {
         };
 
         // Use shared WAL behavior for batch operations
-        let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
-        let wal_behavior = self.shared_wal_behavior.get_or_init(&memtable_config);
+        let wal_behavior = self.default_wal_behavior();
         let sequences = wal_behavior.add_vector_batch(&collection_id, batch).await?;
         let duration = start_time.elapsed();
 
@@ -1979,8 +1929,7 @@ impl WriteAheadLogManager {
         collection_id: &str,
         record_id: &VectorId,
     ) -> Result<Option<ProximaRecord>> {
-        let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
-        let wal_behavior = self.shared_wal_behavior.get_or_init(&memtable_config);
+        let wal_behavior = self.default_wal_behavior();
         wal_behavior.vector_by_id(collection_id, record_id).await
     }
 
@@ -1991,8 +1940,7 @@ impl WriteAheadLogManager {
         from_sequence: u64,
         limit: Option<usize>,
     ) -> Result<Vec<ProximaRecord>> {
-        let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
-        let wal_behavior = self.shared_wal_behavior.get_or_init(&memtable_config);
+        let wal_behavior = self.default_wal_behavior();
         let records = wal_behavior.get_collection_vectors(collection_id).await?;
 
         let filtered: Vec<ProximaRecord> = records
@@ -2031,8 +1979,7 @@ impl WriteAheadLogManager {
         &self,
         collection_id: &str,
     ) -> Result<Vec<proximadb_records::ProximaRecord>> {
-        let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
-        let wal_behavior = self.shared_wal_behavior.get_or_init(&memtable_config);
+        let wal_behavior = self.default_wal_behavior();
         wal_behavior.get_collection_vectors(collection_id).await
     }
 
@@ -2166,13 +2113,7 @@ impl WriteAheadLogManager {
         &self,
     ) -> Arc<crate::storage::memtable::specialized::wal_behavior::WALBehaviorWrapper> {
         // Convert MemTableConfig to MemtableConfig
-        let memtable_config = crate::storage::memtable::core::MemtableConfig {
-            max_size_bytes: self.config.memtable.global_memory_limit,
-            flush_threshold_bytes: self.config.memtable.global_memory_limit / 2,
-            enable_mvcc: self.config.enable_mvcc,
-            mvcc_cleanup_interval_secs: self.config.performance.mvcc_cleanup_interval_secs,
-            max_versions_per_key: self.config.memtable.mvcc_versions_retained,
-        };
+        let memtable_config = Self::configured_memtable_config(&self.config);
         self.shared_wal_behavior.get_or_init(&memtable_config)
     }
 
@@ -2237,8 +2178,7 @@ impl WriteAheadLogManager {
 
         // First, add to memtable
         let sequences = {
-            let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
-            let wal_behavior = self.shared_wal_behavior.get_or_init(&memtable_config);
+            let wal_behavior = self.default_wal_behavior();
             if insert_only {
                 wal_behavior
                     .add_vector_batch_insert_only(collection_id, native_batch.clone())
@@ -2300,16 +2240,10 @@ impl WriteAheadLogManager {
             // Serialize the batch and write to disk
             use crate::storage::persistence::filesystem::FilesystemFactory;
             use crate::storage::persistence::write_ahead_log::WriteAheadLogDiskManager;
-            use crate::storage::persistence::write_ahead_log::serialization::{
-                SerializationFormat, SerializerFactory,
-            };
+            use crate::storage::persistence::write_ahead_log::serialization::SerializerFactory;
 
             // Determine serialization format based on strategy type
-            let format = match self.strategy_type {
-                config::WriteBufferStrategyType::BincodeBatch => SerializationFormat::Bincode,
-                config::WriteBufferStrategyType::AvroBatch => SerializationFormat::Avro,
-                config::WriteBufferStrategyType::ProtoBatch => SerializationFormat::ProtocolBuffers,
-            };
+            let format = self.strategy_serialization_format();
             trace!("WAL: Selected serialization format: {:?}", format);
 
             // Create serializer and serialize batch
@@ -2534,8 +2468,7 @@ impl WriteAheadLogManager {
 
         // Write to memory first
         let sequences = {
-            let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
-            let wal_behavior = self.shared_wal_behavior.get_or_init(&memtable_config);
+            let wal_behavior = self.default_wal_behavior();
             wal_behavior
                 .add_vector_batch(&collection_id, batch.clone())
                 .await
@@ -2551,16 +2484,10 @@ impl WriteAheadLogManager {
             // Serialize the batch and write to disk
             use crate::storage::persistence::filesystem::FilesystemFactory;
             use crate::storage::persistence::write_ahead_log::WriteAheadLogDiskManager;
-            use crate::storage::persistence::write_ahead_log::serialization::{
-                SerializationFormat, SerializerFactory,
-            };
+            use crate::storage::persistence::write_ahead_log::serialization::SerializerFactory;
 
             // Determine serialization format based on strategy type
-            let format = match self.strategy_type {
-                config::WriteBufferStrategyType::BincodeBatch => SerializationFormat::Bincode,
-                config::WriteBufferStrategyType::AvroBatch => SerializationFormat::Avro,
-                config::WriteBufferStrategyType::ProtoBatch => SerializationFormat::ProtocolBuffers,
-            };
+            let format = self.strategy_serialization_format();
 
             // Create serializer and serialize batch
             let serializer = SerializerFactory::create(format);
@@ -2634,8 +2561,7 @@ impl WriteAheadLogManager {
         collection_id: &str,
         vector_id: &VectorId,
     ) -> Result<Option<proximadb_records::ProximaRecord>> {
-        let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
-        let wal_behavior = self.shared_wal_behavior.get_or_init(&memtable_config);
+        let wal_behavior = self.default_wal_behavior();
         wal_behavior.vector_by_id(collection_id, vector_id).await
     }
 
@@ -2647,8 +2573,7 @@ impl WriteAheadLogManager {
         collection_id: &str,
         vector_id: &VectorId,
     ) -> Result<Option<proximadb_records::ProximaRecord>> {
-        let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
-        let wal_behavior = self.shared_wal_behavior.get_or_init(&memtable_config);
+        let wal_behavior = self.default_wal_behavior();
         wal_behavior
             .latest_version_by_id(collection_id, vector_id)
             .await
@@ -2662,10 +2587,31 @@ impl WriteAheadLogManager {
     /// `MemtableManager` handle it doesn't hold. Best-effort: `0` for an unknown
     /// collection (no unflushed delta).
     pub async fn get_collection_working_set_bytes(&self, collection_id: &str) -> Result<u64> {
-        let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
-        let wal_behavior = self.shared_wal_behavior.get_or_init(&memtable_config);
+        let wal_behavior = self.default_wal_behavior();
         let batches = wal_behavior.get_unflushed_batches(collection_id).await?;
         Ok(batches.iter().map(|b| b.total_size_bytes as u64).sum())
+    }
+
+    /// Materialize a zero-score marker record (deletion tombstone or
+    /// TTL-expired empty candidate) from an unflushed WAL record — shared by
+    /// the tombstone-collection push and the post-cut zero-marker
+    /// materialization in [`Self::search_unflushed_vectors`].
+    fn zero_score_marker(
+        vector_record: &proximadb_records::ProximaRecord,
+    ) -> crate::core::search::results::OptimizedSearchRecord {
+        crate::core::search::results::OptimizedSearchRecord {
+            id: vector_record.oid.clone(),
+            vector_id: Some(vector_record.oid.clone()),
+            score: 0.0,
+            similarity: Some(0.0),
+            vector: None,
+            version: Some(vector_record.record_version as u32),
+            timestamp: Some(vector_record.created_at_ns / 1_000_000),
+            updated_at: Some(vector_record.updated_at_ns / 1_000_000),
+            expires_at: vector_record.valid_to_ns.map(|ns| ns / 1_000_000_000),
+            valid_to_ns: vector_record.valid_to_ns,
+            ..Default::default()
+        }
     }
 
     /// Enhanced search with bloom filter optimization for WAL/memtable data
@@ -2691,8 +2637,7 @@ impl WriteAheadLogManager {
         );
 
         // Step 1: Get unflushed batches through strategy (which accesses global memtable)
-        let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
-        let wal_behavior = self.shared_wal_behavior.get_or_init(&memtable_config);
+        let wal_behavior = self.default_wal_behavior();
         let batches = wal_behavior
             .get_unflushed_batches(collection_id)
             .await
@@ -2776,19 +2721,7 @@ impl WriteAheadLogManager {
                         // Deletion tombstone: cheap suppression marker, EXEMPT
                         // from the top_k cut (TD-188), kept in full.
                         tracing::trace!("Returning tombstone marker for: {}", vector_record.oid);
-                        tombstones.push(crate::core::search::results::OptimizedSearchRecord {
-                            id: vector_record.oid.clone(),
-                            vector_id: Some(vector_record.oid.clone()),
-                            score: 0.0,
-                            similarity: Some(0.0),
-                            vector: None,
-                            version: Some(vector_record.record_version as u32),
-                            timestamp: Some(vector_record.created_at_ns / 1_000_000),
-                            updated_at: Some(vector_record.updated_at_ns / 1_000_000),
-                            expires_at: expires_at_secs,
-                            valid_to_ns: vector_record.valid_to_ns,
-                            ..Default::default()
-                        });
+                        tombstones.push(Self::zero_score_marker(vector_record));
                     } else {
                         // TTL-expired empty: a score-0.0 candidate subject to the
                         // cut (as the original scored is_tombstone records whose
@@ -2843,19 +2776,7 @@ impl WriteAheadLogManager {
                 let vector_record = &filtered_batches[batch_idx].vector_records[record_idx];
                 let expires_at_secs = vector_record.valid_to_ns.map(|ns| ns / 1_000_000_000);
                 if is_zero_marker {
-                    return crate::core::search::results::OptimizedSearchRecord {
-                        id: vector_record.oid.clone(),
-                        vector_id: Some(vector_record.oid.clone()),
-                        score: 0.0,
-                        similarity: Some(0.0),
-                        vector: None,
-                        version: Some(vector_record.record_version as u32),
-                        timestamp: Some(vector_record.created_at_ns / 1_000_000),
-                        updated_at: Some(vector_record.updated_at_ns / 1_000_000),
-                        expires_at: expires_at_secs,
-                        valid_to_ns: vector_record.valid_to_ns,
-                        ..Default::default()
-                    };
+                    return Self::zero_score_marker(vector_record);
                 }
                 let vec_values_cow = vector_record
                     .embeddings
@@ -3059,8 +2980,7 @@ impl WriteAheadLogManager {
         collection_id: &str,
     ) -> Result<Vec<proximadb_records::ProximaRecord>> {
         {
-            let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
-            let wal_behavior = self.shared_wal_behavior.get_or_init(&memtable_config);
+            let wal_behavior = self.default_wal_behavior();
             wal_behavior.get_collection_vectors(collection_id).await
         }
     }
@@ -3071,8 +2991,7 @@ impl WriteAheadLogManager {
         &self,
         collection_id: &str,
     ) -> Result<Vec<proximadb_records::ProximaRecord>> {
-        let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
-        let wal_behavior = self.shared_wal_behavior.get_or_init(&memtable_config);
+        let wal_behavior = self.default_wal_behavior();
         wal_behavior.get_collection_vectors_raw(collection_id).await
     }
 
@@ -3088,8 +3007,7 @@ impl WriteAheadLogManager {
         predicate: Option<&(dyn Fn(&proximadb_records::ProximaRecord) -> bool + Send + Sync)>,
         now_ns: i64,
     ) -> Result<Vec<proximadb_records::ProximaRecord>> {
-        let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
-        let wal_behavior = self.shared_wal_behavior.get_or_init(&memtable_config);
+        let wal_behavior = self.default_wal_behavior();
         wal_behavior
             .stream_unflushed_records(collection_id, after, limit, predicate, now_ns)
             .await
@@ -3102,8 +3020,7 @@ impl WriteAheadLogManager {
         limit: Option<usize>,
     ) -> Result<Vec<crate::storage::memtable::specialized::wal_behavior::WALVectorBatch>> {
         {
-            let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
-            let wal_behavior = self.shared_wal_behavior.get_or_init(&memtable_config);
+            let wal_behavior = self.default_wal_behavior();
             // Get unflushed batches for the collection
             let batches = wal_behavior.get_unflushed_batches(collection_id).await?;
 
@@ -3160,8 +3077,7 @@ impl WriteAheadLogManager {
         _sequences: &[u64],
     ) -> Result<WALVectorBatch> {
         // Get the batch from the strategy's memory
-        let memtable_config = crate::storage::memtable::core::MemtableConfig::default();
-        let wal_behavior = self.shared_wal_behavior.get_or_init(&memtable_config);
+        let wal_behavior = self.default_wal_behavior();
         let collection_vectors = wal_behavior
             .get_collection_vectors(collection_id)
             .await
@@ -3206,6 +3122,19 @@ impl WriteAheadLogManager {
         }
     }
 
+    /// The on-disk serialization format implied by the configured strategy
+    /// type — shared by the two sync-to-disk append paths.
+    fn strategy_serialization_format(
+        &self,
+    ) -> crate::storage::persistence::write_ahead_log::serialization::SerializationFormat {
+        use crate::storage::persistence::write_ahead_log::serialization::SerializationFormat;
+        match self.strategy_type {
+            config::WriteBufferStrategyType::BincodeBatch => SerializationFormat::Bincode,
+            config::WriteBufferStrategyType::AvroBatch => SerializationFormat::Avro,
+            config::WriteBufferStrategyType::ProtoBatch => SerializationFormat::ProtocolBuffers,
+        }
+    }
+
     /// Enhanced force sync for a collection using atomic coordination
     pub async fn force_sync_collection(&self, collection_id: &str) -> Result<()> {
         debug!("Force sync requested for collection '{}'", collection_id);
@@ -3213,13 +3142,7 @@ impl WriteAheadLogManager {
         // Use proper atomic sync with durability guarantees
         // Force sync is achieved by flushing all vectors which will trigger disk writes
         // Convert MemTableConfig to MemtableConfig for get_or_init
-        let memtable_config = crate::storage::memtable::core::MemtableConfig {
-            max_size_bytes: self.config.memtable.global_memory_limit,
-            flush_threshold_bytes: self.config.memtable.global_memory_limit / 2,
-            enable_mvcc: self.config.enable_mvcc,
-            mvcc_cleanup_interval_secs: self.config.performance.mvcc_cleanup_interval_secs,
-            max_versions_per_key: self.config.memtable.mvcc_versions_retained,
-        };
+        let memtable_config = Self::configured_memtable_config(&self.config);
         let wal_behavior = self.shared_wal_behavior.get_or_init(&memtable_config);
 
         // Get collection vectors and flush them
@@ -3484,29 +3407,39 @@ mod simple_context_tests {
     use proximadb_distance_kernel::DistanceMetric;
     use std::collections::HashMap;
 
-    #[tokio::test]
-    async fn test_background_flush_context_creation() {
-        let _ = proximadb_hardware::hardware_capabilities(); // OnceLock auto-init
-
-        debug!("🧪 TEST: BackgroundFlushContext creation and validation");
-
-        let context = BackgroundFlushContext {
-            collection_id: "test_collection".to_string(),
-            storage_engine: StorageEngineType::Viper,
+    /// Shared fixture: the four literals in these tests differed only in
+    /// collection id, engine, and batch-size hint (all other tuning verbatim).
+    pub(crate) fn flush_context(
+        collection_id: &str,
+        storage_engine: StorageEngineType,
+        batch_size_hint: usize,
+    ) -> BackgroundFlushContext {
+        BackgroundFlushContext {
+            collection_id: collection_id.to_string(),
+            storage_engine,
             base_location: "file:///tmp/test".to_string(),
             dimension: 384,
             distance_metric: DistanceMetric::Cosine,
             compression_config: CompressionConfig::default(),
             filterable_columns: Vec::new(),
             quantization: None,
-            batch_size_hint: Some(1000),
+            batch_size_hint: Some(batch_size_hint),
             priority: OperationPriority::Normal,
             timeout_ms: Some(60_000),
             extra_metadata: HashMap::new(),
 
             tenant_id: None,
             collection_meta: None,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn test_background_flush_context_creation() {
+        let _ = proximadb_hardware::hardware_capabilities(); // OnceLock auto-init
+
+        debug!("🧪 TEST: BackgroundFlushContext creation and validation");
+
+        let context = flush_context("test_collection", StorageEngineType::Viper, 1000);
 
         // Validate context fields
         assert_eq!(context.collection_id, "test_collection");
@@ -3516,23 +3449,7 @@ mod simple_context_tests {
         assert_eq!(context.engine_name(), "viper");
 
         // Test SST engine as well
-        let sst_context = BackgroundFlushContext {
-            collection_id: "sst_collection".to_string(),
-            storage_engine: StorageEngineType::Sst,
-            base_location: "file:///tmp/test".to_string(),
-            dimension: 384,
-            distance_metric: DistanceMetric::Cosine,
-            compression_config: CompressionConfig::default(),
-            filterable_columns: Vec::new(),
-            quantization: None,
-            batch_size_hint: Some(500),
-            priority: OperationPriority::Normal,
-            timeout_ms: Some(60_000),
-            extra_metadata: HashMap::new(),
-
-            tenant_id: None,
-            collection_meta: None,
-        };
+        let sst_context = flush_context("sst_collection", StorageEngineType::Sst, 500);
         assert_eq!(sst_context.engine_name(), "sst");
 
         info!("✅ BackgroundFlushContext creation test passed");
@@ -3544,23 +3461,7 @@ mod simple_context_tests {
 
         debug!("🧪 TEST: Context performance configuration");
 
-        let viper_context = BackgroundFlushContext {
-            collection_id: "perf_test".to_string(),
-            storage_engine: StorageEngineType::Viper,
-            base_location: "file:///tmp/test".to_string(),
-            dimension: 384,
-            distance_metric: DistanceMetric::Cosine,
-            compression_config: CompressionConfig::default(),
-            filterable_columns: Vec::new(),
-            quantization: None,
-            batch_size_hint: Some(1000),
-            priority: OperationPriority::Normal,
-            timeout_ms: Some(60_000),
-            extra_metadata: HashMap::new(),
-
-            tenant_id: None,
-            collection_meta: None,
-        };
+        let viper_context = flush_context("perf_test", StorageEngineType::Viper, 1000);
 
         // Test dimension-based optimizations
         assert_eq!(viper_context.dimension, 384);
@@ -3794,6 +3695,7 @@ mod inline_flush_drain_tests {
 
 #[cfg(test)]
 mod optimization_validation_tests {
+    use super::simple_context_tests::flush_context;
     use super::*;
     use crate::storage::background_flush_context::{
         BackgroundFlushContext, CompressionConfig, OperationPriority, StorageEngineType,
@@ -3877,23 +3779,7 @@ mod optimization_validation_tests {
         let _result = mock_service.get_collection("test_collection").await;
         debug!("   VectorOperationsService → Collection Service Call #1 (creates context)");
 
-        let context = BackgroundFlushContext {
-            collection_id: "test_collection".to_string(),
-            storage_engine: StorageEngineType::Viper,
-            base_location: "file:///tmp/test".to_string(),
-            dimension: 384,
-            distance_metric: DistanceMetric::Cosine,
-            compression_config: CompressionConfig::default(),
-            filterable_columns: Vec::new(),
-            quantization: None,
-            batch_size_hint: Some(1000),
-            priority: OperationPriority::Normal,
-            timeout_ms: Some(60_000),
-            extra_metadata: HashMap::new(),
-
-            tenant_id: None,
-            collection_meta: None,
-        };
+        let context = flush_context("test_collection", StorageEngineType::Viper, 1000);
 
         debug!("   BackgroundManager → Uses pre-computed context (NO service call)");
         debug!("   FlushCoordinator → Uses pre-computed context (NO service call)");
