@@ -1076,61 +1076,16 @@ impl MetadataSerializer for NovaMetadataSerializer {
 }
 
 #[cfg(test)]
-mod test_fs_port {
-    //! extract_metadata is a placeholder that never touches the filesystem, so
-    //! tests inject a no-op `FilesystemPort` (TD-DECOMP-75 pattern).
-    use async_trait::async_trait;
-    use proximadb_storage_filesystem_types::{DirEntry, FileOptions, FileSystem, FsResult};
-    use std::sync::Arc;
-
-    pub(super) fn noop_port() -> Arc<dyn proximadb_storage_ports::FilesystemPort> {
-        Arc::new(NoopPort)
-    }
-
-    struct NoopPort;
-
-    #[async_trait]
-    impl proximadb_storage_ports::FilesystemPort for NoopPort {
-        fn get_filesystem(&self, _url: &str) -> FsResult<Arc<dyn FileSystem>> {
-            Err(
-                proximadb_storage_filesystem_types::FilesystemError::NotFound(
-                    "test stub".to_string(),
-                ),
-            )
-        }
-        async fn create_dir_all(&self, _url: &str) -> FsResult<()> {
-            Ok(())
-        }
-        async fn write(
-            &self,
-            _url: &str,
-            _data: &[u8],
-            _options: Option<FileOptions>,
-        ) -> FsResult<()> {
-            Ok(())
-        }
-        async fn move_atomic(&self, _from: &str, _to: &str) -> FsResult<()> {
-            Ok(())
-        }
-        async fn delete(&self, _url: &str) -> FsResult<()> {
-            Ok(())
-        }
-        async fn read(&self, _url: &str) -> FsResult<Vec<u8>> {
-            Ok(Vec::new())
-        }
-        async fn list(&self, _url: &str) -> FsResult<Vec<DirEntry>> {
-            Ok(Vec::new())
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    // extract_metadata is a placeholder that never touches the filesystem, so
+    // tests inject the shared no-op `FilesystemPort` (`crate::testutil`,
+    // TD-DECOMP-75 pattern).
+    use crate::testutil::noop_filesystem_port as noop_port;
 
     #[tokio::test]
     async fn test_nova_metadata_serialization() -> Result<(), ProximaDBError> {
-        let serializer = NovaMetadataSerializer::new(test_fs_port::noop_port());
+        let serializer = NovaMetadataSerializer::new(noop_port());
 
         // Test serialization
         let serialized = serializer.serialize_metadata("/test/file.nova", "test_collection")?;
@@ -1146,7 +1101,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_nova_columnar_optimization() -> Result<(), ProximaDBError> {
-        let serializer = NovaMetadataSerializer::new(test_fs_port::noop_port());
+        let serializer = NovaMetadataSerializer::new(noop_port());
 
         let serialized = serializer.serialize_metadata("/test/file.nova", "test_collection")?;
         let metadata = serializer.deserialize_metadata(&serialized)?;
@@ -1174,7 +1129,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_nova_similarity_search_optimization() -> Result<(), ProximaDBError> {
-        let serializer = NovaMetadataSerializer::new(test_fs_port::noop_port());
+        let serializer = NovaMetadataSerializer::new(noop_port());
 
         let serialized = serializer.serialize_metadata("/test/file.nova", "test_collection")?;
         let metadata = serializer.deserialize_metadata(&serialized)?;

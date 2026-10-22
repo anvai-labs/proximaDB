@@ -100,8 +100,8 @@ impl SimdDecoder for Avx2Decoder {
                 _ => {}
             }
 
-            // For non-aligned bit widths, fall back to scalar with SIMD post-processing
-            decode_variable_bits_i64(input, bits_per_value, output)
+            // For non-aligned bit widths, fall back to the shared scalar path
+            super::common::decode_variable_bits_i64(input, bits_per_value, output)
         }
 
         #[cfg(not(target_arch = "x86_64"))]
@@ -136,8 +136,8 @@ impl SimdDecoder for Avx2Decoder {
                 _ => {}
             }
 
-            // For non-aligned bit widths, fall back to scalar
-            decode_variable_bits_i32(input, bits_per_value, output)
+            // For non-aligned bit widths, fall back to the shared scalar path
+            super::common::decode_variable_bits_i32(input, bits_per_value, output)
         }
 
         #[cfg(not(target_arch = "x86_64"))]
@@ -147,35 +147,25 @@ impl SimdDecoder for Avx2Decoder {
     }
 
     fn decode_delta_f32(&self, input: &[u8], base: f32, output: &mut [f32]) -> Result<usize> {
-        if input.is_empty() || output.is_empty() {
+        if output.is_empty() {
             return Ok(0);
         }
 
         // Parse header
-        if input.len() < 5 {
-            bail!("Input too short for delta header");
-        }
-
-        let count = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
-        let bits = input[4];
-
-        if count == 0 {
+        let Some(header) = super::common::parse_delta_header(input)? else {
             return Ok(0);
-        }
+        };
 
-        let actual_count = count.min(output.len());
-        let packed_data = &input[5..];
+        let actual_count = header.count.min(output.len());
 
         #[cfg(target_arch = "x86_64")]
         {
             // Decode deltas to i64
             let mut deltas = vec![0i64; actual_count];
-            let decoded = self.decode_bitpacked_i64(packed_data, bits, &mut deltas)?;
+            let decoded = self.decode_bitpacked_i64(header.packed, header.bits, &mut deltas)?;
 
-            // Reconstruct using AVX2 SIMD
-            unsafe {
-                reconstruct_delta_f32_avx2(&deltas[..decoded], base, &mut output[..decoded])?;
-            }
+            // Reconstruct bit patterns (shared scalar path)
+            super::common::reconstruct_delta_f32(&deltas[..decoded], base, &mut output[..decoded]);
 
             Ok(decoded.min(actual_count))
         }
@@ -187,35 +177,23 @@ impl SimdDecoder for Avx2Decoder {
     }
 
     fn decode_delta_i64(&self, input: &[u8], base: i64, output: &mut [i64]) -> Result<usize> {
-        if input.is_empty() || output.is_empty() {
+        if output.is_empty() {
             return Ok(0);
         }
 
         // Parse header
-        if input.len() < 5 {
-            bail!("Input too short for delta header");
-        }
-
-        let count = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
-        let bits = input[4];
-
-        if count == 0 {
+        let Some(header) = super::common::parse_delta_header(input)? else {
             return Ok(0);
-        }
+        };
 
-        let actual_count = count.min(output.len());
-        let packed_data = &input[5..];
+        let actual_count = header.count.min(output.len());
 
         // Decode deltas
-        let decoded = self.decode_bitpacked_i64(packed_data, bits, &mut output[..actual_count])?;
+        let decoded =
+            self.decode_bitpacked_i64(header.packed, header.bits, &mut output[..actual_count])?;
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            // Apply prefix sum using SIMD (partial, then finalize)
-            unsafe {
-                prefix_sum_i64_avx2(&mut output[..decoded], base);
-            }
-        }
+        // Apply prefix sum (sequential finalization, shared scalar path)
+        super::common::prefix_sum_i64(&mut output[..decoded], base);
 
         Ok(decoded)
     }
@@ -538,183 +516,26 @@ fn decode_32bit_to_i32(input: &[u8], output: &mut [i32]) -> Result<usize> {
     Ok(count)
 }
 
-#[cfg(target_arch = "x86_64")]
-fn decode_variable_bits_i64(input: &[u8], bits: u8, output: &mut [i64]) -> Result<usize> {
-    // For non-byte-aligned bit widths, use scalar extraction
-    // This is still faster than pure scalar due to cache-friendly access patterns
-    let bits_usize = bits as usize;
-    let total_bits = input.len() * 8;
-    let max_values = total_bits / bits_usize;
-    let count = max_values.min(output.len());
-
-    if count == 0 {
-        return Ok(0);
-    }
-
-    let mask: u64 = if bits == 64 {
-        u64::MAX
-    } else {
-        (1u64 << bits) - 1
-    };
-
-    for i in 0..count {
-        let bit_offset = i * bits_usize;
-        let byte_offset = bit_offset / 8;
-        let bit_in_byte = bit_offset % 8;
-
-        // Read enough bytes
-        let bytes_needed = (bit_in_byte + bits_usize).div_ceil(8);
-        if byte_offset + bytes_needed > input.len() {
-            break;
-        }
-
-        // Assemble value
-        let mut value: u64 = 0;
-        for j in 0..bytes_needed.min(8) {
-            if byte_offset + j < input.len() {
-                value |= (input[byte_offset + j] as u64) << (j * 8);
-            }
-        }
-
-        output[i] = ((value >> bit_in_byte) & mask) as i64;
-    }
-
-    Ok(count)
-}
-
-#[cfg(target_arch = "x86_64")]
-fn decode_variable_bits_i32(input: &[u8], bits: u8, output: &mut [i32]) -> Result<usize> {
-    let bits_usize = bits as usize;
-    let total_bits = input.len() * 8;
-    let max_values = total_bits / bits_usize;
-    let count = max_values.min(output.len());
-
-    if count == 0 {
-        return Ok(0);
-    }
-
-    let mask: u32 = if bits == 32 {
-        u32::MAX
-    } else {
-        (1u32 << bits) - 1
-    };
-
-    for i in 0..count {
-        let bit_offset = i * bits_usize;
-        let byte_offset = bit_offset / 8;
-        let bit_in_byte = bit_offset % 8;
-
-        let bytes_needed = (bit_in_byte + bits_usize).div_ceil(8);
-        if byte_offset + bytes_needed > input.len() {
-            break;
-        }
-
-        let mut value: u64 = 0;
-        for j in 0..bytes_needed.min(8) {
-            if byte_offset + j < input.len() {
-                value |= (input[byte_offset + j] as u64) << (j * 8);
-            }
-        }
-
-        output[i] = (((value >> bit_in_byte) as u32) & mask) as i32;
-    }
-
-    Ok(count)
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn reconstruct_delta_f32_avx2(deltas: &[i64], base: f32, output: &mut [f32]) -> Result<()> {
-    let base_bits = base.to_bits() as i64;
-    let count = deltas.len().min(output.len());
-
-    // Process 4 values at a time (limited by i64 lane count in AVX2)
-    let chunks = count / 4;
-
-    for i in 0..chunks {
-        let idx = i * 4;
-
-        // Reconstruct bit patterns
-        let v0 = (base_bits + deltas[idx]) as u32;
-        let v1 = (base_bits + deltas[idx + 1]) as u32;
-        let v2 = (base_bits + deltas[idx + 2]) as u32;
-        let v3 = (base_bits + deltas[idx + 3]) as u32;
-
-        // Convert to f32
-        output[idx] = f32::from_bits(v0);
-        output[idx + 1] = f32::from_bits(v1);
-        output[idx + 2] = f32::from_bits(v2);
-        output[idx + 3] = f32::from_bits(v3);
-    }
-
-    // Handle remaining
-    for i in (chunks * 4)..count {
-        let value_bits = (base_bits + deltas[i]) as u32;
-        output[i] = f32::from_bits(value_bits);
-    }
-
-    Ok(())
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn prefix_sum_i64_avx2(output: &mut [i64], base: i64) {
-    if output.is_empty() {
-        return;
-    }
-
-    // For prefix sum, we need sequential dependency
-    // AVX2 can help with parallel partial sums, but final accumulation is sequential
-    output[0] += base;
-
-    for i in 1..output.len() {
-        output[i] += output[i - 1];
-    }
-}
+// Non-byte-aligned bit widths, delta-header parsing, f32 bit-pattern
+// reconstruction, and prefix-sum finalization are the shared scalar fallbacks
+// in `super::common` — defined once, identical on every target.
 
 #[cfg(test)]
 #[cfg(target_arch = "x86_64")]
 mod tests {
     use super::*;
+    use crate::simd_decode::test_support;
 
     fn skip_if_no_avx2() -> bool {
         !is_x86_feature_detected!("avx2")
     }
 
-    fn create_bitpacked_data(values: &[u64], bits: u8) -> Vec<u8> {
-        let total_bits = values.len() * bits as usize;
-        let byte_count = (total_bits + 7) / 8;
-        let mut result = vec![0u8; byte_count];
-
-        let mask = if bits == 64 {
-            u64::MAX
-        } else {
-            (1u64 << bits) - 1
-        };
-
-        for (i, &value) in values.iter().enumerate() {
-            let bit_offset = i * bits as usize;
-            let byte_offset = bit_offset / 8;
-            let bit_in_byte = bit_offset % 8;
-
-            let masked_value = value & mask;
-
-            let mut remaining_bits = bits as usize;
-            let mut current_byte = byte_offset;
-            let mut current_bit = bit_in_byte;
-            let mut value_bits = masked_value;
-
-            while remaining_bits > 0 {
-                let bits_in_byte = (8 - current_bit).min(remaining_bits);
-                let byte_mask = ((1u64 << bits_in_byte) - 1) as u8;
-                result[current_byte] |= ((value_bits as u8) & byte_mask) << current_bit;
-
-                value_bits >>= bits_in_byte;
-                remaining_bits -= bits_in_byte;
-                current_byte += 1;
-                current_bit = 0;
-            }
+    #[test]
+    fn test_avx2_golden_decode_battery() {
+        if skip_if_no_avx2() {
+            return;
         }
-
-        result
+        test_support::run_golden_decode_battery(&Avx2Decoder::new());
     }
 
     #[test]
@@ -722,20 +543,7 @@ mod tests {
         if skip_if_no_avx2() {
             return;
         }
-
-        let decoder = Avx2Decoder::new();
-        let values: Vec<u64> = (0..32).map(|i| i as u64).collect();
-        let packed = create_bitpacked_data(&values, 8);
-
-        let mut output = vec![0i64; values.len()];
-        let count = decoder
-            .decode_bitpacked_i64(&packed, 8, &mut output)
-            .unwrap();
-
-        assert_eq!(count, values.len());
-        for (i, &expected) in values.iter().enumerate() {
-            assert_eq!(output[i] as u64, expected, "Mismatch at index {}", i);
-        }
+        test_support::assert_decodes_i64(&Avx2Decoder::new(), &test_support::scaled_ramp(32, 1), 8);
     }
 
     #[test]
@@ -743,20 +551,11 @@ mod tests {
         if skip_if_no_avx2() {
             return;
         }
-
-        let decoder = Avx2Decoder::new();
-        let values: Vec<u64> = (0..32).map(|i| (i * 1000) as u64).collect();
-        let packed = create_bitpacked_data(&values, 16);
-
-        let mut output = vec![0i64; values.len()];
-        let count = decoder
-            .decode_bitpacked_i64(&packed, 16, &mut output)
-            .unwrap();
-
-        assert_eq!(count, values.len());
-        for (i, &expected) in values.iter().enumerate() {
-            assert_eq!(output[i] as u64, expected, "Mismatch at index {}", i);
-        }
+        test_support::assert_decodes_i64(
+            &Avx2Decoder::new(),
+            &test_support::scaled_ramp(32, 1_000),
+            16,
+        );
     }
 
     #[test]
@@ -764,20 +563,11 @@ mod tests {
         if skip_if_no_avx2() {
             return;
         }
-
-        let decoder = Avx2Decoder::new();
-        let values: Vec<u64> = (0..32).map(|i| (i * 100000) as u64).collect();
-        let packed = create_bitpacked_data(&values, 32);
-
-        let mut output = vec![0i64; values.len()];
-        let count = decoder
-            .decode_bitpacked_i64(&packed, 32, &mut output)
-            .unwrap();
-
-        assert_eq!(count, values.len());
-        for (i, &expected) in values.iter().enumerate() {
-            assert_eq!(output[i] as u64, expected, "Mismatch at index {}", i);
-        }
+        test_support::assert_decodes_i64(
+            &Avx2Decoder::new(),
+            &test_support::scaled_ramp(32, 100_000),
+            32,
+        );
     }
 
     #[test]
@@ -785,20 +575,11 @@ mod tests {
         if skip_if_no_avx2() {
             return;
         }
-
-        let decoder = Avx2Decoder::new();
-        let values: Vec<u64> = (0..32).map(|i| (i * 100) as u64).collect();
-        let packed = create_bitpacked_data(&values, 16);
-
-        let mut output = vec![0i32; values.len()];
-        let count = decoder
-            .decode_bitpacked_i32(&packed, 16, &mut output)
-            .unwrap();
-
-        assert_eq!(count, values.len());
-        for (i, &expected) in values.iter().enumerate() {
-            assert_eq!(output[i] as u64, expected, "Mismatch at index {}", i);
-        }
+        test_support::assert_decodes_i32(
+            &Avx2Decoder::new(),
+            &test_support::scaled_ramp(32, 100),
+            16,
+        );
     }
 
     #[test]
@@ -806,34 +587,7 @@ mod tests {
         if skip_if_no_avx2() {
             return;
         }
-
-        use super::super::bitpacked_scalar::ScalarDecoder;
-
-        let avx2_decoder = Avx2Decoder::new();
-        let scalar_decoder = ScalarDecoder::new();
-
-        // Test various bit widths
-        for bits in [4, 8, 12, 16, 20, 24, 32] {
-            let values: Vec<u64> = (0..100).map(|i| i as u64 % (1 << bits.min(63))).collect();
-            let packed = create_bitpacked_data(&values, bits);
-
-            let mut avx2_output = vec![0i64; values.len()];
-            let mut scalar_output = vec![0i64; values.len()];
-
-            let avx2_count = avx2_decoder
-                .decode_bitpacked_i64(&packed, bits, &mut avx2_output)
-                .unwrap();
-            let scalar_count = scalar_decoder
-                .decode_bitpacked_i64(&packed, bits, &mut scalar_output)
-                .unwrap();
-
-            assert_eq!(avx2_count, scalar_count, "Count mismatch for {} bits", bits);
-            assert_eq!(
-                avx2_output, scalar_output,
-                "Output mismatch for {} bits",
-                bits
-            );
-        }
+        test_support::assert_matches_scalar_reference(&Avx2Decoder::new());
     }
 
     #[test]

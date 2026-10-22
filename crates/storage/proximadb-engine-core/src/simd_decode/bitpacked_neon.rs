@@ -80,8 +80,8 @@ impl SimdDecoder for NeonDecoder {
                 _ => {}
             }
 
-            // For non-aligned bit widths, use scalar with NEON post-processing
-            decode_variable_bits_i64_neon(input, bits_per_value, output)
+            // For non-aligned bit widths, use the shared scalar path
+            super::common::decode_variable_bits_i64(input, bits_per_value, output)
         }
 
         #[cfg(not(target_arch = "aarch64"))]
@@ -115,7 +115,7 @@ impl SimdDecoder for NeonDecoder {
                 _ => {}
             }
 
-            decode_variable_bits_i32_neon(input, bits_per_value, output)
+            super::common::decode_variable_bits_i32(input, bits_per_value, output)
         }
 
         #[cfg(not(target_arch = "aarch64"))]
@@ -125,30 +125,22 @@ impl SimdDecoder for NeonDecoder {
     }
 
     fn decode_delta_f32(&self, input: &[u8], base: f32, output: &mut [f32]) -> Result<usize> {
-        if input.is_empty() || output.is_empty() {
+        if output.is_empty() {
             return Ok(0);
         }
 
         // Parse header
-        if input.len() < 5 {
-            bail!("Input too short for delta header");
-        }
-
-        let count = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
-        let bits = input[4];
-
-        if count == 0 {
+        let Some(header) = super::common::parse_delta_header(input)? else {
             return Ok(0);
-        }
+        };
 
-        let actual_count = count.min(output.len());
-        let packed_data = &input[5..];
+        let actual_count = header.count.min(output.len());
 
         #[cfg(target_arch = "aarch64")]
         {
             // Decode deltas to i64
             let mut deltas = vec![0i64; actual_count];
-            let decoded = self.decode_bitpacked_i64(packed_data, bits, &mut deltas)?;
+            let decoded = self.decode_bitpacked_i64(header.packed, header.bits, &mut deltas)?;
 
             // Reconstruct using NEON SIMD
             unsafe {
@@ -165,33 +157,23 @@ impl SimdDecoder for NeonDecoder {
     }
 
     fn decode_delta_i64(&self, input: &[u8], base: i64, output: &mut [i64]) -> Result<usize> {
-        if input.is_empty() || output.is_empty() {
+        if output.is_empty() {
             return Ok(0);
         }
 
         // Parse header
-        if input.len() < 5 {
-            bail!("Input too short for delta header");
-        }
-
-        let count = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
-        let bits = input[4];
-
-        if count == 0 {
+        let Some(header) = super::common::parse_delta_header(input)? else {
             return Ok(0);
-        }
+        };
 
-        let actual_count = count.min(output.len());
-        let packed_data = &input[5..];
+        let actual_count = header.count.min(output.len());
 
         // Decode deltas
-        let decoded = self.decode_bitpacked_i64(packed_data, bits, &mut output[..actual_count])?;
+        let decoded =
+            self.decode_bitpacked_i64(header.packed, header.bits, &mut output[..actual_count])?;
 
-        // Apply prefix sum (sequential - NEON helps with partial sums)
-        #[cfg(target_arch = "aarch64")]
-        {
-            prefix_sum_i64(output, decoded, base);
-        }
+        // Apply prefix sum (sequential finalization, shared scalar path)
+        super::common::prefix_sum_i64(&mut output[..decoded], base);
 
         Ok(decoded)
     }
@@ -526,86 +508,10 @@ fn decode_32bit_to_i32_neon(input: &[u8], output: &mut [i32]) -> Result<usize> {
     Ok(count)
 }
 
-#[cfg(target_arch = "aarch64")]
-fn decode_variable_bits_i64_neon(input: &[u8], bits: u8, output: &mut [i64]) -> Result<usize> {
-    // For non-byte-aligned bit widths, use scalar extraction
-    let bits_usize = bits as usize;
-    let total_bits = input.len() * 8;
-    let max_values = total_bits / bits_usize;
-    let count = max_values.min(output.len());
-
-    if count == 0 {
-        return Ok(0);
-    }
-
-    let mask: u64 = if bits == 64 {
-        u64::MAX
-    } else {
-        (1u64 << bits) - 1
-    };
-
-    for (i, out_val) in output.iter_mut().enumerate().take(count) {
-        let bit_offset = i * bits_usize;
-        let byte_offset = bit_offset / 8;
-        let bit_in_byte = bit_offset % 8;
-
-        let bytes_needed = (bit_in_byte + bits_usize).div_ceil(8);
-        if byte_offset + bytes_needed > input.len() {
-            break;
-        }
-
-        let mut value: u64 = 0;
-        for j in 0..bytes_needed.min(8) {
-            if byte_offset + j < input.len() {
-                value |= (input[byte_offset + j] as u64) << (j * 8);
-            }
-        }
-
-        *out_val = ((value >> bit_in_byte) & mask) as i64;
-    }
-
-    Ok(count)
-}
-
-#[cfg(target_arch = "aarch64")]
-fn decode_variable_bits_i32_neon(input: &[u8], bits: u8, output: &mut [i32]) -> Result<usize> {
-    let bits_usize = bits as usize;
-    let total_bits = input.len() * 8;
-    let max_values = total_bits / bits_usize;
-    let count = max_values.min(output.len());
-
-    if count == 0 {
-        return Ok(0);
-    }
-
-    let mask: u32 = if bits == 32 {
-        u32::MAX
-    } else {
-        (1u32 << bits) - 1
-    };
-
-    for (i, out_val) in output.iter_mut().enumerate().take(count) {
-        let bit_offset = i * bits_usize;
-        let byte_offset = bit_offset / 8;
-        let bit_in_byte = bit_offset % 8;
-
-        let bytes_needed = (bit_in_byte + bits_usize).div_ceil(8);
-        if byte_offset + bytes_needed > input.len() {
-            break;
-        }
-
-        let mut value: u64 = 0;
-        for j in 0..bytes_needed.min(8) {
-            if byte_offset + j < input.len() {
-                value |= (input[byte_offset + j] as u64) << (j * 8);
-            }
-        }
-
-        *out_val = (((value >> bit_in_byte) as u32) & mask) as i32;
-    }
-
-    Ok(count)
-}
+// Non-byte-aligned bit widths, delta-header parsing, and prefix-sum
+// finalization are the shared scalar fallbacks in `super::common` — defined
+// once, identical on every target. Only the NEON f32 reconstruction below
+// uses real SIMD intrinsics and stays per-target.
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn reconstruct_delta_f32_neon(deltas: &[i64], base: f32, output: &mut [f32]) -> Result<()> {
@@ -642,160 +548,52 @@ unsafe fn reconstruct_delta_f32_neon(deltas: &[i64], base: f32, output: &mut [f3
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-fn prefix_sum_i64(output: &mut [i64], count: usize, base: i64) {
-    if count == 0 {
-        return;
-    }
-
-    // Prefix sum requires sequential accumulation
-    output[0] += base;
-
-    for i in 1..count {
-        output[i] += output[i - 1];
-    }
-}
-
 #[cfg(test)]
 #[cfg(target_arch = "aarch64")]
 mod tests {
     use super::*;
+    use crate::simd_decode::test_support;
 
-    fn create_bitpacked_data(values: &[u64], bits: u8) -> Vec<u8> {
-        let total_bits = values.len() * bits as usize;
-        let byte_count = total_bits.div_ceil(8);
-        let mut result = vec![0u8; byte_count];
-
-        let mask = if bits == 64 {
-            u64::MAX
-        } else {
-            (1u64 << bits) - 1
-        };
-
-        for (i, &value) in values.iter().enumerate() {
-            let bit_offset = i * bits as usize;
-            let byte_offset = bit_offset / 8;
-            let bit_in_byte = bit_offset % 8;
-
-            let masked_value = value & mask;
-
-            let mut remaining_bits = bits as usize;
-            let mut current_byte = byte_offset;
-            let mut current_bit = bit_in_byte;
-            let mut value_bits = masked_value;
-
-            while remaining_bits > 0 {
-                let bits_in_byte = (8 - current_bit).min(remaining_bits);
-                let byte_mask = ((1u64 << bits_in_byte) - 1) as u8;
-                result[current_byte] |= ((value_bits as u8) & byte_mask) << current_bit;
-
-                value_bits >>= bits_in_byte;
-                remaining_bits -= bits_in_byte;
-                current_byte += 1;
-                current_bit = 0;
-            }
-        }
-
-        result
+    #[test]
+    fn test_neon_golden_decode_battery() {
+        test_support::run_golden_decode_battery(&NeonDecoder::new());
     }
 
     #[test]
     fn test_neon_decode_8bit() {
-        let decoder = NeonDecoder::new();
-        let values: Vec<u64> = (0..32).map(|i| i as u64).collect();
-        let packed = create_bitpacked_data(&values, 8);
-
-        let mut output = vec![0i64; values.len()];
-        let count = decoder
-            .decode_bitpacked_i64(&packed, 8, &mut output)
-            .unwrap();
-
-        assert_eq!(count, values.len());
-        for (i, &expected) in values.iter().enumerate() {
-            assert_eq!(output[i] as u64, expected, "Mismatch at index {}", i);
-        }
+        test_support::assert_decodes_i64(&NeonDecoder::new(), &test_support::scaled_ramp(32, 1), 8);
     }
 
     #[test]
     fn test_neon_decode_16bit() {
-        let decoder = NeonDecoder::new();
-        let values: Vec<u64> = (0..32).map(|i| (i * 1000) as u64).collect();
-        let packed = create_bitpacked_data(&values, 16);
-
-        let mut output = vec![0i64; values.len()];
-        let count = decoder
-            .decode_bitpacked_i64(&packed, 16, &mut output)
-            .unwrap();
-
-        assert_eq!(count, values.len());
-        for (i, &expected) in values.iter().enumerate() {
-            assert_eq!(output[i] as u64, expected, "Mismatch at index {}", i);
-        }
+        test_support::assert_decodes_i64(
+            &NeonDecoder::new(),
+            &test_support::scaled_ramp(32, 1_000),
+            16,
+        );
     }
 
     #[test]
     fn test_neon_decode_32bit() {
-        let decoder = NeonDecoder::new();
-        let values: Vec<u64> = (0..32).map(|i| (i * 100000) as u64).collect();
-        let packed = create_bitpacked_data(&values, 32);
-
-        let mut output = vec![0i64; values.len()];
-        let count = decoder
-            .decode_bitpacked_i64(&packed, 32, &mut output)
-            .unwrap();
-
-        assert_eq!(count, values.len());
-        for (i, &expected) in values.iter().enumerate() {
-            assert_eq!(output[i] as u64, expected, "Mismatch at index {}", i);
-        }
+        test_support::assert_decodes_i64(
+            &NeonDecoder::new(),
+            &test_support::scaled_ramp(32, 100_000),
+            32,
+        );
     }
 
     #[test]
     fn test_neon_decode_i32() {
-        let decoder = NeonDecoder::new();
-        let values: Vec<u64> = (0..32).map(|i| (i * 100) as u64).collect();
-        let packed = create_bitpacked_data(&values, 16);
-
-        let mut output = vec![0i32; values.len()];
-        let count = decoder
-            .decode_bitpacked_i32(&packed, 16, &mut output)
-            .unwrap();
-
-        assert_eq!(count, values.len());
-        for (i, &expected) in values.iter().enumerate() {
-            assert_eq!(output[i] as u64, expected, "Mismatch at index {}", i);
-        }
+        test_support::assert_decodes_i32(
+            &NeonDecoder::new(),
+            &test_support::scaled_ramp(32, 100),
+            16,
+        );
     }
 
     #[test]
     fn test_neon_vs_scalar_equivalence() {
-        use super::super::bitpacked_scalar::ScalarDecoder;
-
-        let neon_decoder = NeonDecoder::new();
-        let scalar_decoder = ScalarDecoder::new();
-
-        // Test various bit widths
-        for bits in [4, 8, 12, 16, 20, 24, 32] {
-            let values: Vec<u64> = (0..100).map(|i| i as u64 % (1 << bits.min(63))).collect();
-            let packed = create_bitpacked_data(&values, bits);
-
-            let mut neon_output = vec![0i64; values.len()];
-            let mut scalar_output = vec![0i64; values.len()];
-
-            let neon_count = neon_decoder
-                .decode_bitpacked_i64(&packed, bits, &mut neon_output)
-                .unwrap();
-            let scalar_count = scalar_decoder
-                .decode_bitpacked_i64(&packed, bits, &mut scalar_output)
-                .unwrap();
-
-            assert_eq!(neon_count, scalar_count, "Count mismatch for {} bits", bits);
-            assert_eq!(
-                neon_output, scalar_output,
-                "Output mismatch for {} bits",
-                bits
-            );
-        }
+        test_support::assert_matches_scalar_reference(&NeonDecoder::new());
     }
 
     #[test]
