@@ -1051,6 +1051,13 @@ pub async fn try_run_select(
                     target: "proximadb::pgwire::new_pipeline",
                     "relational schema resolve for `{raw}` failed: {e}; falling through to legacy"
                 );
+                // TD-USUB-2: the legacy path would drop a window function — but
+                // say why this table has no relational route (a typo, a vector
+                // collection) rather than suggest enabling one. System catalogs
+                // keep their legacy stubs.
+                if require_engagement && !is_system_catalog_relation(raw) {
+                    return unresolved_window_decline(query, raw, &e).map(Err);
+                }
                 return None;
             }
         }
@@ -1490,16 +1497,7 @@ pub async fn try_run_select(
         Some(Ok(p)) => p,
         Some(Err(e)) => return Some(Err(e)),
         None if !require_engagement => return None,
-        None => {
-            return query_window_function_name(query).map(|name| {
-                Err(format!(
-                    "0A000: window function {name}() OVER (...) is not supported on this \
-                     table without a DataFusion route; enable the native table provider \
-                     (PROXIMADB_NATIVE_TABLE_PROVIDER=1) or ALTER TABLE ... MATERIALIZE so \
-                     DataFusion serves it (TD-USUB-2)"
-                ))
-            });
-        }
+        None => return window_decline(query, relational_abac_required).map(Err),
     };
     crate::observability::io_trace::record_setup_ms(setup_start.elapsed().as_millis() as u64);
     match execute_physical(physical, &snapshot, controls).await {
@@ -3717,7 +3715,11 @@ fn query_engages_relational_engine(query: &SqlQuery) -> bool {
     // walk can only misparse it. Engage the relational/OLAP route; the
     // frontend's CTE decline then falls the query through to the DataFusion
     // floor (which plans CTEs, recursive included, natively).
-    query.with.is_some() || set_expr_engages(&query.body)
+    query.with.is_some()
+        || set_expr_engages(&query.body)
+        // TD-USUB-2: a window function anywhere (ORDER BY, a nested
+        // expression) is beyond the legacy path just as a projected one is.
+        || query_window_function_name(query).is_some()
 }
 
 /// TD-OLAP-4 operation dimension: classify the SELECT's OLAP operation from the AST
@@ -4163,47 +4165,71 @@ fn geometry_subqueries_of_expr<'a>(expr: &'a SqlExpr, out: &mut Vec<&'a SqlQuery
     }
 }
 
-/// True if a projection item applies a window function (`… OVER (…)`).
+/// True if a projection item applies a window function (`… OVER (…)`) at any
+/// depth — `coalesce(lag(x) OVER (…), 0)` and `CASE WHEN rank() OVER (…) …`
+/// count as much as a bare `lag(x) OVER (…)`.
 fn select_item_has_window(item: &SelectItem) -> bool {
-    select_item_window_function(item).is_some()
+    first_window_function(item).is_some()
 }
 
-/// The first window function call (`… OVER (…)`) a projection item applies, if any.
-fn select_item_window_function(item: &SelectItem) -> Option<&sqlparser::ast::Function> {
-    match item {
-        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-            expr_window_function(e)
-        }
-        _ => None,
+/// Name of the first window function (`… OVER (…)`) anywhere in `node`.
+fn first_window_function<V: sqlparser::ast::Visit>(node: &V) -> Option<String> {
+    use std::ops::ControlFlow;
+    match sqlparser::ast::visit_expressions(node, |expr| match expr {
+        SqlExpr::Function(f) if f.over.is_some() => ControlFlow::Break(f.name.to_string()),
+        _ => ControlFlow::Continue(()),
+    }) {
+        ControlFlow::Break(name) => Some(name),
+        ControlFlow::Continue(()) => None,
     }
 }
 
-fn expr_window_function(expr: &SqlExpr) -> Option<&sqlparser::ast::Function> {
-    match expr {
-        SqlExpr::Function(f) if f.over.is_some() => Some(f),
-        SqlExpr::BinaryOp { left, right, .. } => {
-            expr_window_function(left).or_else(|| expr_window_function(right))
-        }
-        SqlExpr::UnaryOp { expr, .. } | SqlExpr::Nested(expr) | SqlExpr::Cast { expr, .. } => {
-            expr_window_function(expr)
-        }
-        _ => None,
-    }
-}
-
-/// TD-USUB-2: name of the first window function in the top-level SELECT projection —
-/// the shape `set_expr_engages` engages on (TD-187). When no DataFusion route serves
-/// such a query, the legacy single-table path would drop the `OVER (…)` and return a
-/// silently wrong answer, so `try_run_select` declines it with `0A000` instead.
+/// TD-USUB-2: name of the first window function anywhere in the query — the
+/// projection at any depth, ORDER BY, derived tables, CTEs and set operations.
+/// The relational frontend declines every `OVER (…)` (TD-187), so such a query
+/// is served correctly only by a DataFusion route; the legacy single-table path
+/// would drop the window and return a silently wrong answer.
 fn query_window_function_name(query: &SqlQuery) -> Option<String> {
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return None;
+    first_window_function(query)
+}
+
+/// TD-USUB-2: the pgwire decline for a windowed query no DataFusion route
+/// serves. `MATERIALIZE` is offered only where it would help: the Parquet route
+/// is closed to ABAC-governed sessions.
+fn window_decline(query: &SqlQuery, abac_governed: bool) -> Option<String> {
+    let name = query_window_function_name(query)?;
+    let materialize = if abac_governed {
+        ""
+    } else {
+        " or ALTER TABLE ... MATERIALIZE"
     };
-    select
-        .projection
-        .iter()
-        .find_map(select_item_window_function)
-        .map(|f| f.name.to_string())
+    Some(format!(
+        "0A000: window function {name} OVER (...) is not supported on this table without \
+         a DataFusion route; enable the native table provider \
+         (PROXIMADB_NATIVE_TABLE_PROVIDER=1){materialize} so DataFusion serves it (TD-USUB-2)"
+    ))
+}
+
+/// TD-USUB-2: the decline for a windowed query naming a relation that does not
+/// resolve as a relational table — carrying the resolution error, since the
+/// remedy is the name or the object, not a gate.
+fn unresolved_window_decline(
+    query: &SqlQuery,
+    relation: &str,
+    error: &anyhow::Error,
+) -> Option<String> {
+    let name = query_window_function_name(query)?;
+    Some(format!(
+        "0A000: window function {name} OVER (...) needs a relational table, and `{relation}` \
+         did not resolve as one: {error} (TD-USUB-2)"
+    ))
+}
+
+/// `pg_catalog.*` / `information_schema.*` — served by pgwire's introspection
+/// stubs, never by the relational pipeline.
+fn is_system_catalog_relation(relation: &str) -> bool {
+    let lower = relation.trim().to_ascii_lowercase();
+    lower.starts_with("pg_catalog.") || lower.starts_with("information_schema.")
 }
 
 fn set_expr_engages(body: &SetExpr) -> bool {
@@ -4819,6 +4845,94 @@ mod tests {
         );
         assert_eq!(window_name("SELECT id, abs(val) FROM t"), None);
         assert_eq!(window_name("SELECT count(*) FROM t"), None);
+        // Any depth and any position — every shape the legacy path would serve
+        // wrongly must be found (review of #2128).
+        for (sql, name) in [
+            (
+                "SELECT coalesce(lag(val) OVER (ORDER BY id), 0) FROM t",
+                "lag",
+            ),
+            (
+                "SELECT abs(val - lag(val) OVER (ORDER BY id)) FROM t",
+                "lag",
+            ),
+            (
+                "SELECT CASE WHEN lead(val) OVER (ORDER BY id) IS NULL THEN 1 END FROM t",
+                "lead",
+            ),
+            (
+                "SELECT id FROM t ORDER BY row_number() OVER (ORDER BY val)",
+                "row_number",
+            ),
+            (
+                "SELECT id FROM (SELECT id, rank() OVER (ORDER BY val) AS r FROM t) s",
+                "rank",
+            ),
+            (
+                "WITH w AS (SELECT ntile(2) OVER (ORDER BY id) AS b FROM t) SELECT b FROM w",
+                "ntile",
+            ),
+            ("(SELECT id, lag(val) OVER (ORDER BY id) FROM t)", "lag"),
+            (
+                "SELECT id FROM t UNION SELECT dense_rank() OVER (ORDER BY id) FROM t",
+                "dense_rank",
+            ),
+        ] {
+            assert_eq!(window_name(sql).as_deref(), Some(name), "{sql}");
+        }
+        // Engagement follows the same rule, so none of these reaches the legacy path.
+        let engages = |sql: &str| match Parser::parse_sql(&GenericDialect {}, sql)
+            .expect("parse")
+            .pop()
+        {
+            Some(Statement::Query(query)) => query_engages_relational_engine(&query),
+            _ => panic!("expected a SELECT"),
+        };
+        for (sql, name) in [
+            (
+                "SELECT rank() OVER w FROM t WINDOW w AS (ORDER BY val)",
+                "rank",
+            ),
+            (
+                "SELECT id FROM t QUALIFY row_number() OVER (ORDER BY id) = 1",
+                "row_number",
+            ),
+        ] {
+            assert_eq!(window_name(sql).as_deref(), Some(name), "{sql}");
+        }
+        // The hint offers MATERIALIZE only where the Parquet route could serve.
+        let query = match Parser::parse_sql(&GenericDialect {}, "SELECT lag(v) OVER () FROM t")
+            .expect("parse")
+            .pop()
+        {
+            Some(Statement::Query(query)) => query,
+            _ => panic!("expected a SELECT"),
+        };
+        let open = window_decline(&query, false).expect("windowed");
+        let governed = window_decline(&query, true).expect("windowed");
+        assert!(
+            open.starts_with("0A000: ") && open.contains("MATERIALIZE"),
+            "{open}"
+        );
+        assert!(!governed.contains("MATERIALIZE"), "{governed}");
+        // An unresolved relation says why, and system catalogs keep their stubs.
+        let unresolved = unresolved_window_decline(
+            &query,
+            "nosuch",
+            &anyhow::anyhow!("Table 'nosuch' does not exist"),
+        )
+        .expect("windowed");
+        assert!(unresolved.contains("nosuch") && unresolved.contains("does not exist"));
+        assert!(is_system_catalog_relation("PG_CATALOG.pg_proc"));
+        assert!(is_system_catalog_relation("information_schema.columns"));
+        assert!(!is_system_catalog_relation("public.t"));
+        assert!(engages(
+            "SELECT coalesce(lag(val) OVER (ORDER BY id), 0) FROM t"
+        ));
+        assert!(engages(
+            "SELECT id FROM t ORDER BY row_number() OVER (ORDER BY val)"
+        ));
+        assert!(!engages("SELECT id, abs(val) FROM t"));
     }
 
     /// ADR-058 D5 / §9.A: the stats-trust derivation is the load-bearing security

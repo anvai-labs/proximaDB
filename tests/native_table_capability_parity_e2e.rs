@@ -139,6 +139,22 @@ async fn body() {
         db.message()
     );
 
+    // A window nested in another expression declines the same way (it used to
+    // escape detection and reach the legacy path).
+    let nested = client
+        .simple_query("select id, coalesce(lag(val) over (order by id), 0) as p from usub2_t")
+        .await
+        .expect_err("a nested window function must decline with the gate OFF");
+    let nested_db = nested
+        .as_db_error()
+        .unwrap_or_else(|| panic!("expected a server error, got {nested}"));
+    assert_eq!(nested_db.code().code(), "0A000");
+    assert!(
+        nested_db.message().contains("lag") && nested_db.message().contains("TD-USUB-2"),
+        "the nested window must be declined by the window decline: {}",
+        nested_db.message()
+    );
+
     drop(client);
     drop(server);
 
