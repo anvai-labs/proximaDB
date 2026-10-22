@@ -47,3 +47,25 @@ only rewrite of a canonical-format WAL is the system catalog compacting its *own
 snapshot checkpoint (`src/services/system_catalog.rs:610`). Verified with
 `grep -rn min_unflushed_lsn src crates` and `grep -rn rewrite_canonical_wal src crates`. The
 rework is still required, because truncation is planned (P2), not because it ships today.
+
+== P2.4 slice 3: multi-part Parquet writer (2026-10-22)
+
+`proximadb_storage_common::parquet_multipart::MultipartParquetWriter` streams Arrow batches
+into size-capped data files (`{dir}/{stem}-{nnnnn}.parquet`). Each file is an
+`AsyncArrowWriter` over an `object_store` multipart `BufWriter`, written with the warehouse
+`ParquetWritePolicy` and Iceberg field ids. Two new policy knobs size the parts:
+
+* `target_file_rows` (`PROXIMADB_MATERIALIZE_TARGET_FILE_ROWS`, default 16 Mi rows) is exact,
+  because a batch that crosses the cap is split;
+* `target_file_bytes` (`PROXIMADB_MATERIALIZE_TARGET_FILE_BYTES`, default 256 MiB) is checked
+  between batches.
+
+Up to one row group is buffered before a part opens, so the part's Bloom filters are sized
+from a full row group rather than from the first small batch. `finish` returns the parts for
+the caller to commit as one snapshot; `abort` aborts the open upload and deletes the finished
+parts. `ObjectStoreBridge::object_store_path` lets the writer address a base-prefixed bridge's
+store directly.
+
+Evidence: the `parquet_multipart::tests` suite: exact row roll-over with every row kept, byte
+roll-over, an empty publication writing one empty part, abort removing every part, a mismatched
+batch rejected, and Bloom filters sized from a full row group.

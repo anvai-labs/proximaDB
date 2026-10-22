@@ -36,6 +36,13 @@ pub trait ObjectStoreBridge: Send + Sync {
     /// Returns a reference to the underlying `ObjectStore` implementation.
     fn inner_store(&self) -> Arc<dyn ObjectStore>;
 
+    /// The key in [`inner_store`](Self::inner_store) of a bridge-relative `key`
+    /// (a bridge rooted under a base prefix prepends it). For writers that go to
+    /// the store directly, e.g. multipart uploads. Default: the key itself.
+    fn object_store_path(&self, key: &Path) -> Path {
+        key.clone()
+    }
+
     /// Reads a Parquet file from object storage and yields a stream of Arrow `RecordBatch`es.
     /// This is the primary ingestion path for DataFusion logical plans.
     async fn read_parquet_batches(
