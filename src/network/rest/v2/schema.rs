@@ -113,18 +113,7 @@ pub async fn get_schema(
         ));
     }
 
-    let metadata = state
-        .api_handlers
-        .get_collection_schema_metadata(&collection_id, Some(&tenant.tenant_id))
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("not found") {
-                ApiError::CollectionNotFound(collection_id.clone())
-            } else {
-                ApiError::Internal(format!("Failed to get collection schema: {}", e))
-            }
-        })?
-        .ok_or_else(|| ApiError::CollectionNotFound(collection_id.clone()))?;
+    let metadata = load_schema_metadata(&state, &collection_id, &tenant).await?;
 
     if !metadata.enabled {
         return Err(ApiError::CollectionNotFound(format!(
@@ -317,18 +306,7 @@ pub async fn update_schema(
         let _ = parse_rest_data_type(column)?;
     }
 
-    let existing_metadata = state
-        .api_handlers
-        .get_collection_schema_metadata(&collection_id, Some(&tenant.tenant_id))
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("not found") {
-                ApiError::CollectionNotFound(collection_id.clone())
-            } else {
-                ApiError::Internal(format!("Failed to get collection schema: {}", e))
-            }
-        })?
-        .ok_or_else(|| ApiError::CollectionNotFound(collection_id.clone()))?;
+    let existing_metadata = load_schema_metadata(&state, &collection_id, &tenant).await?;
 
     let existing_schema = existing_metadata
         .enabled
@@ -501,6 +479,28 @@ pub async fn update_schema(
         warnings,
         updated_at: now,
     }))
+}
+
+/// Load a collection's schema metadata for `tenant`. A missing collection —
+/// an absent row or a not-found error — reads as 404; any other error is a
+/// 500 with schema context (deliberately not `collection_op_error`'s message).
+async fn load_schema_metadata(
+    state: &AppState,
+    collection_id: &str,
+    tenant: &TenantContext,
+) -> ApiResult<CollectionSchemaMetadata> {
+    state
+        .api_handlers
+        .get_collection_schema_metadata(collection_id, Some(&tenant.tenant_id))
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("not found") {
+                ApiError::CollectionNotFound(collection_id.to_string())
+            } else {
+                ApiError::Internal(format!("Failed to get collection schema: {}", e))
+            }
+        })?
+        .ok_or_else(|| ApiError::CollectionNotFound(collection_id.to_string()))
 }
 
 fn schema_definition_from_metadata(metadata: &CollectionSchemaMetadata) -> SchemaDefinition {

@@ -47,7 +47,9 @@ use crate::errors::{ApiError, ApiResult};
 use crate::index::axis::management::AnnIndexAdvisor;
 use crate::network::middleware::tenant::TenantContext;
 use crate::network::rest::canonical::handlers::AppState;
-use crate::proto::proximadb_v1::{CollectionConfig, CollectionOperation, CollectionRequest};
+use crate::proto::proximadb_v1::{
+    CollectionConfig, CollectionOperation, CollectionRequest, CollectionResponse,
+};
 
 fn collection_storage_engine_label(storage_engine: Option<i32>) -> &'static str {
     match storage_engine {
@@ -105,6 +107,43 @@ fn collection_create_error(collection_name: &str, e: impl std::fmt::Display) -> 
     } else {
         ApiError::Internal(format!("Failed to create collection: {e}"))
     }
+}
+
+/// Build a v1 `CollectionRequest` for `operation` on `collection_id` with
+/// every other field empty; sites that carry a config, query params or
+/// options set them via struct-update.
+fn collection_request(
+    operation: CollectionOperation,
+    collection_id: Option<String>,
+) -> CollectionRequest {
+    CollectionRequest {
+        operation: operation as i32,
+        collection_id,
+        collection_config: None,
+        query_params: Default::default(),
+        options: Default::default(),
+        migration_config: Default::default(),
+    }
+}
+
+/// Tenant-scoped collection GET through the unified handlers; a not-found
+/// error reads as 404 via [`collection_op_error`].
+async fn get_collection_for_tenant(
+    state: &AppState,
+    collection_id: &str,
+    tenant: &TenantContext,
+) -> ApiResult<CollectionResponse> {
+    state
+        .api_handlers
+        .handle_collection_operation_for_tenant(
+            collection_request(
+                CollectionOperation::CollectionGet,
+                Some(collection_id.to_string()),
+            ),
+            Some(&tenant.tenant_id),
+        )
+        .await
+        .map_err(|e| collection_op_error("get", collection_id, e))
 }
 
 fn collection_create_failure_error(collection_name: &str, error_code: Option<&str>) -> ApiError {
@@ -821,19 +860,18 @@ pub async fn create_collection_v2(
         );
     }
 
-    let collection_request = CollectionRequest {
-        operation: CollectionOperation::CollectionCreate as i32,
-        collection_id: Some(request.name.clone()),
+    let create_request = CollectionRequest {
         collection_config: Some(collection_config),
-        query_params: Default::default(),
-        options: Default::default(),
-        migration_config: Default::default(),
+        ..collection_request(
+            CollectionOperation::CollectionCreate,
+            Some(request.name.clone()),
+        )
     };
 
     // Create collection via unified handlers
     match state
         .api_handlers
-        .handle_collection_operation_for_tenant(collection_request, Some(&tenant.tenant_id))
+        .handle_collection_operation_for_tenant(create_request, Some(&tenant.tenant_id))
         .await
     {
         Ok(resp) if !resp.success => {
@@ -1022,14 +1060,10 @@ pub async fn get_collection_v2(
     }
 
     // Get collection via unified handlers
-    let request = CollectionRequest {
-        operation: CollectionOperation::CollectionGet as i32,
-        collection_id: Some(collection_id.clone()),
-        collection_config: None,
-        query_params: Default::default(),
-        options: Default::default(),
-        migration_config: Default::default(),
-    };
+    let request = collection_request(
+        CollectionOperation::CollectionGet,
+        Some(collection_id.clone()),
+    );
 
     match state
         .api_handlers
@@ -1290,12 +1324,9 @@ pub async fn list_collections_v2(
     options.insert("include_stats".to_string(), include_stats);
 
     let request = CollectionRequest {
-        operation: CollectionOperation::CollectionList as i32,
-        collection_id: None,
-        collection_config: None,
         query_params,
         options,
-        migration_config: Default::default(),
+        ..collection_request(CollectionOperation::CollectionList, None)
     };
 
     match state
@@ -1391,14 +1422,10 @@ pub async fn delete_collection_v2(
         ));
     }
 
-    let request = CollectionRequest {
-        operation: CollectionOperation::CollectionDelete as i32,
-        collection_id: Some(collection_id.clone()),
-        collection_config: None,
-        query_params: Default::default(),
-        options: Default::default(),
-        migration_config: Default::default(),
-    };
+    let request = collection_request(
+        CollectionOperation::CollectionDelete,
+        Some(collection_id.clone()),
+    );
 
     let response = state
         .api_handlers
@@ -2297,20 +2324,7 @@ pub async fn get_collection_statistics_v2(
         ));
     }
 
-    let request = CollectionRequest {
-        operation: CollectionOperation::CollectionGet as i32,
-        collection_id: Some(collection_id.clone()),
-        collection_config: None,
-        query_params: Default::default(),
-        options: Default::default(),
-        migration_config: Default::default(),
-    };
-
-    let resp = state
-        .api_handlers
-        .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
-        .await
-        .map_err(|e| collection_op_error("get", &collection_id, e))?;
+    let resp = get_collection_for_tenant(&state, &collection_id, &tenant).await?;
 
     // A collection this tenant cannot resolve reads exactly as a missing one;
     // statistics are only ever read or written under its canonical id.
@@ -2399,20 +2413,7 @@ pub async fn get_collection_route_health_v2(
         ));
     }
 
-    let request = CollectionRequest {
-        operation: CollectionOperation::CollectionGet as i32,
-        collection_id: Some(collection_id.clone()),
-        collection_config: None,
-        query_params: Default::default(),
-        options: Default::default(),
-        migration_config: Default::default(),
-    };
-
-    let resp = state
-        .api_handlers
-        .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
-        .await
-        .map_err(|e| collection_op_error("get", &collection_id, e))?;
+    let resp = get_collection_for_tenant(&state, &collection_id, &tenant).await?;
 
     let collection = resp
         .collection
@@ -2761,20 +2762,7 @@ pub async fn post_collection_recall_tune_v2(
 
     require_recall_admin(user_context.as_ref().map(|e| &e.0), "recall-tune")?;
 
-    let request = CollectionRequest {
-        operation: CollectionOperation::CollectionGet as i32,
-        collection_id: Some(collection_id.clone()),
-        collection_config: None,
-        query_params: Default::default(),
-        options: Default::default(),
-        migration_config: Default::default(),
-    };
-
-    let resp = state
-        .api_handlers
-        .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
-        .await
-        .map_err(|e| collection_op_error("get", &collection_id, e))?;
+    let resp = get_collection_for_tenant(&state, &collection_id, &tenant).await?;
 
     let collection = resp
         .collection
@@ -3089,19 +3077,7 @@ async fn ensure_collection_exists(
     collection_id: &str,
     tenant: &TenantContext,
 ) -> ApiResult<()> {
-    let request = CollectionRequest {
-        operation: CollectionOperation::CollectionGet as i32,
-        collection_id: Some(collection_id.to_string()),
-        collection_config: None,
-        query_params: Default::default(),
-        options: Default::default(),
-        migration_config: Default::default(),
-    };
-    state
-        .api_handlers
-        .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
-        .await
-        .map_err(|e| collection_op_error("get", collection_id, e))?;
+    get_collection_for_tenant(state, collection_id, tenant).await?;
     Ok(())
 }
 
@@ -3234,19 +3210,7 @@ pub async fn post_collection_recluster_v2(
     #[cfg(feature = "axis")]
     {
         // (1) Fetch collection config to read the recall_target tag.
-        let request = CollectionRequest {
-            operation: CollectionOperation::CollectionGet as i32,
-            collection_id: Some(collection_id.clone()),
-            collection_config: None,
-            query_params: Default::default(),
-            options: Default::default(),
-            migration_config: Default::default(),
-        };
-        let resp = state
-            .api_handlers
-            .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
-            .await
-            .map_err(|e| collection_op_error("get", &collection_id, e))?;
+        let resp = get_collection_for_tenant(&state, &collection_id, &tenant).await?;
 
         let collection = resp
             .collection

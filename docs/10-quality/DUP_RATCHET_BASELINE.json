@@ -1,7 +1,7 @@
 {
-  "percentage": 6.8226,
-  "clones": 11553,
-  "duplicated_lines": 134578,
-  "recorded_at_commit": "bbec8694e",
+  "percentage": 6.8058,
+  "clones": 11564,
+  "duplicated_lines": 134643,
+  "recorded_at_commit": "a545095ce",
   "note": "Refresh with `make dup-ratchet-baseline` only alongside a justification for the increase (see docs/10-quality/DUPLICATION_CENSUS_2026_10_20.md for methodology)."
 }
