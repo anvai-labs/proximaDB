@@ -5724,14 +5724,20 @@ mod tests {
         drop(first);
 
         let second = SpillRecordStorage::with_flush_threshold(fs, base, None);
-        let get = |oid: &str| second.get_record(&RecordKey::new(oid.to_string()));
+        async fn get(s: &SpillRecordStorage, oid: &str) -> Result<Option<ProximaRecord>> {
+            Ok(s.get_record(&RecordKey::new(oid.to_string())).await?)
+        }
         assert!(
-            get("a").await?.is_none(),
+            get(&second, "a").await?.is_none(),
             "the persisted tombstone shadows `a`"
         );
-        assert!(get("b").await?.is_some_and(|r| status_is(&r, "open")));
-        assert!(get("c").await?.is_some());
-        assert!(get("zz").await?.is_none());
+        assert!(
+            get(&second, "b")
+                .await?
+                .is_some_and(|r| status_is(&r, "open"))
+        );
+        assert!(get(&second, "c").await?.is_some());
+        assert!(get(&second, "zz").await?.is_none());
         assert_eq!(second.key_filters.len(), 2, "one filter per segment");
         Ok(())
     }
