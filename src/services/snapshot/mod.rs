@@ -10,9 +10,8 @@
 //! - the global WAL manifest singleton
 //!   (`crate::storage::persistence::write_ahead_log::manifest`) for the snapshot
 //!   position, and
-//! - `proximadb_catalog::{CatalogProjection, ProjectionFreshnessState}` plus the
-//!   established drop+create update pattern (see
-//!   `CollectionService::upsert_collection_catalog_asset`) for atomic publish.
+//! - `proximadb_catalog::{CatalogProjection, ProjectionFreshnessState}` plus
+//!   `Catalog::replace_table` (in place — TD-CATREPLACE-1) for atomic publish.
 //!
 //! See `docs/12-design/PHASE8_CONTINUOUS_LOOP_HLD_LLD_2026_05_28.adoc` (F1, S0).
 

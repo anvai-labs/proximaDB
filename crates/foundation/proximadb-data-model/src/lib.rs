@@ -743,6 +743,57 @@ impl ProximaValue {
 }
 
 #[cfg(test)]
+mod catreplace_mapping_tests {
+    use super::*;
+
+    fn f(value: ProximaType) -> Option<i32> {
+        proxima_type_to_filterable_type(&value)
+    }
+
+    /// The one mapping every direction uses: the regressions that made the
+    /// two historical copies disagree (TD-CATREPLACE-1).
+    #[test]
+    fn filterable_mapping_agrees_across_the_string_like_and_array_types() {
+        use proximadb_proto::v1::FilterableDataType as F;
+        let string = F::FilterableString as i32;
+        let json = F::FilterableJson as i32;
+        let binary = F::FilterableBinary as i32;
+        let array_string = F::FilterableArrayString as i32;
+        let array_integer = F::FilterableArrayInteger as i32;
+
+        // String kinds are the v1 string type — including Symbol, and NOT via
+        // a silent fallback.
+        assert_eq!(f(ProximaType::String), Some(string));
+        assert_eq!(f(ProximaType::Symbol), Some(string));
+        // Json and Jsonb are the SAME filterable type (the old catalog→narrow
+        // copy rendered Jsonb as String).
+        assert_eq!(f(ProximaType::Json), Some(json));
+        assert_eq!(f(ProximaType::Jsonb), Some(json));
+        // Binary is representable (the old update-direction copy dropped it).
+        assert_eq!(f(ProximaType::Binary), Some(binary));
+        // Arrays narrow to their element's array type (the old catalog→narrow
+        // copy rendered every array as String).
+        assert_eq!(
+            f(ProximaType::Array(Box::new(ProximaType::String))),
+            Some(array_string)
+        );
+        assert_eq!(
+            f(ProximaType::Array(Box::new(ProximaType::Int64))),
+            Some(array_integer)
+        );
+        // No projection: lives only in the canonical schema.
+        assert_eq!(f(ProximaType::UInt64), None);
+        assert_eq!(
+            f(ProximaType::DenseVector {
+                element: crate::VectorElement::Float32,
+                dim: 4
+            }),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -947,6 +998,62 @@ mod tests {
         assert_eq!(original, decoded);
     }
 }
+
+/// TD-CATREPLACE-1: the ONE canonical ProximaType → v1 filterable-type
+/// mapping, shared by every direction (schema updates narrowing into the
+/// collection config, catalog columns projecting the narrow view, and the
+/// fold rule that checks them against each other). Before, two copies
+/// disagreed on the intersection — Jsonb and `Array<…>` rendered String in
+/// the catalog→narrow direction but Json/Array* in the update direction, and
+/// String/Binary had no update-direction arm at all — so a schema round-trip
+/// flip-flopped the stored narrow type and later updates were rejected as
+/// type conflicts.
+///
+/// `None` = no filterable projection exists (Struct, Map, vectors, UInt,
+/// …): the column cannot be stored in a filterable column and lives only in
+/// the canonical schema.
+pub fn proxima_type_to_filterable_type(value: &ProximaType) -> Option<i32> {
+    use proximadb_proto::v1::FilterableDataType as F;
+    let data_type = match value {
+        ProximaType::Int8 | ProximaType::Int16 | ProximaType::Int32 | ProximaType::Int64 => {
+            F::FilterableInteger
+        }
+        ProximaType::Float32 | ProximaType::Float64 => F::FilterableFloat,
+        ProximaType::Decimal { .. } => F::FilterableDecimal,
+        ProximaType::Boolean => F::FilterableBoolean,
+        ProximaType::Timestamp(_) => F::FilterableDatetime,
+        ProximaType::TimestampTz(_) => F::FilterableTimestampTz,
+        ProximaType::Date => F::FilterableDate,
+        ProximaType::Time(_) => F::FilterableTime,
+        ProximaType::Uuid => F::FilterableUuid,
+        ProximaType::String | ProximaType::Symbol => F::FilterableString,
+        ProximaType::Binary => F::FilterableBinary,
+        ProximaType::Json | ProximaType::Jsonb => F::FilterableJson,
+        ProximaType::Array(inner) if matches!(inner.as_ref(), ProximaType::String) => {
+            F::FilterableArrayString
+        }
+        ProximaType::Array(inner) => {
+            let element = inner.as_ref();
+            if matches!(
+                element,
+                ProximaType::Int8 | ProximaType::Int16 | ProximaType::Int32 | ProximaType::Int64
+            ) {
+                F::FilterableArrayInteger
+            } else if matches!(element, ProximaType::Float32 | ProximaType::Float64) {
+                F::FilterableArrayFloat
+            } else if matches!(element, ProximaType::Boolean) {
+                F::FilterableArrayBoolean
+            } else if matches!(element, ProximaType::String) {
+                F::FilterableArrayString
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    Some(data_type as i32)
+}
+
 use serde::{Deserialize, Serialize};
 
 pub type IndexStats = ServiceIndexStats;

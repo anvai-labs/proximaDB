@@ -2439,9 +2439,44 @@ pub trait Catalog: Send + Sync {
         schema: CatalogTableSchema,
     ) -> anyhow::Result<CatalogTableSchema> {
         let created = self.create_table_inner(identifier, schema).await?;
-        if self.identity_authority().is_some() && created.object_id.is_none() {
+        Self::require_object_id(self, "created", identifier, &created)?;
+        Ok(created)
+    }
+
+    /// TD-CATREPLACE-1: replace a table's schema in place. The table is never
+    /// absent to a concurrent reader, and an I/O failure mid-replace leaves the
+    /// previous schema intact — the drop+create dance could lose the table
+    /// entirely (drop succeeded, create failed).
+    ///
+    /// The schema is validated BEFORE anything is touched, so a rejected
+    /// schema costs nothing. Identity follows [`Catalog::create_table`]: a
+    /// caller-supplied `object_id` is adopted; backends mint otherwise.
+    ///
+    /// **Do not override** — this is the sealed TD-CAT-7 post-condition over
+    /// [`Catalog::replace_table_inner`], exactly as `create_table` seals
+    /// `create_table_inner` (minting must be unforgettable, not merely
+    /// implemented). Backends override `replace_table_inner`.
+    async fn replace_table(
+        &self,
+        identifier: &TableIdentifier,
+        schema: CatalogTableSchema,
+    ) -> anyhow::Result<CatalogTableSchema> {
+        let replaced = self.replace_table_inner(identifier, schema).await?;
+        Self::require_object_id(self, "replaced", identifier, &replaced)?;
+        Ok(replaced)
+    }
+
+    /// The TD-CAT-7 post-condition shared by the sealed `create_table` and
+    /// `replace_table` wrappers.
+    fn require_object_id(
+        &self,
+        verb: &str,
+        identifier: &TableIdentifier,
+        written: &CatalogTableSchema,
+    ) -> anyhow::Result<()> {
+        if self.identity_authority().is_some() && written.object_id.is_none() {
             anyhow::bail!(
-                "TD-CAT-7: catalog '{}' ({}) is an identity authority but created table {:?} \
+                "TD-CAT-7: catalog '{}' ({}) is an identity authority but {verb} table {:?} \
                  with no object_id; authorization keys on it, so the row must not be committed \
                  without one",
                 self.name(),
@@ -2449,7 +2484,26 @@ pub trait Catalog: Send + Sync {
                 identifier,
             );
         }
-        Ok(created)
+        Ok(())
+    }
+
+    /// The backend half of [`Catalog::replace_table`]. The default keeps the
+    /// historical drop+create semantics for catalogs without an atomic
+    /// overwrite (routing through the sealed `create_table`, so identity
+    /// minting stays inside the one chokepoint); backends whose authority is
+    /// a single object (the native catalog) override with one write.
+    async fn replace_table_inner(
+        &self,
+        identifier: &TableIdentifier,
+        schema: CatalogTableSchema,
+    ) -> anyhow::Result<CatalogTableSchema> {
+        let mut schema = schema;
+        crate::schema::normalize_identity(&mut schema);
+        crate::schema::validate_schema(&schema)?;
+        if self.table_exists(identifier).await? {
+            self.drop_table(identifier, false).await?;
+        }
+        self.create_table(identifier, schema).await
     }
 
     async fn drop_table(&self, identifier: &TableIdentifier, purge: bool) -> anyhow::Result<bool>;

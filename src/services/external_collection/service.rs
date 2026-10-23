@@ -683,8 +683,8 @@ impl ExternalCollectionService {
             .find(|p| p.name == EXTERNAL_INDEX_PROJECTION))
     }
 
-    /// Mutate the external-index projection via the drop+create update pattern
-    /// (no `Catalog::update_table` exists), mirroring `SnapshotPublishCoordinator`.
+    /// Mutate the external-index projection in place (TD-CATREPLACE-1: no
+    /// drop window).
     async fn set_projection_state<F>(&self, collection_id: &str, mutate: F) -> Result<()>
     where
         F: FnOnce(&mut CatalogProjection),
@@ -716,8 +716,8 @@ impl ExternalCollectionService {
                 schema.projections.push(proj);
             }
         }
-        catalog.drop_table(&identifier, false).await?;
-        catalog.create_table(&identifier, schema).await?;
+        // TD-CATREPLACE-1: replace in place — no drop window.
+        catalog.replace_table(&identifier, schema).await?;
         Ok(())
     }
 }

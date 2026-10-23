@@ -1,0 +1,49 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-WTGC-1: worktree target/ grows unbounded — stale hashed artifacts are never pruned
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-23, from the TD-CATREPLACE-1 session's disk cleanup).
+| Priority | **MEDIUM** — an e2e-heavy session leaves 100–150 GB of regenerable artifacts per worktree and can take the volume to 96%+; nothing today prunes them but full removal.
+| Component | `scripts/worktree.sh` (`gc`); `docs/10-quality/WORKSPACE_ISOLATION.md`
+| Relates to | the disk notes in `WORKSPACE_ISOLATION.md`
+|===
+
+== Problem
+
+Cargo never garbage-collects `target/`. Every source edit, feature set, or
+configuration (`check` vs `nextest` vs `clippy`, dev vs test profile) mints new
+`<crate>-<hash>` artifacts without deleting the old ones, so a verification-heavy
+session (the mandated local gate before every push) accumulates:
+
+* ~1 GB `libproximadb-*.rlib` per post-edit compile — 17 copies / 11.3 GB in one
+  session's worktree;
+* the whole ~200-file `tests/` integration suite as debug binaries with full
+  `debug = 2` info — 437 artifacts over 100 MB totaling 140.8 GB, most in two
+  hashed copies (two configurations of the same crate).
+
+`worktree.sh gc` only purges `target/*/incremental` (39.3 GB across worktrees in
+the same cleanup). The remaining ~150 GB is only recoverable by removing the
+whole worktree — which is impossible while its PR is in flight, exactly when the
+space is needed.
+
+== Fix (two independent slices)
+
+. **Prune stale hashed artifacts in `worktree.sh gc`.** For each
+   `target/debug/deps` file family (crate + extension), keep the artifacts the
+   NEWEST fingerprint references (newest mtime per crate stem is a sufficient
+   proxy) and delete older hashed siblings, plus their `.d` files. Dry-run
+   default with the size it would reclaim, mirroring `clean --dry-run`. This
+   reclaims most of the 140 GB without a full rebuild (the newest set stays).
+. **Shrink new artifacts for e2e-heavy sessions.** Document — and have
+   `worktree.sh new`'s printed env export — `CARGO_PROFILE_TEST_DEBUG=0`
+   (already the CI default) and, when the session is test-binary-heavy,
+   `CARGO_PROFILE_DEV_DEBUG=0`: the test binaries drop ~10×. Backtraces suffer;
+   that is the documented trade for interactive e2e loops that print failures,
+   not debug them in a debugger.
+
+Test: a `gc` unit test against a synthetic `deps/` dir (new + stale hashes) and
+a dry-run assertion on the real tree; the existing `gc --dry-run` output grows a
+line.
