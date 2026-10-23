@@ -12,13 +12,13 @@ target's `src_path`, so autodiscovered bins/tests/benches/examples and explicit
 Transitivity is the whole point. A local rule -- "is this file's stem named in a
 `mod` somewhere in its parent directory" -- counts the children of an *orphaned*
 `mod.rs` as reached, because the declaration exists but nothing reaches the file
-making it. `src/storage/engines/sst/tests/mod.rs` is the live example: nothing
-declares it, and it declares 15 test modules totalling ~8.2k LOC that no build
-compiles.
+making it. `src/storage/engines/sst/tests/mod.rs` was the example: nothing
+declared it, and it declared 15 test modules totalling ~8.2k LOC that no build
+compiled (deleted under TD-ORPHAN-1).
 
 Comments are stripped before scanning, because a commented-out `mod x;` is not a
-declaration -- four `viper/tests/*.rs` files are unreachable exactly because
-their declarations sit behind `// TEMPORARILY DISABLED`.
+declaration -- four `viper/tests/*.rs` files were unreachable exactly because
+their declarations sat behind `// TEMPORARILY DISABLED`.
 
 Verify an individual hit with the compiler using `--all-targets`, or
 `cargo test --no-run --lib` for root-crate files. A bare `cargo check -p <crate>`
@@ -35,7 +35,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-BASELINE = 58  # TD-ORPHAN-1; lower this as files are removed or re-attached.
+BASELINE = 0  # TD-ORPHAN-1 resolved: every crate `src/` file is reachable; keep it at zero.
 
 MOD_RE = re.compile(
     r"^\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;",
