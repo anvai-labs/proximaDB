@@ -67,6 +67,7 @@ use proximadb_records::{
     ProximaRecord, RecordKey, RecordScan, RecordScanOptions, RecordScanPredicate, RecordScanView,
     RecordStore, RecordStoreResult,
 };
+use proximadb_storage_common::id_index::BloomFilter;
 use proximadb_storage_common::parquet_write_policy::{ParquetLayoutHints, ParquetWritePolicy};
 use proximadb_storage_common::proxima_arrow::{
     SYS_COL_OID, column_materializable, infer_proxima_schema,
@@ -223,6 +224,50 @@ impl std::fmt::Debug for SpillSchemaSource {
 /// A relational record store that keeps recent rows resident and flushes older
 /// ones to durable Parquet segments, serving reads as a merge over both.
 #[derive(Debug)]
+/// What a point probe needs to rule a segment out without reading it: the oid
+/// range (a flush writes its rows oid-sorted) and a Bloom filter over every oid
+/// the segment holds, its persisted tombstones included (TD-USUB-21).
+///
+/// Without it, a probe for an oid in no segment — every INSERT's existence
+/// check — read and decoded every segment of the partition, so a bulk load
+/// decoded about `n²/2` rows. With it, such a probe reads nothing (bar a ~1 %
+/// false positive per segment). About 1.2 bytes per row, held per segment.
+struct SegmentKeyFilter {
+    /// `None` for a segment with no rows: it holds no oid.
+    range: Option<(String, String)>,
+    bloom: BloomFilter,
+}
+
+impl SegmentKeyFilter {
+    const FALSE_POSITIVE_RATE: f64 = 0.01;
+
+    fn from_oids<'a>(oids: impl Iterator<Item = &'a str> + Clone) -> Self {
+        let count = oids.clone().count();
+        // `max(1)`: a zero-capacity filter has no bits to index.
+        let mut bloom = BloomFilter::new(count.max(1), Self::FALSE_POSITIVE_RATE);
+        let mut range: Option<(&str, &str)> = None;
+        for oid in oids {
+            bloom.insert(oid);
+            range = Some(match range {
+                None => (oid, oid),
+                Some((lo, hi)) => (lo.min(oid), hi.max(oid)),
+            });
+        }
+        Self {
+            range: range.map(|(lo, hi)| (lo.to_string(), hi.to_string())),
+            bloom,
+        }
+    }
+
+    /// `false` only when the segment certainly holds no row for `oid`.
+    fn may_contain(&self, oid: &str) -> bool {
+        self.range
+            .as_ref()
+            .is_some_and(|(lo, hi)| lo.as_str() <= oid && oid <= hi.as_str())
+            && self.bloom.contains(oid)
+    }
+}
+
 pub struct SpillRecordStorage {
     /// Resident rows. Always strictly newer than any segment copy.
     memtable: DashMap<String, Resident>,
@@ -236,6 +281,12 @@ pub struct SpillRecordStorage {
     next_generation: AtomicU64,
     /// Flushed segment paths, oldest first. Later entries shadow earlier ones.
     segments: parking_lot::RwLock<Vec<String>>,
+    /// Per-segment probe filters, keyed by path (TD-USUB-21). Inserted by
+    /// `flush` before it publishes the path, built on first probe for a
+    /// discovered segment, cleared with the segments by a purge (which lets the
+    /// sequence, and so a path, be reused). A path absent here is never assumed
+    /// empty: the filter is built from the segment itself.
+    key_filters: DashMap<String, Arc<SegmentKeyFilter>>,
     /// Serializes `flush` against any other structural mutation of the
     /// segment set — today `delete_record` and `purge_durable_objects`.
     ///
@@ -419,6 +470,7 @@ impl SpillRecordStorage {
             tombstones: DashMap::new(),
             next_generation: AtomicU64::new(0),
             segments: parking_lot::RwLock::new(Vec::new()),
+            key_filters: DashMap::new(),
             flush_guard: tokio::sync::Mutex::new(()),
             unresolved_segment_writes: AtomicU64::new(0),
             flush_threshold,
@@ -1075,6 +1127,7 @@ impl SpillRecordStorage {
         // nothing. It makes the oid column's row-group and page min/max exact,
         // which the declared sort below tells every reader.
         written.sort_unstable_by(|a, b| a.oid.cmp(&b.oid));
+        let key_filter = SegmentKeyFilter::from_oids(written.iter().map(|r| r.oid.as_str()));
         let batch = proxima_records_to_record_batch_with_residual(&written, &schema)
             .context("spill: encode resident records and tombstones to Arrow")?;
         let writer_properties = self.write_policy.writer_properties(
@@ -1165,6 +1218,8 @@ impl SpillRecordStorage {
         // Only drop the resident rows AFTER the segment is durable. A crash
         // before this point simply leaves them resident, and the WAL replays
         // them regardless — the store cannot lose a row either way.
+        // The filter first: a probe that sees the path finds it ready.
+        self.key_filters.insert(path.clone(), Arc::new(key_filter));
         self.segments.write().push(path.clone());
         // `evicting`, which is `residents` minus the ambiguous oids — so every
         // row this removes from the memtable is in the object that just landed.
@@ -1430,42 +1485,34 @@ impl SpillRecordStorage {
         if !has_segments {
             return Ok(false);
         }
-        let paths = self.segments.read().clone();
-        for path in paths.iter().rev() {
-            // Newest segment first, and the FIRST hit is authoritative — the
-            // same rule `get_record` states and `merged_records` implements. A
-            // dead hit means the row is gone; it does NOT mean an older segment
-            // should be consulted for a live copy.
-            //
-            // Getting this wrong is subtle, and an earlier version of this
-            // commit did: it filtered dead rows *within* each segment and then
-            // CONTINUED to an older one, so a row dead in the newest segment and
-            // live in an older one reported that this DELETE removed it — while
-            // `get_record` and `merged_records`, on identical state, both
-            // reported it absent. Filtering per-segment answers "does this
-            // segment hold a live copy", which is the wrong question; the right
-            // one is "what does the newest segment holding this oid say".
-            let records = match self.read_segment(path).await {
-                Ok(records) => records,
-                // The delete is applied (the removal and tombstone above) and,
-                // on the write path, already durable; only its advisory answer
-                // rests on this read. Failing here would fail a done delete —
-                // and make the caller skip its index maintenance.
-                Err(error) => {
-                    tracing::warn!(
-                        error = %format!("{error:#}"),
-                        path = %path,
-                        "spill: segment read for a delete's answer failed; the delete stands, \
-                         reported as removing no row"
-                    );
-                    return Ok(false);
-                }
-            };
-            if let Some(found) = records.into_iter().find(|r| r.oid == key.oid) {
-                return Ok(!found.is_dead(now_ns));
+        // Newest segment first, and the FIRST hit is authoritative — the same
+        // rule `get_record` states and `merged_records` implements. A dead hit
+        // means the row is gone; it does NOT mean an older segment should be
+        // consulted for a live copy.
+        //
+        // Getting this wrong is subtle, and an earlier version of this commit
+        // did: it filtered dead rows *within* each segment and then CONTINUED to
+        // an older one, so a row dead in the newest segment and live in an older
+        // one reported that this DELETE removed it — while `get_record` and
+        // `merged_records`, on identical state, both reported it absent.
+        // Filtering per-segment answers "does this segment hold a live copy",
+        // which is the wrong question; the right one is "what does the newest
+        // segment holding this oid say".
+        match self.newest_segment_copy(&key.oid).await {
+            Ok(found) => Ok(found.is_some_and(|found| !found.is_dead(now_ns))),
+            // The delete is applied (the removal and tombstone above) and, on
+            // the write path, already durable; only its advisory answer rests
+            // on this read. Failing here would fail a done delete — and make
+            // the caller skip its index maintenance.
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "spill: segment read for a delete's answer failed; the delete stands, \
+                     reported as removing no row"
+                );
+                Ok(false)
             }
         }
-        Ok(false)
     }
 
     /// The one memtable write path: value, fresh generation and LSN replace the
@@ -1574,6 +1621,42 @@ impl SpillRecordStorage {
             .map_err(|e| anyhow::anyhow!("spill: read segment '{path}' failed: {e}"))?;
         read_segment_records(&bytes, &[], &[], None)
             .with_context(|| format!("spill: decode segment '{path}'"))
+    }
+
+    /// The probe filter of the segment at `path`, built from the segment on
+    /// first use when this process did not write it (a discovered segment).
+    async fn key_filter(&self, path: &str) -> Result<Arc<SegmentKeyFilter>> {
+        if let Some(filter) = self.key_filters.get(path) {
+            return Ok(filter.clone());
+        }
+        let records = self.read_segment(path).await?;
+        let filter = Arc::new(SegmentKeyFilter::from_oids(
+            records.iter().map(|r| r.oid.as_str()),
+        ));
+        self.key_filters.insert(path.to_string(), filter.clone());
+        Ok(filter)
+    }
+
+    /// The newest segment copy of `oid`, live or dead, or `None` when no
+    /// segment holds it. Newest segment first and the FIRST hit is
+    /// authoritative (see `get_record`). A segment whose filter rules the oid
+    /// out is not read (TD-USUB-21).
+    async fn newest_segment_copy(&self, oid: &str) -> Result<Option<ProximaRecord>> {
+        let paths = self.segments.read().clone();
+        for path in paths.iter().rev() {
+            if !self.key_filter(path).await?.may_contain(oid) {
+                continue;
+            }
+            if let Some(found) = self
+                .read_segment(path)
+                .await?
+                .into_iter()
+                .find(|r| r.oid == oid)
+            {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
     }
 
     /// The segment list, the resident rows and the tombstones, taken TOGETHER
@@ -1810,24 +1893,13 @@ impl RecordStore for SpillRecordStorage {
         // Newest segment first: a later flush shadows an earlier copy.
         // `now_ns` is taken once above and reused, so the memtable and segment
         // arms judge liveness against the same instant.
-        let paths = self.segments.read().clone();
-        for path in paths.iter().rev() {
-            if let Some(found) = self
-                .read_segment(path)
-                .await?
-                .into_iter()
-                .find(|r| r.oid == key.oid)
-            {
-                // Mandate #16a here too. Newest segment first, so the first hit
-                // is authoritative: a dead hit means the row is GONE, not that an
-                // older segment should be consulted for a live copy.
-                if found.is_dead(now_ns) {
-                    return Ok(None);
-                }
-                return Ok(Some(found));
-            }
-        }
-        Ok(None)
+        // Mandate #16a here too. Newest segment first, so the first hit is
+        // authoritative: a dead hit means the row is GONE, not that an older
+        // segment should be consulted for a live copy.
+        Ok(self
+            .newest_segment_copy(&key.oid)
+            .await?
+            .filter(|found| !found.is_dead(now_ns)))
     }
 
     async fn delete_record(&self, key: &RecordKey) -> RecordStoreResult<bool> {
@@ -1908,6 +1980,7 @@ impl RecordStore for SpillRecordStorage {
         // Every recorded path is gone; the obligation is discharged.
         self.clear_purge_obligation().await?;
         self.segments.write().clear();
+        self.key_filters.clear();
         self.tombstones.clear();
         // The prefix has been reconciled by deletion, so any orphan an
         // unresolved write left is gone too — this is the one path that can zero
@@ -5596,5 +5669,82 @@ mod tests {
         );
         drop(dir);
         Ok(())
+    }
+    /// TD-USUB-21: a probe for an oid no segment holds — every INSERT's
+    /// existence check — reads no segment. The segment files are removed from
+    /// under the store, so any read would fail: the absent oid must still
+    /// answer cleanly, and a flushed oid must still go to its segment.
+    #[tokio::test]
+    async fn a_probe_for_an_absent_oid_reads_no_segment() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let s = SpillRecordStorage::with_flush_threshold(fs, base.clone(), Some(4));
+        for i in 0..12 {
+            s.upsert_record(record(&format!("o{i:02}"), "open")).await?;
+        }
+        assert!(s.segment_count() >= 3, "precondition: several segments");
+        for path in s.segments.read().iter() {
+            std::fs::remove_file(path)?;
+        }
+
+        // Out of every segment's oid range, and inside it but never written.
+        for absent in ["zz", "o05x"] {
+            assert!(
+                s.get_record(&RecordKey::new(absent.to_string()))
+                    .await?
+                    .is_none()
+            );
+            assert!(!s.delete_record(&RecordKey::new(absent.to_string())).await?);
+        }
+        // A flushed oid passes its segment's filter and reads the segment.
+        assert!(
+            s.get_record(&RecordKey::new("o05".to_string()))
+                .await
+                .is_err(),
+            "a flushed oid must still be looked up in its segment"
+        );
+        Ok(())
+    }
+
+    /// TD-USUB-21: a segment this process did not write gets its filter from
+    /// the segment itself, tombstones included — a persisted tombstone in the
+    /// newest segment still shadows the live copy in an older one.
+    #[tokio::test]
+    async fn a_discovered_segment_filter_keeps_tombstones_authoritative() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let first = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None);
+        first.upsert_record(record("a", "open")).await?;
+        first.upsert_record(record("b", "open")).await?;
+        first.flush().await?;
+        first
+            .delete_record(&RecordKey::new("a".to_string()))
+            .await?;
+        first.upsert_record(record("c", "open")).await?;
+        first.flush().await?;
+        assert_eq!(first.segment_count(), 2);
+        drop(first);
+
+        let second = SpillRecordStorage::with_flush_threshold(fs, base, None);
+        let get = |oid: &str| second.get_record(&RecordKey::new(oid.to_string()));
+        assert!(
+            get("a").await?.is_none(),
+            "the persisted tombstone shadows `a`"
+        );
+        assert!(get("b").await?.is_some_and(|r| status_is(&r, "open")));
+        assert!(get("c").await?.is_some());
+        assert!(get("zz").await?.is_none());
+        assert_eq!(second.key_filters.len(), 2, "one filter per segment");
+        Ok(())
+    }
+
+    #[test]
+    fn a_key_filter_never_rules_out_an_oid_it_holds() {
+        let oids: Vec<String> = (0..5_000).map(|i| format!("t:row:{i:019}")).collect();
+        let filter = SegmentKeyFilter::from_oids(oids.iter().map(String::as_str));
+        assert!(oids.iter().all(|oid| filter.may_contain(oid)));
+        // Past the range: ruled out by the bounds alone.
+        assert!(!filter.may_contain("t:row:9999999999999999999"));
+        assert!(!filter.may_contain("a"));
+        // An empty segment holds nothing.
+        assert!(!SegmentKeyFilter::from_oids(std::iter::empty()).may_contain("x"));
     }
 }
