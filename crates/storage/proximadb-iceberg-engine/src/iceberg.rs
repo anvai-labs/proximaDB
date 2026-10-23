@@ -188,8 +188,9 @@ fn avro_header_entries(buf: &[u8]) -> Result<(AvroHeaderEntries, usize), Storage
 
 /// Re-encode `container`'s header with `avro.schema` set to `schema_json` verbatim.
 ///
-/// apache-avro writes no header at all when nothing was appended (an empty
-/// manifest), so an empty `container` gets a fresh header — `avro.schema`,
+/// apache-avro <= 0.16 wrote no header at all when nothing was appended (an
+/// empty manifest); since 0.21 `into_inner()` writes the header first, so this
+/// branch is defensive. An empty `container` gets a fresh header — `avro.schema`,
 /// `avro.codec` = `null`, `user_metadata` and a new sync marker — with no data
 /// blocks, which is a valid, empty Avro object container.
 fn with_verbatim_schema(
@@ -1133,5 +1134,39 @@ mod tests {
         assert_eq!(list.len(), 1);
         let recovered = read_manifest(&manifest_bytes).unwrap();
         assert_eq!(recovered, data);
+    }
+
+    /// Mixed-read gate for the apache-avro 0.16 -> 0.21 upgrade (mandate #8):
+    /// manifests already in object storage were written by 0.16, so the
+    /// current reader must decode those exact bytes. The fixtures were produced
+    /// by `write_manifest` / `write_manifest_list` built against apache-avro
+    /// 0.16.0 and are pinned here unchanged.
+    #[test]
+    fn reads_manifests_written_by_apache_avro_0_16() {
+        let mut expected = files();
+        expected[0].column_stats = vec![ColumnFileStats {
+            field_id: 1,
+            column_size: Some(512),
+            value_count: Some(100),
+            null_value_count: Some(3),
+            lower_bound: Some(7i64.to_le_bytes().to_vec()),
+            upper_bound: Some(900i64.to_le_bytes().to_vec()),
+        }];
+        let manifest = include_bytes!("../testdata/manifest_avro016.avro");
+        assert_eq!(read_manifest(manifest).unwrap(), expected);
+
+        let list = include_bytes!("../testdata/manifest_list_avro016.avro");
+        assert_eq!(
+            read_manifest_list(list).unwrap(),
+            vec![ManifestFileMeta {
+                manifest_path: "data/t/ns/tbl/metadata/m-0.avro".into(),
+                manifest_length: 2254,
+                added_files_count: 2,
+                added_rows_count: 150,
+                added_snapshot_id: 42,
+                sequence_number: 9,
+                first_row_id: Some(1000),
+            }]
+        );
     }
 }

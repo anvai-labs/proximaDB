@@ -670,7 +670,7 @@ xz2 = "0.1"              # XZ/LZMA2 compression
 sysinfo = "0.30"
 
 # Avro serialization with schema evolution
-apache-avro = "0.16"
+apache-avro = "0.21"
 bytes = "1.5"
 
 # Cloud storage: the canonical object_store crate provides true byte-range
@@ -810,7 +810,7 @@ metal = { version = "0.27", optional = true }  # Metal GPU acceleration for Appl
 [build-dependencies]
 tonic-build = "0.14"
 tonic-prost-build = "0.14"  # Required for prost-based protobuf compilation in tonic-build 0.14+
-apache-avro = "0.16"
+apache-avro = "0.21"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
