@@ -782,6 +782,37 @@ pub fn proxima_records_to_record_batch_with_residual(
         .map_err(|e| StorageError::Serialization(format!("proxima_arrow: residual batch: {e}")))
 }
 
+/// What one [`SYS_COL_RESIDUAL`] cell overrides: the top-level prop names it
+/// carries (each replaces that prop's typed-column value on read-back) and
+/// whether it replaces the embeddings. Only the names are decoded.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ResidualOverrides {
+    pub props: Vec<String>,
+    pub embeddings: bool,
+}
+
+/// Decode which props and embeddings a residual cell overrides, without
+/// materializing their values.
+pub fn residual_overrides(bytes: &[u8]) -> Result<ResidualOverrides, StorageError> {
+    // Unknown fields fail the decode: a residual field added later may override
+    // something this reader does not account for, and a caller treats an
+    // undecodable residual as overriding everything.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Shape {
+        #[serde(default)]
+        props: HashMap<String, serde::de::IgnoredAny>,
+        #[serde(default)]
+        embeddings: Option<serde::de::IgnoredAny>,
+    }
+    let shape: Shape = rmp_serde::from_slice(bytes)
+        .map_err(|e| StorageError::Serialization(format!("proxima_arrow: residual: {e}")))?;
+    Ok(ResidualOverrides {
+        props: shape.props.into_keys().collect(),
+        embeddings: shape.embeddings.is_some(),
+    })
+}
+
 /// Indices of `records` that would NOT read back identically (props, embeddings
 /// and identity) through [`proxima_records_to_record_batch_with_residual`]. A
 /// durable writer holds these rather than writing them; with the residual
@@ -1248,6 +1279,61 @@ mod tests {
     use super::*;
     use proximadb_records::EmbeddingValues;
     use std::collections::HashMap;
+
+    #[test]
+    fn residual_overrides_names_exactly_what_the_residual_carries() {
+        let with_props = Residual {
+            props: HashMap::from([
+                (
+                    "score".to_string(),
+                    ProximaTreeNode::Value(ProximaValue::Int64(3)),
+                ),
+                (
+                    "Extra".to_string(),
+                    ProximaTreeNode::Value(ProximaValue::Boolean(true)),
+                ),
+            ]),
+            embeddings: None,
+        };
+        let bytes = rmp_serde::to_vec_named(&with_props).unwrap();
+        let mut got = residual_overrides(&bytes).unwrap();
+        got.props.sort();
+        assert_eq!(
+            got,
+            ResidualOverrides {
+                props: vec!["Extra".to_string(), "score".to_string()],
+                embeddings: false,
+            }
+        );
+
+        let embeddings_only = Residual {
+            props: HashMap::new(),
+            embeddings: Some(Vec::new()),
+        };
+        let bytes = rmp_serde::to_vec_named(&embeddings_only).unwrap();
+        assert_eq!(
+            residual_overrides(&bytes).unwrap(),
+            ResidualOverrides {
+                props: Vec::new(),
+                embeddings: true,
+            }
+        );
+        assert!(residual_overrides(b"not msgpack").is_err());
+        #[derive(serde::Serialize)]
+        struct Later {
+            props: HashMap<String, ProximaTreeNode>,
+            identity: bool,
+        }
+        let later = rmp_serde::to_vec_named(&Later {
+            props: HashMap::new(),
+            identity: true,
+        })
+        .unwrap();
+        assert!(
+            residual_overrides(&later).is_err(),
+            "an unknown residual field fails closed"
+        );
+    }
 
     fn col(id: i32, name: &str, dt: ProximaType, nullable: bool) -> ProximaColumn {
         ProximaColumn {

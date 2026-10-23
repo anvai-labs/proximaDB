@@ -1,6 +1,6 @@
 // Copyright (C) 2026 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
-//! Row-group pruning for Layer A segments (ADR-097 P3.1, PR 5).
+//! Row-group pruning for Layer A segments (ADR-097 P3.1, PRs 5–6).
 //!
 //! The scan's filters are pushed down `Inexact` — DataFusion re-applies them —
 //! so pruning only has to be **safe**: a row group it skips must hold no row
@@ -14,9 +14,15 @@
 //!   column alone — whose rows enter the merge invisible, still shadowing every
 //!   older copy. The oldest segment shadows nothing, so its pruned row groups
 //!   are skipped outright.
-//! * **The residual.** A row's served value can come from its residual instead
-//!   of the typed column, which the statistics describe. A row group with any
-//!   residual row is never pruned.
+//! * **The residual.** A row's served value for a column comes from its
+//!   residual instead of the typed column (which the statistics describe) when
+//!   the residual names that column. A row group the statistics would prune
+//!   but that holds residual rows is a *candidate*: its residual column alone
+//!   is read, and the prune stands only if no residual row names a column the
+//!   filters reference (compared case-insensitively), or replaces embeddings
+//!   while a filter references a vector column (only those are served from
+//!   embeddings) ([`SegmentPruner::residual_allows_prune`]). A residual the
+//!   reader cannot read or decode keeps the row group.
 //! * **Types and keys.** Statistics are used only for a column the segment
 //!   holds under the catalog's own Arrow type (otherwise its values are
 //!   conformed, and the stored ones say nothing about the served ones); and a
@@ -33,7 +39,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, UInt64Array};
 use arrow::compute::nullif;
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::pruning::PruningStatistics;
 use datafusion::common::{Column, DFSchema, ScalarValue};
@@ -43,7 +49,7 @@ use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningPredicate
 use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder};
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::file::metadata::ParquetMetaData;
-use proximadb_storage_common::proxima_arrow::SYS_COL_RESIDUAL;
+use proximadb_storage_common::proxima_arrow::{SYS_COL_RESIDUAL, residual_overrides};
 
 /// The scan's filters as a row-group pruning predicate, plus what it pruned.
 pub(crate) struct SegmentPruner {
@@ -51,8 +57,24 @@ pub(crate) struct SegmentPruner {
     /// The catalog Arrow schema (every live column) the predicate is over.
     catalog: SchemaRef,
     primary_key: Option<String>,
+    /// The columns the pruning filters reference, as [`prop_head`]s.
+    columns: HashSet<String>,
+    /// Does a filter reference a vector column (served from embeddings)?
+    vector_filter: bool,
     row_groups_total: Count,
     row_groups_pruned: Count,
+    residual_checked: Count,
+    residual_unreadable: Count,
+}
+
+/// A segment's pruning plan before the residual check.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RowGroupPlan {
+    /// Per row group: may it hold a matching row?
+    pub keep: Vec<bool>,
+    /// Row groups the statistics prune but that hold (or may hold) residual
+    /// rows: kept unless [`SegmentPruner::residual_allows_prune`] clears them.
+    pub residual_candidates: Vec<usize>,
 }
 
 impl std::fmt::Debug for SegmentPruner {
@@ -76,10 +98,21 @@ impl SegmentPruner {
         let df_schema = DFSchema::try_from(catalog.as_ref().clone()).ok()?;
         // A filter that cannot be planned here (a subquery, a placeholder) is
         // left out rather than disabling pruning for the rest.
-        let usable = filters
+        let usable: Vec<Expr> = filters
             .iter()
             .filter(|f| state.create_physical_expr((*f).clone(), &df_schema).is_ok())
-            .cloned();
+            .cloned()
+            .collect();
+        let referenced: Vec<&Column> = usable.iter().flat_map(|f| f.column_refs()).collect();
+        let columns = referenced.iter().map(|c| prop_head(&c.name)).collect();
+        let vector_filter = referenced.iter().any(|c| {
+            catalog.field_with_name(&c.name).is_ok_and(|f| {
+                matches!(
+                    f.data_type(),
+                    DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..)
+                )
+            })
+        });
         let physical = state
             .create_physical_expr(conjunction(usable)?, &df_schema)
             .ok()?;
@@ -94,14 +127,22 @@ impl SegmentPruner {
             predicate,
             catalog,
             primary_key,
+            columns,
+            vector_filter,
             row_groups_total: MetricBuilder::new(metrics).global_counter("row_groups_total"),
             row_groups_pruned: MetricBuilder::new(metrics).global_counter("row_groups_pruned"),
+            residual_checked: MetricBuilder::new(metrics)
+                .global_counter("row_groups_residual_checked"),
+            residual_unreadable: MetricBuilder::new(metrics)
+                .global_counter("row_groups_residual_unreadable"),
         })
     }
 
     /// Per row group of a segment: may it hold a matching row? (`false` ⇒ it
-    /// may be read as a key spine only.) Any failure keeps every row group.
-    pub fn keep(&self, metadata: &ParquetMetaData, segment: &Schema) -> Vec<bool> {
+    /// may be read as a key spine only.) A row group the statistics prune but
+    /// that holds residual rows is kept here and listed as a candidate for
+    /// [`Self::residual_allows_prune`]. Any failure keeps every row group.
+    pub fn plan(&self, metadata: &ParquetMetaData, segment: &Schema) -> RowGroupPlan {
         let n = metadata.num_row_groups();
         let stats = SegmentStatistics {
             metadata,
@@ -115,13 +156,47 @@ impl SegmentPruner {
         if keep.len() != n {
             keep = vec![true; n];
         }
-        for (k, has_residual) in keep.iter_mut().zip(stats.residual_row_groups()) {
-            *k |= has_residual;
+        let mut residual_candidates = Vec::new();
+        for (i, (k, has_residual)) in keep.iter_mut().zip(stats.residual_row_groups()).enumerate() {
+            if has_residual && !*k {
+                *k = true;
+                residual_candidates.push(i);
+            }
         }
-        self.row_groups_total.add(n);
+        RowGroupPlan {
+            keep,
+            residual_candidates,
+        }
+    }
+
+    /// May a candidate row group stay pruned, given (a batch of) its residual
+    /// cells? Only when every cell decodes and none names a filter column (by
+    /// [`prop_head`]) or replaces the embeddings under a vector filter.
+    pub fn residual_allows_prune<'a>(&self, cells: impl IntoIterator<Item = &'a [u8]>) -> bool {
+        cells.into_iter().all(|bytes| {
+            residual_overrides(bytes).is_ok_and(|o| {
+                !(o.embeddings && self.vector_filter)
+                    && o.props
+                        .iter()
+                        .all(|p| !self.columns.contains(&prop_head(p)))
+            })
+        })
+    }
+
+    /// Count one candidate's residual check, and whether its column could not
+    /// be read (which keeps it).
+    pub fn count_residual_check(&self, unreadable: bool) {
+        self.residual_checked.add(1);
+        if unreadable {
+            self.residual_unreadable.add(1);
+        }
+    }
+
+    /// Count a segment's final fates.
+    pub fn record(&self, keep: &[bool]) {
+        self.row_groups_total.add(keep.len());
         self.row_groups_pruned
             .add(keep.iter().filter(|k| !**k).count());
-        keep
     }
 }
 
@@ -195,7 +270,7 @@ impl SegmentStatistics<'_> {
     }
 
     /// Row groups holding any residual row (or whose residual statistics are
-    /// missing) — never pruned.
+    /// missing) — pruned only after the residual check.
     fn residual_row_groups(&self) -> Vec<bool> {
         let n = self.metadata.num_row_groups();
         if self.segment.field_with_name(SYS_COL_RESIDUAL).is_err() {
@@ -247,6 +322,14 @@ impl PruningStatistics for SegmentStatistics<'_> {
     fn contained(&self, _column: &Column, _values: &HashSet<ScalarValue>) -> Option<BooleanArray> {
         None
     }
+}
+
+/// The top-level prop a column or residual key resolves through, lowercased:
+/// a column `a.b` reads the nested prop `a` → `b` (`tree_get`), so a residual
+/// replacing `a` overrides it. Case is folded so the comparison only errs
+/// towards keeping a row group.
+fn prop_head(name: &str) -> String {
+    name.split('.').next().unwrap_or(name).to_lowercase()
 }
 
 /// Runs of consecutive row groups with the same fate, in file order.

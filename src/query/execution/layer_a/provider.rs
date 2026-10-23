@@ -8,6 +8,7 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use arrow::array::{Array, BinaryArray};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -28,11 +29,11 @@ use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
 use proximadb_catalog_schema::CatalogTableSchema;
 use proximadb_records::ProximaRecord;
-use proximadb_storage_common::proxima_arrow::SYS_COL_OID;
+use proximadb_storage_common::proxima_arrow::{SYS_COL_OID, SYS_COL_RESIDUAL};
 
 use super::conform::{ConformContext, Conformed, SegmentShape, conform_segment_batch};
 use super::merge::{ConformedStream, LayerAMerge};
-use super::prune::{SegmentPruner, runs};
+use super::prune::{RowGroupPlan, SegmentPruner, runs};
 use crate::services::layer_a_snapshot::{LayerARowAccess, LayerASnapshot, NativeLayerASnapshot};
 use crate::storage::engines::sst::segment_format::read_segment_records;
 use crate::storage::persistence::filesystem::FileSystem;
@@ -332,6 +333,53 @@ async fn open_merge(
     ))
 }
 
+/// Residual candidates of one segment checked concurrently.
+const RESIDUAL_CHECKS_IN_FLIGHT: usize = 4;
+
+/// May a residual candidate row group stay pruned? Streams its residual column
+/// alone and stops at the first cell that blocks. A column that cannot be read
+/// keeps the row group.
+async fn residual_allows_prune(
+    reader: &FileSystemParquetReader,
+    arrow: &ArrowReaderMetadata,
+    group: usize,
+    batch_size: usize,
+    pruner: &SegmentPruner,
+) -> bool {
+    let check = async {
+        let column = arrow.schema().index_of(SYS_COL_RESIDUAL)?;
+        let descr = arrow.metadata().file_metadata().schema_descr_ptr();
+        let mut stream =
+            ParquetRecordBatchStreamBuilder::new_with_metadata(reader.clone(), arrow.clone())
+                .with_row_groups(vec![group])
+                .with_projection(ProjectionMask::roots(&descr, [column]))
+                .with_batch_size(batch_size)
+                .build()?;
+        while let Some(batch) = stream.try_next().await? {
+            let cells = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .context("the residual column is not Binary")?;
+            if !pruner.residual_allows_prune(cells.iter().flatten()) {
+                return Ok(false);
+            }
+        }
+        Ok::<bool, anyhow::Error>(true)
+    };
+    match check.await {
+        Ok(allows) => {
+            pruner.count_residual_check(false);
+            allows
+        }
+        Err(e) => {
+            tracing::debug!(group, error = %e, "layer A: residual column unreadable; row group kept");
+            pruner.count_residual_check(true);
+            false
+        }
+    }
+}
+
 /// Is every row group declared sorted by the oid column, ascending?
 fn declares_oid_order(metadata: &ParquetMetaData) -> bool {
     let schema = metadata.file_metadata().schema_descr();
@@ -384,11 +432,34 @@ async fn open_segment(
             .index_of(SYS_COL_OID)
             .context("an oid-ordered segment has no oid column")?;
         let spine_mask = ProjectionMask::roots(&descr, [oid]);
+        let reader = reader.with_metadata(metadata.clone());
         let keep = match &pruner {
-            Some(pruner) => pruner.keep(&metadata, arrow.schema()),
+            Some(pruner) => {
+                let RowGroupPlan {
+                    mut keep,
+                    residual_candidates,
+                } = pruner.plan(&metadata, arrow.schema());
+                let cleared: Vec<usize> = futures::stream::iter(residual_candidates)
+                    .map(|group| {
+                        let (reader, arrow) = (&reader, &arrow);
+                        async move {
+                            residual_allows_prune(reader, arrow, group, batch_size, pruner)
+                                .await
+                                .then_some(group)
+                        }
+                    })
+                    .buffer_unordered(RESIDUAL_CHECKS_IN_FLIGHT)
+                    .filter_map(futures::future::ready)
+                    .collect()
+                    .await;
+                for group in cleared {
+                    keep[group] = false;
+                }
+                pruner.record(&keep);
+                keep
+            }
             None => vec![true; metadata.num_row_groups()],
         };
-        let reader = reader.with_metadata(metadata);
         // Row groups in file (= oid) order: kept runs are read in full, pruned
         // runs as a key spine — or not at all in the oldest segment, which
         // shadows nothing (see `prune`).
