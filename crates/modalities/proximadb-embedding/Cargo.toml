@@ -107,7 +107,7 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 # fetches a prebuilt ONNX Runtime shared library at build time so the binary
 # is self-contained on macOS/Linux without a system install. Gated to keep
 # default builds dependency-light.
-ort = { version = "2.0.0-rc.10", optional = true, default-features = false, features = [
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = [
     "std",
     "download-binaries",
     "ndarray",

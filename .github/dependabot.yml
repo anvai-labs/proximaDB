@@ -52,6 +52,14 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: "metal"
         update-types: ["version-update:semver-major"]
+      # ort is a 2.0 pre-release, so rc.14+ arrives inside the minor/patch group,
+      # but rc.15 needs one process-wide ONNX Runtime environment shared by two
+      # crates, which is a design change and not a bump (TD-ORT-1). Without
+      # this ignore, the whole cargo-minor-patch group PR fails to build every week.
+      - dependency-name: "ort"
+        versions: [">=2.0.0-rc.14"]
+      - dependency-name: "ort-sys"
+        versions: [">=2.0.0-rc.14"]
     groups:
       cargo-minor-patch:
         update-types: ["minor", "patch"]

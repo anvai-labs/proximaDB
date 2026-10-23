@@ -769,7 +769,6 @@ async-trait = "0.1"
 futures = "0.3"
 regex = "1.10"
 nom = "7"
-hostname = "0.3"  # Get hostname for leader election
 
 # Multi-model storage (Document + Observability)
 tantivy = "0.26"  # Full-text search for documents

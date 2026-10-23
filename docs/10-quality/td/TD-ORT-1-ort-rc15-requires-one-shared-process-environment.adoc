@@ -1,0 +1,53 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-ORT-1: `ort` 2.0.0-rc.15 needs one ONNX Runtime environment shared by the whole process, and two crates build sessions independently
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** `ort` is pinned `=2.0.0-rc.13` in both manifests, so a local `cargo update` cannot pull rc.15 either. `.github/dependabot.yml` ignores `ort` `>=2.0.0-rc.14`, so the grouped minor/patch PR stops re-proposing an upgrade that cannot build.
+| Severity | Low. Nothing is broken today. The cost is staying on a pre-release that will stop receiving fixes.
+| Component | `crates/modalities/proximadb-embedding/src/models/bge.rs` (BGE session pool), `crates/modalities/proximadb-rank-onnx/src/ort_scorer_session.rs`, `ort_tokenized_scorer_session.rs`
+| Found | 2026-10-23. Dependabot's grouped PR #2139 bumped `ort` rc.13 to rc.15, and the `Feature Matrix (cloud-full+onnx)` leg failed with `E0061: this function takes 1 argument but 0 arguments were supplied` at `bge.rs:308`.
+| Related | link:TD-DEPS-2-breaking-cargo-upgrades-deferred.adoc[TD-DEPS-2] (how deferred breaking upgrades are recorded)
+|===
+
+== What changed in `ort`
+
+rc.15 makes the ONNX Runtime environment explicit:
+
+* `Session::builder()` became `Session::builder(&Environment)`.
+* An `Environment` comes from `ort::init()...build()`, and only **one may exist per process**.
+  `EnvironmentBuilder::build` returns `"only one environment is allowed per process"` once the
+  process-global `CURRENT_ENV` cell is set. That cell is a `OnceLock<Weak<_>>`, so it stays set even
+  after every strong handle is dropped. Building a second one fails for the life of the process,
+  even when no environment is live.
+* `Environment::current()` is `pub(crate)`, so a crate cannot borrow an environment another crate
+  created.
+
+== Why this is not a drop-in fix
+
+Three call sites build sessions: the BGE pool in `proximadb-embedding` and the two scorer sessions
+in `proximadb-rank-onnx`. The two crates do not depend on each other. The root crate's `onnx`
+feature enables both: it covers the `cloud-full+onnx` test binaries and any process built on
+`proximadb/onnx`. The server's own `onnx` feature turns on only `proximadb-embedding/onnx` today,
+so a production server does not link both yet. If each crate built its own environment, whichever
+loaded second would fail at runtime, and the compiler would not catch it. Only a process that loads
+both a BGE model and an ONNX reranker would fail, and it fails as soon as one exists.
+
+A live environment is also needed beyond session construction: copying tensors needs one (see
+`value/impl_tensor/copy.rs`). So the owner must hold it for the life of the process, not only while
+building sessions. rc.14 was not inspected, which is why the hold starts at rc.14.
+
+== Fix
+
+. Add one owner for the process environment, built once and held for the life of the process.
+  For example, a small `onnx-runtime` module in a crate both already depend on, or a new leaf
+  crate with `ort` as an optional dependency. The owner exposes
+  `shared_environment() -> Result<&'static Environment>`.
+. Move the execution-provider choice to the owner if rc.15 expects environment-level providers.
+  Today `bge.rs::register_provider` registers them per `SessionBuilder`.
+. Change all three call sites to `Session::builder(shared_environment()?)`.
+. Gate: the `cloud-full+onnx` feature-matrix leg, plus a test that loads a BGE session and a
+  scorer session in one process. That test is the regression a per-crate environment would fail.
+. Remove the `=2.0.0-rc.13` pins and the `ort` ignore from `.github/dependabot.yml`.

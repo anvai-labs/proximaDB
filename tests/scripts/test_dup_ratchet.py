@@ -33,8 +33,17 @@ class DupRatchetContract(unittest.TestCase):
         BASELINE.write_text(self.saved)
 
     def _write_baseline(self, percentage):
+        # Scale the line cap with the percentage: a "generous" baseline must be
+        # generous on BOTH metrics, or the tree's real dup-line drift (e.g. a
+        # PR merge-ref one line over the committed cap) fails a test that is
+        # meant to be unfailable. Below 50% the cap is 0, which dup_ratchet.py
+        # treats as absent (a falsy cap disables the line check), so the 0% test
+        # exercises the percentage path alone. Do not "tighten" it to 1. Tests
+        # that need a real line cap set it explicitly afterwards.
         doc = json.loads(self.saved)
         doc["percentage"] = percentage
+        if "duplicated_lines" in doc:
+            doc["duplicated_lines"] = 10**9 if percentage >= 50 else 0
         BASELINE.write_text(json.dumps(doc, indent=2) + "\n")
 
     def test_ratchet_fails_when_baseline_beats_reality(self):
