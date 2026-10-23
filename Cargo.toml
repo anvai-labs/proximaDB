@@ -628,7 +628,7 @@ mime_guess = { version = "2", optional = true }
 
 # Storage & Memory Management
 memmap2 = "0.9"
-lru = "0.18"  # LRU cache for disk-backed graph storage
+lru = "0.19"  # LRU cache for disk-backed graph storage
 rocksdb = { version = "0.21", optional = true }  # Optional for metadata backend
 tokio-postgres = { version = "0.7", optional = true }  # PostgreSQL client for CDC (experimental-cdc-connectors)
 sqlx = { version = "0.9", features = ["runtime-tokio", "tls-native-tls", "json", "chrono", "uuid"], optional = true }  # OLTP catalog backends (oltp-catalog)
