@@ -17,107 +17,18 @@
 //! test pins the core invariant: for every shape, the extended protocol's
 //! Describe equals the simple protocol's RowDescription, or is empty.
 
-use std::net::TcpListener;
 use std::time::Duration;
 
-use proximadb::core::Config;
-use proximadb::database::ProximaDB;
-use tempfile::TempDir;
 use tokio::time::sleep;
 
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
-}
+#[path = "common/pg_server.rs"]
+mod pg_server;
 
-struct PgServer {
-    pg_port: u16,
-    db: Option<ProximaDB>,
-    _tmp: TempDir,
-}
-
-impl PgServer {
-    async fn start() -> anyhow::Result<Self> {
-        let pg_port = free_port();
-        let rest_port = free_port();
-        let grpc_port = free_port();
-        let tmp = TempDir::new()?;
-        let mut config = Config::default();
-        config.server.bind_address = "127.0.0.1".to_string();
-        config.server.port = rest_port;
-        config.server.data_dir = tmp.path().to_path_buf();
-        config.api.rest_port = rest_port;
-        config.api.grpc_port = grpc_port;
-        config.api.unified_mode = false;
-        config.api.pg_port = Some(pg_port);
-        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
-            url: format!("file://{}", tmp.path().display()),
-            ..Default::default()
-        }];
-        config.storage.metadata_url = format!("file://{}/metadata", tmp.path().display());
-        config.storage.wal_config.write_buffer_directory =
-            format!("file://{}/wal", tmp.path().display());
-        let mut db = ProximaDB::new(config).await?;
-        db.start().await?;
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .no_proxy()
-            .build()?;
-        let health = format!("http://127.0.0.1:{rest_port}/health");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match http.get(&health).send().await {
-                Ok(r) if r.status().is_success() => break,
-                _ if std::time::Instant::now() > deadline => anyhow::bail!("REST not ready"),
-                _ => sleep(Duration::from_millis(100)).await,
-            }
-        }
-        sleep(Duration::from_millis(200)).await;
-        Ok(Self {
-            pg_port,
-            db: Some(db),
-            _tmp: tmp,
-        })
-    }
-
-    fn conn_str(&self) -> String {
-        format!(
-            "host=127.0.0.1 port={} user=postgres dbname=proximadb sslmode=disable",
-            self.pg_port
-        )
-    }
-}
-
-impl Drop for PgServer {
-    fn drop(&mut self) {
-        if let Some(mut db) = self.db.take() {
-            tokio::spawn(async move {
-                let _ = db.shutdown().await;
-            });
-        }
-    }
-}
+use pg_server::TestPgServer as PgServer;
+use pg_server::db_err as explain_err;
 
 async fn connect(server: &PgServer) -> tokio_postgres::Client {
-    let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            eprintln!("pgwire connection error: {e}");
-        }
-    });
-    client
-}
-
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    if let Some(db) = e.as_db_error() {
-        format!("[{}] {}", db.code().code(), db.message())
-    } else {
-        e.to_string()
-    }
+    server.connect().await.expect("tokio-postgres connect")
 }
 
 async fn seed(client: &tokio_postgres::Client) {

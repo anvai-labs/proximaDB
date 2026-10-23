@@ -1940,6 +1940,7 @@ fn encode_binary_cell_rejects_mismatched_text_without_panicking() {
         ("ééééééééééééééé", PgType::Uuid),
         ("\\xé1", PgType::Bytea),
         ("\\x0", PgType::Bytea),
+        ("\\x+f", PgType::Bytea),
         ("not-a-date", PgType::Date),
         ("[1,x]", PgType::Vector),
         ("maybe", PgType::Bool),

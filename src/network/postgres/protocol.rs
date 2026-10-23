@@ -6811,6 +6811,19 @@ impl PostgresProtocol {
                 .and_then(|d| d.and_hms_opt(0, 0, 0))
                 .ok_or_else(|| "PostgreSQL epoch is not representable".to_string())
         }
+        // Hex digit pairs to bytes; `None` on an odd length or a non-hex
+        // (including multi-byte) character — never a slicing panic.
+        fn hex_bytes(hex: &str) -> Option<Vec<u8>> {
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| {
+                    hex.get(i..i + 2)
+                        // `from_str_radix` alone would accept a sign (`+f`).
+                        .filter(|pair| pair.bytes().all(|b| b.is_ascii_hexdigit()))
+                        .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                })
+                .collect()
+        }
         fn timestamp_micros(text: &str) -> Result<i64, String> {
             let text = text.trim();
             let text = text.strip_suffix("+00").unwrap_or(text);
@@ -6846,14 +6859,7 @@ impl PostgresProtocol {
                 let hex = text
                     .strip_prefix("\\x")
                     .ok_or_else(|| format!("cannot encode `{text}` as bytea"))?;
-                (0..hex.len())
-                    .step_by(2)
-                    .map(|i| {
-                        hex.get(i..i + 2)
-                            .and_then(|pair| u8::from_str_radix(pair, 16).ok())
-                            .ok_or_else(|| format!("cannot encode `{text}` as bytea"))
-                    })
-                    .collect()
+                hex_bytes(hex).ok_or_else(|| format!("cannot encode `{text}` as bytea"))
             }
             PgType::Date => {
                 let date = chrono::NaiveDate::parse_from_str(text.trim(), "%Y-%m-%d")
@@ -6871,14 +6877,7 @@ impl PostgresProtocol {
                 if hex.len() != 32 {
                     return Err(format!("cannot encode `{text}` as uuid"));
                 }
-                (0..32)
-                    .step_by(2)
-                    .map(|i| {
-                        hex.get(i..i + 2)
-                            .and_then(|pair| u8::from_str_radix(pair, 16).ok())
-                            .ok_or_else(|| format!("cannot encode `{text}` as uuid"))
-                    })
-                    .collect()
+                hex_bytes(&hex).ok_or_else(|| format!("cannot encode `{text}` as uuid"))
             }
             // pgvector's binary form: int16 dimension, int16 unused, then
             // float4 per element (big-endian).
