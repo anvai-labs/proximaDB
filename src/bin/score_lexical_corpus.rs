@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -160,16 +160,26 @@ impl EvalIndex {
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
     let mut source = File::open(path)
         .with_context(|| format!("failed to open {} for hashing", path.display()))?;
     let mut digest = Sha256::new();
-    std::io::copy(&mut source, &mut digest)
-        .with_context(|| format!("failed to hash {}", path.display()))?;
-    Ok(format!("{:x}", digest.finalize()))
+    let mut buf = [0u8; 65536];
+    // sha2 0.11 no longer implements io::Write for its digest types; stream
+    // through update() instead (same bytes hashed, same output).
+    loop {
+        let n = source
+            .read(&mut buf)
+            .with_context(|| format!("failed to hash {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        digest.update(&buf[..n]);
+    }
+    Ok(hex::encode(digest.finalize()))
 }
 
 fn load_jsonl<T: DeserializeOwned>(path: &Path, kind: &str) -> Result<Vec<T>> {

@@ -18,13 +18,13 @@ aes-gcm = "0.10"
 anyhow.workspace = true
 async-trait.workspace = true
 bincode.workspace = true
-hkdf = "0.12"
+hkdf = "0.13"
 memmap2 = "0.9"
 proximadb-storage-filesystem-types.workspace = true
 rand.workspace = true
 rayon.workspace = true
 serde.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 tokio.workspace = true
 tracing.workspace = true
 

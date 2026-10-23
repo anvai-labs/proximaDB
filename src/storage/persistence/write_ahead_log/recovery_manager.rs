@@ -649,7 +649,7 @@ impl RecoveryManager {
             .filter(|r| r.valid_to_ns == Some(0) && r.origin.as_deref() == Some("delete"))
             .filter_map(|r| oid_to_lsn.get(&r.oid).map(|&lsn| (r.oid.clone(), lsn)))
             .collect();
-        let digest = format!("{:x}", digest.finalize());
+        let digest = hex::encode(digest.finalize());
         let range = match (
             replay.first().and_then(|object| object.token.as_ref()),
             replay.last().and_then(|object| object.token.as_ref()),
