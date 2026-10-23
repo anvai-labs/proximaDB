@@ -13,8 +13,8 @@ use proximadb::core::Config;
 use proximadb::database::ProximaDB;
 use proximadb::proto::proximadb_v2::proxima_record_service_client::ProximaRecordServiceClient;
 use proximadb::proto::proximadb_v2::{
-    BatchWriteMode, ProximaRecord, ProximaRecordBatch, TypedSearchRequest, V2CollectionConfig,
-    V2ListCollectionsRequest,
+    BatchWriteMode, GetSchemaRequest, ListSchemasRequest, ProximaRecord, ProximaRecordBatch,
+    TypedSearchRequest, V2CollectionConfig, V2ListCollectionsRequest,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -119,12 +119,12 @@ fn record(id: &str, vector: [f32; 3]) -> ProximaRecord {
     }
 }
 
-#[tokio::test]
-async fn grpc_created_collection_stores_and_serves_records_e2e() {
-    let server = Server::start().await.expect("server start");
-    let mut grpc = connect_grpc(server.grpc_port).await;
-    let name = "grpc_created";
-
+/// A dimension-3 cosine SST collection created over gRPC (TD-GRPCSCHEMA-1's
+/// shape: no way to enable ProximaRecord, canonical schema persisted).
+async fn grpc_create_cosine_3d(
+    grpc: &mut ProximaRecordServiceClient<tonic::transport::Channel>,
+    name: &str,
+) {
     grpc.create_collection(V2CollectionConfig {
         name: name.to_string(),
         dimension: 3,
@@ -134,6 +134,15 @@ async fn grpc_created_collection_stores_and_serves_records_e2e() {
     })
     .await
     .expect("gRPC CreateCollection");
+}
+
+#[tokio::test]
+async fn grpc_created_collection_stores_and_serves_records_e2e() {
+    let server = Server::start().await.expect("server start");
+    let mut grpc = connect_grpc(server.grpc_port).await;
+    let name = "grpc_created";
+
+    grpc_create_cosine_3d(&mut grpc, name).await;
 
     let inserted = grpc
         .insert_records(ProximaRecordBatch {
@@ -539,5 +548,158 @@ async fn narrowed_filterable_types_are_accepted_e2e() {
     assert_eq!(
         after["inserted_count"], 1,
         "insert after the updates: {after}"
+    );
+}
+
+/// TD-GRPCSCHEMA-1: a collection created over gRPC (which cannot enable
+/// ProximaRecord) still has a persisted canonical schema — embedding plus any
+/// filterable columns — and GetSchema must serve it instead of answering
+/// NotFound. The REST GET answers the same catalog-authoritative view.
+#[tokio::test]
+async fn grpc_created_collection_serves_its_schema_e2e() {
+    let server = Server::start().await.expect("server start");
+    let mut grpc = connect_grpc(server.grpc_port).await;
+    let http = reqwest::Client::builder().no_proxy().build().expect("http");
+    let base = format!("http://127.0.0.1:{}", server.rest_port);
+    let name = "grpc_schema_served";
+
+    grpc_create_cosine_3d(&mut grpc, name).await;
+
+    let schema = grpc
+        .get_schema(GetSchemaRequest {
+            collection_id: name.to_string(),
+            schema_id: None,
+        })
+        .await
+        .expect("gRPC GetSchema must serve the persisted schema")
+        .into_inner();
+    assert!(schema.success, "{schema:?}");
+    let columns = schema.schema.expect("schema present").columns;
+    let embedding = columns
+        .iter()
+        .find(|column| column.name == "embedding")
+        .expect("the persisted schema carries the embedding column");
+    assert_eq!(embedding.vector_dimension, Some(3));
+
+    let rest = http
+        .get(format!("{base}/api/v2/collections/{name}/schema"))
+        .send()
+        .await
+        .expect("REST schema GET");
+    assert_eq!(
+        rest.status(),
+        reqwest::StatusCode::OK,
+        "REST must serve the same catalog-authoritative schema"
+    );
+    let body: serde_json::Value = rest.json().await.expect("json");
+    let names: Vec<&str> = body["schema"]["columns"]
+        .as_array()
+        .map(|columns| {
+            columns
+                .iter()
+                .map(|column| column["name"].as_str().unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        names.contains(&"embedding"),
+        "REST schema must carry the embedding column: {body}"
+    );
+}
+
+/// TD-GRPCSCHEMA-1 (review round 1): the read and the evolution baseline must
+/// agree — ListSchemas serves a flag-off collection's schema too, and a schema
+/// PUT cannot silently drop a column GET advertises (the embedding column),
+/// while an additive PUT still works.
+#[tokio::test]
+async fn schema_read_and_evolution_baseline_agree_e2e() {
+    let server = Server::start().await.expect("server start");
+    let mut grpc = connect_grpc(server.grpc_port).await;
+    let http = reqwest::Client::builder().no_proxy().build().expect("http");
+    let base = format!("http://127.0.0.1:{}", server.rest_port);
+    let name = "grpc_schema_baseline";
+
+    grpc_create_cosine_3d(&mut grpc, name).await;
+
+    let listed = grpc
+        .list_schemas(ListSchemasRequest {
+            collection_id: name.to_string(),
+            limit: None,
+            offset: None,
+        })
+        .await
+        .expect("gRPC ListSchemas")
+        .into_inner();
+    assert_eq!(
+        listed.total_count, 1,
+        "a flag-off collection lists its schema"
+    );
+    assert!(
+        listed.schemas[0]
+            .columns
+            .iter()
+            .any(|column| column.name == "embedding"),
+        "the listed schema carries the embedding column"
+    );
+
+    // A PUT that drops the advertised embedding column is rejected.
+    let rejected = http
+        .put(format!("{base}/api/v2/collections/{name}/schema"))
+        .json(&serde_json::json!({
+            "columns": [
+                {"name": "lang", "data_type": "text", "nullable": true}
+            ]
+        }))
+        .send()
+        .await
+        .expect("REST schema PUT");
+    let status = rejected.status();
+    let body = rejected.text().await.expect("body");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CONFLICT,
+        "dropping the advertised embedding column must be a 409: {status} {body}"
+    );
+    assert!(
+        body.contains("embedding"),
+        "the rejection must name the column-removal rule for `embedding`: {body}"
+    );
+
+    // An additive PUT (embedding kept) succeeds and GET still serves it.
+    let added = http
+        .put(format!("{base}/api/v2/collections/{name}/schema"))
+        .json(&serde_json::json!({
+            "columns": [
+                {"name": "embedding", "data_type": "vector", "vector_dimension": 3},
+                {"name": "lang", "data_type": "text", "nullable": true}
+            ]
+        }))
+        .send()
+        .await
+        .expect("REST schema PUT");
+    let status = added.status();
+    let body = added.text().await.expect("body");
+    assert!(
+        status.is_success(),
+        "additive PUT must succeed: {status} {body}"
+    );
+
+    let schema = grpc
+        .get_schema(GetSchemaRequest {
+            collection_id: name.to_string(),
+            schema_id: None,
+        })
+        .await
+        .expect("gRPC GetSchema after the additive PUT")
+        .into_inner();
+    let schema = schema.schema.expect("schema present");
+    let names: Vec<&str> = schema
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect();
+    assert!(
+        names.contains(&"embedding") && names.contains(&"lang"),
+        "{names:?}"
     );
 }
