@@ -46,57 +46,140 @@ pub struct LocalConfig {
     pub sync_enabled: bool,
 }
 
-/// Directories whose own entry (in their parent) is known durable: a
-/// [`sync_new_entries`] walk fsynced every directory above it — up to the
-/// filesystem root, the configured root or another such directory — and
-/// completed. Process-wide because directories are; keys are absolute. A
-/// deleted or moved directory is evicted with everything under it
-/// ([`forget_durable_dirs`]).
-fn durable_dirs() -> &'static dashmap::DashSet<PathBuf> {
-    static DURABLE: std::sync::OnceLock<dashmap::DashSet<PathBuf>> = std::sync::OnceLock::new();
-    DURABLE.get_or_init(dashmap::DashSet::new)
+/// What this process knows about which directory entries are durable.
+/// Process-wide because directories are; paths are absolute. One small mutex,
+/// held only for set operations, never across I/O.
+#[derive(Default)]
+struct EntryDurability {
+    /// Directories whose own entry (in their parent) is durable: a
+    /// [`sync_new_entries`] walk fsynced every directory above it — up to the
+    /// filesystem root or another such directory — and completed.
+    durable_dirs: std::collections::HashSet<PathBuf>,
+    /// Trees being removed or moved ([`TreeRemoval`]); nothing under them is
+    /// trusted durable.
+    removing: Vec<PathBuf>,
+    /// Bumped by every eviction.
+    epoch: u64,
+    /// The last [`EVICTION_LOG`] evictions, oldest first, with the epoch each
+    /// produced: a walk records nothing under a path evicted while it ran,
+    /// since what it synced there may be gone.
+    evictions: std::collections::VecDeque<(u64, PathBuf)>,
 }
 
-/// A deleted or moved directory, and everything under it, is no longer known
-/// durable: re-created at the same path, its entry must be synced afresh.
-fn forget_durable_dirs(path: &Path) {
-    if let Ok(path) = std::path::absolute(path) {
-        durable_dirs().retain(|dir| !dir.starts_with(&path));
+const EVICTION_LOG: usize = 1024;
+
+impl EntryDurability {
+    fn trusted(&self, dir: &Path) -> bool {
+        self.durable_dirs.contains(dir) && !self.removing.iter().any(|r| dir.starts_with(r))
+    }
+
+    fn forget_under(&mut self, path: &Path) {
+        self.epoch += 1;
+        self.evictions.push_back((self.epoch, path.to_path_buf()));
+        if self.evictions.len() > EVICTION_LOG {
+            self.evictions.pop_front();
+        }
+        self.durable_dirs.retain(|dir| !dir.starts_with(path));
+    }
+
+    /// Record what a walk that started at epoch `since` made durable, except
+    /// under paths evicted since — or nothing, if the log no longer reaches
+    /// back that far.
+    fn record_walk(&mut self, since: u64, dirs: Vec<&Path>) {
+        if self.epoch != since
+            && self
+                .evictions
+                .front()
+                .is_none_or(|(oldest, _)| *oldest > since + 1)
+        {
+            return;
+        }
+        let evicted: Vec<PathBuf> = self
+            .evictions
+            .iter()
+            .filter(|(epoch, _)| *epoch > since)
+            .map(|(_, path)| path.clone())
+            .collect();
+        for dir in dirs {
+            if !evicted.iter().any(|path| dir.starts_with(path)) {
+                self.durable_dirs.insert(dir.to_path_buf());
+            }
+        }
     }
 }
 
-/// Make a written file's directory entry durable, and the entries of every
-/// directory above it not yet known durable: fsync the parent, then walk up,
-/// fsyncing each parent, until reaching a directory known durable, `stop_at`
-/// (the configured root) or the filesystem root. A file's own fsync covers its
-/// data, not the entries that name it — after a power loss the file could
-/// otherwise vanish while callers (WAL truncation) already rely on it.
+fn entry_durability() -> &'static parking_lot::Mutex<EntryDurability> {
+    static STATE: std::sync::OnceLock<parking_lot::Mutex<EntryDurability>> =
+        std::sync::OnceLock::new();
+    STATE.get_or_init(Default::default)
+}
+
+/// Brackets the removal or move of a directory tree. Until dropped nothing
+/// under it is trusted durable and walks overlapping it record nothing; when
+/// dropped, what was known under it is forgotten — re-created at the same
+/// path, its entries must be synced afresh.
+struct TreeRemoval(Option<PathBuf>);
+
+impl TreeRemoval {
+    fn begin(path: &Path) -> Self {
+        let Ok(path) = std::path::absolute(path) else {
+            return Self(None);
+        };
+        let mut state = entry_durability().lock();
+        state.forget_under(&path);
+        state.removing.push(path.clone());
+        Self(Some(path))
+    }
+}
+
+impl Drop for TreeRemoval {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let mut state = entry_durability().lock();
+            state.forget_under(&path);
+            if let Some(i) = state.removing.iter().position(|r| *r == path) {
+                state.removing.swap_remove(i);
+            }
+        }
+    }
+}
+
+/// Make `path`'s directory entry durable, and the entries of every directory
+/// above it not yet known durable: fsync its parent, then walk up, fsyncing
+/// each parent, until reaching a directory known durable or the filesystem
+/// root. A file's own fsync covers its data, not the entries that name it —
+/// after a power loss the file could otherwise vanish while callers (WAL
+/// truncation) already rely on it.
 ///
-/// "Already exists" is not "durable" — for the file (an earlier attempt may
-/// have created it, then failed before this sync) or for an ancestor (a
-/// concurrent writer may have just created it). Hence every synced write walks,
-/// and a directory is recorded durable only once the whole walk has succeeded:
-/// a concurrent walker stops at it trusting every entry above it. Known-durable
-/// parents make the common walk one fsync.
-async fn sync_new_entries(file: &Path, stop_at: Option<&Path>) -> FsResult<()> {
-    let file = std::path::absolute(file).map_err(FilesystemError::Io)?;
-    let stop_at = stop_at
+/// "Already exists" is not "durable": a concurrent writer may have just
+/// created an ancestor. So a directory is recorded durable only once a whole
+/// walk through it has succeeded — a concurrent walker stops at it trusting
+/// every entry above it — and not under a tree evicted while it ran.
+/// `path_is_dir`: `path` is a directory, itself recorded durable too.
+///
+/// `root` (the configured root) decides which syncs are required: the
+/// parent's, and any inside the root. Above the root (or with none) an
+/// ancestor this process cannot open, or a read-only one, cannot be fsynced by
+/// it at all; failing would break every write for a guarantee no retry gives.
+async fn sync_new_entries(path: &Path, root: Option<&Path>, path_is_dir: bool) -> FsResult<()> {
+    let path = std::path::absolute(path).map_err(FilesystemError::Io)?;
+    let root = root
         .map(std::path::absolute)
         .transpose()
         .map_err(FilesystemError::Io)?;
-    let Some(parent) = file.parent() else {
+    let Some(parent) = path.parent() else {
         return Ok(());
     };
+    let epoch = entry_durability().lock().epoch;
     let mut made_durable: Vec<&Path> = Vec::new();
+    if path_is_dir {
+        made_durable.push(&path);
+    }
     let mut dir = parent;
     loop {
-        // The file's own directory, and any inside the root, must sync.
-        // Above the root (or with none) an ancestor this process cannot open
-        // or that is read-only cannot be fsynced by it at all; failing would
-        // break every write for a guarantee no retry can give.
-        let required = dir == parent || stop_at.as_deref().is_some_and(|s| dir.starts_with(s));
+        let required = dir == parent || root.as_deref().is_some_and(|r| dir.starts_with(r));
         sync_dir(dir, required).await?;
-        if durable_dirs().contains(dir) || stop_at.as_deref() == Some(dir) {
+        if entry_durability().lock().trusted(dir) {
             break;
         }
         made_durable.push(dir);
@@ -105,9 +188,8 @@ async fn sync_new_entries(file: &Path, stop_at: Option<&Path>) -> FsResult<()> {
         };
         dir = up;
     }
-    for dir in made_durable {
-        durable_dirs().insert(dir.to_path_buf());
-    }
+    let mut state = entry_durability().lock();
+    state.record_walk(epoch, made_durable);
     Ok(())
 }
 
@@ -260,11 +342,13 @@ impl LocalFileSystem {
                     root_dir.display()
                 )));
             }
-            // Per-write walks stop at the root; make the root's own entry
-            // durable once here. Best-effort: the root may sit under
-            // directories this process cannot fsync.
+            // Make the root's own entry durable once, so per-write walks stop
+            // at it. If that fails, the root is not recorded durable and those
+            // walks continue above it, under their rules — where an ancestor
+            // this process cannot fsync is tolerated, as it is here only
+            // through this warning.
             if config.sync_enabled
-                && let Err(e) = sync_new_entries(root_dir, None).await
+                && let Err(e) = sync_new_entries(root_dir, None, true).await
             {
                 warn!(root = %root_dir.display(), error = %e, "root directory entry not fsynced");
             }
@@ -464,11 +548,13 @@ impl LocalFileSystem {
                     root_dir.display()
                 )));
             }
-            // Per-write walks stop at the root; make the root's own entry
-            // durable once here. Best-effort: the root may sit under
-            // directories this process cannot fsync.
+            // Make the root's own entry durable once, so per-write walks stop
+            // at it. If that fails, the root is not recorded durable and those
+            // walks continue above it, under their rules — where an ancestor
+            // this process cannot fsync is tolerated, as it is here only
+            // through this warning.
             if config.sync_enabled
-                && let Err(e) = sync_new_entries(root_dir, None).await
+                && let Err(e) = sync_new_entries(root_dir, None, true).await
             {
                 warn!(root = %root_dir.display(), error = %e, "root directory entry not fsynced");
             }
@@ -716,9 +802,11 @@ impl FileSystem for LocalFileSystem {
 
             // Sync data to disk to prevent truncation issues
             file.sync_all().await.map_err(FilesystemError::Io)?;
-            // Even an overwrite: the entry may be one an earlier, failed
-            // attempt created and never synced.
-            sync_new_entries(&resolved_path, self.config.root_dir.as_deref()).await?;
+            // Even an overwrite: "exists" is not "durable" — the entry may be
+            // one an earlier attempt (this process or one that crashed), a
+            // rename, or another writer created and never synced. In a
+            // durable directory this is one fsync.
+            sync_new_entries(&resolved_path, self.config.root_dir.as_deref(), false).await?;
         } else {
             // Fast write without sync (for development/testing only)
             fs::write(&resolved_path, data_to_write)
@@ -782,7 +870,7 @@ impl FileSystem for LocalFileSystem {
         if self.config.sync_enabled {
             file.sync_all().await.map_err(FilesystemError::Io)?;
             // The commit point is the directory entry, not only the bytes.
-            sync_new_entries(&resolved_path, self.config.root_dir.as_deref()).await?;
+            sync_new_entries(&resolved_path, self.config.root_dir.as_deref(), false).await?;
         }
         Ok(())
     }
@@ -826,11 +914,15 @@ impl FileSystem for LocalFileSystem {
         }
 
         if resolved_path.is_dir() {
-            let removed = fs::remove_dir_all(&resolved_path)
-                .await
-                .map_err(FilesystemError::Io);
-            forget_durable_dirs(&resolved_path);
-            removed
+            // The guard lives with the blocking removal: a cancelled caller
+            // must not end it while the removal still runs.
+            tokio::task::spawn_blocking(move || {
+                let _removal = TreeRemoval::begin(&resolved_path);
+                std::fs::remove_dir_all(&resolved_path)
+            })
+            .await
+            .map_err(|e| FilesystemError::Io(std::io::Error::other(e)))?
+            .map_err(FilesystemError::Io)
         } else {
             fs::remove_file(&resolved_path)
                 .await
@@ -1149,15 +1241,21 @@ impl FileSystem for LocalFileSystem {
         }
 
         trace!("Attempting rename from {:?} to {:?}", from_path, to_path);
-        let moving_dir = from_path.is_dir();
-        let result = fs::rename(&from_path, &to_path).await.map_err(|e| {
+        // A moved directory's guards live with the blocking rename: a
+        // cancelled caller must not end them while the rename still runs.
+        let (from, to) = (from_path.clone(), to_path.clone());
+        let result = tokio::task::spawn_blocking(move || {
+            let _removals = from
+                .is_dir()
+                .then(|| (TreeRemoval::begin(&from), TreeRemoval::begin(&to)));
+            std::fs::rename(&from, &to)
+        })
+        .await
+        .map_err(|e| FilesystemError::Io(std::io::Error::other(e)))?
+        .map_err(|e| {
             debug!("Rename failed, will try copy: {}", e);
             FilesystemError::Io(e)
         });
-        if moving_dir {
-            forget_durable_dirs(&from_path);
-            forget_durable_dirs(&to_path);
-        }
 
         if result.is_ok() {
             trace!("File moved successfully");
@@ -2179,7 +2277,12 @@ mod tests {
                 dir.display()
             );
         }
-        assert!(durable_dirs().contains(&root.join("spill/t1/orders")));
+        let durable = |dir: &Path| entry_durability().lock().trusted(dir);
+        assert!(durable(&root.join("spill/t1/orders")));
+        assert!(
+            durable(&root),
+            "the constructor made the root's entry durable"
+        );
 
         // A second file in a now-durable directory syncs only its parent.
         let before = synced_dirs_for_tests().lock().len();
@@ -2209,8 +2312,9 @@ mod tests {
             b"z"
         );
 
-        // A file that already exists — say an earlier attempt created it and
-        // failed before syncing — is not durable: the retry walks the chain.
+        // A file that already exists is not therefore durable — an earlier
+        // attempt, or a process that crashed, may have created it and never
+        // synced its entry: the overwrite walks the chain.
         std::fs::create_dir_all(root.join("retry/a")).unwrap();
         std::fs::write(root.join("retry/a/f"), b"partial").unwrap();
         let before = synced_dirs_for_tests().lock().len();
@@ -2224,13 +2328,29 @@ mod tests {
             );
         }
 
-        // A deleted directory is forgotten: re-created, it is synced again.
-        fs.delete("spill").await.unwrap();
+        // While a tree is being removed nothing under it is trusted, and what
+        // a walk overlapping the removal learns is forgotten after it.
+        let removal = TreeRemoval::begin(&root.join("spill"));
+        let before = synced_dirs_for_tests().lock().len();
+        fs.write_if_absent("spill/t1/orders/seg3.parquet", b"w", options.clone())
+            .await
+            .unwrap();
+        let after = synced_dirs_for_tests().lock().clone();
         assert!(
-            !durable_dirs()
-                .iter()
-                .any(|d| d.starts_with(root.join("spill")))
+            after[before..].contains(&root.join("spill")),
+            "walked past the tree being removed"
         );
+        drop(removal);
+        assert!(!durable(&root.join("spill/t1/orders")));
+
+        // A deleted directory is forgotten: re-created, it is synced again.
+        fs.write_if_absent("spill/t1/orders/seg4.parquet", b"v", options.clone())
+            .await
+            .unwrap();
+        assert!(durable(&root.join("spill/t1/orders")));
+        fs.delete("spill").await.unwrap();
+        assert!(!durable(&root.join("spill")));
+        assert!(!durable(&root.join("spill/t1/orders")));
         let before = synced_dirs_for_tests().lock().len();
         fs.write_if_absent("spill/t1/orders/seg.parquet", b"x", options)
             .await
