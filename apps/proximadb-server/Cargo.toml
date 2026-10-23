@@ -96,7 +96,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde.workspace = true
 serde_json.workspace = true
 # Cold backup manifest checksums (already in the workspace lockfile via the root crate).
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 libc = "0.2"
 
