@@ -42,7 +42,7 @@ tracing.workspace = true
 # crates/modalities/proximadb-embedding so both crates link against
 # the same ort native library at runtime (avoids dual-load of
 # onnxruntime which destabilises the EP registry).
-ort = { version = "2.0.0-rc.10", optional = true, default-features = false, features = [
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = [
     "std",
     "download-binaries",
     "ndarray",
