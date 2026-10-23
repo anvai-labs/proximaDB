@@ -1915,6 +1915,86 @@ mod tests {
     use proximadb_storage_common::ProjectionDirective;
     use std::sync::Arc;
 
+    /// ADR-097 data format 2: the frame layout is frozen — `[magic "PXWAL001"]
+    /// [version u16 LE][codec u8][flags u8][sequence u64 LE][payload_len u32 LE]
+    /// [payload_crc32 u32 LE][payload]`, version 1 for one entry and 2 for a
+    /// group. The frozen frames below were built outside this code (Python:
+    /// `struct` + `zlib.crc32` over the payloads frozen in
+    /// `proximadb-storage-common/tests/wal_format_compat.rs`), so they check
+    /// the codec against an independent oracle. Never regenerate them to make
+    /// a failure go away; a new format adds a new pair.
+    #[test]
+    fn format_2_frames_still_decode_and_todays_writer_emits_the_same_header() {
+        const SINGLE_V1: &str = "505857414c303031010001000f000000000000006700000089ed228684af73657175656e63655f6e756d6265720fac74696d657374616d705f6d73cf00000199c82cc000a96f7065726174696f6e81af436174616c6f674d75746174696f6e82a36b6579a9666e3a646f75626c65a5627974657393010203a974656e616e745f6964c0";
+        const GROUP_V2: &str = "505857414c303031020001000e00000000000000d0000000cf35ed209284af73657175656e63655f6e756d6265720eac74696d657374616d705f6d73cf00000199c82cc000a96f7065726174696f6e81b35265636f7264506172746974696f6e44726f7081ad636f6c6c656374696f6e5f6964a66f7264657273a974656e616e745f6964c084af73657175656e63655f6e756d6265720fac74696d657374616d705f6d73cf00000199c82cc000a96f7065726174696f6e81af436174616c6f674d75746174696f6e82a36b6579a9666e3a646f75626c65a5627974657393010203a974656e616e745f6964c0";
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+                .collect()
+        };
+        let entry = |sequence_number, operation| CanonicalWalEntry {
+            sequence_number,
+            timestamp_ms: 1_760_000_000_000,
+            operation,
+            tenant_id: None,
+        };
+        let drop = entry(
+            14,
+            CanonicalOperation::RecordPartitionDrop {
+                collection_id: "orders".to_string(),
+            },
+        );
+        let catalog = entry(
+            15,
+            CanonicalOperation::CatalogMutation {
+                key: "fn:double".to_string(),
+                bytes: vec![1, 2, 3],
+            },
+        );
+        let payloads = |entries: &[CanonicalWalEntry]| -> Vec<Vec<u8>> {
+            entries
+                .iter()
+                .map(|e| rmp_serde::to_vec_named(e).expect("encode"))
+                .collect()
+        };
+
+        for (frozen, expected, version) in [
+            (hex(SINGLE_V1), vec![catalog.clone()], FRAME_VERSION),
+            (
+                hex(GROUP_V2),
+                vec![drop.clone(), catalog.clone()],
+                FRAME_VERSION_GROUP,
+            ),
+        ] {
+            // Readable: what format-2 binaries wrote decodes whole.
+            let (decoded, consumed) = decode_frame(&frozen)
+                .expect("format-2 frame must decode")
+                .expect("complete frame");
+            assert_eq!(consumed, frozen.len());
+            assert_eq!(payloads(&decoded), payloads(&expected));
+
+            // Written the same way today: identical header fields, and the
+            // length and CRC describe the payload actually written.
+            let mut written = Vec::new();
+            if version == FRAME_VERSION {
+                encode_frame(&expected[0], &mut written).expect("encode frame");
+            } else {
+                encode_group_frame(&expected, &mut written).expect("encode group frame");
+            }
+            assert_eq!(FRAME_HEADER_LEN, 28);
+            assert_eq!(
+                &written[..20],
+                &frozen[..20],
+                "magic/version/codec/flags/sequence"
+            );
+            let len = u32::from_le_bytes(written[20..24].try_into().expect("len")) as usize;
+            assert_eq!(len, written.len() - FRAME_HEADER_LEN);
+            let crc = u32::from_le_bytes(written[24..28].try_into().expect("crc"));
+            assert_eq!(crc, checksum(&written[FRAME_HEADER_LEN..]));
+        }
+    }
+
     fn upsert_operation(collection_id: &str, oid: &str) -> CanonicalOperation {
         CanonicalOperation::RecordUpsert {
             collection_id: collection_id.to_string(),
