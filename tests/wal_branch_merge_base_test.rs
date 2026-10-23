@@ -118,13 +118,20 @@ fn sources(wal: &Arc<FramedTableWalAppender>) -> Vec<Arc<dyn WalFloorSource>> {
     ]
 }
 
-#[tokio::test]
-async fn a_merge_after_truncating_below_the_branch_point_equals_the_untruncated_merge() -> Result<()>
-{
+/// A data dir with [`seed`]'s history in its canonical WAL: the guard, the
+/// data dir, the shared appender and the first branch write's sequence.
+async fn seeded() -> Result<(TempDir, PathBuf, Arc<FramedTableWalAppender>, u64)> {
     let dir = TempDir::new()?;
     let data_dir = dir.path().to_path_buf();
     let wal = FramedTableWalAppender::open_shared(wal_path(&data_dir)).await?;
     let fork = seed(&wal).await?;
+    Ok((dir, data_dir, wal, fork))
+}
+
+#[tokio::test]
+async fn a_merge_after_truncating_below_the_branch_point_equals_the_untruncated_merge() -> Result<()>
+{
+    let (_dir, data_dir, wal, fork) = seeded().await?;
 
     let untruncated = merge(&data_dir, COLLECTION)
         .await
@@ -159,10 +166,7 @@ async fn a_merge_after_truncating_below_the_branch_point_equals_the_untruncated_
 
 #[tokio::test]
 async fn a_collection_branched_after_its_history_was_truncated_refuses() -> Result<()> {
-    let dir = TempDir::new()?;
-    let data_dir = dir.path().to_path_buf();
-    let wal = FramedTableWalAppender::open_shared(wal_path(&data_dir)).await?;
-    seed(&wal).await?;
+    let (_dir, data_dir, wal, _) = seeded().await?;
     wal_truncator::run_once(&wal, &sources(&wal)).await?;
 
     // A collection whose history was truncated but that has nothing to merge
