@@ -1269,41 +1269,57 @@ pub(crate) fn cluster_external_mvcc(
         estimated_ivf_training_peak_bytes(dim, shape).ok_or_else(|| {
             SstError::Compaction("spill IVF memory estimate overflows u64".to_string())
         })?;
-    if estimated_training_peak_bytes > max_working_memory_bytes {
-        return Err(SstError::Compaction(format!(
-            "spill IVF training needs an estimated {estimated_training_peak_bytes} bytes, above the admitted {max_working_memory_bytes} byte working set"
-        )));
-    }
-
-    let mut pca = IncrementalPCA::new(dim, shape.n_components);
-    let mut usable_index = 0usize;
-    winners.for_each_record(|item| {
-        if let Some(vector) = first_f32_embedding(&item.record) {
-            if usable_index.is_multiple_of(shape.sample_step) {
-                pca.add_sample(vector);
+    // TD-PAXDIR-1 D3: classify with the collection's shared model when the
+    // compaction set one and no retrain trigger fires. No training happens
+    // then, so the training-memory bound applies only to the training arm.
+    let (classifier, frozen_radii_sq, trained_on) = match shared_spill_classifier(
+        &winners,
+        dim,
+        usable_rows,
+        destination_url,
+    )? {
+        Some(shared) => shared,
+        None => {
+            if estimated_training_peak_bytes > max_working_memory_bytes {
+                return Err(SstError::Compaction(format!(
+                    "spill IVF training needs an estimated {estimated_training_peak_bytes} bytes, above the admitted {max_working_memory_bytes} byte working set"
+                )));
             }
-            usable_index = usable_index.saturating_add(1);
-        }
-        Ok(())
-    })?;
-    pca.finalize();
-    let projection = IvfPcaProjection::from_finalized(&pca).ok_or_else(|| {
-        SstError::Compaction("spill IVF PCA did not produce a projection".to_string())
-    })?;
+            let mut pca = IncrementalPCA::new(dim, shape.n_components);
+            let mut usable_index = 0usize;
+            winners.for_each_record(|item| {
+                if let Some(vector) = first_f32_embedding(&item.record) {
+                    if usable_index.is_multiple_of(shape.sample_step) {
+                        pca.add_sample(vector);
+                    }
+                    usable_index = usable_index.saturating_add(1);
+                }
+                Ok(())
+            })?;
+            pca.finalize();
+            let projection = IvfPcaProjection::from_finalized(&pca).ok_or_else(|| {
+                SstError::Compaction("spill IVF PCA did not produce a projection".to_string())
+            })?;
 
-    let mut sample_coords = Vec::with_capacity(shape.train_sample);
-    usable_index = 0;
-    winners.for_each_record(|item| {
-        if let Some(vector) = first_f32_embedding(&item.record) {
-            if usable_index.is_multiple_of(shape.sample_step) {
-                sample_coords.push(projection.project(vector));
-            }
-            usable_index = usable_index.saturating_add(1);
+            let mut sample_coords = Vec::with_capacity(shape.train_sample);
+            usable_index = 0;
+            winners.for_each_record(|item| {
+                if let Some(vector) = first_f32_embedding(&item.record) {
+                    if usable_index.is_multiple_of(shape.sample_step) {
+                        sample_coords.push(projection.project(vector));
+                    }
+                    usable_index = usable_index.saturating_add(1);
+                }
+                Ok(())
+            })?;
+            let classifier = finish_ivf_probe_classifier(projection, shape, &sample_coords)
+                .ok_or_else(|| {
+                    SstError::Compaction("spill IVF k-means training failed".to_string())
+                })?;
+            let trained_on = sample_coords.len() as u64;
+            (classifier, None, trained_on)
         }
-        Ok(())
-    })?;
-    let classifier = finish_ivf_probe_classifier(projection, shape, &sample_coords)
-        .ok_or_else(|| SstError::Compaction("spill IVF k-means training failed".to_string()))?;
+    };
     let cell_count = classifier.cell_count();
     let mut cell_rows = vec![0u64; cell_count];
     let mut radii_sq = vec![0f32; cell_count];
@@ -1332,6 +1348,8 @@ pub(crate) fn cluster_external_mvcc(
             spill,
         })
     })?;
+    // TD-PAXDIR-1 D3: a shared-model output keeps the space's trained radii.
+    let radii_sq = frozen_radii_sq.unwrap_or(radii_sq);
     let model = classifier
         .finish_model(&cell_rows, &radii_sq)
         .ok_or_else(|| {
@@ -1341,9 +1359,78 @@ pub(crate) fn cluster_external_mvcc(
         model,
         winners.stats.output_records,
         usable_rows as u64,
-        sample_coords.len() as u64,
+        trained_on,
         estimated_training_peak_bytes,
     )
+}
+
+/// TD-PAXDIR-1 D3: the collection's shared model as a spill classifier, or
+/// `None` when none is set for this write or a retrain trigger fires.
+/// Returns the classifier, the space's trained radii (squared) for the
+/// output to keep, and 0 rows trained. The
+/// dimension and cell-count checks run before any pass over the rows; drift
+/// is then measured on a strided sample (one extra sequential pass over the
+/// winner run, far cheaper than the PCA and k-means passes it replaces).
+fn shared_spill_classifier(
+    winners: &ExternalMvccOutput,
+    dim: usize,
+    usable_rows: usize,
+    destination_url: Option<&str>,
+) -> Result<
+    Option<(
+        crate::storage::engines::sst::block_cluster::IvfProbeClassifier,
+        Option<Vec<f32>>,
+        u64,
+    )>,
+> {
+    use crate::storage::engines::sst::block_cluster::{
+        IvfProbeClassifier, SHARED_MODEL_DRIFT_SAMPLE, SharedModelVerdict,
+        current_collection_model, outside_trained_radius, shared_model_drift,
+        shared_model_precheck,
+    };
+    let Some(space) = current_collection_model() else {
+        return Ok(None);
+    };
+    let retrain = |verdict: SharedModelVerdict| {
+        tracing::info!(
+            ?verdict,
+            rows = usable_rows,
+            "PAX shared collection model retrained (spill)"
+        );
+    };
+    let verdict = shared_model_precheck(&space, usable_rows, dim, destination_url);
+    if verdict != SharedModelVerdict::Accept {
+        retrain(verdict);
+        return Ok(None);
+    }
+    let model = &space.model;
+    let Some(classifier) = IvfProbeClassifier::from_collection_model(model) else {
+        return Ok(None);
+    };
+    let step = usable_rows.div_ceil(SHARED_MODEL_DRIFT_SAMPLE).max(1);
+    let (mut sampled, mut outside, mut usable_index) = (0usize, 0usize, 0usize);
+    winners.for_each_record(|item| {
+        if let Some(vector) = first_f32_embedding(&item.record) {
+            if usable_index.is_multiple_of(step)
+                && let Some(assignment) = classifier.classify(vector)
+            {
+                sampled += 1;
+                outside += usize::from(outside_trained_radius(model, &assignment));
+            }
+            usable_index = usable_index.saturating_add(1);
+        }
+        Ok(())
+    })?;
+    let verdict = shared_model_drift(outside, sampled);
+    if verdict != SharedModelVerdict::Accept {
+        retrain(verdict);
+        return Ok(None);
+    }
+    Ok(Some((
+        classifier,
+        Some(crate::storage::engines::sst::block_cluster::frozen_radii_sq(model)),
+        0,
+    )))
 }
 
 struct ExternalCellBuilder {
@@ -2137,6 +2224,64 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    /// TD-PAXDIR-1 D3: an output from the same distribution reuses the
+    /// collection's shared model (identical PCA and centroids, so the segment
+    /// lands in the same cell space); data that drifted outside the model's
+    /// trained radii retrains instead.
+    #[test]
+    fn external_ivf_reuses_the_shared_model_and_retrains_on_drift() {
+        use crate::storage::engines::sst::block_cluster::{
+            CollectionModelScope, cluster_plan_ivf_probe,
+        };
+        let records = |offset: usize, shift: f32| {
+            (0..128)
+                .map(|index| {
+                    let mut record = vector_record(&format!("oid-{index:03}"), index + offset);
+                    if let Some(proximadb_records::EmbeddingValues::Fp32(values)) =
+                        record.embeddings.first_mut().map(|e| &mut e.values)
+                    {
+                        values.iter_mut().for_each(|v| *v += shift);
+                    }
+                    record
+                })
+                .collect::<Vec<_>>()
+        };
+        let model = cluster_plan_ivf_probe(&records(0, 0.0), 0, None)
+            .expect("train the shared model")
+            .model;
+        let shared = std::sync::Arc::new(
+            proximadb_storage_common::centroid_directory::SharedCellSpace {
+                covered_rows: model.rows_covered(),
+                model,
+            },
+        );
+        let cluster = |input: Vec<ProximaRecord>| {
+            let root = tempfile::tempdir().expect("test root");
+            let winners = resolve_external_mvcc(
+                root.path(),
+                spill(input).into_iter().map(Ok),
+                2_048,
+                2,
+                10_000,
+            )
+            .expect("MVCC winners");
+            let _scope = CollectionModelScope::enter(Some(std::sync::Arc::clone(&shared)));
+            cluster_external_mvcc(winners, root.path(), 2_048, 2, 64 * 1024 * 1024, None)
+                .expect("cluster")
+                .model()
+                .clone()
+        };
+        // The same rows: every row lies within its trained radius.
+        let reused = cluster(records(0, 0.0));
+        assert_eq!(reused.pca_mean, shared.model.pca_mean);
+        assert_eq!(reused.pca_components, shared.model.pca_components);
+        assert_eq!(reused.centroids, shared.model.centroids);
+        assert_eq!(reused.cell_rows.iter().sum::<u64>(), 128);
+
+        let drifted = cluster(records(0, 50.0));
+        assert_ne!(drifted.pca_mean, shared.model.pca_mean, "drift retrains");
     }
 
     #[test]

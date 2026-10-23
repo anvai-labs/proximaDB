@@ -136,6 +136,13 @@ mod tests {
     /// A collection of `SEGMENTS` trained segments (`rows` split evenly), with
     /// a published directory.
     async fn arm(id: &str, rows: &[Vec<f32>]) -> Arm {
+        arm_with(id, rows, false).await
+    }
+
+    /// With `shared_model`, segments after the first are written with the
+    /// collection model reconstructed from the first one's directory entry
+    /// (TD-PAXDIR-1 D3), as a compaction with the shared-model gate does.
+    async fn arm_with(id: &str, rows: &[Vec<f32>], shared_model: bool) -> Arm {
         let temp = TempDir::new().unwrap();
         let base = temp.path().to_str().unwrap().to_string();
         let collection = collection(id, &temp);
@@ -157,7 +164,23 @@ mod tests {
         );
         let storage_url = ctx.collection_storage_path().unwrap();
         tokio::fs::create_dir_all(&storage_url).await.unwrap();
+        let fs = factory.get_filesystem(&storage_url).unwrap();
+        let mut collection_model = None;
         for s in 0..SEGMENTS {
+            if shared_model && s == 1 {
+                publish_centroid_directory(fs.as_ref(), &storage_url)
+                    .await
+                    .unwrap();
+                collection_model = crate::storage::engines::sst::centroid_directory_publisher::
+                    load_newest_directory(fs.as_ref(), &storage_url)
+                    .await
+                    .and_then(|dir| dir.collection_model())
+                    .map(Arc::new);
+                assert!(collection_model.is_some());
+            }
+            let _scope = crate::storage::engines::sst::block_cluster::CollectionModelScope::enter(
+                collection_model.clone(),
+            );
             let per_segment = rows.len() / SEGMENTS;
             let records: Vec<ProximaRecord> = (s * per_segment..(s + 1) * per_segment)
                 .map(|i| record(i, &rows[i]))
@@ -175,12 +198,11 @@ mod tests {
             )
             .unwrap();
         }
-        let fs = factory.get_filesystem(&storage_url).unwrap();
         assert_eq!(
             publish_centroid_directory(fs.as_ref(), &storage_url)
                 .await
                 .unwrap(),
-            Some(1)
+            Some(if shared_model { 2 } else { 1 })
         );
         Arm {
             _temp: temp,
@@ -417,6 +439,68 @@ mod tests {
                 )
                 .await
                 .is_empty()
+        );
+    }
+
+    /// TD-PAXDIR-1 D3: segments written with the shared collection model form
+    /// one directory model, so the global count is over distinct cells and a
+    /// selected cell is probed in every segment holding it — at the recall of
+    /// the per-segment path.
+    #[tokio::test]
+    async fn shared_model_segments_plan_on_distinct_cells_at_equal_recall() {
+        enable_env();
+        let rows = corpus();
+        let off = arm("paxdir_shared_off", &rows).await;
+        let on = arm_with("paxdir_shared_on", &rows, true).await;
+        let bytes = std::fs::read(format!(
+            "{}/{}",
+            on.storage_url,
+            proximadb_storage_common::centroid_directory::object_name(2)
+        ))
+        .unwrap();
+        let dir = proximadb_storage_common::centroid_directory::PaxCentroidDirectory::parse(&bytes)
+            .unwrap();
+        assert_eq!(dir.models.len(), 1, "every segment speaks one cell space");
+        let k = dir.collection_model().unwrap().model.k_c();
+        let files: Vec<(String, u64)> = std::fs::read_dir(&on.storage_url)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".pax"))
+            .map(|e| {
+                (
+                    e.path().to_string_lossy().into_owned(),
+                    e.metadata().unwrap().len(),
+                )
+            })
+            .collect();
+        let plan = crate::storage::engines::sst::centroid_directory_reader::plan_segments(
+            &dir,
+            files.iter().map(|(u, s)| (u.as_str(), Some(*s))),
+            &rows[11],
+            TOP_K,
+        )
+        .unwrap();
+        let mut holders: std::collections::HashMap<u32, usize> = Default::default();
+        for cells in plan.values() {
+            for &cell in cells.iter() {
+                *holders.entry(cell).or_default() += 1;
+            }
+        }
+        assert!(
+            !holders.is_empty() && holders.len() <= k,
+            "distinct cells: {holders:?}"
+        );
+        assert!(
+            holders.values().any(|&segments| segments > 1),
+            "a selected cell is probed in every segment holding it: {holders:?}"
+        );
+
+        let (recall_off, _) = measure(&off, &rows, false).await;
+        let (recall_on, _) = measure(&on, &rows, true).await;
+        eprintln!("shared model: recall {recall_on:.3} vs per-segment {recall_off:.3}");
+        assert!(
+            recall_on >= recall_off - 0.01,
+            "{recall_on} vs {recall_off}"
         );
     }
 

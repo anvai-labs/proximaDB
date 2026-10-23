@@ -77,8 +77,12 @@ pub struct CoarseModel {
     /// Coarse centroids in PCA space, emission (Hilbert) order
     /// (`k_c × n_comp` values).
     pub centroids: Vec<f32>,
-    /// Per-cell max member→centroid distance in PCA space (`k_c` values) — the
-    /// escalation lower bound `LB(c) = d_pca(q, centroid_c) − radius_c`.
+    /// Per-cell **trained** radius in PCA space (`k_c` values): the max
+    /// member→centroid distance of the rows the model was trained on. A segment
+    /// classified with a shared collection model (TD-PAXDIR-1 D3) keeps the
+    /// model's radii, so up to the drift threshold (5%) of its own members may
+    /// lie outside — a radius is not a strict bound for every member, and must
+    /// not be used as a pruning lower bound without re-deriving it.
     pub radii: Vec<f32>,
     /// Rows per cell in emission order (`k_c` values; empty cells are 0). The
     /// writer turns the prefix sums into cell row ranges and block boundaries.

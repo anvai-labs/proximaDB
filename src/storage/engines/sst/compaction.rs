@@ -1673,6 +1673,30 @@ impl Compaction {
         Ok(failed)
     }
 
+    /// TD-PAXDIR-1 D3: the collection's shared cell space for an output in
+    /// `output`'s directory — the space covering the most rows in the newest
+    /// valid centroid directory — when `PROXIMADB_PAX_WRITE_SHARED_MODEL` is
+    /// on. It needs a published directory, so it also requires the directory
+    /// write gate (no LIST or GET otherwise). `None` trains as before; the
+    /// writer still retrains on drift, growth or a dimension mismatch.
+    async fn shared_collection_model(
+        &self,
+        output: &Path,
+    ) -> Option<Arc<proximadb_storage_common::centroid_directory::SharedCellSpace>> {
+        use super::centroid_directory_publisher::{
+            centroid_directory_write_enabled, load_newest_directory,
+        };
+        if !super::block_cluster::shared_model_enabled() || !centroid_directory_write_enabled() {
+            return None;
+        }
+        let dir_url = output.parent()?.to_string_lossy().into_owned();
+        let fs = self.filesystem_factory.get_filesystem(&dir_url).ok()?;
+        load_newest_directory(fs.as_ref(), &dir_url)
+            .await?
+            .collection_model()
+            .map(Arc::new)
+    }
+
     /// TD-PAXDIR-1 D1: bring the collection centroid directory up to date with
     /// the live set once the output is published and the inputs retired. The
     /// directory is a projection, so a failure is logged and never fails the
@@ -1993,21 +2017,26 @@ impl Compaction {
                         "update local-spill IVF manifest: {error}"
                     ))
                 })?;
-            SpillOrdering::Ivf(
-                cluster_external_mvcc(
-                    winners,
-                    &scratch_root,
-                    run_buffer_bytes,
-                    merge_fan_in,
-                    plan.memory_bytes,
-                    task.output_file.to_str(),
-                )
-                .map_err(|error| {
-                    crate::core::StorageError::SstEngine(format!(
-                        "local-spill IVF ordering failed: {error}"
-                    ))
-                })?,
-            )
+            // TD-PAXDIR-1 D3: classify with the collection's shared model.
+            let collection_model = self.shared_collection_model(&task.output_file).await;
+            let model_scope =
+                crate::storage::engines::sst::block_cluster::CollectionModelScope::enter(
+                    collection_model,
+                );
+            let clustered = cluster_external_mvcc(
+                winners,
+                &scratch_root,
+                run_buffer_bytes,
+                merge_fan_in,
+                plan.memory_bytes,
+                task.output_file.to_str(),
+            );
+            drop(model_scope);
+            SpillOrdering::Ivf(clustered.map_err(|error| {
+                crate::core::StorageError::SstEngine(format!(
+                    "local-spill IVF ordering failed: {error}"
+                ))
+            })?)
         } else {
             SpillOrdering::Mvcc(winners)
         };
@@ -2726,6 +2755,13 @@ impl Compaction {
                         &task.input_files,
                     )
                     .await;
+                    // TD-PAXDIR-1 D3: classify with the collection's shared
+                    // model (scoped to the synchronous write below).
+                    let collection_model = self.shared_collection_model(&task.output_file).await;
+                    let model_scope =
+                        crate::storage::engines::sst::block_cluster::CollectionModelScope::enter(
+                            collection_model,
+                        );
                     if cache_on_write.includes_invariants() {
                         let write = crate::storage::engines::sst::segment_format::
                             write_pax_segment_compacted_with_cache_seed_shredded(
@@ -2766,6 +2802,7 @@ impl Compaction {
                             ))
                         })?;
                     }
+                    drop(model_scope);
                     info!(
                         "✅ COMPACTION: Wrote {} records to PAX segment",
                         records.len()
@@ -2900,6 +2937,13 @@ impl Compaction {
                         &task.input_files,
                     )
                     .await;
+                    // TD-PAXDIR-1 D3: classify with the collection's shared
+                    // model (scoped to the synchronous write below).
+                    let collection_model = self.shared_collection_model(&task.output_file).await;
+                    let model_scope =
+                        crate::storage::engines::sst::block_cluster::CollectionModelScope::enter(
+                            collection_model,
+                        );
                     if cache_on_write.includes_invariants() {
                         let write = crate::storage::engines::sst::segment_format::
                             write_pax_segment_compacted_with_cache_seed_shredded(
@@ -2940,6 +2984,7 @@ impl Compaction {
                             ))
                         })?;
                     }
+                    drop(model_scope);
                     info!(
                         "✅ COMPACTION (non-atomic): Wrote {} records to PAX segment",
                         records.len()

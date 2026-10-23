@@ -57,8 +57,8 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Result, bail};
 
 use crate::coarse_directory::{
-    CoarseCellEntry, CoarseDirectory, fnv1a64, project_with_model, read_f32s, read_u16, read_u32,
-    read_u64,
+    CoarseCellEntry, CoarseDirectory, CoarseModel, fnv1a64, project_with_model, read_f32s,
+    read_u16, read_u32, read_u64,
 };
 
 /// Directory magic — first 4 bytes of the serialized object.
@@ -187,8 +187,18 @@ pub struct ScoredCell {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbePlan {
     pub cells_by_segment: HashMap<String, Vec<u32>>,
-    /// Usable non-empty cells the ranking chose from.
+    /// Distinct usable non-empty cells `(cell space, a0_cell)` the ranking
+    /// chose from (segments sharing a cell space share their cells).
     pub usable_cells: usize,
+}
+
+/// TD-PAXDIR-1 D3: the collection's shared cell space, as a compaction uses
+/// it: the model to classify with and the rows the space already covers (the
+/// growth trigger sizes cells on collection rows, not on one output).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SharedCellSpace {
+    pub model: CoarseModel,
+    pub covered_rows: u64,
 }
 
 /// The parsed collection directory.
@@ -199,6 +209,22 @@ pub struct PaxCentroidDirectory {
     pub models: Vec<DirectoryModel>,
     pub segments: Vec<DirectorySegment>,
     pub cells: Vec<DirectoryCell>,
+    /// Per-segment cell-space ids, computed once on first use (a directory is
+    /// loaded once per generation and planned against on every query).
+    /// Derived from the fields above; ignored by equality.
+    pub space_ids: SpaceIds,
+}
+
+/// Lazily computed per-segment cell-space ids of a [`PaxCentroidDirectory`]
+/// (see `cell_spaces`). Derived data: always equal, so it never affects
+/// directory equality.
+#[derive(Debug, Clone, Default)]
+pub struct SpaceIds(std::sync::OnceLock<Vec<u64>>);
+
+impl PartialEq for SpaceIds {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 impl PaxCentroidDirectory {
@@ -347,6 +373,7 @@ impl PaxCentroidDirectory {
             models,
             segments,
             cells,
+            space_ids: SpaceIds::default(),
         };
         dir.validate()?;
         Ok(dir)
@@ -482,7 +509,12 @@ impl PaxCentroidDirectory {
         self.select_usable_cells(query, nprobe, min_rows, |_| true)
     }
 
-    /// [`Self::select_cells`] restricted to cells of segments `usable` accepts.
+    /// [`Self::select_cells`] restricted to cells of segments `usable` accepts,
+    /// counted over **distinct cells** (TD-PAXDIR-1 D3): segments written with
+    /// one shared model hold the same cell — same cell space, same A0 index —
+    /// once each, so a selected cell is probed in every usable segment that
+    /// holds it and counts once toward `nprobe`. With one model per segment
+    /// every cell is distinct and this is the D2 behaviour.
     fn select_usable_cells(
         &self,
         query: &[f32],
@@ -491,21 +523,122 @@ impl PaxCentroidDirectory {
         usable: impl Fn(u32) -> bool,
     ) -> Option<Vec<usize>> {
         let ranked = self.rank_cells(query)?;
-        let mut selected = Vec::new();
+        let spaces = self.cell_spaces();
+        let group = |c: &DirectoryCell| (spaces[c.segment_idx as usize], c.a0_cell);
+        let eligible = |c: &DirectoryCell| c.rows() > 0 && usable(c.segment_idx);
+        let mut group_rows: HashMap<(u64, u32), u64> = HashMap::new();
+        for cell in self.cells.iter().filter(|c| eligible(c)) {
+            *group_rows.entry(group(cell)).or_default() += cell.rows();
+        }
+        let mut chosen: HashSet<(u64, u32)> = HashSet::new();
         let mut rows = 0u64;
-        for scored in ranked {
-            if selected.len() >= nprobe && rows >= min_rows {
+        for scored in &ranked {
+            if chosen.len() >= nprobe && rows >= min_rows {
                 break;
             }
             let cell = &self.cells[scored.cell];
-            let cell_rows = cell.rows();
-            if cell_rows == 0 || !usable(cell.segment_idx) {
-                continue;
+            if eligible(cell) && chosen.insert(group(cell)) {
+                rows += group_rows[&group(cell)];
             }
-            selected.push(scored.cell);
-            rows += cell_rows;
         }
-        Some(selected)
+        Some(
+            ranked
+                .iter()
+                .map(|s| &self.cells[s.cell])
+                .zip(ranked.iter().map(|s| s.cell))
+                .filter(|(c, _)| eligible(c) && chosen.contains(&group(c)))
+                .map(|(_, idx)| idx)
+                .collect(),
+        )
+    }
+
+    /// Per segment, the id of its **cell space**: its model plus its exact
+    /// centroid table. Two segments share cells only when both match — equal
+    /// PCA bytes alone do not make equal cells (the same rows clustered with
+    /// a different `k`, or a partitioned plan, share the PCA but not the
+    /// centroids). Uncovered segments get 0, never used for grouping.
+    fn cell_spaces(&self) -> &[u64] {
+        self.space_ids.0.get_or_init(|| self.compute_cell_spaces())
+    }
+
+    fn compute_cell_spaces(&self) -> Vec<u64> {
+        let mut bytes: Vec<Vec<u8>> = self
+            .segments
+            .iter()
+            .map(|s| match s.is_covered() {
+                true => self.models[s.model_idx as usize]
+                    .model_id
+                    .to_le_bytes()
+                    .to_vec(),
+                false => Vec::new(),
+            })
+            .collect();
+        for cell in &self.cells {
+            let buf = &mut bytes[cell.segment_idx as usize];
+            buf.extend_from_slice(&cell.a0_cell.to_le_bytes());
+            for v in &cell.centroid {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        bytes
+            .iter()
+            .map(|b| if b.is_empty() { 0 } else { fnv1a64(b) })
+            .collect()
+    }
+
+    /// TD-PAXDIR-1 D3: the collection's shared cell space — the one covering
+    /// the most rows — as a [`CoarseModel`] a compaction can classify with,
+    /// plus the rows it covers. Centroids and radii come from the space's
+    /// largest segment (A0 lists every cell, empty ones included). Radii are
+    /// that one segment's, not a max over segments, so an accepted output's
+    /// outliers cannot ratchet the drift test open. `None` when nothing is
+    /// covered or the template's cells are incomplete.
+    pub fn collection_model(&self) -> Option<SharedCellSpace> {
+        let spaces = self.cell_spaces();
+        let mut rows_by_space: HashMap<u64, u64> = HashMap::new();
+        for (idx, segment) in self.covered_segments() {
+            *rows_by_space.entry(spaces[idx]).or_default() += segment.rows_covered;
+        }
+        let (space, covered_rows) = rows_by_space
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))?;
+        let (template, segment) = self
+            .covered_segments()
+            .filter(|(idx, _)| spaces[*idx] == space)
+            .max_by(|a, b| a.1.rows_covered.cmp(&b.1.rows_covered).then(b.0.cmp(&a.0)))?;
+        let model = &self.models[segment.model_idx as usize];
+        let cells: Vec<&DirectoryCell> = self
+            .cells
+            .iter()
+            .filter(|c| c.segment_idx as usize == template)
+            .collect();
+        if cells.is_empty()
+            || cells
+                .iter()
+                .enumerate()
+                .any(|(i, c)| c.a0_cell as usize != i)
+        {
+            return None;
+        }
+        let out = CoarseModel {
+            dim: self.dim,
+            n_comp: model.n_comp,
+            pca_mean: model.pca_mean.clone(),
+            pca_components: model.pca_components.clone(),
+            centroids: cells
+                .iter()
+                .flat_map(|c| c.centroid.iter().copied())
+                .collect(),
+            radii: cells.iter().map(|c| c.radius).collect(),
+            cell_rows: cells.iter().map(|c| c.rows()).collect(),
+            seed: 0,
+            trained_on: segment.rows_covered,
+        };
+        out.validate().ok()?;
+        Some(SharedCellSpace {
+            model: out,
+            covered_rows,
+        })
     }
 
     /// Plan a query against the live segment set (TD-PAXDIR-1 D2).
@@ -536,7 +669,9 @@ impl PaxCentroidDirectory {
             .cells
             .iter()
             .filter(|c| usable[c.segment_idx as usize] && c.rows() > 0)
-            .count();
+            .map(|c| (self.cell_spaces()[c.segment_idx as usize], c.a0_cell))
+            .collect::<HashSet<_>>()
+            .len();
         if usable_cells == 0 {
             return None;
         }
@@ -739,6 +874,7 @@ impl DirectoryBuilder {
             models,
             segments,
             cells,
+            space_ids: SpaceIds::default(),
         };
         dir.validate()?;
         Ok(dir)
@@ -1281,6 +1417,7 @@ mod tests {
             models,
             segments,
             cells,
+            space_ids: SpaceIds::default(),
         };
 
         let ranked = poisoned
@@ -1365,5 +1502,122 @@ mod tests {
             dir.plan_probe(&[0.0; 3], &live(&[("b.pax", 200)]), |n| n, |_| 0),
             None
         );
+    }
+
+    /// Segments written with one shared model hold the same cells: a
+    /// selected cell is probed in every segment holding it and counts once.
+    #[test]
+    fn shared_model_cells_count_once_and_expand_to_every_segment() {
+        let cells: &[&[f32]] = &[&[0.0, 0.0], &[5.0, 5.0], &[-5.0, 5.0]];
+        let mut b = DirectoryBuilder::default();
+        b.add_covered("s1.pax", 10, &a0(4, 2, 0.0, cells, &[4, 4, 4]))
+            .unwrap();
+        b.add_covered("s2.pax", 20, &a0(4, 2, 0.0, cells, &[3, 0, 9]))
+            .unwrap();
+        let dir = b.build(1).unwrap();
+        assert_eq!(dir.models.len(), 1, "one shared model");
+        let live = [
+            LiveSegment {
+                name: "s1.pax".into(),
+                size_bytes: 10,
+            },
+            LiveSegment {
+                name: "s2.pax".into(),
+                size_bytes: 20,
+            },
+        ];
+        let query = [0.1f32, 0.1, 0.0, 0.0];
+        let plan = dir.plan_probe(&query, &live, |n| n, |_| 0).unwrap();
+        assert_eq!(plan.usable_cells, 3, "distinct cells, not 5 entries");
+        let one = dir.plan_probe(&query, &live, |_| 1, |_| 0).unwrap();
+        assert_eq!(one.cells_by_segment["s1.pax"], [0]);
+        assert_eq!(
+            one.cells_by_segment["s2.pax"],
+            [0],
+            "same cell in both segments"
+        );
+        // The row floor counts a cell's rows across all its segments: cell 0
+        // holds 4 + 3 rows, so a floor of 8 needs a second cell.
+        let floor = dir.plan_probe(&query, &live, |_| 1, |_| 8).unwrap();
+        assert_eq!(floor.cells_by_segment["s1.pax"].len(), 2);
+    }
+
+    #[test]
+    fn the_collection_model_is_the_model_covering_most_rows() {
+        let shared: &[&[f32]] = &[&[0.0, 0.0], &[5.0, 5.0], &[-5.0, 5.0]];
+        let mut b = DirectoryBuilder::default();
+        let big = a0(4, 2, 0.0, shared, &[40, 0, 9]);
+        b.add_covered("s1.pax", 10, &big).unwrap();
+        let mut s2 = a0(4, 2, 0.0, shared, &[1, 2, 3]);
+        s2.model.radii = vec![0.25, 2.0, 0.75];
+        b.add_covered("s2.pax", 20, &s2).unwrap();
+        b.add_covered("other.pax", 30, &a0(4, 2, 1.0, &[&[1.0, 1.0]], &[30]))
+            .unwrap();
+        b.add_uncovered("l0.pax", 5);
+        let dir = b.build(1).unwrap();
+        let shared_space = dir.collection_model().unwrap();
+        assert_eq!(
+            shared_space.covered_rows, 55,
+            "s1 + s2 share one cell space"
+        );
+        let model = shared_space.model;
+        assert_eq!(model.k_c(), 3);
+        assert_eq!(model.pca_mean, big.model.pca_mean);
+        assert_eq!(model.pca_components, big.model.pca_components);
+        assert_eq!(model.centroids, big.model.centroids);
+        assert_eq!(
+            model.radii, big.model.radii,
+            "radii are the largest segment's, never a max that ratchets"
+        );
+        assert_eq!(model.cell_rows, [40, 0, 9]);
+        assert!(
+            PaxCentroidDirectory {
+                generation: 1,
+                dim: 4,
+                models: Vec::new(),
+                segments: Vec::new(),
+                cells: Vec::new(),
+                space_ids: SpaceIds::default(),
+            }
+            .collection_model()
+            .is_none()
+        );
+    }
+
+    /// Equal PCA bytes do not make equal cells: two segments with the same
+    /// projection but different centroids are distinct cell spaces, so their
+    /// cells never merge (the D2 read behaviour) and the shared model is one
+    /// of them, never a blend.
+    #[test]
+    fn same_pca_with_different_centroids_are_distinct_cell_spaces() {
+        let mut b = DirectoryBuilder::default();
+        b.add_covered(
+            "a.pax",
+            1,
+            &a0(4, 2, 0.0, &[&[0.0, 0.0], &[3.0, 3.0]], &[5, 5]),
+        )
+        .unwrap();
+        b.add_covered("b.pax", 1, &a0(4, 2, 0.0, &[&[9.0, 9.0]], &[30]))
+            .unwrap();
+        let dir = b.build(1).unwrap();
+        assert_eq!(dir.models.len(), 1, "one PCA entry");
+        let live = [
+            LiveSegment {
+                name: "a.pax".into(),
+                size_bytes: 1,
+            },
+            LiveSegment {
+                name: "b.pax".into(),
+                size_bytes: 1,
+            },
+        ];
+        let plan = dir.plan_probe(&[0.0; 4], &live, |n| n, |_| 0).unwrap();
+        assert_eq!(plan.usable_cells, 3, "cell 0 of a and cell 0 of b differ");
+        let one = dir.plan_probe(&[0.0; 4], &live, |_| 1, |_| 0).unwrap();
+        assert_eq!(one.cells_by_segment["a.pax"], [0]);
+        assert!(one.cells_by_segment["b.pax"].is_empty());
+        let shared = dir.collection_model().unwrap();
+        assert_eq!(shared.model.k_c(), 1, "b's space covers more rows");
+        assert_eq!(shared.covered_rows, 30);
     }
 }
