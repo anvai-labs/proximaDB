@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::services::canonical_wal::{WalAppendIndeterminate, WalAppenderPoisoned};
-use crate::services::dml::{DmlResult, DmlService, DmlStatement};
+use crate::services::dml::{DmlResult, DmlService, DmlStatement, TxnLockScope};
 use crate::services::txn_staging::{
     AtomicCommitUnsupported, CommitOutcomeUnknown, StagingTableRecordStore,
     TxnSerializationConflict,
@@ -158,19 +158,28 @@ pub struct AtomicOutcome {
 }
 
 /// The op-lock set `statements` need: each target, plus the ON DELETE cascade
-/// closure for DELETEs only.
+/// closure for DELETEs and the referencing children for an UPDATE / UPSERT
+/// that writes a UNIQUE column (TD-RELIDEQ-2).
 pub async fn lock_set_for(
     dml: &DmlService,
     statements: &[AtomicStatement],
 ) -> anyhow::Result<std::collections::HashSet<crate::catalog::TableIdentifier>> {
-    let tables: Vec<(String, Option<TenantContext>, bool)> = statements
+    let tables: Vec<(String, Option<TenantContext>, TxnLockScope)> = statements
         .iter()
         .map(|s| {
-            (
-                s.table.clone(),
-                s.tenant.clone(),
-                matches!(s.statement, DmlStatement::Delete { .. }),
-            )
+            let scope = match &s.statement {
+                DmlStatement::Delete { .. } => TxnLockScope::DeleteCascade,
+                DmlStatement::Update { assignments, .. } => TxnLockScope::UpdateColumns(
+                    assignments
+                        .iter()
+                        .map(|(column, _)| column.clone())
+                        .collect(),
+                ),
+                // An UPSERT replaces the whole row: every column is written.
+                DmlStatement::Upsert { .. } => TxnLockScope::UpdateColumns(Vec::new()),
+                _ => TxnLockScope::Target,
+            };
+            (s.table.clone(), s.tenant.clone(), scope)
         })
         .collect();
     dml.transaction_op_lock_set(&tables).await

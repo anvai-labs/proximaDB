@@ -1209,6 +1209,31 @@ pub(crate) fn schema_unique_column_sets(table_schema: &CatalogTableSchema) -> Ve
     sets
 }
 
+/// TD-RELIDEQ-2: the column whose value IS the whole record `oid` — a
+/// declared single-column primary key. `None` for a keyless table (generated
+/// `oid`; `id`/`record_id` live in `props`) and for a composite key (the `oid`
+/// encodes the whole tuple, not one column). UNIQUE tuples, the unique index
+/// and FOREIGN KEY resolution read a column from the `oid` only when it is
+/// this one; every other column comes from `props`, which holds every column
+/// (`CatalogRow::to_proxima_record`).
+pub(crate) fn schema_oid_key_column(table_schema: &CatalogTableSchema) -> Option<String> {
+    match proximadb_catalog::relational::effective_primary_key(table_schema).as_slice() {
+        [column] => Some((*column).to_string()),
+        _ => None,
+    }
+}
+
+/// TD-RELIDEQ-2: the declared primary-key columns (composite-aware, empty for a
+/// keyless table) — the columns a row's `oid` encodes.
+pub(crate) fn schema_declared_primary_key_columns(
+    table_schema: &CatalogTableSchema,
+) -> Vec<String> {
+    proximadb_catalog::relational::effective_primary_key(table_schema)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
 /// The single-column primary key for a table (explicit, else conventional
 /// `id`/`record_id`). The PK value lives in `oid`, not `props` — see
 /// [`record_unique_tuple`].
@@ -1327,12 +1352,17 @@ pub(crate) fn build_unique_candidate_sets(
                 continue; // NULL/absent in the tuple → exempt
             };
             if !candidates.insert(tuple.clone()) {
-                return Err(anyhow!(
-                    "duplicate key value violates unique constraint on ({}) for table '{}': ({}) appears more than once in this statement",
-                    columns.join(", "),
-                    table_schema.name,
-                    tuple.join(", ")
-                ));
+                // Typed so every wire maps it to 23505 (it surfaced as 42P01).
+                return Err(proximadb_catalog::relational::RelationalConstraintViolation::new(
+                    proximadb_catalog::relational::RelationalConstraintKind::Unique,
+                    format!(
+                        "duplicate key value violates unique constraint on ({}) for table '{}': ({}) appears more than once in this statement",
+                        columns.join(", "),
+                        table_schema.name,
+                        tuple.join(", ")
+                    ),
+                )
+                .into());
             }
         }
         if !candidates.is_empty() {
@@ -2665,7 +2695,7 @@ impl DirectWalTableRecordStore {
         // once it has been built (first `check_unique_conflict`). Until then the
         // lazy build captures these writes from current state, so skipping is
         // safe; checking once avoids per-write work for tables never probed.
-        let index_primary_key = schema_primary_key_column(table_schema);
+        let index_primary_key = schema_oid_key_column(table_schema);
         let maintain_index = !schema_unique_column_sets(table_schema).is_empty()
             && self.unique_index.read().contains_key(index_key);
         // TD-127: maintain the secondary index on the same once-built basis as the
@@ -2936,7 +2966,7 @@ impl DirectWalTableRecordStore {
         if set_columns.is_empty() {
             return Ok(());
         }
-        let primary_key = schema_primary_key_column(table_schema);
+        let primary_key = schema_oid_key_column(table_schema);
         let existing = self
             .scan_visible_records_for_index(table_schema, tenant_id, &collection_id, &legacy_key)
             .await?;

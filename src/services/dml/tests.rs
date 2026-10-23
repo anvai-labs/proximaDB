@@ -7197,7 +7197,7 @@ async fn transaction_fork_defers_statistics_until_commit() {
     // A transaction that never commits: its staged inserts move no stats.
     {
         let locks = dml
-            .transaction_op_lock_set(&[("txn_stats".to_string(), None, false)])
+            .transaction_op_lock_set(&[("txn_stats".to_string(), None, TxnLockScope::Target)])
             .await
             .expect("lock set");
         let fork =
@@ -7215,7 +7215,7 @@ async fn transaction_fork_defers_statistics_until_commit() {
 
     // A transaction that commits: the queued bumps land exactly once.
     let locks = dml
-        .transaction_op_lock_set(&[("txn_stats".to_string(), None, false)])
+        .transaction_op_lock_set(&[("txn_stats".to_string(), None, TxnLockScope::Target)])
         .await
         .expect("lock set");
     let staging = Arc::new(StagingTableRecordStore::new(base.clone()));
@@ -7294,7 +7294,7 @@ async fn transaction_fork_retains_dml_leases_until_released() -> Result<()> {
     let (_, table_id) = manager.resolve_table("leased").await.expect("resolve");
 
     let locks = dml
-        .transaction_op_lock_set(&[("leased".to_string(), None, false)])
+        .transaction_op_lock_set(&[("leased".to_string(), None, TxnLockScope::Target)])
         .await
         .expect("lock set");
     let fork = dml.fork_for_transaction(Arc::new(StagingTableRecordStore::new(base)), locks);
