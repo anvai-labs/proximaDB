@@ -2756,7 +2756,15 @@ impl DirectWalTableRecordStore {
                     };
                     // Delete from BOTH partitions during the cutover window. The
                     // legacy copy's delete is not this WAL entry's (replay routes
-                    // it to the primary), so it stays untracked.
+                    // it to the primary), so it stays untracked: a tracked one
+                    // would let truncation drop the only evidence of it.
+                    //
+                    // Known cost, cutover only (`PROXIMADB_WAL_OBJECT_ID_KEY`,
+                    // default off): once the legacy partition has segments,
+                    // these untracked tombstones make the record tier refuse
+                    // truncation until that partition flushes them. The WAL
+                    // grows; nothing is lost. Finish the cutover (or flush the
+                    // legacy partitions) to let truncation resume.
                     if let Some(legacy) = &legacy_partition {
                         legacy.delete_record(&key).await?;
                     }

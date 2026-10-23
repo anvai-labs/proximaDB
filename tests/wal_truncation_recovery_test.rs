@@ -16,7 +16,8 @@ use anyhow::{Context, Result};
 use proximadb::services::FramedTableWalAppender;
 use proximadb::services::branch_base_store::BranchBaseStore;
 use proximadb::services::record_store::{
-    DirectWalTableRecordStore, TableRecordScanRequest, TableRecordStore, TableWalAppender,
+    DirectWalTableRecordStore, TableRecordMutation, TableRecordMutationKind,
+    TableRecordScanRequest, TableRecordStore, TableWalAppender,
 };
 use proximadb::services::wal_truncator::{
     self, BranchMergeBase, ChangeFeedRetention, RecordTierFloor, TruncationRun, WalFloorSource,
@@ -272,15 +273,24 @@ async fn a_crash_after_truncation_recovers_every_row_from_segments_and_the_wal_t
 #[tokio::test]
 async fn seeded_crash_truncate_interleavings_match_a_reference_model() -> Result<()> {
     spill_gate();
+    let mut over_pending_delete = 0;
     for seed in 0..8 {
-        soak(seed, 300)
+        over_pending_delete += soak(seed, 300)
             .await
             .with_context(|| format!("soak seed {seed}"))?;
     }
+    // The case #2132 exists for: a truncation while a memory-only tombstone
+    // holds the floor, then a crash. Some seed must have hit it (each such run
+    // also checked that the floor did not pass the tombstone's LSN).
+    assert!(
+        over_pending_delete > 0,
+        "no seed truncated while a tombstone was memory-only"
+    );
     Ok(())
 }
 
-async fn soak(seed: u64, steps: usize) -> Result<()> {
+/// Returns how many truncations ran while a memory-only tombstone existed.
+async fn soak(seed: u64, steps: usize) -> Result<usize> {
     let mut rng = StdRng::seed_from_u64(seed);
     let dir = TempDir::new()?;
     let (mut wal, store) = open(dir.path()).await?;
@@ -290,7 +300,14 @@ async fn soak(seed: u64, steps: usize) -> Result<()> {
         .map(|tenant| (*tenant, BTreeMap::new()))
         .collect();
     let mut version = 0;
-    let (mut truncations, mut restarts) = (0, 0);
+    let (mut truncations, mut restarts, mut over_pending_delete) = (0, 0, 0);
+    // Exactly the memory-only tombstones the store holds, per tenant as
+    // oid → LSN: a delete records one only once its partition has a segment
+    // (a flush since the last drop); a repeat delete keeps the earliest LSN;
+    // an upsert of the oid clears it (the newer write supersedes the delete);
+    // a flush persists them all; a drop clears its tenant's.
+    let mut has_segments: BTreeMap<&str, bool> = BTreeMap::new();
+    let mut pending_tombstones: BTreeMap<&str, BTreeMap<String, u64>> = BTreeMap::new();
 
     for step in 0..=steps {
         let tenant = TENANTS[rng.gen_range(0..TENANTS.len())];
@@ -302,17 +319,50 @@ async fn soak(seed: u64, steps: usize) -> Result<()> {
             rng.gen_range(0..100)
         };
         match roll {
-            0..=54 => {
+            0..=52 => {
                 version += 1;
                 write(&wal, &store, tenant, upsert(&oid, tenant, version)).await?;
+                if let Some(tombstones) = pending_tombstones.get_mut(tenant) {
+                    tombstones.remove(&oid);
+                }
                 model.get_mut(tenant).expect("tenant").insert(oid, version);
             }
-            55..=74 => {
-                write(&wal, &store, tenant, delete(&oid)).await?;
+            53..=72 => {
+                let lsn = write(&wal, &store, tenant, delete(&oid)).await?;
                 model.get_mut(tenant).expect("tenant").remove(&oid);
+                if has_segments.get(tenant).copied().unwrap_or(false) {
+                    pending_tombstones
+                        .entry(tenant)
+                        .or_default()
+                        .entry(oid.clone())
+                        .or_insert(lsn);
+                }
+            }
+            // DROP TABLE: purges the partition's segments; replay of a
+            // retained drop must purge too.
+            73..=74 => {
+                let drop = CanonicalOperation::RecordPartitionDrop {
+                    collection_id: TABLE.to_string(),
+                };
+                write(&wal, &store, tenant, drop).await?;
+                model.get_mut(tenant).expect("tenant").clear();
+                has_segments.insert(tenant, false);
+                pending_tombstones.remove(tenant);
             }
             75..=84 => {
                 store.flush_partitions().await?;
+                for tenant in TENANTS {
+                    // A flush writes a segment only if the partition held
+                    // anything; an emptied one keeps whatever it had.
+                    let wrote = !model[tenant].is_empty()
+                        || pending_tombstones
+                            .get(tenant)
+                            .is_some_and(|t| !t.is_empty());
+                    if wrote {
+                        has_segments.insert(tenant, true);
+                    }
+                }
+                pending_tombstones.clear();
             }
             85..=94 => {
                 let run = wal_truncator::run_once(&wal, &truncator_sources(&wal, &store)).await?;
@@ -320,6 +370,21 @@ async fn soak(seed: u64, steps: usize) -> Result<()> {
                     !matches!(run, TruncationRun::Refused { .. }),
                     "seed {seed} step {step}: every write is LSN-tracked: {run:?}"
                 );
+                let oldest_tombstone = pending_tombstones
+                    .values()
+                    .flat_map(|tombstones| tombstones.values())
+                    .min()
+                    .copied();
+                if let (TruncationRun::Truncated { floor, .. }, Some(oldest)) =
+                    (&run, oldest_tombstone)
+                {
+                    assert!(
+                        *floor <= oldest,
+                        "seed {seed} step {step}: truncated to {floor}, past the memory-only \
+                         tombstone at {oldest}"
+                    );
+                    over_pending_delete += 1;
+                }
                 truncations += matches!(run, TruncationRun::Truncated { .. }) as usize;
             }
             _ => {
@@ -339,6 +404,7 @@ async fn soak(seed: u64, steps: usize) -> Result<()> {
                     .await?;
                 (wal, store) = (reopened_wal, Arc::new(reopened));
                 restarts += 1;
+                // Replay rebuilt any memory-only tombstone from the WAL.
                 for tenant in TENANTS {
                     assert_eq!(
                         rows(&store, tenant).await?,
@@ -352,6 +418,67 @@ async fn soak(seed: u64, steps: usize) -> Result<()> {
     assert!(
         truncations > 0 && restarts > 1,
         "seed {seed} exercised too little: {truncations} truncation(s), {restarts} restart(s)"
+    );
+    Ok(over_pending_delete)
+}
+
+/// The production write path (`write_mutations`), not replay: a DELETE there
+/// must reach the spill partition with its WAL LSN, so the record tier answers
+/// a floor at it. Were the delete applied untracked, the truncator would
+/// refuse; were it tracked wrongly, recovery would resurrect the row.
+#[tokio::test]
+async fn a_delete_through_the_write_path_is_a_truncation_floor_and_recovers() -> Result<()> {
+    spill_gate();
+    let dir = TempDir::new()?;
+    let (wal, store) = open(dir.path()).await?;
+    let store = Arc::new(store);
+    let schema = CatalogTableSchema::new(TABLE);
+    let tenant = StorageTenantContext::for_tenant_id("t1");
+    let row = |oid: &str, version: i64| match upsert(oid, "t1", version) {
+        CanonicalOperation::RecordUpsert { record, .. } => *record,
+        _ => unreachable!(),
+    };
+
+    let mutations = (0..4)
+        .map(|i| {
+            TableRecordMutation::new(TableRecordMutationKind::Upsert, row(&format!("r{i}"), 1))
+        })
+        .collect();
+    store
+        .write_mutations(&schema, mutations, Some(&tenant))
+        .await?;
+    store.flush_partitions().await?;
+
+    store
+        .write_mutations(
+            &schema,
+            vec![TableRecordMutation::new(
+                TableRecordMutationKind::Delete,
+                row("r1", 1),
+            )],
+            Some(&tenant),
+        )
+        .await?;
+    let delete_lsn = wal.last_sequence();
+
+    let run = wal_truncator::run_once(&wal, &truncator_sources(&wal, &store)).await?;
+    assert!(
+        matches!(run, TruncationRun::Truncated { floor, .. } if floor == delete_lsn),
+        "the write-path delete is the floor: {run:?}"
+    );
+
+    drop(store);
+    drop(wal);
+    let (wal, store) = open(dir.path()).await?;
+    store.replay_wal_entries(wal.read_entries().await?).await?;
+    let expected: BTreeMap<String, i64> = ["r0", "r2", "r3"]
+        .iter()
+        .map(|oid| (oid.to_string(), 1))
+        .collect();
+    assert_eq!(
+        rows(&store, "t1").await?,
+        expected,
+        "the delete survived the crash"
     );
     Ok(())
 }
