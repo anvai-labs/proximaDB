@@ -171,26 +171,21 @@ pub(crate) fn merge_canonical_band(
                 ),
             }
         } else {
-            // `String` has no arm in the shared partial mapping but IS the v1
-            // filterable vocabulary's string type (the default for gRPC
-            // `filterable_columns`), so it folds into a String filterable
-            // column. Anything else with no filterable projection (Struct,
-            // Map, SparseVector, …) cannot be stored in the filterable column
-            // and is rejected rather than silently accepted.
-            let filterable = match proximadb_runtime::handlers::proxima_type_to_filterable_type(
-                &column.data_type,
-            ) {
-                Some(data_type) => data_type,
-                None if matches!(column.data_type, ProximaType::String) => {
-                    FilterableDataType::FilterableString as i32
-                }
-                None => anyhow::bail!(
-                    "column '{}' is declared as {:?}, which cannot be stored in its filterable \
-                     column",
-                    column.name,
-                    column.data_type
-                ),
-            };
+            // A column with no filterable projection (Struct, Map,
+            // SparseVector, UInt, …) cannot be stored in the filterable column
+            // and is rejected rather than silently accepted. The mapping is
+            // the ONE shared one (TD-CATREPLACE-1), so what folds here is what
+            // the narrow view renders.
+            let filterable =
+                match proximadb_data_model::proxima_type_to_filterable_type(&column.data_type) {
+                    Some(data_type) => data_type,
+                    None => anyhow::bail!(
+                        "column '{}' is declared as {:?}, which cannot be stored in its filterable \
+                         column",
+                        column.name,
+                        column.data_type
+                    ),
+                };
             let narrowed = catalog_data_type(filterable);
             if reserved.data_type != narrowed {
                 anyhow::bail!(
@@ -900,23 +895,15 @@ fn catalog_index_type(algorithm: i32) -> CatalogIndexType {
     }
 }
 
+/// TD-CATREPLACE-1: the total (catalog→narrow) view of the ONE shared mapping
+/// (`proxima_type_to_filterable_type` in the foundation data-model crate): a
+/// column with no filterable projection still renders as the v1 string type,
+/// exactly as before, while String-like, Json/Jsonb, Binary and array columns
+/// now render the same type in both directions (they used to disagree, so a
+/// schema round-trip flip-flopped the stored narrow type).
 fn filterable_data_type(data_type: &ProximaType) -> i32 {
-    match data_type {
-        ProximaType::Int8 | ProximaType::Int16 | ProximaType::Int32 | ProximaType::Int64 => {
-            FilterableDataType::FilterableInteger as i32
-        }
-        ProximaType::Float32 | ProximaType::Float64 => FilterableDataType::FilterableFloat as i32,
-        ProximaType::Boolean => FilterableDataType::FilterableBoolean as i32,
-        ProximaType::Timestamp(_) => FilterableDataType::FilterableDatetime as i32,
-        ProximaType::TimestampTz(_) => FilterableDataType::FilterableTimestampTz as i32,
-        ProximaType::Decimal { .. } => FilterableDataType::FilterableDecimal as i32,
-        ProximaType::Date => FilterableDataType::FilterableDate as i32,
-        ProximaType::Time(_) => FilterableDataType::FilterableTime as i32,
-        ProximaType::Uuid => FilterableDataType::FilterableUuid as i32,
-        ProximaType::Binary => FilterableDataType::FilterableBinary as i32,
-        ProximaType::Json => FilterableDataType::FilterableJson as i32,
-        _ => FilterableDataType::FilterableString as i32,
-    }
+    proximadb_data_model::proxima_type_to_filterable_type(data_type)
+        .unwrap_or(FilterableDataType::FilterableString as i32)
 }
 
 fn indexing_algorithm(index_type: CatalogIndexType) -> i32 {
@@ -942,6 +929,48 @@ fn storage_engine_from_catalog(engine: &str) -> i32 {
         "TITAN" => StorageEngine::Titan as i32,
         "CHRONO" => StorageEngine::Chrono as i32,
         _ => StorageEngine::Sst as i32,
+    }
+}
+
+#[cfg(test)]
+mod catreplace_tests {
+    use super::*;
+
+    /// TD-CATREPLACE-1: the catalog→narrow view must render the SAME filterable
+    /// type the update direction stores, or a schema round-trip flip-flops the
+    /// stored narrow type and the next update is rejected as a conflict. On the
+    /// old code Jsonb and every array rendered String here while the update
+    /// direction stored Json / Array*.
+    #[test]
+    fn narrow_view_renders_the_shared_filterable_mapping() {
+        for (data_type, expected) in [
+            (
+                ProximaType::Jsonb,
+                FilterableDataType::FilterableJson as i32,
+            ),
+            (
+                ProximaType::Array(Box::new(ProximaType::String)),
+                FilterableDataType::FilterableArrayString as i32,
+            ),
+            (
+                ProximaType::Binary,
+                FilterableDataType::FilterableBinary as i32,
+            ),
+            (
+                ProximaType::String,
+                FilterableDataType::FilterableString as i32,
+            ),
+        ] {
+            assert_eq!(
+                filterable_data_type(&data_type),
+                expected,
+                "{data_type:?} must narrow the same way in both directions"
+            );
+            // The two historical mappings agree wherever the strict one has an
+            // arm (the invariant TD-CATREPLACE-1 pins).
+            let strict = proximadb_data_model::proxima_type_to_filterable_type(&data_type);
+            assert_eq!(strict, Some(expected), "{data_type:?}");
+        }
     }
 }
 

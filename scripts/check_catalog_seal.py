@@ -11,10 +11,10 @@ Rust has no ``final`` method, so an implementation could quietly override
 failure shape TD-CAT-7 exists to close: a mechanism whose bypass looks like
 ordinary code and reports success. This guard is the seal.
 
-Backends implement ``create_table_inner``. Nothing implements ``create_table``.
+Backends implement ``create_table_inner`` and ``replace_table_inner``. Nothing implements the sealed ``create_table`` / ``replace_table`` wrappers.
 
 Exit status:
-* 0 - every ``impl Catalog for ...`` block defines only ``create_table_inner``.
+* 0 - every ``impl Catalog for ...`` block defines only ``create_table_inner`` / ``replace_table_inner``.
 * 1 - an implementation overrides ``create_table`` (the seal is broken), or the
       sealed default has gone missing from the trait itself.
 """
@@ -30,7 +30,9 @@ SCAN_ROOTS = ("src", "crates", "apps", "tests")
 SKIP_DIRS = {"target", ".git", "node_modules"}
 
 IMPL_RE = re.compile(r"^\s*impl(?:<[^>]*>)?\s+Catalog\s+for\s+(\S+)")
-OVERRIDE_RE = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+create_table\s*\(")
+OVERRIDE_RE = re.compile(
+    r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+(?:create_table|replace_table)\s*\("
+)
 TRAIT_FILE = ROOT / "crates/control/proximadb-catalog/src/lib.rs"
 
 
@@ -60,10 +62,11 @@ def scan(path: Path) -> list[str]:
                 if depth <= 0:  # single-line or trait-bound continuation
                     target = None
             continue
+        kind = "create_table" if "fn create_table(" in line else "replace_table"
         if OVERRIDE_RE.match(line):
             violations.append(
                 f"{path.relative_to(ROOT)}:{lineno}: `impl Catalog for {target}` "
-                f"overrides `create_table`; implement `create_table_inner` instead "
+                f"overrides `{kind}`; implement `{kind}_inner` instead "
                 f"so the identity post-condition still runs (TD-CAT-7)"
             )
         depth += line.count("{") - line.count("}")
@@ -81,19 +84,20 @@ def main() -> int:
         violations.extend(scan(path))
 
     trait_src = TRAIT_FILE.read_text(encoding="utf-8", errors="replace")
-    if "async fn create_table_inner(" not in trait_src:
-        violations.append(
-            f"{TRAIT_FILE.relative_to(ROOT)}: the `Catalog` trait no longer declares "
-            f"`create_table_inner`; the sealed `create_table` wrapper carrying the "
-            f"identity post-condition has been removed (TD-CAT-7)"
-        )
+    for inner in ("create_table_inner", "replace_table_inner"):
+        if f"async fn {inner}(" not in trait_src:
+            violations.append(
+                f"{TRAIT_FILE.relative_to(ROOT)}: the `Catalog` trait no longer declares "
+                f"`{inner}`; the sealed wrapper carrying the identity post-condition "
+                f"has been removed (TD-CAT-7)"
+            )
 
     if violations:
         print("❌ catalog seal broken:")
         for violation in violations:
             print(f"   {violation}")
         return 1
-    print("✅ catalog seal intact: create_table is provided, backends implement create_table_inner")
+    print("✅ catalog seal intact: create_table and replace_table are provided, backends implement the _inner halves")
     return 0
 
 

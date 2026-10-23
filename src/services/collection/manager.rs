@@ -616,10 +616,9 @@ impl CollectionService {
                 serde_json::to_string(&full).context("serializing collection config")?,
             );
         }
-        // No in-place update on the catalog trait: replace the entry with the
-        // same schema (the established drop+create pattern).
-        let _ = catalog.drop_table(&identifier, false).await?;
-        catalog.create_table(&identifier, schema).await?;
+        // TD-CATREPLACE-1: replace in place — no drop window (this path used
+        // the drop+create pattern this TD retires).
+        catalog.replace_table(&identifier, schema).await?;
         Ok(true)
     }
 
@@ -2042,8 +2041,15 @@ impl CollectionService {
                 if let Some(previous) = previous_record.config.as_ref() {
                     proximadb_tenant::ownership::carry_over_owner(previous, existing_config);
                 }
-                if !new_config.filterable_columns.is_empty() {
-                    existing_config.filterable_columns = new_config.filterable_columns;
+                // TD-CATREPLACE-1: a schema update (marked by the record-schema
+                // block `apply_schema_update` always sets) carries the
+                // authoritative FULL list — replace it even when empty, so a
+                // removed filterable column stops being served. A raw config
+                // patch without that intent — including one that only flips
+                // `enable_proxima_record` — keeps the legacy non-empty merge.
+                let schema_update_intent = new_config.record_schema.is_some();
+                if schema_update_intent || !new_config.filterable_columns.is_empty() {
+                    existing_config.filterable_columns = new_config.filterable_columns.clone();
                 }
                 // Add other fields as needed
             } else {
@@ -2646,11 +2652,9 @@ impl CollectionService {
                     existing.location = schema.location.clone();
                 }
 
-                // TD-GRPCCREATE-1: validate before the drop (see below).
-                proximadb_catalog::schema::normalize_identity(&mut existing);
-                proximadb_catalog::schema::validate_schema(&existing)?;
-                let _ = catalog.drop_table(&identifier, false).await?;
-                catalog.create_table(&identifier, existing).await?;
+                // TD-GRPCCREATE-1 validates first; TD-CATREPLACE-1 replaces in
+                // place — no drop window in which the collection has no table.
+                catalog.replace_table(&identifier, existing).await?;
                 return Ok(());
             }
         }
@@ -2671,12 +2675,9 @@ impl CollectionService {
                 canonical,
             );
         }
-        proximadb_catalog::schema::normalize_identity(&mut schema);
-        proximadb_catalog::schema::validate_schema(&schema)?;
-        if catalog.table_exists(&identifier).await? {
-            let _ = catalog.drop_table(&identifier, false).await?;
-        }
-        catalog.create_table(&identifier, schema).await?;
+        // TD-GRPCCREATE-1 validates first (inside replace_table);
+        // TD-CATREPLACE-1 replaces in place — no drop window.
+        catalog.replace_table(&identifier, schema).await?;
         Ok(())
     }
 
@@ -3157,6 +3158,139 @@ mod tests {
             index_policy: None,
             pax_vector_quant: None,
         }
+    }
+
+    /// TD-CATREPLACE-1: a schema update (the record-schema switch
+    /// `apply_schema_update` always sets) carries the authoritative FULL
+    /// filterable list — an empty list REMOVES the columns. Before, an empty
+    /// list was ignored, so a removed filterable column kept being served and
+    /// could not be retyped or removed afterwards.
+    #[tokio::test]
+    async fn schema_update_clears_filterable_columns_it_empties() -> Result<()> {
+        use crate::proto::proximadb_v1::{FilterableColumnSpec, FilterableDataType};
+
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path = format!("file://{}", temp_dir.path().display());
+        let mgr = Arc::new(CatalogManager::new());
+        mgr.create_native_catalog("default", &temp_path).await?;
+        let svc = CollectionService::new(StorageConfig::default())
+            .await?
+            .with_catalog_manager(mgr.clone());
+
+        // The schema-update intent marker `apply_schema_update` always writes.
+        let record_schema = || crate::proto::proximadb_v1::RecordSchemaConfig {
+            schema_id: "s1".to_string(),
+            schema_version: "1".to_string(),
+            enforcement: 0,
+            auto_evolve: false,
+            columns: vec![],
+        };
+        let int_x = || FilterableColumnSpec {
+            name: "x".to_string(),
+            data_type: FilterableDataType::FilterableInteger as i32,
+            indexed: true,
+            supports_range: true,
+            estimated_cardinality: None,
+        };
+        let mut config = collection_config("catreplace_removal");
+        config.filterable_columns = vec![int_x()];
+        assert!(svc.create_collection(&config).await?.success);
+
+        // A schema update that no longer declares `x` filterable — marked by
+        // the record-schema block `apply_schema_update` always sets (NOT by
+        // `enable_proxima_record`: a raw flag flip must not clear columns).
+        let mut update = collection_config("catreplace_removal");
+        update.filterable_columns = vec![];
+        update.enable_proxima_record = Some(true);
+        update.record_schema = Some(record_schema());
+        assert!(
+            svc.update_collection("catreplace_removal", Some(update))
+                .await?
+                .success
+        );
+
+        let after = svc
+            .collection("catreplace_removal")
+            .await?
+            .expect("collection present");
+        assert!(
+            after
+                .config
+                .as_ref()
+                .expect("config")
+                .filterable_columns
+                .is_empty(),
+            "an emptied filterable list must remove the columns, got {:?}",
+            after.config.as_ref().unwrap().filterable_columns
+        );
+
+        // A RAW flag flip (enable_proxima_record set, no record-schema block)
+        // must NOT clear the columns — only a schema update carries the
+        // authoritative list (review M3).
+        let mut restore = collection_config("catreplace_removal");
+        restore.filterable_columns = vec![int_x()];
+        restore.enable_proxima_record = Some(true);
+        assert!(
+            svc.update_collection("catreplace_removal", Some(restore))
+                .await?
+                .success
+        );
+        let mut flag_flip = collection_config("catreplace_removal");
+        flag_flip.filterable_columns = vec![];
+        flag_flip.enable_proxima_record = Some(true);
+        assert!(
+            svc.update_collection("catreplace_removal", Some(flag_flip))
+                .await?
+                .success
+        );
+        let after_flip = svc
+            .collection("catreplace_removal")
+            .await?
+            .expect("collection present");
+        assert_eq!(
+            after_flip.config.as_ref().unwrap().filterable_columns.len(),
+            1,
+            "a raw enable_proxima_record flip must keep the filterable columns"
+        );
+
+        // Clear it again via a schema update for the catalog-band assertions.
+        let mut clear = collection_config("catreplace_removal");
+        clear.filterable_columns = vec![];
+        clear.enable_proxima_record = Some(true);
+        clear.record_schema = Some(record_schema());
+        assert!(
+            svc.update_collection("catreplace_removal", Some(clear))
+                .await?
+                .success
+        );
+
+        // The catalog table's reserved filterable band follows.
+        // `get_catalog` (not the counted `default_catalog`): the anonymous-
+        // identity guard ratchets direct default-catalog uses in this file, and
+        // a test-side lookup must not spend one.
+        let catalog = mgr.get_catalog("default").await?;
+        let identifier = crate::storage::metadata::collection_mapping::collection_table_identifier(
+            after.config.as_ref().unwrap(),
+        );
+        let table = catalog.get_table(&identifier).await?;
+        // The reserved filterable band is ids [100, 200): assert by RANGE, not by a
+        // bound the column ids can never satisfy (round-2 review: the old `< 100`
+        // was vacuous — filterable columns start at 100).
+        let gone = !table.columns.iter().any(|c| {
+            c.name == "x"
+                && (100..crate::storage::metadata::collection_mapping::CANONICAL_COLUMN_ID_BASE)
+                    .contains(&c.id)
+        });
+        assert!(
+            gone,
+            "the reserved filterable column must be gone, got {:?}",
+            table
+                .columns
+                .iter()
+                .map(|c| (c.id, c.name.clone()))
+                .collect::<Vec<_>>()
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -4918,8 +5052,16 @@ impl proximadb_runtime::CollectionPort for CollectionService {
             Self::collection_tenant_id(&collection).as_deref(),
             crate::storage::metadata::collection_mapping::collection_table_identifier(config),
         );
-        if !catalog.table_exists(&identifier).await.unwrap_or(false) {
-            return Ok(());
+        // TD-CATREPLACE-1 (review m4): fail closed. The canonical columns are
+        // the schema authority; silently dropping them while reporting success
+        // (which the old best-effort no-op did once the caller reordered to
+        // canonical-first) leaves the collection wearing a schema it does not
+        // have. A collection without its catalog asset is already inconsistent.
+        if !catalog.table_exists(&identifier).await? {
+            anyhow::bail!(
+                "collection '{}' has no catalog asset to hold its schema columns",
+                id
+            );
         }
         let mut schema = catalog.get_table(&identifier).await?;
         // ADR-048 P1: the canonical schema IS the typed catalog columns (200+
@@ -4944,13 +5086,11 @@ impl proximadb_runtime::CollectionPort for CollectionService {
                 columns,
             ),
         )?;
-        // Validate before the drop, exactly as `create_table` will (normalize,
-        // then validate): the catalog has no atomic replace, so a schema it would
-        // reject must never cost the existing table (TD-GRPCCREATE-1).
+        // TD-GRPCCREATE-1: validate before touching the table (replace_table
+        // does). TD-CATREPLACE-1: replace in place — no drop window.
         proximadb_catalog::schema::normalize_identity(&mut schema);
         proximadb_catalog::schema::validate_schema(&schema)?;
-        let _ = catalog.drop_table(&identifier, false).await?;
-        catalog.create_table(&identifier, schema).await?;
+        catalog.replace_table(&identifier, schema).await?;
         Ok(())
     }
 
