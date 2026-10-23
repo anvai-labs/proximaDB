@@ -188,3 +188,98 @@ async fn a_collection_branched_after_its_history_was_truncated_refuses() -> Resu
 
     Ok(())
 }
+
+fn upsert_op(collection: &str, record: ProximaRecord) -> CanonicalOperation {
+    CanonicalOperation::RecordUpsert {
+        collection_id: collection.to_string(),
+        record: Box::new(record),
+        projections: Vec::new(),
+    }
+}
+
+/// Appends `ops` as one batch: with rotation after every append, the batch is
+/// one multi-entry segment. Returns the batch's first sequence.
+async fn batch(wal: &FramedTableWalAppender, ops: Vec<CanonicalOperation>) -> Result<u64> {
+    Ok(wal.append_operations(ops, None).await?[0].sequence_number)
+}
+
+#[tokio::test]
+async fn a_later_branched_collection_merges_from_its_image_plus_the_retained_suffix() -> Result<()>
+{
+    const LATE: &str = "late";
+    let dir = TempDir::new()?;
+    let data_dir = dir.path().to_path_buf();
+    let wal = FramedTableWalAppender::open_shared(wal_path(&data_dir)).await?;
+    wal.enable_segment_rotation(1);
+    // Segment 1: main-line history of `late` (and of `col`).
+    batch(
+        &wal,
+        vec![
+            upsert_op(LATE, record("l1", None, "v0", &["x"])),
+            upsert_op(LATE, record("l2", None, "v0", &[])),
+            upsert_op(COLLECTION, record("c1", None, "v0", &[])),
+        ],
+    )
+    .await?;
+    // Segment 2: `col` branches first — the global floor lands mid-segment,
+    // so `late`'s writes on either side of it stay retained.
+    let floor = batch(
+        &wal,
+        vec![
+            upsert_op(LATE, record("l3", None, "v0", &[])),
+            upsert_op(COLLECTION, record("c1", Some("a"), "left", &[])),
+            upsert_op(LATE, record("l1", None, "v1", &["x", "y"])),
+        ],
+    )
+    .await?
+        + 1;
+    // Segment 3: more main-line changes to `late` before it branches — the
+    // suffix the image does not cover.
+    let drop_l2 = CanonicalOperation::RecordDelete {
+        collection_id: LATE.to_string(),
+        oid: "l2".to_string(),
+        projections: Vec::new(),
+    };
+    batch(
+        &wal,
+        vec![drop_l2, upsert_op(LATE, record("l3", None, "v1", &["z"]))],
+    )
+    .await?;
+    // Segment 4: `late` branches.
+    batch(
+        &wal,
+        vec![
+            upsert_op(LATE, record("l1", Some("a"), "left", &["x", "y"])),
+            upsert_op(LATE, record("l3", Some("b"), "right", &["z", "w"])),
+            upsert_op(LATE, record("l1", Some("b"), "right", &["x"])),
+            upsert_op(LATE, record("l2", Some("a"), "back", &[])),
+        ],
+    )
+    .await?;
+
+    let untruncated = merge(&data_dir, LATE).await.expect("full history merges");
+    let run = wal_truncator::run_once(&wal, &sources(&wal)).await?;
+    assert!(
+        matches!(run, TruncationRun::Truncated { floor: f, .. } if f == floor),
+        "{run:?}"
+    );
+    assert!(wal.retained_from() > 1 && wal.retained_from() < floor);
+    let truncated = merge(&data_dir, LATE).await.expect("image + suffix");
+    assert_eq!(truncated, untruncated);
+
+    // A real (non-dry-run) merge writes back under the pin.
+    let head = wal.last_sequence();
+    let request: GraphBranchMergeRequest =
+        serde_json::from_value(serde_json::json!({ "target_branch": "b", "dry_run": false }))
+            .expect("request");
+    let written = merge_graph_branch_inner(&data_dir, "default", LATE, "a", request)
+        .await
+        .expect("write-back after truncation")
+        .0;
+    let entries_written = written["write_back"]["entries_written"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(entries_written > 0, "{written}");
+    assert_eq!(wal.last_sequence(), head + entries_written);
+    Ok(())
+}

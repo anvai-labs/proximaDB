@@ -6,7 +6,7 @@
 |===
 | Field | Value
 | Status | **In Progress.** P2.2a primitives landed 2026-10-19; P2.2b checkpoints and the REST 410 on 2026-10-20; the P2.2c truncator on 2026-10-20 (see "Landed"). It is **on by default** since #2146 (`PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS=0` disables it). Since 2026-10-22 the durable branch merge-base (hazard 2) lets it truncate below a branch point and branch merge still compute its base; a merge refuses (410) only for a collection that lost history before it was branched (see "Landed: the durable branch merge-base"). Filed 2026-10-19 from a survey of every reader of the shared canonical WAL (`data_dir/pgwire/canonical-records.wal`), done before implementing truncation (TD-SEAM-2 / P2.2).
-| Priority | **MEDIUM.** Truncation runs only when an operator opts in; the remaining branch-merge gaps refuse rather than risk history.
+| Priority | **MEDIUM.** Truncation is on by default (#2146); the remaining branch-merge gaps refuse (410) rather than risk history.
 | Component | `src/services/canonical_wal.rs`, `src/services/record_store.rs`, `src/services/{rank_profile_store,function_store}.rs`, `src/graph/merge.rs`, `src/network/rest/v2/records.rs` (change feed), `src/network/postgres/relational_pipeline.rs` (OLAP delta merge)
 | Relates to | TD-SEAM-2, TD-USUB-1 (slice 2b), TD-OLAPFMT-3, ADR-012 (branch merge), ADR-097 S2
 | Blocked by | Nothing.
@@ -168,6 +168,9 @@ Still open:
 
 == Correction (2026-10-21): the branch guard alone was not fail-closed
 
+Historical: the blanket 410 below was superseded on 2026-10-23 by the durable merge-base (see
+"Landed: the durable branch merge-base"); `truncated_through_at` no longer exists.
+
 A design review of the durable merge-base found that `BranchEntriesGuard` did not
 make hazard 2 fail-closed, as the "Landed (P2.2c)" section implied:
 
@@ -236,9 +239,19 @@ PRs #2124, #2125 and the slice-3–5 follow-ups.
   included.
 ** It reads the base from the retained history when that is complete for the collection, or from
    its image otherwise.
-** It returns **410** (`MergeBaseTruncated`) only when the base is gone: the collection lost
-   history before it was branched, or history was truncated before any merge base was tracked. This
-   replaces the blanket 410 of the 2026-10-21 correction.
+** It returns **410** only when the base cannot be recovered. That happens in three cases:
+*** `MergeBaseTruncated`: the collection lost history before it was branched; history was
+    truncated before any merge base was tracked; or the image no longer reaches the retained
+    history (`through + 1 < retained_from`).
+*** `BranchForkFolded`: the image folded a merged branch's fork.
+*** `ImageAboveMergeBase`: the image runs past the merge base.
+** This replaces the blanket 410 of the 2026-10-21 correction.
+** No branch pair returns 404 whatever the history.
+** A merge-base generation that fails replay ("header but not all rows") returns 500. It does so
+   for every merge on a truncated WAL, and the truncator refuses too. Both fail closed.
+** Recovery from a failed replay: restore the WAL directory from backup, or delete the damaged
+   generation's rows (collection `__proxima_branch_bases__`, generation named in the error) with an
+   offline rewrite. The next truncation run then writes a fresh generation.
 ** The WAL-exists check now counts sealed segments, so a merge right after a rotation is no longer
    a 404.
 * **Gates:**
