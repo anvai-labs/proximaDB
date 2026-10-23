@@ -304,7 +304,7 @@ thiserror = "2.0"
 tokio = { version = "1.37", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", features = ["gzip", "tls-native-roots"] }
-toml = "0.8"
+toml = "1.1"
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 proximadb-vector = { path = "crates/modalities/proximadb-vector" }
