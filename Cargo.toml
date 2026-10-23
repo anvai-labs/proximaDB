@@ -663,7 +663,7 @@ snap = "1.1"             # Snappy compression
 zstd = "0.13"            # Zstandard compression
 flate2 = { version = "1.0", default-features = true }  # Gzip/Deflate/Zlib compression
 brotli = "6.0"           # Brotli compression - Updated from 3.5
-bzip2 = "0.5"            # Bzip2 compression - Updated from 0.4
+bzip2 = "0.6"            # Bzip2 compression - Updated from 0.5
 xz2 = "0.1"              # XZ/LZMA2 compression
 
 # System monitoring
