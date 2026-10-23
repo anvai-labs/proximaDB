@@ -783,12 +783,19 @@ impl FramedTableWalAppender {
         *self.branch_fence.lock() = Some(BranchFence { covered, marked });
     }
 
-    /// Highest sequence ever truncated from the WAL at `path` (`0` = its
-    /// history is complete), read from the durable floor marker. For readers
-    /// that open the WAL by path and must know whether what they read starts
-    /// at the beginning (TD-SEAM-12). A damaged marker is an error.
-    pub async fn truncated_through_at(path: &Path) -> Result<u64> {
-        read_floor_marker(path).await
+    /// Whether a WAL exists at `path`: its active file, a sealed segment, or
+    /// a truncation floor. The active file alone is not enough — right after
+    /// a rotation it is gone until the next append.
+    pub async fn exists_at(path: &Path) -> Result<bool> {
+        for candidate in [path.to_path_buf(), floor_marker_path(path)] {
+            if tokio::fs::try_exists(&candidate)
+                .await
+                .with_context(|| format!("checking {}", candidate.display()))?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(!discover_sealed_segments(path).await?.is_empty())
     }
 
     /// First sequence still readable; `0` when nothing was ever truncated.

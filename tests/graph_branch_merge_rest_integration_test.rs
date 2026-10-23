@@ -338,7 +338,9 @@ async fn merge_endpoint_returns_404_when_no_branch_entries_for_collection() -> R
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TD-SEAM-12 hazard 2: truncated history refuses the merge (410), never a
-// silently wrong merge base.
+// silently wrong merge base. A floor marker with no merge-base generation in
+// the WAL is history truncated before merge bases were tracked: whether the
+// collection's base survived cannot be told, so the merge refuses.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -353,7 +355,8 @@ async fn merge_endpoint_refuses_when_wal_history_was_truncated() -> Result<()> {
     let (status, _) = post_json(router_for_test(data_dir.clone()), &uri, body.clone()).await?;
     assert_eq!(status, StatusCode::OK);
 
-    // The durable floor marker says the main-line base write (seq 1) is gone.
+    // The durable floor marker says the main-line base write (seq 1) is gone,
+    // and no merge-base generation recorded what it held.
     let mut floor = wal_path.as_os_str().to_owned();
     floor.push(".floor");
     std::fs::write(&floor, "1")?;
@@ -363,6 +366,12 @@ async fn merge_endpoint_refuses_when_wal_history_was_truncated() -> Result<()> {
         status,
         StatusCode::GONE,
         "a merge base computed from truncated history must be refused: {response}"
+    );
+    assert!(
+        response
+            .to_string()
+            .contains("before merge bases were tracked"),
+        "refused because nothing tracked the truncated history: {response}"
     );
     Ok(())
 }
