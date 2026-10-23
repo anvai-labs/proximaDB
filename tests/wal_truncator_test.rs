@@ -4,12 +4,14 @@
 //!   cargo test --test wal_truncator_test
 
 use anyhow::Result;
+use proximadb::services::branch_base_store::{BranchBaseStore, BranchBases, MergeBase};
+use proximadb::services::canonical_wal::TenantCollection;
 use proximadb::services::canonical_wal::WalHistoryTruncated;
 use proximadb::services::record_store::{
     DirectWalTableRecordStore, TableRecordStore, TableWalAppender,
 };
 use proximadb::services::wal_truncator::{
-    self, BranchEntriesGuard, ChangeFeedRetention, FunctionCheckpoint, PublishedSnapshotFloor,
+    self, BranchMergeBase, ChangeFeedRetention, FunctionCheckpoint, PublishedSnapshotFloor,
     RankProfileCheckpoint, RecordTierFloor, TruncationRun, WalFloorSource,
 };
 use proximadb::services::{
@@ -25,8 +27,12 @@ use tempfile::TempDir;
 const PROFILE: &str = "[first_phase]\nexpression = \"1.0\"\nheap_size = 100\n";
 
 fn upsert(oid: &str, branch: Option<&str>) -> CanonicalOperation {
+    upsert_in("orders", oid, branch)
+}
+
+fn upsert_in(collection: &str, oid: &str, branch: Option<&str>) -> CanonicalOperation {
     CanonicalOperation::RecordUpsert {
-        collection_id: "orders".to_string(),
+        collection_id: collection.to_string(),
         record: Box::new(ProximaRecord {
             oid: oid.to_string(),
             branch_id: branch.map(str::to_string),
@@ -189,28 +195,103 @@ async fn an_appending_source_is_asked_only_when_the_run_can_truncate() -> Result
 }
 
 #[tokio::test]
-async fn branch_tagged_records_block_truncation() -> Result<()> {
+async fn a_branch_floors_truncation_at_its_oldest_entry_and_keeps_its_base() -> Result<()> {
     let dir = TempDir::new()?;
     let wal = rotating_wal(&dir).await?;
-    wal.append_operations(vec![upsert("main", None)], None)
+    for oid in ["r1", "r2", "r3"] {
+        wal.append_operations(vec![upsert(oid, None)], None).await?;
+    }
+    wal.append_operations(vec![upsert("r1", Some("feature"))], None)
         .await?;
-    let guard: Arc<dyn WalFloorSource> = Arc::new(BranchEntriesGuard(wal.clone()));
-    assert_eq!(guard.floor(wal.last_sequence()).await?, None);
+    wal.append_operations(vec![upsert("r9", None)], None)
+        .await?;
+    let base: Arc<dyn WalFloorSource> =
+        Arc::new(BranchMergeBase(Arc::new(BranchBaseStore::new(wal.clone()))));
 
-    wal.append_operations(vec![upsert("b", Some("feature"))], None)
-        .await?;
-    let run = wal_truncator::run_once(&wal, &[guard, Arc::new(ChangeFeedRetention(0))]).await?;
+    let run = wal_truncator::run_once(&wal, &[Arc::new(ChangeFeedRetention(0)), base]).await?;
     assert!(
-        matches!(&run, TruncationRun::Refused { source, .. } if source == "branch-merge"),
+        matches!(run, TruncationRun::Truncated { floor: 4, .. }),
+        "history from the branch's first write up stays: {run:?}"
+    );
+
+    // The base the merge needs survives as an image, across a restart.
+    drop(wal);
+    let reopened =
+        Arc::new(FramedTableWalAppender::open(dir.path().join("canonical-records.wal")).await?);
+    let bases = BranchBases::replay(&reopened.read_entries().await?)?;
+    let orders = TenantCollection::new(None, "orders");
+    match bases.base_for(&orders, reopened.retained_from())? {
+        MergeBase::Image(image) => {
+            assert_eq!(image.through, 3);
+            let mut oids: Vec<_> = image.records.keys().cloned().collect();
+            oids.sort();
+            assert_eq!(oids, ["r1", "r2", "r3"]);
+        }
+        MergeBase::Retained => panic!("orders' history before 4 is gone"),
+    }
+    Ok(())
+}
+
+/// Branches a collection with history below the floor between the merge-base
+/// checkpoint and the truncation.
+struct BranchRacer(Arc<FramedTableWalAppender>);
+
+#[async_trait::async_trait]
+impl WalFloorSource for BranchRacer {
+    fn name(&self) -> &str {
+        "racer"
+    }
+    // An appending source runs after the read-only ones, in list order: this
+    // one lands between the merge-base checkpoint and the truncation.
+    fn appends(&self) -> bool {
+        true
+    }
+    async fn floor(&self, _head: u64) -> Result<Option<u64>> {
+        self.0
+            .append_operations(vec![upsert_in("late", "x", Some("feature"))], None)
+            .await?;
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn a_collection_branched_during_a_run_refuses_its_truncation() -> Result<()> {
+    let dir = TempDir::new()?;
+    let wal = rotating_wal(&dir).await?;
+    wal.append_operations(vec![upsert_in("late", "x", None)], None)
+        .await?;
+    wal.append_operations(vec![upsert("r1", None)], None)
+        .await?;
+    let store = Arc::new(BranchBaseStore::new(wal.clone()));
+    let sources: Vec<Arc<dyn WalFloorSource>> = vec![
+        Arc::new(ChangeFeedRetention(0)),
+        Arc::new(BranchMergeBase(store.clone())),
+        Arc::new(BranchRacer(wal.clone())),
+    ];
+    let run = wal_truncator::run_once(&wal, &sources).await?;
+    assert!(
+        matches!(&run, TruncationRun::Refused { source, reason }
+            if source == "branch-fence" && reason.contains("default/late")),
         "{run:?}"
     );
     assert_eq!(wal.retained_from(), 0, "nothing deleted");
 
-    // The guard survives a restart (rebuilt from the retained segments).
-    drop(wal);
-    let reopened =
-        Arc::new(FramedTableWalAppender::open(dir.path().join("canonical-records.wal")).await?);
-    assert!(reopened.has_branch_entries());
+    // The next run images `late` before truncating its history.
+    let run = wal_truncator::run_once(
+        &wal,
+        &[
+            Arc::new(ChangeFeedRetention(0)) as Arc<dyn WalFloorSource>,
+            Arc::new(BranchMergeBase(store)),
+        ],
+    )
+    .await?;
+    assert!(matches!(run, TruncationRun::Truncated { .. }), "{run:?}");
+    let bases = BranchBases::replay(&wal.read_entries().await?)?;
+    assert!(
+        bases
+            .image(&TenantCollection::new(None, "late"))
+            .is_some_and(|image| image.records.contains_key("x"))
+    );
     Ok(())
 }
 
@@ -274,10 +355,10 @@ async fn catalog_checkpoints_let_a_run_drop_their_history() -> Result<()> {
     let run = wal_truncator::run_once(
         &wal,
         &[
-            Arc::new(BranchEntriesGuard(wal.clone())),
             Arc::new(ChangeFeedRetention(0)),
             Arc::new(RankProfileCheckpoint(profiles.clone())),
             Arc::new(FunctionCheckpoint(functions.clone())),
+            Arc::new(BranchMergeBase(Arc::new(BranchBaseStore::new(wal.clone())))),
         ],
     )
     .await?;
