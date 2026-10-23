@@ -46,6 +46,47 @@ pub struct LocalConfig {
     pub sync_enabled: bool,
 }
 
+/// The deepest ancestor of `path` that already exists — the directory that
+/// gains a new entry when the missing ones below it are created.
+fn deepest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .skip(1)
+        .find(|dir| dir.exists())
+        .map(Path::to_path_buf)
+}
+
+/// Make a newly created file's directory entry durable: fsync its parent and,
+/// when `create_dir_all` made directories for it, every directory up to and
+/// including the deepest one that already existed. A file's own fsync covers
+/// its data, not the entry that names it — after a power loss the file could
+/// otherwise vanish while callers (WAL truncation) already rely on it.
+async fn sync_new_entries(file: &Path, deepest_existing: Option<&Path>) -> FsResult<()> {
+    let Some(parent) = file.parent() else {
+        return Ok(());
+    };
+    for dir in parent.ancestors() {
+        sync_dir(dir).await?;
+        if deepest_existing.is_none_or(|stop| dir == stop) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn sync_dir(dir: &Path) -> FsResult<()> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || std::fs::File::open(&dir).and_then(|d| d.sync_all()))
+        .await
+        .map_err(|e| FilesystemError::Io(std::io::Error::other(e)))?
+        .map_err(FilesystemError::Io)
+}
+
+#[cfg(not(unix))]
+async fn sync_dir(_dir: &Path) -> FsResult<()> {
+    Ok(())
+}
+
 impl Default for LocalConfig {
     fn default() -> Self {
         Self {
@@ -540,6 +581,7 @@ impl FileSystem for LocalFileSystem {
         let path_str = self.resolve_path(path)?;
         let resolved_path = PathBuf::from(path_str);
         let options = options.clone();
+        let deepest_existing = deepest_existing_ancestor(&resolved_path);
 
         // Create parent directories if requested
         if options.as_ref().is_some_and(|o| o.create_dirs)
@@ -591,6 +633,7 @@ impl FileSystem for LocalFileSystem {
 
             // Sync data to disk to prevent truncation issues
             file.sync_all().await.map_err(FilesystemError::Io)?;
+            sync_new_entries(&resolved_path, deepest_existing.as_deref()).await?;
         } else {
             // Fast write without sync (for development/testing only)
             fs::write(&resolved_path, data_to_write)
@@ -618,6 +661,7 @@ impl FileSystem for LocalFileSystem {
         options: Option<FileOptions>,
     ) -> FsResult<()> {
         let resolved_path = PathBuf::from(self.resolve_path(path)?);
+        let deepest_existing = deepest_existing_ancestor(&resolved_path);
         if options.as_ref().is_some_and(|o| o.create_dirs)
             && let Some(parent) = resolved_path.parent()
         {
@@ -653,6 +697,8 @@ impl FileSystem for LocalFileSystem {
             .map_err(FilesystemError::Io)?;
         if self.config.sync_enabled {
             file.sync_all().await.map_err(FilesystemError::Io)?;
+            // The commit point is the directory entry, not only the bytes.
+            sync_new_entries(&resolved_path, deepest_existing.as_deref()).await?;
         }
         Ok(())
     }
@@ -2009,6 +2055,42 @@ mod tests {
                 path
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_synced_write_into_new_directories_creates_and_syncs_the_whole_chain() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        std::fs::create_dir_all(root.join("spill")).unwrap();
+        let file = root
+            .join("spill")
+            .join("t1")
+            .join("orders")
+            .join("seg.parquet");
+        assert_eq!(
+            deepest_existing_ancestor(&file).as_deref(),
+            Some(root.join("spill").as_path()),
+            "the sync walk stops at the directory that gains the new entry"
+        );
+        let fs = LocalFileSystem::new(LocalConfig {
+            root_dir: Some(root.to_path_buf()),
+            sync_enabled: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let options = Some(FileOptions {
+            create_dirs: true,
+            ..Default::default()
+        });
+        fs.write_if_absent("spill/t1/orders/seg.parquet", b"x", options.clone())
+            .await
+            .unwrap();
+        fs.write("spill/t2/orders/obligation.json", b"{}", options)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"x");
+        assert!(root.join("spill/t2/orders/obligation.json").exists());
     }
 
     #[tokio::test]

@@ -806,9 +806,10 @@ impl SpillRecordStorage {
         // refusing the *flush* converts a correctness guard into an outage.
         //
         // Dropping them from this flush's snapshot is what keeps it safe: they
-        // stay in `self.tombstones`, so `min_unflushed_lsn` keeps failing closed
-        // (identical safety — the WAL entry that reconstructs the delete is
-        // retained) while the resident rows still become durable.
+        // stay in `self.tombstones`, so `min_unflushed_lsn` keeps the WAL from
+        // the earliest of their delete LSNs (or refuses, for an untracked one) —
+        // the entry that reconstructs each delete is retained — while the
+        // resident rows still become durable.
         // ONE binding, deliberately: the write below and the post-commit clear
         // must not be able to drift apart. Before this they were two separate
         // conditions (`tenant.is_none()` cleared the local list; `tenant.is_some()`
@@ -825,8 +826,8 @@ impl SpillRecordStorage {
                     path = %self.base_path.trim_end_matches('/'),
                     "spill: not persisting tombstone(s) — the store has no non-empty tenant, \
                      and an unattributed record must not enter a tenant-scoped segment. They \
-                     stay in memory, so `min_unflushed_lsn` keeps refusing to truncate. \
-                     Construct the store with `with_tenant`."
+                     stay in memory, so `min_unflushed_lsn` keeps retaining the WAL from \
+                     their deletes. Construct the store with `with_tenant`."
                 );
             }
             Vec::new()
@@ -842,8 +843,9 @@ impl SpillRecordStorage {
         // row and a tombstone for one oid.
         //
         // Why neither side may win. The authoritative order is the WAL's LSN
-        // order — and `tombstones` is a `DashSet<String>` of oids that carries NO
-        // LSN, so this store cannot tell which operation came later. An earlier
+        // order — and a tombstone's LSN can be `None` (a plain `delete_record`)
+        // and a resident row's too, so this store cannot always tell which
+        // operation came later. An earlier
         // draft picked the tombstone, reasoning that `get_record` consults
         // `tombstones` first so "absent" is already the answer being served. That
         // was wrong, and the way it was wrong is worth keeping: the post-commit
@@ -856,7 +858,8 @@ impl SpillRecordStorage {
         //
         // So the oid is simply not flushed: no row written, nothing evicted,
         // nothing cleared. It stays in memory, where the tombstone keeps
-        // `min_unflushed_lsn` refusing (mandate #1). This also removes
+        // `min_unflushed_lsn` retaining its delete's WAL entry, or refusing when
+        // that is untracked (mandate #1). This also removes
         // TD-USUB-16's inconsistency at the source: no segment ever holds a live
         // and a dead row for one oid.
         //
@@ -884,9 +887,9 @@ impl SpillRecordStorage {
                 oids = ambiguous.len(),
                 path = %self.base_path.trim_end_matches('/'),
                 "spill: not flushing oid(s) that are both resident and tombstoned — a concurrent \
-                 upsert and delete left an order this store cannot resolve (tombstones carry no \
-                 LSN). They stay in memory and keep `min_unflushed_lsn` refusing until a later \
-                 write or WAL replay resolves them. See TD-USUB-16."
+                 upsert and delete left an order this store cannot resolve. They stay in memory, \
+                 holding back WAL truncation, until a later write or WAL replay resolves them. \
+                 See TD-USUB-16."
             );
         }
 
@@ -1254,13 +1257,27 @@ impl SpillRecordStorage {
     /// tombstone this may record (see [`RecordStore::delete_record_at_lsn`]).
     ///
     /// Tombstones count toward the flush threshold like resident rows, so a
-    /// delete-heavy workload flushes (and so lets truncation advance) too. The
-    /// flush runs only after the answer is known: a flush first would put this
-    /// delete's tombstone in the newest segment, and the segment probe would
-    /// then report a removed live row as absent.
+    /// delete-heavy workload flushes (and so lets truncation advance) too.
+    /// This delete's own flush runs only after its answer is known: flushing
+    /// first would put the tombstone in the newest segment, and the segment
+    /// probe would then report a removed live row as absent. (A CONCURRENT
+    /// flush can still do that; the answer is advisory — callers apply the
+    /// delete either way.)
+    ///
+    /// The flush is best effort. The delete is already applied and its WAL
+    /// entry durable, so a failed flush loses nothing — the tombstone stays
+    /// resident and keeps the WAL from its LSN — and must not turn a done
+    /// delete into an error (the caller would then skip index maintenance).
     async fn delete_tracked(&self, key: &RecordKey, lsn: Option<u64>) -> Result<bool> {
         let removed = self.delete_unflushed(key, lsn).await?;
-        self.flush_if_over_threshold().await?;
+        if let Err(error) = self.flush_if_over_threshold().await {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                path = %self.base_path.trim_end_matches('/'),
+                "spill: flush after a delete failed; the delete stands, its tombstone stays \
+                 resident and the WAL is retained from it until a later flush succeeds"
+            );
+        }
         Ok(removed)
     }
 
