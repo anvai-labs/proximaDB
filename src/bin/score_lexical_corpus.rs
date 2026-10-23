@@ -96,9 +96,13 @@ struct RunRow<'a> {
 enum EvalIndex {
     DocumentTantivy {
         _root: tempfile::TempDir,
-        index: DocumentFullTextIndex,
+        // Both variants boxed: tantivy 0.27's index handle grew past clippy's
+        // large_enum_variant threshold, and boxing only this variant left
+        // CanonicalHybrid as the new oversized one. These are long-lived
+        // eval harness handles, so the extra indirection is noise.
+        index: Box<DocumentFullTextIndex>,
     },
-    CanonicalHybrid(CanonicalFullTextIndex),
+    CanonicalHybrid(Box<CanonicalFullTextIndex>),
 }
 
 impl EvalIndex {
@@ -122,7 +126,10 @@ impl EvalIndex {
                 let mut index = DocumentFullTextIndex::new_persistent("source-eval", root.path())?;
                 index.add_field("title")?;
                 index.add_field("body")?;
-                Ok(Self::DocumentTantivy { _root: root, index })
+                Ok(Self::DocumentTantivy {
+                    _root: root,
+                    index: Box::new(index),
+                })
             }
             Engine::CanonicalHybrid => {
                 let mut index = CanonicalFullTextIndex::new(TokenizerConfig::for_keyword_search());
@@ -130,7 +137,7 @@ impl EvalIndex {
                     let text = format!("{}\n\n{}", document.title, document.body);
                     index.add_document(&document.id, &text)?;
                 }
-                Ok(Self::CanonicalHybrid(index))
+                Ok(Self::CanonicalHybrid(Box::new(index)))
             }
         }
     }
