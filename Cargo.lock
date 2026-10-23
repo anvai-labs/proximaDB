@@ -1785,15 +1785,6 @@ dependencies = [
 
 [[package]]
 name = "bzip2"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49ecfb22d906f800d4fe833b6282cf4dc1c298f5057ca0b5445e5c209735ca47"
-dependencies = [
- "bzip2-sys",
-]
-
-[[package]]
-name = "bzip2"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f3a53fac24f34a81bc9954b5d6cfce0c21e18ec6959f44f56e8e90e4bb7c346c"
@@ -7221,7 +7212,7 @@ dependencies = [
  "brotli 6.0.0",
  "bytemuck",
  "bytes",
- "bzip2 0.5.2",
+ "bzip2",
  "cap-fs-ext",
  "cap-std",
  "chrono",
@@ -7809,7 +7800,7 @@ version = "0.4.2"
 dependencies = [
  "anyhow",
  "brotli 6.0.0",
- "bzip2 0.6.1",
+ "bzip2",
  "flate2",
  "lz4_flex 0.11.6",
  "proximadb-compression-types",
@@ -9204,7 +9195,7 @@ dependencies = [
  "bincode",
  "brotli 6.0.0",
  "bytemuck",
- "bzip2 0.6.1",
+ "bzip2",
  "flate2",
  "lz4_flex 0.11.6",
  "num_cpus",
