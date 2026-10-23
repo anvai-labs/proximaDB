@@ -32,7 +32,8 @@ pub struct LayerASnapshot {
     /// segments; a store that cannot name it returns no snapshot at all.
     pub filesystem: Option<Arc<dyn FileSystem>>,
     /// A row belongs to the table iff its `variation_id` is unset or equals
-    /// this — the same membership rule every catalog-table scan applies.
+    /// this — the same membership rule every catalog-table scan applies (the
+    /// streaming provider evaluates it after newest-wins resolution).
     pub table_name: String,
 }
 
@@ -44,16 +45,6 @@ impl std::fmt::Debug for LayerASnapshot {
             .field("segments", &self.view.segments)
             .field("table_name", &self.table_name)
             .finish_non_exhaustive()
-    }
-}
-
-impl LayerASnapshot {
-    /// Does `record` belong to this snapshot's table?
-    pub fn is_member(&self, record: &ProximaRecord) -> bool {
-        record
-            .variation_id
-            .as_deref()
-            .is_none_or(|variation| variation == self.table_name)
     }
 }
 

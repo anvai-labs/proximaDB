@@ -165,6 +165,35 @@ impl DataFusionLocalEngine {
         if let Some(native) = context.native_tables.as_ref() {
             use proximadb_storage_common::proxima_arrow::proxima_records_to_record_batch;
             for name in native.tables.values() {
+                // ADR-097 P3.1: stream the record tier when the store offers a
+                // snapshot — no row cap, nothing materialized up front. The
+                // snapshot runs the same identity/ABAC prelude as the scan below.
+                if crate::query::execution::layer_a::layer_a_provider_enabled()
+                    && let Some(snapshot) = native
+                        .source
+                        .layer_a_snapshot(
+                            name,
+                            context.identity.tenant_id.as_deref(),
+                            context.identity.as_borrowed(),
+                        )
+                        .await
+                        .map_err(|e| {
+                            ExecutionError::Context(format!("native table snapshot {name}: {e}"))
+                        })?
+                {
+                    let provider =
+                        crate::query::execution::layer_a::LayerATableProvider::new(snapshot);
+                    ctx.register_table(name.as_str(), std::sync::Arc::new(provider))
+                        .map_err(|e| {
+                            ExecutionError::Context(format!("register native table {name}: {e}"))
+                        })?;
+                    tracing::debug!(
+                        target: "proximadb::compute_route",
+                        table = %name,
+                        "registered native relational table as a streaming Layer A provider"
+                    );
+                    continue;
+                }
                 let scanned = native
                     .source
                     .full_table_records(

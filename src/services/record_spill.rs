@@ -1766,7 +1766,7 @@ impl RecordStore for SpillRecordStorage {
 }
 
 /// Wall clock in nanoseconds, for the canonical dead-record predicate.
-fn now_ns() -> i64 {
+pub(crate) fn now_ns() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)

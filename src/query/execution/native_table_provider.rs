@@ -38,8 +38,9 @@
 //! **It is memory-bounded, and declines rather than degrading.** The whole table is
 //! materialized in memory, exactly as the ADR-025 read-merge base already is. A table
 //! larger than `row_cap` returns `None`, and the caller keeps its existing behaviour
-//! (Volcano + the honest decline) rather than risking an OOM. Streaming is future work
-//! and is tracked with the same note the read-merge carries.
+//! (Volcano + the honest decline) rather than risking an OOM. This materialized path
+//! is now the fallback: a table whose store offers a Layer A snapshot is streamed by
+//! [`crate::query::execution::layer_a`] instead, with no row cap.
 
 use std::collections::HashMap;
 use std::sync::Arc;
