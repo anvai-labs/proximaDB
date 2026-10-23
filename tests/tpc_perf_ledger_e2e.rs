@@ -1348,7 +1348,7 @@ struct LoadStats {
     materialize_wall_ms: u128,
     /// Peak memory per phase (`load`, `materialize`, `queries`).
     memory: Vec<PhaseMemory>,
-    /// Per-table share of the load phase, in schema order.
+    /// Per-table INSERT statements and their summed time, in schema order.
     load_tables: Vec<TableTiming>,
     /// Per-table MATERIALIZE, in schema order.
     materialize_tables: Vec<TableTiming>,
@@ -1363,6 +1363,7 @@ struct TableTiming {
     /// statements run one at a time, so this is the table's share of the wall
     /// time; above 1 they overlap and the sum exceeds the wall time.
     ms: u128,
+    /// MATERIALIZE outcome; a failed INSERT panics, so load entries are `true`.
     ok: bool,
 }
 
@@ -1373,14 +1374,14 @@ fn insert_target(sql: &str) -> &str {
         .unwrap_or("?")
 }
 
-/// Per-table `(statements, ms)` accumulated across load connections.
-type LoadTally = std::sync::Arc<Mutex<std::collections::HashMap<String, (usize, u128)>>>;
+/// Per-table `(statements, time)` accumulated across load connections.
+type LoadTally = std::sync::Arc<Mutex<std::collections::HashMap<String, (usize, Duration)>>>;
 
 fn tally_statement(tally: &LoadTally, sql: &str, elapsed: Duration) {
     let mut tally = tally.lock().expect("load tally lock");
     let entry = tally.entry(insert_target(sql).to_string()).or_default();
     entry.0 += 1;
-    entry.1 += elapsed.as_millis();
+    entry.1 += elapsed;
 }
 
 /// Peak memory of one harness phase. `peak_rss_mib` is this process's VmHWM,
@@ -1966,15 +1967,21 @@ async fn seed(
     let load_tables = schema
         .iter()
         .map(|(name, _)| {
-            let (statements, ms) = tally.remove(*name).unwrap_or_default();
+            let (statements, elapsed) = tally.remove(*name).unwrap_or_default();
             TableTiming {
                 table: name.to_string(),
                 statements,
-                ms,
+                ms: elapsed.as_millis(),
                 ok: true,
             }
         })
         .collect();
+    // Every statement targets a schema table; anything left is a parse miss.
+    assert!(
+        tally.is_empty(),
+        "[{benchmark}] INSERTs outside the schema: {:?}",
+        tally.keys().collect::<Vec<_>>()
+    );
 
     LoadStats {
         benchmark: benchmark.to_string(),

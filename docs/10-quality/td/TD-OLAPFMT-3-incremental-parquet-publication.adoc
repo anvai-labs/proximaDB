@@ -73,11 +73,10 @@ batch rejected, and Bloom filters sized from a full row group.
 == P2.4 gate run (2026-10-23)
 
 Release build, TPC-DS load-only (`docs/_internal/status/P24_SF1_GATE_EVIDENCE_2026_10_23.adoc`).
-Streaming MATERIALIZE is bounded: it added +366 / +329 / +405 MiB of peak RSS over the loaded
-state at SF 0.01 / 0.1 / 0.2 and published 22/22 tables each time, including from spilled
-segments. The SF1 gate itself did not run to completion: with spill on, bulk INSERT is
-quadratic once a table spills
-(link:TD-USUB-21-insert-existence-probe-decodes-every-spill-segment.adoc[TD-USUB-21];
-257× slower at SF 0.01 with a 16,384 threshold), and with spill off the memtable needs ≈ 39 GiB
-at SF1. The SF 0.05 OOM in "Why" (13.7 GB inside MATERIALIZE) was the whole-table in-memory
-rewrite that P2.4 replaced.
+SF1 was not run: with spill on, bulk INSERT is quadratic once a table spills
+(link:TD-USUB-21-insert-existence-probe-decodes-every-spill-segment.adoc[TD-USUB-21]; 257×
+slower at SF 0.01 with a 16,384 threshold), and with spill off the memtable needs ≈ 39 GiB at SF1.
+With spill off, MATERIALIZE peaked +210 / +329 / +405 MiB above the load phase's peak at
+SF 0.01 / 0.1 / 0.2 and published 22/22 tables each time; over a spilled segment it was measured
+once (+265 MiB, one 16,384-row segment). The SF 0.05 OOM recorded in "Why" was measured on the
+whole-table in-memory rewrite that P2.4 replaced; it was not re-run.

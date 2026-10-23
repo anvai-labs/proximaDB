@@ -7,12 +7,13 @@
 
 [.lead]
 The P2.4 gate is "TPC-DS SF1 loads on a release build without OOM, peak RSS recorded"
-(TD-SEAM-4). **It did not pass at SF1 here**, and not because of memory: with the Layer A
-spill on (the default), an INSERT into a table that has spilled decodes every spill segment
-per row (link:../../10-quality/td/TD-USUB-21-insert-existence-probe-decodes-every-spill-segment.adoc[TD-USUB-21]),
-so load time grows quadratically and SF1 does not finish. Streaming MATERIALIZE itself
-is bounded: at every scale measured it added 0.3–0.4 GiB over the loaded state and published
-all 22 tables, including from spilled segments.
+(TD-SEAM-4). **SF1 was not run**: neither configuration can complete it on develop.
+With the Layer A spill on (the default), an INSERT into a table that has spilled decodes every
+spill segment per row
+(link:../../10-quality/td/TD-USUB-21-insert-existence-probe-decodes-every-spill-segment.adoc[TD-USUB-21]),
+so load time grows quadratically; with spill off, the memtable needs ≈ 39 GiB at SF1. What was
+measured: streaming MATERIALIZE peaked 0.2–0.4 GiB above the load phase's peak at every scale
+run (SF 0.01–0.2) and published all 22 tables in every run that reached it.
 
 == Setup
 
@@ -28,48 +29,62 @@ all 22 tables, including from spilled segments.
 ----
 
 `scripts/run_tpc_perf_ledger.sh` needs systemd and cgroup v2; this host has neither, so the
-runs used the shell's existing 13.7 GiB cgroup v1 limit (13.4 GiB, 2.4 GiB short of the host).
-The cgroup peak includes page cache, so it reaches the limit without an OOM kill; VmHWM is the
-process's peak RSS.
+runs used the shell's existing cgroup v1 limit of 13,677 MiB (13.4 GiB), which leaves 2.4 GiB
+of the host's 15.7 GiB. The cgroup peak includes page cache, so it reaches the limit without an
+OOM kill; VmHWM is the process's peak RSS.
+
+Row counts below are the generator's (`scaled(…)` in the harness; they match the INSERT batch
+counts exactly): 61,187 rows at SF 0.01, 586,787 at SF 0.1, 1,170,787 at SF 0.2, 5,842,787 at
+SF1. `store_sales` is 28,800 rows at SF 0.01 and 288,000 at SF 0.1.
 
 == Results
 
-=== Spill on (default, 65,536 resident rows per partition)
+=== Spill on
+
+A partition flushes its memtable to a segment when resident rows reach the threshold, default
+65,536.
 
 [cols="1,1,1,3",options="header"]
 |===
 | Scale | Spill threshold | Load wall | Note
 | 0.01 | 65,536 (default) | 6.7 s | no table reaches the threshold, so nothing spills
-| 0.01 | 16,384 | **1,746 s** (29.1 min) | `store_sales` (28.8 k rows) and `catalog_sales` spill one segment each: **257×** the spill-off load (6.8 s)
-| 0.1 | 65,536 (default) | stopped at 712 s, load unfinished | `store_sales` 288 k rows; one core at 100 % inside `SpillRecordStorage::get_record` → `read_segment` (gdb, 4 samples)
+| 0.01 | 16,384 | **1,746 s** (29.1 min) | only `store_sales` spills: one 16,384-row segment, then each of the remaining 12,416 rows decodes it. **257×** the spill-off load (6.8 s); ≈ 8.6 µs per decoded row
+| 0.1 | 65,536 (default) | stopped at 712 s, load unfinished | one core at 100 %; 4 of 4 gdb samples of the busy thread inside `SpillRecordStorage::get_record` → `read_segment`
 |===
 
-The 16,384 run published all 22 tables (`store_sales` in 879 ms, `catalog_sales` in 829 ms, from
-their spilled segments plus memtable) before the 30-minute task limit stopped it. A second run at
-4,096 panicked because a temp-directory cleanup removed its data directory mid-run; it is not
-evidence.
+The 16,384 run went on to publish all 22 tables (`store_sales` in 879 ms from its segment plus
+memtable) with MATERIALIZE peaking at 4,175 MiB against the load phase's 3,910 MiB (+265 MiB).
+
+A run at 4,096 panicked 15 s in on a missing `store_sales` segment file. It started when the
+16,384 run was killed, and a `find /tmp -name '.tmp*' -exec rm -rf` cleanup ran 20 s later and
+removed its data directory. Rerun at the same setting for 240 s, it wrote two `store_sales`
+segments and read them back on every INSERT with no error.
 
 === Spill off (`PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT=0`)
 
 [cols="1,1,1,1,1,1,1",options="header"]
 |===
-| Scale | Rows loaded | Load wall | Load peak RSS | MATERIALIZE wall | MATERIALIZE peak RSS | Run peak RSS (sampled)
-| 0.01 | 57 k | 6.7 s | 3,691 MiB | 2.6 s | 4,057 MiB | 4,058 MiB
-| 0.1 | 572 k | 61.5 s | 6,992 MiB | 21.3 s | 7,321 MiB | 7,321 MiB
-| 0.2 | 1,144 k | 133.3 s | 10,648 MiB | 44.2 s | 11,053 MiB | 11,054 MiB
+| Scale | Rows loaded | Load wall | Load peak RSS | MATERIALIZE wall | MATERIALIZE peak RSS | Δ
+| 0.01 | 61,187 | 6.8 s | 3,692 MiB | 2.4 s | 3,902 MiB | +210 MiB
+| 0.1 | 586,787 | 61.5 s | 6,992 MiB | 21.3 s | 7,321 MiB | +329 MiB
+| 0.2 | 1,170,787 | 133.3 s | 10,648 MiB | 44.2 s | 11,053 MiB | +405 MiB
 |===
 
-All runs: 22/22 tables published, no OOM. SF 0.2 is the largest scale that fits this cgroup
-with spill off: resident rows cost ≈ 6.5 KiB of RSS each ((10,648 − 6,992) MiB over 572 k rows)
-on a ≈ 3.3 GiB process baseline, so SF1 (5.72 M rows) needs ≈ 39 GiB with spill off. Row counts
-are the generator's (`scaled(…)` in the harness); INSERT batches hold up to 200 rows.
+All three: 22/22 tables published, no OOM. The default-threshold SF 0.01 run above does the same
+work (nothing spills) and measured 3,691 / 4,057 MiB (+366 MiB): run-to-run noise at this scale is
+about 150 MiB.
+
+SF 0.2 is the largest scale that fits this cgroup with spill off. Resident rows cost ≈ 6.4 KiB of
+RSS each ((10,648 − 6,992) MiB over 584,000 rows) on a ≈ 3.3 GiB baseline, so SF1 with spill off
+needs ≈ 39 GiB.
 
 Per table at SF 0.2 (the ledger's `load_tables` / `materialize_tables`; tables under 10 INSERT
-batches omitted):
+batches omitted). Load times are summed per-statement round trips, truncated to whole
+milliseconds per statement in this run (≈ 2 % low; the harness now sums exact durations):
 
 [cols="2,1,1,1",options="header"]
 |===
-| Table | INSERT batches (200 rows) | Load ms | MATERIALIZE ms
+| Table | INSERT batches (≤ 200 rows) | Load ms | MATERIALIZE ms
 | store_sales | 2,880 | 57,903 | 21,991
 | catalog_sales | 1,440 | 42,543 | 12,568
 | web_sales | 720 | 18,931 | 6,362
@@ -84,22 +99,22 @@ batches omitted):
 
 == Reading
 
-* **MATERIALIZE is bounded.** Its peak over the loaded state was +366 MiB (SF 0.01), +329 MiB
-  (SF 0.1) and +405 MiB (SF 0.2) while the data grew 20×. This is the P2.4 claim (chunked scan,
-  sort under a capped pool, multipart part writer), and it holds over spilled segments too.
-* **Load is the blocker, in two ways.**
-  . With spill on, every INSERT probes for an existing row; a miss in the memtable reads and
-    decodes every spill segment whole (TD-USUB-21). Cost per row grows with the spilled
-    data, so load is quadratic. That code is the P2.2 spill path (default on since
-    2026-10-22, `c62ab32b7`), not P2.4's.
-  . With spill off, the memtable holds every row at ≈ 6.5 KiB each, so SF1 needs ≈ 39 GiB.
-* **The ≈ 3.3 GiB baseline** is present 5 s into an SF 0.01 run, before most of the 57 k rows
-  arrive. It is not explained here; it bounds how small a host can run the gate at all.
+* **MATERIALIZE's peak stayed 0.2–0.4 GiB above the load peak** while the data grew 19×
+  (spill off, SF 0.01 → 0.2), consistent with the P2.4 design (chunked scan, sort under a capped
+  pool, multipart part writer). Δ is MATERIALIZE peak minus load peak, so it understates growth
+  over the RSS at MATERIALIZE start. Over spilled segments it was measured once (one 16,384-row
+  segment, +265 MiB); the SF1 rerun is the real test of that path.
+* **Load is the blocker.**
+  . With spill on, every INSERT probes for an existing row, and a memtable miss reads and decodes
+    every spill segment whole (TD-USUB-21), so loading `n` rows decodes about `n²/2` rows. That
+    code is the P2.2 spill path (default on since 2026-10-22, `c62ab32b7`), not P2.4's.
+  . With spill off, the memtable holds every row (≈ 6.4 KiB each).
+* **The ≈ 3.3 GiB baseline**: the SF 0.1 spill-off run was at 3,467 MiB RSS 5 s into a 61 s load.
+  It is not explained here; it bounds how small a host can run the gate at all.
 
 == What it takes to close the gate
 
-Fix TD-USUB-21 (skip the probe for generated oids; prune the point lookup by the segments'
-oid sort and Bloom filters), then rerun at SF1 with spill on:
+Fix TD-USUB-21, then run SF1 with spill on:
 
 ----
 TPC_PERF_SCALE=1 TPC_PERF_BENCHMARK=tpcds TPC_PERF_LOAD_ONLY=1 \
@@ -109,4 +124,4 @@ TPC_PERF_ALLOW_LARGE_SCALE=I_ACCEPT_ISOLATED_OOM TPC_PERF_HOST_HEADROOM_MIB=2048
 
 Disk: the spill-off runs peaked at 1.0 GiB (SF 0.1) and 2.0 GiB (SF 0.2) of temp data, so a
 spill-off SF1 would need ≈ 10 GiB against the 8.8 GiB free here. With spill on the WAL is
-truncated behind flushed segments (P2.2), so the SF1 rerun is expected to need less; measure it.
+truncated behind flushed segments (P2.2), so the SF1 run is expected to need less; measure it.
