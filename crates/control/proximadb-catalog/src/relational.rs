@@ -496,7 +496,11 @@ impl CatalogRow {
     }
 }
 
-fn effective_primary_key(schema: &CatalogTableSchema) -> Vec<&str> {
+/// The DECLARED primary key — the columns whose encoded values become a row's
+/// `oid` in [`CatalogRow::to_proxima_record`]. Empty for a keyless table: its
+/// rows get a generated `oid`, and a column named `id`/`record_id` is an
+/// ordinary column (TD-RELIDEQ-1/2). Prefers `relational_capabilities`.
+pub fn effective_primary_key(schema: &CatalogTableSchema) -> Vec<&str> {
     if !schema.relational_capabilities.primary_key.is_empty() {
         schema
             .relational_capabilities

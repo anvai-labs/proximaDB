@@ -17,6 +17,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 #[cfg(feature = "abac-policy")]
 use proximadb_abac::{ReadContext, SystemReadReason};
+use proximadb_catalog::relational::{RelationalConstraintKind, RelationalConstraintViolation};
 use proximadb_catalog::{
     CatalogPhysicalFormat, CatalogStorageLayout, CatalogTableSchema, ColumnConstraint,
 };
@@ -28,8 +29,7 @@ use crate::query::table_write_plan::{
 };
 use crate::services::WriteLane;
 use crate::services::record_store::{
-    TableRecordGetRequest, TableRecordMutation, TableRecordMutationKind, TableRecordScanRequest,
-    TableRecordStore,
+    TableRecordMutation, TableRecordMutationKind, TableRecordScanRequest, TableRecordStore,
 };
 
 /// Execution status for a routed table-write plan.
@@ -355,7 +355,7 @@ impl TableWriteExecutor for NativeTableWriteExecutor {
             // next batch's probe. (PK duplicates are rejected by write_mutations'
             // Insert-conflict check.)
             let primary_key =
-                crate::services::record_store::schema_primary_key_column(request.target_schema);
+                crate::services::record_store::schema_oid_key_column(request.target_schema);
             let candidate_sets = crate::services::record_store::build_unique_candidate_sets(
                 request.target_schema,
                 &batch,
@@ -370,16 +370,21 @@ impl TableWriteExecutor for NativeTableWriteExecutor {
                         primary_key.as_deref(),
                         &candidate_sets,
                         &std::collections::HashSet::new(),
-                        None,
+                        // The rows land in the writing tenant's partition; probe it.
+                        request.tenant_context,
                     )
                     .await?
             {
-                return Err(anyhow!(
-                    "duplicate key value violates unique constraint on ({}) for table '{}': ({}) already exists",
-                    conflict.columns.join(", "),
-                    request.target_schema.name,
-                    conflict.tuple.join(", ")
-                ));
+                return Err(RelationalConstraintViolation::new(
+                    RelationalConstraintKind::Unique,
+                    format!(
+                        "duplicate key value violates unique constraint on ({}) for table '{}': ({}) already exists",
+                        conflict.columns.join(", "),
+                        request.target_schema.name,
+                        conflict.tuple.join(", ")
+                    ),
+                )
+                .into());
             }
             // TD-110: enforce FOREIGN KEY references on the INSERT-SELECT / native
             // path. Requires a catalog lookup port to resolve parent tables; when
@@ -448,11 +453,12 @@ impl TableWriteExecutor for PlannedOnlyTableWriteExecutor {
 }
 
 /// Enforce FOREIGN KEY references for one source batch against parent tables
-/// in the same partition. Mirrors `DmlService::enforce_foreign_keys`: the
-/// supported shape is a single-column FK referencing the parent PRIMARY KEY,
-/// verified by a point `get_by_key` on the parent. NULL FK values are exempt;
-/// unsupported shapes (composite FK, or a referenced column that is not the
-/// parent PK) are cleanly rejected rather than silently accepted.
+/// in the same partition. Mirrors `DmlService::enforce_foreign_keys` through
+/// the shared resolver (`services::referential`): an FK (single- or
+/// multi-column) referencing the parent's declared key or one of its UNIQUE
+/// sets, in full and in order. NULL FK values are exempt (MATCH SIMPLE); any
+/// other referenced column set is cleanly rejected rather than silently
+/// accepted.
 async fn enforce_foreign_keys_for_batch(
     resolver: &Arc<dyn ParentTableResolver>,
     record_store: &Arc<dyn TableRecordStore>,
@@ -460,7 +466,6 @@ async fn enforce_foreign_keys_for_batch(
     batch: &[ProximaRecord],
     tenant_context: Option<&crate::storage::tenant::context::TenantContext>,
 ) -> Result<()> {
-    let child_primary_key = crate::services::record_store::schema_primary_key_column(target_schema);
     for constraint in &target_schema.relational_capabilities.constraints {
         let ColumnConstraint::ForeignKey {
             columns,
@@ -471,15 +476,15 @@ async fn enforce_foreign_keys_for_batch(
         else {
             continue;
         };
-        if columns.len() != 1 || references_columns.len() != 1 {
+        if columns.len() != references_columns.len() {
             return Err(anyhow!(
-                "composite FOREIGN KEY ({}) on table '{}' is not supported yet",
+                "FOREIGN KEY ({}) on table '{}' has mismatched column counts ({} local vs {} referenced)",
                 columns.join(", "),
-                target_schema.name
+                target_schema.name,
+                columns.len(),
+                references_columns.len()
             ));
         }
-        let fk_column = &columns[0];
-        let referenced_column = &references_columns[0];
 
         let Some(parent) = resolver
             .resolve_parent_table(
@@ -490,60 +495,65 @@ async fn enforce_foreign_keys_for_batch(
         else {
             return Err(anyhow!(
                 "FOREIGN KEY ({}) on table '{}' references missing table '{}'",
-                fk_column,
+                columns.join(", "),
                 target_schema.name,
                 references_table
             ));
         };
-        if crate::services::record_store::schema_primary_key_column(&parent.schema).as_deref()
-            != Some(referenced_column.as_str())
-        {
+        // TD-RELIDEQ-2: the parent's declared key (its oid) or a UNIQUE set —
+        // the same resolution the DML path uses.
+        let Some(referenced_key) = crate::services::referential::resolve_referenced_key(
+            &parent.schema,
+            references_columns,
+        ) else {
             return Err(anyhow!(
-                "FOREIGN KEY ({}) REFERENCES {}({}) on table '{}' is only supported when it references the parent primary key",
-                fk_column,
+                "FOREIGN KEY ({}) REFERENCES {}({}) on table '{}' must reference the parent's primary key or a UNIQUE constraint, in full and in order",
+                columns.join(", "),
                 references_table,
-                referenced_column,
+                references_columns.join(", "),
                 target_schema.name
             ));
-        }
+        };
 
         for record in batch {
-            let Some(values) = crate::services::record_store::record_unique_tuple(
-                record,
-                std::slice::from_ref(fk_column),
-                child_primary_key.as_deref(),
-            ) else {
-                continue; // NULL/absent FK → no reference required
+            // MATCH SIMPLE: a NULL/absent FK column → no reference required.
+            let Some(values) = crate::services::referential::record_key_values(record, columns)
+            else {
+                continue;
             };
-            let key = values.into_iter().next().unwrap_or_default();
-            let referenced_exists = record_store
-                .get_by_key(
-                    &parent.schema,
-                    TableRecordGetRequest {
-                        table_id: parent.table_id_name.clone(),
-                        key: key.clone(),
-                        include_vector: false,
-                        include_props: false,
-                    },
-                    // The parent row is looked up in the writing tenant's partition.
-                    tenant_context,
-                    #[cfg(feature = "abac-policy")]
-                    &ReadContext::system(
-                        SystemReadReason::ForeignKeyResolution,
-                        "table_write_executor",
+            let referenced_exists = crate::services::referential::referenced_parent_exists(
+                record_store.as_ref(),
+                &parent.schema,
+                &parent.table_id_name,
+                referenced_key,
+                references_columns,
+                &values,
+                // The parent row is looked up in the writing tenant's partition.
+                tenant_context,
+                #[cfg(feature = "abac-policy")]
+                &ReadContext::system(
+                    SystemReadReason::ForeignKeyResolution,
+                    "table_write_executor",
+                ),
+            )
+            .await?;
+            if !referenced_exists {
+                return Err(RelationalConstraintViolation::new(
+                    RelationalConstraintKind::ForeignKey,
+                    format!(
+                        "FOREIGN KEY ({}) on table '{}' violates reference: ({}) is not present in {}({})",
+                        columns.join(", "),
+                        target_schema.name,
+                        values
+                            .iter()
+                            .map(crate::services::record_store::proxima_value_to_unique_text)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        references_table,
+                        references_columns.join(", ")
                     ),
                 )
-                .await?
-                .is_some();
-            if !referenced_exists {
-                return Err(anyhow!(
-                    "FOREIGN KEY ({}) on table '{}' violates reference: '{}' is not present in {}({})",
-                    fk_column,
-                    target_schema.name,
-                    key,
-                    references_table,
-                    referenced_column
-                ));
+                .into());
             }
         }
     }

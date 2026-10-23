@@ -1110,6 +1110,115 @@ impl crate::query::execution::native_table_provider::NativeTableSource for DmlSe
     }
 }
 
+/// What a transaction statement's op-lock set must cover beyond its target
+/// table ([`DmlService::transaction_op_lock_set`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxnLockScope {
+    /// INSERT / UPSERT, or an UPDATE of no UNIQUE column: the target only.
+    Target,
+    /// DELETE: the ON DELETE cascade closure.
+    DeleteCascade,
+    /// UPDATE / UPSERT writing these columns (empty = every column, as an
+    /// UPSERT's whole-row replace does): the children referencing any of them
+    /// through a UNIQUE set (TD-RELIDEQ-2, ON UPDATE NO ACTION).
+    UpdateColumns(Vec<String>),
+}
+
+/// TD-110 / TD-RELIDEQ-2: the child tables (anywhere in the tenant's namespace
+/// subtree) whose FOREIGN KEY references `parent_id`'s declared key or one of
+/// its UNIQUE sets, in full and in order. Self-references are excluded.
+async fn child_references(
+    catalog_manager: &CatalogManager,
+    catalog: &Arc<dyn crate::catalog::Catalog>,
+    parent_id: &crate::catalog::TableIdentifier,
+    parent_schema: &CatalogTableSchema,
+    tenant: Option<&str>,
+) -> Result<Vec<ChildReference>> {
+    // Nothing can reference a table with neither a declared key nor a UNIQUE
+    // set — skip the tenant-wide catalog walk (review m3).
+    if crate::services::record_store::schema_declared_primary_key_columns(parent_schema).is_empty()
+        && crate::services::record_store::schema_unique_column_sets(parent_schema).is_empty()
+    {
+        return Ok(Vec::new());
+    }
+    // TD-110 S3: enumerate candidate children across the tenant's WHOLE
+    // namespace subtree (not just the parent's namespace), so a child living
+    // in another namespace whose FK references this parent is found. Scoped
+    // to the tenant (`Some([tenant])`) to keep child discovery intra-tenant;
+    // cross-tenant children are never enumerated. The per-child reference
+    // match below still requires the FK to resolve to THIS parent (name AND
+    // namespace), so a same-named table in another namespace never matches.
+    let tenant_scope = tenant.map(|t| vec![t.to_string()]);
+    let sibling_ids = catalog
+        .list_all_tables_in_scope(tenant_scope.as_deref())
+        .await?;
+    let mut out = Vec::new();
+    for child_id in sibling_ids {
+        if child_id.name == parent_id.name && child_id.namespace == parent_id.namespace {
+            continue; // Self-referencing FK on the same table: out of scope.
+        }
+        let child_schema = catalog.get_table(&child_id).await?;
+        for constraint in &child_schema.relational_capabilities.constraints {
+            let proximadb_catalog::ColumnConstraint::ForeignKey {
+                columns,
+                references_table,
+                references_columns,
+                on_delete,
+                on_update,
+            } = constraint
+            else {
+                continue;
+            };
+            if columns.len() != references_columns.len() {
+                continue; // Malformed FK (mismatched arities): skip.
+            }
+            // Does this FK reference `parent_id`? Resolve under the SAME
+            // tenant scope so cross-tenant FKs never match.
+            let Ok((_, referenced_id)) = catalog_manager
+                .resolve_table_scoped(references_table, tenant)
+                .await
+            else {
+                continue;
+            };
+            if referenced_id.name != parent_id.name
+                || referenced_id.namespace != parent_id.namespace
+            {
+                continue;
+            }
+            // Only FKs referencing the parent's full declared key or a full
+            // UNIQUE set (in order) are enforced (TD-RELIDEQ-2).
+            let Some(referenced_key) = crate::services::referential::resolve_referenced_key(
+                parent_schema,
+                references_columns,
+            ) else {
+                continue;
+            };
+            out.push(ChildReference {
+                child_id: child_id.clone(),
+                child_schema: child_schema.clone(),
+                fk_columns: columns.clone(),
+                references_columns: references_columns.clone(),
+                referenced_key,
+                on_delete: *on_delete,
+                on_update: *on_update,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// TD-110 / TD-RELIDEQ-2: a child table's FOREIGN KEY onto a parent, and how
+/// its referenced columns identify the parent row.
+struct ChildReference {
+    child_id: crate::catalog::TableIdentifier,
+    child_schema: CatalogTableSchema,
+    fk_columns: Vec<String>,
+    references_columns: Vec<String>,
+    referenced_key: crate::services::referential::ReferencedKey,
+    on_delete: Option<proximadb_catalog::ReferentialAction>,
+    on_update: Option<proximadb_catalog::ReferentialAction>,
+}
+
 impl DmlService {
     /// Create a new DML service
     pub fn new(catalog_manager: Arc<CatalogManager>, vector_ops: Arc<VectorOps>) -> Self {
@@ -1342,17 +1451,19 @@ impl DmlService {
     }
 
     /// The op-lock set a transaction touching `tables` must hold: each table
-    /// plus its ON DELETE cascade closure, resolved in each entry's tenant scope.
+    /// plus what its statement walks ([`TxnLockScope`]), resolved in each
+    /// entry's tenant scope.
     pub async fn transaction_op_lock_set(
         &self,
-        tables: &[(String, Option<TenantContext>, bool)],
+        tables: &[(String, Option<TenantContext>, TxnLockScope)],
     ) -> Result<std::collections::HashSet<TableIdentifier>> {
         let mut set = std::collections::HashSet::new();
-        // The bool asks for the ON DELETE cascade closure — only DELETE walks
-        // it; INSERT/UPDATE/UPSERT hold just their target (`ensure_held` fails
-        // closed if that is ever too small). Skipping it avoids a tenant-wide
-        // catalog scan per statement (review S4a F7).
-        for (table_name, tenant_context, with_cascade_closure) in tables {
+        // Only DELETE walks the ON DELETE cascade closure, and only an UPDATE of
+        // a UNIQUE column its referencing children; everything else holds just
+        // its target (`ensure_held` fails closed if that is ever too small).
+        // Skipping the walk avoids a tenant-wide catalog scan per statement
+        // (review S4a F7).
+        for (table_name, tenant_context, scope) in tables {
             let (catalog, table_id) = self
                 .catalog_manager
                 .resolve_table_scoped(
@@ -1360,18 +1471,37 @@ impl DmlService {
                     tenant_context.as_ref().map(|t| t.tenant_id.as_str()),
                 )
                 .await?;
-            if *with_cascade_closure && catalog.table_exists(&table_id).await? {
+            if !matches!(scope, TxnLockScope::Target) && catalog.table_exists(&table_id).await? {
                 let schema = catalog.get_table(&table_id).await?;
-                for (namespace, name) in self
-                    .discover_cascade_child_set(
-                        &catalog,
-                        &table_id,
-                        &schema,
-                        tenant_context.as_ref(),
-                    )
-                    .await?
-                {
-                    set.insert(TableIdentifier { namespace, name });
+                match scope {
+                    TxnLockScope::Target => {}
+                    TxnLockScope::DeleteCascade => {
+                        for (namespace, name) in self
+                            .discover_cascade_child_set(
+                                &catalog,
+                                &table_id,
+                                &schema,
+                                tenant_context.as_ref(),
+                            )
+                            .await?
+                        {
+                            set.insert(TableIdentifier { namespace, name });
+                        }
+                    }
+                    TxnLockScope::UpdateColumns(columns) => {
+                        for child in self
+                            .children_referencing_columns(
+                                &catalog,
+                                &table_id,
+                                &schema,
+                                columns,
+                                tenant_context.as_ref(),
+                            )
+                            .await?
+                        {
+                            set.insert(child.child_id);
+                        }
+                    }
                 }
             }
             set.insert(table_id);
@@ -4330,8 +4460,21 @@ impl DmlService {
         let dml_lock_guard = self
             .acquire_table_dml_lock(&table_id, tenant_context, LockIntent::Write)
             .await?;
-        // TD-110 S1: non-reentrant in-process operation lock (see execute_insert).
-        let _op_lock = self.op_lock(&table_id).await?;
+        // TD-RELIDEQ-2: hold the children that reference an assigned column
+        // through a UNIQUE set (TD-110 S1 op-lock with the target, sorted).
+        let assigned: Vec<String> = assignments
+            .iter()
+            .map(|(column, _)| column.clone())
+            .collect();
+        let (referencing_children, _op_locks, child_dml_locks) = self
+            .lock_unique_referencing_children(
+                &catalog,
+                &table_id,
+                &table_schema,
+                &assigned,
+                tenant_context,
+            )
+            .await?;
         let ids_to_update = if let Some(ref wc) = where_clause {
             self.resolve_matching_ids(&table_schema, &table_id.name, wc, tenant_context)
                 .await?
@@ -4350,6 +4493,7 @@ impl DmlService {
         Self::validate_update_assignments(&assignments, &table_schema)?;
 
         let mut records = Vec::new();
+        let mut old_rows = Vec::new();
         let mut warnings = Vec::new();
         for record_id in &ids_to_update {
             let Some(existing) = self
@@ -4375,6 +4519,9 @@ impl DmlService {
                 continue;
             };
 
+            if !referencing_children.is_empty() {
+                old_rows.push(Self::rich_result_to_record(existing.clone()));
+            }
             records.push(self.build_updated_proxima_record(
                 existing,
                 &assignments,
@@ -4391,7 +4538,8 @@ impl DmlService {
         // rows are excluded so a row keeping or vacating its own unique value is
         // not flagged as a self-conflict. (PK is immutable on UPDATE — rejected by
         // validate_update_assignments — so only non-PK UNIQUE sets apply here.)
-        let primary_key = Self::primary_key_column(&table_schema);
+        // TD-RELIDEQ-2: only a declared single-column key is read from the oid.
+        let primary_key = crate::services::record_store::schema_oid_key_column(&table_schema);
         let candidate_sets =
             Self::build_unique_candidate_sets(&table_schema, &records, primary_key.as_deref())?;
         if !candidate_sets.is_empty() {
@@ -4416,6 +4564,15 @@ impl DmlService {
         // TD-110: an UPDATE may change a FOREIGN KEY column — re-verify references.
         self.enforce_foreign_keys(&table_schema, &records, tenant_context)
             .await?;
+        // TD-RELIDEQ-2: … and may change a value children reference.
+        self.enforce_update_referential_actions(
+            &table_schema,
+            &referencing_children,
+            &old_rows,
+            &records,
+            tenant_context,
+        )
+        .await?;
 
         let updated_count = records.len();
         let mutations = records
@@ -4448,7 +4605,8 @@ impl DmlService {
             format!("Updated {} rows", updated_count),
         );
         result.warnings = warnings;
-        self.finish_dml_guards(dml_lock_guard).await;
+        self.finish_dml_guards(dml_lock_guard.into_iter().chain(child_dml_locks))
+            .await;
         Ok(result)
     }
 
@@ -4705,7 +4863,19 @@ impl DmlService {
         // TD-DML-1: the same non-reentrant in-process op-lock INSERT holds (see
         // execute_insert) — the constraint probes below and the write must not
         // interleave with a concurrent writer or a cascading parent DELETE.
-        let _op_lock = self.op_lock(&table_id).await?;
+        // TD-RELIDEQ-2: a replaced row can change a UNIQUE value children
+        // reference, so the referencing children are held too. An UPSERT
+        // replaces the WHOLE row — a column missing from its list is written as
+        // NULL/default — so every column counts as written (`&[]`).
+        let (referencing_children, _op_locks, child_dml_locks) = self
+            .lock_unique_referencing_children(
+                &catalog,
+                &table_id,
+                &table_schema,
+                &[],
+                tenant_context,
+            )
+            .await?;
         let (write_intent, write_lane_decision) = Self::route_row_dml_write_intent(
             &table_schema,
             WriteOperationKind::Upsert,
@@ -4725,6 +4895,25 @@ impl DmlService {
             )?;
             inserted_ids.push(record.oid.clone());
             records.push(record);
+        }
+
+        // TD-RELIDEQ-2: ON UPDATE NO ACTION for the rows being replaced — the
+        // live rows at these oids. Checked BEFORE the integrity sequence below,
+        // which may claim keys in the fenced CKS and releases them only on its
+        // own failure: a rejection here must leave no claim behind.
+        if !referencing_children.is_empty() {
+            let oids: Vec<String> = records.iter().map(|record| record.oid.clone()).collect();
+            let old_rows = self
+                .fetch_rows_by_oid(&table_schema, &table_id.name, &oids, tenant_context)
+                .await?;
+            self.enforce_update_referential_actions(
+                &table_schema,
+                &referencing_children,
+                &old_rows,
+                &records,
+                tenant_context,
+            )
+            .await?;
         }
 
         // TD-DML-1: an UPSERT writes rows exactly like INSERT does, so it runs
@@ -4781,7 +4970,8 @@ impl DmlService {
         let result =
             DmlResult::success(num_records as u64, format!("Upserted {} rows", num_records))
                 .with_inserted_ids(inserted_ids);
-        self.finish_dml_guards(dml_lock_guard).await;
+        self.finish_dml_guards(dml_lock_guard.into_iter().chain(child_dml_locks))
+            .await;
         Ok(result)
     }
 
@@ -5457,7 +5647,8 @@ impl DmlService {
             return Err(anyhow!("UPDATE requires at least one assignment"));
         }
 
-        let primary_key_column = Self::primary_key_column(table_schema);
+        let declared_key =
+            crate::services::record_store::schema_declared_primary_key_columns(table_schema);
         for (column_name, value) in assignments {
             let Some(column) = table_schema
                 .columns
@@ -5470,9 +5661,10 @@ impl DmlService {
                     table_schema.name
                 ));
             };
-            if primary_key_column.as_deref() == Some(column_name.as_str())
-                && Self::table_declares_primary_key(table_schema)
-            {
+            // TD-RELIDEQ-2: every DECLARED key column is immutable (a composite
+            // key's columns too — the oid encodes the whole tuple); a keyless
+            // table's `id`/`record_id` fallback is an ordinary column.
+            if declared_key.iter().any(|key| key == column_name) {
                 return Err(anyhow!(
                     "UPDATE cannot modify primary key column '{}'",
                     column_name
@@ -5549,15 +5741,15 @@ impl DmlService {
         existing: &RichSearchResult,
         table_schema: &CatalogTableSchema,
     ) -> Result<HashMap<String, ProximaValue>> {
-        let primary_key_column = Self::primary_key_column(table_schema);
+        // TD-RELIDEQ-1/2: only a declared SINGLE-column key IS the oid. A
+        // composite key's oid encodes the whole tuple (its columns come from
+        // props, which hold every column), and a keyless table's
+        // `id`/`record_id` fallback is an ordinary column.
+        let oid_key_column = crate::services::record_store::schema_oid_key_column(table_schema);
         let mut row_values = HashMap::new();
 
         for column in &table_schema.columns {
-            // TD-RELIDEQ-1: only a declared key lives in the oid; a keyless
-            // table's `id`/`record_id` fallback column is an ordinary column.
-            if primary_key_column.as_deref() == Some(column.name.as_str())
-                && Self::table_declares_primary_key(table_schema)
-            {
+            if oid_key_column.as_deref() == Some(column.name.as_str()) {
                 row_values.insert(
                     column.name.clone(),
                     Self::primary_key_string_to_proxima_value(
@@ -5854,7 +6046,8 @@ impl DmlService {
         // excludes nothing (every row is new). UPSERT excludes the statement's
         // own oids: a replaced row vacates its old UNIQUE values (exactly as
         // UPDATE excludes its target rows), and a new row's oid is not stored.
-        let primary_key = Self::primary_key_column(table_schema);
+        // TD-RELIDEQ-2: only a declared single-column key is read from the oid.
+        let primary_key = crate::services::record_store::schema_oid_key_column(table_schema);
         let candidate_sets =
             Self::build_unique_candidate_sets(table_schema, records, primary_key.as_deref())?;
         if !candidate_sets.is_empty() {
@@ -5940,10 +6133,6 @@ impl DmlService {
         deleted_keys: &[String],
         tenant_context: Option<&TenantContext>,
     ) -> Result<()> {
-        let Some(_parent_pk) = Self::primary_key_column(parent_schema) else {
-            return Ok(()); // No PK → nothing can reference these rows.
-        };
-
         // Reject a cyclic CASCADE chain up front, before any mutation, so the
         // error leaves nothing partially deleted. The transitive write locks
         // (in-process op-locks + durable DML locks) for the child set are
@@ -5964,6 +6153,7 @@ impl DmlService {
             parent_table_id,
             parent_schema,
             deleted_keys,
+            None,
             tenant_context,
             std::collections::HashSet::new(),
             0,
@@ -6018,91 +6208,29 @@ impl DmlService {
     /// Factored out so both the discovery pass and the recursive worker share one
     /// copy of the FK-matching logic. Self-references are excluded; only FKs that
     /// reference the parent's FULL PK (in order) are returned — partial / non-PK
-    /// references remain unsupported (S2 scope).
+    /// references remain unsupported (S2 scope). TD-RELIDEQ-2: "PK" is the
+    /// DECLARED key; an FK may also reference a parent UNIQUE set (the SQL
+    /// rule), which is how a keyless parent is referenced.
     async fn child_tables_referencing(
         &self,
         catalog: &Arc<dyn crate::catalog::Catalog>,
         parent_id: &crate::catalog::TableIdentifier,
         parent_schema: &CatalogTableSchema,
         tenant_context: Option<&TenantContext>,
-    ) -> Result<
-        Vec<(
-            crate::catalog::TableIdentifier,
-            CatalogTableSchema,
-            Vec<String>,
-            Option<proximadb_catalog::ReferentialAction>,
-        )>,
-    > {
-        let parent_pk_cols = Self::primary_key_columns(parent_schema);
-        if parent_pk_cols.is_empty() {
-            return Ok(Vec::new());
-        }
-        // TD-110 S3: enumerate candidate children across the tenant's WHOLE
-        // namespace subtree (not just the parent's namespace), so a child living
-        // in another namespace whose FK references this parent is found. Scoped
-        // to the tenant (`Some([tenant])`) to keep child discovery intra-tenant;
-        // cross-tenant children are never enumerated. The per-child reference
-        // match below still requires the FK to resolve to THIS parent (name AND
-        // namespace), so a same-named table in another namespace never matches.
-        let tenant_scope = tenant_context.map(|t| vec![t.tenant_id.clone()]);
-        let sibling_ids = catalog
-            .list_all_tables_in_scope(tenant_scope.as_deref())
-            .await?;
-        let mut out = Vec::new();
-        for child_id in sibling_ids {
-            if child_id.name == parent_id.name && child_id.namespace == parent_id.namespace {
-                continue; // Self-referencing FK on the same table: out of scope.
-            }
-            let child_schema = catalog.get_table(&child_id).await?;
-            for constraint in &child_schema.relational_capabilities.constraints {
-                let proximadb_catalog::ColumnConstraint::ForeignKey {
-                    columns,
-                    references_table,
-                    references_columns,
-                    on_delete,
-                    ..
-                } = constraint
-                else {
-                    continue;
-                };
-                if columns.len() != references_columns.len() {
-                    continue; // Malformed FK (mismatched arities): skip.
-                }
-                // Does this FK reference `parent_id`? Resolve under the SAME
-                // tenant scope so cross-tenant FKs never match.
-                let Ok((_, referenced_id)) = self
-                    .catalog_manager
-                    .resolve_table_scoped(
-                        references_table,
-                        tenant_context.map(|t| t.tenant_id.as_str()),
-                    )
-                    .await
-                else {
-                    continue;
-                };
-                if referenced_id.name != parent_id.name
-                    || referenced_id.namespace != parent_id.namespace
-                {
-                    continue;
-                }
-                // Only FKs referencing the parent's FULL primary key (in order)
-                // are enforced; partial / non-PK references are not (S2 scope).
-                if references_columns.as_slice() != parent_pk_cols.as_slice() {
-                    continue;
-                }
-                out.push((
-                    child_id.clone(),
-                    child_schema.clone(),
-                    columns.clone(),
-                    *on_delete,
-                ));
-            }
-        }
-        Ok(out)
+    ) -> Result<Vec<ChildReference>> {
+        child_references(
+            &self.catalog_manager,
+            catalog,
+            parent_id,
+            parent_schema,
+            tenant_context.map(|t| t.tenant_id.as_str()),
+        )
+        .await
     }
 
     /// TD-110 S1: the transitive closure of child tables reachable from
-    /// `parent_id` via any single-column FK on the parent PK (any action). Used
+    /// `parent_id` via any FK on its declared key or a UNIQUE set (any action,
+    /// see [`child_references`]). Used
     /// to size the DML write-lock set before the cascade. Cycle- and
     /// diamond-safe (each table visited once); excludes the parent itself.
     async fn discover_cascade_child_set(
@@ -6120,7 +6248,11 @@ impl DmlService {
         let mut frontier: Vec<(crate::catalog::TableIdentifier, CatalogTableSchema)> =
             vec![(parent_id.clone(), parent_schema.clone())];
         while let Some((tid, schema)) = frontier.pop() {
-            for (child_id, child_schema, _fk_column, _on_delete) in self
+            for ChildReference {
+                child_id,
+                child_schema,
+                ..
+            } in self
                 .child_tables_referencing(catalog, &tid, &schema, tenant_context)
                 .await?
             {
@@ -6186,7 +6318,12 @@ impl DmlService {
             ));
         }
         gray.insert(key.clone());
-        for (child_id, child_schema, _fk_column, on_delete) in self
+        for ChildReference {
+            child_id,
+            child_schema,
+            on_delete,
+            ..
+        } in self
             .child_tables_referencing(catalog, id, schema, tenant_context)
             .await?
         {
@@ -6210,6 +6347,241 @@ impl DmlService {
         Ok(())
     }
 
+    /// The rows of `child`'s table whose FOREIGN KEY values reference one of
+    /// `referenced` — parent keys in
+    /// [`crate::services::referential::parent_referenced_key_text`] form, which
+    /// [`crate::services::referential::child_reference_text`] matches for both
+    /// key and UNIQUE references, single- and multi-column. MATCH SIMPLE: a
+    /// child with any NULL, absent or non-scalar FK column references nothing.
+    async fn find_referencing_rows(
+        &self,
+        child: &ChildReference,
+        parent_schema: &CatalogTableSchema,
+        referenced: &std::collections::HashSet<String>,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<Vec<ProximaRecord>> {
+        let pred = |record: &ProximaRecord| {
+            crate::services::referential::record_key_values(record, &child.fk_columns)
+                .and_then(|values| {
+                    crate::services::referential::child_reference_text(
+                        &values,
+                        child.referenced_key,
+                        &child.references_columns,
+                        parent_schema,
+                    )
+                })
+                .is_some_and(|text| referenced.contains(&text))
+        };
+        let predicate: Option<&proximadb_records::RecordScanPredicate<'_>> = Some(&pred);
+        self.record_store
+            .scan_records_filtered(
+                &child.child_schema,
+                TableRecordScanRequest {
+                    filter: None,
+                    table_id: child.child_id.name.clone(),
+                    limit: None,
+                    include_vector: true,
+                    include_props: true,
+                },
+                predicate,
+                tenant_context,
+                #[cfg(feature = "abac-policy")]
+                &ReadContext::system(
+                    SystemReadReason::ForeignKeyResolution,
+                    "dml::referencing_check",
+                ),
+            )
+            .await
+    }
+
+    /// TD-RELIDEQ-2: the op-locks (and cross-pod DML locks) for a write that
+    /// may change `assigned` columns: the target plus every child referencing
+    /// one of them through a UNIQUE set, acquired in the same sorted order as
+    /// DELETE's cascade set (non-reentrant op-locks; no lock inversion). Holding
+    /// the children keeps a child row referencing an old value from slipping in
+    /// mid-statement. Returns those children for the ON UPDATE check.
+    async fn lock_unique_referencing_children(
+        &self,
+        catalog: &Arc<dyn crate::catalog::Catalog>,
+        table_id: &TableIdentifier,
+        table_schema: &CatalogTableSchema,
+        assigned: &[String],
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<(
+        Vec<ChildReference>,
+        Vec<tokio::sync::OwnedSemaphorePermit>,
+        Vec<DmlLockGuard>,
+    )> {
+        let children = self
+            .children_referencing_columns(catalog, table_id, table_schema, assigned, tenant_context)
+            .await?;
+        let child_set: std::collections::BTreeSet<(Vec<String>, String)> = children
+            .iter()
+            .map(|child| {
+                (
+                    child.child_id.namespace.clone(),
+                    child.child_id.name.clone(),
+                )
+            })
+            .collect();
+        let mut tables: Vec<TableIdentifier> = child_set
+            .iter()
+            .map(|(namespace, name)| TableIdentifier {
+                namespace: namespace.clone(),
+                name: name.clone(),
+            })
+            .collect();
+        tables.push(table_id.clone());
+        let op_locks = self.op_locks_sorted(tables).await?;
+        let dml_locks = self
+            .acquire_cascade_child_dml_locks(&child_set, tenant_context)
+            .await?;
+        Ok((children, op_locks, dml_locks))
+    }
+
+    /// TD-RELIDEQ-2: the direct children whose FOREIGN KEY references, through
+    /// a UNIQUE set, a column in `assigned` — the children an UPDATE of those
+    /// columns can orphan. Empty without a catalog scan when no assigned column
+    /// is in a UNIQUE set (the common UPDATE); a primary-key reference never
+    /// qualifies (the key is immutable on UPDATE).
+    async fn children_referencing_columns(
+        &self,
+        catalog: &Arc<dyn crate::catalog::Catalog>,
+        table_id: &crate::catalog::TableIdentifier,
+        table_schema: &CatalogTableSchema,
+        assigned: &[String],
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<Vec<ChildReference>> {
+        // An empty column list (INSERT … VALUES without one) writes every column.
+        let writes = |column: &str| {
+            assigned.is_empty() || assigned.iter().any(|a| a.eq_ignore_ascii_case(column))
+        };
+        let touches_unique = crate::services::record_store::schema_unique_column_sets(table_schema)
+            .iter()
+            .flatten()
+            .any(|column| writes(column));
+        if !touches_unique {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .child_tables_referencing(catalog, table_id, table_schema, tenant_context)
+            .await?
+            .into_iter()
+            .filter(|child| {
+                child.referenced_key == crate::services::referential::ReferencedKey::Unique
+                    && child.references_columns.iter().any(|column| writes(column))
+            })
+            .collect())
+    }
+
+    /// TD-RELIDEQ-2: ON UPDATE NO ACTION for UNIQUE references — reject an
+    /// UPDATE that removes a referenced value children still use. Values the
+    /// statement removes but also re-creates (A→B alongside C→A) stay
+    /// referenced, as in PostgreSQL's end-of-statement check.
+    async fn enforce_update_referential_actions(
+        &self,
+        table_schema: &CatalogTableSchema,
+        referencing_children: &[ChildReference],
+        old_rows: &[ProximaRecord],
+        new_rows: &[ProximaRecord],
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<()> {
+        for child in referencing_children {
+            let key_texts = |rows: &[ProximaRecord]| -> std::collections::HashSet<String> {
+                rows.iter()
+                    .filter_map(|row| {
+                        crate::services::referential::parent_referenced_key_text(
+                            row,
+                            child.referenced_key,
+                            &child.references_columns,
+                            table_schema,
+                        )
+                    })
+                    .collect()
+            };
+            let after = key_texts(new_rows);
+            let removed: std::collections::HashSet<String> = key_texts(old_rows)
+                .into_iter()
+                .filter(|text| !after.contains(text))
+                .collect();
+            if removed.is_empty() {
+                continue;
+            }
+            let referencing = self
+                .find_referencing_rows(child, table_schema, &removed, tenant_context)
+                .await?;
+            if referencing.is_empty() {
+                continue;
+            }
+            // Only NO ACTION / RESTRICT are implemented; a declared CASCADE /
+            // SET NULL / SET DEFAULT must not be silently enforced as NO ACTION.
+            if let Some(
+                action @ (proximadb_catalog::ReferentialAction::Cascade
+                | proximadb_catalog::ReferentialAction::SetNull
+                | proximadb_catalog::ReferentialAction::SetDefault),
+            ) = child.on_update
+            {
+                return Err(anyhow!(
+                    "ON UPDATE {action:?} on table '{}' (FOREIGN KEY {}) is not supported",
+                    child.child_id.name,
+                    child.fk_columns.join(", ")
+                ));
+            }
+            {
+                return Err(RelationalConstraintViolation::new(
+                    RelationalConstraintKind::ForeignKey,
+                    format!(
+                        "changing ({}) on table '{}' violates FOREIGN KEY ({}) on table '{}': {} referencing row(s) still use the old value (ON UPDATE NO ACTION)",
+                        child.references_columns.join(", "),
+                        table_schema.name,
+                        child.fk_columns.join(", "),
+                        child.child_id.name,
+                        referencing.len()
+                    ),
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// TD-RELIDEQ-2: the live rows behind `oids` (props included), for ON
+    /// DELETE matching on a UNIQUE reference. A row that is already gone has
+    /// nothing left to reference it and is skipped.
+    async fn fetch_rows_by_oid(
+        &self,
+        table_schema: &CatalogTableSchema,
+        table_id: &str,
+        oids: &[String],
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<Vec<ProximaRecord>> {
+        let mut rows = Vec::with_capacity(oids.len());
+        for oid in oids {
+            if let Some(row) = self
+                .record_store
+                .get_by_key(
+                    table_schema,
+                    TableRecordGetRequest {
+                        table_id: table_id.to_string(),
+                        key: oid.clone(),
+                        include_vector: false,
+                        include_props: true,
+                    },
+                    tenant_context,
+                    #[cfg(feature = "abac-policy")]
+                    &ReadContext::system(
+                        SystemReadReason::ForeignKeyResolution,
+                        "dml::referential_action",
+                    ),
+                )
+                .await?
+            {
+                rows.push(Self::rich_result_to_record(row));
+            }
+        }
+        Ok(rows)
+    }
+
     /// TD-110 S1: recursive worker that applies ON DELETE actions for one level
     /// and, for CASCADE, descends into the deleted children. `ancestors` is the
     /// set of `(namespace, table)` on the path from the root EXCLUDING the
@@ -6223,6 +6595,7 @@ impl DmlService {
         table_id: &crate::catalog::TableIdentifier,
         table_schema: &CatalogTableSchema,
         deleted_keys: &[String],
+        deleted_rows: Option<&[ProximaRecord]>,
         tenant_context: Option<&TenantContext>,
         ancestors: std::collections::HashSet<(Vec<String>, String)>,
         depth: u32,
@@ -6242,65 +6615,66 @@ impl DmlService {
                 table_id.name
             ));
         }
-        let Some(_pk) = Self::primary_key_column(table_schema) else {
-            return Ok(()); // No PK → nothing can reference these rows.
-        };
-        let deleted: std::collections::HashSet<&str> =
-            deleted_keys.iter().map(String::as_str).collect();
+        let deleted_oids: std::collections::HashSet<String> =
+            deleted_keys.iter().cloned().collect();
+        // TD-RELIDEQ-2: a UNIQUE reference matches children against the deleted
+        // rows' referenced VALUES, not their oids. Below the top level the rows
+        // are passed in (they are already tombstoned); at the top level the
+        // parent rows are still live and are read once, on first need.
+        let mut fetched_rows: Option<Vec<ProximaRecord>> = None;
 
-        for (child_id, child_schema, fk_columns, on_delete) in self
+        for child in self
             .child_tables_referencing(catalog, table_id, table_schema, tenant_context)
             .await?
         {
-            // Find child rows referencing any deleted parent key (tuple). The FK
-            // columns' typed values are extracted from the record and encoded
-            // with the SAME encoder that built the deleted parent oids
-            // (`encode_primary_key_tuple` / `stable_value_string`), so a probe
-            // always matches the oid exactly — for both single- and multi-column
-            // FKs. MATCH SIMPLE: any NULL/absent/non-scalar FK column → exempt.
-            let fk_for_pred = fk_columns.clone();
-            let deleted_ref = &deleted;
-            let pred = move |record: &ProximaRecord| {
-                let mut values: Vec<ProximaValue> = Vec::with_capacity(fk_for_pred.len());
-                for col in &fk_for_pred {
-                    match record.props.get(col) {
-                        Some(ProximaTreeNode::Value(value))
-                            if !matches!(value, ProximaValue::Null) =>
-                        {
-                            values.push(value.clone());
+            let deleted: std::collections::HashSet<String> = match child.referenced_key {
+                crate::services::referential::ReferencedKey::PrimaryKey => deleted_oids.clone(),
+                crate::services::referential::ReferencedKey::Unique => {
+                    let rows: &[ProximaRecord] = match deleted_rows {
+                        Some(rows) => rows,
+                        None => {
+                            if fetched_rows.is_none() {
+                                fetched_rows = Some(
+                                    self.fetch_rows_by_oid(
+                                        table_schema,
+                                        &table_id.name,
+                                        deleted_keys,
+                                        tenant_context,
+                                    )
+                                    .await?,
+                                );
+                            }
+                            fetched_rows.as_deref().unwrap_or(&[])
                         }
-                        _ => return false, // NULL/absent/non-scalar FK → MATCH SIMPLE exempt.
-                    }
-                }
-                match encode_primary_key_tuple(&values) {
-                    Ok(encoded) => deleted_ref.contains(encoded.as_str()),
-                    Err(_) => false,
+                    };
+                    rows.iter()
+                        .filter_map(|row| {
+                            crate::services::referential::parent_referenced_key_text(
+                                row,
+                                child.referenced_key,
+                                &child.references_columns,
+                                table_schema,
+                            )
+                        })
+                        .collect()
                 }
             };
-            let predicate: Option<&proximadb_records::RecordScanPredicate<'_>> = Some(&pred);
+            if deleted.is_empty() {
+                continue;
+            }
             let referencing = self
-                .record_store
-                .scan_records_filtered(
-                    &child_schema,
-                    TableRecordScanRequest {
-                        filter: None,
-                        table_id: child_id.name.clone(),
-                        limit: None,
-                        include_vector: true,
-                        include_props: true,
-                    },
-                    predicate,
-                    tenant_context,
-                    #[cfg(feature = "abac-policy")]
-                    &ReadContext::system(
-                        SystemReadReason::ForeignKeyResolution,
-                        "dml::referencing_check",
-                    ),
-                )
+                .find_referencing_rows(&child, table_schema, &deleted, tenant_context)
                 .await?;
             if referencing.is_empty() {
                 continue;
             }
+            let ChildReference {
+                child_id,
+                child_schema,
+                fk_columns,
+                on_delete,
+                ..
+            } = child;
 
             match on_delete {
                 None
@@ -6369,6 +6743,7 @@ impl DmlService {
                             &child_id,
                             &child_schema,
                             &child_deleted_keys,
+                            Some(&referencing),
                             tenant_context,
                             child_ancestors,
                             depth + 1,
@@ -6377,6 +6752,10 @@ impl DmlService {
                     }
                 }
                 Some(proximadb_catalog::ReferentialAction::SetNull) => {
+                    // Nulling the FK columns is an UPDATE of the child: when they
+                    // are a UNIQUE set referenced in turn, NO ACTION applies to
+                    // the grandchildren (locked with the cascade closure).
+                    let previous = referencing.clone();
                     let mut updated = Vec::with_capacity(referencing.len());
                     for mut record in referencing {
                         // Null ALL FK columns (standard SET NULL on a composite FK).
@@ -6387,6 +6766,23 @@ impl DmlService {
                         }
                         updated.push(record);
                     }
+                    let grandchildren = self
+                        .children_referencing_columns(
+                            catalog,
+                            &child_id,
+                            &child_schema,
+                            &fk_columns,
+                            tenant_context,
+                        )
+                        .await?;
+                    self.enforce_update_referential_actions(
+                        &child_schema,
+                        &grandchildren,
+                        &previous,
+                        &updated,
+                        tenant_context,
+                    )
+                    .await?;
                     let mutations = updated
                         .into_iter()
                         .map(|record| {
@@ -6419,11 +6815,11 @@ impl DmlService {
 
     /// TD-110: enforce FOREIGN KEY references for `records` against parent tables
     /// in the same partition (cross-table state the row-local catalog validator
-    /// cannot check). Supported shape (S2): a single- or multi-column FK
-    /// referencing the parent's FULL primary key (in order) — verified by a point
-    /// `get_by_key` on the parent using the encoded PK tuple. MATCH SIMPLE: any
-    /// NULL/absent FK column exempts the row. Partial / non-PK-referencing FKs
-    /// are cleanly rejected rather than silently accepted.
+    /// cannot check). Supported shape: a single- or multi-column FK referencing
+    /// the parent's FULL declared key (point lookup on the encoded key, or the
+    /// CKS) or one of its UNIQUE sets (the parent's unique index), in order
+    /// (TD-RELIDEQ-2). MATCH SIMPLE: any NULL/absent FK column exempts the row.
+    /// Any other referenced column set is cleanly rejected.
     async fn enforce_foreign_keys(
         &self,
         table_schema: &CatalogTableSchema,
@@ -6472,46 +6868,32 @@ impl DmlService {
                 ));
             }
             let parent_schema = parent_catalog.get_table(&parent_table_id).await?;
-            let parent_pk_cols = Self::primary_key_columns(&parent_schema);
-            // Only FKs referencing the parent's FULL primary key (in order) are
-            // enforced — partial / non-PK references are not (S2 scope).
-            if parent_pk_cols.is_empty()
-                || references_columns.as_slice() != parent_pk_cols.as_slice()
-            {
+            // TD-RELIDEQ-2: the referenced columns must be the parent's
+            // DECLARED primary key (the row oid) or one of its UNIQUE sets
+            // (props values), in order. A keyless parent's `id` is an ordinary
+            // column — referenceable only through a UNIQUE constraint.
+            let Some(referenced_key) = crate::services::referential::resolve_referenced_key(
+                &parent_schema,
+                references_columns,
+            ) else {
                 return Err(anyhow!(
-                    "FOREIGN KEY ({}) REFERENCES {}({}) on table '{}' is only supported when it references the parent primary key ({}) in full, in order",
+                    "FOREIGN KEY ({}) REFERENCES {}({}) on table '{}' must reference the parent's primary key ({}) or a UNIQUE constraint, in full and in order",
                     fk_columns.join(", "),
                     references_table,
                     references_columns.join(", "),
                     table_schema.name,
-                    parent_pk_cols.join(", ")
+                    Self::declared_key_display(&parent_schema)
                 ));
-            }
+            };
 
             for record in records {
-                // Extract the FK columns' typed values. MATCH SIMPLE: any NULL,
-                // absent, or non-scalar FK column → exempt (no reference required).
-                let mut values: Vec<ProximaValue> = Vec::with_capacity(fk_columns.len());
-                let mut exempt = false;
-                for col in fk_columns {
-                    match record.props.get(col) {
-                        Some(ProximaTreeNode::Value(value))
-                            if !matches!(value, ProximaValue::Null) =>
-                        {
-                            values.push(value.clone());
-                        }
-                        _ => {
-                            // NULL / absent / non-scalar FK column → MATCH SIMPLE exempt.
-                            exempt = true;
-                            break;
-                        }
-                    }
-                }
-                if exempt {
+                // MATCH SIMPLE: any NULL, absent, or non-scalar FK column →
+                // exempt (no reference required).
+                let Some(values) =
+                    crate::services::referential::record_key_values(record, fk_columns)
+                else {
                     continue;
-                }
-                // Encode with the same encoder that built the parent oids so the
-                // point lookup matches exactly (single- or multi-column).
+                };
                 let key = encode_primary_key_tuple(&values)?;
                 // F5 (ADR-072): when the fenced ConditionalKeyStore is wired,
                 // resolve FK existence against the SAME store that fences the
@@ -6519,17 +6901,15 @@ impl DmlService {
                 // — "foreign-key existence checks (phase 2) ride this method"),
                 // instead of a check-then-act probe on the record store. This
                 // makes the child-insert see the authoritative uniqueness index
-                // and closes the TOCTOU with a concurrent parent delete. The FK
-                // references the parent's FULL PK in order (checked above), and
-                // the parent claim is keyed on that full tuple (TD-DML-2), so
-                // single- and multi-column FKs both resolve through the CKS.
-                // TD-RELIDEQ-1: only a parent with a DECLARED key is fenced in
-                // the CKS; a keyless parent resolves through the record store.
-                let referenced_exists = if let Some(cks) = self
-                    .conditional_key_store
-                    .as_ref()
-                    .filter(|_| Self::table_declares_primary_key(&parent_schema))
-                {
+                // and closes the TOCTOU with a concurrent parent delete. The
+                // parent claim is keyed on the full declared-key tuple (TD-DML-2),
+                // so single- and multi-column FKs both resolve through the CKS.
+                // Only a primary-key reference is fenced there; a UNIQUE
+                // reference resolves through the parent's unique index.
+                let referenced_exists = if let Some(cks) =
+                    self.conditional_key_store.as_ref().filter(|_| {
+                        referenced_key == crate::services::referential::ReferencedKey::PrimaryKey
+                    }) {
                     let id = proximadb_storage_ports::Identity::from_bytes(
                         proximadb_data_model::key_codec::encode_identity(
                             &record.tenant_id,
@@ -6539,24 +6919,21 @@ impl DmlService {
                     );
                     cks.get(&id).await?.is_some()
                 } else {
-                    self.record_store
-                        .get_by_key(
-                            &parent_schema,
-                            TableRecordGetRequest {
-                                table_id: parent_table_id.name.clone(),
-                                key: key.clone(),
-                                include_vector: false,
-                                include_props: false,
-                            },
-                            tenant_context,
-                            #[cfg(feature = "abac-policy")]
-                            &ReadContext::system(
-                                SystemReadReason::ForeignKeyResolution,
-                                "dml::fk_check",
-                            ),
-                        )
-                        .await?
-                        .is_some()
+                    crate::services::referential::referenced_parent_exists(
+                        self.record_store.as_ref(),
+                        &parent_schema,
+                        &parent_table_id.name,
+                        referenced_key,
+                        references_columns,
+                        &values,
+                        tenant_context,
+                        #[cfg(feature = "abac-policy")]
+                        &ReadContext::system(
+                            SystemReadReason::ForeignKeyResolution,
+                            "dml::fk_check",
+                        ),
+                    )
+                    .await?
                 };
                 if !referenced_exists {
                     return Err(RelationalConstraintViolation::new(
@@ -6738,8 +7115,18 @@ impl DmlService {
     /// `record_id`, which is NOT the record oid for a keyless relational row
     /// (TD-RELIDEQ-1).
     fn table_declares_primary_key(table_schema: &CatalogTableSchema) -> bool {
-        !table_schema.primary_key.is_empty()
-            || !table_schema.relational_capabilities.primary_key.is_empty()
+        !crate::services::record_store::schema_declared_primary_key_columns(table_schema).is_empty()
+    }
+
+    /// The declared primary key for error messages; `none` for a keyless table.
+    fn declared_key_display(table_schema: &CatalogTableSchema) -> String {
+        let columns =
+            crate::services::record_store::schema_declared_primary_key_columns(table_schema);
+        if columns.is_empty() {
+            "none".to_string()
+        } else {
+            columns.join(", ")
+        }
     }
 
     fn extract_pk_candidate_ids(
