@@ -771,7 +771,7 @@ regex = "1.10"
 nom = "7"
 
 # Multi-model storage (Document + Observability)
-tantivy = "0.26"  # Full-text search for documents
+tantivy = "0.27"  # Full-text search for documents
 jsonpath-rust = "0.5"  # JSON path queries for document filtering (actively maintained)
 flume = "0.12"  # High-performance MPSC channels for observability
 
