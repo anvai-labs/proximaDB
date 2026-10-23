@@ -1923,8 +1923,8 @@ mod tests {
     /// `proximadb-storage-common/tests/wal_format_compat.rs`), so they check
     /// the codec against an independent oracle. Never regenerate them to make
     /// a failure go away; a new format adds a new pair.
-    #[test]
-    fn format_2_frames_still_decode_and_todays_writer_emits_the_same_header() {
+    #[tokio::test]
+    async fn format_2_frames_still_decode_and_todays_writer_emits_the_same_header() {
         const SINGLE_V1: &str = "505857414c303031010001000f000000000000006700000089ed228684af73657175656e63655f6e756d6265720fac74696d657374616d705f6d73cf00000199c82cc000a96f7065726174696f6e81af436174616c6f674d75746174696f6e82a36b6579a9666e3a646f75626c65a5627974657393010203a974656e616e745f6964c0";
         const GROUP_V2: &str = "505857414c303031020001000e00000000000000d0000000cf35ed209284af73657175656e63655f6e756d6265720eac74696d657374616d705f6d73cf00000199c82cc000a96f7065726174696f6e81b35265636f7264506172746974696f6e44726f7081ad636f6c6c656374696f6e5f6964a66f7264657273a974656e616e745f6964c084af73657175656e63655f6e756d6265720fac74696d657374616d705f6d73cf00000199c82cc000a96f7065726174696f6e81af436174616c6f674d75746174696f6e82a36b6579a9666e3a646f75626c65a5627974657393010203a974656e616e745f6964c0";
         let hex = |s: &str| -> Vec<u8> {
@@ -1992,6 +1992,58 @@ mod tests {
             assert_eq!(len, written.len() - FRAME_HEADER_LEN);
             let crc = u32::from_le_bytes(written[24..28].try_into().expect("crc"));
             assert_eq!(crc, checksum(&written[FRAME_HEADER_LEN..]));
+            // And the payload is still named msgpack carrying every key and
+            // value format 2 wrote (added keys allowed): a switch to
+            // positional arrays, or a rename, fails here even though the
+            // writer would agree with itself.
+            let as_json = |bytes: &[u8]| -> serde_json::Value {
+                rmp_serde::from_slice(bytes).expect("msgpack payload")
+            };
+            if let Err(drift) = payload_covers(
+                &as_json(&written[FRAME_HEADER_LEN..]),
+                &as_json(&frozen[FRAME_HEADER_LEN..]),
+                "payload",
+            ) {
+                panic!("format-2 payload drift: {drift}");
+            }
+        }
+
+        // The file scan reads frozen bytes too, and a torn frame after them
+        // (a crash mid-append) is dropped, not misread.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("frozen.wal");
+        let mut file = hex(GROUP_V2);
+        file.extend_from_slice(&hex(SINGLE_V1)[..FRAME_HEADER_LEN + 7]);
+        std::fs::write(&path, &file).expect("write frozen WAL");
+        let read = FramedTableWalAppender::read_entries_from_path(&path)
+            .await
+            .expect("frozen WAL file must read");
+        assert_eq!(payloads(&read), payloads(&[drop, catalog]));
+    }
+
+    /// `new` holds every key and value of `old` (recursively, arrays
+    /// element-wise); keys only `new` has are additions.
+    fn payload_covers(
+        new: &serde_json::Value,
+        old: &serde_json::Value,
+        path: &str,
+    ) -> std::result::Result<(), String> {
+        use serde_json::Value;
+        match (new, old) {
+            (Value::Object(new), Value::Object(old)) => old.iter().try_for_each(|(key, old)| {
+                let path = format!("{path}.{key}");
+                match new.get(key) {
+                    Some(new) => payload_covers(new, old, &path),
+                    None => Err(format!("{path}: written by format 2, missing now")),
+                }
+            }),
+            (Value::Array(new), Value::Array(old)) if new.len() == old.len() => new
+                .iter()
+                .zip(old)
+                .enumerate()
+                .try_for_each(|(i, (new, old))| payload_covers(new, old, &format!("{path}[{i}]"))),
+            _ if new == old => Ok(()),
+            _ => Err(format!("{path}: format 2 wrote {old}, now {new}")),
         }
     }
 

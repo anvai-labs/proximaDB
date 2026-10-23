@@ -71,9 +71,9 @@
  P2  S1/S2/S3 one write path                     [###########.]  96%
      P2.1 segmented WAL + per-segment index      [############] 100%  #2079
      P2.2 Layer A (spill) in production          [############] 100%  #2085…#2146; default ON; WAL format frozen #2162
-     P2.3 WAL truncation                         [###########.]  98%  default ON #2146; merge-base #2124 #2125 #2144 #2161; REST #2166 in review
+     P2.3 WAL truncation                         [############] 100%  default ON #2146; merge-base 6/6 #2124 #2125 #2144 #2161 #2166
      P2.4 streaming MATERIALIZE (SF1, no OOM)    [##########..]  85%  slices 1–6 #2126 #2149 #2150 #2151 #2155 #2156; SF1 harness #2160; SF1 run pending
- P3  S5/S6/S9 format-independent SQL, ANN op     [#...........]  16%  P3.1 80% (provider #2153 #2159; pruning #2167), P3.2–P3.5 0%
+ P3  S5/S6/S9 format-independent SQL, ANN op     [##..........]  18%  P3.1 90% (provider #2153 #2159, pruning #2167), P3.2–P3.5 0%
  P4  Modalities onto the seams                   [............]   0%
  P5  Vector tier economics                       [######......]  58%
      P5a defaults                                [############] 100%  #2078
@@ -123,7 +123,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | Spill scan snapshot taken under the segments lock (no lost rows, no resurrected deletes during a racing flush) | Done | #2122 | `a_scan_racing_a_flush_loses_no_row_and_resurrects_no_delete`. Also P3.1 PR 1.
 | Crash-after-truncation recovery gate (spill + rotation + truncator, restart, replay) | Done | #2129 | `tests/wal_truncation_recovery_test.rs`: two partitions (untenanted and tenanted); flushed rows come back from segments, the WAL tail from replay; deletes and updates kept across two truncations and two restarts; an unflushed tombstone holds the floor at its delete (since the LSN-tracked tombstone slice). Prerequisite for default-on.
 | LSN-tracked tombstones: a memory-only tombstone yields a floor instead of refusing | Done | #2132 | `RecordStore::delete_record_at_lsn` (default: `delete_record`); the spill keeps `oid → Option<lsn>` per tombstone, a repeat delete keeps the earliest; `min_unflushed_lsn` = min over resident rows and tombstones, refusing only for an untracked tombstone; tombstones count toward the flush threshold (where the store can persist them), the flush running after the delete's answer. Write path and replay pass the delete's LSN; the legacy-partition cutover delete stays untracked. Gates: `a_tracked_tombstone_is_a_floor_not_a_refusal`, `tombstones_count_toward_the_flush_threshold`, recovery test phase 2.
-| Durable branch merge-base | **Track A** (design §5.2); slices 1–4/6 Done | #2124 #2125 #2144 #2161 | Slice 1: per-segment branch summary, tenant-keyed truncation marks, `collections_below`, branch fence (re-checked under the append lock; refusal reported as `Refused`). Slice 2 (#2125) merged after its review blocker was fixed (images record folded forks; main-line deletes and drops fold in). Slice 3 (#2144): durable merge-base images in the canonical WAL. Until the merge-base lands: merge refuses (410) once any WAL history is truncated (correction 2026-10-21, `merge_endpoint_refuses_when_wal_history_was_truncated`).
+| Durable branch merge-base | **Track A** (design §5.2); Done (6/6) | #2124 #2125 #2144 #2161 #2166 | Slice 1: per-segment branch summary, tenant-keyed truncation marks, `collections_below`, branch fence (re-checked under the append lock; refusal reported as `Refused`). Slice 2 (#2125) merged after its review blocker was fixed (images record folded forks; main-line deletes and drops fold in). Slice 3 (#2144): durable merge-base images in the canonical WAL. Until the merge-base lands: merge refuses (410) once any WAL history is truncated (correction 2026-10-21, `merge_endpoint_refuses_when_wal_history_was_truncated`).
 | Catalog prefix registration (object-store placement of spill segments) | Open | — | TD-SEAM-3.
 | MATERIALIZE LSN capture via the per-collection high-water | Done in #2095 | #2095 | Superseded by `capture_snapshot_lsn` with a WAL pin.
 | P2.4 streaming / incremental MATERIALIZE publisher | **Track B**; slices 1–6 + SF1 harness Done; SF1 no-OOM run (peak RSS recorded) pending | #2126 #2149 #2150 #2151 #2155 #2156 #2160 | Slice 1: Parquet readers (DuckDB, DataFusion, native-over-Parquet) read only the snapshot manifest's files and fail closed on any manifest error (no directory listing beside a metadata log). Gate: TPC-DS SF1 on a release build loads with no OOM and peak RSS recorded. TD-USUB-10, TD-OLAPFMT-3.
@@ -135,7 +135,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 [cols="3,1,1,3",options="header"]
 |===
 | Slice | Status | PR | Gate / notes
-| P3.1 `LayerATableProvider`: streaming, pushdown, ABAC, WAL-tail union (replaces `MemTable` and the 1M-row cap) | **Track C**; streaming provider Done (no row cap), pruning in review | #2122 #2128 #2133 #2136 #2153 #2158 #2159; #2167 | `native_table_capability_parity_e2e`.
+| P3.1 `LayerATableProvider`: streaming, pushdown, ABAC, WAL-tail union (replaces `MemTable` and the 1M-row cap) | **Track C**; streaming provider (no row cap) + pruning Done | #2122 #2128 #2133 #2136 #2153 #2158 #2159 #2167 | `native_table_capability_parity_e2e`.
 | P3.2 Register `PaxTableProvider`; UDTF-only queries go to DataFusion | Open | — |
 | P3.3 `FilteredAnnExec` (filter/limit/dynamic-filter pushdown, emits `oid`) | Open | — | `filtered_ann_recall_bands` ≥ 0.95 in every band.
 | P3.4 SBBF probe for join runtime filters; P3.5 facade passes `vector_ops`/`graph_ops` | Open | — |
@@ -167,9 +167,9 @@ tracks report through a "Tracker update" paragraph in each PR body.
 |===
 | Track | Scope | First PRs
 | Lead | Coordination, this tracker, P2.2 recovery gate and default-on; independent adversarial review of every track PR (posted as a PR comment) before merge | #2119, #2122, #2129, #2132, #2145, #2146, #2162 merged
-| A | Durable branch merge-base, §5.2 (6 commits) | #2124 #2125 #2144 #2161 merged (4/6); #2166 in review
+| A | Durable branch merge-base, §5.2 (6 commits) | Done: #2124 #2125 #2144 #2161 #2166 (slices 5–6)
 | B | P2.4 streaming MATERIALIZE, §5.3 PRs 1–7 incl. the SF1 no-OOM gate | #2126 #2149 #2150 #2151 #2155 #2156 #2160 merged; SF1 run pending
-| C | P3.1 LayerATableProvider, §5.4 PRs 0 and 2–5 | #2128 #2133 #2136 #2153 #2158 #2159 merged; #2167 in review
+| C | P3.1 LayerATableProvider, §5.4 PRs 0 and 2–5 | #2128 #2133 #2136 #2153 #2158 #2159 #2167 merged
 | D | P5b PAX centroid directory + cluster-contiguous compaction: design, then 2 slices | #2120 (design, TD-PAXDIR-1); #2127 #2148 (D1 + review fixes), #2152 (D2) merged
 |===
 
