@@ -12,8 +12,10 @@ description = "Canonical quantization-level model for ProximaDB: UnifiedQuantiza
 [features]
 # Gates the TurboQuant variant/payload + calibration paths (moved verbatim from
 # proximadb-vector/src/quantization/internal_types.rs). Default off; same gate as
-# proximadb-quantization-types' experimental-turboquant.
-experimental-turboquant = []
+# proximadb-quantization-types' experimental-turboquant, and forwarded to it: the
+# gated code names that crate's TurboQuant items, so a standalone build needs both
+# (TD-TQFEAT-1; the root build only worked through feature unification).
+experimental-turboquant = ["proximadb-quantization-types/experimental-turboquant"]
 
 [dependencies]
 proximadb-quantization-types = { workspace = true }
