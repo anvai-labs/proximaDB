@@ -320,6 +320,9 @@ fn rewrite_coalesced_footer(
 #[derive(Debug)]
 struct PrefetchErrorFileSystem {
     inner: Arc<dyn proximadb_storage_filesystem_types::FileSystem>,
+    /// Fail the first single `read_range` that starts inside this byte range
+    /// (once), on top of every batched read failing.
+    fail_once_in: Option<(std::ops::Range<u64>, std::sync::atomic::AtomicBool)>,
 }
 
 #[async_trait::async_trait]
@@ -338,6 +341,14 @@ impl proximadb_storage_filesystem_types::FileSystem for PrefetchErrorFileSystem 
         offset: u64,
         length: u64,
     ) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
+        if let Some((range, fired)) = &self.fail_once_in
+            && range.contains(&offset)
+            && !fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(proximadb_storage_filesystem_types::FilesystemError::Io(
+                std::io::Error::other("injected range failure"),
+            ));
+        }
         self.inner.read_range(path, offset, length).await
     }
 
@@ -551,6 +562,7 @@ async fn oid_prefetch_fallback_records_each_physical_get_once() {
         .expect("local filesystem");
     let fs = PrefetchErrorFileSystem {
         inner: Arc::new(local),
+        fail_once_in: None,
     };
     let _ = drain_get_trace();
 
@@ -5080,5 +5092,364 @@ async fn m2_unfiltered_recall_neutral_vs_global() {
         r_on >= r_off - 0.05,
         "M2 partition layout degrades unfiltered recall vs global: \
              on={r_on:.3} off={r_off:.3} (tol 0.05)"
+    );
+}
+
+const SAME_WAVE_DIM: usize = 64;
+const SAME_WAVE_N: usize = 400;
+
+/// A v3 (A0) segment of 400 rows probed on every cell, with no prefix
+/// prefetch beyond the header, so the probe's Region-A reads and the footer
+/// form a real cold wave. Returns the corpus and records.
+fn same_wave_fixture() -> (Vec<Vec<f32>>, Vec<ProximaRecord>) {
+    enable_coalesced_rabitq();
+    // SAFETY: nextest runs each test in its own process.
+    unsafe {
+        std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
+        std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "1");
+        std::env::set_var("PROXIMADB_IVF_K", "4");
+        std::env::set_var("PROXIMADB_PAX_READ_COARSE_NPROBE", "4");
+        std::env::set_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES", "0");
+        std::env::set_var("PROXIMADB_TRACE_GETS", "1");
+    }
+    let corpus: Vec<Vec<f32>> = (0..SAME_WAVE_N)
+        .map(|i| {
+            (0..SAME_WAVE_DIM)
+                .map(|d| (((i * 131 + d * 17) % 251) as f32) * 0.01)
+                .collect()
+        })
+        .collect();
+    let records = corpus
+        .iter()
+        .enumerate()
+        .map(|(i, v)| rec(&format!("r{i}"), 1000 + i as i64, v.clone()))
+        .collect();
+    (corpus, records)
+}
+
+fn write_same_wave_segment(dir: &std::path::Path, name: &str, records: &[ProximaRecord]) -> String {
+    let seg = dir.join(name);
+    write_pax_segment_compacted(
+        &seg,
+        records,
+        "col",
+        1,
+        VectorQuant::RaBitQ,
+        VectorQuant::Sq8,
+        false,
+        Some(16 * 1024),
+        None,
+    )
+    .unwrap();
+    seg.to_string_lossy().to_string()
+}
+
+fn set_same_wave(on: bool) {
+    // SAFETY: nextest runs each test in its own process.
+    unsafe {
+        std::env::set_var(
+            "PROXIMADB_PAX_READ_SAME_WAVE_RERANK",
+            if on { "1" } else { "0" },
+        )
+    };
+}
+
+fn hit_summary(hits: &[CascadeHit]) -> Vec<(String, u32)> {
+    hits.iter()
+        .map(|h| (h.oid.clone(), h.distance.to_bits()))
+        .collect()
+}
+
+fn first_of(trace: &[(CacheTier, u64)], tier: CacheTier) -> Option<usize> {
+    trace.iter().position(|(t, _)| *t == tier)
+}
+
+fn tier_bytes(trace: &[(CacheTier, u64)], tier: CacheTier) -> u64 {
+    trace
+        .iter()
+        .filter(|(t, _)| *t == tier)
+        .map(|(_, len)| *len)
+        .sum()
+}
+
+/// TD-PAXDIR-1 D5: with `PROXIMADB_PAX_READ_SAME_WAVE_RERANK` the probed
+/// cells' SQ8 extents ride the coarse probe's Region-A wave, so the rerank
+/// issues no wave of its own. The GET trace records the footer's tier after
+/// the wave's per-range records, so a Region-B read inside the wave appears
+/// before it; without the gate the rerank's Region-B read follows it.
+#[tokio::test]
+async fn same_wave_rerank_serves_survivors_from_the_probe_wave() {
+    use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
+    let (corpus, records) = same_wave_fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let fs = LocalFileSystem::new(LocalConfig::default()).await.unwrap();
+    let mut results = Vec::new();
+    for (name, on) in [("off.pax", false), ("on.pax", true)] {
+        let path = write_same_wave_segment(dir.path(), name, &records);
+        set_same_wave(on);
+        drain_get_trace();
+        let hits =
+            rabitq_search_segment_coalesced(&fs, &path, &corpus[7], 5, RankMetric::L2, None, None)
+                .await
+                .unwrap()
+                .expect("probe search hits");
+        results.push((hits, drain_get_trace()));
+    }
+    let (off_hits, off_trace) = &results[0];
+    let (on_hits, on_trace) = &results[1];
+    assert_eq!(
+        hit_summary(on_hits),
+        hit_summary(off_hits),
+        "identical hits and distances"
+    );
+    let on_b = first_of(on_trace, CacheTier::SurvivorPayload).expect("Region B read");
+    let on_footer = first_of(on_trace, CacheTier::InvariantMeta).expect("footer read");
+    assert!(
+        on_b < on_footer,
+        "Region B rode the probe wave: {on_trace:?}"
+    );
+    assert_eq!(
+        tier_bytes(on_trace, CacheTier::SurvivorPayload),
+        (SAME_WAVE_N * SAME_WAVE_DIM) as u64,
+        "every probed cell's codes, once, and no rerank fetch"
+    );
+    let off_b = first_of(off_trace, CacheTier::SurvivorPayload).expect("Region B read");
+    let off_footer = first_of(off_trace, CacheTier::InvariantMeta).expect("footer read");
+    assert!(
+        off_b > off_footer,
+        "without the gate the rerank fetches after: {off_trace:?}"
+    );
+}
+
+/// The wave's Region-B bytes populate the survivor-range cache exactly as a
+/// rerank fetch would, so a warm repeat issues no Region-B read either way.
+#[tokio::test]
+async fn same_wave_rerank_warms_the_survivor_cache_like_a_rerank_fetch() {
+    use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
+    let (corpus, records) = same_wave_fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let fs = LocalFileSystem::new(LocalConfig::default()).await.unwrap();
+    for (name, on) in [("off.pax", false), ("on.pax", true)] {
+        let path = write_same_wave_segment(dir.path(), name, &records);
+        set_same_wave(on);
+        let survivor = SurvivorRangeCache::new(64 * 1024 * 1024);
+        let search = || {
+            rabitq_search_segment_coalesced(
+                &fs,
+                &path,
+                &corpus[7],
+                5,
+                RankMetric::L2,
+                None,
+                Some(&survivor),
+            )
+        };
+        let first = search().await.unwrap().expect("cold hits");
+        drain_get_trace();
+        let second = search().await.unwrap().expect("warm hits");
+        let warm = drain_get_trace();
+        assert_eq!(hit_summary(&first), hit_summary(&second));
+        assert_eq!(
+            tier_bytes(&warm, CacheTier::SurvivorPayload),
+            0,
+            "same_wave={on}: warm repeat must read no Region B: {warm:?}"
+        );
+    }
+}
+
+/// A filtered probe never rides Region B on the wave (a selective filter can
+/// probe every cell for a few survivors); a failed batched read falls back
+/// to the sequential path with identical hits.
+#[tokio::test]
+async fn same_wave_rerank_skips_filtered_probes_and_survives_prefetch_errors() {
+    use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
+    let (corpus, records) = same_wave_fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let local: Arc<dyn proximadb_storage_filesystem_types::FileSystem> =
+        Arc::new(LocalFileSystem::new(LocalConfig::default()).await.unwrap());
+    set_same_wave(true);
+
+    let path = write_same_wave_segment(dir.path(), "filtered.pax", &records);
+    let allow: proximadb_block_format::RowAllow = (0..SAME_WAVE_N).collect();
+    drain_get_trace();
+    rabitq_search_segment_coalesced_allowed(
+        local.as_ref(),
+        &path,
+        &corpus[7],
+        5,
+        RankMetric::L2,
+        None,
+        None,
+        Some(&allow),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("filtered hits");
+    let trace = drain_get_trace();
+    assert!(
+        first_of(&trace, CacheTier::ProbeIndex).is_some(),
+        "the filtered probe ran: {trace:?}"
+    );
+    let b = first_of(&trace, CacheTier::SurvivorPayload).expect("Region B read");
+    let footer = first_of(&trace, CacheTier::InvariantMeta).expect("footer read");
+    assert!(
+        b > footer,
+        "a filtered probe must not ride Region B: {trace:?}"
+    );
+
+    // Gate-off reference hits.
+    set_same_wave(false);
+    let reference = write_same_wave_segment(dir.path(), "reference.pax", &records);
+    let expected = rabitq_search_segment_coalesced(
+        local.as_ref(),
+        &reference,
+        &corpus[7],
+        5,
+        RankMetric::L2,
+        None,
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("reference hits");
+
+    // Gate on, every batched read fails (sequential fallback) and the first
+    // single Region-B read — the wave's own — fails too: the wave soft-fails,
+    // the rerank fetches Region B itself, and the hits are unchanged.
+    set_same_wave(true);
+    let path = write_same_wave_segment(dir.path(), "fallback.pax", &records);
+    let header_bytes = std::fs::read(&path).unwrap();
+    let header = proximadb_storage_common::segment_layout::SegmentHeaderPrefix::parse(
+        &header_bytes[..proximadb_storage_common::segment_layout::SEG_HEADER_PREFIX_LEN],
+    )
+    .unwrap();
+    let failing = PrefetchErrorFileSystem {
+        inner: Arc::clone(&local),
+        fail_once_in: Some((
+            header.sq8_off..header.sq8_off + header.sq8_len,
+            std::sync::atomic::AtomicBool::new(false),
+        )),
+    };
+    drain_get_trace();
+    let hits =
+        rabitq_search_segment_coalesced(&failing, &path, &corpus[7], 5, RankMetric::L2, None, None)
+            .await
+            .unwrap()
+            .expect("fallback hits");
+    let trace = drain_get_trace();
+    assert!(
+        failing
+            .fail_once_in
+            .as_ref()
+            .unwrap()
+            .1
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the wave's Region-B read was attempted and failed"
+    );
+    assert_eq!(hit_summary(&hits), hit_summary(&expected));
+    assert!(
+        first_of(&trace, CacheTier::ProbeIndex).is_some(),
+        "the probe survived the Region-B failure: {trace:?}"
+    );
+    let b = first_of(&trace, CacheTier::SurvivorPayload).expect("rerank Region B read");
+    let footer = first_of(&trace, CacheTier::InvariantMeta).expect("footer read");
+    assert!(b > footer, "the rerank fetched Region B itself: {trace:?}");
+}
+
+/// TD-PAXDIR-1 D5: only cold-A cells ride; extents merge where they touch,
+/// are clamped to Region B, and a planned range is served only when one
+/// prefetched extent covers it.
+#[test]
+fn same_wave_b_ranges_are_cold_clamped_merged_and_served_on_full_coverage() {
+    use proximadb_storage_common::coarse_directory::CoarseCellEntry;
+    let cell = |a_off: u64, b_off: u64, b_len: u64| CoarseCellEntry {
+        a_off,
+        a_len: 10,
+        b_off,
+        b_len,
+        ..Default::default()
+    };
+    let cells = [
+        cell(0, 100, 40),
+        cell(10, 140, 40),
+        cell(20, 300, 20),
+        cell(30, 0, 0),
+        cell(40, 900, 50),
+    ];
+    let cold = [0..30, 40..50];
+    assert_eq!(
+        probed_cell_b_ranges(&cells, &[2, 0, 1, 3, 4], &cold, 100, 400),
+        vec![100..180, 300..320],
+        "adjacent cells merge; empty and out-of-region extents are skipped"
+    );
+    assert_eq!(
+        probed_cell_b_ranges(&cells, &[0, 2], &[20..30], 100, 400),
+        vec![300..320],
+        "a warm-A cell does not ride"
+    );
+    let prefetched = vec![
+        (100u64, (0..80u8).collect::<Vec<_>>()),
+        (300u64, (200..220u8).collect::<Vec<_>>()),
+    ];
+    assert_eq!(prefetched_range(&prefetched, 104, 108), Some((0, 4..8)));
+    assert_eq!(prefetched_range(&prefetched, 300, 304), Some((1, 0..4)));
+    assert_eq!(
+        prefetched_range(&prefetched, 176, 184),
+        None,
+        "spans past the extent"
+    );
+    assert_eq!(prefetched_range(&prefetched, 50, 60), None);
+    assert_eq!(prefetched_range(&[], 0, 1), None);
+}
+
+/// TD-PAXDIR-1 D5: rerank ranges never cross a prefetched extent's
+/// boundary (so covered rows are always served from the wave), and rows stay
+/// in ascending order; with no extents the plan is the plain planner's.
+#[test]
+fn rerank_ranges_never_cross_a_prefetched_extent() {
+    use crate::storage::engines::sst::readers::sst_query_engine::ObjectRangeCoalescePolicy;
+    let policy = ObjectRangeCoalescePolicy {
+        max_gap_bytes: 1 << 20,
+        max_range_bytes: 0,
+    };
+    // dim 4, codes_base 0: row g is bytes [4g, 4g + 4).
+    let survivors = [1usize, 2, 10, 11, 30, 31, 60];
+    let plain = plan_coalesced_row_ranges(&survivors, 4, 0, &policy);
+    assert_eq!(plain.len(), 1, "the wide gap policy merges everything");
+    assert_eq!(
+        plan_rerank_ranges(&survivors, 4, 0, &policy, &[])
+            .iter()
+            .map(|f| (f.start, f.end))
+            .collect::<Vec<_>>(),
+        plain.iter().map(|f| (f.start, f.end)).collect::<Vec<_>>()
+    );
+    // Extents cover rows 0..16 and 28..32; rows 60 is outside both.
+    let extents = [0u64..64, 112..128];
+    let planned = plan_rerank_ranges(&survivors, 4, 0, &policy, &extents);
+    for fetch in &planned {
+        let inside = extents
+            .iter()
+            .any(|e| e.start <= fetch.start && fetch.end <= e.end);
+        let crosses = extents.iter().any(|e| {
+            fetch.start < e.end
+                && e.start < fetch.end
+                && !(e.start <= fetch.start && fetch.end <= e.end)
+        });
+        assert!(
+            inside || !crosses,
+            "{:?} crosses an extent",
+            (fetch.start, fetch.end)
+        );
+    }
+    let rows: Vec<usize> = planned
+        .iter()
+        .flat_map(|f| f.rows.iter().copied())
+        .collect();
+    assert_eq!(rows, survivors, "every row once, ascending");
+    assert_eq!(
+        planned.len(),
+        3,
+        "extent 1, extent 2, and the uncovered tail"
     );
 }
