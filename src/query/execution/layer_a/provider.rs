@@ -15,7 +15,7 @@ use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -82,23 +82,6 @@ impl LayerATableProvider {
 
 #[async_trait]
 impl TableProvider for LayerATableProvider {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    /// Inexact for every filter: DataFusion keeps evaluating them above the
-    /// scan, so correctness never depends on what the scan prunes.
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
-    }
-
     async fn scan(
         &self,
         state: &dyn Session,
@@ -118,7 +101,7 @@ impl TableProvider for LayerATableProvider {
             table_name,
             projection.map(Vec::as_slice),
             self.table.access.clone(),
-            now_ns(),
+            crate::services::record_spill::now_ns(),
         )
         .map_err(|e| DataFusionError::Plan(format!("{e:#}")))?;
         Ok(Arc::new(LayerAScanExec::new(
@@ -128,13 +111,14 @@ impl TableProvider for LayerATableProvider {
             state.config().batch_size(),
         )))
     }
-}
 
-fn now_ns() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
 }
 
 /// One partition: the merge of every segment plus the resident rows.
@@ -211,24 +195,6 @@ impl ExecutionPlan for LayerAScanExec {
         &self.properties
     }
 
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn apply_expressions(
-        &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
-    ) -> DFResult<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(self)
-    }
-
     fn execute(
         &self,
         partition: usize,
@@ -261,6 +227,24 @@ impl ExecutionPlan for LayerAScanExec {
             .try_flatten()
             .map_err(|e: anyhow::Error| DataFusionError::External(e.into()));
         Ok(Box::pin(RecordBatchStreamAdapter::new(output, stream)))
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 }
 
