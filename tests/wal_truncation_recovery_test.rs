@@ -279,16 +279,17 @@ async fn seeded_crash_truncate_interleavings_match_a_reference_model() -> Result
             .await
             .with_context(|| format!("soak seed {seed}"))?;
     }
-    // The case #2132 exists for: a truncation that stops at a memory-only
-    // tombstone, then a crash. Some seed must have hit it.
+    // The case #2132 exists for: a truncation while a memory-only tombstone
+    // holds the floor, then a crash. Some seed must have hit it (each such run
+    // also checked that the floor did not pass the tombstone's LSN).
     assert!(
         over_pending_delete > 0,
-        "no seed truncated while a delete was still memory-only"
+        "no seed truncated while a tombstone was memory-only"
     );
     Ok(())
 }
 
-/// Returns how many truncations ran while a delete was not yet flushed.
+/// Returns how many truncations ran while a memory-only tombstone existed.
 async fn soak(seed: u64, steps: usize) -> Result<usize> {
     let mut rng = StdRng::seed_from_u64(seed);
     let dir = TempDir::new()?;
@@ -300,8 +301,13 @@ async fn soak(seed: u64, steps: usize) -> Result<usize> {
         .collect();
     let mut version = 0;
     let (mut truncations, mut restarts, mut over_pending_delete) = (0, 0, 0);
-    // A delete applied since the last flush: its tombstone is memory-only.
-    let mut pending_delete = false;
+    // Exactly the memory-only tombstones the store holds, per tenant as
+    // oid → LSN: a delete records one only once its partition has a segment
+    // (a flush since the last drop); a repeat delete keeps the earliest LSN;
+    // an upsert of the oid clears it (the newer write supersedes the delete);
+    // a flush persists them all; a drop clears its tenant's.
+    let mut has_segments: BTreeMap<&str, bool> = BTreeMap::new();
+    let mut pending_tombstones: BTreeMap<&str, BTreeMap<String, u64>> = BTreeMap::new();
 
     for step in 0..=steps {
         let tenant = TENANTS[rng.gen_range(0..TENANTS.len())];
@@ -316,12 +322,21 @@ async fn soak(seed: u64, steps: usize) -> Result<usize> {
             0..=52 => {
                 version += 1;
                 write(&wal, &store, tenant, upsert(&oid, tenant, version)).await?;
+                if let Some(tombstones) = pending_tombstones.get_mut(tenant) {
+                    tombstones.remove(&oid);
+                }
                 model.get_mut(tenant).expect("tenant").insert(oid, version);
             }
             53..=72 => {
-                write(&wal, &store, tenant, delete(&oid)).await?;
+                let lsn = write(&wal, &store, tenant, delete(&oid)).await?;
                 model.get_mut(tenant).expect("tenant").remove(&oid);
-                pending_delete = true;
+                if has_segments.get(tenant).copied().unwrap_or(false) {
+                    pending_tombstones
+                        .entry(tenant)
+                        .or_default()
+                        .entry(oid.clone())
+                        .or_insert(lsn);
+                }
             }
             // DROP TABLE: purges the partition's segments; replay of a
             // retained drop must purge too.
@@ -331,10 +346,23 @@ async fn soak(seed: u64, steps: usize) -> Result<usize> {
                 };
                 write(&wal, &store, tenant, drop).await?;
                 model.get_mut(tenant).expect("tenant").clear();
+                has_segments.insert(tenant, false);
+                pending_tombstones.remove(tenant);
             }
             75..=84 => {
                 store.flush_partitions().await?;
-                pending_delete = false;
+                for tenant in TENANTS {
+                    // A flush writes a segment only if the partition held
+                    // anything; an emptied one keeps whatever it had.
+                    let wrote = !model[tenant].is_empty()
+                        || pending_tombstones
+                            .get(tenant)
+                            .is_some_and(|t| !t.is_empty());
+                    if wrote {
+                        has_segments.insert(tenant, true);
+                    }
+                }
+                pending_tombstones.clear();
             }
             85..=94 => {
                 let run = wal_truncator::run_once(&wal, &truncator_sources(&wal, &store)).await?;
@@ -342,9 +370,22 @@ async fn soak(seed: u64, steps: usize) -> Result<usize> {
                     !matches!(run, TruncationRun::Refused { .. }),
                     "seed {seed} step {step}: every write is LSN-tracked: {run:?}"
                 );
-                let truncated = matches!(run, TruncationRun::Truncated { .. });
-                truncations += truncated as usize;
-                over_pending_delete += (truncated && pending_delete) as usize;
+                let oldest_tombstone = pending_tombstones
+                    .values()
+                    .flat_map(|tombstones| tombstones.values())
+                    .min()
+                    .copied();
+                if let (TruncationRun::Truncated { floor, .. }, Some(oldest)) =
+                    (&run, oldest_tombstone)
+                {
+                    assert!(
+                        *floor <= oldest,
+                        "seed {seed} step {step}: truncated to {floor}, past the memory-only \
+                         tombstone at {oldest}"
+                    );
+                    over_pending_delete += 1;
+                }
+                truncations += matches!(run, TruncationRun::Truncated { .. }) as usize;
             }
             _ => {
                 for tenant in TENANTS {

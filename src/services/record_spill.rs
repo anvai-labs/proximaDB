@@ -1266,16 +1266,19 @@ impl SpillRecordStorage {
     ///
     /// The flush is best effort. The delete is already applied and its WAL
     /// entry durable, so a failed flush loses nothing — the tombstone stays
-    /// resident and keeps the WAL from its LSN — and must not turn a done
-    /// delete into an error (the caller would then skip index maintenance).
+    /// resident and keeps the WAL from its LSN (and a segment write of unknown
+    /// outcome makes `min_unflushed_lsn` refuse until a purge or restart
+    /// reconciles it) — and must not turn a done delete into an error (the
+    /// caller would then skip index maintenance).
     async fn delete_tracked(&self, key: &RecordKey, lsn: Option<u64>) -> Result<bool> {
         let removed = self.delete_unflushed(key, lsn).await?;
         if let Err(error) = self.flush_if_over_threshold().await {
             tracing::warn!(
                 error = %format!("{error:#}"),
                 path = %self.base_path.trim_end_matches('/'),
-                "spill: flush after a delete failed; the delete stands, its tombstone stays \
-                 resident and the WAL is retained from it until a later flush succeeds"
+                "spill: flush after a delete failed; the delete stands and its tombstone stays \
+                 resident, so the WAL is retained from it until a flush succeeds (or, after \
+                 a segment write of unknown outcome, until a purge or restart reconciles it)"
             );
         }
         Ok(removed)
