@@ -610,18 +610,18 @@ lettre = "0.11"  # Email sending for alert notifications
 
 # OTLP metering push (TD-161 dual-sink, ADR-027). OPTIONAL + default-OFF behind the
 # `otlp-metering` feature: the durable per-tenant `_metering` writer is OSS-native (no
-# deps); only the external OTLP push pulls these. Pinned to the 0.32 line, which is the
+# deps); only the external OTLP push pulls these. On the 0.33 line; 0.32 was the
 # first to resolve against the repo's own `tonic 0.14` / `prost 0.14` with NO duplicate
 # gRPC stack (otlp <=0.30 drags in a second tonic 0.12-0.13 + prost 0.13). `grpc-tonic`
 # reuses the existing tonic transport and avoids pulling reqwest 0.12.
-opentelemetry = { version = "0.32", optional = true }
+opentelemetry = { version = "0.33", optional = true }
 # `rt-tokio` + `experimental_metrics_periodicreader_with_async_runtime` gate
 # `runtime::Tokio` and the async-runtime `PeriodicReader`, which drive export on the
 # tokio runtime — REQUIRED with the grpc-tonic exporter (the default thread-based
 # reader block_on's a tonic call with no reactor → runtime panic). The async-runtime
 # feature transitively enables `experimental_async_runtime`.
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "experimental_metrics_periodicreader_with_async_runtime", "metrics"], optional = true }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "metrics"], optional = true }
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "experimental_metrics_periodicreader_with_async_runtime", "metrics"], optional = true }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "metrics"], optional = true }
 # MLflow UI embedding (TD-MLOPS-3) — optional behind the `mlflow-ui` feature.
 include_dir = { version = "0.7", optional = true }
 mime_guess = { version = "2", optional = true }
