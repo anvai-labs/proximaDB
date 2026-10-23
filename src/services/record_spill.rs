@@ -107,6 +107,11 @@ pub(crate) fn configured_flush_threshold() -> Option<usize> {
 /// [`SpillRecordStorage::admit_writes`] refuses new writes. Writes trigger a
 /// flush at the threshold, so a backlog this far past it means flushes are
 /// failing.
+///
+/// A soft bound: writers admitted together, and one large batch, overshoot
+/// it. WAL replay at boot is not admitted at all — it must apply what is
+/// durable — so with the object store down a restart holds the WAL's whole
+/// unflushed tail resident.
 const BACKLOG_FACTOR: usize = 4;
 
 /// How long after a failed flush the post-write path waits before trying
@@ -356,6 +361,10 @@ pub struct SpillRecordStorage {
     /// When the last threshold flush failed; cleared by the next that succeeds.
     /// Spaces retries out by [`FLUSH_RETRY_BACKOFF`].
     flush_failed_at: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Set while a threshold flush runs: one at a time, so writers past the
+    /// threshold skip it instead of queueing on `flush_guard` behind a slow,
+    /// failing one, each to run its own.
+    threshold_flush_running: std::sync::atomic::AtomicBool,
     /// Tenant this partition belongs to, used to stamp a SYNTHESISED tombstone
     /// record at flush time.
     ///
@@ -432,6 +441,7 @@ impl SpillRecordStorage {
             next_segment: AtomicU64::new(0),
             discovered: tokio::sync::OnceCell::new(),
             flush_failed_at: parking_lot::Mutex::new(None),
+            threshold_flush_running: std::sync::atomic::AtomicBool::new(false),
             tenant_id: None,
             write_policy: ParquetWritePolicy::from_env(),
             schema_source: None,
@@ -1517,9 +1527,10 @@ impl SpillRecordStorage {
         self.memtable.len() + tombstones
     }
 
-    /// Flush once the backlog reaches the threshold — unless the last such
-    /// flush failed less than [`FLUSH_RETRY_BACKOFF`] ago, in which case this
-    /// skips it (the backlog stays resident and the WAL retained).
+    /// Flush once the backlog reaches the threshold — unless another threshold
+    /// flush is already running, or the last one failed less than
+    /// [`FLUSH_RETRY_BACKOFF`] ago, in which case this skips it (the backlog
+    /// stays resident and the WAL retained).
     async fn flush_if_over_threshold(&self) -> Result<()> {
         let Some(threshold) = self.flush_threshold else {
             return Ok(());
@@ -1534,6 +1545,22 @@ impl SpillRecordStorage {
         {
             return Ok(());
         }
+        /// Clears the flag however the flush ends, cancellation included — a
+        /// flag left set would stop threshold flushes for good.
+        struct Running<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        if self
+            .threshold_flush_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        let _running = Running(&self.threshold_flush_running);
         match self.flush().await {
             Ok(_) => *self.flush_failed_at.lock() = None,
             Err(error) => {
