@@ -1915,6 +1915,138 @@ mod tests {
     use proximadb_storage_common::ProjectionDirective;
     use std::sync::Arc;
 
+    /// ADR-097 data format 2: the frame layout is frozen — `[magic "PXWAL001"]
+    /// [version u16 LE][codec u8][flags u8][sequence u64 LE][payload_len u32 LE]
+    /// [payload_crc32 u32 LE][payload]`, version 1 for one entry and 2 for a
+    /// group. The frozen frames below were built outside this code (Python:
+    /// `struct` + `zlib.crc32` over the payloads frozen in
+    /// `proximadb-storage-common/tests/wal_format_compat.rs`), so they check
+    /// the codec against an independent oracle. Never regenerate them to make
+    /// a failure go away; a new format adds a new pair.
+    #[tokio::test]
+    async fn format_2_frames_still_decode_and_todays_writer_emits_the_same_header() {
+        const SINGLE_V1: &str = "505857414c303031010001000f000000000000006700000089ed228684af73657175656e63655f6e756d6265720fac74696d657374616d705f6d73cf00000199c82cc000a96f7065726174696f6e81af436174616c6f674d75746174696f6e82a36b6579a9666e3a646f75626c65a5627974657393010203a974656e616e745f6964c0";
+        const GROUP_V2: &str = "505857414c303031020001000e00000000000000d0000000cf35ed209284af73657175656e63655f6e756d6265720eac74696d657374616d705f6d73cf00000199c82cc000a96f7065726174696f6e81b35265636f7264506172746974696f6e44726f7081ad636f6c6c656374696f6e5f6964a66f7264657273a974656e616e745f6964c084af73657175656e63655f6e756d6265720fac74696d657374616d705f6d73cf00000199c82cc000a96f7065726174696f6e81af436174616c6f674d75746174696f6e82a36b6579a9666e3a646f75626c65a5627974657393010203a974656e616e745f6964c0";
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+                .collect()
+        };
+        let entry = |sequence_number, operation| CanonicalWalEntry {
+            sequence_number,
+            timestamp_ms: 1_760_000_000_000,
+            operation,
+            tenant_id: None,
+        };
+        let drop = entry(
+            14,
+            CanonicalOperation::RecordPartitionDrop {
+                collection_id: "orders".to_string(),
+            },
+        );
+        let catalog = entry(
+            15,
+            CanonicalOperation::CatalogMutation {
+                key: "fn:double".to_string(),
+                bytes: vec![1, 2, 3],
+            },
+        );
+        let payloads = |entries: &[CanonicalWalEntry]| -> Vec<Vec<u8>> {
+            entries
+                .iter()
+                .map(|e| rmp_serde::to_vec_named(e).expect("encode"))
+                .collect()
+        };
+
+        for (frozen, expected, version) in [
+            (hex(SINGLE_V1), vec![catalog.clone()], FRAME_VERSION),
+            (
+                hex(GROUP_V2),
+                vec![drop.clone(), catalog.clone()],
+                FRAME_VERSION_GROUP,
+            ),
+        ] {
+            // Readable: what format-2 binaries wrote decodes whole.
+            let (decoded, consumed) = decode_frame(&frozen)
+                .expect("format-2 frame must decode")
+                .expect("complete frame");
+            assert_eq!(consumed, frozen.len());
+            assert_eq!(payloads(&decoded), payloads(&expected));
+
+            // Written the same way today: identical header fields, and the
+            // length and CRC describe the payload actually written.
+            let mut written = Vec::new();
+            if version == FRAME_VERSION {
+                encode_frame(&expected[0], &mut written).expect("encode frame");
+            } else {
+                encode_group_frame(&expected, &mut written).expect("encode group frame");
+            }
+            assert_eq!(FRAME_HEADER_LEN, 28);
+            assert_eq!(
+                &written[..20],
+                &frozen[..20],
+                "magic/version/codec/flags/sequence"
+            );
+            let len = u32::from_le_bytes(written[20..24].try_into().expect("len")) as usize;
+            assert_eq!(len, written.len() - FRAME_HEADER_LEN);
+            let crc = u32::from_le_bytes(written[24..28].try_into().expect("crc"));
+            assert_eq!(crc, checksum(&written[FRAME_HEADER_LEN..]));
+            // And the payload is still named msgpack carrying every key and
+            // value format 2 wrote (added keys allowed): a switch to
+            // positional arrays, or a rename, fails here even though the
+            // writer would agree with itself.
+            let as_json = |bytes: &[u8]| -> serde_json::Value {
+                rmp_serde::from_slice(bytes).expect("msgpack payload")
+            };
+            if let Err(drift) = payload_covers(
+                &as_json(&written[FRAME_HEADER_LEN..]),
+                &as_json(&frozen[FRAME_HEADER_LEN..]),
+                "payload",
+            ) {
+                panic!("format-2 payload drift: {drift}");
+            }
+        }
+
+        // The file scan reads frozen bytes too, and a torn frame after them
+        // (a crash mid-append) is dropped, not misread.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("frozen.wal");
+        let mut file = hex(GROUP_V2);
+        file.extend_from_slice(&hex(SINGLE_V1)[..FRAME_HEADER_LEN + 7]);
+        std::fs::write(&path, &file).expect("write frozen WAL");
+        let read = FramedTableWalAppender::read_entries_from_path(&path)
+            .await
+            .expect("frozen WAL file must read");
+        assert_eq!(payloads(&read), payloads(&[drop, catalog]));
+    }
+
+    /// `new` holds every key and value of `old` (recursively, arrays
+    /// element-wise); keys only `new` has are additions.
+    fn payload_covers(
+        new: &serde_json::Value,
+        old: &serde_json::Value,
+        path: &str,
+    ) -> std::result::Result<(), String> {
+        use serde_json::Value;
+        match (new, old) {
+            (Value::Object(new), Value::Object(old)) => old.iter().try_for_each(|(key, old)| {
+                let path = format!("{path}.{key}");
+                match new.get(key) {
+                    Some(new) => payload_covers(new, old, &path),
+                    None => Err(format!("{path}: written by format 2, missing now")),
+                }
+            }),
+            (Value::Array(new), Value::Array(old)) if new.len() == old.len() => new
+                .iter()
+                .zip(old)
+                .enumerate()
+                .try_for_each(|(i, (new, old))| payload_covers(new, old, &format!("{path}[{i}]"))),
+            _ if new == old => Ok(()),
+            _ => Err(format!("{path}: format 2 wrote {old}, now {new}")),
+        }
+    }
+
     fn upsert_operation(collection_id: &str, oid: &str) -> CanonicalOperation {
         CanonicalOperation::RecordUpsert {
             collection_id: collection_id.to_string(),
