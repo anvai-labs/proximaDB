@@ -649,40 +649,6 @@ fn abac_security_is_pushdown(
 }
 
 impl VectorOperationsService {
-    /// Create service with a shared context for cross-cutting concerns
-    pub fn new_with_context(
-        storage_engine: Arc<SstEngine>,
-        wal_manager: Arc<crate::storage::persistence::write_ahead_log::WriteAheadLogManager>,
-        #[cfg(feature = "axis")] axis_index_manager: Arc<crate::index::AxisManager>,
-        collection_port: Arc<dyn proximadb_runtime::CollectionPort>,
-        ctx: &crate::core::context::SharedContext,
-    ) -> Self {
-        let mut svc = {
-            #[cfg(feature = "axis")]
-            {
-                Self::new(
-                    storage_engine,
-                    wal_manager,
-                    axis_index_manager,
-                    collection_port,
-                )
-            }
-            #[cfg(not(feature = "axis"))]
-            {
-                Self::new(storage_engine, wal_manager, collection_port)
-            }
-        };
-        svc.orchestrator = ctx.orchestrator.clone();
-        // Tenant integration from shared context
-        if let Some(ref tenant_manager) = ctx.tenant_manager {
-            svc.tenant_manager = Some(tenant_manager.clone());
-        }
-        if let Some(ref rbac_enforcer) = ctx.rbac_enforcer {
-            svc.rbac_enforcer = Some(rbac_enforcer.clone());
-        }
-        svc
-    }
-
     /// Install the FA-2 vector ABAC enforcer (default-OFF behind `abac-policy`).
     /// When set, `unified_search_native` enforces the subject's accessibility
     /// predicate on every vector search (push-down for conjunctive policies,

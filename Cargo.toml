@@ -996,7 +996,6 @@ compile_protobuf = []
 #   cargo test --features test-full            # All tests
 
 # Default test runs (lean - unit tests only in CI by default)
-comprehensive_tests = []  # Legacy flag for comprehensive tests
 perf_tests = []           # Legacy flag for performance tests
 
 # Strategic test categories for CI/CD

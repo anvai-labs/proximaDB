@@ -827,54 +827,6 @@ impl ViperEngine {
             .await
     }
 
-    /// Optimized row group reading for prefetching (delegates to universal optimizer)
-    async fn read_row_group_optimized(
-        file_path: &str,
-        row_group_idx: usize,
-        _optimizer: &UniversalPerformanceOptimizer,
-        filesystem_factory: Arc<FilesystemFactory>,
-        cached_filesystem: Arc<
-            crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingFilesystem,
-        >,
-        collection_id: &str,
-    ) -> Result<Vec<u8>> {
-        // For row group reading, we don't need dimension - Parquet has schema info
-        // Use 0 to indicate dimension is not needed for this operation
-        let reader = super::readers::UnifiedParquetReader::new(
-            vec![file_path.to_string()],
-            0,
-            filesystem_factory,
-            cached_filesystem,
-            collection_id.to_string(),
-            "viper".to_string(),
-        )?;
-
-        // Read vectors from the specific row group
-        // Note: UnifiedParquetReader currently reads all data, but in production
-        // this would be optimized to read only the specific row group using Arrow's
-        // row group API for selective reading
-        let record_batches = reader
-            .read_row_groups_projected(file_path, &[row_group_idx], None)
-            .await?;
-
-        // Calculate approximate row group boundaries
-        // Parquet typically has row groups of ~50-100MB or ~50k-100k rows
-        let rows_per_group = 50000;
-        let _start_idx = row_group_idx * rows_per_group;
-        let _end_idx = ((row_group_idx + 1) * rows_per_group).min(10000); // Placeholder, since all_vectors no longer exists
-
-        // Extract data from the record batches
-        // Vector extraction from Parquet: vectors stored as FixedSizeList<f32>
-        // This needs to read actual vector data from the batch columns
-        if !record_batches.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Row group data extraction not yet implemented"
-            ));
-        }
-
-        Ok(Vec::new())
-    }
-
     /// Memory pool optimization for columnar operations (delegates to universal optimizer)
     async fn get_columnar_buffer(&self, size: usize) -> Result<Vec<f32>> {
         self.universal_optimizer
