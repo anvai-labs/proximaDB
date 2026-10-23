@@ -5711,7 +5711,9 @@ mod tests {
     #[tokio::test]
     async fn a_discovered_segment_filter_keeps_tombstones_authoritative() -> Result<()> {
         let (fs, base) = fs_and_base().await;
-        let first = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None);
+        // A tenant, so the flush persists the tombstone (see `with_tenant`).
+        let first = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None)
+            .with_tenant("tenant-a");
         first.upsert_record(record("a", "open")).await?;
         first.upsert_record(record("b", "open")).await?;
         first.flush().await?;
@@ -5723,7 +5725,8 @@ mod tests {
         assert_eq!(first.segment_count(), 2);
         drop(first);
 
-        let second = SpillRecordStorage::with_flush_threshold(fs, base, None);
+        let second =
+            SpillRecordStorage::with_flush_threshold(fs, base, None).with_tenant("tenant-a");
         async fn get(s: &SpillRecordStorage, oid: &str) -> Result<Option<ProximaRecord>> {
             Ok(s.get_record(&RecordKey::new(oid.to_string())).await?)
         }
