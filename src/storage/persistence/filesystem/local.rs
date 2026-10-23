@@ -46,72 +46,105 @@ pub struct LocalConfig {
     pub sync_enabled: bool,
 }
 
-/// Directories whose own entry (in their parent) is known durable — fsynced
-/// by this process. Process-wide because directories are; it only grows.
+/// Directories whose own entry (in their parent) is known durable: a
+/// [`sync_new_entries`] walk fsynced every directory above it — up to the
+/// filesystem root, the configured root or another such directory — and
+/// completed. Process-wide because directories are; keys are absolute. A
+/// deleted or moved directory is evicted with everything under it
+/// ([`forget_durable_dirs`]).
 fn durable_dirs() -> &'static dashmap::DashSet<PathBuf> {
     static DURABLE: std::sync::OnceLock<dashmap::DashSet<PathBuf>> = std::sync::OnceLock::new();
     DURABLE.get_or_init(dashmap::DashSet::new)
 }
 
-/// Make a newly created file's directory entry durable, and the entries of
-/// every directory above it that this process has not yet made durable: fsync
-/// the parent, then walk up, fsyncing each parent, until reaching a directory
-/// already known durable, `stop_at` (the configured root) or the filesystem
-/// root. A file's own fsync covers its data, not the entries that name it —
-/// after a power loss the file could otherwise vanish while callers (WAL
-/// truncation) already rely on it.
+/// A deleted or moved directory, and everything under it, is no longer known
+/// durable: re-created at the same path, its entry must be synced afresh.
+fn forget_durable_dirs(path: &Path) {
+    if let Ok(path) = std::path::absolute(path) {
+        durable_dirs().retain(|dir| !dir.starts_with(&path));
+    }
+}
+
+/// Make a written file's directory entry durable, and the entries of every
+/// directory above it not yet known durable: fsync the parent, then walk up,
+/// fsyncing each parent, until reaching a directory known durable, `stop_at`
+/// (the configured root) or the filesystem root. A file's own fsync covers its
+/// data, not the entries that name it — after a power loss the file could
+/// otherwise vanish while callers (WAL truncation) already rely on it.
 ///
-/// "Already exists" is not "durable": a concurrent writer may have just
-/// created an ancestor without syncing it yet. Hence the walk up to a
-/// directory THIS process synced, done once per directory per process.
+/// "Already exists" is not "durable" — for the file (an earlier attempt may
+/// have created it, then failed before this sync) or for an ancestor (a
+/// concurrent writer may have just created it). Hence every synced write walks,
+/// and a directory is recorded durable only once the whole walk has succeeded:
+/// a concurrent walker stops at it trusting every entry above it. Known-durable
+/// parents make the common walk one fsync.
 async fn sync_new_entries(file: &Path, stop_at: Option<&Path>) -> FsResult<()> {
-    let Some(mut dir) = file.parent() else {
+    let file = std::path::absolute(file).map_err(FilesystemError::Io)?;
+    let stop_at = stop_at
+        .map(std::path::absolute)
+        .transpose()
+        .map_err(FilesystemError::Io)?;
+    let Some(parent) = file.parent() else {
         return Ok(());
     };
-    let mut synced_child: Option<&Path> = None;
+    let mut made_durable: Vec<&Path> = Vec::new();
+    let mut dir = parent;
     loop {
-        sync_dir(dir).await?;
-        if let Some(child) = synced_child {
-            durable_dirs().insert(child.to_path_buf());
+        // The file's own directory, and any inside the root, must sync.
+        // Above the root (or with none) an ancestor this process cannot open
+        // or that is read-only cannot be fsynced by it at all; failing would
+        // break every write for a guarantee no retry can give.
+        let required = dir == parent || stop_at.as_deref().is_some_and(|s| dir.starts_with(s));
+        sync_dir(dir, required).await?;
+        if durable_dirs().contains(dir) || stop_at.as_deref() == Some(dir) {
+            break;
         }
-        let Some(parent) = dir.parent() else {
+        made_durable.push(dir);
+        let Some(up) = dir.parent() else {
             break;
         };
-        if durable_dirs().contains(dir) || stop_at.is_some_and(|stop| dir == stop) {
-            break;
-        }
-        synced_child = Some(dir);
-        dir = parent;
+        dir = up;
+    }
+    for dir in made_durable {
+        durable_dirs().insert(dir.to_path_buf());
     }
     Ok(())
 }
 
-/// fsync a directory. `""` (the parent of a bare relative name) is `.`.
-/// EINVAL/EBADF — filesystems that cannot fsync a directory (some FUSE and
-/// network mounts) — are tolerated, as PostgreSQL does: there is nothing
-/// stronger to do there, and failing would break every write.
+/// fsync a directory. EINVAL/EBADF — filesystems that cannot fsync a directory
+/// (some FUSE and network mounts) — are tolerated, as PostgreSQL does: there is
+/// nothing stronger to do there, and failing would break every write. Unless
+/// `required`, so are EACCES/EPERM/EROFS (see [`sync_new_entries`]).
 #[cfg(unix)]
-async fn sync_dir(dir: &Path) -> FsResult<()> {
-    let dir = if dir.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        dir.to_path_buf()
-    };
+async fn sync_dir(dir: &Path, required: bool) -> FsResult<()> {
+    let dir = dir.to_path_buf();
     #[cfg(test)]
     synced_dirs_for_tests().lock().push(dir.clone());
-    let result =
-        tokio::task::spawn_blocking(move || std::fs::File::open(&dir).and_then(|d| d.sync_all()))
-            .await
-            .map_err(|e| FilesystemError::Io(std::io::Error::other(e)))?;
+    let opened = dir.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        std::fs::File::open(&opened).and_then(|d| d.sync_all())
+    })
+    .await
+    .map_err(|e| FilesystemError::Io(std::io::Error::other(e)))?;
     match result {
         Ok(()) => Ok(()),
         Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL) | Some(libc::EBADF)) => Ok(()),
+        Err(e)
+            if !required
+                && matches!(
+                    e.raw_os_error(),
+                    Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::EROFS)
+                ) =>
+        {
+            tracing::debug!(dir = %dir.display(), error = %e, "ancestor directory not fsynced");
+            Ok(())
+        }
         Err(e) => Err(FilesystemError::Io(e)),
     }
 }
 
 #[cfg(not(unix))]
-async fn sync_dir(_dir: &Path) -> FsResult<()> {
+async fn sync_dir(_dir: &Path, _required: bool) -> FsResult<()> {
     Ok(())
 }
 
@@ -226,6 +259,14 @@ impl LocalFileSystem {
                     "Root path is not a directory: {}",
                     root_dir.display()
                 )));
+            }
+            // Per-write walks stop at the root; make the root's own entry
+            // durable once here. Best-effort: the root may sit under
+            // directories this process cannot fsync.
+            if config.sync_enabled
+                && let Err(e) = sync_new_entries(root_dir, None).await
+            {
+                warn!(root = %root_dir.display(), error = %e, "root directory entry not fsynced");
             }
         }
 
@@ -423,6 +464,14 @@ impl LocalFileSystem {
                     root_dir.display()
                 )));
             }
+            // Per-write walks stop at the root; make the root's own entry
+            // durable once here. Best-effort: the root may sit under
+            // directories this process cannot fsync.
+            if config.sync_enabled
+                && let Err(e) = sync_new_entries(root_dir, None).await
+            {
+                warn!(root = %root_dir.display(), error = %e, "root directory entry not fsynced");
+            }
         }
 
         Ok(Self {
@@ -616,7 +665,6 @@ impl FileSystem for LocalFileSystem {
         let path_str = self.resolve_path(path)?;
         let resolved_path = PathBuf::from(path_str);
         let options = options.clone();
-        let newly_created = !resolved_path.exists();
 
         // Create parent directories if requested
         if options.as_ref().is_some_and(|o| o.create_dirs)
@@ -668,10 +716,9 @@ impl FileSystem for LocalFileSystem {
 
             // Sync data to disk to prevent truncation issues
             file.sync_all().await.map_err(FilesystemError::Io)?;
-            // An overwrite's entry already exists; a new file's does not.
-            if newly_created {
-                sync_new_entries(&resolved_path, self.config.root_dir.as_deref()).await?;
-            }
+            // Even an overwrite: the entry may be one an earlier, failed
+            // attempt created and never synced.
+            sync_new_entries(&resolved_path, self.config.root_dir.as_deref()).await?;
         } else {
             // Fast write without sync (for development/testing only)
             fs::write(&resolved_path, data_to_write)
@@ -779,9 +826,11 @@ impl FileSystem for LocalFileSystem {
         }
 
         if resolved_path.is_dir() {
-            fs::remove_dir_all(&resolved_path)
+            let removed = fs::remove_dir_all(&resolved_path)
                 .await
-                .map_err(FilesystemError::Io)
+                .map_err(FilesystemError::Io);
+            forget_durable_dirs(&resolved_path);
+            removed
         } else {
             fs::remove_file(&resolved_path)
                 .await
@@ -1100,10 +1149,15 @@ impl FileSystem for LocalFileSystem {
         }
 
         trace!("Attempting rename from {:?} to {:?}", from_path, to_path);
+        let moving_dir = from_path.is_dir();
         let result = fs::rename(&from_path, &to_path).await.map_err(|e| {
             debug!("Rename failed, will try copy: {}", e);
             FilesystemError::Io(e)
         });
+        if moving_dir {
+            forget_durable_dirs(&from_path);
+            forget_durable_dirs(&to_path);
+        }
 
         if result.is_ok() {
             trace!("File moved successfully");
@@ -2139,20 +2193,61 @@ mod tests {
             .collect();
         assert_eq!(new, vec![&root.join("spill/t1/orders")], "only the parent");
 
-        // An overwrite of an existing file syncs no directory.
+        // An overwrite in a durable directory syncs only its parent.
         let before = synced_dirs_for_tests().lock().len();
         fs.write("spill/t1/orders/seg2.parquet", b"z", None)
             .await
             .unwrap();
         let after = synced_dirs_for_tests().lock().clone();
-        assert!(
-            !after[before..].iter().any(|d| d.starts_with(&root)),
-            "an overwrite needs no directory sync"
-        );
+        let new: Vec<_> = after[before..]
+            .iter()
+            .filter(|d| d.starts_with(&root))
+            .collect();
+        assert_eq!(new, vec![&root.join("spill/t1/orders")], "only the parent");
         assert_eq!(
             std::fs::read(root.join("spill/t1/orders/seg2.parquet")).unwrap(),
             b"z"
         );
+
+        // A file that already exists — say an earlier attempt created it and
+        // failed before syncing — is not durable: the retry walks the chain.
+        std::fs::create_dir_all(root.join("retry/a")).unwrap();
+        std::fs::write(root.join("retry/a/f"), b"partial").unwrap();
+        let before = synced_dirs_for_tests().lock().len();
+        fs.write("retry/a/f", b"whole", None).await.unwrap();
+        let after = synced_dirs_for_tests().lock().clone();
+        for dir in [root.join("retry/a"), root.join("retry"), root.clone()] {
+            assert!(
+                after[before..].contains(&dir),
+                "{} not fsynced",
+                dir.display()
+            );
+        }
+
+        // A deleted directory is forgotten: re-created, it is synced again.
+        fs.delete("spill").await.unwrap();
+        assert!(
+            !durable_dirs()
+                .iter()
+                .any(|d| d.starts_with(root.join("spill")))
+        );
+        let before = synced_dirs_for_tests().lock().len();
+        fs.write_if_absent("spill/t1/orders/seg.parquet", b"x", options)
+            .await
+            .unwrap();
+        let after = synced_dirs_for_tests().lock().clone();
+        for dir in [
+            root.join("spill/t1/orders"),
+            root.join("spill/t1"),
+            root.join("spill"),
+            root.clone(),
+        ] {
+            assert!(
+                after[before..].contains(&dir),
+                "{} not re-synced",
+                dir.display()
+            );
+        }
     }
 
     #[tokio::test]
