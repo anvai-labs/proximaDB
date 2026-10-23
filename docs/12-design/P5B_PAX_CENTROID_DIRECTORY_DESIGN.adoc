@@ -243,6 +243,13 @@ interleaves per cell:
   when the destination's `IopsBudget` profile is an object store (S3, Azure, GCS) and keeps
   separate regions on local disk. Both layouts are readable everywhere.
 
+*As built (D5, owner decision 2026-10-23):* the first step is a same-wave fetch rather than a
+new layout. The probe appends each probed cell's Region-B extent (already in A0) to its cold
+Region-A wave, and the rerank reads survivors from those buffers
+(`PROXIMADB_PAX_READ_SAME_WAVE_RERANK`). The rerank wave disappears with no format change; a
+probed cell costs up to two ranges instead of one. The co-located layout above is built only
+if D7 shows the second range breaks the request budget.
+
 === 3.4 Collapsing the per-segment metadata waves (D6)
 
 The remaining per-segment reads before a cell read are the header prefix, A0 and the

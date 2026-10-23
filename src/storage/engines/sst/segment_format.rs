@@ -3200,6 +3200,115 @@ struct CoarseProbeResult {
     /// Region-A wave or overlapped the rank). `None` = the caller owns the
     /// footer (cache hit classified Ready) or the probe never ran.
     footer_bytes: Option<Vec<u8>>,
+    /// TD-PAXDIR-1 D5: the probed cells' Region-B (SQ8) extents, fetched in
+    /// the same wave as their Region-A codes (`start offset`, bytes), sorted
+    /// by offset. Empty unless `PROXIMADB_PAX_READ_SAME_WAVE_RERANK` is on and
+    /// the probe issued a cold wave; the rerank then needs no wave of its own.
+    prefetched_b: Vec<(u64, Vec<u8>)>,
+}
+
+/// TD-PAXDIR-1 D5 READ gate: fetch the probed cells' SQ8 rerank bytes in the
+/// coarse probe's Region-A wave (A0 records each cell's Region-B extent), so
+/// the rerank needs no dependent wave. Trades bytes (every row of a probed
+/// cell, not only survivors) for one fewer round trip. Default OFF.
+fn same_wave_rerank_enabled() -> bool {
+    crate::storage::engines::sst::block_cluster::env_gate_on("PROXIMADB_PAX_READ_SAME_WAVE_RERANK")
+}
+
+/// Region-B extents of the probed `cells` (A0 entries) whose Region-A read was
+/// cold (`cold_a`), clamped to Region B `[sq8_off, sq8_end)` and merged where
+/// they touch. A malformed extent (overflow, outside Region B) is skipped —
+/// the rerank then fetches it the normal way.
+fn probed_cell_b_ranges(
+    cells: &[proximadb_storage_common::coarse_directory::CoarseCellEntry],
+    probed: &[usize],
+    cold_a: &[std::ops::Range<u64>],
+    sq8_off: u64,
+    sq8_end: u64,
+) -> Vec<std::ops::Range<u64>> {
+    let a_is_cold = |cell: &proximadb_storage_common::coarse_directory::CoarseCellEntry| {
+        cell.a_off.checked_add(cell.a_len).is_some_and(|a_end| {
+            cold_a
+                .iter()
+                .any(|r| r.start <= cell.a_off && a_end <= r.end)
+        })
+    };
+    let mut ranges: Vec<std::ops::Range<u64>> = probed
+        .iter()
+        .filter_map(|&c| cells.get(c))
+        .filter(|cell| cell.b_len > 0 && a_is_cold(cell))
+        .filter_map(|cell| {
+            let end = cell.b_off.checked_add(cell.b_len)?;
+            (cell.b_off >= sq8_off && end <= sq8_end).then_some(cell.b_off..end)
+        })
+        .collect();
+    ranges.sort_by_key(|r| r.start);
+    let mut merged: Vec<std::ops::Range<u64>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
+/// Where `[start, end)` lies in the same-wave prefetched Region-B extents
+/// (sorted by offset): the extent index and the byte range within it, or
+/// `None` when no single extent covers it.
+fn prefetched_range(
+    prefetched: &[(u64, Vec<u8>)],
+    start: u64,
+    end: u64,
+) -> Option<(usize, std::ops::Range<usize>)> {
+    let idx = prefetched
+        .partition_point(|(off, _)| *off <= start)
+        .checked_sub(1)?;
+    let (off, bytes) = &prefetched[idx];
+    let rel_start = usize::try_from(start.checked_sub(*off)?).ok()?;
+    let rel_end = usize::try_from(end.checked_sub(*off)?).ok()?;
+    (rel_start <= rel_end && rel_end <= bytes.len()).then_some((idx, rel_start..rel_end))
+}
+
+/// TD-PAXDIR-1 D5: plan the rerank's SQ8 ranges so that none crosses the
+/// boundary of a same-wave prefetched extent — survivors inside one extent,
+/// and survivors in each gap between extents, are planned separately — so
+/// every range over prefetched rows is served from the wave and none
+/// re-reads bytes the probe already fetched. Survivors stay in ascending row
+/// order across the result. With no extents this is the plain planner.
+fn plan_rerank_ranges(
+    survivors: &[usize],
+    dim: usize,
+    codes_base: u64,
+    policy: &crate::storage::engines::sst::readers::sst_query_engine::ObjectRangeCoalescePolicy,
+    extents: &[std::ops::Range<u64>],
+) -> Vec<RowFetch> {
+    if extents.is_empty() {
+        return plan_coalesced_row_ranges(survivors, dim, codes_base, policy);
+    }
+    let dim64 = dim as u64;
+    // (extents starting at or before the row, whether an extent covers it):
+    // non-decreasing over ascending rows, so equal keys form runs.
+    let key = |g: usize| {
+        let start = codes_base + (g as u64) * dim64;
+        let at = extents.partition_point(|r| r.start <= start);
+        let covered = at > 0 && start + dim64 <= extents[at - 1].end;
+        (at, !covered)
+    };
+    let mut out = Vec::new();
+    let mut run_start = 0;
+    for i in 1..=survivors.len() {
+        if i == survivors.len() || key(survivors[i]) != key(survivors[run_start]) {
+            out.extend(plan_coalesced_row_ranges(
+                &survivors[run_start..i],
+                dim,
+                codes_base,
+                policy,
+            ));
+            run_start = i;
+        }
+    }
+    out
 }
 
 /// TD-RDSTRAT-13 C4: the cascade's footer classification — `Ready` (served
@@ -3541,6 +3650,31 @@ async fn coarse_probe_survivors(
         }
     }
 
+    // TD-PAXDIR-1 D5: ride the probed cells' SQ8 extents on this cold wave
+    // (only when there is one — a fully warm probe leaves the rerank to its
+    // cached path).
+    // Filtered probes are excluded (a selective filter can probe every cell
+    // that holds one matching row — the whole Region B for a few survivors),
+    // and the wave is capped at 8 IOP-sized blocks for the storage class.
+    let a_wave_len = cold_ranges.len();
+    let b_wave = if same_wave_rerank_enabled() && a_wave_len > 0 && row_allow.is_none() {
+        let first_a = usize::from(footer_queued);
+        let ranges = probed_cell_b_ranges(
+            &dir.cells,
+            &probed,
+            &cold_ranges[first_a..],
+            header.sq8_off,
+            header.sq8_off.saturating_add(header.sq8_len),
+        );
+        let budget = proximadb_storage_common::iops_budget::IopsBudget::for_path(path)
+            .target_block_bytes()
+            .saturating_mul(8);
+        let total: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+        if total <= budget { ranges } else { Vec::new() }
+    } else {
+        Vec::new()
+    };
+    cold_ranges.extend(b_wave.iter().cloned());
     // One bounded-concurrent I/O round for every true-cold range. `INFLIGHT`
     // caps in-flight GETs here; sequential behavior when unset/≤1 is unchanged
     // from the baseline loop (the cap defers to PARALLEL).
@@ -3556,21 +3690,48 @@ async fn coarse_probe_survivors(
             Err(_) => {
                 // Defensive fallback to the sequential baseline shape.
                 let mut seq = Vec::with_capacity(cold_ranges.len());
-                for range in &cold_ranges {
-                    let b = fs
+                for (i, range) in cold_ranges.iter().enumerate() {
+                    let read = fs
                         .read_range(path, range.start, range.end - range.start)
-                        .await
-                        .map_err(|err| {
-                            anyhow::anyhow!("coarse-probe Region A fallback {path}: {err}")
-                        })?;
+                        .await;
+                    let b = match read {
+                        Ok(b) => b,
+                        // D5: a same-wave Region-B read is an optimisation —
+                        // an empty buffer covers nothing and the rerank
+                        // fetches it the normal way.
+                        Err(_) if i >= a_wave_len => Vec::new(),
+                        Err(err) => {
+                            return Err(anyhow::anyhow!(
+                                "coarse-probe Region A fallback {path}: {err}"
+                            ));
+                        }
+                    };
                     seq.push(b);
                 }
                 seq
             }
         };
-        for ((range, buf), slot) in cold_ranges.iter().zip(batched).zip(cold_bytes.iter_mut()) {
-            crate::observability::io_trace::record_pax_region_bytes(buf.len() as u64, 0);
-            record_get_physical(CacheTier::ProbeIndex, range.end - range.start, trace_on);
+        for (i, ((range, buf), slot)) in cold_ranges
+            .iter()
+            .zip(batched)
+            .zip(cold_bytes.iter_mut())
+            .enumerate()
+        {
+            if i >= a_wave_len {
+                // D5: a same-wave Region-B extent (survivor payload tier); an
+                // empty buffer is a soft-failed read, not a GET's payload.
+                if !buf.is_empty() {
+                    crate::observability::io_trace::record_pax_region_bytes(0, buf.len() as u64);
+                    record_get_physical(
+                        CacheTier::SurvivorPayload,
+                        range.end - range.start,
+                        trace_on,
+                    );
+                }
+            } else {
+                crate::observability::io_trace::record_pax_region_bytes(buf.len() as u64, 0);
+                record_get_physical(CacheTier::ProbeIndex, range.end - range.start, trace_on);
+            }
             *slot = Some(buf);
         }
         // C4: the queued footer rode this wave at index 0 — Meta tier, not a
@@ -3590,6 +3751,15 @@ async fn coarse_probe_survivors(
         crate::observability::io_trace::drain_and_forward_read_ranges_metrics();
     }
 
+    // D5: the same-wave Region-B buffers sit after every Region-A range.
+    let prefetched_b: Vec<(u64, Vec<u8>)> = b_wave
+        .iter()
+        .zip(cold_bytes.drain(a_wave_len.min(cold_bytes.len())..))
+        .filter_map(|(range, buf)| {
+            buf.filter(|b| b.len() as u64 == range.end - range.start)
+                .map(|b| (range.start, b))
+        })
+        .collect();
     // C4: the footer slot (always index 0 when present) is already consumed —
     // pop it so the remaining slots align 1:1 with the fetch list.
     if footer_queued {
@@ -3746,6 +3916,7 @@ async fn coarse_probe_survivors(
         a0_bytes,
         rabitq_header_bytes: hdr_bytes,
         footer_bytes: footer_out,
+        prefetched_b,
     }))
 }
 
@@ -4121,7 +4292,7 @@ pub async fn rabitq_search_segment_coalesced_allowed(
             len: header.footer_len,
         }
     };
-    let probe = if probe_armed {
+    let mut probe = if probe_armed {
         coarse_probe_survivors(
             fs,
             path,
@@ -4308,9 +4479,30 @@ pub async fn rabitq_search_segment_coalesced_allowed(
             estimate_with_whole_region_fallback(estimate, header.sq8_len)
         },
     );
-    let sq8_fetches = plan_coalesced_row_ranges(&sorted_survivors, dim, codes_base, &policy);
+    // TD-PAXDIR-1 D5: the probe's same-wave Region-B extents, moved out so
+    // they are freed with this stage, before the Region-D fetch.
+    let prefetched_b: Vec<(u64, Vec<u8>)> = probe
+        .as_mut()
+        .map(|p| std::mem::take(&mut p.prefetched_b))
+        .unwrap_or_default();
+    let prefetched_extents: Vec<std::ops::Range<u64>> = prefetched_b
+        .iter()
+        .map(|(off, bytes)| *off..*off + bytes.len() as u64)
+        .collect();
+    let sq8_fetches = plan_rerank_ranges(
+        &sorted_survivors,
+        dim,
+        codes_base,
+        &policy,
+        &prefetched_extents,
+    );
     let mut scored: Vec<(usize, f32)> = Vec::with_capacity(survivors.len());
     let ranges_bytes: u64 = sq8_fetches.iter().map(|f| f.end - f.start).sum();
+    // TD-PAXDIR-1 D5: planned ranges the probe's wave already carried are fed
+    // to the clustered path below as fetched bytes (same cache population,
+    // order and scoring as a real fetch). Covered ranges total at most the
+    // codes, below the Region-B length, so they never take the whole-region
+    // branch.
     if ranges_bytes >= header.sq8_len {
         // Scattered survivors (sign-bit / no-IVF order): the coalesced ranges would
         // over-read >= the whole Region B — fetch it in one GET instead (fewer GETs,
@@ -4471,6 +4663,9 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         enum RegionBSlot {
             SiteServed,
             Cold(usize),
+            /// D5: carried by the coarse probe's wave (extent, byte range) —
+            /// no read here.
+            Prefetched(usize, std::ops::Range<usize>),
         }
         let mut slots: Vec<RegionBSlot> = Vec::with_capacity(sq8_fetches.len());
         let mut cold_ranges: Vec<std::ops::Range<u64>> = Vec::new();
@@ -4491,10 +4686,13 @@ pub async fn rabitq_search_segment_coalesced_allowed(
                 {
                     slots.push(RegionBSlot::SiteServed);
                 }
-                _ => {
-                    slots.push(RegionBSlot::Cold(cold_ranges.len()));
-                    cold_ranges.push(fetch.start..fetch.end);
-                }
+                _ => match prefetched_range(&prefetched_b, fetch.start, fetch.end) {
+                    Some((extent, rel)) => slots.push(RegionBSlot::Prefetched(extent, rel)),
+                    None => {
+                        slots.push(RegionBSlot::Cold(cold_ranges.len()));
+                        cold_ranges.push(fetch.start..fetch.end);
+                    }
+                },
             }
         }
         // One bounded-concurrent wave for every true-cold range (INFLIGHT cap;
@@ -4553,6 +4751,9 @@ pub async fn rabitq_search_segment_coalesced_allowed(
                     )
                 })?),
                 RegionBSlot::SiteServed => None,
+                RegionBSlot::Prefetched(extent, rel) => {
+                    Some(prefetched_b[*extent].1[rel.clone()].to_vec())
+                }
             };
             // ADR-065 Q3: survivor-range cache. On a hit the loader never runs,
             // so the billed GET fires only on a true miss — bytes-not-billed
@@ -4657,6 +4858,7 @@ pub async fn rabitq_search_segment_coalesced_allowed(
     scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     let top_k_rows: Vec<usize> = scored.iter().take(k).map(|(g, _)| *g).collect();
 
+    drop(prefetched_b); // D5: the same-wave extents are spent
     // 5. ADR-065 Region D: fetch ONLY the top-k OIDs from the row blocks (≤k
     //    coalesced GETs — vs PR2's M-survivor block fetches). Map top-k rows →
     //    blocks via cumulative row counts.
