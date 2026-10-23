@@ -73,7 +73,7 @@ pub(crate) async fn ensure_exact_directory(
 /// Deterministic partition selector. Same `tenant_id` always lands on the
 /// same partition for a given `partition_count`, preserving per-tenant FIFO.
 ///
-/// Uses `xxhash3` (`twox-hash` crate) modulo partition count. xxhash gives
+/// Uses `xxhash64` (`twox-hash` crate) modulo partition count. xxhash gives
 /// uniform distribution on string inputs with negligible per-call cost.
 pub fn partition_for(tenant_id: &str, partition_count: u32) -> PartitionId {
     debug_assert!(partition_count > 0, "partition_count must be > 0");
