@@ -489,6 +489,19 @@ async fn small_row_group_store(rows: usize) -> (SpillRecordStorage, Arc<dyn File
 /// Run the provider's scan with `filter` pushed in; the rows it returned
 /// (before DataFusion re-applies the filter) and its row-group counters.
 async fn pruned_scan(table: NativeLayerASnapshot, filter: Expr) -> (Vec<i64>, usize, usize) {
+    let (scanned, count) = pruned_scan_counting(table, filter).await;
+    (
+        scanned,
+        count("row_groups_pruned"),
+        count("row_groups_total"),
+    )
+}
+
+/// [`pruned_scan`], with every metric by name.
+async fn pruned_scan_counting(
+    table: NativeLayerASnapshot,
+    filter: Expr,
+) -> (Vec<i64>, impl Fn(&str) -> usize) {
     let ctx = SessionContext::new();
     let provider = LayerATableProvider::new(table);
     let plan = datafusion::datasource::TableProvider::scan(
@@ -504,12 +517,8 @@ async fn pruned_scan(table: NativeLayerASnapshot, filter: Expr) -> (Vec<i64>, us
         .await
         .expect("execute");
     let metrics = plan.metrics().expect("metrics");
-    let count = |name: &str| metrics.sum_by_name(name).map_or(0, |v| v.as_usize());
-    (
-        batches.iter().flat_map(ids).collect(),
-        count("row_groups_pruned"),
-        count("row_groups_total"),
-    )
+    let count = move |name: &str| metrics.sum_by_name(name).map_or(0, |v| v.as_usize());
+    (batches.iter().flat_map(ids).collect(), count)
 }
 
 /// Pruning skips row groups whose statistics rule the filter out, and the SQL
@@ -589,16 +598,17 @@ async fn a_pruned_newer_copy_still_hides_an_older_matching_one() {
     );
 }
 
-/// A row group holding a residual row is never pruned, whatever its
-/// statistics say — on any column, since the residual can carry any value.
+/// A residual row overrides only the props its residual names. Row 3's
+/// residual names `score` (an integer in a float column), so its row group's
+/// `id` statistics still describe every served `id`: `id >= 10` prunes it
+/// after the residual check, and the residual value is still served.
 #[tokio::test]
-async fn a_row_group_with_a_residual_row_is_never_pruned() {
+async fn a_residual_row_not_naming_a_filter_column_does_not_block_pruning() {
     use datafusion::prelude::{col, lit};
     let (store, fs) = small_row_group_store(10).await;
     for i in 0..20 {
         let mut r = padded(i, 1000.0 + i as f64);
         if i == 3 {
-            // An integer in a float column reads back as a float: residual.
             r.props.insert(
                 "score".into(),
                 ProximaTreeNode::Value(ProximaValue::Int64(1003)),
@@ -607,13 +617,206 @@ async fn a_row_group_with_a_residual_row_is_never_pruned() {
         store.upsert_record(r).await.unwrap();
     }
     store.flush().await.unwrap().expect("segment");
-    let (_, pruned, total) = pruned_scan(
+    let (scanned, count) = pruned_scan_counting(
         unrestricted(snapshot_of(&store, &fs).await),
-        col("id").lt(lit(0_i64)),
+        col("id").gt_eq(lit(10_i64)),
     )
     .await;
-    assert_eq!(total, 2);
-    assert_eq!(pruned, 1, "the row group holding the residual row is kept");
+    assert_eq!(count("row_groups_total"), 2);
+    assert_eq!(count("row_groups_residual_checked"), 1);
+    assert_eq!(
+        count("row_groups_pruned"),
+        1,
+        "the residual names no filter column"
+    );
+    assert_eq!(scanned, (10..20).collect::<Vec<_>>());
+
+    let got = query(
+        unrestricted(snapshot_of(&store, &fs).await),
+        "select id from orders where id >= 10 order by id",
+    )
+    .await;
+    assert_eq!(ids(&got), (10..20).collect::<Vec<_>>());
+    let three = query(
+        unrestricted(snapshot_of(&store, &fs).await),
+        "select score from orders where id = 3",
+    )
+    .await;
+    let score = three
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    assert_eq!(score.value(0), 1003.0, "the residual value is still served");
+}
+
+/// A row group the residual check clears in a NEWER segment is still read as
+/// a key spine: its rows (renamed away from the filter) keep shadowing the
+/// older matching copies, which must not come back.
+#[tokio::test]
+async fn a_residual_cleared_row_group_still_shadows_older_copies() {
+    use datafusion::prelude::{col, lit};
+    let (store, fs) = small_row_group_store(10).await;
+    for i in 0..20 {
+        store.upsert_record(padded(i, 0.0)).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment 1");
+    for i in 0..10 {
+        let mut r = padded(i, 0.0);
+        r.props.insert(
+            "name".into(),
+            ProximaTreeNode::Value(ProximaValue::String("z".to_string())),
+        );
+        if i == 3 {
+            // A residual naming `score`, not the filter column.
+            r.props.insert(
+                "score".into(),
+                ProximaTreeNode::Value(ProximaValue::Int64(7)),
+            );
+        }
+        store.upsert_record(r).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment 2");
+
+    let (scanned, count) = pruned_scan_counting(
+        unrestricted(snapshot_of(&store, &fs).await),
+        col("name").eq(lit("p")),
+    )
+    .await;
+    assert_eq!(count("row_groups_residual_checked"), 1);
+    assert_eq!(count("row_groups_pruned"), 1, "segment 2's renamed rows");
+    assert_eq!(scanned, (10..20).collect::<Vec<_>>(), "no stale copy");
+    let got = query(
+        unrestricted(snapshot_of(&store, &fs).await),
+        "select id from orders where name = 'p' order by id",
+    )
+    .await;
+    assert_eq!(ids(&got), (10..20).collect::<Vec<_>>());
+}
+
+/// A residual row that names a filter column keeps its row group, whatever
+/// the statistics say: that column's served value is not in them.
+#[tokio::test]
+async fn a_residual_row_naming_a_filter_column_keeps_its_row_group() {
+    use datafusion::prelude::{col, lit};
+    let (store, fs) = small_row_group_store(10).await;
+    for i in 0..20 {
+        let mut r = padded(i, 0.0);
+        if i == 3 {
+            // Not a string in a string column: the typed column cannot hold
+            // it, so it is residual.
+            r.props.insert(
+                "name".into(),
+                ProximaTreeNode::Value(ProximaValue::Int64(1003)),
+            );
+        }
+        store.upsert_record(r).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment");
+    let (scanned, count) = pruned_scan_counting(
+        unrestricted(snapshot_of(&store, &fs).await),
+        col("name").eq(lit("zzz")),
+    )
+    .await;
+    assert_eq!(count("row_groups_total"), 2);
+    assert_eq!(count("row_groups_residual_checked"), 1);
+    assert_eq!(
+        count("row_groups_pruned"),
+        1,
+        "only the row group without residual rows is pruned"
+    );
+    assert!(scanned.contains(&3), "{scanned:?}");
+}
+
+/// The residual check errs only towards keeping: a residual key matches a
+/// filter column case-insensitively and through a dotted column's top-level
+/// prop; a residual that does not decode keeps the row group, and so does one
+/// replacing embeddings when a filter references a vector column (the only
+/// columns served from embeddings).
+#[test]
+fn the_residual_check_keeps_any_row_group_it_cannot_clear() {
+    use datafusion::common::Column;
+    use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+    use datafusion::prelude::lit;
+    use std::collections::HashMap;
+
+    #[derive(serde::Serialize)]
+    struct Cell {
+        #[serde(skip_serializing_if = "HashMap::is_empty")]
+        props: HashMap<String, ProximaTreeNode>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        embeddings: Option<Vec<u8>>,
+    }
+    let cell = |key: Option<&str>, embeddings: bool| {
+        let props = key
+            .map(|k| {
+                HashMap::from([(
+                    k.to_string(),
+                    ProximaTreeNode::Value(ProximaValue::Int64(1)),
+                )])
+            })
+            .unwrap_or_default();
+        rmp_serde::to_vec_named(&Cell {
+            props,
+            embeddings: embeddings.then(Vec::new),
+        })
+        .unwrap()
+    };
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    let catalog = Arc::new(Schema::new(vec![
+        Field::new("Name", DataType::Utf8, true),
+        Field::new("a.b", DataType::Int64, true),
+        Field::new("other", DataType::Int64, true),
+        Field::new(
+            "v",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+            true,
+        ),
+    ]));
+    let ctx = SessionContext::new();
+    let pruner = super::prune::SegmentPruner::try_new(
+        &[
+            Expr::Column(Column::new_unqualified("Name")).eq(lit("x")),
+            Expr::Column(Column::new_unqualified("a.b")).gt(lit(1_i64)),
+        ],
+        catalog.clone(),
+        None,
+        &ctx.state(),
+        &ExecutionPlanMetricsSet::new(),
+    )
+    .expect("a pruning predicate");
+    let vector_pruner = super::prune::SegmentPruner::try_new(
+        &[Expr::Column(Column::new_unqualified("v")).is_not_null()],
+        catalog,
+        None,
+        &ctx.state(),
+        &ExecutionPlanMetricsSet::new(),
+    )
+    .expect("a pruning predicate");
+
+    let allows = |cells: &[Vec<u8>]| pruner.residual_allows_prune(cells.iter().map(Vec::as_slice));
+    assert!(
+        allows(&[cell(Some("other"), false)]),
+        "names no filter column"
+    );
+    assert!(allows(&[]), "no residual cell");
+    assert!(!allows(&[cell(Some("NAME"), false)]), "case-insensitive");
+    assert!(!allows(&[cell(Some("a"), false)]), "a.b reads through a");
+    assert!(!allows(&[cell(Some("A.B"), false)]), "same head, folded");
+    assert!(
+        allows(&[cell(None, true)]),
+        "embeddings serve no scalar filter column"
+    );
+    assert!(
+        !vector_pruner.residual_allows_prune([cell(None, true).as_slice()]),
+        "replaces the embeddings a vector filter reads"
+    );
+    assert!(!allows(&[b"\xc1".to_vec()]), "undecodable");
+    assert!(
+        !allows(&[cell(Some("other"), false), cell(Some("name"), false)]),
+        "any cell naming a filter column"
+    );
 }
 
 /// A row whose key column is NULL serves its key from the oid, which the
