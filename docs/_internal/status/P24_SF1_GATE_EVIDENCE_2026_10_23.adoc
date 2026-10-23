@@ -7,7 +7,7 @@
 
 [.lead]
 The P2.4 gate is "TPC-DS SF1 loads on a release build without OOM, peak RSS recorded"
-(TD-SEAM-4). **SF1 was not run**: neither configuration can complete it on develop.
+(TD-SEAM-4). **SF1 was not run**: neither configuration can complete it on develop on this host.
 With the Layer A spill on (the default), an INSERT into a table that has spilled decodes every
 spill segment per row
 (link:../../10-quality/td/TD-USUB-21-insert-existence-probe-decodes-every-spill-segment.adoc[TD-USUB-21]),
@@ -49,16 +49,17 @@ A partition flushes its memtable to a segment when resident rows reach the thres
 | Scale | Spill threshold | Load wall | Note
 | 0.01 | 65,536 (default) | 6.7 s | no table reaches the threshold, so nothing spills
 | 0.01 | 16,384 | **1,746 s** (29.1 min) | only `store_sales` spills: one 16,384-row segment, then each of the remaining 12,416 rows decodes it. **257×** the spill-off load (6.8 s); ≈ 8.6 µs per decoded row
-| 0.1 | 65,536 (default) | stopped at 712 s, load unfinished | one core at 100 %; 4 of 4 gdb samples of the busy thread inside `SpillRecordStorage::get_record` → `read_segment`
+| 0.1 | 65,536 (default) | stopped at 712 s, load unfinished | `top` showed the process at 100 % of one core; 4 of 4 gdb samples of the busy thread inside `SpillRecordStorage::get_record` → `read_segment`
 |===
 
 The 16,384 run went on to publish all 22 tables (`store_sales` in 879 ms from its segment plus
 memtable) with MATERIALIZE peaking at 4,175 MiB against the load phase's 3,910 MiB (+265 MiB).
 
 A run at 4,096 panicked 15 s in on a missing `store_sales` segment file. It started when the
-16,384 run was killed, and a `find /tmp -name '.tmp*' -exec rm -rf` cleanup ran 20 s later and
-removed its data directory. Rerun at the same setting for 240 s, it wrote two `store_sales`
-segments and read them back on every INSERT with no error.
+16,384 run was killed, and a `find /tmp -name '.tmp*' -exec rm -rf` cleanup ran while it was
+starting; the sampled `/tmp` usage drops 168 → 150 MiB between 10 s and 15 s, consistent with that
+cleanup removing its data directory. Rerun at the same setting with a 240 s timeout, it ran to the
+timeout with no panic, and two `store_sales` segment files were on disk afterwards.
 
 === Spill off (`PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT=0`)
 

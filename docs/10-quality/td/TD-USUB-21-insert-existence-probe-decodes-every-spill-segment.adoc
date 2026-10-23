@@ -27,8 +27,8 @@ enough:
 
 * `commit_atomic` probes each row the same way.
 * Tables with a declared key are probed a **second** time by `enforce_row_write_constraints` →
-  `get_by_key` → `get_record` whenever no `ConditionalKeyStore` is wired, which is every build
-  without `oltp-integrity` and a `data_dir`.
+  `get_by_key` → `get_record` whenever no `ConditionalKeyStore` is wired: any build without
+  `oltp-integrity`, or without a `data_dir`.
 * During a cutover, migrate-on-write calls `legacy.delete_record` for every written row, and
   `delete_record`'s segment arm has the same shape.
 
@@ -45,7 +45,7 @@ enough:
   `SpillRecordStorage::read_segment` ← `get_record` ← `write_mutations` ←
   `DmlService::execute_insert`.
 * At SF1 the keyed dimension tables pay it too: `customer` and `customer_address` (100,000 rows
-  each) would decode ≈ 34,464 × 65,536 rows twice over, ≈ 10 h each at 8.6 µs.
+  each) would decode ≈ 34,464 × 65,536 rows twice over, ≈ 11 h each at 8.6 µs.
 
 Segment codec is not the cost: segments are Parquet with no compression set. A faster codec
 changes a constant, not the quadratic.
@@ -63,7 +63,8 @@ changes a constant, not the quadratic.
      segments if per-segment Bloom pruning is wanted;
   .. per-segment oid min/max prunes little for keyed tables: an INT key is encoded as its
      decimal string, so "2" sorts after "10" and each segment spans almost the whole key domain.
-     The page index within a segment still bounds the read to about one page per row group.
+     Within a segment the oid sort makes row-group ranges disjoint, so the page index bounds the
+     read to one page per segment.
 . **Do not skip the probe for keyless tables.** It looks free (the fact tables are keyless,
   their oids generated), but the generated oid is `{table}:row:{now_ns}`
   (`new_local_record_id`, `crates/control/proximadb-catalog/src/relational.rs`): no counter or
