@@ -1,0 +1,39 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-CDC-1: The cdc-kafka feature is a shell — the Kafka sink references rdkafka, which was never added as a dependency
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-23 from the tier-3 codegraph feature-coverage sweep plus compiler probing. The `onnx-cdc-duckdb` feature-matrix leg (this PR) documents the gap; no code change beyond the TD.
+| Severity | Medium. 718 lines (`proximadb-cdc/src/sinks/kafka.rs`) read as a Kafka sink but cannot compile in any configuration. The feature name promises a capability that does not exist.
+| Component | `crates/integrations/proximadb-cdc` (`cdc-kafka = []`), root `Cargo.toml` (`cdc-kafka = []`, gates three `[[test]]` targets)
+| Found | Fresh-context review of the onnx-cdc-duckdb leg flagged that root's `cdc-kafka` does not forward to the cdc crate. Probing the forward revealed the deeper truth: `cargo check -p proximadb-cdc --features cdc-kafka` fails with E0433/E0432 — `rdkafka` is not a dependency of any manifest. The comment "rdkafka dependency would be added when enabling this feature" was never executed.
+| Related | link:TD-TQFEAT-1-experimental-turboquant-not-compiled-in-ci.adoc[TD-TQFEAT-1] (the coverage-sweep method), link:TD-ORPHAN-1-fifty-eight-source-files-are-not-reachable.adoc[TD-ORPHAN-1] (code that reads live but no build reaches)
+|===
+
+== What
+
+Two features named `cdc-kafka` exist and gate different things:
+
+* Root: gates the three cdc `[[test]]` targets via `required-features`. Those tests compile
+  and are now compiled by the `onnx-cdc-duckdb` feature-matrix leg. They do not touch rdkafka.
+* `proximadb-cdc`: `cdc-kafka = []` with a comment saying rdkafka is used "when enabled" —
+  but no manifest declares rdkafka, so enabling the feature opens `cfg` gates onto code that
+  cannot resolve its imports. Unbuildable by construction; nothing in CI or out has ever
+  compiled it.
+
+== Options
+
+. **Wire rdkafka in**: add the optional dep + `dep:rdkafka` forward, pick a version, satisfy
+  its native build (librdkafka) in CI, and fix whatever API drift the 718 lines carry. Real
+  integration work; gate on the cdc e2e tests actually running against a Kafka container.
+. **Delete the sink**: if Kafka CDC is not on the near-term roadmap, 718 lines of unreachable
+  code is exactly the "reads as coverage, compiled by nothing" disease of TD-ORPHAN-1. Delete
+  `sinks/kafka.rs` and both shell features, and reopen when Kafka CDC is scheduled.
+
+== Disposition
+
+Deliberate decision needed (product: is Kafka CDC committed?). Until then the feature is
+recorded here as a sanctioned gap so coverage sweeps stop reporting it as a fixable
+forward.
