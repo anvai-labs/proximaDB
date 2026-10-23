@@ -11,6 +11,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
+use datafusion::logical_expr::Expr;
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use proximadb_catalog_schema::{CatalogColumn, CatalogTableSchema};
@@ -460,4 +461,231 @@ async fn a_record_route_row_keeps_a_composite_key_it_does_not_project() {
         .downcast_ref::<arrow::array::Float64Array>()
         .unwrap();
     assert_eq!(c.values().to_vec(), vec![11.0, 12.0, 21.0]);
+}
+
+// ---------------------------------------------------------------------------
+// Row-group pruning (ADR-097 P3.1 PR 5)
+// ---------------------------------------------------------------------------
+
+/// Zero-padded oids, so oid order (the segment order) is id order and a row
+/// group covers a contiguous id range.
+fn padded(id: i64, score: f64) -> ProximaRecord {
+    ProximaRecord {
+        oid: format!("{id:04}"),
+        ..row(id, "p", score)
+    }
+}
+
+/// A spill store whose segments have `rows`-row row groups.
+async fn small_row_group_store(rows: usize) -> (SpillRecordStorage, Arc<dyn FileSystem>) {
+    let (store, fs) = spill_store().await;
+    let policy = proximadb_storage_common::parquet_write_policy::ParquetWritePolicy {
+        row_group_rows: rows,
+        ..Default::default()
+    };
+    (store.with_write_policy(policy), fs)
+}
+
+/// Run the provider's scan with `filter` pushed in; the rows it returned
+/// (before DataFusion re-applies the filter) and its row-group counters.
+async fn pruned_scan(table: NativeLayerASnapshot, filter: Expr) -> (Vec<i64>, usize, usize) {
+    let ctx = SessionContext::new();
+    let provider = LayerATableProvider::new(table);
+    let plan = datafusion::datasource::TableProvider::scan(
+        &provider,
+        &ctx.state(),
+        Some(&vec![0]),
+        &[filter],
+        None,
+    )
+    .await
+    .expect("scan");
+    let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
+        .await
+        .expect("execute");
+    let metrics = plan.metrics().expect("metrics");
+    let count = |name: &str| metrics.sum_by_name(name).map_or(0, |v| v.as_usize());
+    (
+        batches.iter().flat_map(ids).collect(),
+        count("row_groups_pruned"),
+        count("row_groups_total"),
+    )
+}
+
+/// Pruning skips row groups whose statistics rule the filter out, and the SQL
+/// answer is the unpruned one.
+#[tokio::test]
+async fn pruning_skips_row_groups_and_keeps_the_answer() {
+    use datafusion::prelude::{col, lit};
+    let (store, fs) = small_row_group_store(10).await;
+    for i in 0..100 {
+        store.upsert_record(padded(i, i as f64)).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment");
+
+    let (scanned, pruned, total) = pruned_scan(
+        unrestricted(snapshot_of(&store, &fs).await),
+        col("id").gt_eq(lit(90_i64)),
+    )
+    .await;
+    assert_eq!(total, 10, "ten row groups of ten");
+    assert_eq!(pruned, 9, "only the 90..99 row group can match");
+    assert_eq!(scanned, (90..100).collect::<Vec<_>>());
+
+    let got = query(
+        unrestricted(snapshot_of(&store, &fs).await),
+        "select id from orders where id >= 90 order by id",
+    )
+    .await;
+    assert_eq!(ids(&got), (90..100).collect::<Vec<_>>());
+}
+
+/// A pruned row group still shadows older copies of its oids (the key spine):
+/// row 5 was updated to a name the filter excludes, and its older matching
+/// copy must not come back.
+#[tokio::test]
+async fn a_pruned_newer_copy_still_hides_an_older_matching_one() {
+    use datafusion::prelude::{col, lit};
+    let (store, fs) = small_row_group_store(10).await;
+    for i in 0..50 {
+        store.upsert_record(padded(i, i as f64)).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment 1");
+    let mut renamed = padded(5, 5.0);
+    renamed.props.insert(
+        "name".into(),
+        ProximaTreeNode::Value(ProximaValue::String("z".to_string())),
+    );
+    store.upsert_record(renamed).await.unwrap();
+    store.flush().await.unwrap().expect("segment 2");
+
+    let (scanned, pruned, _) = pruned_scan(
+        unrestricted(snapshot_of(&store, &fs).await),
+        col("name").eq(lit("p")),
+    )
+    .await;
+    assert!(pruned >= 1, "the newer copy's row group is pruned");
+    assert!(
+        !scanned.contains(&5),
+        "the stale copy of 5 must stay hidden"
+    );
+
+    let got = query(
+        unrestricted(snapshot_of(&store, &fs).await),
+        "select id from orders where name = 'p' order by id",
+    )
+    .await;
+    let want: Vec<i64> = (0..50).filter(|&i| i != 5).collect();
+    assert_eq!(ids(&got), want);
+    assert_eq!(
+        columns(&got),
+        columns(
+            &query(
+                unrestricted(snapshot_of(&store, &fs).await),
+                "select id from orders where name = 'p' and id <> 5 order by id",
+            )
+            .await
+        )
+    );
+}
+
+/// A row group holding a residual row is never pruned, whatever its
+/// statistics say — on any column, since the residual can carry any value.
+#[tokio::test]
+async fn a_row_group_with_a_residual_row_is_never_pruned() {
+    use datafusion::prelude::{col, lit};
+    let (store, fs) = small_row_group_store(10).await;
+    for i in 0..20 {
+        let mut r = padded(i, 1000.0 + i as f64);
+        if i == 3 {
+            // An integer in a float column reads back as a float: residual.
+            r.props.insert(
+                "score".into(),
+                ProximaTreeNode::Value(ProximaValue::Int64(1003)),
+            );
+        }
+        store.upsert_record(r).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment");
+    let (_, pruned, total) = pruned_scan(
+        unrestricted(snapshot_of(&store, &fs).await),
+        col("id").lt(lit(0_i64)),
+    )
+    .await;
+    assert_eq!(total, 2);
+    assert_eq!(pruned, 1, "the row group holding the residual row is kept");
+}
+
+/// A row whose key column is NULL serves its key from the oid, which the
+/// statistics do not cover: its row group must not be pruned on the key.
+/// Every other row's typed key is 1000+, so the statistics alone would prune
+/// `id = 7`; the keyless row's key is 7, from its oid.
+#[tokio::test]
+async fn a_row_group_whose_key_is_null_in_some_row_is_not_pruned_on_the_key() {
+    use datafusion::prelude::{col, lit};
+    let (store, fs) = small_row_group_store(10).await;
+    for i in 0..10 {
+        let mut r = padded(i, 0.0);
+        if i == 7 {
+            r.props.remove("id");
+        } else {
+            r.props.insert(
+                "id".into(),
+                ProximaTreeNode::Value(ProximaValue::Int64(1000 + i)),
+            );
+        }
+        store.upsert_record(r).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment");
+    let (scanned, pruned, _) = pruned_scan(
+        unrestricted(snapshot_of(&store, &fs).await),
+        col("id").eq(lit(7_i64)),
+    )
+    .await;
+    assert_eq!(
+        pruned, 0,
+        "the key statistics are withheld for this row group"
+    );
+    assert!(scanned.contains(&7), "{scanned:?}");
+}
+
+/// A row group whose key column is NULL in every row is not pruned on the key
+/// either: its null count would otherwise prove "no non-NULL key" to the
+/// predicate, while every row's served key is its oid (review of PR 5).
+#[tokio::test]
+async fn a_row_group_whose_key_is_null_in_every_row_is_not_pruned_on_the_key() {
+    use datafusion::prelude::{col, lit};
+    let (store, fs) = small_row_group_store(10).await;
+    for i in 0..10 {
+        let mut r = padded(i, 0.0);
+        r.props.remove("id");
+        store.upsert_record(r).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment");
+    for filter in [col("id").eq(lit(7_i64)), col("id").is_not_null()] {
+        let (scanned, pruned, _) =
+            pruned_scan(unrestricted(snapshot_of(&store, &fs).await), filter.clone()).await;
+        assert_eq!(pruned, 0, "{filter}: the key statistics are withheld");
+        assert!(scanned.contains(&7), "{filter}: {scanned:?}");
+    }
+}
+
+/// Parquet leaves NaN out of float min/max while DataFusion orders NaN above
+/// every number, so a float column is never pruned on (review of PR 5).
+#[tokio::test]
+async fn a_nan_float_row_is_never_pruned_away() {
+    use datafusion::prelude::{col, lit};
+    let (store, fs) = small_row_group_store(10).await;
+    for i in 0..10 {
+        let score = if i == 7 { f64::NAN } else { 0.5 };
+        store.upsert_record(padded(i, score)).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment");
+    let (scanned, pruned, _) = pruned_scan(
+        unrestricted(snapshot_of(&store, &fs).await),
+        col("score").gt(lit(1.0_f64)),
+    )
+    .await;
+    assert_eq!(pruned, 0, "float statistics are not used");
+    assert!(scanned.contains(&7), "{scanned:?}");
 }

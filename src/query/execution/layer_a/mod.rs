@@ -11,7 +11,9 @@
 //!    memory tombstones, segment paths — taken under one lock, with no segment
 //!    read ([`crate::services::layer_a_snapshot`]);
 //! 2. each spill segment read row group by row group through the `FileSystem`
-//!    port ([`FileSystemParquetReader`]);
+//!    port ([`FileSystemParquetReader`]), a row group the pushed filters
+//!    cannot match read as its oids alone so it still shadows older copies
+//!    ([`prune`]);
 //! 3. a newest-wins k-way merge over the oid-sorted segments, under the resident
 //!    rows and tombstones ([`merge`]);
 //! 4. every row conformed to the catalog schema exactly as the materialized path
@@ -28,6 +30,7 @@
 pub(crate) mod conform;
 pub(crate) mod merge;
 pub mod provider;
+pub(crate) mod prune;
 
 pub use provider::{LayerAScanExec, LayerATableProvider};
 

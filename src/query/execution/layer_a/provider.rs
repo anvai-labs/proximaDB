@@ -15,9 +15,10 @@ use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::{StreamExt, TryStreamExt};
@@ -31,6 +32,7 @@ use proximadb_storage_common::proxima_arrow::SYS_COL_OID;
 
 use super::conform::{ConformContext, Conformed, SegmentShape, conform_segment_batch};
 use super::merge::{ConformedStream, LayerAMerge};
+use super::prune::{SegmentPruner, runs};
 use crate::services::layer_a_snapshot::{LayerARowAccess, LayerASnapshot, NativeLayerASnapshot};
 use crate::storage::engines::sst::segment_format::read_segment_records;
 use crate::storage::persistence::filesystem::FileSystem;
@@ -86,7 +88,7 @@ impl TableProvider for LayerATableProvider {
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Table membership is the snapshot's (`LayerASnapshot::table_name`);
@@ -104,16 +106,36 @@ impl TableProvider for LayerATableProvider {
             crate::services::record_spill::now_ns(),
         )
         .map_err(|e| DataFusionError::Plan(format!("{e:#}")))?;
+        let metrics = ExecutionPlanMetricsSet::new();
+        let pruner = SegmentPruner::try_new(
+            filters,
+            self.schema.clone(),
+            ctx.pk_name.clone(),
+            state,
+            &metrics,
+        )
+        .map(Arc::new);
         Ok(Arc::new(LayerAScanExec::new(
             self.table.clone(),
             Arc::new(ctx),
             limit,
             state.config().batch_size(),
+            pruner,
+            metrics,
         )))
     }
 
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    /// Inexact: segment pruning only skips row groups that cannot match, and
+    /// DataFusion keeps evaluating every filter above the scan.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
     fn table_type(&self) -> TableType {
@@ -127,6 +149,9 @@ pub struct LayerAScanExec {
     ctx: Arc<ConformContext>,
     limit: Option<usize>,
     batch_size: usize,
+    /// Row-group pruning from the scan's filters (see `prune`).
+    pruner: Option<Arc<SegmentPruner>>,
+    metrics: ExecutionPlanMetricsSet,
     properties: Arc<PlanProperties>,
 }
 
@@ -145,6 +170,8 @@ impl LayerAScanExec {
         ctx: Arc<ConformContext>,
         limit: Option<usize>,
         batch_size: usize,
+        pruner: Option<Arc<SegmentPruner>>,
+        metrics: ExecutionPlanMetricsSet,
     ) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(ctx.output.clone()),
@@ -157,6 +184,8 @@ impl LayerAScanExec {
             ctx,
             limit,
             batch_size,
+            pruner,
+            metrics,
             properties: Arc::new(properties),
         }
     }
@@ -173,7 +202,7 @@ impl DisplayAs for LayerAScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
         write!(
             f,
-            "LayerAScanExec: table={}, segments={}, resident={}, records_only={}, limit={:?}",
+            "LayerAScanExec: table={}, segments={}, resident={}, records_only={}, pruning={}, limit={:?}",
             self.table.schema.name,
             self.segment_count(),
             self.table
@@ -181,6 +210,7 @@ impl DisplayAs for LayerAScanExec {
                 .as_ref()
                 .map_or(0, |s| s.view.resident.len()),
             self.ctx.records_only,
+            self.pruner.is_some(),
             self.limit
         )
     }
@@ -193,6 +223,10 @@ impl ExecutionPlan for LayerAScanExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn execute(
@@ -214,18 +248,17 @@ impl ExecutionPlan for LayerAScanExec {
             )));
         };
         let ctx = self.ctx.clone();
-        let (limit, batch_size) = (self.limit, self.batch_size);
-        let stream =
-            futures::stream::once(
-                async move { open_merge(snapshot, ctx, limit, batch_size).await },
-            )
-            .map_ok(|merge| {
-                futures::stream::try_unfold(merge, |mut merge| async move {
-                    Ok(merge.next_batch().await?.map(|batch| (batch, merge)))
-                })
+        let (limit, batch_size, pruner) = (self.limit, self.batch_size, self.pruner.clone());
+        let stream = futures::stream::once(async move {
+            open_merge(snapshot, ctx, limit, batch_size, pruner).await
+        })
+        .map_ok(|merge| {
+            futures::stream::try_unfold(merge, |mut merge| async move {
+                Ok(merge.next_batch().await?.map(|batch| (batch, merge)))
             })
-            .try_flatten()
-            .map_err(|e: anyhow::Error| DataFusionError::External(e.into()));
+        })
+        .try_flatten()
+        .map_err(|e: anyhow::Error| DataFusionError::External(e.into()));
         Ok(Box::pin(RecordBatchStreamAdapter::new(output, stream)))
     }
 
@@ -254,6 +287,7 @@ async fn open_merge(
     ctx: Arc<ConformContext>,
     limit: Option<usize>,
     batch_size: usize,
+    pruner: Option<Arc<SegmentPruner>>,
 ) -> Result<LayerAMerge> {
     let LayerASnapshot {
         view,
@@ -269,16 +303,22 @@ async fn open_merge(
     let mut shadow: HashSet<String> = view.tombstones.iter().cloned().collect();
     shadow.extend(resident.iter().map(|r| r.oid.clone()));
 
-    let segments =
-        if view.segments.is_empty() {
-            Vec::new()
-        } else {
-            let filesystem = filesystem.context("layer A: segments without a filesystem")?;
-            futures::future::try_join_all(view.segments.iter().map(|path| {
-                open_segment(filesystem.clone(), path.clone(), ctx.clone(), batch_size)
-            }))
-            .await?
-        };
+    let segments = if view.segments.is_empty() {
+        Vec::new()
+    } else {
+        let filesystem = filesystem.context("layer A: segments without a filesystem")?;
+        futures::future::try_join_all(view.segments.iter().enumerate().map(|(i, path)| {
+            open_segment(
+                filesystem.clone(),
+                path.clone(),
+                ctx.clone(),
+                batch_size,
+                pruner.clone(),
+                i > 0,
+            )
+        }))
+        .await?
+    };
     let resident = (!resident.is_empty())
         .then(|| Conformed::from_records(&ctx, &resident))
         .transpose()?;
@@ -318,6 +358,8 @@ async fn open_segment(
     path: String,
     ctx: Arc<ConformContext>,
     batch_size: usize,
+    pruner: Option<Arc<SegmentPruner>>,
+    shadows_older: bool,
 ) -> Result<ConformedStream> {
     let mut reader = FileSystemParquetReader::new(filesystem.clone(), path.clone());
     // An I/O failure fails the scan. Only an object that is not Parquet, or
@@ -332,27 +374,61 @@ async fn open_segment(
     if let Some(metadata) = metadata.filter(|m| declares_oid_order(m)) {
         let arrow = ArrowReaderMetadata::try_new(metadata.clone(), ArrowReaderOptions::new())
             .with_context(|| format!("layer A: read schema of segment '{path}'"))?;
-        let mask = match ctx.segment_columns(arrow.schema()) {
-            Some(roots) => {
-                ProjectionMask::roots(arrow.metadata().file_metadata().schema_descr(), roots)
-            }
+        let descr = arrow.metadata().file_metadata().schema_descr_ptr();
+        let rows_mask = match ctx.segment_columns(arrow.schema()) {
+            Some(roots) => ProjectionMask::roots(&descr, roots),
             None => ProjectionMask::all(),
         };
-        let stream = ParquetRecordBatchStreamBuilder::new_with_metadata(
-            reader.with_metadata(metadata),
-            arrow,
-        )
-        .with_projection(mask)
-        .with_batch_size(batch_size)
-        .build()
-        .with_context(|| format!("layer A: open segment '{path}'"))?;
-        let shape = Arc::new(SegmentShape::of(&ctx, stream.schema())?);
-        return Ok(stream
-            .map(move |batch| {
-                let batch = batch.with_context(|| format!("layer A: decode segment '{path}'"))?;
-                conform_segment_batch(&ctx, &shape, &batch)
-            })
-            .boxed());
+        let oid = arrow
+            .schema()
+            .index_of(SYS_COL_OID)
+            .context("an oid-ordered segment has no oid column")?;
+        let spine_mask = ProjectionMask::roots(&descr, [oid]);
+        let keep = match &pruner {
+            Some(pruner) => pruner.keep(&metadata, arrow.schema()),
+            None => vec![true; metadata.num_row_groups()],
+        };
+        let reader = reader.with_metadata(metadata);
+        // Row groups in file (= oid) order: kept runs are read in full, pruned
+        // runs as a key spine — or not at all in the oldest segment, which
+        // shadows nothing (see `prune`).
+        let mut parts: Vec<ConformedStream> = Vec::new();
+        for (kept, groups) in runs(&keep) {
+            if !kept && !shadows_older {
+                continue;
+            }
+            let stream =
+                ParquetRecordBatchStreamBuilder::new_with_metadata(reader.clone(), arrow.clone())
+                    .with_row_groups(groups)
+                    .with_projection(if kept {
+                        rows_mask.clone()
+                    } else {
+                        spine_mask.clone()
+                    })
+                    .with_batch_size(batch_size)
+                    .build()
+                    .with_context(|| format!("layer A: open segment '{path}'"))?;
+            let (ctx, path) = (ctx.clone(), path.clone());
+            parts.push(if kept {
+                let shape = Arc::new(SegmentShape::of(&ctx, stream.schema())?);
+                stream
+                    .map(move |batch| {
+                        let batch =
+                            batch.with_context(|| format!("layer A: decode segment '{path}'"))?;
+                        conform_segment_batch(&ctx, &shape, &batch)
+                    })
+                    .boxed()
+            } else {
+                stream
+                    .map(move |batch| {
+                        let batch =
+                            batch.with_context(|| format!("layer A: decode segment '{path}'"))?;
+                        Conformed::spine(&ctx, &batch)
+                    })
+                    .boxed()
+            });
+        }
+        return Ok(futures::stream::iter(parts).flatten().boxed());
     }
 
     let bytes = filesystem

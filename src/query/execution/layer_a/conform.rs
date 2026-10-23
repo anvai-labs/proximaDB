@@ -67,7 +67,7 @@ pub(crate) struct ConformContext {
     /// on the materialized path, so it must be decided on the stored key here.
     /// Only the first key column falls back to the oid (`project_one_record`);
     /// a NULL in a later one is NULL on both paths.
-    pk_name: Option<String>,
+    pub(crate) pk_name: Option<String>,
     /// Every row goes through records — see the module note.
     pub records_only: bool,
     access: Arc<LayerARowAccess>,
@@ -246,6 +246,24 @@ impl Conformed {
             oids,
             visible,
         })
+    }
+
+    /// A key spine (see `prune`): rows that shadow older copies of their oids
+    /// in the merge but are never emitted.
+    pub fn spine(ctx: &ConformContext, batch: &RecordBatch) -> Result<Self> {
+        let idx = batch.schema().index_of(SYS_COL_OID)?;
+        let oids = utf8(batch, idx, SYS_COL_OID)?.clone();
+        if oids.null_count() > 0 {
+            return Err(anyhow!("layer A: segment row with a NULL {SYS_COL_OID}"));
+        }
+        let n = oids.len();
+        let columns = ctx
+            .internal
+            .fields()
+            .iter()
+            .map(|f| new_null_array(f.data_type(), n))
+            .collect();
+        Self::new(ctx, columns, oids, BooleanArray::from(vec![false; n]))
     }
 
     /// Canonical records — resident rows, or a segment that cannot be streamed.
