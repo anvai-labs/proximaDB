@@ -1146,7 +1146,7 @@ dependencies = [
  "bytes",
  "form_urlencoded",
  "hex",
- "hmac 0.13.0",
+ "hmac",
  "http 0.2.12",
  "http 1.5.0",
  "percent-encoding",
@@ -3319,7 +3319,6 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer 0.10.4",
  "crypto-common 0.1.7",
- "subtle",
 ]
 
 [[package]]
@@ -4184,7 +4183,7 @@ dependencies = [
  "bytes",
  "google-cloud-gax",
  "hex",
- "hmac 0.13.0",
+ "hmac",
  "http 1.5.0",
  "jiff",
  "reqwest 0.13.4",
@@ -4526,29 +4525,11 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hkdf"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
-dependencies = [
- "hmac 0.12.1",
-]
-
-[[package]]
-name = "hkdf"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
 dependencies = [
- "hmac 0.13.0",
-]
-
-[[package]]
-name = "hmac"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
-dependencies = [
- "digest 0.10.7",
+ "hmac",
 ]
 
 [[package]]
@@ -6970,7 +6951,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "fallible-iterator 0.2.0",
- "hmac 0.13.0",
+ "hmac",
  "md-5 0.11.0",
  "memchr",
  "rand 0.10.3",
@@ -7243,7 +7224,7 @@ dependencies = [
  "google-cloud-storage",
  "half",
  "hex",
- "hkdf 0.12.4",
+ "hkdf",
  "http 1.5.0",
  "http-body-util",
  "httpmock",
@@ -7437,7 +7418,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "serde_yaml",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "snap",
  "sqlparser",
  "sqlx",
@@ -7481,7 +7462,7 @@ dependencies = [
  "proximadb-filter-expression",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.21",
 ]
 
@@ -7637,7 +7618,7 @@ dependencies = [
  "moka",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
 ]
@@ -7655,6 +7636,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "futures",
+ "hex",
  "object_store",
  "parking_lot",
  "prost",
@@ -7676,7 +7658,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sqlx",
  "tempfile",
  "thiserror 2.0.21",
@@ -8275,7 +8257,7 @@ dependencies = [
  "proximadb-storage-common",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
  "tracing",
@@ -9238,7 +9220,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
  "tokio-postgres",
@@ -9345,13 +9327,13 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bincode",
- "hkdf 0.12.4",
+ "hkdf",
  "memmap2",
  "proximadb-storage-filesystem-types",
  "rand 0.8.6",
  "rayon",
  "serde",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tokio",
  "tracing",
 ]
@@ -9539,7 +9521,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile 2.2.0",
  "serde",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.21",
  "time",
@@ -11254,8 +11236,8 @@ dependencies = [
  "futures-core",
  "futures-util",
  "hex",
- "hkdf 0.13.0",
- "hmac 0.13.0",
+ "hkdf",
+ "hmac",
  "itoa",
  "log",
  "md-5 0.11.0",
