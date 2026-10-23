@@ -9,6 +9,7 @@
 
 /// Pure pgvector helpers: WHERE metadata-filter extraction (TD-100) and
 /// extended-protocol parameter inference + result-column description (TD-102).
+pub mod describe;
 pub mod pgvector_params;
 /// PostgreSQL Protocol v3.0 message parsing and encoding
 pub mod protocol;

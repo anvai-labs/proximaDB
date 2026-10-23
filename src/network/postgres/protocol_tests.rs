@@ -1888,3 +1888,62 @@ fn startup_identity_leaves_the_stable_id_absent_when_unminted_or_unwired() {
     let unwired = PostgresProtocol::startup_identity("acme", "alice", None);
     assert_eq!(unwired.tenant_stable_id, None);
 }
+
+/// TD-PGEXT-1: binary result cells decode, by PostgreSQL's rules, to the
+/// value `wire_text` rendered.
+#[test]
+fn encode_binary_cell_matches_postgres_binary_formats() {
+    let enc = PostgresProtocol::encode_binary_cell;
+    assert_eq!(
+        enc("2000-01-02", &PgType::Date),
+        Ok(1i32.to_be_bytes().to_vec())
+    );
+    assert_eq!(
+        enc("1999-12-31", &PgType::Date),
+        Ok((-1i32).to_be_bytes().to_vec())
+    );
+    assert_eq!(
+        enc("2000-01-01 00:00:01.5", &PgType::Timestamp),
+        Ok(1_500_000i64.to_be_bytes().to_vec())
+    );
+    assert_eq!(
+        enc("2000-01-01 00:00:01+00", &PgType::Timestamptz),
+        Ok(1_000_000i64.to_be_bytes().to_vec())
+    );
+    let uuid = enc("00112233-4455-6677-8899-aabbccddeeff", &PgType::Uuid).expect("uuid");
+    assert_eq!(uuid, (0u8..16).map(|i| i * 0x11).collect::<Vec<_>>());
+    assert_eq!(enc("\\x00ff10", &PgType::Bytea), Ok(vec![0x00, 0xff, 0x10]));
+    let mut vector = vec![0, 2, 0, 0];
+    vector.extend_from_slice(&1.5f32.to_be_bytes());
+    vector.extend_from_slice(&(-2f32).to_be_bytes());
+    assert_eq!(enc("[1.5,-2]", &PgType::Vector), Ok(vector));
+    assert_eq!(
+        enc("{\"a\":1}", &PgType::Jsonb),
+        Ok(b"\x01{\"a\":1}".to_vec())
+    );
+    assert_eq!(enc("NaN", &PgType::Float8).map(|b| b.len()), Ok(8));
+    assert_eq!(
+        enc("inf", &PgType::Float8),
+        Ok(f64::INFINITY.to_be_bytes().to_vec())
+    );
+    assert_eq!(enc("t", &PgType::Bool), Ok(vec![1]));
+}
+
+/// A cell whose text is not its described type is an error, never miscast
+/// bytes — and never a panic, even on multi-byte input.
+#[test]
+fn encode_binary_cell_rejects_mismatched_text_without_panicking() {
+    let enc = PostgresProtocol::encode_binary_cell;
+    for (text, ty) in [
+        ("postgres", PgType::Int4),
+        ("é0112233445566778899aabbccddeef", PgType::Uuid),
+        ("ééééééééééééééé", PgType::Uuid),
+        ("\\xé1", PgType::Bytea),
+        ("\\x0", PgType::Bytea),
+        ("not-a-date", PgType::Date),
+        ("[1,x]", PgType::Vector),
+        ("maybe", PgType::Bool),
+    ] {
+        assert!(enc(text, &ty).is_err(), "{text:?} as {ty:?}");
+    }
+}
