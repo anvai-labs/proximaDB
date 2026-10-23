@@ -45,6 +45,8 @@ use datafusion::common::pruning::PruningStatistics;
 use datafusion::common::{Column, DFSchema, ScalarValue};
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::utils::conjunction;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::utils::collect_columns;
 use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningPredicateBuilder};
 use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder};
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
@@ -103,19 +105,71 @@ impl SegmentPruner {
             .filter(|f| state.create_physical_expr((*f).clone(), &df_schema).is_ok())
             .cloned()
             .collect();
-        let referenced: Vec<&Column> = usable.iter().flat_map(|f| f.column_refs()).collect();
-        let columns = referenced.iter().map(|c| prop_head(&c.name)).collect();
+        let names: Vec<String> = usable
+            .iter()
+            .flat_map(|f| f.column_refs())
+            .map(|c| c.name.clone())
+            .collect();
+        let physical = state
+            .create_physical_expr(conjunction(usable)?, &df_schema)
+            .ok()?;
+        let counter = |name: &'static str| MetricBuilder::new(metrics).global_counter(name);
+        Self::from_physical(
+            physical,
+            &names,
+            catalog,
+            primary_key,
+            [
+                counter("row_groups_total"),
+                counter("row_groups_pruned"),
+                counter("row_groups_residual_checked"),
+                counter("row_groups_residual_unreadable"),
+            ],
+        )
+    }
+
+    /// A pruner for the current state of a dynamic (runtime) filter pushed
+    /// into the scan: `expr` is over `schema`, the scan's output schema. Its
+    /// counters are private — the scan counts what dynamic filters prune.
+    pub fn from_dynamic(
+        expr: Arc<dyn PhysicalExpr>,
+        schema: SchemaRef,
+        primary_key: Option<String>,
+    ) -> Option<Self> {
+        let names: Vec<String> = collect_columns(&expr)
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
+        Self::from_physical(
+            expr,
+            &names,
+            schema,
+            primary_key,
+            std::array::from_fn(|_| Count::new()),
+        )
+    }
+
+    fn from_physical(
+        physical: Arc<dyn PhysicalExpr>,
+        referenced: &[String],
+        catalog: SchemaRef,
+        primary_key: Option<String>,
+        [
+            row_groups_total,
+            row_groups_pruned,
+            residual_checked,
+            residual_unreadable,
+        ]: [Count; 4],
+    ) -> Option<Self> {
+        let columns = referenced.iter().map(|c| prop_head(c)).collect();
         let vector_filter = referenced.iter().any(|c| {
-            catalog.field_with_name(&c.name).is_ok_and(|f| {
+            catalog.field_with_name(c).is_ok_and(|f| {
                 matches!(
                     f.data_type(),
                     DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..)
                 )
             })
         });
-        let physical = state
-            .create_physical_expr(conjunction(usable)?, &df_schema)
-            .ok()?;
         let predicate = PruningPredicateBuilder::new()
             .with_file_schema(catalog.clone())
             .try_build(physical)
@@ -129,12 +183,10 @@ impl SegmentPruner {
             primary_key,
             columns,
             vector_filter,
-            row_groups_total: MetricBuilder::new(metrics).global_counter("row_groups_total"),
-            row_groups_pruned: MetricBuilder::new(metrics).global_counter("row_groups_pruned"),
-            residual_checked: MetricBuilder::new(metrics)
-                .global_counter("row_groups_residual_checked"),
-            residual_unreadable: MetricBuilder::new(metrics)
-                .global_counter("row_groups_residual_unreadable"),
+            row_groups_total,
+            row_groups_pruned,
+            residual_checked,
+            residual_unreadable,
         })
     }
 

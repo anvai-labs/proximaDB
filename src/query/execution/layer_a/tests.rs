@@ -22,9 +22,9 @@ use proximadb_storage_common::proxima_arrow::{
 };
 use proximadb_storage_common::proxima_parquet::record_batches_to_parquet_bytes;
 
-use super::LayerATableProvider;
 use super::conform::{ConformContext, Conformed};
 use super::merge::LayerAMerge;
+use super::{LayerAScanExec, LayerATableProvider};
 use crate::services::SpillRecordStorage;
 use crate::services::dml::DmlService;
 use crate::services::layer_a_snapshot::{LayerARowAccess, LayerASnapshot, NativeLayerASnapshot};
@@ -891,4 +891,242 @@ async fn a_nan_float_row_is_never_pruned_away() {
     .await;
     assert_eq!(pruned, 0, "float statistics are not used");
     assert!(scanned.contains(&7), "{scanned:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic (runtime) filters (ADR-097 P3.1 PR 7)
+// ---------------------------------------------------------------------------
+
+/// The ids an executed plan returned, and one of its scan's counters.
+async fn run_counting(
+    plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    ctx: &SessionContext,
+    metric: &str,
+) -> (Vec<i64>, usize) {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
+        .await
+        .expect("execute");
+    let mut counted = 0;
+    plan.apply(|node| {
+        if node.name() == "LayerAScanExec"
+            && let Some(m) = node.metrics()
+        {
+            counted += m.sum_by_name(metric).map_or(0, |v| v.as_usize());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .expect("walk");
+    (batches.iter().flat_map(ids).collect(), counted)
+}
+
+/// A dynamic filter is evaluated per row group when it is read: while it is
+/// still the unresolved `true` placeholder it prunes nothing; once DataFusion
+/// resolves it (here by hand), row groups it rules out are pruned — in the
+/// oldest segment, skipped outright.
+#[tokio::test]
+async fn a_dynamic_filter_prunes_row_groups_once_it_is_resolved() {
+    use datafusion::physical_expr::expressions::{BinaryExpr, DynamicFilterPhysicalExpr, col, lit};
+    let (store, fs) = small_row_group_store(10).await;
+    for i in 0..100 {
+        store.upsert_record(padded(i, 0.0)).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment");
+
+    let ctx = SessionContext::new();
+    let provider = LayerATableProvider::new(unrestricted(snapshot_of(&store, &fs).await));
+    let plan = datafusion::datasource::TableProvider::scan(
+        &provider,
+        &ctx.state(),
+        Some(&vec![0]),
+        &[],
+        None,
+    )
+    .await
+    .expect("scan");
+    let exec = plan
+        .downcast_ref::<LayerAScanExec>()
+        .expect("a LayerAScanExec");
+    let output = plan.schema();
+    let id = col("id", &output).unwrap();
+    let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(vec![id.clone()], lit(true)));
+
+    let unresolved: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+        Arc::new(exec.with_dynamic_filters(vec![dynamic.clone()]));
+    let (scanned, pruned) = run_counting(unresolved, &ctx, "row_groups_pruned_dynamic").await;
+    assert_eq!(pruned, 0, "the placeholder prunes nothing");
+    assert_eq!(scanned, (0..100).collect::<Vec<_>>());
+
+    dynamic
+        .update(Arc::new(BinaryExpr::new(
+            id,
+            datafusion::logical_expr::Operator::GtEq,
+            lit(90_i64),
+        )))
+        .unwrap();
+    let resolved: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+        Arc::new(exec.with_dynamic_filters(vec![dynamic]));
+    let (scanned, pruned) = run_counting(resolved, &ctx, "row_groups_pruned_dynamic").await;
+    assert_eq!(pruned, 9, "row groups 0..=8 hold no id >= 90");
+    assert_eq!(scanned, (90..100).collect::<Vec<_>>());
+}
+
+/// End to end: DataFusion pushes a hash join's build-side filter into the
+/// scan, which prunes the probe side's row groups; the join's answer is exact.
+/// One partition, so the probe is read after the build side completes; `picks`
+/// is the left (build) side, as the provider reports no statistics.
+#[tokio::test]
+async fn a_hash_join_build_side_prunes_the_layer_a_probe() {
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionConfig;
+    let (store, fs) = small_row_group_store(10).await;
+    for i in 0..100 {
+        store.upsert_record(padded(i, 0.0)).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment");
+
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    ctx.register_table(
+        TABLE,
+        Arc::new(LayerATableProvider::new(unrestricted(
+            snapshot_of(&store, &fs).await,
+        ))),
+    )
+    .expect("register");
+    let picks_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("pick", arrow::datatypes::DataType::Int64, false),
+    ]));
+    let picks = RecordBatch::try_new(
+        picks_schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![91_i64, 95]))],
+    )
+    .unwrap();
+    ctx.register_table(
+        "picks",
+        Arc::new(MemTable::try_new(picks_schema, vec![vec![picks]]).unwrap()),
+    )
+    .expect("register picks");
+
+    let plan = ctx
+        .sql("select o.id from picks p join orders o on o.id = p.pick order by o.id")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let shown = datafusion::physical_plan::displayable(plan.as_ref())
+        .indent(true)
+        .to_string();
+    let (got, pruned) = run_counting(plan, &ctx, "row_groups_pruned_dynamic").await;
+    assert_eq!(got, vec![91, 95]);
+    assert!(
+        pruned >= 9,
+        "the probe's row groups below 91 are pruned: {pruned}\n{shown}"
+    );
+}
+
+/// A TopK's threshold is a dynamic filter too. Rows stream in oid (= id)
+/// order in batches of 10, so after the first row group the threshold of
+/// `order by id limit 3` excludes every later group, which is pruned; the
+/// answer is exact, including over an updated (resident) row. The pruning
+/// count relies on each segment's row groups being decided one at a time, as
+/// the merge pulls them, so TopK has published a threshold by the time later
+/// groups are decided.
+#[tokio::test]
+async fn a_top_k_threshold_prunes_later_row_groups_and_is_exact() {
+    use datafusion::prelude::SessionConfig;
+    let (store, fs) = small_row_group_store(10).await;
+    for i in 0..100 {
+        store.upsert_record(padded(i, 0.0)).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment");
+    store.upsert_record(padded(5, 0.0)).await.unwrap();
+
+    let ctx = SessionContext::new_with_config(
+        SessionConfig::new()
+            .with_target_partitions(1)
+            .with_batch_size(10),
+    );
+    ctx.register_table(
+        TABLE,
+        Arc::new(LayerATableProvider::new(unrestricted(
+            snapshot_of(&store, &fs).await,
+        ))),
+    )
+    .expect("register");
+    let plan = ctx
+        .sql("select id from orders order by id limit 3")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let (got, pruned) = run_counting(plan, &ctx, "row_groups_pruned_dynamic").await;
+    assert_eq!(got, vec![0, 1, 2]);
+    assert!(
+        pruned > 0,
+        "later row groups cannot beat the threshold: {pruned}"
+    );
+
+    let got = query(
+        unrestricted(snapshot_of(&store, &fs).await),
+        "select id from orders order by id desc limit 3",
+    )
+    .await;
+    assert_eq!(ids(&got), vec![99, 98, 97]);
+}
+
+/// Newest wins under a dynamic filter: a newer segment's row group the filter
+/// prunes is still read as a key spine, so the older matching copies of its
+/// oids stay hidden.
+#[tokio::test]
+async fn a_dynamically_pruned_newer_copy_still_hides_an_older_matching_one() {
+    use datafusion::physical_expr::expressions::{BinaryExpr, DynamicFilterPhysicalExpr, col, lit};
+    let (store, fs) = small_row_group_store(10).await;
+    for i in 0..20 {
+        store.upsert_record(padded(i, 0.0)).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment 1");
+    for i in 0..10 {
+        let mut r = padded(i, 0.0);
+        r.props.insert(
+            "name".into(),
+            ProximaTreeNode::Value(ProximaValue::String("z".to_string())),
+        );
+        store.upsert_record(r).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment 2");
+
+    let ctx = SessionContext::new();
+    let provider = LayerATableProvider::new(unrestricted(snapshot_of(&store, &fs).await));
+    let plan = datafusion::datasource::TableProvider::scan(
+        &provider,
+        &ctx.state(),
+        Some(&vec![0, 1]),
+        &[],
+        None,
+    )
+    .await
+    .expect("scan");
+    let exec = plan
+        .downcast_ref::<LayerAScanExec>()
+        .expect("a LayerAScanExec");
+    let output = plan.schema();
+    let name = col("name", &output).unwrap();
+    let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+        vec![name.clone()],
+        lit(true),
+    ));
+    dynamic
+        .update(Arc::new(BinaryExpr::new(
+            name,
+            datafusion::logical_expr::Operator::Eq,
+            lit("p"),
+        )))
+        .unwrap();
+    let filtered: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+        Arc::new(exec.with_dynamic_filters(vec![dynamic]));
+    let (scanned, pruned) = run_counting(filtered, &ctx, "row_groups_pruned_dynamic").await;
+    assert!(pruned >= 1, "segment 2's renamed rows are pruned: {pruned}");
+    assert_eq!(scanned, (10..20).collect::<Vec<_>>(), "no stale copy");
 }
