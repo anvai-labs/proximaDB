@@ -1,0 +1,79 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-21: The INSERT existence probe decodes every spill segment, so bulk load is quadratic once a table spills
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Open. Filed 2026-10-23 by the ADR-097 P2.4 gate run.
+| Priority | **HIGH**: blocks the P2.4 exit gate (TD-SEAM-4: TPC-DS SF1 load), and any bulk INSERT into a table past the spill threshold, on the default configuration since 2026-10-22 (`c62ab32b7`).
+| Component | `src/services/record_spill.rs` (`SpillRecordStorage::get_record`, `read_segment`, `delete_record`), `src/services/record_store.rs` (`DirectWalTableRecordStore::write_mutations`, `commit_atomic`), `src/services/dml/mod.rs` (`enforce_row_write_constraints`)
+| Relates to | TD-USUB-1, TD-SEAM-4, TD-OLAPFMT-3
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+`write_mutations` checks every INSERT (and UPDATE) row for an existing copy with
+`partition.get_record(&key)`, and the legacy partition's during an ADR-031 cutover. In a spill
+partition, a key that is not in the memtable goes through `get_record`'s segment arm: for each
+segment, newest first, `read_segment` reads the whole file, decodes it into `ProximaRecord`s
+(one `HashMap` per row) and searches it linearly. A new key is in no segment, so every INSERT
+row decodes every segment of its table: loading `n` rows decodes about `n²/2` rows (precisely,
+each row decodes the rows already spilled, which lag it by up to one threshold).
+
+The same whole-segment probe runs at other sites, so fixing `write_mutations` alone is not
+enough:
+
+* `commit_atomic` probes each row the same way.
+* Tables with a declared key are probed a **second** time by `enforce_row_write_constraints` →
+  `get_by_key` → `get_record` whenever no `ConditionalKeyStore` is wired: any build without
+  `oltp-integrity`, or without a `data_dir`.
+* During a cutover, migrate-on-write calls `legacy.delete_record` for every written row, and
+  `delete_record`'s segment arm has the same shape.
+
+== Evidence
+
+`docs/_internal/status/P24_SF1_GATE_EVIDENCE_2026_10_23.adoc`, release build:
+
+* TPC-DS SF 0.01 load-only: 6.8 s with spill off; **1,746 s (257×)** with the threshold at
+  16,384, where only `store_sales` (28,800 rows) spills one segment, so 12,416 rows each decode
+  16,384 rows: ≈ 8.6 µs per decoded row.
+* SF 0.1 at the default threshold (65,536): stopped after 712 s with the load unfinished. gdb
+  samples of the busy thread all sit in `record_batch_to_proxima_records` /
+  `ParquetRecordReader::read_records` ← `read_segment_records` ←
+  `SpillRecordStorage::read_segment` ← `get_record` ← `write_mutations` ←
+  `DmlService::execute_insert`.
+* At SF1 the keyed dimension tables pay it too: `customer` and `customer_address` (100,000 rows
+  each) would decode ≈ 34,464 × 65,536 rows twice over, ≈ 11 h each at 8.6 µs.
+
+Segment codec is not the cost: segments are Parquet with no compression set. A faster codec
+changes a constant, not the quadratic.
+
+== Proposed fix
+
+. **Probe a batch, not a row.** Each probe site checks all of a statement's keys against a
+  segment in one pass (decode once, look up every key), so a 200-row INSERT decodes each segment
+  once instead of 200 times. Small and local; it does not remove the quadratic in statements.
+. **Make the point lookup cheap.** Segments are oid-sorted with a page index. Cache each
+  segment's footer at flush and discovery and read only the pages whose oid range can hold the
+  key, by range rather than the whole file. Two corrections to the obvious version:
+  .. there is no oid Bloom filter to use: `ParquetWritePolicy::bloom_columns` skips the leading
+     sort column, which is `__proxima_oid` for spill segments. Turn it on explicitly for spill
+     segments if per-segment Bloom pruning is wanted;
+  .. per-segment oid min/max prunes little for keyed tables: an INT key is encoded as its
+     decimal string, so "2" sorts after "10" and each segment spans almost the whole key domain.
+     Within a segment the oid sort makes row-group ranges disjoint, so the page index bounds the
+     read to one page per segment.
+. **Do not skip the probe for keyless tables.** It looks free (the fact tables are keyless,
+  their oids generated), but the generated oid is `{table}:row:{now_ns}`
+  (`new_local_record_id`, `crates/control/proximadb-catalog/src/relational.rs`): no counter or
+  nonce, so two rows in one clock tick, or after the clock steps back, collide. Today the probe
+  turns that into `INSERT_CONFLICT`; without it, `upsert_resident` silently overwrites a
+  committed row. (Collisions inside one statement are already unguarded, because every probe
+  runs before any row is applied; that is pre-existing.) Make the generator unique first
+  (UUIDv7, or `now_ns` + counter + instance nonce); only then can a generated oid skip the probe.
+
+Gate for the fix: a regression test that inserts past several flushes and asserts a probe for a
+new key reads at most one page per segment, a test that a colliding generated oid is still
+rejected, and the SF1 run in the evidence doc.

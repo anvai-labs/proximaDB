@@ -1348,6 +1348,40 @@ struct LoadStats {
     materialize_wall_ms: u128,
     /// Peak memory per phase (`load`, `materialize`, `queries`).
     memory: Vec<PhaseMemory>,
+    /// Per-table INSERT statements and their summed time, in schema order.
+    load_tables: Vec<TableTiming>,
+    /// Per-table MATERIALIZE, in schema order.
+    materialize_tables: Vec<TableTiming>,
+}
+
+/// One table's statements within a load or MATERIALIZE phase.
+#[derive(serde::Serialize, Debug)]
+struct TableTiming {
+    table: String,
+    statements: usize,
+    /// Summed statement round-trip time. At `TPC_PERF_LOAD_PARALLELISM=1`
+    /// statements run one at a time, so this is the table's share of the wall
+    /// time; above 1 they overlap and the sum exceeds the wall time.
+    ms: u128,
+    /// MATERIALIZE outcome; a failed INSERT panics, so load entries are `true`.
+    ok: bool,
+}
+
+/// Table an `INSERT INTO <table> ...` statement targets.
+fn insert_target(sql: &str) -> &str {
+    sql.strip_prefix("INSERT INTO ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or("?")
+}
+
+/// Per-table `(statements, time)` accumulated across load connections.
+type LoadTally = std::sync::Arc<Mutex<std::collections::HashMap<String, (usize, Duration)>>>;
+
+fn tally_statement(tally: &LoadTally, sql: &str, elapsed: Duration) {
+    let mut tally = tally.lock().expect("load tally lock");
+    let entry = tally.entry(insert_target(sql).to_string()).or_default();
+    entry.0 += 1;
+    entry.1 += elapsed;
 }
 
 /// Peak memory of one harness phase. `peak_rss_mib` is this process's VmHWM,
@@ -1871,13 +1905,16 @@ async fn seed(
         .unwrap_or(1);
     let t0 = Instant::now();
     let batches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tally = LoadTally::default();
     if parallelism == 1 {
         let mut inserts = inserts;
         while let Some(sql) = inserts.recv().await {
+            let t = Instant::now();
             client
                 .simple_query(&sql)
                 .await
                 .unwrap_or_else(|e| panic!("INSERT: {}", pg_server::db_err(&e)));
+            tally_statement(&tally, &sql, t.elapsed());
             batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     } else {
@@ -1887,6 +1924,7 @@ async fn seed(
             let cs = conn_str.to_string();
             let inserts = inserts.clone();
             let batches = batches.clone();
+            let tally = tally.clone();
             set.spawn(async move {
                 let (c, conn) = tokio_postgres::connect(&cs, tokio_postgres::NoTls)
                     .await
@@ -1898,10 +1936,12 @@ async fn seed(
                     let Some(sql) = inserts.lock().await.recv().await else {
                         return Ok(());
                     };
+                    let t = Instant::now();
                     c.simple_query(&sql).await.map_err(|e| {
                         let head = &sql[..sql.len().min(120)];
                         format!("INSERT: {} :: {}", pg_server::db_err(&e), head)
                     })?;
+                    tally_statement(&tally, &sql, t.elapsed());
                     batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             });
@@ -1923,6 +1963,25 @@ async fn seed(
     eprintln!(
         "[{benchmark}] loaded {insert_batches} insert batches (parallelism {parallelism}) in {load_wall_ms} ms"
     );
+    let mut tally = std::mem::take(&mut *tally.lock().expect("load tally lock"));
+    let load_tables = schema
+        .iter()
+        .map(|(name, _)| {
+            let (statements, elapsed) = tally.remove(*name).unwrap_or_default();
+            TableTiming {
+                table: name.to_string(),
+                statements,
+                ms: elapsed.as_millis(),
+                ok: true,
+            }
+        })
+        .collect();
+    // Every statement targets a schema table; anything left is a parse miss.
+    assert!(
+        tally.is_empty(),
+        "[{benchmark}] INSERTs outside the schema: {:?}",
+        tally.keys().collect::<Vec<_>>()
+    );
 
     LoadStats {
         benchmark: benchmark.to_string(),
@@ -1932,6 +1991,8 @@ async fn seed(
         materialize_ok: 0,
         materialize_wall_ms: 0,
         memory: Vec::new(),
+        load_tables,
+        materialize_tables: Vec::new(),
     }
 }
 
@@ -1981,16 +2042,29 @@ async fn run_benchmark(
     let t_mat = Instant::now();
     let mut materialize_ok = 0usize;
     for (name, _) in schema {
-        match client
+        let t = Instant::now();
+        let ok = match client
             .simple_query(&format!("ALTER TABLE {name} MATERIALIZE"))
             .await
         {
-            Ok(_) => materialize_ok += 1,
-            Err(e) => eprintln!(
-                "[{benchmark}] · MATERIALIZE {name}: {}",
-                pg_server::db_err(&e)
-            ),
-        }
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!(
+                    "[{benchmark}] · MATERIALIZE {name}: {}",
+                    pg_server::db_err(&e)
+                );
+                false
+            }
+        };
+        materialize_ok += usize::from(ok);
+        let timing = TableTiming {
+            table: name.to_string(),
+            statements: 1,
+            ms: t.elapsed().as_millis(),
+            ok,
+        };
+        eprintln!("[{benchmark}] · {timing:?}");
+        stats.materialize_tables.push(timing);
     }
     stats.materialize_ok = materialize_ok;
     stats.materialize_wall_ms = t_mat.elapsed().as_millis();
