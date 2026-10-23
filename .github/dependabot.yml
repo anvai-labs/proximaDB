@@ -65,6 +65,20 @@ updates:
       # mechanical trait-import migration, tracked in TD-DEPS-2's open list.
       - dependency-name: "rand_chacha"
         versions: [">=0.4"]
+      # arrow 60 is not admitted by datafusion 55.x (which rides arrow 59.x):
+      # dependabot #2179's lock split the family three ways (60.0.0 beside
+      # datafusion's 59.3.x and duckdb's 58.3.0) — arrow/datafusion/parquet
+      # must move as one coordinated family (TD-DEPS-2 open list).
+      - dependency-name: "arrow"
+        versions: [">=60"]
+      - dependency-name: "arrow-array"
+        versions: [">=60"]
+      - dependency-name: "arrow-buffer"
+        versions: [">=60"]
+      - dependency-name: "arrow-data"
+        versions: [">=60"]
+      - dependency-name: "arrow-schema"
+        versions: [">=60"]
       - dependency-name: "ort-sys"
         versions: [">=2.0.0-rc.14"]
     groups:
