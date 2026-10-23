@@ -114,7 +114,7 @@ mod tests {
              ownership rule on its result",
         ),
         ("src/services/ddl/mod.rs", 5, "unit tests"),
-        ("src/services/dml/tests.rs", 20, "unit tests"),
+        ("src/services/dml/tests.rs", 21, "unit tests"),
         (
             "src/services/external_collection/service.rs",
             1,
