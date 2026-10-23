@@ -119,7 +119,6 @@
 //! - **`s3.rs`**: Amazon S3 backend
 //! - **`azure.rs`**: Azure Data Lake Storage
 //! - **`gcs.rs`**: Google Cloud Storage
-//! - **`hdfs.rs`**: Hadoop HDFS support
 //! - **`zero_copy_filesystem.rs`**: High-performance I/O layer
 //! - **`atomic_strategy.rs`**: Atomic write implementations
 //! - **`manager.rs`**: Filesystem factory and routing

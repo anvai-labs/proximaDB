@@ -12,7 +12,7 @@
 //!
 //! Design principles:
 //! - Reuse existing UnifiedHandlers for consistency with REST/gRPC
-//! - Reuse existing Arrow infrastructure (arrow_ipc_scanner, columnar_io)
+//! - Reuse existing Arrow infrastructure (columnar_io)
 //! - Minimal new code, maximum leverage of proven patterns
 
 pub mod codec;

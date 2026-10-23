@@ -5,8 +5,8 @@
 
 //! Arrow <-> Proto codec for Flight protocol
 //!
-//! Reuses existing Arrow infrastructure from arrow_ipc_scanner.rs and columnar_io.rs
-//! for maximum code reuse and consistency.
+//! Reuses existing Arrow infrastructure from columnar_io.rs for maximum code reuse
+//! and consistency.
 
 use anyhow::{Context, Result};
 use arrow_array::{
@@ -113,7 +113,7 @@ pub struct FlightRequestMetadata {
 
 /// Arrow-Proto bidirectional codec
 ///
-/// Reuses existing conversion functions from arrow_ipc_scanner.rs
+/// Reuses existing Arrow conversion functions
 pub struct ArrowProtoCodec;
 
 /// Canonical v2 vector-search ticket for Arrow Flight `DoGet` (TD-FLIGHT-1).
