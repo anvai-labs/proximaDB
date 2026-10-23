@@ -119,31 +119,6 @@ const BACKLOG_FACTOR: usize = 4;
 /// a doomed flush would turn one outage into a stall of every writer.
 const FLUSH_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 
-fn spill_counter(
-    cell: &'static std::sync::OnceLock<prometheus::IntCounter>,
-    name: &'static str,
-    help: &'static str,
-) -> prometheus::IntCounter {
-    cell.get_or_init(|| {
-        prometheus::register_int_counter!(name, help).unwrap_or_else(|_| {
-            prometheus::IntCounter::new(format!("{name}_fallback"), "fallback")
-                .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
-        })
-    })
-    .clone()
-}
-
-/// Threshold flushes that failed. The rows and tombstones they carried stay
-/// resident and the WAL is retained until a flush succeeds.
-fn spill_flush_failures_counter() -> prometheus::IntCounter {
-    static COUNTER: std::sync::OnceLock<prometheus::IntCounter> = std::sync::OnceLock::new();
-    spill_counter(
-        &COUNTER,
-        "proximadb_spill_flush_failures_total",
-        "Spill threshold flushes that failed (their rows stay resident; the WAL is retained)",
-    )
-}
-
 /// A write refused before it was made durable: the partition's backlog is at
 /// its cap and its flushes are failing. Nothing was written; retryable.
 /// pgwire reports it as SQLSTATE 53000.
@@ -151,33 +126,44 @@ fn spill_flush_failures_counter() -> prometheus::IntCounter {
 #[error("{0}")]
 pub struct SpillBacklogFull(pub String);
 
-/// Writes refused before they were made durable because a partition's
-/// backlog reached its cap with flushes failing.
-fn spill_writes_refused_counter() -> prometheus::IntCounter {
-    static COUNTER: std::sync::OnceLock<prometheus::IntCounter> = std::sync::OnceLock::new();
-    spill_counter(
-        &COUNTER,
-        "proximadb_spill_writes_refused_total",
-        "Writes refused because a spill partition's backlog reached its cap",
-    )
+/// The spill's counters, registered once per process.
+struct SpillMetrics {
+    /// Rows a flush held back because they did not read back identically
+    /// through the segment encoding. Expected to stay 0; anything else is a
+    /// codec defect.
+    rows_held: prometheus::IntCounter,
+    /// Threshold flushes that failed. The rows and tombstones they carried
+    /// stay resident and the WAL is retained until a flush succeeds.
+    flush_failures: prometheus::IntCounter,
+    /// Writes refused before they were made durable because a partition's
+    /// backlog reached its cap with flushes failing.
+    writes_refused: prometheus::IntCounter,
 }
 
-/// Rows a flush held back because they did not read back identically through
-/// the segment encoding. Expected to stay 0; anything else is a codec defect.
-fn spill_rows_held_counter() -> prometheus::IntCounter {
-    static COUNTER: std::sync::OnceLock<prometheus::IntCounter> = std::sync::OnceLock::new();
-    COUNTER
-        .get_or_init(|| {
-            prometheus::register_int_counter!(
-                "proximadb_spill_rows_held_total",
-                "Spill rows held resident because they did not round-trip through the segment encoding"
-            )
-            .unwrap_or_else(|_| {
-                prometheus::IntCounter::new("proximadb_spill_rows_held_total_fallback", "fallback")
+fn spill_metrics() -> &'static SpillMetrics {
+    static METRICS: std::sync::OnceLock<SpillMetrics> = std::sync::OnceLock::new();
+    METRICS.get_or_init(|| {
+        let counter = |name: &str, help: &str| {
+            prometheus::register_int_counter!(name, help).unwrap_or_else(|_| {
+                prometheus::IntCounter::new(format!("{name}_fallback"), "fallback")
                     .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
             })
-        })
-        .clone()
+        };
+        SpillMetrics {
+            rows_held: counter(
+                "proximadb_spill_rows_held_total",
+                "Spill rows held resident because they did not round-trip through the segment encoding",
+            ),
+            flush_failures: counter(
+                "proximadb_spill_flush_failures_total",
+                "Spill threshold flushes that failed (their rows stay resident; the WAL is retained)",
+            ),
+            writes_refused: counter(
+                "proximadb_spill_writes_refused_total",
+                "Writes refused because a spill partition's backlog reached its cap",
+            ),
+        }
+    })
 }
 
 /// One resident row: the value, the write that produced it, and that write's
@@ -991,7 +977,7 @@ impl SpillRecordStorage {
             .partition(|(i, _)| !lossy.contains(i));
         let evicting: Vec<Resident> = evicting.into_iter().map(|(_, r)| r).collect();
         if let Some((_, example)) = held.first() {
-            spill_rows_held_counter().inc_by(held.len() as u64);
+            spill_metrics().rows_held.inc_by(held.len() as u64);
             tracing::error!(
                 rows = held.len(),
                 example_oid = %example.record.oid,
@@ -1348,15 +1334,21 @@ impl SpillRecordStorage {
     /// report a durable write as failed. The backlog this leaves is bounded
     /// before the next write is made durable, by [`RecordStore::admit_writes`].
     async fn flush_after_write(&self) {
+        self.threshold_flush_best_effort("after a write").await;
+    }
+
+    /// [`Self::flush_if_over_threshold`], logging and counting a failure
+    /// instead of returning it. `when` names the caller in the log.
+    async fn threshold_flush_best_effort(&self, when: &str) {
         if let Err(error) = self.flush_if_over_threshold().await {
-            spill_flush_failures_counter().inc();
+            spill_metrics().flush_failures.inc();
             tracing::warn!(
                 error = %format!("{error:#}"),
                 path = %self.base_path.trim_end_matches('/'),
                 backlog = self.backlog(),
-                "spill: flush after a write failed; the write stands and stays resident, so the \
-                 WAL is retained from it until a flush succeeds (or, after a segment write of \
-                 unknown outcome, until a purge or restart reconciles it)"
+                "spill: flush {when} failed; what it carried stays resident, so the WAL is \
+                 retained until a flush succeeds (or, after a segment write of unknown \
+                 outcome, until a purge or restart reconciles it)"
             );
         }
     }
@@ -1692,19 +1684,13 @@ impl RecordStore for SpillRecordStorage {
         if self.backlog() < cap {
             return Ok(());
         }
-        if let Err(error) = self.flush_if_over_threshold().await {
-            spill_flush_failures_counter().inc();
-            tracing::warn!(
-                error = %format!("{error:#}"),
-                path = %self.base_path.trim_end_matches('/'),
-                "spill: the overdue flush at the backlog cap failed"
-            );
-        }
+        self.threshold_flush_best_effort("overdue at the backlog cap")
+            .await;
         let backlog = self.backlog();
         if backlog < cap || self.flush_failed_at.lock().is_none() {
             return Ok(());
         }
-        spill_writes_refused_counter().inc();
+        spill_metrics().writes_refused.inc();
         Err(SpillBacklogFull(format!(
             "spill partition '{}' holds {backlog} unflushed rows and tombstones (cap {cap}) \
              because its flushes are failing; refusing new writes until a flush succeeds \
