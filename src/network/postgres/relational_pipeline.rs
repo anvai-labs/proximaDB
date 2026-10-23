@@ -3692,6 +3692,27 @@ mod route_explain_tests {
 // Engagement gate + table-name collection (over the parsed AST)
 // =========================================================================
 
+/// TD-PGEXT-1: whether `sql` is a SELECT the relational pipeline routes
+/// (joins, aggregates, GROUP BY, set operations, CTEs) rather than pgwire's
+/// legacy single-table reader. Mirrors `try_run_select`'s gate — same dialect,
+/// same opt-out — so `Describe` can follow the route `Execute` takes.
+pub(super) fn select_engages_relational_engine(sql: &str) -> bool {
+    if std::env::var("PROXIMADB_PGWIRE_RELATIONAL_PIPELINE")
+        .ok()
+        .as_deref()
+        == Some("0")
+    {
+        return false;
+    }
+    match Parser::parse_sql(&GenericDialect {}, sql) {
+        Ok(statements) => matches!(
+            statements.as_slice(),
+            [Statement::Query(query)] if query_engages_relational_engine(query)
+        ),
+        Err(_) => false,
+    }
+}
+
 /// True iff the query uses a feature the legacy single-table path can't serve
 /// (join / GROUP BY / HAVING / aggregate projection / set-op / WITH), so it
 /// should be routed to the algebra engine over real data. Simple single-table

@@ -1785,6 +1785,21 @@ impl DmlService {
         })
     }
 
+    /// The columns a legacy single-table SELECT returns, resolved exactly as
+    /// [`Self::select_table_records_with_projection_where`] and
+    /// [`Self::select_table_records_with_projection`] resolve them, without
+    /// scanning a row. pgwire's extended protocol uses it to answer
+    /// `Describe` with the shape `Execute` will stream (TD-PGEXT-1).
+    pub async fn describe_select_columns(
+        &self,
+        table_name: &str,
+        projection_column_names: &[String],
+        tenant: Option<&str>,
+    ) -> Result<Vec<CatalogColumn>> {
+        let (table_schema, _) = self.resolve_select_table(table_name, tenant).await?;
+        Self::resolve_select_projection(&table_schema, projection_column_names)
+    }
+
     /// Select current visible records for a catalog table using the same faithful
     /// boolean [`WhereClause`] IR that UPDATE/DELETE use — so OR / mixed-AND-OR /
     /// grouped SELECT predicates push into the scan instead of degrading to a full
