@@ -58,6 +58,13 @@ updates:
       # this ignore, the whole cargo-minor-patch group PR fails to build every week.
       - dependency-name: "ort"
         versions: [">=2.0.0-rc.14"]
+      # rand_chacha 0.9 pulls a second rand_core (0.9) while all 19 ChaCha*Rng
+      # call sites import SeedableRng from rand 0.8 (rand_core 0.6) — E0599
+      # dual-trait scope error at every site. Streams are verified bit-identical
+      # 0.3.1 <-> 0.9.0 (seed_from_u64 and from_seed), so the upgrade is a
+      # mechanical trait-import migration, tracked in TD-DEPS-2's open list.
+      - dependency-name: "rand_chacha"
+        versions: [">=0.4"]
       - dependency-name: "ort-sys"
         versions: [">=2.0.0-rc.14"]
     groups:
