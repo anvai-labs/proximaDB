@@ -1,0 +1,53 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-21: The INSERT existence probe decodes every spill segment, so bulk load is quadratic once a table spills
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | Open. Filed 2026-10-23 by the ADR-097 P2.4 gate run.
+| Priority | **HIGH**: blocks the P2.4 exit gate (TD-SEAM-4: TPC-DS SF1 load), and any bulk INSERT into a table past the spill threshold, on the default configuration since 2026-10-22 (`c62ab32b7`).
+| Component | `src/services/record_spill.rs` (`SpillRecordStorage::get_record`, `read_segment`), `src/services/record_store.rs` (`DirectWalTableRecordStore::write_mutations`, the Insert and Update arms)
+| Relates to | TD-USUB-1, TD-SEAM-4, TD-OLAPFMT-3
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+`write_mutations` checks every INSERT row for an existing copy with
+`partition.get_record(&key)` (and the legacy partition's). In a spill partition, a key that
+is not in the memtable goes through `get_record`'s segment arm: for each segment,
+newest first, `read_segment` reads the whole file and decodes it into `ProximaRecord`s
+(one `HashMap` per row), then searches linearly for the oid. A new key is in no segment, so
+every INSERT row decodes every segment of its table.
+
+The `i`-th row decodes every row already spilled, about `i` rows, so loading a table of `n`
+rows decodes about `n²/2` rows in total, whatever the threshold.
+
+== Evidence
+
+`docs/_internal/status/P24_SF1_GATE_EVIDENCE_2026_10_23.adoc`, release build:
+
+* TPC-DS SF 0.01 load-only: 6.8 s with spill off; **1,746 s (257×)** with the threshold at
+  16,384, where `store_sales` and `catalog_sales` spill one segment each.
+* SF 0.1 at the default threshold (65,536): stopped after 712 s with the load unfinished. gdb
+  samples of the busy thread all sit in `record_batch_to_proxima_records` ←
+  `read_segment_records` ← `SpillRecordStorage::read_segment` ← `get_record` ←
+  `write_mutations` ← `DmlService::execute_insert`.
+
+Segment codec is not the cost: segments are Parquet with no compression set. A faster codec
+changes a constant, not the quadratic.
+
+== Proposed fix
+
+. **Skip the probe when the oid was generated.** A keyless table's row gets a fresh oid,
+  which cannot collide; the TPC-DS fact tables are keyless.
+. **Make the point lookup cheap.** Segments are oid-sorted and written with page index,
+  row-group statistics and (where the policy chooses) an oid SBBF. Cache each segment's
+  footer (per row-group oid min/max, Bloom offsets) at flush and discovery; a probe skips
+  segments and row groups whose range or Bloom filter excludes the oid, and reads the one
+  remaining row group by range rather than the whole file. `delete_record`'s segment probe
+  has the same shape and takes the same fix.
+
+Gate for the fix: a regression test that inserts past several flushes and asserts the probe
+reads no segment for a new generated oid, plus the SF1 rerun in the evidence doc.
