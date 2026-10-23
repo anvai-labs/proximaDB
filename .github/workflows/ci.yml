@@ -1387,8 +1387,8 @@ jobs:
     timeout-minutes: 110
     # max 53 min over 14 runs, 2026-10-09..11. 15 legs since 2026-10-14
     # (bert-tokenizer added; ~1min leg); back to 14 when enterprise-catalogs
-    # moved to its own job (TD-CITIER-1); 15 since 2026-10-23
-    # (experimental-turboquant, TD-TQFEAT-1). An earlier comment said 15: GitHub
+    # moved to its own job (TD-CITIER-1); 15 with experimental-turboquant, 16
+    # with onnx-cdc-duckdb, both 2026-10-23 (TD-TQFEAT-1). An earlier comment said 15: GitHub
     # reports a SKIPPED matrix job under its raw un-expanded name, which the
     # sample counted as a leg.
     needs: changes
@@ -1441,6 +1441,12 @@ jobs:
           # so is each sub-crate that declares the feature: `-p proximadb --tests` builds
           # dependencies as libs only, so their gated #[cfg(test)] code needs its own -p.
           - { label: "experimental-turboquant", pkg: "proximadb proximadb-quantization-types proximadb-quantization-model proximadb-distance-kernel proximadb-vector proximadb-quantization-kernel", args: "--features experimental-turboquant" }
+          # TD-TQFEAT-1 class: three more non-default root features whose gated code
+          # (incl. the onnx-gated service_tests module and cdc-kafka's three
+          # required-features [[test]] targets) no leg compiled. The server's own
+          # `onnx` feature forwards only to proximadb-embedding, so root onnx code
+          # needs this -p proximadb leg.
+          - { label: "onnx-cdc-duckdb",     pkg: proximadb,        args: "--features onnx,cdc-kafka,duckdb" }
           # Embedded crate (default, no language bindings) — validates the extracted
           # crate compiles against root at every tier. Python-feature + wheel build
           # is a qa→main (FULL) concern (heavy pyo3/numpy deps).
