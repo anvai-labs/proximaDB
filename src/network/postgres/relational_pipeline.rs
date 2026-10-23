@@ -627,20 +627,7 @@ fn pgvector_distance(
     record: &proximadb_search_types::results::OptimizedSearchRecord,
     metric: proximadb_distance_types::DistanceMetric,
 ) -> Result<f64, String> {
-    let expected = match metric {
-        proximadb_distance_types::DistanceMetric::L2 => {
-            proximadb_distance_kernel::DistanceMetric::Euclidean
-        }
-        proximadb_distance_types::DistanceMetric::Cosine => {
-            proximadb_distance_kernel::DistanceMetric::Cosine
-        }
-        proximadb_distance_types::DistanceMetric::InnerProduct => {
-            proximadb_distance_kernel::DistanceMetric::DotProduct
-        }
-        proximadb_distance_types::DistanceMetric::L1 => {
-            proximadb_distance_kernel::DistanceMetric::Manhattan
-        }
-    };
+    let expected = crate::services::dml::kernel_distance_metric(metric);
     let semantic = record.semantic_similarity.as_ref().ok_or_else(|| {
         format!(
             "vector search result '{}' omitted the requested {metric} distance",

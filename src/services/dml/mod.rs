@@ -2305,20 +2305,7 @@ impl DmlService {
                     })
             })
             .collect::<Result<Vec<_>>>()?;
-        let kernel_metric = match metric {
-            proximadb_distance_types::DistanceMetric::L2 => {
-                proximadb_distance_kernel::DistanceMetric::Euclidean
-            }
-            proximadb_distance_types::DistanceMetric::Cosine => {
-                proximadb_distance_kernel::DistanceMetric::Cosine
-            }
-            proximadb_distance_types::DistanceMetric::InnerProduct => {
-                proximadb_distance_kernel::DistanceMetric::DotProduct
-            }
-            proximadb_distance_types::DistanceMetric::L1 => {
-                proximadb_distance_kernel::DistanceMetric::Manhattan
-            }
-        };
+        let kernel_metric = kernel_distance_metric(metric);
         let distance =
             proximadb_distance_kernel::engine::UnifiedDistanceCompute::new(kernel_metric);
         let mut results = proximadb_search_types::bounded_queue::BoundedPriorityQueue::new(top_k);
@@ -4190,14 +4177,8 @@ impl DmlService {
         tenant_context: Option<&TenantContext>,
     ) -> Result<DmlResult> {
         let (catalog, table_id) = self
-            .catalog_manager
-            .resolve_table_scoped(table_name, tenant_context.map(|t| t.tenant_id.as_str()))
+            .resolve_existing_table(table_name, tenant_context)
             .await?;
-
-        // Verify table exists
-        if !catalog.table_exists(&table_id).await? {
-            return Err(anyhow!("Table '{table_name}' does not exist"));
-        }
 
         // Get table schema for column mapping
         let table_schema = catalog.get_table(&table_id).await?;
@@ -4327,14 +4308,8 @@ impl DmlService {
         tenant_context: Option<&TenantContext>,
     ) -> Result<DmlResult> {
         let (catalog, table_id) = self
-            .catalog_manager
-            .resolve_table_scoped(table_name, tenant_context.map(|t| t.tenant_id.as_str()))
+            .resolve_existing_table(table_name, tenant_context)
             .await?;
-
-        // Verify table exists
-        if !catalog.table_exists(&table_id).await? {
-            return Err(anyhow!("Table '{table_name}' does not exist"));
-        }
 
         let table_schema = catalog.get_table(&table_id).await?;
         let dml_lock_guard = self
@@ -4465,6 +4440,23 @@ impl DmlService {
     /// Execute DELETE statement
     ///
     /// Note: DELETE by ID is the primary supported operation.
+    /// Resolve `table_name` in the caller's tenant scope, failing when the table
+    /// does not exist.
+    async fn resolve_existing_table(
+        &self,
+        table_name: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<(Arc<dyn proximadb_catalog::Catalog>, TableIdentifier)> {
+        let (catalog, table_id) = self
+            .catalog_manager
+            .resolve_table_scoped(table_name, tenant_context.map(|t| t.tenant_id.as_str()))
+            .await?;
+        if !catalog.table_exists(&table_id).await? {
+            return Err(anyhow!("Table '{table_name}' does not exist"));
+        }
+        Ok((catalog, table_id))
+    }
+
     async fn execute_delete(
         &self,
         table_name: &str,
@@ -4497,14 +4489,8 @@ impl DmlService {
         tenant_context: Option<&TenantContext>,
     ) -> Result<DmlResult> {
         let (catalog, table_id) = self
-            .catalog_manager
-            .resolve_table_scoped(table_name, tenant_context.map(|t| t.tenant_id.as_str()))
+            .resolve_existing_table(table_name, tenant_context)
             .await?;
-
-        // Verify table exists
-        if !catalog.table_exists(&table_id).await? {
-            return Err(anyhow!("Table '{table_name}' does not exist"));
-        }
 
         let table_schema = catalog.get_table(&table_id).await?;
         let dml_lock_guard = self
@@ -4693,14 +4679,8 @@ impl DmlService {
         tenant_context: Option<&TenantContext>,
     ) -> Result<DmlResult> {
         let (catalog, table_id) = self
-            .catalog_manager
-            .resolve_table_scoped(table_name, tenant_context.map(|t| t.tenant_id.as_str()))
+            .resolve_existing_table(table_name, tenant_context)
             .await?;
-
-        // Verify table exists
-        if !catalog.table_exists(&table_id).await? {
-            return Err(anyhow!("Table '{table_name}' does not exist"));
-        }
 
         // Get table schema
         let table_schema = catalog.get_table(&table_id).await?;
@@ -7485,6 +7465,20 @@ impl crate::services::ddl::TableMaterializer for DmlTableMaterializer {
 }
 
 mod materialize_stream;
+
+/// The distance-kernel metric that computes a catalog `DistanceMetric`.
+pub(crate) fn kernel_distance_metric(
+    metric: proximadb_distance_types::DistanceMetric,
+) -> proximadb_distance_kernel::DistanceMetric {
+    use proximadb_distance_kernel::DistanceMetric as Kernel;
+    use proximadb_distance_types::DistanceMetric as Catalog;
+    match metric {
+        Catalog::L2 => Kernel::Euclidean,
+        Catalog::Cosine => Kernel::Cosine,
+        Catalog::InnerProduct => Kernel::DotProduct,
+        Catalog::L1 => Kernel::Manhattan,
+    }
+}
 
 #[cfg(test)]
 mod tests;
