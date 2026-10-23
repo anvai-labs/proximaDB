@@ -30,7 +30,7 @@ arrow-schema.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 # Spec-compliant Iceberg manifest / manifest-list (Avro) + TableMetadata (JSON).
-apache-avro = "0.16"
+apache-avro = "0.21"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 bincode.workspace = true
