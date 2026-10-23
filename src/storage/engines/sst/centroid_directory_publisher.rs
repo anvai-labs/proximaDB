@@ -99,6 +99,16 @@ async fn load_newest_valid(
     None
 }
 
+/// The newest valid directory of the collection data directory `dir_url`
+/// (one LIST plus one read), or `None` when there is none or it is unreadable.
+pub(crate) async fn load_newest_directory(
+    fs: &dyn FileSystem,
+    dir_url: &str,
+) -> Option<PaxCentroidDirectory> {
+    let entries = fs.list(dir_url.trim_end_matches('/')).await.ok()?;
+    load_newest_valid(fs, &directory_objects_newest_first(&entries)).await
+}
+
 async fn object_size(fs: &dyn FileSystem, entry: &DirEntry) -> Option<u64> {
     if entry.metadata.size > 0 {
         return Some(entry.metadata.size);

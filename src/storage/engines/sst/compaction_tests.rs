@@ -1461,3 +1461,141 @@ async fn tier_probe_read_error_aborts_and_keeps_exact_inputs() -> anyhow::Result
     assert!(result.is_err(), "the compaction must abort");
     Ok(())
 }
+
+/// TD-PAXDIR-1 D3: with the shared-model and directory write gates on, a
+/// compaction classifies its output with the collection's shared cell space
+/// (read from the published centroid directory beside the inputs) instead of
+/// training a new model, and republishes the directory for the output.
+#[tokio::test]
+async fn shared_model_gate_classifies_compaction_output_with_the_collection_model()
+-> anyhow::Result<()> {
+    use crate::storage::engines::sst::centroid_directory_publisher::{
+        load_newest_directory, publish_centroid_directory, read_segment_a0,
+    };
+    use crate::storage::engines::sst::segment_format::write_pax_segment_compacted;
+    use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
+    use proximadb_block_format::VectorQuant;
+    use proximadb_records::{EmbeddingCell, ProximaRecord};
+    use proximadb_storage_filesystem_types::FileSystem;
+
+    // SAFETY: nextest runs each test in its own process.
+    unsafe {
+        for (gate, value) in [
+            ("PROXIMADB_PAX_COALESCED_RABITQ", "1"),
+            ("PROXIMADB_PAX_WRITE_A0_TRAIN", "1"),
+            ("PROXIMADB_IVF_K", "4"),
+            ("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY", "1"),
+            ("PROXIMADB_PAX_WRITE_SHARED_MODEL", "1"),
+        ] {
+            std::env::set_var(gate, value);
+        }
+    }
+    let dir = tempfile::tempdir()?;
+    // The same vectors under different oids: every output row lies inside
+    // the shared model's trained radii, so no drift retrain can fire.
+    let records = |prefix: &str| -> Vec<ProximaRecord> {
+        (0..300)
+            .map(|i| ProximaRecord {
+                oid: format!("{prefix}-{i:04}"),
+                tenant_id: "t".into(),
+                created_at_ns: 1_000 + i as i64,
+                updated_at_ns: 1_000 + i as i64,
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "",
+                    "dense",
+                    16,
+                    (0..16)
+                        .map(|d| (((i * 131 + d * 17) % 251) as f32) * 0.01)
+                        .collect(),
+                )],
+                ..ProximaRecord::default()
+            })
+            .collect()
+    };
+    let input_a = dir.path().join("segment_L0_a.pax");
+    let input_b = dir.path().join("segment_L0_b.pax");
+    for (path, prefix) in [(&input_a, "a"), (&input_b, "b")] {
+        write_pax_segment_compacted(
+            path,
+            &records(prefix),
+            "collection-7",
+            1,
+            VectorQuant::RaBitQ,
+            VectorQuant::Sq8,
+            false,
+            Some(16 * 1024),
+            None,
+        )?;
+    }
+    let fs = LocalFileSystem::new(LocalConfig::default()).await?;
+    let dir_url = dir.path().to_string_lossy().to_string();
+    assert_eq!(publish_centroid_directory(&fs, &dir_url).await?, Some(1));
+    let shared = load_newest_directory(&fs, &dir_url)
+        .await
+        .and_then(|d| d.collection_model())
+        .expect("a shared cell space");
+
+    // Training would now make 5 cells; the shared space has 4 (5 is within
+    // its 2x tolerance), so the output's shape tells the two paths apart.
+    // SAFETY: nextest runs each test in its own process.
+    unsafe { std::env::set_var("PROXIMADB_IVF_K", "5") };
+    assert_eq!(shared.model.k_c(), 4);
+
+    let output = dir.path().join("segment_L1_compacted.pax");
+    let config = SstConfig::default();
+    let compaction = Compaction::new(config.clone()).await?;
+    let task = CompactionTask {
+        collection_object_id: 7,
+        collection_identity: crate::core::stable_id::CollectionIdentity::default(),
+        level: 0,
+        input_files: vec![input_a, input_b],
+        input_bytes: 0,
+        output_file: output.clone(),
+        priority: CompactionPriority::High,
+        block_size_kb: None,
+        compression_config: None,
+        precision_hint: None,
+        rg_layout: None,
+        vector_quant: None,
+    };
+    compaction
+        .perform_compaction_enhanced(&task, &config, None, None)
+        .await?;
+
+    let output_url = output.to_string_lossy().to_string();
+    let size = fs.metadata(&output_url).await?.size;
+    let a0 = read_segment_a0(&fs, &output_url, size)
+        .await?
+        .expect("the output carries an A0");
+    assert_eq!(a0.model.pca_mean, shared.model.pca_mean);
+    assert_eq!(a0.model.pca_components, shared.model.pca_components);
+    assert_eq!(
+        a0.model.centroids, shared.model.centroids,
+        "same cell space"
+    );
+    assert_eq!(
+        a0.model.k_c(),
+        4,
+        "classified, not trained (training gives 5)"
+    );
+    assert_eq!(
+        a0.model.trained_on, 300,
+        "the template's rows, not a 600-row training"
+    );
+    assert_eq!(
+        a0.model.radii, shared.model.radii,
+        "the space's frozen radii"
+    );
+    assert_eq!(a0.model.rows_covered(), 600);
+
+    // The compaction republished the directory for the output alone.
+    let republished = load_newest_directory(&fs, &dir_url)
+        .await
+        .expect("republished directory");
+    let covered: Vec<&str> = republished
+        .covered_segments()
+        .map(|(_, s)| s.name.as_str())
+        .collect();
+    assert_eq!(covered, ["segment_L1_compacted.pax"]);
+    Ok(())
+}

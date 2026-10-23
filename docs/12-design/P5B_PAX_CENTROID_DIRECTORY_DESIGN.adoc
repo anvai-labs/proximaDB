@@ -184,13 +184,24 @@ make a cell cost one read:
   model (`IvfProbeClassifier` built from the persisted PCA and centroids) instead of training a
   new one, provided `dim` matches and the model is not stale. The classifier/training split
   already exists (`finish_ivf_probe_classifier` vs `classify_coords`), so this is a new
-  constructor, not a new algorithm. Retraining is triggered when either:
-  ** rows covered by the model exceed `4 ×` the rows it was trained over, or
-  ** the mean assignment distance of the output exceeds `1.5 ×` the training-time mean
-     (cells drifted).
+  constructor, not a new algorithm. *As built (D3):* the shared model is the **cell space**
+  (model plus exact centroid table) covering the most rows; its centroids and radii come from
+  that space's largest segment. Retraining is triggered when any of these holds:
+  ** the dimension differs;
+  ** the collection's rows (the space's covered rows, or the output if larger) need more than
+     `2 ×` the model's cells, or fewer than half of them (the model no longer suits the
+     collection);
+  ** more than 5% of a strided sample (up to 4096 rows) falls outside its cell's trained radius
+     (the data drifted). The radius test replaced the draft's "1.5 × training-time mean
+     distance": a training-time mean is not persisted, and per-segment max radii are. Radii
+     come from one template segment, never a max over segments, so accepted outliers cannot
+     ratchet the test open.
 +
-A retrain produces a new model; segments keep their own model id until rewritten, which the
-model table already handles. `k` for the collection model is sized on the **collection's**
+The cheap checks run before any row is classified. The tag-partitioned plan (TD-FPRUNE-1)
+still trains its own model in D3. A retrain produces a new model; segments keep their own model
+id until rewritten, which the model table already handles. The read side counts `nprobe` over
+**distinct** cells `(cell space, a0_cell)` and probes a selected cell in every usable segment
+holding it. `k` for the collection model is sized on the **collection's**
 covered rows, so each cell's A+B bytes approach the coalescer's target range on the storage
 class: `k_G = clamp(N · (a_row + b_row) / (IopsBudget.target / 2), 16, 4096)`.
 For SIFT1M on S3 (8 MiB target; A+B ≈ 152 B/row once co-located) that is ≈ 36 cells, and
