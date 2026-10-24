@@ -2394,6 +2394,16 @@ impl DirectWalTableRecordStore {
         ))
     }
 
+    /// Every live partition with its key, snapshotted so the read lock is not
+    /// held across the per-partition awaits that follow.
+    fn partition_snapshot(&self) -> Vec<((String, String), Arc<dyn RecordStorage>)> {
+        self.partitions
+            .read()
+            .iter()
+            .map(|(key, partition)| (key.clone(), partition.clone()))
+            .collect()
+    }
+
     /// Flush every partition whose oldest unflushed row is more than
     /// `max_lag` WAL entries behind `head` (TD-USUB-22), returning how many
     /// flushed.
@@ -2418,12 +2428,7 @@ impl DirectWalTableRecordStore {
         if self.shared_storage {
             return 0;
         }
-        let partitions: Vec<((String, String), Arc<dyn RecordStorage>)> = self
-            .partitions
-            .read()
-            .iter()
-            .map(|(key, partition)| (key.clone(), partition.clone()))
-            .collect();
+        let partitions = self.partition_snapshot();
         let mut flushed = 0;
         for ((tenant_id, collection), partition) in partitions {
             // A partition that refuses (a memtable, an unresolved segment
@@ -2487,12 +2492,7 @@ impl DirectWalTableRecordStore {
     /// failure. A failed flush loses nothing — the rows stay resident and the
     /// WAL, which is never truncated past an unflushed row, replays them.
     pub async fn flush_partitions(&self) -> Result<usize> {
-        let partitions: Vec<((String, String), Arc<dyn RecordStorage>)> = self
-            .partitions
-            .read()
-            .iter()
-            .map(|(key, partition)| (key.clone(), partition.clone()))
-            .collect();
+        let partitions = self.partition_snapshot();
         let mut failures = Vec::new();
         for ((tenant_id, collection), partition) in &partitions {
             if let Err(error) = partition.flush().await {
@@ -2740,12 +2740,7 @@ impl DirectWalTableRecordStore {
                  durable per partition, so the WAL cannot be truncated on its account"
             );
         }
-        let partitions: Vec<((String, String), Arc<dyn RecordStorage>)> = self
-            .partitions
-            .read()
-            .iter()
-            .map(|(key, partition)| (key.clone(), partition.clone()))
-            .collect();
+        let partitions = self.partition_snapshot();
         let mut floor: Option<u64> = None;
         for ((tenant_id, collection), partition) in partitions {
             let partition_floor = partition.min_unflushed_lsn().await.with_context(|| {
@@ -4083,6 +4078,22 @@ mod tests {
     /// Forgotten tempdir root for a spill test: `(root, base)` — the dir is
     /// deliberately leaked (test-hygiene: unique per test, never shared), and
     /// `base` is its string form for path closures.
+    /// A WAL upsert of a propless row `r{lsn}` into `collection` for `tenant`.
+    fn upsert_entry(lsn: u64, tenant: &str, collection: &str) -> CanonicalWalEntry {
+        CanonicalWalEntry::new(
+            lsn,
+            CanonicalOperation::RecordUpsert {
+                collection_id: collection.to_string(),
+                record: Box::new(ProximaRecord {
+                    oid: format!("r{lsn}"),
+                    ..Default::default()
+                }),
+                projections: vec![],
+            },
+            Some(tenant.to_string()),
+        )
+    }
+
     fn spill_root() -> (std::path::PathBuf, String) {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
@@ -6808,20 +6819,7 @@ mod tests {
             local_fs().await,
             tenant_path_resolver(base),
         );
-        let upsert = |lsn: u64, collection: &str| {
-            CanonicalWalEntry::new(
-                lsn,
-                CanonicalOperation::RecordUpsert {
-                    collection_id: collection.to_string(),
-                    record: Box::new(ProximaRecord {
-                        oid: format!("r{lsn}"),
-                        ..Default::default()
-                    }),
-                    projections: vec![],
-                },
-                Some("tenant-a".to_string()),
-            )
-        };
+        let upsert = |lsn: u64, collection: &str| upsert_entry(lsn, "tenant-a", collection);
         // `dims`: LSNs 1 and 2, below the threshold, so they stay resident.
         // `facts`: LSNs 3..=9 — 3..=6 flush at the threshold, 7..=9 resident.
         let mut entries: Vec<CanonicalWalEntry> = (1..=2).map(|lsn| upsert(lsn, "dims")).collect();
@@ -6988,20 +6986,7 @@ mod tests {
             fs,
             tenant_path_resolver(base),
         );
-        let upsert = |lsn: u64, tenant: &str, collection: &str| {
-            CanonicalWalEntry::new(
-                lsn,
-                CanonicalOperation::RecordUpsert {
-                    collection_id: collection.to_string(),
-                    record: Box::new(ProximaRecord {
-                        oid: format!("r{lsn}"),
-                        ..Default::default()
-                    }),
-                    projections: vec![],
-                },
-                Some(tenant.to_string()),
-            )
-        };
+        let upsert = upsert_entry;
 
         // `orders`: LSNs 1..=6 at threshold 4 — 1..=4 flush, 5 and 6 stay
         // resident. `items`: LSNs 7 and 8, both resident.
@@ -7096,20 +7081,7 @@ mod tests {
         .await
         .expect("open");
         store
-            .replay_wal_entries((1..=20u64).map(|lsn| {
-                CanonicalWalEntry::new(
-                    lsn,
-                    CanonicalOperation::RecordUpsert {
-                        collection_id: "orders".to_string(),
-                        record: Box::new(ProximaRecord {
-                            oid: format!("r{lsn}"),
-                            ..Default::default()
-                        }),
-                        projections: vec![],
-                    },
-                    Some("tenant-a".to_string()),
-                )
-            }))
+            .replay_wal_entries((1..=20u64).map(|lsn| upsert_entry(lsn, "tenant-a", "orders")))
             .await
             .expect("replay");
         assert_eq!(store.flush_partitions().await.expect("flush"), 1);
