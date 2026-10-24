@@ -2769,6 +2769,7 @@ impl DirectWalTableRecordStore {
         let index_key = (tenant_id.to_string(), collection_id.to_string());
         self.unique_index.write().remove(&index_key);
         self.secondary_index.write().remove(&index_key);
+        self.set_lag_flushed_at(index_key, None);
     }
 
     /// Apply already-durable mutations to the memtable partitions and the
