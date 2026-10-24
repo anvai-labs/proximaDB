@@ -2896,6 +2896,21 @@ impl SharedServices {
             Some(lock_service) => base_dml.with_dml_lock_service(lock_service),
             None => base_dml,
         });
+        // TD-DML-3: the canonical WAL was replayed above, so the record store
+        // now reflects every durable row — release fenced PK claims whose row
+        // does not exist (left by a crash or an ambiguous write failure).
+        // Non-fatal: an unreconciled claim is still reconciled lazily on the
+        // next claim of its key.
+        match dml_service_for_grpc
+            .reconcile_conditional_key_claims()
+            .await
+        {
+            Ok(released) if released > 0 => {
+                info!(released, "reconciled fenced PK claims at startup");
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "startup reconciliation of fenced PK claims failed"),
+        }
 
         // TD-135: one DdlService Arc shared by BOTH the adapter (gRPC port path →
         // adapter.execute_sql) and the RecordOpsService (REST write path), so DDL

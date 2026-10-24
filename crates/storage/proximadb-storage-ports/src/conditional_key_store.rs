@@ -134,6 +134,14 @@ pub trait ConditionalKeyStore: Send + Sync {
     /// `put_if_absent` of the same `key` is a *new* version, not a slot reuse.
     /// Physical reclamation happens off the request path (F6).
     async fn tombstone(&self, key: &Identity, fence: Generation) -> Result<()>;
+
+    /// Every key that currently has a LIVE holder, with that holder — the
+    /// input of a startup reconciliation that releases claims whose row does
+    /// not exist (TD-DML-3). `None` ⇒ this backend cannot enumerate (the
+    /// caller then relies on lazy, per-key reconciliation only).
+    async fn live_claims(&self) -> Result<Option<Vec<(Identity, Oid)>>> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

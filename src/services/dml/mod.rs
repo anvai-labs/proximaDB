@@ -616,7 +616,7 @@ pub enum DmlStatement {
         /// Optional filter restricting which rows are deleted.
         where_clause: Option<WhereClause>,
     },
-    /// INSERT INTO ... ON CONFLICT DO UPDATE
+    /// INSERT INTO ... ON CONFLICT [target] DO NOTHING | DO UPDATE SET ...
     Upsert {
         /// Target table name.
         table_name: String,
@@ -624,10 +624,8 @@ pub enum DmlStatement {
         columns: Vec<String>,
         /// Rows to insert or update; each inner `Vec` is one row of values.
         values: Vec<Vec<SqlValueLiteral>>,
-        /// Columns that define the conflict (unique key).
-        conflict_columns: Vec<String>,
-        /// Column-value pairs applied when a conflict is detected.
-        update_assignments: Vec<(String, SqlValueLiteral)>,
+        /// The conflict target and action (TD-DML-3).
+        on_conflict: OnConflictClause,
     },
     /// INSERT INTO target SELECT ... FROM source.
     InsertSelect {
@@ -658,6 +656,86 @@ impl DmlStatement {
             }
         }
     }
+}
+
+/// TD-DML-3: which unique constraint(s) arbitrate an `INSERT … ON CONFLICT`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnConflictTarget {
+    /// No target: a conflict on ANY unique constraint (PRIMARY KEY or UNIQUE)
+    /// triggers the action. PostgreSQL allows this for `DO NOTHING` only; the
+    /// MySQL `ON DUPLICATE KEY UPDATE` spelling also lowers here.
+    AnyUnique,
+    /// `ON CONFLICT (col, …)`: the unique constraint over exactly these columns
+    /// (order-insensitive). No such constraint is SQLSTATE 42P10.
+    Columns(Vec<String>),
+    /// `ON CONFLICT ON CONSTRAINT name`. An unknown name is SQLSTATE 42704.
+    Constraint(String),
+}
+
+/// TD-DML-3: what `INSERT … ON CONFLICT` does with a conflicting row.
+#[derive(Debug, Clone)]
+pub enum OnConflictAction {
+    /// Skip the proposed row; the existing row is left unchanged.
+    DoNothing,
+    /// Update the existing row. Values and the optional `WHERE` are evaluated
+    /// against the EXISTING row, with `EXCLUDED.col` naming the proposed row.
+    DoUpdate {
+        /// `SET column = expression` pairs, in statement order.
+        assignments: Vec<(String, sqlparser::ast::Expr)>,
+        /// Optional `WHERE` gating the update (false/NULL ⇒ row not updated).
+        selection: Option<Box<sqlparser::ast::Expr>>,
+    },
+}
+
+/// TD-DML-3: the `ON CONFLICT` clause of an `INSERT`.
+#[derive(Debug, Clone)]
+pub struct OnConflictClause {
+    /// Which unique constraint(s) arbitrate.
+    pub target: OnConflictTarget,
+    /// What happens to a conflicting row.
+    pub action: OnConflictAction,
+    /// Qualifier naming the existing row in `DO UPDATE` expressions: the
+    /// `INSERT INTO t AS alias` alias when given, else the table name.
+    pub target_qualifier: String,
+    /// The caller the statement runs for, when the protocol knows one. Under
+    /// `abac-policy` a `DO UPDATE` must be able to SEE the conflicting row
+    /// (PostgreSQL: the UPDATE `USING` policy, else 42501). Set by the
+    /// protocol surface after parsing; `None` ⇒ an internal statement.
+    pub caller_identity: Option<proximadb_runtime::OwnedPortIdentity>,
+}
+
+/// TD-DML-3: a `DO UPDATE` bound against the table — each expression lowered
+/// to the canonical relational [`proximadb_relational_types::Expr`] over the
+/// row `existing ++ proposed` (see `lower_on_conflict_expr`).
+struct BoundOnConflictUpdate {
+    assignments: Vec<(String, proximadb_relational_types::Expr)>,
+    selection: Option<proximadb_relational_types::Expr>,
+}
+
+/// TD-DML-3: an existing row read for UPDATE / DO UPDATE / arbitration.
+enum ExistingRow {
+    /// The full canonical envelope — preserves the TTL, every vector column
+    /// and every non-column prop across an update.
+    Envelope(Box<ProximaRecord>),
+    /// The `get_by_key` projection, for stores without envelope reads (lossy).
+    Projection(RichSearchResult),
+}
+
+impl ExistingRow {
+    /// The row's oid (its identity).
+    fn id(&self) -> &str {
+        match self {
+            Self::Envelope(record) => &record.oid,
+            Self::Projection(projection) => &projection.id,
+        }
+    }
+}
+
+/// TD-DML-3: whether a key holds a row (mandate #16a: dead rows hold nothing).
+enum RowState {
+    Live(ExistingRow),
+    Dead,
+    Absent,
 }
 
 /// SQL value literals for DML operations
@@ -876,14 +954,18 @@ impl ParentTableResolver for CatalogManagerParentResolver {
 }
 
 /// Which row-producing statement `enforce_row_write_constraints` runs for
-/// (TD-DML-1): INSERT and UPSERT share one enforcement sequence and differ only
-/// in what a live PK holder means.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RowWriteConstraintMode {
-    /// A live PK holder is a duplicate (23505).
+/// (TD-DML-1): INSERT and `INSERT … ON CONFLICT` share one enforcement
+/// sequence and differ only in the rows the statement rewrites in place.
+#[derive(Debug, Clone, Copy)]
+enum RowWriteConstraintMode<'a> {
+    /// Every record is a new row: a live PK holder is a duplicate (23505).
     Insert,
-    /// A live PK holder is the row being replaced.
-    Upsert,
+    /// TD-DML-3: records whose oid is in `updated` are existing rows rewritten
+    /// by `DO UPDATE` (their PK is already held; their old UNIQUE values are
+    /// vacated); every other record is a new row, exactly as for `Insert`.
+    OnConflict {
+        updated: &'a std::collections::HashSet<String>,
+    },
 }
 
 /// DML Service for executing DML statements
@@ -1578,6 +1660,132 @@ impl DmlService {
         self
     }
 
+    /// TD-DML-3: the fenced-store identity of a primary-key tuple, scoped by
+    /// the SESSION tenant (the partition the row lives in). DML records carry
+    /// an empty `tenant_id`, so keying on the record alone made two tenants'
+    /// same-named tables share one PK fence.
+    fn cks_identity(
+        tenant_context: Option<&TenantContext>,
+        record_tenant: &str,
+        table: &str,
+        values: &[ProximaValue],
+    ) -> Result<proximadb_storage_ports::Identity> {
+        let tenant = tenant_context
+            .map(|tc| tc.tenant_id.as_str())
+            .filter(|tenant| !tenant.is_empty())
+            .unwrap_or(record_tenant);
+        Ok(proximadb_storage_ports::Identity::from_bytes(
+            proximadb_data_model::key_codec::encode_identity(tenant, table, values)?,
+        ))
+    }
+
+    /// TD-DML-3: startup reconciliation of fenced PK claims against the record
+    /// store (run after WAL replay) — releases every claim whose row does not
+    /// exist and whose write is provably not durable, or whose table no longer
+    /// exists. A claim that cannot be routed or checked is kept (fail closed).
+    /// Returns the number of claims released. No-op without a CKS or when the
+    /// CKS backend cannot enumerate its claims.
+    pub async fn reconcile_conditional_key_claims(&self) -> Result<usize> {
+        let Some(cks) = &self.conditional_key_store else {
+            return Ok(0);
+        };
+        let Some(claims) = cks.live_claims().await? else {
+            return Ok(0);
+        };
+        let mut released = 0usize;
+        for (id, oid) in claims {
+            let Ok((tenant, table)) =
+                proximadb_data_model::key_codec::decode_identity_scope(id.as_bytes())
+            else {
+                continue;
+            };
+            let tenant_scope = (!tenant.is_empty()).then_some(tenant.as_str());
+            let Ok((catalog, table_id)) = self
+                .catalog_manager
+                .resolve_table_scoped(&table, tenant_scope)
+                .await
+            else {
+                continue;
+            };
+            let release = match catalog.table_exists(&table_id).await {
+                Ok(false) => true,
+                Ok(true) => {
+                    let schema = catalog.get_table(&table_id).await?;
+                    let tenant_context = tenant_scope.map(TenantContext::for_tenant_id);
+                    matches!(
+                        self.row_state(&schema, &table_id, &oid.0, tenant_context.as_ref())
+                            .await?,
+                        RowState::Absent
+                    ) && self
+                        .record_store
+                        .durable_row_write(&schema, &oid.0, tenant_context.as_ref())
+                        .await?
+                        != Some(true)
+                }
+                Err(_) => false,
+            };
+            if release {
+                cks.tombstone(&id, proximadb_storage_ports::Generation(0))
+                    .await?;
+                released += 1;
+            }
+        }
+        if released > 0 {
+            info!(
+                released,
+                "released fenced PK claims whose rows do not exist"
+            );
+        }
+        Ok(released)
+    }
+
+    /// TD-DML-3 (`abac-policy`): a `DO UPDATE` may only rewrite a conflicting
+    /// row the caller can see (PostgreSQL's UPDATE `USING` check, 42501).
+    #[cfg(feature = "abac-policy")]
+    fn check_on_conflict_update_visible(
+        &self,
+        identity: Option<&proximadb_runtime::OwnedPortIdentity>,
+        table_schema: &CatalogTableSchema,
+        existing: &ExistingRow,
+    ) -> Result<()> {
+        use crate::security::rls::AbacScanResult;
+        let Some(identity) = identity else {
+            return Ok(()); // internal statement: no caller policy applies
+        };
+        let denied = || -> anyhow::Error {
+            RelationalConstraintViolation::new(
+                RelationalConstraintKind::InsufficientPrivilege,
+                format!(
+                    "new row violates row-level security policy (USING expression) for table \"{}\": ON CONFLICT DO UPDATE cannot update a conflicting row the caller cannot see",
+                    table_schema.name
+                ),
+            )
+            .into()
+        };
+        match self.abac_row_filter(identity.as_borrowed(), table_schema) {
+            None | Some(AbacScanResult::Unrestricted) => Ok(()),
+            Some(AbacScanResult::Denied(_)) => Err(denied()),
+            Some(AbacScanResult::Restricted(visible)) => {
+                let admitted = match existing {
+                    ExistingRow::Envelope(record) => visible(record),
+                    ExistingRow::Projection(projection) => {
+                        let mut record = ProximaRecord {
+                            oid: projection.id.clone(),
+                            ..ProximaRecord::default()
+                        };
+                        for (key, value) in &projection.props {
+                            record
+                                .props
+                                .insert(key.clone(), ProximaTreeNode::Value(value.clone()));
+                        }
+                        visible(&record)
+                    }
+                };
+                if admitted { Ok(()) } else { Err(denied()) }
+            }
+        }
+    }
+
     /// T4.1: Get the canonical table-record store.
     ///
     /// Provides access to the record store for components that need direct
@@ -1671,18 +1879,10 @@ impl DmlService {
                 table_name,
                 columns,
                 values,
-                conflict_columns,
-                update_assignments,
+                on_conflict,
             } => {
-                self.execute_upsert(
-                    &table_name,
-                    &columns,
-                    values,
-                    &conflict_columns,
-                    update_assignments,
-                    tenant_context,
-                )
-                .await?
+                self.execute_upsert(&table_name, &columns, values, &on_conflict, tenant_context)
+                    .await?
             }
             DmlStatement::InsertSelect { plan, columns }
             | DmlStatement::InsertOverwrite { plan, columns } => {
@@ -4374,14 +4574,15 @@ impl DmlService {
         // secondary UNIQUE and FOREIGN KEY — the ONE enforcement sequence every
         // row-producing DML shares (UPSERT runs the same one). CHECK / NOT NULL /
         // types were already enforced row-locally by `CatalogRow::validate`.
-        self.enforce_row_write_constraints(
-            &table_schema,
-            &table_id,
-            &records,
-            RowWriteConstraintMode::Insert,
-            tenant_context,
-        )
-        .await?;
+        let pk_claims = self
+            .enforce_row_write_constraints(
+                &table_schema,
+                &table_id,
+                &records,
+                RowWriteConstraintMode::Insert,
+                tenant_context,
+            )
+            .await?;
 
         // Compute per-column min/max and NDV from the canonical record props before moving records
         // into mutations. Only orderable types (String, integers) tracked for min/max; floats and
@@ -4396,11 +4597,28 @@ impl DmlService {
             .into_iter()
             .map(|record| TableRecordMutation::new(TableRecordMutationKind::Insert, record))
             .collect::<Vec<_>>();
-        let batch_result = self
+        // PK claims are released when the store says nothing became durable:
+        // a store-reported rejection (`Ok(!success)`) or an `Err` marked
+        // `RejectedBeforeAppend` (validation / health / pre-append reads). Any
+        // other `Err` may follow a durable WAL append (e.g. the memtable-full
+        // bail), so the claim is kept (fail closed) — and reconciled lazily on
+        // the next claim of the key, or by the startup sweep, once the durable
+        // log provably lacks the row.
+        let batch_result = match self
             .record_store
             .write_mutations(&table_schema, mutations, tenant_context)
-            .await?;
+            .await
+        {
+            Ok(batch_result) => batch_result,
+            Err(error) => {
+                if crate::services::record_store::is_rejected_before_append(&error) {
+                    self.release_pk_claims(&table_schema, &pk_claims).await;
+                }
+                return Err(error);
+            }
+        };
         if !batch_result.success {
+            self.release_pk_claims(&table_schema, &pk_claims).await;
             let detail = batch_result
                 .errors
                 .first()
@@ -4496,20 +4714,10 @@ impl DmlService {
         let mut old_rows = Vec::new();
         let mut warnings = Vec::new();
         for record_id in &ids_to_update {
-            let Some(existing) = self
-                .record_store
-                .get_by_key(
-                    &table_schema,
-                    TableRecordGetRequest {
-                        table_id: table_id.name.clone(),
-                        key: record_id.clone(),
-                        include_vector: true,
-                        include_props: true,
-                    },
-                    tenant_context,
-                    #[cfg(feature = "abac-policy")]
-                    &ReadContext::system(SystemReadReason::Statistics, "dml [CLIENT-PLACEHOLDER]"),
-                )
+            // TD-DML-3: the full envelope (TTL, every vector column) where the
+            // store serves one; a dead row is not updated (mandate #16a).
+            let RowState::Live(existing) = self
+                .row_state(&table_schema, &table_id, record_id, tenant_context)
                 .await?
             else {
                 warnings.push(format!(
@@ -4520,7 +4728,12 @@ impl DmlService {
             };
 
             if !referencing_children.is_empty() {
-                old_rows.push(Self::rich_result_to_record(existing.clone()));
+                old_rows.push(match &existing {
+                    ExistingRow::Envelope(record) => (**record).clone(),
+                    ExistingRow::Projection(projection) => {
+                        Self::rich_result_to_record(projection.clone())
+                    }
+                });
             }
             records.push(self.build_updated_proxima_record(
                 existing,
@@ -4771,13 +4984,13 @@ impl DmlService {
                     .iter()
                     .filter_map(|rec| {
                         let pk_values = Self::record_primary_key_values(rec, &pk_cols)?;
-                        proximadb_data_model::key_codec::encode_identity(
+                        Self::cks_identity(
+                            tenant_context,
                             &rec.tenant_id,
                             &table_schema.name,
                             &pk_values,
                         )
                         .ok()
-                        .map(proximadb_storage_ports::Identity::from_bytes)
                     })
                     .collect()
             } else {
@@ -4841,14 +5054,31 @@ impl DmlService {
         Ok(result)
     }
 
-    /// Execute UPSERT statement
+    /// Execute `INSERT … ON CONFLICT [target] DO NOTHING | DO UPDATE` with
+    /// PostgreSQL semantics (TD-DML-3).
+    ///
+    /// Rows are arbitrated one at a time, in statement order, against the
+    /// committed table AND the rows this statement already wrote (a later row
+    /// sees an earlier one, as in PostgreSQL):
+    ///
+    /// * no conflict on an arbiter → the row is inserted;
+    /// * conflict + `DO NOTHING` → the row is skipped, the holder untouched;
+    /// * conflict + `DO UPDATE` → the holder's assignments are evaluated
+    ///   against it (`EXCLUDED` = proposed row); a false `WHERE` skips it; a
+    ///   holder this statement already inserted or updated is 21000.
+    ///
+    /// The surviving inserts and updates then run the ONE TD-DML-1 enforcement
+    /// sequence (PK claim for new rows, UNIQUE on every written row excluding
+    /// the updated rows' own old values, FK), and are written as one batch.
+    /// CHECK / NOT NULL ran row-locally when each row was built — on the
+    /// proposed row (as PostgreSQL does before arbitration) and on every
+    /// post-update row.
     async fn execute_upsert(
         &self,
         table_name: &str,
         columns: &[String],
         values: Vec<Vec<SqlValueLiteral>>,
-        _conflict_columns: &[String],
-        _update_assignments: Vec<(String, SqlValueLiteral)>,
+        on_conflict: &OnConflictClause,
         tenant_context: Option<&TenantContext>,
     ) -> Result<DmlResult> {
         let (catalog, table_id) = self
@@ -4857,6 +5087,22 @@ impl DmlService {
 
         // Get table schema
         let table_schema = catalog.get_table(&table_id).await?;
+        // Bind the clause before taking any lock: a bad target or expression
+        // is a statement error, not a write.
+        let arbiters = Self::resolve_conflict_arbiters(&table_schema, &on_conflict.target)?;
+        let bound_update = match &on_conflict.action {
+            OnConflictAction::DoNothing => None,
+            OnConflictAction::DoUpdate {
+                assignments,
+                selection,
+            } => Some(self.bind_on_conflict_update(
+                &table_schema,
+                &on_conflict.target_qualifier,
+                assignments,
+                selection.as_deref(),
+            )?),
+        };
+
         let dml_lock_guard = self
             .acquire_table_dml_lock(&table_id, tenant_context, LockIntent::Write)
             .await?;
@@ -4883,19 +5129,140 @@ impl DmlService {
         );
         Self::trace_row_dml_write_lane(&write_intent, &write_lane_decision);
 
-        let mut records = Vec::new();
+        // Rows this statement writes, in order, with their mutation kind.
+        let mut written: Vec<(ProximaRecord, TableRecordMutationKind)> = Vec::new();
+        // Oids this statement inserted or updated (a DO UPDATE hitting one is 21000).
+        let mut touched: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Committed rows rewritten by DO UPDATE (their stored image is stale).
+        let mut updated: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut inserted_ids = Vec::new();
 
         for row in values {
-            let record = self.build_mutation_record(
+            let (proposed, proposed_values) = self.build_mutation_record_with_values(
                 columns,
                 &row,
                 &table_schema,
-                RelationalMutationKind::Upsert,
+                RelationalMutationKind::Insert,
             )?;
-            inserted_ids.push(record.oid.clone());
-            records.push(record);
+            let holder = self
+                .find_conflict_holder(
+                    &table_schema,
+                    &table_id,
+                    &arbiters,
+                    &proposed,
+                    &written,
+                    &updated,
+                    tenant_context,
+                )
+                .await?;
+            let Some((holder_oid, holder_row)) = holder else {
+                touched.insert(proposed.oid.clone());
+                inserted_ids.push(proposed.oid.clone());
+                written.push((proposed, TableRecordMutationKind::Insert));
+                continue;
+            };
+            let Some(update) = &bound_update else {
+                continue; // DO NOTHING
+            };
+            if touched.contains(&holder_oid) {
+                return Err(RelationalConstraintViolation::new(
+                    RelationalConstraintKind::UpsertAffectsRowTwice,
+                    format!(
+                        "ON CONFLICT DO UPDATE command cannot affect row a second time: row '{}' of table '{}' was already inserted or updated by this statement",
+                        holder_oid, table_schema.name
+                    ),
+                )
+                .into());
+            }
+            // A committed holder was read (live) during arbitration; an
+            // in-statement holder was already answered by the 21000 check.
+            let existing = holder_row.ok_or_else(|| {
+                anyhow!(
+                    "ON CONFLICT DO UPDATE: conflicting row '{}' of table '{}' is no longer visible",
+                    holder_oid,
+                    table_schema.name
+                )
+            })?;
+            let existing_values = Self::existing_row_values(&existing, &table_schema)?;
+            let eval_row: proximadb_relational_types::RelationalRow = table_schema
+                .columns
+                .iter()
+                .map(|column| {
+                    existing_values
+                        .get(&column.name)
+                        .cloned()
+                        .unwrap_or(ProximaValue::Null)
+                })
+                .chain(table_schema.columns.iter().map(|column| {
+                    proposed_values
+                        .get(&column.name)
+                        .cloned()
+                        .unwrap_or(ProximaValue::Null)
+                }))
+                .collect();
+            let funcs = proximadb_functions::builtins();
+            if let Some(selection) = &update.selection {
+                let verdict = selection
+                    .eval(&eval_row, funcs)
+                    .map_err(|e| Self::expr_error("ON CONFLICT DO UPDATE WHERE", e))?;
+                // Three-valued logic: NULL and false both leave the row alone.
+                if !matches!(verdict, ProximaValue::Boolean(true)) {
+                    continue;
+                }
+            }
+            // PostgreSQL RLS: DO UPDATE requires the caller to see the
+            // conflicting row (UPDATE USING); otherwise 42501.
+            #[cfg(feature = "abac-policy")]
+            self.check_on_conflict_update_visible(
+                on_conflict.caller_identity.as_ref(),
+                &table_schema,
+                &existing,
+            )?;
+            let mut assigned = Vec::with_capacity(update.assignments.len());
+            let mut assigned_timestamp_ns = None;
+            for (column_name, expr) in &update.assignments {
+                let value = expr.eval(&eval_row, funcs).map_err(|e| {
+                    Self::expr_error(&format!("ON CONFLICT DO UPDATE SET {column_name}"), e)
+                })?;
+                let value = self.coerce_assigned_value(column_name, value, &table_schema)?;
+                if column_name == "timestamp" {
+                    assigned_timestamp_ns = match &value {
+                        ProximaValue::Timestamp(
+                            ms,
+                            proximadb_data_model::TimeUnit::Millisecond,
+                        )
+                        | ProximaValue::TimestampTz(
+                            ms,
+                            proximadb_data_model::TimeUnit::Millisecond,
+                        ) => Some(ms.saturating_mul(1_000_000)),
+                        _ => assigned_timestamp_ns,
+                    };
+                }
+                assigned.push((column_name.clone(), value));
+            }
+            let record = Self::updated_record_from_values(
+                &existing,
+                existing_values,
+                assigned,
+                assigned_timestamp_ns,
+                &table_schema,
+            )?;
+            touched.insert(holder_oid.clone());
+            updated.insert(holder_oid);
+            written.push((record, TableRecordMutationKind::Update));
         }
+
+        if written.is_empty() {
+            self.finish_dml_guards(dml_lock_guard.into_iter().chain(child_dml_locks))
+                .await;
+            return Ok(DmlResult::success(0, "Inserted 0 rows, updated 0 rows"));
+        }
+
+        // TD-DML-1: the shared integrity sequence over exactly the rows this
+        // statement writes — new rows as INSERT, DO UPDATE rows as in-place
+        // rewrites (UNIQUE probe excludes their own old values).
+        let (records, kinds): (Vec<ProximaRecord>, Vec<TableRecordMutationKind>) =
+            written.into_iter().unzip();
 
         // TD-RELIDEQ-2: ON UPDATE NO ACTION for the rows being replaced — the
         // live rows at these oids. Checked BEFORE the integrity sequence below,
@@ -4915,64 +5282,506 @@ impl DmlService {
             )
             .await?;
         }
-
-        // TD-DML-1: an UPSERT writes rows exactly like INSERT does, so it runs
-        // the SAME integrity sequence (PK claim, secondary UNIQUE, FOREIGN KEY);
-        // CHECK / NOT NULL ran row-locally in `build_mutation_record`. The
-        // Upsert mode differs only where the semantics do: a live PK holder is
-        // the row being replaced (not a duplicate), and replaced rows vacate
-        // their own UNIQUE values (no self-conflict).
-        let replaced = self
+        let pk_claims = self
             .enforce_row_write_constraints(
                 &table_schema,
                 &table_id,
                 &records,
-                RowWriteConstraintMode::Upsert,
+                RowWriteConstraintMode::OnConflict { updated: &updated },
                 tenant_context,
             )
             .await?;
-        let new_rows = replaced.iter().filter(|existed| !**existed).count();
 
-        let num_records = records.len();
+        let inserted_count = inserted_ids.len();
+        let updated_count = updated.len();
         let mutations = records
             .into_iter()
-            .map(|record| TableRecordMutation::new(TableRecordMutationKind::Upsert, record))
+            .zip(kinds)
+            .map(|(record, kind)| TableRecordMutation::new(kind, record))
             .collect::<Vec<_>>();
-        let batch_result = self
+        // PK claims are released when the store says nothing became durable:
+        // a store-reported rejection (`Ok(!success)`) or an `Err` marked
+        // `RejectedBeforeAppend` (validation / health / pre-append reads). Any
+        // other `Err` may follow a durable WAL append (e.g. the memtable-full
+        // bail), so the claim is kept (fail closed) — and reconciled lazily on
+        // the next claim of the key, or by the startup sweep, once the durable
+        // log provably lacks the row.
+        let batch_result = match self
             .record_store
             .write_mutations(&table_schema, mutations, tenant_context)
-            .await?;
+            .await
+        {
+            Ok(batch_result) => batch_result,
+            Err(error) => {
+                if crate::services::record_store::is_rejected_before_append(&error) {
+                    self.release_pk_claims(&table_schema, &pk_claims).await;
+                }
+                return Err(error);
+            }
+        };
         if !batch_result.success {
-            return Err(anyhow!(
-                "Upsert failed: {}",
-                batch_result
-                    .errors
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "unknown error".to_string())
-            ));
+            self.release_pk_claims(&table_schema, &pk_claims).await;
+            let detail = batch_result
+                .errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "unknown error".to_string());
+            if batch_result.error_code.as_deref() == Some("INSERT_CONFLICT") {
+                return Err(RelationalConstraintViolation::new(
+                    RelationalConstraintKind::Unique,
+                    format!("duplicate key value violates primary key: {detail}"),
+                )
+                .into());
+            }
+            return Err(anyhow!("Upsert failed: {detail}"));
         }
 
         info!(
             table = %table_name,
-            rows = num_records,
-            "Upserted rows"
+            inserted = inserted_count,
+            updated = updated_count,
+            "INSERT ON CONFLICT applied"
         );
 
-        // Only rows that did not exist grow the table; replaced rows do not.
+        // Only inserted rows grow the table; updated and skipped rows do not.
         self.bump_row_count_stats(
             table_name,
             tenant_context.map(|t| t.tenant_id.as_str()),
-            new_rows as i64,
+            inserted_count as i64,
         )
         .await;
 
-        let result =
-            DmlResult::success(num_records as u64, format!("Upserted {} rows", num_records))
-                .with_inserted_ids(inserted_ids);
+        let result = DmlResult::success(
+            (inserted_count + updated_count) as u64,
+            format!("Inserted {inserted_count} rows, updated {updated_count} rows"),
+        )
+        .with_inserted_ids(inserted_ids);
         self.finish_dml_guards(dml_lock_guard.into_iter().chain(child_dml_locks))
             .await;
         Ok(result)
+    }
+
+    /// TD-DML-3: [`Self::resolve_declared_column_name`] with the PostgreSQL
+    /// SQLSTATE for an unknown column (42703).
+    fn resolve_declared_column_typed(
+        raw: &str,
+        table_schema: &CatalogTableSchema,
+    ) -> Result<String> {
+        Self::resolve_declared_column_name(raw, table_schema).map_err(|e| {
+            RelationalConstraintViolation::new(
+                RelationalConstraintKind::UndefinedColumn,
+                e.to_string(),
+            )
+            .into()
+        })
+    }
+
+    /// TD-DML-3: a write-expression evaluation error with the SQLSTATE
+    /// PostgreSQL raises for the same failure (22012 / 22003 / 42804 / 42883 /
+    /// 42846); any
+    /// other evaluator error stays untyped.
+    fn expr_error(context: &str, error: proximadb_relational_types::ExprError) -> anyhow::Error {
+        use proximadb_relational_types::ExprError;
+        let kind = match &error {
+            ExprError::DivisionByZero => Some(RelationalConstraintKind::DivisionByZero),
+            ExprError::InvalidTextRepresentation { .. } => {
+                Some(RelationalConstraintKind::InvalidTextRepresentation)
+            }
+            ExprError::ArithmeticOverflow => Some(RelationalConstraintKind::NumericValueOutOfRange),
+            ExprError::TypeMismatch { .. } => Some(RelationalConstraintKind::DatatypeMismatch),
+            ExprError::OperatorNotDefined { .. } | ExprError::UnaryOperatorNotDefined { .. } => {
+                Some(RelationalConstraintKind::UndefinedFunction)
+            }
+            ExprError::UnsupportedCast { .. } => Some(RelationalConstraintKind::CannotCoerce),
+            _ => None,
+        };
+        let message = format!("{context}: {error}");
+        match kind {
+            Some(kind) => RelationalConstraintViolation::new(kind, message).into(),
+            None => anyhow!(message),
+        }
+    }
+
+    /// TD-DML-3: the unique column sets that arbitrate an `ON CONFLICT`, each
+    /// in catalog order (the order the record-store UNIQUE index is keyed by).
+    /// The PRIMARY KEY set, when present, is first.
+    fn resolve_conflict_arbiters(
+        table_schema: &CatalogTableSchema,
+        target: &OnConflictTarget,
+    ) -> Result<Vec<Vec<String>>> {
+        let pk_columns = Self::primary_key_columns(table_schema);
+        let same_set = |a: &[String], b: &[String]| {
+            a.len() == b.len() && a.iter().all(|column| b.contains(column))
+        };
+        let mut all: Vec<Vec<String>> = Vec::new();
+        if !pk_columns.is_empty() {
+            all.push(pk_columns.clone());
+        }
+        for set in crate::services::record_store::schema_unique_column_sets(table_schema) {
+            if !all.iter().any(|known| same_set(known, &set)) {
+                all.push(set);
+            }
+        }
+
+        match target {
+            OnConflictTarget::AnyUnique => Ok(all),
+            OnConflictTarget::Columns(requested) => {
+                let requested = requested
+                    .iter()
+                    .map(|column| Self::resolve_declared_column_typed(column, table_schema))
+                    .collect::<Result<Vec<_>>>()?;
+                let matching: Vec<Vec<String>> = all
+                    .into_iter()
+                    .filter(|set| same_set(set, &requested))
+                    .collect();
+                if matching.is_empty() {
+                    return Err(RelationalConstraintViolation::new(
+                        RelationalConstraintKind::NoMatchingConflictTarget,
+                        format!(
+                            "there is no unique or exclusion constraint matching the ON CONFLICT specification ({}) on table '{}'",
+                            requested.join(", "),
+                            table_schema.name
+                        ),
+                    )
+                    .into());
+                }
+                Ok(matching)
+            }
+            OnConflictTarget::Constraint(name) => {
+                let table = &table_schema.name;
+                let named = |set: &[String]| -> bool {
+                    let default_name = if same_set(set, &pk_columns) {
+                        format!("{table}_pkey")
+                    } else {
+                        format!("{table}_{}_key", set.join("_"))
+                    };
+                    default_name.eq_ignore_ascii_case(name)
+                        || table_schema
+                            .relational_capabilities
+                            .unique_indexes
+                            .iter()
+                            .any(|index| {
+                                index.name.eq_ignore_ascii_case(name)
+                                    && same_set(&index.columns, set)
+                            })
+                };
+                match all.into_iter().find(|set| named(set)) {
+                    Some(set) => Ok(vec![set]),
+                    None => Err(RelationalConstraintViolation::new(
+                        RelationalConstraintKind::UndefinedConstraint,
+                        format!("constraint \"{name}\" for table \"{table}\" does not exist"),
+                    )
+                    .into()),
+                }
+            }
+        }
+    }
+
+    /// TD-DML-3: bind a `DO UPDATE` against the table — resolve each SET target
+    /// to a declared, non-PK column and lower every expression with the
+    /// canonical relational frontend (`lower_on_conflict_expr`), the same
+    /// lowering and evaluator SELECT uses.
+    fn bind_on_conflict_update(
+        &self,
+        table_schema: &CatalogTableSchema,
+        target_qualifier: &str,
+        assignments: &[(String, sqlparser::ast::Expr)],
+        selection: Option<&sqlparser::ast::Expr>,
+    ) -> Result<BoundOnConflictUpdate> {
+        if assignments.is_empty() {
+            return Err(anyhow!(
+                "ON CONFLICT DO UPDATE requires at least one assignment"
+            ));
+        }
+        let relational_schema = proximadb_relational_types::RelationalSchema::new(
+            table_schema
+                .columns
+                .iter()
+                .map(|column| {
+                    proximadb_relational_types::ColumnInfo::new(
+                        column.name.clone(),
+                        column.data_type.clone(),
+                        column.nullable,
+                    )
+                })
+                .collect(),
+        );
+        let lower = |expr: &sqlparser::ast::Expr| {
+            proximadb_relational_frontend::lower_on_conflict_expr(
+                expr,
+                target_qualifier,
+                &relational_schema,
+            )
+            .map_err(|e| {
+                let message = format!("ON CONFLICT DO UPDATE expression `{expr}`: {e}");
+                match e {
+                    proximadb_relational_frontend::FrontendError::ColumnNotFound(_) => {
+                        RelationalConstraintViolation::new(
+                            RelationalConstraintKind::UndefinedColumn,
+                            message,
+                        )
+                        .into()
+                    }
+                    _ => anyhow!(message),
+                }
+            })
+        };
+        let primary_key_columns = Self::primary_key_columns(table_schema);
+        let mut bound = Vec::with_capacity(assignments.len());
+        for (target, expr) in assignments {
+            let column_name = Self::resolve_declared_column_typed(target, table_schema)?;
+            if primary_key_columns.contains(&column_name) {
+                return Err(RelationalConstraintViolation::new(
+                    RelationalConstraintKind::FeatureNotSupported,
+                    format!(
+                        "ON CONFLICT DO UPDATE cannot modify primary key column '{column_name}'"
+                    ),
+                )
+                .into());
+            }
+            if bound.iter().any(|(seen, _)| seen == &column_name) {
+                return Err(RelationalConstraintViolation::new(
+                    RelationalConstraintKind::DuplicateColumn,
+                    format!("multiple assignments to same column \"{column_name}\""),
+                )
+                .into());
+            }
+            // `SET col = DEFAULT` — the column's declared default, typed as for INSERT.
+            let is_default = matches!(
+                expr,
+                sqlparser::ast::Expr::Identifier(ident)
+                    if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("DEFAULT")
+            );
+            let lowered = if is_default {
+                let literal = self.effective_insert_literal(
+                    &column_name,
+                    &SqlValueLiteral::Default,
+                    table_schema,
+                )?;
+                let value =
+                    self.literal_to_proxima_value_for_column(&column_name, &literal, table_schema)?;
+                let ty = table_schema
+                    .columns
+                    .iter()
+                    .find(|column| column.name == column_name)
+                    .map(|column| column.data_type.clone())
+                    .ok_or_else(|| anyhow!("Column '{column_name}' does not exist"))?;
+                proximadb_relational_types::Expr::Literal { value, ty }
+            } else {
+                lower(expr)?
+            };
+            bound.push((column_name, lowered));
+        }
+        let selection = selection.map(lower).transpose()?;
+        Ok(BoundOnConflictUpdate {
+            assignments: bound,
+            selection,
+        })
+    }
+
+    /// TD-DML-3: coerce an evaluated `DO UPDATE` value to its column's type.
+    /// Text goes through the SAME literal coercion INSERT uses (DATE,
+    /// TIMESTAMP, JSON, DECIMAL text); other scalars through the relational
+    /// `cast_value`; NULL and non-scalar values (vectors, JSON documents,
+    /// arrays) pass through for `CatalogRow::validate` to type-check.
+    fn coerce_assigned_value(
+        &self,
+        column_name: &str,
+        value: ProximaValue,
+        table_schema: &CatalogTableSchema,
+    ) -> Result<ProximaValue> {
+        let Some(column) = table_schema
+            .columns
+            .iter()
+            .find(|column| column.name == column_name)
+        else {
+            return Err(anyhow!("Column '{column_name}' does not exist"));
+        };
+        match value {
+            ProximaValue::Null
+            | ProximaValue::Json(_)
+            | ProximaValue::Jsonb(_)
+            | ProximaValue::DenseVector(_)
+            | ProximaValue::SparseVector { .. }
+            | ProximaValue::BinaryVector(_)
+            | ProximaValue::Array(_)
+            | ProximaValue::Map(_)
+            | ProximaValue::Struct(_) => Ok(value),
+            ProximaValue::String(text)
+                if !matches!(column.data_type, ProximaType::String | ProximaType::Uuid) =>
+            {
+                self.literal_to_proxima_value_for_column(
+                    column_name,
+                    &SqlValueLiteral::String(text.clone()),
+                    table_schema,
+                )
+                .map_err(|e| {
+                    RelationalConstraintViolation::new(
+                        RelationalConstraintKind::InvalidTextRepresentation,
+                        format!(
+                            "invalid input syntax for type {:?} of column '{column_name}': \"{text}\" ({e})",
+                            column.data_type
+                        ),
+                    )
+                    .into()
+                })
+            }
+            // An assignment whose value has the wrong type is PostgreSQL's
+            // 42804 ("column is of type X but expression is of type Y"); bad
+            // text for the column type stays 22P02.
+            other => proximadb_relational_types::cast_value(&other, &column.data_type).map_err(
+                |e| {
+                    let message = format!(
+                        "ON CONFLICT DO UPDATE: column '{column_name}' is of type {:?} but the expression is {other:?}: {e}",
+                        column.data_type
+                    );
+                    let kind = match e {
+                        proximadb_relational_types::ExprError::InvalidTextRepresentation {
+                            ..
+                        } => RelationalConstraintKind::InvalidTextRepresentation,
+                        _ => RelationalConstraintKind::DatatypeMismatch,
+                    };
+                    RelationalConstraintViolation::new(kind, message).into()
+                },
+            ),
+        }
+    }
+
+    /// TD-DML-3: the oid of the row `proposed` conflicts with on any of the
+    /// `arbiters`, or `None`. Rows this statement already wrote are checked
+    /// first (they hold the current value of their keys); committed rows are
+    /// probed next, excluding rows a DO UPDATE rewrote (their stored image is
+    /// stale). A NULL in an arbiter column never conflicts.
+    #[allow(clippy::too_many_arguments)]
+    async fn find_conflict_holder(
+        &self,
+        table_schema: &CatalogTableSchema,
+        table_id: &TableIdentifier,
+        arbiters: &[Vec<String>],
+        proposed: &ProximaRecord,
+        written: &[(ProximaRecord, TableRecordMutationKind)],
+        updated: &std::collections::HashSet<String>,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<Option<(String, Option<ExistingRow>)>> {
+        use crate::services::record_store::{UniqueCandidateSet, record_unique_tuple};
+
+        // TD-RELIDEQ-2: declared-key semantics. A keyless table's id/record_id
+        // fallback is NOT the oid — an ON CONFLICT target on it arbitrates by
+        // its column VALUE (the unique-index tuple), never the generated oid.
+        let primary_key = crate::services::record_store::schema_oid_key_column(table_schema);
+        let pk_columns =
+            crate::services::record_store::schema_declared_primary_key_columns(table_schema);
+        for arbiter in arbiters {
+            let is_pk = arbiter.len() == pk_columns.len()
+                && arbiter.iter().all(|column| pk_columns.contains(column));
+            // The PK tuple IS the oid (composite-aware, TD-DML-2).
+            let tuple_of = |record: &ProximaRecord| {
+                if is_pk {
+                    Some(vec![record.oid.clone()])
+                } else {
+                    record_unique_tuple(record, arbiter, primary_key.as_deref())
+                }
+            };
+            let Some(tuple) = tuple_of(proposed) else {
+                continue;
+            };
+            if let Some((holder, _)) = written
+                .iter()
+                .find(|(record, _)| tuple_of(record).as_ref() == Some(&tuple))
+            {
+                return Ok(Some((holder.oid.clone(), None)));
+            }
+            if is_pk {
+                if updated.contains(&proposed.oid) {
+                    continue; // its current image is in `written`, checked above
+                }
+                // Mandate #16a: a dead (tombstoned / TTL-expired) holder holds
+                // nothing — only a LIVE row arbitrates.
+                if let RowState::Live(existing) = self
+                    .row_state(table_schema, table_id, &proposed.oid, tenant_context)
+                    .await?
+                {
+                    return Ok(Some((proposed.oid.clone(), Some(existing))));
+                }
+            } else {
+                let sets = [UniqueCandidateSet {
+                    columns: arbiter.clone(),
+                    candidates: std::iter::once(tuple).collect(),
+                }];
+                if let Some(conflict) = self
+                    .record_store
+                    .check_unique_conflict(
+                        table_schema,
+                        &table_id.name,
+                        primary_key.as_deref(),
+                        &sets,
+                        updated,
+                        tenant_context,
+                    )
+                    .await?
+                {
+                    // Re-validate the indexed holder: only a LIVE row
+                    // arbitrates. (The index probe already skips dead owners
+                    // it can see; this also covers stores without one. A
+                    // holder that is not live here is not a conflict for THIS
+                    // arbiter — the enforcement probe still fails closed.)
+                    if let RowState::Live(existing) = self
+                        .row_state(table_schema, table_id, &conflict.oid, tenant_context)
+                        .await?
+                    {
+                        return Ok(Some((conflict.oid, Some(existing))));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// TD-DML-3: the current state of the row keyed `key` — LIVE (with its
+    /// full envelope where the store serves one), DEAD (tombstoned or
+    /// TTL-expired, mandate #16a) or ABSENT. Stores without envelope reads
+    /// fall back to `get_by_key` (which cannot tell dead from live).
+    async fn row_state(
+        &self,
+        table_schema: &CatalogTableSchema,
+        table_id: &TableIdentifier,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<RowState> {
+        use crate::services::record_store::RecordEnvelopeLookup;
+        match self
+            .record_store
+            .get_record_envelope(table_schema, key, tenant_context)
+            .await?
+        {
+            RecordEnvelopeLookup::Live(record) => Ok(RowState::Live(ExistingRow::Envelope(record))),
+            RecordEnvelopeLookup::Dead => Ok(RowState::Dead),
+            RecordEnvelopeLookup::Absent => Ok(RowState::Absent),
+            RecordEnvelopeLookup::Unsupported => Ok(
+                match self
+                    .record_store
+                    .get_by_key(
+                        table_schema,
+                        TableRecordGetRequest {
+                            table_id: table_id.name.clone(),
+                            key: key.to_string(),
+                            include_vector: true,
+                            include_props: true,
+                        },
+                        tenant_context,
+                        #[cfg(feature = "abac-policy")]
+                        &ReadContext::system(
+                            SystemReadReason::ForeignKeyResolution,
+                            "dml::row_state",
+                        ),
+                    )
+                    .await?
+                {
+                    Some(projection) => RowState::Live(ExistingRow::Projection(projection)),
+                    None => RowState::Absent,
+                },
+            ),
+        }
     }
 
     // ========================
@@ -5376,6 +6185,20 @@ impl DmlService {
         table_schema: &CatalogTableSchema,
         mutation_kind: RelationalMutationKind,
     ) -> Result<ProximaRecord> {
+        self.build_mutation_record_with_values(columns, values, table_schema, mutation_kind)
+            .map(|(record, _)| record)
+    }
+
+    /// [`Self::build_mutation_record`], also returning the row's typed column
+    /// values keyed by declared column name (provided values plus DEFAULTs).
+    /// TD-DML-3 uses them as the `EXCLUDED` row of `ON CONFLICT DO UPDATE`.
+    fn build_mutation_record_with_values(
+        &self,
+        columns: &[String],
+        values: &[SqlValueLiteral],
+        table_schema: &CatalogTableSchema,
+        mutation_kind: RelationalMutationKind,
+    ) -> Result<(ProximaRecord, HashMap<String, ProximaValue>)> {
         // `INSERT INTO t VALUES (...)` without an explicit column
         // list is standard SQL — the values are mapped to the table's
         // declared columns in order. Synthesize the column list
@@ -5458,6 +6281,7 @@ impl DmlService {
             row_values.insert(column.name.clone(), proxima_value.clone());
         }
 
+        let typed_values = row_values.clone();
         let catalog_row =
             CatalogRow::validate(table_schema, row_values, &RelationalWriteProfile::oltp())?;
         let record = catalog_row.to_mutation_record(
@@ -5469,7 +6293,7 @@ impl DmlService {
                 ..RelationalRecordOptions::default()
             },
         )?;
-        Ok(record)
+        Ok((record, typed_values))
     }
 
     fn mutation_method(kind: RelationalMutationKind) -> &'static str {
@@ -5661,14 +6485,12 @@ impl DmlService {
                     table_schema.name
                 ));
             };
-            // TD-RELIDEQ-2: every DECLARED key column is immutable (a composite
-            // key's columns too — the oid encodes the whole tuple); a keyless
-            // table's `id`/`record_id` fallback is an ordinary column.
             if declared_key.iter().any(|key| key == column_name) {
-                return Err(anyhow!(
-                    "UPDATE cannot modify primary key column '{}'",
-                    column_name
-                ));
+                return Err(RelationalConstraintViolation::new(
+                    RelationalConstraintKind::FeatureNotSupported,
+                    format!("UPDATE cannot modify primary key column '{column_name}'"),
+                )
+                .into());
             }
             if Self::literal_is_null(value) && !column.nullable {
                 return Err(anyhow!(
@@ -5687,18 +6509,13 @@ impl DmlService {
 
     fn build_updated_proxima_record(
         &self,
-        existing: RichSearchResult,
+        existing: ExistingRow,
         assignments: &[(String, SqlValueLiteral)],
         table_schema: &CatalogTableSchema,
     ) -> Result<ProximaRecord> {
-        let mut row_values = Self::row_values_from_existing(&existing, table_schema)?;
-        let mut created_at_ns = existing
-            .timestamp
-            .map(|timestamp_ms| timestamp_ms.saturating_mul(1_000_000));
-        let mut updated_at_ns = chrono::Utc::now()
-            .timestamp_millis()
-            .saturating_mul(1_000_000);
-
+        let row_values = Self::existing_row_values(&existing, table_schema)?;
+        let mut assigned = Vec::with_capacity(assignments.len());
+        let mut assigned_timestamp_ns = None;
         for (column_name, value) in assignments {
             let effective_value =
                 self.effective_insert_literal(column_name, value, table_schema)?;
@@ -5707,54 +6524,175 @@ impl DmlService {
                 &effective_value,
                 table_schema,
             )?;
-
             if column_name == "timestamp"
                 && let Some(timestamp_ms) = self.literal_to_timestamp(&effective_value)?
             {
-                let timestamp_ns = timestamp_ms.saturating_mul(1_000_000);
-                created_at_ns = Some(timestamp_ns);
-                updated_at_ns = timestamp_ns;
+                assigned_timestamp_ns = Some(timestamp_ms.saturating_mul(1_000_000));
             }
+            assigned.push((column_name.clone(), proxima_value));
+        }
+        Self::updated_record_from_values(
+            &existing,
+            row_values,
+            assigned,
+            assigned_timestamp_ns,
+            table_schema,
+        )
+    }
 
-            row_values.insert(column_name.clone(), proxima_value);
+    /// The ONE "apply assignments to an existing row" step shared by UPDATE
+    /// and `ON CONFLICT DO UPDATE` (TD-DML-3): overlay the already-typed
+    /// `assigned` values on the existing row's values, re-validate the whole
+    /// row (CHECK / NOT NULL / types) and envelope it as an Update with a
+    /// bumped record version.
+    fn updated_record_from_values(
+        existing: &ExistingRow,
+        mut row_values: HashMap<String, ProximaValue>,
+        assigned: Vec<(String, ProximaValue)>,
+        assigned_timestamp_ns: Option<i64>,
+        table_schema: &CatalogTableSchema,
+    ) -> Result<ProximaRecord> {
+        let mut created_at_ns = match existing {
+            ExistingRow::Envelope(record) => Some(record.created_at_ns),
+            ExistingRow::Projection(projection) => projection
+                .timestamp
+                .map(|timestamp_ms| timestamp_ms.saturating_mul(1_000_000)),
+        };
+        let record_version = match existing {
+            ExistingRow::Envelope(record) => Some(record.record_version.saturating_add(1)),
+            ExistingRow::Projection(projection) => {
+                projection.version.map(|version| version as u64 + 1)
+            }
+        };
+        let mut updated_at_ns = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_mul(1_000_000);
+        if let Some(timestamp_ns) = assigned_timestamp_ns {
+            created_at_ns = Some(timestamp_ns);
+            updated_at_ns = timestamp_ns;
+        }
+        for (column_name, value) in assigned {
+            row_values.insert(column_name, value);
         }
 
         let catalog_row =
             CatalogRow::validate(table_schema, row_values, &RelationalWriteProfile::oltp())?;
-        catalog_row.to_mutation_record(
+        let mut record = catalog_row.to_mutation_record(
             table_schema,
             RelationalMutationKind::Update,
             RelationalRecordOptions {
                 method: Some("sql_dml_update".to_string()),
                 created_at_ns,
                 updated_at_ns: Some(updated_at_ns),
-                record_version: existing.version.map(|version| version as u64 + 1),
+                record_version,
                 // TD-RELIDEQ-1: a keyless row keeps its oid (ignored when the
                 // table declares a key, whose value is the oid).
-                record_id: Some(existing.id.clone()),
+                record_id: Some(existing.id().to_owned()),
                 ..RelationalRecordOptions::default()
             },
-        )
+        )?;
+        let existing_id = existing.id();
+        // TD-DML-3: an update rewrites THIS row. A table with no primary key
+        // has no key to re-derive the identity from (`to_proxima_record` would
+        // mint a fresh `<table>:row:<ns>` oid, so the Update targeted a row
+        // that does not exist); pin the identity to the row being updated.
+        // For a keyed table the re-derived oid MUST already equal it — a
+        // mismatch means a PK column changed, which UPDATE / DO UPDATE reject
+        // up front; refuse rather than write a row whose identity and key
+        // columns disagree.
+        if !Self::primary_key_columns(table_schema).is_empty() && record.oid != existing_id {
+            return Err(anyhow!(
+                "update of row '{}' in table '{}' re-derived a different key '{}'; refusing to rewrite the row's identity",
+                existing_id,
+                table_schema.name,
+                record.oid
+            ));
+        }
+        record.oid = existing_id.to_string();
+        record.local_id = Some(existing_id.to_string());
+        // TD-DML-3: carry the envelope fields that are not columns, so an
+        // update does not silently clear them — the TTL / validity window,
+        // the tenant stamp and the row-level security envelope. Props are
+        // rebuilt from the DECLARED columns only: an undeclared prop is a
+        // dropped column's stale value (carrying it would let a later ADD
+        // COLUMN resurrect it), and write-path system metadata (pseudo-query
+        // props) is regenerated by the store on write.
+        if let ExistingRow::Envelope(previous) = existing {
+            record.valid_from_ns = previous.valid_from_ns;
+            record.valid_to_ns = previous.valid_to_ns;
+            if record.tenant_id.is_empty() {
+                record.tenant_id = previous.tenant_id.clone();
+            }
+            record.permitted_principals = previous.permitted_principals.clone();
+            record.rls_policy_id = previous.rls_policy_id.clone();
+        }
+        Ok(record)
+    }
+
+    /// TD-DML-3: the existing row's typed column values. From a full
+    /// envelope they are the stored column props (every PK column and every
+    /// vector column exactly as written); from a `get_by_key` projection they
+    /// are reconstructed (lossy: one embedding, PK decoded from the key).
+    fn existing_row_values(
+        existing: &ExistingRow,
+        table_schema: &CatalogTableSchema,
+    ) -> Result<HashMap<String, ProximaValue>> {
+        match existing {
+            ExistingRow::Envelope(record) => Ok(table_schema
+                .columns
+                .iter()
+                .filter_map(|column| match record.props.get(&column.name) {
+                    Some(ProximaTreeNode::Value(value)) => {
+                        Some((column.name.clone(), value.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()),
+            ExistingRow::Projection(projection) => {
+                Self::row_values_from_existing(projection, table_schema)
+            }
+        }
     }
 
     fn row_values_from_existing(
         existing: &RichSearchResult,
         table_schema: &CatalogTableSchema,
     ) -> Result<HashMap<String, ProximaValue>> {
-        // TD-RELIDEQ-1/2: only a declared SINGLE-column key IS the oid. A
-        // composite key's oid encodes the whole tuple (its columns come from
-        // props, which hold every column), and a keyless table's
-        // `id`/`record_id` fallback is an ordinary column.
-        let oid_key_column = crate::services::record_store::schema_oid_key_column(table_schema);
+        // TD-DML-3: the oid is the ENCODED PK tuple — one `\u{1f}`-joined part
+        // per PK column (TD-110 S2). Decoding it into the FIRST PK column only
+        // (the pre-TD-DML-3 behaviour) put the whole tuple into that column, so
+        // every UPDATE / DO UPDATE of a composite-PK row rewrote a different,
+        // non-existent key.
+        // TD-RELIDEQ-2: DECLARED keys only — a keyless table's id/record_id
+        // fallback column must not receive the generated oid as its value.
+        let primary_key_columns =
+            crate::services::record_store::schema_declared_primary_key_columns(table_schema);
+        // A single-column key is the whole oid — its value may itself contain
+        // the separator, so it is never split.
+        let primary_key_parts: Vec<&str> = if primary_key_columns.len() <= 1 {
+            vec![existing.id.as_str()]
+        } else {
+            split_primary_key_tuple(&existing.id)
+        };
+        if !primary_key_columns.is_empty() && primary_key_parts.len() != primary_key_columns.len() {
+            return Err(anyhow!(
+                "row key '{}' of table '{}' decoded to {} part(s) but its primary key ({}) has {} column(s)",
+                existing.id,
+                table_schema.name,
+                primary_key_parts.len(),
+                primary_key_columns.join(", "),
+                primary_key_columns.len()
+            ));
+        }
         let mut row_values = HashMap::new();
 
         for column in &table_schema.columns {
-            if oid_key_column.as_deref() == Some(column.name.as_str()) {
+            if let Some(position) = primary_key_columns.iter().position(|pk| pk == &column.name) {
                 row_values.insert(
                     column.name.clone(),
                     Self::primary_key_string_to_proxima_value(
                         &column.name,
-                        &existing.id,
+                        primary_key_parts.get(position).copied().unwrap_or_default(),
                         table_schema,
                     )?,
                 );
@@ -5873,19 +6811,19 @@ impl DmlService {
     /// CHECK / NOT NULL / type constraints are row-local and already ran in
     /// `CatalogRow::validate` when the records were built.
     ///
-    /// Returns, per record in order, whether its PK already had a live row. For
-    /// `Insert` a live holder is a 23505 error, so every entry is `false`; for
-    /// `Upsert` it marks the row being replaced. If a later step rejects the
-    /// statement, PK claims this call made in the fenced store are released so
-    /// a rejected statement leaves no claimed-but-rowless key behind.
+    /// Returns the fenced PK claims this call made, so the caller can release
+    /// them if the subsequent `write_mutations` is rejected before anything is
+    /// durable ([`Self::release_pk_claims`]).
+    /// If a later step of THIS sequence rejects the statement, the claims are
+    /// released here, so a rejected statement leaves no claimed-but-rowless key.
     async fn enforce_row_write_constraints(
         &self,
         table_schema: &CatalogTableSchema,
         table_id: &TableIdentifier,
         records: &[ProximaRecord],
-        mode: RowWriteConstraintMode,
+        mode: RowWriteConstraintMode<'_>,
         tenant_context: Option<&TenantContext>,
-    ) -> Result<Vec<bool>> {
+    ) -> Result<Vec<proximadb_storage_ports::Identity>> {
         let mut fresh_claims: Vec<proximadb_storage_ports::Identity> = Vec::new();
         let outcome = self
             .enforce_row_write_constraints_inner(
@@ -5897,23 +6835,42 @@ impl DmlService {
                 &mut fresh_claims,
             )
             .await;
-        if outcome.is_err()
-            && let Some(cks) = &self.conditional_key_store
-        {
-            for id in &fresh_claims {
-                if let Err(release_err) = cks
-                    .tombstone(id, proximadb_storage_ports::Generation(0))
-                    .await
-                {
-                    warn!(
-                        table = %table_schema.name,
-                        error = %release_err,
-                        "failed to release a fenced PK claim after a rejected write"
-                    );
-                }
+        match outcome {
+            Ok(_) => Ok(fresh_claims),
+            Err(error) => {
+                self.release_pk_claims(table_schema, &fresh_claims).await;
+                Err(error)
             }
         }
-        outcome
+    }
+
+    /// Release fenced PK claims this statement made (`cks.tombstone`) when the
+    /// statement is known NOT to have landed — rejected by a later integrity
+    /// step, or rejected by the store before anything is durable
+    /// (`write_mutations` returning `Ok(!success)`, TD-DML-3) — so no
+    /// claimed-but-rowless key is left to spuriously reject the next INSERT of
+    /// it. Never called for an `Err` from `write_mutations` (durability
+    /// unknown; fail closed). No-op without a CKS.
+    async fn release_pk_claims(
+        &self,
+        table_schema: &CatalogTableSchema,
+        claims: &[proximadb_storage_ports::Identity],
+    ) {
+        let Some(cks) = &self.conditional_key_store else {
+            return;
+        };
+        for id in claims {
+            if let Err(release_err) = cks
+                .tombstone(id, proximadb_storage_ports::Generation(0))
+                .await
+            {
+                warn!(
+                    table = %table_schema.name,
+                    error = %release_err,
+                    "failed to release a fenced PK claim after a rejected write"
+                );
+            }
+        }
     }
 
     async fn enforce_row_write_constraints_inner(
@@ -5921,7 +6878,7 @@ impl DmlService {
         table_schema: &CatalogTableSchema,
         table_id: &TableIdentifier,
         records: &[ProximaRecord],
-        mode: RowWriteConstraintMode,
+        mode: RowWriteConstraintMode<'_>,
         tenant_context: Option<&TenantContext>,
         fresh_claims: &mut Vec<proximadb_storage_ports::Identity>,
     ) -> Result<Vec<bool>> {
@@ -5937,23 +6894,27 @@ impl DmlService {
             for (index, record) in records.iter().enumerate() {
                 let key = record.oid.as_str();
                 if !batch_keys.insert(key) {
-                    return Err(match mode {
-                        RowWriteConstraintMode::Insert => RelationalConstraintViolation::new(
-                            RelationalConstraintKind::Unique,
-                            format!(
-                                "duplicate key value violates primary key '{}' on table '{}': '{}' appears more than once in this INSERT",
-                                pk_column, table_schema.name, key
-                            ),
+                    // ON CONFLICT arbitration (execute_upsert) already turned
+                    // every in-statement repeat on an arbiter into a skip, an
+                    // update or 21000, so a repeat reaching here is a new row
+                    // colliding on a NON-arbiter PK: a duplicate, as in INSERT.
+                    return Err(RelationalConstraintViolation::new(
+                        RelationalConstraintKind::Unique,
+                        format!(
+                            "duplicate key value violates primary key '{}' on table '{}': '{}' appears more than once in this INSERT",
+                            pk_column, table_schema.name, key
                         ),
-                        RowWriteConstraintMode::Upsert => RelationalConstraintViolation::new(
-                            RelationalConstraintKind::UpsertAffectsRowTwice,
-                            format!(
-                                "ON CONFLICT DO UPDATE command cannot affect row a second time: primary key '{}' value '{}' appears more than once in this statement on table '{}'",
-                                pk_column, key, table_schema.name
-                            ),
-                        ),
-                    }
+                    )
                     .into());
+                }
+                // TD-DML-3: a DO UPDATE rewrites a row that holds its PK (read
+                // under the op-lock); the PK is immutable, so there is nothing
+                // to claim.
+                if let RowWriteConstraintMode::OnConflict { updated } = mode
+                    && updated.contains(key)
+                {
+                    pk_live[index] = true;
+                    continue;
                 }
                 // F2 (ADR-072 D3): when a fenced ConditionalKeyStore is wired,
                 // claim the PK atomically (oid == primary_key_string, so the row
@@ -5972,7 +6933,7 @@ impl DmlService {
                     .as_ref()
                     .filter(|_| Self::table_declares_primary_key(table_schema))
                 {
-                    use proximadb_storage_ports::{Generation, Identity, Oid, PutOutcome};
+                    use proximadb_storage_ports::{Generation, Oid, PutOutcome};
                     // Key on the F0 typed, order-preserving codec built from the
                     // row's typed PK tuple (every PK column, in catalog order —
                     // TD-DML-2) and its tenant/keyspace scope — not the legacy
@@ -5986,48 +6947,80 @@ impl DmlService {
                                 table_schema.name
                             )
                         })?;
-                    let id =
-                        Identity::from_bytes(proximadb_data_model::key_codec::encode_identity(
-                            &record.tenant_id,
-                            &table_schema.name,
-                            &pk_values,
-                        )?);
+                    let id = Self::cks_identity(
+                        tenant_context,
+                        &record.tenant_id,
+                        &table_schema.name,
+                        &pk_values,
+                    )?;
                     match cks
                         .put_if_absent(&id, &Oid(key.to_string()), Generation(0))
                         .await?
                     {
-                        PutOutcome::Conflict { .. } => true,
+                        // A held claim normally means a live row. TD-DML-3:
+                        // * the holder row is DEAD (TTL-expired) — it occupies
+                        //   nothing; the key is free and the existing claim
+                        //   covers the new row;
+                        // * the holder row is ABSENT — a claim left by a crash
+                        //   or an ambiguous write failure. Reconcile lazily:
+                        //   only when the store's DURABLE log provably holds no
+                        //   live write of the key is the claim released and
+                        //   re-taken; otherwise it stays a conflict (fail
+                        //   closed — the row may reappear on replay).
+                        PutOutcome::Conflict { .. } => {
+                            match self
+                                .row_state(table_schema, table_id, key, tenant_context)
+                                .await?
+                            {
+                                RowState::Live(_) => true,
+                                RowState::Dead => false,
+                                RowState::Absent => {
+                                    if self
+                                        .record_store
+                                        .durable_row_write(table_schema, key, tenant_context)
+                                        .await?
+                                        == Some(false)
+                                    {
+                                        cks.tombstone(&id, Generation(0)).await?;
+                                        match cks
+                                            .put_if_absent(
+                                                &id,
+                                                &Oid(key.to_string()),
+                                                Generation(0),
+                                            )
+                                            .await?
+                                        {
+                                            PutOutcome::Committed { .. } => {
+                                                fresh_claims.push(id);
+                                                false
+                                            }
+                                            PutOutcome::Conflict { .. } => true,
+                                        }
+                                    } else {
+                                        true
+                                    }
+                                }
+                            }
+                        }
                         PutOutcome::Committed { .. } => {
                             fresh_claims.push(id);
                             false
                         }
                     }
                 } else {
-                    self.record_store
-                        .get_by_key(
-                            table_schema,
-                            TableRecordGetRequest {
-                                table_id: table_id.name.clone(),
-                                key: key.to_string(),
-                                include_vector: false,
-                                include_props: false,
-                            },
-                            // The tenant's partition — the one this INSERT writes.
-                            // Probing with `None` looked in the default partition,
-                            // missed the existing row in every tenant-scoped
-                            // session, and let the duplicate surface later as an
-                            // untyped store conflict (42P01 instead of 23505).
-                            tenant_context,
-                            #[cfg(feature = "abac-policy")]
-                            &ReadContext::system(
-                                SystemReadReason::ForeignKeyResolution,
-                                "dml::fk_check",
-                            ),
-                        )
-                        .await?
-                        .is_some()
+                    // The tenant's partition — the one this INSERT writes.
+                    // Probing with `None` looked in the default partition,
+                    // missed the existing row in every tenant-scoped session,
+                    // and let the duplicate surface later as an untyped store
+                    // conflict (42P01 instead of 23505). Only a LIVE row is a
+                    // duplicate (mandate #16a, TD-DML-3).
+                    matches!(
+                        self.row_state(table_schema, table_id, key, tenant_context)
+                            .await?,
+                        RowState::Live(_)
+                    )
                 };
-                if is_live && mode == RowWriteConstraintMode::Insert {
+                if is_live {
                     return Err(RelationalConstraintViolation::new(
                         RelationalConstraintKind::Unique,
                         format!(
@@ -6043,19 +7036,22 @@ impl DmlService {
 
         // TD-110: secondary UNIQUE constraints/indexes — within-statement dedup +
         // cross-existing probe (O(1) on index-backed stores, Slice C). INSERT
-        // excludes nothing (every row is new). UPSERT excludes the statement's
-        // own oids: a replaced row vacates its old UNIQUE values (exactly as
-        // UPDATE excludes its target rows), and a new row's oid is not stored.
         // TD-RELIDEQ-2: only a declared single-column key is read from the oid.
+        // excludes nothing (every row is new). ON CONFLICT excludes the rows its
+        // DO UPDATE rewrites: an updated row vacates its old UNIQUE values
+        // (exactly as UPDATE excludes its target rows), so the probe checks the
+        // POST-update row against every OTHER row.
+        // TD-RELIDEQ-2 (a14d02e76): only a DECLARED single-column key is read
+        // from the oid — the id/record_id fallback is an ordinary column, and a
+        // composite key's oid is the whole tuple. The store-side unique index
+        // keys the same way, so candidates must too.
         let primary_key = crate::services::record_store::schema_oid_key_column(table_schema);
         let candidate_sets =
             Self::build_unique_candidate_sets(table_schema, records, primary_key.as_deref())?;
         if !candidate_sets.is_empty() {
             let exclude_oids: std::collections::HashSet<String> = match mode {
                 RowWriteConstraintMode::Insert => std::collections::HashSet::new(),
-                RowWriteConstraintMode::Upsert => {
-                    records.iter().map(|record| record.oid.clone()).collect()
-                }
+                RowWriteConstraintMode::OnConflict { updated } => updated.clone(),
             };
             if let Some(conflict) = self
                 .record_store
@@ -6910,14 +7906,21 @@ impl DmlService {
                     self.conditional_key_store.as_ref().filter(|_| {
                         referenced_key == crate::services::referential::ReferencedKey::PrimaryKey
                     }) {
-                    let id = proximadb_storage_ports::Identity::from_bytes(
-                        proximadb_data_model::key_codec::encode_identity(
-                            &record.tenant_id,
-                            &parent_schema.name,
-                            &values,
-                        )?,
-                    );
+                    let id = Self::cks_identity(
+                        tenant_context,
+                        &record.tenant_id,
+                        &parent_schema.name,
+                        &values,
+                    )?;
+                    // TD-DML-3: a claim is necessary but not sufficient — a
+                    // claim whose row is absent (left by a failed write) or
+                    // dead (TTL-expired) is no parent.
                     cks.get(&id).await?.is_some()
+                        && matches!(
+                            self.row_state(&parent_schema, &parent_table_id, &key, tenant_context)
+                                .await?,
+                            RowState::Live(_)
+                        )
                 } else {
                     crate::services::referential::referenced_parent_exists(
                         self.record_store.as_ref(),

@@ -3299,6 +3299,26 @@ impl PostgresProtocol {
                         }
                         _ => None,
                     };
+                    // TD-DML-3: a table with VECTOR columns stores through the
+                    // vector store, which checks a row's (first) embedding
+                    // against the backing collection's dimension. The shim used
+                    // to be dimension 1, so every VECTOR(n≠1) row was rejected.
+                    // Declare the first VECTOR column's dimension instead; each
+                    // vector is also validated against its OWN column's
+                    // VECTOR(n) by the relational row contract.
+                    let backing_dimension: u32 = match &statement {
+                        crate::services::DdlStatement::CreateTable { columns, .. } => columns
+                            .iter()
+                            .find_map(|column| match column.data_type {
+                                crate::services::ddl::SqlDataType::Vector { dimension } => {
+                                    Some(dimension)
+                                }
+                                _ => None,
+                            })
+                            .filter(|dimension| *dimension > 0)
+                            .unwrap_or(1),
+                        _ => 1,
+                    };
                     // TD-064: scope table-targeting DDL (CREATE/DROP/ALTER TABLE,
                     // CREATE/DROP INDEX) onto the connection's tenant so a tenant's
                     // CREATE-then-INSERT address one tenant-prefixed schema row.
@@ -3338,6 +3358,7 @@ impl PostgresProtocol {
                                     &table_name,
                                     ddl_scope.as_deref(),
                                     backing_precision.as_deref(),
+                                    backing_dimension,
                                 )
                                 .await?;
                             }
@@ -3434,6 +3455,7 @@ impl PostgresProtocol {
         table_name: &str,
         tenant_id: Option<&str>,
         canonical_embedding_precision_label: Option<&str>,
+        dimension: u32,
     ) -> Result<()> {
         use crate::proto::proximadb_v1::{CollectionConfig, EmbeddingPrecision, StorageEngine};
 
@@ -3457,12 +3479,12 @@ impl PostgresProtocol {
             })
             .map(|p| p as i32);
 
-        // Relational tables don't carry vectors; the backing collection is a
-        // catalog-visibility shim. CollectionService rejects dimension=0, so
-        // pin the shim at 1 (matches other zero-vector compatibility paths).
+        // A table without VECTOR columns gets a catalog-visibility shim at
+        // dimension 1 (CollectionService rejects 0); a table with VECTOR
+        // columns declares its first VECTOR column's dimension (TD-DML-3).
         let config = CollectionConfig {
             name: table_name.to_string(),
-            dimension: 1,
+            dimension: dimension.max(1),
             storage_engine: Some(StorageEngine::Sst as i32),
             description: Some(format!(
                 "Relational table backing collection: {}",
@@ -6043,7 +6065,19 @@ impl PostgresProtocol {
         let parser = SqlFrontendParser::new();
 
         match parser.parse_dml(query) {
-            Ok(Some(statement)) => {
+            Ok(Some(mut statement)) => {
+                // TD-DML-3: an ON CONFLICT DO UPDATE must evaluate the caller's
+                // read policy on the conflicting row (abac-policy), so the
+                // statement carries the session identity — through buffering
+                // too, since it travels with the statement.
+                if let crate::services::dml::DmlStatement::Upsert { on_conflict, .. } =
+                    &mut statement
+                {
+                    on_conflict.caller_identity =
+                        self.session.read().await.identity.as_ref().map(|identity| {
+                            proximadb_runtime::PortIdentity::from(identity).into_owned()
+                        });
+                }
                 // Slice 6.3: gate runs post-parse so the (tenant_id,
                 // target_table) pair is known; pre-execute so a
                 // misroute never touches the catalog or WAL on this

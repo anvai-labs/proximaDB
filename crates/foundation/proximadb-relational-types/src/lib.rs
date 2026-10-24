@@ -103,6 +103,11 @@ pub enum ExprError {
     #[error("division by zero")]
     DivisionByZero,
 
+    /// Text that is not a valid literal of the target type (PostgreSQL's
+    /// `invalid_text_representation`, 22P02) — e.g. `CAST('x' AS BOOLEAN)`.
+    #[error("invalid input syntax for type {to:?}: \"{value}\"")]
+    InvalidTextRepresentation { value: String, to: ProximaType },
+
     #[error("arithmetic overflow")]
     ArithmeticOverflow,
 
@@ -1354,10 +1359,19 @@ pub fn cast_value(v: &ProximaValue, target: &ProximaType) -> Result<ProximaValue
                 to: PT::Float64,
             })?)
         }
-        (PV::String(s), PT::Boolean) => PV::Boolean(matches!(
-            s.to_ascii_lowercase().as_str(),
-            "true" | "t" | "1" | "yes" | "y"
-        )),
+        // PostgreSQL's boolean input: the accepted spellings (case-insensitive,
+        // surrounding whitespace ignored); anything else is 22P02, never a
+        // silent `false`.
+        (PV::String(s), PT::Boolean) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "t" | "yes" | "y" | "on" | "1" => PV::Boolean(true),
+            "false" | "f" | "no" | "n" | "off" | "0" => PV::Boolean(false),
+            _ => {
+                return Err(ExprError::InvalidTextRepresentation {
+                    value: s.clone(),
+                    to: PT::Boolean,
+                });
+            }
+        },
         // Number → string
         (PV::Int64(n), PT::String) => PV::String(n.to_string()),
         (PV::Int32(n), PT::String) => PV::String(n.to_string()),

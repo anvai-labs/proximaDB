@@ -185,6 +185,17 @@ impl StagingTableRecordStore {
         if let Some(staged) = self.staged(key, oid) {
             return Ok(staged.is_some_and(|record| !record.is_dead(now_ns())));
         }
+        // TD-DML-3: a dead (TTL-expired) base row does not occupy the key.
+        use crate::services::record_store::RecordEnvelopeLookup;
+        match self
+            .base
+            .get_record_envelope(table_schema, oid, tenant_context)
+            .await?
+        {
+            RecordEnvelopeLookup::Live(_) => return Ok(true),
+            RecordEnvelopeLookup::Dead | RecordEnvelopeLookup::Absent => return Ok(false),
+            RecordEnvelopeLookup::Unsupported => {}
+        }
         Ok(self
             .base
             .get_by_key(
@@ -302,6 +313,39 @@ impl TableRecordStore for StagingTableRecordStore {
         _batches: Vec<StagedTableWrite>,
     ) -> Result<Vec<TableRecordWriteResult>> {
         Err(anyhow!("nested atomic commit inside a staged transaction"))
+    }
+
+    /// TD-DML-3: nothing staged is durable yet — the base store answers.
+    async fn durable_row_write(
+        &self,
+        table_schema: &CatalogTableSchema,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<Option<bool>> {
+        self.base
+            .durable_row_write(table_schema, key, tenant_context)
+            .await
+    }
+
+    /// TD-DML-3: the staged image wins (a staged delete is absent), else the
+    /// base store's envelope.
+    async fn get_record_envelope(
+        &self,
+        table_schema: &CatalogTableSchema,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<crate::services::record_store::RecordEnvelopeLookup> {
+        use crate::services::record_store::RecordEnvelopeLookup;
+        let table = table_key(table_schema, tenant_context);
+        match self.staged(&table, key) {
+            Some(Some(record)) => Ok(RecordEnvelopeLookup::classify(Some(record))),
+            Some(None) => Ok(RecordEnvelopeLookup::Absent),
+            None => {
+                self.base
+                    .get_record_envelope(table_schema, key, tenant_context)
+                    .await
+            }
+        }
     }
 
     async fn get_by_key(
@@ -469,6 +513,7 @@ impl TableRecordStore for StagingTableRecordStore {
                     return Ok(Some(UniqueConflict {
                         columns: set.columns.clone(),
                         tuple,
+                        oid: record.oid.clone(),
                     }));
                 }
             }

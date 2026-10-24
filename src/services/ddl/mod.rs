@@ -1163,6 +1163,78 @@ impl DdlService {
     }
 
     /// Apply schema evolution changes (add/drop columns, rename, etc.) to an existing table.
+    /// TD-DML-3: remove the props named `columns` from every live row of the
+    /// table (each row is rewritten as an Update through the record store).
+    /// Returns the number of rows rewritten. No-op without a record store.
+    async fn purge_column_values(
+        &self,
+        schema: &proximadb_catalog::CatalogTableSchema,
+        table_id: &str,
+        columns: &[String],
+        tenant: Option<&str>,
+    ) -> Result<usize> {
+        use crate::services::record_store::{
+            TableRecordMutation, TableRecordMutationKind, TableRecordScanRequest,
+        };
+        let Some(store) = &self.record_store else {
+            return Ok(0);
+        };
+        let tenant_context =
+            tenant.map(crate::storage::tenant::context::TenantContext::for_tenant_id);
+        let records = store
+            .scan_records(
+                schema,
+                TableRecordScanRequest {
+                    filter: None,
+                    table_id: table_id.to_string(),
+                    limit: None,
+                    include_vector: true,
+                    include_props: true,
+                },
+                tenant_context.as_ref(),
+                #[cfg(feature = "abac-policy")]
+                &proximadb_abac::ReadContext::system(
+                    proximadb_abac::SystemReadReason::Compaction,
+                    "ddl::purge_column_values",
+                ),
+            )
+            .await?;
+        let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+        let mutations: Vec<TableRecordMutation> = records
+            .into_iter()
+            .filter(|record| !record.is_dead(now_ns))
+            .filter_map(|mut record| {
+                let mut removed = false;
+                for column in columns {
+                    removed |= record.props.remove(column).is_some();
+                }
+                removed.then(|| {
+                    record.record_version = record.record_version.saturating_add(1);
+                    record.updated_at_ns = now_ns;
+                    TableRecordMutation::new(TableRecordMutationKind::Update, record)
+                })
+            })
+            .collect();
+        let rewritten = mutations.len();
+        for chunk in mutations.chunks(512) {
+            let result = store
+                .write_mutations(schema, chunk.to_vec(), tenant_context.as_ref())
+                .await?;
+            if !result.success {
+                return Err(anyhow!(
+                    "purging column(s) {} of table '{}' failed: {}",
+                    columns.join(", "),
+                    schema.name,
+                    result.errors.first().cloned().unwrap_or_default()
+                ));
+            }
+        }
+        if rewritten > 0 {
+            info!(table = %schema.name, rows = rewritten, columns = %columns.join(", "), "purged column values");
+        }
+        Ok(rewritten)
+    }
+
     async fn alter_table(
         &self,
         table_name: &str,
@@ -1179,11 +1251,61 @@ impl DdlService {
             return Err(anyhow!("Table '{}' does not exist", table_name));
         }
 
+        // TD-DML-3: a dropped column's values must never come back. Rows keep
+        // a column's value as a prop keyed by its name, so (a) before a column
+        // is ADDed, any prop of that name on existing rows is a stale value of
+        // an earlier, dropped column — purge it first (a pre-existing row must
+        // read NULL for a new column, as in PostgreSQL); (b) after a DROP, the
+        // dropped values are purged so they are not retained. (a) is the
+        // correctness guarantee and fails the ALTER if it cannot complete;
+        // (b) is retention hygiene and is logged, not fatal (the catalog
+        // change has committed).
+        let added: Vec<String> = changes
+            .iter()
+            .filter_map(|change| match change {
+                AlterTableChange::AddColumn(column) => Some(column.name.clone()),
+                _ => None,
+            })
+            .collect();
+        let dropped: Vec<String> = changes
+            .iter()
+            .filter_map(|change| match change {
+                AlterTableChange::DropColumn(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        if !added.is_empty() {
+            let schema = catalog.get_table(&table_id).await?;
+            let stale: Vec<String> = added
+                .into_iter()
+                .filter(|name| !schema.columns.iter().any(|column| &column.name == name))
+                .collect();
+            if !stale.is_empty() {
+                self.purge_column_values(&schema, &table_id.name, &stale, tenant)
+                    .await?;
+            }
+        }
+
         // Convert changes to catalog schema evolution
         let evolution = self.build_schema_evolution(changes)?;
 
         // Apply evolution
         catalog.evolve_schema(&table_id, evolution).await?;
+
+        if !dropped.is_empty() {
+            let schema = catalog.get_table(&table_id).await?;
+            if let Err(e) = self
+                .purge_column_values(&schema, &table_id.name, &dropped, tenant)
+                .await
+            {
+                error!(
+                    table = %table_name,
+                    error = %e,
+                    "purging dropped column values failed; they are retained until the column \
+                     name is re-added (which purges them first)"
+                );
+            }
+        }
 
         // Bump corpus_version: a schema change definitionally
         // invalidates cached plans — predicate types may shift,
