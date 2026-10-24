@@ -1915,6 +1915,7 @@ mod range_coalesce_gate_tests {
 }
 
 /// Error mapping shared by the `object_store`-backed backends (S3, Azure).
+#[cfg(any(feature = "aws", feature = "azure"))]
 pub(crate) mod object_store_errors {
     use super::{FilesystemError, FsResult};
 
