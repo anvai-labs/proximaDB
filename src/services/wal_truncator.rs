@@ -203,7 +203,10 @@ impl WalFloorSource for RecordTierFloor {
         "record-tier"
     }
     async fn floor(&self, head: u64) -> Result<Option<u64>> {
+        // Never below the change-feed retention: its floor would hold the WAL
+        // there anyway, so a flush inside that window frees nothing.
         if let Some(max_lag) = configured_flush_lag() {
+            let max_lag = max_lag.max(configured_retain_entries());
             self.0.flush_lagging_partitions(head, max_lag).await;
         }
         let inflight = self.0.inflight_floor();

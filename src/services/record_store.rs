@@ -2225,6 +2225,12 @@ pub struct DirectWalTableRecordStore {
     wal_appender: Arc<dyn TableWalAppender>,
     /// Appended-but-not-yet-applied writes (TD-SEAM-12); see [`InflightWrites`].
     inflight: InflightWrites,
+    /// Per partition, the oldest unflushed LSN a lag flush last saw
+    /// (TD-USUB-22). A partition whose oldest LSN is unchanged since then was
+    /// not moved by that flush (its oldest rows are held resident: a codec
+    /// hold or an ambiguous oid), so flushing it again would only write
+    /// another small segment.
+    lag_flushed: std::sync::Mutex<std::collections::HashMap<(String, String), u64>>,
     /// TD-110 Slice C: UNIQUE/PK index keyed by `(tenant_id, collection)` so a
     /// table's UNIQUE/PK enforcement is per-tenant. Presence of a key == "index
     /// built". Lazily built on first `check_unique_conflict`, then maintained on
@@ -2398,9 +2404,14 @@ impl DirectWalTableRecordStore {
     ///
     /// Best effort: a partition that refuses to report a floor (a memtable) is
     /// skipped, and a failed flush is logged and leaves its rows resident, so
-    /// the floor computed afterwards still retains them. Writes may race it;
-    /// `flush` is safe under concurrent writes (it runs inline on the write
-    /// path at the threshold).
+    /// the floor computed afterwards still retains them. A failed or cancelled
+    /// segment write also makes that partition refuse (`min_unflushed_lsn`)
+    /// until a purge or restart, which stops truncation for the whole tier:
+    /// fail-closed, but worth the warning it logs. A partition whose oldest
+    /// unflushed LSN did not move since its last lag flush is not flushed
+    /// again (see `lag_flushed`). Writes may race it: `flush` serializes on
+    /// its `flush_guard` and evicts only the generation it wrote, and a DROP's
+    /// purge empties the partition under the same guard.
     pub async fn flush_lagging_partitions(&self, head: u64, max_lag: u64) -> usize {
         if self.shared_storage {
             return 0;
@@ -2413,11 +2424,25 @@ impl DirectWalTableRecordStore {
             .collect();
         let mut flushed = 0;
         for ((tenant_id, collection), partition) in partitions {
+            // A partition that refuses (a memtable, an unresolved segment
+            // write, an untracked row) is skipped: the floor recomputed after
+            // this refuses on its account anyway, so nothing is hidden.
             let Ok(Some(oldest)) = partition.min_unflushed_lsn().await else {
                 continue;
             };
             if head.saturating_sub(oldest) <= max_lag {
                 continue;
+            }
+            let key = (tenant_id.clone(), collection.clone());
+            {
+                let mut seen = self
+                    .lag_flushed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if seen.get(&key) == Some(&oldest) {
+                    continue;
+                }
+                seen.insert(key, oldest);
             }
             match partition.flush().await {
                 Ok(()) => flushed += 1,
@@ -2566,6 +2591,7 @@ impl DirectWalTableRecordStore {
             shared_storage,
             wal_appender,
             inflight: InflightWrites::default(),
+            lag_flushed: std::sync::Mutex::new(std::collections::HashMap::new()),
             unique_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
             secondary_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
             poisoned: std::sync::atomic::AtomicBool::new(false),
@@ -6743,16 +6769,13 @@ mod tests {
         );
     }
 
-    /// With the spill gate on, the tier floor is the minimum over spill
-    /// partitions' resident LSNs — the untenanted (`""`) partition included,
-    /// since it spills too — and ONE refusing partition (a memtable) makes the
-    /// whole tier refuse.
-    ///
-    /// Process-isolated under nextest, so the env gate does not leak.
     /// TD-USUB-22: a partition below the flush threshold — a small table
     /// loaded once — pins the tier's floor at its first row until something
     /// flushes it. `flush_lagging_partitions` flushes exactly the partitions
-    /// lagging the head by more than the allowed lag, and the floor moves up.
+    /// lagging the head by more than the allowed lag, the floor moves up, and
+    /// the flushed rows still read back.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
     #[tokio::test]
     async fn a_lagging_partition_is_flushed_so_it_stops_pinning_the_floor() {
         unsafe {
@@ -6796,8 +6819,27 @@ mod tests {
             Some(Some(7)),
             "the floor moves up to the next partition's oldest resident row"
         );
+        let dims = store.partition("tenant-a", "dims");
+        assert!(
+            dims.get_record(&RecordKey::new("r1".to_string()))
+                .await
+                .expect("read")
+                .is_some(),
+            "the flushed row is served from its segment"
+        );
+        // `facts` now lags by 4 > 3 and flushes; afterwards it holds nothing
+        // unflushed, so a second run has nothing to flush.
+        assert_eq!(store.flush_lagging_partitions(11, 3).await, 1);
+        assert_eq!(store.flush_lagging_partitions(11, 3).await, 0);
+        assert_eq!(store.min_unflushed_lsn().await.ok(), Some(None));
     }
 
+    /// With the spill gate on, the tier floor is the minimum over spill
+    /// partitions' resident LSNs — the untenanted (`""`) partition included,
+    /// since it spills too — and ONE refusing partition (a memtable) makes the
+    /// whole tier refuse.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
     #[tokio::test]
     async fn record_tier_floor_is_the_minimum_over_spill_partitions() {
         unsafe {

@@ -1908,6 +1908,12 @@ impl RecordStore for SpillRecordStorage {
         // Every recorded path is gone; the obligation is discharged.
         self.clear_purge_obligation().await?;
         self.segments.write().clear();
+        // The resident rows too: they belong to the dropped table. A caller
+        // still holding this partition (the truncator's lag flush, TD-USUB-22)
+        // must find nothing to flush, or it would write the dropped rows back
+        // into the prefix this purge just emptied. Under `flush_guard`, so a
+        // flush in progress completes before this and is purged with the rest.
+        self.memtable.clear();
         self.tombstones.clear();
         // The prefix has been reconciled by deletion, so any orphan an
         // unresolved write left is gone too — this is the one path that can zero
@@ -2431,6 +2437,23 @@ mod tests {
             Some(55),
             "a deleted row must stop pinning the WAL"
         );
+        Ok(())
+    }
+
+    /// TD-USUB-22: a purge empties the partition, resident rows included, so a
+    /// caller still holding it (the truncator's lag flush, racing a DROP) finds
+    /// nothing to flush and cannot write the dropped rows back into the prefix.
+    #[tokio::test]
+    async fn a_purged_partition_has_nothing_left_to_flush() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let s = SpillRecordStorage::with_flush_threshold(fs, base.clone(), None)
+            .with_tenant("tenant-a");
+        s.upsert_record(record("a", "open")).await?;
+        s.upsert_record(record("b", "open")).await?;
+        s.purge_durable_objects().await?;
+        assert_eq!(s.flush().await?, None, "nothing resident after a purge");
+        assert_eq!(segment_files_on_disk(&base), 0);
+        assert_eq!(s.min_unflushed_lsn().await?, None);
         Ok(())
     }
 
