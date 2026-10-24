@@ -670,26 +670,47 @@ impl SplitReader for ObjectStoreParquetSplitReader {
         // the selected columns in ascending FILE order; `reorder` maps them back
         // to the requested projection order so the batch matches `out_schema`.
         // For a flat schema, root columns == leaf columns, so `roots` is exact.
-        let (builder, reorder) = match projection {
-            Some(proj) if proj.len() != self.schema.fields().len() || !is_identity(proj) => {
-                let mask = ProjectionMask::roots(builder.parquet_schema(), proj.iter().copied());
-                let mut file_order: Vec<usize> = proj.to_vec();
-                file_order.sort_unstable();
-                file_order.dedup();
-                // Each requested column is in `file_order` by construction (it is
-                // built from `proj`); map fallibly rather than panic (panic policy).
-                let reorder: Vec<usize> = proj
-                    .iter()
-                    .map(|c| {
-                        file_order.iter().position(|x| x == c).ok_or_else(|| {
-                            df_err("projection", "requested column missing from selected set")
-                        })
+        // Requested table columns resolved to THIS file's columns by name. A
+        // published file may carry hidden system columns the planning schema
+        // drops (`__proxima_oid`, P2.4 slice 2; see
+        // `normalize_schema_for_planning`), so a read of every table column
+        // still needs a mask, and the table's column `i` need not be the file's.
+        let file_schema = builder.schema().clone();
+        let requested: Vec<usize> = match projection {
+            Some(proj) => proj.to_vec(),
+            None => (0..self.schema.fields().len()).collect(),
+        };
+        let file_columns: Vec<usize> = requested
+            .iter()
+            .map(|&c| {
+                let name = self.schema.field(c).name();
+                file_schema.index_of(name).map_err(|_| {
+                    df_err("projection", format!("column '{name}' is not in the file"))
+                })
+            })
+            .collect::<DFResult<Vec<_>>>()?;
+        let whole_file =
+            file_columns.len() == file_schema.fields().len() && is_identity(&file_columns);
+        let (builder, reorder) = if whole_file {
+            // Every file column, in file order: no mask, no reorder.
+            (builder, None)
+        } else {
+            let mask =
+                ProjectionMask::roots(builder.parquet_schema(), file_columns.iter().copied());
+            let mut file_order: Vec<usize> = file_columns.clone();
+            file_order.sort_unstable();
+            file_order.dedup();
+            // Each requested column is in `file_order` by construction (it is
+            // built from `file_columns`); map fallibly rather than panic.
+            let reorder: Vec<usize> = file_columns
+                .iter()
+                .map(|c| {
+                    file_order.iter().position(|x| x == c).ok_or_else(|| {
+                        df_err("projection", "requested column missing from selected set")
                     })
-                    .collect::<DFResult<Vec<_>>>()?;
-                (builder.with_projection(mask), Some(reorder))
-            }
-            // Full/absent projection: read every column, no reorder.
-            _ => (builder, None),
+                })
+                .collect::<DFResult<Vec<_>>>()?;
+            (builder.with_projection(mask), Some(reorder))
         };
 
         let mut stream = builder
@@ -995,10 +1016,17 @@ impl ObjectStoreParquetTable {
     /// tables at planning time (`Cannot project plan column … field metadata
     /// differs`). Schema-level (file) metadata is kept: it does not participate
     /// in field comparison.
+    ///
+    /// It also drops hidden system columns (`__proxima_*`, e.g. the
+    /// `__proxima_oid` a publication carries for incremental append, P2.4
+    /// slice 2): user columns cannot take that prefix (catalog validation), so
+    /// the filter hides only system columns, and a file with or without them
+    /// plans to the same schema.
     fn normalize_schema_for_planning(schema: SchemaRef) -> SchemaRef {
         let fields: Vec<arrow_schema::Field> = schema
             .fields()
             .iter()
+            .filter(|f| !proximadb_catalog::system_columns::is_reserved_column_name(f.name()))
             .map(|f| {
                 let field = f.as_ref().clone();
                 if field.metadata().is_empty() {

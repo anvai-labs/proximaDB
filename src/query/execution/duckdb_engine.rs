@@ -118,7 +118,12 @@ fn run_duckdb(
     // skipping commit-style files `_`/`.` prefixed; partitioned layouts use
     // `colname=value/` subdirs). NOT a recursive glob.
     for (name, source) in views {
-        let ddl = format!("CREATE VIEW \"{name}\" AS SELECT * FROM read_parquet({source})");
+        // Hidden system columns (`__proxima_oid`, P2.4 slice 2) stay out of the
+        // view; `union_by_name` lets a snapshot mix files written before them.
+        let ddl = format!(
+            "CREATE VIEW \"{name}\" AS SELECT COLUMNS(lambda c: NOT starts_with(c, '__proxima_')) \
+             FROM read_parquet({source}, union_by_name = true)"
+        );
         conn.execute_batch(&ddl)
             .map_err(|e| ExecutionError::Execution(format!("duckdb register {name}: {e}")))?;
     }

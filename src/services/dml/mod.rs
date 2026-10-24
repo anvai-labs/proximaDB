@@ -2950,7 +2950,8 @@ impl DmlService {
         let data_dir = format!("{prefix}/data");
         let full_columns = Self::resolve_select_projection(&schema, &[])?;
         let col_names: Vec<String> = full_columns.iter().map(|c| c.name.clone()).collect();
-        let arrow_schema = proxima_records_to_record_batch(&[], &schema)?.schema();
+        let table_arrow_schema = proxima_records_to_record_batch(&[], &schema)?.schema();
+        let arrow_schema = materialize_stream::with_oid_field(table_arrow_schema);
         // The cluster sort is declared as Parquet `sorting_columns`, and the
         // warehouse write policy adds the page index + spec SBBF Bloom filters.
         let sort_columns: Vec<String> = cluster_col.iter().cloned().collect();
@@ -2988,7 +2989,11 @@ impl DmlService {
                     continue;
                 }
                 ndv.observe(&records);
-                let batch = proxima_records_to_record_batch(&records, &schema)?;
+                let batch = materialize_stream::with_oid_column(
+                    proxima_records_to_record_batch(&records, &schema)?,
+                    records.iter().map(|r| r.oid.as_str()),
+                    arrow_schema.clone(),
+                )?;
                 if tx.send(Ok(batch)).await.is_err() {
                     break; // the writer side failed; its error is reported
                 }
