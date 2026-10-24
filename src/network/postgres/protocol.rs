@@ -410,8 +410,16 @@ enum AutocommitFailure {
 /// SQLSTATE for a failed DmlService statement: a typed relational integrity
 /// violation (TD-DML-1) maps to its PostgreSQL class (23505 unique, 23503
 /// foreign key, 23514 check, 21000 cardinality); anything else keeps the
-/// call site's historical `fallback`.
+/// call site's historical `fallback`. A write refused for a spill backlog
+/// (nothing written, retryable) is 53000.
 fn dml_error_sqlstate(err: &anyhow::Error, fallback: &'static str) -> &'static str {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::services::record_spill::SpillBacklogFull>()
+            .is_some()
+    }) {
+        return "53000";
+    }
     proximadb_catalog::relational::find_relational_constraint_violation(err)
         .map(|violation| violation.sqlstate())
         .unwrap_or(fallback)
@@ -2720,6 +2728,21 @@ impl PostgresProtocol {
                             )
                             .is_some()
                     }) =>
+            {
+                Err(AutocommitFailure::Atomic(AtomicTxnError::OutcomeUnknown {
+                    reason: format!("{error:#}"),
+                    written_tables: vec![table.to_string()],
+                }))
+            }
+            // Durable but not applied (the record store poisoned itself): the
+            // write reappears on restart replay, so it must not read as a plain
+            // statement failure a driver would retry.
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<crate::services::txn_staging::CommitOutcomeUnknown>()
+                        .is_some()
+                }) =>
             {
                 Err(AutocommitFailure::Atomic(AtomicTxnError::OutcomeUnknown {
                     reason: format!("{error:#}"),

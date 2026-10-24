@@ -103,22 +103,67 @@ pub(crate) fn configured_flush_threshold() -> Option<usize> {
     .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
 }
 
-/// Rows a flush held back because they did not read back identically through
-/// the segment encoding. Expected to stay 0; anything else is a codec defect.
-fn spill_rows_held_counter() -> prometheus::IntCounter {
-    static COUNTER: std::sync::OnceLock<prometheus::IntCounter> = std::sync::OnceLock::new();
-    COUNTER
-        .get_or_init(|| {
-            prometheus::register_int_counter!(
-                "proximadb_spill_rows_held_total",
-                "Spill rows held resident because they did not round-trip through the segment encoding"
-            )
-            .unwrap_or_else(|_| {
-                prometheus::IntCounter::new("proximadb_spill_rows_held_total_fallback", "fallback")
+/// Backlog cap, as a multiple of the flush threshold, at which
+/// [`SpillRecordStorage::admit_writes`] refuses new writes. Writes trigger a
+/// flush at the threshold, so a backlog this far past it means flushes are
+/// failing.
+///
+/// A soft bound: writers admitted together, and one large batch, overshoot
+/// it. WAL replay at boot is not admitted at all — it must apply what is
+/// durable — so with the object store down a restart holds the WAL's whole
+/// unflushed tail resident.
+const BACKLOG_FACTOR: usize = 4;
+
+/// How long after a failed flush the post-write path waits before trying
+/// again. With the object store down, every write retrying — and waiting out —
+/// a doomed flush would turn one outage into a stall of every writer.
+const FLUSH_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A write refused before it was made durable: the partition's backlog is at
+/// its cap and its flushes are failing. Nothing was written; retryable.
+/// pgwire reports it as SQLSTATE 53000.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct SpillBacklogFull(pub String);
+
+/// The spill's counters, registered once per process.
+struct SpillMetrics {
+    /// Rows a flush held back because they did not read back identically
+    /// through the segment encoding. Expected to stay 0; anything else is a
+    /// codec defect.
+    rows_held: prometheus::IntCounter,
+    /// Threshold flushes that failed. The rows and tombstones they carried
+    /// stay resident and the WAL is retained until a flush succeeds.
+    flush_failures: prometheus::IntCounter,
+    /// Writes refused before they were made durable because a partition's
+    /// backlog reached its cap with flushes failing.
+    writes_refused: prometheus::IntCounter,
+}
+
+fn spill_metrics() -> &'static SpillMetrics {
+    static METRICS: std::sync::OnceLock<SpillMetrics> = std::sync::OnceLock::new();
+    METRICS.get_or_init(|| {
+        let counter = |name: &str, help: &str| {
+            prometheus::register_int_counter!(name, help).unwrap_or_else(|_| {
+                prometheus::IntCounter::new(format!("{name}_fallback"), "fallback")
                     .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
             })
-        })
-        .clone()
+        };
+        SpillMetrics {
+            rows_held: counter(
+                "proximadb_spill_rows_held_total",
+                "Spill rows held resident because they did not round-trip through the segment encoding",
+            ),
+            flush_failures: counter(
+                "proximadb_spill_flush_failures_total",
+                "Spill threshold flushes that failed (their rows stay resident; the WAL is retained)",
+            ),
+            writes_refused: counter(
+                "proximadb_spill_writes_refused_total",
+                "Writes refused because a spill partition's backlog reached its cap",
+            ),
+        }
+    })
 }
 
 /// One resident row: the value, the write that produced it, and that write's
@@ -299,6 +344,13 @@ pub struct SpillRecordStorage {
     /// Guards [`Self::ensure_discovered`] so the listing runs at most once per
     /// store, and so concurrent first-touches cannot both populate `segments`.
     discovered: tokio::sync::OnceCell<()>,
+    /// When the last threshold flush failed; cleared by the next that succeeds.
+    /// Spaces retries out by [`FLUSH_RETRY_BACKOFF`].
+    flush_failed_at: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Set while a threshold flush runs: one at a time, so writers past the
+    /// threshold skip it instead of queueing on `flush_guard` behind a slow,
+    /// failing one, each to run its own.
+    threshold_flush_running: std::sync::atomic::AtomicBool,
     /// Tenant this partition belongs to, used to stamp a SYNTHESISED tombstone
     /// record at flush time.
     ///
@@ -374,6 +426,8 @@ impl SpillRecordStorage {
             base_path: base_path.into(),
             next_segment: AtomicU64::new(0),
             discovered: tokio::sync::OnceCell::new(),
+            flush_failed_at: parking_lot::Mutex::new(None),
+            threshold_flush_running: std::sync::atomic::AtomicBool::new(false),
             tenant_id: None,
             write_policy: ParquetWritePolicy::from_env(),
             schema_source: None,
@@ -923,7 +977,7 @@ impl SpillRecordStorage {
             .partition(|(i, _)| !lossy.contains(i));
         let evicting: Vec<Resident> = evicting.into_iter().map(|(_, r)| r).collect();
         if let Some((_, example)) = held.first() {
-            spill_rows_held_counter().inc_by(held.len() as u64);
+            spill_metrics().rows_held.inc_by(held.len() as u64);
             tracing::error!(
                 rows = held.len(),
                 example_oid = %example.record.oid,
@@ -1264,24 +1318,39 @@ impl SpillRecordStorage {
     /// flush can still do that; the answer is advisory — callers apply the
     /// delete either way.)
     ///
-    /// The flush is best effort. The delete is already applied and its WAL
-    /// entry durable, so a failed flush loses nothing — the tombstone stays
-    /// resident and keeps the WAL from its LSN (and a segment write of unknown
-    /// outcome makes `min_unflushed_lsn` refuse until a purge or restart
-    /// reconciles it) — and must not turn a done delete into an error (the
-    /// caller would then skip index maintenance).
+    /// The flush is best effort ([`Self::flush_after_write`]).
     async fn delete_tracked(&self, key: &RecordKey, lsn: Option<u64>) -> Result<bool> {
         let removed = self.delete_unflushed(key, lsn).await?;
+        self.flush_after_write().await;
+        Ok(removed)
+    }
+
+    /// The flush a write triggers, best effort. The write is already applied
+    /// and its WAL entry durable, so a failed flush loses nothing — the row or
+    /// tombstone stays resident and keeps the WAL from its LSN (and a segment
+    /// write of unknown outcome makes `min_unflushed_lsn` refuse until a purge
+    /// or restart reconciles it). Turning a done write into an error would make
+    /// the caller skip its index maintenance and the rest of its batch, and
+    /// report a durable write as failed. The backlog this leaves is bounded
+    /// before the next write is made durable, by [`RecordStore::admit_writes`].
+    async fn flush_after_write(&self) {
+        self.threshold_flush_best_effort("after a write").await;
+    }
+
+    /// [`Self::flush_if_over_threshold`], logging and counting a failure
+    /// instead of returning it. `when` names the caller in the log.
+    async fn threshold_flush_best_effort(&self, when: &str) {
         if let Err(error) = self.flush_if_over_threshold().await {
+            spill_metrics().flush_failures.inc();
             tracing::warn!(
                 error = %format!("{error:#}"),
                 path = %self.base_path.trim_end_matches('/'),
-                "spill: flush after a delete failed; the delete stands and its tombstone stays \
-                 resident, so the WAL is retained from it until a flush succeeds (or, after \
-                 a segment write of unknown outcome, until a purge or restart reconciles it)"
+                backlog = self.backlog(),
+                "spill: flush {when} failed; what it carried stays resident, so the WAL is \
+                 retained until a flush succeeds (or, after a segment write of unknown \
+                 outcome, until a purge or restart reconciles it)"
             );
         }
-        Ok(removed)
     }
 
     async fn delete_unflushed(&self, key: &RecordKey, lsn: Option<u64>) -> Result<bool> {
@@ -1376,12 +1445,23 @@ impl SpillRecordStorage {
             // reported it absent. Filtering per-segment answers "does this
             // segment hold a live copy", which is the wrong question; the right
             // one is "what does the newest segment holding this oid say".
-            if let Some(found) = self
-                .read_segment(path)
-                .await?
-                .into_iter()
-                .find(|r| r.oid == key.oid)
-            {
+            let records = match self.read_segment(path).await {
+                Ok(records) => records,
+                // The delete is applied (the removal and tombstone above) and,
+                // on the write path, already durable; only its advisory answer
+                // rests on this read. Failing here would fail a done delete —
+                // and make the caller skip its index maintenance.
+                Err(error) => {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        path = %path,
+                        "spill: segment read for a delete's answer failed; the delete stands, \
+                         reported as removing no row"
+                    );
+                    return Ok(false);
+                }
+            };
+            if let Some(found) = records.into_iter().find(|r| r.oid == key.oid) {
                 return Ok(!found.is_dead(now_ns));
             }
         }
@@ -1422,25 +1502,63 @@ impl SpillRecordStorage {
             }
         }
 
-        self.flush_if_over_threshold().await?;
+        self.flush_after_write().await;
         Ok(record)
     }
 
-    /// Flush once the buffered state — resident rows plus the tombstones a
-    /// flush can persist — reaches the threshold. A store with no tenant cannot
-    /// persist tombstones (see `flush`), so they do not count there: counting
-    /// state no flush can drain would flush on every write.
-    async fn flush_if_over_threshold(&self) -> Result<()> {
-        let Some(threshold) = self.flush_threshold else {
-            return Ok(());
-        };
+    /// The buffered state a flush drains: resident rows plus the tombstones a
+    /// flush can persist. A store with no tenant cannot persist tombstones (see
+    /// `flush`), so they do not count there: counting state no flush can drain
+    /// would flush on every write.
+    fn backlog(&self) -> usize {
         let tombstones = if self.tenant_id.is_some() {
             self.tombstones.len()
         } else {
             0
         };
-        if self.memtable.len() + tombstones >= threshold {
-            self.flush().await?;
+        self.memtable.len() + tombstones
+    }
+
+    /// Flush once the backlog reaches the threshold — unless another threshold
+    /// flush is already running, or the last one failed less than
+    /// [`FLUSH_RETRY_BACKOFF`] ago, in which case this skips it (the backlog
+    /// stays resident and the WAL retained).
+    async fn flush_if_over_threshold(&self) -> Result<()> {
+        let Some(threshold) = self.flush_threshold else {
+            return Ok(());
+        };
+        if self.backlog() < threshold {
+            return Ok(());
+        }
+        if self
+            .flush_failed_at
+            .lock()
+            .is_some_and(|failed_at| failed_at.elapsed() < FLUSH_RETRY_BACKOFF)
+        {
+            return Ok(());
+        }
+        /// Clears the flag however the flush ends, cancellation included — a
+        /// flag left set would stop threshold flushes for good.
+        struct Running<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        if self
+            .threshold_flush_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        let _running = Running(&self.threshold_flush_running);
+        match self.flush().await {
+            Ok(_) => *self.flush_failed_at.lock() = None,
+            Err(error) => {
+                *self.flush_failed_at.lock() = Some(std::time::Instant::now());
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -1546,6 +1664,40 @@ impl RecordStore for SpillRecordStorage {
         lsn: u64,
     ) -> RecordStoreResult<ProximaRecord> {
         self.upsert_resident(record, Some(lsn)).await
+    }
+
+    /// Admission, before anything is durable:
+    ///
+    /// 1. Run discovery now. The apply step's delete needs it, and a LIST that
+    ///    fails there would fail a write that is already durable.
+    /// 2. Refuse while the backlog is at [`BACKLOG_FACTOR`] × the flush
+    ///    threshold AND flushes are failing. At the cap this first retries the
+    ///    overdue flush (subject to the retry backoff). A backlog over the cap
+    ///    with flushes succeeding — rows a flush must keep resident — is not a
+    ///    failure this refusal could resolve, so it admits.
+    async fn admit_writes(&self) -> RecordStoreResult<()> {
+        self.ensure_discovered().await?;
+        let Some(threshold) = self.flush_threshold.filter(|threshold| *threshold > 0) else {
+            return Ok(());
+        };
+        let cap = threshold.saturating_mul(BACKLOG_FACTOR);
+        if self.backlog() < cap {
+            return Ok(());
+        }
+        self.threshold_flush_best_effort("overdue at the backlog cap")
+            .await;
+        let backlog = self.backlog();
+        if backlog < cap || self.flush_failed_at.lock().is_none() {
+            return Ok(());
+        }
+        spill_metrics().writes_refused.inc();
+        Err(SpillBacklogFull(format!(
+            "spill partition '{}' holds {backlog} unflushed rows and tombstones (cap {cap}) \
+             because its flushes are failing; refusing new writes until a flush succeeds \
+             (nothing was written; retry)",
+            self.base_path.trim_end_matches('/')
+        ))
+        .into())
     }
 
     /// Minimum LSN among resident (unflushed) rows.
@@ -5371,6 +5523,78 @@ mod tests {
              prefix must be empty before it is reused (TD-USUB-1 open item: \
              deletion-obligation marker + drain)"
         );
+        Ok(())
+    }
+
+    /// A flush that fails after a write was applied must not fail the write:
+    /// its caller already made it durable and goes on to maintain indexes and
+    /// apply the rest of its batch. The backlog that leaves is bounded before
+    /// the NEXT write is made durable: at `BACKLOG_FACTOR` × the threshold,
+    /// `admit_writes` retries the overdue flush and refuses only while it still
+    /// fails — and admits again once one succeeds.
+    #[tokio::test]
+    async fn a_failed_flush_keeps_the_write_and_admission_bounds_the_backlog() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        let failing = Arc::new(BarrierFs::failing().await);
+        let threshold = 2;
+        let store =
+            SpillRecordStorage::with_flush_threshold(failing.clone(), base, Some(threshold))
+                .with_tenant("tenant-a");
+        let cap = threshold * BACKLOG_FACTOR;
+        for i in 0..cap {
+            RecordStore::admit_writes(&store).await?;
+            RecordStore::upsert_record_at_lsn(
+                &store,
+                record(&format!("k{i}"), "open"),
+                i as u64 + 1,
+            )
+            .await
+            .expect("a failed flush must not fail the applied write");
+        }
+        RecordStore::delete_record_at_lsn(&store, &RecordKey::new("k0".to_string()), 100)
+            .await
+            .expect("nor an applied delete");
+        assert!(
+            store
+                .get_record(&RecordKey::new("k1".to_string()))
+                .await?
+                .is_some(),
+            "the writes stand, resident"
+        );
+        assert_eq!(store.backlog(), cap - 1);
+        RecordStore::upsert_record_at_lsn(&store, record("k0", "open"), 101).await?;
+        assert_eq!(store.backlog(), cap);
+
+        let err = RecordStore::admit_writes(&store)
+            .await
+            .expect_err("at the cap with flushes failing, refuse before anything is durable");
+        assert!(
+            err.downcast_ref::<SpillBacklogFull>().is_some(),
+            "a typed, retryable refusal: {err}"
+        );
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(&store).await.ok(),
+            None,
+            "a failed segment write still keeps truncation closed"
+        );
+
+        // The object store recovers: admission retries the overdue flush (the
+        // retry backoff cleared, as if it had elapsed) and admits again.
+        failing
+            .fail_writes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        *store.flush_failed_at.lock() = None;
+        RecordStore::admit_writes(&store).await?;
+        assert_eq!(store.backlog(), 0, "the flush drained the backlog");
+        assert!(
+            store
+                .get_record(&RecordKey::new("k3".to_string()))
+                .await?
+                .is_some(),
+            "and the rows read back from the segment"
+        );
+        drop(dir);
         Ok(())
     }
 }

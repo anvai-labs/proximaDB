@@ -3313,6 +3313,12 @@ impl TableRecordStore for DirectWalTableRecordStore {
         }
 
         let tenant_id = tenant_context.map(|tenant| tenant.tenant_id.clone());
+        // Backpressure while nothing is durable yet: a refusal here is truthful.
+        // The legacy partition takes this write's migrate-on-write deletes.
+        partition.admit_writes().await?;
+        if let Some(legacy) = &legacy_partition {
+            legacy.admit_writes().await?;
+        }
         // Bind the result: each entry's `sequence_number` is the durable WAL LSN
         // of the corresponding operation, and until TD-USUB-1's 2b work it was
         // discarded here. `operations` and `storage_actions` are pushed in
@@ -3350,7 +3356,18 @@ impl TableRecordStore for DirectWalTableRecordStore {
                 storage_actions,
                 lsns.as_deref(),
             )
-            .await?;
+            .await
+            .map_err(|err| {
+                // Durable but only partly applied (indexes and the rest of the
+                // batch skipped): refuse to serve it, as `commit_atomic` does.
+                self.poisoned
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                tracing::error!(
+                    error = %format!("{err:#}"),
+                    "applying durable writes failed; record store poisoned until restart"
+                );
+                crate::services::txn_staging::CommitOutcomeUnknown(format!("{err:#}"))
+            })?;
 
         Ok(TableRecordWriteResult::success(record_ids))
     }
@@ -3474,6 +3491,13 @@ impl TableRecordStore for DirectWalTableRecordStore {
             });
         }
 
+        // Backpressure while nothing is durable yet: a refusal here is truthful.
+        for batch in &planned {
+            batch.partition.admit_writes().await?;
+            if let Some(legacy) = &batch.legacy_partition {
+                legacy.admit_writes().await?;
+            }
+        }
         let expected = operations.len();
         // Held until the batch is applied (TD-SEAM-12).
         let _inflight = self.reserve_inflight();
@@ -5989,6 +6013,94 @@ mod tests {
             root.display()
         );
         unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+    }
+
+    /// A spill flush failing while a durable write is applied must not abort
+    /// the apply. It used to: the error skipped the UNIQUE index update (so a
+    /// later duplicate passed the check), skipped the rest of the batch in
+    /// memory, and reported a write that replay would bring back as failed.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn a_failing_spill_flush_neither_fails_the_write_nor_skips_the_unique_index() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "2");
+        }
+        // Directories occupy the first segment names, so flushes fail
+        // (`write_if_absent` finds the name taken) while discovery, which
+        // lists files only, still sees an empty partition.
+        let (root, base) = spill_root();
+        for seq in 0..8u64 {
+            std::fs::create_dir_all(root.join("users").join(format!("spill-{seq:016x}.parquet")))
+                .expect("blocker directory");
+        }
+        let store = DirectWalTableRecordStore::new_spilling(
+            Arc::new(RecordingWalAppender::default()),
+            local_fs().await,
+            tenant_path_resolver(base),
+        );
+        let mut schema = CatalogTableSchema::new("users").with_column(CatalogColumn::new(
+            1,
+            "email",
+            ProximaType::String,
+        ));
+        schema.relational_capabilities.constraints.push(
+            proximadb_catalog::ColumnConstraint::Unique {
+                columns: vec!["email".to_string()],
+            },
+        );
+        let row = |oid: &str, email: &str| {
+            props_record(
+                oid,
+                "users",
+                vec![("email", ProximaValue::String(email.to_string()))],
+            )
+        };
+        let no_exclusions = std::collections::HashSet::new();
+        // The first probe builds the index; the writes below maintain it.
+        let probe = |email: &str| {
+            build_unique_candidate_sets(&schema, &[row("probe", email)], None).expect("candidates")
+        };
+        assert!(
+            store
+                .check_unique_conflict(&schema, "users", None, &probe("a@x"), &no_exclusions, None)
+                .await
+                .expect("probe")
+                .is_none()
+        );
+
+        let written = store
+            .write_mutations(
+                &schema,
+                vec![
+                    TableRecordMutation::new(TableRecordMutationKind::Insert, row("u1", "a@x")),
+                    TableRecordMutation::new(TableRecordMutationKind::Insert, row("u2", "b@x")),
+                    TableRecordMutation::new(TableRecordMutationKind::Insert, row("u3", "c@x")),
+                ],
+                None,
+            )
+            .await
+            .expect("a failing flush must not fail a durable write");
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+        assert!(written.success);
+
+        for email in ["a@x", "b@x", "c@x"] {
+            assert!(
+                store
+                    .check_unique_conflict(
+                        &schema,
+                        "users",
+                        None,
+                        &probe(email),
+                        &no_exclusions,
+                        None
+                    )
+                    .await
+                    .expect("probe")
+                    .is_some(),
+                "every row of the batch is applied and indexed: a duplicate of {email} is caught"
+            );
+        }
     }
 
     /// ADR-097 P3.1: a spilling store's Layer A snapshot names the segments its

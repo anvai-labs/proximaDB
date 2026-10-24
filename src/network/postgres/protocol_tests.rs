@@ -1948,3 +1948,16 @@ fn encode_binary_cell_rejects_mismatched_text_without_panicking() {
         assert!(enc(text, &ty).is_err(), "{text:?} as {ty:?}");
     }
 }
+
+#[test]
+fn a_spill_backlog_refusal_is_a_retryable_insufficient_resources_error() {
+    let refused = anyhow::Error::from(crate::services::record_spill::SpillBacklogFull(
+        "backlog at cap".to_string(),
+    ))
+    .context("INSERT into t");
+    assert_eq!(dml_error_sqlstate(&refused, "42P01"), "53000");
+    assert_eq!(
+        dml_error_sqlstate(&anyhow::anyhow!("something else"), "42P01"),
+        "42P01"
+    );
+}

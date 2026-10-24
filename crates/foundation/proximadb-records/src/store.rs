@@ -200,6 +200,21 @@ pub trait RecordStore: Send + Sync {
         self.upsert_record(record).await
     }
 
+    /// Backpressure, asked BEFORE a write is made durable: `Err` means "do not
+    /// append more writes for me now" — a refusal the caller can report
+    /// truthfully (nothing was written) and the client can retry.
+    ///
+    /// Once a write is durable, applying it must not fail on account of the
+    /// store's own housekeeping (a spill flush): the caller would skip its index
+    /// maintenance and the rest of its batch, and report a durable write as
+    /// failed. A store whose housekeeping can fail keeps it best effort after
+    /// the write and bounds the backlog here instead.
+    ///
+    /// The default admits: a store that buffers nothing has no backlog.
+    async fn admit_writes(&self) -> RecordStoreResult<()> {
+        Ok(())
+    }
+
     /// The lowest WAL LSN this store still needs retained — i.e. the minimum LSN
     /// among records it holds that are **not** yet in a durable segment.
     ///
