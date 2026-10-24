@@ -157,6 +157,30 @@ async fn olap_delta_merge_gate_off_stale_then_on_corrects() {
         3,
         "COUNT(*) must be the merged cardinality, not the Parquet footer count"
     );
+    // Filters and limits apply after the merge: `v = 30` matches only the
+    // stale base copy of 3, a range keeps the updated and inserted rows, and a
+    // limit never counts a suppressed row.
+    assert_eq!(
+        one_i64(&client, "SELECT COUNT(*) AS c FROM dvm WHERE v = 30").await,
+        0,
+        "a predicate matching only a stale copy must match nothing"
+    );
+    assert_eq!(
+        pairs(
+            &client,
+            "SELECT id, v FROM dvm WHERE v >= 30 GROUP BY id, v ORDER BY id"
+        )
+        .await,
+        vec![(3, 99), (4, 40)],
+    );
+    assert_eq!(
+        pairs(
+            &client,
+            "SELECT id, v FROM dvm GROUP BY id, v ORDER BY id LIMIT 2"
+        )
+        .await,
+        vec![(1, 10), (3, 99)],
+    );
 
     // Default-ON (ADR-025 PR3, the headline of this flip): with the env var UNSET
     // the merge is on by default — removing it must STILL reconcile the snapshot,

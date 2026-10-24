@@ -62,7 +62,8 @@ pub use filesystem_parquet_reader::{
 };
 pub use helix_adapter::{HelixSplitReader, HelixTableProvider};
 pub use object_store_parquet_reader::{
-    ObjectStoreParquetSplitReader, ObjectStoreParquetTable, register_object_store_parquet_location,
+    ObjectStoreParquetSplitReader, ObjectStoreParquetTable, open_object_store_parquet_location,
+    register_object_store_parquet_location,
 };
 pub use pax_adapter::PaxSplitReader;
 pub use pax_segment_locator::discover_pax_segments;
