@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open.** `ort` is pinned `=2.0.0-rc.13` in both manifests, so a local `cargo update` cannot pull rc.15 either. `.github/dependabot.yml` ignores `ort` `>=2.0.0-rc.14`, so the grouped minor/patch PR stops re-proposing an upgrade that cannot build.
+| Status | **Resolved (2026-10-24).** A new leaf crate, `crates/horizontal/proximadb-onnx-runtime`, owns the process environment (`shared_environment()`, built once, held for the life of the process); `proximadb-embedding` and `proximadb-rank-onnx` both route their session builders through it; both `=rc.13` pins and the dependabot ignores are removed. rc.15's execution providers still register per-session, so the EP-choice step below was answered 'no change needed' (verified against rc.15's `ExecutionProvider::register(&self, &mut SessionBuilder)`). The regression gate runs in CI on the onnx-cdc-duckdb leg.
 | Severity | Low. Nothing is broken today. The cost is staying on a pre-release that will stop receiving fixes.
 | Component | `crates/modalities/proximadb-embedding/src/models/bge.rs` (BGE session pool), `crates/modalities/proximadb-rank-onnx/src/ort_scorer_session.rs`, `ort_tokenized_scorer_session.rs`
 | Found | 2026-10-23. Dependabot's grouped PR #2139 bumped `ort` rc.13 to rc.15, and the `Feature Matrix (cloud-full+onnx)` leg failed with `E0061: this function takes 1 argument but 0 arguments were supplied` at `bge.rs:308`.

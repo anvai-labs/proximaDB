@@ -305,7 +305,16 @@ impl BgeModel {
 
             let mut sessions = Vec::with_capacity(pool_size);
             for idx in 0..pool_size {
-                let mut builder = ort::session::Session::builder().map_err(|e| {
+                // TD-ORT-1: one environment per process, owned by
+                // proximadb-onnx-runtime and shared with the rank-onnx scorers.
+                let mut builder = ort::session::Session::builder(
+                    proximadb_onnx_runtime::shared_environment().map_err(|e| {
+                        crate::EmbeddingError::ModelUnavailable(format!(
+                            "ort environment (session {idx}): {e}"
+                        ))
+                    })?,
+                )
+                .map_err(|e| {
                     crate::EmbeddingError::ModelUnavailable(format!(
                         "ort builder (session {idx}): {e}"
                     ))

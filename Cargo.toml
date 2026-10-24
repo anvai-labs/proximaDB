@@ -68,6 +68,7 @@ members = [
     "crates/horizontal/proximadb-resilience",
     "crates/horizontal/proximadb-automl",
     "crates/horizontal/proximadb-audit",
+    "crates/horizontal/proximadb-onnx-runtime",
     "crates/horizontal/proximadb-cross-modal-fusion",
     "crates/horizontal/proximadb-utility-scorer",
     "crates/horizontal/proximadb-document-geo-index",
@@ -328,6 +329,7 @@ proximadb-tls = { path = "crates/horizontal/proximadb-tls" }
 proximadb-resilience = { path = "crates/horizontal/proximadb-resilience" }
 proximadb-automl = { path = "crates/horizontal/proximadb-automl" }
 proximadb-audit = { path = "crates/horizontal/proximadb-audit" }
+proximadb-onnx-runtime = { path = "crates/horizontal/proximadb-onnx-runtime" }
 proximadb-cross-modal-fusion = { path = "crates/horizontal/proximadb-cross-modal-fusion" }
 proximadb-utility-scorer = { path = "crates/horizontal/proximadb-utility-scorer" }
 proximadb-document-geo-index = { path = "crates/horizontal/proximadb-document-geo-index" }
