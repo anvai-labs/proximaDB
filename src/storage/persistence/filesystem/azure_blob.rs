@@ -189,15 +189,6 @@ impl AzureBlobFileSystem {
     fn net(ctx: &str, e: impl std::fmt::Display) -> FilesystemError {
         FilesystemError::Network(format!("{ctx}: {e}"))
     }
-
-    /// [`Self::net`], except that a missing object is `NotFound`, as on the
-    /// local backend: callers tell "absent" from "unreachable" by the variant.
-    fn object_error(ctx: &str, path: &str, e: object_store::Error) -> FilesystemError {
-        match e {
-            object_store::Error::NotFound { .. } => FilesystemError::NotFound(path.to_string()),
-            other => Self::net(ctx, other),
-        }
-    }
 }
 
 #[async_trait]
@@ -212,7 +203,7 @@ impl FileSystem for AzureBlobFileSystem {
         let result = store
             .get(&ObjPath::from(blob))
             .await
-            .map_err(|e| Self::object_error("Azure get", path, e))?;
+            .map_err(|e| super::object_store_errors::object_error("Azure get", path, e))?;
         let bytes = result
             .bytes()
             .await
@@ -232,7 +223,7 @@ impl FileSystem for AzureBlobFileSystem {
         let bytes = store
             .get_range(&ObjPath::from(blob), offset..(offset + length))
             .await
-            .map_err(|e| Self::object_error("Azure get_range", path, e))?;
+            .map_err(|e| super::object_store_errors::object_error("Azure get_range", path, e))?;
         // ADR-030 / TD-158: physical GET boundary — feed the per-query I/O accumulator
         // (task-local; no-op outside a query scope). Always-on core counters.
         super::record_physical_range_read(bytes.len() as u64);
@@ -373,20 +364,17 @@ impl FileSystem for AzureBlobFileSystem {
         store
             .delete(&ObjPath::from(blob))
             .await
-            .map_err(|e| Self::object_error("Azure delete", path, e))?;
+            .map_err(|e| super::object_store_errors::object_error("Azure delete", path, e))?;
         Ok(())
     }
 
     async fn exists(&self, path: &str) -> FsResult<bool> {
         let (container, blob) = Self::parse(path)?;
         let store = self.store_for(&container)?;
-        // Only a missing object is `false`; any other failure (auth, network)
-        // propagates rather than reading as "absent".
-        match store.head(&ObjPath::from(blob)).await {
-            Ok(_) => Ok(true),
-            Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(e) => Err(Self::net("Azure head", e)),
-        }
+        super::object_store_errors::exists_from_head(
+            "Azure head",
+            store.head(&ObjPath::from(blob)).await,
+        )
     }
 
     async fn metadata(&self, path: &str) -> FsResult<FsFileMetadata> {
@@ -395,7 +383,7 @@ impl FileSystem for AzureBlobFileSystem {
         let meta = store
             .head(&ObjPath::from(blob))
             .await
-            .map_err(|e| Self::object_error("Azure head", path, e))?;
+            .map_err(|e| super::object_store_errors::object_error("Azure head", path, e))?;
         Ok(FsFileMetadata {
             path: path.to_string(),
             size: meta.size,

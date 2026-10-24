@@ -28,6 +28,24 @@ async fn factory() -> Arc<FilesystemFactory> {
     )
 }
 
+/// fake-gcs is configured and the GCS backend registered (best-effort tier:
+/// otherwise warn and pass rather than block).
+async fn gcs_backend_ready() -> bool {
+    if std::env::var("PROXIMADB_GCS_ENDPOINT").is_err() {
+        eprintln!("skip: set PROXIMADB_GCS_ENDPOINT (fake-gcs) to run");
+        return false;
+    }
+    if factory()
+        .await
+        .get_filesystem("gs://proximadb-test/probe")
+        .is_err()
+    {
+        eprintln!("::warning:: GCS backend did not register (best-effort tier) — skipping");
+        return false;
+    }
+    true
+}
+
 /// PUT under a fresh prefix → LIST(prefix) must see it; exists(prefix) must be
 /// FALSE (flat keyspace: HEAD on a prefix key matches nothing) while the child
 /// object exists and LIST proves it.
@@ -147,13 +165,7 @@ async fn s3_local_file_multipart_publish_contract() {
 #[tokio::test]
 #[ignore = "needs fake-gcs — set PROXIMADB_GCS_ENDPOINT + PROXIMADB_GCS_ANONYMOUS=1"]
 async fn gcs_prefix_list_and_exists_contract_best_effort() {
-    if std::env::var("PROXIMADB_GCS_ENDPOINT").is_err() {
-        eprintln!("skip: set PROXIMADB_GCS_ENDPOINT (fake-gcs) to run");
-        return;
-    }
-    let factory = factory().await;
-    if factory.get_filesystem("gs://proximadb-test/probe").is_err() {
-        eprintln!("::warning:: GCS backend did not register (best-effort tier) — skipping");
+    if !gcs_backend_ready().await {
         return;
     }
     contract_prefix_semantics("gs://proximadb-test").await;
@@ -299,42 +311,28 @@ async fn s3_write_if_absent_contract() {
 #[tokio::test]
 #[ignore = "needs fake-gcs — set PROXIMADB_GCS_ENDPOINT + PROXIMADB_GCS_ANONYMOUS=1"]
 async fn gcs_write_if_absent_contract_best_effort() {
-    if std::env::var("PROXIMADB_GCS_ENDPOINT").is_err() {
-        eprintln!("skip: set PROXIMADB_GCS_ENDPOINT (fake-gcs) to run");
-        return;
-    }
-    let factory = factory().await;
-    if factory.get_filesystem("gs://proximadb-test/probe").is_err() {
-        eprintln!("::warning:: GCS backend did not register (best-effort tier) — skipping");
+    if !gcs_backend_ready().await {
         return;
     }
     contract_write_if_absent_semantics("gs://proximadb-test", false).await;
 }
 
-/// A missing object is `NotFound` — the variant callers use to tell "absent"
-/// from "unreachable", as on the local backend. Reporting it as `Network`
-/// made the record spill refuse every fresh partition on object storage (its
-/// first discovery reads a purge-obligation marker that does not exist yet).
-/// A delete of a missing object may be a no-op (S3 answers 204) or
-/// `NotFound`; it must not be `Network`.
+/// A missing object is `NotFound`; see `check_missing_object_contract`. Also:
+/// an empty prefix lists as empty.
 async fn contract_missing_object_is_not_found(base: &str) {
     let run = uuid::Uuid::new_v4().simple().to_string();
     let key = format!("{base}/contract/{run}/never-written.json");
     let factory = factory().await;
     let fs = factory.get_filesystem(&key).expect("backend for key");
-    match fs.read(&key).await {
-        Err(FilesystemError::NotFound(_)) => {}
-        other => panic!("read of a missing object: expected NotFound, got {other:?}"),
+    if let Err(violation) =
+        proximadb::storage::persistence::filesystem::check_missing_object_contract(
+            fs.as_ref(),
+            &key,
+        )
+        .await
+    {
+        panic!("{violation}");
     }
-    match fs.read_range(&key, 0, 4).await {
-        Err(FilesystemError::NotFound(_)) => {}
-        other => panic!("ranged read of a missing object: expected NotFound, got {other:?}"),
-    }
-    match fs.delete(&key).await {
-        Ok(()) | Err(FilesystemError::NotFound(_)) => {}
-        other => panic!("delete of a missing object: expected Ok or NotFound, got {other:?}"),
-    }
-    assert!(!fs.exists(&key).await.expect("exists answers"));
     assert!(
         fs.list(&format!("{base}/contract/{run}/"))
             .await
@@ -366,13 +364,7 @@ async fn s3_missing_object_is_not_found_contract() {
 #[tokio::test]
 #[ignore = "needs fake-gcs — set PROXIMADB_GCS_ENDPOINT + PROXIMADB_GCS_ANONYMOUS=1"]
 async fn gcs_missing_object_is_not_found_contract_best_effort() {
-    if std::env::var("PROXIMADB_GCS_ENDPOINT").is_err() {
-        eprintln!("skip: set PROXIMADB_GCS_ENDPOINT (fake-gcs) to run");
-        return;
-    }
-    let factory = factory().await;
-    if factory.get_filesystem("gs://proximadb-test/probe").is_err() {
-        eprintln!("::warning:: GCS backend did not register (best-effort tier) — skipping");
+    if !gcs_backend_ready().await {
         return;
     }
     contract_missing_object_is_not_found("gs://proximadb-test").await;
