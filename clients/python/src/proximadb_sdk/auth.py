@@ -84,6 +84,12 @@ class AuthResult:
     token_expires_at: datetime | None = None
     access_token: str | None = None
     refresh_token: str | None = None
+    error: str | None = None
+
+    @property
+    def success(self) -> bool:
+        """TD-SDKERR-1: authentication succeeded (a user identity came back)."""
+        return bool(self.user_id)
 
     def __post_init__(self):
         if self.roles is None:

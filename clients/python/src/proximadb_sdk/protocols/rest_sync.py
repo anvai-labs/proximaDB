@@ -45,10 +45,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from ..batching_unified import (
-    BatchConfig,
-    ThreadedBatchProcessor,
-)
+from ..batching_unified import BatchConfig, ThreadedBatchProcessor
 from ..cache import ResponseCache
 from ..config import ClientConfig, load_config
 from ..exceptions import (
@@ -1659,6 +1656,21 @@ class ProximaDBClient:
             batch_size=batch_size,
         )
 
+    @staticmethod
+    def _unwrap_props_cells(props: Any) -> dict[str, Any]:
+        """TD-SDKERR-1: REST returns properties as `{"type": ..., "value": ...}`
+        cells (proto-aligned); gRPC returns plain values. Unwrap the cells so
+        both transports expose plain `metadata[key]` values."""
+        if not isinstance(props, dict):
+            return props or {}
+        unwrapped: dict[str, Any] = {}
+        for key, cell in props.items():
+            if isinstance(cell, dict) and set(cell.keys()) == {"type", "value"}:
+                unwrapped[key] = cell["value"]
+            else:
+                unwrapped[key] = cell
+        return unwrapped
+
     def search(
         self,
         collection_id: str,
@@ -1797,7 +1809,9 @@ class ProximaDBClient:
                     rank=result.get("rank", 0),
                     vector=(result.get("vector", []) if include_vectors else None),
                     metadata=(
-                        result.get("props", result.get("metadata", {}))
+                        self._unwrap_props_cells(
+                            result.get("props", result.get("metadata", {}))
+                        )
                         if include_metadata
                         else None
                     ),
