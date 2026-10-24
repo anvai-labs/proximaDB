@@ -3630,8 +3630,10 @@ fn materialized_table_is_readable_through_datafusion_reader() {
 }
 
 /// P2.4 slice 2: a published file carries each row's oid as a hidden LAST
-/// column `__proxima_oid`, Bloom-filtered and without an Iceberg field id, and
-/// the DataFusion reader hides it: `SELECT *` returns the table's columns only.
+/// column `__proxima_oid`, Bloom-filtered, with a reserved Iceberg field id
+/// (table columns keep ids 1..N), aligned with its row through the cluster
+/// sort; the DataFusion reader hides it: `SELECT *` returns the table's
+/// columns only.
 #[cfg(feature = "datafusion-integration")]
 #[test]
 fn published_files_carry_a_hidden_oid_column() {
@@ -3646,15 +3648,16 @@ fn published_files_carry_a_hidden_oid_column() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (_manager, dml) = dml_over_wal_table(
             dir.path(),
-            "CREATE TABLE inv (id TEXT NOT NULL, status TEXT, PRIMARY KEY (id));",
+            "CREATE TABLE inv (id TEXT NOT NULL, status TEXT, d DATE, PRIMARY KEY (id));",
             "hidden-oid.wal",
         )
         .await;
         let parser = crate::query::sql_frontend::SqlFrontendParser::new();
-        for id in ["i1", "i2", "i3"] {
+        // Dates descend as ids ascend, so the cluster sort (by `d`) reorders rows.
+        for (id, day) in [("i1", 3), ("i2", 2), ("i3", 1)] {
             let stmt = parser
                 .parse_dml(&format!(
-                    "INSERT INTO inv (id, status) VALUES ('{id}', 'open');"
+                    "INSERT INTO inv (id, status, d) VALUES ('{id}', 'open', DATE '2020-01-0{day}');"
                 ))
                 .expect("parse insert")
                 .expect("insert stmt");
@@ -3687,9 +3690,19 @@ fn published_files_carry_a_hidden_oid_column() {
             .to_vec();
         let last = columns.last().expect("columns");
         assert_eq!(last.name(), SYS_COL_OID, "the oid is the last column");
-        assert!(
-            !last.self_type().get_basic_info().has_id(),
-            "no Iceberg field id on the hidden column"
+        let ids: Vec<i32> = columns
+            .iter()
+            .map(|c| c.self_type().get_basic_info().id())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                1,
+                2,
+                3,
+                proximadb_storage_common::parquet_multipart::SYSTEM_FIELD_ID_BASE as i32
+            ],
+            "table columns keep 1..N; the hidden column takes the reserved id"
         );
         let oid_index = columns.len() - 1;
         assert!(
@@ -3705,26 +3718,37 @@ fn published_files_carry_a_hidden_oid_column() {
             std::fs::File::open(&file).expect("open part"),
         )
         .expect("arrow reader");
-        let mut oids: Vec<String> = builder
+        // Each row's oid stays with its row through the sort: the key column
+        // `id` and the oid agree row by row, in date order.
+        let pairs: Vec<(String, String)> = builder
             .build()
             .expect("build reader")
             .flat_map(|batch| {
                 let batch = batch.expect("batch");
-                let column = batch
-                    .column_by_name(SYS_COL_OID)
-                    .expect("oid column")
-                    .as_any()
-                    .downcast_ref::<arrow_array::StringArray>()
-                    .expect("utf8")
-                    .clone();
-                (0..column.len())
-                    .map(|i| column.value(i).to_string())
+                let text = |name: &str| {
+                    batch
+                        .column_by_name(name)
+                        .expect("column")
+                        .as_any()
+                        .downcast_ref::<arrow_array::StringArray>()
+                        .expect("utf8")
+                        .clone()
+                };
+                let (ids, oids) = (text("id"), text(SYS_COL_OID));
+                (0..ids.len())
+                    .map(|i| (ids.value(i).to_string(), oids.value(i).to_string()))
                     .collect::<Vec<_>>()
             })
             .collect();
-        oids.sort();
-        assert_eq!(oids.len(), 3);
-        assert!(oids.iter().all(|oid| !oid.is_empty()));
+        assert_eq!(
+            pairs.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["i3", "i2", "i1"],
+            "rows in date order"
+        );
+        assert!(
+            pairs.iter().all(|(id, oid)| oid.ends_with(id.as_str())),
+            "each oid belongs to its row: {pairs:?}"
+        );
 
         // The reader hides it.
         let ctx = create_session_context().expect("session ctx");
@@ -3750,7 +3774,10 @@ fn published_files_carry_a_hidden_oid_column() {
             .iter()
             .map(|f| f.name().clone())
             .collect();
-        assert_eq!(names, vec!["id".to_string(), "status".to_string()]);
+        assert_eq!(
+            names,
+            vec!["id".to_string(), "status".to_string(), "d".to_string()]
+        );
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
     });
 }

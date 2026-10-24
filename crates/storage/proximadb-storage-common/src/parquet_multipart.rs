@@ -33,13 +33,22 @@ use proximadb_kernel::error::StorageError;
 use crate::object_store_bridge::ObjectStoreBridge;
 use crate::parquet_write_policy::{ParquetLayoutHints, ParquetWritePolicy};
 
+/// First Iceberg field id of the hidden system columns: far above any table
+/// column's positional id, and below Iceberg's reserved metadata ids (which
+/// start near `i32::MAX - 200`).
+pub const SYSTEM_FIELD_ID_BASE: i64 = 2_000_000_000;
+
 /// Stamp Iceberg field ids (`PARQUET:field_id`) on the top-level fields: field id
 /// `i + 1` for column `i`, the assignment the warehouse publisher's Iceberg schema
 /// uses. Iceberg readers resolve Parquet columns by field id.
 ///
-/// Hidden system columns (`__proxima_oid`) get no id: they are not in the
-/// Iceberg schema, so an Iceberg reader skips them, and a later `ADD COLUMN`
-/// (which takes the next positional id) cannot collide with one.
+/// Hidden system columns (`__proxima_oid`) get ids from
+/// [`SYSTEM_FIELD_ID_BASE`] up, which no table column reaches: they are not in
+/// the Iceberg schema, so an Iceberg reader resolving by id leaves them
+/// unprojected, and a later `ADD COLUMN` (the next positional id) cannot
+/// collide with one. Every column must carry an id: a reader such as PyIceberg
+/// treats a file with any id-less column as having no ids and falls back to
+/// name mapping, which rejects the unknown column.
 pub fn iceberg_field_id_schema(schema: &Schema) -> SchemaRef {
     const FIELD_ID: &str = "PARQUET:field_id";
     let fields: Vec<arrow_schema::Field> = schema
@@ -47,11 +56,15 @@ pub fn iceberg_field_id_schema(schema: &Schema) -> SchemaRef {
         .iter()
         .enumerate()
         .map(|(i, f)| {
-            if crate::proxima_arrow::is_system_column(f.name()) {
-                return f.as_ref().clone();
-            }
+            let id = match crate::proxima_arrow::SYSTEM_COLUMNS
+                .iter()
+                .position(|c| c == f.name())
+            {
+                Some(system) => SYSTEM_FIELD_ID_BASE + system as i64,
+                None => (i + 1) as i64,
+            };
             let mut md = f.metadata().clone();
-            md.insert(FIELD_ID.to_string(), (i + 1).to_string());
+            md.insert(FIELD_ID.to_string(), id.to_string());
             f.as_ref().clone().with_metadata(md)
         })
         .collect();
