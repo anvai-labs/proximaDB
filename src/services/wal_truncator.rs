@@ -56,6 +56,20 @@ pub fn configured_interval() -> Option<std::time::Duration> {
     .map(std::time::Duration::from_secs)
 }
 
+/// Env gate: WAL entries a partition's oldest unflushed row may lag the head
+/// before [`RecordTierFloor`] flushes it (TD-USUB-22). Default ON
+/// ([`DEFAULT_SPILL_FLUSH_LAG_ENTRIES`](crate::services::storage_format::DEFAULT_SPILL_FLUSH_LAG_ENTRIES));
+/// `0` or `off` disables it.
+pub const FLUSH_LAG_ENV: &str = "PROXIMADB_RELATIONAL_SPILL_FLUSH_LAG_ENTRIES";
+
+/// The configured flush lag ([`FLUSH_LAG_ENV`]), or `None` when off.
+pub fn configured_flush_lag() -> Option<u64> {
+    crate::services::storage_format::default_on_gate(
+        FLUSH_LAG_ENV,
+        crate::services::storage_format::DEFAULT_SPILL_FLUSH_LAG_ENTRIES,
+    )
+}
+
 /// The configured change-feed retention ([`RETAIN_ENTRIES_ENV`]).
 pub fn configured_retain_entries() -> u64 {
     std::env::var(RETAIN_ENTRIES_ENV)
@@ -176,6 +190,11 @@ impl WalFloorSource for ChangeFeedRetention {
 /// The relational record tier: rows not yet durable in a segment, and writes
 /// appended but not yet applied. A memtable partition refuses (its rows exist
 /// only in memory), so this source refuses unless every partition spills.
+///
+/// Before answering it flushes any partition lagging the head by more than
+/// [`FLUSH_LAG_ENV`] entries: a partition below the flush threshold otherwise
+/// pins the WAL from its first row forever (TD-USUB-22). The flush writes
+/// segments, not WAL entries, so this stays a read-only source.
 pub struct RecordTierFloor(pub Arc<DirectWalTableRecordStore>);
 
 #[async_trait]
@@ -183,7 +202,10 @@ impl WalFloorSource for RecordTierFloor {
     fn name(&self) -> &str {
         "record-tier"
     }
-    async fn floor(&self, _head: u64) -> Result<Option<u64>> {
+    async fn floor(&self, head: u64) -> Result<Option<u64>> {
+        if let Some(max_lag) = configured_flush_lag() {
+            self.0.flush_lagging_partitions(head, max_lag).await;
+        }
         let inflight = self.0.inflight_floor();
         let unflushed = self.0.min_unflushed_lsn().await?;
         Ok(match (inflight, unflushed) {
