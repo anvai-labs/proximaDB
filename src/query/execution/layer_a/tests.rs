@@ -486,6 +486,40 @@ async fn small_row_group_store(rows: usize) -> (SpillRecordStorage, Arc<dyn File
     (store.with_write_policy(policy), fs)
 }
 
+/// A session whose scans stay one partition, so row-group counters are exact
+/// (a partitioned scan sums them over its partitions).
+fn single_partition() -> SessionContext {
+    SessionContext::new_with_config(
+        datafusion::prelude::SessionConfig::new().with_target_partitions(1),
+    )
+}
+
+/// `padded(id)` renamed to `z`, away from a `name = 'p'` filter.
+fn renamed(id: i64) -> ProximaRecord {
+    let mut r = padded(id, 0.0);
+    r.props.insert(
+        "name".into(),
+        ProximaTreeNode::Value(ProximaValue::String("z".to_string())),
+    );
+    r
+}
+
+/// Segment 1 holds rows `0..rows` named `p`; segment 2 renames `0..renamed_rows`
+/// to `z`, so a `name = 'p'` filter prunes segment 2 to key spines that must
+/// still hide segment 1's stale copies.
+async fn renamed_over(rows: i64, renamed_rows: i64) -> (SpillRecordStorage, Arc<dyn FileSystem>) {
+    let (store, fs) = small_row_group_store(10).await;
+    for i in 0..rows {
+        store.upsert_record(padded(i, 0.0)).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment 1");
+    for i in 0..renamed_rows {
+        store.upsert_record(renamed(i)).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment 2");
+    (store, fs)
+}
+
 /// Run the provider's scan with `filter` pushed in; the rows it returned
 /// (before DataFusion re-applies the filter) and its row-group counters.
 async fn pruned_scan(table: NativeLayerASnapshot, filter: Expr) -> (Vec<i64>, usize, usize) {
@@ -502,7 +536,7 @@ async fn pruned_scan_counting(
     table: NativeLayerASnapshot,
     filter: Expr,
 ) -> (Vec<i64>, impl Fn(&str) -> usize) {
-    let ctx = SessionContext::new();
+    let ctx = single_partition();
     let provider = LayerATableProvider::new(table);
     let plan = datafusion::datasource::TableProvider::scan(
         &provider,
@@ -518,7 +552,10 @@ async fn pruned_scan_counting(
         .expect("execute");
     let metrics = plan.metrics().expect("metrics");
     let count = move |name: &str| metrics.sum_by_name(name).map_or(0, |v| v.as_usize());
-    (batches.iter().flat_map(ids).collect(), count)
+    // Sorted: a partitioned scan streams its oid ranges one after another.
+    let mut scanned: Vec<i64> = batches.iter().flat_map(ids).collect();
+    scanned.sort_unstable();
+    (scanned, count)
 }
 
 /// Pruning skips row groups whose statistics rule the filter out, and the SQL
@@ -662,11 +699,7 @@ async fn a_residual_cleared_row_group_still_shadows_older_copies() {
     }
     store.flush().await.unwrap().expect("segment 1");
     for i in 0..10 {
-        let mut r = padded(i, 0.0);
-        r.props.insert(
-            "name".into(),
-            ProximaTreeNode::Value(ProximaValue::String("z".to_string())),
-        );
+        let mut r = renamed(i);
         if i == 3 {
             // A residual naming `score`, not the filter column.
             r.props.insert(
@@ -774,7 +807,7 @@ fn the_residual_check_keeps_any_row_group_it_cannot_clear() {
             true,
         ),
     ]));
-    let ctx = SessionContext::new();
+    let ctx = single_partition();
     let pruner = super::prune::SegmentPruner::try_new(
         &[
             Expr::Column(Column::new_unqualified("Name")).eq(lit("x")),
@@ -917,7 +950,10 @@ async fn run_counting(
         Ok(TreeNodeRecursion::Continue)
     })
     .expect("walk");
-    (batches.iter().flat_map(ids).collect(), counted)
+    // Sorted: a partitioned scan streams its oid ranges one after another.
+    let mut got: Vec<i64> = batches.iter().flat_map(ids).collect();
+    got.sort_unstable();
+    (got, counted)
 }
 
 /// A dynamic filter is evaluated per row group when it is read: while it is
@@ -933,7 +969,7 @@ async fn a_dynamic_filter_prunes_row_groups_once_it_is_resolved() {
     }
     store.flush().await.unwrap().expect("segment");
 
-    let ctx = SessionContext::new();
+    let ctx = single_partition();
     let provider = LayerATableProvider::new(unrestricted(snapshot_of(&store, &fs).await));
     let plan = datafusion::datasource::TableProvider::scan(
         &provider,
@@ -1082,22 +1118,9 @@ async fn a_top_k_threshold_prunes_later_row_groups_and_is_exact() {
 #[tokio::test]
 async fn a_dynamically_pruned_newer_copy_still_hides_an_older_matching_one() {
     use datafusion::physical_expr::expressions::{BinaryExpr, DynamicFilterPhysicalExpr, col, lit};
-    let (store, fs) = small_row_group_store(10).await;
-    for i in 0..20 {
-        store.upsert_record(padded(i, 0.0)).await.unwrap();
-    }
-    store.flush().await.unwrap().expect("segment 1");
-    for i in 0..10 {
-        let mut r = padded(i, 0.0);
-        r.props.insert(
-            "name".into(),
-            ProximaTreeNode::Value(ProximaValue::String("z".to_string())),
-        );
-        store.upsert_record(r).await.unwrap();
-    }
-    store.flush().await.unwrap().expect("segment 2");
+    let (store, fs) = renamed_over(20, 10).await;
 
-    let ctx = SessionContext::new();
+    let ctx = single_partition();
     let provider = LayerATableProvider::new(unrestricted(snapshot_of(&store, &fs).await));
     let plan = datafusion::datasource::TableProvider::scan(
         &provider,
@@ -1129,4 +1152,133 @@ async fn a_dynamically_pruned_newer_copy_still_hides_an_older_matching_one() {
     let (scanned, pruned) = run_counting(filtered, &ctx, "row_groups_pruned_dynamic").await;
     assert!(pruned >= 1, "segment 2's renamed rows are pruned: {pruned}");
     assert_eq!(scanned, (10..20).collect::<Vec<_>>(), "no stale copy");
+}
+
+// ---------------------------------------------------------------------------
+// Oid-range partitions (ADR-097 P3.1 PR 7b)
+// ---------------------------------------------------------------------------
+
+/// Split into four oid-range partitions over three segments with updates,
+/// deletes, resident rows and memory tombstones: every partition streams its
+/// own oids in order, no row is served twice, and together they are exactly
+/// the materialized merge — row for row, column for column.
+#[tokio::test]
+async fn oid_range_partitions_serve_every_row_exactly_once() {
+    use datafusion::prelude::SessionConfig;
+    let (store, fs) = small_row_group_store(10).await;
+    for i in 0..100 {
+        store.upsert_record(padded(i, i as f64)).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment 1");
+    for i in 5..15 {
+        store
+            .upsert_record(padded(i, 1000.0 + i as f64))
+            .await
+            .unwrap();
+    }
+    for i in 20..25 {
+        store
+            .delete_record(&RecordKey::new(format!("{i:04}")))
+            .await
+            .unwrap();
+    }
+    for i in 100..110 {
+        store.upsert_record(padded(i, i as f64)).await.unwrap();
+    }
+    store.flush().await.unwrap().expect("segment 2");
+    for i in 40..45 {
+        store
+            .upsert_record(padded(i, 2000.0 + i as f64))
+            .await
+            .unwrap();
+    }
+    store.flush().await.unwrap().expect("segment 3");
+    store.upsert_record(padded(50, 3050.0)).await.unwrap();
+    store
+        .delete_record(&RecordKey::new("0060".to_string()))
+        .await
+        .unwrap();
+
+    let want = materialized(&store).await;
+    for target in [4, 64] {
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_target_partitions(target)
+                .with_batch_size(7),
+        );
+        let provider = LayerATableProvider::new(unrestricted(snapshot_of(&store, &fs).await));
+        let plan =
+            datafusion::datasource::TableProvider::scan(&provider, &ctx.state(), None, &[], None)
+                .await
+                .expect("scan");
+        let declared =
+            datafusion::physical_plan::ExecutionPlanProperties::output_partitioning(&plan)
+                .partition_count();
+        assert!(
+            (2..=target).contains(&declared),
+            "{target}: the scan is split, into at most the target: {declared}"
+        );
+        let partitions =
+            datafusion::physical_plan::collect_partitioned(plan.clone(), ctx.task_ctx())
+                .await
+                .expect("execute");
+        assert_eq!(partitions.len(), declared);
+        let per_partition: Vec<Vec<i64>> = partitions
+            .iter()
+            .map(|batches| batches.iter().flat_map(ids).collect())
+            .collect();
+        // Disjoint, increasing oid ranges (padded oids order like ids). Within a
+        // partition, resident rows come after the segment rows.
+        let spans: Vec<(i64, i64)> = per_partition
+            .iter()
+            .filter(|ids| !ids.is_empty())
+            .map(|ids| (*ids.iter().min().unwrap(), *ids.iter().max().unwrap()))
+            .collect();
+        assert!(
+            spans.windows(2).all(|w| w[0].1 < w[1].0),
+            "{target}: partitions own disjoint oid ranges: {spans:?}"
+        );
+        let all: Vec<RecordBatch> = partitions.into_iter().flatten().collect();
+        let merged = concat_batches(&plan.schema(), &all).expect("concat");
+        let order = arrow::compute::sort_to_indices(merged.column(0), None, None).expect("sort");
+        let sorted = arrow::compute::take_record_batch(&merged, &order).expect("take");
+        assert_eq!(
+            ids(&sorted),
+            ids(&want),
+            "{target}: every live row exactly once"
+        );
+        assert_eq!(
+            columns(&sorted),
+            columns(&want),
+            "{target}: and the same values"
+        );
+    }
+}
+
+/// Partitions and pruning together: a newer segment renames rows 0..50 away
+/// from the filter, its row groups are pruned to key spines, and the ranges
+/// split row groups of both segments — no stale copy of a renamed row comes
+/// back in any partition.
+#[tokio::test]
+async fn a_partitioned_pruned_scan_keeps_newest_wins_across_boundaries() {
+    use datafusion::prelude::SessionConfig;
+    let (store, fs) = renamed_over(100, 50).await;
+
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(3));
+    ctx.register_table(
+        TABLE,
+        Arc::new(LayerATableProvider::new(unrestricted(
+            snapshot_of(&store, &fs).await,
+        ))),
+    )
+    .expect("register");
+    let got = ctx
+        .sql("select id from orders where name = 'p' order by id")
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("execute");
+    let got: Vec<i64> = got.iter().flat_map(ids).collect();
+    assert_eq!(got, (50..100).collect::<Vec<_>>());
 }

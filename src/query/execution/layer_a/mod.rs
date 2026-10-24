@@ -21,6 +21,9 @@
 //! 4. every row conformed to the catalog schema exactly as the materialized path
 //!    builds it, with ABAC applied per row before any limit ([`conform`]).
 //!
+//! A scan over segments runs as several DataFusion partitions, one per oid
+//! range, each its own newest-wins merge ([`partition`]).
+//!
 //! # Kill switch
 //!
 //! `PROXIMADB_NATIVE_TABLE_LAYER_A=0` puts registration back on the `MemTable`
@@ -31,6 +34,7 @@
 
 pub(crate) mod conform;
 pub(crate) mod merge;
+pub(crate) mod partition;
 pub mod provider;
 pub(crate) mod prune;
 
