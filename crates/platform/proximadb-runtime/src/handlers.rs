@@ -252,7 +252,14 @@ fn schema_metadata_from_collection(collection: &Collection) -> CollectionSchemaM
         schema_version: record_schema.map(|schema| schema.schema_version.clone()),
         enforcement: record_schema.map(|schema| enforcement_from_i32(schema.enforcement)),
         auto_evolve: record_schema.is_none_or(|schema| schema.auto_evolve),
-        enabled: config.enable_proxima_record.unwrap_or(false) || record_schema.is_some(),
+        // TD-GRPCSCHEMA-2: `enabled` is the enforcement answer — key it on the
+        // flag alone, exactly like every write-path gate (sst/flush shred spec,
+        // props promotion). The old `|| record_schema.is_some()` disjunct was
+        // the heuristic for the era when the flag never persisted; now a
+        // pinned-OFF create can carry a record_schema block, and it made this
+        // read ON (contradicting REST's flag-derived view) for a collection the
+        // caller explicitly created OFF.
+        enabled: config.enable_proxima_record.unwrap_or(false),
         columns,
     }
 }
@@ -520,6 +527,24 @@ impl ApiHandlersPort for UnifiedHandlers {
         update: CollectionSchemaUpdate,
         tenant_id: Option<&str>,
     ) -> Result<CollectionSchemaMetadata> {
+        // A schema UPDATE turns record mode on (the SDK semantic): delegate
+        // with the mode unpinned. TD-GRPCSCHEMA-2.
+        self.update_collection_schema_metadata_with_record_mode(
+            collection_id,
+            update,
+            tenant_id,
+            None,
+        )
+        .await
+    }
+
+    async fn update_collection_schema_metadata_with_record_mode(
+        &self,
+        collection_id: &str,
+        update: CollectionSchemaUpdate,
+        tenant_id: Option<&str>,
+        record_mode: Option<bool>,
+    ) -> Result<CollectionSchemaMetadata> {
         let collection = self
             .collection
             .get_collection(collection_id, tenant_id)
@@ -529,6 +554,9 @@ impl ApiHandlersPort for UnifiedHandlers {
         // Narrow projection (best-effort); the canonical columns are persisted
         // verbatim via the sidecar below so rich ProximaType variants survive.
         apply_schema_update(&mut config, &update)?;
+        if let Some(mode) = record_mode {
+            config.enable_proxima_record = Some(mode);
+        }
         // TD-CATREPLACE-1: canonical FIRST. The canonical write validates the
         // whole update (including the fold against the stored filterable
         // columns); a rejection here leaves the narrow config untouched — the

@@ -2051,6 +2051,17 @@ impl CollectionService {
                 if schema_update_intent || !new_config.filterable_columns.is_empty() {
                     existing_config.filterable_columns = new_config.filterable_columns.clone();
                 }
+                // TD-GRPCSCHEMA-2: a schema update carries the authoritative
+                // record-mode block too — before, the merge DROPPED
+                // `enable_proxima_record`/`record_schema` (and the text-column
+                // projection), so record mode could never be enabled after
+                // create, no matter how many schema updates ran.
+                if schema_update_intent {
+                    existing_config.enable_proxima_record = new_config.enable_proxima_record;
+                    existing_config.record_schema = new_config.record_schema.clone();
+                    existing_config.text_columns = new_config.text_columns.clone();
+                    existing_config.text_storage_configs = new_config.text_storage_configs.clone();
+                }
                 // Add other fields as needed
             } else {
                 // No existing config, use the new one
@@ -3160,6 +3171,64 @@ mod tests {
         }
     }
 
+    /// TD-GRPCSCHEMA-2: a schema update persists the record-mode block.
+    /// Before, `update_collection`'s field merge dropped `enable_proxima_record`
+    /// and `record_schema`, so record mode could never be enabled after create.
+    #[tokio::test]
+    async fn schema_update_persists_record_mode() -> Result<()> {
+        let (svc, mgr, _temp_dir) = service_in_tempdir().await?;
+
+        let name = "grpcschema2_record";
+        assert!(
+            svc.create_collection(&collection_config(name))
+                .await?
+                .success
+        );
+        let before = svc.collection(name).await?.expect("present");
+        assert_ne!(
+            before.config.as_ref().unwrap().enable_proxima_record,
+            Some(true),
+            "precondition: record mode is off after create"
+        );
+
+        let mut update = collection_config(name);
+        update.enable_proxima_record = Some(true);
+        update.record_schema = Some(crate::proto::proximadb_v1::RecordSchemaConfig {
+            schema_id: "s1".to_string(),
+            schema_version: "1".to_string(),
+            enforcement: 0,
+            auto_evolve: false,
+            columns: vec![],
+        });
+        assert!(svc.update_collection(name, Some(update)).await?.success);
+
+        let after = svc.collection(name).await?.expect("present");
+        let config = after.config.as_ref().unwrap();
+        assert_eq!(
+            config.enable_proxima_record,
+            Some(true),
+            "the record-mode switch must persist through the merge"
+        );
+        assert!(
+            config.record_schema.is_some(),
+            "the record-schema block must persist through the merge"
+        );
+        Ok(())
+    }
+
+    /// A collection service over a fresh native catalog in a tempdir.
+    async fn service_in_tempdir()
+    -> Result<(CollectionService, Arc<CatalogManager>, tempfile::TempDir)> {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path = format!("file://{}", temp_dir.path().display());
+        let mgr = Arc::new(CatalogManager::new());
+        mgr.create_native_catalog("default", &temp_path).await?;
+        let svc = CollectionService::new(StorageConfig::default())
+            .await?
+            .with_catalog_manager(mgr.clone());
+        Ok((svc, mgr, temp_dir))
+    }
+
     /// TD-CATREPLACE-1: a schema update (the record-schema switch
     /// `apply_schema_update` always sets) carries the authoritative FULL
     /// filterable list — an empty list REMOVES the columns. Before, an empty
@@ -3169,13 +3238,7 @@ mod tests {
     async fn schema_update_clears_filterable_columns_it_empties() -> Result<()> {
         use crate::proto::proximadb_v1::{FilterableColumnSpec, FilterableDataType};
 
-        let temp_dir = tempfile::tempdir()?;
-        let temp_path = format!("file://{}", temp_dir.path().display());
-        let mgr = Arc::new(CatalogManager::new());
-        mgr.create_native_catalog("default", &temp_path).await?;
-        let svc = CollectionService::new(StorageConfig::default())
-            .await?
-            .with_catalog_manager(mgr.clone());
+        let (svc, mgr, _temp_dir) = service_in_tempdir().await?;
 
         // The schema-update intent marker `apply_schema_update` always writes.
         let record_schema = || crate::proto::proximadb_v1::RecordSchemaConfig {

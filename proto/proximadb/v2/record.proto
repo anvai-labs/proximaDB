@@ -625,6 +625,9 @@ message GetSchemaResponse {
   bool success = 1;
   optional RecordSchema schema = 2;
   optional string error_message = 3;
+  // TD-GRPCSCHEMA-2: whether record mode (write enforcement) is ON for the
+  // collection — the schema above is served either way.
+  optional bool record_enabled = 4;
 }
 
 message ListSchemasRequest {
@@ -751,6 +754,9 @@ message V2CollectionConfig {
   // Optional index tuning; when empty the server auto-selects a sensible index.
   repeated V2IndexSpec index_specs = 7;
   optional V2QuantizationConfig quantization = 8;
+  // TD-GRPCSCHEMA-2: record mode at create (REST parity; before, a gRPC-created
+  // collection could never enable it).
+  optional bool enable_proxima_record = 9;
 }
 
 message V2Collection {

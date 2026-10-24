@@ -2086,18 +2086,17 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
 
         // TD-GRPCSCHEMA-1: the persisted schema is the authority (ADR-047) —
         // serve it regardless of the ProximaRecord flag, which gates record
-        // ENFORCEMENT on writes, not the existence of a schema. A gRPC-created
-        // collection has the flag off (V2CollectionConfig cannot set it) yet
-        // its create-time canonical schema (embedding + filterable columns)
-        // was persisted precisely so this read could serve it. NOTE: neither
-        // this response nor any gRPC surface exposes the flag today
-        // (TD-GRPCSCHEMA-2).
+        // ENFORCEMENT on writes, not the existence of a schema. The flag is
+        // settable at create and surfaced below since TD-GRPCSCHEMA-2.
         let schema = Some(runtime_metadata_to_grpc_schema(&metadata));
 
         Ok(Response::new(GetSchemaResponse {
             success: true,
             schema,
             error_message: None,
+            // TD-GRPCSCHEMA-2: surface the mode — the schema is served either
+            // way; this says whether write enforcement is ON.
+            record_enabled: Some(metadata.enabled),
         }))
     }
 
@@ -2269,6 +2268,9 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
             }),
             ..Default::default()
         };
+        // TD-GRPCSCHEMA-2: record mode at create (REST parity).
+        let mut v1_config = v1_config;
+        v1_config.enable_proxima_record = cfg.enable_proxima_record;
 
         let req = CollectionRequest {
             operation: CollectionOperation::CollectionCreate as i32,
@@ -2306,10 +2308,16 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         };
         if let Err(e) = self
             .api_handlers
-            .update_collection_schema_metadata(
+            .update_collection_schema_metadata_with_record_mode(
                 &cfg.name,
                 canonical_update,
                 Some(tenant_id.as_str()),
+                // The caller's create-time choice owns the mode; the canonical
+                // persist step is persistence, not a schema update that turns
+                // record mode on (TD-GRPCSCHEMA-2). UNSET means OFF — REST
+                // create's default, and the behavior every pre-field gRPC
+                // client had (round 1 review: None would have meant ON).
+                Some(cfg.enable_proxima_record.unwrap_or(false)),
             )
             .await
         {
@@ -2552,6 +2560,8 @@ fn collection_to_v2(c: crate::proto::proximadb_v1::Collection) -> V2Collection {
     V2Collection {
         id: c.id,
         config: Some(V2CollectionConfig {
+            // TD-GRPCSCHEMA-2: round-trip the mode on reads too.
+            enable_proxima_record: cfg.enable_proxima_record,
             name: cfg.name,
             dimension: cfg.dimension,
             distance_metric,
@@ -2609,6 +2619,7 @@ mod tests {
             description: String::new(),
             index_specs: Vec::new(),
             quantization: None,
+            enable_proxima_record: None,
         };
         let cols = v2_config_to_canonical_columns(&cfg);
         // Primary vector column mirrors config.dimension; empty filterable names skipped.
