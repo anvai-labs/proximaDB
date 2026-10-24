@@ -212,3 +212,27 @@ The MATERIALIZE input no longer has to be the whole table at once. `RecordScan::
 `TableRecordStore::scan_records_chunked` adds table membership and the primary-over-legacy merge. `DmlService::scan_table_records_chunked` adds the governed-read prelude.
 
 Evidence: `chunked_scan_equals_the_merged_scan` builds several segments, updates, persisted and in-memory deletes, a re-insert and resident rows. It asserts strictly ascending oids, the chunk bound, and equality with `scan_records`.
+
+=== P2.4 slice 2a: published files carry a hidden row key (2026-10-24)
+
+Incremental append (slice 2b) must tell an insert from an update by probing what is already
+published, so every published file now carries each row's oid as a hidden LAST column,
+`__proxima_oid` (Utf8, non-null).
+
+* It is always Bloom-filtered unless it leads the sort (`ParquetWritePolicy::bloom_columns`; spill
+  segments, sorted by oid, are unchanged), subject to the policy's `min_rows` and enable flags.
+* It is not in the Iceberg schema. Every column carries a `PARQUET:field_id` (PyIceberg treats a
+  file with any id-less column as id-less and falls back to name mapping, which rejects an
+  unknown column): table columns keep `1..N`, system columns take `SYSTEM_FIELD_ID_BASE`
+  (2,000,000,000) and up, below Iceberg's reserved metadata range.
+* Readers hide it. DataFusion drops `__proxima_*` columns from its planning schema and resolves
+  each requested column to the file's column by name; the DuckDB view selects
+  `COLUMNS(lambda c: NOT starts_with(c, '__proxima_'))` with `union_by_name`. Catalog validation
+  already rejects user columns with that prefix.
+* Being last keeps every table column at the same position in files written before and after
+  the change. The semi-join Bloom lookup and the native route still index file columns by the
+  table's position, so a snapshot must not mix files of different widths; every publication
+  today is a full rewrite, and slice 2b appends only to files whose columns match exactly.
+
+Gate: `published_files_carry_a_hidden_oid_column` (last column, oids aligned with their rows
+through the cluster sort, field ids `[1, 2, 3, 2000000000]`, `SELECT *` without it).
