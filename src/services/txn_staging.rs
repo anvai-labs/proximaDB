@@ -573,6 +573,10 @@ impl TableRecordStore for StagingTableRecordStore {
             .await
     }
 
+    fn has_change_feed(&self, table_schema: &CatalogTableSchema) -> bool {
+        self.base.has_change_feed(table_schema)
+    }
+
     async fn capture_snapshot_lsn(
         &self,
         collection_id: &str,

@@ -76,10 +76,18 @@ impl PublishedOids {
             if !same_columns(builder.schema(), expected) {
                 return Ok(None);
             }
-            let Ok(column) = builder.schema().index_of(SYS_COL_OID) else {
+            let metadata = builder.metadata().clone();
+            // The Parquet leaf index, which differs from the Arrow field index
+            // once a nested column precedes the oid column.
+            let Some(column) = metadata
+                .file_metadata()
+                .schema_descr()
+                .columns()
+                .iter()
+                .position(|c| c.path().string() == SYS_COL_OID)
+            else {
                 return Ok(None);
             };
-            let metadata = builder.metadata().clone();
             for (index, row_group) in metadata.row_groups().iter().enumerate() {
                 if row_group.num_rows() == 0 {
                     continue;

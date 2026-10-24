@@ -3860,12 +3860,26 @@ fn an_insert_only_republication_appends_and_an_update_rewrites() {
         assert_eq!(v1.len(), 1);
         assert_eq!(qty_sum(location.clone()).await, (3, 3));
 
-        // Unchanged: nothing is published.
+        let metadata_prefix = format!(
+            "{}/metadata",
+            prefix.strip_suffix("/data").expect("data location")
+        );
+        let metadata_version = || async {
+            bridge
+                .latest_metadata_version(&metadata_prefix)
+                .await
+                .expect("metadata log")
+                .expect("a committed snapshot")
+        };
+        let version1 = metadata_version().await;
+
+        // Unchanged: nothing is published, not even a new metadata version.
         assert_eq!(
             materialize().await.expect("materialize unchanged"),
             location
         );
         assert_eq!(published_data_files(&bridge, &prefix).await, v1);
+        assert_eq!(metadata_version().await, version1);
 
         // Insert-only: the first file is carried, one new part holds the 2 new rows.
         for i in 3..5 {
@@ -3907,6 +3921,42 @@ fn an_insert_only_republication_appends_and_an_update_rewrites() {
         let v3 = published_data_files(&bridge, &prefix).await;
         assert!(v3.iter().all(|p| !v2.contains(p)), "a rewrite: {v3:?}");
         assert_eq!(qty_sum(location.clone()).await, (5, 110));
+
+        // A new oid inside the published oid range ('i05' sorts between 'i0'
+        // and 'i1') is still an append: the Bloom filter rules it out.
+        dml.execute(run(
+            "INSERT INTO inv (id, qty) VALUES ('i05', 1000);".to_string()
+        ))
+        .await
+        .expect("insert in range");
+        materialize().await.expect("materialize 4");
+        let v4 = published_data_files(&bridge, &prefix).await;
+        assert_eq!(v4.len(), v3.len() + 1, "an in-range append: {v4:?}");
+        assert!(v3.iter().all(|p| v4.contains(p)));
+        assert_eq!(qty_sum(location.clone()).await, (6, 1110));
+
+        // A row inserted and deleted between publications changes nothing.
+        dml.execute(run(
+            "INSERT INTO inv (id, qty) VALUES ('i9', 9);".to_string()
+        ))
+        .await
+        .expect("insert transient");
+        dml.execute(run("DELETE FROM inv WHERE id = 'i9';".to_string()))
+            .await
+            .expect("delete transient");
+        let version4 = metadata_version().await;
+        materialize().await.expect("materialize 5");
+        assert_eq!(published_data_files(&bridge, &prefix).await, v4);
+        assert_eq!(metadata_version().await, version4);
+
+        // A delete of a published row rewrites.
+        dml.execute(run("DELETE FROM inv WHERE id = 'i1';".to_string()))
+            .await
+            .expect("delete published");
+        materialize().await.expect("materialize 6");
+        let v6 = published_data_files(&bridge, &prefix).await;
+        assert!(v6.iter().all(|p| !v4.contains(p)), "a rewrite: {v6:?}");
+        assert_eq!(qty_sum(location.clone()).await, (5, 1109));
     });
 }
 
@@ -4155,6 +4205,8 @@ impl crate::services::ddl::PublishFence for RefusingFence {
 /// of the second losing the metadata CAS.
 #[tokio::test]
 async fn materialize_is_fenced_and_serialized_per_table() {
+    // Every run must rewrite so each one exercises the fenced publish.
+    let _append = EnvGuard::set("PROXIMADB_MATERIALIZE_APPEND_MAX_ROWS", "0");
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let (manager, dml) = dml_over_wal_table(
         temp_dir.path(),

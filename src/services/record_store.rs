@@ -1063,6 +1063,15 @@ pub trait TableRecordStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Whether every write to `table_schema` reaches the change feed
+    /// [`Self::read_changes_since_scoped`] serves. Only then does an empty feed
+    /// prove the table unchanged (P2.4 incremental MATERIALIZE). The default is
+    /// `false`; the WAL-backed store and the stores that route to it override it.
+    fn has_change_feed(&self, table_schema: &CatalogTableSchema) -> bool {
+        let _ = table_schema;
+        false
+    }
+
     /// Capture the snapshot LSN for MATERIALIZE before it scans the table
     /// (ADR-025). The default reads the table's newest change, which is sound
     /// only when the WAL never truncates; the WAL-backed store pins history
@@ -1741,6 +1750,15 @@ impl TableRecordStore for CatalogRoutingTableRecordStore {
 
     async fn capture_snapshot_lsn(&self, collection_id: &str) -> Result<SnapshotLsn> {
         self.iceberg_store.capture_snapshot_lsn(collection_id).await
+    }
+
+    /// Only a relational route writes to `iceberg_store`, whose feed this
+    /// router serves.
+    fn has_change_feed(&self, table_schema: &CatalogTableSchema) -> bool {
+        matches!(
+            TableRecordStoreRoute::for_schema(table_schema),
+            TableRecordStoreRoute::RelationalStorage
+        ) && self.iceberg_store.has_change_feed(table_schema)
     }
 }
 
@@ -3398,6 +3416,11 @@ impl TableRecordStore for DirectWalTableRecordStore {
     /// must replay it). Chosen under the WAL's append lock and pinned there,
     /// so no truncation can slip between the capture and the pin. Falls back
     /// to the table's newest change for an appender that never truncates.
+    /// Every write goes through the canonical WAL this store reads its feed from.
+    fn has_change_feed(&self, _table_schema: &CatalogTableSchema) -> bool {
+        true
+    }
+
     async fn capture_snapshot_lsn(&self, collection_id: &str) -> Result<SnapshotLsn> {
         let inflight = &self.inflight;
         let below_inflight = |head: u64| {

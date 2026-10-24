@@ -236,3 +236,42 @@ published, so every published file now carries each row's oid as a hidden LAST c
 
 Gate: `published_files_carry_a_hidden_oid_column` (last column, oids aligned with their rows
 through the cluster sort, field ids `[1, 2, 3, 2000000000]`, `SELECT *` without it).
+
+=== P2.4 slice 2b: insert-only incremental append (2026-10-24)
+
+A republication no longer always rewrites the table. It reads the oids written since the
+published layout's `snapshot_lsn` from the route's change feed and classifies them against the
+published files' hidden oid column (per row group: min/max statistics, then the Bloom filter):
+
+* No changed oid: nothing is published (no new metadata version); the layout's `snapshot_lsn`
+  advances under the publication fence.
+* Every changed oid provably absent from the published files: their current rows are written as
+  extra parts and the snapshot is the carried files plus the new parts; GC keeps the carried
+  files. A changed oid with no current row (inserted and deleted in between) writes nothing.
+* Otherwise a full rewrite, as before. The probe has no false negatives, so an update or delete
+  of a published row always rewrites; a Bloom false positive only costs a rewrite.
+
+An append is attempted only when it is provably sound, and rewrites otherwise:
+
+* the store has a WAL change feed for the table's route (`TableRecordStore::has_change_feed`);
+  an empty answer from a store without one proves nothing;
+* the layout is at the location being published and its `snapshot_lsn` is not newer than the
+  one this run captured;
+* every carried file has exactly the columns this publication writes (a schema change since the
+  last publication rewrites), carries the oid column (files from before slice 2a rewrite) and
+  has oid statistics in every row group;
+* the delta is at most `PROXIMADB_MATERIALIZE_APPEND_MAX_ROWS` rows (default 1,000,000, the rows
+  held in memory while written; `0`/`off` disables append).
+
+Accepted limits, each cleared by the next full rewrite:
+
+* rows that expired by TTL stay in carried files;
+* NDV statistics are not republished on an append;
+* carried files are not compacted, so many small appends leave many small parts (compaction is
+  a later slice).
+
+Gates: `an_insert_only_republication_appends_and_an_update_rewrites` (unchanged run publishes no
+metadata version; insert-only carries the file and appends a part holding only the new rows; an
+in-range new oid still appends; insert-then-delete publishes nothing; an update or a delete of a
+published row rewrites; counts and sums correct throughout) and
+`classification_appends_only_rows_no_published_file_can_hold`.

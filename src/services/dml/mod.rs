@@ -2956,14 +2956,17 @@ impl DmlService {
         if let (Some(previous), Some(max_rows)) =
             (parent, materialize_append::configured_append_max_rows())
         {
+            let location = Self::published_location(warehouse_root_url, &prefix);
             match self
                 .plan_append(
                     bridge,
                     &catalog,
                     &table_id,
+                    &schema,
+                    &location,
                     &metadata_prefix,
                     previous,
-                    table_name,
+                    snapshot_lsn,
                     scope_tenant,
                     max_rows,
                     &materialize_stream::with_oid_field(
@@ -2973,24 +2976,38 @@ impl DmlService {
                 .await
             {
                 Ok((materialize_append::AppendPlan::Append(oids), files)) => {
-                    let (_, rows) =
-                        <Self as crate::query::execution::olap_delta_merge::OlapDeltaSource>::current_records(
-                            self,
-                            table_name,
-                            &oids,
-                            scope_tenant,
-                        )
-                        .await?;
-                    if rows.is_empty() {
+                    match <Self as crate::query::execution::olap_delta_merge::OlapDeltaSource>::current_records(
+                        self,
+                        table_name,
+                        &oids,
+                        scope_tenant,
+                    )
+                    .await
+                    {
                         // Every new row was deleted again: nothing to publish,
-                        // and the published snapshot is still exact.
-                        return Ok(Self::published_location(warehouse_root_url, &prefix));
+                        // and the published files are exact as of now.
+                        Ok((_, rows)) if rows.is_empty() => {
+                            self.advance_snapshot_lsn(&catalog, &table_id, snapshot_lsn, fence)
+                                .await?;
+                            return Ok(location);
+                        }
+                        Ok((_, rows)) => {
+                            carried = files;
+                            appended_rows = Some(rows);
+                        }
+                        Err(e) => warn!(
+                            table = %table_name,
+                            "MATERIALIZE: reading the appended rows failed, rewriting: {e:#}"
+                        ),
                     }
-                    carried = files;
-                    appended_rows = Some(rows);
                 }
                 Ok((materialize_append::AppendPlan::Unchanged, _)) => {
-                    return Ok(Self::published_location(warehouse_root_url, &prefix));
+                    // Nothing changed since the published snapshot: its files are
+                    // exact as of now, so only its LSN moves up (which also lets
+                    // WAL truncation pass the old one).
+                    self.advance_snapshot_lsn(&catalog, &table_id, snapshot_lsn, fence)
+                        .await?;
+                    return Ok(location);
                 }
                 Ok((materialize_append::AppendPlan::Rewrite(reason), _)) => {
                     info!(table = %table_name, "MATERIALIZE: full rewrite ({reason})");
@@ -3283,20 +3300,54 @@ impl DmlService {
         format!("{}/{prefix}/data", warehouse_root_url.trim_end_matches('/'))
     }
 
-    /// Whether a republication of `table` can append (P2.4 slice 2): the catalog
-    /// layout must name the latest Iceberg version (`previous`), every file of
-    /// that snapshot must carry the hidden oid column, and the oids written
-    /// since its `snapshot_lsn` must all be new. Returns the plan and the
-    /// snapshot's files (the ones an append carries forward).
+    /// Move the published layout's `snapshot_lsn` up to `snapshot_lsn` without a
+    /// new Iceberg version: for a republication that found nothing to publish,
+    /// whose files are therefore exact as of that LSN. Fenced like a commit.
+    async fn advance_snapshot_lsn(
+        &self,
+        catalog: &Arc<dyn proximadb_catalog::Catalog>,
+        table_id: &TableIdentifier,
+        snapshot_lsn: u64,
+        fence: &dyn crate::services::ddl::PublishFence,
+    ) -> Result<()> {
+        fence
+            .check()
+            .await
+            .map_err(|e| e.context("MATERIALIZE: publish fence refused the snapshot advance"))?;
+        let mut layouts = catalog.get_table(table_id).await?.storage_layouts;
+        if let Some(layout) = layouts.iter_mut().find(|l| l.name == "parquet-snapshot") {
+            layout
+                .properties
+                .insert("snapshot_lsn".to_string(), snapshot_lsn.to_string());
+            catalog.set_storage_layouts(table_id, layouts).await?;
+        }
+        Ok(())
+    }
+
+    /// Whether a republication of `table` can append (P2.4 slice 2). Every
+    /// condition below must hold, or the plan is a full rewrite:
+    ///
+    /// * the table's writes reach a change feed this service reads
+    ///   (`has_change_feed`): an empty feed proves nothing otherwise;
+    /// * the catalog layout is this publication's (`location`), names the
+    ///   latest Iceberg version (`previous`), and its `snapshot_lsn` is not
+    ///   ahead of the one just captured;
+    /// * every file of that snapshot has exactly the columns this publication
+    ///   writes, the hidden oid column included;
+    /// * the oids written since its `snapshot_lsn` are all new.
+    ///
+    /// Returns the plan and the snapshot's files (the ones an append carries).
     #[allow(clippy::too_many_arguments)]
     async fn plan_append(
         &self,
         bridge: &dyn ObjectStoreBridge,
         catalog: &Arc<dyn proximadb_catalog::Catalog>,
         table_id: &TableIdentifier,
+        schema: &CatalogTableSchema,
+        location: &str,
         metadata_prefix: &str,
         previous: u64,
-        table_name: &str,
+        captured_lsn: u64,
         tenant: Option<&str>,
         max_rows: usize,
         expected: &arrow_schema::Schema,
@@ -3305,10 +3356,22 @@ impl DmlService {
         Vec<object_store::path::Path>,
     )> {
         use materialize_append::AppendPlan;
+        if !self.record_store.has_change_feed(schema) {
+            return Ok((
+                AppendPlan::Rewrite("the table's writes have no change feed"),
+                Vec::new(),
+            ));
+        }
         let layouts = catalog.get_table(table_id).await?.storage_layouts;
         let Some(layout) = layouts.iter().find(|l| l.name == "parquet-snapshot") else {
             return Ok((AppendPlan::Rewrite("no published layout"), Vec::new()));
         };
+        if layout.location.as_deref() != Some(location) {
+            return Ok((
+                AppendPlan::Rewrite("the published layout is at another location"),
+                Vec::new(),
+            ));
+        }
         let version = layout
             .properties
             .get(materialize_stream::METADATA_VERSION_PROPERTY)
@@ -3326,6 +3389,12 @@ impl DmlService {
         else {
             return Ok((AppendPlan::Rewrite("no snapshot LSN"), Vec::new()));
         };
+        if snapshot_lsn > captured_lsn {
+            return Ok((
+                AppendPlan::Rewrite("the published snapshot LSN is ahead of the WAL"),
+                Vec::new(),
+            ));
+        }
         let files = bridge
             .read_iceberg_table(metadata_prefix, previous)
             .await
@@ -3344,7 +3413,7 @@ impl DmlService {
         let changed =
             <Self as crate::query::execution::olap_delta_merge::OlapDeltaSource>::changed_oids_since(
                 self,
-                table_name,
+                &schema.name,
                 snapshot_lsn,
                 tenant,
             )
