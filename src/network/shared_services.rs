@@ -2044,18 +2044,35 @@ impl SharedServices {
             let atomic_commit = crate::services::oltp_gate::atomic_commit_enabled();
             // TD-SEAM-3: spill-backed partitions (default on; `0` ⇒ the legacy
             // partitioned memtable), with segments beside the WAL they recover
-            // with.
-            let spill_root = opt_config
-                .map(|cfg| cfg.server.data_dir.join("pgwire").join("record-spill"))
-                .unwrap_or_default();
+            // with, or under `PROXIMADB_RELATIONAL_SPILL_URL`. Resolving the
+            // placement refuses — fatally — a move that would strand rows the
+            // truncated WAL no longer holds, and a prefix another data
+            // directory owns.
+            let wal_truncated = appender.retained_from() > 1;
+            let spill_target = match opt_config {
+                Some(cfg) => {
+                    crate::services::spill_placement::resolve_spill_target(
+                        &cfg.server.data_dir.join("pgwire"),
+                        &filesystem_factory,
+                        wal_truncated,
+                    )
+                    .await?
+                }
+                None => crate::services::spill_placement::SpillTarget::Local(Default::default()),
+            };
+            let spill_location = match &spill_target {
+                crate::services::spill_placement::SpillTarget::Local(root) => {
+                    root.display().to_string()
+                }
+                crate::services::spill_placement::SpillTarget::Object { url, .. } => url.clone(),
+            };
             // Spilled rows the truncated WAL no longer holds: these must never
             // be served from an in-memory fallback.
-            let spill_holds_only_copy = appender.retained_from() > 1
-                && crate::services::storage_format::spill_root_has_state(&spill_root);
+            let spill_holds_only_copy = wal_truncated && spill_target.has_state().await;
             let store =
-                match crate::services::record_store::DirectWalTableRecordStore::open_for_server(
+                match crate::services::record_store::DirectWalTableRecordStore::open_for_server_at(
                     appender.clone(),
-                    spill_root.clone(),
+                    spill_target,
                 )
                 .await
                 {
@@ -2069,9 +2086,8 @@ impl SharedServices {
                     // an in-memory fallback would serve a silent subset.
                     Err(e) if spill_holds_only_copy => {
                         anyhow::bail!(
-                            "opening the spill-backed record store failed and {} holds spilled \
-                             rows; refusing to serve without them: {e:#}",
-                            spill_root.display()
+                            "opening the spill-backed record store failed and {spill_location} \
+                             holds spilled rows; refusing to serve without them: {e:#}"
                         );
                     }
                     Err(e) => {

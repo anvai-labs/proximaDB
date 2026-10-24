@@ -115,7 +115,11 @@ pub fn ensure_data_format(dir: &Path) -> Result<u32> {
             return Ok(format);
         }
     }
-    write_marker(dir, &path)?;
+    let bytes = serde_json::to_vec_pretty(&Marker {
+        format: CURRENT_FORMAT,
+        written_by: crate::version::PROXIMADB_VERSION.to_string(),
+    })?;
+    write_marker(dir, FORMAT_MARKER, &bytes)?;
     tracing::info!(
         dir = %dir.display(),
         from = ?found,
@@ -125,23 +129,22 @@ pub fn ensure_data_format(dir: &Path) -> Result<u32> {
     Ok(CURRENT_FORMAT)
 }
 
-fn write_marker(dir: &Path, path: &Path) -> Result<()> {
+/// Install `bytes` as `dir/name` durably: temp file, fsync, rename, fsync of
+/// the directory.
+pub(crate) fn write_marker(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let bytes = serde_json::to_vec_pretty(&Marker {
-        format: CURRENT_FORMAT,
-        written_by: crate::version::PROXIMADB_VERSION.to_string(),
-    })?;
+    let path = dir.join(name);
     // Per-process temp name: two processes booting on one directory must not
     // rename each other's file out from under them.
-    let tmp: PathBuf = dir.join(format!("{FORMAT_MARKER}.{}.tmp", std::process::id()));
+    let tmp: PathBuf = dir.join(format!("{name}.{}.tmp", std::process::id()));
     {
         use std::io::Write;
         let mut file =
             std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
     }
-    std::fs::rename(&tmp, path).with_context(|| format!("installing {}", path.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("installing {}", path.display()))?;
     std::fs::File::open(dir)
         .and_then(|d| d.sync_all())
         .with_context(|| format!("syncing {}", dir.display()))

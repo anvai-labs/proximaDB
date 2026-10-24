@@ -257,6 +257,7 @@ if [ "$SCOPE" = "restart" ]; then
   CARGO_BUILD_JOBS=1 cargo test -p proximadb --features azure --lib -- \
     warm_manifest_round_trips_on_object_store \
     a_missing_object_is_not_found_on_object_store \
+    spill_segments_round_trip_on_object_store \
     --ignored --nocapture --test-threads=1
   # TD-OBJSTORE-5 S2 (backend contract tests) moved to --qa — see below.
   # Keeping it here forced a 3rd cold feature-set compile (aws,azure,gcp)

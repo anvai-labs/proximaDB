@@ -478,6 +478,9 @@ jobs:
             # UNCONDITIONALLY at develop->qa.
             object_store_restart_changes:
               - 'src/storage/persistence/**'
+              # The relational spill on object storage (TD-SEAM-3).
+              - 'src/services/spill_placement.rs'
+              - 'src/services/record_spill.rs'
               - 'src/storage/memtable/**'
               # Review of #2043: the durable-write + flush + lease path the
               # server crosses between INSERT and the SIGKILL/recover cycles,
