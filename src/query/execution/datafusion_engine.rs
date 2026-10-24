@@ -996,13 +996,8 @@ async fn register_merged_olap_table(
     source: &dyn crate::query::execution::olap_delta_merge::OlapDeltaSource,
     tenant: Option<&str>,
 ) -> Result<(), ExecutionError> {
-    use crate::services::record_store::proxima_value_to_unique_text;
-    use datafusion::arrow::array::BooleanArray;
-    use datafusion::arrow::compute::filter_record_batch;
     use datafusion::arrow::record_batch::RecordBatch;
-    use proximadb_storage_common::proxima_arrow::{
-        arrow_cell_to_proxima_value, proxima_records_to_record_batch,
-    };
+    use proximadb_storage_common::proxima_arrow::proxima_records_to_record_batch;
     use std::collections::HashSet;
     use std::sync::Arc;
 
@@ -1027,90 +1022,53 @@ async fn register_merged_olap_table(
         .map_err(|e| ExecutionError::Context(format!("olap-merge bare register {name}: {e}")))?;
         return Ok(());
     }
-    let suppress: HashSet<String> = changed.iter().cloned().collect();
 
-    // 2. Read the cold Parquet base in an isolated session so the hidden base
-    //    registration never leaks into the query's table namespace.
-    let base_ctx = crate::datafusion::create_session_context()
-        .map_err(|e| ExecutionError::Context(format!("olap-merge base session: {e}")))?;
-    crate::datafusion::register_object_store_parquet_location(
-        &base_ctx,
+    // 2. The cold Parquet base, opened but not registered: the merge wraps it.
+    let base = crate::datafusion::open_object_store_parquet_location(
         name,
         location,
         tenant,
         proximadb_data_model::StatsTrust::Trusted,
     )
     .await
-    .map_err(|e| ExecutionError::Context(format!("olap-merge base register {name}: {e}")))?;
-    let base_schema = base_ctx
-        .table_provider(name)
-        .await
-        .map_err(|e| ExecutionError::Context(format!("olap-merge base provider {name}: {e}")))?
-        .schema();
-    let base_batches = base_ctx
-        .table(name)
-        .await
-        .map_err(|e| ExecutionError::Context(format!("olap-merge base table {name}: {e}")))?
-        .collect()
-        .await
-        .map_err(|e| ExecutionError::Context(format!("olap-merge base collect {name}: {e}")))?;
+    .map_err(|e| ExecutionError::Context(format!("olap-merge base open {name}: {e}")))?;
+    let base_schema = datafusion::datasource::TableProvider::schema(base.as_ref());
 
-    // 3. Keep base rows whose recomputed oid is not suppressed. (TTL on the base
-    //    is eventual-until-rematerialize — the snapshot carries no valid_to_ns,
-    //    a documented first-cut limitation; explicit deletes are always caught by
-    //    the suppress-set.)
-    let pk_idx = base_schema
-        .index_of(table.pk_column.as_str())
-        .map_err(|e| {
-            ExecutionError::Context(format!(
-                "olap-merge pk column `{}` not in base {name}: {e}",
-                table.pk_column
-            ))
-        })?;
-    let mut batches: Vec<RecordBatch> = Vec::with_capacity(base_batches.len() + 1);
-    for batch in &base_batches {
-        let pk_array = batch.column(pk_idx);
-        let keep: BooleanArray = (0..batch.num_rows())
-            .map(|row| {
-                let oid = arrow_cell_to_proxima_value(pk_array, row)
-                    .map(|v| proxima_value_to_unique_text(&v))
-                    .unwrap_or_default();
-                Some(!suppress.contains(&oid))
-            })
-            .collect();
-        let kept = filter_record_batch(batch, &keep)
-            .map_err(|e| ExecutionError::Context(format!("olap-merge filter {name}: {e}")))?;
-        // TD-185a: `filter_record_batch` preserves the batch's ORIGINAL schema,
-        // which carries the Parquet file's baked-in field metadata. The table
-        // schema is metadata-normalized (recursive-CTE field comparison), so
-        // re-wrap the columns onto it — MemTable requires every partition batch
-        // to match its schema exactly.
-        let conformed = RecordBatch::try_new(base_schema.clone(), kept.columns().to_vec())
-            .map_err(|e| ExecutionError::Context(format!("olap-merge conform {name}: {e}")))?;
-        batches.push(conformed);
-    }
-
-    // 4. Append the current live rows for the changed oids, encoded with the same
+    // 3. The current live rows for the changed oids, encoded with the same
     //    catalog schema the base was written with and normalized onto the base
-    //    schema so every MemTable partition batch shares one schema.
+    //    schema. (TTL on the base is eventual-until-rematerialize — the snapshot
+    //    carries no valid_to_ns, a documented first-cut limitation; explicit
+    //    deletes are always caught by the suppress-set.)
     let (schema, append_records) = source
         .current_records(name, &changed, tenant)
         .await
         .map_err(|e| ExecutionError::Context(format!("olap-merge appends {name}: {e}")))?;
+    let mut appends = Vec::new();
     if !append_records.is_empty() {
         let append_batch = proxima_records_to_record_batch(&append_records, &schema)
             .map_err(|e| ExecutionError::Context(format!("olap-merge append batch {name}: {e}")))?;
-        let normalized = RecordBatch::try_new(base_schema.clone(), append_batch.columns().to_vec())
+        let normalized = RecordBatch::try_new(base_schema, append_batch.columns().to_vec())
             .map_err(|e| {
                 ExecutionError::Context(format!("olap-merge append schema {name}: {e}"))
             })?;
-        batches.push(normalized);
+        appends.push(normalized);
     }
 
-    // 5. Register the reconciled rows as the table the query reads.
-    let mem = datafusion::datasource::MemTable::try_new(base_schema, vec![batches])
-        .map_err(|e| ExecutionError::Context(format!("olap-merge memtable {name}: {e}")))?;
-    ctx.register_table(name, Arc::new(mem))
+    // 4. Register the merge: the base streams, minus every changed oid's stale
+    //    copy, beside the changed rows (ADR-097 P3.1 PR 9 — no base MemTable).
+    let merged = crate::query::execution::layer_a::olap_merge::OlapMergeTable::try_new(
+        base,
+        table.pk_column.as_str(),
+        changed.into_iter().collect::<HashSet<String>>(),
+        appends,
+    )
+    .map_err(|e| {
+        ExecutionError::Context(format!(
+            "olap-merge pk column `{}` not in base {name}: {e}",
+            table.pk_column
+        ))
+    })?;
+    ctx.register_table(name, Arc::new(merged))
         .map_err(|e| ExecutionError::Context(format!("olap-merge register {name}: {e}")))?;
     Ok(())
 }

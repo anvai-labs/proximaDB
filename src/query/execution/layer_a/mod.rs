@@ -24,6 +24,9 @@
 //! A scan over segments runs as several DataFusion partitions, one per oid
 //! range, each its own newest-wins merge ([`partition`]).
 //!
+//! The ADR-025 read-merge of a materialized table with its post-snapshot delta
+//! streams the same way ([`olap_merge`]).
+//!
 //! # Kill switch
 //!
 //! `PROXIMADB_NATIVE_TABLE_LAYER_A=0` puts registration back on the `MemTable`
@@ -34,6 +37,7 @@
 
 pub(crate) mod conform;
 pub(crate) mod merge;
+pub mod olap_merge;
 pub(crate) mod partition;
 pub mod provider;
 pub(crate) mod prune;

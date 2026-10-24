@@ -1852,6 +1852,19 @@ pub async fn register_object_store_parquet_location(
     tenant: Option<&str>,
     stats_trust: proximadb_data_model::StatsTrust,
 ) -> DFResult<Arc<ObjectStoreParquetTable>> {
+    let table = open_object_store_parquet_location(name, location, tenant, stats_trust).await?;
+    ctx.register_table(name, table.clone())?;
+    Ok(table)
+}
+
+/// Open the Parquet table at `location` without registering it — for a
+/// provider that wraps it (the ADR-025 read-merge).
+pub async fn open_object_store_parquet_location(
+    name: &str,
+    location: &str,
+    tenant: Option<&str>,
+    stats_trust: proximadb_data_model::StatsTrust,
+) -> DFResult<Arc<ObjectStoreParquetTable>> {
     // Table-OPEN cache (TD-OLAP-4): on a hit, skip LIST + HEAD + footer discovery
     // and rebuild the table from cached metadata + a fresh per-query traced store.
     // Gated default-OFF; the cache is a pure function of the immutable snapshot,
@@ -1865,7 +1878,6 @@ pub async fn register_object_store_parquet_location(
                 .with_table_name(stats_key.clone())
                 .with_stats_trust(stats_trust),
         );
-        ctx.register_table(name, table.clone())?;
         crate::observability::io_trace::record_table_open(true);
         return Ok(table);
     }
@@ -1878,7 +1890,6 @@ pub async fn register_object_store_parquet_location(
     );
     super::table_open_cache::insert(tenant, location, table.discovery());
     crate::observability::io_trace::record_table_open(false);
-    ctx.register_table(name, table.clone())?;
     Ok(table)
 }
 
