@@ -5,7 +5,14 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open** (filed 2026-10-23, found reviewing the TD-GRPCSCHEMA-1 fix).
+| Status | **Resolved (2026-10-23).** A schema update (the `record_schema`-intent marker from TD-CATREPLACE-1) now persists `enable_proxima_record`, `record_schema` and the text-column projection through `update_collection`'s merge. `V2CollectionConfig.enable_proxima_record` sets the mode at gRPC create (REST parity; the create path's canonical persist step pins the caller's choice instead of force-enabling), `V2Collection` round-trips it on reads, and `GetSchemaResponse.record_enabled` surfaces it. An UNSET create flag lands OFF (REST create's default — every pre-field gRPC client's behavior);
+`CollectionSchemaMetadata.enabled` is now flag-derived, exactly like every write-path gate (the old
+`|| record_schema.is_some()` disjunct was the heuristic for the era when the flag never persisted,
+and made a pinned-OFF create read ON). A raw config update carrying a `record_schema` block
+wholesale-replaces the record/text columns — the same intent-marker rule class as TD-CATREPLACE-1's
+filterable rule. Pinned by the manager unit test (mutation-checked) and
+`record_mode_is_settable_and_enableable_over_grpc_e2e` (unset, explicit-off, explicit-on, and
+enable-after-create rows).
 | Priority | **MEDIUM** — record mode (PAX shredding, write enforcement) cannot be enabled after create over any API that routes through `update_collection`, and gRPC clients cannot see the mode at all.
 | Component | `src/services/collection/manager.rs` (`update_collection` field merge); gRPC v2 schema/collection messages
 | Relates to | TD-GRPCSCHEMA-1

@@ -695,6 +695,10 @@ pub struct GetSchemaResponse {
     pub schema: ::core::option::Option<RecordSchema>,
     #[prost(string, optional, tag = "3")]
     pub error_message: ::core::option::Option<::prost::alloc::string::String>,
+    /// TD-GRPCSCHEMA-2: whether record mode (write enforcement) is ON for the
+    /// collection — the schema above is served either way.
+    #[prost(bool, optional, tag = "4")]
+    pub record_enabled: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListSchemasRequest {
@@ -868,6 +872,10 @@ pub struct V2CollectionConfig {
     pub index_specs: ::prost::alloc::vec::Vec<V2IndexSpec>,
     #[prost(message, optional, tag = "8")]
     pub quantization: ::core::option::Option<V2QuantizationConfig>,
+    /// TD-GRPCSCHEMA-2: record mode at create (REST parity; before, a gRPC-created
+    /// collection could never enable it).
+    #[prost(bool, optional, tag = "9")]
+    pub enable_proxima_record: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct V2Collection {

@@ -104,6 +104,23 @@ pub trait ApiHandlersPort: Send + Sync {
         tenant_id: Option<&str>,
     ) -> Result<CollectionSchemaMetadata>;
 
+    /// [`Self::update_collection_schema_metadata`] with the record mode
+    /// pinned: `Some(v)` forces the persisted `enable_proxima_record` to `v`
+    /// (the gRPC create path's canonical persist step — persistence, not a
+    /// mode switch); `None` keeps schema-update semantics (mode on).
+    /// TD-GRPCSCHEMA-2. The default ignores the pin (mocks).
+    async fn update_collection_schema_metadata_with_record_mode(
+        &self,
+        collection_id: &str,
+        update: CollectionSchemaUpdate,
+        tenant_id: Option<&str>,
+        record_mode: Option<bool>,
+    ) -> Result<CollectionSchemaMetadata> {
+        let _ = record_mode;
+        self.update_collection_schema_metadata(collection_id, update, tenant_id)
+            .await
+    }
+
     // ── Vector ────────────────────────────────────────────────────────────────
 
     /// `identity` carries the tenant scope + authenticated principal for ABAC

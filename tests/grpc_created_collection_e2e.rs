@@ -119,6 +119,75 @@ fn record(id: &str, vector: [f32; 3]) -> ProximaRecord {
     }
 }
 
+/// PUT the additive schema (embedding + lang) — the TD-GRPCSCHEMA-1/2 shape
+/// both tests enable or evolve with. Returns (status, body).
+async fn put_schema_embedding_lang(
+    http: &reqwest::Client,
+    base: &str,
+    name: &str,
+) -> (reqwest::StatusCode, String) {
+    let response = http
+        .put(format!("{base}/api/v2/collections/{name}/schema"))
+        .json(&serde_json::json!({
+            "columns": [
+                {"name": "embedding", "data_type": "vector", "vector_dimension": 3},
+                {"name": "lang", "data_type": "text", "nullable": true}
+            ]
+        }))
+        .send()
+        .await
+        .expect("REST schema PUT");
+    let status = response.status();
+    let body = response.text().await.expect("body");
+    (status, body)
+}
+
+/// GetSchema's `record_enabled` answer for `name` (the enforcement mode).
+async fn grpc_record_enabled(
+    grpc: &mut ProximaRecordServiceClient<tonic::transport::Channel>,
+    name: &str,
+) -> Option<bool> {
+    grpc.get_schema(GetSchemaRequest {
+        collection_id: name.to_string(),
+        schema_id: None,
+    })
+    .await
+    .expect("gRPC GetSchema")
+    .into_inner()
+    .record_enabled
+}
+
+/// REST GET /collections/{name}'s proxima_record_enabled value.
+async fn rest_record_enabled(http: &reqwest::Client, base: &str, name: &str) -> serde_json::Value {
+    http.get(format!("{base}/api/v2/collections/{name}"))
+        .send()
+        .await
+        .expect("REST GET collection")
+        .json()
+        .await
+        .expect("json")
+}
+
+/// A dimension-3 cosine SST collection created over gRPC, with record mode
+/// explicitly on or off (TD-GRPCSCHEMA-2; canonical schema persisted either
+/// way — TD-GRPCSCHEMA-1's shape).
+async fn grpc_create_cosine_3d_with_record(
+    grpc: &mut ProximaRecordServiceClient<tonic::transport::Channel>,
+    name: &str,
+    record: bool,
+) {
+    grpc.create_collection(V2CollectionConfig {
+        name: name.to_string(),
+        dimension: 3,
+        distance_metric: "cosine".to_string(),
+        storage_engine: "sst".to_string(),
+        enable_proxima_record: Some(record),
+        ..Default::default()
+    })
+    .await
+    .expect("gRPC CreateCollection");
+}
+
 /// A dimension-3 cosine SST collection created over gRPC (TD-GRPCSCHEMA-1's
 /// shape: no way to enable ProximaRecord, canonical schema persisted).
 async fn grpc_create_cosine_3d(
@@ -666,19 +735,7 @@ async fn schema_read_and_evolution_baseline_agree_e2e() {
     );
 
     // An additive PUT (embedding kept) succeeds and GET still serves it.
-    let added = http
-        .put(format!("{base}/api/v2/collections/{name}/schema"))
-        .json(&serde_json::json!({
-            "columns": [
-                {"name": "embedding", "data_type": "vector", "vector_dimension": 3},
-                {"name": "lang", "data_type": "text", "nullable": true}
-            ]
-        }))
-        .send()
-        .await
-        .expect("REST schema PUT");
-    let status = added.status();
-    let body = added.text().await.expect("body");
+    let (status, body) = put_schema_embedding_lang(&http, &base, name).await;
     assert!(
         status.is_success(),
         "additive PUT must succeed: {status} {body}"
@@ -702,4 +759,89 @@ async fn schema_read_and_evolution_baseline_agree_e2e() {
         names.contains(&"embedding") && names.contains(&"lang"),
         "{names:?}"
     );
+}
+
+/// TD-GRPCSCHEMA-2: record mode is settable at gRPC create (REST parity) and
+/// enableable afterwards via a schema update; GetSchema surfaces the mode.
+#[tokio::test]
+async fn record_mode_is_settable_and_enableable_over_grpc_e2e() {
+    let server = Server::start().await.expect("server start");
+    let mut grpc = connect_grpc(server.grpc_port).await;
+    let http = reqwest::Client::builder().no_proxy().build().expect("http");
+    let base = format!("http://127.0.0.1:{}", server.rest_port);
+
+    // Created with the flag ON: visible on GetSchema and REST immediately.
+    let on = "grpc_record_on";
+    grpc_create_cosine_3d_with_record(&mut grpc, on, true).await;
+    let schema = grpc
+        .get_schema(GetSchemaRequest {
+            collection_id: on.to_string(),
+            schema_id: None,
+        })
+        .await
+        .expect("GetSchema")
+        .into_inner();
+    assert_eq!(schema.record_enabled, Some(true), "create-time mode is ON");
+    let rest = rest_record_enabled(&http, &base, on).await;
+    assert_eq!(rest["proxima_record_enabled"], true, "{rest}");
+
+    // Created with the flag UNSET: OFF — REST create's default, and what every
+    // pre-field gRPC client had (round 1 review: None must not mean ON).
+    let unset = "grpc_record_unset";
+    grpc.create_collection(V2CollectionConfig {
+        name: unset.to_string(),
+        dimension: 3,
+        distance_metric: "cosine".to_string(),
+        storage_engine: "sst".to_string(),
+        ..Default::default()
+    })
+    .await
+    .expect("gRPC CreateCollection (unset)");
+    let rest = rest_record_enabled(&http, &base, unset).await;
+    assert_eq!(
+        rest["proxima_record_enabled"], false,
+        "an UNSET create must land OFF: {rest}"
+    );
+    assert_eq!(
+        grpc_record_enabled(&mut grpc, unset).await,
+        Some(false),
+        "record_enabled is the enforcement answer for an unset create"
+    );
+
+    // Created with the flag explicitly OFF: GetSchema agrees BEFORE any update
+    // (round 1 review: it used to read ON from the persisted record_schema
+    // block, contradicting REST).
+    let later = "grpc_record_later";
+    grpc_create_cosine_3d_with_record(&mut grpc, later, false).await;
+    assert_eq!(
+        grpc_record_enabled(&mut grpc, later).await,
+        Some(false),
+        "a Some(false) create must read OFF on GetSchema too"
+    );
+    let rest = rest_record_enabled(&http, &base, later).await;
+    assert_eq!(
+        rest["proxima_record_enabled"], false,
+        "precondition: off after create"
+    );
+
+    let (status, body) = put_schema_embedding_lang(&http, &base, later).await;
+    assert!(
+        status.is_success(),
+        "schema PUT must succeed: {status} {body}"
+    );
+
+    let rest = rest_record_enabled(&http, &base, later).await;
+    assert_eq!(
+        rest["proxima_record_enabled"], true,
+        "a schema update must turn record mode ON (it used to be dropped by the merge)"
+    );
+    let schema = grpc
+        .get_schema(GetSchemaRequest {
+            collection_id: later.to_string(),
+            schema_id: None,
+        })
+        .await
+        .expect("GetSchema")
+        .into_inner();
+    assert_eq!(schema.record_enabled, Some(true));
 }
