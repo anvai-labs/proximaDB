@@ -115,13 +115,11 @@ pub async fn get_schema(
 
     let metadata = load_schema_metadata(&state, &collection_id, &tenant).await?;
 
-    if !metadata.enabled {
-        return Err(ApiError::CollectionNotFound(format!(
-            "No schema defined for collection '{}'. Enable ProximaRecord to use schemas.",
-            collection_id
-        )));
-    }
-
+    // TD-GRPCSCHEMA-1: serve the persisted schema regardless of the
+    // ProximaRecord flag (it gates record enforcement on writes, not the
+    // existence of a schema) — the same rule as gRPC GetSchema. The response
+    // does not expose the flag (see TD-GRPCSCHEMA-2); REST GET
+    // /collections/{id} carries `proxima_record_enabled`.
     let schema_id = metadata
         .schema_id
         .clone()
@@ -308,9 +306,11 @@ pub async fn update_schema(
 
     let existing_metadata = load_schema_metadata(&state, &collection_id, &tenant).await?;
 
-    let existing_schema = existing_metadata
-        .enabled
-        .then(|| schema_definition_from_metadata(&existing_metadata));
+    // TD-GRPCSCHEMA-1 (review round 1): the evolution baseline is the SAME
+    // authoritative schema GET serves — otherwise GET advertises columns a PUT
+    // then lets a client silently drop (the embedding column), while the
+    // identical PUT against a flag-on collection is rejected.
+    let existing_schema = Some(schema_definition_from_metadata(&existing_metadata));
 
     // Step 2: Validate schema evolution rules
     let validation_result = validate_schema(schema, existing_schema.as_ref());
@@ -423,16 +423,9 @@ pub async fn update_schema(
                 ),
             });
         }
-    } else {
-        // No existing schema - this is the initial schema
-        for col in &schema.columns {
-            changes.push(SchemaChange {
-                change_type: "ADD_COLUMN".to_string(),
-                column: Some(col.name.clone()),
-                description: format!("Added column '{}' with type '{}'", col.name, col.data_type),
-            });
-        }
     }
+    // TD-GRPCSCHEMA-1: no `else` — the baseline is always the persisted schema
+    // GET serves, so every PUT validates as an evolution of something.
 
     // Step 4: Create new schema version
     let previous_schema_id = existing_metadata

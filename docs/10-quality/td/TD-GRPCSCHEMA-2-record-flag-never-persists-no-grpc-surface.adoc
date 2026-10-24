@@ -1,0 +1,41 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-GRPCSCHEMA-2: the ProximaRecord flag never persists through a schema update, and no gRPC surface exposes it
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-23, found reviewing the TD-GRPCSCHEMA-1 fix).
+| Priority | **MEDIUM** — record mode (PAX shredding, write enforcement) cannot be enabled after create over any API that routes through `update_collection`, and gRPC clients cannot see the mode at all.
+| Component | `src/services/collection/manager.rs` (`update_collection` field merge); gRPC v2 schema/collection messages
+| Relates to | TD-GRPCSCHEMA-1
+|===
+
+== Problem
+
+* `apply_schema_update` (runtime handlers) sets `enable_proxima_record = Some(true)` and a
+  `record_schema` block on the update it hands to `update_collection`, but the manager's field
+  merge persists only name/dimension/metric/engine/description/tags/owner/filterable_columns — it
+  drops `enable_proxima_record`, `record_schema` and `text_columns`. A collection created with the
+  flag off therefore stays off forever: write enforcement (`sst/flush` gates on
+  `enable_proxima_record == Some(true)`) and record mode never engage, no matter how many schema
+  updates run. The narrow-config fields a schema update intends to persist need to survive the
+  merge (or the merge must take them from the record-schema-intent marker, as TD-CATREPLACE-1 did
+  for `filterable_columns`).
+* No gRPC v2 message exposes the flag (`V2Collection`, `V2CollectionConfig`, `GetSchemaResponse`,
+  `RecordSchema`), so a gRPC client cannot distinguish a flag-off from a flag-on collection. REST
+  carries `proxima_record_enabled` on `GET /collections/{id}`. Fixing this needs a proto field
+  (and the SDK regeneration the spec-driven mandate requires) or a documented REST-only surface.
+
+A corner the TD-GRPCSCHEMA-1 review surfaced: when a gRPC create's best-effort canonical write
+failed (warn-and-continue), that collection carries no `embedding` sidecar, so schema GET serves
+none and schema PUTs omitting `embedding` succeed — GET and the PUT baseline stay in agreement
+(the invariant), but the embedding protection is create-outcome-dependent.
+
+== Fix
+
+Persist the record-schema fields in `update_collection`'s merge under the same
+schema-update-intent rule as TD-CATREPLACE-1; expose the flag on gRPC surfaces in the same PR as
+the codegen regen. Test: schema update on a flag-off collection, then a write that the flag gates
+(shredding or enforcement) must behave as enabled; a gRPC GetSchema/GetCollection response carries
+the mode.

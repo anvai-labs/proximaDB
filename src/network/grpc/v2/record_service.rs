@@ -2084,13 +2084,14 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
                 Status::not_found(format!("Collection not found: {}", req.collection_id))
             })?;
 
-        if !metadata.enabled {
-            return Err(Status::not_found(format!(
-                "No schema defined for collection '{}'. Enable ProximaRecord to use schemas.",
-                req.collection_id
-            )));
-        }
-
+        // TD-GRPCSCHEMA-1: the persisted schema is the authority (ADR-047) —
+        // serve it regardless of the ProximaRecord flag, which gates record
+        // ENFORCEMENT on writes, not the existence of a schema. A gRPC-created
+        // collection has the flag off (V2CollectionConfig cannot set it) yet
+        // its create-time canonical schema (embedding + filterable columns)
+        // was persisted precisely so this read could serve it. NOTE: neither
+        // this response nor any gRPC surface exposes the flag today
+        // (TD-GRPCSCHEMA-2).
         let schema = Some(runtime_metadata_to_grpc_schema(&metadata));
 
         Ok(Response::new(GetSchemaResponse {
@@ -2121,8 +2122,9 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
                 }
             })?;
 
+        // TD-GRPCSCHEMA-1: same rule as GetSchema — the persisted schema is
+        // served regardless of the ProximaRecord flag.
         let schemas = metadata
-            .filter(|metadata| metadata.enabled)
             .map(|metadata| vec![runtime_metadata_to_grpc_schema(&metadata)])
             .unwrap_or_default();
         let total_count = schemas.len() as i64;
