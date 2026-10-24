@@ -1084,18 +1084,32 @@ pub async fn try_run_select(
     // resolves through `vector_ops`/`graph_ops`, which do not apply the relational row
     // filter. `query_has_table_function` is the fail-closed guard that keeps a governed
     // query from mixing governed rows with an ungoverned source.
+    //
+    // ADR-097 P3.2: a query over table functions ALONE (no catalog table — e.g. an
+    // aggregate or join over `vector_search(...)`) is admitted too: the frontend
+    // cannot lower a table function, so it used to fall through to the legacy
+    // single-table path. Ungoverned sessions only, by the same guard.
     #[cfg(feature = "datafusion-integration")]
-    let (native_registerable, mixed_registerable) = {
+    let (native_registerable, mixed_registerable, has_udtf) = {
         let gate = crate::query::execution::native_table_provider::native_table_provider_enabled();
         let parquet = |k: &String| parquet_loc_by_key.contains_key(k);
+        let has_udtf = query_has_table_function(query);
         let all_native = !tables.is_empty()
             && tables.keys().all(|k| !parquet(k))
-            && (!relational_abac_required || !query_has_table_function(query));
+            && (!relational_abac_required || !has_udtf);
         let mixed = gate
             && !relational_abac_required
             && tables.keys().any(parquet)
             && tables.keys().any(|k| !parquet(k));
-        ((gate && all_native) || mixed, mixed)
+        // pgwire only (`require_engagement`): it hands the floor the vector and
+        // graph ports, so every function the query names is registered; other
+        // callers keep their own fallback for these queries.
+        let udtf_only = gate
+            && require_engagement
+            && !relational_abac_required
+            && tables.is_empty()
+            && query_reads_only_table_functions(query);
+        ((gate && all_native) || mixed || udtf_only, mixed, has_udtf)
     };
     #[cfg(not(feature = "datafusion-integration"))]
     let native_registerable = false;
@@ -1471,7 +1485,9 @@ pub async fn try_run_select(
         }
         match engine_result {
             Ok(result) => {
-                if let Some((skey, lsn)) = &cache_ctx {
+                // A table function's rows are not catalog-table dependencies, so
+                // the cache could not invalidate them: never cached.
+                if let Some((skey, lsn)) = cache_ctx.as_ref().filter(|_| !has_udtf) {
                     populate_olap_result_cache(result_cache, skey, *lsn, result.clone(), &tables);
                 }
                 return Some(Ok(result));
@@ -3872,6 +3888,62 @@ fn query_has_table_function(query: &SqlQuery) -> bool {
     set_expr_has_tvf(&query.body)
 }
 
+/// ADR-097 P3.2: does `query` read table functions the DataFusion floor
+/// registers — and nothing else a table-less query could name? Unlike the
+/// fail-closed [`query_has_table_function`] guard, this answers `true` only
+/// for what it recognizes: every FROM item is one of the registered functions,
+/// a CTE reference (the query names no catalog table), or a subquery / join of
+/// those, and at least one function is read.
+fn query_reads_only_table_functions(query: &SqlQuery) -> bool {
+    const REGISTERED: [&str; 4] = [
+        "vector_search",
+        "graph_traverse",
+        "timeseries_range",
+        "documents",
+    ];
+    fn factor(f: &TableFactor, found: &mut bool) -> bool {
+        match f {
+            TableFactor::Table {
+                name,
+                args: Some(_),
+                ..
+            } => {
+                let registered = name.0.len() == 1
+                    && REGISTERED
+                        .iter()
+                        .any(|r| name.to_string().eq_ignore_ascii_case(r));
+                *found |= registered;
+                registered
+            }
+            TableFactor::Table { args: None, .. } => true,
+            TableFactor::Derived { subquery, .. } => query_reads(subquery, found),
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => twj(table_with_joins, found),
+            _ => false,
+        }
+    }
+    fn twj(t: &TableWithJoins, found: &mut bool) -> bool {
+        factor(&t.relation, found) && t.joins.iter().all(|j| factor(&j.relation, found))
+    }
+    fn body(b: &SetExpr, found: &mut bool) -> bool {
+        match b {
+            SetExpr::Select(select) => select.from.iter().all(|t| twj(t, found)),
+            SetExpr::Query(q) => query_reads(q, found),
+            SetExpr::SetOperation { left, right, .. } => body(left, found) && body(right, found),
+            _ => false,
+        }
+    }
+    fn query_reads(q: &SqlQuery, found: &mut bool) -> bool {
+        q.with
+            .as_ref()
+            .is_none_or(|w| w.cte_tables.iter().all(|c| query_reads(&c.query, found)))
+            && body(&q.body, found)
+    }
+    let mut found = false;
+    query_reads(query, &mut found) && found
+}
+
 fn query_join_bearing(query: &SqlQuery) -> bool {
     // Generic expression traversal covers scalar/IN/EXISTS subqueries in
     // projection, WHERE, HAVING, GROUP BY, ORDER BY, and other query clauses.
@@ -5383,6 +5455,26 @@ mod tests {
     /// query also reaches an ungoverned source. A false negative here leaks rows, so
     /// the guard must see a table function at every nesting level, and must fail
     /// closed on shapes it does not decompose.
+    #[test]
+    fn only_registered_table_functions_admit_a_table_less_query() {
+        let reads = |sql: &str| query_reads_only_table_functions(&parse_query(sql));
+        assert!(reads("SELECT count(*) FROM timeseries_range('m', 0, 9) t"));
+        assert!(reads(
+            "WITH v AS (SELECT * FROM vector_search('c', '[1]', 3)) \
+             SELECT count(*) FROM v JOIN graph_traverse('g', 'a', 2) g ON v.id = g.node_id"
+        ));
+        assert!(reads(
+            "SELECT * FROM (SELECT * FROM DOCUMENTS('d')) x \
+             UNION ALL SELECT * FROM documents('e')"
+        ));
+        // No table function, an unknown one, or a FROM item it does not know.
+        assert!(!reads("SELECT 1 UNION SELECT 2"));
+        assert!(!reads("SELECT count(*) FROM (VALUES (1), (2)) v(x)"));
+        assert!(!reads("SELECT * FROM generate_series(1, 3)"));
+        assert!(!reads("SELECT * FROM s.vector_search('c', '[1]', 3)"));
+        assert!(!reads("SELECT * FROM UNNEST(ARRAY[1, 2])"));
+    }
+
     #[test]
     fn table_function_guard_sees_udtfs_at_every_nesting_level() {
         // Plain catalog tables: no UDTF, so a governed session may use the native route.
