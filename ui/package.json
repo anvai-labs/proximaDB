@@ -20,7 +20,7 @@
     "@types/react-dom": "^17.0.0",
     "@vitejs/plugin-react": "^6.1.2",
     "typescript": "^5.9.3",
-    "vite": "^8.3.4"
+    "vite": "^8.3.5"
   },
   "overrides": {
     "react-redux": "8.1.3"
