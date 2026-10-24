@@ -670,8 +670,26 @@ impl SplitReader for ObjectStoreParquetSplitReader {
         // the selected columns in ascending FILE order; `reorder` maps them back
         // to the requested projection order so the batch matches `out_schema`.
         // For a flat schema, root columns == leaf columns, so `roots` is exact.
+        // A published file may carry hidden system columns after the table's
+        // own (`__proxima_oid`, P2.4 slice 2), which the planning schema drops
+        // (see `normalize_schema_for_planning`). They are always LAST, so the
+        // table's column `i` is the file's column `i`; a read of every table
+        // column still needs a mask, or it would return the hidden ones too.
+        let all_columns: Vec<usize>;
+        let projection = match projection {
+            None if builder.schema().fields().len() > self.schema.fields().len() => {
+                all_columns = (0..self.schema.fields().len()).collect();
+                Some(all_columns.as_slice())
+            }
+            other => other,
+        };
+        let hidden_columns = builder.schema().fields().len() > self.schema.fields().len();
         let (builder, reorder) = match projection {
-            Some(proj) if proj.len() != self.schema.fields().len() || !is_identity(proj) => {
+            Some(proj)
+                if hidden_columns
+                    || proj.len() != self.schema.fields().len()
+                    || !is_identity(proj) =>
+            {
                 let mask = ProjectionMask::roots(builder.parquet_schema(), proj.iter().copied());
                 let mut file_order: Vec<usize> = proj.to_vec();
                 file_order.sort_unstable();
@@ -995,10 +1013,17 @@ impl ObjectStoreParquetTable {
     /// tables at planning time (`Cannot project plan column … field metadata
     /// differs`). Schema-level (file) metadata is kept: it does not participate
     /// in field comparison.
+    ///
+    /// It also drops hidden system columns (`__proxima_*`, e.g. the
+    /// `__proxima_oid` a publication carries for incremental append, P2.4
+    /// slice 2): user columns cannot take that prefix (catalog validation), so
+    /// the filter hides only system columns, and a file with or without them
+    /// plans to the same schema.
     fn normalize_schema_for_planning(schema: SchemaRef) -> SchemaRef {
         let fields: Vec<arrow_schema::Field> = schema
             .fields()
             .iter()
+            .filter(|f| !proximadb_catalog::system_columns::is_reserved_column_name(f.name()))
             .map(|f| {
                 let field = f.as_ref().clone();
                 if field.metadata().is_empty() {
