@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Resolved 2026-10-24** (per-segment key filters; see Resolution). Filed 2026-10-23 by the ADR-097 P2.4 gate run.
+| Status | **Resolved 2026-10-24** for the load path (per-segment key filters; see Resolution). The P2.4 SF1 gate run itself is recorded in the gate evidence, not here. Filed 2026-10-23 by the ADR-097 P2.4 gate run.
 | Priority | **HIGH**: blocks the P2.4 exit gate (TD-SEAM-4: TPC-DS SF1 load), and any bulk INSERT into a table past the spill threshold, on the default configuration since 2026-10-22 (`c62ab32b7`).
 | Component | `src/services/record_spill.rs` (`SpillRecordStorage::get_record`, `read_segment`, `delete_record`), `src/services/record_store.rs` (`DirectWalTableRecordStore::write_mutations`, `commit_atomic`), `src/services/dml/mod.rs` (`enforce_row_write_constraints`)
 | Relates to | TD-USUB-1, TD-SEAM-4, TD-OLAPFMT-3
@@ -90,7 +90,12 @@ needing a Parquet oid Bloom filter or a footer read per probe.
 * A probe for a new key reads no segment (bar a ~1 % false positive per segment). A probe that
   hits still decodes that one segment whole, as before; that is the UPDATE / DELETE-of-a-flushed-
   row path, not the load path.
-* Memory: about 1.2 bytes per segment row (≈ 79 KB per 65,536-row segment).
+* Memory: about 1.2 bytes per flushed row (≈ 79 KB per 65,536-row segment), held for as long as
+  the segment exists. There is no compaction yet, so the total grows with every row a loaded
+  partition has flushed: ≈ 7 MB at TPC-DS SF1, ≈ 1.2 GB per billion flushed rows. A cap or
+  eviction belongs with segment compaction.
+* Behaviour change: a probe for an oid every filter rules out no longer reads, and so no longer
+  fails on, an unreadable segment.
 * The probe is not skipped for generated oids (option 3 stands).
 
 Measured, release build, TPC-DS load-only: SF 0.01 with a 16,384 threshold loads in **7.9 s**

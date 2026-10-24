@@ -221,9 +221,6 @@ impl std::fmt::Debug for SpillSchemaSource {
     }
 }
 
-/// A relational record store that keeps recent rows resident and flushes older
-/// ones to durable Parquet segments, serving reads as a merge over both.
-#[derive(Debug)]
 /// What a point probe needs to rule a segment out without reading it: the oid
 /// range (a flush writes its rows oid-sorted) and a Bloom filter over every oid
 /// the segment holds, its persisted tombstones included (TD-USUB-21).
@@ -232,6 +229,7 @@ impl std::fmt::Debug for SpillSchemaSource {
 /// check — read and decoded every segment of the partition, so a bulk load
 /// decoded about `n²/2` rows. With it, such a probe reads nothing (bar a ~1 %
 /// false positive per segment). About 1.2 bytes per row, held per segment.
+#[derive(Debug)]
 struct SegmentKeyFilter {
     /// `None` for a segment with no rows: it holds no oid.
     range: Option<(String, String)>,
@@ -268,6 +266,9 @@ impl SegmentKeyFilter {
     }
 }
 
+/// A relational record store that keeps recent rows resident and flushes older
+/// ones to durable Parquet segments, serving reads as a merge over both.
+#[derive(Debug)]
 pub struct SpillRecordStorage {
     /// Resident rows. Always strictly newer than any segment copy.
     memtable: DashMap<String, Resident>,
@@ -283,9 +284,9 @@ pub struct SpillRecordStorage {
     segments: parking_lot::RwLock<Vec<String>>,
     /// Per-segment probe filters, keyed by path (TD-USUB-21). Inserted by
     /// `flush` before it publishes the path, built on first probe for a
-    /// discovered segment, cleared with the segments by a purge (which lets the
-    /// sequence, and so a path, be reused). A path absent here is never assumed
-    /// empty: the filter is built from the segment itself.
+    /// discovered segment, cleared with the segments by a purge. A path absent
+    /// here is never assumed empty: the filter is built from the segment itself.
+    /// About 1.2 bytes per flushed row, held for as long as the segment is.
     key_filters: DashMap<String, Arc<SegmentKeyFilter>>,
     /// Serializes `flush` against any other structural mutation of the
     /// segment set — today `delete_record` and `purge_durable_objects`.
@@ -1633,8 +1634,13 @@ impl SpillRecordStorage {
         let filter = Arc::new(SegmentKeyFilter::from_oids(
             records.iter().map(|r| r.oid.as_str()),
         ));
-        self.key_filters.insert(path.to_string(), filter.clone());
-        Ok(filter)
+        // Insert-if-absent: a filter already there (a concurrent probe's, or
+        // flush's) is never replaced by one built from an earlier read.
+        Ok(self
+            .key_filters
+            .entry(path.to_string())
+            .or_insert(filter)
+            .clone())
     }
 
     /// The newest segment copy of `oid`, live or dead, or `None` when no
