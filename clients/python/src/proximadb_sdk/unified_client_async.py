@@ -38,6 +38,7 @@ from .models import (
     DeleteResult,
     OperationMetrics,
     SearchResult,
+    normalize_collection_config_kwargs,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -205,8 +206,17 @@ class ProximaDBAsyncUnified:
         """Create a collection via the generated ``create_collection`` async op."""
         from .protocols import _rest_codegen_async as _gen_async
 
+        # TD-SDKENG-1: never silently drop an unknown keyword; only the
+        # transport-consumed pass-through travels past the config.
+        config_kwargs, passthrough = normalize_collection_config_kwargs(kwargs)
         if config is None:
-            config = CollectionConfig(name=name, **kwargs)
+            config = CollectionConfig(name=name, **config_kwargs)
+        elif config_kwargs:
+            # Round-2 review: re-validate (model_copy skips validation and
+            # does not translate field aliases like quantization=).
+            merged = config.model_dump(exclude={"name"})
+            merged.update(config_kwargs)
+            config = CollectionConfig(name=name, **merged)
         body: dict[str, Any] = {
             "name": name,
             "dimension": config.dimension,
@@ -216,6 +226,40 @@ class ProximaDBAsyncUnified:
             ),
             "enable_proxima_record": True,
         }
+        # TD-SDKENG-1 (round-2 review): index and quantization settings must
+        # reach the server under the REQUEST schema's names — index_configs
+        # (not the response's index_specs) with hnsw_config, and quantization
+        # with strategy (not type).
+        if config.index_configs:
+            body["index_configs"] = [
+                {
+                    "index_name": index.index_name,
+                    "algorithm": getattr(index.algorithm, "value", index.algorithm),
+                    **(
+                        {
+                            "hnsw_config": {
+                                "m": index.hnsw_config.m,
+                                "ef_construction": index.hnsw_config.ef_construction,
+                                "ef_search": index.hnsw_config.ef_search,
+                            }
+                        }
+                        if index.hnsw_config
+                        else {}
+                    ),
+                    "is_primary": bool(index.is_primary),
+                }
+                for index in config.index_configs
+            ]
+        quant = config.quantization_config
+        if quant and quant.enabled:
+            v2_quant: dict[str, Any] = {"enabled": True}
+            # Round-3 review: the server's strategy enum is
+            # SMART_DEFAULTS|CUSTOM_LEVELS|MINIMAL|AGGRESSIVE — the SDK's
+            # type (scalar/pq/...) is a method, not a strategy.
+            if getattr(quant.type, "value", quant.type) not in (None, "none"):
+                v2_quant["strategy"] = "custom_levels"
+            body["quantization"] = v2_quant
+        body.update({k: v for k, v in passthrough.items() if k != "indexing_algorithm"})
         resp = await _gen_async.create_collection(self._require_gen_client(), body)
         parsed = resp.parsed
         self._raise_for_error(parsed, context="create_collection failed")
