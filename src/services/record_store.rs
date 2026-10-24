@@ -2434,18 +2434,18 @@ impl DirectWalTableRecordStore {
                 continue;
             }
             let key = (tenant_id.clone(), collection.clone());
-            {
-                let mut seen = self
-                    .lag_flushed
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if seen.get(&key) == Some(&oldest) {
-                    continue;
-                }
-                seen.insert(key, oldest);
+            if self.lag_flushed_at(&key) == Some(oldest) {
+                continue;
             }
             match partition.flush().await {
-                Ok(()) => flushed += 1,
+                Ok(()) => {
+                    flushed += 1;
+                    // Remember the partition only when this flush did not move
+                    // its oldest row (held resident); a failed flush is never
+                    // remembered, so the next run retries it.
+                    let after = partition.min_unflushed_lsn().await.ok().flatten();
+                    self.set_lag_flushed_at(key, (after == Some(oldest)).then_some(oldest));
+                }
                 Err(error) => tracing::warn!(
                     tenant_id = %tenant_id,
                     collection = %collection,
@@ -2457,6 +2457,25 @@ impl DirectWalTableRecordStore {
             }
         }
         flushed
+    }
+
+    fn lag_flushed_at(&self, key: &(String, String)) -> Option<u64> {
+        self.lag_flushed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .copied()
+    }
+
+    fn set_lag_flushed_at(&self, key: (String, String), stuck_at: Option<u64>) {
+        let mut seen = self
+            .lag_flushed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match stuck_at {
+            Some(lsn) => seen.insert(key, lsn),
+            None => seen.remove(&key),
+        };
     }
 
     /// Flush every live partition's write buffer to durable segments
@@ -6832,6 +6851,113 @@ mod tests {
         assert_eq!(store.flush_lagging_partitions(11, 3).await, 1);
         assert_eq!(store.flush_lagging_partitions(11, 3).await, 0);
         assert_eq!(store.min_unflushed_lsn().await.ok(), Some(None));
+    }
+
+    /// A partition double for the lag flush: its oldest unflushed LSN stays put
+    /// until a flush succeeds and frees it (unless `stuck`); the first
+    /// `failures` flushes fail.
+    struct LagProbePartition {
+        oldest: std::sync::Mutex<Option<u64>>,
+        failures: std::sync::atomic::AtomicUsize,
+        stuck: bool,
+        flushes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl LagProbePartition {
+        fn new(oldest: u64, failures: usize, stuck: bool) -> Self {
+            Self {
+                oldest: std::sync::Mutex::new(Some(oldest)),
+                failures: std::sync::atomic::AtomicUsize::new(failures),
+                stuck,
+                flushes: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn flushes(&self) -> usize {
+            self.flushes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl RecordStore for LagProbePartition {
+        async fn upsert_record(&self, record: ProximaRecord) -> Result<ProximaRecord> {
+            Ok(record)
+        }
+        async fn get_record(&self, _key: &RecordKey) -> Result<Option<ProximaRecord>> {
+            Ok(None)
+        }
+        async fn delete_record(&self, _key: &RecordKey) -> Result<bool> {
+            Ok(false)
+        }
+        async fn min_unflushed_lsn(&self) -> Result<Option<u64>> {
+            Ok(*self.oldest.lock().expect("lock"))
+        }
+        async fn flush(&self) -> Result<()> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.flushes.fetch_add(1, SeqCst);
+            if self
+                .failures
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                anyhow::bail!("transient segment write failure");
+            }
+            if !self.stuck {
+                *self.oldest.lock().expect("lock") = None;
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl RecordScan for LagProbePartition {
+        async fn scan_records(&self, _limit: usize) -> Result<Vec<ProximaRecord>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn lag_probe_store(partition: Arc<LagProbePartition>) -> DirectWalTableRecordStore {
+        DirectWalTableRecordStore::with_storage_factory(
+            Arc::new(RecordingWalAppender::default()),
+            Arc::new(move |_: &str, _: &str| partition.clone() as Arc<dyn RecordStorage>),
+        )
+    }
+
+    /// TD-USUB-22 review: a failed lag flush is retried on the next run — it
+    /// must not mark the partition as "flushed, did not move", or one transient
+    /// error would leave a small idle table pinning the WAL for good.
+    #[tokio::test]
+    async fn a_failed_lag_flush_is_retried_on_the_next_run() {
+        let partition = Arc::new(LagProbePartition::new(1, 1, false));
+        let store = lag_probe_store(partition.clone());
+        let _ = store.partition("t", "dims");
+        assert_eq!(
+            store.flush_lagging_partitions(100, 10).await,
+            0,
+            "flush failed"
+        );
+        assert_eq!(
+            store.flush_lagging_partitions(100, 10).await,
+            1,
+            "and is retried"
+        );
+        assert_eq!(partition.flushes(), 2);
+        assert_eq!(store.min_unflushed_lsn().await.ok(), Some(None));
+    }
+
+    /// TD-USUB-22 review: a partition a lag flush did not move (its oldest rows
+    /// are held resident) is not flushed again while that row stays oldest.
+    #[tokio::test]
+    async fn a_lag_flush_that_frees_nothing_is_not_repeated() {
+        let partition = Arc::new(LagProbePartition::new(1, 0, true));
+        let store = lag_probe_store(partition.clone());
+        let _ = store.partition("t", "dims");
+        assert_eq!(store.flush_lagging_partitions(100, 10).await, 1);
+        assert_eq!(store.flush_lagging_partitions(200, 10).await, 0);
+        assert_eq!(
+            partition.flushes(),
+            1,
+            "no second flush of a stuck partition"
+        );
     }
 
     /// With the spill gate on, the tier floor is the minimum over spill
