@@ -241,6 +241,19 @@ pub trait RecordStore: Send + Sync {
 
     async fn get_record(&self, key: &RecordKey) -> RecordStoreResult<Option<ProximaRecord>>;
 
+    /// Point lookup that ALSO returns a copy the store still holds but that is
+    /// dead (`ProximaRecord::is_dead`: tombstoned or TTL-expired), so a caller
+    /// can tell "dead" from "absent" — e.g. an index owner whose row expired
+    /// (TD-DML-3). The default is [`Self::get_record`], which is exact for
+    /// stores whose `get_record` never hides a dead copy; a store that filters
+    /// dead copies out of `get_record` must override this.
+    async fn get_record_including_dead(
+        &self,
+        key: &RecordKey,
+    ) -> RecordStoreResult<Option<ProximaRecord>> {
+        self.get_record(key).await
+    }
+
     /// Batch point-lookup: fetch many records by key in one logical operation,
     /// returning one slot per input key, in order (`None` = absent).
     ///

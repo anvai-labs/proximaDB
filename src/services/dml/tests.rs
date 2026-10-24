@@ -6706,6 +6706,43 @@ mod abac_relational_enforcement_tests {
         }
     }
 
+    /// TD-DML-3 round 3: `DO UPDATE` may only rewrite a conflicting row the
+    /// caller can SEE — PostgreSQL's UPDATE `USING` check under RLS, 42501
+    /// otherwise. An internal statement (no caller) is not restricted.
+    #[test]
+    fn on_conflict_update_requires_the_caller_to_see_the_row() {
+        let dml = dml_with_enforcer();
+        let schema = schema_with_stable_ids();
+        let row = |dept: &str| {
+            let mut record = ProximaRecord {
+                oid: "r1".to_string(),
+                ..ProximaRecord::default()
+            };
+            record.props.insert(
+                "dept".to_string(),
+                ProximaTreeNode::Value(ProximaValue::String(dept.to_string())),
+            );
+            ExistingRow::Envelope(Box::new(record))
+        };
+        let caller = |subject: &str| proximadb_runtime::OwnedPortIdentity {
+            tenant_id: Some("t7".to_string()),
+            subject: Some(subject.to_string()),
+            tenant_stable_id: Some(TENANT),
+            auth_class: proximadb_tenant::AuthClass::Authenticated,
+        };
+
+        dml.check_on_conflict_update_visible(Some(&caller("alice")), &schema, &row("eng"))
+            .expect("a visible row may be updated");
+        dml.check_on_conflict_update_visible(None, &schema, &row("ops"))
+            .expect("an internal statement is not restricted");
+        for (who, dept) in [("alice", "ops"), ("mallory", "eng")] {
+            let err = dml
+                .check_on_conflict_update_visible(Some(&caller(who)), &schema, &row(dept))
+                .expect_err("an invisible conflicting row must not be updated");
+            assert_eq!(dml3_sqlstate(&err), "42501", "{who}/{dept}: {err}");
+        }
+    }
+
     fn dml_with_enforcer() -> DmlService {
         DmlService::with_record_store_and_table_write_executor(
             Arc::new(CatalogManager::new()),
@@ -7349,4 +7386,1292 @@ async fn transaction_fork_retains_dml_leases_until_released() -> Result<()> {
         .expect("the other pod gets the lease once it is released");
     after.release().await;
     Ok(())
+}
+
+/// TD-DML-3 fixture: `ctr (id BIGINT PK, email UNIQUE, counter CHECK (>= 0),
+/// note)` seeded with (1,'a',10,'n1') and (2,'b',20,'n2').
+#[cfg(test)]
+async fn dml3_counter_fixture(
+    temp_dir: &tempfile::TempDir,
+) -> (DmlService, crate::query::sql_frontend::SqlFrontendParser) {
+    use crate::services::record_store::DirectWalTableRecordStore;
+    use crate::services::{FramedTableWalAppender, MemtableRecordStorage};
+
+    let manager = Arc::new(CatalogManager::new());
+    manager
+        .create_native_catalog("native", temp_dir.path().to_string_lossy().as_ref())
+        .await
+        .expect("native catalog");
+    let ddl = DdlService::new(manager.clone());
+    ddl.execute(DdlStatement::CreateNamespace {
+        namespace: vec!["default".to_string()],
+        if_not_exists: true,
+        properties: HashMap::new(),
+    })
+    .await
+    .expect("create namespace");
+    let parser = crate::query::sql_frontend::SqlFrontendParser::new();
+    let ddl_stmt = parser
+        .parse_ddl(
+            "CREATE TABLE ctr (id BIGINT NOT NULL, email TEXT, counter BIGINT, note TEXT, \
+             PRIMARY KEY (id), UNIQUE (email), CHECK (counter >= 0));",
+        )
+        .expect("parse create")
+        .expect("ddl");
+    ddl.execute(ddl_stmt).await.expect("create table");
+    let wal_appender = Arc::new(
+        FramedTableWalAppender::open(temp_dir.path().join("dml3.wal"))
+            .await
+            .expect("open WAL"),
+    );
+    let record_store = Arc::new(DirectWalTableRecordStore::new(
+        Arc::new(MemtableRecordStorage::new()),
+        wal_appender,
+    ));
+    let dml = DmlService::with_record_store_and_table_write_executor(
+        manager,
+        record_store,
+        Arc::new(PlannedOnlyTableWriteExecutor::new()),
+    );
+    let seed = parser
+        .parse_dml(
+            "INSERT INTO ctr (id, email, counter, note) VALUES (1, 'a', 10, 'n1'), (2, 'b', 20, 'n2');",
+        )
+        .expect("parse seed")
+        .expect("dml");
+    dml.execute(seed).await.expect("seed");
+    (dml, parser)
+}
+
+/// Every live `ctr` row as `id|email|counter|note` (NULL as `∅`), id-ordered.
+#[cfg(test)]
+async fn dml3_rows(dml: &DmlService) -> Vec<String> {
+    let (_, records) = dml.scan_table_records("ctr", None).await.expect("scan ctr");
+    let render = |record: &ProximaRecord, column: &str| match record.props.get(column) {
+        Some(ProximaTreeNode::Value(ProximaValue::Int64(v))) => v.to_string(),
+        Some(ProximaTreeNode::Value(ProximaValue::String(v))) => v.clone(),
+        Some(ProximaTreeNode::Value(ProximaValue::Null)) | None => "∅".to_string(),
+        Some(other) => format!("{other:?}"),
+    };
+    let mut rows: Vec<(i64, String)> = records
+        .iter()
+        .map(|record| {
+            let id = match record.props.get("id") {
+                Some(ProximaTreeNode::Value(ProximaValue::Int64(v))) => *v,
+                _ => i64::MIN,
+            };
+            let row = ["id", "email", "counter", "note"]
+                .iter()
+                .map(|column| render(record, column))
+                .collect::<Vec<_>>()
+                .join("|");
+            (id, row)
+        })
+        .collect();
+    rows.sort();
+    rows.into_iter().map(|(_, row)| row).collect()
+}
+
+#[cfg(test)]
+fn dml3_sqlstate(err: &anyhow::Error) -> String {
+    proximadb_catalog::relational::find_relational_constraint_violation(err)
+        .map(|violation| violation.sqlstate().to_string())
+        .unwrap_or_else(|| format!("untyped: {err}"))
+}
+
+/// TD-DML-3: DO NOTHING skips a conflicting row (on the PK, on a UNIQUE
+/// column, with no target, and on a key repeated within the statement) while
+/// inserting the rest, and counts only inserted rows.
+#[tokio::test]
+async fn on_conflict_do_nothing_skips_and_counts_only_inserted_rows() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (dml, parser) = dml3_counter_fixture(&temp_dir).await;
+    let stmt = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml");
+
+    let result = dml
+        .execute(stmt(
+            "INSERT INTO ctr (id, email, counter, note) VALUES (1, 'z', 99, 'clobber'), (3, 'c', 30, 'n3') \
+             ON CONFLICT (id) DO NOTHING;",
+        ))
+        .await
+        .expect("DO NOTHING on PK");
+    assert_eq!(result.rows_affected, 1);
+    assert_eq!(
+        dml3_rows(&dml).await,
+        vec!["1|a|10|n1", "2|b|20|n2", "3|c|30|n3"]
+    );
+
+    let result = dml
+        .execute(stmt(
+            "INSERT INTO ctr (id, email, counter, note) VALUES (4, 'a', 40, 'dup'), (5, 'e', 50, 'n5') \
+             ON CONFLICT (email) DO NOTHING;",
+        ))
+        .await
+        .expect("DO NOTHING on a UNIQUE column is a skip, not a 23505");
+    assert_eq!(result.rows_affected, 1);
+
+    let result = dml
+        .execute(stmt(
+            "INSERT INTO ctr (id, email, counter, note) VALUES (2, 'q', 0, 'pk'), (6, 'b', 0, 'uq'), \
+             (7, 'g', 70, 'n7'), (7, 'h', 71, 'again') ON CONFLICT DO NOTHING;",
+        ))
+        .await
+        .expect("DO NOTHING with no target");
+    assert_eq!(result.rows_affected, 1);
+    assert_eq!(
+        dml3_rows(&dml).await,
+        vec![
+            "1|a|10|n1",
+            "2|b|20|n2",
+            "3|c|30|n3",
+            "5|e|50|n5",
+            "7|g|70|n7"
+        ]
+    );
+
+    // Mandate #16a: a deleted (tombstoned) row is dead and never arbitrates —
+    // neither on the PK nor on the UNIQUE value it used to hold.
+    dml.execute(stmt("DELETE FROM ctr WHERE id = 3;"))
+        .await
+        .expect("delete");
+    let result = dml
+        .execute(stmt(
+            "INSERT INTO ctr (id, email, counter, note) VALUES (3, 'c', 31, 'reborn') \
+             ON CONFLICT (id) DO NOTHING;",
+        ))
+        .await
+        .expect("re-insert over a tombstoned PK");
+    assert_eq!(result.rows_affected, 1);
+    dml.execute(stmt("DELETE FROM ctr WHERE id = 3;"))
+        .await
+        .expect("delete again");
+    let result = dml
+        .execute(stmt(
+            "INSERT INTO ctr (id, email, counter, note) VALUES (30, 'c', 32, 'by-email') \
+             ON CONFLICT (email) DO UPDATE SET note = 'must-not-update';",
+        ))
+        .await
+        .expect("a tombstoned UNIQUE holder does not arbitrate");
+    assert_eq!(result.rows_affected, 1);
+    assert!(
+        dml3_rows(&dml)
+            .await
+            .contains(&"30|c|32|by-email".to_string())
+    );
+}
+
+/// TD-DML-3: DO UPDATE SET evaluates assignments against the existing row
+/// (unqualified and table-qualified) with EXCLUDED as the proposed row, keeps
+/// unassigned columns, honours WHERE, and resolves a non-PK target.
+#[tokio::test]
+async fn on_conflict_do_update_evaluates_assignments_against_existing_row() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (dml, parser) = dml3_counter_fixture(&temp_dir).await;
+    let stmt = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml");
+
+    let result = dml
+        .execute(stmt(
+            "INSERT INTO ctr (id, email, counter, note) VALUES (1, 'zz', 5, 'proposed') \
+             ON CONFLICT (id) DO UPDATE SET counter = ctr.counter + EXCLUDED.counter;",
+        ))
+        .await
+        .expect("DO UPDATE with arithmetic");
+    assert_eq!(result.rows_affected, 1);
+    assert_eq!(dml3_rows(&dml).await, vec!["1|a|15|n1", "2|b|20|n2"]);
+
+    dml.execute(stmt(
+        "INSERT INTO ctr (id, email, counter, note) VALUES (1, 'zz', 0, 'p') \
+         ON CONFLICT (id) DO UPDATE SET counter = counter + 1, note = excluded.note || '!';",
+    ))
+    .await
+    .expect("unqualified column names the existing row");
+    assert_eq!(dml3_rows(&dml).await, vec!["1|a|16|p!", "2|b|20|n2"]);
+
+    let result = dml
+        .execute(stmt(
+            "INSERT INTO ctr (id, email, counter, note) VALUES (2, 'b', 1, 'blocked') \
+             ON CONFLICT (id) DO UPDATE SET note = EXCLUDED.note WHERE ctr.counter > 1000;",
+        ))
+        .await
+        .expect("false WHERE");
+    assert_eq!(
+        result.rows_affected, 0,
+        "a false WHERE neither updates nor counts"
+    );
+    let result = dml
+        .execute(stmt(
+            "INSERT INTO ctr (id, email, counter, note) VALUES (2, 'b', 1, 'gated') \
+             ON CONFLICT (id) DO UPDATE SET note = EXCLUDED.note WHERE ctr.counter > 10;",
+        ))
+        .await
+        .expect("true WHERE");
+    assert_eq!(result.rows_affected, 1);
+    assert_eq!(dml3_rows(&dml).await, vec!["1|a|16|p!", "2|b|20|gated"]);
+
+    let result = dml
+        .execute(stmt(
+            "INSERT INTO ctr (id, email, counter, note) VALUES (99, 'a', 1, 'via-email'), (3, 'c', 3, 'n3') \
+             ON CONFLICT (email) DO UPDATE SET note = EXCLUDED.note;",
+        ))
+        .await
+        .expect("non-PK target");
+    assert_eq!(result.rows_affected, 2);
+    assert_eq!(
+        dml3_rows(&dml).await,
+        vec!["1|a|16|via-email", "2|b|20|gated", "3|c|3|n3"]
+    );
+}
+
+/// TD-DML-3: the post-update row is integrity-checked (UNIQUE 23505 — also
+/// against a row inserted earlier in the same statement — and CHECK 23514);
+/// affecting one row twice is 21000; a target matching no unique constraint is
+/// 42P10; an unknown constraint name is 42704. Nothing is written on rejection.
+#[tokio::test]
+async fn on_conflict_rejections_are_typed_and_write_nothing() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (dml, parser) = dml3_counter_fixture(&temp_dir).await;
+    let stmt = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml");
+    let before = dml3_rows(&dml).await;
+
+    for (sql, want) in [
+        (
+            "INSERT INTO ctr (id, email, counter, note) VALUES (2, 'x', 0, '') \
+             ON CONFLICT (id) DO UPDATE SET email = 'a';",
+            "23505",
+        ),
+        (
+            "INSERT INTO ctr (id, email, counter, note) VALUES (5, 'x', 1, ''), (6, 'a', 2, '') \
+             ON CONFLICT (email) DO UPDATE SET email = 'x';",
+            "23505",
+        ),
+        (
+            "INSERT INTO ctr (id, email, counter, note) VALUES (2, 'x', 0, '') \
+             ON CONFLICT (id) DO UPDATE SET counter = ctr.counter - 1000;",
+            "23514",
+        ),
+        (
+            "INSERT INTO ctr (id, email, counter, note) VALUES (1, 'x', 1, ''), (1, 'y', 2, '') \
+             ON CONFLICT (id) DO UPDATE SET counter = EXCLUDED.counter;",
+            "21000",
+        ),
+        (
+            "INSERT INTO ctr (id, email, counter, note) VALUES (5, 'a', 1, ''), (6, 'a', 2, '') \
+             ON CONFLICT (email) DO UPDATE SET counter = EXCLUDED.counter;",
+            "21000",
+        ),
+        (
+            "INSERT INTO ctr (id, email, counter, note) VALUES (1, 'x', 1, '') \
+             ON CONFLICT (note) DO NOTHING;",
+            "42P10",
+        ),
+        (
+            "INSERT INTO ctr (id, email, counter, note) VALUES (1, 'x', 1, '') \
+             ON CONFLICT ON CONSTRAINT nope DO NOTHING;",
+            "42704",
+        ),
+    ] {
+        let err = dml
+            .execute(stmt(sql))
+            .await
+            .expect_err("statement must be rejected");
+        assert_eq!(dml3_sqlstate(&err), want, "{sql}: {err}");
+        assert_eq!(dml3_rows(&dml).await, before, "unchanged after: {sql}");
+    }
+
+    // PostgreSQL requires a conflict target for DO UPDATE (rejected at parse).
+    assert!(
+        parser
+            .parse_dml("INSERT INTO ctr (id) VALUES (1) ON CONFLICT DO UPDATE SET note = 'n';")
+            .is_err()
+    );
+}
+
+/// TD-DML-3 review fixture: a native catalog + WAL-backed store with `ddl`
+/// applied; returns the service and the shared record store.
+#[cfg(test)]
+async fn dml3_table_fixture(
+    temp_dir: &tempfile::TempDir,
+    ddl_sql: &str,
+) -> (
+    DmlService,
+    crate::query::sql_frontend::SqlFrontendParser,
+    Arc<CatalogManager>,
+) {
+    use crate::services::record_store::DirectWalTableRecordStore;
+    use crate::services::{FramedTableWalAppender, MemtableRecordStorage};
+
+    let manager = Arc::new(CatalogManager::new());
+    manager
+        .create_native_catalog("native", temp_dir.path().to_string_lossy().as_ref())
+        .await
+        .expect("native catalog");
+    let ddl = DdlService::new(manager.clone());
+    ddl.execute(DdlStatement::CreateNamespace {
+        namespace: vec!["default".to_string()],
+        if_not_exists: true,
+        properties: HashMap::new(),
+    })
+    .await
+    .expect("create namespace");
+    let parser = crate::query::sql_frontend::SqlFrontendParser::new();
+    let ddl_stmt = parser
+        .parse_ddl(ddl_sql)
+        .expect("parse create")
+        .expect("ddl");
+    ddl.execute(ddl_stmt).await.expect("create table");
+    let wal_appender = Arc::new(
+        FramedTableWalAppender::open(temp_dir.path().join("dml3r.wal"))
+            .await
+            .expect("open WAL"),
+    );
+    let record_store = Arc::new(DirectWalTableRecordStore::new(
+        Arc::new(MemtableRecordStorage::new()),
+        wal_appender,
+    ));
+    let dml = DmlService::with_record_store_and_table_write_executor(
+        manager.clone(),
+        record_store,
+        Arc::new(PlannedOnlyTableWriteExecutor::new()),
+    );
+    (dml, parser, manager)
+}
+
+/// Every live row of `table` as `|`-joined `columns` (NULL as `∅`), sorted.
+#[cfg(test)]
+async fn dml3_table_rows(dml: &DmlService, table: &str, columns: &[&str]) -> Vec<String> {
+    let (_, records) = dml.scan_table_records(table, None).await.expect("scan");
+    let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+    let mut rows: Vec<String> = records
+        .iter()
+        .filter(|record| !record.is_dead(now_ns))
+        .map(|record| {
+            columns
+                .iter()
+                .map(|column| match record.props.get(*column) {
+                    Some(ProximaTreeNode::Value(ProximaValue::Int64(v))) => v.to_string(),
+                    Some(ProximaTreeNode::Value(ProximaValue::String(v))) => v.clone(),
+                    Some(ProximaTreeNode::Value(ProximaValue::Null)) | None => "∅".to_string(),
+                    Some(other) => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// TD-DML-3 review #1: DO UPDATE of an existing COMPOSITE-PK row (mixed with
+/// an insert) and a plain UPDATE of a composite-PK row both rewrite the SAME
+/// row — the existing row's PK columns are decoded from every part of the
+/// encoded key, not the whole key into the first column.
+#[tokio::test]
+async fn composite_pk_do_update_and_update_rewrite_the_same_row() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (dml, parser, _) = dml3_table_fixture(
+        &temp_dir,
+        "CREATE TABLE cp (a TEXT NOT NULL, b BIGINT NOT NULL, n BIGINT, PRIMARY KEY (a, b));",
+    )
+    .await;
+    let stmt = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml");
+    dml.execute(stmt("INSERT INTO cp (a, b, n) VALUES ('x', 1, 1);"))
+        .await
+        .expect("seed");
+
+    let result = dml
+        .execute(stmt(
+            "INSERT INTO cp (a, b, n) VALUES ('x', 1, 5), ('x', 2, 2) \
+             ON CONFLICT (a, b) DO UPDATE SET n = cp.n + EXCLUDED.n;",
+        ))
+        .await
+        .expect("composite DO UPDATE + insert");
+    assert_eq!(result.rows_affected, 2);
+    assert_eq!(
+        dml3_table_rows(&dml, "cp", &["a", "b", "n"]).await,
+        vec!["x|1|6", "x|2|2"]
+    );
+
+    let result = dml
+        .execute(stmt("UPDATE cp SET n = 9 WHERE a = 'x' AND b = 2;"))
+        .await
+        .expect("composite plain UPDATE");
+    assert_eq!(result.rows_affected, 1);
+    assert_eq!(
+        dml3_table_rows(&dml, "cp", &["a", "b", "n"]).await,
+        vec!["x|1|6", "x|2|9"]
+    );
+}
+
+/// TD-DML-3 review #2: on a table with NO primary key, DO UPDATE (arbitrated
+/// by a UNIQUE column) rewrites the holder row in place — it must not mint a
+/// new identity and miss the row.
+#[tokio::test]
+async fn pk_less_do_update_rewrites_the_unique_holder() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (dml, parser, _) = dml3_table_fixture(
+        &temp_dir,
+        "CREATE TABLE nopk (email TEXT, n BIGINT, UNIQUE (email));",
+    )
+    .await;
+    let stmt = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml");
+    dml.execute(stmt("INSERT INTO nopk (email, n) VALUES ('a', 1);"))
+        .await
+        .expect("seed");
+    let result = dml
+        .execute(stmt(
+            "INSERT INTO nopk (email, n) VALUES ('a', 5) \
+             ON CONFLICT (email) DO UPDATE SET n = nopk.n + EXCLUDED.n;",
+        ))
+        .await
+        .expect("PK-less DO UPDATE");
+    assert_eq!(result.rows_affected, 1);
+    assert_eq!(
+        dml3_table_rows(&dml, "nopk", &["email", "n"]).await,
+        vec!["a|6"]
+    );
+}
+
+/// TD-DML-3 review #4: write-expression and binding failures carry the
+/// PostgreSQL SQLSTATE instead of the generic fallback.
+#[tokio::test]
+async fn on_conflict_expression_errors_carry_postgres_sqlstates() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (dml, parser) = dml3_counter_fixture(&temp_dir).await;
+    let stmt = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml");
+    let before = dml3_rows(&dml).await;
+    for (sql, want) in [
+        (
+            "INSERT INTO ctr (id, email, counter, note) VALUES (1, 'z', 1, '') \
+             ON CONFLICT (id) DO UPDATE SET counter = 'abc';",
+            "22P02",
+        ),
+        (
+            "INSERT INTO ctr (id, email, counter, note) VALUES (1, 'z', 1, '') \
+             ON CONFLICT (id) DO UPDATE SET counter = ctr.counter / 0;",
+            "22012",
+        ),
+        (
+            "INSERT INTO ctr (id, email, counter, note) VALUES (1, 'z', 1, '') \
+             ON CONFLICT (id) DO UPDATE SET nosuch = 1;",
+            "42703",
+        ),
+        (
+            "INSERT INTO ctr (id, email, counter, note) VALUES (1, 'z', 1, '') \
+             ON CONFLICT (id) DO UPDATE SET counter = ctr.nosuch;",
+            "42703",
+        ),
+        (
+            "INSERT INTO ctr (id, email, counter, note) VALUES (1, 'z', 1, '') \
+             ON CONFLICT (nosuch) DO NOTHING;",
+            "42703",
+        ),
+        (
+            "INSERT INTO ctr (id, email, counter, note) VALUES (1, 'z', 1, '') \
+             ON CONFLICT (id) DO UPDATE SET counter = 1, counter = 2;",
+            "42701",
+        ),
+        (
+            "INSERT INTO ctr (id, email, counter, note) VALUES (1, 'z', 1, '') \
+             ON CONFLICT (email) DO UPDATE SET id = 7;",
+            "0A000",
+        ),
+        (
+            "INSERT INTO ctr (id, email, counter, note) VALUES (1, 'z', 1, '') \
+             ON CONFLICT (id) DO UPDATE SET counter = ctr.note - 1;",
+            "42883",
+        ),
+        (
+            "INSERT INTO ctr (id, email, counter, note) VALUES (1, 'z', 1, '') \
+             ON CONFLICT (id) DO UPDATE SET counter = CAST(ctr.note AS BOOLEAN);",
+            "22P02",
+        ),
+        (
+            "INSERT INTO ctr (id, email, counter, note) VALUES (1, 'z', 1, '') \
+             ON CONFLICT (id) DO UPDATE SET counter = CAST('true' AS BOOLEAN);",
+            "42804",
+        ),
+    ] {
+        let err = dml
+            .execute(stmt(sql))
+            .await
+            .expect_err("statement must be rejected");
+        assert_eq!(dml3_sqlstate(&err), want, "{sql}: {err}");
+        assert_eq!(dml3_rows(&dml).await, before, "unchanged after: {sql}");
+    }
+}
+
+/// TD-DML-3 review #6 / mandate #16a: a TTL-EXPIRED row is dead, so the
+/// UNIQUE value it held arbitrates nothing — neither DO UPDATE nor DO NOTHING
+/// treats it as a conflict, and the new row is inserted.
+#[tokio::test]
+async fn ttl_expired_unique_holder_does_not_arbitrate() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (dml, parser) = dml3_counter_fixture(&temp_dir).await;
+    let stmt = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml");
+
+    // Plant an already-expired row holding email 'ttl'.
+    let (catalog, table_id) = dml
+        .catalog_manager
+        .resolve_table("ctr")
+        .await
+        .expect("resolve");
+    let schema = catalog.get_table(&table_id).await.expect("schema");
+    let mut expired = dml
+        .build_mutation_record(
+            &[
+                "id".to_string(),
+                "email".to_string(),
+                "counter".to_string(),
+                "note".to_string(),
+            ],
+            &[
+                SqlValueLiteral::Integer(40),
+                SqlValueLiteral::String("ttl".to_string()),
+                SqlValueLiteral::Integer(4),
+                SqlValueLiteral::String("expired".to_string()),
+            ],
+            &schema,
+            RelationalMutationKind::Insert,
+        )
+        .expect("record");
+    expired.valid_to_ns = Some(1); // 1ns after the epoch: long expired
+    let written = dml
+        .record_store()
+        .write_mutations(
+            &schema,
+            vec![TableRecordMutation::new(
+                TableRecordMutationKind::Insert,
+                expired,
+            )],
+            None,
+        )
+        .await
+        .expect("plant expired row");
+    assert!(written.success, "{:?}", written.errors);
+
+    let result = dml
+        .execute(stmt(
+            "INSERT INTO ctr (id, email, counter, note) VALUES (41, 'ttl', 1, 'fresh') \
+             ON CONFLICT (email) DO UPDATE SET note = 'must-not-update';",
+        ))
+        .await
+        .expect("an expired holder is no conflict");
+    assert_eq!(result.rows_affected, 1);
+    let rows = dml3_rows(&dml).await;
+    assert!(rows.contains(&"41|ttl|1|fresh".to_string()), "{rows:?}");
+    assert!(
+        !rows.iter().any(|row| row.contains("must-not-update")),
+        "{rows:?}"
+    );
+}
+
+/// TD-DML-3 review #3: a record store whose next `write_mutations` fails:
+/// * mode 1 — a store-reported rejection BEFORE anything is durable
+///   (`Ok(failure)`, the WAL store's pre-append INSERT_CONFLICT shape);
+/// * mode 2 — an UNMARKED `Err` (durability unknown) where nothing was in fact
+///   written — the case lazy reconciliation must resolve;
+/// * mode 3 — an `Err` marked [`rejected_before_append`] (validation, health);
+/// * mode 4 — the write lands durably, THEN an unmarked `Err` is returned.
+#[cfg(all(test, feature = "oltp-integrity"))]
+struct FailNextWriteStore {
+    inner: Arc<dyn TableRecordStore>,
+    fail_next: std::sync::atomic::AtomicU8,
+}
+
+#[cfg(all(test, feature = "oltp-integrity"))]
+#[async_trait::async_trait]
+impl TableRecordStore for FailNextWriteStore {
+    async fn write_mutations(
+        &self,
+        table_schema: &CatalogTableSchema,
+        mutations: Vec<TableRecordMutation>,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<TableRecordWriteResult> {
+        match self.fail_next.swap(0, std::sync::atomic::Ordering::SeqCst) {
+            1 => {
+                return Ok(TableRecordWriteResult::failure(
+                    "injected pre-append rejection".to_string(),
+                    "INJECTED",
+                ));
+            }
+            2 => return Err(anyhow!("injected write failure, durability unknown")),
+            3 => {
+                return Err(crate::services::record_store::rejected_before_append(
+                    anyhow!("injected validation failure"),
+                ));
+            }
+            4 => {
+                self.inner
+                    .write_mutations(table_schema, mutations, tenant_context)
+                    .await?;
+                return Err(anyhow!("injected failure after a durable write"));
+            }
+            _ => {}
+        }
+        self.inner
+            .write_mutations(table_schema, mutations, tenant_context)
+            .await
+    }
+
+    async fn get_by_key(
+        &self,
+        table_schema: &CatalogTableSchema,
+        request: TableRecordGetRequest,
+        tenant_context: Option<&TenantContext>,
+        #[cfg(feature = "abac-policy")] read_context: &ReadContext,
+    ) -> Result<TableRecordGetResponse> {
+        self.inner
+            .get_by_key(
+                table_schema,
+                request,
+                tenant_context,
+                #[cfg(feature = "abac-policy")]
+                read_context,
+            )
+            .await
+    }
+
+    async fn get_record_envelope(
+        &self,
+        table_schema: &CatalogTableSchema,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<crate::services::record_store::RecordEnvelopeLookup> {
+        self.inner
+            .get_record_envelope(table_schema, key, tenant_context)
+            .await
+    }
+
+    async fn durable_row_write(
+        &self,
+        table_schema: &CatalogTableSchema,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<Option<bool>> {
+        self.inner
+            .durable_row_write(table_schema, key, tenant_context)
+            .await
+    }
+
+    async fn scan_records(
+        &self,
+        table_schema: &CatalogTableSchema,
+        request: TableRecordScanRequest,
+        tenant_context: Option<&TenantContext>,
+        #[cfg(feature = "abac-policy")] read_context: &ReadContext,
+    ) -> Result<TableRecordScanResponse> {
+        self.inner
+            .scan_records(
+                table_schema,
+                request,
+                tenant_context,
+                #[cfg(feature = "abac-policy")]
+                read_context,
+            )
+            .await
+    }
+
+    async fn check_unique_conflict(
+        &self,
+        table_schema: &CatalogTableSchema,
+        table_id: &str,
+        primary_key: Option<&str>,
+        sets: &[crate::services::record_store::UniqueCandidateSet],
+        exclude_oids: &std::collections::HashSet<String>,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<Option<crate::services::record_store::UniqueConflict>> {
+        self.inner
+            .check_unique_conflict(
+                table_schema,
+                table_id,
+                primary_key,
+                sets,
+                exclude_oids,
+                tenant_context,
+            )
+            .await
+    }
+}
+
+/// A CKS-fenced `fw (id TEXT PK, note TEXT)` over a [`FailNextWriteStore`].
+#[cfg(feature = "oltp-integrity")]
+async fn dml3_fenced_fixture(
+    temp_dir: &tempfile::TempDir,
+) -> (
+    DmlService,
+    crate::query::sql_frontend::SqlFrontendParser,
+    Arc<FailNextWriteStore>,
+    Arc<proximadb_cks_local::LocalWalKeyStore>,
+    Arc<CatalogManager>,
+) {
+    use crate::services::record_store::DirectWalTableRecordStore;
+    use crate::services::{FramedTableWalAppender, MemtableRecordStorage};
+    use proximadb_cks_local::{LocalWalKeyStore, SyncPolicy};
+
+    let manager = Arc::new(CatalogManager::new());
+    manager
+        .create_native_catalog("native", temp_dir.path().to_string_lossy().as_ref())
+        .await
+        .expect("native catalog");
+    let ddl = DdlService::new(manager.clone());
+    ddl.execute(DdlStatement::CreateNamespace {
+        namespace: vec!["default".to_string()],
+        if_not_exists: true,
+        properties: HashMap::new(),
+    })
+    .await
+    .expect("create namespace");
+    let parser = crate::query::sql_frontend::SqlFrontendParser::new();
+    ddl.execute(
+        parser
+            .parse_ddl("CREATE TABLE fw (id TEXT NOT NULL, note TEXT, PRIMARY KEY (id));")
+            .expect("parse create")
+            .expect("ddl"),
+    )
+    .await
+    .expect("create table");
+    let wal = Arc::new(
+        FramedTableWalAppender::open(temp_dir.path().join("fw.wal"))
+            .await
+            .expect("open WAL"),
+    );
+    // One memtable per (tenant, table) partition, as production — `new`
+    // would share ONE store across tenants.
+    let store = Arc::new(FailNextWriteStore {
+        inner: Arc::new(DirectWalTableRecordStore::with_storage_factory(
+            wal,
+            Arc::new(|_tenant: &str, _collection: &str| {
+                Arc::new(MemtableRecordStorage::new()) as Arc<dyn proximadb_records::RecordStorage>
+            }),
+        )),
+        fail_next: std::sync::atomic::AtomicU8::new(0),
+    });
+    let cks = Arc::new(
+        LocalWalKeyStore::open(temp_dir.path().join("fw-cks.wal"), SyncPolicy::PerOp)
+            .expect("open cks"),
+    );
+    let dml = DmlService::with_record_store_and_table_write_executor(
+        manager.clone(),
+        store.clone(),
+        Arc::new(PlannedOnlyTableWriteExecutor::new()),
+    )
+    .with_conditional_key_store(cks.clone());
+    (dml, parser, store, cks, manager)
+}
+
+/// TD-DML-3 review #3 / round 3: a fenced PK claim is never left fencing a
+/// key whose row does not exist.
+/// * A rejection known to precede any durable write — `Ok(failure)` or an
+///   `Err` marked [`rejected_before_append`] — releases the claim at once.
+/// * An UNMARKED `Err` keeps the claim (the append may have landed), but the
+///   next claim attempt reconciles it lazily: the store's durable log provably
+///   holds no write of the key, so the claim is released and the retry
+///   succeeds.
+/// * When the write DID land before the `Err`, the row exists and the retry is
+///   a genuine duplicate (23505).
+#[cfg(feature = "oltp-integrity")]
+#[tokio::test]
+async fn pk_claims_are_released_when_the_write_fails() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (dml, parser, store, _cks, _) = dml3_fenced_fixture(&temp_dir).await;
+    let stmt = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml");
+
+    for (mode, key) in [(1u8, "f1"), (3, "f3"), (2, "f2")] {
+        for on_conflict in ["", " ON CONFLICT (id) DO NOTHING"] {
+            let key = format!("{key}{}", on_conflict.len());
+            store
+                .fail_next
+                .store(mode, std::sync::atomic::Ordering::SeqCst);
+            dml.execute(stmt(&format!(
+                "INSERT INTO fw (id, note) VALUES ('{key}', 'a'){on_conflict};"
+            )))
+            .await
+            .expect_err("injected write failure");
+            dml.execute(stmt(&format!(
+                "INSERT INTO fw (id, note) VALUES ('{key}', 'b');"
+            )))
+            .await
+            .unwrap_or_else(|e| {
+                panic!("mode {mode}: the key must not stay fenced without a row: {key}: {e}")
+            });
+        }
+    }
+
+    store
+        .fail_next
+        .store(4, std::sync::atomic::Ordering::SeqCst);
+    dml.execute(stmt("INSERT INTO fw (id, note) VALUES ('f4', 'a');"))
+        .await
+        .expect_err("injected failure after the write landed");
+    let err = dml
+        .execute(stmt("INSERT INTO fw (id, note) VALUES ('f4', 'b');"))
+        .await
+        .expect_err("the row exists: a genuine duplicate");
+    assert_eq!(dml3_sqlstate(&err), "23505", "{err}");
+}
+
+/// TD-DML-3 round 3: the startup sweep releases every fenced claim whose row
+/// does not exist (e.g. left by a crash between claim and write), and keeps
+/// the claims of rows that do.
+#[cfg(feature = "oltp-integrity")]
+#[tokio::test]
+async fn startup_sweep_releases_rowless_claims() {
+    use proximadb_storage_ports::{ConditionalKeyStore, Generation, Identity, Oid};
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (dml, parser, _store, cks, _) = dml3_fenced_fixture(&temp_dir).await;
+    let stmt = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml");
+    dml.execute(stmt("INSERT INTO fw (id, note) VALUES ('kept', 'a');"))
+        .await
+        .expect("a real row");
+    let identity = |key: &str| {
+        Identity::from_bytes(
+            proximadb_data_model::key_codec::encode_identity(
+                "",
+                "fw",
+                &[ProximaValue::String(key.to_string())],
+            )
+            .expect("identity"),
+        )
+    };
+    cks.put_if_absent(
+        &identity("orphan"),
+        &Oid("orphan".to_string()),
+        Generation(0),
+    )
+    .await
+    .expect("plant a rowless claim");
+
+    let released = dml
+        .reconcile_conditional_key_claims()
+        .await
+        .expect("reconcile");
+    assert_eq!(released, 1);
+    assert!(cks.get(&identity("orphan")).await.expect("get").is_none());
+    assert!(cks.get(&identity("kept")).await.expect("get").is_some());
+}
+
+/// TD-DML-3 round 3: fenced claims are keyed by the SESSION tenant, so two
+/// tenants' same-named tables never share a PK fence.
+#[cfg(feature = "oltp-integrity")]
+#[tokio::test]
+async fn pk_claims_are_tenant_scoped() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (dml, parser, _store, _cks, manager) = dml3_fenced_fixture(&temp_dir).await;
+    let ddl = DdlService::new(manager);
+    for tenant in ["acme", "globex"] {
+        ddl.execute_scoped(
+            parser
+                .parse_ddl("CREATE TABLE tt (id TEXT NOT NULL, note TEXT, PRIMARY KEY (id));")
+                .expect("parse create")
+                .expect("ddl"),
+            Some(tenant),
+        )
+        .await
+        .expect("create tenant table");
+    }
+    for tenant in ["acme", "globex"] {
+        let tc = crate::storage::tenant::context::TenantContext::for_tenant_id(tenant);
+        dml.execute_scoped(
+            parser
+                .parse_dml("INSERT INTO tt (id, note) VALUES ('k1', 'x');")
+                .expect("parse")
+                .expect("dml"),
+            Some(&tc),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("{tenant}: the same key in another tenant is not a duplicate: {e}")
+        });
+    }
+}
+
+/// TD-DML-3 delta review: UPDATE may not assign ANY primary-key column — on a
+/// composite PK the non-first columns used to be accepted, leaving the row's
+/// identity (its oid) out of step with its key columns. Every PK column is
+/// rejected with 0A000 and the table is left unchanged.
+#[tokio::test]
+async fn update_rejects_every_composite_primary_key_column() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (dml, parser, _) = dml3_table_fixture(
+        &temp_dir,
+        "CREATE TABLE cq (a TEXT NOT NULL, b BIGINT NOT NULL, n BIGINT, PRIMARY KEY (a, b));",
+    )
+    .await;
+    let stmt = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml");
+    dml.execute(stmt("INSERT INTO cq (a, b, n) VALUES ('x', 1, 1);"))
+        .await
+        .expect("seed");
+    for sql in [
+        "UPDATE cq SET b = 5 WHERE a = 'x' AND b = 1;",
+        "UPDATE cq SET a = 'y' WHERE a = 'x' AND b = 1;",
+    ] {
+        let err = dml
+            .execute(stmt(sql))
+            .await
+            .expect_err("a PK column may not be assigned");
+        assert_eq!(dml3_sqlstate(&err), "0A000", "{sql}: {err}");
+        assert_eq!(
+            dml3_table_rows(&dml, "cq", &["a", "b", "n"]).await,
+            vec!["x|1|1"],
+            "unchanged after: {sql}"
+        );
+    }
+}
+
+/// TD-DML-3 delta review: a SINGLE-column PK value may contain the composite
+/// key separator (U+001F); it must not be split when the existing row is
+/// decoded for UPDATE.
+#[tokio::test]
+async fn update_of_single_pk_containing_the_key_separator() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (dml, parser, _) = dml3_table_fixture(
+        &temp_dir,
+        "CREATE TABLE sq (id TEXT NOT NULL, n BIGINT, PRIMARY KEY (id));",
+    )
+    .await;
+    let stmt = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml");
+    dml.execute(stmt("INSERT INTO sq (id, n) VALUES ('a\u{1f}b', 1);"))
+        .await
+        .expect("seed");
+    let result = dml
+        .execute(stmt("UPDATE sq SET n = 2 WHERE n = 1;"))
+        .await
+        .expect("UPDATE of a separator-bearing single PK");
+    assert_eq!(result.rows_affected, 1);
+    assert_eq!(
+        dml3_table_rows(&dml, "sq", &["id", "n"]).await,
+        vec!["a\u{1f}b|2"]
+    );
+}
+
+/// Write one row of `table` straight through the record store with the given
+/// `valid_to_ns` (TTL), bypassing DML — the only way to plant an expired or
+/// TTL-bearing row in a unit test.
+#[cfg(test)]
+async fn dml3_plant(
+    dml: &DmlService,
+    table: &str,
+    columns: &[&str],
+    values: Vec<SqlValueLiteral>,
+    valid_to_ns: i64,
+) {
+    let (catalog, table_id) = dml
+        .catalog_manager
+        .resolve_table(table)
+        .await
+        .expect("resolve");
+    let schema = catalog.get_table(&table_id).await.expect("schema");
+    let columns: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
+    let mut record = dml
+        .build_mutation_record(&columns, &values, &schema, RelationalMutationKind::Insert)
+        .expect("record");
+    record.valid_to_ns = Some(valid_to_ns);
+    let written = dml
+        .record_store()
+        .write_mutations(
+            &schema,
+            vec![TableRecordMutation::new(
+                TableRecordMutationKind::Insert,
+                record,
+            )],
+            None,
+        )
+        .await
+        .expect("plant row");
+    assert!(written.success, "{:?}", written.errors);
+}
+
+/// The counter fixture's table over a SPILLING record store (flush threshold
+/// 1: every row is flushed to a segment), seeded like `dml3_counter_fixture`.
+#[cfg(test)]
+async fn dml3_spill_counter_fixture(
+    temp_dir: &tempfile::TempDir,
+) -> (DmlService, crate::query::sql_frontend::SqlFrontendParser) {
+    use crate::services::record_store::DirectWalTableRecordStore;
+    use crate::services::{FramedTableWalAppender, SpillRecordStorage};
+    use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
+
+    let manager = Arc::new(CatalogManager::new());
+    manager
+        .create_native_catalog("native", temp_dir.path().to_string_lossy().as_ref())
+        .await
+        .expect("native catalog");
+    let ddl = DdlService::new(manager.clone());
+    ddl.execute(DdlStatement::CreateNamespace {
+        namespace: vec!["default".to_string()],
+        if_not_exists: true,
+        properties: HashMap::new(),
+    })
+    .await
+    .expect("create namespace");
+    let parser = crate::query::sql_frontend::SqlFrontendParser::new();
+    ddl.execute(
+        parser
+            .parse_ddl(
+                "CREATE TABLE ctr (id BIGINT NOT NULL, email TEXT, counter BIGINT, note TEXT, \
+                 PRIMARY KEY (id), UNIQUE (email), CHECK (counter >= 0));",
+            )
+            .expect("parse create")
+            .expect("ddl"),
+    )
+    .await
+    .expect("create table");
+    let wal = Arc::new(
+        FramedTableWalAppender::open(temp_dir.path().join("dml3s.wal"))
+            .await
+            .expect("open WAL"),
+    );
+    let fs: Arc<dyn crate::storage::persistence::filesystem::FileSystem> = Arc::new(
+        LocalFileSystem::new(LocalConfig::default())
+            .await
+            .expect("local filesystem"),
+    );
+    let base = temp_dir.path().join("spill").to_string_lossy().to_string();
+    let store = Arc::new(DirectWalTableRecordStore::with_storage_factory(
+        wal,
+        Arc::new(move |tenant: &str, collection: &str| {
+            Arc::new(
+                SpillRecordStorage::with_flush_threshold(
+                    fs.clone(),
+                    format!("{base}/{tenant}/{collection}"),
+                    Some(1),
+                )
+                .with_tenant(tenant),
+            ) as Arc<dyn proximadb_records::RecordStorage>
+        }),
+    ));
+    let dml = DmlService::with_record_store_and_table_write_executor(
+        manager,
+        store,
+        Arc::new(PlannedOnlyTableWriteExecutor::new()),
+    );
+    dml.execute(
+        parser
+            .parse_dml(
+                "INSERT INTO ctr (id, email, counter, note) VALUES (1, 'a', 10, 'n1'), (2, 'b', 20, 'n2');",
+            )
+            .expect("parse seed")
+            .expect("dml"),
+    )
+    .await
+    .expect("seed");
+    (dml, parser)
+}
+
+/// Shared body: a TTL-EXPIRED row arbitrates nothing — on its PRIMARY KEY or
+/// on its UNIQUE value — for ON CONFLICT and for a plain INSERT.
+#[cfg(test)]
+async fn dml3_assert_expired_rows_never_conflict(
+    dml: &DmlService,
+    parser: &crate::query::sql_frontend::SqlFrontendParser,
+) {
+    let stmt = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml");
+    let cols = ["id", "email", "counter", "note"];
+    let row = |id: i64, email: &str| {
+        vec![
+            SqlValueLiteral::Integer(id),
+            SqlValueLiteral::String(email.to_string()),
+            SqlValueLiteral::Integer(4),
+            SqlValueLiteral::String("expired".to_string()),
+        ]
+    };
+    for (id, email) in [(50, "p50"), (51, "p51"), (52, "u52")] {
+        dml3_plant(dml, "ctr", &cols, row(id, email), 1).await;
+    }
+
+    let result = dml
+        .execute(stmt(
+            "INSERT INTO ctr (id, email, counter, note) VALUES (50, 'p50x', 5, 'fresh-pk') \
+             ON CONFLICT (id) DO UPDATE SET note = 'must-not-update';",
+        ))
+        .await
+        .expect("an expired PK holder is no conflict");
+    assert_eq!(result.rows_affected, 1);
+    dml.execute(stmt(
+        "INSERT INTO ctr (id, email, counter, note) VALUES (51, 'p51x', 6, 'plain');",
+    ))
+    .await
+    .expect("a plain INSERT over an expired PK succeeds");
+    let result = dml
+        .execute(stmt(
+            "INSERT INTO ctr (id, email, counter, note) VALUES (53, 'u52', 7, 'fresh-uq') \
+             ON CONFLICT (email) DO UPDATE SET note = 'must-not-update';",
+        ))
+        .await
+        .expect("an expired UNIQUE holder is no conflict");
+    assert_eq!(result.rows_affected, 1);
+
+    let rows = dml3_table_rows(dml, "ctr", &cols).await;
+    for want in ["50|p50x|5|fresh-pk", "51|p51x|6|plain", "53|u52|7|fresh-uq"] {
+        assert!(
+            rows.contains(&want.to_string()),
+            "{want} missing from {rows:?}"
+        );
+    }
+    assert!(
+        !rows.iter().any(|r| r.contains("must-not-update")),
+        "{rows:?}"
+    );
+}
+
+/// TD-DML-3 (user addendum #1): expired holders do not conflict — default store.
+#[tokio::test]
+async fn expired_pk_and_unique_holders_never_conflict() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (dml, parser) = dml3_counter_fixture(&temp_dir).await;
+    dml3_assert_expired_rows_never_conflict(&dml, &parser).await;
+}
+
+/// TD-DML-3 (user addendum #1 + delta MEDIUM): the same under the SPILL store,
+/// whose `get_record` hides dead copies — dead must not read as "absent ⇒
+/// conflict" on the UNIQUE probe.
+#[tokio::test]
+async fn expired_holders_never_conflict_under_spill_store() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (dml, parser) = dml3_spill_counter_fixture(&temp_dir).await;
+    dml3_assert_expired_rows_never_conflict(&dml, &parser).await;
+}
+
+/// TD-DML-3 (user addendum #2): UPDATE and DO UPDATE rebuild the row from its
+/// full envelope — the TTL (`valid_to_ns`) survives, and EVERY vector column
+/// keeps its own value (not the first embedding copied into all of them).
+#[tokio::test]
+async fn update_preserves_ttl_and_every_vector_column() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (dml, parser, _) = dml3_table_fixture(
+        &temp_dir,
+        "CREATE TABLE mv (id TEXT NOT NULL, note TEXT, v1 VECTOR(3), v2 VECTOR(3), PRIMARY KEY (id));",
+    )
+    .await;
+    let stmt = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml");
+    let ttl = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(i64::MAX / 2)
+        + 3_600_000_000_000;
+    let vector = |v: f64| {
+        SqlValueLiteral::Array(vec![
+            SqlValueLiteral::Float(v),
+            SqlValueLiteral::Float(v),
+            SqlValueLiteral::Float(v),
+        ])
+    };
+    dml3_plant(
+        &dml,
+        "mv",
+        &["id", "note", "v1", "v2"],
+        vec![
+            SqlValueLiteral::String("a".to_string()),
+            SqlValueLiteral::String("n0".to_string()),
+            vector(1.0),
+            vector(2.0),
+        ],
+        ttl,
+    )
+    .await;
+
+    let check = |label: &'static str| {
+        let dml = &dml;
+        async move {
+            let (_, records) = dml.scan_table_records("mv", None).await.expect("scan");
+            let record = records
+                .iter()
+                .find(|r| r.oid == "a")
+                .unwrap_or_else(|| panic!("{label}: row a missing"));
+            assert_eq!(record.valid_to_ns, Some(ttl), "{label}: TTL must survive");
+            for (column, want) in [("v1", 1.0f32), ("v2", 2.0f32)] {
+                match record.props.get(column) {
+                    Some(ProximaTreeNode::Value(ProximaValue::DenseVector(v))) => {
+                        assert_eq!(v, &vec![want; 3], "{label}: {column}")
+                    }
+                    other => panic!("{label}: {column} = {other:?}"),
+                }
+            }
+        }
+    };
+
+    dml.execute(stmt("UPDATE mv SET note = 'u' WHERE id = 'a';"))
+        .await
+        .expect("UPDATE");
+    check("UPDATE").await;
+    dml.execute(stmt(
+        "INSERT INTO mv (id, note) VALUES ('a', 'd') ON CONFLICT (id) DO UPDATE SET note = EXCLUDED.note;",
+    ))
+    .await
+    .expect("DO UPDATE");
+    check("DO UPDATE").await;
+}
+
+/// TD-DML-3 round 3: an update rebuilds the row from its declared columns
+/// only — a prop that is NOT a declared column (e.g. the value of a DROPPED
+/// column) is not carried forward, so a later ADD COLUMN cannot resurrect it.
+#[tokio::test]
+async fn update_does_not_carry_undeclared_props() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (dml, parser) = dml3_counter_fixture(&temp_dir).await;
+    let stmt = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml");
+    let (catalog, table_id) = dml
+        .catalog_manager
+        .resolve_table("ctr")
+        .await
+        .expect("resolve");
+    let schema = catalog.get_table(&table_id).await.expect("schema");
+    let mut record = dml
+        .build_mutation_record(
+            &[
+                "id".to_string(),
+                "email".to_string(),
+                "counter".to_string(),
+                "note".to_string(),
+            ],
+            &[
+                SqlValueLiteral::Integer(60),
+                SqlValueLiteral::String("g".to_string()),
+                SqlValueLiteral::Integer(1),
+                SqlValueLiteral::String("n".to_string()),
+            ],
+            &schema,
+            RelationalMutationKind::Insert,
+        )
+        .expect("record");
+    record.props.insert(
+        "secret".to_string(),
+        ProximaTreeNode::Value(ProximaValue::String("dropped-value".to_string())),
+    );
+    let written = dml
+        .record_store()
+        .write_mutations(
+            &schema,
+            vec![TableRecordMutation::new(
+                TableRecordMutationKind::Insert,
+                record,
+            )],
+            None,
+        )
+        .await
+        .expect("plant row with a dropped column's value");
+    assert!(written.success);
+
+    for sql in [
+        "UPDATE ctr SET note = 'u' WHERE id = 60;",
+        "INSERT INTO ctr (id, email, counter, note) VALUES (60, 'g', 1, 'd') \
+         ON CONFLICT (id) DO UPDATE SET note = EXCLUDED.note;",
+    ] {
+        dml.execute(stmt(sql)).await.expect(sql);
+        let (_, records) = dml.scan_table_records("ctr", None).await.expect("scan");
+        let row = records
+            .iter()
+            .find(|r| {
+                matches!(
+                    r.props.get("id"),
+                    Some(ProximaTreeNode::Value(ProximaValue::Int64(60)))
+                )
+            })
+            .expect("row 60");
+        assert!(
+            !row.props.contains_key("secret"),
+            "{sql}: an undeclared prop must not survive an update: {:?}",
+            row.props
+        );
+    }
 }

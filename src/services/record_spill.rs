@@ -1790,6 +1790,37 @@ impl RecordStore for SpillRecordStorage {
         Ok(lsns.into_iter().chain(tombstone_floor).min())
     }
 
+    /// TD-DML-3: [`Self::get_record`] without the dead-copy filter. A
+    /// tombstoned oid is still absent (DELETE removed it); a resident or
+    /// segment copy that `is_dead` (TTL-expired) is returned so the caller can
+    /// tell "dead" from "absent". Newest copy wins, as in `get_record`.
+    async fn get_record_including_dead(
+        &self,
+        key: &RecordKey,
+    ) -> RecordStoreResult<Option<ProximaRecord>> {
+        self.ensure_discovered().await?;
+        if self.tombstones.contains_key(&key.oid) {
+            return Ok(None);
+        }
+        // Resident copies are `record`-shaped since the bound-memtable change;
+        // dead copies are intentionally returned (see the doc comment above).
+        if let Some(entry) = self.memtable.get(&key.oid) {
+            return Ok(Some(entry.value().record.clone()));
+        }
+        let paths = self.segments.read().clone();
+        for path in paths.iter().rev() {
+            if let Some(found) = self
+                .read_segment(path)
+                .await?
+                .into_iter()
+                .find(|r| r.oid == key.oid)
+            {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
     async fn get_record(&self, key: &RecordKey) -> RecordStoreResult<Option<ProximaRecord>> {
         self.ensure_discovered().await?;
         if self.tombstones.contains_key(&key.oid) {

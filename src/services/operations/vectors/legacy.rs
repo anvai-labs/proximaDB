@@ -1012,6 +1012,23 @@ impl VectorOperationsService {
     /// (gRPC/internal callers). Enforcement is `abac-policy`-gated; default
     /// builds pass the identity through ignored. (TD-ABAC-7: one method,
     /// identity decides — no `_abac` twin.)
+    /// TD-DML-3: the stored canonical record for `record_id` — the FULL
+    /// envelope (every prop, embedding, TTL), dead copies INCLUDED so the
+    /// caller can tell dead from absent (`ProximaRecord::is_dead`). Internal
+    /// (system) read: callers apply their own read policy.
+    pub async fn get_record_envelope_with_tenant_context(
+        &self,
+        collection_id: &str,
+        record_id: &str,
+        tenant_context: Option<&crate::storage::tenant::context::TenantContext>,
+    ) -> Result<Option<ProximaRecord>> {
+        let collection_id = self
+            .validate_tenant_collection_access(collection_id, tenant_context)
+            .await?
+            .to_string();
+        self.vector(&collection_id, record_id, true, true).await
+    }
+
     pub async fn get_record_with_tenant_context(
         &self,
         request: RichRecordGetRequest,
@@ -1157,6 +1174,34 @@ impl VectorOperationsService {
                 record.tenant_id.is_empty() || record.tenant_id == tenant_context.tenant_id
             });
         }
+        // TD-DML-3: one CURRENT version per oid. The raw WAL view holds every
+        // write of a key, and an UPDATE of a relational row on this store
+        // appends a new version — so a SELECT returned the old and the new row
+        // side by side. Latest wins (highest record_version, then
+        // updated_at_ns, then the later write), and it is chosen BEFORE the
+        // dead filter so a newer tombstone / expired version hides its older
+        // live copy (mandate #16d).
+        let mut latest: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::with_capacity(records.len());
+        for (index, record) in records.iter().enumerate() {
+            let newer = match latest.get(&record.oid).and_then(|&kept| records.get(kept)) {
+                Some(kept) => {
+                    (record.record_version, record.updated_at_ns)
+                        >= (kept.record_version, kept.updated_at_ns)
+                }
+                None => true,
+            };
+            if newer {
+                latest.insert(record.oid.clone(), index);
+            }
+        }
+        let current: std::collections::HashSet<usize> = latest.into_values().collect();
+        records = records
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| current.contains(index))
+            .map(|(_, record)| record)
+            .collect();
         // Defense-in-depth: drop dead records (tombstone / TTL-expired) using
         // the canonical ProximaRecord::is_dead on valid_to_ns (ns). Winner
         // selection already drops tombstoned winners; this guarantees no scan
@@ -2590,13 +2635,19 @@ impl VectorOperationsService {
         mut records: Vec<ProximaRecord>,
         tenant_context: Option<&crate::storage::tenant::context::TenantContext>,
     ) -> Result<BatchOperationResult> {
+        use crate::services::record_store::rejected_before_append;
+        // TD-DML-3: every check below precedes the WAL write, so its failure
+        // is marked "rejected before append" — a caller may release state it
+        // reserved for the write (fenced PK claims).
         let collection_id = self
             .validate_tenant_collection_access(collection_id, tenant_context)
-            .await?
+            .await
+            .map_err(rejected_before_append)?
             .to_string();
 
         if let Some(tenant_ctx) = tenant_context {
-            ensure_tenant_on_records(&mut records, &tenant_ctx.tenant_id)?;
+            ensure_tenant_on_records(&mut records, &tenant_ctx.tenant_id)
+                .map_err(rejected_before_append)?;
         }
 
         // PR 3b follow-up: while the precision-schema-v2 feature flag is
@@ -2608,7 +2659,9 @@ impl VectorOperationsService {
         if !cached_precision_config().schema_v2_enabled
             && let Err(e) = validate_records_for_schema_v1(records.iter())
         {
-            return Err(anyhow::anyhow!(e));
+            return Err(crate::services::record_store::rejected_before_append(
+                anyhow::anyhow!(e),
+            ));
         }
 
         let result = self

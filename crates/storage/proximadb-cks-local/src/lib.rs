@@ -398,6 +398,23 @@ impl ConditionalKeyStore for LocalWalKeyStore {
             .and_then(|v| v.oid.clone()))
     }
 
+    async fn live_claims(&self) -> Result<Option<Vec<(Identity, Oid)>>> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("conditional key store lock poisoned"))?;
+        Ok(Some(
+            g.map
+                .iter()
+                .filter_map(|(key, versions)| {
+                    latest(versions)
+                        .and_then(|v| v.oid.clone())
+                        .map(|oid| (key.clone(), oid))
+                })
+                .collect(),
+        ))
+    }
+
     async fn tombstone(&self, key: &Identity, fence: Generation) -> Result<()> {
         let mut g = self.inner.lock().unwrap();
         let live = g

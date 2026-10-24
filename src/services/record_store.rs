@@ -972,9 +972,44 @@ pub trait TableRecordStore: Send + Sync {
                 return Ok(Some(UniqueConflict {
                     columns: set.columns.clone(),
                     tuple,
+                    oid: existing.oid.clone(),
                 }));
             }
         }
+        Ok(None)
+    }
+
+    /// TD-DML-3: the FULL canonical record envelope for `key` (not the lossy
+    /// `RichSearchResult` projection `get_by_key` returns), classified as
+    /// live / dead (tombstoned or TTL-expired — `ProximaRecord::is_dead`) /
+    /// absent. DML uses it to (a) treat a dead row as no conflict and (b)
+    /// rewrite a row from its whole envelope (TTL, every vector column).
+    ///
+    /// The default is [`RecordEnvelopeLookup::Unsupported`]; callers then fall
+    /// back to `get_by_key`.
+    async fn get_record_envelope(
+        &self,
+        table_schema: &CatalogTableSchema,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<RecordEnvelopeLookup> {
+        let _ = (table_schema, key, tenant_context);
+        Ok(RecordEnvelopeLookup::Unsupported)
+    }
+
+    /// TD-DML-3: whether this store's DURABLE log holds a live write of `key`
+    /// for the table — `Some(true)` the last durable operation on `key` is an
+    /// upsert, `Some(false)` provably none (never written, deleted, or the
+    /// partition was dropped since), `None` the store cannot tell. Used to
+    /// reconcile a fenced PK claim whose row is absent after an ambiguous write
+    /// failure: only a provable `Some(false)` lets the claim be released.
+    async fn durable_row_write(
+        &self,
+        table_schema: &CatalogTableSchema,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<Option<bool>> {
+        let _ = (table_schema, key, tenant_context);
         Ok(None)
     }
 
@@ -1037,6 +1072,90 @@ pub trait TableRecordStore: Send + Sync {
     }
 }
 
+/// TD-DML-3: marker carried by a `write_mutations` error raised BEFORE the
+/// store made anything durable (validation, health, existence-read failures),
+/// so the caller may release state it reserved for the write — e.g. fenced PK
+/// claims. Any `Err` WITHOUT this marker may follow a durable append and must
+/// be treated as durability-unknown. Attached with [`rejected_before_append`];
+/// `Display` is the original message, so user-visible text is unchanged.
+#[derive(Debug, Clone)]
+pub struct RejectedBeforeAppend(String);
+
+impl std::fmt::Display for RejectedBeforeAppend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Mark `error` as raised before anything was made durable (see
+/// [`RejectedBeforeAppend`]). The original error stays in the chain, so typed
+/// violations (SQLSTATEs) are still found.
+pub fn rejected_before_append(error: anyhow::Error) -> anyhow::Error {
+    let message = error.to_string();
+    error.context(RejectedBeforeAppend(message))
+}
+
+/// Whether `error` carries the [`RejectedBeforeAppend`] marker.
+pub fn is_rejected_before_append(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RejectedBeforeAppend>().is_some()
+}
+
+/// TD-DML-3: result of [`TableRecordStore::get_record_envelope`].
+#[derive(Debug, Clone)]
+pub enum RecordEnvelopeLookup {
+    /// A live row and its full envelope.
+    Live(Box<ProximaRecord>),
+    /// The store holds the key but the row is dead (tombstoned / TTL-expired).
+    Dead,
+    /// The store does not hold the key.
+    Absent,
+    /// The store cannot serve full envelopes; use `get_by_key`.
+    Unsupported,
+}
+
+impl RecordEnvelopeLookup {
+    /// Classify a raw point-lookup result (which may include a dead copy).
+    pub fn classify(record: Option<ProximaRecord>) -> Self {
+        match record {
+            None => Self::Absent,
+            Some(record) if record.is_dead(unix_now_ns()) => Self::Dead,
+            Some(record) => Self::Live(Box::new(record)),
+        }
+    }
+}
+
+/// Wall-clock nanoseconds since the Unix epoch (the `is_dead` clock).
+pub(crate) fn unix_now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Mandate #16a: whether `key` holds a LIVE row in `partition` (or the
+/// legacy cutover partition). A dead copy (TTL-expired) does not occupy the
+/// key, so an INSERT over it is not a conflict and an UPDATE of it finds
+/// nothing (TD-DML-3).
+async fn live_row_present(
+    partition: &Arc<dyn RecordStorage>,
+    legacy: Option<&Arc<dyn RecordStorage>>,
+    key: &RecordKey,
+) -> Result<bool> {
+    let now_ns = unix_now_ns();
+    // The primary partition wins when it holds the key at all (a dead primary
+    // copy shadows an older legacy one), exactly as the reads resolve it.
+    if let Some(record) = partition.get_record(key).await? {
+        return Ok(!record.is_dead(now_ns));
+    }
+    Ok(match legacy {
+        Some(legacy) => legacy
+            .get_record(key)
+            .await?
+            .is_some_and(|record| !record.is_dead(now_ns)),
+        None => false,
+    })
+}
+
 /// One unique column set plus the candidate tuples a write intends to insert
 /// (already NULL-exempt + deduped within the statement). See
 /// [`TableRecordStore::check_unique_conflict`].
@@ -1048,13 +1167,17 @@ pub struct UniqueCandidateSet {
     pub candidates: std::collections::HashSet<Vec<String>>,
 }
 
-/// A detected uniqueness violation: which column set, and the existing tuple.
+/// A detected uniqueness violation: which column set, the existing tuple, and
+/// the row holding it.
 #[derive(Debug, Clone)]
 pub struct UniqueConflict {
     /// The violated unique constraint/index columns.
     pub columns: Vec<String>,
     /// The committed tuple that the candidate collided with.
     pub tuple: Vec<String>,
+    /// Oid of the row holding `tuple` — the row an `ON CONFLICT` on this
+    /// constraint arbitrates against (TD-DML-3).
+    pub oid: String,
 }
 
 /// Canonical comparable-text rendering of a scalar `ProximaValue` for UNIQUE/PK
@@ -1352,7 +1475,7 @@ pub(crate) fn build_unique_candidate_sets(
                 continue; // NULL/absent in the tuple → exempt
             };
             if !candidates.insert(tuple.clone()) {
-                // Typed so every wire maps it to 23505 (it surfaced as 42P01).
+                // Typed (23505) like every other UNIQUE rejection (TD-DML-3).
                 return Err(proximadb_catalog::relational::RelationalConstraintViolation::new(
                     proximadb_catalog::relational::RelationalConstraintKind::Unique,
                     format!(
@@ -1419,6 +1542,28 @@ impl CatalogRoutingTableRecordStore {
 
 #[async_trait]
 impl TableRecordStore for CatalogRoutingTableRecordStore {
+    async fn durable_row_write(
+        &self,
+        table_schema: &CatalogTableSchema,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<Option<bool>> {
+        self.store_for_schema(table_schema)
+            .durable_row_write(table_schema, key, tenant_context)
+            .await
+    }
+
+    async fn get_record_envelope(
+        &self,
+        table_schema: &CatalogTableSchema,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<RecordEnvelopeLookup> {
+        self.store_for_schema(table_schema)
+            .get_record_envelope(table_schema, key, tenant_context)
+            .await
+    }
+
     async fn drop_table_records(
         &self,
         table_schema: &CatalogTableSchema,
@@ -1617,6 +1762,22 @@ impl VectorOpsTableRecordStore {
 
 #[async_trait]
 impl TableRecordStore for VectorOpsTableRecordStore {
+    /// TD-DML-3: the full envelope from the vector store (dead copies
+    /// included), so UPDATE / DO UPDATE on a vector table keep every vector
+    /// column and the TTL, and a dead holder is told apart from a live one.
+    async fn get_record_envelope(
+        &self,
+        table_schema: &CatalogTableSchema,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<RecordEnvelopeLookup> {
+        Ok(RecordEnvelopeLookup::classify(
+            self.vector_ops
+                .get_record_envelope_with_tenant_context(&table_schema.name, key, tenant_context)
+                .await?,
+        ))
+    }
+
     async fn write_mutations(
         &self,
         table_schema: &CatalogTableSchema,
@@ -1789,7 +1950,7 @@ impl TableRecordStore for RecordStorageTableRecordStore {
 
             match kind {
                 TableRecordMutationKind::Insert => {
-                    if self.storage.get_record(&key).await?.is_some() {
+                    if live_row_present(&self.storage, None, &key).await? {
                         return Ok(TableRecordWriteResult::failure(
                             format!(
                                 "Record '{}' already exists in table '{}'",
@@ -1822,6 +1983,19 @@ impl TableRecordStore for RecordStorageTableRecordStore {
         }
 
         Ok(TableRecordWriteResult::success(record_ids))
+    }
+
+    async fn get_record_envelope(
+        &self,
+        _table_schema: &CatalogTableSchema,
+        key: &str,
+        _tenant_context: Option<&TenantContext>,
+    ) -> Result<RecordEnvelopeLookup> {
+        Ok(RecordEnvelopeLookup::classify(
+            self.storage
+                .get_record_including_dead(&RecordKey::new(key.to_string()))
+                .await?,
+        ))
     }
 
     async fn get_by_key(
@@ -1998,8 +2172,9 @@ impl TableUniqueIndex {
         }
     }
 
-    /// First candidate tuple in `candidates` that already exists for the set
-    /// matching `columns`, owned by some oid NOT in `exclude_oids`, if any.
+    /// Every `(candidate tuple, owner oid)` in `candidates` that already exists
+    /// for the set matching `columns`, owned by an oid NOT in `exclude_oids`.
+    /// The caller filters out owners that are dead (TTL-expired).
     /// `exclude_oids` lets an UPDATE ignore the rows it is itself rewriting (so a
     /// row keeping or vacating its own unique value is not a self-conflict).
     fn conflict(
@@ -2007,16 +2182,20 @@ impl TableUniqueIndex {
         columns: &[String],
         candidates: &std::collections::HashSet<Vec<String>>,
         exclude_oids: &std::collections::HashSet<String>,
-    ) -> Option<Vec<String>> {
-        let set = self.sets.iter().find(|set| set.columns == columns)?;
+    ) -> Vec<(Vec<String>, String)> {
+        let Some(set) = self.sets.iter().find(|set| set.columns == columns) else {
+            return Vec::new();
+        };
         candidates
             .iter()
-            .find(|candidate| {
-                set.tuple_to_oids
-                    .get(*candidate)
-                    .is_some_and(|owners| owners.iter().any(|oid| !exclude_oids.contains(oid)))
+            .filter_map(|candidate| Some((candidate, set.tuple_to_oids.get(candidate)?)))
+            .flat_map(|(candidate, owners)| {
+                owners
+                    .iter()
+                    .filter(|oid| !exclude_oids.contains(*oid))
+                    .map(move |oid| (candidate.clone(), oid.clone()))
             })
-            .cloned()
+            .collect()
     }
 }
 
@@ -3212,7 +3391,11 @@ impl TableRecordStore for DirectWalTableRecordStore {
         mutations: Vec<TableRecordMutation>,
         tenant_context: Option<&TenantContext>,
     ) -> Result<TableRecordWriteResult> {
-        self.ensure_healthy()?;
+        // TD-DML-3: every failure before `append_operations` below is marked
+        // "rejected before append" — nothing is durable yet, so a caller may
+        // release what it reserved for this write (fenced PK claims). Failures
+        // from the append onward stay unmarked (durability unknown).
+        self.ensure_healthy().map_err(rejected_before_append)?;
         let mut operations = Vec::with_capacity(mutations.len());
         let mut storage_actions = Vec::with_capacity(mutations.len());
         let projections = projection_directives_for_schema(table_schema);
@@ -3241,11 +3424,9 @@ impl TableRecordStore for DirectWalTableRecordStore {
 
             match kind {
                 TableRecordMutationKind::Insert => {
-                    let exists = partition.get_record(&key).await?.is_some()
-                        || match &legacy_partition {
-                            Some(legacy) => legacy.get_record(&key).await?.is_some(),
-                            None => false,
-                        };
+                    let exists = live_row_present(&partition, legacy_partition.as_ref(), &key)
+                        .await
+                        .map_err(rejected_before_append)?;
                     if exists {
                         return Ok(TableRecordWriteResult::failure(
                             format!(
@@ -3263,11 +3444,9 @@ impl TableRecordStore for DirectWalTableRecordStore {
                     storage_actions.push((kind, record));
                 }
                 TableRecordMutationKind::Update => {
-                    let exists = partition.get_record(&key).await?.is_some()
-                        || match &legacy_partition {
-                            Some(legacy) => legacy.get_record(&key).await?.is_some(),
-                            None => false,
-                        };
+                    let exists = live_row_present(&partition, legacy_partition.as_ref(), &key)
+                        .await
+                        .map_err(rejected_before_append)?;
                     if !exists {
                         return Ok(TableRecordWriteResult::failure(
                             format!(
@@ -3423,11 +3602,7 @@ impl TableRecordStore for DirectWalTableRecordStore {
                     Some(present) => *present,
                     None => {
                         let key = RecordKey::from(&record);
-                        partition.get_record(&key).await?.is_some()
-                            || match &legacy_partition {
-                                Some(legacy) => legacy.get_record(&key).await?.is_some(),
-                                None => false,
-                            }
+                        live_row_present(&partition, legacy_partition.as_ref(), &key).await?
                     }
                 };
                 match mutation.kind {
@@ -3784,6 +3959,76 @@ impl TableRecordStore for DirectWalTableRecordStore {
         Ok(merge_scan_primary_wins(primary_recs, legacy_recs, limit))
     }
 
+    /// TD-DML-3: the canonical WAL is this store's durable log — scan it for
+    /// the last durable operation on `key` in this table's partition(s) and
+    /// tenant. A live upsert ⇒ `Some(true)`; a delete, a dead upsert, a later
+    /// partition drop, or no entry at all ⇒ `Some(false)` (the row would NOT
+    /// come back on replay). WAL-truncated rows live in segments and are never
+    /// asked about (they are present, not absent).
+    async fn durable_row_write(
+        &self,
+        table_schema: &CatalogTableSchema,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<Option<bool>> {
+        self.ensure_healthy()?;
+        let tenant = Self::tenant_key(tenant_context);
+        let want = (!tenant.is_empty()).then_some(tenant.as_str());
+        let (collection_id, legacy_key) = memtable_partition_keys(table_schema);
+        let ours = |c: &str| c == collection_id || legacy_key.as_deref() == Some(c);
+        let now_ns = unix_now_ns();
+        let mut last: Option<(u64, bool)> = None;
+        for entry in self.wal_appender.read_all_entries().await? {
+            if entry.tenant_id.as_deref().filter(|t| !t.is_empty()) != want {
+                continue;
+            }
+            let state = match &entry.operation {
+                CanonicalOperation::RecordUpsert {
+                    collection_id: c,
+                    record,
+                    ..
+                } if ours(c) && record.oid == key => Some(!record.is_dead(now_ns)),
+                CanonicalOperation::RecordDelete {
+                    collection_id: c,
+                    oid,
+                    ..
+                } if ours(c) && oid == key => Some(false),
+                CanonicalOperation::RecordPartitionDrop { collection_id: c } if ours(c) => {
+                    Some(false)
+                }
+                _ => None,
+            };
+            if let Some(state) = state
+                && last.is_none_or(|(lsn, _)| entry.sequence_number >= lsn)
+            {
+                last = Some((entry.sequence_number, state));
+            }
+        }
+        Ok(Some(last.is_some_and(|(_, live)| live)))
+    }
+
+    /// TD-DML-3: the full envelope from the tenant's partition (primary, then
+    /// the legacy cutover partition), dead copies included so the caller can
+    /// tell dead from absent.
+    async fn get_record_envelope(
+        &self,
+        table_schema: &CatalogTableSchema,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<RecordEnvelopeLookup> {
+        self.ensure_healthy()?;
+        let tenant = Self::tenant_key(tenant_context);
+        let (primary, legacy) = self.partitions_for(&tenant, table_schema);
+        let key = RecordKey::new(key.to_string());
+        let mut record = primary.get_record_including_dead(&key).await?;
+        if record.is_none()
+            && let Some(legacy) = &legacy
+        {
+            record = legacy.get_record_including_dead(&key).await?;
+        }
+        Ok(RecordEnvelopeLookup::classify(record))
+    }
+
     /// TD-110 Slice C: O(1) index-backed override of the default scan. Builds the
     /// per-table index on first use (from WAL-recovered current state), then
     /// probes candidate tuples directly.
@@ -3800,18 +4045,51 @@ impl TableRecordStore for DirectWalTableRecordStore {
         let tenant_scope = Self::tenant_key(tenant_context);
         self.ensure_unique_index_built(table_schema, &tenant_scope)
             .await?;
-        let index_key = (tenant_scope, memtable_partition_keys(table_schema).0);
-        let index = self.unique_index.read();
-        let Some(table_index) = index.get(&index_key) else {
-            return Ok(None); // table has no UNIQUE/PK sets
+        let index_key = (
+            tenant_scope.clone(),
+            memtable_partition_keys(table_schema).0,
+        );
+        // Collect the indexed owners first: the index guard must not be held
+        // across the liveness reads below.
+        let owners: Vec<(Vec<String>, Vec<String>, String)> = {
+            let index = self.unique_index.read();
+            let Some(table_index) = index.get(&index_key) else {
+                return Ok(None); // table has no UNIQUE/PK sets
+            };
+            sets.iter()
+                .flat_map(|set| {
+                    table_index
+                        .conflict(&set.columns, &set.candidates, exclude_oids)
+                        .into_iter()
+                        .map(|(tuple, oid)| (set.columns.clone(), tuple, oid))
+                })
+                .collect()
         };
-        for set in sets {
-            if let Some(tuple) = table_index.conflict(&set.columns, &set.candidates, exclude_oids) {
-                return Ok(Some(UniqueConflict {
-                    columns: set.columns.clone(),
-                    tuple,
-                }));
+        // Mandate #16a / TD-DML-3: the index keeps a TTL-expired row's tuple
+        // until it is purged, so an indexed owner that is DEAD holds nothing.
+        // An owner the partitions no longer return is kept as a conflict
+        // (fail closed — the index is the authority for "held").
+        let now_ns = unix_now_ns();
+        let (primary, legacy) = self.partitions_for(&tenant_scope, table_schema);
+        for (columns, tuple, oid) in owners {
+            let key = RecordKey::new(oid.clone());
+            // `get_record_including_dead`: a store that hides dead copies from
+            // `get_record` (the spill store) would otherwise make an expired
+            // owner read as ABSENT and fail closed as a conflict.
+            let mut record = primary.get_record_including_dead(&key).await?;
+            if record.is_none()
+                && let Some(legacy) = &legacy
+            {
+                record = legacy.get_record_including_dead(&key).await?;
             }
+            if record.is_some_and(|record| record.is_dead(now_ns)) {
+                continue;
+            }
+            return Ok(Some(UniqueConflict {
+                columns,
+                tuple,
+                oid,
+            }));
         }
         Ok(None)
     }

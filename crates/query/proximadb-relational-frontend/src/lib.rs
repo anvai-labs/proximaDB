@@ -2372,6 +2372,7 @@ fn post_aggregate_scope(group_by: &[NamedExpr], aggregates: &[NamedAggregate]) -
                 nullable: true,
             },
             ordinal,
+            qualified_only: false,
         });
         ordinal += 1;
     }
@@ -2384,6 +2385,7 @@ fn post_aggregate_scope(group_by: &[NamedExpr], aggregates: &[NamedAggregate]) -
                 nullable: !matches!(a.agg, AggregateExpr::Count { .. }),
             },
             ordinal,
+            qualified_only: false,
         });
         ordinal += 1;
     }
@@ -2761,6 +2763,9 @@ struct ScopeColumn {
     /// Position in the combined relation (used as the `ordinal`
     /// in resulting `ColumnRef`s).
     ordinal: usize,
+    /// Reachable only as `table.column`, never unqualified (TD-DML-3: the
+    /// `EXCLUDED` pseudo-row of `INSERT … ON CONFLICT DO UPDATE`).
+    qualified_only: bool,
 }
 
 impl Scope {
@@ -2780,6 +2785,7 @@ impl Scope {
                     table: table_alias.to_string(),
                     column: c.clone(),
                     ordinal: i,
+                    qualified_only: false,
                 })
                 .collect(),
         }
@@ -2796,6 +2802,7 @@ impl Scope {
                     table: String::new(),
                     column: c.clone(),
                     ordinal: i,
+                    qualified_only: false,
                 })
                 .collect(),
         }
@@ -2809,6 +2816,7 @@ impl Scope {
                 table: sc.table.clone(),
                 column: sc.column.clone(),
                 ordinal: sc.ordinal + offset,
+                qualified_only: sc.qualified_only,
             });
         }
         combined
@@ -2843,7 +2851,7 @@ impl Scope {
     /// ambiguous — resolution stays strict rather than guessing.
     fn resolve_unqualified_folded(&self, name: &str) -> Result<ColumnRef, FrontendError> {
         let mut declared: Option<&str> = None;
-        for c in &self.columns {
+        for c in self.columns.iter().filter(|c| !c.qualified_only) {
             if c.column.name.eq_ignore_ascii_case(name) {
                 match declared {
                     Some(d) if d != c.column.name => {
@@ -2863,7 +2871,7 @@ impl Scope {
         let mut hits: Vec<&ScopeColumn> = self
             .columns
             .iter()
-            .filter(|c| c.column.name == name)
+            .filter(|c| !c.qualified_only && c.column.name == name)
             .collect();
         match hits.len() {
             0 => Err(FrontendError::ColumnNotFound(name.into())),
@@ -2944,6 +2952,53 @@ impl Scope {
 }
 
 // =========================================================================
+// INSERT … ON CONFLICT DO UPDATE lowering (TD-DML-3)
+// =========================================================================
+
+/// Lower one `INSERT … ON CONFLICT DO UPDATE` `SET` value or `WHERE` condition
+/// into an engine-neutral [`Expr`] evaluated by [`Expr::eval`] — the SAME
+/// `lower_expr` (and so the same scalar grammar and builtins) the SELECT path
+/// uses, so DML does not grow a second expression evaluator.
+///
+/// The row the result evaluates against is the EXISTING row's columns
+/// (ordinals `0..n`, in `schema` order) followed by the PROPOSED row's columns
+/// (ordinals `n..2n`). An existing-row column resolves as `col` or
+/// `target_qualifier.col`; a proposed-row column only as `EXCLUDED.col`
+/// (case-insensitive, like PostgreSQL's unquoted `excluded`).
+///
+/// Deliberate superset of PostgreSQL: there an unqualified `col` that both rows
+/// carry is ambiguous (42702); here it names the existing row, so every
+/// statement PostgreSQL accepts evaluates identically.
+pub fn lower_on_conflict_expr(
+    expr: &SqlExpr,
+    target_qualifier: &str,
+    schema: &RelationalSchema,
+) -> Result<Expr, FrontendError> {
+    let existing = Scope::from_table(target_qualifier, schema);
+    let mut excluded = Scope::from_table(ON_CONFLICT_EXCLUDED, schema);
+    for column in &mut excluded.columns {
+        column.qualified_only = true;
+    }
+    let mut expr = expr.clone();
+    // `EXCLUDED` is a keyword-like pseudo-table: fold its unquoted spelling so
+    // resolution does not depend on the identifier case-fold gate.
+    let _ = sqlparser::ast::visit_expressions_mut(&mut expr, |e| {
+        if let SqlExpr::CompoundIdentifier(parts) = e
+            && let Some(first) = parts.first_mut()
+            && first.quote_style.is_none()
+            && first.value.eq_ignore_ascii_case(ON_CONFLICT_EXCLUDED)
+        {
+            first.value = ON_CONFLICT_EXCLUDED.to_string();
+        }
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+    lower_expr_sealed(&expr, &existing.concat(&excluded))
+}
+
+/// The pseudo-table naming the proposed row inside `ON CONFLICT DO UPDATE`.
+const ON_CONFLICT_EXCLUDED: &str = "excluded";
+
+// =========================================================================
 // CREATE FUNCTION body lowering (F5)
 // =========================================================================
 
@@ -3009,6 +3064,39 @@ mod tests {
 
     fn lower(sql: &str) -> LogicalNode {
         lower_sql(sql, &catalog()).unwrap_or_else(|e| panic!("lower failed: {e:?}"))
+    }
+
+    /// TD-DML-3: an ON CONFLICT expression sees the existing row (unqualified
+    /// or table-qualified) at ordinals 0..n and the proposed row only as
+    /// `EXCLUDED.col` at n..2n.
+    #[test]
+    fn on_conflict_expr_binds_existing_and_excluded_rows() {
+        let schema = users_schema();
+        let parse = |sql: &str| {
+            Parser::new(&GenericDialect {})
+                .try_with_sql(sql)
+                .and_then(|mut p| p.parse_expr())
+                .unwrap_or_else(|e| panic!("parse {sql}: {e}"))
+        };
+        let row: proximadb_relational_types::RelationalRow = vec![
+            ProximaValue::Int64(1),
+            ProximaValue::String("old".into()),
+            ProximaValue::Int32(10),
+            ProximaValue::Int64(1),
+            ProximaValue::String("new".into()),
+            ProximaValue::Int32(5),
+        ];
+        let eval = |sql: &str| {
+            lower_on_conflict_expr(&parse(sql), "users", &schema)
+                .unwrap_or_else(|e| panic!("lower {sql}: {e:?}"))
+                .eval(&row, proximadb_functions::builtins())
+                .unwrap_or_else(|e| panic!("eval {sql}: {e:?}"))
+        };
+        assert_eq!(eval("users.age + EXCLUDED.age"), ProximaValue::Int32(15));
+        assert_eq!(eval("age + excluded.age"), ProximaValue::Int32(15));
+        assert_eq!(eval("excluded.name"), ProximaValue::String("new".into()));
+        assert_eq!(eval("name"), ProximaValue::String("old".into()));
+        assert!(lower_on_conflict_expr(&parse("nobody.age"), "users", &schema).is_err());
     }
 
     #[test]
