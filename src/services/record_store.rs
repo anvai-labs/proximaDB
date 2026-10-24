@@ -2225,11 +2225,13 @@ pub struct DirectWalTableRecordStore {
     wal_appender: Arc<dyn TableWalAppender>,
     /// Appended-but-not-yet-applied writes (TD-SEAM-12); see [`InflightWrites`].
     inflight: InflightWrites,
-    /// Per partition, the oldest unflushed LSN a lag flush last saw
-    /// (TD-USUB-22). A partition whose oldest LSN is unchanged since then was
-    /// not moved by that flush (its oldest rows are held resident: a codec
-    /// hold or an ambiguous oid), so flushing it again would only write
-    /// another small segment.
+    /// Per partition, the WAL head at its last successful lag flush
+    /// (TD-USUB-22). A partition is lag-flushed at most once per lag window,
+    /// whatever that flush achieved: one whose oldest rows a flush cannot move
+    /// (held resident by a codec hold or an ambiguous oid, or a purge's hold)
+    /// costs at most one small segment per window, and is retried each window
+    /// in case it can move now. A failed flush is not recorded, so the next
+    /// run retries it.
     lag_flushed: std::sync::Mutex<std::collections::HashMap<(String, String), u64>>,
     /// TD-110 Slice C: UNIQUE/PK index keyed by `(tenant_id, collection)` so a
     /// table's UNIQUE/PK enforcement is per-tenant. Presence of a key == "index
@@ -2407,11 +2409,11 @@ impl DirectWalTableRecordStore {
     /// the floor computed afterwards still retains them. A failed or cancelled
     /// segment write also makes that partition refuse (`min_unflushed_lsn`)
     /// until a purge or restart, which stops truncation for the whole tier:
-    /// fail-closed, but worth the warning it logs. A partition whose oldest
-    /// unflushed LSN did not move since its last lag flush is not flushed
-    /// again (see `lag_flushed`). Writes may race it: `flush` serializes on
-    /// its `flush_guard` and evicts only the generation it wrote, and a DROP's
-    /// purge empties the partition under the same guard.
+    /// fail-closed, but worth the warning it logs. A partition lag-flushed
+    /// within the last `max_lag` entries is not flushed again (see
+    /// `lag_flushed`). Writes may race it: `flush` serializes on its
+    /// `flush_guard` and evicts only the generation it wrote, and after a
+    /// DROP's purge `flush` writes nothing until the partition's next write.
     pub async fn flush_lagging_partitions(&self, head: u64, max_lag: u64) -> usize {
         if self.shared_storage {
             return 0;
@@ -2434,17 +2436,16 @@ impl DirectWalTableRecordStore {
                 continue;
             }
             let key = (tenant_id.clone(), collection.clone());
-            if self.lag_flushed_at(&key) == Some(oldest) {
+            if self
+                .lag_flushed_at(&key)
+                .is_some_and(|at| head.saturating_sub(at) <= max_lag)
+            {
                 continue;
             }
             match partition.flush().await {
                 Ok(()) => {
                     flushed += 1;
-                    // Remember the partition only when this flush did not move
-                    // its oldest row (held resident); a failed flush is never
-                    // remembered, so the next run retries it.
-                    let after = partition.min_unflushed_lsn().await.ok().flatten();
-                    self.set_lag_flushed_at(key, (after == Some(oldest)).then_some(oldest));
+                    self.set_lag_flushed_at(key, Some(head));
                 }
                 Err(error) => tracing::warn!(
                     tenant_id = %tenant_id,
@@ -2467,12 +2468,12 @@ impl DirectWalTableRecordStore {
             .copied()
     }
 
-    fn set_lag_flushed_at(&self, key: (String, String), stuck_at: Option<u64>) {
+    fn set_lag_flushed_at(&self, key: (String, String), head: Option<u64>) {
         let mut seen = self
             .lag_flushed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match stuck_at {
+        match head {
             Some(lsn) => seen.insert(key, lsn),
             None => seen.remove(&key),
         };
@@ -6946,19 +6947,25 @@ mod tests {
     }
 
     /// TD-USUB-22 review: a partition a lag flush did not move (its oldest rows
-    /// are held resident) is not flushed again while that row stays oldest.
+    /// are held resident) is flushed at most once per lag window, and retried
+    /// in the next window in case it can move then.
     #[tokio::test]
-    async fn a_lag_flush_that_frees_nothing_is_not_repeated() {
+    async fn a_lag_flush_that_frees_nothing_waits_a_lag_window() {
         let partition = Arc::new(LagProbePartition::new(1, 0, true));
         let store = lag_probe_store(partition.clone());
         let _ = store.partition("t", "dims");
         assert_eq!(store.flush_lagging_partitions(100, 10).await, 1);
-        assert_eq!(store.flush_lagging_partitions(200, 10).await, 0);
         assert_eq!(
-            partition.flushes(),
-            1,
-            "no second flush of a stuck partition"
+            store.flush_lagging_partitions(110, 10).await,
+            0,
+            "same window"
         );
+        assert_eq!(
+            store.flush_lagging_partitions(111, 10).await,
+            1,
+            "next window"
+        );
+        assert_eq!(partition.flushes(), 2);
     }
 
     /// With the spill gate on, the tier floor is the minimum over spill
