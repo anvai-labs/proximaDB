@@ -20,6 +20,40 @@ use futures::stream::BoxStream;
 use object_store::path::Path;
 use proximadb_storage_common::object_store_bridge::ObjectStoreBridge;
 
+/// The table schema with the hidden row key appended LAST (P2.4 slice 2).
+///
+/// A published file carries each row's oid as `__proxima_oid`, so a later
+/// publication can tell an insert from an update by probing the published
+/// files' bounds and Bloom filters. Readers drop it from their planning schema,
+/// and being the last column keeps every table column at the same position in
+/// files written before and after it.
+pub(crate) fn with_oid_field(table: SchemaRef) -> SchemaRef {
+    let mut fields: Vec<arrow_schema::FieldRef> = table.fields().iter().cloned().collect();
+    fields.push(std::sync::Arc::new(arrow_schema::Field::new(
+        proximadb_storage_common::proxima_arrow::SYS_COL_OID,
+        arrow_schema::DataType::Utf8,
+        false,
+    )));
+    std::sync::Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        table.metadata().clone(),
+    ))
+}
+
+/// `batch` (the table's columns for `oids`, in order) with the oid column
+/// appended, under `schema` ([`with_oid_field`]).
+pub(crate) fn with_oid_column<'a>(
+    batch: RecordBatch,
+    oids: impl Iterator<Item = &'a str>,
+    schema: SchemaRef,
+) -> Result<RecordBatch> {
+    let mut columns = batch.columns().to_vec();
+    columns.push(std::sync::Arc::new(
+        arrow_array::StringArray::from_iter_values(oids),
+    ));
+    RecordBatch::try_new(schema, columns).map_err(|e| anyhow!("MATERIALIZE: oid column: {e}"))
+}
+
 /// Rows per scan chunk (`PROXIMADB_MATERIALIZE_SCAN_CHUNK_ROWS`).
 const DEFAULT_SCAN_CHUNK_ROWS: usize = 8_192;
 /// Memory budget of the cluster-key sort before it spills

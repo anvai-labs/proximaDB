@@ -3629,6 +3629,132 @@ fn materialized_table_is_readable_through_datafusion_reader() {
     });
 }
 
+/// P2.4 slice 2: a published file carries each row's oid as a hidden LAST
+/// column `__proxima_oid`, Bloom-filtered and without an Iceberg field id, and
+/// the DataFusion reader hides it: `SELECT *` returns the table's columns only.
+#[cfg(feature = "datafusion-integration")]
+#[test]
+fn published_files_carry_a_hidden_oid_column() {
+    crate::query::execution::test_runtime::run_with_timeout(30, async {
+        use crate::datafusion::create_session_context;
+        use crate::datafusion::engine_adapters::register_object_store_parquet_location;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use proximadb_iceberg_engine::IcebergObjectStoreBridge;
+        use proximadb_storage_common::proxima_arrow::SYS_COL_OID;
+
+        let _bloom = EnvGuard::set("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_manager, dml) = dml_over_wal_table(
+            dir.path(),
+            "CREATE TABLE inv (id TEXT NOT NULL, status TEXT, PRIMARY KEY (id));",
+            "hidden-oid.wal",
+        )
+        .await;
+        let parser = crate::query::sql_frontend::SqlFrontendParser::new();
+        for id in ["i1", "i2", "i3"] {
+            let stmt = parser
+                .parse_dml(&format!(
+                    "INSERT INTO inv (id, status) VALUES ('{id}', 'open');"
+                ))
+                .expect("parse insert")
+                .expect("insert stmt");
+            dml.execute(stmt).await.expect("insert");
+        }
+        let store_dir = tempfile::tempdir().expect("store tempdir");
+        let root_url = format!("file://{}", store_dir.path().display());
+        let bridge = Arc::new(IcebergObjectStoreBridge::from_url(&root_url).expect("bridge"));
+        let location = dml
+            .materialize_table_to_parquet(&*bridge, &root_url, "inv", None)
+            .await
+            .expect("materialize");
+
+        // The file: the oid is the last column, holds each row's oid, has a
+        // Bloom filter, and no Iceberg field id.
+        let data_dir = location.trim_start_matches("file://");
+        let file = std::fs::read_dir(data_dir)
+            .expect("data dir")
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "parquet"))
+            .expect("a published part");
+        let reader = SerializedFileReader::new(std::fs::File::open(&file).expect("open part"))
+            .expect("parquet reader");
+        let columns = reader
+            .metadata()
+            .file_metadata()
+            .schema_descr()
+            .columns()
+            .to_vec();
+        let last = columns.last().expect("columns");
+        assert_eq!(last.name(), SYS_COL_OID, "the oid is the last column");
+        assert!(
+            !last.self_type().get_basic_info().has_id(),
+            "no Iceberg field id on the hidden column"
+        );
+        let oid_index = columns.len() - 1;
+        assert!(
+            reader
+                .metadata()
+                .row_group(0)
+                .column(oid_index)
+                .bloom_filter_offset()
+                .is_some(),
+            "the row key is Bloom-filtered"
+        );
+        let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(&file).expect("open part"),
+        )
+        .expect("arrow reader");
+        let mut oids: Vec<String> = builder
+            .build()
+            .expect("build reader")
+            .flat_map(|batch| {
+                let batch = batch.expect("batch");
+                let column = batch
+                    .column_by_name(SYS_COL_OID)
+                    .expect("oid column")
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .expect("utf8")
+                    .clone();
+                (0..column.len())
+                    .map(|i| column.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        oids.sort();
+        assert_eq!(oids.len(), 3);
+        assert!(oids.iter().all(|oid| !oid.is_empty()));
+
+        // The reader hides it.
+        let ctx = create_session_context().expect("session ctx");
+        register_object_store_parquet_location(
+            &ctx,
+            "inv_parquet",
+            &location,
+            None,
+            proximadb_data_model::StatsTrust::Trusted,
+        )
+        .await
+        .expect("register parquet location");
+        let batches = ctx
+            .sql("SELECT * FROM inv_parquet")
+            .await
+            .expect("plan select")
+            .collect()
+            .await
+            .expect("collect");
+        let names: Vec<String> = batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(names, vec!["id".to_string(), "status".to_string()]);
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    });
+}
+
 /// Restores an environment variable when dropped (lib tests run one per process
 /// under nextest; locally they run serialized).
 struct EnvGuard(&'static str, Option<String>);

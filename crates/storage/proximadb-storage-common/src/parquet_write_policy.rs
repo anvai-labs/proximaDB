@@ -221,10 +221,14 @@ impl ParquetWritePolicy {
         let mut out = Vec::new();
         for (i, field) in schema.fields().iter().enumerate() {
             let name = field.name().as_str();
-            let selected = match &self.bloom.columns {
-                Some(list) => list.iter().any(|c| c == name),
-                None => bloom_eligible(field.data_type()) && Some(name) != leading_sort,
-            };
+            // The row key is always filtered (point probes by oid, P2.4 slice 2)
+            // unless it leads the sort, where min/max already answers exactly.
+            let key = name == crate::proxima_arrow::SYS_COL_OID && Some(name) != leading_sort;
+            let selected = key
+                || match &self.bloom.columns {
+                    Some(list) => list.iter().any(|c| c == name),
+                    None => bloom_eligible(field.data_type()) && Some(name) != leading_sort,
+                };
             if !selected {
                 continue;
             }

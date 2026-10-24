@@ -36,6 +36,10 @@ use crate::parquet_write_policy::{ParquetLayoutHints, ParquetWritePolicy};
 /// Stamp Iceberg field ids (`PARQUET:field_id`) on the top-level fields: field id
 /// `i + 1` for column `i`, the assignment the warehouse publisher's Iceberg schema
 /// uses. Iceberg readers resolve Parquet columns by field id.
+///
+/// Hidden system columns (`__proxima_oid`) get no id: they are not in the
+/// Iceberg schema, so an Iceberg reader skips them, and a later `ADD COLUMN`
+/// (which takes the next positional id) cannot collide with one.
 pub fn iceberg_field_id_schema(schema: &Schema) -> SchemaRef {
     const FIELD_ID: &str = "PARQUET:field_id";
     let fields: Vec<arrow_schema::Field> = schema
@@ -43,6 +47,9 @@ pub fn iceberg_field_id_schema(schema: &Schema) -> SchemaRef {
         .iter()
         .enumerate()
         .map(|(i, f)| {
+            if crate::proxima_arrow::is_system_column(f.name()) {
+                return f.as_ref().clone();
+            }
             let mut md = f.metadata().clone();
             md.insert(FIELD_ID.to_string(), (i + 1).to_string());
             f.as_ref().clone().with_metadata(md)
