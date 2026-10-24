@@ -107,31 +107,34 @@ def test_distance_metric_round_trip():
 
 
 def test_storage_engine_to_int_all_inputs():
-    assert ProtoConverter.storage_engine_to_int(None) == 1  # default VIPER
+    # TD-SDKENG-1: SST (2) is the default everywhere; VIPER is deprecated
+    # (ADR-093) and the server rejects it.
+    assert ProtoConverter.storage_engine_to_int(None) == 2  # default SST
     assert ProtoConverter.storage_engine_to_int(5) == 5
     assert ProtoConverter.storage_engine_to_int("nova") == 3
     assert ProtoConverter.storage_engine_to_int("RAPTOR") == 6
     assert ProtoConverter.storage_engine_to_int("mmap") == 1  # legacy alias
     assert ProtoConverter.storage_engine_to_int("hybrid") == 1  # legacy alias
-    assert ProtoConverter.storage_engine_to_int("unknown") == 1  # default
+    assert ProtoConverter.storage_engine_to_int("unknown") == 2  # default
     assert ProtoConverter.storage_engine_to_int(IntEngine.NOVA) == 3
     assert ProtoConverter.storage_engine_to_int(StrEngine.VIPER) == 1
-    assert ProtoConverter.storage_engine_to_int(3.14) == 1  # unsupported type
+    assert ProtoConverter.storage_engine_to_int(3.14) == 2  # unsupported type
 
 
 def test_storage_engine_to_str_all_inputs():
-    assert ProtoConverter.storage_engine_to_str(None) == "viper"
+    # TD-SDKENG-1: unknown/None fall back to SST; the known legacy aliases
+    # (mmap/hybrid) still resolve through the int table to viper.
+    assert ProtoConverter.storage_engine_to_str(None) == "sst"
     assert ProtoConverter.storage_engine_to_str("nova") == "nova"
     assert ProtoConverter.storage_engine_to_str("NOVA") == "nova"
-    # legacy alias resolves through int back to canonical name
     assert ProtoConverter.storage_engine_to_str("mmap") == "viper"
     assert ProtoConverter.storage_engine_to_str("hybrid") == "viper"
-    assert ProtoConverter.storage_engine_to_str("unknown") == "viper"  # default
+    assert ProtoConverter.storage_engine_to_str("unknown") == "sst"  # default
     assert ProtoConverter.storage_engine_to_str(2) == "sst"
-    assert ProtoConverter.storage_engine_to_str(999) == "viper"  # unknown int default
+    assert ProtoConverter.storage_engine_to_str(999) == "sst"  # unknown int default
     assert ProtoConverter.storage_engine_to_str(IntEngine.NOVA) == "nova"
     assert ProtoConverter.storage_engine_to_str(StrEngine.VIPER) == "viper"
-    assert ProtoConverter.storage_engine_to_str(3.14) == "viper"  # unsupported type
+    assert ProtoConverter.storage_engine_to_str(3.14) == "sst"  # unsupported type
 
 
 # ============================================================================
@@ -262,7 +265,7 @@ def test_collection_config_to_dict_defaults():
         "name": "col",
         "dimension": 128,
         "distance_metric": "cosine",
-        "storage_engine": "viper",
+        "storage_engine": "sst",
         "index_type": "hnsw",
     }
 

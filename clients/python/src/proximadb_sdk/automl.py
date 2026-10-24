@@ -349,10 +349,10 @@ class EngineSelector:
         scores: list[tuple[str, float, dict[str, Any]]] = []
 
         for engine, profile in self.ENGINE_PROFILES.items():
-            # Skip SWIFT for large datasets
-            if engine == "swift" and characteristics.vector_count > profile.get(
-                "max_vectors", float("inf")
-            ):
+            # TD-SDKENG-1: never RECOMMEND an engine the server rejects or
+            # gates — VIPER is deprecated (ADR-093), SWIFT/RAPTOR are
+            # experimental. Profiles stay for scoring history.
+            if engine in ("viper", "swift", "raptor"):
                 continue
 
             score = self._calculate_score(engine, profile, characteristics, goal)
@@ -452,44 +452,22 @@ class EngineSelector:
         profile: dict[str, Any],
         characteristics: WorkloadCharacteristics,
     ) -> dict[str, Any]:
-        """Generate optimized configuration for an engine"""
-        config = {}
+        """Generate optimized configuration for an engine.
+
+        TD-SDKENG-1 (review): only CollectionConfig-field overrides — the
+        documented pattern `client.create_collection(..., engine=rec.engine,
+        **rec.config_overrides)` now REJECTS unknown keywords (rightly), so
+        the old tuning knobs that were silently dropped (flush_threshold_mb,
+        pca_dimensions, ...) must not be emitted. The engines' real tuning
+        surfaces (storage_config) are a follow-up.
+        """
+        config: dict[str, Any] = {}
 
         if engine == "sst":
-            # Tune SST for workload
             if characteristics.write_ratio > 0.7:
-                config["compression"] = "lz4"  # Fast compression
-                config["flush_threshold_mb"] = 128
+                config["compression"] = {"algorithm": "lz4"}
             else:
-                config["compression"] = "zstd"  # Better compression
-                config["bloom_filter_fpp"] = 0.001
-
-        elif engine == "helix":
-            # Tune HELIX for dimensions and clustering
-            if characteristics.vector_dimension > 512:
-                config["pca_dimensions"] = min(
-                    128, characteristics.vector_dimension // 4
-                )
-            config["hilbert_bits"] = (
-                16 if characteristics.spatial_locality > 0.7 else 12
-            )
-
-        elif engine == "viper":
-            config["row_group_size"] = (
-                100000 if characteristics.vector_count > 100000 else 10000
-            )
-            config["enable_statistics"] = True
-
-        elif engine == "swift":
-            config["in_memory"] = True
-            config["exact_search"] = (
-                characteristics.target_latency_ms is None
-                or characteristics.target_latency_ms > 5
-            )
-
-        elif engine == "raptor":
-            config["adaptive_pruning"] = True
-            config["cache_hot_blocks"] = characteristics.hot_data_ratio > 0.3
+                config["compression"] = {"algorithm": "zstd"}
 
         return config
 
@@ -559,6 +537,13 @@ class EngineSelector:
         recommendations.sort(key=lambda x: x.confidence, reverse=True)
         return recommendations
 
+    def _engine_selectable(self, engine: str) -> bool:
+        # TD-SDKENG-1: never hand back an engine the server would reject —
+        # VIPER is deprecated (ADR-093), SWIFT/RAPTOR experimental, and
+        # MMAP/HYBRID map to VIPER on the gRPC path and are absent from the
+        # v2 REST engine options (round-3 review).
+        return engine in ("sst", "nova", "helix")
+
     def _get_engine_recommendation(
         self,
         engine: str,
@@ -568,11 +553,9 @@ class EngineSelector:
         profile = self.ENGINE_PROFILES.get(engine)
         if not profile:
             return None
-
-        # Check constraints
-        if engine == "swift" and characteristics.vector_count > profile.get(
-            "max_vectors", float("inf")
-        ):
+        # TD-SDKENG-1: no recommendation for engines the server rejects or
+        # gates (VIPER deprecated, SWIFT/RAPTOR experimental).
+        if not self._engine_selectable(engine):
             return None
 
         score = self._calculate_score(
