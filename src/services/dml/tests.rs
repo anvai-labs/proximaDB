@@ -3640,6 +3640,7 @@ fn published_files_carry_a_hidden_oid_column() {
     crate::query::execution::test_runtime::run_with_timeout(30, async {
         use crate::datafusion::create_session_context;
         use crate::datafusion::engine_adapters::register_object_store_parquet_location;
+        use arrow_array::Array;
         use parquet::file::reader::{FileReader, SerializedFileReader};
         use proximadb_iceberg_engine::IcebergObjectStoreBridge;
         use proximadb_storage_common::proxima_arrow::SYS_COL_OID;
