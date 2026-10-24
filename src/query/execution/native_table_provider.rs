@@ -71,6 +71,12 @@ pub fn native_table_provider_enabled() -> bool {
     )
 }
 
+/// Marks the planning error raised when a query MIXING Parquet-backed and
+/// native tables names a native table over the row cap (no streaming Layer A
+/// provider for it): the pgwire pipeline then serves the query on Volcano, as
+/// before mixed queries reached DataFusion, rather than fail it.
+pub const MIXED_QUERY_ROW_CAP_DECLINE: &str = "native table over the row cap in a mixed query";
+
 /// Row cap for a natively-registered table (see [`DEFAULT_NATIVE_TABLE_ROW_CAP`]).
 pub fn native_table_row_cap() -> usize {
     std::env::var(NATIVE_TABLE_ROW_CAP_ENV)

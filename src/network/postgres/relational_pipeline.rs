@@ -1054,7 +1054,8 @@ pub async fn try_run_select(
     // true under `datafusion-integration`, where the DataFusion destination is
     // compiled — and feed it into the canonical `ComputeScheduler` so the ROUTE
     // DECISION and the physical DISPATCH come from ONE place. Mixed Parquet+native
-    // queries report `false` (cross-engine join is a later phase) → Volcano.
+    // queries report `false` here; they reach the DataFusion floor through
+    // `native_registerable` (ADR-097 P3.1 PR 8).
     #[cfg(feature = "datafusion-integration")]
     let parquet_backed = !relational_abac_required
         && !tables.is_empty()
@@ -1067,11 +1068,14 @@ pub async fn try_run_select(
     // is what makes CTEs / window functions / joins reachable without a manual
     // `ALTER TABLE … MATERIALIZE` — the capability cliff ADR-094 records as defect (b).
     //
-    // Mixed Parquet+native queries stay `false` (the Parquet arm already serves those,
-    // and cross-representation joins are a later phase).
+    // ADR-097 P3.1 PR 8: a query MIXING Parquet-backed and native tables is admitted
+    // too — the floor registers the Parquet tables (with their ADR-025 delta merge)
+    // and the native ones side by side, so a cross-representation join no longer
+    // falls back to Volcano. Ungoverned sessions only: the Parquet side reads files
+    // directly and cannot apply a row filter, exactly as the Parquet arm.
     //
-    // TD-USUB-3: a governed (ABAC-scoped) session IS admitted here, unlike the Parquet
-    // arm. That asymmetry is the whole point — every row this path registers comes from
+    // TD-USUB-3: a governed (ABAC-scoped) session IS admitted for an all-native
+    // query (not a mixed one), unlike the Parquet arm. That asymmetry is the whole point — every row this path registers comes from
     // `scan_table_relational`, which resolves the ABAC row filter itself, so the rows
     // handed to DataFusion are already governed. The Parquet arm reads files directly
     // and cannot apply a row filter, which is why it stays excluded under ABAC.
@@ -1081,11 +1085,18 @@ pub async fn try_run_select(
     // filter. `query_has_table_function` is the fail-closed guard that keeps a governed
     // query from mixing governed rows with an ungoverned source.
     #[cfg(feature = "datafusion-integration")]
-    let native_registerable =
-        crate::query::execution::native_table_provider::native_table_provider_enabled()
-            && !tables.is_empty()
-            && tables.keys().all(|k| !parquet_loc_by_key.contains_key(k))
+    let (native_registerable, mixed_registerable) = {
+        let gate = crate::query::execution::native_table_provider::native_table_provider_enabled();
+        let parquet = |k: &String| parquet_loc_by_key.contains_key(k);
+        let all_native = !tables.is_empty()
+            && tables.keys().all(|k| !parquet(k))
             && (!relational_abac_required || !query_has_table_function(query));
+        let mixed = gate
+            && !relational_abac_required
+            && tables.keys().any(parquet)
+            && tables.keys().any(|k| !parquet(k));
+        ((gate && all_native) || mixed, mixed)
+    };
     #[cfg(not(feature = "datafusion-integration"))]
     let native_registerable = false;
 
@@ -1178,7 +1189,8 @@ pub async fn try_run_select(
     // block does NOT re-decide — it is a thin `match decision.backend` over the
     // parquet-OLAP engines, each PRIMARY owning its own fall-through to the shared
     // DataFusion floor. The DataFusion arm exists only under the feature (and
-    // `parquet_backed`), so a default build never enters it and stays Volcano.
+    // `parquet_backed` or `native_registerable`), so a build without it never
+    // enters and stays Volcano.
     //
     // The outer guard restricts entry to the three parquet-OLAP backends; any
     // other `decision.backend` (never produced for a parquet-OLAP shape) falls
@@ -1372,15 +1384,18 @@ pub async fn try_run_select(
             // ADR-025: reconcile opted-in parquet-backed tables with their
             // post-snapshot WAL delta at scan time. `None` (no opted-in table)
             // keeps the legacy bare-Parquet read (default-OFF).
-            // TD-USUB-2: native relational tables registered as MemTables, so the
-            // DataFusion floor (and its `ctx.sql` fallback) can serve them. `None`
-            // whenever the gate is off or any table is Parquet-backed.
+            // TD-USUB-2: native relational tables registered with the DataFusion
+            // floor (and its `ctx.sql` fallback). `None` whenever the gate is off or
+            // no table is native. A mixed query registers only its non-Parquet
+            // tables here — the Parquet ones arrive through `parquet_tables` — so no
+            // table is registered twice (ADR-097 P3.1 PR 8).
             native_tables: if native_registerable {
                 Some(
                     crate::query::execution::native_table_provider::NativeTableConfig {
                         source: dml.clone(),
                         tables: tables
                             .iter()
+                            .filter(|(k, _)| !parquet_loc_by_key.contains_key(*k))
                             .map(|(k, t)| (k.clone(), t.table_name.clone()))
                             .collect(),
                         row_cap:
@@ -1454,15 +1469,37 @@ pub async fn try_run_select(
             )
             .await;
         }
-        return Some(match engine_result {
+        match engine_result {
             Ok(result) => {
                 if let Some((skey, lsn)) = &cache_ctx {
                     populate_olap_result_cache(result_cache, skey, *lsn, result.clone(), &tables);
                 }
-                Ok(result)
+                return Some(Ok(result));
             }
-            Err(e) => Err(e.to_string()),
-        });
+            // A mixed query naming a native table over the row cap (no streaming
+            // provider for it) is served on Volcano below, as it was before mixed
+            // queries reached DataFusion — never failed, never truncated.
+            Err(e)
+                if mixed_registerable
+                    && e.to_string().contains(
+                        crate::query::execution::native_table_provider::MIXED_QUERY_ROW_CAP_DECLINE,
+                    ) =>
+            {
+                tracing::debug!(
+                    target: "proximadb::compute_route",
+                    error = %e,
+                    "mixed Parquet+native query over the native row cap; Volcano serves"
+                );
+                // Volcano serves, not the DataFusion route stamped above (TD-ROUTE-3).
+                crate::observability::io_trace::record_route(
+                    &crate::query::route_cost_model::shape_class(&shape),
+                    &crate::query::compute_scheduler::backend_label(
+                        &crate::query::table_write_plan::ComputeBackend::Native,
+                    ),
+                );
+            }
+            Err(e) => return Some(Err(e.to_string())),
+        }
     }
 
     let snapshot = SnapshotCatalog {
