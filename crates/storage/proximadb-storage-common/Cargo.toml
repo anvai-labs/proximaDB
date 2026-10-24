@@ -51,7 +51,7 @@ proximadb-bloom = { workspace = true }
 proximadb-hardware.workspace = true
 proximadb-hardware-caps.workspace = true
 regex.workspace = true
-arrow-select = { version = "59", default-features = false }
+arrow-select = { version = "60", default-features = false }
 crc32fast.workspace = true
 proximadb-runtime-common.workspace = true
 # columnar footer_cache + utilities (TD-DECOMP-76)
