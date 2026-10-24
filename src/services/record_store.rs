@@ -2225,6 +2225,14 @@ pub struct DirectWalTableRecordStore {
     wal_appender: Arc<dyn TableWalAppender>,
     /// Appended-but-not-yet-applied writes (TD-SEAM-12); see [`InflightWrites`].
     inflight: InflightWrites,
+    /// Per partition, the WAL head at its last successful lag flush
+    /// (TD-USUB-22). A partition is lag-flushed at most once per lag window,
+    /// whatever that flush achieved: one whose oldest rows a flush cannot move
+    /// (held resident by a codec hold or an ambiguous oid, or a purge's hold)
+    /// costs at most one small segment per window, and is retried each window
+    /// in case it can move now. A failed flush is not recorded, so the next
+    /// run retries it.
+    lag_flushed: std::sync::Mutex<std::collections::HashMap<(String, String), u64>>,
     /// TD-110 Slice C: UNIQUE/PK index keyed by `(tenant_id, collection)` so a
     /// table's UNIQUE/PK enforcement is per-tenant. Presence of a key == "index
     /// built". Lazily built on first `check_unique_conflict`, then maintained on
@@ -2386,6 +2394,96 @@ impl DirectWalTableRecordStore {
         ))
     }
 
+    /// Every live partition with its key, snapshotted so the read lock is not
+    /// held across the per-partition awaits that follow.
+    fn partition_snapshot(&self) -> Vec<((String, String), Arc<dyn RecordStorage>)> {
+        self.partitions
+            .read()
+            .iter()
+            .map(|(key, partition)| (key.clone(), partition.clone()))
+            .collect()
+    }
+
+    /// Flush every partition whose oldest unflushed row is more than
+    /// `max_lag` WAL entries behind `head` (TD-USUB-22), returning how many
+    /// flushed.
+    ///
+    /// A partition flushes on its own only at the resident-row threshold, so a
+    /// table that never reaches it — a small dimension table loaded once —
+    /// keeps its first row's LSN as the tier's floor and pins every WAL entry
+    /// after it. Flushing it makes those rows durable in a segment, so the
+    /// floor moves up to the next partition's.
+    ///
+    /// Best effort: a partition that refuses to report a floor (a memtable) is
+    /// skipped, and a failed flush is logged and leaves its rows resident, so
+    /// the floor computed afterwards still retains them. A failed or cancelled
+    /// segment write also makes that partition refuse (`min_unflushed_lsn`)
+    /// until a purge or restart, which stops truncation for the whole tier:
+    /// fail-closed, but worth the warning it logs. A partition lag-flushed
+    /// within the last `max_lag` entries is not flushed again (see
+    /// `lag_flushed`). Writes may race it: `flush` serializes on its
+    /// `flush_guard` and evicts only the generation it wrote, and after a
+    /// DROP's purge `flush` writes nothing until the partition's next write.
+    pub async fn flush_lagging_partitions(&self, head: u64, max_lag: u64) -> usize {
+        if self.shared_storage {
+            return 0;
+        }
+        let partitions = self.partition_snapshot();
+        let mut flushed = 0;
+        for ((tenant_id, collection), partition) in partitions {
+            // A partition that refuses (a memtable, an unresolved segment
+            // write, an untracked row) is skipped: the floor recomputed after
+            // this refuses on its account anyway, so nothing is hidden.
+            let Ok(Some(oldest)) = partition.min_unflushed_lsn().await else {
+                continue;
+            };
+            if head.saturating_sub(oldest) <= max_lag {
+                continue;
+            }
+            let key = (tenant_id.clone(), collection.clone());
+            if self
+                .lag_flushed_at(&key)
+                .is_some_and(|at| head.saturating_sub(at) <= max_lag)
+            {
+                continue;
+            }
+            match partition.flush().await {
+                Ok(()) => {
+                    flushed += 1;
+                    self.set_lag_flushed_at(key, Some(head));
+                }
+                Err(error) => tracing::warn!(
+                    tenant_id = %tenant_id,
+                    collection = %collection,
+                    oldest,
+                    head,
+                    "flushing a partition that pins WAL truncation failed; its rows stay \
+                     resident and retained: {error:#}"
+                ),
+            }
+        }
+        flushed
+    }
+
+    fn lag_flushed_at(&self, key: &(String, String)) -> Option<u64> {
+        self.lag_flushed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .copied()
+    }
+
+    fn set_lag_flushed_at(&self, key: (String, String), head: Option<u64>) {
+        let mut seen = self
+            .lag_flushed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match head {
+            Some(lsn) => seen.insert(key, lsn),
+            None => seen.remove(&key),
+        };
+    }
+
     /// Flush every live partition's write buffer to durable segments
     /// ([`RecordStore::flush`]; a no-op for a memtable partition). Called on
     /// graceful shutdown AFTER the servers stop, so no write races it.
@@ -2394,12 +2492,7 @@ impl DirectWalTableRecordStore {
     /// failure. A failed flush loses nothing — the rows stay resident and the
     /// WAL, which is never truncated past an unflushed row, replays them.
     pub async fn flush_partitions(&self) -> Result<usize> {
-        let partitions: Vec<((String, String), Arc<dyn RecordStorage>)> = self
-            .partitions
-            .read()
-            .iter()
-            .map(|(key, partition)| (key.clone(), partition.clone()))
-            .collect();
+        let partitions = self.partition_snapshot();
         let mut failures = Vec::new();
         for ((tenant_id, collection), partition) in &partitions {
             if let Err(error) = partition.flush().await {
@@ -2518,6 +2611,7 @@ impl DirectWalTableRecordStore {
             shared_storage,
             wal_appender,
             inflight: InflightWrites::default(),
+            lag_flushed: std::sync::Mutex::new(std::collections::HashMap::new()),
             unique_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
             secondary_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
             poisoned: std::sync::atomic::AtomicBool::new(false),
@@ -2646,12 +2740,7 @@ impl DirectWalTableRecordStore {
                  durable per partition, so the WAL cannot be truncated on its account"
             );
         }
-        let partitions: Vec<((String, String), Arc<dyn RecordStorage>)> = self
-            .partitions
-            .read()
-            .iter()
-            .map(|(key, partition)| (key.clone(), partition.clone()))
-            .collect();
+        let partitions = self.partition_snapshot();
         let mut floor: Option<u64> = None;
         for ((tenant_id, collection), partition) in partitions {
             let partition_floor = partition.min_unflushed_lsn().await.with_context(|| {
@@ -2676,6 +2765,7 @@ impl DirectWalTableRecordStore {
         let index_key = (tenant_id.to_string(), collection_id.to_string());
         self.unique_index.write().remove(&index_key);
         self.secondary_index.write().remove(&index_key);
+        self.set_lag_flushed_at(index_key, None);
     }
 
     /// Apply already-durable mutations to the memtable partitions and the
@@ -3988,6 +4078,22 @@ mod tests {
     /// Forgotten tempdir root for a spill test: `(root, base)` — the dir is
     /// deliberately leaked (test-hygiene: unique per test, never shared), and
     /// `base` is its string form for path closures.
+    /// A WAL upsert of a propless row `r{lsn}` into `collection` for `tenant`.
+    fn upsert_entry(lsn: u64, tenant: &str, collection: &str) -> CanonicalWalEntry {
+        CanonicalWalEntry::new(
+            lsn,
+            CanonicalOperation::RecordUpsert {
+                collection_id: collection.to_string(),
+                record: Box::new(ProximaRecord {
+                    oid: format!("r{lsn}"),
+                    ..Default::default()
+                }),
+                projections: vec![],
+            },
+            Some(tenant.to_string()),
+        )
+    }
+
     fn spill_root() -> (std::path::PathBuf, String) {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
@@ -6695,6 +6801,171 @@ mod tests {
         );
     }
 
+    /// TD-USUB-22: a partition below the flush threshold — a small table
+    /// loaded once — pins the tier's floor at its first row until something
+    /// flushes it. `flush_lagging_partitions` flushes exactly the partitions
+    /// lagging the head by more than the allowed lag, the floor moves up, and
+    /// the flushed rows still read back.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn a_lagging_partition_is_flushed_so_it_stops_pinning_the_floor() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
+        }
+        let (_, base) = spill_root();
+        let store = DirectWalTableRecordStore::new_spilling(
+            Arc::new(RecordingWalAppender::default()),
+            local_fs().await,
+            tenant_path_resolver(base),
+        );
+        let upsert = |lsn: u64, collection: &str| upsert_entry(lsn, "tenant-a", collection);
+        // `dims`: LSNs 1 and 2, below the threshold, so they stay resident.
+        // `facts`: LSNs 3..=9 — 3..=6 flush at the threshold, 7..=9 resident.
+        let mut entries: Vec<CanonicalWalEntry> = (1..=2).map(|lsn| upsert(lsn, "dims")).collect();
+        entries.extend((3..=9).map(|lsn| upsert(lsn, "facts")));
+        store.replay_wal_entries(entries).await.expect("replay");
+        assert_eq!(store.min_unflushed_lsn().await.ok(), Some(Some(1)));
+
+        // Within the allowed lag nothing flushes.
+        assert_eq!(store.flush_lagging_partitions(9, 8).await, 0);
+        assert_eq!(store.min_unflushed_lsn().await.ok(), Some(Some(1)));
+
+        // `dims` lags the head by 8 > 5; `facts` (oldest resident 7) by 2.
+        assert_eq!(store.flush_lagging_partitions(9, 5).await, 1);
+        assert_eq!(
+            store.min_unflushed_lsn().await.ok(),
+            Some(Some(7)),
+            "the floor moves up to the next partition's oldest resident row"
+        );
+        let dims = store.partition("tenant-a", "dims");
+        assert!(
+            dims.get_record(&RecordKey::new("r1".to_string()))
+                .await
+                .expect("read")
+                .is_some(),
+            "the flushed row is served from its segment"
+        );
+        // `facts` now lags by 4 > 3 and flushes; afterwards it holds nothing
+        // unflushed, so a second run has nothing to flush.
+        assert_eq!(store.flush_lagging_partitions(11, 3).await, 1);
+        assert_eq!(store.flush_lagging_partitions(11, 3).await, 0);
+        assert_eq!(store.min_unflushed_lsn().await.ok(), Some(None));
+    }
+
+    /// A partition double for the lag flush: its oldest unflushed LSN stays put
+    /// until a flush succeeds and frees it (unless `stuck`); the first
+    /// `failures` flushes fail.
+    struct LagProbePartition {
+        oldest: std::sync::Mutex<Option<u64>>,
+        failures: std::sync::atomic::AtomicUsize,
+        stuck: bool,
+        flushes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl LagProbePartition {
+        fn new(oldest: u64, failures: usize, stuck: bool) -> Self {
+            Self {
+                oldest: std::sync::Mutex::new(Some(oldest)),
+                failures: std::sync::atomic::AtomicUsize::new(failures),
+                stuck,
+                flushes: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn flushes(&self) -> usize {
+            self.flushes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl RecordStore for LagProbePartition {
+        async fn upsert_record(&self, record: ProximaRecord) -> Result<ProximaRecord> {
+            Ok(record)
+        }
+        async fn get_record(&self, _key: &RecordKey) -> Result<Option<ProximaRecord>> {
+            Ok(None)
+        }
+        async fn delete_record(&self, _key: &RecordKey) -> Result<bool> {
+            Ok(false)
+        }
+        async fn min_unflushed_lsn(&self) -> Result<Option<u64>> {
+            Ok(*self.oldest.lock().expect("lock"))
+        }
+        async fn flush(&self) -> Result<()> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.flushes.fetch_add(1, SeqCst);
+            if self
+                .failures
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                anyhow::bail!("transient segment write failure");
+            }
+            if !self.stuck {
+                *self.oldest.lock().expect("lock") = None;
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl RecordScan for LagProbePartition {
+        async fn scan_records(&self, _limit: usize) -> Result<Vec<ProximaRecord>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn lag_probe_store(partition: Arc<LagProbePartition>) -> DirectWalTableRecordStore {
+        DirectWalTableRecordStore::with_storage_factory(
+            Arc::new(RecordingWalAppender::default()),
+            Arc::new(move |_: &str, _: &str| partition.clone() as Arc<dyn RecordStorage>),
+        )
+    }
+
+    /// TD-USUB-22 review: a failed lag flush is retried on the next run — it
+    /// must not mark the partition as "flushed, did not move", or one transient
+    /// error would leave a small idle table pinning the WAL for good.
+    #[tokio::test]
+    async fn a_failed_lag_flush_is_retried_on_the_next_run() {
+        let partition = Arc::new(LagProbePartition::new(1, 1, false));
+        let store = lag_probe_store(partition.clone());
+        let _ = store.partition("t", "dims");
+        assert_eq!(
+            store.flush_lagging_partitions(100, 10).await,
+            0,
+            "flush failed"
+        );
+        assert_eq!(
+            store.flush_lagging_partitions(100, 10).await,
+            1,
+            "and is retried"
+        );
+        assert_eq!(partition.flushes(), 2);
+        assert_eq!(store.min_unflushed_lsn().await.ok(), Some(None));
+    }
+
+    /// TD-USUB-22 review: a partition a lag flush did not move (its oldest rows
+    /// are held resident) is flushed at most once per lag window, and retried
+    /// in the next window in case it can move then.
+    #[tokio::test]
+    async fn a_lag_flush_that_frees_nothing_waits_a_lag_window() {
+        let partition = Arc::new(LagProbePartition::new(1, 0, true));
+        let store = lag_probe_store(partition.clone());
+        let _ = store.partition("t", "dims");
+        assert_eq!(store.flush_lagging_partitions(100, 10).await, 1);
+        assert_eq!(
+            store.flush_lagging_partitions(110, 10).await,
+            0,
+            "same window"
+        );
+        assert_eq!(
+            store.flush_lagging_partitions(111, 10).await,
+            1,
+            "next window"
+        );
+        assert_eq!(partition.flushes(), 2);
+    }
+
     /// With the spill gate on, the tier floor is the minimum over spill
     /// partitions' resident LSNs — the untenanted (`""`) partition included,
     /// since it spills too — and ONE refusing partition (a memtable) makes the
@@ -6715,20 +6986,7 @@ mod tests {
             fs,
             tenant_path_resolver(base),
         );
-        let upsert = |lsn: u64, tenant: &str, collection: &str| {
-            CanonicalWalEntry::new(
-                lsn,
-                CanonicalOperation::RecordUpsert {
-                    collection_id: collection.to_string(),
-                    record: Box::new(ProximaRecord {
-                        oid: format!("r{lsn}"),
-                        ..Default::default()
-                    }),
-                    projections: vec![],
-                },
-                Some(tenant.to_string()),
-            )
-        };
+        let upsert = upsert_entry;
 
         // `orders`: LSNs 1..=6 at threshold 4 — 1..=4 flush, 5 and 6 stay
         // resident. `items`: LSNs 7 and 8, both resident.
@@ -6823,20 +7081,7 @@ mod tests {
         .await
         .expect("open");
         store
-            .replay_wal_entries((1..=20u64).map(|lsn| {
-                CanonicalWalEntry::new(
-                    lsn,
-                    CanonicalOperation::RecordUpsert {
-                        collection_id: "orders".to_string(),
-                        record: Box::new(ProximaRecord {
-                            oid: format!("r{lsn}"),
-                            ..Default::default()
-                        }),
-                        projections: vec![],
-                    },
-                    Some("tenant-a".to_string()),
-                )
-            }))
+            .replay_wal_entries((1..=20u64).map(|lsn| upsert_entry(lsn, "tenant-a", "orders")))
             .await
             .expect("replay");
         assert_eq!(store.flush_partitions().await.expect("flush"), 1);

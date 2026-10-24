@@ -324,6 +324,19 @@ pub struct SpillRecordStorage {
     /// currently zero and should be *measured* before trading correctness
     /// obviousness for it (mandate #6).
     flush_guard: tokio::sync::Mutex<()>,
+    /// Set by `purge_durable_objects` (under `flush_guard`), cleared by the next
+    /// write to this partition. While set, `flush` writes nothing (TD-USUB-22).
+    ///
+    /// A DROP purges a partition and then removes it from the store's map, but
+    /// a caller that took its handle earlier — the truncator's lag flush, which
+    /// holds handles across awaits — can still call `flush` after the purge,
+    /// and would write the dropped table's resident rows back into the prefix
+    /// the purge just emptied, where a re-created table or the next restart
+    /// adopts them. A dropped partition gets no further writes, so the flag
+    /// stays set and such a flush is a no-op. A LIVE partition whose prefix a
+    /// purge reconciled keeps its resident rows (still retained in the WAL) and
+    /// flushes normally again after its next write.
+    purged_since_write: std::sync::atomic::AtomicBool,
     /// Count of segment writes whose outcome this store never learned, each of
     /// which may have left an ORPHAN: a durable, canonically-named object that is
     /// not in `segments`.
@@ -482,6 +495,7 @@ impl SpillRecordStorage {
             key_filters: DashMap::new(),
             flush_guard: tokio::sync::Mutex::new(()),
             unresolved_segment_writes: AtomicU64::new(0),
+            purged_since_write: std::sync::atomic::AtomicBool::new(false),
             flush_threshold,
             filesystem,
             base_path: base_path.into(),
@@ -879,6 +893,11 @@ impl SpillRecordStorage {
         // delete can observe the pre-push segment list for a row this flush is
         // about to make durable (TD-USUB-13). See `flush_guard`.
         let _publish = self.flush_guard.lock().await;
+        // Purged and not written since: possibly a dropped partition's stale
+        // handle, so write nothing (see `purged_since_write`).
+        if self.purged_since_write.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
         // The RESIDENT rows, kept separate from what gets written. These are the
         // only rows this flush may evict from the memtable afterwards.
         //
@@ -1384,6 +1403,7 @@ impl SpillRecordStorage {
     ///
     /// The flush is best effort ([`Self::flush_after_write`]).
     async fn delete_tracked(&self, key: &RecordKey, lsn: Option<u64>) -> Result<bool> {
+        self.purged_since_write.store(false, Ordering::SeqCst);
         let removed = self.delete_unflushed(key, lsn).await?;
         self.flush_after_write().await;
         Ok(removed)
@@ -1536,6 +1556,7 @@ impl SpillRecordStorage {
         record: ProximaRecord,
         lsn: Option<u64>,
     ) -> Result<ProximaRecord> {
+        self.purged_since_write.store(false, Ordering::SeqCst);
         // Re-inserting a previously deleted oid must clear its tombstone, or the
         // new row would stay invisible behind the suppression of the old one.
         self.tombstones.remove(&record.oid);
@@ -1996,6 +2017,10 @@ impl RecordStore for SpillRecordStorage {
         self.segments.write().clear();
         self.key_filters.clear();
         self.tombstones.clear();
+        // Resident rows stay (a purge may reconcile a LIVE partition's prefix),
+        // but no flush writes them until the next write: under `flush_guard`, so
+        // a flush in progress completes first and is purged with the rest.
+        self.purged_since_write.store(true, Ordering::SeqCst);
         // The prefix has been reconciled by deletion, so any orphan an
         // unresolved write left is gone too — this is the one path that can zero
         // the counter (see the `unresolved_segment_writes` field; re-listing
@@ -2518,6 +2543,27 @@ mod tests {
             Some(55),
             "a deleted row must stop pinning the WAL"
         );
+        Ok(())
+    }
+
+    /// TD-USUB-22: after a purge, a flush writes nothing until the partition is
+    /// written again — a dropped partition's stale handle (the truncator's lag
+    /// flush racing a DROP) cannot write the dropped rows back into the prefix,
+    /// while a live partition resumes flushing after its next write.
+    #[tokio::test]
+    async fn a_purged_partition_is_not_flushed_until_written_again() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let s = SpillRecordStorage::with_flush_threshold(fs, base.clone(), None)
+            .with_tenant("tenant-a");
+        s.upsert_record(record("a", "open")).await?;
+        s.upsert_record(record("b", "open")).await?;
+        s.purge_durable_objects().await?;
+        assert_eq!(s.flush().await?, None, "a purged partition writes nothing");
+        assert_eq!(segment_files_on_disk(&base), 0);
+
+        s.upsert_record(record("c", "open")).await?;
+        assert!(s.flush().await?.is_some(), "a write ends the purge's hold");
+        assert_eq!(segment_files_on_disk(&base), 1);
         Ok(())
     }
 

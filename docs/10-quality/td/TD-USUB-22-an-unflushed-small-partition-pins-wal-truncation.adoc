@@ -1,0 +1,65 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-22: A partition below the flush threshold pins WAL truncation at its first row
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved 2026-10-24** (lagging partitions are flushed by the record-tier floor source; see Resolution). Filed the same day by the ADR-097 P2.4 SF1 gate run.
+| Priority | **HIGH**: with spill and truncation on by default, any server holding one small, rarely written table keeps its whole canonical WAL; the TPC-DS SF1 load wrote 6.8 GB of WAL with nothing truncated.
+| Component | `src/services/wal_truncator.rs` (`RecordTierFloor`), `src/services/record_store.rs` (`DirectWalTableRecordStore::min_unflushed_lsn`, `flush_lagging_partitions`)
+| Relates to | TD-SEAM-2 (truncation), TD-USUB-1, TD-USUB-21, TD-SEAM-4
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+The truncator's record-tier floor is the minimum, over spill partitions, of each partition's
+oldest unflushed LSN (`DirectWalTableRecordStore::min_unflushed_lsn`). A partition flushes only
+when its resident rows reach `PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT` (default 65,536). A table
+that never gets there keeps its rows resident indefinitely, so its first row's LSN is the floor
+for the whole tier and no WAL entry after it can be truncated.
+
+Evidence: the TPC-DS SF1 load-only run with spill on (release build, 2026-10-24). After 1,170 s
+the canonical WAL held 6.8 GB in 107 sealed 64 MiB segments, about 975 bytes per row, with none
+truncated, while the spill segments held 437 MB. Only the five tables past the threshold had
+spilled (`store_sales`, `catalog_sales`, `store_returns`, `customer`, `customer_address`); the
+small dimension tables, loaded first, stayed resident and held the floor at their first rows. The run was stopped before the disk
+filled; at that rate the full load needs about 14 GB of WAL.
+
+== Resolution (2026-10-24)
+
+Before answering, `RecordTierFloor` calls `flush_lagging_partitions(head, lag)`: every partition
+whose oldest unflushed row is more than `lag` entries behind the WAL head is flushed, so its
+rows are durable in a segment and the floor moves up to the next partition's.
+
+* `lag` is `PROXIMADB_RELATIONAL_SPILL_FLUSH_LAG_ENTRIES`, default 1,000,000, the same as the
+  change-feed retention default, so a lagging partition costs no more WAL than the feed already
+  keeps. `0`/`off` disables it.
+* The flush writes a segment, never a WAL entry, so the source stays read-only for the
+  truncator's ordering rule.
+* Best effort: a partition that refuses a floor (a memtable) is skipped; a failed flush is logged
+  and leaves its rows resident, so the floor computed next still retains them.
+* The effective lag is never below the change-feed retention
+  (`PROXIMADB_CANONICAL_WAL_RETAIN_ENTRIES`): that floor holds the WAL there anyway, so a flush
+  inside it would free nothing.
+* A partition is lag-flushed at most once per lag window (`lag_flushed` holds the WAL head at
+  its last successful lag flush). One whose oldest rows a flush cannot move (held resident by a
+  codec hold or an ambiguous oid, or by a purge's hold) therefore costs at most one small segment
+  per window and is retried each window. A failed flush is not recorded, so the next run
+  retries it.
+* A DROP racing the flush: the truncator holds partition handles across awaits, so a purge now
+  sets `purged_since_write` under `flush_guard`, and `flush` writes nothing until the partition's
+  next write. A dropped partition gets no further writes, so a stale handle cannot write the
+  dropped rows back into the purged prefix. A live partition whose prefix a purge reconciled
+  keeps its resident rows (still retained in the WAL) and flushes again after its next write.
+* A failed or cancelled segment write makes that partition refuse its floor until a purge or
+  restart, and one refusal stops truncation for the whole tier. That is fail-closed, as before;
+  this change only makes small partitions reach the flush path.
+* Cost: a table that stops being written costs one small segment. One that keeps a slow trickle
+  of writes costs at most one flush per `lag` WAL entries.
+
+Gates: `a_lagging_partition_is_flushed_so_it_stops_pinning_the_floor`,
+`a_purged_partition_is_not_flushed_until_written_again`, `a_failed_lag_flush_is_retried_on_the_next_run`,
+`a_lag_flush_that_frees_nothing_waits_a_lag_window`, plus the SF1 run in
+`docs/_internal/status/P24_SF1_GATE_EVIDENCE_2026_10_23.adoc`.
