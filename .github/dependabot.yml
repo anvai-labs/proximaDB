@@ -52,12 +52,9 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: "metal"
         update-types: ["version-update:semver-major"]
-      # ort is a 2.0 pre-release, so rc.14+ arrives inside the minor/patch group,
-      # but rc.15 needs one process-wide ONNX Runtime environment shared by two
-      # crates, which is a design change and not a bump (TD-ORT-1). Without
-      # this ignore, the whole cargo-minor-patch group PR fails to build every week.
-      - dependency-name: "ort"
-        versions: [">=2.0.0-rc.14"]
+      # ort ignore REMOVED with TD-ORT-1: rc.15+ builds again (one
+      # process-wide environment owned by proximadb-onnx-runtime), so bumps
+      # can flow through the group.
       # rand_chacha 0.9 pulls a second rand_core (0.9) while all 19 ChaCha*Rng
       # call sites import SeedableRng from rand 0.8 (rand_core 0.6) — E0599
       # dual-trait scope error at every site. Streams are verified bit-identical
@@ -79,8 +76,6 @@ updates:
         versions: [">=60"]
       - dependency-name: "arrow-schema"
         versions: [">=60"]
-      - dependency-name: "ort-sys"
-        versions: [">=2.0.0-rc.14"]
     groups:
       cargo-minor-patch:
         update-types: ["minor", "patch"]

@@ -63,16 +63,23 @@ impl OrtTokenizedScorerSession {
                 reason: "OrtTokenizedScorerSession needs ≥ 1 output slot".into(),
             });
         }
-        let session = ort::session::Session::builder()
-            .map_err(|e| RankError::ModelLoad {
+        // TD-ORT-1: one environment per process, owned by
+        // proximadb-onnx-runtime and shared with the embedding pool.
+        let session = ort::session::Session::builder(
+            proximadb_onnx_runtime::shared_environment().map_err(|e| RankError::ModelLoad {
                 model_id: descriptor.key.to_string(),
-                reason: format!("ort builder: {e}"),
-            })?
-            .commit_from_file(model_path)
-            .map_err(|e| RankError::ModelLoad {
-                model_id: descriptor.key.to_string(),
-                reason: format!("ort commit_from_file({}): {e}", model_path.display()),
-            })?;
+                reason: format!("ort environment: {e}"),
+            })?,
+        )
+        .map_err(|e| RankError::ModelLoad {
+            model_id: descriptor.key.to_string(),
+            reason: format!("ort builder: {e}"),
+        })?
+        .commit_from_file(model_path)
+        .map_err(|e| RankError::ModelLoad {
+            model_id: descriptor.key.to_string(),
+            reason: format!("ort commit_from_file({}): {e}", model_path.display()),
+        })?;
         let memory_bytes = descriptor.estimated_memory_bytes();
         Ok(Self {
             descriptor,
