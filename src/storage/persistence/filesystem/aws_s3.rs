@@ -142,6 +142,15 @@ impl AwsS3FileSystem {
     fn net(ctx: &str, e: impl std::fmt::Display) -> FilesystemError {
         FilesystemError::Network(format!("{ctx}: {e}"))
     }
+
+    /// [`Self::net`], except that a missing object is `NotFound`, as on the
+    /// local backend: callers tell "absent" from "unreachable" by the variant.
+    fn object_error(ctx: &str, e: object_store::Error) -> FilesystemError {
+        match e {
+            object_store::Error::NotFound { path, .. } => FilesystemError::NotFound(path),
+            other => Self::net(ctx, other),
+        }
+    }
 }
 
 #[async_trait]
@@ -156,7 +165,7 @@ impl FileSystem for AwsS3FileSystem {
         let result = store
             .get(&ObjPath::from(key))
             .await
-            .map_err(|e| Self::net("S3 get", e))?;
+            .map_err(|e| Self::object_error("S3 get", e))?;
         let bytes = result.bytes().await.map_err(|e| Self::net("S3 body", e))?;
         let bytes = bytes.to_vec();
         super::record_physical_full_read(bytes.len() as u64);
@@ -173,7 +182,7 @@ impl FileSystem for AwsS3FileSystem {
         let bytes = store
             .get_range(&ObjPath::from(key), offset..(offset + length))
             .await
-            .map_err(|e| Self::net("S3 get_range", e))?;
+            .map_err(|e| Self::object_error("S3 get_range", e))?;
         // ADR-030 / TD-158: physical GET boundary — feed the per-query I/O accumulator
         // (task-local; no-op outside a query scope). Always-on core counters.
         super::record_physical_range_read(bytes.len() as u64);
@@ -313,7 +322,7 @@ impl FileSystem for AwsS3FileSystem {
         store
             .delete(&ObjPath::from(key))
             .await
-            .map_err(|e| Self::net("S3 delete", e))?;
+            .map_err(|e| Self::object_error("S3 delete", e))?;
         Ok(())
     }
 
@@ -329,7 +338,7 @@ impl FileSystem for AwsS3FileSystem {
         let meta = store
             .head(&ObjPath::from(key))
             .await
-            .map_err(|e| Self::net("S3 head", e))?;
+            .map_err(|e| Self::object_error("S3 head", e))?;
         Ok(FsFileMetadata {
             path: path.to_string(),
             size: meta.size,
@@ -345,7 +354,7 @@ impl FileSystem for AwsS3FileSystem {
         let mut stream = store.list(Some(&ObjPath::from(prefix)));
         let mut entries = Vec::new();
         while let Some(meta) = stream.next().await {
-            let meta = meta.map_err(|e| Self::net("S3 list", e))?;
+            let meta = meta.map_err(|e| Self::object_error("S3 list", e))?;
             let key = meta.location.to_string();
             let name = key.rsplit('/').next().unwrap_or(&key).to_string();
             entries.push(DirEntry {

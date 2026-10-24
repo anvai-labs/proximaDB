@@ -1913,3 +1913,41 @@ mod range_coalesce_gate_tests {
         );
     }
 }
+
+/// Object-store backends against an emulator (run by the `--restart` scope of
+/// `scripts/run_cloud_emulator_tests.sh`, which exports
+/// `PROXIMADB_OBJECT_STORE_URL`).
+#[cfg(test)]
+mod object_store_contract_tests {
+    use super::*;
+
+    /// A missing object is `NotFound` — the variant callers use to tell
+    /// "absent" from "unreachable", as on the local backend. Reported as
+    /// `Network`, it made the record spill refuse every fresh partition on
+    /// object storage: its first discovery reads a purge-obligation marker that
+    /// does not exist yet. A delete of a missing object may be a no-op (S3
+    /// answers 204) or `NotFound`, never `Network`.
+    #[tokio::test]
+    #[ignore = "requires an object-store emulator (PROXIMADB_OBJECT_STORE_URL)"]
+    async fn a_missing_object_is_not_found_on_object_store() {
+        let base = std::env::var("PROXIMADB_OBJECT_STORE_URL")
+            .expect("set PROXIMADB_OBJECT_STORE_URL to an emulator prefix");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let key = format!("{base}/missing-object/{run}/never-written.json");
+        let factory = FilesystemFactory::create_default().await.expect("factory");
+        let fs = factory.get_filesystem(&key).expect("backend for the key");
+        match fs.read(&key).await {
+            Err(FilesystemError::NotFound(_)) => {}
+            other => panic!("read of a missing object: expected NotFound, got {other:?}"),
+        }
+        match fs.read_range(&key, 0, 4).await {
+            Err(FilesystemError::NotFound(_)) => {}
+            other => panic!("ranged read of a missing object: expected NotFound, got {other:?}"),
+        }
+        match fs.delete(&key).await {
+            Ok(()) | Err(FilesystemError::NotFound(_)) => {}
+            other => panic!("delete of a missing object: expected Ok or NotFound, got {other:?}"),
+        }
+        assert!(!fs.exists(&key).await.expect("exists answers"));
+    }
+}
