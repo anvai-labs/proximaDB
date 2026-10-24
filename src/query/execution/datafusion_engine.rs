@@ -209,7 +209,15 @@ impl DataFusionLocalEngine {
                 // `None` ⇒ the table exceeds the row cap. Leave it unregistered: planning
                 // then fails with an explicit unresolved-table error, which the caller
                 // surfaces. Registering a truncated scan would be a silently wrong answer.
+                // In a query that also reads Parquet tables, decline with the marker so
+                // the caller serves it on Volcano instead (ADR-097 P3.1 PR 8).
                 let Some((schema, records)) = scanned else {
+                    if !context.parquet_tables.is_empty() {
+                        return Err(ExecutionError::Planning(format!(
+                            "{}: {name}",
+                            crate::query::execution::native_table_provider::MIXED_QUERY_ROW_CAP_DECLINE
+                        )));
+                    }
                     continue;
                 };
                 let row_count = records.len();
@@ -326,7 +334,36 @@ impl DataFusionLocalEngine {
                 // to lowercase, but the registered Parquet schemas keep their
                 // declared (possibly CamelCase) field names — repair unquoted
                 // references to the quoted declared spelling before planning.
-                let repaired = case_repair_sql_for_datafusion(sql, &catalog.schemas);
+                // A query mixing Parquet and native tables repairs against both
+                // sets of spellings, so a native column is never rewritten to a
+                // Parquet table's spelling (ADR-097 P3.1 PR 8).
+                let mut spellings = catalog.schemas.clone();
+                if !context.parquet_tables.is_empty()
+                    && let Some(native) = context.native_tables.as_ref()
+                {
+                    for name in native.tables.values() {
+                        if let Ok(provider) = ctx.table_provider(name.as_str()).await {
+                            spellings.insert(
+                                normalize_table_key(name),
+                                std::sync::Arc::new(RelationalSchema::new(
+                                    provider
+                                        .schema()
+                                        .fields()
+                                        .iter()
+                                        .map(|f| {
+                                            ColumnInfo::new(
+                                                f.name(),
+                                                arrow_type_to_proxima(f.data_type()),
+                                                f.is_nullable(),
+                                            )
+                                        })
+                                        .collect(),
+                                )),
+                            );
+                        }
+                    }
+                }
+                let repaired = case_repair_sql_for_datafusion(sql, &spellings);
                 ctx.sql(&repaired)
                     .await
                     .map_err(|e| ExecutionError::Execution(format!("sql: {e}")))?
