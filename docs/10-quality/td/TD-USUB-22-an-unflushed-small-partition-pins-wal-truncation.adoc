@@ -40,8 +40,21 @@ rows are durable in a segment and the floor moves up to the next partition's.
   truncator's ordering rule.
 * Best effort: a partition that refuses a floor (a memtable) is skipped; a failed flush is logged
   and leaves its rows resident, so the floor computed next still retains them.
+* The effective lag is never below the change-feed retention
+  (`PROXIMADB_CANONICAL_WAL_RETAIN_ENTRIES`): that floor holds the WAL there anyway, so a flush
+  inside it would free nothing.
+* A partition whose oldest unflushed LSN is unchanged since its last lag flush (its oldest rows
+  are held resident: a codec hold, or an oid both resident and tombstoned) is not flushed again,
+  so it cannot add a segment every run.
+* A DROP racing the flush: the truncator holds partition handles across awaits, so a purge now
+  empties the partition (resident rows included) under `flush_guard`. A stale handle then has
+  nothing to flush and cannot write the dropped rows back into the purged prefix.
+* A failed or cancelled segment write makes that partition refuse its floor until a purge or
+  restart, and one refusal stops truncation for the whole tier. That is fail-closed, as before;
+  this change only makes small partitions reach the flush path.
 * Cost: a table that stops being written costs one small segment. One that keeps a slow trickle
   of writes costs at most one flush per `lag` WAL entries.
 
-Gate: `a_lagging_partition_is_flushed_so_it_stops_pinning_the_floor`, plus the SF1 run in
+Gates: `a_lagging_partition_is_flushed_so_it_stops_pinning_the_floor`,
+`a_purged_partition_has_nothing_left_to_flush`, plus the SF1 run in
 `docs/_internal/status/P24_SF1_GATE_EVIDENCE_2026_10_23.adoc`.
