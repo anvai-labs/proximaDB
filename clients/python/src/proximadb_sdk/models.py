@@ -92,13 +92,13 @@ class DistanceMetricType(int, Enum):
 class StorageEngine(str, Enum):
     """Storage engines for ProximaDB
 
-    ProximaDB supports 6 specialized storage engines that auto-optimize for different workloads.
-
-    Default: VIPER (server default, columnar analytics engine)
+    Default: SST (row-based, write-optimized). VIPER is deprecated (ADR-093)
+    and can no longer be selected; SWIFT/RAPTOR are experimental
+    (TD-SDKENG-1).
     """
 
-    VIPER = "viper"  # Columnar Parquet format with advanced quantization (DEFAULT)
-    SST = "sst"  # Row-based, write-optimized with three-stage filtering
+    VIPER = "viper"  # DEPRECATED (ADR-093) — the server rejects it
+    SST = "sst"  # Row-based, write-optimized with three-stage filtering (DEFAULT)
     NOVA = "nova"  # Progressive columnar storage with multi-level quantization
     HELIX = "helix"  # Locality-optimized storage with Hilbert curve clustering
     SWIFT = "swift"  # High-speed row-based with FastLanes encoding
@@ -988,7 +988,8 @@ class CollectionConfig(BaseModel):
         if not self.compression:
             return
 
-        engine = self.storage_engine or StorageEngine.VIPER  # Use server default
+        # TD-SDKENG-1: SST is the default; VIPER is deprecated (ADR-093).
+        engine = self.storage_engine or StorageEngine.SST
 
         if engine == StorageEngine.VIPER:
             # VIPER engine: quantization features are valid
@@ -1666,3 +1667,70 @@ class UpdateSchemaResponse(BaseModel):
 
 # Simple alias
 Vector = VectorRecord
+
+
+# TD-SDKENG-1: `create_collection(name, **kwargs)` used to build
+# `CollectionConfig(name=name, **kwargs)`, and pydantic IGNORES unknown fields
+# — `engine=` (the REST API's spelling) and `index_params=` were silently
+# discarded, so a user asking for HELIX got the SST default.
+_COLLECTION_KWARG_ALIASES: dict[str, str] = {
+    "engine": "storage_engine",
+    "index_params": "index_configs",
+    "index_specs": "index_configs",
+}
+
+# Keyword arguments the TRANSPORT layer consumes (not CollectionConfig
+# fields — they are forwarded past the config, never into it):
+# rest_sync.create_collection(schema=..., initial_capacity=...) builds the
+# v2 body; grpc_sync.create_collection(indexing_algorithm=...) tunes the
+# primary index. Round-1 review: rejecting these broke the SDK's only route
+# to CreateCollectionRequest.schema.
+_COLLECTION_PASSTHROUGH_KWARGS = frozenset(
+    {"schema", "initial_capacity", "indexing_algorithm"}
+)
+
+
+def normalize_collection_config_kwargs(
+    kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split create-style kwargs into (config fields, transport pass-through).
+
+    Applies the REST-spelling aliases, REJECTS unknown keywords with a clear
+    error (a wrong keyword is a caller bug — silently dropping it created a
+    different collection than asked for), and keeps the transport-consumed
+    keywords separate so they are forwarded to the transport, never into the
+    config. The `quantization=` spelling needs no alias here: pydantic's own
+    field alias already accepts it.
+    """
+    config_kwargs: dict[str, Any] = {}
+    passthrough: dict[str, Any] = {}
+    source_of: dict[str, str] = {}
+    for key, value in kwargs.items():
+        if key in _COLLECTION_PASSTHROUGH_KWARGS:
+            passthrough[key] = value
+            continue
+        target = _COLLECTION_KWARG_ALIASES.get(key, key)
+        if target in source_of and source_of[target] != key:
+            raise TypeError(
+                f"conflicting keyword arguments: both "
+                f"{source_of[target]}= and {key}= given"
+            )
+        source_of[target] = key
+        config_kwargs[target] = value
+    # Field names AND pydantic's own field aliases (e.g. `quantization` is
+    # CollectionConfig.quantization_config's alias) are accepted spellings.
+    accepted = set(CollectionConfig.model_fields) | {
+        field.alias for field in CollectionConfig.model_fields.values() if field.alias
+    }
+    unknown = sorted(set(config_kwargs) - accepted)
+    if unknown:
+        alias_hint = ", ".join(
+            f"{alias}={target}" for alias, target in _COLLECTION_KWARG_ALIASES.items()
+        )
+        raise TypeError(
+            f"create_collection() got unexpected keyword argument(s): "
+            f"{', '.join(unknown)}. Accepted: CollectionConfig fields plus "
+            f"{sorted(_COLLECTION_PASSTHROUGH_KWARGS)} "
+            f"(aliases: {alias_hint})"
+        )
+    return config_kwargs, passthrough
