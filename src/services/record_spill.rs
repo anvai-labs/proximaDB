@@ -229,11 +229,19 @@ impl std::fmt::Debug for SpillSchemaSource {
 /// check — read and decoded every segment of the partition, so a bulk load
 /// decoded about `n²/2` rows. With it, such a probe reads nothing (bar a ~1 %
 /// false positive per segment). About 1.2 bytes per row, held per segment.
-#[derive(Debug)]
 struct SegmentKeyFilter {
     /// `None` for a segment with no rows: it holds no oid.
     range: Option<(String, String)>,
     bloom: BloomFilter,
+}
+
+/// The range only: the Bloom bits are ~79 KB per segment.
+impl std::fmt::Debug for SegmentKeyFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SegmentKeyFilter")
+            .field("range", &self.range)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SegmentKeyFilter {
@@ -5748,6 +5756,30 @@ mod tests {
         assert!(get(&second, "c").await?.is_some());
         assert!(get(&second, "zz").await?.is_none());
         assert_eq!(second.key_filters.len(), 2, "one filter per segment");
+        Ok(())
+    }
+
+    /// TD-USUB-21: the filter a flush builds holds the tombstones it persists.
+    /// With only the OLDER segment's file removed, a tombstone in the newest
+    /// segment answers on its own; a filter that left it out would skip the
+    /// newest segment and fail reading the removed one.
+    #[tokio::test]
+    async fn a_flushed_tombstone_is_in_its_segment_filter() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let s = SpillRecordStorage::with_flush_threshold(fs, base, None).with_tenant("tenant-a");
+        s.upsert_record(record("a", "open")).await?;
+        s.flush().await?;
+        s.delete_record(&RecordKey::new("a".to_string())).await?;
+        s.upsert_record(record("b", "open")).await?;
+        s.flush().await?;
+        let oldest = s.segments.read()[0].clone();
+        std::fs::remove_file(&oldest)?;
+        assert!(
+            s.get_record(&RecordKey::new("a".to_string()))
+                .await?
+                .is_none(),
+            "the newest segment's tombstone is authoritative"
+        );
         Ok(())
     }
 
