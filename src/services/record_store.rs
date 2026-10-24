@@ -2386,6 +2386,54 @@ impl DirectWalTableRecordStore {
         ))
     }
 
+    /// Flush every partition whose oldest unflushed row is more than
+    /// `max_lag` WAL entries behind `head` (TD-USUB-22), returning how many
+    /// flushed.
+    ///
+    /// A partition flushes on its own only at the resident-row threshold, so a
+    /// table that never reaches it — a small dimension table loaded once —
+    /// keeps its first row's LSN as the tier's floor and pins every WAL entry
+    /// after it. Flushing it makes those rows durable in a segment, so the
+    /// floor moves up to the next partition's.
+    ///
+    /// Best effort: a partition that refuses to report a floor (a memtable) is
+    /// skipped, and a failed flush is logged and leaves its rows resident, so
+    /// the floor computed afterwards still retains them. Writes may race it;
+    /// `flush` is safe under concurrent writes (it runs inline on the write
+    /// path at the threshold).
+    pub async fn flush_lagging_partitions(&self, head: u64, max_lag: u64) -> usize {
+        if self.shared_storage {
+            return 0;
+        }
+        let partitions: Vec<((String, String), Arc<dyn RecordStorage>)> = self
+            .partitions
+            .read()
+            .iter()
+            .map(|(key, partition)| (key.clone(), partition.clone()))
+            .collect();
+        let mut flushed = 0;
+        for ((tenant_id, collection), partition) in partitions {
+            let Ok(Some(oldest)) = partition.min_unflushed_lsn().await else {
+                continue;
+            };
+            if head.saturating_sub(oldest) <= max_lag {
+                continue;
+            }
+            match partition.flush().await {
+                Ok(()) => flushed += 1,
+                Err(error) => tracing::warn!(
+                    tenant_id = %tenant_id,
+                    collection = %collection,
+                    oldest,
+                    head,
+                    "flushing a partition that pins WAL truncation failed; its rows stay \
+                     resident and retained: {error:#}"
+                ),
+            }
+        }
+        flushed
+    }
+
     /// Flush every live partition's write buffer to durable segments
     /// ([`RecordStore::flush`]; a no-op for a memtable partition). Called on
     /// graceful shutdown AFTER the servers stop, so no write races it.
@@ -6701,6 +6749,55 @@ mod tests {
     /// whole tier refuse.
     ///
     /// Process-isolated under nextest, so the env gate does not leak.
+    /// TD-USUB-22: a partition below the flush threshold — a small table
+    /// loaded once — pins the tier's floor at its first row until something
+    /// flushes it. `flush_lagging_partitions` flushes exactly the partitions
+    /// lagging the head by more than the allowed lag, and the floor moves up.
+    #[tokio::test]
+    async fn a_lagging_partition_is_flushed_so_it_stops_pinning_the_floor() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
+        }
+        let (_, base) = spill_root();
+        let store = DirectWalTableRecordStore::new_spilling(
+            Arc::new(RecordingWalAppender::default()),
+            local_fs().await,
+            tenant_path_resolver(base),
+        );
+        let upsert = |lsn: u64, collection: &str| {
+            CanonicalWalEntry::new(
+                lsn,
+                CanonicalOperation::RecordUpsert {
+                    collection_id: collection.to_string(),
+                    record: Box::new(ProximaRecord {
+                        oid: format!("r{lsn}"),
+                        ..Default::default()
+                    }),
+                    projections: vec![],
+                },
+                Some("tenant-a".to_string()),
+            )
+        };
+        // `dims`: LSNs 1 and 2, below the threshold, so they stay resident.
+        // `facts`: LSNs 3..=9 — 3..=6 flush at the threshold, 7..=9 resident.
+        let mut entries: Vec<CanonicalWalEntry> = (1..=2).map(|lsn| upsert(lsn, "dims")).collect();
+        entries.extend((3..=9).map(|lsn| upsert(lsn, "facts")));
+        store.replay_wal_entries(entries).await.expect("replay");
+        assert_eq!(store.min_unflushed_lsn().await.ok(), Some(Some(1)));
+
+        // Within the allowed lag nothing flushes.
+        assert_eq!(store.flush_lagging_partitions(9, 8).await, 0);
+        assert_eq!(store.min_unflushed_lsn().await.ok(), Some(Some(1)));
+
+        // `dims` lags the head by 8 > 5; `facts` (oldest resident 7) by 2.
+        assert_eq!(store.flush_lagging_partitions(9, 5).await, 1);
+        assert_eq!(
+            store.min_unflushed_lsn().await.ok(),
+            Some(Some(7)),
+            "the floor moves up to the next partition's oldest resident row"
+        );
+    }
+
     #[tokio::test]
     async fn record_tier_floor_is_the_minimum_over_spill_partitions() {
         unsafe {

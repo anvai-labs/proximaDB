@@ -31,6 +31,13 @@ pub const DEFAULT_TRUNCATE_INTERVAL_SECS: u64 = 300;
 /// (`PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT`).
 pub const DEFAULT_SPILL_MAX_RESIDENT: u64 = 65_536;
 
+/// Default WAL lag, in entries, past which a partition's unflushed rows are
+/// flushed so they stop pinning WAL truncation
+/// (`PROXIMADB_RELATIONAL_SPILL_FLUSH_LAG_ENTRIES`). Equal to the change-feed
+/// retention default, so a lagging partition costs no more WAL than the feed
+/// already keeps.
+pub const DEFAULT_SPILL_FLUSH_LAG_ENTRIES: u64 = 1_000_000;
+
 /// A positive-integer gate that defaults ON: unset or empty ⇒ `default`;
 /// `0` (in any spelling), `off`, `false`, `no`, `none` or `disabled` ⇒ `None`
 /// (off); a positive integer ⇒ that value.
