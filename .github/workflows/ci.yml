@@ -1495,6 +1495,19 @@ jobs:
           else
             cargo test -p proximadb-rank-onnx --features bert-tokenizer
           fi
+      # TD-ORT-1's regression gate: two ONNX sessions through the one shared
+      # process environment (a per-crate environment fails the second build for
+      # the life of the process). Runs on the leg whose feature set pulls ort.
+      - name: serve onnx-runtime shared-environment test (TD-ORT-1)
+        if: matrix.label == 'onnx-cdc-duckdb'
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+        run: |
+          if cargo nextest --version >/dev/null 2>&1; then
+            cargo nextest run -p proximadb-onnx-runtime
+          else
+            cargo test -p proximadb-onnx-runtime
+          fi
 
   # Feature Matrix (enterprise-catalogs) — split out of the `feature-matrix`
   # matrix (TD-CITIER-1) because it is the only leg that also SERVES tests and

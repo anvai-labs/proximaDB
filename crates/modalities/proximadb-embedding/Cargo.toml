@@ -19,7 +19,7 @@ default = []
 # crate compiles but `BgeModel::initialize` returns ModelUnavailable for
 # production paths. Test code that needs a deterministic vector source uses
 # `test-synthetic` (test-cfg only).
-onnx = ["dep:ort", "dep:ndarray"]
+onnx = ["dep:ort", "dep:ndarray", "dep:proximadb-onnx-runtime"]
 # CoreML execution provider (macOS / iOS). Opt-in because it links a macOS-
 # only framework and ort/coreml only builds on Apple targets. When enabled,
 # PROXIMADB_EMBED_PROVIDER=coreml routes inference through CoreML; otherwise
@@ -107,13 +107,16 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 # fetches a prebuilt ONNX Runtime shared library at build time so the binary
 # is self-contained on macOS/Linux without a system install. Gated to keep
 # default builds dependency-light.
-ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = [
+# Un-pinned with TD-ORT-1: the process environment is owned by
+# proximadb-onnx-runtime (rc.15 allows one environment per process).
+ort = { version = "2.0.0-rc.15", optional = true, default-features = false, features = [
     "std",
     "download-binaries",
     "ndarray",
     "tls-rustls",
     "half",
 ] }
+proximadb-onnx-runtime = { path = "../../horizontal/proximadb-onnx-runtime", optional = true }
 # half (`f16`/`bf16`) for fp16 ONNX output extraction AND the precision
 # hw_capability micro-bench (PR 7 of EMBEDDING_PRECISION_LLD_2026_05_22).
 # Unconditional — the probe runs at startup regardless of which inference
