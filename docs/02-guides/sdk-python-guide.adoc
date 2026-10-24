@@ -85,13 +85,19 @@ client = ProximaDBClient(
 
 [source,python]
 ----
-# In-process engine (no server); requires the [embedded] extra
-from proximadb_embedded import ProximaDB
+# doc-smoke: skip embedded mode starts its own engine, not the smoke server
+# In-process engine (no server); requires the [embedded] extra. The API is async.
+import asyncio
 
-db = ProximaDB(data_dirs="./data")
-db.create_collection("vectors", dimension=4)
-db.insert("vectors", ids=["v1"], vectors=[[0.1, 0.2, 0.3, 0.4]])
-results = db.search("vectors", query=[0.1, 0.2, 0.3, 0.4], top_k=5)
+from proximadb_sdk.embedded import EmbeddedProximaDB
+
+
+async def main():
+    async with EmbeddedProximaDB(data_dir="./data") as db:
+        await db.create_collection("vectors", dimension=4)
+
+
+asyncio.run(main())
 ----
 
 == Storage Engine Selection
@@ -146,20 +152,24 @@ but new code should call `insert_records()`.
 ----
 from proximadb_sdk import ProximaRecord, TypedValue
 
+client.create_collection("my_collection", dimension=768)
+
 # Single insert
 client.insert_records("my_collection", [
     ProximaRecord(
         id="vec_001",
-        vector=[0.1, 0.2, 0.3, ...],
+        vector=[0.1] * 768,
     )
     .set_typed("category", TypedValue.text("electronics"))
     .set_typed("price", TypedValue.float_(299.99))
 ])
 
 # Batch insert
+embeddings = [[0.1] * 768 for _ in range(100)]  # your embeddings
+data = [{"title": f"Document {i}"} for i in range(100)]  # their properties
 records = [
     ProximaRecord(id=f"vec_{i}", vector=embeddings[i], flexible_fields=data[i])
-    for i in range(1000)
+    for i in range(100)
 ]
 client.insert_records("my_collection", records)
 ----
@@ -168,6 +178,7 @@ client.insert_records("my_collection", records)
 
 [source,python]
 ----
+query_embedding = [0.1] * 768  # your query's embedding
 results = client.search("my_collection", vector=query_embedding, top_k=10)
 for r in results:
     print(r.id, r.score)
@@ -193,6 +204,11 @@ Graph methods exist on the REST client only (`protocol=Protocol.REST`).
 
 [source,python]
 ----
+from proximadb_sdk import Protocol, ProximaDBClient
+
+# Graph methods exist on the REST client only
+client = ProximaDBClient(url="http://localhost:5678", protocol=Protocol.REST)
+
 client.create_graph("knowledge", name="Knowledge graph")
 
 client.batch_create_nodes([
@@ -213,13 +229,6 @@ print(result)
 
 === Graph Analytics
 
-[WARNING]
-====
-The examples in this section have not been executed against a released server and several use
-call shapes the SDK does not have. They are illustrative until TD-SDKDOC-1 makes this guide's
-examples run in CI.
-====
-
 [source,python]
 ----
 from proximadb_sdk import GraphAnalytics
@@ -233,16 +242,23 @@ pagerank_scores = analytics.pagerank("knowledge", damping_factor=0.85)
 communities = analytics.community_detection("knowledge", resolution=1.0)
 
 # Shortest path
-path = analytics.shortest_path("knowledge", source="entity_1", target="entity_5")
+# Shortest path on the named graph -> list of node ids, or None
+path = analytics.shortest_path("knowledge", source="entity_1", target="entity_2")
 
 # Semantic traversal (graph + vector similarity)
+from proximadb_sdk.graph_analytics import SemanticTraversalConfig
+
+embedding = [0.1] * 768  # the query's embedding
+
 semantic_results = analytics.semantic_traverse(
     graph_id="knowledge",
     start_node="entity_1",
     query_vector=embedding,
-    edge_types=["SIMILAR_TO"],
-    similarity_threshold=0.7,
-    max_depth=3,
+    config=SemanticTraversalConfig(
+        edge_types=["SIMILAR_TO"],
+        similarity_threshold=0.7,
+        max_depth=3,
+    ),
 )
 ----
 
@@ -250,16 +266,18 @@ semantic_results = analytics.semantic_traverse(
 
 [source,python]
 ----
-from proximadb_sdk import GraphPattern, node, relationship
+from proximadb_sdk import GraphPattern
+from proximadb_sdk.graph_analytics import PatternElement
 
-# Find triangles: A -> B -> C -> A
-pattern = (GraphPattern()
-    .node("a", label="Person")
-    .relationship("r1", type="KNOWS")
-    .node("b", label="Person")
-    .relationship("r2", type="KNOWS")
-    .node("c", label="Person")
-    .relationship("r3", type="KNOWS", target="a"))
+# Find a two-hop chain: a -[KNOWS]-> b -[KNOWS]-> c
+a = PatternElement(variable="a", label="Person")
+b = PatternElement(variable="b", label="Person")
+c = PatternElement(variable="c", label="Person")
+pattern = (
+    GraphPattern()
+    .relationship(a, b, rel_type="KNOWS")
+    .relationship(b, c, rel_type="KNOWS")
+)
 
 matches = analytics.pattern_match("knowledge", pattern)
 ----
@@ -267,6 +285,15 @@ matches = analytics.pattern_match("knowledge", pattern)
 == Multi-Modal Queries
 
 Combine vector, graph, document, and observability queries:
+
+[NOTE]
+====
+The executor below runs client-side. Today only its vector leg reaches the server correctly: with
+`ProximaDBClient` the graph leg returns no rows, and the document, log and metric legs call client
+methods with arguments those methods do not take, which the executor reduces to a warning and an
+empty leg (TD-SDKMMQ-1). Because the graph leg is empty, the semantic join in this example drops
+every vector row, so as written it returns **no results** today; it shows the builder's shape.
+====
 
 [source,python]
 ----
@@ -280,11 +307,11 @@ from proximadb_sdk import (
 # Build a multi-modal query
 query = (MultiModalQueryBuilder()
     # Vector similarity search
-    .vector("products", query_embedding, top_k=20)
+    .vector("my_collection", query_embedding, top_k=20)
     # Graph traversal from vector results
     .graph_from_vector_results("knowledge", edge_types=["RELATED_TO"])
     # Join by semantic similarity
-    .join_semantic("vector.embedding", "graph.node.embedding", threshold=0.8)
+    .join_semantic("vector.embedding", "graph.node.embedding", similarity_threshold=0.8)
     # Fuse with Reciprocal Rank Fusion
     .fuse(FusionStrategy.RRF)
     # Apply time decay
@@ -302,35 +329,24 @@ for record in results:
 
 === Convenience Functions
 
-[WARNING]
+[NOTE]
 ====
-The examples in this section have not been executed against a released server and several use
-call shapes the SDK does not have. They are illustrative until TD-SDKDOC-1 makes this guide's
-examples run in CI.
+With `ProximaDBClient`, the client-side multi-modal executor's graph leg returns no rows today, so
+the graph expansion adds nothing to the vector results (TD-SDKMMQ-1). For a graph walk, call
+`client.traverse_graph` directly. There is no `knowledge_graph_search` helper.
 ====
 
 [source,python]
 ----
-from proximadb_sdk import semantic_search_with_graph, knowledge_graph_search
+from proximadb_sdk import semantic_search_with_graph
 
 # Semantic search + graph expansion
 results = semantic_search_with_graph(
     client,
-    collection="products",
+    collection="my_collection",
     query_vector=embedding,
-    graph_id="product_relations",
-    edge_types=["SIMILAR_TO", "BUNDLED_WITH"],
-    top_k=10,
-)
-
-# Knowledge graph with semantic ranking
-results = knowledge_graph_search(
-    client,
     graph_id="knowledge",
-    start_label="Concept",
-    query_vector=embedding,
-    vector_collection="concept_embeddings",
-    max_depth=2,
+    edge_types=["WORKS_AT"],
     top_k=10,
 )
 ----
@@ -409,8 +425,8 @@ obs.logger.info("Search completed",
     latency_ms=5.2
 )
 
-# Get JSON logs
-logs = obs.logger.get_logs(level="INFO", limit=100)
+# Recorded traces (there is no get_logs)
+traces = obs.get_traces()
 ----
 
 == Security
@@ -419,6 +435,7 @@ logs = obs.logger.get_logs(level="INFO", limit=100)
 
 [source,python]
 ----
+# doc-smoke: skip needs a live OAuth2 identity provider
 from proximadb_sdk import OAuth2Config, OAuth2Provider, OAuth2TokenManager, ProximaDBClient, Protocol
 
 # Configure OAuth2
@@ -474,7 +491,7 @@ ctx = security.create_context(
 # Use context for operations
 with security_context(ctx):
     # Operations run with analyst permissions
-    results = client.search("vectors", query, top_k=10)
+    results = client.search("my_collection", query_embedding, top_k=10)
 ----
 
 === Audit Logging
@@ -485,7 +502,7 @@ from proximadb_sdk import AuditLogger, AuditEventType
 
 # Initialize audit logger
 audit = AuditLogger(
-    log_file="/var/log/proximadb/audit.jsonl",
+    log_file="audit.jsonl",  # e.g. /var/log/proximadb/audit.jsonl in production
     enable_signing=True,  # Tamper-evident logs
 )
 
@@ -508,6 +525,7 @@ audit.log_data_access(
 
 [source,python]
 ----
+# doc-smoke: skip needs real client certificates on disk
 from proximadb_sdk import MTLSConfig, ProximaDBClient
 
 # Configure mTLS
@@ -533,27 +551,29 @@ ssl_context = mtls.create_ssl_context()
 
 === Filter Builder
 
-[WARNING]
-====
-`FilterBuilder().add` does not exist in the SDK; this block is illustrative until TD-SDKDOC-1.
-Use `metadata_filter=` for equality filters.
-====
-
 [source,python]
 ----
-from proximadb_sdk import FilterBuilder, eq, gt, lt, in_list, and_filters, or_filters
+from proximadb_sdk import FilterBuilder
 
-# Simple filters
-filter1 = FilterBuilder().add(eq("category", "electronics")).build()
-filter2 = FilterBuilder().add(gt("price", 100)).add(lt("price", 500)).build()
+# Simple filters (fluent methods; .build() -> the filter dict for metadata_filter=)
+filter1 = FilterBuilder().equals("category", "electronics").build()
+filter2 = (
+    FilterBuilder().greater_than("price", 100).less_than("price", 500).build()
+)
 
 # IN operator
-filter3 = FilterBuilder().add(in_list("status", ["active", "pending"])).build()
+filter3 = FilterBuilder().in_("status", ["active", "pending"]).build()
 
 # Logical combinations
-complex_filter = or_filters(
-    and_filters(eq("category", "electronics"), gt("price", 200)),
-    and_filters(eq("category", "books"), lt("price", 50))
+complex_filter = (
+    FilterBuilder()
+    .equals("category", "electronics")
+    .greater_than("price", 200)
+    .or_()  # open an OR group: the conditions below join it
+    .equals("category", "books")
+    .less_than("price", 50)
+    .end_group()
+    .build()
 )
 ----
 
@@ -561,26 +581,53 @@ complex_filter = or_filters(
 
 [source,python]
 ----
-from proximadb_sdk import RequestBatcher, BatchStrategy
-
-# Create batcher
-batcher = RequestBatcher(
-    client=client,
-    strategy=BatchStrategy.SIZE,
-    batch_size=100,
-    flush_interval_ms=1000,
+from proximadb_sdk import ProximaRecord
+from proximadb_sdk.batching import (
+    BatchConfig,
+    BatchOperationType,
+    BatchRequest,
+    BatchStrategy,
+    ThreadedBatchProcessor,
 )
 
-# Queue operations
-for record in records:
-    batcher.queue_insert("my_collection", record)
 
-# Flush remaining
-batcher.flush()
+def send_batch(operation, collection_id, batch):
+    """Called with each flushed batch: one write for the whole batch."""
+    return client.insert_records(collection_id, batch)
+
+
+# Size-based batching: each flush takes up to 100 queued requests
+processor = ThreadedBatchProcessor(
+    BatchConfig(
+        strategy=BatchStrategy.SIZE_BASED,
+        max_batch_size=100,
+        max_wait_time_ms=1000,
+    ),
+    execute_batch_fn=send_batch,
+)
+processor.start()
+
+# submit_request blocks until its request's batch is flushed and returns that
+# request's result, so requests share a batch only when submitted
+# concurrently - here from a thread pool.
+from concurrent.futures import ThreadPoolExecutor
+
+records = [ProximaRecord(id=f"batched_{i}", vector=[0.1] * 768) for i in range(10)]
+requests = [
+    BatchRequest(
+        operation=BatchOperationType.INSERT_RECORDS,
+        collection_id="my_collection",
+        data=record,
+    )
+    for record in records
+]
+with ThreadPoolExecutor(max_workers=len(requests)) as pool:
+    results = list(pool.map(processor.submit_request, requests))
+processor.stop()
 
 # Get metrics
-metrics = batcher.get_metrics()
-print(f"Batches sent: {metrics.batches_sent}")
+metrics = processor.get_metrics()
+print(f"Batches sent: {metrics.total_batches}")
 print(f"Average batch size: {metrics.avg_batch_size}")
 ----
 
@@ -598,7 +645,7 @@ from proximadb_sdk import (
 )
 
 try:
-    results = client.search("my_collection", query, top_k=10)
+    results = client.search("my_collection", query_embedding, top_k=10)
 except CollectionNotFoundError:
     print("Collection does not exist")
 except VectorDimensionError as e:
@@ -639,43 +686,48 @@ client = ProximaDBClient(
 ----
 from proximadb_sdk import ProximaRecord
 
-# Good: Batch inserts
-records = [ProximaRecord(id=f"v{i}", vector=vecs[i]) for i in range(1000)]
-client.insert_records("collection", records)
+vecs = [[0.1] * 768 for _ in range(100)]  # your embeddings
 
-# Bad: Individual inserts
-for i in range(1000):
-    client.insert_records("collection", [ProximaRecord(id=f"v{i}", vector=vecs[i])])
+# Good: one batched insert
+records = [ProximaRecord(id=f"v{i}", vector=vecs[i]) for i in range(100)]
+client.insert_records("my_collection", records)
+
+# Bad: one round-trip per record
+for i in range(100):
+    client.insert_records("my_collection", [ProximaRecord(id=f"v{i}", vector=vecs[i])])
 ----
 
 === Engine Selection
 
 [source,python]
 ----
-# Use AutoML for optimal engine selection
+# doc-smoke: skip fragment - the full form is in "AutoML Features" above
 from proximadb_sdk import AutoML
 
 automl = AutoML(client)
 rec = automl.recommend_engine(
-    dimension=768,
-    expected_count=1_000_000,
+    vector_dimension=768,
+    vector_count=1_000_000,
 )
-# Apply recommendation
 ----
 
 === Resource Cleanup
 
 [source,python]
 ----
-# Embedded mode - always flush before exit
-from proximadb_embedded import ProximaDB
+# doc-smoke: skip embedded mode starts its own engine, not the smoke server
+# Embedded mode - always stop before exit: leaving `async with` awaits stop()
+import asyncio
 
-db = ProximaDB(data_dirs="./data")
-try:
-    # ... operations ...
-finally:
-    db.flush()
-    db.close()
+from proximadb_sdk.embedded import EmbeddedProximaDB
+
+
+async def main():
+    async with EmbeddedProximaDB(data_dir="./data") as db:
+        ...  # operations
+
+
+asyncio.run(main())
 ----
 
 == Related Documentation

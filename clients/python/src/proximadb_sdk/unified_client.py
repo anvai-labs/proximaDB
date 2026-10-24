@@ -973,8 +973,13 @@ class ProximaDBClient:
         enable_prefetch: bool | None = None,
         prefetch_budget: int | None = None,
         timeout: float | None = None,
+        graph_id: str = "default",
     ):
-        """Unified shortest path across gRPC/REST with prefetch overrides."""
+        """Unified shortest path across gRPC/REST with prefetch overrides.
+
+        ``graph_id`` names the graph; both transports take it, and before
+        TD-SDKDOC-1 this wrapper dropped it, so every call ran on ``default``.
+        """
         if self._active_protocol == Protocol.GRPC and hasattr(
             self._client, "shortest_path"
         ):
@@ -987,6 +992,7 @@ class ProximaDBClient:
                 k,
                 enable_prefetch,
                 prefetch_budget,
+                graph_id=graph_id,
             )
         # Fallback to REST
         if hasattr(self._client, "graph_shortest_path"):
@@ -1000,6 +1006,7 @@ class ProximaDBClient:
                 enable_prefetch,
                 prefetch_budget,
                 timeout=timeout,
+                graph_id=graph_id,
             )
         raise ProximaDBError("Active client does not support graph_shortest_path")
 

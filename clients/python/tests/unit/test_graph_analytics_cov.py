@@ -47,8 +47,30 @@ class ShortestPathClient:
         self._result = result
         self.calls = []
 
-    def graph_shortest_path(self, **kwargs):
-        self.calls.append(kwargs)
+    # The REAL client signature, not **kwargs: a **kwargs mock is how the
+    # start_node=/end_node= call shape (TypeError on every real client)
+    # passed these tests (TD-SDKDOC-1).
+    def graph_shortest_path(
+        self,
+        start_node_id,
+        target_node_id,
+        max_depth=None,
+        edge_types=None,
+        algorithm="DIJKSTRA",
+        k=None,
+        enable_prefetch=None,
+        prefetch_budget=None,
+        timeout=None,
+        graph_id="default",
+    ):
+        self.calls.append(
+            {
+                "start_node_id": start_node_id,
+                "target_node_id": target_node_id,
+                "edge_types": edge_types,
+                "graph_id": graph_id,
+            }
+        )
         return self._result
 
 
@@ -435,8 +457,12 @@ def test_shortest_path_via_client_method():
     a = GraphAnalytics(c)
     out = a.shortest_path("g", "a", "b", edge_types=["E"])
     assert out == ["a", "x", "b"]
-    assert c.calls[0]["start_node"] == "a"
-    assert c.calls[0]["end_node"] == "b"
+    assert c.calls[0] == {
+        "start_node_id": "a",
+        "target_node_id": "b",
+        "edge_types": ["E"],
+        "graph_id": "g",
+    }
 
 
 def test_shortest_path_via_client_method_none():

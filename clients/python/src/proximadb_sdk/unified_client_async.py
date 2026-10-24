@@ -776,7 +776,10 @@ class ProximaDBAsyncUnified:
         k: int | None = None,
         enable_prefetch: bool | None = None,
         prefetch_budget: int | None = None,
+        graph_id: str = "default",
     ):
+        # TD-SDKDOC-1: both transports take graph_id; dropping it here ran
+        # every call on the `default` graph (same defect as the sync client).
         if self._grpc and hasattr(self._grpc, "shortest_path"):
             return self._grpc.shortest_path(
                 start_node_id,
@@ -787,6 +790,7 @@ class ProximaDBAsyncUnified:
                 k,
                 enable_prefetch,
                 prefetch_budget,
+                graph_id=graph_id,
             )
         if self._rest:
             return await self._rest.graph_shortest_path(
@@ -798,6 +802,7 @@ class ProximaDBAsyncUnified:
                 k,
                 enable_prefetch,
                 prefetch_budget,
+                graph_id=graph_id,
             )
         raise RuntimeError("Client not started; call astart() first")
 
