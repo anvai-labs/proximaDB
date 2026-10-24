@@ -156,7 +156,7 @@ impl FileSystem for AwsS3FileSystem {
         let result = store
             .get(&ObjPath::from(key))
             .await
-            .map_err(|e| Self::net("S3 get", e))?;
+            .map_err(|e| super::object_store_errors::object_error("S3 get", path, e))?;
         let bytes = result.bytes().await.map_err(|e| Self::net("S3 body", e))?;
         let bytes = bytes.to_vec();
         super::record_physical_full_read(bytes.len() as u64);
@@ -173,7 +173,7 @@ impl FileSystem for AwsS3FileSystem {
         let bytes = store
             .get_range(&ObjPath::from(key), offset..(offset + length))
             .await
-            .map_err(|e| Self::net("S3 get_range", e))?;
+            .map_err(|e| super::object_store_errors::object_error("S3 get_range", path, e))?;
         // ADR-030 / TD-158: physical GET boundary — feed the per-query I/O accumulator
         // (task-local; no-op outside a query scope). Always-on core counters.
         super::record_physical_range_read(bytes.len() as u64);
@@ -313,14 +313,17 @@ impl FileSystem for AwsS3FileSystem {
         store
             .delete(&ObjPath::from(key))
             .await
-            .map_err(|e| Self::net("S3 delete", e))?;
+            .map_err(|e| super::object_store_errors::object_error("S3 delete", path, e))?;
         Ok(())
     }
 
     async fn exists(&self, path: &str) -> FsResult<bool> {
         let (bucket, key) = Self::parse(path)?;
         let store = self.store_for(&bucket)?;
-        Ok(store.head(&ObjPath::from(key)).await.is_ok())
+        super::object_store_errors::exists_from_head(
+            "S3 head",
+            store.head(&ObjPath::from(key)).await,
+        )
     }
 
     async fn metadata(&self, path: &str) -> FsResult<FsFileMetadata> {
@@ -329,7 +332,7 @@ impl FileSystem for AwsS3FileSystem {
         let meta = store
             .head(&ObjPath::from(key))
             .await
-            .map_err(|e| Self::net("S3 head", e))?;
+            .map_err(|e| super::object_store_errors::object_error("S3 head", path, e))?;
         Ok(FsFileMetadata {
             path: path.to_string(),
             size: meta.size,

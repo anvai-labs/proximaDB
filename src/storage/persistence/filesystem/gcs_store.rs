@@ -358,7 +358,15 @@ impl GcsFileSystem {
         if let Some(range) = range {
             builder = builder.set_read_range(range);
         }
-        let mut response = builder.send().await.map_err(|e| Self::net(ctx, e))?;
+        let mut response = builder.send().await.map_err(|e| {
+            // A missing object is `NotFound`, as on the local backend, so
+            // callers can tell "absent" from "unreachable".
+            if e.http_status_code() == Some(404) {
+                FilesystemError::NotFound(format!("gs://{bucket}/{object}"))
+            } else {
+                Self::net(ctx, e)
+            }
+        })?;
         let mut out = Vec::new();
         while let Some(chunk) = response.next().await {
             let chunk = chunk.map_err(|e| Self::net(ctx, e))?;
@@ -595,14 +603,13 @@ impl FileSystem for GcsFileSystem {
         let url = self.json.object_url(&bucket, &object);
         let response = self.json.delete(&url).await?;
         let status = response.status().as_u16();
-        if status == 200 || status == 204 {
-            Ok(())
-        } else {
-            // Missing-object deletes error (Network) — same contract as the
-            // 0.x backend's delete_object.
-            Err(FilesystemError::Network(format!(
+        match status {
+            200 | 204 => Ok(()),
+            // A missing object is `NotFound`, as on the local backend.
+            404 => Err(FilesystemError::NotFound(path.to_string())),
+            _ => Err(FilesystemError::Network(format!(
                 "GCS delete: HTTP {status} for {path}"
-            )))
+            ))),
         }
     }
 
@@ -623,7 +630,7 @@ impl FileSystem for GcsFileSystem {
             .json
             .get_object(&bucket, &object)
             .await?
-            .ok_or_else(|| FilesystemError::Network(format!("GCS object not found: {path}")))?;
+            .ok_or_else(|| FilesystemError::NotFound(path.to_string()))?;
         Ok(FsFileMetadata {
             path: path.to_string(),
             size: obj

@@ -203,7 +203,7 @@ impl FileSystem for AzureBlobFileSystem {
         let result = store
             .get(&ObjPath::from(blob))
             .await
-            .map_err(|e| Self::net("Azure get", e))?;
+            .map_err(|e| super::object_store_errors::object_error("Azure get", path, e))?;
         let bytes = result
             .bytes()
             .await
@@ -223,7 +223,7 @@ impl FileSystem for AzureBlobFileSystem {
         let bytes = store
             .get_range(&ObjPath::from(blob), offset..(offset + length))
             .await
-            .map_err(|e| Self::net("Azure get_range", e))?;
+            .map_err(|e| super::object_store_errors::object_error("Azure get_range", path, e))?;
         // ADR-030 / TD-158: physical GET boundary — feed the per-query I/O accumulator
         // (task-local; no-op outside a query scope). Always-on core counters.
         super::record_physical_range_read(bytes.len() as u64);
@@ -364,14 +364,17 @@ impl FileSystem for AzureBlobFileSystem {
         store
             .delete(&ObjPath::from(blob))
             .await
-            .map_err(|e| Self::net("Azure delete", e))?;
+            .map_err(|e| super::object_store_errors::object_error("Azure delete", path, e))?;
         Ok(())
     }
 
     async fn exists(&self, path: &str) -> FsResult<bool> {
         let (container, blob) = Self::parse(path)?;
         let store = self.store_for(&container)?;
-        Ok(store.head(&ObjPath::from(blob)).await.is_ok())
+        super::object_store_errors::exists_from_head(
+            "Azure head",
+            store.head(&ObjPath::from(blob)).await,
+        )
     }
 
     async fn metadata(&self, path: &str) -> FsResult<FsFileMetadata> {
@@ -380,7 +383,7 @@ impl FileSystem for AzureBlobFileSystem {
         let meta = store
             .head(&ObjPath::from(blob))
             .await
-            .map_err(|e| Self::net("Azure head", e))?;
+            .map_err(|e| super::object_store_errors::object_error("Azure head", path, e))?;
         Ok(FsFileMetadata {
             path: path.to_string(),
             size: meta.size,
