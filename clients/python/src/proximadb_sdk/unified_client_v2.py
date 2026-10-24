@@ -29,6 +29,7 @@ from .models import (
     SearchResult,
     VectorOperationResponse,
     VectorRecord,
+    normalize_collection_config_kwargs,
 )
 from .models_v2 import ProximaRecord
 
@@ -191,9 +192,18 @@ class ProximaDBClient:
         self, name: str, config: CollectionConfig | None = None, **kwargs
     ) -> Collection:
         """Create a new vector collection."""
+        # TD-SDKENG-1: never silently drop an unknown keyword; only the
+        # transport-consumed pass-through travels past the config.
+        config_kwargs, passthrough = normalize_collection_config_kwargs(kwargs)
         if config is None:
-            config = CollectionConfig(name=name, **kwargs)
-        return self._adapter.create_collection(name, config, **kwargs)
+            config = CollectionConfig(name=name, **config_kwargs)
+        elif config_kwargs:
+            # Round-2 review: re-validate (model_copy skips validation and
+            # does not translate field aliases like quantization=).
+            merged = config.model_dump(exclude={"name"})
+            merged.update(config_kwargs)
+            config = CollectionConfig(name=name, **merged)
+        return self._adapter.create_collection(name, config, **passthrough)
 
     def get_collection(self, collection_id: str) -> Collection | None:
         """Get collection metadata by ID or name."""

@@ -43,6 +43,7 @@ from .models import (
     StorageEngine,
     VectorOperationResponse,
     VectorRecord,
+    normalize_collection_config_kwargs,
 )
 from .operation_router import OperationRouter, RoutingConfig, RoutingStrategy
 from .proto_conversion import ProtoConverter
@@ -1598,13 +1599,30 @@ class ProximaDBClient:
             )
             client.create_collection(config=config)
         """
+        # TD-SDKENG-1: never silently drop an unknown keyword — aliases apply,
+        # unknowns raise, and the transport-consumed keywords (schema=,
+        # initial_capacity=, indexing_algorithm=) travel past the config.
+        config_kwargs, passthrough = normalize_collection_config_kwargs(kwargs)
+        if "name" in config_kwargs and config_kwargs["name"] != name:
+            # Round-3 review: a friendly error instead of Python's raw
+            # "got multiple values for argument 'name'".
+            raise TypeError(
+                f"create_collection() got both the positional name ({name!r}) "
+                f"and name={config_kwargs['name']!r}; pass the name once"
+            )
+        config_kwargs.pop("name", None)
         if config is None:
-            config = CollectionConfig(name=name, **kwargs)
-        elif getattr(config, "name", None) != name:
-            if hasattr(config, "model_copy"):
-                config = config.model_copy(update={"name": name})
-            else:
-                config = CollectionConfig(name=name, **config.model_dump())
+            config = CollectionConfig(name=name, **config_kwargs)
+        else:
+            # Round-2 review: model_copy does NOT validate nor translate
+            # pydantic field aliases (quantization= would write a bogus
+            # attribute the read-only property shadows), and the name
+            # mismatch must still apply when overrides are present — so the
+            # config-given branch re-validates through the constructor.
+            merged = config.model_dump(exclude={"name"})
+            merged.update(config_kwargs)
+            config = CollectionConfig(name=name, **merged)
+        kwargs = passthrough
 
         if self._get_local_collection(name) is not None:
             raise ProximaDBError(f"Collection '{name}' already exists")

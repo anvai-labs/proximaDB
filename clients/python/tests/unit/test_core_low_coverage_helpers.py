@@ -298,11 +298,15 @@ def test_proto_converter_distance_storage_index_and_quantization_mappings():
     assert ProtoConverter.distance_metric_to_str(2) == "euclidean"
     assert ProtoConverter.distance_metric_to_str("not-a-metric") == "cosine"
 
-    assert ProtoConverter.storage_engine_to_int(None) == 1
-    assert ProtoConverter.storage_engine_to_int("hybrid") == 1
+    # TD-SDKENG-1: SST is the fallback everywhere; VIPER is deprecated
+    # (ADR-093) and the server rejects it.
+    assert ProtoConverter.storage_engine_to_int(None) == 2
+    assert ProtoConverter.storage_engine_to_int("unknown") == 2
+    # mmap is a KNOWN engine that maps to the viper int slot (pre-existing
+    # table); only unknown/None fall back to SST now.
     assert ProtoConverter.storage_engine_to_str("mmap") == "viper"
     assert ProtoConverter.storage_engine_to_str(3) == "nova"
-    assert ProtoConverter.storage_engine_to_str("unknown") == "viper"
+    assert ProtoConverter.storage_engine_to_str("unknown") == "sst"
 
     assert ProtoConverter.index_type_to_int(None) == 1
     assert ProtoConverter.index_type_to_int("ivf") == 2

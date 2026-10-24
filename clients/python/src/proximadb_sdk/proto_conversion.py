@@ -185,17 +185,23 @@ class ProtoConverter:
             Integer representation for gRPC (1=viper as default)
         """
         if value is None:
-            return 1  # Default to VIPER
+            # TD-SDKENG-1 (round-2 review): SST is the default; VIPER is
+            # deprecated (ADR-093) and the server rejects it.
+            return cls._STORAGE_ENGINE_STR_TO_INT.get("sst", 2)
         if isinstance(value, int):
             return value
         if isinstance(value, Enum):
             val = value.value
             if isinstance(val, int):
                 return val
-            return cls._STORAGE_ENGINE_STR_TO_INT.get(str(val).lower(), 1)
+            return cls._STORAGE_ENGINE_STR_TO_INT.get(
+                str(val).lower(), cls._STORAGE_ENGINE_STR_TO_INT.get("sst", 2)
+            )
         if isinstance(value, str):
-            return cls._STORAGE_ENGINE_STR_TO_INT.get(value.lower(), 1)
-        return 1
+            return cls._STORAGE_ENGINE_STR_TO_INT.get(
+                value.lower(), cls._STORAGE_ENGINE_STR_TO_INT.get("sst", 2)
+            )
+        return cls._STORAGE_ENGINE_STR_TO_INT.get("sst", 2)
 
     @classmethod
     def storage_engine_to_str(cls, value: str | int | Enum | None) -> str:
@@ -205,24 +211,25 @@ class ProtoConverter:
             value: Integer value, string name, or enum instance
 
         Returns:
-            String representation for REST API ("viper" as default)
+            String representation for REST API ("sst" as default)
         """
         if value is None:
-            return "viper"
+            # TD-SDKENG-1: SST default; VIPER deprecated (ADR-093).
+            return "sst"
         if isinstance(value, str):
             lower_val = value.lower()
             if lower_val in cls._STORAGE_ENGINE_STR_TO_INT:
                 int_val = cls._STORAGE_ENGINE_STR_TO_INT[lower_val]
-                return cls._STORAGE_ENGINE_INT_TO_STR.get(int_val, "viper")
-            return "viper"
+                return cls._STORAGE_ENGINE_INT_TO_STR.get(int_val, "sst")
+            return "sst"
         if isinstance(value, int):
-            return cls._STORAGE_ENGINE_INT_TO_STR.get(value, "viper")
+            return cls._STORAGE_ENGINE_INT_TO_STR.get(value, "sst")
         if isinstance(value, Enum):
             val = value.value
             if isinstance(val, int):
-                return cls._STORAGE_ENGINE_INT_TO_STR.get(val, "viper")
+                return cls._STORAGE_ENGINE_INT_TO_STR.get(val, "sst")
             return str(val).lower()
-        return "viper"
+        return "sst"
 
     # =========================================================================
     # Index Type Conversion Methods
@@ -246,7 +253,7 @@ class ProtoConverter:
             val = value.value
             if isinstance(val, int):
                 return val
-            return cls._INDEX_TYPE_STR_TO_INT.get(str(val).lower(), 1)
+            return cls._INDEX_TYPE_STR_TO_INT.get(str(val).lower(), 1)  # hnsw
         if isinstance(value, str):
             return cls._INDEX_TYPE_STR_TO_INT.get(value.lower(), 1)
         return 1

@@ -201,7 +201,11 @@ def test_selector_swift_skipped_for_large_datasets():
     assert rec.engine != "swift"
 
 
-def test_selector_swift_eligible_small():
+def test_selector_never_recommends_deprecated_or_experimental():
+    # TD-SDKENG-1: compare_engines must not hand back VIPER (deprecated,
+    # ADR-093) or SWIFT/RAPTOR (experimental) — following the documented
+    # quickstart with such a rec would ask the server for an engine it
+    # rejects.
     s = EngineSelector()
     wc = WorkloadCharacteristics(
         read_ratio=0.95,
@@ -210,7 +214,8 @@ def test_selector_swift_eligible_small():
     )
     recs = s.compare_engines(wc)
     engines = {r.engine for r in recs}
-    assert "swift" in engines
+    assert engines, "some selectable engine must be recommended"
+    assert engines <= {"sst", "nova", "helix"}, engines
 
 
 def test_selector_target_latency_penalty():
@@ -288,99 +293,6 @@ def test_infer_workload_type_branches():
         )
         == "mixed"
     )
-
-
-def test_generate_config_sst_write_heavy():
-    s = EngineSelector()
-    cfg = s._generate_config(
-        "sst", s.ENGINE_PROFILES["sst"], WorkloadCharacteristics(write_ratio=0.9)
-    )
-    assert cfg["compression"] == "lz4"
-    assert cfg["flush_threshold_mb"] == 128
-
-
-def test_generate_config_sst_read_heavy():
-    s = EngineSelector()
-    cfg = s._generate_config(
-        "sst", s.ENGINE_PROFILES["sst"], WorkloadCharacteristics(write_ratio=0.1)
-    )
-    assert cfg["compression"] == "zstd"
-    assert cfg["bloom_filter_fpp"] == 0.001
-
-
-def test_generate_config_helix_high_dim_spatial():
-    s = EngineSelector()
-    cfg = s._generate_config(
-        "helix",
-        s.ENGINE_PROFILES["helix"],
-        WorkloadCharacteristics(vector_dimension=1024, spatial_locality=0.9),
-    )
-    assert cfg["pca_dimensions"] == min(128, 1024 // 4)
-    assert cfg["hilbert_bits"] == 16
-
-
-def test_generate_config_helix_low_dim_scattered():
-    s = EngineSelector()
-    cfg = s._generate_config(
-        "helix",
-        s.ENGINE_PROFILES["helix"],
-        WorkloadCharacteristics(vector_dimension=128, spatial_locality=0.1),
-    )
-    assert "pca_dimensions" not in cfg
-    assert cfg["hilbert_bits"] == 12
-
-
-def test_generate_config_viper_large_and_small():
-    s = EngineSelector()
-    big = s._generate_config(
-        "viper",
-        s.ENGINE_PROFILES["viper"],
-        WorkloadCharacteristics(vector_count=200000),
-    )
-    assert big["row_group_size"] == 100000
-    assert big["enable_statistics"] is True
-    small = s._generate_config(
-        "viper", s.ENGINE_PROFILES["viper"], WorkloadCharacteristics(vector_count=100)
-    )
-    assert small["row_group_size"] == 10000
-
-
-def test_generate_config_swift_exact_search_branches():
-    s = EngineSelector()
-    none_target = s._generate_config(
-        "swift", s.ENGINE_PROFILES["swift"], WorkloadCharacteristics()
-    )
-    assert none_target["in_memory"] is True
-    assert none_target["exact_search"] is True
-    loose = s._generate_config(
-        "swift",
-        s.ENGINE_PROFILES["swift"],
-        WorkloadCharacteristics(target_latency_ms=10),
-    )
-    assert loose["exact_search"] is True
-    tight = s._generate_config(
-        "swift",
-        s.ENGINE_PROFILES["swift"],
-        WorkloadCharacteristics(target_latency_ms=1),
-    )
-    assert tight["exact_search"] is False
-
-
-def test_generate_config_raptor_hot_blocks():
-    s = EngineSelector()
-    hot = s._generate_config(
-        "raptor",
-        s.ENGINE_PROFILES["raptor"],
-        WorkloadCharacteristics(hot_data_ratio=0.5),
-    )
-    assert hot["adaptive_pruning"] is True
-    assert hot["cache_hot_blocks"] is True
-    cold = s._generate_config(
-        "raptor",
-        s.ENGINE_PROFILES["raptor"],
-        WorkloadCharacteristics(hot_data_ratio=0.1),
-    )
-    assert cold["cache_hot_blocks"] is False
 
 
 def test_generate_config_nova_empty():
@@ -603,3 +515,27 @@ def test_automl_observe_and_analyze():
     wc = am.analyze_workload()
     assert isinstance(wc, WorkloadCharacteristics)
     assert wc.vector_count == 15
+
+
+def test_generate_config_emits_only_config_fields():
+    """TD-SDKENG-1: overrides feed create_collection(**rec.config_overrides),
+    which now REJECTS unknown keywords — so only CollectionConfig fields
+    (or known aliases) may be emitted. The old tuning knobs
+    (flush_threshold_mb, pca_dimensions, ...) were silently dropped."""
+    from proximadb_sdk.automl import WorkloadCharacteristics
+    from proximadb_sdk.models import (
+        CollectionConfig,
+        normalize_collection_config_kwargs,
+    )
+
+    recommender = EngineSelector()
+    chars = WorkloadCharacteristics(
+        vector_count=100_000, vector_dimension=768, write_ratio=0.8
+    )
+    for engine in ("sst", "helix", "nova"):
+        overrides = recommender._generate_config(
+            engine, recommender.ENGINE_PROFILES[engine], chars
+        )
+        config_kwargs, passthrough = normalize_collection_config_kwargs(overrides)
+        CollectionConfig(name="t", dimension=3, **config_kwargs)
+        assert not passthrough
