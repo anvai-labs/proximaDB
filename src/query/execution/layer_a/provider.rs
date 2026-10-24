@@ -40,6 +40,7 @@ use proximadb_storage_common::proxima_arrow::{SYS_COL_OID, SYS_COL_RESIDUAL};
 
 use super::conform::{ConformContext, Conformed, SegmentShape, conform_segment_batch};
 use super::merge::{ConformedStream, LayerAMerge};
+use super::partition::{Layout, OidRange};
 use super::prune::{RowGroupPlan, SegmentPruner, runs};
 use crate::datafusion::proxima_scan_exec::runtime_filter_prune_enabled;
 use crate::services::layer_a_snapshot::{LayerARowAccess, LayerASnapshot, NativeLayerASnapshot};
@@ -124,6 +125,28 @@ impl TableProvider for LayerATableProvider {
             &metrics,
         )
         .map(Arc::new);
+        // Oid-range partitions when there are segments to split (see
+        // `partition`): the layout — ranges and every footer — is loaded once,
+        // here, so the plan declares exactly as many partitions as there are
+        // ranges. Resident rows alone stay one partition.
+        let target = state.config().target_partitions();
+        let layout = match &self.table.snapshot {
+            Some(snapshot) if target > 1 && !snapshot.view.segments.is_empty() => {
+                let filesystem = snapshot.filesystem.clone().ok_or_else(|| {
+                    DataFusionError::Plan("layer A: segments without a filesystem".to_string())
+                })?;
+                let layout = Layout::load(
+                    filesystem,
+                    &snapshot.view.segments,
+                    target,
+                    declares_oid_order,
+                )
+                .await
+                .map_err(|e| DataFusionError::External(e.into()))?;
+                Some(Arc::new(layout))
+            }
+            _ => None,
+        };
         Ok(Arc::new(LayerAScanExec::new(
             self.table.clone(),
             Arc::new(ctx),
@@ -131,6 +154,7 @@ impl TableProvider for LayerATableProvider {
             state.config().batch_size(),
             pruner,
             metrics,
+            layout,
         )))
     }
 
@@ -163,6 +187,9 @@ pub struct LayerAScanExec {
     /// Runtime filters DataFusion pushed in (hash-join build keys, TopK and
     /// aggregate thresholds), evaluated per row group just before it is read.
     dynamic: Arc<DynamicPruning>,
+    /// Oid-range partitions (see `partition`): one per range of the layout
+    /// loaded when the scan was planned; `None` is a single partition.
+    layout: Option<Arc<Layout>>,
     metrics: ExecutionPlanMetricsSet,
     properties: Arc<PlanProperties>,
 }
@@ -265,6 +292,7 @@ impl LayerAScanExec {
         batch_size: usize,
         pruner: Option<Arc<SegmentPruner>>,
         metrics: ExecutionPlanMetricsSet,
+        layout: Option<Arc<Layout>>,
     ) -> Self {
         let dynamic = Arc::new(DynamicPruning {
             filters: Vec::new(),
@@ -274,7 +302,7 @@ impl LayerAScanExec {
         });
         let properties = PlanProperties::new(
             EquivalenceProperties::new(ctx.output.clone()),
-            Partitioning::UnknownPartitioning(1),
+            Partitioning::UnknownPartitioning(layout.as_ref().map_or(1, |l| l.ranges.len())),
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
@@ -285,6 +313,7 @@ impl LayerAScanExec {
             batch_size,
             pruner,
             dynamic,
+            layout,
             metrics,
             properties: Arc::new(properties),
         }
@@ -304,9 +333,14 @@ impl LayerAScanExec {
                 primary_key: self.dynamic.primary_key.clone(),
                 pruned: self.dynamic.pruned.clone(),
             }),
+            layout: self.layout.clone(),
             metrics: self.metrics.clone(),
             properties: self.properties.clone(),
         }
+    }
+
+    fn partitions(&self) -> usize {
+        self.layout.as_ref().map_or(1, |l| l.ranges.len())
     }
 
     fn segment_count(&self) -> usize {
@@ -321,7 +355,7 @@ impl DisplayAs for LayerAScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
         write!(
             f,
-            "LayerAScanExec: table={}, segments={}, resident={}, records_only={}, pruning={}, dynamic_filters={}, limit={:?}",
+            "LayerAScanExec: table={}, segments={}, resident={}, records_only={}, pruning={}, dynamic_filters={}, partitions={}, limit={:?}",
             self.table.schema.name,
             self.segment_count(),
             self.table
@@ -331,6 +365,7 @@ impl DisplayAs for LayerAScanExec {
             self.ctx.records_only,
             self.pruner.is_some(),
             self.dynamic.filters.len(),
+            self.partitions(),
             self.limit
         )
     }
@@ -354,9 +389,10 @@ impl ExecutionPlan for LayerAScanExec {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        if partition != 0 {
+        if partition >= self.partitions() {
             return Err(DataFusionError::Internal(format!(
-                "LayerAScanExec has one partition, asked for {partition}"
+                "LayerAScanExec has {} partition(s), asked for {partition}",
+                self.partitions()
             )));
         }
         let output = self.ctx.output.clone();
@@ -370,8 +406,26 @@ impl ExecutionPlan for LayerAScanExec {
         let ctx = self.ctx.clone();
         let (limit, batch_size, pruner) = (self.limit, self.batch_size, self.pruner.clone());
         let dynamic = self.dynamic.clone();
+        let (range, footers) = match &self.layout {
+            Some(layout) => (
+                layout
+                    .ranges
+                    .get(partition)
+                    .cloned()
+                    .unwrap_or_else(OidRange::empty),
+                Some(layout.footers.clone()),
+            ),
+            None => (OidRange::all(), None),
+        };
         let stream = futures::stream::once(async move {
-            open_merge(snapshot, ctx, limit, batch_size, pruner, dynamic).await
+            let parts = ScanParts {
+                ctx,
+                batch_size,
+                pruner,
+                dynamic,
+                range,
+            };
+            open_merge(snapshot, parts, limit, footers).await
         })
         .map_ok(|merge| {
             futures::stream::try_unfold(merge, |mut merge| async move {
@@ -467,12 +521,11 @@ impl ExecutionPlan for LayerAScanExec {
 /// Open every segment (footers concurrently) and assemble the merge.
 async fn open_merge(
     snapshot: LayerASnapshot,
-    ctx: Arc<ConformContext>,
+    parts: ScanParts,
     limit: Option<usize>,
-    batch_size: usize,
-    pruner: Option<Arc<SegmentPruner>>,
-    dynamic: Arc<DynamicPruning>,
+    footers: Option<Vec<Option<Arc<ParquetMetaData>>>>,
 ) -> Result<LayerAMerge> {
+    let (ctx, batch_size, range) = (parts.ctx.clone(), parts.batch_size, parts.range.clone());
     let LayerASnapshot {
         view,
         filesystem,
@@ -482,7 +535,7 @@ async fn open_merge(
     let resident: Vec<ProximaRecord> = view
         .resident
         .into_iter()
-        .filter(|r| !tombstones.contains(r.oid.as_str()))
+        .filter(|r| !tombstones.contains(r.oid.as_str()) && range.contains(&r.oid))
         .collect();
     let mut shadow: HashSet<String> = view.tombstones.iter().cloned().collect();
     shadow.extend(resident.iter().map(|r| r.oid.clone()));
@@ -495,10 +548,8 @@ async fn open_merge(
             open_segment(
                 filesystem.clone(),
                 path.clone(),
-                ctx.clone(),
-                batch_size,
-                pruner.clone(),
-                dynamic.clone(),
+                footers.as_ref().map(|f| f.get(i).cloned().flatten()),
+                parts.clone(),
                 i > 0,
             )
         }))
@@ -517,6 +568,16 @@ async fn open_merge(
     ))
 }
 
+/// What every segment of one partition is read with.
+#[derive(Clone)]
+struct ScanParts {
+    ctx: Arc<ConformContext>,
+    batch_size: usize,
+    pruner: Option<Arc<SegmentPruner>>,
+    dynamic: Arc<DynamicPruning>,
+    range: OidRange,
+}
+
 /// One oid-ordered segment's open reader and projections.
 struct SegmentRead {
     reader: FileSystemParquetReader,
@@ -526,6 +587,9 @@ struct SegmentRead {
     ctx: Arc<ConformContext>,
     path: String,
     batch_size: usize,
+    /// This partition's oids: rows of a row group straddling a boundary are
+    /// masked to it.
+    range: OidRange,
     /// Per dynamic filter (by index): the snapshot generation its plan was
     /// computed at, and the plan (`None` when the filter cannot prune).
     dynamic_plans: parking_lot::Mutex<HashMap<usize, (u64, Option<DynamicPlan>)>>,
@@ -550,14 +614,14 @@ impl SegmentRead {
         .with_batch_size(self.batch_size)
         .build()
         .with_context(|| format!("layer A: open segment '{}'", self.path))?;
-        let (ctx, path) = (self.ctx.clone(), self.path.clone());
+        let (ctx, path, range) = (self.ctx.clone(), self.path.clone(), self.range.clone());
         Ok(if kept {
             let shape = Arc::new(SegmentShape::of(&ctx, stream.schema())?);
             stream
                 .map(move |batch| {
                     let batch =
                         batch.with_context(|| format!("layer A: decode segment '{path}'"))?;
-                    conform_segment_batch(&ctx, &shape, &batch)
+                    conform_segment_batch(&ctx, &shape, &range.mask(batch)?)
                 })
                 .boxed()
         } else {
@@ -565,7 +629,7 @@ impl SegmentRead {
                 .map(move |batch| {
                     let batch =
                         batch.with_context(|| format!("layer A: decode segment '{path}'"))?;
-                    Conformed::spine(&ctx, &batch)
+                    Conformed::spine(&ctx, &range.mask(batch)?)
                 })
                 .boxed()
         })
@@ -643,21 +707,30 @@ fn declares_oid_order(metadata: &ParquetMetaData) -> bool {
 async fn open_segment(
     filesystem: Arc<dyn FileSystem>,
     path: String,
-    ctx: Arc<ConformContext>,
-    batch_size: usize,
-    pruner: Option<Arc<SegmentPruner>>,
-    dynamic: Arc<DynamicPruning>,
+    footer: Option<Option<Arc<ParquetMetaData>>>,
+    parts: ScanParts,
     shadows_older: bool,
 ) -> Result<ConformedStream> {
+    let ScanParts {
+        ctx,
+        batch_size,
+        pruner,
+        dynamic,
+        range,
+    } = parts;
     let mut reader = FileSystemParquetReader::new(filesystem.clone(), path.clone());
     // An I/O failure fails the scan. Only an object that is not Parquet, or
-    // does not declare oid order, takes the whole-object fallback below.
-    let metadata = match reader.load_metadata(None).await {
-        Ok(metadata) => Some(metadata),
-        Err(e) if is_io_error(&e) => {
-            return Err(anyhow::anyhow!("layer A: read segment '{path}': {e}"));
-        }
-        Err(_) => None,
+    // does not declare oid order, takes the whole-object fallback below. A
+    // partitioned scan's footers were loaded once, by its layout.
+    let metadata = match footer {
+        Some(footer) => footer,
+        None => match reader.load_metadata(None).await {
+            Ok(metadata) => Some(metadata),
+            Err(e) if is_io_error(&e) => {
+                return Err(anyhow::anyhow!("layer A: read segment '{path}': {e}"));
+            }
+            Err(_) => None,
+        },
     };
     if let Some(metadata) = metadata.filter(|m| declares_oid_order(m)) {
         let arrow = ArrowReaderMetadata::try_new(metadata.clone(), ArrowReaderOptions::new())
@@ -673,12 +746,19 @@ async fn open_segment(
             .context("an oid-ordered segment has no oid column")?;
         let spine_mask = ProjectionMask::roots(&descr, [oid]);
         let reader = reader.with_metadata(metadata.clone());
+        // Row groups that may hold an oid of this partition's range; the rest
+        // are not read at all (their oids belong to other partitions).
+        let in_range = range.row_groups(&metadata, &arrow);
         let keep = match &pruner {
             Some(pruner) => {
                 let RowGroupPlan {
                     mut keep,
                     residual_candidates,
                 } = pruner.plan(&metadata, arrow.schema());
+                let residual_candidates: Vec<usize> = residual_candidates
+                    .into_iter()
+                    .filter(|&group| in_range[group])
+                    .collect();
                 let cleared: Vec<usize> = futures::stream::iter(residual_candidates)
                     .map(|group| {
                         let (reader, arrow) = (&reader, &arrow);
@@ -695,7 +775,12 @@ async fn open_segment(
                 for group in cleared {
                     keep[group] = false;
                 }
-                pruner.record(&keep);
+                let counted: Vec<bool> = keep
+                    .iter()
+                    .zip(&in_range)
+                    .filter_map(|(&k, &r)| r.then_some(k))
+                    .collect();
+                pruner.record(&counted);
                 keep
             }
             None => vec![true; metadata.num_row_groups()],
@@ -713,10 +798,19 @@ async fn open_segment(
             ctx,
             path,
             batch_size,
+            range: range.clone(),
             dynamic_plans: Default::default(),
         });
+        let fates: Vec<Option<bool>> = keep
+            .iter()
+            .zip(&in_range)
+            .map(|(&kept, &mine)| mine.then_some(kept))
+            .collect();
         let mut parts: Vec<ConformedStream> = Vec::new();
-        for (kept, groups) in runs(&keep) {
+        for (fate, groups) in runs(&fates) {
+            let Some(kept) = fate else {
+                continue;
+            };
             if !kept && !shadows_older {
                 continue;
             }
@@ -747,6 +841,7 @@ async fn open_segment(
         .map_err(|e| anyhow::anyhow!("layer A: read segment '{path}' failed: {e}"))?;
     let mut records = read_segment_records(&bytes, &[], &[], None)
         .with_context(|| format!("layer A: decode segment '{path}'"))?;
+    records.retain(|r| range.contains(&r.oid));
     records.sort_by(|a, b| a.oid.cmp(&b.oid));
     let chunks: Vec<Result<Conformed>> = records
         .chunks(batch_size.max(1))

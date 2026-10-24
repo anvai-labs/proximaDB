@@ -385,9 +385,9 @@ fn prop_head(name: &str) -> String {
 }
 
 /// Runs of consecutive row groups with the same fate, in file order.
-pub(crate) fn runs(keep: &[bool]) -> Vec<(bool, Vec<usize>)> {
-    let mut out: Vec<(bool, Vec<usize>)> = Vec::new();
-    for (i, &k) in keep.iter().enumerate() {
+pub(crate) fn runs<T: Copy + PartialEq>(fates: &[T]) -> Vec<(T, Vec<usize>)> {
+    let mut out: Vec<(T, Vec<usize>)> = Vec::new();
+    for (i, &k) in fates.iter().enumerate() {
         match out.last_mut() {
             Some((fate, groups)) if *fate == k => groups.push(i),
             _ => out.push((k, vec![i])),
