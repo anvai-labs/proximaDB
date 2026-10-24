@@ -199,13 +199,13 @@ impl FileSystem for AwsS3FileSystem {
                 store
                     .put_opts(&dst, payload, opts)
                     .await
-                    .map_err(|e| Self::net("S3 put_opts", e))?;
+                    .map_err(|e| super::object_store_errors::denied("S3 put_opts", e))?;
             }
             None => {
                 store
                     .put(&dst, payload)
                     .await
-                    .map_err(|e| Self::net("S3 put", e))?;
+                    .map_err(|e| super::object_store_errors::denied("S3 put", e))?;
             }
         }
         Ok(())
@@ -297,7 +297,10 @@ impl FileSystem for AwsS3FileSystem {
             Err(object_store::Error::AlreadyExists { .. }) => {
                 Err(FilesystemError::AlreadyExists(path.to_string()))
             }
-            Err(error) => Err(Self::net("S3 conditional put", error)),
+            Err(error) => Err(super::object_store_errors::denied(
+                "S3 conditional put",
+                error,
+            )),
         }
     }
 
@@ -348,7 +351,7 @@ impl FileSystem for AwsS3FileSystem {
         let mut stream = store.list(Some(&ObjPath::from(prefix)));
         let mut entries = Vec::new();
         while let Some(meta) = stream.next().await {
-            let meta = meta.map_err(|e| Self::net("S3 list", e))?;
+            let meta = meta.map_err(|e| super::object_store_errors::denied("S3 list", e))?;
             let key = meta.location.to_string();
             let name = key.rsplit('/').next().unwrap_or(&key).to_string();
             entries.push(DirEntry {

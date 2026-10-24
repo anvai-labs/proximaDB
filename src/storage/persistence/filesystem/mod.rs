@@ -1924,6 +1924,20 @@ pub(crate) mod object_store_errors {
     pub(crate) fn object_error(ctx: &str, path: &str, e: object_store::Error) -> FilesystemError {
         match e {
             object_store::Error::NotFound { .. } => FilesystemError::NotFound(path.to_string()),
+            other => denied(ctx, other),
+        }
+    }
+
+    /// A refused credential is not a transient fault: callers that retry
+    /// `Network` must not retry these.
+    pub(crate) fn denied(ctx: &str, e: object_store::Error) -> FilesystemError {
+        match e {
+            object_store::Error::PermissionDenied { .. } => {
+                FilesystemError::PermissionDenied(format!("{ctx}: {e}"))
+            }
+            object_store::Error::Unauthenticated { .. } => {
+                FilesystemError::Auth(format!("{ctx}: {e}"))
+            }
             other => FilesystemError::Network(format!("{ctx}: {other}")),
         }
     }
@@ -1934,7 +1948,7 @@ pub(crate) mod object_store_errors {
         match head {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(e) => Err(FilesystemError::Network(format!("{ctx}: {e}"))),
+            Err(e) => Err(denied(ctx, e)),
         }
     }
 }

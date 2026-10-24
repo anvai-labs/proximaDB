@@ -250,13 +250,13 @@ impl FileSystem for AzureBlobFileSystem {
                 store
                     .put_opts(&dst, payload, opts)
                     .await
-                    .map_err(|e| Self::net("Azure put_opts", e))?;
+                    .map_err(|e| super::object_store_errors::denied("Azure put_opts", e))?;
             }
             None => {
                 store
                     .put(&dst, payload)
                     .await
-                    .map_err(|e| Self::net("Azure put", e))?;
+                    .map_err(|e| super::object_store_errors::denied("Azure put", e))?;
             }
         }
         Ok(())
@@ -348,7 +348,10 @@ impl FileSystem for AzureBlobFileSystem {
             Err(object_store::Error::AlreadyExists { .. }) => {
                 Err(FilesystemError::AlreadyExists(path.to_string()))
             }
-            Err(error) => Err(Self::net("Azure conditional put", error)),
+            Err(error) => Err(super::object_store_errors::denied(
+                "Azure conditional put",
+                error,
+            )),
         }
     }
 
@@ -399,7 +402,7 @@ impl FileSystem for AzureBlobFileSystem {
         let mut stream = store.list(Some(&ObjPath::from(prefix)));
         let mut entries = Vec::new();
         while let Some(meta) = stream.next().await {
-            let meta = meta.map_err(|e| Self::net("Azure list", e))?;
+            let meta = meta.map_err(|e| super::object_store_errors::denied("Azure list", e))?;
             let key = meta.location.to_string();
             let name = key.rsplit('/').next().unwrap_or(&key).to_string();
             entries.push(DirEntry {

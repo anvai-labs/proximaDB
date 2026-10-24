@@ -12,6 +12,11 @@
 //! Binaries older than the marker cannot check it: rolling back across the
 //! format-1 → 2 transition is not supported.
 //!
+//! **Format 3** ([`OBJECT_SPILL_FORMAT`]) marks a directory whose spill
+//! segments may sit at an object-store prefix; it is recorded only by a
+//! directory's first object placement, so other directories stay at 2 and can
+//! still roll back to a format-2 binary.
+//!
 //! Defaults: rotation, truncation and the spill are ON. Each gate's env var
 //! still sets the value; `0` or `off` turns it off.
 
@@ -72,8 +77,15 @@ pub fn default_on_gate(env: &str, default: u64) -> Option<u64> {
     }
 }
 
-/// The format this binary writes and the newest it can read.
+/// The format this binary writes by default.
 pub const CURRENT_FORMAT: u32 = 2;
+
+/// **Format 3**: spill segments may live at an object-store prefix
+/// (`PROXIMADB_RELATIONAL_SPILL_URL`), not only beside the WAL. Recorded
+/// ([`raise_data_format`]) before a directory's first object placement, so a
+/// binary that only knows local segments refuses the directory instead of
+/// serving it without them. The newest format this binary can read.
+pub const OBJECT_SPILL_FORMAT: u32 = 3;
 
 /// Marker file, beside the canonical WAL.
 pub const FORMAT_MARKER: &str = "DATA_FORMAT";
@@ -84,11 +96,11 @@ struct Marker {
     written_by: String,
 }
 
-/// Check `dir`'s format marker and record [`CURRENT_FORMAT`] in it. Call before
+/// Check `dir`'s format marker and record at least [`CURRENT_FORMAT`] in it. Call before
 /// opening anything in `dir`.
 ///
-/// Refuses a marker newer than [`CURRENT_FORMAT`] (written by a newer binary)
-/// or one that cannot be read — guessing would risk serving a subset of the
+/// Refuses a marker newer than [`OBJECT_SPILL_FORMAT`] (written by a newer
+/// binary) or one that cannot be read — guessing would risk serving a subset of the
 /// data. A missing marker is a format-1 directory, or a new one; either way it
 /// is upgraded, durably (temp file, fsync, rename, fsync of the directory),
 /// before the caller can write anything format 2.
@@ -110,45 +122,85 @@ pub fn ensure_data_format(dir: &Path) -> Result<u32> {
         }
     };
     if let Some(format) = found {
-        if format > CURRENT_FORMAT {
+        if format > OBJECT_SPILL_FORMAT {
             anyhow::bail!(
-                "{} was written in data format {format}, newer than this binary's {CURRENT_FORMAT} \
+                "{} was written in data format {format}, newer than this binary's {OBJECT_SPILL_FORMAT} \
                  (ProximaDB {}); serving it could silently drop data. Run a newer binary.",
                 dir.display(),
                 crate::version::PROXIMADB_VERSION
             );
         }
-        if format == CURRENT_FORMAT {
+        if format >= CURRENT_FORMAT {
             return Ok(format);
         }
     }
-    write_marker(dir, &path)?;
+    record_format(dir, found, CURRENT_FORMAT)
+}
+
+/// Raise `dir`'s format marker to at least `format` (never lowers it). Call
+/// before writing anything only a binary that reads `format` can find.
+pub fn raise_data_format(dir: &Path, format: u32) -> Result<u32> {
+    let found = ensure_data_format(dir)?;
+    if found >= format {
+        return Ok(found);
+    }
+    record_format(dir, Some(found), format)
+}
+
+fn record_format(dir: &Path, found: Option<u32>, format: u32) -> Result<u32> {
+    let bytes = serde_json::to_vec_pretty(&Marker {
+        format,
+        written_by: crate::version::PROXIMADB_VERSION.to_string(),
+    })?;
+    write_marker(dir, FORMAT_MARKER, &bytes)?;
     tracing::info!(
         dir = %dir.display(),
         from = ?found,
-        to = CURRENT_FORMAT,
+        to = format,
         "data format marker recorded"
     );
-    Ok(CURRENT_FORMAT)
+    Ok(format)
 }
 
-fn write_marker(dir: &Path, path: &Path) -> Result<()> {
+/// Install `bytes` as `dir/name` durably: temp file, fsync, rename, fsync of
+/// the directory.
+pub(crate) fn write_marker(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    let (tmp, path) = write_temp(dir, name, bytes)?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("installing {}", path.display()))?;
+    sync_dir(dir)
+}
+
+/// [`write_marker`], create-only: `false` (and nothing written) when
+/// `dir/name` already exists. Atomic like it: the marker appears complete or
+/// not at all.
+pub(crate) fn install_marker_if_absent(dir: &Path, name: &str, bytes: &[u8]) -> Result<bool> {
+    let (tmp, path) = write_temp(dir, name, bytes)?;
+    let linked = std::fs::hard_link(&tmp, &path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => sync_dir(dir).map(|()| true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("installing {}", path.display())),
+    }
+}
+
+/// `bytes` in a synced temp file beside `dir/name`; returns both paths.
+fn write_temp(dir: &Path, name: &str, bytes: &[u8]) -> Result<(PathBuf, PathBuf)> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let bytes = serde_json::to_vec_pretty(&Marker {
-        format: CURRENT_FORMAT,
-        written_by: crate::version::PROXIMADB_VERSION.to_string(),
-    })?;
     // Per-process temp name: two processes booting on one directory must not
     // rename each other's file out from under them.
-    let tmp: PathBuf = dir.join(format!("{FORMAT_MARKER}.{}.tmp", std::process::id()));
+    let tmp: PathBuf = dir.join(format!("{name}.{}.tmp", std::process::id()));
     {
         use std::io::Write;
         let mut file =
             std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
     }
-    std::fs::rename(&tmp, path).with_context(|| format!("installing {}", path.display()))?;
+    Ok((tmp, dir.join(name)))
+}
+
+fn sync_dir(dir: &Path) -> Result<()> {
     std::fs::File::open(dir)
         .and_then(|d| d.sync_all())
         .with_context(|| format!("syncing {}", dir.display()))
@@ -226,10 +278,15 @@ mod tests {
         )?;
         assert_eq!(ensure_data_format(dir.path())?, CURRENT_FORMAT);
 
+        // Raising records format 3, which later checks keep (never lower).
+        assert_eq!(raise_data_format(dir.path(), OBJECT_SPILL_FORMAT)?, 3);
+        assert_eq!(ensure_data_format(dir.path())?, 3);
+        assert_eq!(raise_data_format(dir.path(), CURRENT_FORMAT)?, 3);
+
         // A newer one refuses, and is left as it was.
         let newer = format!(
             r#"{{"format":{},"written_by":"future"}}"#,
-            CURRENT_FORMAT + 1
+            OBJECT_SPILL_FORMAT + 1
         );
         std::fs::write(dir.path().join(FORMAT_MARKER), &newer)?;
         let err = ensure_data_format(dir.path()).expect_err("newer format");
