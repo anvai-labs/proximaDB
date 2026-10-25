@@ -81,6 +81,25 @@ tokio::task_local! {
     /// (TD-OLAP-3). All counters are atomic, so concurrent spawned readers
     /// aggregate into the one shared trace correctly.
     static IO_TRACE: Arc<IoTrace>;
+    /// TD-PAXDIR-1 D7: the concurrent scan unit (one per-segment scan of a
+    /// fan-out) the current future belongs to; see [`scope_concurrent_unit`].
+    static REQUEST_UNIT: u64;
+}
+
+/// Source of [`REQUEST_UNIT`] ids (process-wide; only distinctness matters).
+static NEXT_REQUEST_UNIT: AtomicU64 = AtomicU64::new(1);
+
+/// TD-PAXDIR-1 D7: run one of a query's **concurrent** per-segment scans as
+/// its own wave unit. A fan-out that polls its scans inside one task
+/// (`join_all`) gives them a single task id, so grouping requests by task
+/// would merge one scan's later wave with another's earlier one and
+/// undercount the critical path; [`critical_path_waves`] groups by unit
+/// first. Only concurrent scans take a unit — sequential ones stay on the
+/// query's root, whose waves add up.
+pub async fn scope_concurrent_unit<F: std::future::Future>(future: F) -> F::Output {
+    REQUEST_UNIT
+        .scope(NEXT_REQUEST_UNIT.fetch_add(1, Ordering::Relaxed), future)
+        .await
 }
 
 /// Classification of an object-store operation by its cost shape. The universe
@@ -384,8 +403,9 @@ pub struct IoTrace {
 /// query issues tens; the cap only bounds a pathological scan's memory.
 pub const MAX_TRACED_REQUESTS: usize = 4096;
 
-/// One recorded request: issuing task, issue time, completion time.
-pub type TracedRequest = (Option<tokio::task::Id>, Instant, Instant);
+/// One recorded request: issuing task, concurrent scan unit (if any), issue
+/// time, completion time.
+pub type TracedRequest = (Option<tokio::task::Id>, Option<u64>, Instant, Instant);
 
 #[derive(Debug, Default)]
 struct RequestLog {
@@ -396,26 +416,36 @@ struct RequestLog {
 /// TD-PAXDIR-1 D7 (design §4.1): a query's sequential request **waves**
 /// along its critical path.
 ///
-/// Within one task, a wave is a maximal group of overlapping request
-/// intervals: requests the task issues together (one `read_ranges_prefetch`
-/// wave) overlap, requests it issues one after another do not. A query runs
-/// its own requests on `root_task` (discovery LIST, directory, sequential
-/// segment scans) and fans segment scans out to spawned tasks that run
-/// concurrently and are all awaited, so its critical path is the root's waves
-/// plus the most waves of any spawned task. Grouping by task matters:
-/// overlapping all requests at once would merge one segment's second wave
-/// with another segment's first whenever their tasks start a little apart.
+/// Within one sequential stream of requests, a wave is a maximal group of
+/// overlapping intervals: requests issued together (one
+/// `read_ranges_prefetch` wave) overlap, requests issued one after another do
+/// not. A query issues its own requests on its root (discovery LIST,
+/// directory, sequential segment scans) and fans segment scans out
+/// concurrently, awaiting them all, so its critical path is the root's waves
+/// plus the most waves of any concurrent scan. A stream is a concurrent scan
+/// unit ([`scope_concurrent_unit`]) when the request has one, else its task
+/// (spawned scans are separate tasks). Grouping matters: overlapping all
+/// requests at once would merge one scan's second wave with another's first
+/// whenever they start a little apart.
 pub fn critical_path_waves(
     requests: impl IntoIterator<Item = TracedRequest>,
     root_task: Option<tokio::task::Id>,
 ) -> usize {
-    let mut by_task: std::collections::HashMap<Option<tokio::task::Id>, Vec<(Instant, Instant)>> =
-        std::collections::HashMap::new();
-    for (task, start, end) in requests {
-        by_task.entry(task).or_default().push((start, end));
+    #[derive(PartialEq, Eq, Hash)]
+    enum Stream {
+        Unit(u64),
+        Task(Option<tokio::task::Id>),
     }
-    let root = by_task.remove(&root_task).map_or(0, overlap_waves);
-    root + by_task.into_values().map(overlap_waves).max().unwrap_or(0)
+    let mut streams: std::collections::HashMap<Stream, Vec<(Instant, Instant)>> =
+        std::collections::HashMap::new();
+    for (task, unit, start, end) in requests {
+        let stream = unit.map_or(Stream::Task(task), Stream::Unit);
+        streams.entry(stream).or_default().push((start, end));
+    }
+    let root = streams
+        .remove(&Stream::Task(root_task))
+        .map_or(0, overlap_waves);
+    root + streams.into_values().map(overlap_waves).max().unwrap_or(0)
 }
 
 /// Maximal groups of overlapping intervals.
@@ -629,7 +659,12 @@ impl IoTrace {
         if log.intervals.len() >= MAX_TRACED_REQUESTS {
             log.overflowed = true;
         } else {
-            log.intervals.push((tokio::task::try_id(), started, ended));
+            log.intervals.push((
+                tokio::task::try_id(),
+                REQUEST_UNIT.try_with(|unit| *unit).ok(),
+                started,
+                ended,
+            ));
         }
     }
 
@@ -2163,16 +2198,27 @@ mod tests {
         let id = |n: u64| tokio::spawn(async move { n }).id();
         let (a, b) = (id(1), id(2));
         let requests = vec![
-            (None, at(0), at(10)), // root: LIST
+            (None, None, at(0), at(10)), // root: LIST
             // Segment a: two waves; segment b: two waves, started 2 ms later.
-            (Some(a), at(10), at(20)),
-            (Some(a), at(20), at(30)),
-            (Some(b), at(12), at(22)),
-            (Some(b), at(22), at(32)),
+            (Some(a), None, at(10), at(20)),
+            (Some(a), None, at(20), at(30)),
+            (Some(b), None, at(12), at(22)),
+            (Some(b), None, at(22), at(32)),
         ];
         assert_eq!(critical_path_waves(requests.clone(), None), 3);
-        let flat: Vec<_> = requests.iter().map(|(_, s, e)| (*s, *e)).collect();
+        let flat: Vec<_> = requests.iter().map(|(_, _, s, e)| (*s, *e)).collect();
         assert_eq!(overlap_waves(flat), 2, "a global count would undercount");
+        // The same skewed scans polled inside ONE task (`join_all`): their
+        // units, not their shared task id, keep them apart.
+        let joined: Vec<_> = requests
+            .iter()
+            .enumerate()
+            .map(|(i, (task, _, s, e))| {
+                let unit = task.map(|_| if i <= 2 { 1 } else { 2 });
+                (None, unit, *s, *e)
+            })
+            .collect();
+        assert_eq!(critical_path_waves(joined, None), 3);
     }
 
     /// The trace counts waves from its leaf-recorded requests; overflow makes

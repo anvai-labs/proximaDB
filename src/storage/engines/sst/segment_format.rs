@@ -5021,13 +5021,17 @@ pub async fn rabitq_search_segment_coalesced_allowed(
             .get(bi)
             .is_some_and(|s| s.as_ref().is_some_and(|stats| stats.oid_chunk_len > 0))
     });
-    // TD-PAXDIR-1 D6: a directory-decoded scan's caller rehydrates exactly
+    // TD-PAXDIR-1 D6: a directory-planned scan's caller rehydrates exactly
     // these top-k blocks next. Fetch them whole in one wave instead of their
     // OID chunks, read the OIDs from them, and hand the bytes to the
     // rehydration, so the rows cost one wave (design §3.5 wave 2) and one
     // request per block instead of a chunk plus a block. Bounded like the D5
     // same-wave bytes (8 IOP-sized blocks); larger sets keep the chunk arm.
-    let handoff = if directory_decoded {
+    // D7: on every directory-planned scan, not only metadata-decoded ones —
+    // the gate run measured a warm invariants cache (hit ratio 0.999), under
+    // which a decoded-only hand-off never fired and every query paid the
+    // chunk wave and then the block wave.
+    let handoff = if row_allow.is_none() {
         DIRECTORY_CHOICE.try_with(Arc::clone).ok()
     } else {
         None

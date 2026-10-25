@@ -780,4 +780,159 @@ mod tests {
             assert_eq!(entry.footer_bytes, real_footer(&on, &file.url).await);
         }
     }
+
+    /// TD-PAXDIR-1 D7: the default (Adaptive) search counts vectors from a
+    /// listing and the scan lists again; the gate run measured that as two
+    /// sequential LIST round trips per query. One search lists once.
+    #[tokio::test]
+    async fn an_adaptive_search_lists_the_collection_once() {
+        use crate::observability::io_trace;
+        enable_env();
+        let rows = corpus();
+        let arm = arm("paxdir_d7_one_list", &rows).await;
+        set_directory_read(false);
+        let params = Arc::new(SearchParams {
+            vector: Some(rows[9].clone()),
+            top_k: Some(1),
+            distance_metric: Some(DistanceMetric::Euclidean),
+            search_mode: crate::core::search::SearchMode::Adaptive { threshold: 1 },
+            ..Default::default()
+        });
+        let ctx = StorageQueryContext::new(params, Arc::new(arm.collection.clone()));
+        let (ids, snap) = io_trace::scope(async {
+            let ids: Vec<String> = Arc::clone(&arm.engine)
+                .search_vectors_unified_arc(&ctx)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            (ids, io_trace::snapshot().unwrap())
+        })
+        .await;
+        assert_eq!(ids, ["r9"]);
+        assert_eq!(snap.list_ops, 1, "count and scan share one listing");
+    }
+
+    /// TD-PAXDIR-1 D7: once a segment's metadata is cached (a warm process —
+    /// the gate run measured a 0.999 invariants hit ratio in its "cold"
+    /// phase), a directory-planned query still takes LIST → cells → top-k
+    /// blocks. The block hand-off used to fire only on decoded scans, so a
+    /// warm query paid the OID-chunk wave and then the rehydration wave.
+    #[tokio::test]
+    async fn a_warm_directory_planned_query_also_takes_three_waves() {
+        use crate::observability::io_trace;
+        enable_env();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe {
+            std::env::set_var("PROXIMADB_TEST_FS_LATENCY_MS", "20");
+            std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "16");
+            std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", "4");
+            std::env::set_var("PROXIMADB_PAX_READ_SAME_WAVE_RERANK", "1");
+            std::env::set_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES", "0");
+            std::env::set_var("PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS", "1");
+        }
+        let rows = corpus();
+        let arm = arm("paxdir_d7_warm", &rows).await;
+        // Warm the invariants cache with each segment's REAL metadata (a
+        // per-segment query caches it; a decoded scan never does), then load
+        // the directory, as a long-running server has.
+        set_directory_read(false);
+        for q in [3usize, 1500, 3000, 4500] {
+            assert_eq!(search(&arm, &rows[q], 1).await, [format!("r{q}")]);
+        }
+        set_directory_read(true);
+        arm.engine
+            .discover_sstable_files(&arm.storage_url)
+            .await
+            .unwrap();
+        let fs = arm
+            .engine
+            .filesystem()
+            .get_filesystem(&arm.storage_url)
+            .unwrap();
+        assert!(
+            crate::storage::engines::sst::centroid_directory_reader::load_directory(
+                fs.as_ref(),
+                &arm.storage_url,
+            )
+            .await
+            .is_some()
+        );
+        let query = rows[1234].clone();
+        let warm = io_trace::scope(async {
+            assert_eq!(search(&arm, &query, 1).await, ["r1234"]);
+            io_trace::snapshot().unwrap()
+        })
+        .await;
+        assert_eq!(
+            warm.waves,
+            Some(3),
+            "warm: LIST, probed cells, top-k blocks ({warm:?})"
+        );
+    }
+
+    /// TD-PAXDIR-1 D7: the server's search reaches the StorageEngine trait's
+    /// `search_vectors_unified` and its non-Arc fan-out, where the P5b gate
+    /// run found the directory dark. Through that entry a covered cold query
+    /// (directory loaded, decode keys on) takes 3 waves, as on the Arc path.
+    #[tokio::test]
+    async fn the_server_search_path_plans_on_the_directory() {
+        use crate::observability::io_trace;
+        use proximadb_storage_traits::UnifiedStorageFormat;
+        enable_env();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe {
+            std::env::set_var("PROXIMADB_TEST_FS_LATENCY_MS", "20");
+            std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "16");
+            std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", "4");
+            std::env::set_var("PROXIMADB_PAX_READ_SAME_WAVE_RERANK", "1");
+            std::env::set_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES", "0");
+            std::env::set_var("PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS", "1");
+        }
+        set_directory_read(true);
+        let rows = corpus();
+        let arm = arm("paxdir_d7_server_path", &rows).await;
+        arm.engine
+            .discover_sstable_files(&arm.storage_url)
+            .await
+            .unwrap();
+        let fs = arm
+            .engine
+            .filesystem()
+            .get_filesystem(&arm.storage_url)
+            .unwrap();
+        assert!(
+            crate::storage::engines::sst::centroid_directory_reader::load_directory(
+                fs.as_ref(),
+                &arm.storage_url,
+            )
+            .await
+            .is_some()
+        );
+        let params = Arc::new(SearchParams {
+            vector: Some(rows[7].clone()),
+            top_k: Some(1),
+            distance_metric: Some(DistanceMetric::Euclidean),
+            search_mode: crate::core::search::SearchMode::Approximate { nprobe: None },
+            ..Default::default()
+        });
+        let ctx = StorageQueryContext::new(params, Arc::new(arm.collection.clone()));
+        let (ids, snap) = io_trace::scope(async {
+            let ids: Vec<String> = UnifiedStorageFormat::search_vectors_unified(&*arm.engine, &ctx)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            (ids, io_trace::snapshot().unwrap())
+        })
+        .await;
+        assert_eq!(ids, ["r7"]);
+        assert_eq!(
+            snap.waves,
+            Some(3),
+            "server path: LIST, probed cells, top-k blocks ({snap:?})"
+        );
+    }
 }

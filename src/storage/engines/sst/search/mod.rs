@@ -55,6 +55,20 @@ impl Drop for UmbrellaTimer {
     }
 }
 
+tokio::task_local! {
+    /// TD-PAXDIR-1 D7: one query's segment listing, by storage URL. Bound by
+    /// [`scope_discovery_memo`] around a search, so the Adaptive-mode vector
+    /// count and the scan share one LIST (the P5b gate run measured them as
+    /// two sequential round trips on every query). Within one query both see
+    /// the same segment set.
+    static DISCOVERY_MEMO: std::sync::Mutex<std::collections::HashMap<String, Vec<DiscoveredSstFile>>>;
+}
+
+/// Run one search with a per-query discovery memo (see [`DISCOVERY_MEMO`]).
+async fn scope_discovery_memo<F: std::future::Future>(search: F) -> F::Output {
+    DISCOVERY_MEMO.scope(Default::default(), search).await
+}
+
 /// TD-RDSTRAT-13 C3: a discovered segment plus the size the listing already
 /// reported. `size_bytes` lets the read path skip the per-segment HEAD (one
 /// billed metadata op per segment per query); `None` means the backend did
@@ -707,6 +721,13 @@ impl SstEngine {
     /// This is the primary search entry point that implements intelligent
     /// search routing and the three-stage filtering pipeline.
     pub async fn search_vectors_unified(
+        &self,
+        ctx: &StorageQueryContext,
+    ) -> Result<Vec<OptimizedSearchRecord>> {
+        scope_discovery_memo(self.search_vectors_unified_inner(ctx)).await
+    }
+
+    async fn search_vectors_unified_inner(
         &self,
         ctx: &StorageQueryContext,
     ) -> Result<Vec<OptimizedSearchRecord>> {
@@ -1392,6 +1413,29 @@ impl SstEngine {
                 prune_config,
             )
             .await?;
+        // TD-PAXDIR-1 D7: the server's StorageEngine search reaches this
+        // fan-out, not the Arc one, so the collection centroid directory is
+        // planned here too (the P5b gate run found every "directory on" query
+        // on this path with the directory dark). Same preconditions and the
+        // same per-segment scope as `fallback_to_direct_search_arc`.
+        let directory_cells = self
+            .centroid_directory_cells(
+                storage_url,
+                &sstable_files,
+                query_vector,
+                k,
+                distance_metric,
+                filter_expression.is_some() || prune_config.force_exact,
+            )
+            .await;
+        let sstable_files: Vec<DiscoveredSstFile> = sstable_files
+            .into_iter()
+            .filter(|f| {
+                directory_cells
+                    .get(&f.url)
+                    .is_none_or(|c| !c.cells.is_empty())
+            })
+            .collect();
         let discovery_us = discovery_start.elapsed().as_micros() as u64;
         tracing::info!(
             target: "sst_warm_phase",
@@ -1448,7 +1492,10 @@ impl SstEngine {
                 let sstable_path = discovered.url.as_str();
                 let known_size = discovered.size_bytes;
                 let filter_owned = filter_expression.cloned();
-                async move {
+                let directory_choice = directory_cells.get(sstable_path).cloned();
+                // TD-PAXDIR-1 D7: concurrent scans polled in one task each
+                // get their own wave unit (`io_trace::scope_concurrent_unit`).
+                crate::observability::io_trace::scope_concurrent_unit(async move {
                     let result: Result<Vec<OptimizedSearchRecord>, String> = async {
                         // PAX cascade
                         let pax_cascade: Option<Vec<OptimizedSearchRecord>> =
@@ -1457,8 +1504,9 @@ impl SstEngine {
                                 distance_metric,
                                 prune_config,
                             ) {
-                                match self
-                                    .try_pax_cascade(
+                                match crate::storage::engines::sst::segment_format::scope_directory_cells(
+directory_choice,
+self.try_pax_cascade(
                                         sstable_path,
                                         query_vector,
                                         filter_expression,
@@ -1468,8 +1516,9 @@ impl SstEngine {
                                         storage_url,
                                         snapshot_lsn,
                                         known_size,
-                                    )
-                                    .await
+),
+)
+.await
                                 {
                                     Ok(Some(records)) => Some(records),
                                     Ok(None) => None,
@@ -1526,7 +1575,7 @@ impl SstEngine {
                     }
                     .await;
                     (sstable_path, result)
-                }
+                })
             });
 
             let results = join_all(file_futures).await;
@@ -1565,8 +1614,9 @@ impl SstEngine {
                 // (not-PAX / no RaBitQ / error) — so this is additive and mixed-read-safe.
                 let pax_cascade: Option<Vec<OptimizedSearchRecord>> =
                     if Self::should_try_pax_cascade(sstable_path, distance_metric, prune_config) {
-                        match self
-                            .try_pax_cascade(
+                        match crate::storage::engines::sst::segment_format::scope_directory_cells(
+                            directory_cells.get(sstable_path).cloned(),
+                            self.try_pax_cascade(
                                 sstable_path,
                                 query_vector,
                                 filter_expression,
@@ -1576,8 +1626,9 @@ impl SstEngine {
                                 storage_url,
                                 snapshot_lsn,
                                 known_size,
-                            )
-                            .await
+                            ),
+                        )
+                        .await
                         {
                             Ok(Some(records)) => {
                                 debug!(
@@ -2300,6 +2351,13 @@ impl SstEngine {
         self: std::sync::Arc<Self>,
         ctx: &StorageQueryContext,
     ) -> Result<Vec<OptimizedSearchRecord>> {
+        scope_discovery_memo(self.search_vectors_unified_arc_inner(ctx)).await
+    }
+
+    async fn search_vectors_unified_arc_inner(
+        self: std::sync::Arc<Self>,
+        ctx: &StorageQueryContext,
+    ) -> Result<Vec<OptimizedSearchRecord>> {
         let _compute_guard = ComputeMsGuard::new("sst");
         let _in_flight_guard = InFlightSearchGuard::acquire(); // S2b: adaptive degree
 
@@ -2643,6 +2701,30 @@ impl SstEngine {
     /// `pub(crate)` so the flush path can reuse it for the L0 compaction
     /// trigger (TD-114) without duplicating segment discovery.
     pub(crate) async fn discover_sstable_files(
+        &self,
+        storage_url: &str,
+    ) -> Result<Vec<DiscoveredSstFile>> {
+        // TD-PAXDIR-1 D7: within one search, reuse its first listing.
+        if let Ok(Some(files)) = DISCOVERY_MEMO.try_with(|memo| {
+            memo.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(storage_url)
+                .cloned()
+        }) {
+            return Ok(files);
+        }
+        let files = self.discover_sstable_files_listed(storage_url).await?;
+        let _ = DISCOVERY_MEMO.try_with(|memo| {
+            memo.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(storage_url.to_owned(), files.clone())
+        });
+        Ok(files)
+    }
+
+    /// One LIST of the collection data directory (see
+    /// [`Self::discover_sstable_files`]).
+    async fn discover_sstable_files_listed(
         &self,
         storage_url: &str,
     ) -> Result<Vec<DiscoveredSstFile>> {
