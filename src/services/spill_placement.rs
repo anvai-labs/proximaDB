@@ -822,6 +822,22 @@ mod tests {
         format!("file://{}", path.display())
     }
 
+    /// A data directory (`dir`) and a bucket whose `spill` prefix is `url`;
+    /// the temp dirs live as long as the bindings.
+    async fn fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        String,
+        FilesystemFactory,
+    ) {
+        let data = tempfile::tempdir().expect("tempdir");
+        let bucket = tempfile::tempdir().expect("tempdir");
+        let dir = data.path().join("pgwire");
+        let url = file_url(&bucket.path().join("spill"));
+        (data, bucket, dir, url, factory().await)
+    }
+
     async fn resolve(
         dir: &Path,
         factory: &FilesystemFactory,
@@ -896,11 +912,7 @@ mod tests {
 
     #[tokio::test]
     async fn placement_is_recorded_claimed_and_advanced_each_boot() {
-        let data = tempfile::tempdir().expect("tempdir");
-        let bucket = tempfile::tempdir().expect("tempdir");
-        let dir = data.path().join("pgwire");
-        let url = file_url(&bucket.path().join("spill"));
-        let factory = factory().await;
+        let (_data, bucket, dir, url, factory) = fixture().await;
 
         // Fresh directory, no URL: local, and the identity is recorded.
         let target = resolve(&dir, &factory, false, None).await.expect("local");
@@ -983,11 +995,7 @@ mod tests {
 
     #[tokio::test]
     async fn moved_segments_are_adopted_only_on_request() {
-        let data = tempfile::tempdir().expect("tempdir");
-        let bucket = tempfile::tempdir().expect("tempdir");
-        let dir = data.path().join("pgwire");
-        let url = file_url(&bucket.path().join("spill"));
-        let factory = factory().await;
+        let (_data, bucket, dir, url, factory) = fixture().await;
         resolve(&dir, &factory, false, None).await.expect("local");
         segment(&dir.join("record-spill"), "spill-0.parquet");
         let adopting = Settings {
@@ -1063,11 +1071,7 @@ mod tests {
 
     #[tokio::test]
     async fn other_directories_copies_and_nested_prefixes_are_fenced() {
-        let data = tempfile::tempdir().expect("tempdir");
-        let bucket = tempfile::tempdir().expect("tempdir");
-        let dir = data.path().join("pgwire");
-        let url = file_url(&bucket.path().join("spill"));
-        let factory = factory().await;
+        let (_data, bucket, dir, url, factory) = fixture().await;
         resolve(&dir, &factory, false, Some(&url))
             .await
             .expect("claim");
@@ -1123,11 +1127,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_lost_owner_marker_refuses_only_after_truncation() {
-        let data = tempfile::tempdir().expect("tempdir");
-        let bucket = tempfile::tempdir().expect("tempdir");
-        let dir = data.path().join("pgwire");
-        let url = file_url(&bucket.path().join("spill"));
-        let factory = factory().await;
+        let (_data, bucket, dir, url, factory) = fixture().await;
         resolve(&dir, &factory, false, Some(&url))
             .await
             .expect("claim");
@@ -1154,11 +1154,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_crash_inside_the_claim_recovers_on_the_next_boot() {
-        let data = tempfile::tempdir().expect("tempdir");
-        let bucket = tempfile::tempdir().expect("tempdir");
-        let dir = data.path().join("pgwire");
-        let url = file_url(&bucket.path().join("spill"));
-        let factory = factory().await;
+        let (_data, _bucket, dir, url, factory) = fixture().await;
         resolve(&dir, &factory, false, Some(&url))
             .await
             .expect("claim");
@@ -1237,11 +1233,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_the_spill_off_nothing_is_claimed_or_recorded() {
-        let data = tempfile::tempdir().expect("tempdir");
-        let bucket = tempfile::tempdir().expect("tempdir");
-        let dir = data.path().join("pgwire");
-        let url = file_url(&bucket.path().join("spill"));
-        let factory = factory().await;
+        let (_data, bucket, dir, url, factory) = fixture().await;
         let off = |url| Settings {
             url,
             spill_on: false,
