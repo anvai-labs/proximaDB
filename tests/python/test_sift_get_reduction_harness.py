@@ -1072,3 +1072,28 @@ def test_local_geometry_lists_published_directories(tmp_path: Path) -> None:
     (collection / "centroids-0000000000000002.pxcd").write_bytes(b"d")
     geometry = HARNESS.LocalPaxGeometry(tmp_path)
     assert geometry.directory_objects() == ["t/c/centroids-0000000000000002.pxcd"]
+
+
+def test_unready_segments_name_untrained_tails_and_wrong_layouts() -> None:
+    # TD-PAXDIR-1 D7 finding: a bed can settle on a small untrained L0 flush
+    # tail that training compaction never replaces; the settle loop must name
+    # it instead of timing out silently.
+    geometry = {
+        "segments": [
+            {"path": "L2_a.pax", "layout_version": 1, "coarse_cells": 7, "bytes": 9},
+            {"path": "L0_b.pax", "layout_version": 1, "coarse_cells": 0, "bytes": 2_950_953},
+            {"path": "L1_c.pax", "layout_version": 3, "coarse_cells": 4, "bytes": 5},
+            {"path": "unparsed.pax"},
+        ]
+    }
+    assert HARNESS.unready_segments(geometry, 1) == [
+        "L0_b.pax: untrained (no coarse A0; 2,950,953 bytes)",
+        "L1_c.pax: layout v3",
+    ]
+    # Downloaded (materialized) geometry is fully parsed; there the untrained
+    # tail alone keeps the settle loop waiting.
+    parsed = {"segments": geometry["segments"][:2]}
+    assert not HARNESS.layout_candidate_is_ready(parsed, 1, azure_inventory=False)
+    assert HARNESS.unready_segments(parsed, 1) == [
+        "L0_b.pax: untrained (no coarse A0; 2,950,953 bytes)"
+    ]

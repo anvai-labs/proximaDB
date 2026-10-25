@@ -1174,6 +1174,27 @@ def wal_is_quiescent(wal_bytes: float | None) -> bool:
     return wal_bytes is None or wal_bytes == 0
 
 
+def unready_segments(geometry: dict, required_layout_version: int | None) -> list[str]:
+    """The settled segments ``layout_candidate_is_ready`` rejects, with why
+    (parsed geometry only): the wrong layout version, or no coarse A0 — an
+    untrained flush tail too small for training compaction ever to replace."""
+    out = []
+    for segment in geometry.get("segments", []):
+        if "layout_version" not in segment:
+            continue
+        if (
+            required_layout_version is not None
+            and segment["layout_version"] != required_layout_version
+        ):
+            out.append(f"{segment['path']}: layout v{segment['layout_version']}")
+        elif not segment.get("coarse_cells"):
+            out.append(
+                f"{segment['path']}: untrained (no coarse A0; "
+                f"{segment.get('bytes', 0):,} bytes)"
+            )
+    return out
+
+
 def layout_candidate_is_ready(
     geometry: dict,
     required_layout_version: int | None,
@@ -1235,6 +1256,7 @@ def wait_for_materialization(
     # that double-serve rows at query time. A stable window is only trustworthy
     # when the compaction counter is quiet for its whole duration.
     compactions_at_window_start = None
+    last_layout_rejection: list[str] = []
     while time.monotonic() < deadline:
         now = time.monotonic()
         try:
@@ -1336,6 +1358,19 @@ def wait_for_materialization(
                         required_layout_version,
                         azure_inventory=False,
                     ):
+                        # The listing settled but a downloaded header is not a
+                        # terminal layout: say which segment, here and in the
+                        # timeout error, instead of polling silently.
+                        last_layout_rejection = unready_segments(
+                            geometry, required_layout_version
+                        )
+                        if now - last_report >= 15:
+                            print(
+                                "settle: settled objects are not a terminal layout: "
+                                f"{last_layout_rejection}",
+                                flush=True,
+                            )
+                            last_report = now
                         stable_since = None
                         prior = signature
                         time.sleep(3)
@@ -1360,7 +1395,8 @@ def wait_for_materialization(
         "materialization/compaction did not quiesce: "
         f"rows={geometry.get('row_count', 'not-snapshotted')}/{expected_rows}, "
         f"segments={geometry['segment_count']} (max {max_segments}), "
-        f"last_parse_error={last_parse_error!r}"
+        f"last_parse_error={last_parse_error!r}, "
+        f"unready_segments={last_layout_rejection!r}"
     )
 
 
