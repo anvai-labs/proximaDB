@@ -296,17 +296,7 @@ impl GcsFileSystem {
 
     /// Parse `gs://bucket/object` (or `gcs://`) into `(bucket, object)`.
     fn parse(path: &str) -> FsResult<(String, String)> {
-        let rest = path
-            .strip_prefix("gs://")
-            .or_else(|| path.strip_prefix("gcs://"))
-            .ok_or_else(|| FilesystemError::InvalidPath(format!("not a gs:// path: {path}")))?;
-        let (bucket, object) = rest.split_once('/').ok_or_else(|| {
-            FilesystemError::InvalidPath(format!("missing object in gs path: {path}"))
-        })?;
-        if bucket.is_empty() || object.is_empty() {
-            return Err(FilesystemError::InvalidPath(format!("bad gs path: {path}")));
-        }
-        Ok((bucket.to_string(), object.to_string()))
+        super::split_object_url(path, &["gs://", "gcs://"], ("a", "gs"), "object")
     }
 
     fn net(ctx: &str, e: impl std::fmt::Display) -> FilesystemError {

@@ -87,17 +87,7 @@ impl AwsS3FileSystem {
 
     /// Parse `s3://bucket/key` (or `s3a://`).
     fn parse(path: &str) -> FsResult<(String, String)> {
-        let rest = path
-            .strip_prefix("s3://")
-            .or_else(|| path.strip_prefix("s3a://"))
-            .ok_or_else(|| FilesystemError::InvalidPath(format!("not an s3 path: {path}")))?;
-        let (bucket, key) = rest.split_once('/').ok_or_else(|| {
-            FilesystemError::InvalidPath(format!("missing key in s3 path: {path}"))
-        })?;
-        if bucket.is_empty() || key.is_empty() {
-            return Err(FilesystemError::InvalidPath(format!("bad s3 path: {path}")));
-        }
-        Ok((bucket.to_string(), key.to_string()))
+        super::split_object_url(path, &["s3://", "s3a://"], ("an", "s3"), "key")
     }
 
     /// Build (and cache) an `ObjectStore` for a bucket.

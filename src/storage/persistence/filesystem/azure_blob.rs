@@ -123,21 +123,12 @@ impl AzureBlobFileSystem {
 
     /// Parse `abfs://container/blob` (or `adls://`/`az://`/`azure://`).
     fn parse(path: &str) -> FsResult<(String, String)> {
-        let rest = path
-            .strip_prefix("abfs://")
-            .or_else(|| path.strip_prefix("adls://"))
-            .or_else(|| path.strip_prefix("az://"))
-            .or_else(|| path.strip_prefix("azure://"))
-            .ok_or_else(|| FilesystemError::InvalidPath(format!("not an azure path: {path}")))?;
-        let (container, blob) = rest.split_once('/').ok_or_else(|| {
-            FilesystemError::InvalidPath(format!("missing blob in azure path: {path}"))
-        })?;
-        if container.is_empty() || blob.is_empty() {
-            return Err(FilesystemError::InvalidPath(format!(
-                "bad azure path: {path}"
-            )));
-        }
-        Ok((container.to_string(), blob.to_string()))
+        super::split_object_url(
+            path,
+            &["abfs://", "adls://", "az://", "azure://"],
+            ("an", "azure"),
+            "blob",
+        )
     }
 
     /// Build (and cache) an `ObjectStore` for a container.

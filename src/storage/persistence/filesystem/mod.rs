@@ -1914,6 +1914,33 @@ mod range_coalesce_gate_tests {
     }
 }
 
+/// `scheme://bucket/key` → `(bucket, key)` for the object-store backends.
+/// `schemes` are the accepted prefixes; `(article, name)` names the backend
+/// in errors and `part` what follows the bucket.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+pub(crate) fn split_object_url(
+    path: &str,
+    schemes: &[&str],
+    (article, name): (&str, &str),
+    part: &str,
+) -> FsResult<(String, String)> {
+    let rest = schemes
+        .iter()
+        .find_map(|scheme| path.strip_prefix(scheme))
+        .ok_or_else(|| {
+            FilesystemError::InvalidPath(format!("not {article} {name} path: {path}"))
+        })?;
+    let (bucket, key) = rest.split_once('/').ok_or_else(|| {
+        FilesystemError::InvalidPath(format!("missing {part} in {name} path: {path}"))
+    })?;
+    if bucket.is_empty() || key.is_empty() {
+        return Err(FilesystemError::InvalidPath(format!(
+            "bad {name} path: {path}"
+        )));
+    }
+    Ok((bucket.to_string(), key.to_string()))
+}
+
 /// Error mapping shared by the `object_store`-backed backends (S3, Azure).
 #[cfg(any(feature = "aws", feature = "azure"))]
 pub(crate) mod object_store_errors {
