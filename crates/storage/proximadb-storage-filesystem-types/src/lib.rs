@@ -981,11 +981,18 @@ pub trait FileSystem: Send + Sync + std::fmt::Debug {
     /// Create directory and all parent directories
     async fn create_dir_all(&self, path: &str) -> FsResult<()>;
 
-    /// Copy file
-    async fn copy(&self, from: &str, to: &str) -> FsResult<()>;
+    /// Copy file. Default: read it whole, write it whole (what an object
+    /// store without a native copy does).
+    async fn copy(&self, from: &str, to: &str) -> FsResult<()> {
+        let data = self.read(from).await?;
+        self.write(to, &data, None).await
+    }
 
-    /// Move/rename file
-    async fn move_file(&self, from: &str, to: &str) -> FsResult<()>;
+    /// Move/rename file. Default: copy, then delete the source (not atomic).
+    async fn move_file(&self, from: &str, to: &str) -> FsResult<()> {
+        self.copy(from, to).await?;
+        self.delete(from).await
+    }
 
     /// Get filesystem type identifier
     fn filesystem_type(&self) -> &'static str;

@@ -367,16 +367,6 @@ impl FileSystem for AwsS3FileSystem {
         Ok(())
     }
 
-    async fn copy(&self, from: &str, to: &str) -> FsResult<()> {
-        let data = self.read(from).await?;
-        self.write(to, &data, None).await
-    }
-
-    async fn move_file(&self, from: &str, to: &str) -> FsResult<()> {
-        self.copy(from, to).await?;
-        self.delete(from).await
-    }
-
     fn filesystem_type(&self) -> &'static str {
         "s3"
     }

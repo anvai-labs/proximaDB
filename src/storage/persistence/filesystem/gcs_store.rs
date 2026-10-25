@@ -670,17 +670,9 @@ impl FileSystem for GcsFileSystem {
         Ok(())
     }
 
-    async fn copy(&self, from: &str, to: &str) -> FsResult<()> {
-        // GCS has a native copy/rewrite; download+upload keeps this backend lean
-        // and is sufficient for the cold-path use (small index objects).
-        let data = self.read(from).await?;
-        self.write(to, &data, None).await
-    }
-
-    async fn move_file(&self, from: &str, to: &str) -> FsResult<()> {
-        self.copy(from, to).await?;
-        self.delete(from).await
-    }
+    // `copy` / `move_file`: the trait defaults (download + upload). GCS has a
+    // native copy/rewrite; this keeps the backend lean and is sufficient for
+    // the cold-path use (small index objects).
 
     fn filesystem_type(&self) -> &'static str {
         "gcs"
