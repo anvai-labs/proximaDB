@@ -5282,6 +5282,8 @@ components:
             "enable_proxima_record": true
         }
         ```
+        Unknown fields are rejected (TD-RESTGET-1): a misspelt setting used to be
+        dropped, and the collection silently got the default instead.
       required:
       - name
       - dimension
@@ -5305,6 +5307,7 @@ components:
             Options: "auto", "sst", "helix", "swift", "nova", "raptor", "tst"
             Default: "auto" (system selects optimal engine)
             ("viper" is no longer accepted — deprecated by ADR-093)
+            `storage_engine` is accepted as an alias.
         schema:
           oneOf:
           - type: 'null'
@@ -5332,6 +5335,7 @@ components:
 
             Options: "cosine", "euclidean", "dot_product"
             Default: "cosine"
+            `metric` is accepted as an alias.
         initial_capacity:
           type:
           - integer
@@ -5389,6 +5393,22 @@ components:
               the system decides cost-derived (`mode = "auto"`). Owners with hard SLAs
               override here; query-time precedence is per-query `search_mode` > this
               policy > cost-model auto-default.
+        description:
+          type:
+          - string
+          - 'null'
+          description: Free-text description, persisted on the collection config.
+        index_type:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Legacy field the released Rust and TypeScript SDKs send on every create
+            (default "hnsw"). Index selection is cost-derived, so "hnsw" is accepted
+            and has no effect; any other value is rejected — declare an index with
+            `index_configs` or force a route with `index_policy.mode` instead.
+          deprecated: true
+      additionalProperties: false
     CreateCollectionV2Response:
       type: object
       description: Response for collection creation
@@ -5776,6 +5796,7 @@ components:
           - 'null'
           format: int32
           minimum: 0
+      additionalProperties: false
     HnswConfigOutput:
       type: object
       description: REST output for HNSW params (mirrors gRPC `V2HnswConfig`).
@@ -5877,6 +5898,7 @@ components:
           - boolean
           - 'null'
           description: Mark this index as the collection's primary ANN index (gRPC-v2 parity).
+      additionalProperties: false
     IndexPolicyInput:
       type: object
       description: |-
@@ -5916,6 +5938,7 @@ components:
             nprobe override for index modes. 0/omitted ⇒ cost-derived. Rejected when
             `mode = "exact"`.
           minimum: 0
+      additionalProperties: false
     IndexSpecOutput:
       type: object
       description: REST output for a single index config (mirrors gRPC `V2IndexSpec`).
@@ -6131,6 +6154,7 @@ components:
           - 'null'
           format: int32
           minimum: 0
+      additionalProperties: false
     IvfConfigOutput:
       type: object
       description: REST output for IVF params (mirrors gRPC `V2IvfConfig`).
@@ -6293,6 +6317,7 @@ components:
           - string
           - 'null'
           description: 'Strategy: "smart_defaults" (default) | "minimal" | "aggressive" | "custom_levels".'
+      additionalProperties: false
     QuantizationConfigOutput:
       type: object
       description: REST output for quantization config (mirrors gRPC `V2QuantizationConfig`).
@@ -6545,6 +6570,7 @@ components:
           format: int32
           description: Dimension for VECTOR type
           minimum: 0
+      additionalProperties: false
     ScanRecordsRequest:
       type: object
       description: |-

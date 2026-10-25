@@ -29,7 +29,6 @@ class HnswConfigInput:
     m: int | None | Unset = UNSET
     ef_construction: int | None | Unset = UNSET
     ef_search: int | None | Unset = UNSET
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         m: int | None | Unset
@@ -51,7 +50,7 @@ class HnswConfigInput:
             ef_search = self.ef_search
 
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update({})
         if m is not UNSET:
             field_dict["m"] = m
@@ -99,21 +98,4 @@ class HnswConfigInput:
             ef_search=ef_search,
         )
 
-        hnsw_config_input.additional_properties = d
         return hnsw_config_input
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

@@ -33,6 +33,7 @@
 use axum::{
     Json,
     extract::{Extension, Path, Query, State},
+    response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
@@ -199,7 +200,10 @@ fn collection_embedding_precision_label(precision: Option<i32>) -> Option<String
 ///     "enable_proxima_record": true
 /// }
 /// ```
+/// Unknown fields are rejected (TD-RESTGET-1): a misspelt setting used to be
+/// dropped, and the collection silently got the default instead.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateCollectionV2Request {
     /// Collection name (required)
     #[schema(min_length = 1)]
@@ -212,6 +216,8 @@ pub struct CreateCollectionV2Request {
     /// Options: "auto", "sst", "helix", "swift", "nova", "raptor", "tst"
     /// Default: "auto" (system selects optimal engine)
     /// ("viper" is no longer accepted — deprecated by ADR-093)
+    /// `storage_engine` is accepted as an alias.
+    #[serde(alias = "storage_engine")]
     pub engine: Option<String>,
     /// Schema definition with column types
     pub schema: Option<SchemaDefinition>,
@@ -228,6 +234,8 @@ pub struct CreateCollectionV2Request {
     ///
     /// Options: "cosine", "euclidean", "dot_product"
     /// Default: "cosine"
+    /// `metric` is accepted as an alias.
+    #[serde(alias = "metric")]
     pub distance_metric: Option<String>,
     /// Initial capacity hint for pre-allocation
     pub initial_capacity: Option<u64>,
@@ -257,11 +265,20 @@ pub struct CreateCollectionV2Request {
     /// override here; query-time precedence is per-query `search_mode` > this
     /// policy > cost-model auto-default.
     pub index_policy: Option<IndexPolicyInput>,
+    /// Free-text description, persisted on the collection config.
+    pub description: Option<String>,
+    /// Legacy field the released Rust and TypeScript SDKs send on every create
+    /// (default "hnsw"). Index selection is cost-derived, so "hnsw" is accepted
+    /// and has no effect; any other value is rejected — declare an index with
+    /// `index_configs` or force a route with `index_policy.mode` instead.
+    #[schema(deprecated)]
+    pub index_type: Option<String>,
 }
 
 /// REST input for the per-collection index routing policy (mirrors proto
 /// `IndexPolicy`; ADR-028).
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IndexPolicyInput {
     /// Routing mode: "auto" (default) | "exact" | "ivf" | "hnsw" | "helix".
     /// "auto"/omitted ⇒ cost-derived. "exact" ⇒ always brute-force (no index).
@@ -343,6 +360,7 @@ fn build_index_policy(
 
 /// REST input for a single index config (mirrors proto `IndexConfig`).
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IndexConfigInput {
     /// Optional index name (defaults to `index_<n>`).
     pub index_name: Option<String>,
@@ -362,6 +380,7 @@ pub struct IndexConfigInput {
 /// REST input for quantization config (mirrors proto `QuantizationConfig`;
 /// gRPC-v2 parity with `V2QuantizationConfig`).
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct QuantizationConfigInput {
     /// Enable quantization for this collection.
     pub enabled: Option<bool>,
@@ -371,6 +390,7 @@ pub struct QuantizationConfigInput {
 
 /// REST input for HNSW index params (mirrors proto `HnswConfig`).
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HnswConfigInput {
     pub m: Option<u32>,
     pub ef_construction: Option<u32>,
@@ -379,6 +399,7 @@ pub struct HnswConfigInput {
 
 /// REST input for IVF index params (mirrors proto `IvfConfig`).
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IvfConfigInput {
     pub n_lists: Option<u32>,
     pub n_probe: Option<u32>,
@@ -409,6 +430,7 @@ pub type ColumnDefinition = RestColumnDefinition;
 
 /// Column definition for schema
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RestColumnDefinition {
     /// Column name
     pub name: String,
@@ -633,7 +655,24 @@ pub struct CreateCollectionV2Response {
 pub async fn create_collection_v2(
     Extension(tenant): Extension<TenantContext>,
     State(state): State<AppState>,
-    Json(mut request): Json<CreateCollectionV2Request>,
+    payload: Result<Json<CreateCollectionV2Request>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    // TD-RESTGET-1: a body the request type rejects — an unknown field (the
+    // request denies them, so `"hnsw"` for `"hnsw_config"` no longer creates an
+    // index without parameters), a wrong type, a missing field — is the
+    // documented 400 in the API's error envelope, not axum's plain-text 422.
+    match super::json_body(payload) {
+        Ok(request) => create_collection_v2_checked(tenant, state, request)
+            .await
+            .into_response(),
+        Err(rejected) => rejected,
+    }
+}
+
+async fn create_collection_v2_checked(
+    tenant: TenantContext,
+    state: AppState,
+    mut request: CreateCollectionV2Request,
 ) -> ApiResult<Json<CreateCollectionV2Response>> {
     info!(
         "V2 API: Creating collection '{}' with dimension {}",
@@ -766,6 +805,24 @@ pub async fn create_collection_v2(
         })
         .map(|p| p as i32);
 
+    // TD-RESTGET-1: `index_type` is what the released Rust and TypeScript SDKs
+    // send on EVERY create, defaulting to "hnsw", and the server has always
+    // ignored it — index selection is cost-derived. "hnsw" therefore stays
+    // accepted with no effect: turning it into `index_configs` would opt every
+    // such collection into a flush-time AXIS build and a different search
+    // route, an unmeasured serving change (co-design mandate). Any other value
+    // was a request the server silently did not honour, so it is now a 400
+    // naming the fields that do express it.
+    if let Some(index_type) = request.index_type.take()
+        && !index_type.trim().eq_ignore_ascii_case("hnsw")
+    {
+        return Err(ApiError::InvalidArgument(format!(
+            "index_type '{index_type}' is not honoured: index selection is cost-derived. \
+             Declare an index with index_configs, or force a route with \
+             index_policy.mode (e.g. \"exact\" for brute force)"
+        )));
+    }
+
     // v1-parity: convert REST index_configs → proto IndexConfig so an explicit
     // IVF/HNSW index is persisted and read back by `active_algorithm_for`.
     let index_configs = match request.index_configs.take() {
@@ -814,17 +871,30 @@ pub async fn create_collection_v2(
     };
 
     // gRPC-v2 parity: map the optional quantization config onto the proto.
-    let quantization = request.quantization.take().map(|q| {
-        use crate::proto::proximadb_v1::{QuantizationConfig, quantization_config::Strategy};
-        QuantizationConfig {
-            enabled: q.enabled,
-            strategy: q.strategy.map(|s| {
-                Strategy::from_str_name(&s.to_ascii_uppercase()).unwrap_or(Strategy::SmartDefaults)
-                    as i32
-            }),
-            ..Default::default()
+    // TD-RESTGET-1: an unknown strategy is a 400 naming the valid ones; it used
+    // to be silently replaced by SMART_DEFAULTS.
+    let quantization = match request.quantization.take() {
+        None => None,
+        Some(q) => {
+            use crate::proto::proximadb_v1::{QuantizationConfig, quantization_config::Strategy};
+            let strategy = match q.strategy {
+                None => None,
+                Some(s) => Some(Strategy::from_str_name(&s.to_ascii_uppercase()).ok_or_else(
+                    || {
+                        ApiError::InvalidArgument(format!(
+                            "quantization.strategy '{s}' is not one of smart_defaults, \
+                             custom_levels, minimal, aggressive"
+                        ))
+                    },
+                )? as i32),
+            };
+            Some(QuantizationConfig {
+                enabled: q.enabled,
+                strategy,
+                ..Default::default()
+            })
         }
-    });
+    };
 
     // ADR-028: validate + map the optional index routing policy. Fail-closed on
     // nonsensical combinations (the mode×rehydrate/nprobe validity matrix) so a
@@ -845,6 +915,7 @@ pub async fn create_collection_v2(
         index_policy,
         tags: request.tags.take().unwrap_or_default(),
         enable_proxima_record: Some(proxima_record_enabled),
+        description: request.description.take(),
         ..Default::default()
     };
 

@@ -386,6 +386,11 @@ func (a *Adapter) CreateCollection(ctx context.Context, req *CreateCollectionReq
 	if req.Engine != "" {
 		body.Engine = ptr(req.Engine)
 	}
+	// TD-RESTGET-1: the server persists a create description; this adapter
+	// used to drop the caller's Description without sending it.
+	if req.Description != "" {
+		body.Description = ptr(req.Description)
+	}
 
 	resp, err := a.gen.CreateCollection(ctx, nil, body)
 	if err != nil {

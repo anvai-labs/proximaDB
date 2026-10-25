@@ -42,6 +42,34 @@ pub(crate) const CANONICAL_SCHEMA_PROPERTY: &str = "collection.canonical_schema"
 /// reconstructs `filterable_columns` from `id >= 100`).
 pub(crate) const CANONICAL_COLUMN_ID_BASE: i32 = 200;
 
+/// A schema declaration the caller got wrong — a duplicate, a system column, an
+/// `embedding` that does not match the collection, a type the filterable column
+/// cannot hold. A client error: surfaces map it to HTTP 400 / gRPC
+/// `INVALID_ARGUMENT`, never to an internal error (TD-RESTGET-1). Anything else
+/// the schema update fails with stays a server error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaDeclarationRejected(pub String);
+
+impl std::fmt::Display for SchemaDeclarationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SchemaDeclarationRejected {}
+
+/// The declaration rejection anywhere in `error`'s chain, if the update failed
+/// because of the caller's schema rather than the server.
+pub fn schema_declaration_rejection(error: &anyhow::Error) -> Option<&SchemaDeclarationRejected> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<SchemaDeclarationRejected>())
+}
+
+fn rejected(message: String) -> anyhow::Error {
+    SchemaDeclarationRejected(message).into()
+}
+
 /// ADR-048 P1: map canonical `CollectionSchemaColumn`s to typed `CatalogColumn`s
 /// in the 200+ band. `name`/`data_type`/`nullable` become the typed column; the
 /// per-column hints (indexed/filterable/text_storage/max_length) round-trip via
@@ -138,8 +166,19 @@ pub(crate) fn merge_canonical_band(
     }
     let mut seen = std::collections::HashSet::new();
     for column in canonical {
+        // The catalog reserves this prefix and would reject it later as a
+        // plain error (a 500); it is the caller's declaration (TD-RESTGET-1).
+        if proximadb_catalog::system_columns::is_reserved_column_name(&column.name) {
+            return Err(rejected(format!(
+                "column '{}' uses a name reserved for ProximaDB system metadata",
+                column.name
+            )));
+        }
         if !seen.insert(column.name.clone()) {
-            anyhow::bail!("column '{}' is declared more than once", column.name);
+            return Err(rejected(format!(
+                "column '{}' is declared more than once",
+                column.name
+            )));
         }
         let Some(reserved) = schema
             .columns
@@ -150,10 +189,10 @@ pub(crate) fn merge_canonical_band(
             continue;
         };
         if reserved.id < SYSTEM_COLUMN_ID_LIMIT {
-            anyhow::bail!(
+            return Err(rejected(format!(
                 "column '{}' is a ProximaDB system column and cannot be declared in a schema",
                 column.name
-            );
+            )));
         }
         if reserved.id == EMBEDDING_COLUMN_ID {
             let collection_dim = reserved
@@ -162,13 +201,18 @@ pub(crate) fn merge_canonical_band(
                 .and_then(|d| d.parse::<usize>().ok());
             match (&column.data_type, collection_dim) {
                 (ProximaType::DenseVector { dim, .. }, Some(expected)) if *dim == expected => {}
-                (ProximaType::DenseVector { dim, .. }, Some(expected)) => anyhow::bail!(
-                    "column 'embedding' has dimension {dim}, which conflicts with the collection \
-                     dimension {expected}"
-                ),
-                (other, _) => anyhow::bail!(
-                    "column 'embedding' must be a dense vector matching the collection, not {other:?}"
-                ),
+                (ProximaType::DenseVector { dim, .. }, Some(expected)) => {
+                    return Err(rejected(format!(
+                        "column 'embedding' has dimension {dim}, which conflicts with the \
+                         collection dimension {expected}"
+                    )));
+                }
+                (other, _) => {
+                    return Err(rejected(format!(
+                        "column 'embedding' must be a dense vector matching the collection, not \
+                         {other:?}"
+                    )));
+                }
             }
         } else {
             // A column with no filterable projection (Struct, Map,
@@ -179,21 +223,20 @@ pub(crate) fn merge_canonical_band(
             let filterable =
                 match proximadb_data_model::proxima_type_to_filterable_type(&column.data_type) {
                     Some(data_type) => data_type,
-                    None => anyhow::bail!(
-                        "column '{}' is declared as {:?}, which cannot be stored in its filterable \
-                         column",
-                        column.name,
-                        column.data_type
-                    ),
+                    None => {
+                        return Err(rejected(format!(
+                            "column '{}' is declared as {:?}, which cannot be stored in its \
+                             filterable column",
+                            column.name, column.data_type
+                        )));
+                    }
                 };
             let narrowed = catalog_data_type(filterable);
             if reserved.data_type != narrowed {
-                anyhow::bail!(
+                return Err(rejected(format!(
                     "column '{}' is declared as {:?}, which conflicts with its filterable type {:?}",
-                    column.name,
-                    column.data_type,
-                    reserved.data_type
-                );
+                    column.name, column.data_type, reserved.data_type
+                )));
             }
         }
         let declared = typed_band_columns(std::slice::from_ref(&column));

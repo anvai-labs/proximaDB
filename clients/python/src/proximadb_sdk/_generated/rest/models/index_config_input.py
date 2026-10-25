@@ -41,7 +41,6 @@ class IndexConfigInput:
     hnsw_config: HnswConfigInput | None | Unset = UNSET
     ivf_config: IvfConfigInput | None | Unset = UNSET
     is_primary: bool | None | Unset = UNSET
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.hnsw_config_input import HnswConfigInput  # noqa: PLC0415
@@ -85,7 +84,7 @@ class IndexConfigInput:
             is_primary = self.is_primary
 
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update(
             {
                 "algorithm": algorithm,
@@ -183,21 +182,4 @@ class IndexConfigInput:
             is_primary=is_primary,
         )
 
-        index_config_input.additional_properties = d
         return index_config_input
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

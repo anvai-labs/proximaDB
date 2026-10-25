@@ -159,11 +159,23 @@ export class CollectionBuilder {
       throw new Error("Dimension is required for collection creation");
     }
 
+    // TD-RESTGET-1: the server ignores `index_type` "hnsw" (index selection
+    // is cost-derived) and rejects any other value, which it never honoured.
+    // Send what each choice means: Hnsw keeps the default payload; Flat forces
+    // brute force through the routing policy; the others declare that index.
+    const index = String(this.indexValue);
+    const indexFields =
+      index === "hnsw"
+        ? { index_type: index }
+        : index === "flat"
+          ? { index_policy: { mode: "exact" } }
+          : { index_configs: [{ algorithm: index, is_primary: true }] };
+
     const request = {
       name: this.collectionName,
       dimension: this.dimensionValue,
       engine: this.engineValue,
-      index_type: this.indexValue,
+      ...indexFields,
       distance_metric: this.metricValue,
       description: this.descriptionValue ?? undefined,
       tags: this.tagsValue.length > 0 ? this.tagsValue : undefined,

@@ -2046,7 +2046,12 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
             .update_collection_schema_metadata(&req.collection_id, update, Some(tenant_id.as_str()))
             .await
             .map_err(|e| {
-                if e.to_string().contains("not found") {
+                if let Some(rejected) =
+                    crate::storage::metadata::collection_mapping::schema_declaration_rejection(&e)
+                {
+                    // TD-RESTGET-1: the caller's schema, not the server.
+                    Status::invalid_argument(rejected.to_string())
+                } else if e.to_string().contains("not found") {
                     Status::not_found(format!("Collection not found: {}", req.collection_id))
                 } else {
                     Status::internal(format!("Failed to create schema: {}", e))
@@ -2182,7 +2187,12 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
             .update_collection_schema_metadata(&req.collection_id, update, Some(tenant_id.as_str()))
             .await
             .map_err(|e| {
-                if e.to_string().contains("not found") {
+                if let Some(rejected) =
+                    crate::storage::metadata::collection_mapping::schema_declaration_rejection(&e)
+                {
+                    // TD-RESTGET-1: the caller's schema, not the server.
+                    Status::invalid_argument(rejected.to_string())
+                } else if e.to_string().contains("not found") {
                     Status::not_found(format!("Collection not found: {}", req.collection_id))
                 } else {
                     Status::internal(format!("Failed to evolve schema: {}", e))
