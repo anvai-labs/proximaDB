@@ -18,11 +18,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
-use proximadb_storage_filesystem_types::{
-    DirEntry, FileOptions, FileSystem, FilesystemFile, FsFileMetadata, FsResult,
-    RangeCoalescePolicy,
-};
+use proximadb_storage_filesystem_types::{DirEntry, FileSystem, FsFileMetadata, FsResult};
 
 /// One recorded request: issuing task (`None` = not a spawned task), its
 /// interval, and a label (`op path [offset+len]`) for failure messages.
@@ -143,108 +139,42 @@ impl LatencyFileSystem {
     }
 }
 
-#[async_trait]
-impl FileSystem for LatencyFileSystem {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self.inner.as_any()
-    }
-    fn filesystem_type(&self) -> &'static str {
-        self.inner.filesystem_type()
-    }
-    fn supports_mmap(&self) -> bool {
-        false // every read must pay the injected latency
-    }
-    fn range_coalesce_policy(&self) -> Option<RangeCoalescePolicy> {
-        self.inner.range_coalesce_policy()
-    }
+proximadb_storage_filesystem_types::forward_filesystem_impl! {
+    impl FileSystem for LatencyFileSystem => inner;
+    forward [
+        as_any, filesystem_type, range_coalesce_policy, write, compare_exchange,
+        supports_bounded_local_file_write, write_local_file, write_if_absent, append,
+        supports_append, supports_conditional_replace, delete, create_dir, create_dir_all,
+        copy, move_file, sync, open_file,
+    ];
+    {
+        fn supports_mmap(&self) -> bool {
+            false // every read must pay the injected latency
+        }
 
-    // Latency-bearing requests. `read_ranges` / `read_ranges_prefetch` keep
-    // the trait defaults, which issue `self.read_range` per physical range.
-    async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
-        self.timed(format!("read {path}"), self.inner.read(path))
-            .await
-    }
-    async fn read_range(&self, path: &str, offset: u64, length: u64) -> FsResult<Vec<u8>> {
-        let label = format!("range {path} [{offset}+{length}]");
-        self.timed(label, self.inner.read_range(path, offset, length))
-            .await
-    }
-    async fn list(&self, path: &str) -> FsResult<Vec<DirEntry>> {
-        self.timed(format!("list {path}"), self.inner.list(path))
-            .await
-    }
-    async fn metadata(&self, path: &str) -> FsResult<FsFileMetadata> {
-        self.timed(format!("head {path}"), self.inner.metadata(path))
-            .await
-    }
-    async fn exists(&self, path: &str) -> FsResult<bool> {
-        self.timed(format!("exists {path}"), self.inner.exists(path))
-            .await
-    }
-
-    // Pass-through (no latency): writes and file handles.
-    async fn write(&self, path: &str, data: &[u8], options: Option<FileOptions>) -> FsResult<()> {
-        self.inner.write(path, data, options).await
-    }
-    fn supports_bounded_local_file_write(&self) -> bool {
-        self.inner.supports_bounded_local_file_write()
-    }
-    async fn write_local_file(
-        &self,
-        path: &str,
-        local_path: &std::path::Path,
-        options: Option<FileOptions>,
-    ) -> FsResult<u64> {
-        self.inner.write_local_file(path, local_path, options).await
-    }
-    async fn write_if_absent(
-        &self,
-        path: &str,
-        data: &[u8],
-        options: Option<FileOptions>,
-    ) -> FsResult<()> {
-        self.inner.write_if_absent(path, data, options).await
-    }
-    async fn append(&self, path: &str, data: &[u8]) -> FsResult<()> {
-        self.inner.append(path, data).await
-    }
-    async fn compare_exchange(
-        &self,
-        path: &str,
-        expected: Option<&[u8]>,
-        replacement: &[u8],
-        guards: &[(&str, Option<&[u8]>)],
-    ) -> FsResult<bool> {
-        self.inner
-            .compare_exchange(path, expected, replacement, guards)
-            .await
-    }
-    fn supports_append(&self) -> bool {
-        self.inner.supports_append()
-    }
-    fn supports_conditional_replace(&self) -> bool {
-        self.inner.supports_conditional_replace()
-    }
-    async fn delete(&self, path: &str) -> FsResult<()> {
-        self.inner.delete(path).await
-    }
-    async fn create_dir(&self, path: &str) -> FsResult<()> {
-        self.inner.create_dir(path).await
-    }
-    async fn create_dir_all(&self, path: &str) -> FsResult<()> {
-        self.inner.create_dir_all(path).await
-    }
-    async fn copy(&self, from: &str, to: &str) -> FsResult<()> {
-        self.inner.copy(from, to).await
-    }
-    async fn move_file(&self, from: &str, to: &str) -> FsResult<()> {
-        self.inner.move_file(from, to).await
-    }
-    async fn sync(&self) -> FsResult<()> {
-        self.inner.sync().await
-    }
-    async fn open_file(&self, path: &str, create: bool) -> FsResult<Box<dyn FilesystemFile>> {
-        self.inner.open_file(path, create).await
+        // Latency-bearing requests. `read_ranges` / `read_ranges_prefetch` keep
+        // the trait defaults, which issue `self.read_range` per physical range.
+        async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
+            self.timed(format!("read {path}"), self.inner.read(path))
+                .await
+        }
+        async fn read_range(&self, path: &str, offset: u64, length: u64) -> FsResult<Vec<u8>> {
+            let label = format!("range {path} [{offset}+{length}]");
+            self.timed(label, self.inner.read_range(path, offset, length))
+                .await
+        }
+        async fn list(&self, path: &str) -> FsResult<Vec<DirEntry>> {
+            self.timed(format!("list {path}"), self.inner.list(path))
+                .await
+        }
+        async fn metadata(&self, path: &str) -> FsResult<FsFileMetadata> {
+            self.timed(format!("head {path}"), self.inner.metadata(path))
+                .await
+        }
+        async fn exists(&self, path: &str) -> FsResult<bool> {
+            self.timed(format!("exists {path}"), self.inner.exists(path))
+                .await
+        }
     }
 }
 
