@@ -297,6 +297,7 @@ Engines cannot be changed in-place. To migrate:
 
 [source,python]
 ----
+# doc-smoke: skip migration outline; export_all_records stands for your export step
 # Export from the SST collection (pseudocode: page through the records with the REST scan
 # endpoint or the Arrow Flight export in the Arrow export guide)
 vectors = export_all_records("old_collection")

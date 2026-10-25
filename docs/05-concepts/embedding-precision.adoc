@@ -51,11 +51,15 @@ curl -X POST http://localhost:5678/api/v1/collections \
 a|
 [source,python]
 ----
-client.create_collection(CollectionConfig(
-    name="docs_fp16",
+from proximadb_sdk import EmbeddingPrecision, Protocol, ProximaDBClient
+
+client = ProximaDBClient(url="http://localhost:5678", protocol=Protocol.REST)
+
+client.create_collection(
+    "docs_fp16",
     dimension=768,
     canonical_embedding_precision=EmbeddingPrecision.FP16,
-))
+)
 ----
 
 | pgwire SQL `CREATE TABLE ... WITH (...)`

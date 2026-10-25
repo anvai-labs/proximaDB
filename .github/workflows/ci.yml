@@ -159,6 +159,7 @@ jobs:
       # filter definition below and the rust-compile job comment.
       compile: ${{ steps.filter.outputs.compile }}
       python: ${{ steps.filter.outputs.python }}
+      sdk_docs: ${{ steps.filter.outputs.sdk_docs }}
       ui: ${{ steps.filter.outputs.ui }}
       docker: ${{ steps.filter.outputs.docker }}
       docs: ${{ steps.filter.outputs.docs }}
@@ -319,6 +320,13 @@ jobs:
               - 'pyproject.toml'
               - 'clients/python-queue-embedded/**'
               - '.github/workflows/ci.yml'
+            # TD-SDKDOC-1: the doc families whose Python blocks the doc smoke
+            # executes. A docs-only edit must still run them, or an example
+            # broken by that edit passes review exactly as before.
+            sdk_docs:
+              - 'docs/02-guides/sdk-python-guide.adoc'
+              - 'docs/01-quick-start/**'
+              - 'docs/05-concepts/**'
             ui:
               - 'ui/**'
               - '.github/workflows/ci.yml'
@@ -1184,7 +1192,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 70  # max 36 min over 14 runs, 2026-10-09..11 (run 37880949062)
     needs: changes
-    if: (needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true') && !contains(needs.changes.outputs.reused, ',python-sdk-round-trip,')
+    if: (needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true' || needs.changes.outputs.sdk_docs == 'true') && !contains(needs.changes.outputs.reused, ',python-sdk-round-trip,')
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -1221,6 +1229,17 @@ jobs:
         run: pytest clients/python/tests/test_round_trip.py -v
         env:
           PROXIMADB_REST_URL: http://127.0.0.1:5678
+      # TD-SDKDOC-1: execute the SDK guide / quick-start / concept examples
+      # against this server, in document order, so an example that fails as
+      # written fails the build. Blocks marked `# doc-smoke: skip` are skipped
+      # explicitly; the compile and symbol tiers also run in the unit lane.
+      - name: Doc smoke (TD-SDKDOC-1)
+        # ~30 s when healthy; each block also has a 120 s limit and the run
+        # stops at the first block that finds the server dead.
+        timeout-minutes: 15
+        run: pytest clients/python/tests/unit/test_doc_examples.py -v
+        env:
+          PROXIMADB_DOC_SMOKE_URL: http://127.0.0.1:5678
       - name: Stop server
         if: always()
         run: kill $(cat /tmp/server.pid) 2>/dev/null || true

@@ -126,10 +126,9 @@ results = client.search(
 print(f"\nQuery: '{query}'")
 print("Top results:")
 for i, result in enumerate(results, 1):
-    # Over REST, properties come back as {"type": ..., "value": ...} cells today (TD-SDKERR-1).
-    print(f"{i}. {result.metadata['name']['value']}")
+    print(f"{i}. {result.metadata['name']}")
     print(f"   Score: {result.score:.4f}")
-    print(f"   Price: ${result.metadata['price']['value']}")
+    print(f"   Price: ${result.metadata['price']}")
     print()
 ```
 
@@ -166,6 +165,7 @@ See the [PostgreSQL reference](../03-api-reference/postgres.adoc) for what is su
 Run this against a fresh server (it creates `products`).
 
 ```python
+# doc-smoke: fresh-server
 from proximadb_sdk import ProximaDBClient, ProximaRecord, Protocol
 from sentence_transformers import SentenceTransformer
 
@@ -197,7 +197,7 @@ query_emb = encoder.encode([query])[0]
 results = client.search("products", vector=query_emb.tolist(), top_k=2)
 
 for r in results:
-    print(f"{r.metadata['name']['value']}: ${r.metadata['price']['value']} (score: {r.score:.3f})")
+    print(f"{r.metadata['name']}: ${r.metadata['price']} (score: {r.score:.3f})")
 ```
 
 ---
