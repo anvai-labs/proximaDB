@@ -50,4 +50,4 @@ The benchmarking guide already warns that `PROXIMADB_COUNT_FS_IO` "changes the s
 
 As described in the Status cell.
 
-`UnifiedCachingFilesystem` also does not forward `compare_exchange` or `supports_conditional_replace`, so conditional writes through it fail with the trait default's `InvalidOperation`. Forwarding them has cache-coherence implications: the cache must be invalidated around a CAS. That is left for a separate change. `read_ranges_prefetch` is deliberately **not** forwarded: its default goes through `self.read_range`, which is how the counting and latency decorators observe prefetch reads.
+`UnifiedCachingFilesystem` also does not forward `compare_exchange` or `supports_conditional_replace`, so conditional writes through it fail with the trait default's `InvalidOperation`. Forwarding them needs the cache invalidated around a CAS. That is now done in TD-CACHECAS-1 (Resolved). `read_ranges_prefetch` is deliberately **not** forwarded: its default goes through `self.read_range`, which is how the counting and latency decorators observe prefetch reads.
