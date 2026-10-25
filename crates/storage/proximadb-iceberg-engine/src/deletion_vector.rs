@@ -13,18 +13,21 @@
 //!
 //! The portable 64-bit format is a `u64` LE bucket count, then per bucket (ascending)
 //! a `u32` LE key holding the positions' high 32 bits and that bucket's low 32 bits as
-//! a standard 32-bit Roaring bitmap (the `RoaringFormatSpec` portable layout). The
-//! in-repo [`RoaringBitmap`] holds each bucket in memory; its own `serialize` is a
-//! private layout, so the portable encoding lives here.
+//! a standard 32-bit Roaring bitmap (the `RoaringFormatSpec` portable layout).
 //!
 //! Decoding accepts every container kind (array, bitmap, run) and both cookies, since
-//! other writers emit run containers. Encoding writes array and bitmap containers
-//! under the no-run cookie, which every reader accepts.
+//! other writers emit run containers, and validates each container against its declared
+//! cardinality (ascending arrays, ascending non-overlapping runs), so a hostile file
+//! costs at most one pass over its 2^16 values per container. Encoding writes array and
+//! bitmap containers under the no-run cookie, which every reader accepts.
+//!
+//! In memory each 2^16-position container is a sorted array or a bitmap, built in
+//! bulk: the in-repo `RoaringBitmap` re-optimizes on every insert, which made dense
+//! vectors slow to build and to decode, and its own `serialize` is a private layout.
 
 use std::collections::BTreeMap;
 
 use proximadb_kernel::error::StorageError;
-use proximadb_storage_common::bitmap::RoaringBitmap;
 
 /// The `deletion-vector-v1` magic.
 const DV_MAGIC: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
@@ -38,17 +41,140 @@ const NO_OFFSET_THRESHOLD: usize = 4;
 /// An array container holds at most this many values; more is a bitmap container.
 const ARRAY_MAX: usize = 4096;
 /// A bitmap container is 2^16 bits.
-const BITMAP_BYTES: usize = 8192;
+const BITMAP_WORDS: usize = 1024;
+const BITMAP_BYTES: usize = BITMAP_WORDS * 8;
+/// The largest bucket key (high 32 bits of a position) Iceberg's Java reader accepts.
+const MAX_BUCKET_KEY: u32 = i32::MAX as u32 - 1;
 
 fn dv_err(context: &str) -> StorageError {
     StorageError::Serialization(format!("iceberg deletion vector: {context}"))
 }
 
-/// The deleted row positions of one data file.
-#[derive(Debug, Clone, Default)]
+/// The low 16 bits of the positions of one 2^16-position range.
+#[derive(Debug, Clone, PartialEq)]
+enum Container {
+    /// Ascending, at most [`ARRAY_MAX`] values.
+    Array(Vec<u16>),
+    /// More than [`ARRAY_MAX`] values; the count is kept alongside.
+    Bitmap(Box<[u64; BITMAP_WORDS]>, u32),
+}
+
+impl Container {
+    fn cardinality(&self) -> u64 {
+        match self {
+            Container::Array(values) => values.len() as u64,
+            Container::Bitmap(_, count) => u64::from(*count),
+        }
+    }
+
+    fn contains(&self, low: u16) -> bool {
+        match self {
+            Container::Array(values) => values.binary_search(&low).is_ok(),
+            Container::Bitmap(words, _) => words[usize::from(low) / 64] & (1 << (low % 64)) != 0,
+        }
+    }
+
+    fn insert(&mut self, low: u16) -> bool {
+        match self {
+            Container::Array(values) => match values.binary_search(&low) {
+                Ok(_) => false,
+                Err(at) => {
+                    values.insert(at, low);
+                    if values.len() > ARRAY_MAX {
+                        *self = Container::from_sorted(values);
+                    }
+                    true
+                }
+            },
+            Container::Bitmap(words, count) => {
+                let (word, bit) = (usize::from(low) / 64, 1u64 << (low % 64));
+                let new = words[word] & bit == 0;
+                words[word] |= bit;
+                *count += u32::from(new);
+                new
+            }
+        }
+    }
+
+    /// From ascending, distinct values.
+    fn from_sorted(values: &[u16]) -> Self {
+        if values.len() <= ARRAY_MAX {
+            return Container::Array(values.to_vec());
+        }
+        let mut words = Box::new([0u64; BITMAP_WORDS]);
+        for low in values {
+            words[usize::from(*low) / 64] |= 1 << (low % 64);
+        }
+        Container::Bitmap(words, values.len() as u32)
+    }
+
+    /// The values, ascending.
+    fn values(&self) -> Vec<u16> {
+        match self {
+            Container::Array(values) => values.clone(),
+            Container::Bitmap(words, count) => {
+                let mut out = Vec::with_capacity(*count as usize);
+                for (w, word) in words.iter().enumerate() {
+                    let mut word = *word;
+                    while word != 0 {
+                        out.push((w * 64) as u16 + word.trailing_zeros() as u16);
+                        word &= word - 1;
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    fn union(&self, other: &Container) -> Container {
+        match (self, other) {
+            (Container::Bitmap(a, _), Container::Bitmap(b, _)) => {
+                let mut words = a.clone();
+                for (w, o) in words.iter_mut().zip(b.iter()) {
+                    *w |= o;
+                }
+                let count = words.iter().map(|w| w.count_ones()).sum();
+                Container::Bitmap(words, count)
+            }
+            _ => {
+                let (a, b) = (self.values(), other.values());
+                let mut merged = Vec::with_capacity(a.len() + b.len());
+                let (mut i, mut j) = (0, 0);
+                while i < a.len() || j < b.len() {
+                    let next = match (a.get(i), b.get(j)) {
+                        (Some(x), Some(y)) if x == y => {
+                            i += 1;
+                            j += 1;
+                            *x
+                        }
+                        (Some(x), Some(y)) if x < y => {
+                            i += 1;
+                            *x
+                        }
+                        (Some(x), None) => {
+                            i += 1;
+                            *x
+                        }
+                        (_, Some(y)) => {
+                            j += 1;
+                            *y
+                        }
+                        (None, None) => unreachable!("loop condition"),
+                    };
+                    merged.push(next);
+                }
+                Container::from_sorted(&merged)
+            }
+        }
+    }
+}
+
+/// The deleted row positions of one data file. Positions are row indices within
+/// the file, so far below the `2^63` the portable format can name.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PositionDeletes {
-    /// High 32 bits of a position → its low 32 bits.
-    buckets: BTreeMap<u32, RoaringBitmap>,
+    /// `position >> 16` → the low 16 bits of the positions in that range.
+    containers: BTreeMap<u64, Container>,
 }
 
 impl PositionDeletes {
@@ -58,47 +184,47 @@ impl PositionDeletes {
 
     /// Mark `position` deleted. `true` if it was not already.
     pub fn insert(&mut self, position: u64) -> bool {
-        self.buckets
-            .entry((position >> 32) as u32)
-            .or_default()
-            .insert(position as u32)
+        self.containers
+            .entry(position >> 16)
+            .or_insert_with(|| Container::Array(Vec::new()))
+            .insert(position as u16)
     }
 
     pub fn contains(&self, position: u64) -> bool {
-        self.buckets
-            .get(&((position >> 32) as u32))
-            .is_some_and(|b| b.contains(position as u32))
+        self.containers
+            .get(&(position >> 16))
+            .is_some_and(|c| c.contains(position as u16))
     }
 
     /// The number of deleted positions (the delete file's `record_count`).
     pub fn cardinality(&self) -> u64 {
-        self.buckets.values().map(RoaringBitmap::cardinality).sum()
+        self.containers.values().map(Container::cardinality).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.buckets.values().all(RoaringBitmap::is_empty)
+        self.cardinality() == 0
     }
 
     /// Add every position of `other` (a new DV must carry the previous one's).
     pub fn union_with(&mut self, other: &PositionDeletes) {
-        for (key, bitmap) in &other.buckets {
-            let merged = match self.buckets.get(key) {
-                Some(mine) => mine.union(bitmap),
-                None => bitmap.clone(),
+        for (key, container) in &other.containers {
+            let merged = match self.containers.get(key) {
+                Some(mine) => mine.union(container),
+                None => container.clone(),
             };
-            self.buckets.insert(*key, merged);
+            self.containers.insert(*key, merged);
         }
     }
 
     /// The deleted positions, ascending.
     pub fn positions(&self) -> Vec<u64> {
         let mut out = Vec::with_capacity(self.cardinality() as usize);
-        for (key, bitmap) in &self.buckets {
-            let mut low: Vec<u32> = bitmap.to_vec();
-            low.sort_unstable();
+        for (key, container) in &self.containers {
             out.extend(
-                low.into_iter()
-                    .map(|l| (u64::from(*key) << 32) | u64::from(l)),
+                container
+                    .values()
+                    .into_iter()
+                    .map(|low| (key << 16) | u64::from(low)),
             );
         }
         out
@@ -106,21 +232,21 @@ impl PositionDeletes {
 
     /// The portable 64-bit Roaring encoding.
     pub fn encode_portable(&self) -> Vec<u8> {
-        let buckets: Vec<(u32, Vec<u32>)> = self
-            .buckets
-            .iter()
-            .filter(|(_, b)| !b.is_empty())
-            .map(|(key, bitmap)| {
-                let mut low = bitmap.to_vec();
-                low.sort_unstable();
-                (*key, low)
-            })
-            .collect();
+        // Non-empty containers grouped by bucket (the high 32 bits).
+        let mut buckets: BTreeMap<u32, Vec<(u16, &Container)>> = BTreeMap::new();
+        for (key, container) in &self.containers {
+            if container.cardinality() > 0 {
+                buckets
+                    .entry((key >> 16) as u32)
+                    .or_default()
+                    .push((*key as u16, container));
+            }
+        }
         let mut out = Vec::new();
         out.extend_from_slice(&(buckets.len() as u64).to_le_bytes());
-        for (key, low) in &buckets {
-            out.extend_from_slice(&key.to_le_bytes());
-            encode_roaring32(low, &mut out);
+        for (bucket, containers) in &buckets {
+            out.extend_from_slice(&bucket.to_le_bytes());
+            encode_roaring32(containers, &mut out);
         }
         out
     }
@@ -132,13 +258,18 @@ impl PositionDeletes {
         let mut out = Self::new();
         let mut previous: Option<u32> = None;
         for _ in 0..count {
-            let key = cur.u32_le()?;
-            if previous.is_some_and(|p| p >= key) {
+            let bucket = cur.u32_le()?;
+            if previous.is_some_and(|p| p >= bucket) {
                 return Err(dv_err("bucket keys are not ascending"));
             }
-            previous = Some(key);
-            let bitmap = decode_roaring32(&mut cur)?;
-            out.buckets.insert(key, bitmap);
+            if bucket > MAX_BUCKET_KEY {
+                return Err(dv_err("position beyond the 64-bit format's range"));
+            }
+            previous = Some(bucket);
+            for (key, container) in decode_roaring32(&mut cur)? {
+                out.containers
+                    .insert((u64::from(bucket) << 16) | u64::from(key), container);
+            }
         }
         if cur.pos != bytes.len() {
             return Err(dv_err("trailing bytes after the bitmap"));
@@ -180,60 +311,43 @@ impl PositionDeletes {
     }
 }
 
-/// Append one 32-bit Roaring bitmap (portable layout, no-run cookie) of the
-/// ascending, distinct `values`.
-fn encode_roaring32(values: &[u32], out: &mut Vec<u8>) {
-    let mut containers: Vec<(u16, &[u32])> = Vec::new();
-    let mut start = 0;
-    while start < values.len() {
-        let key = (values[start] >> 16) as u16;
-        let end = start + values[start..].partition_point(|v| (v >> 16) as u16 == key);
-        containers.push((key, &values[start..end]));
-        start = end;
-    }
+/// Append one 32-bit Roaring bitmap (portable layout, no-run cookie) of `containers`
+/// (ascending keys, each non-empty).
+fn encode_roaring32(containers: &[(u16, &Container)], out: &mut Vec<u8>) {
     out.extend_from_slice(&SERIAL_COOKIE_NO_RUNCONTAINER.to_le_bytes());
     out.extend_from_slice(&(containers.len() as u32).to_le_bytes());
-    for (key, members) in &containers {
+    for (key, container) in containers {
         out.extend_from_slice(&key.to_le_bytes());
-        out.extend_from_slice(&((members.len() - 1) as u16).to_le_bytes());
+        out.extend_from_slice(&((container.cardinality() - 1) as u16).to_le_bytes());
     }
     // Offsets are relative to the start of this 32-bit bitmap.
-    let header = 8 + containers.len() * 8;
-    let mut offset = header;
-    let base = out.len() - 8 - containers.len() * 4;
-    for (_, members) in &containers {
+    let mut offset = 8 + containers.len() * 8;
+    for (_, container) in containers {
         out.extend_from_slice(&(offset as u32).to_le_bytes());
-        offset += container_size(members.len());
+        offset += match container {
+            Container::Array(values) => values.len() * 2,
+            Container::Bitmap(..) => BITMAP_BYTES,
+        };
     }
-    for (_, members) in &containers {
-        if members.len() <= ARRAY_MAX {
-            for v in *members {
-                out.extend_from_slice(&(*v as u16).to_le_bytes());
+    for (_, container) in containers {
+        match container {
+            Container::Array(values) => {
+                for v in values {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
             }
-        } else {
-            let mut words = [0u64; BITMAP_BYTES / 8];
-            for v in *members {
-                let low = (*v & 0xFFFF) as usize;
-                words[low / 64] |= 1 << (low % 64);
-            }
-            for word in words {
-                out.extend_from_slice(&word.to_le_bytes());
+            Container::Bitmap(words, _) => {
+                for word in words.iter() {
+                    out.extend_from_slice(&word.to_le_bytes());
+                }
             }
         }
     }
-    debug_assert_eq!(out.len() - base, offset);
 }
 
-fn container_size(cardinality: usize) -> usize {
-    if cardinality <= ARRAY_MAX {
-        cardinality * 2
-    } else {
-        BITMAP_BYTES
-    }
-}
-
-/// Decode one 32-bit Roaring bitmap (portable layout, either cookie).
-fn decode_roaring32(cur: &mut Cursor<'_>) -> Result<RoaringBitmap, StorageError> {
+/// Decode one 32-bit Roaring bitmap (portable layout, either cookie) into its
+/// containers, validating each against its declared cardinality.
+fn decode_roaring32(cur: &mut Cursor<'_>) -> Result<Vec<(u16, Container)>, StorageError> {
     let cookie = cur.u32_le()?;
     let (count, run_flags) = if cookie == SERIAL_COOKIE_NO_RUNCONTAINER {
         (cur.u32_le()? as usize, None)
@@ -248,8 +362,13 @@ fn decode_roaring32(cur: &mut Cursor<'_>) -> Result<RoaringBitmap, StorageError>
         return Err(dv_err("more containers than 16-bit keys"));
     }
     let mut descriptors = Vec::with_capacity(count);
+    let mut previous: Option<u16> = None;
     for _ in 0..count {
         let key = cur.u16_le()?;
+        if previous.is_some_and(|p| p >= key) {
+            return Err(dv_err("container keys are not ascending"));
+        }
+        previous = Some(key);
         let cardinality = usize::from(cur.u16_le()?) + 1;
         descriptors.push((key, cardinality));
     }
@@ -257,42 +376,69 @@ fn decode_roaring32(cur: &mut Cursor<'_>) -> Result<RoaringBitmap, StorageError>
         // The offset header only speeds up random access; containers follow in order.
         cur.take(count * 4)?;
     }
-    let mut bitmap = RoaringBitmap::new();
+    let mut out = Vec::with_capacity(count);
     for (i, (key, cardinality)) in descriptors.into_iter().enumerate() {
-        let high = u32::from(key) << 16;
         let is_run = run_flags
             .as_ref()
             .is_some_and(|flags| flags[i / 8] & (1 << (i % 8)) != 0);
-        if is_run {
+        let container = if is_run {
             let runs = usize::from(cur.u16_le()?);
+            let mut values = Vec::with_capacity(cardinality.min(ARRAY_MAX + 1));
+            let mut words: Option<Box<[u64; BITMAP_WORDS]>> =
+                (cardinality > ARRAY_MAX).then(|| Box::new([0u64; BITMAP_WORDS]));
+            let (mut next, mut total) = (0u32, 0usize);
             for _ in 0..runs {
                 let start = u32::from(cur.u16_le()?);
                 let length = u32::from(cur.u16_le()?);
-                if start + length > 0xFFFF {
-                    return Err(dv_err("run past the end of its container"));
+                // Ascending and non-overlapping, so the runs cover at most 2^16 values.
+                if start < next || start + length > 0xFFFF {
+                    return Err(dv_err("runs overlap or leave their container"));
+                }
+                total += (length + 1) as usize;
+                if total > cardinality {
+                    return Err(dv_err("runs exceed the declared cardinality"));
                 }
                 for low in start..=start + length {
-                    bitmap.insert(high | low);
+                    match words.as_mut() {
+                        Some(w) => w[low as usize / 64] |= 1 << (low % 64),
+                        None => values.push(low as u16),
+                    }
                 }
+                next = start + length + 1;
+            }
+            if total != cardinality {
+                return Err(dv_err("runs do not match the declared cardinality"));
+            }
+            match words {
+                Some(w) => Container::Bitmap(w, cardinality as u32),
+                None => Container::Array(values),
             }
         } else if cardinality <= ARRAY_MAX {
+            let mut values = Vec::with_capacity(cardinality);
             for _ in 0..cardinality {
-                bitmap.insert(high | u32::from(cur.u16_le()?));
-            }
-        } else {
-            let words = cur.take(BITMAP_BYTES)?;
-            let (chunks, _) = words.as_chunks::<8>();
-            for (w, chunk) in chunks.iter().enumerate() {
-                let mut word = u64::from_le_bytes(*chunk);
-                while word != 0 {
-                    let bit = word.trailing_zeros();
-                    bitmap.insert(high | (w as u32 * 64 + bit));
-                    word &= word - 1;
+                let low = cur.u16_le()?;
+                if values.last().is_some_and(|last| *last >= low) {
+                    return Err(dv_err("array container values are not ascending"));
                 }
+                values.push(low);
             }
-        }
+            Container::Array(values)
+        } else {
+            let bytes = cur.take(BITMAP_BYTES)?;
+            let mut words = Box::new([0u64; BITMAP_WORDS]);
+            let (chunks, _) = bytes.as_chunks::<8>();
+            for (word, chunk) in words.iter_mut().zip(chunks) {
+                *word = u64::from_le_bytes(*chunk);
+            }
+            let count: u32 = words.iter().map(|w| w.count_ones()).sum();
+            if count as usize != cardinality {
+                return Err(dv_err("bitmap container does not match its cardinality"));
+            }
+            Container::Bitmap(words, count)
+        };
+        out.push((key, container));
     }
-    Ok(bitmap)
+    Ok(out)
 }
 
 struct Cursor<'a> {

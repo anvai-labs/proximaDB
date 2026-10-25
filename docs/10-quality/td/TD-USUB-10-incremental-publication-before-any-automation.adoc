@@ -299,8 +299,11 @@ It lands in three PRs, readers before the writer, so no reader ever meets a dele
 * `deletion_vector`: a data file's deleted positions in the portable 64-bit Roaring encoding,
   inside the spec's `deletion-vector-v1` framing (big-endian length, magic `D1 D3 39 64`,
   CRC-32). The encoding is pinned byte for byte against CRoaring (`pyroaring` golden vectors);
-  decoding also accepts run containers and the run cookie, which other writers emit. The
-  in-repo `RoaringBitmap` holds positions in memory; its own `serialize` is a private layout.
+  decoding also accepts run containers and the run cookie, which other writers emit, and
+  checks every container against its declared cardinality (ascending arrays, ascending
+  non-overlapping runs), so a hostile vector costs at most one pass per container. In memory
+  each 2^16-position container is a sorted array or a bitmap built in bulk (the in-repo
+  `RoaringBitmap` re-optimizes on every insert and serializes to a private layout).
 * `puffin`: the Puffin file (`PFA1` magic, JSON footer) holding one vector per data file, each
   blob over `_pos` (field id 2147483645) with the `referenced-data-file` and `cardinality`
   properties. Compressed footers are rejected.
