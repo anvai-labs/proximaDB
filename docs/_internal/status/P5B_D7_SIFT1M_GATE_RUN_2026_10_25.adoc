@@ -54,7 +54,8 @@ Each of 1–4 is fixed in this branch with a test that fails without it.
 
 == Provenance
 
-* Result files (local, not checked in): `~/bench-beds/p5b-runs/{fx-dir-off,fx-dir-on,fx-dir-on-k32,fx-dir-on-k64}/result.json` (round 2); `{dir-on,dir-off,dir-on2,dir-off2,dir-on-k32}` (round 1).
+* **Provenance rerun at the PR HEAD** (`b000d6275`, corrected wave rule, all gates armed): `--ivf-k 32` directory on — recall 0.9818, **3 waves** (p95 4), **18.82 requests/q**, 224/280 ms, warm 2 waves; harness **exit 0 (every gate passes)**. Directory off — recall 0.9824, 7 waves, 22.66 requests/q, 494/779 ms. Result files: `~/bench-beds/p5b-runs/{pv-dir-on-k32,pv-dir-off}/result.json`.
+* Earlier rounds (local, not checked in): `~/bench-beds/p5b-runs/{fx-dir-off,fx-dir-on,fx-dir-on-k32,fx-dir-on-k64}/result.json` (round 2, binary `138b47140`); `{dir-on,dir-off,dir-on2,dir-off2,dir-on-k32}` (round 1, binary `7d84e8074`).
 * MinIO traces: `~/bench-beds/p5b-runs/k32-object-cold-trace.txt` (round 1), `fx-dir-on-object-cold-trace.txt` (round 2).
 * Commands: see the TD-PAXDIR-1 D7 row; arms differ only in `--centroid-directory`, `--ivf-k` and the gate flags.
 * Indicative single-machine emulator evidence, not an SLA or a cloud-latency claim.
