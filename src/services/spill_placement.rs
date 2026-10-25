@@ -438,7 +438,7 @@ fn target_for(
 ///
 /// `dir` holds the canonical WAL (and the placement marker); `wal_truncated`
 /// is whether the WAL no longer starts at its first entry. With the spill off
-/// nothing is claimed or recorded: the target is the recorded placement, for
+/// no placement is claimed or recorded: the target is the recorded placement, for
 /// the caller's check that no rows live only there.
 pub async fn resolve_spill_target(
     dir: &Path,
@@ -1019,6 +1019,23 @@ mod tests {
             .await
             .expect("adopted");
         assert_eq!((state(&dir).placement, state(&dir).epoch), (url.clone(), 1));
+        // An attempt after the placement was recorded (a retry once a claim
+        // was recovered) re-checks against it, not the old one: no
+        // "still holds" refusal over the adopted segments.
+        let local_root = dir.join("record-spill");
+        let target = target_for(&url, &local_root, &factory).expect("target");
+        let step = Step {
+            dir: &dir,
+            local_root: &local_root,
+            factory: &factory,
+            target: &target,
+            wal_truncated: true,
+            adopt: true,
+        };
+        let mut recorded = state(&dir);
+        step.place(&mut recorded).await.expect("first attempt");
+        step.place(&mut recorded).await.expect("retry");
+
         // Later boots need no opt-in.
         resolve(&dir, &factory, true, Some(&url))
             .await
@@ -1169,6 +1186,38 @@ mod tests {
         resolve(&dir, &factory, true, Some(&url))
             .await
             .expect("claim never reached the store");
+
+        // A first claim (local → URL) cut off after the owner write: the
+        // recovery raises the data format before it records the URL.
+        let first = tempfile::tempdir().expect("tempdir");
+        let first_dir = first.path().join("pgwire");
+        let first_url = file_url(&first.path().join("bucket"));
+        resolve(&first_dir, &factory, false, None)
+            .await
+            .expect("local");
+        let mut local = state(&first_dir);
+        local.pending = Some("n-3".to_string());
+        write_placement(&first_dir, &local).expect("pending");
+        let claimed = OwnerMarker {
+            instance: local.instance.clone(),
+            epoch: 1,
+            nonce: Some("n-3".to_string()),
+            written_by: "test".to_string(),
+        };
+        std::fs::create_dir_all(first.path().join("bucket")).expect("mkdir");
+        std::fs::write(
+            first.path().join("bucket").join(OWNER_MARKER),
+            serde_json::to_vec(&claimed).expect("json"),
+        )
+        .expect("owner");
+        resolve(&first_dir, &factory, true, Some(&first_url))
+            .await
+            .expect("our own interrupted first claim");
+        assert_eq!(state(&first_dir).placement, first_url);
+        assert_eq!(
+            crate::services::storage_format::ensure_data_format(&first_dir).expect("format"),
+            crate::services::storage_format::OBJECT_SPILL_FORMAT
+        );
 
         // A first claim cut off mid-write left an empty owner marker.
         let fresh = tempfile::tempdir().expect("tempdir");
