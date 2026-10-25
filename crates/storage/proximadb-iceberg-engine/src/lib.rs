@@ -91,6 +91,8 @@ pub mod iceberg;
 /// Iceberg-style atomic manifest commits (optimistic concurrency via `put_if_absent`).
 pub mod manifest;
 pub mod metadata;
+mod snapshot_deletes;
+pub use snapshot_deletes::{IcebergSnapshotFiles, SnapshotDeletionVector};
 /// Puffin files: the container of a v3 table's deletion vectors.
 pub mod puffin;
 /// Parquet footer → Iceberg manifest column metrics.
@@ -307,6 +309,7 @@ impl IcebergObjectStoreBridge {
         let parent = committer.latest_version().await?;
         self.commit_iceberg_snapshot(
             &keys,
+            &[],
             parent,
             FooterPolicy::DegradeToEmpty,
             &SnapshotTarget {
@@ -346,9 +349,43 @@ impl IcebergObjectStoreBridge {
         timestamp_ms: i64,
         format_version: iceberg::FormatVersion,
     ) -> Result<u64, StorageError> {
+        self.publish_files_inner(
+            files,
+            &[],
+            parent,
+            metadata_prefix,
+            table_uuid,
+            table_location,
+            fields,
+            snapshot_id,
+            timestamp_ms,
+            format_version,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_files_inner(
+        &self,
+        files: &[Path],
+        deletes: &[iceberg::DeleteFileMeta],
+        parent: Option<u64>,
+        metadata_prefix: &str,
+        table_uuid: &str,
+        table_location: &str,
+        fields: &[iceberg::IcebergField],
+        snapshot_id: i64,
+        timestamp_ms: i64,
+        format_version: iceberg::FormatVersion,
+    ) -> Result<u64, StorageError> {
         if files.is_empty() {
             return Err(StorageError::Serialization(
                 "iceberg-engine: publish_iceberg_files needs at least one data file".into(),
+            ));
+        }
+        if !deletes.is_empty() && format_version != iceberg::FormatVersion::V3 {
+            return Err(StorageError::Serialization(
+                "iceberg-engine: deletion vectors need format version 3".into(),
             ));
         }
         let target = SnapshotTarget {
@@ -361,7 +398,7 @@ impl IcebergObjectStoreBridge {
             format_version,
         };
         match self
-            .commit_iceberg_snapshot(files, parent, FooterPolicy::Required, &target)
+            .commit_iceberg_snapshot(files, deletes, parent, FooterPolicy::Required, &target)
             .await?
         {
             CommitOutcome::Committed(version) => Ok(version),
@@ -377,6 +414,7 @@ impl IcebergObjectStoreBridge {
     async fn commit_iceberg_snapshot(
         &self,
         files: &[Path],
+        deletes: &[iceberg::DeleteFileMeta],
         parent: Option<u64>,
         footers: FooterPolicy,
         target: &SnapshotTarget<'_>,
@@ -452,7 +490,7 @@ impl IcebergObjectStoreBridge {
         {
             return Ok(conflict);
         }
-        let manifest_list = vec![iceberg::ManifestFileMeta {
+        let mut manifest_list = vec![iceberg::ManifestFileMeta {
             manifest_path: self.object_uri(manifest_path.as_ref()),
             manifest_length,
             added_files_count: added_files as i32,
@@ -461,7 +499,41 @@ impl IcebergObjectStoreBridge {
             sequence_number: lineage.sequence_number,
             first_row_id: (format_version == iceberg::FormatVersion::V3)
                 .then_some(lineage.first_row_id),
+            content: iceberg::ManifestContent::Data,
         }];
+        // The snapshot's deletion vectors, in a second (delete) manifest whose
+        // entries inherit this snapshot's sequence number, so they apply to its
+        // data files. Row ids are assigned to data manifests only.
+        if !deletes.is_empty() {
+            let delete_bytes = iceberg::write_delete_manifest(
+                deletes,
+                snapshot_id,
+                &iceberg::ManifestHeader {
+                    schema_json: &schema_json,
+                    format_version,
+                },
+            )?;
+            let delete_path = Path::from(format!(
+                "{metadata_prefix}/v{version:020}-{snapshot_id}-m1.avro"
+            ));
+            let delete_length = delete_bytes.len() as i64;
+            if let Some(conflict) = self
+                .put_generation_object(&committer, &delete_path, delete_bytes)
+                .await?
+            {
+                return Ok(conflict);
+            }
+            manifest_list.push(iceberg::ManifestFileMeta {
+                manifest_path: self.object_uri(delete_path.as_ref()),
+                manifest_length: delete_length,
+                added_files_count: deletes.len() as i32,
+                added_rows_count: deletes.iter().map(|d| d.record_count).sum(),
+                added_snapshot_id: snapshot_id,
+                sequence_number: lineage.sequence_number,
+                first_row_id: None,
+                content: iceberg::ManifestContent::Deletes,
+            });
+        }
         let list_bytes = iceberg::write_manifest_list(&manifest_list)?;
         let list_path = Path::from(format!(
             "{metadata_prefix}/snap-{snapshot_id}-v{version:020}-list.avro"
@@ -519,41 +591,26 @@ impl IcebergObjectStoreBridge {
     /// Resolve the data-file keys of the current snapshot in the Iceberg metadata log at
     /// `metadata_prefix` (decodes `TableMetadata` → manifest list → manifests). Each returned
     /// path is consumable by [`read_parquet_batches`](ObjectStoreBridge::read_parquet_batches).
+    ///
+    /// A snapshot with deletion vectors is an error here: its data files alone would
+    /// return deleted rows. Readers that apply them use
+    /// [`read_iceberg_snapshot_with_deletes`](Self::read_iceberg_snapshot_with_deletes).
     pub async fn read_iceberg_snapshot(
         &self,
         metadata_prefix: &str,
         version: u64,
     ) -> Result<Vec<Path>, StorageError> {
-        let committer = metadata::MetadataCommitter::new(self.store.clone(), metadata_prefix);
-        let meta_bytes = committer.read_metadata(version).await?;
-        let meta_json =
-            std::str::from_utf8(&meta_bytes).map_err(|e| read_err("metadata utf8", e))?;
-        let Some(list_loc) = iceberg::current_manifest_list(meta_json)? else {
-            return Ok(Vec::new());
-        };
-        // Recorded paths are absolute URIs (or legacy bridge-relative keys). The
-        // table prefix re-roots URIs under the table `location` when this bridge is
-        // opened somewhere other than the writer's root.
-        let table_location = serde_json::from_str::<serde_json::Value>(meta_json)
-            .ok()
-            .and_then(|v| v.get("location").and_then(|l| l.as_str()).map(String::from));
-        let table_prefix = metadata_prefix
-            .trim_end_matches('/')
-            .strip_suffix("metadata")
-            .map(|p| p.trim_end_matches('/'))
-            .unwrap_or("");
-        let resolve =
-            |p: &str| self.resolve_recorded_path(p, table_location.as_deref(), table_prefix);
-        let list_bytes = self.store.get(&resolve(&list_loc)).await?;
-        let manifests = iceberg::read_manifest_list(&list_bytes)?;
-        let mut out = Vec::new();
-        for m in manifests {
-            let mbytes = self.store.get(&resolve(&m.manifest_path)).await?;
-            for df in iceberg::read_manifest(&mbytes)? {
-                out.push(resolve(&df.file_path));
-            }
+        let snapshot = self
+            .read_iceberg_snapshot_with_deletes(metadata_prefix, version)
+            .await?;
+        if !snapshot.deletion_vectors.is_empty() {
+            return Err(StorageError::Serialization(format!(
+                "iceberg-engine: snapshot {version} under {metadata_prefix} has {} deletion \
+                 vectors, which this reader does not apply",
+                snapshot.deletion_vectors.len()
+            )));
         }
-        Ok(out)
+        Ok(snapshot.data_files)
     }
 }
 

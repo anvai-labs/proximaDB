@@ -286,3 +286,42 @@ in-range new oid still appends; insert-then-delete publishes nothing; an update 
 published row rewrites; counts and sums correct throughout),
 `an_update_under_object_id_keying_outside_default_rewrites` and
 `classification_appends_only_rows_no_published_file_can_hold`.
+
+=== P2.4 slice 3a: deletion vectors in the Iceberg engine (2026-10-25)
+
+Slice 3 lets a republication delete published rows instead of rewriting the table. Published
+tables are format v3, so the mechanism is the v3 **deletion vector** (a Puffin blob of deleted
+row positions per data file), not v2 position-delete files, which v3 writers may no longer add.
+It lands in three PRs, readers before the writer, so no reader ever meets a delete it ignores:
+3a (this: format and engine), 3b (the DataFusion and DuckDB readers apply vectors), 3c
+(MATERIALIZE writes vectors for updates and deletes).
+
+* `deletion_vector`: a data file's deleted positions in the portable 64-bit Roaring encoding,
+  inside the spec's `deletion-vector-v1` framing (big-endian length, magic `D1 D3 39 64`,
+  CRC-32). The encoding is pinned byte for byte against CRoaring (`pyroaring` golden vectors);
+  decoding also accepts run containers and the run cookie, which other writers emit. The
+  in-repo `RoaringBitmap` holds positions in memory; its own `serialize` is a private layout.
+* `puffin`: the Puffin file (`PFA1` magic, JSON footer) holding one vector per data file, each
+  blob over `_pos` (field id 2147483645) with the `referenced-data-file` and `cardinality`
+  properties. Compressed footers are rejected.
+* Delete manifests (`iceberg::write_delete_manifest`): content `deletes`, entries
+  POSITION_DELETES / PUFFIN with `referenced_data_file`, `content_offset`,
+  `content_size_in_bytes` (field ids 143–145), inheriting the snapshot's sequence number. The
+  manifest list now records each manifest's `content`. Reading back accepts only deletion
+  vectors: an equality delete or a v2 position-delete file is an error (fail closed).
+* The bridge: `write_deletion_vectors` (Puffin, create-only),
+  `publish_iceberg_files_with_deletes` (v3 only; every vector names a data file of the same
+  snapshot; at most one per file), `read_iceberg_snapshot_with_deletes` (checks both again) and
+  `read_deletion_vector` (a ranged read of one blob, checked against its manifest cardinality).
+* `read_iceberg_snapshot` / `read_iceberg_table` now **refuse** a snapshot that has deletion
+  vectors. Every reader goes through them, and the DataFusion and DuckDB routes fail closed on
+  that error, so until 3b no route can return a deleted row. Nothing writes vectors before 3c.
+
+Interop check (manual, not in CI): a snapshot written by `publish_iceberg_files_with_deletes`
+scans correctly in PyIceberg 0.12 (deleted positions dropped). DuckDB 1.5.6 could not be checked
+in the sandbox (its extension download is blocked); 3c extends the CI read-back gate, which
+installs both readers, to tables with deletion vectors.
+
+Gates: the `deletion_vector`, `puffin`, `iceberg::deletes` and `snapshot_deletes` unit tests
+(round trips, CRoaring byte equality, damaged blobs, invalid publishes refused, data-only reads
+refused).

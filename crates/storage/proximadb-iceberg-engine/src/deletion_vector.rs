@@ -281,8 +281,9 @@ fn decode_roaring32(cur: &mut Cursor<'_>) -> Result<RoaringBitmap, StorageError>
             }
         } else {
             let words = cur.take(BITMAP_BYTES)?;
-            for (w, chunk) in words.chunks_exact(8).enumerate() {
-                let mut word = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+            let (chunks, _) = words.as_chunks::<8>();
+            for (w, chunk) in chunks.iter().enumerate() {
+                let mut word = u64::from_le_bytes(*chunk);
                 while word != 0 {
                     let bit = word.trailing_zeros();
                     bitmap.insert(high | (w as u32 * 64 + bit));
