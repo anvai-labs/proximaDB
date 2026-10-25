@@ -27,6 +27,8 @@ Remaining:
 * `SchemaDefinition` itself (the `columns`/`enforcement`/`allow_additional_fields` object) stays permissive: it is `#[serde(flatten)]`ed into the schema PUT, where serde cannot deny unknown fields. Its columns are strict.
 * `RestColumnDefinition` is also a response type (`SchemaResponse`), so the spec now publishes `additionalProperties: false` on that response shape. A strict third-party client would reject a future column field. The in-repo SDKs read responses permissively. Split the request and response types if that matters.
 
+* The TypeScript builder's `index()` normalizes case and whitespace and throws on an unknown value, so a plain-JS `"HNSW"` is the default route, not a declared index. `engineStr()` and `metric()` still pass strings through unvalidated; applying the same rule to them is a separate follow-up.
+
 Found along the way, filed: TD-COLLTIME-1 (`Collection.created_at` is written in two units; the schema GET renders it as year 58784).
 | Priority | **MEDIUM** — a misspelt setting is accepted and silently replaced.
 | Component | REST v2 `GET /api/v2/collections/{name}` and `POST /api/v2/collections` (request validation)

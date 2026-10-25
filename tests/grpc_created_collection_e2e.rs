@@ -1085,3 +1085,65 @@ async fn grpc_schema_declaration_errors_are_invalid_argument_e2e() {
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
     assert!(err.message().contains("system column"), "{err:?}");
 }
+
+/// The exact create bodies the in-repo Rust and TypeScript SDKs emit for a
+/// non-default index choice (TD-RESTGET-1 follow-up): accepted by the strict
+/// server, and they do what they say — an IVF request declares an IVF index,
+/// a Flat request is a routing policy and declares none.
+#[tokio::test]
+async fn sdk_index_shapes_are_accepted_e2e() {
+    let server = Server::start().await.expect("server start");
+    let http = reqwest::Client::builder().no_proxy().build().expect("http");
+    let base = format!("http://127.0.0.1:{}", server.rest_port);
+
+    let flat = json!({"name": "sdk_flat", "dimension": 4, "engine": "sst",
+                      "distance_metric": "cosine", "index_policy": {"mode": "exact"}});
+    let (status, text) = rest_post_create(&http, &base, flat).await;
+    assert!(
+        status.is_success(),
+        "Flat (index_policy exact): {status} {text}"
+    );
+    for algorithm in ["ivf", "lsh", "pq", "annoy"] {
+        let name = format!("sdk_{algorithm}");
+        let body = json!({"name": name, "dimension": 4, "engine": "sst",
+                          "distance_metric": "cosine",
+                          "index_configs": [{"algorithm": algorithm, "is_primary": true}]});
+        let (status, text) = rest_post_create(&http, &base, body).await;
+        assert!(
+            status.is_success(),
+            "{algorithm} (index_configs): {status} {text}"
+        );
+    }
+
+    let mut grpc = connect_grpc(server.grpc_port).await;
+    // Every declared index reads back as itself — a server that accepted the
+    // body but dropped or remapped the index would fail here.
+    for algorithm in ["ivf", "lsh", "pq", "annoy"] {
+        let specs = grpc_index_specs(&mut grpc, &format!("sdk_{algorithm}")).await;
+        assert_eq!(specs.len(), 1, "{algorithm}: exactly one index: {specs:?}");
+        assert!(
+            specs[0].algorithm.eq_ignore_ascii_case(algorithm) && specs[0].is_primary,
+            "{algorithm}: must read back as the primary {algorithm} index: {specs:?}"
+        );
+    }
+    let flat = grpc_index_specs(&mut grpc, "sdk_flat").await;
+    assert!(
+        flat.is_empty(),
+        "Flat is a routing policy, not an index: {flat:?}"
+    );
+}
+
+async fn grpc_index_specs(
+    grpc: &mut ProximaRecordServiceClient<tonic::transport::Channel>,
+    name: &str,
+) -> Vec<proximadb::proto::proximadb_v2::V2IndexSpec> {
+    grpc.get_collection(proximadb::proto::proximadb_v2::V2GetCollectionRequest {
+        collection_id: name.to_string(),
+    })
+    .await
+    .expect("gRPC GetCollection")
+    .into_inner()
+    .config
+    .expect("collection config")
+    .index_specs
+}
