@@ -253,13 +253,20 @@ published files' hidden oid column (per row group: min/max statistics, then the 
 
 An append is attempted only when it is provably sound, and rewrites otherwise:
 
-* the store has a WAL change feed for the table's route (`TableRecordStore::has_change_feed`);
-  an empty answer from a store without one proves nothing;
+* the store has a WAL change feed for the table's route (`TableRecordStore::has_change_feed`,
+  which for the WAL-backed store is its appender's `has_readable_log`); an empty answer from a
+  store without one proves nothing;
 * the layout is at the location being published and its `snapshot_lsn` is not newer than the
   one this run captured;
 * every carried file has exactly the columns this publication writes (a schema change since the
   last publication rewrites), carries the oid column (files from before slice 2a rewrite) and
   has oid statistics in every row group;
+* the change feed is read under the keys the writes use (`wal_collection_id`: the table's name
+  and, under `PROXIMADB_WAL_OBJECT_ID_KEY`, its `object_id`), taken from the table's own schema,
+  never by re-resolving its bare name (which would look in `default` and miss every
+  object_id-keyed write of a table elsewhere);
+* the snapshot holds fewer than `APPEND_MAX_FILES` (64) files, so parts stay compacted and the
+  probe, which reads every part's footer, stays bounded;
 * the delta is at most `PROXIMADB_MATERIALIZE_APPEND_MAX_ROWS` rows (default 1,000,000, the rows
   held in memory while written; `0`/`off` disables append).
 
@@ -267,11 +274,15 @@ Accepted limits, each cleared by the next full rewrite:
 
 * rows that expired by TTL stay in carried files;
 * NDV statistics are not republished on an append;
-* carried files are not compacted, so many small appends leave many small parts (compaction is
-  a later slice).
+* carried files are re-listed as added in each snapshot (an Iceberg `overwrite`), so
+  `added-files`/`added-records` count them and v3 row ids are reassigned on every append.
+
+An unchanged republication advances `snapshot_lsn` only on the layout it planned against (same
+metadata version), so it never relabels a newer publication.
 
 Gates: `an_insert_only_republication_appends_and_an_update_rewrites` (unchanged run publishes no
 metadata version; insert-only carries the file and appends a part holding only the new rows; an
 in-range new oid still appends; insert-then-delete publishes nothing; an update or a delete of a
-published row rewrites; counts and sums correct throughout) and
+published row rewrites; counts and sums correct throughout),
+`an_update_under_object_id_keying_outside_default_rewrites` and
 `classification_appends_only_rows_no_published_file_can_hold`.

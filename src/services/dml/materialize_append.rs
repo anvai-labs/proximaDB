@@ -26,6 +26,11 @@ pub const APPEND_MAX_ROWS_ENV: &str = "PROXIMADB_MATERIALIZE_APPEND_MAX_ROWS";
 /// while they are written, so this bounds that memory.
 pub const DEFAULT_APPEND_MAX_ROWS: u64 = 1_000_000;
 
+/// The most files a snapshot may hold for a republication to append to it. Each
+/// append adds a part, and every republication probes every part's footer, so
+/// past this a full rewrite compacts them.
+pub const APPEND_MAX_FILES: usize = 64;
+
 /// The configured append bound, or `None` when incremental append is off.
 pub(crate) fn configured_append_max_rows() -> Option<usize> {
     crate::services::storage_format::default_on_gate(APPEND_MAX_ROWS_ENV, DEFAULT_APPEND_MAX_ROWS)

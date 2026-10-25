@@ -180,6 +180,13 @@ pub trait TableWalAppender: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Whether [`Self::read_all_entries`] returns the log (`false` for the
+    /// default, which returns nothing). Only then is an empty change feed proof
+    /// that nothing changed.
+    fn has_readable_log(&self) -> bool {
+        false
+    }
+
     /// Entries with `sequence_number > since` that may belong to
     /// `collection_id`, oldest first (callers still filter by collection). The
     /// default reads everything; a segmented WAL (P2.1) reads only the segments
@@ -3411,9 +3418,10 @@ impl TableRecordStore for DirectWalTableRecordStore {
         Ok(())
     }
 
-    /// Every write goes through the canonical WAL this store reads its feed from.
+    /// Every write goes through the canonical WAL this store reads its feed
+    /// from, so the feed is complete whenever that log can be read back.
     fn has_change_feed(&self, _table_schema: &CatalogTableSchema) -> bool {
-        true
+        self.wal_appender.has_readable_log()
     }
 
     /// The snapshot LSN is the WAL head, lowered below any write that is

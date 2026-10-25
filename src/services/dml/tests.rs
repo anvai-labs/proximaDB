@@ -3960,6 +3960,74 @@ fn an_insert_only_republication_appends_and_an_update_rewrites() {
     });
 }
 
+/// P2.4 slice 2: with object_id WAL keying on, an update to a table outside the
+/// `default` namespace still reaches the append plan's change feed (it is keyed
+/// from the table's own schema, not a re-resolution of its bare name), so the
+/// republication rewrites instead of keeping the stale row as "unchanged".
+#[tokio::test]
+async fn an_update_under_object_id_keying_outside_default_rewrites() {
+    let _keying = EnvGuard::set("PROXIMADB_WAL_OBJECT_ID_KEY", "1");
+    let _bloom = EnvGuard::set("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1");
+    use proximadb_iceberg_engine::IcebergObjectStoreBridge;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (manager, dml) = dml_over_wal_table(
+        temp_dir.path(),
+        "CREATE TABLE unused (id TEXT NOT NULL, PRIMARY KEY (id));",
+        "keyed.wal",
+    )
+    .await;
+    let ddl = DdlService::new(manager.clone());
+    ddl.execute(DdlStatement::CreateNamespace {
+        namespace: vec!["analytics".to_string()],
+        if_not_exists: true,
+        properties: HashMap::new(),
+    })
+    .await
+    .expect("create namespace");
+    let parser = crate::query::sql_frontend::SqlFrontendParser::new();
+    ddl.execute(
+        parser
+            .parse_ddl("CREATE TABLE analytics.inv (id TEXT NOT NULL, qty INT, PRIMARY KEY (id));")
+            .expect("parse ddl")
+            .expect("ddl stmt"),
+    )
+    .await
+    .expect("create table");
+    let run = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml stmt");
+    for i in 0..3 {
+        dml.execute(run(&format!(
+            "INSERT INTO analytics.inv (id, qty) VALUES ('i{i}', {i});"
+        )))
+        .await
+        .expect("insert");
+    }
+    let store_dir = tempfile::tempdir().expect("store tempdir");
+    let root_url = format!("file://{}", store_dir.path().display());
+    let bridge = IcebergObjectStoreBridge::from_url(&root_url).expect("bridge");
+    let location = dml
+        .materialize_table_to_parquet(&bridge, &root_url, "analytics.inv", None)
+        .await
+        .expect("materialize 1");
+    let prefix = location
+        .strip_prefix(&format!("{root_url}/"))
+        .expect("location under root")
+        .to_string();
+    let v1 = published_data_files(&bridge, &prefix).await;
+
+    dml.execute(run("UPDATE analytics.inv SET qty = 100 WHERE id = 'i0';"))
+        .await
+        .expect("update");
+    dml.materialize_table_to_parquet(&bridge, &root_url, "analytics.inv", None)
+        .await
+        .expect("materialize 2");
+    let v2 = published_data_files(&bridge, &prefix).await;
+    assert!(
+        v2.iter().all(|p| !v1.contains(p)),
+        "the update must rewrite, not be skipped as unchanged: {v1:?} -> {v2:?}"
+    );
+}
+
 /// Restores an environment variable when dropped (lib tests run one per process
 /// under nextest; locally they run serialized).
 struct EnvGuard(&'static str, Option<String>);

@@ -1058,28 +1058,12 @@ impl crate::query::execution::olap_delta_merge::OlapDeltaSource for DmlService {
         // by the bare name (legacy) OR the stable object_id (post-cutover), so we
         // union both. With the object_id-first design this is the path that lets the
         // tenant predicate drop out at O4 (object_id is globally unique).
-        let mut oids: std::collections::HashSet<String> = self
-            .record_store
-            .read_changes_since_scoped(table, tenant, snapshot_lsn)
-            .await?
-            .into_iter()
-            .map(|c| c.key)
-            .collect();
-        if let Ok((schema, _)) = self.resolve_select_table(table, tenant).await
-            && let Some(oid) = schema.object_id
-        {
-            let oid_key = oid.to_string();
-            if oid_key != table {
-                for c in self
-                    .record_store
-                    .read_changes_since_scoped(&oid_key, tenant, snapshot_lsn)
-                    .await?
-                {
-                    oids.insert(c.key);
-                }
-            }
-        }
-        Ok(oids.into_iter().collect())
+        let object_id = match self.resolve_select_table(table, tenant).await {
+            Ok((schema, _)) => schema.object_id,
+            Err(_) => None,
+        };
+        self.changed_oids_under(table, object_id, snapshot_lsn, tenant)
+            .await
     }
 
     async fn current_records(
@@ -2976,7 +2960,8 @@ impl DmlService {
                 .await
             {
                 Ok((materialize_append::AppendPlan::Append(oids), files)) => {
-                    match <Self as crate::query::execution::olap_delta_merge::OlapDeltaSource>::current_records(
+                    use crate::query::execution::olap_delta_merge::OlapDeltaSource;
+                    match <Self as OlapDeltaSource>::current_records(
                         self,
                         table_name,
                         &oids,
@@ -2987,8 +2972,14 @@ impl DmlService {
                         // Every new row was deleted again: nothing to publish,
                         // and the published files are exact as of now.
                         Ok((_, rows)) if rows.is_empty() => {
-                            self.advance_snapshot_lsn(&catalog, &table_id, snapshot_lsn, fence)
-                                .await?;
+                            self.advance_snapshot_lsn(
+                                &catalog,
+                                &table_id,
+                                previous,
+                                snapshot_lsn,
+                                fence,
+                            )
+                            .await?;
                             return Ok(location);
                         }
                         Ok((_, rows)) => {
@@ -3005,7 +2996,7 @@ impl DmlService {
                     // Nothing changed since the published snapshot: its files are
                     // exact as of now, so only its LSN moves up (which also lets
                     // WAL truncation pass the old one).
-                    self.advance_snapshot_lsn(&catalog, &table_id, snapshot_lsn, fence)
+                    self.advance_snapshot_lsn(&catalog, &table_id, previous, snapshot_lsn, fence)
                         .await?;
                     return Ok(location);
                 }
@@ -3294,6 +3285,39 @@ impl DmlService {
         Ok(location)
     }
 
+    /// The oids written to a table since `snapshot_lsn`: the union of its
+    /// name-keyed (legacy) and object_id-keyed (ADR-031) canonical-WAL feeds.
+    /// The name key is not namespace-unique, so the union can include another
+    /// table's oids; a superset is sound for every caller (they re-read rows).
+    async fn changed_oids_under(
+        &self,
+        name_key: &str,
+        object_id: Option<u64>,
+        snapshot_lsn: u64,
+        tenant: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let mut oids: std::collections::HashSet<String> = self
+            .record_store
+            .read_changes_since_scoped(name_key, tenant, snapshot_lsn)
+            .await?
+            .into_iter()
+            .map(|c| c.key)
+            .collect();
+        if let Some(oid) = object_id {
+            let oid_key = oid.to_string();
+            if oid_key != name_key {
+                for c in self
+                    .record_store
+                    .read_changes_since_scoped(&oid_key, tenant, snapshot_lsn)
+                    .await?
+                {
+                    oids.insert(c.key);
+                }
+            }
+        }
+        Ok(oids.into_iter().collect())
+    }
+
     /// The catalog `location` of a publication under `prefix`: the directory its
     /// data files are immediate children of.
     fn published_location(warehouse_root_url: &str, prefix: &str) -> String {
@@ -3307,6 +3331,7 @@ impl DmlService {
         &self,
         catalog: &Arc<dyn proximadb_catalog::Catalog>,
         table_id: &TableIdentifier,
+        previous: u64,
         snapshot_lsn: u64,
         fence: &dyn crate::services::ddl::PublishFence,
     ) -> Result<()> {
@@ -3315,7 +3340,15 @@ impl DmlService {
             .await
             .map_err(|e| e.context("MATERIALIZE: publish fence refused the snapshot advance"))?;
         let mut layouts = catalog.get_table(table_id).await?.storage_layouts;
-        if let Some(layout) = layouts.iter_mut().find(|l| l.name == "parquet-snapshot") {
+        // Only the publication this run planned against: if another one has
+        // flipped the layout since, its LSN describes its own files.
+        if let Some(layout) = layouts.iter_mut().find(|l| {
+            l.name == "parquet-snapshot"
+                && l.properties
+                    .get(materialize_stream::METADATA_VERSION_PROPERTY)
+                    .and_then(|v| v.parse::<u64>().ok())
+                    == Some(previous)
+        }) {
             layout
                 .properties
                 .insert("snapshot_lsn".to_string(), snapshot_lsn.to_string());
@@ -3399,6 +3432,12 @@ impl DmlService {
             .read_iceberg_table(metadata_prefix, previous)
             .await
             .map_err(|e| anyhow!("reading the published snapshot: {e}"))?;
+        if files.len() >= materialize_append::APPEND_MAX_FILES {
+            return Ok((
+                AppendPlan::Rewrite("the snapshot has many parts; a rewrite compacts them"),
+                Vec::new(),
+            ));
+        }
         let Some(published) =
             materialize_append::PublishedOids::read(bridge, &files, expected).await?
         else {
@@ -3410,13 +3449,11 @@ impl DmlService {
                 Vec::new(),
             ));
         };
-        let changed =
-            <Self as crate::query::execution::olap_delta_merge::OlapDeltaSource>::changed_oids_since(
-                self,
-                &schema.name,
-                snapshot_lsn,
-                tenant,
-            )
+        // Keyed exactly as the writes are (`wal_collection_id`), from the schema
+        // in hand: re-resolving the bare name would look in the `default`
+        // namespace and could miss every object_id-keyed write.
+        let changed = self
+            .changed_oids_under(&schema.name, schema.object_id, snapshot_lsn, tenant)
             .await?;
         Ok((
             materialize_append::classify(changed, &published, max_rows),
