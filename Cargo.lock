@@ -8224,6 +8224,7 @@ dependencies = [
  "bincode",
  "bytes",
  "chrono",
+ "crc32fast",
  "futures",
  "object_store",
  "parquet",
