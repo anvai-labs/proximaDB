@@ -15,6 +15,8 @@ use std::io::Error as IoError;
 pub mod counting;
 pub mod faults;
 mod forwarding;
+#[doc(hidden)]
+pub mod testing;
 
 // `forward_filesystem_impl!` expands in the caller's crate; these let it name
 // the attribute and the mmap type without the caller depending on either.

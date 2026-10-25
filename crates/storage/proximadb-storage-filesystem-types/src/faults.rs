@@ -143,7 +143,8 @@ crate::forward_filesystem_impl! {
         as_any, filesystem_type, supports_mmap, range_coalesce_policy, read_ranges,
         get_mmap, write, supports_bounded_local_file_write, write_local_file,
         write_if_absent, append, supports_append, supports_conditional_replace, exists,
-        metadata, list, create_dir, create_dir_all, copy, move_file, sync, open_file,
+        metadata, list, create_dir, create_dir_all, copy, move_file, sync, sync_file,
+        sync_data, open_file,
     ];
     {
 

@@ -179,7 +179,7 @@ crate::forward_filesystem_impl! {
         filesystem_type, supports_mmap, write, supports_bounded_local_file_write,
         write_local_file, write_if_absent, append, supports_append,
         supports_conditional_replace, delete, exists, metadata, list, create_dir,
-        create_dir_all, copy, move_file, sync, open_file,
+        create_dir_all, copy, move_file, sync, sync_file, sync_data, open_file,
     ];
     {
         fn as_any(&self) -> &dyn std::any::Any {

@@ -27,7 +27,10 @@
 /// `inner` names the wrapped field (anything that derefs to a `FileSystem`).
 /// Each method in `forward [..]` becomes `self.inner.<method>(..)` with the
 /// trait's exact signature; the block holds every other method the decorator
-/// implements. A method neither forwarded nor written keeps the trait default.
+/// implements. A method neither forwarded nor written keeps the trait default —
+/// so always forward (or write) `sync_file` and `sync_data`: their defaults are
+/// a no-op and a call to that no-op, which would silently drop the wrapped
+/// filesystem's fsync.
 #[macro_export]
 macro_rules! forward_filesystem_impl {
     (
@@ -231,6 +234,24 @@ macro_rules! forward_filesystem_impl {
             }
         ], [$($rest),*]);
     };
+    // Durability barriers. A decorator must forward both: the trait defaults
+    // are `sync_file` = `Ok(())` and `sync_data` = `self.sync_file`, so one
+    // that forwards neither turns every fsync on the wrapped filesystem into a
+    // silent no-op (TD-FSDECOR-1).
+    (@munch $ty:ty, $inner:ident, [$($acc:tt)*], [sync_file $(, $rest:ident)*]) => {
+        $crate::forward_filesystem_impl!(@munch $ty, $inner, [$($acc)*
+            async fn sync_file(&self, path: &str) -> $crate::FsResult<()> {
+                self.$inner.sync_file(path).await
+            }
+        ], [$($rest),*]);
+    };
+    (@munch $ty:ty, $inner:ident, [$($acc:tt)*], [sync_data $(, $rest:ident)*]) => {
+        $crate::forward_filesystem_impl!(@munch $ty, $inner, [$($acc)*
+            async fn sync_data(&self, path: &str) -> $crate::FsResult<()> {
+                self.$inner.sync_data(path).await
+            }
+        ], [$($rest),*]);
+    };
     (@munch $ty:ty, $inner:ident, [$($acc:tt)*], [sync $(, $rest:ident)*]) => {
         $crate::forward_filesystem_impl!(@munch $ty, $inner, [$($acc)*
             async fn sync(&self) -> $crate::FsResult<()> {
@@ -249,4 +270,42 @@ macro_rules! forward_filesystem_impl {
             }
         ], [$($rest),*]);
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::FileSystem;
+    use crate::counting::{CountingFileSystem, GetCounters};
+    use crate::faults::FaultInjectingFileSystem;
+    use crate::testing::SyncRecorder;
+
+    /// TD-FSDECOR-1: a decorator must pass both durability barriers through.
+    /// The trait defaults are `sync_file` = `Ok(())` and `sync_data` =
+    /// `self.sync_file`, so a decorator that forwards neither turns every
+    /// fsync on the wrapped (local) filesystem into a silent no-op.
+    async fn assert_barriers_reach_inner(decorated: &dyn FileSystem, inner: &SyncRecorder) {
+        decorated.sync_file("seg.pax").await.expect("sync_file");
+        decorated.sync_data("wal.log").await.expect("sync_data");
+        assert_eq!(
+            inner.synced(),
+            vec!["file seg.pax".to_string(), "data wal.log".to_string()],
+            "the decorator must forward sync_file and sync_data to the wrapped filesystem"
+        );
+    }
+
+    #[test]
+    fn counting_file_system_forwards_durability_barriers() {
+        let inner = Arc::new(SyncRecorder::default());
+        let decorated = CountingFileSystem::new(inner.clone(), Arc::new(GetCounters::default()));
+        futures::executor::block_on(assert_barriers_reach_inner(&decorated, &inner));
+    }
+
+    #[test]
+    fn fault_injecting_file_system_forwards_durability_barriers() {
+        let inner = Arc::new(SyncRecorder::default());
+        let decorated = FaultInjectingFileSystem::new(inner.clone());
+        futures::executor::block_on(assert_barriers_reach_inner(&decorated, &inner));
+    }
 }

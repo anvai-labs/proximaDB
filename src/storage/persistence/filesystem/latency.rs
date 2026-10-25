@@ -145,7 +145,7 @@ proximadb_storage_filesystem_types::forward_filesystem_impl! {
         as_any, filesystem_type, range_coalesce_policy, write, compare_exchange,
         supports_bounded_local_file_write, write_local_file, write_if_absent, append,
         supports_append, supports_conditional_replace, delete, create_dir, create_dir_all,
-        copy, move_file, sync, open_file,
+        copy, move_file, sync, sync_file, sync_data, open_file,
     ];
     {
         fn supports_mmap(&self) -> bool {

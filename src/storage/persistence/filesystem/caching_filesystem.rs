@@ -536,6 +536,19 @@ impl FileSystem for UnifiedCachingFilesystem {
         self.underlying_fs.sync().await
     }
 
+    // TD-FSDECOR-1: this cache is write-through (writes invalidate and go
+    // straight to `underlying_fs`), so a durability barrier is the underlying
+    // filesystem's own. Without these, the trait defaults made both a silent
+    // no-op — and this layer wraps the storage engines unconditionally, so e.g.
+    // RAPTOR's flush-footer `sync_file` never reached disk.
+    async fn sync_file(&self, path: &str) -> FsResult<()> {
+        self.underlying_fs.sync_file(path).await
+    }
+
+    async fn sync_data(&self, path: &str) -> FsResult<()> {
+        self.underlying_fs.sync_data(path).await
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -785,5 +798,29 @@ mod tests {
 
         assert_eq!(range, b"cde");
         assert!(fs.get_metrics().await.total_hits >= 1);
+    }
+}
+
+#[cfg(test)]
+mod sync_forwarding_tests {
+    use std::sync::Arc;
+
+    use proximadb_storage_filesystem_types::testing::SyncRecorder;
+
+    use super::{FileSystem, UnifiedCachingFilesystem};
+
+    /// TD-FSDECOR-1: the always-on caching layer must pass both durability
+    /// barriers to the filesystem it caches.
+    #[tokio::test]
+    async fn caching_filesystem_forwards_durability_barriers() {
+        let inner = Arc::new(SyncRecorder::default());
+        let cached =
+            UnifiedCachingFilesystem::new(inner.clone(), "c".to_string(), "sst".to_string());
+        cached.sync_file("seg.pax").await.expect("sync_file");
+        cached.sync_data("wal.log").await.expect("sync_data");
+        assert_eq!(
+            inner.synced(),
+            vec!["file seg.pax".to_string(), "data wal.log".to_string()]
+        );
     }
 }
