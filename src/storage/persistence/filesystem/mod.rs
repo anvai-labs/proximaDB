@@ -183,6 +183,9 @@ pub mod aws_s3;
 pub mod azure_blob;
 #[cfg(feature = "gcp")]
 pub mod gcs_store;
+/// TD-PAXDIR-1 D6 test support: injected request latency + wave counting.
+#[cfg(test)]
+pub(crate) mod latency;
 pub mod scheme_validation;
 pub mod write_strategy;
 // zero_copy_filesystem removed - functionality integrated into UnifiedCachingFilesystem
@@ -579,6 +582,9 @@ impl FilesystemFactory {
         } else {
             fs
         };
+        // TD-PAXDIR-1 D6: test builds only, armed by PROXIMADB_TEST_FS_LATENCY_MS.
+        #[cfg(test)]
+        let fs = latency::maybe_wrap(fs);
         if std::env::var_os("PROXIMADB_COUNT_FS_IO").is_some() {
             Ok(Arc::new(
                 proximadb_storage_filesystem_types::counting::CountingFileSystem::new(

@@ -715,7 +715,7 @@ impl BlockTierAssignment {
     }
 }
 
-fn write_block_entry(
+pub(crate) fn write_block_entry(
     output: &mut Vec<u8>,
     block: &FooterBlockEntry,
     stats: Option<&FooterRowGroupStats>,
@@ -741,7 +741,7 @@ fn write_block_entry(
 /// Returns the per-entry stats payloads (index-aligned with the entries).
 /// Unknown or zero-length stats tags decode to `None` — forward- and
 /// backward-compatible with v1/v3 footers and any future stats kind.
-fn read_blocks(
+pub(crate) fn read_blocks(
     input: &[u8],
     position: &mut usize,
 ) -> Result<(Vec<FooterBlockEntry>, Vec<Option<FooterRowGroupStats>>)> {

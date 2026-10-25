@@ -41,17 +41,22 @@ enum Scheme {
 }
 
 impl Scheme {
+    /// Object stores resolve through the filesystem seam's single scheme list
+    /// (`ObjectStoreScheme`), which the ranged-read wave width shares.
     fn of(path: &str) -> Self {
-        match path
-            .split_once("://")
-            .map(|(s, _)| s.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("azure" | "abfs" | "adls" | "az") => Self::Azure,
-            Some("s3" | "http" | "https") => Self::S3,
-            Some("gs" | "gcs") => Self::Gcs,
-            Some("file" | "minio") | None => Self::Local,
-            Some(_) => Self::Unknown,
+        use proximadb_storage_filesystem_types::object_store_scheme::ObjectStoreScheme;
+        match ObjectStoreScheme::of(path) {
+            Some(ObjectStoreScheme::Azure) => Self::Azure,
+            Some(ObjectStoreScheme::S3) => Self::S3,
+            Some(ObjectStoreScheme::Gcs) => Self::Gcs,
+            None => match path
+                .split_once("://")
+                .map(|(s, _)| s.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("file" | "minio") | None => Self::Local,
+                Some(_) => Self::Unknown,
+            },
         }
     }
 }

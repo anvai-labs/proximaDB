@@ -63,6 +63,9 @@ impl Drop for UmbrellaTimer {
 pub(crate) struct DiscoveredSstFile {
     pub url: String,
     pub size_bytes: Option<u64>,
+    /// The listing's ETag, when the backend reports one (TD-PAXDIR-1 D6
+    /// binds a directory decode key to it).
+    pub etag: Option<String>,
 }
 
 /// TD-SEARCH-2 S2: process-wide in-flight cold-scan counter — the input to
@@ -2054,7 +2057,10 @@ impl SstEngine {
         k: usize,
         distance_metric: DistanceMetric,
         filtered_or_exact: bool,
-    ) -> std::collections::HashMap<String, std::sync::Arc<[u32]>> {
+    ) -> std::collections::HashMap<
+        String,
+        std::sync::Arc<crate::storage::engines::sst::centroid_directory_reader::DirectoryChoice>,
+    > {
         use crate::storage::engines::sst::centroid_directory_reader as reader;
         if filtered_or_exact
             || !Self::is_pax_cascade_metric(distance_metric)
@@ -2072,7 +2078,9 @@ impl SstEngine {
         };
         reader::plan_segments(
             &dir,
-            files.iter().map(|f| (f.url.as_str(), f.size_bytes)),
+            files
+                .iter()
+                .map(|f| (f.url.as_str(), f.size_bytes, f.etag.as_deref())),
             query,
             k,
         )
@@ -2136,7 +2144,11 @@ impl SstEngine {
                 filter_expression.is_some() || prune_config.force_exact,
             )
             .await;
-        sstable_files.retain(|f| directory_cells.get(&f.url).is_none_or(|c| !c.is_empty()));
+        sstable_files.retain(|f| {
+            directory_cells
+                .get(&f.url)
+                .is_none_or(|c| !c.cells.is_empty())
+        });
 
         let file_count = u16::try_from(sstable_files.len()).unwrap_or(u16::MAX);
         let degree = resolve_search_parallelism(self.config().search_parallel_files)
@@ -2178,6 +2190,7 @@ impl SstEngine {
                 let DiscoveredSstFile {
                     url: path,
                     size_bytes: known_size,
+                    ..
                 } = discovered;
                 // Gate concurrency: await a permit before spawning (bound at degree).
                 let permit = std::sync::Arc::clone(&sem).acquire_owned().await?;
@@ -2708,6 +2721,7 @@ impl SstEngine {
                 // reader fall back to a real stat; never guess.
                 files.push(DiscoveredSstFile {
                     size_bytes: (entry.metadata.size > 0).then_some(entry.metadata.size),
+                    etag: entry.metadata.etag.clone(),
                     url: entry.url,
                 });
                 tracing::debug!("[SST] Found data file: {}", entry.name);

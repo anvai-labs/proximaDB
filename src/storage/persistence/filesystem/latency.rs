@@ -1,0 +1,271 @@
+//! TD-PAXDIR-1 D6 test support: a fixed per-request latency and a sequential
+//! wave count (design §4.1, "a test-only `LatencyFileSystem` wrapper").
+//!
+//! `LatencyFileSystem` sleeps `PROXIMADB_TEST_FS_LATENCY_MS` before every
+//! read, ranged read, LIST, HEAD and existence check, and records each
+//! request's `(task, start, end)`. Requests a task issues concurrently (one
+//! `read_ranges_prefetch` wave) overlap; requests it issues one after another
+//! do not, so a task's **waves** are its maximal groups of overlapping
+//! requests. [`critical_path_waves`] adds the waves of the query's own task
+//! (LIST, directory) to those of its slowest spawned per-segment scan, which
+//! is exact for the search fan-out — it waits for every scan — and, unlike
+//! one global overlap count, never merges two scans' waves because their
+//! tasks started a few microseconds apart.
+//!
+//! Compiled only for tests and installed by the filesystem factory only when
+//! the env gate is set.
+
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use proximadb_storage_filesystem_types::{
+    DirEntry, FileOptions, FileSystem, FilesystemFile, FsFileMetadata, FsResult,
+    RangeCoalescePolicy,
+};
+
+/// One recorded request: issuing task (`None` = not a spawned task), its
+/// interval, and a label (`op path [offset+len]`) for failure messages.
+type Request = (Option<tokio::task::Id>, Instant, Instant, String);
+
+fn requests() -> &'static Mutex<Vec<Request>> {
+    static REQUESTS: OnceLock<Mutex<Vec<Request>>> = OnceLock::new();
+    REQUESTS.get_or_init(Default::default)
+}
+
+fn delay() -> Option<Duration> {
+    static DELAY: OnceLock<Option<Duration>> = OnceLock::new();
+    *DELAY.get_or_init(|| {
+        std::env::var("PROXIMADB_TEST_FS_LATENCY_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    })
+}
+
+/// Wrap `fs` when `PROXIMADB_TEST_FS_LATENCY_MS` is set; otherwise return it.
+pub(crate) fn maybe_wrap(fs: Arc<dyn FileSystem>) -> Arc<dyn FileSystem> {
+    match delay() {
+        Some(delay) => Arc::new(LatencyFileSystem { inner: fs, delay }),
+        None => fs,
+    }
+}
+
+/// Forget every recorded request.
+pub(crate) fn reset() {
+    requests()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
+/// Requests recorded since the last [`reset`].
+pub(crate) fn request_count() -> usize {
+    requests()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len()
+}
+
+/// Sequential waves since the last [`reset`]: the root task's waves plus the
+/// most of any spawned task (see the module docs).
+pub(crate) fn critical_path_waves() -> usize {
+    let recorded = requests()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let mut by_task: std::collections::HashMap<Option<tokio::task::Id>, Vec<(Instant, Instant)>> =
+        Default::default();
+    for (task, start, end, _) in recorded {
+        by_task.entry(task).or_default().push((start, end));
+    }
+    let root = by_task.remove(&None).map_or(0, |r| waves(r));
+    root + by_task.into_values().map(waves).max().unwrap_or(0)
+}
+
+/// Every recorded request as `task +start_ms..end_ms label`, in start order
+/// (for diagnosing a wave count).
+pub(crate) fn describe() -> String {
+    let mut recorded = requests()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    recorded.sort_by_key(|r| r.1);
+    let Some(t0) = recorded.first().map(|r| r.1) else {
+        return String::new();
+    };
+    recorded
+        .iter()
+        .map(|(task, start, end, label)| {
+            format!(
+                "{task:?} +{}..{}ms {label}\n",
+                (*start - t0).as_millis(),
+                (*end - t0).as_millis()
+            )
+        })
+        .collect()
+}
+
+/// Maximal groups of overlapping intervals.
+fn waves(mut intervals: Vec<(Instant, Instant)>) -> usize {
+    intervals.sort_by_key(|(start, _)| *start);
+    let mut count = 0;
+    let mut group_end: Option<Instant> = None;
+    for (start, end) in intervals {
+        match group_end {
+            Some(e) if start < e => group_end = Some(e.max(end)),
+            _ => {
+                count += 1;
+                group_end = Some(end);
+            }
+        }
+    }
+    count
+}
+
+#[derive(Debug)]
+struct LatencyFileSystem {
+    inner: Arc<dyn FileSystem>,
+    delay: Duration,
+}
+
+impl LatencyFileSystem {
+    async fn timed<T>(&self, label: String, op: impl std::future::Future<Output = T>) -> T {
+        let start = Instant::now();
+        tokio::time::sleep(self.delay).await;
+        let out = op.await;
+        requests()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((tokio::task::try_id(), start, Instant::now(), label));
+        out
+    }
+}
+
+#[async_trait]
+impl FileSystem for LatencyFileSystem {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self.inner.as_any()
+    }
+    fn filesystem_type(&self) -> &'static str {
+        self.inner.filesystem_type()
+    }
+    fn supports_mmap(&self) -> bool {
+        false // every read must pay the injected latency
+    }
+    fn range_coalesce_policy(&self) -> Option<RangeCoalescePolicy> {
+        self.inner.range_coalesce_policy()
+    }
+
+    // Latency-bearing requests. `read_ranges` / `read_ranges_prefetch` keep
+    // the trait defaults, which issue `self.read_range` per physical range.
+    async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
+        self.timed(format!("read {path}"), self.inner.read(path))
+            .await
+    }
+    async fn read_range(&self, path: &str, offset: u64, length: u64) -> FsResult<Vec<u8>> {
+        let label = format!("range {path} [{offset}+{length}]");
+        self.timed(label, self.inner.read_range(path, offset, length))
+            .await
+    }
+    async fn list(&self, path: &str) -> FsResult<Vec<DirEntry>> {
+        self.timed(format!("list {path}"), self.inner.list(path))
+            .await
+    }
+    async fn metadata(&self, path: &str) -> FsResult<FsFileMetadata> {
+        self.timed(format!("head {path}"), self.inner.metadata(path))
+            .await
+    }
+    async fn exists(&self, path: &str) -> FsResult<bool> {
+        self.timed(format!("exists {path}"), self.inner.exists(path))
+            .await
+    }
+
+    // Pass-through (no latency): writes and file handles.
+    async fn write(&self, path: &str, data: &[u8], options: Option<FileOptions>) -> FsResult<()> {
+        self.inner.write(path, data, options).await
+    }
+    fn supports_bounded_local_file_write(&self) -> bool {
+        self.inner.supports_bounded_local_file_write()
+    }
+    async fn write_local_file(
+        &self,
+        path: &str,
+        local_path: &std::path::Path,
+        options: Option<FileOptions>,
+    ) -> FsResult<u64> {
+        self.inner.write_local_file(path, local_path, options).await
+    }
+    async fn write_if_absent(
+        &self,
+        path: &str,
+        data: &[u8],
+        options: Option<FileOptions>,
+    ) -> FsResult<()> {
+        self.inner.write_if_absent(path, data, options).await
+    }
+    async fn append(&self, path: &str, data: &[u8]) -> FsResult<()> {
+        self.inner.append(path, data).await
+    }
+    async fn compare_exchange(
+        &self,
+        path: &str,
+        expected: Option<&[u8]>,
+        replacement: &[u8],
+        guards: &[(&str, Option<&[u8]>)],
+    ) -> FsResult<bool> {
+        self.inner
+            .compare_exchange(path, expected, replacement, guards)
+            .await
+    }
+    fn supports_append(&self) -> bool {
+        self.inner.supports_append()
+    }
+    fn supports_conditional_replace(&self) -> bool {
+        self.inner.supports_conditional_replace()
+    }
+    async fn delete(&self, path: &str) -> FsResult<()> {
+        self.inner.delete(path).await
+    }
+    async fn create_dir(&self, path: &str) -> FsResult<()> {
+        self.inner.create_dir(path).await
+    }
+    async fn create_dir_all(&self, path: &str) -> FsResult<()> {
+        self.inner.create_dir_all(path).await
+    }
+    async fn copy(&self, from: &str, to: &str) -> FsResult<()> {
+        self.inner.copy(from, to).await
+    }
+    async fn move_file(&self, from: &str, to: &str) -> FsResult<()> {
+        self.inner.move_file(from, to).await
+    }
+    async fn sync(&self) -> FsResult<()> {
+        self.inner.sync().await
+    }
+    async fn open_file(&self, path: &str, create: bool) -> FsResult<Box<dyn FilesystemFile>> {
+        self.inner.open_file(path, create).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::waves;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn overlapping_requests_form_one_wave_and_sequential_ones_do_not() {
+        let t = Instant::now();
+        let at = |ms: u64| t + Duration::from_millis(ms);
+        assert_eq!(waves(Vec::new()), 0);
+        // Three parallel reads, then two sequential ones.
+        let intervals = vec![
+            (at(0), at(10)),
+            (at(1), at(11)),
+            (at(2), at(12)),
+            (at(12), at(22)),
+            (at(30), at(40)),
+        ];
+        assert_eq!(waves(intervals), 3);
+    }
+}

@@ -12,6 +12,11 @@
 //! 3. Read the Region A0 of every other live segment (header prefix, then A0:
 //!    two ranged reads, off the query path). Segments without a usable A0 are
 //!    recorded as examined-but-uncovered, so later publishes skip them.
+//!    TD-PAXDIR-1 D6 (`PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS`, default
+//!    OFF): a covered segment also gets a **decode key** (its Region-A header
+//!    and footer: two more ranged reads, and its listed ETag), kept only when
+//!    the A0 the directory rebuilds from it is byte-identical to the
+//!    segment's. Entries carried from the base keep their key, if any.
 //! 4. Write generation `g + 1` **create-only**. Losing the race to another
 //!    publisher reloads and retries; repeated losses give up, since the next
 //!    compaction repairs the directory.
@@ -22,11 +27,16 @@
 //! failure is logged and never fails the compaction: the directory is a
 //! projection, and without one queries use the per-segment cascade.
 
+use std::collections::HashMap;
+
 use proximadb_storage_common::centroid_directory::{
-    LiveSegment, PaxCentroidDirectory, object_name, parse_object_name, plan_reconcile,
+    DirectorySegment, LiveSegment, PaxCentroidDirectory, SegmentDecodeKey, object_name,
+    parse_object_name, plan_reconcile_keeping,
 };
 use proximadb_storage_common::coarse_directory::CoarseDirectory;
-use proximadb_storage_common::segment_layout::{SEG_HEADER_PREFIX_LEN, SegmentHeaderPrefix};
+use proximadb_storage_common::segment_layout::{
+    SEG_HEADER_PREFIX_LEN, SegmentFooterIndex, SegmentHeaderPrefix,
+};
 use proximadb_storage_filesystem_types::{DirEntry, FileSystem, FilesystemError};
 
 use crate::storage::engines::sst::block_cluster::env_gate_on;
@@ -40,6 +50,13 @@ pub fn centroid_directory_write_enabled() -> bool {
     env_gate_on("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY")
 }
 
+/// TD-PAXDIR-1 D6 WRITE gate: publishes add decode keys for the segments they
+/// load (two more ranged reads each) and write the v2 format. Off, the
+/// directory is the D1 format, byte for byte.
+pub fn directory_decode_keys_write_enabled() -> bool {
+    env_gate_on("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS")
+}
+
 /// Directory objects in a listing, newest generation first.
 pub(crate) fn directory_objects_newest_first(entries: &[DirEntry]) -> Vec<(u64, &DirEntry)> {
     let mut objects: Vec<(u64, &DirEntry)> = entries
@@ -51,6 +68,15 @@ pub(crate) fn directory_objects_newest_first(entries: &[DirEntry]) -> Vec<(u64, 
     objects
 }
 
+/// A segment's Region A0 as the publisher reads it.
+pub(crate) struct SegmentA0 {
+    pub(crate) a0: CoarseDirectory,
+    /// The raw A0 bytes (the decode-key rebuild must reproduce them).
+    a0_bytes: Vec<u8>,
+    header: SegmentHeaderPrefix,
+    prefix: Vec<u8>,
+}
+
 /// Read and parse a segment's Region A0. `Ok(None)` when the segment has no
 /// usable A0 (a non-coalesced layout, an untrained segment, or a corrupt
 /// directory); `Err` only for I/O failures.
@@ -59,6 +85,16 @@ pub(crate) async fn read_segment_a0(
     url: &str,
     size_bytes: u64,
 ) -> Result<Option<CoarseDirectory>, FilesystemError> {
+    Ok(read_segment_a0_with_header(fs, url, size_bytes)
+        .await?
+        .map(|s| s.a0))
+}
+
+async fn read_segment_a0_with_header(
+    fs: &dyn FileSystem,
+    url: &str,
+    size_bytes: u64,
+) -> Result<Option<SegmentA0>, FilesystemError> {
     let prefix_len = (SEG_HEADER_PREFIX_LEN as u64).min(size_bytes);
     if prefix_len < SEG_HEADER_PREFIX_LEN as u64 {
         return Ok(None);
@@ -67,15 +103,109 @@ pub(crate) async fn read_segment_a0(
     let Ok(header) = SegmentHeaderPrefix::parse(&prefix) else {
         return Ok(None);
     };
-    let in_bounds = header
-        .a0_off
-        .checked_add(header.a0_len)
-        .is_some_and(|end| end <= size_bytes);
-    if header.a0_len == 0 || !in_bounds {
+    if header.a0_len == 0 || !within(size_bytes, header.a0_off, header.a0_len) {
         return Ok(None);
     }
-    let bytes = fs.read_range(url, header.a0_off, header.a0_len).await?;
-    Ok(CoarseDirectory::parse(&bytes).ok())
+    let a0_bytes = fs.read_range(url, header.a0_off, header.a0_len).await?;
+    Ok(CoarseDirectory::parse(&a0_bytes).ok().map(|a0| SegmentA0 {
+        a0,
+        a0_bytes,
+        header,
+        prefix,
+    }))
+}
+
+fn within(size_bytes: u64, off: u64, len: u64) -> bool {
+    off.checked_add(len).is_some_and(|end| end <= size_bytes)
+}
+
+/// TD-PAXDIR-1 D6: read the rest of a covered segment's query-path metadata
+/// (the Region-A header and the footer) and build its decode key. `None` when
+/// a read fails or the parts disagree: the segment stays covered without a
+/// key and its queries read their own metadata.
+async fn read_decode_key(
+    fs: &dyn FileSystem,
+    url: &str,
+    size_bytes: u64,
+    etag: Option<&str>,
+    segment: &SegmentA0,
+) -> Option<SegmentDecodeKey> {
+    let header = &segment.header;
+    let hdr_len = proximadb_block_format::region_header_len(segment.a0.model.dim) as u64;
+    if !within(size_bytes, header.rabitq_off, hdr_len)
+        || !within(size_bytes, header.footer_off, header.footer_len)
+    {
+        return None;
+    }
+    let read = async {
+        let rabitq_header = fs.read_range(url, header.rabitq_off, hdr_len).await?;
+        let footer = fs
+            .read_range(url, header.footer_off, header.footer_len)
+            .await?;
+        Ok::<_, FilesystemError>((rabitq_header, footer))
+    };
+    let (rabitq_header, footer) = match read.await {
+        Ok(parts) => parts,
+        Err(error) => {
+            tracing::debug!(%url, %error, "segment metadata unreadable; no decode key");
+            return None;
+        }
+    };
+    let footer = SegmentFooterIndex::parse(&footer).ok()?;
+    SegmentDecodeKey::from_segment(&segment.prefix, &segment.a0, &rabitq_header, &footer, etag)
+        .map_err(|error| tracing::debug!(%url, %error, "segment has no decode key"))
+        .ok()
+}
+
+/// Keys the published directory may keep: none when the write gate is off
+/// (so turning it off returns the directory to the D1 v1 format, carried
+/// keys included), and otherwise only keys whose recorded ETag still matches
+/// the segment's listing (a carried key for a rewritten object is dropped
+/// rather than refused by every reader).
+fn retain_current_decode_keys(
+    dir: &mut PaxCentroidDirectory,
+    decode_keys: bool,
+    listed: &HashMap<String, (String, Option<String>)>,
+) {
+    for segment in &mut dir.segments {
+        if !(decode_keys && key_matches_listing(segment, listed)) {
+            segment.decode_key = None;
+        }
+    }
+}
+
+/// Whether `segment`'s decode key records the ETag its listing reports.
+fn key_matches_listing(
+    segment: &DirectorySegment,
+    listed: &HashMap<String, (String, Option<String>)>,
+) -> bool {
+    segment.decode_key.as_ref().is_some_and(|key| {
+        listed
+            .get(&segment.name)
+            .is_some_and(|(_, etag)| key.matches_object(etag.as_deref()))
+    })
+}
+
+/// Drop every freshly added key whose rebuilt A0 is not byte-identical to
+/// the segment's own (e.g. two models sharing a `model_id`): a key must never
+/// describe a segment differently from its bytes.
+fn verify_decode_keys(dir: &mut PaxCentroidDirectory, a0_by_name: &HashMap<String, Vec<u8>>) {
+    for idx in 0..dir.segments.len() {
+        let Some(expected) = a0_by_name.get(&dir.segments[idx].name) else {
+            continue;
+        };
+        if dir.segments[idx].decode_key.is_none() {
+            continue;
+        }
+        let rebuilt = dir.segment_decode(idx).map(|d| d.a0);
+        if rebuilt.as_ref().ok() != Some(expected) {
+            tracing::warn!(
+                segment = %dir.segments[idx].name,
+                "decode key does not reproduce the segment's A0; publishing without it"
+            );
+            dir.segments[idx].decode_key = None;
+        }
+    }
 }
 
 /// Newest directory in `entries` that reads and parses; corrupt or unreadable
@@ -128,7 +258,7 @@ pub async fn publish_centroid_directory(
         let entries = fs.list(dir_url).await?;
         let pending = retirement_ledger::pending_paths();
         let mut live = Vec::new();
-        let mut urls = std::collections::HashMap::new();
+        let mut urls: HashMap<String, (String, Option<String>)> = HashMap::new();
         for entry in &entries {
             if entry.metadata.is_directory
                 || !entry.name.ends_with(".pax")
@@ -139,7 +269,10 @@ pub async fn publish_centroid_directory(
             let Some(size_bytes) = object_size(fs, entry).await else {
                 continue; // vanished between LIST and stat: not live
             };
-            urls.insert(entry.name.clone(), entry.url.clone());
+            urls.insert(
+                entry.name.clone(),
+                (entry.url.clone(), entry.metadata.etag.clone()),
+            );
             live.push(LiveSegment {
                 name: entry.name.clone(),
                 size_bytes,
@@ -148,24 +281,46 @@ pub async fn publish_centroid_directory(
         let objects = directory_objects_newest_first(&entries);
         let newest_generation = objects.first().map(|(g, _)| *g);
         let base = load_newest_valid(fs, &objects).await;
-        let mut plan = plan_reconcile(base.as_ref(), &live);
+        let decode_keys = directory_decode_keys_write_enabled();
+        // D6: a carried entry whose key no longer matches its object (a
+        // rewrite in place) is reloaded, cells included.
+        let mut plan = plan_reconcile_keeping(base.as_ref(), &live, |segment| {
+            segment
+                .decode_key
+                .as_ref()
+                .is_none_or(|_| key_matches_listing(segment, &urls))
+        });
         // A base older than the newest object (the newest was corrupt) is
-        // republished even if it matches the live set.
+        // republished even if it matches the live set, and so is one whose
+        // keys the write gate no longer allows (turning the gate off must
+        // return the directory to v1 without waiting for another change).
         let base_is_newest = base.as_ref().map(|d| d.generation) == newest_generation;
-        if !plan.changed && base_is_newest {
+        let keys_to_drop = !decode_keys
+            && base
+                .as_ref()
+                .is_some_and(|d| d.segments.iter().any(|s| s.decode_key.is_some()));
+        if !plan.changed && base_is_newest && !keys_to_drop {
             return Ok(None);
         }
+        let mut a0_by_name = HashMap::new();
         for segment in &plan.to_load {
-            let url = &urls[&segment.name];
-            match read_segment_a0(fs, url, segment.size_bytes).await {
-                Ok(Some(a0)) => {
+            let (url, etag) = &urls[&segment.name];
+            match read_segment_a0_with_header(fs, url, segment.size_bytes).await {
+                Ok(Some(read)) => {
                     if let Err(error) =
                         plan.builder
-                            .add_covered(&segment.name, segment.size_bytes, &a0)
+                            .add_covered(&segment.name, segment.size_bytes, &read.a0)
                     {
                         tracing::debug!(%url, %error, "segment not addressable by the directory");
                         plan.builder
                             .add_uncovered(&segment.name, segment.size_bytes);
+                    } else if decode_keys
+                        && let Some(key) =
+                            read_decode_key(fs, url, segment.size_bytes, etag.as_deref(), &read)
+                                .await
+                        && plan.builder.set_decode_key(&segment.name, key).is_ok()
+                    {
+                        a0_by_name.insert(segment.name.clone(), read.a0_bytes);
                     }
                 }
                 Ok(None) => plan
@@ -178,7 +333,10 @@ pub async fn publish_centroid_directory(
             }
         }
         let generation = newest_generation.map_or(1, |g| g.saturating_add(1));
-        let bytes = plan.builder.build(generation)?.to_bytes()?;
+        let mut dir = plan.builder.build(generation)?;
+        verify_decode_keys(&mut dir, &a0_by_name);
+        retain_current_decode_keys(&mut dir, decode_keys, &urls);
+        let bytes = dir.to_bytes()?;
         let url = format!("{dir_url}/{}", object_name(generation));
         match fs.write_if_absent(&url, &bytes, None).await {
             Ok(()) => {
@@ -203,7 +361,7 @@ pub async fn publish_centroid_directory(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::storage::engines::sst::segment_format::write_pax_segment_compacted;
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
@@ -241,7 +399,7 @@ mod tests {
             .collect()
     }
 
-    fn write_segment(dir: &std::path::Path, name: &str, seed: usize) {
+    pub(crate) fn write_segment(dir: &std::path::Path, name: &str, seed: usize) {
         write_pax_segment_compacted(
             &dir.join(name),
             &records(seed, 300),
@@ -326,6 +484,184 @@ mod tests {
             publish_centroid_directory(&fs, &dir_url).await.unwrap(),
             None
         );
+    }
+
+    /// TD-PAXDIR-1 D6: every covered segment is published with a decode key
+    /// that rebuilds its header, Region A0, Region-A header and the footer's
+    /// ANN fields exactly as the segment stores them.
+    #[tokio::test]
+    async fn published_decode_keys_reproduce_the_segment_metadata() {
+        enable_trained_layout();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1") };
+        let tmp = tempfile::tempdir().unwrap();
+        write_segment(tmp.path(), "a.pax", 0);
+        write_segment(tmp.path(), "b.pax", 7);
+        let fs = local_fs().await;
+        let dir_url = tmp.path().to_string_lossy().to_string();
+        publish_centroid_directory(&fs, &dir_url).await.unwrap();
+        let dir = &newest(&fs, &dir_url).await[0].1;
+        assert_eq!(dir.covered_segments().count(), 2, "both segments covered");
+        for (idx, segment) in dir.covered_segments() {
+            // Read the segment's own metadata through the FileSystem seam,
+            // as ranged reads — the same way the query path would.
+            let url = format!("{dir_url}/{}", segment.name);
+            let read = |off: u64, len: u64| fs.read_range(&url, off, len);
+            let prefix = read(0, SEG_HEADER_PREFIX_LEN as u64).await.unwrap();
+            let header = SegmentHeaderPrefix::parse(&prefix).unwrap();
+            let decoded = dir
+                .segment_decode(idx)
+                .expect("covered segments carry a key");
+            assert_eq!(decoded.header_prefix, prefix);
+            assert_eq!(
+                decoded.a0,
+                read(header.a0_off, header.a0_len).await.unwrap()
+            );
+            let hdr_len = proximadb_block_format::region_header_len(DIM as u32) as u64;
+            assert_eq!(
+                decoded.rabitq_header,
+                read(header.rabitq_off, hdr_len).await.unwrap()
+            );
+            let real = SegmentFooterIndex::parse(
+                &read(header.footer_off, header.footer_len).await.unwrap(),
+            )
+            .unwrap();
+            let ann = SegmentFooterIndex::parse(&decoded.ann_footer).unwrap();
+            assert_eq!(ann.row_count, real.row_count);
+            assert_eq!(
+                (ann.sq8_min.to_bits(), ann.sq8_scale.to_bits()),
+                (real.sq8_min.to_bits(), real.sq8_scale.to_bits())
+            );
+            assert_eq!(ann.embed_dim, real.embed_dim);
+            assert_eq!(ann.embed_count, real.embed_count);
+            assert_eq!(ann.embed_quant_tag, real.embed_quant_tag);
+            assert_eq!(ann.has_f32_tier, real.has_f32_tier);
+            assert_eq!(
+                (ann.rabitq_off, ann.rabitq_len, ann.sq8_off, ann.sq8_len),
+                (real.rabitq_off, real.rabitq_len, real.sq8_off, real.sq8_len)
+            );
+            assert_eq!(
+                (ann.a0_off, ann.a0_len, ann.c_off, ann.c_len),
+                (real.a0_off, real.a0_len, real.c_off, real.c_len)
+            );
+            assert_eq!(ann.blocks, real.blocks);
+            assert_eq!(ann.block_stats, real.block_stats);
+        }
+    }
+
+    /// Turning the decode-key write gate off returns the next publish to the
+    /// D1 (v1) format, even for keys carried from a keyed base.
+    #[tokio::test]
+    async fn turning_the_key_gate_off_drops_carried_keys() {
+        enable_trained_layout();
+        let tmp = tempfile::tempdir().unwrap();
+        write_segment(tmp.path(), "a.pax", 0);
+        let fs = local_fs().await;
+        let dir_url = tmp.path().to_string_lossy().to_string();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1") };
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            Some(1)
+        );
+        let keyed = fs
+            .read(&format!("{dir_url}/{}", object_name(1)))
+            .await
+            .unwrap();
+        assert_eq!(keyed[4], 2, "v2 with a key");
+
+        // No live change: turning the gate off alone republishes as v1,
+        // once; a later change keeps v1.
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "0") };
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            Some(2)
+        );
+        let v1 = fs
+            .read(&format!("{dir_url}/{}", object_name(2)))
+            .await
+            .unwrap();
+        assert_eq!(v1[4], 1, "the gate alone returns the directory to v1");
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            None,
+            "and only once"
+        );
+        write_segment(tmp.path(), "b.pax", 7);
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            Some(3)
+        );
+        let bytes = fs
+            .read(&format!("{dir_url}/{}", object_name(3)))
+            .await
+            .unwrap();
+        assert_eq!(bytes[4], 1, "back to v1");
+        let dir = PaxCentroidDirectory::parse(&bytes).unwrap();
+        assert_eq!(dir.covered_segments().count(), 2);
+        assert!(dir.segments.iter().all(|s| s.decode_key.is_none()));
+    }
+
+    /// A carried key whose recorded ETag no longer matches the listing means
+    /// the object was rewritten in place: the segment is reloaded (cells and
+    /// key), not carried. The local backend lists no ETag, so the newest
+    /// generation is planted with a key recording one.
+    #[tokio::test]
+    async fn a_stale_etag_reloads_the_segment() {
+        enable_trained_layout();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1") };
+        let tmp = tempfile::tempdir().unwrap();
+        write_segment(tmp.path(), "a.pax", 0);
+        let fs = local_fs().await;
+        let dir_url = tmp.path().to_string_lossy().to_string();
+        publish_centroid_directory(&fs, &dir_url).await.unwrap();
+        let mut planted = newest(&fs, &dir_url).await.remove(0).1;
+        planted.generation = 2;
+        planted.segments[0].decode_key.as_mut().unwrap().object_etag = Some("old".into());
+        fs.write_if_absent(
+            &format!("{dir_url}/{}", object_name(2)),
+            &planted.to_bytes().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            Some(3),
+            "a stale key is a change"
+        );
+        let dir = &newest(&fs, &dir_url).await[0].1;
+        let key = dir.segments[0].decode_key.as_ref().expect("reloaded key");
+        assert!(key.matches_object(None), "rebuilt from the listed object");
+        assert_eq!(
+            publish_centroid_directory(&fs, &dir_url).await.unwrap(),
+            None
+        );
+    }
+
+    /// With the decode-key write gate off, a publish writes the D1 (v1)
+    /// format byte for byte: no keys, no extra segment reads.
+    #[tokio::test]
+    async fn without_the_key_gate_the_directory_is_the_d1_format() {
+        enable_trained_layout();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS") };
+        assert!(!directory_decode_keys_write_enabled());
+        let tmp = tempfile::tempdir().unwrap();
+        write_segment(tmp.path(), "a.pax", 0);
+        let fs = local_fs().await;
+        let dir_url = tmp.path().to_string_lossy().to_string();
+        publish_centroid_directory(&fs, &dir_url).await.unwrap();
+        let bytes = fs
+            .read(&format!("{dir_url}/{}", object_name(1)))
+            .await
+            .unwrap();
+        assert_eq!(bytes[4], 1, "v1");
+        let dir = PaxCentroidDirectory::parse(&bytes).unwrap();
+        assert_eq!(dir.covered_segments().count(), 1);
+        assert!(dir.segments.iter().all(|s| s.decode_key.is_none()));
     }
 
     #[tokio::test]

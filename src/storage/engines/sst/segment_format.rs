@@ -42,6 +42,7 @@ use proximadb_storage_common::segment_layout::{
 };
 
 use crate::storage::engines::core::formats::proximablocks::ProximaDataBlock;
+use crate::storage::engines::sst::centroid_directory_reader::DirectoryChoice;
 use crate::storage::engines::sst::survivor_range_cache::SurvivorRangeCache;
 
 // `SegmentFormat` (detection + `is_pax_segment`) now lives in the format layer —
@@ -1429,41 +1430,46 @@ pub(crate) async fn read_records_by_positions(
     // 2b): the probe warmed the invariants cache EARLIER IN THIS QUERY, so the
     // rehydrate's lookups are L1 hits — no HEAD, no header GET, no footer GET.
     // On a miss (cold cache), fall back to the exact stat+read path.
-    let (_header, footer) = if let Some(cache) = cache
-        && let Some(inv) = cache.get_or_promote(path).await.value()
-    {
-        match (
-            SegmentHeaderPrefix::parse(&inv.header_bytes),
-            SegmentFooterIndex::parse(&inv.footer_bytes),
-        ) {
-            (Ok(h), Ok(f)) => (h, f),
-            (Err(e), _) | (_, Err(e)) => {
-                anyhow::bail!("rehydrate cached layout {path}: {e}")
-            }
-        }
-    } else {
-        let size = fs
-            .metadata(path)
-            .await
-            .map_err(|e| anyhow::anyhow!("rehydrate stat {path}: {e}"))?
-            .size;
-        if size < (SEG_HEADER_PREFIX_LEN as u64 + SEGMENT_MAGIC.len() as u64) {
-            anyhow::bail!("rehydrate {path}: not a coalesced segment");
-        }
-        let read_len = (coalesced_header_prefetch_floor() as u64).min(size);
-        let header_bytes = fs
-            .read_range(path, 0, read_len)
-            .await
-            .map_err(|e| anyhow::anyhow!("rehydrate header {path}: {e}"))?;
-        let header = SegmentHeaderPrefix::parse(&header_bytes)
-            .map_err(|e| anyhow::anyhow!("rehydrate header parse {path}: {e}"))?;
-        let footer_bytes = fs
-            .read_range(path, header.footer_off, header.footer_len)
-            .await
-            .map_err(|e| anyhow::anyhow!("rehydrate footer {path}: {e}"))?;
-        let footer = SegmentFooterIndex::parse(&footer_bytes)?;
-        (header, footer)
+    // TD-PAXDIR-1 D6: a directory-planned scan with a decode key takes the
+    // block table from the directory too (its scan never cached metadata).
+    let cached = match cache {
+        Some(cache) => cache.get_or_promote(path).await.value(),
+        None => None,
     };
+    let (_header, footer) =
+        if let Some(inv) = cached.or_else(|| directory_decoded_invariants().map(Arc::new)) {
+            match (
+                SegmentHeaderPrefix::parse(&inv.header_bytes),
+                SegmentFooterIndex::parse(&inv.footer_bytes),
+            ) {
+                (Ok(h), Ok(f)) => (h, f),
+                (Err(e), _) | (_, Err(e)) => {
+                    anyhow::bail!("rehydrate cached layout {path}: {e}")
+                }
+            }
+        } else {
+            let size = fs
+                .metadata(path)
+                .await
+                .map_err(|e| anyhow::anyhow!("rehydrate stat {path}: {e}"))?
+                .size;
+            if size < (SEG_HEADER_PREFIX_LEN as u64 + SEGMENT_MAGIC.len() as u64) {
+                anyhow::bail!("rehydrate {path}: not a coalesced segment");
+            }
+            let read_len = (coalesced_header_prefetch_floor() as u64).min(size);
+            let header_bytes = fs
+                .read_range(path, 0, read_len)
+                .await
+                .map_err(|e| anyhow::anyhow!("rehydrate header {path}: {e}"))?;
+            let header = SegmentHeaderPrefix::parse(&header_bytes)
+                .map_err(|e| anyhow::anyhow!("rehydrate header parse {path}: {e}"))?;
+            let footer_bytes = fs
+                .read_range(path, header.footer_off, header.footer_len)
+                .await
+                .map_err(|e| anyhow::anyhow!("rehydrate footer {path}: {e}"))?;
+            let footer = SegmentFooterIndex::parse(&footer_bytes)?;
+            (header, footer)
+        };
     let mut block_start: Vec<u64> = Vec::with_capacity(footer.blocks.len());
     let mut acc = 0u64;
     for b in &footer.blocks {
@@ -1495,49 +1501,48 @@ pub(crate) async fn read_records_by_positions(
     blocks.dedup();
 
     // 4. Coalesced fetch of just those blocks (same policy plumbing as stage F).
-    let iop_target =
-        proximadb_storage_common::iops_budget::IopsBudget::for_path(path).target_block_bytes();
-    let defaults =
-        crate::storage::engines::sst::readers::sst_query_engine::ObjectRangeCoalescePolicy {
-            max_gap_bytes: (iop_target / 4).max(64 * 1024),
-            max_range_bytes: iop_target,
-        };
-    let policy = resolve_adaptive_range_policy(
-        path,
-        "region_d_filter",
-        "PROXIMADB_PAX_COALESCE_GAP",
-        "PROXIMADB_PAX_COALESCE_RANGE",
-        defaults,
-        |candidate| {
-            estimate_coalesced_byte_ranges(
-                blocks.iter().filter_map(|&index| {
-                    footer
-                        .blocks
-                        .get(index)
-                        .map(|block| (block.offset, block.offset + block.size as u64))
-                }),
-                candidate,
-            )
-        },
-    );
-    let fetches = plan_coalesced_block_ranges(&footer, &blocks, &policy);
+    let fetches = rehydrate_block_fetches(path, &footer, &blocks);
 
-    // 5. Decode the requested rows.
+    // 5. Decode the requested rows. TD-PAXDIR-1 D6: blocks the cascade
+    // already fetched whole for this query are taken from its hand-off; a
+    // fetch is read only when one of its blocks was not handed over.
+    let handed: Option<Arc<DirectoryChoice>> = DIRECTORY_CHOICE.try_with(Arc::clone).ok();
     for fetch in &fetches {
-        let buf = fs
-            .read_range(path, fetch.start, fetch.end - fetch.start)
-            .await
-            .map_err(|e| anyhow::anyhow!("rehydrate blocks {path}: {e}"))?;
-        for &bi in &fetch.blocks {
+        let handed_blocks: Option<Vec<Arc<[u8]>>> = handed.as_ref().and_then(|choice| {
+            fetch
+                .blocks
+                .iter()
+                .map(|&bi| {
+                    let b = footer.blocks.get(bi)?;
+                    choice
+                        .take_block(b.offset)
+                        .filter(|bytes| bytes.len() == b.size as usize)
+                })
+                .collect()
+        });
+        let buf = match &handed_blocks {
+            Some(_) => Vec::new(),
+            None => fs
+                .read_range(path, fetch.start, fetch.end - fetch.start)
+                .await
+                .map_err(|e| anyhow::anyhow!("rehydrate blocks {path}: {e}"))?,
+        };
+        for (i, &bi) in fetch.blocks.iter().enumerate() {
             let Some(b) = footer.blocks.get(bi) else {
                 continue;
             };
-            let Some(rel) = b.offset.checked_sub(fetch.start).map(|r| r as usize) else {
-                continue;
-            };
-            let end = rel + b.size as usize;
-            let Some(block_bytes) = buf.get(rel..end) else {
-                continue;
+            let block_bytes = match &handed_blocks {
+                Some(blocks) => &blocks[i][..],
+                None => {
+                    let Some(rel) = b.offset.checked_sub(fetch.start).map(|r| r as usize) else {
+                        continue;
+                    };
+                    let end = rel + b.size as usize;
+                    let Some(block_bytes) = buf.get(rel..end) else {
+                        continue;
+                    };
+                    block_bytes
+                }
             };
             let reader = PaxBlockReader::open(block_bytes)
                 .map_err(|e| anyhow::anyhow!("rehydrate block open {path}: {e}"))?;
@@ -1834,6 +1839,43 @@ fn wave_split_threshold_mb() -> Option<u64> {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
     })
+}
+
+/// The coalesced block fetches that top-k rehydration issues for `blocks`
+/// (same policy plumbing as stage F). TD-PAXDIR-1 D6: the cascade's top-k
+/// block hand-off fetches exactly this plan, so the rehydration that follows
+/// finds every block it needs.
+fn rehydrate_block_fetches(
+    path: &str,
+    footer: &proximadb_storage_common::segment_layout::SegmentFooterIndex,
+    blocks: &[usize],
+) -> Vec<CoalescedFetch> {
+    let iop_target =
+        proximadb_storage_common::iops_budget::IopsBudget::for_path(path).target_block_bytes();
+    let defaults =
+        crate::storage::engines::sst::readers::sst_query_engine::ObjectRangeCoalescePolicy {
+            max_gap_bytes: (iop_target / 4).max(64 * 1024),
+            max_range_bytes: iop_target,
+        };
+    let policy = resolve_adaptive_range_policy(
+        path,
+        "region_d_filter",
+        "PROXIMADB_PAX_COALESCE_GAP",
+        "PROXIMADB_PAX_COALESCE_RANGE",
+        defaults,
+        |candidate| {
+            estimate_coalesced_byte_ranges(
+                blocks.iter().filter_map(|&index| {
+                    footer
+                        .blocks
+                        .get(index)
+                        .map(|block| (block.offset, block.offset + block.size as u64))
+                }),
+                candidate,
+            )
+        },
+    );
+    plan_coalesced_block_ranges(footer, blocks, &policy)
 }
 
 /// Plan coalesced ranged GETs over a set of survivor block indices using the
@@ -3166,24 +3208,34 @@ pub(crate) fn centroid_directory_nprobe(total_cells: usize) -> usize {
 }
 
 tokio::task_local! {
-    /// TD-PAXDIR-1 D2: the Region A0 cells the collection-global centroid
-    /// directory selected for the segment this task is scanning. Set by the
-    /// collection fan-out around one segment's scan; the coarse probe uses it
-    /// in place of its own per-segment nprobe ranking.
-    static DIRECTORY_CELLS: Arc<[u32]>;
+    /// TD-PAXDIR-1 D2: the collection-global centroid directory's choice for
+    /// the segment this task is scanning — the Region A0 cells it selected
+    /// and (D6) its decode key. Set by the collection fan-out around one
+    /// segment's scan; the coarse probe uses the cells in place of its own
+    /// per-segment nprobe ranking.
+    static DIRECTORY_CHOICE: Arc<DirectoryChoice>;
 }
 
-/// Run `scan` with the directory-selected A0 cells for its segment (or, with
-/// `None`, unchanged). The probe runs inline in the scanning task, so the
-/// scope reaches it without widening the cascade's signatures.
+/// Run `scan` with the directory's choice for its segment (or, with `None`,
+/// unchanged). The probe runs inline in the scanning task, so the scope
+/// reaches it without widening the cascade's signatures.
 pub(crate) async fn scope_directory_cells<F: std::future::Future>(
-    cells: Option<Arc<[u32]>>,
+    choice: Option<Arc<DirectoryChoice>>,
     scan: F,
 ) -> F::Output {
-    match cells {
-        Some(cells) => DIRECTORY_CELLS.scope(cells, scan).await,
+    match choice {
+        Some(choice) => DIRECTORY_CHOICE.scope(choice, scan).await,
         None => scan.await,
     }
+}
+
+/// TD-PAXDIR-1 D6: this segment's metadata rebuilt from the directory's
+/// decode key, when the scan runs inside a directory scope that has one.
+fn directory_decoded_invariants() -> Option<SegmentInvariants> {
+    DIRECTORY_CHOICE
+        .try_with(|choice| choice.decode_invariants())
+        .ok()
+        .flatten()
 }
 
 /// Outcome of a coarse probe: the global survivor rows plus the io_trace
@@ -3337,6 +3389,15 @@ fn prefix_prefetch_bytes() -> Option<u64> {
     (configured > 0).then_some(configured.min(MAX_PREFIX_PREFETCH_BYTES))
 }
 
+/// TD-PAXDIR-1 D6: whether the scan's cold header-prefix read would fetch
+/// the whole `size_bytes` object. Such a segment gains nothing from a decode
+/// key: that one read already returns (and caches) every byte its queries
+/// need, so the planner leaves it on its own metadata path.
+pub(crate) fn prefix_read_covers_segment(size_bytes: u64) -> bool {
+    let floor = coalesced_header_prefetch_floor() as u64;
+    prefix_prefetch_bytes().unwrap_or(floor).max(floor) >= size_bytes
+}
+
 /// Largest known coalesced header-prefix length across layout versions
 /// (TD-PAXRG-1: v4 = 88 B). Prefix GETs fetch AT LEAST this many bytes
 /// (clamped to file size) so one read covers v1/v3/v4; `SegmentHeaderPrefix::parse`
@@ -3438,9 +3499,10 @@ async fn coarse_probe_survivors(
     // cells against every other segment's; probe exactly its choice (valid,
     // non-empty, distinct cells only). Filtered queries never carry a
     // directory choice.
-    let directory_cells: Option<Vec<usize>> = DIRECTORY_CELLS
-        .try_with(|cells| {
-            cells
+    let directory_cells: Option<Vec<usize>> = DIRECTORY_CHOICE
+        .try_with(|choice| {
+            choice
+                .cells
                 .iter()
                 .map(|&c| c as usize)
                 .filter(|&c| c < k_c && dir.cells[c].row_end > dir.cells[c].row_begin)
@@ -4112,6 +4174,49 @@ async fn rank_probed_rows_morsels_inner(
     Ok(merged.into_iter().map(|(row, _)| row).collect())
 }
 
+/// Resolve the top-k OIDs of block `bi` from its whole bytes (`block`): the
+/// selected local rows in `block_rows[bi]`, keyed by global row (block base
+/// from `block_start`) into `oid_of`. Fails closed on a missing stripe, an
+/// empty identity or a row resolved twice.
+fn resolve_block_oids(
+    path: &str,
+    bi: usize,
+    block: &[u8],
+    block_rows: &std::collections::BTreeMap<usize, Vec<usize>>,
+    block_start: &[u64],
+    oid_of: &mut std::collections::HashMap<usize, String>,
+) -> Result<()> {
+    use proximadb_block_format::{PaxBlockReader, col_id};
+    let reader = PaxBlockReader::open(block).map_err(|err| {
+        anyhow::anyhow!("coalesced scan OID block decode {path} block {bi}: {err}")
+    })?;
+    let oids = reader
+        .decode_str_stripe_checked(col_id::OID)
+        .map_err(|err| anyhow::anyhow!("coalesced scan OID block decode {path} block {bi}: {err}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("coalesced scan OID block decode {path} block {bi}: OID stripe missing")
+        })?;
+    let locals = block_rows
+        .get(&bi)
+        .ok_or_else(|| anyhow::anyhow!("coalesced scan OID block {bi} has no selected rows"))?;
+    for &local in locals {
+        let oid = oids
+            .get(local)
+            .and_then(Option::as_ref)
+            .filter(|oid| !oid.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "coalesced scan OID block decode {path} block {bi} row {local} produced no identity"
+                )
+            })?;
+        let g = block_start[bi] as usize + local;
+        if oid_of.insert(g, oid.clone()).is_some() {
+            anyhow::bail!("coalesced scan OID row {g} resolved more than once");
+        }
+    }
+    Ok(())
+}
+
 pub async fn rabitq_search_segment_coalesced(
     fs: &dyn proximadb_storage_filesystem_types::FileSystem,
     path: &str,
@@ -4157,7 +4262,7 @@ pub async fn rabitq_search_segment_coalesced_allowed(
     // per-segment HEAD (a billed metadata op); `None` stats exactly as before.
     known_size: Option<u64>,
 ) -> Result<Option<Vec<CascadeHit>>> {
-    use proximadb_block_format::{PaxBlockReader, RaBitQRegion, coalesced_sq8, col_id};
+    use proximadb_block_format::{RaBitQRegion, coalesced_sq8};
     use proximadb_storage_common::segment_layout::{
         SEG_HEADER_PREFIX_LEN, SegmentFooterIndex, SegmentHeaderPrefix,
     };
@@ -4175,7 +4280,20 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         Some(cache) => cache.get_or_promote(path).await,
         None => InvariantLookup::Miss,
     };
-    let cached = invariant_lookup.value();
+    // TD-PAXDIR-1 D6: on a miss, a directory-planned segment with a decode
+    // key takes its header, A0, Region-A header and ANN footer from the
+    // directory — no header, A0 or footer read; its first read is the probed
+    // cells. Unfiltered only, and never admitted to the cache: the rebuilt
+    // footer carries only this cascade's fields.
+    let mut directory_decoded = false;
+    let cached = invariant_lookup.value().or_else(|| {
+        let decoded = row_allow
+            .is_none()
+            .then(directory_decoded_invariants)
+            .flatten()?;
+        directory_decoded = true;
+        Some(Arc::new(decoded))
+    });
     // TD-METRICS-1: this lookup is the cache's only read boundary — count
     // hit/miss here (a hit means 3 GETs avoided) and sample resident bytes.
     if cache.is_some() {
@@ -4419,7 +4537,10 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         || (cached_region.is_none() && region_bytes.is_some())
         || (cached_a0.is_none() && probe_a0.is_some())
         || (cached_rabitq_header.is_none() && probe_rabitq_header.is_some());
-    if cache_changed && let Some(c) = cache {
+    if cache_changed
+        && !directory_decoded
+        && let Some(c) = cache
+    {
         c.put_with_l2(
             path.to_string(),
             Arc::new(SegmentInvariants {
@@ -4900,7 +5021,50 @@ pub async fn rabitq_search_segment_coalesced_allowed(
             .get(bi)
             .is_some_and(|s| s.as_ref().is_some_and(|stats| stats.oid_chunk_len > 0))
     });
-    if v4_chunk_fetch {
+    // TD-PAXDIR-1 D6: a directory-decoded scan's caller rehydrates exactly
+    // these top-k blocks next. Fetch them whole in one wave instead of their
+    // OID chunks, read the OIDs from them, and hand the bytes to the
+    // rehydration, so the rows cost one wave (design §3.5 wave 2) and one
+    // request per block instead of a chunk plus a block. Bounded like the D5
+    // same-wave bytes (8 IOP-sized blocks); larger sets keep the chunk arm.
+    let handoff = if directory_decoded {
+        DIRECTORY_CHOICE.try_with(Arc::clone).ok()
+    } else {
+        None
+    };
+    let handoff_fetches: Option<Vec<CoalescedFetch>> = handoff.as_ref().and_then(|_| {
+        let fetches = rehydrate_block_fetches(path, &footer, &topk_blocks);
+        let total: u64 = fetches.iter().map(|f| f.end - f.start).sum();
+        (total <= iop_target.saturating_mul(8)).then_some(fetches)
+    });
+    if let (Some(choice), Some(fetches)) = (handoff, handoff_fetches) {
+        let ranges: Vec<std::ops::Range<u64>> = fetches.iter().map(|f| f.start..f.end).collect();
+        let bufs = fs
+            .read_ranges_prefetch(path, ranges)
+            .await
+            .map_err(|e| anyhow::anyhow!("coalesced scan top-k blocks {path}: {e}"))?;
+        crate::observability::io_trace::drain_and_forward_read_ranges_metrics();
+        for (fetch, buf) in fetches.iter().zip(bufs) {
+            record_get_physical(CacheTier::ResultPayload, fetch.end - fetch.start, trace_on);
+            for &bi in &fetch.blocks {
+                let b = footer.blocks.get(bi).ok_or_else(|| {
+                    anyhow::anyhow!("coalesced scan top-k block {bi} is missing from footer")
+                })?;
+                let block = b
+                    .offset
+                    .checked_sub(fetch.start)
+                    .and_then(|rel| usize::try_from(rel).ok())
+                    .and_then(|rel| buf.get(rel..rel.checked_add(b.size as usize)?))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "coalesced scan top-k block {path} block {bi} is outside its fetch"
+                        )
+                    })?;
+                resolve_block_oids(path, bi, block, &block_rows, &block_start, &mut oid_of)?;
+                choice.stash_block(b.offset, Arc::from(block));
+            }
+        }
+    } else if v4_chunk_fetch {
         // TD-PAXRG-1 Phase D + TD-RDSTRAT-13 PR-B 2b: per-RG OID-chunk fetch,
         // WAVED — the chunks were previously fetched strictly sequentially
         // (up to ~top-k serial GETs; on object stores that is ~top-k × RTT).
@@ -5266,37 +5430,14 @@ pub async fn rabitq_search_segment_coalesced_allowed(
                         buf.len()
                     );
                 }
-                let reader = PaxBlockReader::open(&buf[rel..end]).map_err(|err| {
-                    anyhow::anyhow!("coalesced scan OID block decode {path} block {bi}: {err}")
-                })?;
-                let oids = reader
-                    .decode_str_stripe_checked(col_id::OID)
-                    .map_err(|err| {
-                        anyhow::anyhow!("coalesced scan OID block decode {path} block {bi}: {err}")
-                    })?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "coalesced scan OID block decode {path} block {bi}: OID stripe missing"
-                        )
-                    })?;
-                let locals = block_rows.get(&bi).ok_or_else(|| {
-                    anyhow::anyhow!("coalesced scan OID block {bi} has no selected rows")
-                })?;
-                for &local in locals {
-                    let oid = oids
-                        .get(local)
-                        .and_then(Option::as_ref)
-                        .filter(|oid| !oid.is_empty())
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "coalesced scan OID block decode {path} block {bi} row {local} produced no identity"
-                            )
-                        })?;
-                    let g = block_start[bi] as usize + local;
-                    if oid_of.insert(g, oid.clone()).is_some() {
-                        anyhow::bail!("coalesced scan OID row {g} resolved more than once");
-                    }
-                }
+                resolve_block_oids(
+                    path,
+                    bi,
+                    &buf[rel..end],
+                    &block_rows,
+                    &block_start,
+                    &mut oid_of,
+                )?;
             }
         }
     }

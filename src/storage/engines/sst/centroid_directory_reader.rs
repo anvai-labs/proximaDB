@@ -20,6 +20,12 @@
 //!
 //! Gate: `PROXIMADB_PAX_READ_CENTROID_DIRECTORY` (default OFF). Filtered and
 //! exact queries never use the directory.
+//!
+//! TD-PAXDIR-1 D6: with `PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS` (default
+//! OFF) also on, a planned segment whose directory entry carries a decode key
+//! rebuilds its header, Region A0, Region-A header and ANN footer from the
+//! directory on an invariants-cache miss, so its first read is its probed
+//! cells ([`DirectoryChoice::decode_invariants`]).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -30,12 +36,70 @@ use proximadb_storage_filesystem_types::{DirEntry, FileSystem};
 use crate::storage::engines::sst::block_cluster::env_gate_on;
 use crate::storage::engines::sst::centroid_directory_publisher::directory_objects_newest_first;
 use crate::storage::engines::sst::segment_format::{
-    centroid_directory_nprobe, pax_rabitq_pool_for_top_k,
+    SegmentInvariants, centroid_directory_nprobe, pax_rabitq_pool_for_top_k,
+    prefix_read_covers_segment,
 };
 
 /// READ gate: plan unfiltered ANN queries on the collection centroid directory.
 pub fn centroid_directory_read_enabled() -> bool {
     env_gate_on("PROXIMADB_PAX_READ_CENTROID_DIRECTORY")
+}
+
+/// TD-PAXDIR-1 D6 READ gate: planned segments with a decode key take their
+/// query-path metadata from the directory instead of reading it. Needs
+/// directories published with `PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS`.
+pub fn directory_decode_keys_read_enabled() -> bool {
+    env_gate_on("PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS")
+}
+
+/// One segment's part of a directory-planned query.
+#[derive(Debug)]
+pub(crate) struct DirectoryChoice {
+    /// The Region A0 cells to probe, in rank order (empty ⇒ skip the segment).
+    pub(crate) cells: Arc<[u32]>,
+    /// D6: the directory and this segment's index in it, when its entry has a
+    /// decode key, the decode-key read gate is on, and the segment is larger
+    /// than the scan's cold prefix read.
+    decode: Option<(Arc<PaxCentroidDirectory>, usize)>,
+    /// D6: top-k row-group blocks the cascade fetched whole (by absolute
+    /// offset), handed to this query's rehydration so the rows cost one wave.
+    /// Lives as long as the query's choice; rehydration takes what it uses.
+    blocks: Mutex<HashMap<u64, Arc<[u8]>>>,
+}
+
+impl DirectoryChoice {
+    /// D6: the segment's header, A0, Region-A header and ANN footer rebuilt
+    /// from the directory, or `None` (no key, gate off, or the rebuild
+    /// failed — the scan then reads them as before). The footer holds only the
+    /// unfiltered ANN cascade's fields, so the result must never be admitted
+    /// to the invariants cache.
+    pub(crate) fn decode_invariants(&self) -> Option<SegmentInvariants> {
+        let (dir, idx) = self.decode.as_ref()?;
+        match dir.segment_decode(*idx) {
+            Ok(d) => Some(SegmentInvariants {
+                header_bytes: d.header_prefix,
+                region_bytes: None,
+                footer_bytes: d.ann_footer,
+                a0_bytes: Some(Arc::from(d.a0)),
+                rabitq_header_bytes: Some(Arc::from(d.rabitq_header)),
+            }),
+            Err(error) => {
+                tracing::debug!(%error, "decode key unusable; reading segment metadata");
+                None
+            }
+        }
+    }
+
+    /// D6: keep a top-k block the cascade fetched for this query's
+    /// rehydration.
+    pub(crate) fn stash_block(&self, offset: u64, bytes: Arc<[u8]>) {
+        lock(&self.blocks).insert(offset, bytes);
+    }
+
+    /// D6: take a block the cascade stashed (`None`: rehydration reads it).
+    pub(crate) fn take_block(&self, offset: u64) -> Option<Arc<[u8]>> {
+        lock(&self.blocks).remove(&offset)
+    }
 }
 
 /// Collection directories whose parsed centroid directory stays cached. Each
@@ -145,21 +209,25 @@ fn object_name(url: &str) -> &str {
 }
 
 /// Per-segment directory choices for one query, keyed by segment URL: the A0
-/// cells to probe (empty ⇒ skip the segment). Segments absent from the map
-/// keep the per-segment path. `files` are the discovered `(url, size)` pairs;
-/// a segment of unknown size is never usable (its stamp cannot be checked).
+/// cells to probe (empty ⇒ skip the segment) and, with D6, the decode key.
+/// Segments absent from the map keep the per-segment path. `files` are the
+/// discovered `(url, size, etag)` triples; a segment of unknown size is never
+/// usable (its stamp cannot be checked), and a key is used only for the
+/// object whose listed ETag it records.
 pub(crate) fn plan_segments<'a>(
-    dir: &PaxCentroidDirectory,
-    files: impl IntoIterator<Item = (&'a str, Option<u64>)>,
+    dir: &Arc<PaxCentroidDirectory>,
+    files: impl IntoIterator<Item = (&'a str, Option<u64>, Option<&'a str>)>,
     query: &[f32],
     k: usize,
-) -> Option<HashMap<String, Arc<[u32]>>> {
+) -> Option<HashMap<String, Arc<DirectoryChoice>>> {
     let mut url_by_name = HashMap::new();
+    let mut etag_by_name: HashMap<String, Option<&str>> = HashMap::new();
     let mut live = Vec::new();
-    for (url, size) in files {
+    for (url, size, etag) in files {
         let Some(size_bytes) = size else { continue };
         let name = object_name(url);
         url_by_name.insert(name.to_owned(), url.to_owned());
+        etag_by_name.insert(name.to_owned(), etag);
         live.push(LiveSegment {
             name: name.to_owned(),
             size_bytes,
@@ -169,13 +237,41 @@ pub(crate) fn plan_segments<'a>(
         let rows = usize::try_from(rows).unwrap_or(usize::MAX);
         pax_rabitq_pool_for_top_k(k, rows) as u64
     })?;
+    let decode_keys = directory_decode_keys_read_enabled();
+    let keyed: HashMap<&str, usize> = dir
+        .segments
+        .iter()
+        .enumerate()
+        // D6: a segment the cold prefix read fetches whole keeps that read
+        // (one request for every byte, then cached); only larger ones use
+        // the key.
+        .filter(|(_, s)| {
+            decode_keys
+                && !prefix_read_covers_segment(s.size_bytes)
+                && s.decode_key.as_ref().is_some_and(|key| {
+                    etag_by_name
+                        .get(&s.name)
+                        .is_some_and(|etag| key.matches_object(*etag))
+                })
+        })
+        .map(|(idx, s)| (s.name.as_str(), idx))
+        .collect();
     Some(
         plan.cells_by_segment
             .into_iter()
             .filter_map(|(name, cells)| {
-                url_by_name
-                    .remove(&name)
-                    .map(|url| (url, Arc::<[u32]>::from(cells)))
+                let decode = keyed.get(name.as_str()).map(|&idx| (Arc::clone(dir), idx));
+                url_by_name.remove(&name).map(|url| {
+                    let cells = Arc::<[u32]>::from(cells);
+                    (
+                        url,
+                        Arc::new(DirectoryChoice {
+                            cells,
+                            decode,
+                            blocks: Mutex::default(),
+                        }),
+                    )
+                })
             })
             .collect(),
     )
@@ -186,6 +282,59 @@ mod tests {
     use super::*;
     use crate::storage::engines::sst::centroid_directory_publisher::publish_centroid_directory;
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
+
+    /// A key is used only for the object whose listed ETag it recorded: a
+    /// rewritten object (another ETag) or a listing without one keeps the
+    /// segment on its own metadata reads, while its cells are still planned.
+    #[tokio::test]
+    async fn a_decode_key_is_used_only_for_the_listed_object_it_recorded() {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe {
+            std::env::set_var("PROXIMADB_PAX_COALESCED_RABITQ", "1");
+            std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
+            std::env::set_var("PROXIMADB_IVF_K", "4");
+            std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1");
+            std::env::set_var("PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS", "1");
+            // Header-only prefix reads, so the small segment is key-eligible.
+            std::env::set_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES", "0");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = LocalFileSystem::new(LocalConfig::default()).await.unwrap();
+        let dir_url = tmp.path().to_string_lossy().to_string();
+        crate::storage::engines::sst::centroid_directory_publisher::tests::write_segment(
+            tmp.path(),
+            "a.pax",
+            0,
+        );
+        publish_centroid_directory(&fs, &dir_url).await.unwrap();
+        let bytes = fs
+            .read(&format!(
+                "{dir_url}/{}",
+                proximadb_storage_common::centroid_directory::object_name(1)
+            ))
+            .await
+            .unwrap();
+        let mut dir = PaxCentroidDirectory::parse(&bytes).unwrap();
+        // The local backend lists no ETag; give the key one, as a cloud
+        // listing would have recorded.
+        dir.segments[0].decode_key.as_mut().unwrap().object_etag = Some("e1".into());
+        let dir = Arc::new(dir);
+        let url = format!("{dir_url}/a.pax");
+        let size = dir.segments[0].size_bytes;
+        let query = vec![0.5f32; 16];
+        let decoded = |etag: Option<&'static str>| {
+            let plan = plan_segments(&dir, [(url.as_str(), Some(size), etag)], &query, 10)
+                .expect("the segment is planned");
+            let choice = &plan[&url];
+            (
+                !choice.cells.is_empty(),
+                choice.decode_invariants().is_some(),
+            )
+        };
+        assert_eq!(decoded(Some("e1")), (true, true), "same object");
+        assert_eq!(decoded(Some("e2")), (true, false), "rewritten object");
+        assert_eq!(decoded(None), (true, false), "listing without an ETag");
+    }
 
     #[test]
     fn read_gate_defaults_off() {
