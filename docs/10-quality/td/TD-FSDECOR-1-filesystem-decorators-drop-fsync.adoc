@@ -1,0 +1,53 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-FSDECOR-1: `FileSystem` decorators silently dropped fsync
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved (2026-10-25).** All four decorators that wrap a real filesystem now forward `sync_file` and `sync_data`:
+
+* the three `forward_filesystem_impl!` decorators: `CountingFileSystem`, `FaultInjectingFileSystem`, and the test-only `LatencyFileSystem`. The macro gained the two arms, and its docs tell every decorator to forward both.
+* the hand-written `UnifiedCachingFilesystem`. It is a write-through cache, so a barrier belongs to the underlying filesystem.
+
+Pinned by `counting_file_system_forwards_durability_barriers`, `fault_injecting_file_system_forwards_durability_barriers` (`proximadb-storage-filesystem-types`, `forwarding.rs`) and `caching_filesystem_forwards_durability_barriers` (`caching_filesystem.rs`). Each fails on the previous code: the wrapped filesystem received neither barrier. All three tests use the shared `testing::SyncRecorder`.
+| Priority | **MEDIUM**: data that a durability barrier was meant to protect was not on disk.
+
+* `UnifiedCachingFilesystem` is **always on**. In a default deployment the one engine call that issues a barrier through it is RAPTOR's flush-footer `sync_file`, and RAPTOR is an experimental engine.
+* The other three only apply under env gates.
+| Component | `crates/storage/proximadb-storage-filesystem-types` (`counting.rs`, `faults.rs`, `forwarding.rs`, `testing.rs`); `src/storage/persistence/filesystem/caching_filesystem.rs` and `latency.rs`
+| Relates to | the duplication fix that introduced `forward_filesystem_impl!` (its fresh-context review found this); ADR-027/030 (`PROXIMADB_COUNT_FS_IO`)
+|===
+
+== Problem
+
+The `FileSystem` trait has two durability barriers:
+
+* `sync_file`: a full fsync. The trait default is `Ok(())`, meaning "no sync".
+* `sync_data`: fdatasync. The trait default calls `self.sync_file`.
+
+`LocalFileSystem` overrides both with real fsync and fdatasync. No decorator forwarded either one, so a decorated filesystem got the defaults, and every barrier became a silent no-op.
+
+Four decorators dropped both barriers.
+
+`UnifiedCachingFilesystem` (`caching_filesystem.rs`) needs no gate. The SST, NOVA, VIPER, HELIX, eventlog and RAPTOR engines build it unconditionally, as does `shared_services`. RAPTOR's writer calls `self.filesystem.sync_file` on it for the flush footer, so that sync never reached disk.
+
+The other three are not test-only either. The production filesystem factory (`src/storage/persistence/filesystem/mod.rs`) wraps every filesystem:
+
+* in `FaultInjectingFileSystem` when `PROXIMADB_TEST_FS_DELETE_FAIL_FIRST` or a read-fault gate is set;
+* in `CountingFileSystem` when `PROXIMADB_COUNT_FS_IO` is set. The check is `var_os(...).is_some()`, so even `=0` turns it on.
+
+Under those gates:
+
+* write-side benchmark numbers left out the cost of fsync;
+* a crash or durability test that also armed a fault gate would pass with no data actually reaching disk. That includes the WAL's barriers (`wal_operations.rs`, `disk_manager.rs`, `batch_sync_coordinator.rs`), which go through the factory-built filesystem.
+
+The benchmarking guide already warns that `PROXIMADB_COUNT_FS_IO` "changes the stack your latency numbers come from". It did not mention durability.
+
+`EncryptedFilesystem` was never affected. It forwards `sync_file` itself, and its `sync_data` falls back to that full fsync, which is a safe superset. It only misses the cheaper `fdatasync` path.
+
+== Fix
+
+As described in the Status cell.
+
+`UnifiedCachingFilesystem` also does not forward `compare_exchange` or `supports_conditional_replace`, so conditional writes through it fail with the trait default's `InvalidOperation`. Forwarding them has cache-coherence implications: the cache must be invalidated around a CAS. That is left for a separate change. `read_ranges_prefetch` is deliberately **not** forwarded: its default goes through `self.read_range`, which is how the counting and latency decorators observe prefetch reads.
