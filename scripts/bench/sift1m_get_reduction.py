@@ -2047,7 +2047,7 @@ class OwnedServer:
         read_ranges_inflight: int = 0,
         read_ranges_wave_split_mb: int = 0,
         rank_degree: int = 0,
-        centroid_directory: bool = False,
+        centroid_directory: str = "default",
     ):
         self.binary = binary
         self.config = config
@@ -2188,15 +2188,21 @@ class OwnedServer:
             environment["PROXIMADB_IVF_K"] = str(self.ivf_k)
         if self.n_comp is not None:
             environment["PROXIMADB_IVF_NCOMP"] = str(self.n_comp)
-        if self.centroid_directory:
+        if self.centroid_directory == "on":  # "default" leaves them unset
             environment.update(dict.fromkeys(CENTROID_DIRECTORY_GATES, "1"))
+        elif self.centroid_directory == "off":
+            # The gates default ON since TD-PAXDIR-1 D8; the OFF arm must
+            # disable them explicitly, not inherit the default.
+            environment.update(dict.fromkeys(CENTROID_DIRECTORY_GATES, "0"))
+        # "default": unset — the server's defaults apply (the point of the
+        # D8 confirmation arm).
         if self.nprobe is not None:
             # An explicit per-segment probe count disables directory planning
             # (skipping a segment is only sound when every planned segment
             # runs the A0 probe), so the directory arm sets the global count.
             environment[
                 "PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE"
-                if self.centroid_directory
+                if self.centroid_directory in ("on", "default")
                 else "PROXIMADB_PAX_READ_COARSE_NPROBE"
             ] = str(self.nprobe)
         if self.training_compaction_min_mb is not None:
@@ -2882,12 +2888,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--centroid-directory",
-        choices=("off", "on"),
-        default="off",
+        choices=("off", "on", "default"),
+        default="default",
         help=(
-            "TD-PAXDIR-1 arm: 'on' publishes the collection centroid directory "
-            "with decode keys and serves directory-planned queries (D2/D5/D6 "
-            "read gates); --nprobe then sets the directory's global cell count"
+            "TD-PAXDIR-1 arm: 'on' sets the D2/D5/D6 gates explicitly; 'off' "
+            "disables them explicitly (they default ON since D8); 'default' "
+            "leaves them unset, proving the defaults end-to-end. --nprobe "
+            "sets the directory's global cell count on the on/default arms"
         ),
     )
     # TD-IOBUDGET-2 (product decision 2026-09-03): the recall floor drops
@@ -3428,7 +3435,7 @@ def main() -> int:
             read_ranges_inflight=args.read_ranges_inflight,
             read_ranges_wave_split_mb=args.read_ranges_wave_split_mb,
             adaptive_read_strategy=args.adaptive_read_strategy,
-            centroid_directory=args.centroid_directory == "on",
+            centroid_directory=args.centroid_directory,
         )
         active.start()
         if args.compaction_spill:
@@ -3525,7 +3532,7 @@ def main() -> int:
             "arm": args.centroid_directory,
             "objects": directory_objects,
         }
-        if args.centroid_directory == "on" and not directory_objects:
+        if args.centroid_directory in ("on", "default") and not directory_objects:
             raise RuntimeError(
                 "--centroid-directory on: no centroids-*.pxcd was published "
                 "after the bed settled (directories publish after a compaction)"
@@ -3587,7 +3594,7 @@ def main() -> int:
             read_ranges_inflight=args.read_ranges_inflight,
             read_ranges_wave_split_mb=args.read_ranges_wave_split_mb,
             adaptive_read_strategy=args.adaptive_read_strategy,
-            centroid_directory=args.centroid_directory == "on",
+            centroid_directory=args.centroid_directory,
         )
         active.start()
         local_warm = run_query_sweep(
@@ -3632,7 +3639,7 @@ def main() -> int:
             read_ranges_inflight=args.read_ranges_inflight,
             read_ranges_wave_split_mb=args.read_ranges_wave_split_mb,
             adaptive_read_strategy=args.adaptive_read_strategy,
-            centroid_directory=args.centroid_directory == "on",
+            centroid_directory=args.centroid_directory,
         )
         active.start()
         object_cold = run_query_sweep(

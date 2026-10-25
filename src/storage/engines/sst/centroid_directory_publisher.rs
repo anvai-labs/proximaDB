@@ -39,7 +39,7 @@ use proximadb_storage_common::segment_layout::{
 };
 use proximadb_storage_filesystem_types::{DirEntry, FileSystem, FilesystemError};
 
-use crate::storage::engines::sst::block_cluster::env_gate_on;
+use crate::storage::engines::sst::block_cluster::env_kill_switch_off;
 use crate::storage::engines::sst::retirement_ledger;
 
 /// Create-only publish attempts before giving up to a concurrent publisher.
@@ -47,14 +47,14 @@ const PUBLISH_ATTEMPTS: usize = 3;
 
 /// WRITE gate: compaction publishes the collection centroid directory.
 pub fn centroid_directory_write_enabled() -> bool {
-    env_gate_on("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY")
+    env_kill_switch_off("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY")
 }
 
 /// TD-PAXDIR-1 D6 WRITE gate: publishes add decode keys for the segments they
-/// load (two more ranged reads each) and write the v2 format. Off, the
-/// directory is the D1 format, byte for byte.
+/// load (two more ranged reads each) and write the v2 format. Default ON
+/// since D8; off, the directory is the D1 format, byte for byte.
 pub fn directory_decode_keys_write_enabled() -> bool {
-    env_gate_on("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS")
+    env_kill_switch_off("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS")
 }
 
 /// Directory objects in a listing, newest generation first.
@@ -646,8 +646,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn without_the_key_gate_the_directory_is_the_d1_format() {
         enable_trained_layout();
+        // Default ON since D8 — disable via the kill-switch for this arm.
         // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS") };
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "0") };
         assert!(!directory_decode_keys_write_enabled());
         let tmp = tempfile::tempdir().unwrap();
         write_segment(tmp.path(), "a.pax", 0);
@@ -751,11 +752,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn write_gate_defaults_off() {
+    fn write_gate_defaults_on_with_kill_switch() {
+        // Default ON since D8; the gate is a kill-switch.
         // SAFETY: nextest runs each test in its own process.
         unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY") };
-        assert!(!centroid_directory_write_enabled());
-        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY", "on") };
         assert!(centroid_directory_write_enabled());
+        unsafe { std::env::set_var("PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY", "0") };
+        assert!(!centroid_directory_write_enabled());
     }
 }

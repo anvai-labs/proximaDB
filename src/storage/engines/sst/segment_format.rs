@@ -3262,9 +3262,12 @@ struct CoarseProbeResult {
 /// TD-PAXDIR-1 D5 READ gate: fetch the probed cells' SQ8 rerank bytes in the
 /// coarse probe's Region-A wave (A0 records each cell's Region-B extent), so
 /// the rerank needs no dependent wave. Trades bytes (every row of a probed
-/// cell, not only survivors) for one fewer round trip. Default OFF.
+/// cell, not only survivors) for one fewer round trip. Default ON since D8
+/// (the passing P5b gate arms ran with it); kill-switch off.
 fn same_wave_rerank_enabled() -> bool {
-    crate::storage::engines::sst::block_cluster::env_gate_on("PROXIMADB_PAX_READ_SAME_WAVE_RERANK")
+    crate::storage::engines::sst::block_cluster::env_kill_switch_off(
+        "PROXIMADB_PAX_READ_SAME_WAVE_RERANK",
+    )
 }
 
 /// Region-B extents of the probed `cells` (A0 entries) whose Region-A read was

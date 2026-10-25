@@ -3402,6 +3402,12 @@ async fn probe_cold_tail_records_read_ranges_metrics_when_inflight_armed() {
         std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "1");
         std::env::set_var("PROXIMADB_IVF_K", "8");
         std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "4");
+        // Scope: this gates the Region-A cold tail's batching (TD-RDSTRAT-12
+        // §3), not D5's same-wave rerank — which changes the rerank's
+        // planning shape (split around prefetched B extents vs a later
+        // query's merged range), so a repeat re-fetches one coalesced B
+        // range. Documented in TD-PAXDIR-1 D8.
+        std::env::set_var("PROXIMADB_PAX_READ_SAME_WAVE_RERANK", "0");
         // The 400-row fixture fits inside the default 1 MiB file-prefix
         // prefetch AND one gap-coalesced range — both would satisfy every
         // probed cell above the cold queue before batching sees it.
@@ -3675,6 +3681,12 @@ async fn region_b_and_oid_cold_tails_batch_when_inflight_armed() {
         std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "1");
         std::env::set_var("PROXIMADB_IVF_K", "8");
         std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "4");
+        // Scope: this gates the Region-A cold tail's batching (TD-RDSTRAT-12
+        // §3), not D5's same-wave rerank — which changes the rerank's
+        // planning shape (split around prefetched B extents vs a later
+        // query's merged range), so a repeat re-fetches one coalesced B
+        // range. Documented in TD-PAXDIR-1 D8.
+        std::env::set_var("PROXIMADB_PAX_READ_SAME_WAVE_RERANK", "0");
         std::env::set_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES", "1");
         std::env::set_var("PROXIMADB_PAX_VECTOR_COALESCE_GAP", "0");
     }
