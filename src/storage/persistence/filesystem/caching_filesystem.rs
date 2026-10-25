@@ -549,6 +549,35 @@ impl FileSystem for UnifiedCachingFilesystem {
         self.underlying_fs.sync_data(path).await
     }
 
+    // TD-CACHECAS-1: conditional replace is the underlying filesystem's, and
+    // the trait defaults made this layer report it unsupported (so callers
+    // that need it — leases, queue offsets — could not run through it). A
+    // swap changes the bytes behind the cached copy, so the copy is dropped
+    // before the swap (no stale copy is served while it runs) and again after
+    // it (a reader that re-cached the old bytes mid-swap does not keep them).
+    fn supports_conditional_replace(&self) -> bool {
+        self.underlying_fs.supports_conditional_replace()
+    }
+
+    async fn compare_exchange(
+        &self,
+        path: &str,
+        expected: Option<&[u8]>,
+        replacement: &[u8],
+        guards: &[(&str, Option<&[u8]>)],
+    ) -> FsResult<bool> {
+        let cache_key = self.cache_key(path);
+        self.metadata_cache.invalidate(&cache_key).await;
+        self.disk_cache.invalidate(path).await;
+        let swapped = self
+            .underlying_fs
+            .compare_exchange(path, expected, replacement, guards)
+            .await;
+        self.metadata_cache.invalidate(&cache_key).await;
+        self.disk_cache.invalidate(path).await;
+        swapped
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -822,5 +851,76 @@ mod sync_forwarding_tests {
             inner.synced(),
             vec!["file seg.pax".to_string(), "data wal.log".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod cas_forwarding_tests {
+    use std::sync::Arc;
+
+    use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
+
+    use super::{FileSystem, UnifiedCacheConfig, UnifiedCachingFilesystem};
+
+    /// TD-CACHECAS-1: a conditional replace goes to the cached filesystem, and
+    /// a swap drops the cached copy — a read after it must never be served the
+    /// pre-swap bytes from the disk cache.
+    #[tokio::test]
+    async fn caching_filesystem_forwards_compare_exchange_and_invalidates() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let local = LocalFileSystem::new(LocalConfig {
+            root_dir: Some(data_dir.path().to_path_buf()),
+            follow_symlinks: true,
+            default_permissions: None,
+            sync_enabled: false,
+        })
+        .await
+        .expect("local fs");
+        let mut config = UnifiedCacheConfig::default();
+        config.disk.path = cache_dir.path().to_path_buf();
+        let cached = UnifiedCachingFilesystem::with_config(
+            Arc::new(local),
+            config,
+            "c".to_string(),
+            "sst".to_string(),
+        );
+
+        assert!(cached.supports_conditional_replace());
+        assert!(
+            cached
+                .compare_exchange("lease.meta", None, b"first", &[])
+                .await
+                .expect("create")
+        );
+        // Read until the path is hot and the disk cache holds a copy.
+        for _ in 0..6 {
+            assert_eq!(cached.read("lease.meta").await.expect("read"), b"first");
+        }
+        assert!(
+            cached.disk_cache.get("lease.meta").await.is_some(),
+            "precondition: reads of the path are served from the disk cache"
+        );
+
+        assert!(
+            cached
+                .compare_exchange("lease.meta", Some(b"first"), b"second", &[])
+                .await
+                .expect("swap")
+        );
+        assert!(
+            cached.disk_cache.get("lease.meta").await.is_none(),
+            "a swap must drop the cached copy"
+        );
+        assert_eq!(cached.read("lease.meta").await.expect("read"), b"second");
+
+        // A stale expectation does not swap, and the value stands.
+        assert!(
+            !cached
+                .compare_exchange("lease.meta", Some(b"first"), b"bad", &[])
+                .await
+                .expect("stale swap")
+        );
+        assert_eq!(cached.read("lease.meta").await.expect("read"), b"second");
     }
 }
