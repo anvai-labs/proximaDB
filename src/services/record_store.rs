@@ -3411,16 +3411,16 @@ impl TableRecordStore for DirectWalTableRecordStore {
         Ok(())
     }
 
-    /// The snapshot LSN is the WAL head, lowered below any write that is
-    /// appended but not yet applied (a scan could miss it, so the read-merge
-    /// must replay it). Chosen under the WAL's append lock and pinned there,
-    /// so no truncation can slip between the capture and the pin. Falls back
-    /// to the table's newest change for an appender that never truncates.
     /// Every write goes through the canonical WAL this store reads its feed from.
     fn has_change_feed(&self, _table_schema: &CatalogTableSchema) -> bool {
         true
     }
 
+    /// The snapshot LSN is the WAL head, lowered below any write that is
+    /// appended but not yet applied (a scan could miss it, so the read-merge
+    /// must replay it). Chosen under the WAL's append lock and pinned there,
+    /// so no truncation can slip between the capture and the pin. Falls back
+    /// to the table's newest change for an appender that never truncates.
     async fn capture_snapshot_lsn(&self, collection_id: &str) -> Result<SnapshotLsn> {
         let inflight = &self.inflight;
         let below_inflight = |head: u64| {
