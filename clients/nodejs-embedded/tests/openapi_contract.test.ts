@@ -18,6 +18,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as YAML from "yaml";
 import { ProximaDBClient } from "../src/client";
+import { normalizeIndexType } from "../src/collection";
+import { IndexType } from "../src/types";
 
 // ---------------------------------------------------------------------------
 // Spec loading
@@ -110,6 +112,81 @@ function collectRequiredKeys(spec: AnyObj, schema: AnyObj): string[] {
   };
   visit(schema);
   return keys;
+}
+
+/**
+ * Spec-derived strictness check: every key in `value` must be declared by the
+ * schema wherever the schema says `additionalProperties: false` — the spec's
+ * image of the server's `deny_unknown_fields` (TD-RESTGET-1), so an SDK that
+ * drifts from the spec fails here, not at a live server's 400.
+ */
+function assertOnlyDeclaredKeys(
+  spec: AnyObj,
+  schema: AnyObj,
+  value: unknown,
+  where: string,
+): void {
+  if (value === null || value === undefined) return;
+  let s = schema.$ref ? resolveRef(spec, schema.$ref as string) : schema;
+  for (const union of ["oneOf", "anyOf"]) {
+    if (Array.isArray(s[union])) {
+      const branches = (s[union] as AnyObj[])
+        .map((b) => (b.$ref ? resolveRef(spec, b.$ref as string) : b))
+        .filter((b) => b.type !== "null");
+      // Only nullable wrappers are understood. A real union would make this
+      // check pass without checking anything, so it is a loud failure.
+      if (branches.length !== 1) {
+        throw new Error(
+          `${where}: ${union} with ${branches.length} non-null branches is not supported`,
+        );
+      }
+      s = branches[0];
+    }
+  }
+  if (Array.isArray(s.allOf)) {
+    // allOf composes one object: its parts' properties all apply, and it is
+    // closed if any part is.
+    const parts = (s.allOf as AnyObj[]).map((part) =>
+      part.$ref ? resolveRef(spec, part.$ref as string) : part,
+    );
+    s = {
+      properties: Object.assign(
+        {},
+        ...[s, ...parts].map((part) => (part.properties ?? {}) as AnyObj),
+      ),
+      additionalProperties: [s, ...parts].some(
+        (part) => part.additionalProperties === false,
+      )
+        ? false
+        : s.additionalProperties,
+    };
+  }
+  if (Array.isArray(value)) {
+    if (s.items) {
+      value.forEach((item, i) =>
+        assertOnlyDeclaredKeys(spec, s.items as AnyObj, item, `${where}[${i}]`),
+      );
+    }
+    return;
+  }
+  if (typeof value !== "object") return;
+  const props = (s.properties ?? {}) as AnyObj;
+  for (const [key, child] of Object.entries(value as AnyObj)) {
+    if (key in props) {
+      assertOnlyDeclaredKeys(spec, props[key] as AnyObj, child, `${where}.${key}`);
+    } else if (s.additionalProperties === false) {
+      throw new Error(
+        `${where}.${key} is not declared by the spec (additionalProperties: false)`,
+      );
+    } else if (typeof s.additionalProperties === "object") {
+      assertOnlyDeclaredKeys(
+        spec,
+        s.additionalProperties as AnyObj,
+        child,
+        `${where}.${key}`,
+      );
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +452,95 @@ describe("OpenAPI contract gate", () => {
 
   // TD-095 (resolved 2026-05-30): SDK `GraphBuilder.execute()` now posts
   // `{ graph_id, name?, description? }` to match `CreateGraphRequest`.
+  // -------------------------------------------------------------------------
+  // createCollection (TD-RESTGET-1): the index choice maps to the field that
+  // expresses it, the body declares only spec keys, and index names are
+  // normalized — a plain-JS "HNSW" is the default route, not a declared index.
+  // -------------------------------------------------------------------------
+
+  const CREATE_RESPONSE = {
+    collection_id: "c1",
+    name: "c",
+    dimension: 4,
+    engine: "sst",
+    proxima_record_enabled: false,
+    created_at: "2026-10-25T00:00:00Z",
+  };
+
+  async function createWithIndex(index: string): Promise<Captured> {
+    const captured = installFetchStub(CREATE_RESPONSE);
+    await makeClient()
+      .createCollection("c")
+      .dimension(4)
+      .index(index as IndexType)
+      .execute();
+    return captured;
+  }
+
+  it("createCollection(...).execute() matches POST /api/v2/collections (createCollection)", async () => {
+    const captured = installFetchStub(CREATE_RESPONSE);
+    await makeClient()
+      .createCollection("c")
+      .dimension(4)
+      .description("d")
+      .tags(["t"])
+      .execute();
+
+    const op = operationFor(SPEC, "/api/v2/collections", "post");
+    expect(op.operationId).toBe("createCollection");
+    expect(captured.method).toBe("POST");
+    expect(captured.url).toBe("http://contract.test/api/v2/collections");
+
+    const reqSchema = requestBodySchema(SPEC, op);
+    expect(reqSchema).not.toBeNull();
+    for (const key of collectRequiredKeys(SPEC, reqSchema!)) {
+      expect(Object.keys(captured.body!)).toContain(key);
+    }
+    assertOnlyDeclaredKeys(SPEC, reqSchema!, captured.body, "body");
+    expect(captured.body).toMatchObject({ name: "c", dimension: 4, description: "d" });
+  });
+
+  it.each([
+    [IndexType.Hnsw, { index_type: "hnsw" }, ["index_configs", "index_policy"]],
+    [IndexType.Flat, { index_policy: { mode: "exact" } }, ["index_type", "index_configs"]],
+    ...[IndexType.Ivf, IndexType.Lsh, IndexType.Pq, IndexType.Annoy].map(
+      (t) =>
+        [
+          t,
+          { index_configs: [{ algorithm: t, is_primary: true }] },
+          ["index_type", "index_policy"],
+        ] as const,
+    ),
+  ])("index %s maps to the field that expresses it", async (index, expected, absent) => {
+    const captured = await createWithIndex(index);
+    expect(captured.body).toMatchObject(expected);
+    for (const key of absent) {
+      expect(captured.body).not.toHaveProperty(key);
+    }
+    const op = operationFor(SPEC, "/api/v2/collections", "post");
+    assertOnlyDeclaredKeys(SPEC, requestBodySchema(SPEC, op)!, captured.body, "body");
+  });
+
+  it.each([
+    ["HNSW", { index_type: "hnsw" }],
+    [" Flat ", { index_policy: { mode: "exact" } }],
+    ["IVF", { index_configs: [{ algorithm: "ivf", is_primary: true }] }],
+  ])("index name %j is normalized, not sent as a declared index", async (index, expected) => {
+    const captured = await createWithIndex(index);
+    expect(captured.body).toMatchObject(expected);
+  });
+
+  it("an unknown index name throws at .index(), before any request", () => {
+    const captured = installFetchStub(CREATE_RESPONSE);
+    const builder = makeClient().createCollection("c").dimension(4);
+    expect(() => builder.index("hnws" as IndexType)).toThrow(TypeError);
+    expect(() => builder.index("hnws" as IndexType)).toThrow(
+      /unknown index type "hnws"; expected one of hnsw, ivf, lsh, flat, pq, annoy/,
+    );
+    expect(captured.url).toBeNull();
+    expect(normalizeIndexType(" Annoy ")).toBe(IndexType.Annoy);
+  });
+
   it("createGraph(...).execute() matches POST /api/v2/graphs (createGraph)", async () => {
     const captured = installFetchStub({ graph_id: "g1", success: true });
     const client = makeClient();
