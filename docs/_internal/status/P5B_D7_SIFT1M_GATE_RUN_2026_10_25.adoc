@@ -23,7 +23,7 @@
 | directory on, `--ivf-k 64` | 16 / 64 | 0.9821 | 19.01 | 4 / 4 | 43.0 | 250 / 284 ms
 |===
 
-Gates at `--ivf-k 32`: **G1 recall ≥ 0.98 pass; G2 cold p50 ≤ 3 waves pass; G3 ≤ 20 requests pass; G2 warm p50 ≤ 1 wave FAIL (2).**
+Gates at `--ivf-k 32`: **G1 recall ≥ 0.98 pass; G2 cold p50 ≤ 3 waves pass; G3 ≤ 20 requests pass; G2 warm 2 waves — fails the original ≤ 1, meets the gate as restated 2026-10-25 (≤ 1 beyond the discovery LIST).**
 G4 (directory-off path does not regress): the off arm improved versus round 1 (22.75 → 21.75 requests, 9 → 8 waves) from the one-LIST fix; nothing regressed.
 Directory on versus off at the same geometry: waves 8 → 3, p50 latency 2.1× lower, recall equal, requests about equal (both read the same bytes in the same number of ranges).
 
@@ -48,7 +48,7 @@ Each of 1–4 is fixed in this branch with a test that fails without it.
 
 == Open
 
-* **Warm gate (G2 warm ≤ 1):** needs a decision — a per-collection listing cache invalidated by flush/compaction commits, or the gate restated as "≤ 1 wave beyond discovery".
+* **Warm gate:** restated by owner decision (2026-10-25) to ≤ 1 wave beyond the discovery LIST, which the k = 32 arm meets (2 waves = LIST + 1). Caching the listing, invalidated by flush and compaction, is link:../../10-quality/td/TD-PAXDIR-2-collection-listing-cache.adoc[TD-PAXDIR-2].
 * **Default cell sizing:** the measured passing geometry is 2× the default; changing `ivf_fine_cell_count` is a write-path default change for its own slice.
 * **G5 (BIGANN 10M):** not run in this slice.
 

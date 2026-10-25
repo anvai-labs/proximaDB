@@ -1319,7 +1319,7 @@ notes = "Replaces the INVALIDATED 2026-08-31 chooser A/B (its ON arm ran chooser
 
 [[claims]]
 id = "paxdir_d7_sift1m_p5b_gate_minio_50ms"
-claim = "TD-PAXDIR-1 P5b cold gates on SIFT1M over MinIO + Toxiproxy (50 ms RTT): with the collection centroid directory on and 32 coarse cells, object-cold recall@10 = 0.9823, p50 = 3 sequential request waves (p95 4), 18.86 requests per query (GET + LIST + HEAD), p50/p95 latency 222/284 ms. Against the directory-off path on the same bed and binary: 8 -> 3 waves and 2.1x lower p50 latency at equal recall; requests about equal. The warm gate (p50 <= 1 wave) is NOT met: every query lists the collection (2 waves warm)."
+claim = "TD-PAXDIR-1 P5b cold gates on SIFT1M over MinIO + Toxiproxy (50 ms RTT): with the collection centroid directory on and 32 coarse cells, object-cold recall@10 = 0.9823, p50 = 3 sequential request waves (p95 4), 18.86 requests per query (GET + LIST + HEAD), p50/p95 latency 222/284 ms. Against the directory-off path on the same bed and binary: 8 -> 3 waves and 2.1x lower p50 latency at equal recall; requests about equal. Warm: 2 waves = the discovery LIST + 1, meeting the gate as restated 2026-10-25 (<= 1 wave beyond discovery); caching the listing is TD-PAXDIR-2."
 metric = "recall@10 + requests_per_query (GET+LIST+HEAD) + per-query critical-path waves p50/p95 + bytes/query + latency p50/p95, object-cold and local-disk-warm phases"
 status = "measured"
 asserted_in = [

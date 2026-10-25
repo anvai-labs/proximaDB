@@ -335,7 +335,7 @@ default.
 |===
 | Gate | Exact condition
 | G1 recall (SIFT1M) | recall@10 ≥ **0.98** over the standard 10,000 SIFT1M queries (sampled 1,000 for the latency arms), `top_k = 10`, against the shipped ground truth; directory on, default nprobe.
-| G2 depth (SIFT1M, MinIO + Toxiproxy 50 ms RTT) | object-cold phase (fresh process, empty caches): p50 waves ≤ **3**; warm phase: p50 waves ≤ **1**.
+| G2 depth (SIFT1M, MinIO + Toxiproxy 50 ms RTT) | object-cold phase (fresh process, empty caches): p50 waves ≤ **3**; warm phase: p50 waves ≤ **1 beyond the discovery LIST** (restated 2026-10-25, owner decision: every query lists the collection; caching the listing is link:../10-quality/td/TD-PAXDIR-2-collection-listing-cache.adoc[TD-PAXDIR-2], which restores the original ≤ 1).
 | G3 requests (same run) | object-cold `requests_per_query` p50 ≤ **20** (LIST + HEAD + GET).
 | G4 no regression | the same harness with the directory **off** stays within its current ledger figures, so the gate is additive and the off path is unchanged.
 | G5 scale (BIGANN 10M) | re-measured and recorded in the ledger: recall@10, waves, requests per query and p50 at the same injected RTT. Recorded, not gated (seams doc §6 P5b).

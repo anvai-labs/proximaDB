@@ -557,6 +557,76 @@ mod tests {
         assert_eq!(search(&arm, &query, 1).await, ["r42"]);
     }
 
+    /// The injected-latency bed of the wave tests: 20 ms inside every timed
+    /// request, parallel waves, the D5 same-wave rerank, and header-only prefix
+    /// reads (at synthetic scale the default 1 MiB prefix would swallow a
+    /// whole segment, which a 1M-row segment's never does).
+    fn enable_latency_env() {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe {
+            std::env::set_var("PROXIMADB_TEST_FS_LATENCY_MS", "20");
+            std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "16");
+            std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", "4");
+            std::env::set_var("PROXIMADB_PAX_READ_SAME_WAVE_RERANK", "1");
+            std::env::set_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES", "0");
+        }
+    }
+
+    /// Load the arm's newest centroid directory into the reader's cache (its
+    /// discovery LIST, then one GET), as a long-running server has: the
+    /// directory is fetched once per generation (design §3.5, wave 0).
+    async fn preload_directory(arm: &Arm) {
+        arm.engine
+            .discover_sstable_files(&arm.storage_url)
+            .await
+            .unwrap();
+        let fs = arm
+            .engine
+            .filesystem()
+            .get_filesystem(&arm.storage_url)
+            .unwrap();
+        assert!(
+            crate::storage::engines::sst::centroid_directory_reader::load_directory(
+                fs.as_ref(),
+                &arm.storage_url,
+            )
+            .await
+            .is_some()
+        );
+    }
+
+    /// One query (`rows[q]`, top-1) in its own trace scope: asserts it finds
+    /// itself and returns the query's production `IoTraceSnapshot`.
+    async fn traced_search(
+        arm: &Arm,
+        rows: &[Vec<f32>],
+        q: usize,
+    ) -> crate::observability::io_trace::IoTraceSnapshot {
+        use crate::observability::io_trace;
+        io_trace::scope(async {
+            assert_eq!(search(arm, &rows[q], 1).await, [format!("r{q}")]);
+            io_trace::snapshot().expect("io_trace scope active")
+        })
+        .await
+    }
+
+    /// A top-1 query context for `rows[q]` under `search_mode`.
+    fn search_ctx(
+        arm: &Arm,
+        rows: &[Vec<f32>],
+        q: usize,
+        search_mode: crate::core::search::SearchMode,
+    ) -> StorageQueryContext {
+        let params = Arc::new(SearchParams {
+            vector: Some(rows[q].clone()),
+            top_k: Some(1),
+            distance_metric: Some(DistanceMetric::Euclidean),
+            search_mode,
+            ..Default::default()
+        });
+        StorageQueryContext::new(params, Arc::new(arm.collection.clone()))
+    }
+
     /// One cold query's sequential waves and requests under the injected
     /// latency, on a fresh arm (empty segment caches). The directory itself
     /// is loaded first when `directory` is on: it is fetched once per
@@ -566,37 +636,15 @@ mod tests {
         rows: &[Vec<f32>],
         directory: bool,
     ) -> (usize, usize, String) {
-        use crate::observability::io_trace;
         set_directory_read(directory);
         let arm = arm(id, rows).await;
         if directory {
-            arm.engine
-                .discover_sstable_files(&arm.storage_url)
-                .await
-                .unwrap();
-            let fs = arm
-                .engine
-                .filesystem()
-                .get_filesystem(&arm.storage_url)
-                .unwrap();
-            assert!(
-                crate::storage::engines::sst::centroid_directory_reader::load_directory(
-                    fs.as_ref(),
-                    &arm.storage_url,
-                )
-                .await
-                .is_some()
-            );
+            preload_directory(&arm).await;
         }
         // TD-PAXDIR-1 D7: waves and requests come from the query's own
         // production trace (the injected latency sits inside each timed
         // request).
-        let query = rows[7].clone();
-        let snap = io_trace::scope(async {
-            assert_eq!(search(&arm, &query, 1).await, ["r7"]);
-            io_trace::snapshot().expect("io_trace scope active")
-        })
-        .await;
+        let snap = traced_search(&arm, rows, 7).await;
         let waves = snap.waves.expect("the query issued requests") as usize;
         let requests = snap.read_requests() as usize;
         (waves, requests, format!("{snap:?}"))
@@ -627,17 +675,7 @@ mod tests {
     #[tokio::test]
     async fn a_covered_segment_cold_query_takes_three_waves() {
         enable_env();
-        // SAFETY: nextest runs each test in its own process.
-        unsafe {
-            std::env::set_var("PROXIMADB_TEST_FS_LATENCY_MS", "20");
-            std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "16");
-            std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", "4");
-            std::env::set_var("PROXIMADB_PAX_READ_SAME_WAVE_RERANK", "1");
-            // Header-only prefix reads: at synthetic scale the default 1 MiB
-            // prefix would swallow a whole segment, which a 1M-row segment's
-            // never does.
-            std::env::set_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES", "0");
-        }
+        enable_latency_env();
         let rows = corpus();
         let set_keys = |on: bool| unsafe {
             std::env::set_var(
@@ -791,14 +829,12 @@ mod tests {
         let rows = corpus();
         let arm = arm("paxdir_d7_one_list", &rows).await;
         set_directory_read(false);
-        let params = Arc::new(SearchParams {
-            vector: Some(rows[9].clone()),
-            top_k: Some(1),
-            distance_metric: Some(DistanceMetric::Euclidean),
-            search_mode: crate::core::search::SearchMode::Adaptive { threshold: 1 },
-            ..Default::default()
-        });
-        let ctx = StorageQueryContext::new(params, Arc::new(arm.collection.clone()));
+        let ctx = search_ctx(
+            &arm,
+            &rows,
+            9,
+            crate::core::search::SearchMode::Adaptive { threshold: 1 },
+        );
         let (ids, snap) = io_trace::scope(async {
             let ids: Vec<String> = Arc::clone(&arm.engine)
                 .search_vectors_unified_arc(&ctx)
@@ -823,15 +859,9 @@ mod tests {
     async fn a_warm_directory_planned_query_also_takes_three_waves() {
         use crate::observability::io_trace;
         enable_env();
+        enable_latency_env();
         // SAFETY: nextest runs each test in its own process.
-        unsafe {
-            std::env::set_var("PROXIMADB_TEST_FS_LATENCY_MS", "20");
-            std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "16");
-            std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", "4");
-            std::env::set_var("PROXIMADB_PAX_READ_SAME_WAVE_RERANK", "1");
-            std::env::set_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES", "0");
-            std::env::set_var("PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS", "1");
-        }
+        unsafe { std::env::set_var("PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS", "1") };
         let rows = corpus();
         let arm = arm("paxdir_d7_warm", &rows).await;
         // Warm the invariants cache with each segment's REAL metadata (a
@@ -842,29 +872,8 @@ mod tests {
             assert_eq!(search(&arm, &rows[q], 1).await, [format!("r{q}")]);
         }
         set_directory_read(true);
-        arm.engine
-            .discover_sstable_files(&arm.storage_url)
-            .await
-            .unwrap();
-        let fs = arm
-            .engine
-            .filesystem()
-            .get_filesystem(&arm.storage_url)
-            .unwrap();
-        assert!(
-            crate::storage::engines::sst::centroid_directory_reader::load_directory(
-                fs.as_ref(),
-                &arm.storage_url,
-            )
-            .await
-            .is_some()
-        );
-        let query = rows[1234].clone();
-        let warm = io_trace::scope(async {
-            assert_eq!(search(&arm, &query, 1).await, ["r1234"]);
-            io_trace::snapshot().unwrap()
-        })
-        .await;
+        preload_directory(&arm).await;
+        let warm = traced_search(&arm, &rows, 1234).await;
         assert_eq!(
             warm.waves,
             Some(3),
@@ -881,43 +890,19 @@ mod tests {
         use crate::observability::io_trace;
         use proximadb_storage_traits::UnifiedStorageFormat;
         enable_env();
+        enable_latency_env();
         // SAFETY: nextest runs each test in its own process.
-        unsafe {
-            std::env::set_var("PROXIMADB_TEST_FS_LATENCY_MS", "20");
-            std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "16");
-            std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", "4");
-            std::env::set_var("PROXIMADB_PAX_READ_SAME_WAVE_RERANK", "1");
-            std::env::set_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES", "0");
-            std::env::set_var("PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS", "1");
-        }
+        unsafe { std::env::set_var("PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS", "1") };
         set_directory_read(true);
         let rows = corpus();
         let arm = arm("paxdir_d7_server_path", &rows).await;
-        arm.engine
-            .discover_sstable_files(&arm.storage_url)
-            .await
-            .unwrap();
-        let fs = arm
-            .engine
-            .filesystem()
-            .get_filesystem(&arm.storage_url)
-            .unwrap();
-        assert!(
-            crate::storage::engines::sst::centroid_directory_reader::load_directory(
-                fs.as_ref(),
-                &arm.storage_url,
-            )
-            .await
-            .is_some()
+        preload_directory(&arm).await;
+        let ctx = search_ctx(
+            &arm,
+            &rows,
+            7,
+            crate::core::search::SearchMode::Approximate { nprobe: None },
         );
-        let params = Arc::new(SearchParams {
-            vector: Some(rows[7].clone()),
-            top_k: Some(1),
-            distance_metric: Some(DistanceMetric::Euclidean),
-            search_mode: crate::core::search::SearchMode::Approximate { nprobe: None },
-            ..Default::default()
-        });
-        let ctx = StorageQueryContext::new(params, Arc::new(arm.collection.clone()));
         let (ids, snap) = io_trace::scope(async {
             let ids: Vec<String> = UnifiedStorageFormat::search_vectors_unified(&*arm.engine, &ctx)
                 .await
