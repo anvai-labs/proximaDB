@@ -28,6 +28,9 @@ use apache_avro::{Reader, Schema, Writer};
 use proximadb_kernel::error::StorageError;
 use serde::{Deserialize, Serialize};
 
+mod deletes;
+pub use deletes::{DeleteFileMeta, read_delete_manifest, write_delete_manifest};
+
 fn ser_err(context: &str, e: impl std::fmt::Display) -> StorageError {
     StorageError::Serialization(format!("iceberg: {context}: {e}"))
 }
@@ -278,6 +281,33 @@ pub struct ManifestFileMeta {
     pub sequence_number: i64,
     /// v3 row lineage: first row id assigned to this manifest's added rows.
     pub first_row_id: Option<i64>,
+    /// Whether the manifest lists data files or delete files.
+    pub content: ManifestContent,
+}
+
+/// A manifest's `content` (manifest-list field 517).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ManifestContent {
+    #[default]
+    Data,
+    Deletes,
+}
+
+impl ManifestContent {
+    fn as_i32(self) -> i32 {
+        match self {
+            ManifestContent::Data => 0,
+            ManifestContent::Deletes => 1,
+        }
+    }
+
+    fn from_i32(v: i32) -> Result<Self, StorageError> {
+        match v {
+            0 => Ok(ManifestContent::Data),
+            1 => Ok(ManifestContent::Deletes),
+            other => Err(ser_err("manifest_file", format!("unknown content {other}"))),
+        }
+    }
 }
 
 // --- Avro serde mirrors (field order MUST match the schemas above) ----------
@@ -543,7 +573,7 @@ pub fn write_manifest_list(manifests: &[ManifestFileMeta]) -> Result<Vec<u8>, St
             manifest_path: m.manifest_path.clone(),
             manifest_length: m.manifest_length,
             partition_spec_id: 0,
-            content: 0, // DATA
+            content: m.content.as_i32(),
             sequence_number: m.sequence_number,
             min_sequence_number: m.sequence_number,
             added_snapshot_id: m.added_snapshot_id,
@@ -584,6 +614,7 @@ pub fn read_manifest_list(bytes: &[u8]) -> Result<Vec<ManifestFileMeta>, Storage
             added_snapshot_id: mf.added_snapshot_id,
             sequence_number: mf.sequence_number,
             first_row_id: mf.first_row_id,
+            content: ManifestContent::from_i32(mf.content)?,
         });
     }
     Ok(out)
@@ -887,6 +918,7 @@ mod tests {
             added_snapshot_id: 12345,
             sequence_number: 3,
             first_row_id: Some(10),
+            content: ManifestContent::Deletes,
         }];
         let bytes = write_manifest_list(&manifests).unwrap();
         let back = read_manifest_list(&bytes).unwrap();
@@ -1166,6 +1198,7 @@ mod tests {
                 added_snapshot_id: 42,
                 sequence_number: 9,
                 first_row_id: Some(1000),
+                content: ManifestContent::Data,
             }]
         );
     }
