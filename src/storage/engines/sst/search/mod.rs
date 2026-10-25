@@ -2704,13 +2704,17 @@ self.try_pax_cascade(
         &self,
         storage_url: &str,
     ) -> Result<Vec<DiscoveredSstFile>> {
-        // TD-PAXDIR-1 D7: within one search, reuse its first listing.
-        if let Ok(Some(files)) = DISCOVERY_MEMO.try_with(|memo| {
+        // TD-PAXDIR-1 D7: within one search, reuse its first listing — minus
+        // anything retired since (the TD-COMPACT-13 pending set is re-read,
+        // as a fresh listing would filter it).
+        if let Ok(Some(mut files)) = DISCOVERY_MEMO.try_with(|memo| {
             memo.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(storage_url)
                 .cloned()
         }) {
+            let pending = crate::storage::engines::sst::retirement_ledger::pending_paths();
+            files.retain(|f| !pending.contains(&f.url));
             return Ok(files);
         }
         let files = self.discover_sstable_files_listed(storage_url).await?;

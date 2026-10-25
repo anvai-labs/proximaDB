@@ -448,17 +448,22 @@ pub fn critical_path_waves(
     root + streams.into_values().map(overlap_waves).max().unwrap_or(0)
 }
 
-/// Maximal groups of overlapping intervals.
+/// Sequential waves of one request stream. A request joins the current wave
+/// only if it was issued before **any** of the wave's requests completed;
+/// one issued after a completion could depend on it, so it starts the next
+/// wave. That keeps a bounded-concurrency window (`read_ranges_prefetch`
+/// past its in-flight cap issues each next range as an earlier one
+/// finishes) from collapsing its rounds into one wave.
 fn overlap_waves(mut intervals: Vec<(Instant, Instant)>) -> usize {
     intervals.sort_by_key(|(start, _)| *start);
     let mut waves = 0;
-    let mut group_end: Option<Instant> = None;
+    let mut first_done: Option<Instant> = None;
     for (start, end) in intervals {
-        match group_end {
-            Some(e) if start < e => group_end = Some(e.max(end)),
+        match first_done {
+            Some(done) if start < done => first_done = Some(done.min(end)),
             _ => {
                 waves += 1;
-                group_end = Some(end);
+                first_done = Some(end);
             }
         }
     }
@@ -1306,7 +1311,13 @@ pub struct IoTraceSnapshot {
     pub head_ops: u64,
     /// TD-PAXDIR-1 D7: the query's sequential request waves along its
     /// critical path ([`critical_path_waves`]); `None` when no request was
-    /// recorded or the per-query log overflowed.
+    /// recorded or the per-query log overflowed. Known limits: requests made
+    /// through the upstream `object_store` stack (`ProximaObjectStore`)
+    /// record no interval; a trace rebound onto another task
+    /// (`scope_with_handle`) has no root stream there, so its sequential
+    /// requests are taken as one concurrent stream; and concurrent scans
+    /// throttled into batches on separate tasks (the Arc fan-out's semaphore
+    /// below the segment count) are counted as one batch.
     #[serde(default)]
     pub waves: Option<u64>,
     /// Coarse-probe rank wall microseconds incl. morsel join (C2).
@@ -1433,7 +1444,11 @@ impl IoTraceSnapshot {
     }
 
     /// TD-PAXDIR-1 D7: the read requests the P5b gate counts — GET, LIST and
-    /// HEAD (design §4.2 G3).
+    /// HEAD (design §4.2 G3). Approximate outside the `FileSystem` vector
+    /// path: a paginated S3/Azure LIST counts once (GCS counts per page),
+    /// failed GETs are not counted (failed LIST/HEAD are), and a few logical
+    /// `record_op_str` call sites (the PAX DataFusion adapter) add to
+    /// `get_ops` beside the physical leaf GETs.
     pub fn read_requests(&self) -> u64 {
         self.get_ops + self.list_ops + self.head_ops
     }
@@ -1488,6 +1503,9 @@ impl IoTraceSnapshot {
             // read_ranges with no other metered I/O) are NOT empty — a trace
             // carrying only wave metrics must still reach the billing observer.
             && self.read_ranges_fetch_rounds == 0
+            // TD-PAXDIR-1 D7: a HEAD-only trace still made object-store
+            // requests that the request meter must see.
+            && self.head_ops == 0
     }
 
     /// Total embedding tokens (input + output).
@@ -2167,8 +2185,10 @@ where
         .await
 }
 
-#[cfg(all(test, feature = "io-trace"))]
-mod tests {
+/// TD-PAXDIR-1 D7 wave and request tests: ungated, so CI runs them (the
+/// module below needs the non-default `io-trace` feature).
+#[cfg(test)]
+mod wave_tests {
     use super::{critical_path_waves, overlap_waves};
 
     /// TD-PAXDIR-1 D7: overlapping requests of one task form one wave,
@@ -2186,6 +2206,11 @@ mod tests {
             (at(30), at(40)),
         ];
         assert_eq!(overlap_waves(intervals), 3);
+        // A bounded window: two in flight; the third is issued when the
+        // first completes, while the second is still running. It may depend
+        // on the first, so it is a second wave, not part of the first.
+        let window = vec![(at(0), at(10)), (at(0), at(15)), (at(10), at(20))];
+        assert_eq!(overlap_waves(window), 2);
     }
 
     /// The critical path is the root task's waves plus the most waves of any
@@ -2206,8 +2231,6 @@ mod tests {
             (Some(b), None, at(22), at(32)),
         ];
         assert_eq!(critical_path_waves(requests.clone(), None), 3);
-        let flat: Vec<_> = requests.iter().map(|(_, _, s, e)| (*s, *e)).collect();
-        assert_eq!(overlap_waves(flat), 2, "a global count would undercount");
         // The same skewed scans polled inside ONE task (`join_all`): their
         // units, not their shared task id, keep them apart.
         let joined: Vec<_> = requests
@@ -2242,6 +2265,10 @@ mod tests {
         }
         assert_eq!(trace.waves(), None, "overflowed");
     }
+}
+
+#[cfg(all(test, feature = "io-trace"))]
+mod tests {
 
     use super::*;
 
