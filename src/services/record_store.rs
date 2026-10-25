@@ -2514,14 +2514,31 @@ impl DirectWalTableRecordStore {
     /// recover with — `{spill_root}/{tenant}/{collection}`, each component
     /// encoded injectively ([`spill_path_segment`]).
     ///
-    /// Local, not object storage, for now: the WAL itself is a local file, so
-    /// segments next to it are durable exactly as long as it is, and recovery
-    /// needs no catalog lookup to find them. Object-store placement waits for
-    /// catalog registration of the prefix (TD-USUB-1 item ii).
+    /// Local by default: segments next to the local WAL are durable exactly as
+    /// long as it is, and recovery needs no catalog lookup to find them. See
+    /// [`Self::open_for_server_at`] for the object-store placement.
     pub async fn open_for_server(
         wal_appender: Arc<dyn TableWalAppender>,
         spill_root: std::path::PathBuf,
     ) -> Result<Self> {
+        Self::open_for_server_at(
+            wal_appender,
+            crate::services::spill_placement::SpillTarget::Local(spill_root),
+        )
+        .await
+    }
+
+    /// [`Self::open_for_server`] with segments at `target`: a local root, or
+    /// an object-store prefix (`PROXIMADB_RELATIONAL_SPILL_URL`, resolved and
+    /// guarded by [`crate::services::spill_placement::resolve_spill_target`]),
+    /// at `{url}/{tenant}/{collection}` — derived from exactly what WAL replay
+    /// carries, so recovery needs no catalog lookup.
+    pub async fn open_for_server_at(
+        wal_appender: Arc<dyn TableWalAppender>,
+        target: crate::services::spill_placement::SpillTarget,
+    ) -> Result<Self> {
+        use crate::services::spill_placement::SpillTarget;
+        let location = target.location();
         if crate::services::record_spill::configured_flush_threshold().is_none() {
             // Spill turned off over a root an earlier run spilled into, AFTER
             // the WAL was truncated: rows flushed there may be in no retained
@@ -2529,36 +2546,50 @@ impl DirectWalTableRecordStore {
             // Refuse. With the history intact, replay rebuilds every row in
             // memory and turning the spill off is safe.
             if wal_appender.retained_from() > 1
-                && crate::services::storage_format::spill_root_has_state(&spill_root)
+                && target.has_state().await.with_context(|| {
+                    format!(
+                        "record spill is off and the WAL was truncated, but {location} could not \
+                         be checked for spill segments whose rows only it holds"
+                    )
+                })?
             {
                 anyhow::bail!(
-                    "record spill is off ({}=0) but {} holds spill segments from an earlier \
-                     run and the WAL below them was truncated, so their rows are in no \
+                    "record spill is off ({}=0) but {location} holds spill segments from an \
+                     earlier run and the WAL below them was truncated, so their rows are in no \
                      retained WAL entry; turn the spill back on",
                     crate::services::record_spill::SPILL_MAX_RESIDENT_ENV,
-                    spill_root.display()
                 );
             }
             return Ok(Self::new_partitioned(wal_appender));
         }
         // An empty root would put segments at `/{tenant}/{collection}`.
-        if spill_root.as_os_str().is_empty() {
+        if location.trim_end_matches('/').is_empty() {
             anyhow::bail!("record spill: the spill gate is set but no spill root was configured");
         }
-        let filesystem = Arc::new(
-            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
-                crate::storage::persistence::filesystem::local::LocalConfig::default(),
-            )
-            .await
-            .map_err(|e| anyhow!("record spill: local filesystem init failed: {e}"))?,
-        );
-        let root = spill_root
-            .to_string_lossy()
-            .trim_end_matches('/')
-            .to_string();
+        let (filesystem, root): (
+            Arc<dyn crate::storage::persistence::filesystem::FileSystem>,
+            String,
+        ) = match target {
+            SpillTarget::Local(spill_root) => (
+                Arc::new(
+                    crate::storage::persistence::filesystem::local::LocalFileSystem::new(
+                        crate::storage::persistence::filesystem::local::LocalConfig::default(),
+                    )
+                    .await
+                    .map_err(|e| anyhow!("record spill: local filesystem init failed: {e}"))?,
+                ),
+                spill_root
+                    .to_string_lossy()
+                    .trim_end_matches('/')
+                    .to_string(),
+            ),
+            SpillTarget::Object { url, filesystem } => {
+                (filesystem, url.trim_end_matches('/').to_string())
+            }
+        };
         tracing::info!(
             spill_root = %root,
-            "relational record spill enabled: partitions flush to local Parquet segments"
+            "relational record spill enabled: partitions flush to Parquet segments"
         );
         Ok(Self::new_spilling(
             wal_appender,
@@ -6564,6 +6595,92 @@ mod tests {
         }
         oids.sort();
         assert_eq!(oids, ["r0", "r1", "r2", "r3", "r4", "r5"]);
+    }
+
+    /// TD-SEAM-3 object-store placement: segments land at
+    /// `{url}/{tenant}/{collection}`, and a store opened later over the same
+    /// target finds them by listing that prefix — no catalog lookup.
+    async fn spill_segments_round_trip_at(url: String) {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
+        }
+        let factory = crate::storage::persistence::filesystem::FilesystemFactory::create_default()
+            .await
+            .expect("factory");
+        let target = || crate::services::spill_placement::SpillTarget::Object {
+            url: url.clone(),
+            filesystem: factory
+                .get_filesystem(&url)
+                .expect("filesystem for the url"),
+        };
+        let schema = CatalogTableSchema::new("orders");
+        let tenant = TenantContext::for_tenant_id("tenant-a");
+        let segments_of = |store: DirectWalTableRecordStore| {
+            let (schema, tenant) = (schema.clone(), tenant.clone());
+            async move {
+                let snapshot = store
+                    .layer_a_snapshot(
+                        &schema,
+                        Some(&tenant),
+                        #[cfg(feature = "abac-policy")]
+                        &ReadContext::system(SystemReadReason::Statistics, "record_store::tests"),
+                    )
+                    .await
+                    .expect("snapshot")
+                    .expect("a spilling store offers a snapshot");
+                (snapshot.view.segments.clone(), snapshot.view.resident.len())
+            }
+        };
+
+        let first = DirectWalTableRecordStore::open_for_server_at(
+            Arc::new(RecordingWalAppender::default()),
+            target(),
+        )
+        .await
+        .expect("open");
+        first
+            .replay_wal_entries(upsert_entries(6, "orders", "tenant-a"))
+            .await
+            .expect("replay");
+        let (written, _) = segments_of(first).await;
+        assert!(!written.is_empty(), "rows past the threshold flushed");
+        let prefix = format!("{url}/tenant-a/orders/");
+        assert!(
+            written.iter().all(|path| path.starts_with(&prefix)),
+            "segments under {prefix}: {written:?}"
+        );
+
+        let later = DirectWalTableRecordStore::open_for_server_at(
+            Arc::new(RecordingWalAppender::default()),
+            target(),
+        )
+        .await
+        .expect("reopen");
+        let (found, resident) = segments_of(later).await;
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+        assert_eq!(found, written, "discovery lists the derived prefix");
+        assert_eq!(resident, 0);
+    }
+
+    /// `file://` exercises the object-store arm (URL-addressed paths, prefix
+    /// listing) without an emulator.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn spill_segments_round_trip_at_a_url_prefix() {
+        let (root, _) = spill_root();
+        spill_segments_round_trip_at(format!("file://{}/bucket/spill", root.display())).await;
+    }
+
+    /// The same against a real object store (run by the `--restart` scope of
+    /// `scripts/run_cloud_emulator_tests.sh`, Azurite).
+    #[tokio::test]
+    #[ignore = "requires an object-store emulator (PROXIMADB_OBJECT_STORE_URL)"]
+    async fn spill_segments_round_trip_on_object_store() {
+        let base = std::env::var("PROXIMADB_OBJECT_STORE_URL")
+            .expect("set PROXIMADB_OBJECT_STORE_URL to an emulator prefix");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        spill_segments_round_trip_at(format!("{base}/spill-round-trip/{run}")).await;
     }
 
     /// The UNTENANTED partition spills too, and persists its deletes.

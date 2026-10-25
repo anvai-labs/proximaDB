@@ -206,6 +206,7 @@ pub mod record_memtable;
 pub mod record_spill;
 pub mod record_store;
 pub mod referential;
+pub mod spill_placement;
 pub mod storage_format;
 pub mod txn_staging;
 pub mod wal_truncator;

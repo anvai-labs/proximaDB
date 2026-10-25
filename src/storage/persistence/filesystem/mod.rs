@@ -1920,6 +1920,33 @@ mod range_coalesce_gate_tests {
     }
 }
 
+/// `scheme://bucket/key` → `(bucket, key)` for the object-store backends.
+/// `schemes` are the accepted prefixes; `(article, name)` names the backend
+/// in errors and `part` what follows the bucket.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+pub(crate) fn split_object_url(
+    path: &str,
+    schemes: &[&str],
+    (article, name): (&str, &str),
+    part: &str,
+) -> FsResult<(String, String)> {
+    let rest = schemes
+        .iter()
+        .find_map(|scheme| path.strip_prefix(scheme))
+        .ok_or_else(|| {
+            FilesystemError::InvalidPath(format!("not {article} {name} path: {path}"))
+        })?;
+    let (bucket, key) = rest.split_once('/').ok_or_else(|| {
+        FilesystemError::InvalidPath(format!("missing {part} in {name} path: {path}"))
+    })?;
+    if bucket.is_empty() || key.is_empty() {
+        return Err(FilesystemError::InvalidPath(format!(
+            "bad {name} path: {path}"
+        )));
+    }
+    Ok((bucket.to_string(), key.to_string()))
+}
+
 /// Error mapping shared by the `object_store`-backed backends (S3, Azure).
 #[cfg(any(feature = "aws", feature = "azure"))]
 pub(crate) mod object_store_errors {
@@ -1930,6 +1957,22 @@ pub(crate) mod object_store_errors {
     pub(crate) fn object_error(ctx: &str, path: &str, e: object_store::Error) -> FilesystemError {
         match e {
             object_store::Error::NotFound { .. } => FilesystemError::NotFound(path.to_string()),
+            other => denied(ctx, other),
+        }
+    }
+
+    /// A refused credential is not a transient fault: callers that retry
+    /// `Network` must not retry these. Only errors object_store classifies
+    /// reach here as such: it reports a refused LIST (S3, Azure) as `Generic`,
+    /// so that stays `Network`.
+    pub(crate) fn denied(ctx: &str, e: object_store::Error) -> FilesystemError {
+        match e {
+            object_store::Error::PermissionDenied { .. } => {
+                FilesystemError::PermissionDenied(format!("{ctx}: {e}"))
+            }
+            object_store::Error::Unauthenticated { .. } => {
+                FilesystemError::Auth(format!("{ctx}: {e}"))
+            }
             other => FilesystemError::Network(format!("{ctx}: {other}")),
         }
     }
@@ -1940,7 +1983,7 @@ pub(crate) mod object_store_errors {
         match head {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(e) => Err(FilesystemError::Network(format!("{ctx}: {e}"))),
+            Err(e) => Err(denied(ctx, e)),
         }
     }
 }

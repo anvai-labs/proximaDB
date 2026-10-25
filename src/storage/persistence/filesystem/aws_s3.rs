@@ -87,17 +87,7 @@ impl AwsS3FileSystem {
 
     /// Parse `s3://bucket/key` (or `s3a://`).
     fn parse(path: &str) -> FsResult<(String, String)> {
-        let rest = path
-            .strip_prefix("s3://")
-            .or_else(|| path.strip_prefix("s3a://"))
-            .ok_or_else(|| FilesystemError::InvalidPath(format!("not an s3 path: {path}")))?;
-        let (bucket, key) = rest.split_once('/').ok_or_else(|| {
-            FilesystemError::InvalidPath(format!("missing key in s3 path: {path}"))
-        })?;
-        if bucket.is_empty() || key.is_empty() {
-            return Err(FilesystemError::InvalidPath(format!("bad s3 path: {path}")));
-        }
-        Ok((bucket.to_string(), key.to_string()))
+        super::split_object_url(path, &["s3://", "s3a://"], ("an", "s3"), "key")
     }
 
     /// Build (and cache) an `ObjectStore` for a bucket.
@@ -199,13 +189,13 @@ impl FileSystem for AwsS3FileSystem {
                 store
                     .put_opts(&dst, payload, opts)
                     .await
-                    .map_err(|e| Self::net("S3 put_opts", e))?;
+                    .map_err(|e| super::object_store_errors::denied("S3 put_opts", e))?;
             }
             None => {
                 store
                     .put(&dst, payload)
                     .await
-                    .map_err(|e| Self::net("S3 put", e))?;
+                    .map_err(|e| super::object_store_errors::denied("S3 put", e))?;
             }
         }
         Ok(())
@@ -297,7 +287,10 @@ impl FileSystem for AwsS3FileSystem {
             Err(object_store::Error::AlreadyExists { .. }) => {
                 Err(FilesystemError::AlreadyExists(path.to_string()))
             }
-            Err(error) => Err(Self::net("S3 conditional put", error)),
+            Err(error) => Err(super::object_store_errors::denied(
+                "S3 conditional put",
+                error,
+            )),
         }
     }
 
@@ -348,7 +341,7 @@ impl FileSystem for AwsS3FileSystem {
         let mut stream = store.list(Some(&ObjPath::from(prefix)));
         let mut entries = Vec::new();
         while let Some(meta) = stream.next().await {
-            let meta = meta.map_err(|e| Self::net("S3 list", e))?;
+            let meta = meta.map_err(|e| super::object_store_errors::denied("S3 list", e))?;
             let key = meta.location.to_string();
             let name = key.rsplit('/').next().unwrap_or(&key).to_string();
             entries.push(DirEntry {
@@ -372,16 +365,6 @@ impl FileSystem for AwsS3FileSystem {
 
     async fn create_dir_all(&self, _path: &str) -> FsResult<()> {
         Ok(())
-    }
-
-    async fn copy(&self, from: &str, to: &str) -> FsResult<()> {
-        let data = self.read(from).await?;
-        self.write(to, &data, None).await
-    }
-
-    async fn move_file(&self, from: &str, to: &str) -> FsResult<()> {
-        self.copy(from, to).await?;
-        self.delete(from).await
     }
 
     fn filesystem_type(&self) -> &'static str {

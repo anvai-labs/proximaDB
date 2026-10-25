@@ -2109,7 +2109,7 @@ pub(crate) fn now_ns() -> i64 {
 ///
 /// Erring toward "real failure" is the safe direction here: a false *absence*
 /// loses data silently, a false *failure* is loud and recorded.
-fn is_absent(err: &proximadb_storage_filesystem_types::FilesystemError) -> bool {
+pub(crate) fn is_absent(err: &proximadb_storage_filesystem_types::FilesystemError) -> bool {
     use proximadb_storage_filesystem_types::FilesystemError;
     match err {
         FilesystemError::NotFound(_) => true,

@@ -169,8 +169,9 @@ impl MetadataClient {
                 serde_json::from_slice(&body).map_err(|e| Self::net("GCS metadata decode", e))?,
             )),
             404 => Ok(None),
-            code => Err(Self::net(
+            code => Err(status_error(
                 "GCS metadata GET",
+                Some(code),
                 format!("HTTP {code}: {}", Self::body_snippet(&body)),
             )),
         }
@@ -204,8 +205,9 @@ impl MetadataClient {
             .await
             .map_err(|e| Self::net("GCS list body", e))?;
         if status != 200 {
-            return Err(Self::net(
+            return Err(status_error(
                 "GCS list",
+                Some(status),
                 format!("HTTP {status}: {}", Self::body_snippet(&body)),
             ));
         }
@@ -294,17 +296,7 @@ impl GcsFileSystem {
 
     /// Parse `gs://bucket/object` (or `gcs://`) into `(bucket, object)`.
     fn parse(path: &str) -> FsResult<(String, String)> {
-        let rest = path
-            .strip_prefix("gs://")
-            .or_else(|| path.strip_prefix("gcs://"))
-            .ok_or_else(|| FilesystemError::InvalidPath(format!("not a gs:// path: {path}")))?;
-        let (bucket, object) = rest.split_once('/').ok_or_else(|| {
-            FilesystemError::InvalidPath(format!("missing object in gs path: {path}"))
-        })?;
-        if bucket.is_empty() || object.is_empty() {
-            return Err(FilesystemError::InvalidPath(format!("bad gs path: {path}")));
-        }
-        Ok((bucket.to_string(), object.to_string()))
+        super::split_object_url(path, &["gs://", "gcs://"], ("a", "gs"), "object")
     }
 
     fn net(ctx: &str, e: impl std::fmt::Display) -> FilesystemError {
@@ -364,7 +356,7 @@ impl GcsFileSystem {
             if e.http_status_code() == Some(404) {
                 FilesystemError::NotFound(format!("gs://{bucket}/{object}"))
             } else {
-                Self::net(ctx, e)
+                status_error(ctx, e.http_status_code(), e)
             }
         })?;
         let mut out = Vec::new();
@@ -499,7 +491,7 @@ impl FileSystem for GcsFileSystem {
         builder
             .send_unbuffered()
             .await
-            .map_err(|e| Self::net("GCS write_object", e))?;
+            .map_err(|e| status_error("GCS write_object", e.http_status_code(), e))?;
         Ok(())
     }
 
@@ -588,7 +580,11 @@ impl FileSystem for GcsFileSystem {
             Err(e) if Self::is_precondition_conflict(&e) => {
                 Err(FilesystemError::AlreadyExists(path.to_string()))
             }
-            Err(e) => Err(Self::net("GCS conditional upload", e)),
+            Err(e) => Err(status_error(
+                "GCS conditional upload",
+                e.http_status_code(),
+                e,
+            )),
         }
     }
 
@@ -674,17 +670,9 @@ impl FileSystem for GcsFileSystem {
         Ok(())
     }
 
-    async fn copy(&self, from: &str, to: &str) -> FsResult<()> {
-        // GCS has a native copy/rewrite; download+upload keeps this backend lean
-        // and is sufficient for the cold-path use (small index objects).
-        let data = self.read(from).await?;
-        self.write(to, &data, None).await
-    }
-
-    async fn move_file(&self, from: &str, to: &str) -> FsResult<()> {
-        self.copy(from, to).await?;
-        self.delete(from).await
-    }
+    // `copy` / `move_file`: the trait defaults (download + upload). GCS has a
+    // native copy/rewrite; this keeps the backend lean and is sufficient for
+    // the cold-path use (small index objects).
 
     fn filesystem_type(&self) -> &'static str {
         "gcs"
@@ -698,6 +686,16 @@ impl FileSystem for GcsFileSystem {
         Err(FilesystemError::InvalidOperation(
             "streaming open_file is not supported on the GCS backend".to_string(),
         ))
+    }
+}
+
+/// A 401/403 is a refused credential, not a transient fault: callers that
+/// retry `Network` must not retry it.
+fn status_error(ctx: &str, status: Option<u16>, detail: impl std::fmt::Display) -> FilesystemError {
+    match status {
+        Some(401) => FilesystemError::Auth(format!("{ctx}: {detail}")),
+        Some(403) => FilesystemError::PermissionDenied(format!("{ctx}: {detail}")),
+        _ => FilesystemError::Network(format!("{ctx}: {detail}")),
     }
 }
 
