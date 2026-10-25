@@ -4131,12 +4131,14 @@ pub mod types {
     /// "enable_proxima_record": true
     /// }
     /// ```
+    /// Unknown fields are rejected (TD-RESTGET-1): a misspelt setting used to be
+    /// dropped, and the collection silently got the default instead.
     ///
     /// <details><summary>JSON schema</summary>
     ///
     /// ```json
     ///{
-    ///  "description": "Request to create a collection with schema support\n\n## Example JSON\n\n```json\n{\n    \"name\": \"products\",\n    \"dimension\": 768,\n    \"engine\": \"sst\",\n    \"schema\": {\n        \"columns\": [\n            {\"name\": \"category\", \"data_type\": \"text\", \"indexed\": true},\n            {\"name\": \"price\", \"data_type\": \"float\", \"filterable\": true},\n            {\"name\": \"description\", \"data_type\": \"text\", \"max_length\": 10000}\n        ],\n        \"enforcement\": \"hybrid\",\n        \"allow_additional_fields\": true\n    },\n    \"enable_proxima_record\": true\n}\n```",
+    ///  "description": "Request to create a collection with schema support\n\n## Example JSON\n\n```json\n{\n    \"name\": \"products\",\n    \"dimension\": 768,\n    \"engine\": \"sst\",\n    \"schema\": {\n        \"columns\": [\n            {\"name\": \"category\", \"data_type\": \"text\", \"indexed\": true},\n            {\"name\": \"price\", \"data_type\": \"float\", \"filterable\": true},\n            {\"name\": \"description\", \"data_type\": \"text\", \"max_length\": 10000}\n        ],\n        \"enforcement\": \"hybrid\",\n        \"allow_additional_fields\": true\n    },\n    \"enable_proxima_record\": true\n}\n```\nUnknown fields are rejected (TD-RESTGET-1): a misspelt setting used to be\ndropped, and the collection silently got the default instead.",
     ///  "type": "object",
     ///  "required": [
     ///    "dimension",
@@ -4150,6 +4152,13 @@ pub mod types {
     ///        "null"
     ///      ]
     ///    },
+    ///    "description": {
+    ///      "description": "Free-text description, persisted on the collection config.",
+    ///      "type": [
+    ///        "string",
+    ///        "null"
+    ///      ]
+    ///    },
     ///    "dimension": {
     ///      "description": "Vector dimension (required)",
     ///      "type": "integer",
@@ -4157,7 +4166,7 @@ pub mod types {
     ///      "minimum": 1.0
     ///    },
     ///    "distance_metric": {
-    ///      "description": "Distance metric for vector similarity\n\nOptions: \"cosine\", \"euclidean\", \"dot_product\"\nDefault: \"cosine\"",
+    ///      "description": "Distance metric for vector similarity\n\nOptions: \"cosine\", \"euclidean\", \"dot_product\"\nDefault: \"cosine\"\n`metric` is accepted as an alias.",
     ///      "type": [
     ///        "string",
     ///        "null"
@@ -4171,7 +4180,7 @@ pub mod types {
     ///      ]
     ///    },
     ///    "engine": {
-    ///      "description": "Storage engine selection\n\nOptions: \"auto\", \"sst\", \"helix\", \"swift\", \"nova\", \"raptor\", \"tst\"\nDefault: \"auto\" (system selects optimal engine)\n(\"viper\" is no longer accepted — deprecated by ADR-093)",
+    ///      "description": "Storage engine selection\n\nOptions: \"auto\", \"sst\", \"helix\", \"swift\", \"nova\", \"raptor\", \"tst\"\nDefault: \"auto\" (system selects optimal engine)\n(\"viper\" is no longer accepted — deprecated by ADR-093)\n`storage_engine` is accepted as an alias.",
     ///      "type": [
     ///        "string",
     ///        "null"
@@ -4189,6 +4198,14 @@ pub mod types {
     ///    },
     ///    "index_policy": {
     ///      "$ref": "#/components/schemas/IndexPolicyInput"
+    ///    },
+    ///    "index_type": {
+    ///      "description": "Legacy field the released Rust and TypeScript SDKs send on every create\n(default \"hnsw\"). Index selection is cost-derived, so \"hnsw\" is accepted\nand has no effect; any other value is rejected — declare an index with\n`index_configs` or force a route with `index_policy.mode` instead.",
+    ///      "deprecated": true,
+    ///      "type": [
+    ///        "string",
+    ///        "null"
+    ///      ]
     ///    },
     ///    "initial_capacity": {
     ///      "description": "Initial capacity hint for pre-allocation",
@@ -4220,11 +4237,13 @@ pub mod types {
     ///        "type": "string"
     ///      }
     ///    }
-    ///  }
+    ///  },
+    ///  "additionalProperties": false
     ///}
     /// ```
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
     pub struct CreateCollectionV2Request {
         /// Canonical embedding precision for stored vectors
         ///
@@ -4235,12 +4254,16 @@ pub mod types {
         /// converge on the same enum discriminant.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub canonical_embedding_precision: ::std::option::Option<::std::string::String>,
+        ///Free-text description, persisted on the collection config.
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub description: ::std::option::Option<::std::string::String>,
         ///Vector dimension (required)
         pub dimension: ::std::num::NonZeroU32,
         /// Distance metric for vector similarity
         ///
         /// Options: "cosine", "euclidean", "dot_product"
         /// Default: "cosine"
+        /// `metric` is accepted as an alias.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub distance_metric: ::std::option::Option<::std::string::String>,
         /// Enable ProximaRecord support for this collection
@@ -4258,6 +4281,7 @@ pub mod types {
         /// Options: "auto", "sst", "helix", "swift", "nova", "raptor", "tst"
         /// Default: "auto" (system selects optimal engine)
         /// ("viper" is no longer accepted — deprecated by ADR-093)
+        /// `storage_engine` is accepted as an alias.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub engine: ::std::option::Option<::std::string::String>,
         /// Index configurations (e.g. an explicit IVF or HNSW index).
@@ -4269,6 +4293,12 @@ pub mod types {
         pub index_configs: ::std::option::Option<::std::vec::Vec<IndexConfigInput>>,
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub index_policy: ::std::option::Option<IndexPolicyInput>,
+        /// Legacy field the released Rust and TypeScript SDKs send on every create
+        /// (default "hnsw"). Index selection is cost-derived, so "hnsw" is accepted
+        /// and has no effect; any other value is rejected — declare an index with
+        /// `index_configs` or force a route with `index_policy.mode` instead.
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub index_type: ::std::option::Option<::std::string::String>,
         ///Initial capacity hint for pre-allocation
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub initial_capacity: ::std::option::Option<i64>,
@@ -9151,11 +9181,13 @@ pub mod types {
     ///      "format": "int32",
     ///      "minimum": 0.0
     ///    }
-    ///  }
+    ///  },
+    ///  "additionalProperties": false
     ///}
     /// ```
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
     pub struct HnswConfigInput {
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub ef_construction: ::std::option::Option<i32>,
@@ -9462,11 +9494,13 @@ pub mod types {
     ///        "type": "string"
     ///      }
     ///    }
-    ///  }
+    ///  },
+    ///  "additionalProperties": false
     ///}
     /// ```
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
     pub struct IndexConfigInput {
         ///Algorithm: "hnsw", "ivf", "pq", "flat", "annoy", "lsh".
         pub algorithm: ::std::string::String,
@@ -9534,11 +9568,13 @@ pub mod types {
     ///        "null"
     ///      ]
     ///    }
-    ///  }
+    ///  },
+    ///  "additionalProperties": false
     ///}
     /// ```
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
     pub struct IndexPolicyInput {
         /// Exact-scan byte budget override (bytes). 0/omitted ⇒ cost-model default
         /// for the storage class.
@@ -10013,11 +10049,13 @@ pub mod types {
     ///      "format": "int32",
     ///      "minimum": 0.0
     ///    }
-    ///  }
+    ///  },
+    ///  "additionalProperties": false
     ///}
     /// ```
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
     pub struct IvfConfigInput {
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub n_lists: ::std::option::Option<i32>,
@@ -12005,11 +12043,13 @@ pub mod types {
     ///        "null"
     ///      ]
     ///    }
-    ///  }
+    ///  },
+    ///  "additionalProperties": false
     ///}
     /// ```
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
     pub struct QuantizationConfigInput {
         ///Enable quantization for this collection.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
@@ -13148,11 +13188,13 @@ pub mod types {
     ///      "format": "int32",
     ///      "minimum": 0.0
     ///    }
-    ///  }
+    ///  },
+    ///  "additionalProperties": false
     ///}
     /// ```
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
     pub struct RestColumnDefinition {
         /// Data type
         ///
@@ -21301,6 +21343,10 @@ pub mod types {
                 ::std::option::Option<::std::string::String>,
                 ::std::string::String,
             >,
+            description: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                ::std::string::String,
+            >,
             dimension: ::std::result::Result<::std::num::NonZeroU32, ::std::string::String>,
             distance_metric: ::std::result::Result<
                 ::std::option::Option<::std::string::String>,
@@ -21318,6 +21364,10 @@ pub mod types {
             >,
             index_policy: ::std::result::Result<
                 ::std::option::Option<super::IndexPolicyInput>,
+                ::std::string::String,
+            >,
+            index_type: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
                 ::std::string::String,
             >,
             initial_capacity:
@@ -21341,12 +21391,14 @@ pub mod types {
             fn default() -> Self {
                 Self {
                     canonical_embedding_precision: Ok(Default::default()),
+                    description: Ok(Default::default()),
                     dimension: Err("no value supplied for dimension".to_string()),
                     distance_metric: Ok(Default::default()),
                     enable_proxima_record: Ok(Default::default()),
                     engine: Ok(Default::default()),
                     index_configs: Ok(Default::default()),
                     index_policy: Ok(Default::default()),
+                    index_type: Ok(Default::default()),
                     initial_capacity: Ok(Default::default()),
                     name: Err("no value supplied for name".to_string()),
                     quantization: Ok(Default::default()),
@@ -21366,6 +21418,16 @@ pub mod types {
                         "error converting supplied value for canonical_embedding_precision: {e}"
                     )
                 });
+                self
+            }
+            pub fn description<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.description = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for description: {e}"));
                 self
             }
             pub fn dimension<T>(mut self, value: T) -> Self
@@ -21430,6 +21492,16 @@ pub mod types {
                     .map_err(|e| format!("error converting supplied value for index_policy: {e}"));
                 self
             }
+            pub fn index_type<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.index_type = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for index_type: {e}"));
+                self
+            }
             pub fn initial_capacity<T>(mut self, value: T) -> Self
             where
                 T: ::std::convert::TryInto<::std::option::Option<i64>>,
@@ -21490,12 +21562,14 @@ pub mod types {
             ) -> ::std::result::Result<Self, super::error::ConversionError> {
                 Ok(Self {
                     canonical_embedding_precision: value.canonical_embedding_precision?,
+                    description: value.description?,
                     dimension: value.dimension?,
                     distance_metric: value.distance_metric?,
                     enable_proxima_record: value.enable_proxima_record?,
                     engine: value.engine?,
                     index_configs: value.index_configs?,
                     index_policy: value.index_policy?,
+                    index_type: value.index_type?,
                     initial_capacity: value.initial_capacity?,
                     name: value.name?,
                     quantization: value.quantization?,
@@ -21508,12 +21582,14 @@ pub mod types {
             fn from(value: super::CreateCollectionV2Request) -> Self {
                 Self {
                     canonical_embedding_precision: Ok(value.canonical_embedding_precision),
+                    description: Ok(value.description),
                     dimension: Ok(value.dimension),
                     distance_metric: Ok(value.distance_metric),
                     enable_proxima_record: Ok(value.enable_proxima_record),
                     engine: Ok(value.engine),
                     index_configs: Ok(value.index_configs),
                     index_policy: Ok(value.index_policy),
+                    index_type: Ok(value.index_type),
                     initial_capacity: Ok(value.initial_capacity),
                     name: Ok(value.name),
                     quantization: Ok(value.quantization),

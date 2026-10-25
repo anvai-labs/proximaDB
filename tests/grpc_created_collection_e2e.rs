@@ -571,9 +571,15 @@ async fn conflicting_embedding_dimension_is_rejected_and_collection_survives_e2e
         json!({"columns": [{"name": "embedding", "data_type": "vector", "vector_dimension": 768}]}),
     )
     .await;
+    // TD-RESTGET-1: the caller's mistake is a 400 naming it, not a 500.
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "a 768-dim embedding on a dim-3 collection is a client error: {body}"
+    );
     assert!(
-        !status.is_success() && body.contains("768"),
-        "a 768-dim embedding on a dim-3 collection must be rejected with the reason: {status} {body}"
+        body.contains("768") && body.contains("invalid_argument"),
+        "the 400 must name the conflict: {body}"
     );
     assert!(
         rest_lists(&http, &base, name).await,
@@ -844,4 +850,238 @@ async fn record_mode_is_settable_and_enableable_over_grpc_e2e() {
         .expect("GetSchema")
         .into_inner();
     assert_eq!(schema.record_enabled, Some(true));
+}
+
+// ---------------------------------------------------------------------------
+// TD-RESTGET-1: the REST v2 create contract. A misspelt or unknown setting, or
+// an invalid value, is a 400 naming it — never silently replaced by a default
+// — and nothing is created.
+// ---------------------------------------------------------------------------
+
+async fn rest_post_create(
+    http: &reqwest::Client,
+    base: &str,
+    body: serde_json::Value,
+) -> (reqwest::StatusCode, String) {
+    let resp = http
+        .post(format!("{base}/api/v2/collections"))
+        .json(&body)
+        .send()
+        .await
+        .expect("REST create");
+    let status = resp.status();
+    (status, resp.text().await.unwrap_or_default())
+}
+
+async fn rest_get_status(http: &reqwest::Client, base: &str, name: &str) -> reqwest::StatusCode {
+    http.get(format!("{base}/api/v2/collections/{name}"))
+        .send()
+        .await
+        .expect("REST get")
+        .status()
+}
+
+#[tokio::test]
+async fn get_missing_collection_is_404_e2e() {
+    let server = Server::start().await.expect("server start");
+    let http = reqwest::Client::builder().no_proxy().build().expect("http");
+    let base = format!("http://127.0.0.1:{}", server.rest_port);
+    let resp = http
+        .get(format!("{base}/api/v2/collections/no_such_collection"))
+        .send()
+        .await
+        .expect("REST get");
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let body = resp.text().await.unwrap_or_default();
+    assert!(body.contains("collection_not_found"), "404 body: {body}");
+}
+
+#[tokio::test]
+async fn create_rejects_unknown_and_misspelt_fields_e2e() {
+    let server = Server::start().await.expect("server start");
+    let http = reqwest::Client::builder().no_proxy().build().expect("http");
+    let base = format!("http://127.0.0.1:{}", server.rest_port);
+
+    let cases = [
+        // top level
+        (
+            "unknown_top",
+            json!({"name": "unknown_top", "dimension": 4, "replicas": 3}),
+            "unknown field `replicas`",
+        ),
+        // nested: `hnsw` for `hnsw_config` used to create an index with no parameters
+        (
+            "misspelt_hnsw",
+            json!({"name": "misspelt_hnsw", "dimension": 4,
+                   "index_configs": [{"algorithm": "hnsw", "hnsw": {"m": 32}}]}),
+            "unknown field `hnsw`",
+        ),
+        (
+            "misspelt_quant",
+            json!({"name": "misspelt_quant", "dimension": 4,
+                   "quantization": {"enabled": true, "type": "scalar"}}),
+            "unknown field `type`",
+        ),
+        (
+            "misspelt_column",
+            json!({"name": "misspelt_column", "dimension": 4, "enable_proxima_record": true,
+                   "schema": {"columns": [{"name": "c", "data_type": "text", "filterabel": true}]}}),
+            "unknown field `filterabel`",
+        ),
+        // invalid value: used to be replaced by smart_defaults
+        (
+            "bad_strategy",
+            json!({"name": "bad_strategy", "dimension": 4,
+                   "quantization": {"enabled": true, "strategy": "scalar"}}),
+            "smart_defaults",
+        ),
+        // index_type other than the released SDKs' "hnsw" default was silently
+        // not honoured; it now says which fields do express it
+        (
+            "index_type_ivf",
+            json!({"name": "index_type_ivf", "dimension": 4, "index_type": "ivf"}),
+            "index_configs",
+        ),
+    ];
+    for (name, body, named) in cases {
+        let (status, text) = rest_post_create(&http, &base, body).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "{name}: must be a 400, got {status}: {text}"
+        );
+        assert!(
+            text.contains("invalid_argument") && text.contains(named),
+            "{name}: the 400 must be the API envelope naming `{named}`: {text}"
+        );
+        assert_eq!(
+            rest_get_status(&http, &base, name).await,
+            reqwest::StatusCode::NOT_FOUND,
+            "{name}: a rejected create must not create the collection"
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_accepts_canonical_and_legacy_spellings_e2e() {
+    let server = Server::start().await.expect("server start");
+    let http = reqwest::Client::builder().no_proxy().build().expect("http");
+    let base = format!("http://127.0.0.1:{}", server.rest_port);
+
+    let accepted = [
+        json!({"name": "valid_strategy", "dimension": 4,
+               "quantization": {"enabled": true, "strategy": "custom_levels"}}),
+        // what the released Rust / TypeScript SDKs send
+        json!({"name": "legacy_sdk", "dimension": 4, "engine": "sst", "index_type": "hnsw",
+               "distance_metric": "cosine", "description": "from the TS SDK"}),
+        // aliases
+        json!({"name": "aliased", "dimension": 4, "metric": "cosine", "storage_engine": "sst"}),
+    ];
+    for body in accepted {
+        let name = body["name"].as_str().unwrap_or_default().to_string();
+        let (status, text) = rest_post_create(&http, &base, body).await;
+        assert!(
+            status.is_success(),
+            "{name}: must be accepted: {status} {text}"
+        );
+    }
+
+    // `description` is persisted, not accepted-and-dropped.
+    let mut grpc = connect_grpc(server.grpc_port).await;
+    let legacy = grpc
+        .get_collection(proximadb::proto::proximadb_v2::V2GetCollectionRequest {
+            collection_id: "legacy_sdk".to_string(),
+        })
+        .await
+        .expect("gRPC GetCollection")
+        .into_inner();
+    let legacy_config = legacy.config.expect("collection config");
+    assert_eq!(
+        legacy_config.description, "from the TS SDK",
+        "the create description must be persisted"
+    );
+    // Round-1 review: the released SDKs' default `index_type: "hnsw"` must not
+    // declare an index — that would opt every such collection into a
+    // flush-time AXIS build and a different search route.
+    assert!(
+        legacy_config.index_specs.is_empty(),
+        "index_type \"hnsw\" must not declare an index: {:?}",
+        legacy_config.index_specs
+    );
+
+    // A body that is not JSON keeps axum's own status (here 415), not a 400.
+    let resp = http
+        .post(format!("{base}/api/v2/collections"))
+        .body(r#"{"name": "no_content_type", "dimension": 4}"#)
+        .send()
+        .await
+        .expect("REST create without content type");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn schema_put_rejections_are_400_e2e() {
+    let server = Server::start().await.expect("server start");
+    let http = reqwest::Client::builder().no_proxy().build().expect("http");
+    let base = format!("http://127.0.0.1:{}", server.rest_port);
+    let name = "schema_put_rejects";
+    rest_create(&http, &base, name).await;
+
+    // A misspelt column field: the same strict body policy as create.
+    let (status, body) = rest_put_schema(
+        &http,
+        &base,
+        name,
+        json!({"columns": [{"name": "c", "data_type": "text", "filterabel": true}]}),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.contains("invalid_argument") && body.contains("unknown field `filterabel`"),
+        "{body}"
+    );
+
+    // A reserved system-metadata name: the caller's declaration, was a 500.
+    let (status, body) = rest_put_schema(
+        &http,
+        &base,
+        name,
+        json!({"columns": [{"name": "__proxima_mine", "data_type": "text"}]}),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("reserved"), "{body}");
+}
+
+#[tokio::test]
+async fn grpc_schema_declaration_errors_are_invalid_argument_e2e() {
+    use proximadb::proto::proximadb_v2::{
+        ColumnDataType, CreateSchemaRequest, RecordSchema, TypedColumn,
+    };
+
+    let server = Server::start().await.expect("server start");
+    let http = reqwest::Client::builder().no_proxy().build().expect("http");
+    let base = format!("http://127.0.0.1:{}", server.rest_port);
+    rest_create(&http, &base, "grpc_sysdecl").await;
+
+    let mut grpc = connect_grpc(server.grpc_port).await;
+    let err = grpc
+        .create_schema(CreateSchemaRequest {
+            collection_id: "grpc_sysdecl".to_string(),
+            schema: Some(RecordSchema {
+                columns: vec![TypedColumn {
+                    name: "tenant_id".to_string(),
+                    data_type: ColumnDataType::Text as i32,
+                    nullable: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect_err("declaring a system column must be rejected");
+    // TD-RESTGET-1: the caller's schema, not the server — was INTERNAL.
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+    assert!(err.message().contains("system column"), "{err:?}");
 }

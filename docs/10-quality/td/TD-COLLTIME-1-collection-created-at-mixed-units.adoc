@@ -1,0 +1,43 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-COLLTIME-1: `Collection.created_at` is written in two units, and the schema GET renders it as year 58784
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-24, found while reproducing TD-RESTGET-1 on develop `64ddfff4a`).
+| Priority | **LOW** — a wrong timestamp in responses; no data is lost, but every client that shows or sorts by creation time is misled.
+| Component | proto `Collection.created_at` (`int64`, no unit documented) and its writers and readers
+| Relates to | TD-RESTGET-1 (same endpoint family: responses that invent data)
+|===
+
+== Problem
+
+`GET /api/v2/collections/{id}/schema` on a collection created through REST v2 answers
+`"created_at": "+58784-04-29T04:37:30+00:00"`.
+
+The field `Collection.created_at` has no documented unit and is written in two:
+
+* **microseconds**: the collection manager's create path, `chrono::Utc::now().timestamp_micros()`
+  (`src/services/collection/manager.rs`, the `let now` feeding `created_at`/`updated_at`), and
+  `src/storage/engine.rs:1098`.
+* **milliseconds**: `src/storage/background_flush_context.rs:243`, `timestamp_millis()`. A
+  `Collection` built on the background-flush path.
+
+The runtime copies it unchanged into a field named `created_at_ms`
+(`crates/platform/proximadb-runtime/src/handlers.rs:187` and `:249`). The REST schema GET then
+divides by 1000 as if it held milliseconds (`src/network/rest/v2/schema.rs`,
+`from_timestamp(created_at_ms / 1000, 0)`). Microseconds treated as milliseconds lands about 58,000
+years in the future.
+
+A fixed `/1000` at the copy would fix the manager path and break the background-flush path, so it
+is not done here.
+
+== Fix
+
+1. Pick one unit for `Collection.created_at`/`updated_at` (milliseconds matches every
+   `*_ms` consumer). Document it on the proto field and convert every writer.
+2. Stored collections keep the old values. Normalise on read once (a value above about 10^14 is
+   microseconds) behind a version marker, per mandate #8, or rewrite them in a migration.
+3. Add a contract test: create through REST v2 and through gRPC, then assert that the schema GET's
+   `created_at` is within a minute of now.

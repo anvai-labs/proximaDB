@@ -75,6 +75,7 @@ from .._generated.rest.models.scan_records_request import ScanRecordsRequest
 from .._generated.rest.models.traverse_request import TraverseRequest
 from .._generated.rest.models.typed_search_request import TypedSearchRequest
 from .._generated.rest.types import UNSET
+from ..exceptions import ValidationError
 
 
 @dataclass(frozen=True)
@@ -101,11 +102,41 @@ def _from_dict(model_cls: Any, body: dict[str, Any]) -> Any:
     """Build a generated attrs request model from a facade-built body dict.
 
     ``from_dict`` round-trips through the generated model so the body we send is
-    exactly the shape the generated client (hence the OpenAPI spec) defines —
-    unknown/extra keys are preserved on ``additional_properties`` where the model
-    allows them, matching the server's tolerant decoding.
+    exactly the shape the generated client (hence the OpenAPI spec) defines.
+    Extra keys are preserved on ``additional_properties`` where the schema
+    allows them. Where it does not (``additionalProperties: false`` — e.g. the
+    collection-create inputs, TD-RESTGET-1) the generated ``from_dict`` DROPS
+    them, which would silently discard a misspelt setting before the server
+    could reject it; so a key lost in the round-trip raises instead.
     """
-    return model_cls.from_dict(body)
+    model = model_cls.from_dict(body)
+    dropped = _dropped_keys(body, model.to_dict())
+    if dropped:
+        raise ValidationError(
+            f"unknown field(s) {', '.join(dropped)} in the request; the server "
+            "rejects fields its schema does not declare",
+            field=dropped[0],
+        )
+    return model
+
+
+def _dropped_keys(sent: Any, kept: Any, path: str = "") -> list[str]:
+    """Dotted paths of keys present in ``sent`` but missing from ``kept``."""
+    if isinstance(sent, dict) and isinstance(kept, dict):
+        lost: list[str] = []
+        for key, value in sent.items():
+            where = f"{path}.{key}" if path else str(key)
+            if key not in kept:
+                lost.append(where)
+            else:
+                lost.extend(_dropped_keys(value, kept[key], where))
+        return lost
+    if isinstance(sent, list) and isinstance(kept, list):
+        lost = []
+        for index, (item, kept_item) in enumerate(zip(sent, kept)):
+            lost.extend(_dropped_keys(item, kept_item, f"{path}[{index}]"))
+        return lost
+    return []
 
 
 # ---------------------------------------------------------------------------

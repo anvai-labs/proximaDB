@@ -2614,6 +2614,8 @@ export interface components {
          *         "enable_proxima_record": true
          *     }
          *     ```
+         *     Unknown fields are rejected (TD-RESTGET-1): a misspelt setting used to be
+         *     dropped, and the collection silently got the default instead.
          */
         CreateCollectionV2Request: {
             /** @description Collection name (required) */
@@ -2629,6 +2631,7 @@ export interface components {
              *     Options: "auto", "sst", "helix", "swift", "nova", "raptor", "tst"
              *     Default: "auto" (system selects optimal engine)
              *     ("viper" is no longer accepted — deprecated by ADR-093)
+             *     `storage_engine` is accepted as an alias.
              */
             engine?: string | null;
             schema?: null | components["schemas"]["SchemaDefinition"];
@@ -2648,6 +2651,7 @@ export interface components {
              *
              *     Options: "cosine", "euclidean", "dot_product"
              *     Default: "cosine"
+             *     `metric` is accepted as an alias.
              */
             distance_metric?: string | null;
             /**
@@ -2681,6 +2685,16 @@ export interface components {
             tags?: string[] | null;
             quantization?: null | components["schemas"]["QuantizationConfigInput"];
             index_policy?: null | components["schemas"]["IndexPolicyInput"];
+            /** @description Free-text description, persisted on the collection config. */
+            description?: string | null;
+            /**
+             * @deprecated
+             * @description Legacy field the released Rust and TypeScript SDKs send on every create
+             *     (default "hnsw"). Index selection is cost-derived, so "hnsw" is accepted
+             *     and has no effect; any other value is rejected — declare an index with
+             *     `index_configs` or force a route with `index_policy.mode` instead.
+             */
+            index_type?: string | null;
         };
         /** @description Response for collection creation */
         CreateCollectionV2Response: {

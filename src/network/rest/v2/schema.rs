@@ -35,6 +35,7 @@
 use axum::{
     Json,
     extract::{Extension, Path, State},
+    response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -263,7 +264,22 @@ pub async fn update_schema(
     Path(collection_id): Path<String>,
     Extension(tenant): Extension<TenantContext>,
     State(state): State<AppState>,
-    Json(request): Json<UpdateSchemaRequest>,
+    payload: Result<Json<UpdateSchemaRequest>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    // TD-RESTGET-1: same body policy as create — its columns are strict too.
+    match super::json_body(payload) {
+        Ok(request) => update_schema_checked(collection_id, tenant, state, request)
+            .await
+            .into_response(),
+        Err(rejected) => rejected,
+    }
+}
+
+async fn update_schema_checked(
+    collection_id: String,
+    tenant: TenantContext,
+    state: AppState,
+    request: UpdateSchemaRequest,
 ) -> ApiResult<Json<UpdateSchemaResponse>> {
     info!("V2 API: Updating schema for collection '{}'", collection_id);
 
@@ -453,7 +469,7 @@ pub async fn update_schema(
         .api_handlers
         .update_collection_schema_metadata(&collection_id, update, Some(&tenant.tenant_id))
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to update collection schema: {}", e)))?;
+        .map_err(schema_update_error)?;
 
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -530,6 +546,19 @@ fn schema_definition_from_metadata(metadata: &CollectionSchemaMetadata) -> Schem
         enforcement: metadata.enforcement.map(runtime_enforcement_to_rest),
         allow_additional_fields: Some(metadata.auto_evolve),
     }
+}
+
+/// Map a schema-update failure to its HTTP shape (TD-RESTGET-1). A declaration
+/// the caller got wrong (an `embedding` of the wrong dimension, a system column,
+/// a type the filterable column cannot hold) is a 400 naming the problem; it
+/// used to be a 500 `internal_error`. Anything else is a server error.
+fn schema_update_error(error: anyhow::Error) -> ApiError {
+    if let Some(rejected) =
+        crate::storage::metadata::collection_mapping::schema_declaration_rejection(&error)
+    {
+        return ApiError::InvalidArgument(rejected.to_string());
+    }
+    ApiError::Internal(format!("Failed to update collection schema: {error}"))
 }
 
 fn runtime_schema_update_from_schema_definition(

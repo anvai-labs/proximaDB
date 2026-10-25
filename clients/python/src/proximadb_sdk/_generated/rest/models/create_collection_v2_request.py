@@ -46,6 +46,8 @@ class CreateCollectionV2Request:
         "enable_proxima_record": true
     }
     ```
+    Unknown fields are rejected (TD-RESTGET-1): a misspelt setting used to be
+    dropped, and the collection silently got the default instead.
 
         Attributes:
             name (str): Collection name (required)
@@ -55,6 +57,7 @@ class CreateCollectionV2Request:
                 Options: "auto", "sst", "helix", "swift", "nova", "raptor", "tst"
                 Default: "auto" (system selects optimal engine)
                 ("viper" is no longer accepted — deprecated by ADR-093)
+                `storage_engine` is accepted as an alias.
             schema (None | SchemaDefinition | Unset):
             enable_proxima_record (bool | None | Unset): Enable ProximaRecord support for this collection
 
@@ -68,6 +71,7 @@ class CreateCollectionV2Request:
 
                 Options: "cosine", "euclidean", "dot_product"
                 Default: "cosine"
+                `metric` is accepted as an alias.
             initial_capacity (int | None | Unset): Initial capacity hint for pre-allocation
             canonical_embedding_precision (None | str | Unset): Canonical embedding precision for stored vectors
 
@@ -87,6 +91,11 @@ class CreateCollectionV2Request:
                 recall advisor / route-health (`services/collection/recall_target.rs`).
             quantization (None | QuantizationConfigInput | Unset):
             index_policy (IndexPolicyInput | None | Unset):
+            description (None | str | Unset): Free-text description, persisted on the collection config.
+            index_type (None | str | Unset): Legacy field the released Rust and TypeScript SDKs send on every create
+                (default "hnsw"). Index selection is cost-derived, so "hnsw" is accepted
+                and has no effect; any other value is rejected — declare an index with
+                `index_configs` or force a route with `index_policy.mode` instead.
     """
 
     name: str
@@ -101,7 +110,8 @@ class CreateCollectionV2Request:
     tags: list[str] | None | Unset = UNSET
     quantization: None | QuantizationConfigInput | Unset = UNSET
     index_policy: IndexPolicyInput | None | Unset = UNSET
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
+    description: None | str | Unset = UNSET
+    index_type: None | str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.index_config_input import IndexConfigInput  # noqa: PLC0415
@@ -190,8 +200,20 @@ class CreateCollectionV2Request:
         else:
             index_policy = self.index_policy
 
+        description: None | str | Unset
+        if isinstance(self.description, Unset):
+            description = UNSET
+        else:
+            description = self.description
+
+        index_type: None | str | Unset
+        if isinstance(self.index_type, Unset):
+            index_type = UNSET
+        else:
+            index_type = self.index_type
+
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update(
             {
                 "name": name,
@@ -218,6 +240,10 @@ class CreateCollectionV2Request:
             field_dict["quantization"] = quantization
         if index_policy is not UNSET:
             field_dict["index_policy"] = index_policy
+        if description is not UNSET:
+            field_dict["description"] = description
+        if index_type is not UNSET:
+            field_dict["index_type"] = index_type
 
         return field_dict
 
@@ -376,6 +402,24 @@ class CreateCollectionV2Request:
 
         index_policy = _parse_index_policy(d.pop("index_policy", UNSET))
 
+        def _parse_description(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        description = _parse_description(d.pop("description", UNSET))
+
+        def _parse_index_type(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        index_type = _parse_index_type(d.pop("index_type", UNSET))
+
         create_collection_v2_request = cls(
             name=name,
             dimension=dimension,
@@ -389,23 +433,8 @@ class CreateCollectionV2Request:
             tags=tags,
             quantization=quantization,
             index_policy=index_policy,
+            description=description,
+            index_type=index_type,
         )
 
-        create_collection_v2_request.additional_properties = d
         return create_collection_v2_request
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties
