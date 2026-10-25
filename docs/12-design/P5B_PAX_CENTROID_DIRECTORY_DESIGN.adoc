@@ -326,8 +326,11 @@ default.
   is no in-process latency wrapper today) makes the count deterministic in CI: with delay `L`
   and parallel reads inside a wave, `query latency ÷ L` must equal the reported waves.
 * **Injected latency for the gate:** MinIO behind Toxiproxy 2.12.0 adding fixed latency in
-  each direction, the bed already recorded in `BENCHMARK_EVIDENCE.toml` (SIFT1M ladder) and
-  `docs/_internal/status/RDSTRAT12_SIFT1M_HIGHRTT_2026_08_29.adoc`.
+  each direction. **Realigned 2026-10-25 (owner decision): the canonical profile is
+  intra-region, 5 + 5 ms** (measured 11.4 ms RTT; intra-region S3 GET p50 is ~5–15 ms) — no
+  cross-region deployments are planned. The original 25 + 25 ms profile is retained as a
+  robustness stress column. Waves and requests are latency-independent; p50 re-prices per
+  profile (at 10 ms the ~74 ms non-wave compute residual dominates — see the D8 artifact).
 
 === 4.2 Gates
 

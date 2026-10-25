@@ -2104,8 +2104,12 @@ class OwnedServer:
             "PROXIMADB_READ_RANGES_INFLIGHT",
             "PROXIMADB_READ_RANGES_WAVE_SPLIT_MB",
             "PROXIMADB_SEARCH_MORSEL_DEGREE",
-            # TD-PAXDIR-1: the directory arm comes from --centroid-directory.
+            # TD-PAXDIR-1: the directory arm comes from --centroid-directory;
+            # the shared-model gate defaults ON since D8 and is armed by the
+            # "default"/"on" arms, so an operator export must not leak (the
+            # TD-IOBUDGET-2 hole class).
             *CENTROID_DIRECTORY_GATES,
+            "PROXIMADB_PAX_WRITE_SHARED_MODEL",
             "PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE",
             # S3 endpoint identity comes from --s3-endpoint/--s3-region only;
             # ambient AWS_* (SDK convention files, endpoint-url variants,
@@ -3534,7 +3538,7 @@ def main() -> int:
         }
         if args.centroid_directory in ("on", "default") and not directory_objects:
             raise RuntimeError(
-                "--centroid-directory on: no centroids-*.pxcd was published "
+                "--centroid-directory on/default: no centroids-*.pxcd was published "
                 "after the bed settled (directories publish after a compaction)"
             )
         if resource_sampler is not None:

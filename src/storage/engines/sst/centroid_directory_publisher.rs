@@ -13,7 +13,7 @@
 //!    two ranged reads, off the query path). Segments without a usable A0 are
 //!    recorded as examined-but-uncovered, so later publishes skip them.
 //!    TD-PAXDIR-1 D6 (`PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS`, default
-//!    OFF): a covered segment also gets a **decode key** (its Region-A header
+//!    ON since D8): a covered segment also gets a **decode key** (its Region-A header
 //!    and footer: two more ranged reads, and its listed ETag), kept only when
 //!    the A0 the directory rebuilds from it is byte-identical to the
 //!    segment's. Entries carried from the base keep their key, if any.

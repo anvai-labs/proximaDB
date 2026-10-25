@@ -23,7 +23,7 @@
 //! use the directory.
 //!
 //! TD-PAXDIR-1 D6: with `PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS` (default
-//! OFF) also on, a planned segment whose directory entry carries a decode key
+//! ON since D8) also on, a planned segment whose directory entry carries a decode key
 //! rebuilds its header, Region A0, Region-A header and ANN footer from the
 //! directory on an invariants-cache miss, so its first read is its probed
 //! cells ([`DirectoryChoice::decode_invariants`]).
