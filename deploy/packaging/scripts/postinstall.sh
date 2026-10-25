@@ -9,21 +9,19 @@ if ! id proximadb &>/dev/null; then
     echo "Created system user 'proximadb'"
 fi
 
-# Create data directory
-if [ ! -d /var/lib/proximadb ]; then
-    mkdir -p /var/lib/proximadb
-    chown proximadb:proximadb /var/lib/proximadb
-    chmod 750 /var/lib/proximadb
-    echo "Created data directory /var/lib/proximadb"
-fi
+# TD-PKG-1: chown UNCONDITIONALLY. dpkg/rpm create the payload's
+# /var/lib/proximadb and /var/log/proximadb as root before postinst runs, so
+# the old "only when absent" guard left them root-owned and the service user
+# could not write to its own state directories.
+mkdir -p /var/lib/proximadb
+chown proximadb:proximadb /var/lib/proximadb
+chmod 750 /var/lib/proximadb
+echo "Data directory /var/lib/proximadb ready"
 
-# Create log directory
-if [ ! -d /var/log/proximadb ]; then
-    mkdir -p /var/log/proximadb
-    chown proximadb:proximadb /var/log/proximadb
-    chmod 750 /var/log/proximadb
-    echo "Created log directory /var/log/proximadb"
-fi
+mkdir -p /var/log/proximadb
+chown proximadb:proximadb /var/log/proximadb
+chmod 750 /var/log/proximadb
+echo "Log directory /var/log/proximadb ready"
 
 # Reload systemd and enable service
 if command -v systemctl >/dev/null 2>&1; then

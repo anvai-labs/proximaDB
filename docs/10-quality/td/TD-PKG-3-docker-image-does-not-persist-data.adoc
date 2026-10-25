@@ -5,7 +5,11 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open** (filed 2026-10-17). Reproduced: `vjsingh1984/proximadb:0.4.1` run for 25 s wrote `d1 d2 d3 data metadata` under `/tmp/proximadb`; `/data/proximadb` held only `log/`.
+| Status | **Resolved (2026-10-25).** The loader now honours `PROXIMADB_DATA_DIR` (the env the image has always set): after `-d` handling, `apply_data_dir_override` rebases every config root still at a shipped `/tmp/proximadb` default: `metadata_url`, every `storage_locations` url, `global_manifest_url`, the WAL write buffer, the SST and VIPER data directories, the audit directory — under the data dir. (The pre-existing cwd-relative rebase arms stay for the fields `resolve_config_paths` has not yet anchored — locations and `metadata_url`; `write_buffer_directory`, the SST and VIPER directories are absolutized by the config loader before this runs, so their relative arms are unreachable on the file-load path — verified live for the packaged configs, whose every root is a `/tmp` one.) Explicitly configured roots are never touched. `-d` wins over the env (verified live).
+
+Pinned by `path_rebase_tests::rebase_moves_shipped_tmp_roots` and `rebase_leaves_explicit_roots_alone` (`apps/proximadb-server/src/main.rs`), and by the release smoke **Data persists across docker rm (TD-PKG-3)** step: create a collection, assert `/data/proximadb/metadata` exists on the volume, `docker rm -f`, start a fresh container on the same volume, read the collection back.
+
+Existing deployments (unchanged rescue path): data written by a pre-fix container can be rescued by mounting the copied tree at `/tmp/proximadb` **running the old image** — on the new image the env rebases the roots off `/tmp/proximadb`, so that mount starts empty (the install guide pins the old image in its rescue steps). The catalog and manifests store absolute paths, so copying into `/data/proximadb` does not work.
 | Priority | **HIGH** — `docker rm` (and every documented upgrade) loses all data, whatever volume is mounted.
 | Component | `deploy/docker/Dockerfile` (copies `config/config.toml` to `/config/config.toml`; `VOLUME ["/data/proximadb"]`; `ENV PROXIMADB_DATA_DIR=/data/proximadb`); `config/config.toml`; the config loader
 | Relates to | TD-PKG-1 (same `/tmp` config in the Linux packages), TD-PKG-2 (same in the MSI); roadmap v0.5

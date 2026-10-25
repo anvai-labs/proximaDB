@@ -5,9 +5,21 @@ After=network.target
 Wants=network-online.target
 
 [Service]
-Type=notify
+# TD-PKG-1: the server never calls sd_notify, so Type=notify can never report
+# ready and `systemctl start` always times out. Type=simple is correct until a
+# readiness notification is implemented.
+Type=simple
 User=proximadb
 Group=proximadb
+# The shipped config keeps its roots under /tmp/proximadb (a development
+# default); PROXIMADB_DATA_DIR moves every root still at that default under
+# /var/lib/proximadb, which survives restarts (PrivateTmp=true gives each
+# start a fresh /tmp).
+# WorkingDirectory must be a directory the service user can write: the server
+# creates ./log there for its rolling log appender, which would otherwise
+# panic under ProtectSystem=strict when cwd is /.
+WorkingDirectory=/var/lib/proximadb
+Environment=PROXIMADB_DATA_DIR=/var/lib/proximadb
 ExecStart=/usr/bin/proximadb-server --config /etc/proximadb/config.toml
 Restart=on-failure
 RestartSec=5s
@@ -21,7 +33,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/proximadb /var/log/proximadb /tmp
+ReadWritePaths=/var/lib/proximadb /var/log/proximadb
 
 # Logging
 StandardOutput=journal
