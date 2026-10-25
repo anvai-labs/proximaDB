@@ -84,11 +84,15 @@ fn with_iceberg_field_ids(batch: RecordBatch) -> Result<RecordBatch, StorageErro
         .map_err(|e| StorageError::Serialization(format!("iceberg field ids: {e}")))
 }
 
+/// Iceberg v3 deletion vectors (`deletion-vector-v1` blobs, portable Roaring).
+pub mod deletion_vector;
 /// Spec-shaped Iceberg v2 manifest / manifest-list (Avro) + TableMetadata (JSON) content.
 pub mod iceberg;
 /// Iceberg-style atomic manifest commits (optimistic concurrency via `put_if_absent`).
 pub mod manifest;
 pub mod metadata;
+/// Puffin files: the container of a v3 table's deletion vectors.
+pub mod puffin;
 /// Parquet footer → Iceberg manifest column metrics.
 pub mod stats;
 
