@@ -484,6 +484,10 @@ async fn resolve_spill_target_for(
         // segments sit does not matter.
         return match (&recorded, wal_truncated) {
             (Some(marker), true) => target_for(&marker.placement, &local_root, factory),
+            (None, true) => {
+                refuse_lost_placement(dir)?;
+                Ok(SpillTarget::Local(local_root))
+            }
             _ => Ok(SpillTarget::Local(local_root)),
         };
     }
@@ -492,16 +496,8 @@ async fn resolve_spill_target_for(
     // directory from before the marker spilled locally, if at all.
     let mut state = match recorded {
         Some(marker) => marker,
-        None if crate::services::storage_format::ensure_data_format(dir)?
-            >= crate::services::storage_format::OBJECT_SPILL_FORMAT =>
-        {
-            return refuse(format!(
-                "{} is missing but this data directory once placed spill segments on an object \
-                 store (data format 3); without the marker their location is unknown. Restore it",
-                dir.join(PLACEMENT_MARKER).display()
-            ));
-        }
         None => {
+            refuse_lost_placement(dir)?;
             let marker = PlacementMarker {
                 placement: LOCAL.to_string(),
                 instance: uuid::Uuid::new_v4().to_string(),
@@ -525,7 +521,6 @@ async fn resolve_spill_target_for(
         local_root: &local_root,
         factory,
         target: &target,
-        changing: state.placement != configured,
         wal_truncated,
         adopt: settings.adopt,
     };
@@ -558,7 +553,7 @@ async fn resolve_spill_target_for(
     if state != before {
         write_placement(dir, &state)?;
     }
-    if step.changing {
+    if before.placement != configured {
         tracing::info!(
             dir = %dir.display(),
             from = %before.placement,
@@ -570,6 +565,22 @@ async fn resolve_spill_target_for(
     Ok(target)
 }
 
+/// A directory with no placement marker is new, or from before the marker —
+/// unless its data format says segments once went to an object store, whose
+/// location only the lost marker recorded.
+fn refuse_lost_placement(dir: &Path) -> Result<()> {
+    if crate::services::storage_format::ensure_data_format(dir)?
+        >= crate::services::storage_format::OBJECT_SPILL_FORMAT
+    {
+        return refuse(format!(
+            "{} is missing but this data directory once placed spill segments on an object \
+             store (data format 3); without the marker their location is unknown. Restore it",
+            dir.join(PLACEMENT_MARKER).display()
+        ));
+    }
+    Ok(())
+}
+
 /// One attempt at resolving a placement: every check and the claim, so a
 /// transient error anywhere is retried as a whole.
 struct Step<'a> {
@@ -577,14 +588,16 @@ struct Step<'a> {
     local_root: &'a Path,
     factory: &'a FilesystemFactory,
     target: &'a SpillTarget,
-    changing: bool,
     wal_truncated: bool,
     adopt: bool,
 }
 
 impl Step<'_> {
     async fn place(&self, state: &mut PlacementMarker) -> Result<()> {
-        if self.changing {
+        // Per attempt: a claim recovered in an earlier attempt already
+        // recorded the new placement.
+        let changing = state.placement != self.target.placement();
+        if changing {
             let configured = self.target.placement();
             let old = target_for(&state.placement, self.local_root, self.factory)?;
             let old_has_state = old.scan().await?.has_state;
@@ -613,10 +626,10 @@ impl Step<'_> {
         }
         match self.target {
             SpillTarget::Object { url, filesystem } => {
-                self.claim(state, url, filesystem.as_ref()).await
+                self.claim(state, url, filesystem.as_ref(), changing).await
             }
             SpillTarget::Local(root) => {
-                if self.changing && self.target.scan().await?.has_state {
+                if changing && self.target.scan().await?.has_state {
                     // A local root holds no owner marker, so whether it is a
                     // root this directory left (with older segments) cannot
                     // be told: adoption is for object prefixes only.
@@ -634,8 +647,9 @@ impl Step<'_> {
         state: &mut PlacementMarker,
         url: &str,
         filesystem: &dyn FileSystem,
+        changing: bool,
     ) -> Result<()> {
-        let (changing, wal_truncated) = (self.changing, self.wal_truncated);
+        let wal_truncated = self.wal_truncated;
         // A full listing only when this directory first takes the prefix: a
         // server nesting a prefix in ours later finds our owner marker among
         // its ancestors, and one wrapping ours later lists ours.
@@ -714,6 +728,11 @@ impl Step<'_> {
                     // Our own claim, cut off before it was recorded here:
                     // record it, then claim afresh under a new nonce (a copy
                     // taken meanwhile carries the old one).
+                    // A non-local placement is never recorded below format 3.
+                    crate::services::storage_format::raise_data_format(
+                        self.dir,
+                        crate::services::storage_format::OBJECT_SPILL_FORMAT,
+                    )?;
                     state.epoch = owner.epoch;
                     state.pending = None;
                     state.placement = url.to_string();
@@ -1194,6 +1213,15 @@ mod tests {
             .await
             .expect("off");
         assert_eq!(target.location(), url);
+
+        // A lost placement marker on a format-3 directory refuses here too:
+        // the spill-off store would otherwise probe only the local root.
+        std::fs::remove_file(dir.join(PLACEMENT_MARKER)).expect("lose the marker");
+        let err = resolve_spill_target_for(&dir, &factory, true, off(None))
+            .await
+            .err()
+            .expect("location unknown");
+        assert!(format!("{err:#}").contains("is missing"), "{err:#}");
     }
 
     /// The claim against a real object store (run by the `--restart` scope of

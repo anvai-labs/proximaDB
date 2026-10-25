@@ -1929,7 +1929,9 @@ pub(crate) mod object_store_errors {
     }
 
     /// A refused credential is not a transient fault: callers that retry
-    /// `Network` must not retry these.
+    /// `Network` must not retry these. Only errors object_store classifies
+    /// reach here as such: it reports a refused LIST (S3, Azure) as `Generic`,
+    /// so that stays `Network`.
     pub(crate) fn denied(ctx: &str, e: object_store::Error) -> FilesystemError {
         match e {
             object_store::Error::PermissionDenied { .. } => {
