@@ -67,6 +67,14 @@ lazy_static! {
         "Per-tenant physical object-store bytes read (TD-IOTRACE-2, KRU physical)",
         &["tenant_id"]
     );
+    /// TD-PAXDIR-1 D7: per-tenant physical object-store **read requests** —
+    /// GET + LIST + HEAD, the quantity the P5b gate's `requests_per_query`
+    /// is defined on (design §4.2 G3). Neutral count only.
+    pub static ref OBJECT_STORE_REQUESTS_TOTAL: CounterVec = registered_counter_vec(
+        "proximadb_object_store_requests_total",
+        "Per-tenant physical object-store read requests: GET + LIST + HEAD (TD-PAXDIR-1 D7)",
+        &["tenant_id"]
+    );
     pub static ref IVF_CELLS_TOTAL: CounterVec = registered_counter_vec(
         "proximadb_ivf_cells_total",
         "Persisted-IVF cells considered by vector queries (TD-RDSTRAT-8)",
@@ -767,6 +775,19 @@ pub fn install_billing_observer() {
             OBJECT_STORE_BYTES_READ_TOTAL
                 .with_label_values(&[t_id])
                 .inc_by(snap.bytes_read as f64);
+        }
+        // TD-PAXDIR-1 D7: request count (GET + LIST + HEAD) and, for vector
+        // queries, the query's sequential wave count.
+        let requests = snap.read_requests();
+        if requests > 0 {
+            OBJECT_STORE_REQUESTS_TOTAL
+                .with_label_values(&[t_id])
+                .inc_by(requests as f64);
+        }
+        if !snap.vector_accesses.is_empty()
+            && let Some(waves) = snap.waves
+        {
+            crate::metrics::operational_metrics::PAX_QUERY_WAVES.observe(waves as f64);
         }
         // TD-RDSTRAT-8 PR-C1: persisted-IVF coarse-probe physical meters (neutral
         // counts; AnvaiOps applies the $/rate-card). Region-A/B bytes are the

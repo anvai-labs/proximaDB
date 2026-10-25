@@ -183,7 +183,8 @@ pub mod aws_s3;
 pub mod azure_blob;
 #[cfg(feature = "gcp")]
 pub mod gcs_store;
-/// TD-PAXDIR-1 D6 test support: injected request latency + wave counting.
+/// TD-PAXDIR-1 test support: request latency injected inside the timed
+/// physical request (`PROXIMADB_TEST_FS_LATENCY_MS`).
 #[cfg(test)]
 pub(crate) mod latency;
 pub mod scheme_validation;
@@ -279,17 +280,52 @@ impl std::fmt::Debug for FilesystemFactory {
 /// Record a successful whole-object read at the physical filesystem boundary.
 /// This is always-on query evidence; `PROXIMADB_COUNT_FS_IO` controls only the
 /// separate process-global benchmark counters.
-pub(super) fn record_physical_full_read(bytes: u64) {
+/// `started` is when the read was issued (TD-PAXDIR-1 D7 wave count).
+pub(super) fn record_physical_full_read(bytes: u64, started: std::time::Instant) {
     crate::observability::io_trace::record_op(crate::observability::io_trace::IoOp::Get);
     crate::observability::io_trace::record_bytes_read(bytes);
+    crate::observability::io_trace::record_request(started);
 }
 
 /// Record a successful ranged read at the physical filesystem boundary.
 /// `get_ops` is the total physical GET count; `range_gets` is its ranged subset.
-pub(super) fn record_physical_range_read(bytes: u64) {
+pub(super) fn record_physical_range_read(bytes: u64, started: std::time::Instant) {
     crate::observability::io_trace::record_op(crate::observability::io_trace::IoOp::Get);
     crate::observability::io_trace::record_range_gets(1);
     crate::observability::io_trace::record_bytes_read(bytes);
+    crate::observability::io_trace::record_request(started);
+}
+
+/// A non-GET read request kind at the physical filesystem boundary.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum TracedOp {
+    /// A LIST (one page, for paginated backends).
+    List,
+    /// A HEAD / existence check.
+    Head,
+}
+
+/// TD-PAXDIR-1 D7: run one LIST or HEAD request and record it into the
+/// per-query trace — counted and timed whether it succeeds or not (a failed
+/// or not-found request still costs its round trip). With the GET recorders
+/// above this is the request count the P5b gate is defined on (GET + LIST +
+/// HEAD) and the input of the query's wave count.
+pub(super) async fn traced_request<T>(
+    op: TracedOp,
+    request: impl std::future::Future<Output = FsResult<T>>,
+) -> FsResult<T> {
+    let started = std::time::Instant::now();
+    #[cfg(test)]
+    latency::inject().await;
+    let out = request.await;
+    match op {
+        TracedOp::List => {
+            crate::observability::io_trace::record_op(crate::observability::io_trace::IoOp::List)
+        }
+        TracedOp::Head => crate::observability::io_trace::record_head(),
+    }
+    crate::observability::io_trace::record_request(started);
+    out
 }
 
 /// Records `ProximaObjectStore` reads into the per-query `IoTrace`.
@@ -582,9 +618,6 @@ impl FilesystemFactory {
         } else {
             fs
         };
-        // TD-PAXDIR-1 D6: test builds only, armed by PROXIMADB_TEST_FS_LATENCY_MS.
-        #[cfg(test)]
-        let fs = latency::maybe_wrap(fs);
         if std::env::var_os("PROXIMADB_COUNT_FS_IO").is_some() {
             Ok(Arc::new(
                 proximadb_storage_filesystem_types::counting::CountingFileSystem::new(

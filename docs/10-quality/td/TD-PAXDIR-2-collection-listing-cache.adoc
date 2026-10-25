@@ -1,0 +1,53 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PAXDIR-2: per-collection segment-listing cache invalidated by flush and compaction
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-25 from the TD-PAXDIR-1 D7 gate run (owner decision: restate the warm gate, file this).
+| Priority | MED. One sequential round trip on every vector query against object storage; the remaining warm-depth term after D7.
+| Component | `src/storage/engines/sst/search/mod.rs` (`discover_sstable_files`, the per-query `DISCOVERY_MEMO`), flush (`flush_materializer.rs`) and compaction retire paths, `CacheInvalidationCoordinator`
+| Relates to | TD-PAXDIR-1 (D7 measured it; D8 flips defaults), TD-PAXMETA-1 (a collection segment manifest would replace the LIST), mandate 16 (read-after-write)
+|===
+
+== Problem
+
+Every vector query lists the collection data directory to find its segments
+(D7 made it one LIST per query; it used to be two). On the P5b gate bed
+(SIFT1M, MinIO + 50 ms RTT) that LIST is a full sequential wave, so a warm
+query — every byte it needs already cached — still takes the LIST plus at
+least one wave: measured 2 waves at p50, against the design's 0–1
+(link:../../_internal/status/P5B_D7_SIFT1M_GATE_RUN_2026_10_25.adoc[artifact]).
+
+== Why it is not a simple cache
+
+A cached listing hides a segment published after it was taken. A flush moves
+rows out of the memtable into a new segment, so a query that misses that
+segment loses those rows — a read-after-write violation (mandate 16). A
+compaction swaps inputs for an output; a stale listing would read retired
+inputs (already filtered by the TD-COMPACT-13 pending set, but deleted
+objects then fail) or miss the output.
+
+== Plan
+
+* A per-collection listing cache with a generation, invalidated **after**
+  every flush publish and every compaction retire commits, through the
+  existing `CacheInvalidationCoordinator` (the write path already invalidates
+  the query and plan caches post-commit).
+* Ordering: invalidate after the new object is durable and before the
+  memtable rows it carries become unreachable in memory, or keep the memtable
+  rows visible until the next listing is taken.
+* Multi-process deployments: a process does not see another's flush. Either
+  bound the cache by a short TTL there, or gate it to single-writer
+  deployments until TD-PAXMETA-1 lands a manifest with a CAS commit.
+* Default OFF behind an env gate; read-after-write tests (insert → flush →
+  query sees the rows; compaction → query reads the output) are the gate.
+
+== Acceptance
+
+* Warm vector queries take ≤ 1 wave beyond discovery with the cache on, and
+  0 LIST requests on a cache hit (`proximadb_object_store_requests_total`,
+  `proximadb_pax_query_waves`).
+* No read-after-write regression: flush and compaction tests pass with the
+  cache on.

@@ -185,33 +185,36 @@ impl MetadataClient {
         page_token: Option<&str>,
         max_results: Option<i32>,
     ) -> FsResult<GcsListPage> {
-        let mut url = format!(
-            "{}/storage/v1/b/{}/o?prefix={}",
-            self.base,
-            percent_encode(bucket, true),
-            percent_encode(prefix, true)
-        );
-        if let Some(token) = page_token {
-            url.push_str("&pageToken=");
-            url.push_str(&percent_encode(token, false));
-        }
-        if let Some(max) = max_results {
-            url.push_str(&format!("&maxResults={max}"));
-        }
-        let response = self.get(&url).await?;
-        let status = response.status().as_u16();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| Self::net("GCS list body", e))?;
-        if status != 200 {
-            return Err(status_error(
-                "GCS list",
-                Some(status),
-                format!("HTTP {status}: {}", Self::body_snippet(&body)),
-            ));
-        }
-        serde_json::from_slice(&body).map_err(|e| Self::net("GCS list decode", e))
+        super::traced_request(super::TracedOp::List, async move {
+            let mut url = format!(
+                "{}/storage/v1/b/{}/o?prefix={}",
+                self.base,
+                percent_encode(bucket, true),
+                percent_encode(prefix, true)
+            );
+            if let Some(token) = page_token {
+                url.push_str("&pageToken=");
+                url.push_str(&percent_encode(token, false));
+            }
+            if let Some(max) = max_results {
+                url.push_str(&format!("&maxResults={max}"));
+            }
+            let response = self.get(&url).await?;
+            let status = response.status().as_u16();
+            let body = response
+                .bytes()
+                .await
+                .map_err(|e| Self::net("GCS list body", e))?;
+            if status != 200 {
+                return Err(status_error(
+                    "GCS list",
+                    Some(status),
+                    format!("HTTP {status}: {}", Self::body_snippet(&body)),
+                ));
+            }
+            serde_json::from_slice(&body).map_err(|e| Self::net("GCS list decode", e))
+        })
+        .await
     }
 
     fn body_snippet(body: &[u8]) -> String {
@@ -437,16 +440,18 @@ impl FileSystem for GcsFileSystem {
     }
 
     async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
+        let started = std::time::Instant::now();
         let (bucket, object) = Self::parse(path)?;
         let bytes = self
             .read_all("GCS read_object", &bucket, &object, None)
             .await?;
-        super::record_physical_full_read(bytes.len() as u64);
+        super::record_physical_full_read(bytes.len() as u64, started);
         Ok(bytes)
     }
 
     /// ADR-023 cold path: a ranged object download — fetches only `[offset, +length)`.
     async fn read_range(&self, path: &str, offset: u64, length: u64) -> FsResult<Vec<u8>> {
+        let started = std::time::Instant::now();
         if length == 0 {
             return Ok(Vec::new());
         }
@@ -461,7 +466,7 @@ impl FileSystem for GcsFileSystem {
             .await?;
         // ADR-030 / TD-158: physical GET boundary — feed the per-query I/O accumulator
         // (task-local; no-op outside a query scope). Always-on core counters.
-        super::record_physical_range_read(bytes.len() as u64);
+        super::record_physical_range_read(bytes.len() as u64, started);
         Ok(bytes)
     }
 
@@ -610,34 +615,40 @@ impl FileSystem for GcsFileSystem {
     }
 
     async fn exists(&self, path: &str) -> FsResult<bool> {
-        let (bucket, object) = Self::parse(path)?;
-        // Fail-closed: only a well-formed "not found" answer is `false`; any
-        // other failure (auth, quota, 5xx) propagates as `Err`. Deliberately
-        // NOT the 0.x backend's `is_ok()` contract, which reported an auth
-        // outage as "object does not exist" — the object_store-based S3
-        // sibling propagates too, and a caching/skip decision built on a
-        // lying `false` is worse than a surfaced error.
-        Ok(self.json.get_object(&bucket, &object).await?.is_some())
+        super::traced_request(super::TracedOp::Head, async move {
+            let (bucket, object) = Self::parse(path)?;
+            // Fail-closed: only a well-formed "not found" answer is `false`; any
+            // other failure (auth, quota, 5xx) propagates as `Err`. Deliberately
+            // NOT the 0.x backend's `is_ok()` contract, which reported an auth
+            // outage as "object does not exist" — the object_store-based S3
+            // sibling propagates too, and a caching/skip decision built on a
+            // lying `false` is worse than a surfaced error.
+            Ok(self.json.get_object(&bucket, &object).await?.is_some())
+        })
+        .await
     }
 
     async fn metadata(&self, path: &str) -> FsResult<FsFileMetadata> {
-        let (bucket, object) = Self::parse(path)?;
-        let obj = self
-            .json
-            .get_object(&bucket, &object)
-            .await?
-            .ok_or_else(|| FilesystemError::NotFound(path.to_string()))?;
-        Ok(FsFileMetadata {
-            path: path.to_string(),
-            size: obj
-                .get("size")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
-            is_directory: false,
-            etag: obj.get("etag").and_then(|v| v.as_str()).map(str::to_string),
-            ..Default::default()
+        super::traced_request(super::TracedOp::Head, async move {
+            let (bucket, object) = Self::parse(path)?;
+            let obj = self
+                .json
+                .get_object(&bucket, &object)
+                .await?
+                .ok_or_else(|| FilesystemError::NotFound(path.to_string()))?;
+            Ok(FsFileMetadata {
+                path: path.to_string(),
+                size: obj
+                    .get("size")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0),
+                is_directory: false,
+                etag: obj.get("etag").and_then(|v| v.as_str()).map(str::to_string),
+                ..Default::default()
+            })
         })
+        .await
     }
 
     async fn list(&self, path: &str) -> FsResult<Vec<DirEntry>> {

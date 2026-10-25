@@ -667,6 +667,9 @@ impl FileSystem for LocalFileSystem {
     }
 
     async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
+        let started = std::time::Instant::now();
+        #[cfg(test)]
+        super::latency::inject().await;
         // Extract path from URL
         let path_str = self.resolve_path(path)?;
         let resolved_path = PathBuf::from(path_str);
@@ -707,7 +710,7 @@ impl FileSystem for LocalFileSystem {
             },
         };
         if let Ok(ref bytes) = result {
-            super::record_physical_full_read(bytes.len() as u64);
+            super::record_physical_full_read(bytes.len() as u64, started);
         }
         result
     }
@@ -931,12 +934,18 @@ impl FileSystem for LocalFileSystem {
     }
 
     async fn exists(&self, path: &str) -> FsResult<bool> {
-        let path_str = self.resolve_path(path)?;
-        let resolved_path = PathBuf::from(path_str);
-        Ok(resolved_path.exists())
+        super::traced_request(super::TracedOp::Head, async move {
+            let path_str = self.resolve_path(path)?;
+            let resolved_path = PathBuf::from(path_str);
+            Ok(resolved_path.exists())
+        })
+        .await
     }
 
     async fn read_range(&self, path: &str, offset: u64, length: u64) -> FsResult<Vec<u8>> {
+        let started = std::time::Instant::now();
+        #[cfg(test)]
+        super::latency::inject().await;
         // ADR-030 / TD-158: this is the leaf physical-GET boundary. Feed the per-query
         // I/O accumulator once per successful ranged read — `UnifiedCachingFilesystem`
         // serves cache hits without delegating here, so `range_gets` reflects TRUE
@@ -1067,7 +1076,7 @@ impl FileSystem for LocalFileSystem {
         }
         .await;
         if let Ok(ref bytes) = result {
-            super::record_physical_range_read(bytes.len() as u64);
+            super::record_physical_range_read(bytes.len() as u64, started);
             if std::env::var_os("PROXIMADB_TRACE_GETS").is_some() {
                 eprintln!("[FS GET] {path} off={offset} len={length}");
             }
@@ -1076,85 +1085,91 @@ impl FileSystem for LocalFileSystem {
     }
 
     async fn metadata(&self, path: &str) -> FsResult<FileMetadata> {
-        let path_str = self.resolve_path(path)?;
-        let resolved_path = PathBuf::from(path_str);
+        super::traced_request(super::TracedOp::Head, async move {
+            let path_str = self.resolve_path(path)?;
+            let resolved_path = PathBuf::from(path_str);
 
-        let metadata = if self.config.follow_symlinks {
-            fs::metadata(&resolved_path).await
-        } else {
-            fs::symlink_metadata(&resolved_path).await
-        };
+            let metadata = if self.config.follow_symlinks {
+                fs::metadata(&resolved_path).await
+            } else {
+                fs::symlink_metadata(&resolved_path).await
+            };
 
-        match metadata {
-            Ok(meta) => Ok(self.convert_metadata(&resolved_path, &meta)),
-            Err(e) => match e.kind() {
-                std::io::ErrorKind::NotFound => Err(FilesystemError::NotFound(
-                    resolved_path.display().to_string(),
-                )),
-                _ => Err(FilesystemError::Io(e)),
-            },
-        }
+            match metadata {
+                Ok(meta) => Ok(self.convert_metadata(&resolved_path, &meta)),
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::NotFound => Err(FilesystemError::NotFound(
+                        resolved_path.display().to_string(),
+                    )),
+                    _ => Err(FilesystemError::Io(e)),
+                },
+            }
+        })
+        .await
     }
 
     async fn list(&self, path: &str) -> FsResult<Vec<DirEntry>> {
-        // Extract path from URL
-        let path_str = self.resolve_path(path)?;
+        super::traced_request(super::TracedOp::List, async move {
+            // Extract path from URL
+            let path_str = self.resolve_path(path)?;
 
-        let resolved_path = PathBuf::from(path_str);
+            let resolved_path = PathBuf::from(path_str);
 
-        let mut entries = Vec::new();
-        let mut dir = fs::read_dir(&resolved_path)
-            .await
-            .map_err(FilesystemError::Io)?;
+            let mut entries = Vec::new();
+            let mut dir = fs::read_dir(&resolved_path)
+                .await
+                .map_err(FilesystemError::Io)?;
 
-        while let Some(entry) = dir.next_entry().await.map_err(FilesystemError::Io)? {
-            let entry_path = entry.path();
-            let name = entry_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| {
-                    FilesystemError::InvalidPath(format!(
-                        "Invalid filename encoding for path: {}",
-                        entry_path.display()
-                    ))
-                })?
-                .to_string();
+            while let Some(entry) = dir.next_entry().await.map_err(FilesystemError::Io)? {
+                let entry_path = entry.path();
+                let name = entry_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| {
+                        FilesystemError::InvalidPath(format!(
+                            "Invalid filename encoding for path: {}",
+                            entry_path.display()
+                        ))
+                    })?
+                    .to_string();
 
-            let metadata = entry.metadata().await.map_err(FilesystemError::Io)?;
-            let file_metadata = self.convert_metadata(&entry_path, &metadata);
+                let metadata = entry.metadata().await.map_err(FilesystemError::Io)?;
+                let file_metadata = self.convert_metadata(&entry_path, &metadata);
 
-            // Create full URL for entry (stateless design)
-            let entry_url = if path.starts_with("file://./") || path.starts_with("./") {
-                // For relative URLs, preserve the relative nature
-                if let Some(root_dir) = &self.config.root_dir {
-                    let relative_from_root = entry_path.strip_prefix(root_dir).map_or_else(
-                        |_| entry_path.display().to_string(),
-                        |p| p.to_string_lossy().to_string(),
-                    );
-                    format!("file://./{}", relative_from_root)
+                // Create full URL for entry (stateless design)
+                let entry_url = if path.starts_with("file://./") || path.starts_with("./") {
+                    // For relative URLs, preserve the relative nature
+                    if let Some(root_dir) = &self.config.root_dir {
+                        let relative_from_root = entry_path.strip_prefix(root_dir).map_or_else(
+                            |_| entry_path.display().to_string(),
+                            |p| p.to_string_lossy().to_string(),
+                        );
+                        format!("file://./{}", relative_from_root)
+                    } else {
+                        // No root_dir, but path is relative - preserve relative nature
+                        format!("file://{}", entry_path.display())
+                    }
                 } else {
-                    // No root_dir, but path is relative - preserve relative nature
+                    // Absolute path
                     format!("file://{}", entry_path.display())
-                }
-            } else {
-                // Absolute path
-                format!("file://{}", entry_path.display())
-            };
-            // Per-file logging removed - too verbose for production
-            // Use trace only if debugging specific file issues
-            trace!("LocalFileSystem entry: '{}' -> {:?}", entry_url, entry_path);
+                };
+                // Per-file logging removed - too verbose for production
+                // Use trace only if debugging specific file issues
+                trace!("LocalFileSystem entry: '{}' -> {:?}", entry_url, entry_path);
 
-            entries.push(DirEntry {
-                name,
-                url: entry_url, // Use full URL instead of path
-                metadata: file_metadata,
-            });
-        }
+                entries.push(DirEntry {
+                    name,
+                    url: entry_url, // Use full URL instead of path
+                    metadata: file_metadata,
+                });
+            }
 
-        // Sort entries by name for consistent ordering
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
+            // Sort entries by name for consistent ordering
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
 
-        Ok(entries)
+            Ok(entries)
+        })
+        .await
     }
 
     async fn create_dir(&self, path: &str) -> FsResult<()> {

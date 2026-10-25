@@ -335,7 +335,7 @@ default.
 |===
 | Gate | Exact condition
 | G1 recall (SIFT1M) | recall@10 ≥ **0.98** over the standard 10,000 SIFT1M queries (sampled 1,000 for the latency arms), `top_k = 10`, against the shipped ground truth; directory on, default nprobe.
-| G2 depth (SIFT1M, MinIO + Toxiproxy 50 ms RTT) | object-cold phase (fresh process, empty caches): p50 waves ≤ **3**; warm phase: p50 waves ≤ **1**.
+| G2 depth (SIFT1M, MinIO + Toxiproxy 50 ms RTT) | object-cold phase (fresh process, empty caches): p50 waves ≤ **3**; warm phase: p50 waves ≤ **1 beyond the discovery LIST** (restated 2026-10-25, owner decision: every query lists the collection; caching the listing is link:../10-quality/td/TD-PAXDIR-2-collection-listing-cache.adoc[TD-PAXDIR-2], which restores the original ≤ 1).
 | G3 requests (same run) | object-cold `requests_per_query` p50 ≤ **20** (LIST + HEAD + GET).
 | G4 no regression | the same harness with the directory **off** stays within its current ledger figures, so the gate is additive and the off path is unchanged.
 | G5 scale (BIGANN 10M) | re-measured and recorded in the ledger: recall@10, waves, requests per query and p50 at the same injected RTT. Recorded, not gated (seams doc §6 P5b).
@@ -353,6 +353,13 @@ python3 scripts/bench/sift1m_get_reduction.py --root <root> --binary <aws-releas
 
 No performance or pricing claim is made until G1–G3 pass and the result is recorded in the
 evidence ledger (seams doc §6 P6).
+
+*As measured (D7, 2026-10-25,* link:../_internal/status/P5B_D7_SIFT1M_GATE_RUN_2026_10_25.adoc[artifact]*):*
+with the directory on and 32 coarse cells, G1, G2-cold and G3 pass (recall 0.9823, 3 waves, 18.86
+requests per query); G2-warm does not (2 waves), because every query lists the collection. The
+default per-segment cell rule gives about 15 cells per 1M rows, half the passing geometry. The
+`--centroid-directory` flag is the harness arm, and `--ivf-k` sets the cell count for the sweep.
+G5 has not been run.
 
 == 5. (e) Implementation slices (PR-sized, in order)
 
