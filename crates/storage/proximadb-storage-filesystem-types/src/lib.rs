@@ -14,6 +14,14 @@ use std::io::Error as IoError;
 /// TD-096 S2 / S1.5: GET-count instrumentation on the filesystem seam.
 pub mod counting;
 pub mod faults;
+mod forwarding;
+
+// `forward_filesystem_impl!` expands in the caller's crate; these let it name
+// the attribute and the mmap type without the caller depending on either.
+#[doc(hidden)]
+pub use async_trait as __async_trait;
+#[doc(hidden)]
+pub use memmap2 as __memmap2;
 /// The object-store URL schemes (TD-IOBUDGET-1 single home).
 pub mod object_store_scheme;
 

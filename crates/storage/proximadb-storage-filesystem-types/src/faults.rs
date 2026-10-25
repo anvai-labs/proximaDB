@@ -16,11 +16,7 @@
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
-use crate::{
-    DirEntry, FileOptions, FileSystem, FilesystemError, FilesystemFile, FsFileMetadata, FsResult,
-    RangeCoalescePolicy,
-};
-use async_trait::async_trait;
+use crate::{FileSystem, FilesystemError, FsResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FaultMode {
@@ -141,123 +137,47 @@ impl FaultInjectingFileSystem {
     }
 }
 
-#[async_trait]
-impl FileSystem for FaultInjectingFileSystem {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self.inner.as_any()
-    }
-    fn filesystem_type(&self) -> &'static str {
-        self.inner.filesystem_type()
-    }
-    fn supports_mmap(&self) -> bool {
-        self.inner.supports_mmap()
-    }
-    fn range_coalesce_policy(&self) -> Option<RangeCoalescePolicy> {
-        self.inner.range_coalesce_policy()
-    }
+crate::forward_filesystem_impl! {
+    impl FileSystem for FaultInjectingFileSystem => inner;
+    forward [
+        as_any, filesystem_type, supports_mmap, range_coalesce_policy, read_ranges,
+        get_mmap, write, supports_bounded_local_file_write, write_local_file,
+        write_if_absent, append, supports_append, supports_conditional_replace, exists,
+        metadata, list, create_dir, create_dir_all, copy, move_file, sync, open_file,
+    ];
+    {
 
-    async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
-        if let Some(error) = self.read_fault(path) {
-            return Err(error);
+        async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
+            if let Some(error) = self.read_fault(path) {
+                return Err(error);
+            }
+            self.inner.read(path).await
         }
-        self.inner.read(path).await
-    }
-    async fn read_range(&self, path: &str, offset: u64, length: u64) -> FsResult<Vec<u8>> {
-        if let Some(error) = self.read_fault(path) {
-            return Err(error);
+        async fn read_range(&self, path: &str, offset: u64, length: u64) -> FsResult<Vec<u8>> {
+            if let Some(error) = self.read_fault(path) {
+                return Err(error);
+            }
+            self.inner.read_range(path, offset, length).await
         }
-        self.inner.read_range(path, offset, length).await
-    }
-    async fn read_ranges(
-        &self,
-        path: &str,
-        ranges: Vec<std::ops::Range<u64>>,
-    ) -> FsResult<Vec<Vec<u8>>> {
-        self.inner.read_ranges(path, ranges).await
-    }
-    async fn get_mmap(&self, path: &str) -> FsResult<Option<memmap2::Mmap>> {
-        self.inner.get_mmap(path).await
-    }
 
-    async fn delete(&self, path: &str) -> FsResult<()> {
-        if let Some(error) = self.delete_fault(path) {
-            return Err(error);
+        async fn delete(&self, path: &str) -> FsResult<()> {
+            if let Some(error) = self.delete_fault(path) {
+                return Err(error);
+            }
+            self.inner.delete(path).await
         }
-        self.inner.delete(path).await
-    }
 
-    // --- Pass-through: writes / metadata / listing ---
-
-    async fn write(&self, path: &str, data: &[u8], options: Option<FileOptions>) -> FsResult<()> {
-        self.inner.write(path, data, options).await
-    }
-    fn supports_bounded_local_file_write(&self) -> bool {
-        self.inner.supports_bounded_local_file_write()
-    }
-    async fn write_local_file(
-        &self,
-        path: &str,
-        local_path: &std::path::Path,
-        options: Option<FileOptions>,
-    ) -> FsResult<u64> {
-        self.inner.write_local_file(path, local_path, options).await
-    }
-    async fn write_if_absent(
-        &self,
-        path: &str,
-        data: &[u8],
-        options: Option<FileOptions>,
-    ) -> FsResult<()> {
-        self.inner.write_if_absent(path, data, options).await
-    }
-    async fn append(&self, path: &str, data: &[u8]) -> FsResult<()> {
-        self.inner.append(path, data).await
-    }
-
-    async fn compare_exchange(
-        &self,
-        path: &str,
-        expected: Option<&[u8]>,
-        replacement: &[u8],
-        guards: &[(&str, Option<&[u8]>)],
-    ) -> FsResult<bool> {
-        self.inner
-            .compare_exchange(path, expected, replacement, guards)
-            .await
-    }
-    fn supports_append(&self) -> bool {
-        self.inner.supports_append()
-    }
-
-    fn supports_conditional_replace(&self) -> bool {
-        self.inner.supports_conditional_replace()
-    }
-    async fn exists(&self, path: &str) -> FsResult<bool> {
-        self.inner.exists(path).await
-    }
-    async fn metadata(&self, path: &str) -> FsResult<FsFileMetadata> {
-        self.inner.metadata(path).await
-    }
-    async fn list(&self, path: &str) -> FsResult<Vec<DirEntry>> {
-        self.inner.list(path).await
-    }
-    async fn create_dir(&self, path: &str) -> FsResult<()> {
-        self.inner.create_dir(path).await
-    }
-    async fn create_dir_all(&self, path: &str) -> FsResult<()> {
-        self.inner.create_dir_all(path).await
-    }
-    async fn copy(&self, from: &str, to: &str) -> FsResult<()> {
-        self.inner.copy(from, to).await
-    }
-    async fn move_file(&self, from: &str, to: &str) -> FsResult<()> {
-        self.inner.move_file(from, to).await
-    }
-    async fn sync(&self) -> FsResult<()> {
-        self.inner.sync().await
-    }
-    async fn open_file(&self, path: &str, create: bool) -> FsResult<Box<dyn FilesystemFile>> {
-        self.inner.open_file(path, create).await
+        async fn compare_exchange(
+            &self,
+            path: &str,
+            expected: Option<&[u8]>,
+            replacement: &[u8],
+            guards: &[(&str, Option<&[u8]>)],
+        ) -> FsResult<bool> {
+            self.inner
+                .compare_exchange(path, expected, replacement, guards)
+                .await
+        }
     }
 }
 
