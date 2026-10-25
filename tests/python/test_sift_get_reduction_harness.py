@@ -959,3 +959,116 @@ def test_server_adaptive_range_policy_removes_inherited_overrides(tmp_path: Path
         "PROXIMADB_PAX_COALESCE_RANGE",
     ):
         assert name not in environment
+
+
+def _wave_scrape(counts: dict[str, float]) -> str:
+    """A Prometheus text body carrying one wave histogram (cumulative)."""
+    lines = ["# TYPE proximadb_pax_query_waves histogram"]
+    for bound, count in counts.items():
+        lines.append(f'proximadb_pax_query_waves_bucket{{le="{bound}"}} {count}')
+    return "\n".join(lines) + "\n"
+
+
+def test_wave_quantiles_come_from_the_histogram_delta() -> None:
+    # TD-PAXDIR-1 D7: before the sweep 5 queries took 7 waves; the sweep adds
+    # 4 queries at 3 waves and 1 at 4. The delta, not the totals, is measured.
+    before = _wave_scrape({"2": 0, "3": 0, "4": 0, "7": 5, "+Inf": 5})
+    after = _wave_scrape({"2": 0, "3": 4, "4": 5, "7": 10, "+Inf": 10})
+    waves = HARNESS.histogram_delta_quantiles(
+        before, after, HARNESS.WAVES_HISTOGRAM, (0.5, 0.95)
+    )
+    assert waves == {"observed": 5.0, "p50": 3.0, "p95": 4.0}
+    empty = HARNESS.histogram_delta_quantiles(
+        after, after, HARNESS.WAVES_HISTOGRAM, (0.5,)
+    )
+    assert empty == {"observed": 0.0, "p50": None}
+    with pytest.raises(RuntimeError, match="backwards"):
+        HARNESS.histogram_delta_quantiles(
+            after, before, HARNESS.WAVES_HISTOGRAM, (0.5,)
+        )
+
+
+def test_request_and_wave_gates_report_breaches_and_missing_waves() -> None:
+    result = {
+        "gets_per_query": 10.0,
+        "requests_per_query": 21.5,
+        "recall_at_k": 0.99,
+        "latency_ms": {"p50": 1.0},
+        "waves": {"observed": 10.0, "p50": 4.0, "p95": 5.0},
+    }
+    failures = HARNESS.gate_failures(
+        "object_cold",
+        result,
+        20.0,
+        0.98,
+        None,
+        require_local_hit=False,
+        max_requests=20.0,
+        max_p50_waves=3.0,
+    )
+    assert failures == [
+        "object_cold: requests/q 21.50 > 20.00",
+        "object_cold: p50 waves 4 > 3",
+    ]
+    result["waves"] = {"observed": 0.0, "p50": None, "p95": None}
+    assert HARNESS.gate_failures(
+        "object_cold",
+        result,
+        None,
+        0.98,
+        None,
+        require_local_hit=False,
+        max_p50_waves=3.0,
+    ) == ["object_cold: no per-query wave observations"]
+    # Unset gates only report.
+    assert HARNESS.gate_failures(
+        "object_cold", result, None, 0.98, None, require_local_hit=False
+    ) == []
+
+
+def test_centroid_directory_arm_sets_every_gate_and_the_global_nprobe(
+    tmp_path: Path,
+) -> None:
+    process = SimpleNamespace(poll=lambda: None)
+
+    def environment(centroid_directory: bool) -> dict:
+        server = HARNESS.OwnedServer(
+            tmp_path / "proximadb-server",
+            tmp_path / "benchmark.toml",
+            "http://127.0.0.1:5790",
+            tmp_path / "server.log",
+            None,
+            nprobe=12,
+            centroid_directory=centroid_directory,
+        )
+        inherited = dict.fromkeys(HARNESS.CENTROID_DIRECTORY_GATES, "1")
+        inherited["PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE"] = "99"
+        with (
+            patch.dict(HARNESS.os.environ, inherited),
+            patch.object(HARNESS.subprocess, "Popen", return_value=process) as popen,
+            patch.object(HARNESS, "request_json", return_value={}),
+        ):
+            server.start()
+        return popen.call_args.kwargs["env"]
+
+    on = environment(True)
+    for gate in HARNESS.CENTROID_DIRECTORY_GATES:
+        assert on[gate] == "1", gate
+    # An explicit per-segment nprobe would disable directory planning.
+    assert "PROXIMADB_PAX_READ_COARSE_NPROBE" not in on
+    assert on["PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE"] == "12"
+
+    off = environment(False)
+    for gate in HARNESS.CENTROID_DIRECTORY_GATES:
+        assert gate not in off, f"inherited {gate} leaked into the off arm"
+    assert "PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE" not in off
+    assert off["PROXIMADB_PAX_READ_COARSE_NPROBE"] == "12"
+
+
+def test_local_geometry_lists_published_directories(tmp_path: Path) -> None:
+    collection = tmp_path / "t" / "c"
+    collection.mkdir(parents=True)
+    (collection / "L1_a.pax").write_bytes(b"x")
+    (collection / "centroids-0000000000000002.pxcd").write_bytes(b"d")
+    geometry = HARNESS.LocalPaxGeometry(tmp_path)
+    assert geometry.directory_objects() == ["t/c/centroids-0000000000000002.pxcd"]

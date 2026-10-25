@@ -53,6 +53,8 @@ AZURE_COALESCE_RANGE_BYTES = 4 * 1024 * 1024
 METRICS = (
     "proximadb_object_store_gets_total",
     "proximadb_object_store_bytes_read_total",
+    # TD-PAXDIR-1 D7: GET + LIST + HEAD, the P5b gate's request count.
+    "proximadb_object_store_requests_total",
     "proximadb_survivor_cache_hits",
     "proximadb_survivor_cache_misses",
     "proximadb_survivor_cache_bytes",
@@ -874,6 +876,13 @@ class AzureCliPaxGeometry:
             ]
         return payload
 
+    def directory_objects(self) -> list[str]:
+        return sorted(
+            str(item.get("name", ""))
+            for item in self._list_blobs()
+            if str(item.get("name", "")).endswith(".pxcd")
+        )
+
     def require_empty_prefix(self) -> None:
         blobs = self._list_blobs()
         if blobs:
@@ -1064,6 +1073,11 @@ class S3PaxGeometry:
             ]
         return objects
 
+    def directory_objects(self) -> list[str]:
+        return sorted(
+            item["name"] for item in self._list_objects() if item["name"].endswith(".pxcd")
+        )
+
     def require_empty_prefix(self) -> None:
         objects = self._list_objects()
         if objects:
@@ -1129,6 +1143,13 @@ class LocalPaxGeometry:
 
     def inventory(self) -> dict:
         return pax_geometry(self.sst_root)
+
+    def directory_objects(self) -> list[str]:
+        return sorted(
+            str(path.relative_to(self.sst_root))
+            for path in self.sst_root.rglob("*.pxcd")
+            if path.is_file()
+        )
 
     @staticmethod
     def stable_signature(inventory: dict) -> tuple:
@@ -1402,7 +1423,12 @@ def scrape_text(server: str) -> str:
 
 
 def scrape(server: str) -> dict[str, float]:
-    return parse_prometheus(scrape_text(server))
+    text = scrape_text(server)
+    totals = parse_prometheus(text)
+    # The raw exposition, for labelled series the totals cannot carry (the
+    # TD-PAXDIR-1 D7 wave histogram's buckets).
+    totals["_text"] = text  # type: ignore[assignment]
+    return totals
 
 
 def labelled_metric(
@@ -1424,6 +1450,53 @@ def labelled_metric(
         except (ValueError, IndexError):
             return None
     return None
+
+
+# TD-PAXDIR-1 D7: the server's per-query wave histogram (design §4.1).
+WAVES_HISTOGRAM = "proximadb_pax_query_waves"
+
+
+def histogram_buckets(text: str, name: str) -> list[tuple[float, float]]:
+    """Cumulative ``(le, count)`` buckets of one unlabelled Prometheus
+    histogram, ascending by ``le`` (``+Inf`` last)."""
+    pattern = re.compile(rf'^{re.escape(name)}_bucket\{{le="([^"]+)"\}}\s+(\S+)')
+    buckets = []
+    for raw_line in text.splitlines():
+        match = pattern.match(raw_line.strip())
+        if match is None:
+            continue
+        bound = math.inf if match.group(1) == "+Inf" else float(match.group(1))
+        buckets.append((bound, float(match.group(2))))
+    buckets.sort(key=lambda item: item[0])
+    return buckets
+
+
+def histogram_delta_quantiles(
+    before_text: str, after_text: str, name: str, quantiles: tuple[float, ...]
+) -> dict:
+    """Quantiles of the observations a histogram gained between two scrapes.
+
+    Each quantile is the smallest bucket bound whose cumulative count reaches
+    it — exact for integer-valued observations on integer buckets (the wave
+    histogram). ``None`` quantiles when nothing was observed.
+    """
+    before = dict(histogram_buckets(before_text, name))
+    delta = [
+        (bound, count - before.get(bound, 0.0))
+        for bound, count in histogram_buckets(after_text, name)
+    ]
+    if any(count < 0 for _, count in delta):
+        raise RuntimeError(f"histogram {name} moved backwards across one process")
+    observed = delta[-1][1] if delta else 0.0
+    out: dict = {"observed": observed}
+    for quantile in quantiles:
+        key = f"p{round(quantile * 100)}"
+        if observed <= 0:
+            out[key] = None
+            continue
+        target = quantile * observed
+        out[key] = next(bound for bound, count in delta if count >= target)
+    return out
 
 
 def metric_delta(before: dict, after: dict, name: str) -> float:
@@ -1600,6 +1673,10 @@ def run_query_sweep(
     quality_checkpoints = prefix_quality_checkpoints(recalls, latencies)
     latencies.sort()
     gets = metric_delta(before, after, "proximadb_object_store_gets_total")
+    requests = metric_delta(before, after, "proximadb_object_store_requests_total")
+    waves = histogram_delta_quantiles(
+        before.get("_text", ""), after.get("_text", ""), WAVES_HISTOGRAM, (0.5, 0.95)
+    )
     bytes_read = metric_delta(before, after, "proximadb_object_store_bytes_read_total")
     survivor_hits = metric_delta(before, after, "proximadb_survivor_cache_hits")
     survivor_misses = metric_delta(before, after, "proximadb_survivor_cache_misses")
@@ -1682,6 +1759,10 @@ def run_query_sweep(
         },
         "physical_gets": gets,
         "gets_per_query": gets / query_count,
+        # TD-PAXDIR-1 D7: GET + LIST + HEAD per query (design §4.2 G3) and
+        # the per-query sequential wave distribution (G2).
+        "requests_per_query": requests / query_count,
+        "waves": waves,
         "bytes_read": bytes_read,
         "bytes_per_query": bytes_read / query_count,
         "survivor": {
@@ -1758,6 +1839,8 @@ def run_query_sweep(
     print(
         f"{phase}: recall@{top_k}={result['recall_at_k']:.4f} "
         f"GET/q={result['gets_per_query']:.2f} "
+        f"req/q={result['requests_per_query']:.2f} "
+        f"waves p50={result['waves']['p50']} "
         f"bytes/q={result['bytes_per_query'] / 1_000_000:.2f}MB "
         f"p50={result['latency_ms']['p50']:.2f}ms "
         f"p95={result['latency_ms']['p95']:.2f}ms "
@@ -1895,6 +1978,18 @@ def effective_flush_interval(
     return 3600 if explicit_flush_every_rows is not None else 12
 
 
+# TD-PAXDIR-1 D7: the gates the --centroid-directory arm turns on — publish the
+# collection directory with decode keys (D1, D6), plan queries on it (D2), ride
+# the rerank on the probe wave (D5), and use the keys on the query path (D6).
+CENTROID_DIRECTORY_GATES = (
+    "PROXIMADB_PAX_WRITE_CENTROID_DIRECTORY",
+    "PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS",
+    "PROXIMADB_PAX_READ_CENTROID_DIRECTORY",
+    "PROXIMADB_PAX_READ_SAME_WAVE_RERANK",
+    "PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS",
+)
+
+
 class OwnedServer:
     def __init__(
         self,
@@ -1916,6 +2011,7 @@ class OwnedServer:
         read_ranges_inflight: int = 0,
         read_ranges_wave_split_mb: int = 0,
         rank_degree: int = 0,
+        centroid_directory: bool = False,
     ):
         self.binary = binary
         self.config = config
@@ -1937,6 +2033,7 @@ class OwnedServer:
         self.read_ranges_inflight = read_ranges_inflight
         self.read_ranges_wave_split_mb = read_ranges_wave_split_mb
         self.rank_degree = rank_degree
+        self.centroid_directory = centroid_directory
         self.process: subprocess.Popen | None = None
         self.log_file = None
 
@@ -1971,6 +2068,9 @@ class OwnedServer:
             "PROXIMADB_READ_RANGES_INFLIGHT",
             "PROXIMADB_READ_RANGES_WAVE_SPLIT_MB",
             "PROXIMADB_SEARCH_MORSEL_DEGREE",
+            # TD-PAXDIR-1: the directory arm comes from --centroid-directory.
+            *CENTROID_DIRECTORY_GATES,
+            "PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE",
             # S3 endpoint identity comes from --s3-endpoint/--s3-region only;
             # ambient AWS_* (SDK convention files, endpoint-url variants,
             # session tokens) and PROXIMADB_S3_* overrides would silently
@@ -2052,8 +2152,17 @@ class OwnedServer:
             environment["PROXIMADB_IVF_K"] = str(self.ivf_k)
         if self.n_comp is not None:
             environment["PROXIMADB_IVF_NCOMP"] = str(self.n_comp)
+        if self.centroid_directory:
+            environment.update(dict.fromkeys(CENTROID_DIRECTORY_GATES, "1"))
         if self.nprobe is not None:
-            environment["PROXIMADB_PAX_READ_COARSE_NPROBE"] = str(self.nprobe)
+            # An explicit per-segment probe count disables directory planning
+            # (skipping a segment is only sound when every planned segment
+            # runs the A0 probe), so the directory arm sets the global count.
+            environment[
+                "PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE"
+                if self.centroid_directory
+                else "PROXIMADB_PAX_READ_COARSE_NPROBE"
+            ] = str(self.nprobe)
         if self.training_compaction_min_mb is not None:
             environment["PROXIMADB_TRAINING_COMPACTION_MIN_MB"] = str(
                 self.training_compaction_min_mb
@@ -2491,8 +2600,22 @@ def gate_failures(
     min_recall: float,
     max_p50_ms: float | None,
     require_local_hit: bool,
+    max_requests: float | None = None,
+    max_p50_waves: float | None = None,
 ) -> list[str]:
     failures = []
+    if max_requests is not None and result["requests_per_query"] > max_requests:
+        failures.append(
+            f"{phase}: requests/q {result['requests_per_query']:.2f} > {max_requests:.2f}"
+        )
+    if max_p50_waves is not None:
+        waves_p50 = result["waves"]["p50"]
+        if waves_p50 is None:
+            failures.append(f"{phase}: no per-query wave observations")
+        elif waves_p50 > max_p50_waves:
+            failures.append(
+                f"{phase}: p50 waves {waves_p50:g} > {max_p50_waves:g}"
+            )
     if max_gets is not None and result["gets_per_query"] > max_gets:
         failures.append(
             f"{phase}: GET/q {result['gets_per_query']:.2f} > {max_gets:.2f}"
@@ -2704,6 +2827,33 @@ def main() -> int:
     parser.add_argument("--post-write-max-gets", type=float, default=12.5)
     parser.add_argument("--local-warm-max-gets", type=float, default=12.5)
     parser.add_argument("--object-cold-max-gets", type=float, default=20.0)
+    # TD-PAXDIR-1 D7 (P5b design §4.2): G3 requests and G2 depth gates. Unset
+    # = reported, not gated.
+    parser.add_argument(
+        "--object-cold-max-requests",
+        type=float,
+        help="gate object-cold requests/q (GET + LIST + HEAD), P5b G3",
+    )
+    parser.add_argument(
+        "--object-cold-max-waves",
+        type=float,
+        help="gate object-cold p50 sequential waves per query, P5b G2",
+    )
+    parser.add_argument(
+        "--warm-max-waves",
+        type=float,
+        help="gate local-disk-warm p50 sequential waves per query, P5b G2",
+    )
+    parser.add_argument(
+        "--centroid-directory",
+        choices=("off", "on"),
+        default="off",
+        help=(
+            "TD-PAXDIR-1 arm: 'on' publishes the collection centroid directory "
+            "with decode keys and serves directory-planned queries (D2/D5/D6 "
+            "read gates); --nprobe then sets the directory's global cell count"
+        ),
+    )
     # TD-IOBUDGET-2 (product decision 2026-09-03): the recall floor drops
     # 0.98 -> 0.975 to make the economical default geometry (k=122 on file://,
     # bytes/q -51%, GETs/q -13% at recall 0.9794) shippable. Paired deltas
@@ -3209,6 +3359,9 @@ def main() -> int:
             "post_write_max_gets_per_query": args.post_write_max_gets,
             "local_disk_warm_max_gets_per_query": args.local_warm_max_gets,
             "object_cold_max_gets_per_query": args.object_cold_max_gets,
+            "object_cold_max_requests_per_query": args.object_cold_max_requests,
+            "object_cold_max_p50_waves": args.object_cold_max_waves,
+            "local_disk_warm_max_p50_waves": args.warm_max_waves,
             "min_recall_at_k": args.min_recall,
             "post_write_max_p50_ms": args.max_p50_ms,
             "local_disk_warm_max_p50_ms": args.local_warm_max_p50_ms,
@@ -3239,6 +3392,7 @@ def main() -> int:
             read_ranges_inflight=args.read_ranges_inflight,
             read_ranges_wave_split_mb=args.read_ranges_wave_split_mb,
             adaptive_read_strategy=args.adaptive_read_strategy,
+            centroid_directory=args.centroid_directory == "on",
         )
         active.start()
         if args.compaction_spill:
@@ -3327,6 +3481,19 @@ def main() -> int:
                     f"forced n_comp={args.n_comp} was not persisted: {wrong_width}"
                 )
         result["settled_geometry"] = geometry
+        # TD-PAXDIR-1 D7: the directory arm must actually serve from a
+        # published directory, or it silently measures the per-segment path.
+        directory_reader = remote_geometry or LocalPaxGeometry(root / "data" / "sst")
+        directory_objects = directory_reader.directory_objects()
+        result["centroid_directory"] = {
+            "arm": args.centroid_directory,
+            "objects": directory_objects,
+        }
+        if args.centroid_directory == "on" and not directory_objects:
+            raise RuntimeError(
+                "--centroid-directory on: no centroids-*.pxcd was published "
+                "after the bed settled (directories publish after a compaction)"
+            )
         if resource_sampler is not None:
             resource_sampler.stop()
             result["compaction_resource_observation"] = resource_sampler.snapshot()
@@ -3384,6 +3551,7 @@ def main() -> int:
             read_ranges_inflight=args.read_ranges_inflight,
             read_ranges_wave_split_mb=args.read_ranges_wave_split_mb,
             adaptive_read_strategy=args.adaptive_read_strategy,
+            centroid_directory=args.centroid_directory == "on",
         )
         active.start()
         local_warm = run_query_sweep(
@@ -3407,6 +3575,7 @@ def main() -> int:
                 args.min_recall,
                 args.local_warm_max_p50_ms,
                 require_local_hit=True,
+                max_p50_waves=args.warm_max_waves,
             )
         )
         active.stop()
@@ -3427,6 +3596,7 @@ def main() -> int:
             read_ranges_inflight=args.read_ranges_inflight,
             read_ranges_wave_split_mb=args.read_ranges_wave_split_mb,
             adaptive_read_strategy=args.adaptive_read_strategy,
+            centroid_directory=args.centroid_directory == "on",
         )
         active.start()
         object_cold = run_query_sweep(
@@ -3450,6 +3620,8 @@ def main() -> int:
                 args.min_recall,
                 args.max_p50_ms,
                 require_local_hit=False,
+                max_requests=args.object_cold_max_requests,
+                max_p50_waves=args.object_cold_max_waves,
             )
         )
         if attribution_failure := ivf_byte_attribution_failure(

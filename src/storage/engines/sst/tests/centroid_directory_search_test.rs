@@ -566,7 +566,7 @@ mod tests {
         rows: &[Vec<f32>],
         directory: bool,
     ) -> (usize, usize, String) {
-        use crate::storage::persistence::filesystem::latency;
+        use crate::observability::io_trace;
         set_directory_read(directory);
         let arm = arm(id, rows).await;
         if directory {
@@ -588,14 +588,18 @@ mod tests {
                 .is_some()
             );
         }
-        latency::reset();
+        // TD-PAXDIR-1 D7: waves and requests come from the query's own
+        // production trace (the injected latency sits inside each timed
+        // request).
         let query = rows[7].clone();
-        assert_eq!(search(&arm, &query, 1).await, ["r7"]);
-        (
-            latency::critical_path_waves(),
-            latency::request_count(),
-            latency::describe(),
-        )
+        let snap = io_trace::scope(async {
+            assert_eq!(search(&arm, &query, 1).await, ["r7"]);
+            io_trace::snapshot().expect("io_trace scope active")
+        })
+        .await;
+        let waves = snap.waves.expect("the query issued requests") as usize;
+        let requests = snap.read_requests() as usize;
+        (waves, requests, format!("{snap:?}"))
     }
 
     /// A segment's own footer bytes, read through the engine's `FileSystem`

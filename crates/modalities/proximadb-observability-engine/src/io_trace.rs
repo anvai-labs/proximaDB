@@ -62,6 +62,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 /// `tracing` target for emitted per-query I/O trace events. Kept distinct so
 /// operators can route/sample it independently (and the future OTLP layer can
@@ -205,6 +206,16 @@ pub struct IoTrace {
     /// (TD-RDSTRAT-13 C3 removes the per-segment HEAD; this counter is how the
     /// removal is proven — `metadata_ops == 0` on the known-size path).
     metadata_ops: AtomicU64,
+    /// TD-PAXDIR-1 D7: physical HEAD / existence checks at the `FileSystem`
+    /// leaf — with `get_ops` and `list_ops`, the request count the P5b gate
+    /// (`requests_per_query`) is defined on.
+    head_ops: AtomicU64,
+    /// TD-PAXDIR-1 D7: every physical request's issuing task and interval,
+    /// for the query's sequential wave count ([`critical_path_waves`]).
+    requests: Mutex<RequestLog>,
+    /// The task that opened this trace's scope (the query's own task); its
+    /// requests run before and after the per-segment fan-out.
+    root_task: Option<tokio::task::Id>,
     /// Coarse-probe rank wall microseconds including any morsel join
     /// (TD-RDSTRAT-13 C2) — the user-visible Compute term of the
     /// waves-not-sums model `T ≈ Σ rounds×RTT + bytes/BW + Compute`.
@@ -367,6 +378,61 @@ pub struct IoTrace {
     /// cache fair-sharing, and authorization joins. Unlike `tenant_id`, this
     /// stays numeric and is never derived from an alias.
     tenant_stable_id: Mutex<Option<u64>>,
+}
+
+/// Per-query cap on recorded request intervals (TD-PAXDIR-1 D7). A P5b
+/// query issues tens; the cap only bounds a pathological scan's memory.
+pub const MAX_TRACED_REQUESTS: usize = 4096;
+
+/// One recorded request: issuing task, issue time, completion time.
+pub type TracedRequest = (Option<tokio::task::Id>, Instant, Instant);
+
+#[derive(Debug, Default)]
+struct RequestLog {
+    intervals: Vec<TracedRequest>,
+    overflowed: bool,
+}
+
+/// TD-PAXDIR-1 D7 (design §4.1): a query's sequential request **waves**
+/// along its critical path.
+///
+/// Within one task, a wave is a maximal group of overlapping request
+/// intervals: requests the task issues together (one `read_ranges_prefetch`
+/// wave) overlap, requests it issues one after another do not. A query runs
+/// its own requests on `root_task` (discovery LIST, directory, sequential
+/// segment scans) and fans segment scans out to spawned tasks that run
+/// concurrently and are all awaited, so its critical path is the root's waves
+/// plus the most waves of any spawned task. Grouping by task matters:
+/// overlapping all requests at once would merge one segment's second wave
+/// with another segment's first whenever their tasks start a little apart.
+pub fn critical_path_waves(
+    requests: impl IntoIterator<Item = TracedRequest>,
+    root_task: Option<tokio::task::Id>,
+) -> usize {
+    let mut by_task: std::collections::HashMap<Option<tokio::task::Id>, Vec<(Instant, Instant)>> =
+        std::collections::HashMap::new();
+    for (task, start, end) in requests {
+        by_task.entry(task).or_default().push((start, end));
+    }
+    let root = by_task.remove(&root_task).map_or(0, overlap_waves);
+    root + by_task.into_values().map(overlap_waves).max().unwrap_or(0)
+}
+
+/// Maximal groups of overlapping intervals.
+fn overlap_waves(mut intervals: Vec<(Instant, Instant)>) -> usize {
+    intervals.sort_by_key(|(start, _)| *start);
+    let mut waves = 0;
+    let mut group_end: Option<Instant> = None;
+    for (start, end) in intervals {
+        match group_end {
+            Some(e) if start < e => group_end = Some(e.max(end)),
+            _ => {
+                waves += 1;
+                group_end = Some(end);
+            }
+        }
+    }
+    waves
 }
 
 /// Neutral primitive tuple carrying one operator's metered actuals into
@@ -545,9 +611,41 @@ pub struct VectorAccessTrace {
 }
 
 impl IoTrace {
-    /// Create an empty trace.
+    /// Create an empty trace owned by the current task (see
+    /// [`critical_path_waves`]).
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            root_task: tokio::task::try_id(),
+            ..Self::default()
+        }
+    }
+
+    /// TD-PAXDIR-1 D7: record one physical request issued at `started` and
+    /// completed now, from the current task. Past [`MAX_TRACED_REQUESTS`] the
+    /// log stops and the query's wave count becomes unknown, never wrong.
+    pub fn record_request(&self, started: Instant) {
+        let ended = Instant::now();
+        let mut log = self.requests.lock().unwrap_or_else(|p| p.into_inner());
+        if log.intervals.len() >= MAX_TRACED_REQUESTS {
+            log.overflowed = true;
+        } else {
+            log.intervals.push((tokio::task::try_id(), started, ended));
+        }
+    }
+
+    /// TD-PAXDIR-1 D7: record one physical HEAD / existence check.
+    pub fn record_head(&self) {
+        self.head_ops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The query's sequential request waves so far: `None` when it issued no
+    /// recorded request or the log overflowed.
+    pub fn waves(&self) -> Option<u64> {
+        let log = self.requests.lock().unwrap_or_else(|p| p.into_inner());
+        if log.overflowed || log.intervals.is_empty() {
+            return None;
+        }
+        Some(critical_path_waves(log.intervals.iter().copied(), self.root_task) as u64)
     }
 
     /// Stamp the stable per-query id (TD-TRACE-2). Set once at `instrument()` entry.
@@ -1022,6 +1120,8 @@ impl IoTrace {
             tier_get_ops: std::array::from_fn(|i| self.tier_get_ops[i].load(Ordering::Relaxed)),
             tier_get_bytes: std::array::from_fn(|i| self.tier_get_bytes[i].load(Ordering::Relaxed)),
             metadata_ops: self.metadata_ops.load(Ordering::Relaxed),
+            head_ops: self.head_ops.load(Ordering::Relaxed),
+            waves: self.waves(),
             ivf_probe_rank_us: self.ivf_probe_rank_us.load(Ordering::Relaxed),
             region_b_rerank_us: self.region_b_rerank_us.load(Ordering::Relaxed),
             region_d_fetch_decode_us: self.region_d_fetch_decode_us.load(Ordering::Relaxed),
@@ -1166,6 +1266,14 @@ pub struct IoTraceSnapshot {
     /// Object-storage metadata ops (HEAD) on the search path (C3).
     #[serde(default)]
     pub metadata_ops: u64,
+    /// TD-PAXDIR-1 D7: physical HEAD / existence checks at the leaf.
+    #[serde(default)]
+    pub head_ops: u64,
+    /// TD-PAXDIR-1 D7: the query's sequential request waves along its
+    /// critical path ([`critical_path_waves`]); `None` when no request was
+    /// recorded or the per-query log overflowed.
+    #[serde(default)]
+    pub waves: Option<u64>,
     /// Coarse-probe rank wall microseconds incl. morsel join (C2).
     #[serde(default)]
     pub ivf_probe_rank_us: u64,
@@ -1289,6 +1397,12 @@ impl IoTraceSnapshot {
         self.get_ops + self.put_ops + self.list_ops + self.delete_ops
     }
 
+    /// TD-PAXDIR-1 D7: the read requests the P5b gate counts — GET, LIST and
+    /// HEAD (design §4.2 G3).
+    pub fn read_requests(&self) -> u64 {
+        self.get_ops + self.list_ops + self.head_ops
+    }
+
     /// Footer-cache hit ratio in `[0, 1]`; `None` when the footer cache was not
     /// consulted (no hits or misses recorded).
     pub fn footer_hit_ratio(&self) -> Option<f64> {
@@ -1403,6 +1517,17 @@ impl IoTraceSnapshot {
 /// no-ops outside an active [`scope`]/[`instrument`].
 pub fn record_op(op: IoOp) {
     let _ = IO_TRACE.try_with(|t| t.record_op(op));
+}
+
+/// TD-PAXDIR-1 D7: record one physical request issued at `started` (and
+/// completed now) into the active query trace, for its wave count.
+pub fn record_request(started: Instant) {
+    let _ = IO_TRACE.try_with(|t| t.record_request(started));
+}
+
+/// TD-PAXDIR-1 D7: record one physical HEAD / existence check.
+pub fn record_head() {
+    let _ = IO_TRACE.try_with(|t| t.record_head());
 }
 
 /// Classify an operation verb (as used by `consumption_metrics`) and record it.
@@ -2009,6 +2134,69 @@ where
 
 #[cfg(all(test, feature = "io-trace"))]
 mod tests {
+    use super::{critical_path_waves, overlap_waves};
+
+    /// TD-PAXDIR-1 D7: overlapping requests of one task form one wave,
+    /// sequential ones do not.
+    #[test]
+    fn overlapping_requests_form_one_wave_and_sequential_ones_do_not() {
+        let t = std::time::Instant::now();
+        let at = |ms: u64| t + std::time::Duration::from_millis(ms);
+        assert_eq!(overlap_waves(Vec::new()), 0);
+        let intervals = vec![
+            (at(0), at(10)),
+            (at(1), at(11)),
+            (at(2), at(12)),
+            (at(12), at(22)),
+            (at(30), at(40)),
+        ];
+        assert_eq!(overlap_waves(intervals), 3);
+    }
+
+    /// The critical path is the root task's waves plus the most waves of any
+    /// spawned task — not one global overlap count, which would merge a
+    /// fan-out's skewed waves.
+    #[tokio::test]
+    async fn the_critical_path_is_root_waves_plus_the_slowest_spawned_task() {
+        let t = std::time::Instant::now();
+        let at = |ms: u64| t + std::time::Duration::from_millis(ms);
+        let id = |n: u64| tokio::spawn(async move { n }).id();
+        let (a, b) = (id(1), id(2));
+        let requests = vec![
+            (None, at(0), at(10)), // root: LIST
+            // Segment a: two waves; segment b: two waves, started 2 ms later.
+            (Some(a), at(10), at(20)),
+            (Some(a), at(20), at(30)),
+            (Some(b), at(12), at(22)),
+            (Some(b), at(22), at(32)),
+        ];
+        assert_eq!(critical_path_waves(requests.clone(), None), 3);
+        let flat: Vec<_> = requests.iter().map(|(_, s, e)| (*s, *e)).collect();
+        assert_eq!(overlap_waves(flat), 2, "a global count would undercount");
+    }
+
+    /// The trace counts waves from its leaf-recorded requests; overflow makes
+    /// the count unknown rather than wrong.
+    #[tokio::test]
+    async fn a_trace_counts_its_waves_and_overflow_reports_none() {
+        let snap = super::scope(async {
+            super::record_head();
+            super::record_request(std::time::Instant::now());
+            let started = std::time::Instant::now();
+            super::record_request(started);
+            super::snapshot().unwrap()
+        })
+        .await;
+        assert_eq!(snap.head_ops, 1);
+        assert_eq!(snap.waves, Some(2));
+        let trace = super::IoTrace::new();
+        assert_eq!(trace.waves(), None, "no request recorded");
+        for _ in 0..=super::MAX_TRACED_REQUESTS {
+            trace.record_request(std::time::Instant::now());
+        }
+        assert_eq!(trace.waves(), None, "overflowed");
+    }
+
     use super::*;
 
     /// ADR-030: the always-on billing observer fires at scope close with the
