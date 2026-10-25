@@ -1,0 +1,60 @@
+= TD-PAXDIR-1 D7: SIFT1M P5b gate run over MinIO + Toxiproxy (50 ms RTT)
+
+**Date:** 2026-10-25 · **Branch:** `feat/paxdir-d7-measurement` · **Binary:** release-server `--features aws` built at `138b47140` (round 2); round 1 at `7d84e8074`.
+**Design:** link:../../12-design/P5B_PAX_CENTROID_DIRECTORY_DESIGN.adoc[P5b design] §4.2 gates · **TD:** link:../../10-quality/td/TD-PAXDIR-1-collection-global-centroid-directory.adoc[TD-PAXDIR-1] D7.
+
+== Bed
+
+* MinIO (`go install`, single drive, `127.0.0.1:12000`) behind Toxiproxy 2.12.0 (`127.0.0.1:12002`), latency toxics 25 ms upstream + 25 ms downstream, jitter 0; measured 51–52 ms per request through the proxy.
+* SIFT1M (TEXMEX, 1,000,000 × 128, L2), full-corpus ground truth, top-10, 1,000 queries per phase (phases use disjoint query ranges), concurrency 1.
+* Harness `scripts/bench/sift1m_get_reduction.py`, `--read-ranges-inflight 16`, `--training-compaction-min-mb 1 --max-segments 3` (deterministic bed: the final flush tail is always trained; see Finding 5), planner pinned to the harness's default 4 MiB coalesce range.
+* Server under `systemd-run --scope -p MemoryMax=64G`; workstation aiserver1 (WSL2 Ubuntu 24.04, 16 vCPU, 125 GB); arms run one at a time on an otherwise idle box.
+* Phases: `post_write` (ingest process, caches warm from ingest), `local_disk_warm` (restart with the local-disk tier, new queries), `object_cold` (restart, no local-disk tier, new queries).
+* Requests = GET + LIST + HEAD (`proximadb_object_store_requests_total`); waves = per-query critical-path waves (`proximadb_pax_query_waves`, D7).
+
+== Result (round 2, fixed binary): `object_cold`
+
+[cols="3,2,2,2,2,2,2",options="header"]
+|===
+| Arm | Cells probed / total | recall@10 | requests/q | waves p50 / p95 | MB/q | latency p50 / p95
+| directory off (k default) | 8 / 15 | 0.9822 | 21.75 | 8 / 12 | 60.2 | 502 / 758 ms
+| directory on (k default) | 9 / 17 | 0.9825 | 21.40 | 3 / 4 | 61.5 | 235 / 313 ms
+| **directory on, `--ivf-k 32`** | 12 / 32 | **0.9823** | **18.86** | **3** / 4 | 53.1 | **222 / 284 ms**
+| directory on, `--ivf-k 64` | 16 / 64 | 0.9821 | 19.01 | 4 / 4 | 43.0 | 250 / 284 ms
+|===
+
+Gates at `--ivf-k 32`: **G1 recall ≥ 0.98 pass; G2 cold p50 ≤ 3 waves pass; G3 ≤ 20 requests pass; G2 warm p50 ≤ 1 wave FAIL (2).**
+G4 (directory-off path does not regress): the off arm improved versus round 1 (22.75 → 21.75 requests, 9 → 8 waves) from the one-LIST fix; nothing regressed.
+Directory on versus off at the same geometry: waves 8 → 3, p50 latency 2.1× lower, recall equal, requests about equal (both read the same bytes in the same number of ranges).
+
+Warm (`local_disk_warm`) is 2 waves on every directory-on arm: one discovery LIST plus the cache misses of new queries (6.05 requests/q at k = 32). Every query lists the collection, so warm cannot reach ≤ 1 without caching the listing, which must then be invalidated by every flush and compaction (read-after-write). That is an owner decision; see "Open".
+
+== Round 1 (binary `7d84e8074`): what the gate run found
+
+Round 1 failed every depth and request gate (e.g. one-segment bed, directory on: 22.65 requests/q, 9 waves, 541 ms; directory off: 22.75, 9, 560 ms — the same within noise). The investigation found:
+
+. **The P5b read path was dark in the server.** The server's search reaches `StorageEngine::search_vectors_unified` → the non-Arc `fallback_to_direct_search` (its log line once per query; the Arc fan-out's never), while D2/D5-hand-off/D6 were wired only into the Arc fan-out that the unit tests call. Every "directory on" arm measured the per-segment cascade; the invariants-cache hit ratio of 0.999 was the tell (decoded scans never populate it). Round 2 shows 0.0.
+. **Every default (Adaptive) query listed the collection twice** — the vector count, then the scan — two sequential round trips (MinIO trace: two `ListObjectsV2` ~52 ms apart per query).
+. **The top-k block hand-off fired only on metadata-decoded scans**, so a warm-metadata query paid the OID-chunk wave and then the rehydration wave.
+. **The new wave counter undercounted single-task fan-outs**: the non-Arc fan-out polls per-segment scans with `join_all` in one task, so grouping by task merged skewed scans' waves (round-1 multi-segment wave figures are lower bounds; one-segment arms ran sequentially and are exact).
+. **A bed could settle on a 2.8 MiB untrained L0 flush tail** that training compaction never replaces; the harness waited 20 minutes silently. The harness now names unready segments; the gate beds use `--training-compaction-min-mb 1`.
+. **Cell geometry is coarse by default**: the per-segment rule (one cell ≈ one IOP of SQ8 bytes) gives about 15 cells per 1M rows, so a query probes ~50% of rows. 32 cells is the passing point; 64 cuts bytes 20% but adds a wave (more, smaller cells push the probe past the same-wave Region-B budget).
+
+Each of 1–4 is fixed in this branch with a test that fails without it.
+
+== Cold-query shape (MinIO trace, round 2, directory on, k default)
+
+77 complete queries: 1 LIST, then one wave of ~14–17 parallel GETs (probed cells' Region A + same-wave Region B, ranges ≤ 4 MiB), then a wave of ~5 GETs (top-k blocks); ~10.5 of 21.4 GETs/q are full 4 MiB Region-B ranges. Region-B bytes (47.6 MB/q) dominate the request count; larger ranges (the S3 profile's 8 MiB) or finer cells are the remaining levers.
+
+== Open
+
+* **Warm gate (G2 warm ≤ 1):** needs a decision — a per-collection listing cache invalidated by flush/compaction commits, or the gate restated as "≤ 1 wave beyond discovery".
+* **Default cell sizing:** the measured passing geometry is 2× the default; changing `ivf_fine_cell_count` is a write-path default change for its own slice.
+* **G5 (BIGANN 10M):** not run in this slice.
+
+== Provenance
+
+* Result files (local, not checked in): `~/bench-beds/p5b-runs/{fx-dir-off,fx-dir-on,fx-dir-on-k32,fx-dir-on-k64}/result.json` (round 2); `{dir-on,dir-off,dir-on2,dir-off2,dir-on-k32}` (round 1).
+* MinIO traces: `~/bench-beds/p5b-runs/k32-object-cold-trace.txt` (round 1), `fx-dir-on-object-cold-trace.txt` (round 2).
+* Commands: see the TD-PAXDIR-1 D7 row; arms differ only in `--centroid-directory`, `--ivf-k` and the gate flags.
+* Indicative single-machine emulator evidence, not an SLA or a cloud-latency claim.

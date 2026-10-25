@@ -1316,3 +1316,20 @@ hardware = "dataserver2 192.168.1.65 (32-core/125 GB), server + MinIO co-located
 date = "2026-09-03"
 version = "binary 462a437f0 stack (sha256 3e88c1245d06559a...); harness 3a3960aa6 + global_manifest_url pin d0d28d264"
 notes = "Replaces the INVALIDATED 2026-08-31 chooser A/B (its ON arm ran chooser-OFF: the harness popped the gate and no CLI wire existed; byte-identical GETs/q 20.05 across arms; zero pax.range_estimator observe lines). This run attests engagement by the wiring print and a -41.6% behavioral delta; the pax.range_estimator tracing target produced no lines at the info level on the 2b binary (logging-config follow-up, not an engagement question). bytes/query rises ~2-4% (larger merged ranges) — the economy claim is GET-round-trip-led per ADR-062. Flip checklist steps 1 and 3 are satisfied; steps 4-5 (re-tier to PROXIMADB_STORAGE_READ_STRATEGY_CHOOSER_DISABLE + alias, default-OFF assertion update) are the flip PR, gated on product review of this claim."
+
+[[claims]]
+id = "paxdir_d7_sift1m_p5b_gate_minio_50ms"
+claim = "TD-PAXDIR-1 P5b cold gates on SIFT1M over MinIO + Toxiproxy (50 ms RTT): with the collection centroid directory on and 32 coarse cells, object-cold recall@10 = 0.9823, p50 = 3 sequential request waves (p95 4), 18.86 requests per query (GET + LIST + HEAD), p50/p95 latency 222/284 ms. Against the directory-off path on the same bed and binary: 8 -> 3 waves and 2.1x lower p50 latency at equal recall; requests about equal. The warm gate (p50 <= 1 wave) is NOT met: every query lists the collection (2 waves warm)."
+metric = "recall@10 + requests_per_query (GET+LIST+HEAD) + per-query critical-path waves p50/p95 + bytes/query + latency p50/p95, object-cold and local-disk-warm phases"
+status = "measured"
+asserted_in = [
+  "docs/10-quality/td/TD-PAXDIR-1-collection-global-centroid-directory.adoc",
+  "docs/12-design/P5B_PAX_CENTROID_DIRECTORY_DESIGN.adoc",
+]
+bench_source = "scripts/bench/sift1m_get_reduction.py"
+bench_command = "systemd-run --user --scope -p MemoryMax=64G python3 scripts/bench/sift1m_get_reduction.py --root <root> --binary target/release-server/proximadb-server --sift-dir <sift1m> --rows 1000000 --queries 1000 --top-k 10 --min-recall 0.98 --object-cold-max-requests 20 --object-cold-max-waves 3 --warm-max-waves 1 --training-compaction-min-mb 1 --max-segments 3 --s3-endpoint http://<toxiproxy 25+25 ms> --storage-url s3://<bucket>/<arm> --read-ranges-inflight 16 --centroid-directory on --ivf-k 32"
+artifact = "docs/_internal/status/P5B_D7_SIFT1M_GATE_RUN_2026_10_25.adoc"
+hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB; MinIO single drive + Toxiproxy 2.12.0 on the same host; arms serialized on an idle box"
+date = "2026-10-25"
+version = "feat/paxdir-d7-measurement @ 138b47140 (release-server --features aws)"
+notes = "Full TEXMEX SIFT1M, 1,000 queries per phase (disjoint ranges), concurrency 1, planner pinned to 4 MiB coalesce range. Directory-off object-cold: recall 0.9822, 21.75 req/q, 8 waves, 502/758 ms. k default (15-17 cells): 21.40 req/q (fails G3). k=64: 19.01 req/q but 4 waves. Round 1 (binary 7d84e8074) measured the per-segment path for every arm because the directory read path was not wired into the server's non-Arc search fan-out; fixed in this branch with the one-LIST-per-query memo, the warm top-k hand-off and unit-grouped wave counting. Single-machine emulator evidence, not an SLA or a cloud-latency claim."
