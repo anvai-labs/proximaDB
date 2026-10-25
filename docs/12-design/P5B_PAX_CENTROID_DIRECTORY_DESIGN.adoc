@@ -259,6 +259,37 @@ segment: the Region-A header bytes, `sq8_min/sq8_scale`, and the footer's block 
 OID-chunk tables. The segment keeps its self-describing copy. A covered segment then needs no
 header, A0 or footer read on the query path.
 
+*As built (D6):* behind the write gate `PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS` (default OFF;
+off, a directory is the D1 v1 format byte for byte), the directory format is `PXCD` v2 (a keyless
+directory is still written as v1, and both parse). Each covered segment entry may carry a decode
+key: the 88-byte header prefix, the Region-A header, the
+A0 model's seed and training count, the footer's row count, SQ8 dequant key and schema facts, and
+its block table with the row-group OID-chunk stats (the footer's own entry wire form). The
+directory rebuilds the segment's Region A0 from its model and cells plus the key
+(`PaxCentroidDirectory::segment_decode`); the publisher keeps a key only when that rebuild is
+byte-identical to the segment's A0. Since a key replaces the segment's own metadata, it is bound
+to the object it was read from: it records the listed ETag, and readers use it only when the
+current listing reports the same one (backends that list no ETag keep the `(name, size)` stamp).
+Behind `PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS` (default
+OFF), a directory-planned, unfiltered scan that misses the invariants cache takes this metadata
+from the directory. The rebuilt footer carries only the ANN cascade's fields, so it is never
+admitted to the invariants cache; the top-k rehydration takes its block table from the key too.
+Because rehydration fetches the top-k row-group blocks anyway, a decoded scan reads those blocks
+whole in one wave (bounded to 8 IOP-sized blocks; larger sets keep the OID-chunk fetch), resolves
+the OIDs from them, and hands the bytes to the rehydration: wave 2 of §3.5 is one request per
+block instead of an OID chunk plus a block, in two dependent waves. Measured under
+`LatencyFileSystem` (4 segments × 1,500 rows, `dim = 32`, header-only prefix reads): a cold query
+against a loaded directory is 3 waves and 20 requests with decode keys, against 7 waves and 40
+requests without them and 7 and 38 with the directory off. A segment no larger than the scan's
+cold prefix read (`PROXIMADB_PAX_PREFIX_PREFETCH_BYTES`, 1 MiB) keeps that read instead of its key:
+the one request returns the whole object and caches it, which beats the key on waves and requests
+(measured: with whole-segment prefix reads, keys would cost 236 reads over 30 queries against 188
+without them; with header-only reads, 236 against 284). Keys are added when a segment is
+(re)loaded by a publish: entries carried over keyless (from a v1 base, or published while the
+write gate was off) gain a key only when compaction rewrites their segment. A carried key whose
+ETag no longer matches the listing reloads its segment, cells included; turning the write gate
+off republishes the directory as v1 at the next publish even with no live change.
+
 === 3.5 The resulting cold query
 
 [cols="1,3,2",options="header"]
@@ -272,7 +303,13 @@ header, A0 or footer read on the query path.
 **3 waves, ≤ 20 requests.** Warm: wave 0 is cached, and wave 1 hits the L2/survivor caches,
 so 0–1 waves. Reads within a wave must actually run in parallel:
 `PROXIMADB_READ_RANGES_INFLIGHT` defaults to sequential today, and D6 sets a parallel default
-for object-store profiles.
+for object-store profiles. *As built (D6):* with `PROXIMADB_READ_RANGES_INFLIGHT` unset, waves
+on object-store paths run 16 wide; local paths keep deferring to
+`PROXIMADB_FS_READ_RANGES_PARALLEL`, and an explicit `0` restores the deferral everywhere. Wave 0
+is two dependent requests (the LIST names the generation), but the directory GET is paid once per
+generation, so a query against a loaded directory is LIST → cells → rows. `minio://` URLs resolve
+as local; the MinIO gate bed is addressed as `s3://` (`--s3-endpoint`), so it gets the parallel
+default.
 
 == 4. (d) Measurement harness and gates
 

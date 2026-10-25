@@ -32,13 +32,40 @@
 //!                       [pca_mean dim × f32][pca_components n_comp × dim × f32]
 //! segments: n_segments × [name_len u32][name utf-8][size_bytes u64]
 //!                         [rows_covered u64][model_idx u32 (u32::MAX = uncovered)]
+//!                         [has_key u8][decode key, when has_key = 1]   (v2 only)
 //! cells:    n_cells × [segment_idx u32][a0_cell u32]
 //!                      [centroid n_comp × f32][radius f32][CoarseCellEntry 72 B]
 //! [checksum u64]   (FNV-1a over all preceding bytes, as Region A0)
+//!
+//! decode key (TD-PAXDIR-1 D6):
+//!   [header prefix 88 B][a0_seed u64][a0_trained_on u64]
+//!   [rabitq_header_len u32][Region-A header bytes]
+//!   [row_count u64][sq8_min f32][sq8_scale f32][embed_dim u32][embed_count u32]
+//!   [embed_quant_tag u8][has_f32_tier u8]
+//!   [n_blocks u32] n_blocks × footer block entry (the footer's own wire form,
+//!                              row-group OID-chunk stats included)
+//!   [etag_len u32 (u32::MAX = none)][object ETag utf-8]
 //! ```
 //!
 //! Segments are sorted by name and cells by `(segment, a0_cell)`, so identical
 //! inputs always serialize to identical bytes regardless of discovery order.
+//!
+//! ## Decode keys (v2)
+//!
+//! A covered segment may carry a **decode key**: the per-segment metadata a
+//! query reads before its first cell (header prefix, Region-A header, SQ8
+//! dequant key, footer block table). Together with the segment's model and
+//! cells already in the directory, it lets [`PaxCentroidDirectory::segment_decode`]
+//! rebuild the header, Region A0 and the ANN-relevant footer without any
+//! segment read, so a covered segment's first read is its probed cells. The
+//! segment keeps its self-describing copy; the key is a projection like the
+//! rest of the directory. A directory with no key is written as v1, byte for
+//! byte the D1 format, and `parse` accepts both versions.
+//!
+//! Because a key replaces the segment's own metadata reads, it is bound to
+//! the exact object it was built from: beyond the `(name, size)` stamp, it
+//! records the object's ETag when the backend lists one, and readers use the
+//! key only when the current listing reports the same ETag.
 //!
 //! ## Departure from the TD-PAXDIR-1 §3.1 wire draft
 //!
@@ -60,12 +87,23 @@ use crate::coarse_directory::{
     CoarseCellEntry, CoarseDirectory, CoarseModel, fnv1a64, project_with_model, read_f32s,
     read_u16, read_u32, read_u64,
 };
+use crate::segment_layout::{
+    FooterBlockEntry, FooterRowGroupStats, SEG_HEADER_PREFIX_LEN, SegmentFooterIndex,
+    SegmentHeaderPrefix, read_blocks, write_block_entry,
+};
 
 /// Directory magic — first 4 bytes of the serialized object.
 pub const DIRECTORY_MAGIC: &[u8; 4] = b"PXCD";
 
-/// Directory serde version (single version pre-GA, as Region A0).
-pub const DIRECTORY_VERSION: u8 = 1;
+/// Directory serde version of a directory that carries decode keys (D6).
+pub const DIRECTORY_VERSION: u8 = 2;
+
+/// The D1 format (no decode keys), still written for a keyless directory so
+/// a reader that predates D6 keeps using it.
+const DIRECTORY_VERSION_V1: u8 = 1;
+
+/// `etag_len` of a key whose segment's listing reported no ETag.
+const NO_ETAG: u32 = u32::MAX;
 
 /// Object-name extension. Not `.pax`: discovery lists `*.pax` as segments.
 pub const DIRECTORY_EXT: &str = ".pxcd";
@@ -133,7 +171,7 @@ impl DirectoryModel {
 }
 
 /// One segment the directory examined — the stamp.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DirectorySegment {
     /// Object name relative to the collection data directory.
     pub name: String,
@@ -143,6 +181,227 @@ pub struct DirectorySegment {
     pub rows_covered: u64,
     /// Index into the model table, or [`NO_MODEL`].
     pub model_idx: u32,
+    /// TD-PAXDIR-1 D6: the segment's query-path metadata, so a covered
+    /// segment needs no header, A0 or footer read. Only covered segments
+    /// carry one; `None` keeps the per-segment metadata reads.
+    pub decode_key: Option<SegmentDecodeKey>,
+}
+
+/// TD-PAXDIR-1 D6: everything a covered segment's ANN query reads before its
+/// first cell, beyond what the directory already holds (model, centroids,
+/// radii, cell extents). Copied from the segment's own bytes at publish.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentDecodeKey {
+    /// The segment's header prefix, verbatim ([`SEG_HEADER_PREFIX_LEN`] bytes).
+    pub header_prefix: Vec<u8>,
+    /// Region A0 model fields the directory does not otherwise store.
+    pub a0_seed: u64,
+    pub a0_trained_on: u64,
+    /// The Region-A header (RaBitQ params and centroid), verbatim.
+    pub rabitq_header: Vec<u8>,
+    /// Footer facts the ANN path reads: row count, SQ8 dequant key, schema.
+    pub row_count: u64,
+    pub sq8_min: f32,
+    pub sq8_scale: f32,
+    pub embed_dim: u32,
+    pub embed_count: u32,
+    pub embed_quant_tag: u8,
+    pub has_f32_tier: bool,
+    /// The footer's block (row-group) table with its OID-chunk stats.
+    pub blocks: Vec<FooterBlockEntry>,
+    pub block_stats: Vec<Option<FooterRowGroupStats>>,
+    /// The segment object's ETag as listed when the key was built (`None`
+    /// when the backend lists none). See [`Self::matches_object`].
+    pub object_etag: Option<String>,
+}
+
+impl SegmentDecodeKey {
+    /// Build from a segment's header prefix, Region-A header bytes, parsed A0
+    /// and footer, and its listed ETag. Fails when they disagree.
+    pub fn from_segment(
+        header_prefix: &[u8],
+        a0: &CoarseDirectory,
+        rabitq_header: &[u8],
+        footer: &SegmentFooterIndex,
+        object_etag: Option<&str>,
+    ) -> Result<Self> {
+        let key = Self {
+            header_prefix: header_prefix
+                .get(..SEG_HEADER_PREFIX_LEN)
+                .ok_or_else(|| anyhow::anyhow!("decode key: header prefix truncated"))?
+                .to_vec(),
+            a0_seed: a0.model.seed,
+            a0_trained_on: a0.model.trained_on,
+            rabitq_header: rabitq_header.to_vec(),
+            row_count: footer.row_count,
+            sq8_min: footer.sq8_min,
+            sq8_scale: footer.sq8_scale,
+            embed_dim: footer.embed_dim,
+            embed_count: footer.embed_count,
+            embed_quant_tag: footer.embed_quant_tag,
+            has_f32_tier: footer.has_f32_tier,
+            blocks: footer.blocks.clone(),
+            block_stats: footer.block_stats.clone(),
+            object_etag: object_etag.map(str::to_owned),
+        };
+        key.check(a0.model.dim, a0.model.rows_covered())?;
+        Ok(key)
+    }
+
+    /// Whether this key describes the object a listing now reports: the
+    /// ETags must agree, and a key built with one never matches a listing
+    /// without one. (`None` on both sides — a backend that lists no ETag —
+    /// leaves the `(name, size)` stamp as the only binding.)
+    pub fn matches_object(&self, listed_etag: Option<&str>) -> bool {
+        self.object_etag.as_deref() == listed_etag
+    }
+
+    /// Internal consistency against the segment's directory entry. Any
+    /// disagreement means the key cannot describe the segment: fail closed.
+    fn check(&self, dim: u32, rows_covered: u64) -> Result<()> {
+        let header = SegmentHeaderPrefix::parse(&self.header_prefix)?;
+        if header.a0_len == 0 {
+            bail!("decode key: segment has no Region A0");
+        }
+        if self.embed_dim != dim {
+            bail!("decode key: dim {} differs from {dim}", self.embed_dim);
+        }
+        if self.rabitq_header.len() != proximadb_block_format::region_header_len(dim) {
+            bail!("decode key: Region-A header length mismatch");
+        }
+        let rq = proximadb_block_format::CoalescedRaBitQHeader::parse(&self.rabitq_header)?;
+        if rq.dim != dim || u64::from(rq.n_rows) != self.row_count {
+            bail!("decode key: Region-A header disagrees with the segment");
+        }
+        if !self.sq8_min.is_finite() || !self.sq8_scale.is_finite() {
+            bail!("decode key: non-finite SQ8 dequant key");
+        }
+        let block_rows: u64 = self.blocks.iter().map(|b| u64::from(b.row_count)).sum();
+        if self.row_count != rows_covered || block_rows != self.row_count {
+            bail!(
+                "decode key: rows disagree (footer {}, blocks {block_rows}, A0 {rows_covered})",
+                self.row_count
+            );
+        }
+        if self.block_stats.len() != self.blocks.len() {
+            bail!("decode key: block stats misaligned with blocks");
+        }
+        // Readers plan coalesced block fetches by block index and slice each
+        // block out of its fetch: offsets must ascend without overlap.
+        let mut end = 0u64;
+        for block in &self.blocks {
+            if block.offset < end {
+                bail!("decode key: block table offsets overlap or descend");
+            }
+            end = block
+                .offset
+                .checked_add(u64::from(block.size))
+                .ok_or_else(|| anyhow::anyhow!("decode key: block extent overflows"))?;
+        }
+        Ok(())
+    }
+
+    fn write_to(&self, buf: &mut Vec<u8>) -> Result<()> {
+        buf.extend_from_slice(&self.header_prefix);
+        buf.extend_from_slice(&self.a0_seed.to_le_bytes());
+        buf.extend_from_slice(&self.a0_trained_on.to_le_bytes());
+        let hdr_len = u32::try_from(self.rabitq_header.len())
+            .map_err(|_| anyhow::anyhow!("decode key Region-A header exceeds u32"))?;
+        buf.extend_from_slice(&hdr_len.to_le_bytes());
+        buf.extend_from_slice(&self.rabitq_header);
+        buf.extend_from_slice(&self.row_count.to_le_bytes());
+        buf.extend_from_slice(&self.sq8_min.to_le_bytes());
+        buf.extend_from_slice(&self.sq8_scale.to_le_bytes());
+        buf.extend_from_slice(&self.embed_dim.to_le_bytes());
+        buf.extend_from_slice(&self.embed_count.to_le_bytes());
+        buf.push(self.embed_quant_tag);
+        buf.push(u8::from(self.has_f32_tier));
+        let n_blocks = u32::try_from(self.blocks.len())
+            .map_err(|_| anyhow::anyhow!("decode key block table exceeds u32"))?;
+        buf.extend_from_slice(&n_blocks.to_le_bytes());
+        for (block, stats) in self.blocks.iter().zip(&self.block_stats) {
+            write_block_entry(buf, block, stats.as_ref());
+        }
+        match &self.object_etag {
+            Some(etag) => {
+                let len = u32::try_from(etag.len())
+                    .ok()
+                    .filter(|len| *len != NO_ETAG)
+                    .ok_or_else(|| anyhow::anyhow!("decode key ETag too long"))?;
+                buf.extend_from_slice(&len.to_le_bytes());
+                buf.extend_from_slice(etag.as_bytes());
+            }
+            None => buf.extend_from_slice(&NO_ETAG.to_le_bytes()),
+        }
+        Ok(())
+    }
+
+    fn read_from(body: &[u8], p: &mut usize) -> Result<Self> {
+        let take = |p: &mut usize, len: usize| -> Result<Vec<u8>> {
+            let end = p
+                .checked_add(len)
+                .filter(|end| *end <= body.len())
+                .ok_or_else(|| anyhow::anyhow!("centroid directory truncated (decode key)"))?;
+            let bytes = body[*p..end].to_vec();
+            *p = end;
+            Ok(bytes)
+        };
+        let header_prefix = take(p, SEG_HEADER_PREFIX_LEN)?;
+        let a0_seed = read_u64(body, p)?;
+        let a0_trained_on = read_u64(body, p)?;
+        let hdr_len = read_u32(body, p)? as usize;
+        let rabitq_header = take(p, hdr_len)?;
+        let row_count = read_u64(body, p)?;
+        let sq8_min = f32::from_bits(read_u32(body, p)?);
+        let sq8_scale = f32::from_bits(read_u32(body, p)?);
+        let embed_dim = read_u32(body, p)?;
+        let embed_count = read_u32(body, p)?;
+        let flags = take(p, 2)?;
+        let has_f32_tier = match flags[1] {
+            0 => false,
+            1 => true,
+            other => bail!("decode key has_f32_tier byte {other}"),
+        };
+        let (blocks, block_stats) = read_blocks(body, p)?;
+        let object_etag = match read_u32(body, p)? {
+            NO_ETAG => None,
+            len => Some(
+                String::from_utf8(take(p, len as usize)?)
+                    .map_err(|_| anyhow::anyhow!("decode key ETag is not UTF-8"))?,
+            ),
+        };
+        Ok(Self {
+            header_prefix,
+            a0_seed,
+            a0_trained_on,
+            rabitq_header,
+            row_count,
+            sq8_min,
+            sq8_scale,
+            embed_dim,
+            embed_count,
+            embed_quant_tag: flags[0],
+            has_f32_tier,
+            blocks,
+            block_stats,
+            object_etag,
+        })
+    }
+}
+
+/// A covered segment's query-path metadata rebuilt from the directory
+/// ([`PaxCentroidDirectory::segment_decode`]), in the forms the segment
+/// itself stores: the header prefix, Region A0 bytes, the Region-A header,
+/// and a footer carrying the ANN path's fields. The footer is **not** the
+/// segment's footer (it omits the encoding map, filter stats and shred map),
+/// so it must only serve the unfiltered ANN cascade and never be cached as
+/// the segment's metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentDecodeBytes {
+    pub header_prefix: Vec<u8>,
+    pub a0: Vec<u8>,
+    pub rabitq_header: Vec<u8>,
+    pub ann_footer: Vec<u8>,
 }
 
 impl DirectorySegment {
@@ -234,8 +493,13 @@ impl PaxCentroidDirectory {
         let dim = self.dim as usize;
         let mut buf = Vec::new();
         buf.extend_from_slice(DIRECTORY_MAGIC);
-        buf.push(DIRECTORY_VERSION);
-        buf.push(0); // flags (reserved; D6 decode keys, TD-PAXMETA-1 snapshot id)
+        let keyed = self.segments.iter().any(|s| s.decode_key.is_some());
+        buf.push(if keyed {
+            DIRECTORY_VERSION
+        } else {
+            DIRECTORY_VERSION_V1
+        });
+        buf.push(0); // flags (reserved; TD-PAXMETA-1 snapshot id)
         buf.extend_from_slice(&0u16.to_le_bytes());
         buf.extend_from_slice(&self.generation.to_le_bytes());
         buf.extend_from_slice(&self.dim.to_le_bytes());
@@ -259,6 +523,15 @@ impl PaxCentroidDirectory {
             buf.extend_from_slice(&segment.size_bytes.to_le_bytes());
             buf.extend_from_slice(&segment.rows_covered.to_le_bytes());
             buf.extend_from_slice(&segment.model_idx.to_le_bytes());
+            if keyed {
+                match &segment.decode_key {
+                    Some(key) => {
+                        buf.push(1);
+                        key.write_to(&mut buf)?;
+                    }
+                    None => buf.push(0),
+                }
+            }
         }
         for cell in &self.cells {
             buf.extend_from_slice(&cell.segment_idx.to_le_bytes());
@@ -282,12 +555,13 @@ impl PaxCentroidDirectory {
         if &bytes[..4] != DIRECTORY_MAGIC {
             bail!("not a centroid directory (bad magic)");
         }
-        if bytes[4] != DIRECTORY_VERSION {
-            bail!("unsupported centroid directory version {}", bytes[4]);
+        let version = bytes[4];
+        if version != DIRECTORY_VERSION && version != DIRECTORY_VERSION_V1 {
+            bail!("unsupported centroid directory version {version}");
         }
-        // v1 assigns no meaning to flags or reserved: reject non-zero values
-        // so a later revision must bump the version instead of silently
-        // reinterpreting v1 bytes.
+        // v1 and v2 assign no meaning to flags or reserved: reject non-zero
+        // values so a later revision must bump the version instead of
+        // silently reinterpreting these bytes.
         if bytes[5] != 0 {
             bail!(
                 "unknown centroid directory flags 0x{:02x} (version {})",
@@ -337,11 +611,28 @@ impl PaxCentroidDirectory {
                 .map_err(|_| anyhow::anyhow!("centroid directory segment name is not UTF-8"))?
                 .to_owned();
             p = end;
+            let size_bytes = read_u64(body, &mut p)?;
+            let rows_covered = read_u64(body, &mut p)?;
+            let model_idx = read_u32(body, &mut p)?;
+            let decode_key = if version == DIRECTORY_VERSION_V1 {
+                None
+            } else {
+                let has_key = *body
+                    .get(p)
+                    .ok_or_else(|| anyhow::anyhow!("centroid directory truncated (key flag)"))?;
+                p += 1;
+                match has_key {
+                    0 => None,
+                    1 => Some(SegmentDecodeKey::read_from(body, &mut p)?),
+                    other => bail!("centroid directory decode-key flag {other}"),
+                }
+            };
             segments.push(DirectorySegment {
                 name,
-                size_bytes: read_u64(body, &mut p)?,
-                rows_covered: read_u64(body, &mut p)?,
-                model_idx: read_u32(body, &mut p)?,
+                size_bytes,
+                rows_covered,
+                model_idx,
+                decode_key,
             });
         }
         let mut cells = Vec::with_capacity(n_cells.min(body.len() / (8 + CELL_ENTRY_LEN)));
@@ -410,6 +701,17 @@ impl PaxCentroidDirectory {
             if segment.is_covered() && segment.model_idx as usize >= self.models.len() {
                 bail!("centroid directory segment {} has no model", segment.name);
             }
+            if let Some(key) = &segment.decode_key {
+                if !segment.is_covered() {
+                    bail!(
+                        "centroid directory uncovered segment {} has a decode key",
+                        segment.name
+                    );
+                }
+                key.check(self.dim, segment.rows_covered).map_err(|e| {
+                    anyhow::anyhow!("centroid directory segment {}: {e}", segment.name)
+                })?;
+            }
         }
         for cell in &self.cells {
             let segment = self
@@ -437,6 +739,108 @@ impl PaxCentroidDirectory {
             .iter()
             .enumerate()
             .filter(|(_, s)| s.is_covered())
+    }
+
+    /// TD-PAXDIR-1 D6: rebuild covered segment `segment_idx`'s query-path
+    /// metadata from its decode key, model and cells — no segment read. The
+    /// Region A0 bytes equal the segment's own (the publisher verifies this
+    /// before it publishes a key). Errors when the segment has no key or the
+    /// rebuilt A0 does not have the length the header records.
+    pub fn segment_decode(&self, segment_idx: usize) -> Result<SegmentDecodeBytes> {
+        let segment = self
+            .segments
+            .get(segment_idx)
+            .filter(|s| s.is_covered())
+            .ok_or_else(|| anyhow::anyhow!("segment {segment_idx} is not covered"))?;
+        let key = segment
+            .decode_key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("segment {} has no decode key", segment.name))?;
+        let header = SegmentHeaderPrefix::parse(&key.header_prefix)?;
+        let (model, cells) = self.segment_model(segment_idx, key.a0_seed, key.a0_trained_on)?;
+        let a0 = CoarseDirectory { model, cells }.to_bytes()?;
+        if a0.len() as u64 != header.a0_len {
+            bail!(
+                "segment {}: rebuilt A0 is {} bytes, header records {}",
+                segment.name,
+                a0.len(),
+                header.a0_len
+            );
+        }
+        let ann_footer = SegmentFooterIndex {
+            row_count: key.row_count,
+            rabitq_off: header.rabitq_off,
+            rabitq_len: header.rabitq_len,
+            sq8_off: header.sq8_off,
+            sq8_len: header.sq8_len,
+            sq8_min: key.sq8_min,
+            sq8_scale: key.sq8_scale,
+            embed_dim: key.embed_dim,
+            embed_count: key.embed_count,
+            embed_quant_tag: key.embed_quant_tag,
+            has_f32_tier: key.has_f32_tier,
+            blocks: key.blocks.clone(),
+            block_stats: key.block_stats.clone(),
+            encoding_map: Vec::new(),
+            block_tier_assignments: Vec::new(),
+            a0_off: header.a0_off,
+            a0_len: header.a0_len,
+            opr_off: 0,
+            opr_len: 0,
+            c_off: header.c_off,
+            c_len: header.c_len,
+            block_filterable_stats: Vec::new(),
+            shred_field_map: Vec::new(),
+        }
+        .to_bytes()?;
+        Ok(SegmentDecodeBytes {
+            header_prefix: key.header_prefix.clone(),
+            a0,
+            rabitq_header: key.rabitq_header.clone(),
+            ann_footer,
+        })
+    }
+
+    /// Covered segment `segment_idx`'s coarse model and A0 cell table as the
+    /// directory holds them: its PCA model, and its cells in A0 order, which
+    /// must be exactly `0..k_c` (A0 lists every cell, empty ones included).
+    /// `seed` and `trained_on` are diagnostics the cell table does not carry.
+    fn segment_model(
+        &self,
+        segment_idx: usize,
+        seed: u64,
+        trained_on: u64,
+    ) -> Result<(CoarseModel, Vec<CoarseCellEntry>)> {
+        let model = &self.models[self.segments[segment_idx].model_idx as usize];
+        let cells: Vec<&DirectoryCell> = self
+            .cells
+            .iter()
+            .filter(|c| c.segment_idx as usize == segment_idx)
+            .collect();
+        if cells.is_empty()
+            || cells
+                .iter()
+                .enumerate()
+                .any(|(i, c)| c.a0_cell as usize != i)
+        {
+            bail!("segment {segment_idx}: directory cells are not a complete A0 table");
+        }
+        let out = CoarseModel {
+            dim: self.dim,
+            n_comp: model.n_comp,
+            pca_mean: model.pca_mean.clone(),
+            pca_components: model.pca_components.clone(),
+            centroids: cells
+                .iter()
+                .flat_map(|c| c.centroid.iter().copied())
+                .collect(),
+            radii: cells.iter().map(|c| c.radius).collect(),
+            cell_rows: cells.iter().map(|c| c.rows()).collect(),
+            seed,
+            trained_on,
+        };
+        out.validate()?;
+        Ok((out, cells.iter().map(|c| c.entry).collect()))
     }
 
     /// Rank every cell across every model by the squared distance from
@@ -606,37 +1010,9 @@ impl PaxCentroidDirectory {
             .covered_segments()
             .filter(|(idx, _)| spaces[*idx] == space)
             .max_by(|a, b| a.1.rows_covered.cmp(&b.1.rows_covered).then(b.0.cmp(&a.0)))?;
-        let model = &self.models[segment.model_idx as usize];
-        let cells: Vec<&DirectoryCell> = self
-            .cells
-            .iter()
-            .filter(|c| c.segment_idx as usize == template)
-            .collect();
-        if cells.is_empty()
-            || cells
-                .iter()
-                .enumerate()
-                .any(|(i, c)| c.a0_cell as usize != i)
-        {
-            return None;
-        }
-        let out = CoarseModel {
-            dim: self.dim,
-            n_comp: model.n_comp,
-            pca_mean: model.pca_mean.clone(),
-            pca_components: model.pca_components.clone(),
-            centroids: cells
-                .iter()
-                .flat_map(|c| c.centroid.iter().copied())
-                .collect(),
-            radii: cells.iter().map(|c| c.radius).collect(),
-            cell_rows: cells.iter().map(|c| c.rows()).collect(),
-            seed: 0,
-            trained_on: segment.rows_covered,
-        };
-        out.validate().ok()?;
+        let (model, _) = self.segment_model(template, 0, segment.rows_covered).ok()?;
         Some(SharedCellSpace {
-            model: out,
+            model,
             covered_rows,
         })
     }
@@ -732,6 +1108,7 @@ impl PaxCentroidDirectory {
                     rows_covered: segment.rows_covered,
                     model,
                     cells: Vec::new(),
+                    decode_key: segment.decode_key.clone(),
                 },
             );
         }
@@ -768,6 +1145,7 @@ struct PendingSegment {
     rows_covered: u64,
     model: Option<DirectoryModel>,
     cells: Vec<DirectoryCell>,
+    decode_key: Option<SegmentDecodeKey>,
 }
 
 /// Accumulates segments into a directory. Order-independent: [`Self::build`]
@@ -814,6 +1192,7 @@ impl DirectoryBuilder {
                 rows_covered: a0.model.rows_covered(),
                 model: Some(DirectoryModel::from_a0(a0)),
                 cells,
+                decode_key: None,
             },
         );
         Ok(())
@@ -830,8 +1209,25 @@ impl DirectoryBuilder {
                 rows_covered: 0,
                 model: None,
                 cells: Vec::new(),
+                decode_key: None,
             },
         );
+    }
+
+    /// TD-PAXDIR-1 D6: attach a decode key to a segment added with
+    /// [`Self::add_covered`]. Fails (leaving the segment keyless) when the
+    /// segment is not covered or the key disagrees with its A0.
+    pub fn set_decode_key(&mut self, name: &str, key: SegmentDecodeKey) -> Result<()> {
+        let dim = self.dim.unwrap_or(0);
+        let pending = self
+            .pending
+            .get_mut(name)
+            .filter(|p| p.model.is_some())
+            .ok_or_else(|| anyhow::anyhow!("segment {name} is not covered"))?;
+        let rows: u64 = pending.cells.iter().map(DirectoryCell::rows).sum();
+        key.check(dim, rows)?;
+        pending.decode_key = Some(key);
+        Ok(())
     }
 
     /// Whether any segment has been added.
@@ -866,6 +1262,7 @@ impl DirectoryBuilder {
                 size_bytes: segment.size_bytes,
                 rows_covered: segment.rows_covered,
                 model_idx,
+                decode_key: segment.decode_key,
             });
         }
         let dir = PaxCentroidDirectory {
@@ -903,6 +1300,18 @@ pub struct ReconcilePlan {
 /// Plan an incremental rebuild: keep base entries for segments that are still
 /// live with the same size, load the rest. With no base this is a full build.
 pub fn plan_reconcile(base: Option<&PaxCentroidDirectory>, live: &[LiveSegment]) -> ReconcilePlan {
+    plan_reconcile_keeping(base, live, |_| true)
+}
+
+/// [`plan_reconcile`], also reloading every live base entry `still_valid`
+/// rejects (TD-PAXDIR-1 D6: a decode key whose recorded ETag no longer
+/// matches the listing is evidence the object was rewritten in place, so its
+/// cells are stale too).
+pub fn plan_reconcile_keeping(
+    base: Option<&PaxCentroidDirectory>,
+    live: &[LiveSegment],
+    still_valid: impl Fn(&DirectorySegment) -> bool,
+) -> ReconcilePlan {
     let live_sizes: HashMap<&str, u64> = live
         .iter()
         .map(|s| (s.name.as_str(), s.size_bytes))
@@ -917,7 +1326,8 @@ pub fn plan_reconcile(base: Option<&PaxCentroidDirectory>, live: &[LiveSegment])
     let mut kept = HashSet::new();
     let mut dropped = false;
     let builder = base.retain_into_builder(|segment| {
-        let keep = live_sizes.get(segment.name.as_str()) == Some(&segment.size_bytes);
+        let keep = live_sizes.get(segment.name.as_str()) == Some(&segment.size_bytes)
+            && still_valid(segment);
         if keep {
             kept.insert(segment.name.clone());
         } else {
@@ -1226,6 +1636,24 @@ mod tests {
         assert!(full.changed && full.to_load.len() == 1);
     }
 
+    /// A base entry the caller rejects is reloaded even when its stamp
+    /// matches, and the plan counts as a change.
+    #[test]
+    fn rejected_base_entries_are_reloaded() {
+        let base = two_model_directory();
+        let live: Vec<LiveSegment> = [("a.pax", 100), ("b.pax", 200), ("l0.pax", 50)]
+            .iter()
+            .map(|(n, s)| LiveSegment {
+                name: (*n).into(),
+                size_bytes: *s,
+            })
+            .collect();
+        let plan = plan_reconcile_keeping(Some(&base), &live, |s| s.name != "b.pax");
+        assert!(plan.changed);
+        let names: Vec<&str> = plan.to_load.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["b.pax"]);
+    }
+
     /// Incremental reconcile produces exactly the directory a full build does.
     #[test]
     fn incremental_build_equals_full_build() {
@@ -1375,12 +1803,14 @@ mod tests {
                 size_bytes: 100,
                 rows_covered: 10,
                 model_idx: 0,
+                decode_key: None,
             },
             DirectorySegment {
                 name: "good.pax".to_string(),
                 size_bytes: 100,
                 rows_covered: 10,
                 model_idx: 1,
+                decode_key: None,
             },
         ];
         let entry = CoarseCellEntry {
@@ -1582,6 +2012,207 @@ mod tests {
             .collection_model()
             .is_none()
         );
+    }
+
+    /// A decode key consistent with `seg` (the `a0` helper's layout), with
+    /// one block per cell and an OID chunk on every block.
+    fn key_for(seg: &CoarseDirectory) -> SegmentDecodeKey {
+        let dim = seg.model.dim;
+        let rows = seg.model.rows_covered();
+        let a0_len = seg.to_bytes().unwrap().len() as u64;
+        let header = SegmentHeaderPrefix {
+            layout_version: crate::segment_layout::SEG_LAYOUT_VERSION,
+            rabitq_off: 88 + a0_len,
+            rabitq_len: 500,
+            sq8_off: 2000,
+            sq8_len: 900,
+            footer_off: 5000,
+            footer_len: 300,
+            a0_off: 88,
+            a0_len,
+            c_off: 0,
+            c_len: 0,
+        };
+        let mut rabitq_header = Vec::new();
+        rabitq_header.extend_from_slice(&(rows as u32).to_le_bytes());
+        rabitq_header.extend_from_slice(&dim.to_le_bytes());
+        rabitq_header.extend_from_slice(&42u64.to_le_bytes());
+        for d in 0..dim {
+            rabitq_header.extend_from_slice(&(d as f32 * 0.5).to_le_bytes());
+        }
+        let blocks: Vec<FooterBlockEntry> = seg
+            .model
+            .cell_rows
+            .iter()
+            .enumerate()
+            .map(|(c, &n)| FooterBlockEntry {
+                offset: 3000 + c as u64 * 100,
+                size: 100,
+                row_count: n as u32,
+                stats_kind: crate::segment_layout::StatsKind::MinMax,
+            })
+            .collect();
+        let block_stats = blocks
+            .iter()
+            .enumerate()
+            .map(|(c, b)| {
+                Some(FooterRowGroupStats {
+                    zone: crate::pax_block::BlockZoneSummary::empty(b.row_count),
+                    oid_chunk_rel_off: 10 + c as u32,
+                    oid_chunk_len: 20,
+                    oid_encoding_id: 3,
+                    oid_is_lz4: c % 2 == 0,
+                })
+            })
+            .collect();
+        SegmentDecodeKey {
+            header_prefix: header.to_bytes(),
+            a0_seed: seg.model.seed,
+            a0_trained_on: seg.model.trained_on,
+            rabitq_header,
+            row_count: rows,
+            sq8_min: -1.5,
+            sq8_scale: 0.01,
+            embed_dim: dim,
+            embed_count: 1,
+            embed_quant_tag: 1,
+            has_f32_tier: false,
+            blocks,
+            block_stats,
+            object_etag: Some("\"etag-1\"".to_owned()),
+        }
+    }
+
+    fn keyed_directory() -> (PaxCentroidDirectory, CoarseDirectory) {
+        let seg = a0(
+            4,
+            2,
+            0.5,
+            &[&[0.0, 0.0], &[5.0, 5.0], &[1.0, 2.0]],
+            &[10, 0, 7],
+        );
+        let mut b = DirectoryBuilder::default();
+        b.add_covered("k.pax", 300, &seg).unwrap();
+        b.set_decode_key("k.pax", key_for(&seg)).unwrap();
+        b.add_covered("plain.pax", 100, &a0(4, 2, 1.0, &[&[1.0, 1.0]], &[4]))
+            .unwrap();
+        b.add_uncovered("l0.pax", 50);
+        (b.build(9).unwrap(), seg)
+    }
+
+    /// TD-PAXDIR-1 D6: a decode key round-trips, and rebuilds the segment's
+    /// Region A0 byte for byte plus a footer with the ANN path's fields.
+    #[test]
+    fn decode_keys_round_trip_and_rebuild_the_segment_metadata() {
+        let (dir, seg) = keyed_directory();
+        let bytes = dir.to_bytes().unwrap();
+        assert_eq!(bytes[4], DIRECTORY_VERSION);
+        let parsed = PaxCentroidDirectory::parse(&bytes).unwrap();
+        assert_eq!(parsed, dir);
+        assert_eq!(parsed.to_bytes().unwrap(), bytes, "deterministic");
+
+        let decoded = parsed.segment_decode(0).unwrap();
+        assert_eq!(decoded.a0, seg.to_bytes().unwrap(), "A0 rebuilt exactly");
+        let key = parsed.segments[0].decode_key.as_ref().unwrap();
+        assert_eq!(decoded.header_prefix, key.header_prefix);
+        assert_eq!(decoded.rabitq_header, key.rabitq_header);
+        let footer = SegmentFooterIndex::parse(&decoded.ann_footer).unwrap();
+        assert_eq!(footer.row_count, 17);
+        assert_eq!((footer.sq8_min, footer.sq8_scale), (-1.5, 0.01));
+        assert_eq!(footer.embed_dim, 4);
+        assert_eq!(footer.blocks, key.blocks);
+        assert_eq!(footer.block_stats, key.block_stats);
+        let header = SegmentHeaderPrefix::parse(&decoded.header_prefix).unwrap();
+        assert_eq!(
+            (footer.sq8_off, footer.sq8_len),
+            (header.sq8_off, header.sq8_len)
+        );
+
+        assert!(key.matches_object(Some("\"etag-1\"")));
+        assert!(!key.matches_object(Some("\"etag-2\"")), "rewritten object");
+        assert!(!key.matches_object(None), "a listing without an ETag");
+
+        // Keyless and uncovered segments have nothing to decode.
+        assert!(parsed.segment_decode(1).is_err());
+        assert!(parsed.segment_decode(2).is_err());
+        assert!(parsed.segment_decode(99).is_err());
+    }
+
+    /// Keys survive an incremental rebuild that keeps the segment, and
+    /// leave with it.
+    #[test]
+    fn decode_keys_are_carried_by_reconcile() {
+        let (dir, _) = keyed_directory();
+        let live = |names: &[(&str, u64)]| -> Vec<LiveSegment> {
+            names
+                .iter()
+                .map(|(n, s)| LiveSegment {
+                    name: (*n).into(),
+                    size_bytes: *s,
+                })
+                .collect()
+        };
+        let kept = plan_reconcile(Some(&dir), &live(&[("k.pax", 300), ("plain.pax", 100)]));
+        let rebuilt = kept.builder.build(10).unwrap();
+        assert!(rebuilt.segments[0].decode_key.is_some());
+        assert_eq!(
+            rebuilt.segment_decode(0).unwrap(),
+            dir.segment_decode(0).unwrap()
+        );
+        let rewritten = plan_reconcile(Some(&dir), &live(&[("k.pax", 301)]));
+        assert!(rewritten.builder.build(10).unwrap().segments.is_empty());
+    }
+
+    /// A key that disagrees with its segment is refused at attach and at
+    /// serialize (fail closed), and a v1 object (no key bytes) still parses.
+    #[test]
+    fn inconsistent_keys_are_rejected_and_v1_still_parses() {
+        let seg = a0(4, 2, 0.5, &[&[0.0, 0.0], &[5.0, 5.0]], &[10, 7]);
+        let mut b = DirectoryBuilder::default();
+        b.add_covered("k.pax", 300, &seg).unwrap();
+        b.add_uncovered("l0.pax", 50);
+        let mut wrong_rows = key_for(&seg);
+        wrong_rows.blocks[0].row_count += 1;
+        assert!(b.set_decode_key("k.pax", wrong_rows).is_err());
+        let mut wrong_header = key_for(&seg);
+        wrong_header.rabitq_header.truncate(16);
+        assert!(b.set_decode_key("k.pax", wrong_header).is_err());
+        let mut wrong_dim = key_for(&seg);
+        wrong_dim.embed_dim = 5;
+        assert!(b.set_decode_key("k.pax", wrong_dim).is_err());
+        let mut overlapping = key_for(&seg);
+        overlapping.blocks[1].offset = overlapping.blocks[0].offset + 1;
+        assert!(b.set_decode_key("k.pax", overlapping).is_err());
+        assert!(b.set_decode_key("l0.pax", key_for(&seg)).is_err());
+        assert!(b.set_decode_key("absent.pax", key_for(&seg)).is_err());
+
+        let mut dir = b.clone().build(1).unwrap();
+        let mut bad = key_for(&seg);
+        bad.row_count = 99;
+        dir.segments[0].decode_key = Some(bad);
+        assert!(dir.to_bytes().is_err(), "serialize validates keys too");
+
+        // A keyless directory is written as v1 — the D1 layout, with no
+        // per-segment key flag — and parses back unchanged.
+        let plain = b.build(1).unwrap();
+        let v1 = plain.to_bytes().unwrap();
+        assert_eq!(v1[4], DIRECTORY_VERSION_V1);
+        let segments_end =
+            v1.len() - CHECKSUM_LEN - plain.cells.len() * (8 + 2 * 4 + 4 + CELL_ENTRY_LEN);
+        let segments_len: usize = plain
+            .segments
+            .iter()
+            .map(|s| 4 + s.name.len() + 8 + 8 + 4)
+            .sum();
+        let names_at = segments_end - segments_len;
+        assert_eq!(
+            &v1[names_at + 4..names_at + 4 + plain.segments[0].name.len()],
+            plain.segments[0].name.as_bytes(),
+            "segments carry no key flag byte in v1"
+        );
+        let parsed = PaxCentroidDirectory::parse(&v1).unwrap();
+        assert_eq!(parsed, plain);
+        assert!(parsed.segments.iter().all(|s| s.decode_key.is_none()));
     }
 
     /// Equal PCA bytes do not make equal cells: two segments with the same

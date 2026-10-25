@@ -113,6 +113,7 @@ mod tests {
             std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "1");
             std::env::set_var("PROXIMADB_IVF_K", "8");
             std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", "1");
+            std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1");
         }
     }
 
@@ -314,7 +315,7 @@ mod tests {
         use crate::storage::engines::sst::centroid_directory_reader::plan_segments;
         use proximadb_storage_common::centroid_directory::{PaxCentroidDirectory, object_name};
         let bytes = std::fs::read(format!("{}/{}", arm.storage_url, object_name(1))).unwrap();
-        let dir = PaxCentroidDirectory::parse(&bytes).unwrap();
+        let dir = Arc::new(PaxCentroidDirectory::parse(&bytes).unwrap());
         let files: Vec<(String, u64)> = std::fs::read_dir(&arm.storage_url)
             .unwrap()
             .map(|e| e.unwrap())
@@ -331,13 +332,13 @@ mod tests {
             .map(|q| {
                 let plan = plan_segments(
                     &dir,
-                    files.iter().map(|(u, s)| (u.as_str(), Some(*s))),
+                    files.iter().map(|(u, s)| (u.as_str(), Some(*s), None)),
                     q,
                     TOP_K,
                 )
                 .unwrap();
                 assert_eq!(plan.len(), SEGMENTS, "every segment is usable");
-                plan.values().filter(|cells| !cells.is_empty()).count()
+                plan.values().filter(|c| !c.cells.is_empty()).count()
             })
             .sum();
         probed as f64 / QUERIES as f64
@@ -458,8 +459,10 @@ mod tests {
             proximadb_storage_common::centroid_directory::object_name(2)
         ))
         .unwrap();
-        let dir = proximadb_storage_common::centroid_directory::PaxCentroidDirectory::parse(&bytes)
-            .unwrap();
+        let dir = Arc::new(
+            proximadb_storage_common::centroid_directory::PaxCentroidDirectory::parse(&bytes)
+                .unwrap(),
+        );
         assert_eq!(dir.models.len(), 1, "every segment speaks one cell space");
         let k = dir.collection_model().unwrap().model.k_c();
         let files: Vec<(String, u64)> = std::fs::read_dir(&on.storage_url)
@@ -475,14 +478,14 @@ mod tests {
             .collect();
         let plan = crate::storage::engines::sst::centroid_directory_reader::plan_segments(
             &dir,
-            files.iter().map(|(u, s)| (u.as_str(), Some(*s))),
+            files.iter().map(|(u, s)| (u.as_str(), Some(*s), None)),
             &rows[11],
             TOP_K,
         )
         .unwrap();
         let mut holders: std::collections::HashMap<u32, usize> = Default::default();
-        for cells in plan.values() {
-            for &cell in cells.iter() {
+        for choice in plan.values() {
+            for &cell in choice.cells.iter() {
                 *holders.entry(cell).or_default() += 1;
             }
         }
@@ -552,5 +555,225 @@ mod tests {
         set_directory_read(true);
         let query = rows[42].clone();
         assert_eq!(search(&arm, &query, 1).await, ["r42"]);
+    }
+
+    /// One cold query's sequential waves and requests under the injected
+    /// latency, on a fresh arm (empty segment caches). The directory itself
+    /// is loaded first when `directory` is on: it is fetched once per
+    /// generation and cached (design §3.5, wave 0).
+    async fn cold_query_shape(
+        id: &str,
+        rows: &[Vec<f32>],
+        directory: bool,
+    ) -> (usize, usize, String) {
+        use crate::storage::persistence::filesystem::latency;
+        set_directory_read(directory);
+        let arm = arm(id, rows).await;
+        if directory {
+            arm.engine
+                .discover_sstable_files(&arm.storage_url)
+                .await
+                .unwrap();
+            let fs = arm
+                .engine
+                .filesystem()
+                .get_filesystem(&arm.storage_url)
+                .unwrap();
+            assert!(
+                crate::storage::engines::sst::centroid_directory_reader::load_directory(
+                    fs.as_ref(),
+                    &arm.storage_url,
+                )
+                .await
+                .is_some()
+            );
+        }
+        latency::reset();
+        let query = rows[7].clone();
+        assert_eq!(search(&arm, &query, 1).await, ["r7"]);
+        (
+            latency::critical_path_waves(),
+            latency::request_count(),
+            latency::describe(),
+        )
+    }
+
+    /// A segment's own footer bytes, read through the engine's `FileSystem`
+    /// (header prefix, then the footer range) — any backend, no path tricks.
+    async fn real_footer(arm: &Arm, url: &str) -> Vec<u8> {
+        use proximadb_storage_common::segment_layout::{
+            SEG_HEADER_PREFIX_LEN, SegmentHeaderPrefix,
+        };
+        let fs = arm.engine.filesystem().get_filesystem(url).unwrap();
+        let prefix = fs
+            .read_range(url, 0, SEG_HEADER_PREFIX_LEN as u64)
+            .await
+            .unwrap();
+        let header = SegmentHeaderPrefix::parse(&prefix).unwrap();
+        fs.read_range(url, header.footer_off, header.footer_len)
+            .await
+            .unwrap()
+    }
+
+    /// TD-PAXDIR-1 D6 exit test: a covered segment's cold query reads no
+    /// header, A0 or footer, so it is LIST → probed cells (A + B in one wave,
+    /// D5) → top-k OID chunks: 3 sequential waves, within the §3.5 request
+    /// budget. Without decode keys the header read adds a wave; with the
+    /// directory off, the decode-key gate changes nothing.
+    #[tokio::test]
+    async fn a_covered_segment_cold_query_takes_three_waves() {
+        enable_env();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe {
+            std::env::set_var("PROXIMADB_TEST_FS_LATENCY_MS", "20");
+            std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "16");
+            std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", "4");
+            std::env::set_var("PROXIMADB_PAX_READ_SAME_WAVE_RERANK", "1");
+            // Header-only prefix reads: at synthetic scale the default 1 MiB
+            // prefix would swallow a whole segment, which a 1M-row segment's
+            // never does.
+            std::env::set_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES", "0");
+        }
+        let rows = corpus();
+        let set_keys = |on: bool| unsafe {
+            std::env::set_var(
+                "PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS",
+                if on { "1" } else { "0" },
+            )
+        };
+
+        set_keys(true);
+        let (keyed_waves, keyed_requests, keyed_trace) =
+            cold_query_shape("paxdir_d6_keys", &rows, true).await;
+        set_keys(false);
+        let (keyless_waves, keyless_requests, _) =
+            cold_query_shape("paxdir_d6_keyless", &rows, true).await;
+        let (off_waves, off_requests, _) = cold_query_shape("paxdir_d6_off", &rows, false).await;
+        set_keys(true);
+        let (off_keys_waves, off_keys_requests, _) =
+            cold_query_shape("paxdir_d6_off_keys", &rows, false).await;
+        eprintln!(
+            "cold query waves/requests: decode keys {keyed_waves}/{keyed_requests}, \
+             directory without keys {keyless_waves}/{keyless_requests}, directory off \
+             {off_waves}/{off_requests} (keys gate on: {off_keys_waves}/{off_keys_requests})"
+        );
+        assert_eq!(
+            keyed_waves, 3,
+            "LIST, probed cells, top-k blocks; requests:\n{keyed_trace}"
+        );
+        assert!(
+            keyed_requests <= 20,
+            "within the §3.5 budget: {keyed_requests}\n{keyed_trace}"
+        );
+        // Without keys the header, A0, Region-A header and footer are
+        // dependent reads, and rehydration repeats header and footer.
+        assert!(
+            keyed_waves < keyless_waves,
+            "{keyed_waves} vs {keyless_waves}"
+        );
+        assert!(
+            keyed_requests < keyless_requests,
+            "{keyed_requests} vs {keyless_requests}"
+        );
+        assert_eq!(
+            (off_keys_waves, off_keys_requests),
+            (off_waves, off_requests),
+            "the directory-off path ignores the decode-key gate"
+        );
+    }
+
+    /// Decode keys change only where metadata comes from: on the same
+    /// directory, results keep the directory-off recall, and a warm repeat
+    /// reads less than without keys (no segment metadata is read at all, and
+    /// the top-k blocks are read once). Segments the cold prefix read fetches
+    /// whole keep that read — it serves every later byte — so at the default
+    /// 1 MiB prefix these small test segments read exactly as without keys.
+    #[tokio::test]
+    async fn decode_keys_keep_recall_and_never_poison_the_metadata_cache() {
+        enable_env();
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("PROXIMADB_PAX_READ_SAME_WAVE_RERANK", "1") };
+        let set_keys = |on: bool| unsafe {
+            std::env::set_var(
+                "PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS",
+                if on { "1" } else { "0" },
+            )
+        };
+        let set_prefix = |bytes: &str| unsafe {
+            std::env::set_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES", bytes)
+        };
+        let rows = corpus();
+
+        // Small segments (the prefix read fetches each whole): keys unused.
+        set_prefix("1048576");
+        set_keys(false);
+        let small = arm("paxdir_d6_small_keyless", &rows).await;
+        let (_, small_keyless) = measure(&small, &rows, true).await;
+        set_keys(true);
+        let small = arm("paxdir_d6_small_keys", &rows).await;
+        let (_, small_keys) = measure(&small, &rows, true).await;
+        assert_eq!(
+            small_keys, small_keyless,
+            "a whole-segment prefix read wins"
+        );
+
+        // Large segments (header-only prefix reads).
+        set_prefix("0");
+        let off = arm("paxdir_d6_recall_off", &rows).await;
+        let keyless = arm("paxdir_d6_recall_keyless", &rows).await;
+        let on = arm("paxdir_d6_recall_on", &rows).await;
+        let (recall_off, _) = measure(&off, &rows, false).await;
+        set_keys(false);
+        let (recall_keyless, reads_keyless) = measure(&keyless, &rows, true).await;
+        set_keys(true);
+        let (recall_on, reads_on) = measure(&on, &rows, true).await;
+        eprintln!(
+            "decode keys: recall {recall_on:.3} reads {reads_on}; without keys: recall \
+             {recall_keyless:.3} reads {reads_keyless}; per-segment recall {recall_off:.3}; \
+             small segments: {small_keys} reads either way"
+        );
+        assert_eq!(recall_on, recall_keyless, "keys change no result");
+        assert!(
+            recall_on >= recall_off - 0.01,
+            "{recall_on} vs {recall_off}"
+        );
+        assert!(reads_on < reads_keyless, "{reads_on} vs {reads_keyless}");
+
+        // The rebuilt footer is ANN-only; every later query must read the
+        // segment's own, so directory-planned scans never admit the rebuilt
+        // bytes to the invariants cache. The keyless arm proves the cache is
+        // keyed by these URLs; the decoded arm then holds no entry, and a
+        // per-segment query afterwards caches each segment's real footer.
+        for (arm, decoded) in [(&keyless, false), (&on, true)] {
+            let cache = arm.engine.segment_invariants_cache.as_ref().unwrap();
+            let files = arm
+                .engine
+                .discover_sstable_files(&arm.storage_url)
+                .await
+                .unwrap();
+            assert_eq!(files.len(), SEGMENTS);
+            for file in &files {
+                match cache.get(&file.url) {
+                    Some(entry) => {
+                        assert!(!decoded, "{} cached from a decoded scan", file.url);
+                        assert_eq!(entry.footer_bytes, real_footer(arm, &file.url).await);
+                    }
+                    None => assert!(decoded, "{} never cached by its own scan", file.url),
+                }
+            }
+        }
+        set_directory_read(false);
+        let query = rows[3].clone();
+        assert_eq!(search(&on, &query, 1).await, ["r3"]);
+        let cache = on.engine.segment_invariants_cache.as_ref().unwrap();
+        for file in on
+            .engine
+            .discover_sstable_files(&on.storage_url)
+            .await
+            .unwrap()
+        {
+            let entry = cache.get(&file.url).expect("per-segment scan caches");
+            assert_eq!(entry.footer_bytes, real_footer(&on, &file.url).await);
+        }
     }
 }
