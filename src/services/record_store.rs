@@ -180,6 +180,13 @@ pub trait TableWalAppender: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Whether [`Self::read_all_entries`] returns the log (`false` for the
+    /// default, which returns nothing). Only then is an empty change feed proof
+    /// that nothing changed.
+    fn has_readable_log(&self) -> bool {
+        false
+    }
+
     /// Entries with `sequence_number > since` that may belong to
     /// `collection_id`, oldest first (callers still filter by collection). The
     /// default reads everything; a segmented WAL (P2.1) reads only the segments
@@ -1063,6 +1070,15 @@ pub trait TableRecordStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Whether every write to `table_schema` reaches the change feed
+    /// [`Self::read_changes_since_scoped`] serves. Only then does an empty feed
+    /// prove the table unchanged (P2.4 incremental MATERIALIZE). The default is
+    /// `false`; the WAL-backed store and the stores that route to it override it.
+    fn has_change_feed(&self, table_schema: &CatalogTableSchema) -> bool {
+        let _ = table_schema;
+        false
+    }
+
     /// Capture the snapshot LSN for MATERIALIZE before it scans the table
     /// (ADR-025). The default reads the table's newest change, which is sound
     /// only when the WAL never truncates; the WAL-backed store pins history
@@ -1741,6 +1757,15 @@ impl TableRecordStore for CatalogRoutingTableRecordStore {
 
     async fn capture_snapshot_lsn(&self, collection_id: &str) -> Result<SnapshotLsn> {
         self.iceberg_store.capture_snapshot_lsn(collection_id).await
+    }
+
+    /// Only a relational route writes to `iceberg_store`, whose feed this
+    /// router serves.
+    fn has_change_feed(&self, table_schema: &CatalogTableSchema) -> bool {
+        matches!(
+            TableRecordStoreRoute::for_schema(table_schema),
+            TableRecordStoreRoute::RelationalStorage
+        ) && self.iceberg_store.has_change_feed(table_schema)
     }
 }
 
@@ -3422,6 +3447,12 @@ impl TableRecordStore for DirectWalTableRecordStore {
             "🗑️ dropped record partition (+ WAL marker) for table"
         );
         Ok(())
+    }
+
+    /// Every write goes through the canonical WAL this store reads its feed
+    /// from, so the feed is complete whenever that log can be read back.
+    fn has_change_feed(&self, _table_schema: &CatalogTableSchema) -> bool {
+        self.wal_appender.has_readable_log()
     }
 
     /// The snapshot LSN is the WAL head, lowered below any write that is

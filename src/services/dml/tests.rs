@@ -3783,6 +3783,251 @@ fn published_files_carry_a_hidden_oid_column() {
     });
 }
 
+/// P2.4 slice 2: an insert-only republication appends one part holding only
+/// the new rows and carries the published files forward; an unchanged table
+/// publishes nothing; an update (a changed oid that is already published)
+/// falls back to a full rewrite. Reads see the right rows throughout.
+#[cfg(feature = "datafusion-integration")]
+#[test]
+fn an_insert_only_republication_appends_and_an_update_rewrites() {
+    let _bloom = EnvGuard::set("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1");
+    crate::query::execution::test_runtime::run_with_timeout(30, async {
+        use crate::datafusion::create_session_context;
+        use crate::datafusion::engine_adapters::register_object_store_parquet_location;
+        use proximadb_iceberg_engine::IcebergObjectStoreBridge;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let (_manager, dml) = dml_over_wal_table(
+            temp_dir.path(),
+            "CREATE TABLE inv (id TEXT NOT NULL, qty INT, PRIMARY KEY (id));",
+            "append.wal",
+        )
+        .await;
+        let parser = crate::query::sql_frontend::SqlFrontendParser::new();
+        let run = |sql: String| {
+            parser
+                .parse_dml(&sql)
+                .expect("parse dml")
+                .expect("dml stmt")
+        };
+        for i in 0..3 {
+            dml.execute(run(format!(
+                "INSERT INTO inv (id, qty) VALUES ('i{i}', {i});"
+            )))
+            .await
+            .expect("insert");
+        }
+        let store_dir = tempfile::tempdir().expect("store tempdir");
+        let root_url = format!("file://{}", store_dir.path().display());
+        let bridge = Arc::new(IcebergObjectStoreBridge::from_url(&root_url).expect("bridge"));
+        let materialize = || dml.materialize_table_to_parquet(&*bridge, &root_url, "inv", None);
+        let qty_sum = |location: String| async move {
+            let ctx = create_session_context().expect("session ctx");
+            register_object_store_parquet_location(
+                &ctx,
+                "inv_parquet",
+                &location,
+                None,
+                proximadb_data_model::StatsTrust::Trusted,
+            )
+            .await
+            .expect("register parquet location");
+            let batches = ctx
+                .sql("SELECT COUNT(*) AS n, SUM(qty) AS s FROM inv_parquet")
+                .await
+                .expect("plan")
+                .collect()
+                .await
+                .expect("collect");
+            let column = |name: &str| {
+                batches[0]
+                    .column_by_name(name)
+                    .expect("column")
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .expect("int64")
+                    .value(0)
+            };
+            (column("n"), column("s"))
+        };
+
+        let location = materialize().await.expect("materialize 1");
+        let prefix = location
+            .strip_prefix(&format!("{root_url}/"))
+            .expect("location under root")
+            .to_string();
+        let v1 = published_data_files(&bridge, &prefix).await;
+        assert_eq!(v1.len(), 1);
+        assert_eq!(qty_sum(location.clone()).await, (3, 3));
+
+        let metadata_prefix = format!(
+            "{}/metadata",
+            prefix.strip_suffix("/data").expect("data location")
+        );
+        let metadata_version = || async {
+            bridge
+                .latest_metadata_version(&metadata_prefix)
+                .await
+                .expect("metadata log")
+                .expect("a committed snapshot")
+        };
+        let version1 = metadata_version().await;
+
+        // Unchanged: nothing is published, not even a new metadata version.
+        assert_eq!(
+            materialize().await.expect("materialize unchanged"),
+            location
+        );
+        assert_eq!(published_data_files(&bridge, &prefix).await, v1);
+        assert_eq!(metadata_version().await, version1);
+
+        // Insert-only: the first file is carried, one new part holds the 2 new rows.
+        for i in 3..5 {
+            dml.execute(run(format!(
+                "INSERT INTO inv (id, qty) VALUES ('i{i}', {i});"
+            )))
+            .await
+            .expect("insert");
+        }
+        assert_eq!(materialize().await.expect("materialize 2"), location);
+        let v2 = published_data_files(&bridge, &prefix).await;
+        assert_eq!(v2.len(), 2, "carried + appended: {v2:?}");
+        assert!(v2.contains(&v1[0]), "the published file is carried");
+        let appended = v2
+            .iter()
+            .find(|p| !v1.contains(p))
+            .expect("an appended part");
+        let mut stream = bridge
+            .read_parquet_batches(
+                appended,
+                Arc::new(arrow_schema::Schema::empty()),
+                1024,
+                None,
+            )
+            .await
+            .expect("read appended part");
+        let mut appended_rows = 0;
+        while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+            appended_rows += batch.expect("batch").num_rows();
+        }
+        assert_eq!(appended_rows, 2, "the append writes only the new rows");
+        assert_eq!(qty_sum(location.clone()).await, (5, 10));
+
+        // An update of a published row: full rewrite, nothing carried.
+        dml.execute(run("UPDATE inv SET qty = 100 WHERE id = 'i0';".to_string()))
+            .await
+            .expect("update");
+        assert_eq!(materialize().await.expect("materialize 3"), location);
+        let v3 = published_data_files(&bridge, &prefix).await;
+        assert!(v3.iter().all(|p| !v2.contains(p)), "a rewrite: {v3:?}");
+        assert_eq!(qty_sum(location.clone()).await, (5, 110));
+
+        // A new oid inside the published oid range ('i05' sorts between 'i0'
+        // and 'i1') is still an append: the Bloom filter rules it out.
+        dml.execute(run(
+            "INSERT INTO inv (id, qty) VALUES ('i05', 1000);".to_string()
+        ))
+        .await
+        .expect("insert in range");
+        materialize().await.expect("materialize 4");
+        let v4 = published_data_files(&bridge, &prefix).await;
+        assert_eq!(v4.len(), v3.len() + 1, "an in-range append: {v4:?}");
+        assert!(v3.iter().all(|p| v4.contains(p)));
+        assert_eq!(qty_sum(location.clone()).await, (6, 1110));
+
+        // A row inserted and deleted between publications changes nothing.
+        dml.execute(run(
+            "INSERT INTO inv (id, qty) VALUES ('i9', 9);".to_string()
+        ))
+        .await
+        .expect("insert transient");
+        dml.execute(run("DELETE FROM inv WHERE id = 'i9';".to_string()))
+            .await
+            .expect("delete transient");
+        let version4 = metadata_version().await;
+        materialize().await.expect("materialize 5");
+        assert_eq!(published_data_files(&bridge, &prefix).await, v4);
+        assert_eq!(metadata_version().await, version4);
+
+        // A delete of a published row rewrites.
+        dml.execute(run("DELETE FROM inv WHERE id = 'i1';".to_string()))
+            .await
+            .expect("delete published");
+        materialize().await.expect("materialize 6");
+        let v6 = published_data_files(&bridge, &prefix).await;
+        assert!(v6.iter().all(|p| !v4.contains(p)), "a rewrite: {v6:?}");
+        assert_eq!(qty_sum(location.clone()).await, (5, 1109));
+    });
+}
+
+/// P2.4 slice 2: with object_id WAL keying on, an update to a table outside the
+/// `default` namespace still reaches the append plan's change feed (it is keyed
+/// from the table's own schema, not a re-resolution of its bare name), so the
+/// republication rewrites instead of keeping the stale row as "unchanged".
+#[tokio::test]
+async fn an_update_under_object_id_keying_outside_default_rewrites() {
+    let _keying = EnvGuard::set("PROXIMADB_WAL_OBJECT_ID_KEY", "1");
+    let _bloom = EnvGuard::set("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1");
+    use proximadb_iceberg_engine::IcebergObjectStoreBridge;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let (manager, dml) = dml_over_wal_table(
+        temp_dir.path(),
+        "CREATE TABLE unused (id TEXT NOT NULL, PRIMARY KEY (id));",
+        "keyed.wal",
+    )
+    .await;
+    let ddl = DdlService::new(manager.clone());
+    ddl.execute(DdlStatement::CreateNamespace {
+        namespace: vec!["analytics".to_string()],
+        if_not_exists: true,
+        properties: HashMap::new(),
+    })
+    .await
+    .expect("create namespace");
+    let parser = crate::query::sql_frontend::SqlFrontendParser::new();
+    ddl.execute(
+        parser
+            .parse_ddl("CREATE TABLE analytics.inv (id TEXT NOT NULL, qty INT, PRIMARY KEY (id));")
+            .expect("parse ddl")
+            .expect("ddl stmt"),
+    )
+    .await
+    .expect("create table");
+    let run = |sql: &str| parser.parse_dml(sql).expect("parse dml").expect("dml stmt");
+    for i in 0..3 {
+        dml.execute(run(&format!(
+            "INSERT INTO analytics.inv (id, qty) VALUES ('i{i}', {i});"
+        )))
+        .await
+        .expect("insert");
+    }
+    let store_dir = tempfile::tempdir().expect("store tempdir");
+    let root_url = format!("file://{}", store_dir.path().display());
+    let bridge = IcebergObjectStoreBridge::from_url(&root_url).expect("bridge");
+    let location = dml
+        .materialize_table_to_parquet(&bridge, &root_url, "analytics.inv", None)
+        .await
+        .expect("materialize 1");
+    let prefix = location
+        .strip_prefix(&format!("{root_url}/"))
+        .expect("location under root")
+        .to_string();
+    let v1 = published_data_files(&bridge, &prefix).await;
+
+    dml.execute(run("UPDATE analytics.inv SET qty = 100 WHERE id = 'i0';"))
+        .await
+        .expect("update");
+    dml.materialize_table_to_parquet(&bridge, &root_url, "analytics.inv", None)
+        .await
+        .expect("materialize 2");
+    let v2 = published_data_files(&bridge, &prefix).await;
+    assert!(
+        v2.iter().all(|p| !v1.contains(p)),
+        "the update must rewrite, not be skipped as unchanged: {v1:?} -> {v2:?}"
+    );
+}
+
 /// Restores an environment variable when dropped (lib tests run one per process
 /// under nextest; locally they run serialized).
 struct EnvGuard(&'static str, Option<String>);
@@ -3858,6 +4103,9 @@ async fn dml_over_wal_table(
 #[cfg(feature = "datafusion-integration")]
 #[test]
 fn materialize_publishes_multi_part_generations_and_collects_old_ones() {
+    // Full rewrites only: this pins generations and GC, which an insert-only
+    // republication would otherwise append to (P2.4 slice 2).
+    let _append = EnvGuard::set("PROXIMADB_MATERIALIZE_APPEND_MAX_ROWS", "0");
     let _rows = EnvGuard::set("PROXIMADB_MATERIALIZE_TARGET_FILE_ROWS", "10");
     let _rg = EnvGuard::set("PROXIMADB_MATERIALIZE_ROW_GROUP_ROWS", "4");
     let _chunk = EnvGuard::set("PROXIMADB_MATERIALIZE_SCAN_CHUNK_ROWS", "7");
@@ -4025,6 +4273,8 @@ impl crate::services::ddl::PublishFence for RefusingFence {
 /// of the second losing the metadata CAS.
 #[tokio::test]
 async fn materialize_is_fenced_and_serialized_per_table() {
+    // Every run must rewrite so each one exercises the fenced publish.
+    let _append = EnvGuard::set("PROXIMADB_MATERIALIZE_APPEND_MAX_ROWS", "0");
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let (manager, dml) = dml_over_wal_table(
         temp_dir.path(),

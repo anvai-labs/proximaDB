@@ -1289,6 +1289,10 @@ impl proximadb_storage_ports::CanonicalWalReaderPort for CanonicalWalReaderBridg
 
 #[async_trait]
 impl TableWalAppender for FramedTableWalAppender {
+    fn has_readable_log(&self) -> bool {
+        true
+    }
+
     async fn read_all_entries(&self) -> Result<Vec<CanonicalWalEntry>> {
         self.read_entries().await
     }
@@ -1466,6 +1470,10 @@ impl TableWalAppender for MemoryTableWalAppender {
     /// `opt_config = None` boot path that uses this appender. Without this
     /// override the trait default returned empty, so the change-feed was silently
     /// empty for in-memory WALs.
+    fn has_readable_log(&self) -> bool {
+        true
+    }
+
     async fn read_all_entries(&self) -> Result<Vec<CanonicalWalEntry>> {
         Ok(self.entries().await)
     }

@@ -734,9 +734,9 @@ pub struct SnapshotCommit<'a> {
 /// Build the `TableMetadata` JSON for `commit`, chained onto `lineage`.
 ///
 /// The snapshot is the table's complete current file set, so a commit with a parent
-/// is an `overwrite` and the parent snapshot is not carried forward: publication
-/// rewrites data objects in place, so the parent's manifests would describe bytes that
-/// no longer exist. The parent stays referenced through `parent-snapshot-id` and the
+/// is an `overwrite` and the parent snapshot is not carried forward: a rewrite replaces
+/// the parent's files, which are then collected, and an append re-lists the files it
+/// carries (as added, so `added-files`/`added-records` count them). The parent stays referenced through `parent-snapshot-id` and the
 /// previous metadata file through `metadata-log`, exactly as after snapshot expiry.
 /// The table is unpartitioned (spec id 0). v3 adds the row-lineage fields
 /// (`next-row-id`, `first-row-id`, `added-rows`).
