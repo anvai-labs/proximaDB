@@ -252,7 +252,7 @@ tenant-ingress-check:
 	@echo "Validating deployment-aware tenant ingress..."
 	python3 scripts/check_tenant_ingress_contract.py
 
-work-commit-check: fmt-check deterministic-commit-contract-check branch-promotion-policy-check docs-claim-check design-status-check status-asof-check capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check panic-policy-module-guard silent-failure-no-regression hygiene-check env-gate-check dup-ratchet-check release-build-features-check release-evidence-contract-check orphan-rust-files-check
+work-commit-check: fmt-check deterministic-commit-contract-check branch-promotion-policy-check docs-claim-check design-status-check status-asof-check capability-matrix-check mvp-contract-check mvp-smoke-test context-benchmark-check workspace-boundaries-check tenant-path-check tenant-ingress-check catalog-seal-check panic-policy-module-guard panic-policy-workspace-no-regression silent-failure-no-regression hygiene-check env-gate-check dup-ratchet-check release-build-features-check release-evidence-contract-check orphan-rust-files-check
 	@echo "✅ work-commit-check: deterministic architecture and commit guardrails passed"
 
 validated-commit-check: work-commit-check
@@ -293,6 +293,23 @@ panic-policy-baseline:
 	bash scripts/count_panic_patterns.sh --mode report --format json --write $(PANIC_POLICY_BASELINE)
 	@echo "Updated baseline: $(PANIC_POLICY_BASELINE)"
 	@$(MAKE) --no-print-directory baseline-merge-skew-warning ARTIFACT="$(PANIC_POLICY_BASELINE)" REVERIFY="make panic-policy-no-regression"
+
+PANIC_POLICY_WORKSPACE_BASELINE ?= docs/_internal/roadmap/PANIC_POLICY_WORKSPACE_BASELINE.json
+
+.PHONY: panic-policy-workspace-no-regression panic-policy-workspace-baseline
+
+panic-policy-workspace-no-regression:
+	@echo "🧯 WS-2 panic policy no-regression check (workspace scope)..."
+	@mkdir -p artifacts/panic_policy
+	bash scripts/count_panic_patterns.sh --scope workspace --mode no-regression \
+	  --baseline $(PANIC_POLICY_WORKSPACE_BASELINE) --format text \
+	  --write artifacts/panic_policy/panic_policy_workspace_no_regression.json
+
+panic-policy-workspace-baseline:
+	@echo "🧯 Refreshing the workspace panic policy baseline..."
+	bash scripts/count_panic_patterns.sh --scope workspace --mode report --format json \
+	  --write $(PANIC_POLICY_WORKSPACE_BASELINE)
+	@echo "Updated baseline: $(PANIC_POLICY_WORKSPACE_BASELINE)"
 
 # Shared post-refresh warning for every COMPUTED WHOLE-TREE SNAPSHOT baseline
 # (v1-proto usage, panic policy, coverage). Not a gate — a reminder printed at the

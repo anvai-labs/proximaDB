@@ -378,6 +378,7 @@ jobs:
               - 'src/**'
               - 'scripts/count_panic_patterns.sh'
               - 'docs/_internal/roadmap/PANIC_POLICY_BASELINE.json'
+              - docs/_internal/roadmap/PANIC_POLICY_WORKSPACE_BASELINE.json
             dup_ratchet:
               - 'scripts/dup_ratchet.py'
               - 'docs/10-quality/DUP_RATCHET_BASELINE.json'
@@ -825,6 +826,8 @@ jobs:
         run: python3 -m unittest discover -s tests/scripts -p 'test_dup_ratchet.py'
       - name: Test promotion tree-reuse gate (TD-CITIER-2)
         run: python3 -m unittest discover -s tests/scripts -p 'test_ci_tree_reuse.py'
+      - name: Test panic-policy scanner scopes (legacy vs workspace)
+        run: python3 -m unittest discover -s tests/scripts -p 'test_count_panic_patterns.py'
       - name: Test Flake Rerun infra-kill matcher (fixture job logs)
         run: python3 -m unittest discover -s tests/scripts -p 'test_flake_rerun.py'
       - name: Test Pre-Release CI await gate (run_id hand-off to release.yml)
@@ -1287,6 +1290,14 @@ jobs:
             --mode no-regression \
             --baseline docs/_internal/roadmap/PANIC_POLICY_BASELINE.json \
             --write artifacts/panic_policy/panic_policy_no_regression.json \
+            --format text
+      - name: Enforce no-regression baseline (workspace scope)
+        run: |
+          mkdir -p artifacts/panic_policy
+          bash scripts/count_panic_patterns.sh \
+            --scope workspace --mode no-regression \
+            --baseline docs/_internal/roadmap/PANIC_POLICY_WORKSPACE_BASELINE.json \
+            --write artifacts/panic_policy/panic_policy_workspace_no_regression.json \
             --format text
 
   panic-policy-module-guard:

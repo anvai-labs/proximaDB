@@ -13,6 +13,7 @@ link:../../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE.adoc], not by anything here.
 | `BENCHMARK_EVIDENCE.toml` | Every performance claim in narrative docs, with its measured evidence. | `scripts/check_perf_claims.py`
 | `CAPABILITY_MATRIX.toml` | Capability-by-surface maturity matrix. | `scripts/validate_capability_matrix.py`
 | `PANIC_POLICY_BASELINE.json` | Allowed panic sites, which may only shrink. | `scripts/count_panic_patterns.sh`
+| `PANIC_POLICY_WORKSPACE_BASELINE.json` | Allowed panic sites, which may only shrink. | `scripts/count_panic_patterns.sh --scope workspace`
 | `SILENT_FAILURE_BASELINE.json` | Silent-failure sites, which may only shrink. | `scripts/count_silent_failures.py`
 | `V1_PROTO_USAGE_BASELINE.json` | Remaining v1-proto usage (TD-PROTO-2). | `scripts/check_v1_proto_usage.py`
 | `COVERAGE_BASELINE.json` | Coverage floor. | `scripts/coverage_ratchet.py`

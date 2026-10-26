@@ -319,6 +319,7 @@ docs/log/
 !config/tier-config.json
 !config/tier-config.example.json
 !docs/_internal/roadmap/PANIC_POLICY_BASELINE.json
+!docs/_internal/roadmap/PANIC_POLICY_WORKSPACE_BASELINE.json
 !docs/10-quality/DUP_RATCHET_BASELINE.json
 !docs/_internal/roadmap/V1_PROTO_USAGE_BASELINE.json
 !docs/_internal/roadmap/SILENT_FAILURE_BASELINE.json
