@@ -4006,6 +4006,7 @@ impl DmlService {
                 .resolve_warehouse_object_prefix(
                     &plan.target.qualified_name(),
                     tenant_context.map(|tc| tc.tenant_id.as_str()),
+                    table_schema.object_id,
                 )
                 .await?
         {
@@ -4114,6 +4115,7 @@ impl DmlService {
         &self,
         table_name: &str,
         tenant: Option<&str>,
+        object_id: Option<u64>,
     ) -> Result<Option<String>> {
         let Some(tenant_id) = tenant.filter(|t| !t.is_empty()) else {
             return Ok(None);
@@ -4128,13 +4130,10 @@ impl DmlService {
         let ns_meta = catalog.get_namespace(&table_id.namespace).await.ok();
         // The object_id keys the path in lockstep with the primary materialize so
         // bulk-appended rows land under the SAME prefix the published `location`
-        // points at (a miss here would orphan them from reads). A catalog lookup
-        // failure falls back to name-keying (Ok-or-None → None object_id).
-        let table_object_id = catalog
-            .get_table(&table_id)
-            .await
-            .ok()
-            .and_then(|schema| schema.object_id);
+        // points at (a miss here would orphan them from reads). It comes from the
+        // caller's schema — the SAME value MATERIALIZE keyed with — not a re-fetch:
+        // a failed re-fetch would degrade this path to name-keying while the
+        // materialize log stays id-keyed, forking the table's engine log.
         let prefix = resolve_materialize_prefix(
             tenant_id,
             ns_meta
@@ -4147,7 +4146,7 @@ impl DmlService {
                 .map(|n| n.storage_pool_class)
                 .unwrap_or_default(),
             &table_id.name,
-            table_object_id,
+            object_id,
         )?;
         Ok(Some(prefix))
     }

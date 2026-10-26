@@ -3463,8 +3463,11 @@ async fn resolve_warehouse_object_prefix_is_namespace_aware_and_tenant_scoped() 
         .expect("create table");
 
     // Tenant scope → namespace-aware, tenant-isolated prefix (NOT the flat fallback).
+    // The object_id comes from the CALLER's schema (TD-SEAM-1 review round B): a
+    // failed re-fetch used to degrade this path to name-keying while the
+    // materialize log stayed id-keyed, forking the table's engine log.
     let prefix = dml
-        .resolve_warehouse_object_prefix("facts", Some("acmecorp"))
+        .resolve_warehouse_object_prefix("facts", Some("acmecorp"), None)
         .await
         .expect("resolve prefix")
         .expect("a tenant scope yields a prefix");
@@ -3482,9 +3485,29 @@ async fn resolve_warehouse_object_prefix_is_namespace_aware_and_tenant_scoped() 
     );
     assert!(!prefix.contains("default_tenant"), "prefix={prefix}");
 
+    // The caller's object_id keys the path segment when the object-id path gate
+    // is on — the value MATERIALIZE keyed with must flow through (review round
+    // B: a failed re-fetch used to silently degrade to name-keying here while
+    // the materialize log stayed id-keyed, forking the table's engine log).
+    let _gate = EnvGuard::set("PROXIMADB_MATERIALIZE_OBJECT_ID_PATHS", "1");
+    let id_keyed = dml
+        .resolve_warehouse_object_prefix("facts", Some("acmecorp"), Some(u64::MAX))
+        .await
+        .expect("resolve prefix (id-keyed)")
+        .expect("a tenant scope yields a prefix");
+    assert_ne!(
+        id_keyed, prefix,
+        "with the gate on, the caller's object_id must key the prefix, not be ignored"
+    );
+    assert!(
+        id_keyed.ends_with(&u64::MAX.to_string()),
+        "the id-keyed segment is the object id: {id_keyed}"
+    );
+    drop(_gate);
+
     // No tenant scope → None (single-tenant/embedded keeps the legacy fallback).
     assert!(
-        dml.resolve_warehouse_object_prefix("facts", None)
+        dml.resolve_warehouse_object_prefix("facts", None, None)
             .await
             .expect("resolve prefix (no tenant)")
             .is_none()
