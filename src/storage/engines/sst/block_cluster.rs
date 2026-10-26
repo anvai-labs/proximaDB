@@ -253,9 +253,13 @@ pub fn cluster_order_pca_ivf(records: &[ProximaRecord], idx: usize) -> Option<Ve
 /// Below this many usable rows a trained model can't beat the bootstrap.
 const MIN_ROWS_FOR_IVF: usize = 64;
 
-/// Fine IVF cell count ≈ blockcount (ADR-065 co-design): one cell ≈ one
-/// IOP-sized block, so survivors span fewer cells → fewer GETs and each
-/// cell-fetch is one efficient IOP. `PROXIMADB_IVF_K` overrides to map the
+/// Fine IVF cell count (P5b design §3.2, `k_G`, default since TD-PAXDIR-1
+/// D8): one cell's Region-A + Region-B bytes ≈ **half** an IOP-sized block —
+/// `k = N·(a_row + b_row) / (target/2)` — so a probed cell's coalesced A+B
+/// fetch approaches the coalescer's target range. The pre-D8 rule (one cell ≈
+/// one IOP of SQ8 bytes alone) sized SIFT1M at ~15 cells/1M rows; the D7 gate
+/// run measured that 2× too coarse (queries probed ~50% of rows; the passing
+/// geometry was 32–36 cells). `PROXIMADB_IVF_K` overrides to map the
 /// GETs-vs-recall curve (eval knob, not a production setting).
 fn ivf_fine_cell_count(n_usable: usize, dim: usize, destination: Option<&str>) -> usize {
     // Shared with the read-side range planner so both sides agree on what an
@@ -270,7 +274,10 @@ fn ivf_fine_cell_count(n_usable: usize, dim: usize, destination: Option<&str>) -
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or_else(|| ((n_usable * dim) / iop_target.max(1)).clamp(2, 4096))
+        .unwrap_or_else(|| {
+            let per_row = proximadb_block_format::code_stride(dim as u32) + dim;
+            ((n_usable * per_row) / (iop_target / 2).max(1)).clamp(2, 4096)
+        })
 }
 
 /// k-means convergence floor: enough samples per centroid to estimate a stable
@@ -693,9 +700,10 @@ pub(crate) fn finish_ivf_probe_classifier(
 /// TD-PAXDIR-1 D3: WRITE gate — compaction classifies its output with the
 /// collection's shared coarse model (the directory's dominant model) instead
 /// of training a new one, so every compacted segment speaks one cell space.
-/// Default OFF until the P5b gate passes.
+/// Default ON since D8 (the P5b gate run passed); kill-switch like every
+/// PAXDIR gate.
 pub fn shared_model_enabled() -> bool {
-    env_gate_on("PROXIMADB_PAX_WRITE_SHARED_MODEL")
+    env_kill_switch_off("PROXIMADB_PAX_WRITE_SHARED_MODEL")
 }
 
 /// Retrain when more than this fraction of an output's rows fall outside
@@ -1084,6 +1092,17 @@ pub fn partition_layout_enabled() -> bool {
 }
 
 /// Boolean gate read: truthy = `1|true|on|yes`.
+pub(crate) fn env_kill_switch_off(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
+
 pub(crate) fn env_gate_on(name: &str) -> bool {
     std::env::var(name)
         .ok()

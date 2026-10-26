@@ -1333,3 +1333,20 @@ hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB; MinIO single drive + 
 date = "2026-10-25"
 version = "feat/paxdir-d7-measurement @ b000d6275, the PR HEAD (release-server --features aws, built in-worktree)"
 notes = "Full TEXMEX SIFT1M, 1,000 queries per phase (disjoint ranges), concurrency 1, planner pinned to 4 MiB coalesce range. The HEAD rerun passed with the corrected dependency-safe wave rule (a wave ends when any of its requests completes). Earlier same-shape arms: k default (15-17 cells) 21.40 req/q (fails G3); k=64 19.01 req/q but 4 waves; round 1 (binary 7d84e8074) measured the per-segment path for every arm because the directory read path was not wired into the server's non-Arc search fan-out — fixed in this branch with the one-LIST-per-query memo, the warm top-k hand-off and unit-grouped wave counting. Single-machine emulator evidence, not an SLA or a cloud-latency claim."
+
+[[claims]]
+id = "paxdir_d8_defaults_on_sift1m"
+claim = "TD-PAXDIR-1 D8: the six P5b gates default ON (kill-switches), confirmed end-to-end with every gate unset. Canonical intra-region profile (MinIO + Toxiproxy 5+5 ms, measured 11.4 ms RTT; owner realigned 2026-10-25 — no cross-region deployments): object-cold recall@10 = 0.9822, p50 = 3 sequential request waves, 19.55 requests per query (GET + LIST + HEAD), p50/p95 latency 107/143 ms, warm 2 waves (= discovery LIST + 1, the gate as restated); harness exit 0. Kill-switch off on the same bed: recall 0.9816, 8 waves, 20.62 req/q, 194/287 ms. At 50 ms RTT (stress column): on 3 waves / 18.82 req/q / 223 ms vs off 8 waves / 21.41 req/q / 500 ms. The default k_G cell rule (~34 cells/1M rows vs the old ~15) also improves the off path (D7 off: 22.66 req/q, 60.2 MB/q -> 21.41, 51.5)."
+metric = "recall@10 + requests_per_query + per-query critical-path waves p50 + bytes/query + latency p50/p95 + qps, object-cold phase, defaults-on vs kill-switch-off, 10 ms and 50 ms profiles"
+status = "measured"
+asserted_in = [
+  "docs/10-quality/td/TD-PAXDIR-1-collection-global-centroid-directory.adoc",
+  "docs/12-design/P5B_PAX_CENTROID_DIRECTORY_DESIGN.adoc",
+]
+bench_source = "scripts/bench/sift1m_get_reduction.py"
+bench_command = "systemd-run --user --scope -p MemoryMax=64G python3 scripts/bench/sift1m_get_reduction.py --root <root> --binary target/release-server/proximadb-server --sift-dir <sift1m> --rows 1000000 --queries 1000 --top-k 10 --min-recall 0.98 --object-cold-max-requests 20 --object-cold-max-waves 3 --warm-max-waves 2 --training-compaction-min-mb 1 --max-segments 3 --s3-endpoint http://<toxiproxy 5+5 ms> --storage-url s3://<bucket>/<arm> --read-ranges-inflight 16 --centroid-directory default"
+artifact = "docs/_internal/status/P5B_D8_DEFAULTS_CONFIRMATION_2026_10_25.adoc"
+hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB; MinIO single drive + Toxiproxy 2.12.0 on the same host; arms serialized on an idle box"
+date = "2026-10-25"
+version = "feat/paxdir-d8-defaults @ 78e99d2c1 (release-server --features aws, built in-worktree)"
+notes = "The 'default' arm leaves all six gates unset (proving the defaults; the shared-model gate's first gate-run evidence — D7's arms did not set it). Waves and requests are latency-independent; p50 re-prices per profile (at 10 ms the non-wave compute residual of ~74 ms dominates). k_G sizes for the default RaBitQ+SQ8 geometry; pre-D8 collections retrain their coarse model once (k 15 -> ~34 exceeds the 2x growth trigger). Single-machine emulator evidence, not an SLA or a cloud-latency claim."

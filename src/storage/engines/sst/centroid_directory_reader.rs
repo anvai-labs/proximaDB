@@ -18,11 +18,12 @@
 //! segments, rewritten objects — keeps the per-segment cascade, so a missing,
 //! stale or corrupt directory changes cost, never results.
 //!
-//! Gate: `PROXIMADB_PAX_READ_CENTROID_DIRECTORY` (default OFF). Filtered and
-//! exact queries never use the directory.
+//! Gate: `PROXIMADB_PAX_READ_CENTROID_DIRECTORY` — default ON since D8 (the
+//! P5b gate run passed), kill-switch off. Filtered and exact queries never
+//! use the directory.
 //!
 //! TD-PAXDIR-1 D6: with `PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS` (default
-//! OFF) also on, a planned segment whose directory entry carries a decode key
+//! ON since D8) also on, a planned segment whose directory entry carries a decode key
 //! rebuilds its header, Region A0, Region-A header and ANN footer from the
 //! directory on an invariants-cache miss, so its first read is its probed
 //! cells ([`DirectoryChoice::decode_invariants`]).
@@ -33,7 +34,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use proximadb_storage_common::centroid_directory::{LiveSegment, PaxCentroidDirectory};
 use proximadb_storage_filesystem_types::{DirEntry, FileSystem};
 
-use crate::storage::engines::sst::block_cluster::env_gate_on;
+use crate::storage::engines::sst::block_cluster::env_kill_switch_off;
 use crate::storage::engines::sst::centroid_directory_publisher::directory_objects_newest_first;
 use crate::storage::engines::sst::segment_format::{
     SegmentInvariants, centroid_directory_nprobe, pax_rabitq_pool_for_top_k,
@@ -42,14 +43,14 @@ use crate::storage::engines::sst::segment_format::{
 
 /// READ gate: plan unfiltered ANN queries on the collection centroid directory.
 pub fn centroid_directory_read_enabled() -> bool {
-    env_gate_on("PROXIMADB_PAX_READ_CENTROID_DIRECTORY")
+    env_kill_switch_off("PROXIMADB_PAX_READ_CENTROID_DIRECTORY")
 }
 
 /// TD-PAXDIR-1 D6 READ gate: planned segments with a decode key take their
-/// query-path metadata from the directory instead of reading it. Needs
-/// directories published with `PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS`.
+/// query-path metadata from the directory instead of reading it. Default ON
+/// since D8; needs directories published with the write-side gate on.
 pub fn directory_decode_keys_read_enabled() -> bool {
-    env_gate_on("PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS")
+    env_kill_switch_off("PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS")
 }
 
 /// One segment's part of a directory-planned query.
@@ -337,12 +338,13 @@ mod tests {
     }
 
     #[test]
-    fn read_gate_defaults_off() {
+    fn read_gate_defaults_on_with_kill_switch() {
+        // Default ON since D8; the gate is a kill-switch.
         // SAFETY: nextest runs each test in its own process.
         unsafe { std::env::remove_var("PROXIMADB_PAX_READ_CENTROID_DIRECTORY") };
-        assert!(!centroid_directory_read_enabled());
-        unsafe { std::env::set_var("PROXIMADB_PAX_READ_CENTROID_DIRECTORY", "1") };
         assert!(centroid_directory_read_enabled());
+        unsafe { std::env::set_var("PROXIMADB_PAX_READ_CENTROID_DIRECTORY", "off") };
+        assert!(!centroid_directory_read_enabled());
     }
 
     #[tokio::test]

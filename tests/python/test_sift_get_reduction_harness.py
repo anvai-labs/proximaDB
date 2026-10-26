@@ -1031,7 +1031,7 @@ def test_centroid_directory_arm_sets_every_gate_and_the_global_nprobe(
 ) -> None:
     process = SimpleNamespace(poll=lambda: None)
 
-    def environment(centroid_directory: bool) -> dict:
+    def environment(centroid_directory: str) -> dict:
         server = HARNESS.OwnedServer(
             tmp_path / "proximadb-server",
             tmp_path / "benchmark.toml",
@@ -1051,18 +1051,25 @@ def test_centroid_directory_arm_sets_every_gate_and_the_global_nprobe(
             server.start()
         return popen.call_args.kwargs["env"]
 
-    on = environment(True)
+    on = environment("on")
     for gate in HARNESS.CENTROID_DIRECTORY_GATES:
         assert on[gate] == "1", gate
     # An explicit per-segment nprobe would disable directory planning.
     assert "PROXIMADB_PAX_READ_COARSE_NPROBE" not in on
     assert on["PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE"] == "12"
 
-    off = environment(False)
+    # The gates default ON since D8: the off arm disables them explicitly.
+    off = environment("off")
     for gate in HARNESS.CENTROID_DIRECTORY_GATES:
-        assert gate not in off, f"inherited {gate} leaked into the off arm"
-    assert "PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE" not in off
+        assert off[gate] == "0", gate
     assert off["PROXIMADB_PAX_READ_COARSE_NPROBE"] == "12"
+
+    # The default arm scrubs inherited exports and leaves the gates unset,
+    # so the server's (D8 default-ON) behavior applies.
+    unset = environment("default")
+    for gate in HARNESS.CENTROID_DIRECTORY_GATES:
+        assert gate not in unset, f"inherited {gate} leaked into the default arm"
+    assert unset["PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE"] == "12"
 
 
 def test_local_geometry_lists_published_directories(tmp_path: Path) -> None:

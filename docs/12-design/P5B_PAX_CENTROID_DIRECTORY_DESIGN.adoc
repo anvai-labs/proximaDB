@@ -326,8 +326,11 @@ default.
   is no in-process latency wrapper today) makes the count deterministic in CI: with delay `L`
   and parallel reads inside a wave, `query latency ÷ L` must equal the reported waves.
 * **Injected latency for the gate:** MinIO behind Toxiproxy 2.12.0 adding fixed latency in
-  each direction, the bed already recorded in `BENCHMARK_EVIDENCE.toml` (SIFT1M ladder) and
-  `docs/_internal/status/RDSTRAT12_SIFT1M_HIGHRTT_2026_08_29.adoc`.
+  each direction. **Realigned 2026-10-25 (owner decision): the canonical profile is
+  intra-region, 5 + 5 ms** (measured 11.4 ms RTT; intra-region S3 GET p50 is ~5–15 ms) — no
+  cross-region deployments are planned. The original 25 + 25 ms profile is retained as a
+  robustness stress column. Waves and requests are latency-independent; p50 re-prices per
+  profile (at 10 ms the ~74 ms non-wave compute residual dominates — see the D8 artifact).
 
 === 4.2 Gates
 
@@ -353,6 +356,11 @@ python3 scripts/bench/sift1m_get_reduction.py --root <root> --binary <aws-releas
 
 No performance or pricing claim is made until G1–G3 pass and the result is recorded in the
 evidence ledger (seams doc §6 P6).
+
+*As built (D8):* the six gates above are **default ON** (kill-switches) on the D7 evidence, and
+`ivf_fine_cell_count` implements the `k_G` rule above (RaBitQ stride + SQ8 bytes per row, over
+half the write target) instead of the SQ8-only estimate that sized SIFT1M at ~15 cells/1M rows.
+The AXIS IVF disk posting-list placeholder is deleted (ADR-097 D2).
 
 *As measured (D7, 2026-10-25,* link:../_internal/status/P5B_D7_SIFT1M_GATE_RUN_2026_10_25.adoc[artifact]*):*
 with the directory on and 32 coarse cells, G1, G2-cold and G3 pass (recall 0.9823, 3 waves, 18.86
