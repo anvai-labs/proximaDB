@@ -1,0 +1,16 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-XMODAL-2-graph-traverse-source: graph_traverse source
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Landed via the `graph_traverse` table function (PR #673)** — ADR-053's reconciliation records it; this entry filed 2026-10-26 so the cited number resolves to a register entry rather than dangling.
+| Priority | TBD when picked up
+| Component | (see scope)
+| Relates to | ADR-053, TD-XMODAL-1 (landed), TD-XMODAL-4 (filed)
+|===
+
+== Scope
+
+A graph_traverse multi-modal query source, per the ADR-053 tracked-under list.

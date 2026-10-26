@@ -1,0 +1,16 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SC-4-signup-provisioning--system-only-write-guard: signup provisioning + system-only write guard
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open, not started** (filed 2026-10-26 from ADR-035 citations; ADR-035 is Proposed — the design and its reconciliation live there, and this lane is gated on its acceptance).
+| Priority | TBD when picked up
+| Component | (see scope)
+| Relates to | ADR-035, TD-CAT-2
+|===
+
+== Scope
+
+provision_tenant_system_catalog at signup plus a system-only write guard for _syscat/*.

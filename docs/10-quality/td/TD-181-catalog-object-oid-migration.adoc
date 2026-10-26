@@ -1,0 +1,16 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-181-catalog-object-oid-migration: catalog-object OID migration (ADR-031 execution)
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Partial / superseded in direction** (verified 2026-10-15; this register entry filed 2026-10-26 — the number was cited for years without one, and ADR-039 also cited it for unrelated DataFusion guards; that collision now has its own entry, TD-DFSEAM-1). Shipped: Phase 0 object_id minting (TD-CAT-7 #1680, TD-CAT-9 #1687), Phase 1 durable _syscat/index.json + heal/prune (#518, #522, #523), Phase 3 S2a oid-keyed dual-write (#497). Superseded: Phases 2-4 — ADR-0083 retires the u64 in favour of the composite CollectionIdentity. Open: the Phase 0 residuals.
+| Priority | MEDIUM (residuals only)
+| Component | (see scope)
+| Relates to | ADR-031, ADR-0083, TD-CAT-7, TD-CAT-9, TD-DFSEAM-1
+|===
+
+== Scope
+
+The plan of record is link:../../12-design/CATALOG_OID_MIGRATION_2026_06_27.adoc[Catalog-Object OID Migration Plan]; status, phases and residuals live there. This entry anchors the TD number.
