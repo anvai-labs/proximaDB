@@ -10,11 +10,11 @@
 | Status | **Accepted (owner decision 2026-10-18).** Implementation Open; tracked by TD-SEAM-1 … TD-SEAM-11.
 | Date | 2026-10-18
 | Deciders | Vijaykumar Singh
-| Design document | link:../LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] (thought experiments TE-1..TE-9, seam table, vector-tier comparison, phases P0–P6)
+| Design document | link:../../current/LAKEHOUSE_PLAN.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] (thought experiments TE-1..TE-9, seam table, vector-tier comparison, phases P0–P6)
 | Supersedes (in part) | The *premise* of link:../../10-quality/td/TD-OLAP-13-fused-multimodal-operators.adoc[TD-OLAP-13] that "DataFusion structurally cannot host" a fused ANN+filter+aggregate (its operators survive, re-homed as `ExecutionPlan` adapters).
 | Amends | link:ADR-052-analytics-execution-competitiveness-codesign.adoc[ADR-052] (non-goal "defensible niche is vector + OLAP + lakehouse (3-mode) co-design; graph/document are stretch modes"); link:ADR-054-native-execution-engine-progressive-cutover.adoc[ADR-054] (logical-IR scope: native operators are physical substitutions under the DataFusion logical plan, not a separate per-query plane for multimodal shapes); link:ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096] (positioning line added; decisions unchanged).
 | Relates to | ADR-094 (one substrate, format follows modality), ADR-020 (canonical WAL authority), ADR-026 (PAX canonical vector path), ADR-055 (document canonical format), ADR-007 (Iceberg REST catalog), ADR-039 (engine boundary, no DataFusion leakage), ADR-033 (cost spine), ADR-011 (filtered-ANN routing), ADR-089 (filter-aware PAX cascade), `RELATIONAL_DOCUMENT_GRAPH_CONVERGENCE_2026_05_14.adoc`
-| Tracked under | TD-SEAM-1 … TD-SEAM-11 (`docs/10-quality/TECHNICAL_DEBT.adoc` §C, `WORK_LEDGER_2026_10_15.adoc` §6)
+| Tracked under | TD-SEAM-1 … TD-SEAM-11 (`docs/10-quality/TECHNICAL_DEBT.adoc` §C, `docs/current/TRACKER.adoc` §6)
 |===
 
 == Context

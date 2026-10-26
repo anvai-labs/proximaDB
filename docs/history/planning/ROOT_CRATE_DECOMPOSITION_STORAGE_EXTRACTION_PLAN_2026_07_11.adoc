@@ -2,11 +2,20 @@
 :toc: macro
 :icons: font
 
+
+[IMPORTANT]
+====
+Historical planning snapshot archived 2026-10-26; statements of "current", "open" or
+"done" below describe the source document at its recorded date, not current delivery.
+Current work: link:../../current/PLATFORM_PLAN.adoc[the consolidated plan/tracker].
+Preserved as design rationale and evidence; do not resume its old task list verbatim.
+====
+
 [cols="1,3", options="header"]
 |===
 | Field | Value
 | Status | **Open/Partial (reconciled 2026-10-15).** Step 1 (stabilize `advisor_observations` + `metadata_types` as foundation types) and Step 2 (extract `infrastructure/concurrent_structures`) are **open**; both files are still in root. Step 3 (AXIS `IndexPort`) is partial: `proximadb-index-types` and `proximadb-index-traits` exist, and 15 `crate::index` up-edges remain. Step 4 (cdc + graph ports) was not re-verified. Step 5 (compute / Slice D) is in progress, at 145 compute up-edges.
-| Relates to | link:ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan] (umbrella), link:ROOT_CRATE_DECOMPOSITION_CI_BUILD_OPTIMIZATION_2026_07_11.adoc[CI-build-opt] (Lever 1/2), link:ROOT_CRATE_DECOMPOSITION_SLICE_D_PORT_INVERSION_2026_06_26.adoc[Slice D]
+| Relates to | link:ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan] (umbrella), link:../../12-design/ROOT_CRATE_DECOMPOSITION_CI_BUILD_OPTIMIZATION_2026_07_11.adoc[CI-build-opt] (Lever 1/2), link:../../12-design/ROOT_CRATE_DECOMPOSITION_SLICE_D_PORT_INVERSION_2026_06_26.adoc[Slice D]
 |===
 
 [abstract]

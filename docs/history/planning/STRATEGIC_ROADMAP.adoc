@@ -4,6 +4,15 @@
 :icons: font
 :last-updated: 2026-10-26
 
+
+[IMPORTANT]
+====
+Historical planning snapshot archived 2026-10-26; statements of "current", "open" or
+"done" below describe the source document at its recorded date, not current delivery.
+Current work: link:../../current/ROADMAP.adoc[the consolidated plan/tracker].
+Preserved as design rationale and evidence; do not resume its old task list verbatim.
+====
+
 [.lead]
 The only plan. Organised by release: each release has a theme, exit criteria and the TDs that
 carry the work (link:../../12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096]
@@ -12,11 +21,11 @@ D4).
 [IMPORTANT]
 ====
 * **Direction** — a SQL-first context engine on object storage — is fixed by ADR-096 and stated
-  in link:../../00-product/VISION.adoc[VISION.adoc]. Changing it takes an ADR, not a roadmap edit.
+  in link:VISION.adoc[VISION.adoc]. Changing it takes an ADR, not a roadmap edit.
 * **What may be claimed** is decided by link:../../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE.adoc].
   A release here can finish work without making it Supported.
 * **Live status** of each item is the TD's own status row (indexed by the
-  link:../../12-design/WORK_LEDGER_2026_10_15.adoc[Work Ledger]). Where this page and a TD
+  link:WORK_LEDGER_2026_10_15.adoc[Work Ledger]). Where this page and a TD
   disagree, the TD wins and this page is fixed.
 ====
 
@@ -52,8 +61,8 @@ The MVP corridor (REST v2 records on SST, single node) is the supported promise.
 == Current execution overlay (2026-10-26)
 
 Release themes below are unchanged. Live P0–P6/SC0–SC6 status and branch ownership are
-centralized in link:../../12-design/LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc[the execution tracker];
-link:../status/ROADMAP_WORKTREE_RECONCILIATION_2026_10_26.adoc[the worktree audit] records WIP,
+centralized in link:LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc[the execution tracker];
+link:ROADMAP_WORKTREE_RECONCILIATION_2026_10_26.adoc[the worktree audit] records WIP,
 cleanup disposition and session nudges. A merged primitive does not close a release gate.
 
 [cols="1,3,3",options="header"]

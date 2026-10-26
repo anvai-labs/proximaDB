@@ -9,18 +9,24 @@ For what ProximaDB is, how to install it and a first query, start at the
 > **Support contract:** Code presence is broader than the supported product surface. A feature
 > existing in the code does not make it supported; the support contract below decides.
 
-## One authority per question
+## Start with current work
+
+Read [current/README.adoc](./current/README.adoc), then the
+[central tracker](./current/TRACKER.adoc) and the plan relevant to your task.
+Seven documents divide direction, sequencing, coordination and three implementation domains.
+Completed narratives and dated evidence live in [history](./history/README.adoc).
 
 | Question | Authority |
 |---|---|
-| What is supported, beta or experimental? | [`SUPPORTED_SURFACE.adoc`](./SUPPORTED_SURFACE.adoc) — wins over every other doc |
-| Where is the product going? | [ADR-096](./12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc) (the decision) · [Vision](./00-product/VISION.adoc) · [PRD](./00-product/PRD.adoc) |
-| What is being built next? | [Strategic Roadmap](./_internal/roadmap/STRATEGIC_ROADMAP.adoc) |
-| How is the system put together? | [System Map](./12-design/SYSTEM_MAP_2026_05_30.adoc) · [diagrams](./architecture-diagrams/README.md) |
-| Why was it built this way? | [ADR index](./12-design/adr/README.adoc) · [design index](./12-design/README.adoc) |
-| What is done, open or broken? | [Work Ledger](./12-design/WORK_LEDGER_2026_10_15.adoc) · [Technical Debt Register](./10-quality/TECHNICAL_DEBT.adoc) · per-TD files in [`10-quality/td/`](./10-quality/td/) |
-| Is a performance number real? | [Benchmark evidence ledger](./_internal/roadmap/BENCHMARK_EVIDENCE.toml) — a number not in the ledger is not a claim |
-| How do I file a TD or ADR? | [How to file a TD and ADR](./12-design/HOW_TO_FILE_TD_AND_ADR.adoc) |
+| What is supported? | [Support contract](./SUPPORTED_SURFACE.adoc) and [MVP corridor](./00-product/MVP_TRUST_CORRIDOR.toml) |
+| Where are we going? | [Vision](./current/VISION.adoc); ADR-096/097 own decisions; PRD owns requirements |
+| What release and exit criteria? | [Roadmap](./current/ROADMAP.adoc) |
+| What is pending, active or blocked; which branch? | [Central tracker](./current/TRACKER.adoc) |
+| What must implementation guarantee? | [Lakehouse](./current/LAKEHOUSE_PLAN.adoc), [storage/economics](./current/STORAGE_PLAN.adoc), [platform](./current/PLATFORM_PLAN.adoc) plans |
+| How is the system built today? | [System map](./12-design/SYSTEM_MAP_2026_05_30.adoc) and [design references](./12-design/README.adoc) |
+| Which decision or detailed defect? | [ADR index](./12-design/adr/README.adoc) and [TD registry](./10-quality/TECHNICAL_DEBT.adoc); stable IDs |
+| What completed, and what proves a number? | [History index](./history/README.adoc) and [evidence ledger](./_internal/roadmap/BENCHMARK_EVIDENCE.toml) |
+| How do I file a TD or ADR? | [Filing convention](./12-design/HOW_TO_FILE_TD_AND_ADR.adoc) |
 
 ## Sections
 
@@ -42,11 +48,15 @@ The published site is built from the Markdown pages by `mkdocs.yml` (home page:
 
 ## Rules for this tree
 
-* Put a doc in the numbered section it belongs to. No one-off reports at the repository root or
-  directly under `docs/`.
-* A new design decision is an ADR; a new piece of work is a TD file. Follow
-  [the filing convention](./12-design/HOW_TO_FILE_TD_AND_ADR.adoc).
-* Point-in-time measurement records go in `_internal/status/`; cite them from the evidence ledger
-  when they back a claim. Do not update them later; write a new dated record instead.
-* When a doc is superseded, delete it and repoint its links to the successor. Git history keeps
-  the old text, so there is no archive tree.
+* Keep active plans and coordination in `current/`; use its existing seven documents before
+  creating another. Keep completed detail and dated evidence in `history/`, with short links
+  from current. Pending work stays detailed in its current plan.
+* Archive a superseded plan once, preserve unique ideas, and repoint links to the appropriate
+  current successor or historical evidence. Historical pending labels are not live status.
+* ADRs, TDs, support contracts and specialist specifications retain stable reference paths.
+  Guides/API/operations documentation stays in its numbered section; this is a planning
+  consolidation, not a relocation of the whole documentation tree.
+* New measurements go in `history/evidence/`; cite the evidence ledger when they back a claim.
+  Existing unrelated `_internal/status/` artifacts remain valid historical references.
+* On completion update the TD and central tracker together, archive the detailed evidence,
+  and remove the finished task narrative from current. Follow the [maintenance protocol](./current/README.adoc).

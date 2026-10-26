@@ -152,5 +152,5 @@ the recall floor.
 
 * xref:../12-design/EMBEDDING_PRECISION_LLD_2026_05_22.adoc[LLD — Embedding Precision Rollout]
 * xref:../12-design/EMBEDDING_PRECISION_END_TO_END_2026_05_22.adoc[End-to-End Architecture]
-* xref:../12-design/EMBEDDING_PRECISION_INTEGRATION_PLAN_2026_05_23.adoc[Integration Plan]
+* xref:../history/planning/EMBEDDING_PRECISION_INTEGRATION_PLAN_2026_05_23.adoc[Integration Plan]
 * xref:../03-api-reference/rest.adoc[REST API Reference]

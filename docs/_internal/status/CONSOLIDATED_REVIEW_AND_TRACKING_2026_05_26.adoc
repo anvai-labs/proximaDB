@@ -45,7 +45,7 @@ Use this precedence when sources disagree:
 | Design/ADR wiring status and consolidation queue.
 
 | 5
-| `docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc`
+| `docs/current/ROADMAP.adoc`
 | Sequencing and investment direction, not support tier.
 
 | 6

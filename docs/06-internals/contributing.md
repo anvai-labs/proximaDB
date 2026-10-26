@@ -59,7 +59,7 @@ of it (ADR-096 D5).
 ### 1. Pick work from the plan
 
 Take work from the current release in the
-[roadmap](../_internal/roadmap/STRATEGIC_ROADMAP.adoc), through its TD. A new design decision is
+[roadmap](../current/ROADMAP.adoc), through its TD. A new design decision is
 an ADR and a new piece of work is a TD file; follow the
 [filing convention](../12-design/HOW_TO_FILE_TD_AND_ADR.adoc). Check open PRs first; many
 sessions work in parallel.

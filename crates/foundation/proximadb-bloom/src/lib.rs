@@ -7,7 +7,7 @@
 //! Bloom-filter implementations for ProximaDB.
 //!
 //! Extracted from the root crate's `src/core/bloom` as a slice of the root-crate
-//! decomposition (see `docs/12-design/ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc`,
+//! decomposition (see `docs/history/planning/ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc`,
 //! Slice D / D1). The root crate re-exports it as `crate::core::bloom` for source
 //! compatibility.
 

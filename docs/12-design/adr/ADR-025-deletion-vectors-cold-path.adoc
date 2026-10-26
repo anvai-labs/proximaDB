@@ -116,7 +116,7 @@ above the immutable storage.
 
 Per the storage-format migration mandate (CLAUDE.md §8): version/magic-byte
 detection, old + new coexist, default-OFF until baked, readers default to
-legacy when the marker is absent. Template: `RABITQ_PAX_SEGMENT_MIGRATION_PLAN_2026_06.adoc`.
+legacy when the marker is absent. Template: `docs/history/planning/RABITQ_PAX_SEGMENT_MIGRATION_PLAN_2026_06.adoc`.
 
 * **N0 — DV primitive.** Per-file Roaring bitmap; Puffin sidecar writer/reader
   (Iceberg-interop surface) and/or inline PAX/Parquet footer slot (vertical-
@@ -191,5 +191,5 @@ cannot cheaply merge a WAL delta into HNSW traversal).
 * `docs/12-design/CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` — cost spine (I/O + egress dominate).
 * `docs/12-design/DATA_WAREHOUSE_AND_ENGINEERING_COURSE_CORRECTION_2026_06_04.adoc` — lakehouse pivot.
 * `docs/12-design/FORMAT_STRATEGY_ICEBERG_DELTA_LANCE_2026_06.adoc` — Iceberg v3 default; P4 deletion vectors.
-* `docs/12-design/RABITQ_PAX_SEGMENT_MIGRATION_PLAN_2026_06.adoc` — mixed-read-safe migration template.
+* `docs/history/planning/RABITQ_PAX_SEGMENT_MIGRATION_PLAN_2026_06.adoc` — mixed-read-safe migration template.
 * Accuracy audit: PRs #305 (dead-record predicate), #310 (cache coherence), #312 (Directive 16 mandate), #313 (scan-predicate filter).

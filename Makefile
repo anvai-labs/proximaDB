@@ -163,11 +163,13 @@ proto-check:
 # Mirrors the proto-sync generated-artifact gate. Regenerate with:
 #   UPDATE_OPENAPI_SPEC=1 cargo test -p proximadb --test openapi_spec_gen
 .PHONY: dup-report dup-ratchet-report dup-ratchet-check dup-ratchet-baseline
+# Frozen planning snapshots deliberately preserve source prose; do not charge their overlap
+# with current contracts as new duplication. Current docs, evidence and code remain checked.
 dup-report: ## Copy/paste duplication census (jscpd) — report lands in target/jscpd-report/
 	@echo " replaying the duplication census (flags inline — census config lives here; see docs/10-quality/DUPLICATION_CENSUS_2026_10_20.md)"
 	npx --yes jscpd . --format rust,python,markdown,asciidoc --min-tokens 50 --similarity \
 		--reporters silent,json,markdown --output target/jscpd-report \
-		--ignore "**/target/**,**/node_modules/**,**/_generated/**,**/*_pb2*.py,third_party/**,crates/foundation/proximadb-proto/src/proto/**,data/**,bench-data/**,artifacts/**,metadata/**,log/**,**/.git/**,ui/**,roadmap/**"
+		--ignore "**/target/**,**/node_modules/**,**/_generated/**,**/*_pb2*.py,third_party/**,crates/foundation/proximadb-proto/src/proto/**,data/**,bench-data/**,artifacts/**,metadata/**,log/**,**/.git/**,ui/**,roadmap/**,docs/history/planning/**"
 
 docs-semantics-report: ## Near-duplicate docs sections (advisory; tier-2 semantic report)
 	@echo "📄 docs semantic near-duplicate report (deterministic TF-IDF; advisory only)..."

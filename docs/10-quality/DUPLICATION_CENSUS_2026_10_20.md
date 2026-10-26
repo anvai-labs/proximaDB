@@ -161,3 +161,16 @@ the "prod"-labeled volume in this census was inline test scaffolding).
   consumers, and the engine-core ColumnarSchema twin.
 - PR-A (#2100) landed the four drift-born correctness fixes (fusion folds, audit fail-closed,
   embedded ids parity, TD-CODEC-1 PFor pins).
+
+## Planning-path migration (2026-10-26)
+
+The owner-directed current/history split retains frozen historical planning snapshots in
+`docs/history/planning/`, including seven files previously excluded under `roadmap/**`.
+Those snapshots deliberately preserve original prose and may overlap the active contracts
+extracted from them. The census excludes that historical planning directory; `docs/current/`,
+historical evidence, all other documents and production code remain checked. The existing
+percentage and duplicated-line thresholds are unchanged. Do not place active plans or source
+code in history to bypass this guard; the current index and tracker own all open work.
+
+The first migration census failed the duplicated-line cap because of this intentional overlap;
+that is a scope change for frozen documentation, not a relaxed implementation threshold.

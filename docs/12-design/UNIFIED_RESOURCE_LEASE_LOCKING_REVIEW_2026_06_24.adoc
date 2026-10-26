@@ -412,7 +412,7 @@ This document refines and constrains:
 * `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc`
 * `CATALOG_OBJECT_MODEL_2026_06_21.adoc`
 * `RELATIONAL_PGWIRE_DML_COMPUTE_BLUEPRINT_2026_05_20.adoc`
-* `roadmap/techdebt/TD_110_OLTP_OLAP_HTAP_STORAGE_AND_CONSTRAINTS_PLAN_2026_06_04.adoc`
+* `docs/history/planning/TD_110_OLTP_OLAP_HTAP_STORAGE_AND_CONSTRAINTS_PLAN_2026_06_04.adoc`
 
 The design remains aligned with the SaaS mandate: tenant isolation must flow
 through real `TenantContext`, and control-plane/object-store paths must be

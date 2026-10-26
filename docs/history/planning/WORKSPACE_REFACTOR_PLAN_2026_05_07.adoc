@@ -2,6 +2,15 @@
 :toc: auto
 :toclevels: 3
 
+
+[IMPORTANT]
+====
+Historical planning snapshot archived 2026-10-26; statements of "current", "open" or
+"done" below describe the source document at its recorded date, not current delivery.
+Current work: link:../../current/PLATFORM_PLAN.adoc[the consolidated plan/tracker].
+Preserved as design rationale and evidence; do not resume its old task list verbatim.
+====
+
 == Decision
 
 Yes, the codebase should move deeper into a real workspace-oriented structure, but *not* as a one-shot crate explosion.
@@ -65,7 +74,7 @@ Crate boundaries should align with change frequency and dependency weight.
 === 7. Align crate boundaries to the platform planes
 
 The workspace isolation strategy must follow
-link:../../docs/12-design/DATA_AI_PLATFORM_ARCHITECTURE_ANCHOR_2026_05_12.adoc[the data and AI
+link:../../12-design/DATA_AI_PLATFORM_ARCHITECTURE_ANCHOR_2026_05_12.adoc[the data and AI
 platform architecture anchor], not just today's module tree. The anchor adds product planes that
 need explicit ownership boundaries:
 
@@ -100,7 +109,7 @@ Implication for isolation:
 === 9. Split modality facades from durable authority
 
 The convergence mandate in
-link:../../docs/12-design/RELATIONAL_DOCUMENT_GRAPH_CONVERGENCE_2026_05_14.adoc[RELATIONAL_DOCUMENT_GRAPH_CONVERGENCE_2026_05_14]
+link:../../12-design/RELATIONAL_DOCUMENT_GRAPH_CONVERGENCE_2026_05_14.adoc[RELATIONAL_DOCUMENT_GRAPH_CONVERGENCE_2026_05_14]
 is now an explicit workspace constraint. Modality crates should isolate behavior that is truly
 modality-specific, but they must not recreate isolated durable systems.
 

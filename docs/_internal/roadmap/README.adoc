@@ -1,15 +1,15 @@
-= Roadmap and Ledgers
+= Machine-checked ledgers and baselines
 :toc: left
 :toclevels: 2
 
 [.lead]
-The roadmap, plus the machine-checked ledgers and baselines CI reads. Support tier is governed by
+The machine-checked ledgers and baselines CI reads. Current plans live in link:../../current/README.adoc[current/]. Support tier is governed by
 link:../../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE.adoc], not by anything here.
 
 |===
 | File | Purpose | Enforced by
 
-| link:STRATEGIC_ROADMAP.adoc[STRATEGIC_ROADMAP.adoc] | Phases, sequencing and the current quarter. Where it disagrees with a TD's own status row, the TD wins. | —
+| link:../../current/ROADMAP.adoc[docs/current/ROADMAP.adoc] | Release sequencing and exit criteria; live coordination is in current/TRACKER.adoc. | —
 | `BENCHMARK_EVIDENCE.toml` | Every performance claim in narrative docs, with its measured evidence. | `scripts/check_perf_claims.py`
 | `CAPABILITY_MATRIX.toml` | Capability-by-surface maturity matrix. | `scripts/validate_capability_matrix.py`
 | `PANIC_POLICY_BASELINE.json` | Allowed panic sites, which may only shrink. | `scripts/count_panic_patterns.sh`
@@ -19,6 +19,5 @@ link:../../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE.adoc], not by anything here.
 | `COVERAGE_BASELINE.json` | Coverage floor. | `scripts/coverage_ratchet.py`
 |===
 
-Historical roadmaps (2025 quarterly plans, the feature dashboard, the execution tracker,
-completed-phase guides and old specifications) were removed on 2026-10-17 and remain in git
-history.
+Historical planning narratives now live in link:../../history/README.adoc[history].
+These ledgers retain stable machine-readable paths and are not additional task queues.

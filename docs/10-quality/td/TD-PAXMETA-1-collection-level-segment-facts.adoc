@@ -8,7 +8,7 @@
 | Status | **Open** (filed 2026-10-19).
 | Priority | **MEDIUM**. Correctness is unaffected; the cost lands on cold queries and on the GET-depth budget the PAX cascade is measured against (ADR-033: DEPTH ≫ WIDTH ≫ BYTES ≫ CPU).
 | Component | PAX segment footer (`crates/storage/proximadb-storage-common/src/segment_layout.rs`, `SegmentFooterIndex`), SST search routing (`src/storage/engines/sst/search/mod.rs`: `segment_vector_count`, `pax_footer_facts`, `all_segments_coarse_rabitq_pax_without_f32_tier`, `durable_vector_count_for_rebuild`), catalog / Iceberg manifests
-| Relates to | TD-SEAM-10 (collection-global centroid directory), TD-SEAM-11 (P5a: `.pax` row count), TD-CACHE-9 (persistent PAX warm tier), TD-PAXRG-1 (row-group Region D), ADR-062 (self-describing tail footer), ADR-097 S7 (indexes as catalog projections), `docs/12-design/LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc` Part C
+| Relates to | TD-SEAM-10 (collection-global centroid directory), TD-SEAM-11 (P5a: `.pax` row count), TD-CACHE-9 (persistent PAX warm tier), TD-PAXRG-1 (row-group Region D), ADR-062 (self-describing tail footer), ADR-097 S7 (indexes as catalog projections), `docs/current/LAKEHOUSE_PLAN.adoc` Part C
 |===
 
 == Problem

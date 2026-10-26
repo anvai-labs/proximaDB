@@ -2,11 +2,20 @@
 :toc: macro
 :icons: font
 
+
+[IMPORTANT]
+====
+Historical planning snapshot archived 2026-10-26; statements of "current", "open" or
+"done" below describe the source document at its recorded date, not current delivery.
+Current work: link:../../current/PLATFORM_PLAN.adoc[the consolidated plan/tracker].
+Preserved as design rationale and evidence; do not resume its old task list verbatim.
+====
+
 [cols="1,3", options="header"]
 |===
 | Field | Value
 | Status | **Partial (reconciled 2026-10-15).** Slices A0–A3 landed (#329, #339, #348). Slice D is partial: up-edge ratchet 271 → **183** today, CI ceiling 197 in `scripts/check-layering.sh`. Slice E is partial: raptor leaves → `proximadb-raptor-{common,engine}` (#955, #958, #962, #985); `proximadb-sst-engine` seeded and engine-core waves landed (TD-DECOMP-69..82, #1628–#1658). 80+ TD-DECOMP leaf extractions landed. **Not met:** the acceptance signal itself. The root crate is still ~797K Rust lines in `src/`, and CI still compiles it at `CARGO_BUILD_JOBS=1`. C (persistence), the rest of E, and F remain.
-| Relates to | link:ROOT_CRATE_DECOMPOSITION_SLICE_D_PORT_INVERSION_2026_06_26.adoc[Slice D], link:ROOT_CRATE_DECOMPOSITION_ENGINES_EXTRACTION_2026_07_12.adoc[engines], link:ROOT_CRATE_DECOMPOSITION_CATALOG_METRICS_2026_07_12.adoc[catalog/metrics], link:ROOT_CRATE_DECOMPOSITION_CI_BUILD_OPTIMIZATION_2026_07_11.adoc[CI-build-opt], link:ROOT_CRATE_DECOMPOSITION_STORAGE_EXTRACTION_PLAN_2026_07_11.adoc[storage-extraction], the three subsystem reviews, `docs/10-quality/td/TD-DECOMP-*`
+| Relates to | link:../../12-design/ROOT_CRATE_DECOMPOSITION_SLICE_D_PORT_INVERSION_2026_06_26.adoc[Slice D], link:../../12-design/ROOT_CRATE_DECOMPOSITION_ENGINES_EXTRACTION_2026_07_12.adoc[engines], link:../../12-design/ROOT_CRATE_DECOMPOSITION_CATALOG_METRICS_2026_07_12.adoc[catalog/metrics], link:../../12-design/ROOT_CRATE_DECOMPOSITION_CI_BUILD_OPTIMIZATION_2026_07_11.adoc[CI-build-opt], link:ROOT_CRATE_DECOMPOSITION_STORAGE_EXTRACTION_PLAN_2026_07_11.adoc[storage-extraction], the three subsystem reviews, `docs/10-quality/td/TD-DECOMP-*`
 |===
 
 [abstract]

@@ -1,0 +1,108 @@
+= History: completed work, evidence and superseded plans
+
+Current direction and work: link:../current/README.adoc[start here]. This index is an archive
+map, not a delivery queue. Sources were frozen during consolidation on 2026-10-26 from draft
+PR #2250, based on origin/develop 69ddbd91b. Historical open items were routed into the current
+plans for premise revalidation; archiving a document does not mark all its proposals completed.
+
+== Completed foundation (bounded claims)
+
+* Canonical WAL segmentation, spill, truncation defaults and durable branch-base work landed;
+  remaining ownership/recovery gates are in the current tracker.
+* Bounded multipart publication and incremental inserts landed. SF1 evidence proves load and
+  publication memory only. DV engine infrastructure is not live v3 delete-writer activation.
+* Streaming provider/mixed-table/merge primitives landed behind rollout gates. Ungoverned
+  UDTF routing is not universal ABAC or PAX admission.
+* PAX directory/shared-model D8 defaults and disk-IVF placeholder retirement landed (#2241).
+  Warm discovery, broad scale proof and deferred physical co-location remain separate.
+* SC0 design/harness and the #2249 cap pilot landed. Different cell geometry prevents a causal
+  cap-only performance claim. Packaging #2247 still needs release-workflow proof.
+
+The archived execution tracker carries PR-level details and the reconciliation audit carries
+branch/cleanup evidence. Past statements must be interpreted at their source commit/date.
+
+SST default and fallback-key identity fixes (TD-ENGSEL-1/TD-RELIDEQ-1), gRPC collection
+create and SDK error/engine/example/REST-get fixes are recorded Resolved in their stable TDs.
+They are removed from the active release implementation queue; release smoke still applies.
+
+== Consolidated central documents
+
+[cols="3,1,1",options="header"]
+|===
+| Former path | Preserved source | Authority now
+| `docs/00-product/VISION.adoc`
+| link:planning/VISION.adoc[Frozen source]
+| link:../current/VISION.adoc[Current successor]
+| `docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc`
+| link:planning/STRATEGIC_ROADMAP.adoc[Frozen source]
+| link:../current/ROADMAP.adoc[Current successor]
+| `docs/12-design/LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc`
+| link:planning/LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc[Frozen source]
+| link:../current/TRACKER.adoc[Current successor]
+| `docs/12-design/WORK_LEDGER_2026_10_15.adoc`
+| link:planning/WORK_LEDGER_2026_10_15.adoc[Frozen source]
+| link:../current/TRACKER.adoc[Current successor]
+| `docs/_internal/status/ROADMAP_WORKTREE_RECONCILIATION_2026_10_26.adoc`
+| link:planning/ROADMAP_WORKTREE_RECONCILIATION_2026_10_26.adoc[Frozen source]
+| link:../current/TRACKER.adoc[Current successor]
+| `docs/12-design/LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc`
+| link:planning/LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[Frozen source]
+| link:../current/LAKEHOUSE_PLAN.adoc[Current successor]
+| `docs/12-design/STORAGE_CLASS_SEAMS_REVIEW_2026_10_25.adoc`
+| link:planning/STORAGE_CLASS_SEAMS_REVIEW_2026_10_25.adoc[Frozen source]
+| link:../current/STORAGE_PLAN.adoc[Current successor]
+| `docs/12-design/STORAGE_CLASS_IMPLEMENTER_PLAN_PROMPT.adoc`
+| link:planning/STORAGE_CLASS_IMPLEMENTER_PLAN_PROMPT.adoc[Frozen source]
+| link:../current/README.adoc[Current successor]
+|===
+
+== Older topic plans
+
+Pending connectivity, workspace, handler, connector and HTAP contracts now live in
+link:../current/PLATFORM_PLAN.adoc[platform plan]; lakehouse freshness/format decisions are
+controlled by ADR-094/097 and link:../current/LAKEHOUSE_PLAN.adoc[lakehouse plan].
+These snapshots preserve full unique rationale, alternatives and old measurements. Their old
+status tables are not instructions to implement an obsolete design. Resolved precision/PAX
+migration and superseded WAL-heap plans are reference history only.
+
+* link:planning/CLUSTERING_AND_STREAMING_FRESHNESS_PLAN_2026_06.adoc[CLUSTERING_AND_STREAMING_FRESHNESS_PLAN_2026_06]
+* link:planning/CONNECTIVITY_AND_MODALITY_COMPLETION_TRACKER_2026_07_21.adoc[CONNECTIVITY_AND_MODALITY_COMPLETION_TRACKER_2026_07_21]
+* link:planning/EMBEDDING_PRECISION_INTEGRATION_PLAN_2026_05_23.adoc[EMBEDDING_PRECISION_INTEGRATION_PLAN_2026_05_23]
+* link:planning/RABITQ_PAX_SEGMENT_MIGRATION_PLAN_2026_06.adoc[RABITQ_PAX_SEGMENT_MIGRATION_PLAN_2026_06]
+* link:planning/ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21]
+* link:planning/ROOT_CRATE_DECOMPOSITION_STORAGE_EXTRACTION_PLAN_2026_07_11.adoc[ROOT_CRATE_DECOMPOSITION_STORAGE_EXTRACTION_PLAN_2026_07_11]
+* link:planning/TD104_HANDLER_CONVERGENCE_PLAN_2026_06_03.adoc[TD104_HANDLER_CONVERGENCE_PLAN_2026_06_03]
+* link:planning/V1_RETIREMENT_ROADMAP_2026_07_08.adoc[V1_RETIREMENT_ROADMAP_2026_07_08]
+* link:planning/PAX_SUBSTRATE_DESIGN_PLAN_2026_06_25.adoc[PAX_SUBSTRATE_DESIGN_PLAN_2026_06_25]
+* link:planning/TD_097_4_GRADLE_JUNIT5_MIGRATION_PLAN_2026_06_03.adoc[TD_097_4_GRADLE_JUNIT5_MIGRATION_PLAN_2026_06_03]
+* link:planning/TD_097_SHARD_AWARE_PARTITION_PLAN_2026_06_03.adoc[TD_097_SHARD_AWARE_PARTITION_PLAN_2026_06_03]
+* link:planning/TD_097_SPARK_FILTER_PUSHDOWN_AND_JNI_MULTIPROCESS_PLAN_2026_06_03.adoc[TD_097_SPARK_FILTER_PUSHDOWN_AND_JNI_MULTIPROCESS_PLAN_2026_06_03]
+* link:planning/TD_099_3C_WAL_SCAN_PUSHDOWN_PLAN_2026_06_03.adoc[TD_099_3C_WAL_SCAN_PUSHDOWN_PLAN_2026_06_03]
+* link:planning/TD_099_3D_WAL_TIME_ORDERED_INDEX_PLAN_2026_06_03.adoc[TD_099_3D_WAL_TIME_ORDERED_INDEX_PLAN_2026_06_03]
+* link:planning/TD_110_OLTP_OLAP_HTAP_STORAGE_AND_CONSTRAINTS_PLAN_2026_06_04.adoc[TD_110_OLTP_OLAP_HTAP_STORAGE_AND_CONSTRAINTS_PLAN_2026_06_04]
+* link:planning/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc[WORKSPACE_REFACTOR_PLAN_2026_05_07]
+
+== Measurement artifacts
+
+* link:evidence/P24_SF1_GATE_EVIDENCE_2026_10_23.adoc[P24_SF1_GATE_EVIDENCE_2026_10_23]
+* link:evidence/P5B_D7_SIFT1M_GATE_RUN_2026_10_25.adoc[P5B_D7_SIFT1M_GATE_RUN_2026_10_25]
+* link:evidence/P5B_D8_DEFAULTS_CONFIRMATION_2026_10_25.adoc[P5B_D8_DEFAULTS_CONFIRMATION_2026_10_25]
+* link:evidence/TIER1_SC0_RANGE_CAP_SWEEP_2026_10_26.adoc[TIER1_SC0_RANGE_CAP_SWEEP_2026_10_26]
+* link:evidence/STORAGE_CLASS_MEDIA_EVIDENCE_2026_10_25.adoc[STORAGE_CLASS_MEDIA_EVIDENCE_2026_10_25]
+* link:evidence/storage_class_media_2026_10_25/d8_existing_result_extract.adoc[d8_existing_result_extract]
+* link:evidence/storage_class_media_2026_10_25/local_media_raw.adoc[local_media_raw]
+* link:evidence/storage_class_media_2026_10_25/minio_ranges_raw.adoc[minio_ranges_raw]
+
+Raw media evidence remains adjacent to its report. Register claimable results in the stable
+link:../_internal/roadmap/BENCHMARK_EVIDENCE.toml[evidence ledger]. Other existing dated records
+under _internal/status remain reference artifacts; this migration moves the active program's
+cited proof, not unrelated operational documentation or stable TD/ADR contracts.
+
+== Adding history
+
+Store one dated completion/evidence record per coherent milestone, including source commit,
+commands, inputs, results, failed cases, limits and successor gate. Link it from the relevant
+current item, then remove the finished implementation narrative from current. Reuse an existing
+record for the same milestone; no parallel handoff/roadmap/status authority in this folder.
+Preserve original measurement values; corrections explain what changed instead of overwriting
+an old run. Relative links may be repaired when a source moves.

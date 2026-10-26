@@ -6,10 +6,19 @@
 :icons: font
 // status-as-of: 2026-10-26
 
+
+[IMPORTANT]
+====
+Historical planning snapshot archived 2026-10-26; statements of "current", "open" or
+"done" below describe the source document at its recorded date, not current delivery.
+Current work: link:../../current/TRACKER.adoc[the consolidated plan/tracker].
+Preserved as design rationale and evidence; do not resume its old task list verbatim.
+====
+
 [cols="1,3"]
 |===
-| Purpose | The resumable status of record for executing link:LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] (the plan: Parts A–D, phases P0–P6) under link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097]. Any engineer or agent session picks up from here **and nothing else**: what is merged, what is in flight, what is next, and how the work is done.
-| Updated | 2026-10-26, against fetched `origin/develop` @ `69ddbd91b` (#2249). Source, PR and local-WIP audit: link:../_internal/status/ROADMAP_WORKTREE_RECONCILIATION_2026_10_26.adoc[worktree reconciliation].
+| Purpose | The resumable status of record for executing link:LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] (the plan: Parts A–D, phases P0–P6) under link:../../12-design/adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097]. Any engineer or agent session picks up from here **and nothing else**: what is merged, what is in flight, what is next, and how the work is done.
+| Updated | 2026-10-26, against fetched `origin/develop` @ `69ddbd91b` (#2249). Source, PR and local-WIP audit: link:ROADMAP_WORKTREE_RECONCILIATION_2026_10_26.adoc[worktree reconciliation].
 | Rule | Update this file in the same PR that lands, opens or re-plans a slice. A slice is **done** only when merged to `develop` with its gate green. Detail lives in the TD files; this file holds status, links and order.
 |===
 
@@ -160,7 +169,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 Worktree/branch names identify the owning local lane, not a claim that a process is live.
 Do not start duplicate work, rebase another session, or prune on clean status alone.
 Detailed locations, evidence and pickup nudges:
-link:../_internal/status/ROADMAP_WORKTREE_RECONCILIATION_2026_10_26.adoc[central worktree audit].
+link:ROADMAP_WORKTREE_RECONCILIATION_2026_10_26.adoc[central worktree audit].
 
 [cols="2,2,3",options="header"]
 |===

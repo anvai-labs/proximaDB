@@ -3,14 +3,23 @@
 = Roadmap and worktree reconciliation — 2026-10-26
 // status-as-of: 2026-10-26
 
+
+[IMPORTANT]
+====
+Historical planning snapshot archived 2026-10-26; statements of "current", "open" or
+"done" below describe the source document at its recorded date, not current delivery.
+Current work: link:../../current/TRACKER.adoc[the consolidated plan/tracker].
+Preserved as design rationale and evidence; do not resume its old task list verbatim.
+====
+
 == Authority and evidence
 
 Snapshot against `origin/develop` `69ddbd91b` (#2249), after fetching remote refs.
 The shared checkout remained at `d929d7993`; it was not reset, switched or edited.
 This is a status and direction audit, not an approval of uncommitted implementations.
 Read live execution state in
-link:../../12-design/LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc[the central tracker];
-release scope remains in link:../roadmap/STRATEGIC_ROADMAP.adoc[the strategic roadmap].
+link:LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc[the central tracker];
+release scope remains in link:STRATEGIC_ROADMAP.adoc[the strategic roadmap].
 
 Evidence: commit ancestry and PR API; every registered worktree's HEAD, dirty paths and
 ignored-file inventory; selected WIP diffs; production caller checks; all three cap-sweep

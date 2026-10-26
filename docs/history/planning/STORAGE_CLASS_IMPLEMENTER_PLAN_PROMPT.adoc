@@ -2,6 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 = ProximaDB storage classes — Claude / GLM5.3 plan-mode handoff
 
+
+[IMPORTANT]
+====
+Historical planning snapshot archived 2026-10-26; statements of "current", "open" or
+"done" below describe the source document at its recorded date, not current delivery.
+Current work: link:../../current/README.adoc[the consolidated plan/tracker].
+Preserved as design rationale and evidence; do not resume its old task list verbatim.
+====
+
 Start in PLAN MODE. This is a design/implementation planning request, not authorization
 to immediately execute every slice. Produce a concrete implementation plan, then wait
 for its approval before production code. Do not claim proposed decisions are accepted ADRs.

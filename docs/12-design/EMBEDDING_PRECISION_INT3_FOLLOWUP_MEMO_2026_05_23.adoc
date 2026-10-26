@@ -3,14 +3,14 @@
 :status: DONE
 :owner: vjdsingh
 :date: 2026-05-23
-:related: link:EMBEDDING_PRECISION_INTEGRATION_PLAN_2026_05_23.adoc[Integration Plan], link:EMBEDDING_PRECISION_LLD_2026_05_22.adoc[LLD]
+:related: link:../history/planning/EMBEDDING_PRECISION_INTEGRATION_PLAN_2026_05_23.adoc[Integration Plan], link:EMBEDDING_PRECISION_LLD_2026_05_22.adoc[LLD]
 
 [cols="1,3", options="header"]
 |===
 | Field | Value
 | Status | **Done.** Bridge-first path chosen and shipped: INT-3-followup-a/b/c/d plus compaction precision wiring and INT-4-full (`687a53fb2`, `fa490977d`, `5788cd848`, `7ddf3d714`, `3e031506e`, `00a93cbf4`, `9b108b7c7`, `9335e7a5f`).
 | Component | `src/storage/schema/proxima_record_bridge.rs`, `src/storage/engines/sst/` (Arrow block writer, compaction), `crates/control/proximadb-catalog` (`CanonicalPrecisionResolver`)
-| Relates to | link:EMBEDDING_PRECISION_INTEGRATION_PLAN_2026_05_23.adoc[INTEGRATION_PLAN], link:EMBEDDING_PRECISION_LLD_2026_05_22.adoc[LLD]
+| Relates to | link:../history/planning/EMBEDDING_PRECISION_INTEGRATION_PLAN_2026_05_23.adoc[INTEGRATION_PLAN], link:EMBEDDING_PRECISION_LLD_2026_05_22.adoc[LLD]
 |===
 
 == History

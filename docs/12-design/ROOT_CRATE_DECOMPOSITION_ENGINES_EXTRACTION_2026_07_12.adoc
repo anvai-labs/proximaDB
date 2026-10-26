@@ -6,7 +6,7 @@
 |===
 | Field | Value
 | Status | **Partial (reconciled 2026-10-15).** The raptor clean-leaf track is done: `raptor/common`+`config`+`constants` → `proximadb-raptor-common` (#955, #958); `consolidated_reader` (#962) and `writer`+`matrix_builder` (#985) → `proximadb-raptor-engine`; `viper/pipeline.rs` deleted as dead. The three DI ports landed (`FilesystemPort` #943, `CacheAccessPatternPort` #948, `AxisClusteringPort` + writer DI #977). The engine-core and sst-engine waves landed (TD-DECOMP-69..82). Open: Engines Slice 2 (cycle-hub cores: `raptor/engine.rs`, `viper/engine.rs`, `sst/object_economy_directory.rs`, `columnar_query_reader`), the rest of storage, and the stated goal of `CARGO_BUILD_JOBS=2` (CI still `=1`).
-| Relates to | link:ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan] (umbrella), link:ROOT_CRATE_DECOMPOSITION_SLICE_D_PORT_INVERSION_2026_06_26.adoc[Slice D]
+| Relates to | link:../history/planning/ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan] (umbrella), link:ROOT_CRATE_DECOMPOSITION_SLICE_D_PORT_INVERSION_2026_06_26.adoc[Slice D]
 |===
 
 [NOTE]
@@ -214,6 +214,6 @@ after the `matrix_builder` extraction).
 
 == Refs
 link:ROOT_CRATE_DECOMPOSITION_CI_BUILD_OPTIMIZATION_2026_07_11.adoc[CI-build-opt (#876)],
-link:ROOT_CRATE_DECOMPOSITION_STORAGE_EXTRACTION_PLAN_2026_07_11.adoc[storage-extraction],
+link:../history/planning/ROOT_CRATE_DECOMPOSITION_STORAGE_EXTRACTION_PLAN_2026_07_11.adoc[storage-extraction],
 link:ROOT_CRATE_DECOMPOSITION_SLICE_D_PORT_INVERSION_2026_06_26.adoc[Slice-D port-inversion],
 ADR-052 (analytics-competitiveness — ClickBench/TPC need a fast, parallel build).

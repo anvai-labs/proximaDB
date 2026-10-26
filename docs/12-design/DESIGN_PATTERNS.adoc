@@ -482,10 +482,10 @@ flowchart LR
 == Related Documents
 
 * link:../05-concepts/architecture.adoc[Architecture Overview]
-* link:../00-product/VISION.adoc[Vision Document]
+* link:../current/VISION.adoc[Vision Document]
 * link:../05-concepts/storage-engines.adoc[Storage Engines Guide]
 * link:../05-concepts/graph-engines.adoc[Graph Engines Guide]
-* link:../_internal/roadmap/STRATEGIC_ROADMAP.adoc[Strategic Roadmap]
+* link:../current/ROADMAP.adoc[Strategic Roadmap]
 
 '''
 

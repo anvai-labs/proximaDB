@@ -346,7 +346,7 @@ Action required before next upgrade.
 To request new features or changes to existing features:
 
 1. Check existing technical debt in TECHNICAL_DEBT.adoc
-2. Review strategic roadmap in STRATEGIC_ROADMAP.adoc  
+2. Review strategic roadmap in docs/current/ROADMAP.adoc
 3. Submit GitHub issue with feature proposal
 4. Include production readiness criteria and timeline
 

@@ -210,5 +210,5 @@ See also:
 
 * link:./rest.adoc[REST API Reference]
 * link:../12-design/adr/ADR-018-pgwire-sql-parity-roadmap.adoc[ADR-018 — pgwire SQL parity roadmap]
-* link:../../roadmap/techdebt/TD_110_OLTP_OLAP_HTAP_STORAGE_AND_CONSTRAINTS_PLAN_2026_06_04.adoc[TD-110 — OLTP/OLAP HTAP storage and PostgreSQL constraint semantics]
+* link:../history/planning/TD_110_OLTP_OLAP_HTAP_STORAGE_AND_CONSTRAINTS_PLAN_2026_06_04.adoc[TD-110 — OLTP/OLAP HTAP storage and PostgreSQL constraint semantics]
 * link:../SUPPORTED_SURFACE.adoc[`docs/SUPPORTED_SURFACE.adoc`] — Supported / Beta / Experimental split.

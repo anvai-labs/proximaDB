@@ -3,6 +3,15 @@
 :toclevels: 3
 :status: SUPERSEDED / ARCHIVED 2026-06-03
 
+
+[IMPORTANT]
+====
+Historical planning snapshot archived 2026-10-26; statements of "current", "open" or
+"done" below describe the source document at its recorded date, not current delivery.
+Current work: link:../../current/PLATFORM_PLAN.adoc[the consolidated plan/tracker].
+Preserved as design rationale and evidence; do not resume its old task list verbatim.
+====
+
 [IMPORTANT]
 .ARCHIVED STATUS
 ====

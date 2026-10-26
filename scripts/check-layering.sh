@@ -2,7 +2,7 @@
 # Canonical workspace layering validation wrapper.
 #
 # Keep the policy table in scripts/check_workspace_boundaries.py and the
-# architecture rationale in roadmap/techdebt/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc.
+# architecture rationale in docs/history/planning/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc.
 
 set -euo pipefail
 

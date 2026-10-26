@@ -720,7 +720,7 @@ println!("Cache hit rate: {:.2}%", stats.cache_hit_rate * 100.0);
 
 == Future Enhancements
 
-**Planned Features** (see link:../../../../docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc[Roadmap]):
+**Planned Features** (see link:../../../../docs/current/ROADMAP.adoc[Roadmap]):
 
 * Dynamic hierarchy reorganization
 * Multi-level caching (SuperBlock + DataBlock)

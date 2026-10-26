@@ -22,7 +22,7 @@ tested (CLAUDE.md mandate #8). Recovery for S1 is a revert of an internal-only c
 (`src/storage/engines/sst/mod.rs` — `SstEntry`, retired 2026-08-05).
 | Relates to | link:TD-V1SUNSET-3-sqlvalue-to-proximavalue.adoc[TD-V1SUNSET-3] (sequenced behind this TD), link:TD-CONFIG-CONSOLIDATE-1-duplicate-config-structs.adoc[TD-CONFIG-CONSOLIDATE-1] (same dead-symbol sweep retired `SstEntry`)
 | Tracked-by | link:../../12-design/adr/ADR-024-single-canonical-data-type-and-schema.adoc[ADR-024] (the
-canonical-type decision); link:../../12-design/V1_RETIREMENT_ROADMAP_2026_07_08.adoc[V1_RETIREMENT_ROADMAP]
+canonical-type decision); link:../../history/planning/V1_RETIREMENT_ROADMAP_2026_07_08.adoc[V1_RETIREMENT_ROADMAP]
 Tier 3; the v1-proto ratchet (`scripts/check_v1_proto_usage.py`).
 | Depends-on | The existing bidirectional conversion bridge (present — verified). The durable *write*
 convergence to `ProximaRecord`-native PAX (ADR-049 M1-3, landed). Does **not** depend on the REST/gRPC
@@ -412,7 +412,7 @@ the `.map(VectorRecord::from)` — no production consumer changes.
 
 * link:../../12-design/adr/ADR-024-single-canonical-data-type-and-schema.adoc[ADR-024] — the canonical
 type/schema decision this migrates toward.
-* link:../../12-design/V1_RETIREMENT_ROADMAP_2026_07_08.adoc[V1_RETIREMENT_ROADMAP_2026_07_08] — Tier 3
+* link:../../history/planning/V1_RETIREMENT_ROADMAP_2026_07_08.adoc[V1_RETIREMENT_ROADMAP_2026_07_08] — Tier 3
 names `VectorRecord` as the ADR-024 long pole.
 * link:TD-V1SUNSET-1-rest-grpc-sunset-cutover.adoc[TD-V1SUNSET-1] — sibling: the REST/gRPC v1 sunset
 cutover (Bucket E owner).

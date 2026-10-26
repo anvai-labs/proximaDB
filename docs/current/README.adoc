@@ -1,0 +1,69 @@
+= Current work: start here
+
+Seven documents, each with one job. Start with this index and the tracker; read only the
+plan for the task being picked up. Do not preload history, the whole TD register or all ADRs.
+
+[cols="1,3",options="header"]
+|===
+| Document | Question it owns
+| link:VISION.adoc[Vision] | What are we building, and what is out of scope?
+| link:ROADMAP.adoc[Roadmap] | In which release/order, and what closes it?
+| link:TRACKER.adoc[Tracker] | What remains, who/which branch owns it, and what is the next gate?
+| link:LAKEHOUSE_PLAN.adoc[Lakehouse plan] | What must the S1–S9 seams and multimodal operators guarantee?
+| link:STORAGE_PLAN.adoc[Storage and economics plan] | What must storage classes, residency and cost experiments prove?
+| link:PLATFORM_PLAN.adoc[Platform plan] | What remains in connectivity, workspace boundaries and connector contracts?
+|===
+
+== Authority and reference material
+
+The tracker owns the live coordination queue; a TD owns its detailed defect and acceptance
+contract. Update both in the same change, rather than silently choosing between conflicting
+status claims. ADRs own decisions; plans explain implementation; roadmap owns sequencing.
+link:../SUPPORTED_SURFACE.adoc[Support contract] and
+link:../00-product/MVP_TRUST_CORRIDOR.toml[MVP corridor] bound all product claims.
+link:../00-product/PRD.adoc[PRD] holds requirements, not a separate schedule.
+link:../00-product/MVP_EXECUTION_SCORECARD.adoc[MVP scorecard] defines adoption evidence and
+review criteria; it contains no competing engineering task queue.
+link:../12-design/SYSTEM_MAP_2026_05_30.adoc[System map] owns as-built architecture.
+link:../10-quality/TECHNICAL_DEBT.adoc[TD registry] retains stable IDs and per-issue details;
+link:../12-design/adr/README.adoc[ADR index] retains stable decisions.
+link:../_internal/roadmap/BENCHMARK_EVIDENCE.toml[Evidence ledger] remains the claim registry.
+These are reference contracts, not additional central trackers. Specialist format/API specs
+stay at stable paths; consult them only for the relevant implementation.
+
+Canonical routing: ADR-096 direction; ADR-094 modality formats; ADR-097 logical IR, PAX
+projection authority and v3 publication; ADR-062/065 ranged reads; TD-AUTHZ-1 tenant admission;
+TD-PGWIRE-AUTH-1 pgwire authentication; TD-LEASE-INFRA-1 leases; TD-DECOMP-* workspace seams.
+Older conflicting prose is historical input, never authority to reverse a newer decision.
+
+== Pickup and handoff (all implementers, including Claude / GLM plan mode)
+
+. Read the tracker row; inspect the named branch/PR before starting overlapping work.
+. Rebase an isolated task worktree on current origin/develop. Verify cited call sites and
+  production reachability; existing primitives are reuse candidates, not automatic completion.
+. In plan mode, propose the smallest remaining slice: TD/track, assumptions, touched files,
+  failure cases, migration/compatibility, acceptance tests and rollout/rollback boundary.
+  Distinguish observed code, unmerged WIP, planned tests and unknowns. No new handoff document.
+. Implement only the authorized slice. Preserve tenant checks, durability, v3-first and
+  existing format/version fences; record changes of direction in the controlling ADR.
+. Run affected guards/tests and required CI. Update the tracker with branch, head/PR,
+  evidence, exact residual gate and next owner. A local test is not a merged delivery.
+. Recheck pending gate semantics after merge. Archive completed implementation detail once,
+  with source commit, commands/results, limitations and links; retain a short history pointer
+  in current. Never declare a parent track done while a residual gate remains.
+
+== Maintenance rules
+
+* `docs/current/` contains direction, open work and implementation detail for upcoming work.
+  Completed work gets at most a short summary/link here, not another PR chronicle.
+* `docs/history/` contains dated evidence and frozen former plans. Historical pending labels
+  do not make those plans active. Append a new evidence record; do not rewrite a past run.
+* Before adding a file, extend the appropriate one above. Split a plan only for a distinct
+  owner/contract that makes navigation easier; add the successor here and remove duplicate authority.
+* Keep issue/spec IDs stable. Repair links, guard allowlists and agent seeds when moving paths.
+  In-flight branches must carry new work into the current successor on rebase, never resurrect
+  an old tracker. Do not rewrite another session's uncommitted work.
+* A merged/superseded worktree is removable only after content coverage, dirty and ignored
+  evidence checks. Age, an idle process list or a similar PR title is insufficient.
+
+Migration inventory and source details: link:../history/README.adoc[history index].

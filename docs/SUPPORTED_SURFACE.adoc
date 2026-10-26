@@ -15,7 +15,7 @@ Canonical product support contract for the ProximaDB working tree. This document
 This matrix is the product support contract.
 
 * Use link:./10-quality/TECHNICAL_DEBT.adoc[Technical Debt Register] for the active backlog.
-* Use link:./_internal/roadmap/STRATEGIC_ROADMAP.adoc[Strategic Roadmap] for sequencing; product direction is ADR-096.
+* Use link:current/ROADMAP.adoc[Strategic Roadmap] for sequencing; product direction is ADR-096.
 * Use link:./12-design/SUPPORTED_SURFACES.adoc[Supported Surfaces: API vs. Physical Projection Status] for the technical API/projection companion matrix.
 * Do not infer support level from code presence alone.
 ====
@@ -37,10 +37,10 @@ marking themselves historical, aspirational, or implementation-only:
 | link:./12-design/SYSTEM_MAP_2026_05_30.adoc[SYSTEM_MAP_2026_05_30.adoc].
 
 | Product direction (identity, front door, model breadth, planning frame)
-| link:./12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096], stated in link:./00-product/VISION.adoc[VISION.adoc]. The engineering mandates of the 2026-06-04 course correction (pgwire, object storage, engine routing) still apply; its "compete with warehouses" framing is superseded.
+| link:./12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096], stated in link:current/VISION.adoc[VISION.adoc]. The engineering mandates of the 2026-06-04 course correction (pgwire, object storage, engine routing) still apply; its "compete with warehouses" framing is superseded.
 
 | Sequencing and release exit criteria
-| link:./_internal/roadmap/STRATEGIC_ROADMAP.adoc[STRATEGIC_ROADMAP.adoc]; live implementation status per TD, indexed by link:./12-design/WORK_LEDGER_2026_10_15.adoc[the Work Ledger].
+| link:current/ROADMAP.adoc[docs/current/ROADMAP.adoc]; live coordination in link:current/TRACKER.adoc[the central tracker], with detailed issue contracts in the TD registry.
 
 | Performance / benchmark claims (what is *measured*)
 | link:./_internal/roadmap/BENCHMARK_EVIDENCE.toml[BENCHMARK_EVIDENCE.toml] — every external perf number maps to a runnable bench; only `status = "measured"` entries carry a dated artifact. Do not quote a perf figure as validated unless its ledger entry is `measured`.

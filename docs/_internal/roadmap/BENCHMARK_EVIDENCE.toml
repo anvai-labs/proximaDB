@@ -526,7 +526,7 @@ artifact = "docs/_internal/status/PAX_RECALL_RATCHET_2026_06_25.adoc"
 hardware = "Apple M1 Max, 64 GB, macOS 26.2 (shared dev machine — indicative, not an SLA)"
 date = "2026-06-25"
 version = "v0.2"
-notes = "qa-gate ratchet (develop→qa promotion). Deterministic seeded LCG corpus (DIM=64). N=1000 REFINE=100 mean recall@10 = 0.9340; N=100000 REFINE=1000 mean recall@10 = 0.9320. Both >= 0.90 ratchet (only goes up, #10). Proves the RaBitQ->SQ8 cascade (stage-1 binary rank -> stage-2 SQ8 rerank, no f32 GET) holds recall at this scale -- a prerequisite for flipping PAX quant default-on (rollout Phase 2). NOTE: REFINE=200 at N=100k gave 0.708; a 1000-wide stage-1 pool (1% of corpus) recovers to 0.932. REPRESENTATIVENESS CAVEAT (audit 2026-06-25, PAX_SUBSTRATE_DESIGN_PLAN_2026_06_25.adoc): this is a DIM=64 synthetic corpus, N<=100k, with a FIXED absolute REFINE=1000 (=1% only at 100k; <0.1% at 1M). It is a fast CI floor, NOT representative of production high-dim embeddings or N>=1M -- the default-on flip (TD-150) is GATED on an additional real-embedding (e.g. SIFT1M / 768-d) N>=1M recall artifact (WS8). Indicative local run, not an SLA."
+notes = "qa-gate ratchet (develop→qa promotion). Deterministic seeded LCG corpus (DIM=64). N=1000 REFINE=100 mean recall@10 = 0.9340; N=100000 REFINE=1000 mean recall@10 = 0.9320. Both >= 0.90 ratchet (only goes up, #10). Proves the RaBitQ->SQ8 cascade (stage-1 binary rank -> stage-2 SQ8 rerank, no f32 GET) holds recall at this scale -- a prerequisite for flipping PAX quant default-on (rollout Phase 2). NOTE: REFINE=200 at N=100k gave 0.708; a 1000-wide stage-1 pool (1% of corpus) recovers to 0.932. REPRESENTATIVENESS CAVEAT (audit 2026-06-25, docs/history/planning/PAX_SUBSTRATE_DESIGN_PLAN_2026_06_25.adoc): this is a DIM=64 synthetic corpus, N<=100k, with a FIXED absolute REFINE=1000 (=1% only at 100k; <0.1% at 1M). It is a fast CI floor, NOT representative of production high-dim embeddings or N>=1M -- the default-on flip (TD-150) is GATED on an additional real-embedding (e.g. SIFT1M / 768-d) N>=1M recall artifact (WS8). Indicative local run, not an SLA."
 
 [[claims]]
 id = "pax_rabitq_sq8_sift1m_recall_at_10"
@@ -1328,7 +1328,7 @@ asserted_in = [
 ]
 bench_source = "scripts/bench/sift1m_get_reduction.py"
 bench_command = "systemd-run --user --scope -p MemoryMax=64G python3 scripts/bench/sift1m_get_reduction.py --root <root> --binary target/release-server/proximadb-server --sift-dir <sift1m> --rows 1000000 --queries 1000 --top-k 10 --min-recall 0.98 --object-cold-max-requests 20 --object-cold-max-waves 3 --warm-max-waves 1 --training-compaction-min-mb 1 --max-segments 3 --s3-endpoint http://<toxiproxy 25+25 ms> --storage-url s3://<bucket>/<arm> --read-ranges-inflight 16 --centroid-directory on --ivf-k 32"
-artifact = "docs/_internal/status/P5B_D7_SIFT1M_GATE_RUN_2026_10_25.adoc"
+artifact = "docs/history/evidence/P5B_D7_SIFT1M_GATE_RUN_2026_10_25.adoc"
 hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB; MinIO single drive + Toxiproxy 2.12.0 on the same host; arms serialized on an idle box"
 date = "2026-10-25"
 version = "feat/paxdir-d7-measurement @ b000d6275, the PR HEAD (release-server --features aws, built in-worktree)"
@@ -1345,7 +1345,7 @@ asserted_in = [
 ]
 bench_source = "scripts/bench/sift1m_get_reduction.py"
 bench_command = "systemd-run --user --scope -p MemoryMax=64G python3 scripts/bench/sift1m_get_reduction.py --root <root> --binary target/release-server/proximadb-server --sift-dir <sift1m> --rows 1000000 --queries 1000 --top-k 10 --min-recall 0.98 --object-cold-max-requests 20 --object-cold-max-waves 3 --warm-max-waves 2 --training-compaction-min-mb 1 --max-segments 3 --s3-endpoint http://<toxiproxy 5+5 ms> --storage-url s3://<bucket>/<arm> --read-ranges-inflight 16 --centroid-directory default"
-artifact = "docs/_internal/status/P5B_D8_DEFAULTS_CONFIRMATION_2026_10_25.adoc"
+artifact = "docs/history/evidence/P5B_D8_DEFAULTS_CONFIRMATION_2026_10_25.adoc"
 hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB; MinIO single drive + Toxiproxy 2.12.0 on the same host; arms serialized on an idle box"
 date = "2026-10-25"
 version = "feat/paxdir-d8-defaults @ 78e99d2c1 (release-server --features aws, built in-worktree)"
@@ -1361,7 +1361,7 @@ asserted_in = [
 ]
 bench_source = "scripts/bench/sift1m_get_reduction.py"
 bench_command = "systemd-run --user --scope -p MemoryMax=64G python3 scripts/bench/sift1m_get_reduction.py --root <root> --binary target/release-server/proximadb-server --sift-dir <sift1m> --rows 1000000 --queries 1000 --top-k 10 --min-recall 0.98 --object-cold-max-requests 20 --object-cold-max-waves 3 --warm-max-waves 2 --training-compaction-min-mb 1 --max-segments 3 --s3-endpoint http://<toxiproxy 5+5 ms> --storage-url s3://<bucket>/<arm> --read-ranges-inflight 16 --coalesce-range-mb <4|16|40> --centroid-directory default"
-artifact = "docs/_internal/status/TIER1_SC0_RANGE_CAP_SWEEP_2026_10_26.adoc"
+artifact = "docs/history/evidence/TIER1_SC0_RANGE_CAP_SWEEP_2026_10_26.adoc"
 hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB; MinIO single drive + Toxiproxy 2.12.0 on the same host; arms serialized on an idle box"
 date = "2026-10-26"
 version = "bench/tier1-cap-sweep @ 41ac7d439 (empty anchor over develop d929d7993; byte-identical release-server --features aws across arms, sha256 30a670c5)"

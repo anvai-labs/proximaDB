@@ -14,7 +14,7 @@
 This specification has been superseded by the tiered HTAP / multi-engine architecture defined in:
 `docs/12-design/DATA_WAREHOUSE_AND_ENGINEERING_COURSE_CORRECTION_2026_06_04.adoc`,
 `docs/12-design/RELATIONAL_STORAGE_FORMAT_AND_INTEROPERABILITY_2026_05_19.adoc`, and
-`roadmap/techdebt/TD_110_OLTP_OLAP_HTAP_STORAGE_AND_CONSTRAINTS_PLAN_2026_06_04.adoc`.
+`docs/history/planning/TD_110_OLTP_OLAP_HTAP_STORAGE_AND_CONSTRAINTS_PLAN_2026_06_04.adoc`.
 
 While this document correctly identified the need for a unified record envelope (`ProximaRecord`),
 its mandate for a *single* physical execution layer and formatting has been replaced. ProximaDB now
@@ -28,7 +28,7 @@ an internal HTAP layout candidate, not an independent schema authority.
 A research-grounded specification for promoting ProximaDB from "vector database with bolted-on
 modalities" to a coherent multi-model system with one record envelope, one type system, one
 buffer pool, one logical algebra, and one security boundary. Companion to
-link:techdebt/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc[WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc].
+link:../docs/history/planning/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc[docs/history/planning/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc].
 
 == Executive Summary
 
@@ -73,12 +73,12 @@ backward compatibility through the existing transitional facade pattern.
 == Status of This Document
 
 * **Authoritative** for record format, type system, and modality boundaries going forward.
-* **Companion** to link:techdebt/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc[the workspace
+* **Companion** to link:../docs/history/planning/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc[the workspace
   refactor plan]: this doc says _what_ the modality runtimes contain; the workspace plan
   says _how_ they decompose into crates.
-* **Updates** link:../docs/00-product/VISION.adoc[Vision], link:../docs/00-product/PRD.adoc[PRD],
+* **Updates** link:../docs/current/VISION.adoc[Vision], link:../docs/00-product/PRD.adoc[PRD],
   link:../docs/05-concepts/architecture.adoc[architecture.adoc], and
-  link:../docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc[Strategic Roadmap] by extension; see
+  link:../docs/current/ROADMAP.adoc[Strategic Roadmap] by extension; see
   Section 15 for the cross-reference table.
 
 == Section 1: Current State Assessment
@@ -159,7 +159,7 @@ prefilter when selectivity drops below `s_min`.
 
 ==== G4: Phase 2.5 Execution Layer Pending [P0]
 
-Per `STRATEGIC_ROADMAP.adoc:274-444`: a vectorized executor exists in
+Per `docs/current/ROADMAP.adoc:274-444`: a vectorized executor exists in
 `vectorized_executor.rs` but the primary query path in `unified_reader.rs` still uses
 scalar loops (TD-041). DataChunks, morsel-driven parallelism, Arrow as cross-model lingua
 franca, row-group statistics pruning, spill-to-disk -- all queued. Without these, the
@@ -263,11 +263,11 @@ projection families so these surfaces do not grow as separate products inside th
 | Graph runtime (extracted) | `crates/modalities/proximadb-graph/`
 | Cross-model query | `src/query/unified/`, `src/query/federated/`, `src/query/multimodel_router.rs`
 | Postgres wire | `src/network/postgres/`
-| Workspace plan | `roadmap/techdebt/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc`
-| Vision | `docs/00-product/VISION.adoc`
+| Workspace plan | `docs/history/planning/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc`
+| Vision | `docs/current/VISION.adoc`
 | PRD | `docs/00-product/PRD.adoc`
 | Architecture | `docs/concepts/architecture.adoc`
-| Strategic roadmap | `docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc`
+| Strategic roadmap | `docs/current/ROADMAP.adoc`
 | Tech debt register | `docs/10-quality/TECHNICAL_DEBT.adoc`
 | Multi-model review (Feb 2026) | `docs/MULTI_MODEL_ARCHITECTURE_REVIEW.md` (removed; in git history)
 |===
@@ -1455,7 +1455,7 @@ GraphAr (arXiv:2312.09577) for graph + relational + document + vector cold tier:
 
 == Section 10: Workspace and Crate Boundaries
 
-This section refines link:techdebt/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc[the workspace
+This section refines link:../docs/history/planning/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc[the workspace
 plan] specifically for the multi-modal overhaul. The stable target skeleton (Foundation,
 Contracts, Modality Runtime, Cross-Model Query, Platform Runtime, Apps) is unchanged.
 
@@ -1694,7 +1694,7 @@ distributed roadmap.
 === Phase H: Phase 2.5 Execution Layer (Concurrent)
 
 The DataChunks / morsel-driven parallelism / vectorized executor work tracked in
-`STRATEGIC_ROADMAP.adoc:274-444` (TD-031 to TD-041) runs concurrently. Owns: G4 fully.
+`docs/current/ROADMAP.adoc:274-444` (TD-031 to TD-041) runs concurrently. Owns: G4 fully.
 Sequencing: starts in Phase A so new code in Phases B-G is built on top of the
 vectorized path.
 
@@ -1916,7 +1916,7 @@ Each ADR is a sticky decision; new turns should not relitigate without explicit 
 |===
 | Doc | Recommended Update
 
-| link:../docs/00-product/VISION.adoc[VISION.adoc]
+| link:../docs/current/VISION.adoc[VISION.adoc]
 | Add "ProximaRecord envelope" and "ProximaType" to Design Principles section. Add Phase A-G in the Year 2 milestones detailing the multi-model overhaul.
 
 | link:../docs/00-product/PRD.adoc[PRD.adoc]
@@ -1925,13 +1925,13 @@ Each ADR is a sticky decision; new turns should not relitigate without explicit 
 | link:../docs/05-concepts/architecture.adoc[architecture.adoc]
 | Replace "Target 8-Model Architecture" table with the per-modality projection table (Section 3.3). Add "Three-Layer Storage Model" diagram (Section 5.1). Reference this spec.
 
-| link:../docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc[STRATEGIC_ROADMAP.adoc]
+| link:../docs/current/ROADMAP.adoc[docs/current/ROADMAP.adoc]
 | Add Phase 6: Multi-Model Overhaul (Phases A-G from this spec) at end of current phase chain. Cross-reference TD-IDs as they are created.
 
 | link:../docs/10-quality/TECHNICAL_DEBT.adoc[TECHNICAL_DEBT.adoc]
 | Track completed Phase A/B/E scaffolding through the existing resolved entries (`TD-R25` through `TD-R27`). Track the new competitive architecture gaps as TD-060 Storage Layout Authority, TD-061 Optional Relational Capabilities, TD-062 Hybrid Retrieval/Reranking, TD-063 Observability/SIEM Convergence, and TD-064 Predicate-Aware Vector Search Correctness.
 
-| link:techdebt/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc[WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc]
+| link:../docs/history/planning/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc[docs/history/planning/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc]
 | Add `proximadb-records`, `proximadb-types`, `proximadb-buffer-pool` to the new-foundation-crates list. Add `proximadb-relational` to the modality-runtime list. Confirm the cleanup items in §10.4 of this spec.
 
 | `SOLID_VECTOR_FRAMEWORK_REDESIGN.md` (removed 2026-10-17; in git history)

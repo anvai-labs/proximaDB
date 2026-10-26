@@ -1,0 +1,117 @@
+= Platform and integration residual plan
+:toc:
+:toclevels: 2
+
+This plan replaces the independent connectivity, workspace and connector planning queues.
+link:TRACKER.adoc[Tracker] owns status/branches; link:ROADMAP.adoc[roadmap] owns release order.
+Older task lists are frozen in link:../history/README.adoc[history]. Their dated code counts,
+completion percentages and filenames are not current premises. Rebaseline the relevant TD
+and real callers before implementing; this migration does not certify every legacy gap open.
+
+== Surface completion: substrate first, shared admission
+
+Preserve the useful connectivity design: each supported modality/surface pair must write,
+read, recover and meter through the real router. Facades own codecs/ergonomics, not private
+authorization, WAL, recovery or billing paths. TenantContext crosses I/O/compute boundaries.
+Canonical records own durability; modality format/index/operator choices remain specialized.
+
+Pickup TD-WAL-2's replay-dispatch and residual document/graph/timeseries work through the
+lakehouse plan. Recheck the named durability-requiring timeseries workload before broadening
+TST scope; existing isolated recovery is not evidence of canonical WAL convergence.
+
+For TD-CONN-1, establish a current surface matrix from tests, then close supported REST graph
+write and gRPC timeseries gaps if still present. Keep pgwire the SQL-write authority unless an
+explicit contract changes that; general SQL-over-Flight is not implied by vector Flight support.
+MCP checkpoint/agent-state writes remain TD-MCP-1, with admission, audit and replay semantics
+before opening a write surface. Generate REST SDKs from OpenAPI with drift checks; test sync/
+async error behavior and filters through the server, not a mock transport.
+
+SaaS and BYOC share the core binary/request/tenant seams. Edge-collapse is an adapter choice,
+not another query/security stack. Cross-region WAL replication and fleet-wide reservations
+require separate ownership/failure contracts; no local feature silently promises them.
+
+== Workspace and handler boundaries
+
+Continue TD-DECOMP-* against the current dependency graph and compile measurements. Reuse
+existing crates before adding more: bounded contexts, transport-free foundation contracts,
+query traits below modality runtimes, and concrete adapters above ports. Separate pure syntax/
+descriptors, planner behavior and runtime I/O. ADR-097 controls the logical IR; old unified-AST
+plans cannot reintroduce competing planning authority.
+
+Before an extraction, enumerate both outward storage edges and the broader cross-subsystem
+edge count with their different scopes; do not compare unlike historical totals. Recheck type
+hubs, concurrent structures, AXIS IndexPort, CDC/graph ports and remaining compute/query runtime
+as candidate cut points. Split only where callers, dependencies and compile benefit justify it.
+No one-crate-per-file program, new generic dumping-ground crate or wholesale stale-plan move.
+
+Each slice preserves public compatibility shims as needed, tests each feature consumer and
+measures cold/incremental builds and boundary-ratchet changes. Keep canonical owner types and
+avoid root reexports that conceal upward dependencies. Implement source movement separately
+from behavior changes where that makes review and rollback tractable.
+
+TD-104 handler convergence: retire the god-object through narrow v2 services/ports, with
+production caller coverage. For v1 retirement (TD-123/TD-ENGINE-1), distinguish dead surface,
+gated compatibility, engine entanglement and load-bearing domain types. A name containing v1
+is not proof it can be deleted. Keep the downward usage ratchet; measure consumers before
+cutover and use RichRecord/ProximaRecord ownership rather than aliases masking old dependencies.
+Old kill-switch scaffolds are not completed retirements.
+
+== Connector and split contracts (post-MVP unless roadmap advances them)
+
+TD-097 shared split-aware reads: one SplitSource describes stable identity, source version,
+partition bounds, estimates and resume tokens. DataFusion, Spark and notebook consumers use
+that same contract. RecordScanSpec/filter semantics and RoutedReadPlan/EXPLAIN must agree;
+apply filters before limit, retain a correct fallback, and test shard/partition assignment
+without gaps or duplicate rows. Do not invent a connector-specific durable authority.
+
+Spark filter pushdown needs a capability-exact JVM translation into the shared IR; unsupported
+predicates stay residual, with null/type semantics proven. JNI process/class-loader lifecycle
+must be explicit: init/reuse/shutdown, concurrent load and cross-process behavior. Gradle/JUnit
+migration is harness work, not evidence of new server capability: preserve existing smoke checks,
+use focused native-method conformance, and verify isolation/fork behavior in CI. Revalidate which
+of TD-097's old F/M/Gradle slices remain before porting any old code sketch.
+
+TD-099's bounded-heap WAL-scan proposal was superseded by the shipped lazy time-ordered index.
+Do not implement both. Revalidate only residual branch filters, lifecycle/invalidation, recovery
+and split reuse; historical as-built notes are linked in history. The current canonical WAL
+and all-consumer floor contract supersedes assumptions about an unbounded historical WAL scan.
+
+== HTAP and freshness contracts
+
+TD-110/ADR-095 own transaction/constraint residuals: constraint descriptors in the catalog,
+atomic check+commit, NULL/UNKNOWN semantics, unique/FK/composite/update behavior, conflict and
+recovery tests. Derive remaining work from the current TD-PGOLTP-* contracts; old sketches of
+single-statement-only DML are historical. Query/cost choices cannot weaken visibility.
+
+Adaptive clustering should expose catalog keys, sort flush/compaction and use Z-order only
+with proven pruning semantics. Cost a rewrite including amplification and workload selectivity.
+The old freshness-by-routing plan's rejection of a streaming delta union is superseded by
+ADR-097's coherent snapshot/WAL-tail providers. Preserve SLA-driven routing and disclosed
+freshness; never choose stale reads merely to keep an old implementation plan intact.
+
+The June PAX-for-every-modality audit is superseded by ADR-094's format-by-modality rule.
+Retain its useful trace/billing separation: optional diagnostic IoTrace cannot gate or sample
+billing-required consumption_metrics. Reuse typed tenant paths, coalesced metering and durable
+usage sinks; do not build a zero-embedding PAX writer solely to obey an obsolete all-PAX premise.
+
+== Deferred precision work
+
+The completed embedding integration does not close LLD Phase 3: native fp16-fp16 kernels,
+adaptive policy auto-flip and bf16/int8 canonical storage remain separately gated candidates.
+Keep external embedding conversion at the boundary and require cold recall, byte accounting
+and mixed-format recovery evidence before any precision rollout. TD-PAXPREC-1 still gates HNSW.
+
+== Release proof and governance pickup
+
+Before claiming installs or compatibility, run published Docker/RPM/DEB/MSI write/restart/read
+checks and JDBC/asyncpg/psycopg smoke against the release image. Packaging merges alone do not
+close those gates. Tenant admission and pgwire SCRAM/ABAC need parity before the SQL corridor
+expands. Security dependency exceptions require per-advisory rationale and removal criteria.
+
+Old ledger governance findings require a fresh check, especially ADR-021/P9, TD-181 citation
+collision, unfiled TD-XMODAL/TD-SC references and comments disagreeing with defaults. Fix extant
+issues under stable IDs; do not reopen findings already resolved or create a duplicate registry.
+
+For each pickup return a concrete slice: current source/TD baseline, owning branch, call path,
+negative tests, migration boundary and remaining gate. Put that handoff in the central tracker;
+archive completion evidence instead of appending another standalone platform tracker.

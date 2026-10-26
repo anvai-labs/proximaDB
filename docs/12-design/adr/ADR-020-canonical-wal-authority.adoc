@@ -12,7 +12,7 @@ Accepted
 
 `RELATIONAL_DOCUMENT_GRAPH_CONVERGENCE_2026_05_14.adoc` (the stacked-durability mandate) and `MULTIMODAL_OVERHAUL_SPEC_2026_05_08.adoc` both establish that durable authority for records lives in **xCatalog + canonical WAL + `ProximaRecord` + policy/RLS + version/time/provenance**. Modality-specific engines (PAX layouts, LSM, columnar, ANN, JSON, graph topology, observability, Arrow/Parquet/Iceberg/Delta/Hudi) are projections, layouts, adapters, or explicit external-authority modes.
 
-The 2026-05-26 design-doc audit (a snapshot since superseded by `docs/12-design/WORK_LEDGER_2026_10_15.adoc`) confirmed that this mandate is mostly wired but four implementation gaps remain, all currently OPEN in `docs/10-quality/TECHNICAL_DEBT.adoc`:
+The 2026-05-26 design-doc audit (a snapshot since superseded by `docs/current/TRACKER.adoc`) confirmed that this mandate is mostly wired but four implementation gaps remain, all currently OPEN in `docs/10-quality/TECHNICAL_DEBT.adoc`:
 
 * **TD-065** — `DocumentService.documents` (`RwLock<HashMap>`) is the primary durable source. The canonical `UpsertCanonicalDocumentRecord` WAL variant exists but is opt-in behind the `canonical-document-store` feature flag.
 * **TD-066** — `OrionGraphEngine::flush_wal()` and `OrionPersistence::save_snapshot()` write to an engine-local WAL that runs in parallel with the canonical `RecordUpsert` WAL. Recovery from the engine WAL alone misses tenant/RLS/versioning/provenance semantics.

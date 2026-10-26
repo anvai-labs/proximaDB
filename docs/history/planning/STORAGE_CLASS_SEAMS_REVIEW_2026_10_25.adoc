@@ -5,6 +5,15 @@
 :toclevels: 2
 // status-as-of: 2026-10-25
 
+
+[IMPORTANT]
+====
+Historical planning snapshot archived 2026-10-26; statements of "current", "open" or
+"done" below describe the source document at its recorded date, not current delivery.
+Current work: link:../../current/STORAGE_PLAN.adoc[the consolidated plan/tracker].
+Preserved as design rationale and evidence; do not resume its old task list verbatim.
+====
+
 == Status and scope
 
 *Proposed implementation contract; design review, not a release or an accepted ADR.*
@@ -16,7 +25,7 @@ This review supersedes their proposed implementation order and the specific prem
 corrected below. Preserve their product intent: object-backed collections with selectable
 cost/residency policies, metered capacity, and rate cards outside the storage engine.
 
-Tracking: link:../10-quality/td/TD-TIER-1-collection-storage-policy-and-residency.adoc[TD-TIER-1].
+Tracking: link:../../10-quality/td/TD-TIER-1-collection-storage-policy-and-residency.adoc[TD-TIER-1].
 Plan-mode entry point: link:STORAGE_CLASS_IMPLEMENTER_PLAN_PROMPT.adoc[implementation planning prompt].
 The SC labels below are storage-class work packages, not ADR-097's foundational S1–S9.
 
@@ -28,7 +37,7 @@ through WSL interop and label extrapolations separately from measurements.
 
 This review's 2026-10-25 audit below is retained as history. Current baseline is
 `69ddbd91b`; link:LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc[the central tracker]
-and link:../_internal/status/ROADMAP_WORKTREE_RECONCILIATION_2026_10_26.adoc[worktree audit]
+and link:ROADMAP_WORKTREE_RECONCILIATION_2026_10_26.adoc[worktree audit]
 control live status/ownership. Do not reimplement from stale findings in §0.
 
 * #2243 merged the M1 reconciliation and TD-SEAM-14/15.
@@ -123,7 +132,7 @@ Foundational refinements for the next multimodal milestone:
   slice. Do not equate the storage-class API or an ANN microbenchmark with multimodal delivery.
 
 Measured hardware/emulator evidence:
-link:../_internal/status/STORAGE_CLASS_MEDIA_EVIDENCE_2026_10_25.adoc[local NVMe, MinIO and EBS bounds].
+link:../evidence/STORAGE_CLASS_MEDIA_EVIDENCE_2026_10_25.adoc[local NVMe, MinIO and EBS bounds].
 
 === V3-first implementation decision (owner amendment, 2026-10-25)
 

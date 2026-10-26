@@ -8,7 +8,7 @@
 //! Provides TLS configuration and certificate management for ProximaDB servers.
 //!
 //! Extracted from the root crate's `src/network/tls` as a slice of the root-crate
-//! decomposition (see `docs/12-design/ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc`). The
+//! decomposition (see `docs/history/planning/ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc`). The
 //! root crate re-exports it as `crate::network::tls` for source compatibility.
 //!
 //! ## Features
