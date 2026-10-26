@@ -1,0 +1,179 @@
+= Existing D8 result extract (not re-run by this review)
+
+[source,json]
+----
+{
+  "source_path": "/home/vsingh/bench-beds/p5b-runs/d8-10ms-on/result.json",
+  "source_sha256": "5f282bb36d079c6acae4fa42a4f0f3556a5f12e18e080eee9bfdc2d3316a3979",
+  "binary": {
+    "bytes": 151708048,
+    "path": "/home/vsingh/code/proximaDB.worktrees/feat-paxdir-d8-defaults/target/release-server/proximadb-server",
+    "profile": "release-server",
+    "sha256": "fb8ff177f34eb578fd36abef32d72f5dfe8205e20a5459b85e5a7595c33ca48d",
+    "source_revision": "78e99d2c12b91db42260b63fed9f7ba835600eac"
+  },
+  "git_revision": "78e99d2c12b91db42260b63fed9f7ba835600eac",
+  "filesystem_profile": {
+    "azurite": false,
+    "geometry_evidence": "s3_boto3_inventory_and_footer_snapshot",
+    "local_disk_path": "/home/vsingh/bench-beds/p5b-runs/d8-10ms-on/local-disk-cache",
+    "note": "S3-shaped backend (e.g. MinIO) over HTTP; GET counters are emitted by the measured ProximaDB process. Out-of-process boto3 inventory/footer reads are excluded from those counters but may warm the endpoint's host page cache; latency is endpoint-network evidence, not production-cloud evidence.",
+    "range_planner": {
+      "max_gap_bytes": 1048576,
+      "max_range_bytes": 4194304,
+      "profile": "azure"
+    },
+    "s3_endpoint": "http://127.0.0.1:12002",
+    "segment_backend": "s3_endpoint",
+    "storage_url": "s3://p5b-gate/p5b-d8-10ms-on"
+  },
+  "settled_geometry": {
+    "bytes": 245638057,
+    "row_count": 1000000,
+    "segment_count": 1,
+    "segments": [
+      {
+        "blob_etag": "2625a3edb79f42c5bdd65d6c4a1e96c5",
+        "bytes": 245638057,
+        "cell_row_max_to_mean": 1.382427,
+        "cell_row_summary": {
+          "max": 51201,
+          "mean": 37037.03703703704,
+          "min": 20158,
+          "p50": 37559,
+          "p95": 50916
+        },
+        "cell_rows": [
+          26362,
+          23641,
+          20158,
+          37403,
+          51201,
+          47035,
+          36723,
+          39764,
+          50340,
+          35018,
+          30058,
+          44770,
+          37559,
+          30332,
+          41914,
+          50916,
+          41735,
+          28576,
+          28705,
+          38171,
+          20530,
+          49832,
+          34440,
+          29634,
+          41429,
+          46090,
+          37664
+        ],
+        "coarse_cells": 27,
+        "coarse_components": 10,
+        "coarse_dimension": 128,
+        "coarse_rows_covered": 1000000,
+        "coarse_seed": 5783000562795955761,
+        "coarse_trained_rows": 748000,
+        "empty_cell_fraction": 0.0,
+        "empty_cells": 0,
+        "layout_version": 1,
+        "mtime_ns": 0,
+        "path": "p5b-d8-10ms-on/1/data/L2_20261025T183032_aa5d155e.pax",
+        "radii": [
+          303.43487548828125,
+          341.69757080078125,
+          304.2464294433594,
+          325.0789794921875,
+          302.30194091796875,
+          321.6727294921875,
+          285.1199951171875,
+          328.4853515625,
+          310.6163024902344,
+          318.0346984863281,
+          327.6277770996094,
+          266.1280822753906,
+          329.2110595703125,
+          321.53466796875,
+          322.29248046875,
+          313.11669921875,
+          294.343505859375,
+          299.1100769042969,
+          313.1121520996094,
+          301.517578125,
+          298.8618469238281,
+          295.5166931152344,
+          311.6753845214844,
+          313.8265380859375,
+          299.19561767578125,
+          305.3421630859375,
+          307.0360107421875
+        ],
+        "radius_summary": {
+          "max": 341.69757080078125,
+          "mean": 309.63471137152777,
+          "min": 266.1280822753906,
+          "p50": 310.6163024902344,
+          "p95": 329.2110595703125
+        },
+        "rows": 1000000,
+        "training_rows_per_cell": 27703.703703703704
+      }
+    ],
+    "wal_unflushed_bytes": 0.0
+  },
+  "phases": {
+    "local_disk_warm": {
+      "bytes_per_query": 11516807.491,
+      "gets_per_query": 4.939,
+      "requests_per_query": 5.94,
+      "latency_ms": {
+        "mean": 107.06810989495716,
+        "p50": 105.45033001108095,
+        "p95": 146.61073801107705
+      },
+      "recall_at_k": 0.9813,
+      "waves": {
+        "observed": 1000.0,
+        "p50": 2.0,
+        "p95": 2.0
+      }
+    },
+    "object_cold": {
+      "bytes_per_query": 54733634.166,
+      "gets_per_query": 18.553,
+      "requests_per_query": 19.553,
+      "latency_ms": {
+        "mean": 107.74969372505439,
+        "p50": 107.40804602392018,
+        "p95": 142.68413500394672
+      },
+      "recall_at_k": 0.9822000000000001,
+      "waves": {
+        "observed": 999.0,
+        "p50": 3.0,
+        "p95": 4.0
+      }
+    },
+    "post_write": {
+      "bytes_per_query": 11286348.731,
+      "gets_per_query": 4.874,
+      "requests_per_query": 5.875,
+      "latency_ms": {
+        "mean": 70.38593427886372,
+        "p50": 69.42220299970359,
+        "p95": 97.3143040027935
+      },
+      "recall_at_k": 0.982,
+      "waves": {
+        "observed": 1000.0,
+        "p50": 2.0,
+        "p95": 2.0
+      }
+    }
+  }
+}
+----

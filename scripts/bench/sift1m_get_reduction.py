@@ -2848,6 +2848,28 @@ def main() -> int:
         help="Arm PROXIMADB_READ_RANGES_INFLIGHT (bounded-concurrent wave width); 0 keeps the sequential default",
     )
     parser.add_argument(
+        "--coalesce-gap-mb",
+        type=float,
+        default=AZURE_COALESCE_GAP_BYTES / (1024 * 1024),
+        help=(
+            "Remote read coalescing gap (MiB) bridged between adjacent ranges "
+            "(PROXIMADB_PAX_{VECTOR_,}COALESCE_GAP). TD-TIER-1 SC0: previously "
+            "hard-coded to 1 MiB in every arm; exposed so the fixed-geometry "
+            "range-cap sweep can vary it and every result records its value"
+        ),
+    )
+    parser.add_argument(
+        "--coalesce-range-mb",
+        type=float,
+        default=AZURE_COALESCE_RANGE_BYTES / (1024 * 1024),
+        help=(
+            "Remote read coalescing range cap (MiB) per physical GET "
+            "(PROXIMADB_PAX_{VECTOR_,}COALESCE_RANGE). Previously hard-coded "
+            "to 4 MiB; the sweep arms (4/16/40 first) vary it with geometry "
+            "otherwise pinned"
+        ),
+    )
+    parser.add_argument(
         "--read-ranges-wave-split-mb",
         type=int,
         default=0,
@@ -2991,6 +3013,10 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+    if args.coalesce_gap_mb < 0 or args.coalesce_range_mb <= 0:
+        raise SystemExit(
+            "--coalesce-gap-mb must be >= 0 and --coalesce-range-mb > 0"
+        )
     if args.write_buffer_mb <= 0:
         raise RuntimeError("--write-buffer-mb must be positive")
     if args.compaction_max_memory_mb < 0:
@@ -3402,6 +3428,11 @@ def main() -> int:
             ),
             "spill_max_disk_mb": args.compaction_spill_max_disk_mb,
         },
+        "coalescing": {
+            # TD-TIER-1 SC0: the cap/gap are experiment inputs, not constants.
+            "gap_bytes": int(args.coalesce_gap_mb * 1024 * 1024),
+            "range_cap_bytes": int(args.coalesce_range_mb * 1024 * 1024),
+        },
         "thresholds": {
             "post_write_max_gets_per_query": args.post_write_max_gets,
             "local_disk_warm_max_gets_per_query": args.local_warm_max_gets,
@@ -3440,6 +3471,8 @@ def main() -> int:
             read_ranges_wave_split_mb=args.read_ranges_wave_split_mb,
             adaptive_read_strategy=args.adaptive_read_strategy,
             centroid_directory=args.centroid_directory,
+            coalesce_gap_bytes=int(args.coalesce_gap_mb * 1024 * 1024),
+            coalesce_range_bytes=int(args.coalesce_range_mb * 1024 * 1024),
         )
         active.start()
         if args.compaction_spill:
@@ -3599,6 +3632,8 @@ def main() -> int:
             read_ranges_wave_split_mb=args.read_ranges_wave_split_mb,
             adaptive_read_strategy=args.adaptive_read_strategy,
             centroid_directory=args.centroid_directory,
+            coalesce_gap_bytes=int(args.coalesce_gap_mb * 1024 * 1024),
+            coalesce_range_bytes=int(args.coalesce_range_mb * 1024 * 1024),
         )
         active.start()
         local_warm = run_query_sweep(
@@ -3644,6 +3679,8 @@ def main() -> int:
             read_ranges_wave_split_mb=args.read_ranges_wave_split_mb,
             adaptive_read_strategy=args.adaptive_read_strategy,
             centroid_directory=args.centroid_directory,
+            coalesce_gap_bytes=int(args.coalesce_gap_mb * 1024 * 1024),
+            coalesce_range_bytes=int(args.coalesce_range_mb * 1024 * 1024),
         )
         active.start()
         object_cold = run_query_sweep(
