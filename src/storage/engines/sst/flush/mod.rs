@@ -583,7 +583,8 @@ impl SstEngine {
                 let rerank_quant = resolve_pax_rerank_quant(rerank_tags);
                 // TD-PAXRG-1: row-group Region D — per-collection
                 // `pax_rg_layout` tag > env `PROXIMADB_PAX_WRITE_RG_LAYOUT` >
-                // default OFF. No-ops for non-RaBitQ-coalesced writes.
+                // default ON (flipped 2026-08-28, Phase-G evidence).
+                // No-ops for non-RaBitQ-coalesced writes.
                 let rg_layout = resolve_pax_rg_layout(rerank_tags);
                 // TD-FPRUNE-1 M1: shred declared filterable tags into typed
                 // user-columns at flush so footer-resident filter pruning fires
@@ -1043,9 +1044,9 @@ impl SstEngine {
     /// Whether L0→base compaction should be triggered after this flush (TD-114,
     /// per-collection override TD-WLP-2 / ADR-061 D5).
     ///
-    /// Default-OFF: absent a per-collection `compaction:on` tag the trigger only
-    /// arms when `PROXIMADB_L0_COMPACTION_ENABLED` is truthy, so the untagged
-    /// flush path is byte-for-byte unchanged. A tagged collection may arm (at
+    /// Default-ON since TD-WLP-4: the default gate with the AppendBulk
+    /// `#[default]` profile leaves an UNTAGGED collection compacting; a
+    /// per-collection `compaction:off` tag opts out. A tagged collection may arm (at
     /// its own `l0_threshold:N`) while the global gate is unset; an explicitly
     /// falsy global env is the master kill-switch nothing can override. When
     /// armed, it reuses the existing segment discovery to count L0 segments and
@@ -1433,8 +1434,10 @@ fn pax_rg_layout_tag(tags: &[String]) -> Option<bool> {
 }
 
 /// Resolve the row-group Region D write switch. Precedence: per-collection
-/// `pax_rg_layout` tag > env `PROXIMADB_PAX_WRITE_RG_LAYOUT` > default OFF.
-/// Only effective for RaBitQ-coalesced writes (Regions A/B are the premise).
+/// `pax_rg_layout` tag > env `PROXIMADB_PAX_WRITE_RG_LAYOUT` > default ON
+/// (flipped 2026-08-28 on the TD-PAXRG-1 Phase-G evidence; the doc once said
+/// OFF — the code and its test say ON). Only effective for RaBitQ-coalesced
+/// writes (Regions A/B are the premise).
 pub(crate) fn resolve_pax_rg_layout(tags: &[String]) -> bool {
     let per_collection = pax_rg_layout_tag(tags);
     per_collection.unwrap_or_else(crate::storage::engines::sst::segment_format::rg_layout_enabled)

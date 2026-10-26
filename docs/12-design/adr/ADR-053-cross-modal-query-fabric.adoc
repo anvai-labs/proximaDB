@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Accepted (2026-07-04) — *partially implemented (reconciled 2026-10-15):* `timeseries_range` (#665) and `graph_traverse` (#673) table functions landed; TD-XMODAL-4 Partial; follow-ups TD-XMODAL-6 Done, -7/-8/-9 Partial, -10 Open (graph_traverse pgwire reachability unverified). **TD-XMODAL-1/-2/-3/-5 named below were never filed** as TD entries — -3 (multi-entity timeseries + anomaly scan) and -5 (per-modality query-scoped I/O trace) remain untracked open work.
+|Status|Accepted (2026-07-04) — *partially implemented (reconciled 2026-10-15):* `timeseries_range` (#665) and `graph_traverse` (#673) table functions landed; TD-XMODAL-4 Partial; follow-ups TD-XMODAL-6 Done, -7/-8/-9 Partial, -10 Open (graph_traverse pgwire reachability unverified). TD-XMODAL-2/-3/-5 were filed 2026-10-26 (-2 records the #673 landing; -3 and -5 remain open work, now tracked).
 |Date|2026-07-04
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-052 (analytics execution = DataFusion vectorized kernels behind the `ComputeBackend` seam), ADR-039 (DataFusion swappable backend / `LogicalNode` seam), ADR-050 (cost-based route selection), ADR-022 (agent memory/event surface), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc`, `DATA_WAREHOUSE_AND_ENGINEERING_COURSE_CORRECTION_2026_06_04.adoc` §8 (zero-ETL multimodal moat), the reference MCP surface (`crates/platform/proximadb-mcp`)

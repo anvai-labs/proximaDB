@@ -106,7 +106,18 @@ drift items.
 ** Raft (2027 vs "done Mar 2026" vs open), DiskANN (2027 vs Q4 2026) and serverless (2028 vs Phase 8 in progress) disagree across documents.
 ** The MVP list contradicts the roadmap's own phase tables.
 * **Code comments that drift from code.**
-** `sst/flush/mod.rs` documents two defaults as "off" that are now on (PAX row-group layout, compaction arming).
+** `sst/flush/mod.rs` documents two defaults as "off" that are now on (PAX row-group layout, compaction arming). *Fixed 2026-10-26.*
+
+// 2026-10-26 governance pass (platform release-proof pickup): TD-181 filed
+// (catalog OID migration, anchored to CATALOG_OID_MIGRATION_2026_06_27); the
+// ADR-039 DataFusion guards filed as TD-DFSEAM-1 with the collision citations
+// re-pointed (ADR-039/052/README, TD-USUB-5, PAX_V3 spec); TD-XMODAL-2/-3/-5
+// filed (-2 records the #673 landing; -3/-5 open); TD-SC-1..5 filed against
+// ADR-035 (SC-3 carries the composite-key conflict). ADR-094 and ADR-036 were
+// already Accepted 2026-10-17, and ADR-021's P9 gating matches its own status
+// — both closed as already-resolved. ADR-023/030/055/089/091 were Accepted
+// with ADR-094/036 on 2026-10-17 (per the resolution paragraph above); only
+// ADR-021 (Proposed, P9-gated) remains open of the status-lag list.
 ** `Cargo.toml` calls `otlp-metering` default-OFF, yet it is a default feature.
 ** `BENCHMARK_EVIDENCE.toml`'s rdstrat12 ladder claim is stale.
 

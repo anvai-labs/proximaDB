@@ -107,7 +107,7 @@ semi-joins), no Adaptive Query Execution.
   Bulk scan/filter/project/aggregate/join/sort over analytical tables executes in DataFusion's
   vectorized kernel set. The row-wise `proximadb-relational-executor` Volcano is the floor for
   OLTP / point-lookup / low-cardinality shapes (where row-wise is fine) and the
-  no-DataFusion build floor (ADR-039 Verification §3 — the "TD-181" number is overloaded in
+  no-DataFusion build floor (ADR-039 Verification §3 — the number was overloaded in TD-181 (now TD-DFSEAM-1) in
   the ledger) — *not* the OLAP execution engine. Conformance
   is identical either way (TPC-H/TPC-DS bind to the `LogicalNode` seam, not the engine).
 
