@@ -1169,19 +1169,12 @@ def test_server_proc_sampler_parses_rss_and_cpu() -> None:
     sampler = HARNESS.ServerProcSampler(pid=99, interval_s=0.001, read=fake_read)
     files[f"/proc/99/status"] = status
     files[f"/proc/99/stat"] = stat_start
-    sampler._sample_once()
+    sampler.start()  # real background thread (daemon); start samples once
     # utime 100->250, stime 50->90 = 190 ticks.
     files[f"/proc/99/stat"] = stat_end
-    sampler._sample_once()
-    sampler._stop.set()  # no background thread was started; stop() must still work
-    out = sampler.stop() if sampler._thread is not None else {
-        "peak_rss_bytes": sampler._peak_rss_bytes,
-        "cpu_seconds": round(
-            max(0, (sampler._cpu_ticks_end or 0) - (sampler._cpu_ticks_start or 0))
-            / 100.0,
-            3,
-        ),
-    }
+    import time as _time
+    _time.sleep(0.01)  # let the thread observe the end state
+    out = sampler.stop()
     assert out["peak_rss_bytes"] == 1234 * 1024
     assert out["cpu_seconds"] == 1.9
 

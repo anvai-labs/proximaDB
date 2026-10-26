@@ -1607,7 +1607,12 @@ class ServerProcSampler:
 
     def start(self) -> None:
         self._sample_once()
-        self._thread = threading.Thread(target=self._run, name="server-proc-sampler")
+        # Daemon per mandate #11 and the ProcessScratchSampler convention:
+        # a phase that raises must not leave a live non-daemon thread hanging
+        # the interpreter at exit.
+        self._thread = threading.Thread(
+            target=self._run, name="server-proc-sampler", daemon=True
+        )
         self._thread.start()
 
     def stop(self) -> dict:
@@ -1711,6 +1716,8 @@ def run_query_sweep(
         groundtruth_path, groundtruth_format, query_start, query_count
     )
     before = scrape(server)
+    # The sampler must stop on EVERY exit (read error, HTTP failure, guard
+    # abort) — not only success; try/finally around the measured section.
     latencies = []
     recalls = []
     ordered_result_digests = []
@@ -1785,10 +1792,10 @@ def run_query_sweep(
         recalls.append(recall_hits / top_k)
     if progress_guard is not None:
         progress_guard()
+    after = scrape(server)
     server_proc: dict = {}
     if sampler is not None:
         server_proc = sampler.stop()
-    after = scrape(server)
     quality_checkpoints = prefix_quality_checkpoints(recalls, latencies)
     latencies.sort()
     gets = metric_delta(before, after, "proximadb_object_store_gets_total")

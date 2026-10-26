@@ -1365,4 +1365,20 @@ artifact = "docs/history/evidence/TIER1_SC0_RANGE_CAP_SWEEP_2026_10_26.adoc"
 hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB; MinIO single drive + Toxiproxy 2.12.0 on the same host; arms serialized on an idle box"
 date = "2026-10-26"
 version = "bench/tier1-cap-sweep @ 41ac7d439 (empty anchor over develop d929d7993; byte-identical release-server --features aws across arms, sha256 30a670c5)"
-notes = "Pilot PR #2249 merged; full E1 gate remains open. The 4 MiB arm failed the request gate (20.005 > 20). Missing p99, CPU, peak RSS, in-flight bytes, useful/overread split and request-size distribution; raw results local-only. Repeat on identical objects/model/ETags with full telemetry, then scale/filter/fragmentation finalists. No production default changed. Single-host emulator evidence, not an SLA or measured EBS performance."
+notes = "Pilot PR #2249 merged; full E1 gate remains open. The 4 MiB arm failed the request gate (20.005 > 20). Missing p99, CPU, peak RSS, in-flight bytes, useful/overread split and request-size distribution; raw results local-only. Repeat on identical objects/model/ETags with full telemetry, then scale/filter/fragmentation finalists. No production default changed. Single-host emulator evidence, not an SLA or measured EBS performance. SUPERSEDED by tier1_e1_fixed_object_cap_sweep (fixed-object protocol): the -50%-magnitude comparison across arms was geometry-confounded; the fixed-object effect is -29%."
+
+[[claims]]
+id = "tier1_e1_fixed_object_cap_sweep"
+claim = "TD-TIER-1 E1 fixed-object repeated range-cap sweep (supersedes the #2249 pilot's -50% figure, which was geometry-confounded): one 36-cell SIFT1M fixture ETag-verified unchanged across all arms, 2 repeats per cap, identical query IDs, only the cap varied. 4 -> 16 MiB cuts object-cold requests -29% (18.462 -> 13.169 per query) at unchanged recall (>= 0.9822), waves (p50 3) and bytes; request counts reproduce EXACTLY across repeats (the plan is a pure function of cap+objects+queries; variance lives in wall-clock only). 16 -> 40 MiB saves 0.289 requests while costing mean +17 ms p50 and +14 s CPU per 1000 queries — 16 MiB is the request, latency and CPU optimum on this bed. p99/RSS/CPU per-phase telemetry landed with this run."
+metric = "requests_per_query + waves p50/p95 + recall@10 + latency p50/p95/p99 + per-phase server CPU seconds + peak RSS, object-cold, n=2 repeats per cap on a fixed fixture"
+status = "measured"
+asserted_in = [
+  "docs/10-quality/td/TD-TIER-1-collection-storage-policy-and-residency.adoc",
+]
+bench_source = "scripts/bench/sift1m_get_reduction.py"
+bench_command = "build fixture once (full run) then per cap x repeat: systemd-run --user --scope -p MemoryMax=64G python3 scripts/bench/sift1m_get_reduction.py --root <root> --binary target/release-server/proximadb-server --sift-dir <sift1m> --rows 1000000 --queries 1000 --top-k 10 --min-recall 0.98 --object-cold-max-gets 1000 --post-write-max-gets 1000 --local-warm-max-gets 1000 --max-p50-ms 100000 --local-warm-max-p50-ms 100000 --training-compaction-min-mb 1 --max-segments 3 --s3-endpoint http://<toxiproxy 5+5ms> --storage-url s3://<bucket>/e1-build --read-ranges-inflight 16 --coalesce-range-mb <4|16|40> --centroid-directory default --skip-ingest --collection-id 1"
+artifact = "docs/_internal/status/TIER1_E1_FIXED_OBJECT_CAP_SWEEP_2026_10_26.adoc"
+hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB; MinIO single drive + Toxiproxy 2.12.0 on the same host; arms serialized on an idle box"
+date = "2026-10-26"
+version = "bench/tier1-e1-fixed @ eb1dd04e2 (binary at f5aef1b0b; later commits harness/tests-only)"
+notes = "Fixture: one 1M-row segment, 36 coarse cells, centroid directory — ETags verified identical before/after (only the warm-cache sidecar object rewrote). --skip-ingest registers the collection in each fresh per-run catalog and fails closed on an id mismatch (first launch 404'd; root-caused, fixture rebuilt, no data from the failed launch used). Warm phases under fixture reuse measure cache re-warming and are NOT compared. Still missing for full E1 closure: request-size distribution, useful/fetched/overread byte split, finalist arms (fragmented/filters/10M/768d) before any default change. p99 with n=2 is directional. Single-machine emulator evidence, not an SLA."

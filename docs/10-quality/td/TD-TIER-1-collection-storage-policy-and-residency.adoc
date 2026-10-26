@@ -39,9 +39,11 @@ primitives should be connected rather than duplicated.
 [cols="1,3,1",options="header"]
 |===
 | Slice | Scope | State
-| SC0 | Premise/evidence and controlled range/local-media experiments | Design/harness merged #2244; cap pilot merged #2249. Measured cold requests/q 20.005 / 10.514 / 10.282 at 4/16/40 MiB, recall >=0.9817. Cells differ (21/25/26), one arm each; fixed-object E1, repeats and full telemetry remain open. No causal latency-neutral claim or default change. See link:../../history/evidence/TIER1_SC0_RANGE_CAP_SWEEP_2026_10_26.adoc[artifact].
 | SC1 | Additive desired policy and truthful observed status | Local WIP in `feat/sc1-storage-policy`, not merged. Generation updates, facade/status parity and generated-contract evidence remain gates.
 | SC2 | Authorized placement and supported capability checks | Partial local WIP in the SC1 branch (SST/scheme checks). Authorized configured targets, final resolved assignment, cross-tenant negatives and placement lifecycle proof remain open.
+| SC0 | Premise/evidence and controlled range/local-media experiments | Design/harness merged #2244; cap pilot merged #2249 (geometry-confounded: cells 21/25/26, one arm each — developed in link:../../history/evidence/TIER1_SC0_RANGE_CAP_SWEEP_2026_10_26.adoc[history]). **E1 proper measured** (link:../../_internal/status/TIER1_E1_FIXED_OBJECT_CAP_SWEEP_2026_10_26.adoc[artifact], ledger `tier1_e1_fixed_object_cap_sweep`): one 36-cell fixture ETag-verified across arms, 2 repeats per cap — 4→16 MiB cuts requests **−29%** (18.462→13.169/q), not the pilot's −50%; request counts reproduce exactly across repeats; 16→40 MiB saves 0.289 requests for mean +17 ms p50 and +14 s CPU — **16 MiB is the request/p99/CPU optimum on this bed**. p99/RSS/CPU telemetry landed. No default change (production S3 targets 8 MiB; fragmented/filters/10M/768d finalists still open; request-size and overread telemetry remain). LIST remains the dominant cold-request term.
+| SC1 | Additive desired policy and truthful observed status | Open
+| SC2 | Authorized placement and supported capability checks | Open
 | SC3 | Atomic reservation/protection and durable usage lifecycle | Open
 | SC4 | Production residency read path and reconciliation | Open
 | SC5 | Optional future-PUT online access tier | Open
