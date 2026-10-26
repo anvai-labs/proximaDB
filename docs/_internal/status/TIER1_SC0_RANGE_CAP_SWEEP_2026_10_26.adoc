@@ -4,38 +4,38 @@
 
 == Bed
 
-Same as the D8 canonical profile: MinIO single drive behind Toxiproxy 5 + 5 ms (measured ~13 ms RTT through the proxy), SIFT1M 1M × 128, full-corpus ground truth, top-10, 1,000 queries per phase (disjoint per phase, identical across arms), concurrency 1, `--read-ranges-inflight 16`, `--training-compaction-min-mb 1 --max-segments 3`, `--centroid-directory default` (P5b defaults on, all gates unset), memory-capped (`MemoryMax=64G`), arms sequential on an idle box. The only inter-arm variable: `--coalesce-range-mb` 4 / 16 / 40 (the SC0-exposed flag; gap fixed at the historical 1 MiB). Every arm's result.json records its cap (the `coalescing` and `range_planner` blocks agree — the SC0 review fix).
+Same as the D8 canonical profile: MinIO single drive behind Toxiproxy 5 + 5 ms (measured ~13 ms RTT through the proxy), SIFT1M 1M × 128, full-corpus ground truth, top-10, 1,000 queries per phase (disjoint per phase, identical across arms), concurrency 1, `--read-ranges-inflight 16`, `--training-compaction-min-mb 1 --max-segments 3`, `--centroid-directory default` — the PAXDIR *feature* gates unset, i.e. server defaults; the sweep's own gates (recall ≥ 0.98, requests ≤ 20, cold waves ≤ 3, warm ≤ 2) were ARMED on every arm, and the 4 MiB arm failed the requests gate), memory-capped (`MemoryMax=64G`), arms sequential on an idle box. The only inter-arm variable: `--coalesce-range-mb` 4 / 16 / 40 (the SC0-exposed flag; gap fixed at the historical 1 MiB). Every arm's result.json records its cap (the `coalescing` and `range_planner` blocks agree — the SC0 review fix).
 
 == Result (`object_cold`)
 
 [cols="2,1,1,1",options="header"]
 |===
 | | 4 MiB | 16 MiB | 40 MiB
-| requests/q (GET+LIST+HEAD) | 20.00 | **10.51** | 10.28
-| GETs/q | 19.00 | 9.51 | 9.28
+| requests/q (GET+LIST+HEAD) | 20.005 | **10.514** | 10.282
+| GETs/q | 19.005 | 9.514 | 9.282
 | waves p50 (p95 = 4 in all) | 3 | 3 | 3
 | recall@10 | 0.9817 | 0.9824 | 0.9825
 | MB/q | 58.7 | 57.8 | 56.6
 | p50 / p95 ms | 107 / 149 | 129 / 181 | 113 / 172
 | qps (c=1) | 9.22 | 7.61 | 8.52
-| warm (`local_disk_warm`) req/q | 6.01 | 4.58 | 4.73
+| warm (`local_disk_warm`) req/q | 6.008 | 4.583 | 4.731
 | settled cells / segments | 21 / 1 | 25 / 1 | 26 / 1
 | ivf fetch rounds/q | 4.08 | 2.67 | 3.37
 |===
 
-All values [M] from the three result.json files (`~/bench-beds/p5b-runs/sweep-cap{4,16,40}/`).
+All values [M] from the three result.json files (`~/bench-beds/p5b-runs/sweep-cap{4,16,40}/`); all three arms ran the byte-identical binary (sha256 30a670c5…) at source revision 41ac7d439.
 
 == Findings
 
 . **4 → 16 MiB halves requests at unchanged recall and wave depth** (20.00 → 10.51 req/q; recall +0.0007; waves p50 3 in all arms). The added transfer time does not add a wave. Warm requests drop too (6.01 → 4.58). This confirms the pre-sweep model: the D8 trace showed ~10.5 of 18.55 GETs were full 4 MiB Region-B ranges that larger caps merge.
-. **16 → 40 MiB is the plateau** (10.51 → 10.28): the remaining GETs are extents that a 16 MiB cap already merges or that widening cannot — disjoint useful bytes, not a cap artifact. The knee the design predicted sits at or before 16 MiB at this geometry. [M]
-. **Geometry was approximately, not exactly, fixed**: settled coarse cells 21 / 25 / 26 across arms (training samples the compaction input rows, which vary per fresh bed). This works *against* the 16/40 arms (more cells ⇒ more probe requests), so the measured request reduction is a conservative bound, not inflated by geometry. Recorded, not smoothed away. [M]
-. **The 4 MiB arm tripped the ≤ 20 requests gate by 0.0004** (20.0004, displayed 20.00): bed-shape variance at the gate boundary, recall held. Sweep arms' binding constraint is recall (≥ 0.98, held in all arms per the design); the gate trip is recorded, not excused. [M]
+. **16 → 40 MiB is the plateau** (10.514 → 10.282, one arm each, no repeats): the remaining GETs are extents a 16 MiB cap already merges or that widening cannot. The disjoint-useful-bytes mechanism is inferred from the D8 trace's extent layout, not measured per-extent here [D]; the knee the design predicted sits at or before 16 MiB at this geometry [M].
+. **Geometry was approximately, not exactly, fixed — and the bias runs BOTH ways**: settled coarse cells 21 / 25 / 26 across arms (training samples the compaction input rows, which vary per fresh bed). Cells *probed* were pinned at ~10 by nprobe in the 4 and 16 arms (9.99 each; 10.99 at 40), so the settled-cell rise added no probe requests; but the 16 arm's smaller cells probed 10.8% fewer rows (422,805 vs 474,122) and 3.9% fewer Region-B bytes — a channel that plausibly REDUCES the 16 arm's requests, i.e. biases modestly *in favor* of the halving. The −50% request effect dwarfs that ±11% channel, and the 4 MiB arm's average 3.1 MB/GET shows extent count (not rows) was the binding term, so the headline stands; recorded without the earlier one-sided "conservative bound" claim. [M]
+. **The 4 MiB arm tripped the ≤ 20 requests gate by 0.005** (20.005 = 20,005 requests / 1,000 queries, displayed 20.00): bed-shape variance at the gate boundary, recall held. The sweep's binding constraint is recall (≥ 0.98, held in all arms per the design); the gate trip is recorded, not excused. [M]
 . **Latency is a wash within bed variance** (p50 107–129 ms band across arms; per-arm beds differ in cells and rounds). No arm regressed waves, which is the latency term the profile controls. [M]
 
 == Cost read [D — derived, S3 us-east-1 list rates on the measured units]
 
-Cold request cost at 1M scale: 4 MiB ≈ $12.4/M queries → 16 MiB ≈ $8.8/M (9.51 GET × $0.40/M + 1 LIST × $5.00/M). After the halving, **the discovery LIST is 57% of the cold request bill** — TD-PAXDIR-2 (listing cache) is the dominant remaining request lever, ahead of any further cap change.
+Cold request cost at 1M scale, both sides from THIS sweep's units: 4 MiB ≈ $12.60/M (19.005 GET × $0.40/M + 1 LIST × $5.00/M) → 16 MiB ≈ $8.81/M (9.514 × $0.40 + $5.00). (The D8-era $12.42/M figure came from a different bed's 18.55 GETs; do not mix the two.) After the halving, **the discovery LIST is 57% of the cold request bill** — TD-PAXDIR-2 (listing cache) is the dominant remaining request lever, ahead of any further cap change.
 
 == Production posture (no default change made)
 
@@ -45,3 +45,4 @@ The harness's historical 4 MiB pin understates production: `IopsBudget::S3` targ
 
 * Result files (local, not checked in): `~/bench-beds/p5b-runs/sweep-cap{4,16,40}/result.json` + logs `cap-sweep2.log`; first launch lost to the worktree-clean incident (see the anchor-commit memory/ADR note; no measurement was taken from it).
 * Single-machine emulator evidence, not an SLA or a cloud-latency claim.
+* **E1 recording-protocol gap (disclosed):** the design's E1 asks for per-arm p99, CPU, peak RSS, in-flight bytes, overread-gap bytes and request-size distribution; the harness does not capture these (only wave p50/p95, max-inflight count, bytes/q), and the result files are local-only. Recorded as a harness follow-up; the in-flight-byte budget the design warns about (16 × 40 MiB buffers) remains unmeasured here.
