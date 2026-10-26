@@ -92,6 +92,13 @@ message CollectionConfig {
   // `pax_vector_format_tag`. Precedence: kill-switch
   // `PROXIMADB_PAX_VECTOR_SEGMENTS_DISABLE` > this tag > global
   // `PROXIMADB_PAX_VECTOR_SEGMENTS` default (flipped on in Phase F).
+
+  // TD-TIER-1 SC1: the collection's desired storage class. UNSPECIFIED/absent
+  // (every pre-SC1 record) resolves to BALANCED — old records decode and serve
+  // unchanged. ECONOMY/PERFORMANCE persist the intent and report it back with
+  // a NOT_ACTIVE status until SC3/SC4 land (read `Collection.storage_class_status`).
+  // Unknown explicit values are rejected at admission.
+  optional StorageClass storage_class = 30;
 }
 
 // Canonical scalar type for a collection's embedding column. Mirrors
@@ -205,6 +212,9 @@ message Collection {
   int64 created_at = 4;
   int64 updated_at = 5;
   optional StorageAssignment storage_assignment = 6;
+  // Observed storage-class status (read-side projection of config.storage_class;
+  // never an input). Computed on read; see StorageClassStatus.
+  optional StorageClassStatus storage_class_status = 7;
 }
 
 // Index configuration
@@ -242,6 +252,47 @@ message StorageConfig {
   optional CompressionAlgorithm compression = 3; // Default: COMPRESSION_ZSTD
   optional uint32 max_file_size_mb = 4; // Default: 128MB
   optional bool enable_caching = 5; // Default: true
+}
+
+// Per-collection storage class (TD-TIER-1 SC1). The DESIRED policy only —
+// observed residency is reported separately via `StorageClassStatus` on the
+// read model, never claimed from this field. UNSPECIFIED (or an absent field,
+// which is every pre-SC1 record) resolves to BALANCED for compatibility;
+// unknown explicit values are rejected at admission on every facade.
+enum StorageClass {
+  STORAGE_CLASS_UNSPECIFIED = 0;
+  STORAGE_CLASS_ECONOMY = 1;
+  STORAGE_CLASS_BALANCED = 2;
+  STORAGE_CLASS_PERFORMANCE = 3;
+}
+
+// Observed storage-class status (read-side projection, computed from the
+// desired policy; never an input). v1 (SC1): BALANCED is ACTIVE; ECONOMY and
+// PERFORMANCE are accepted-but-NOT_ACTIVE — their residency/reservation
+// dependencies (SC3/SC4) are not implemented, so the collection keeps serving
+// with BALANCED behavior and the reason names the missing dependency. The
+// byte levels stay zero-with-reason until those slices land.
+message StorageClassStatus {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    // The desired class is in effect.
+    STATE_ACTIVE = 1;
+    // The policy is persisted but its dependency is not implemented/enabled
+    // in this build; the collection serves balanced behavior.
+    STATE_NOT_ACTIVE = 2;
+  }
+  State state = 1;
+  // Human-readable reason when state != ACTIVE (names the missing dependency).
+  string reason = 2;
+  // Monotonic generation of the desired policy: 0 = never set (pre-SC1
+  // records), 1 = set at create; a policy-change surface will bump it.
+  uint64 policy_generation = 3;
+  // Reserved bytes under the collection's residency admission (SC3). 0 until then.
+  uint64 reserved_bytes = 4;
+  // Bytes resident in the serving cache (SC4). 0 until then.
+  uint64 resident_bytes = 5;
+  // Bytes covered by the READY coverage set (SC4). 0 until then.
+  uint64 covered_bytes = 6;
 }
 
 // Storage assignment information

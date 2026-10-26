@@ -35,10 +35,7 @@ from typing import Any
 from llama_index.core.base.base_retriever import BaseRetriever
 from llama_index.core.bridge.pydantic import PrivateAttr
 from llama_index.core.schema import BaseNode, TextNode
-from llama_index.core.vector_stores import (
-    VectorStoreQuery,
-    VectorStoreQueryResult,
-)
+from llama_index.core.vector_stores import VectorStoreQuery, VectorStoreQueryResult
 from llama_index.core.vector_stores.types import (
     BasePydanticVectorStore,
     MetadataFilters,

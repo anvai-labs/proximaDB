@@ -48,9 +48,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any
 
-from .chunking_strategies.code import (
-    static_supported_extensions,
-)
+from .chunking_strategies.code import static_supported_extensions
 from .code_knowledge import (
     CodeIndexConfig,
     CodeKnowledgeBuilder,

@@ -230,6 +230,7 @@ async fn test_optimization_end_to_end() -> anyhow::Result<()> {
     // IMPORTANT: Use standard path format: {baseurl}/{collectionid}/data
     let collection_storage_path = format!("{}/optimization_test", temp_dir.path().display());
     let collection = Collection {
+        storage_class_status: None,
         id: "optimization_test".to_string(),
         config: Some(CollectionConfig {
             name: "optimization_test".to_string(),
@@ -383,6 +384,7 @@ async fn test_optimization_end_to_end() -> anyhow::Result<()> {
     };
 
     let sst_collection = std::sync::Arc::new(proximadb::proto::proximadb_v1::Collection {
+        storage_class_status: None,
         id: "optimization_test".to_string(),
         config: Some(sst_collection_config),
         stats: None,
@@ -501,6 +503,7 @@ async fn test_optimization_end_to_end() -> anyhow::Result<()> {
     };
 
     let viper_collection = std::sync::Arc::new(proximadb::proto::proximadb_v1::Collection {
+        storage_class_status: None,
         id: "optimization_test".to_string(),
         config: Some(viper_collection_config),
         stats: None,

@@ -2555,6 +2555,31 @@ fn quantization_strategy_to_str(v: Option<i32>) -> String {
         .unwrap_or_default()
 }
 
+/// TD-TIER-1 SC1: map the v1 observed status onto the v2 read model. The
+/// state label mirrors the REST surface ("active" | "not_active"; anything
+/// unrecognized reads as "unspecified", never a false "active").
+fn v2_storage_class_status_from(
+    _cfg: &crate::proto::proximadb_v1::CollectionConfig,
+    status: crate::proto::proximadb_v1::StorageClassStatus,
+) -> proximadb_v2::V2StorageClassStatus {
+    use crate::proto::proximadb_v1::storage_class_status::State;
+    let state = State::try_from(status.state)
+        .map(|s| match s {
+            State::Active => "active",
+            State::NotActive => "not_active",
+            State::Unspecified => "unspecified",
+        })
+        .unwrap_or("unspecified");
+    proximadb_v2::V2StorageClassStatus {
+        state: state.to_string(),
+        reason: status.reason,
+        policy_generation: status.policy_generation,
+        reserved_bytes: status.reserved_bytes,
+        resident_bytes: status.resident_bytes,
+        covered_bytes: status.covered_bytes,
+    }
+}
+
 fn collection_to_v2(c: crate::proto::proximadb_v1::Collection) -> V2Collection {
     let cfg = c.config.unwrap_or_default();
     let distance_metric = cfg
@@ -2567,7 +2592,24 @@ fn collection_to_v2(c: crate::proto::proximadb_v1::Collection) -> V2Collection {
         .and_then(|e| crate::proto::proximadb_v1::StorageEngine::try_from(e).ok())
         .map(|e| e.as_str_name().to_ascii_lowercase())
         .unwrap_or_default();
+    // TD-TIER-1 SC1: echo the resolved desired storage class ("economy" |
+    // "balanced" | "performance"; absent ⇒ balanced) AND the observed status —
+    // desired and observed are distinct surfaces.
+    let storage_class = crate::services::collection::storage_class::storage_class_label(
+        crate::services::collection::storage_class::storage_class_or_balanced(&cfg),
+    )
+    .to_string();
+    let storage_class_status = c
+        .storage_class_status
+        .map(|status| v2_storage_class_status_from(&cfg, status))
+        .unwrap_or_else(|| {
+            v2_storage_class_status_from(
+                &cfg,
+                crate::services::collection::storage_class::storage_class_status(&cfg),
+            )
+        });
     V2Collection {
+        storage_class_status: Some(storage_class_status),
         id: c.id,
         config: Some(V2CollectionConfig {
             // TD-GRPCSCHEMA-2: round-trip the mode on reads too.
@@ -2577,6 +2619,7 @@ fn collection_to_v2(c: crate::proto::proximadb_v1::Collection) -> V2Collection {
             distance_metric,
             storage_engine,
             filterable_columns: cfg.filterable_columns.into_iter().map(|f| f.name).collect(),
+            storage_class: Some(storage_class),
             description: cfg.description.unwrap_or_default(),
             index_specs: cfg
                 .index_configs
@@ -2621,6 +2664,7 @@ mod tests {
     #[test]
     fn v2_config_to_canonical_columns_emits_embedding_plus_filterable_scalars() {
         let cfg = proximadb_v2::V2CollectionConfig {
+            storage_class: None,
             name: "c".to_string(),
             dimension: 128,
             distance_metric: "cosine".to_string(),

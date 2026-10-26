@@ -56,11 +56,7 @@ from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import (
-    Any,
-    Generic,
-    TypeVar,
-)
+from typing import Any, Generic, TypeVar
 
 from tenacity import (
     retry,

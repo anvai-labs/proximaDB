@@ -1810,6 +1810,7 @@ impl SharedServices {
 
                 // Convert storage metadata to proto collection format
                 let collection_config = crate::proto::proximadb_v1::CollectionConfig {
+                    storage_class: None,
                     name: metadata.name.clone(),
                     embedding_config: None,
                     dimension: metadata.dimension as u32,
@@ -1871,7 +1872,12 @@ impl SharedServices {
                     pax_vector_quant: None,
                 };
 
+                let storage_class_status =
+                    crate::services::collection::storage_class::storage_class_status(
+                        &collection_config,
+                    );
                 let proto_collection = crate::proto::proximadb_v1::Collection {
+                    storage_class_status: Some(storage_class_status),
                     id: format!("recovered-{}", Uuid::new_v4()),
                     config: Some(collection_config),
                     stats: Some(crate::proto::proximadb_v1::CollectionStats {

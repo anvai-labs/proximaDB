@@ -96,6 +96,14 @@ class CreateCollectionV2Request:
                 (default "hnsw"). Index selection is cost-derived, so "hnsw" is accepted
                 and has no effect; any other value is rejected — declare an index with
                 `index_configs` or force a route with `index_policy.mode` instead.
+            storage_class (None | str | Unset): Desired storage class (TD-TIER-1 SC1).
+
+                Options: "balanced" (default) | "economy" | "performance". Omitted ⇒
+                balanced (pre-SC1 collections are unchanged). "performance" is admitted
+                only for an object-store-backed SST/PAX placement and reports
+                `not_active` until its residency dependency ships; economy likewise
+                persists intent only. Read `storage_class_status` on the GET response
+                for the observed truth — the class is never a claim.
     """
 
     name: str
@@ -112,6 +120,7 @@ class CreateCollectionV2Request:
     index_policy: IndexPolicyInput | None | Unset = UNSET
     description: None | str | Unset = UNSET
     index_type: None | str | Unset = UNSET
+    storage_class: None | str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.index_config_input import IndexConfigInput  # noqa: PLC0415
@@ -212,6 +221,12 @@ class CreateCollectionV2Request:
         else:
             index_type = self.index_type
 
+        storage_class: None | str | Unset
+        if isinstance(self.storage_class, Unset):
+            storage_class = UNSET
+        else:
+            storage_class = self.storage_class
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -244,6 +259,8 @@ class CreateCollectionV2Request:
             field_dict["description"] = description
         if index_type is not UNSET:
             field_dict["index_type"] = index_type
+        if storage_class is not UNSET:
+            field_dict["storage_class"] = storage_class
 
         return field_dict
 
@@ -420,6 +437,15 @@ class CreateCollectionV2Request:
 
         index_type = _parse_index_type(d.pop("index_type", UNSET))
 
+        def _parse_storage_class(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        storage_class = _parse_storage_class(d.pop("storage_class", UNSET))
+
         create_collection_v2_request = cls(
             name=name,
             dimension=dimension,
@@ -435,6 +461,7 @@ class CreateCollectionV2Request:
             index_policy=index_policy,
             description=description,
             index_type=index_type,
+            storage_class=storage_class,
         )
 
         return create_collection_v2_request

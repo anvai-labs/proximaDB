@@ -757,6 +757,30 @@ message V2CollectionConfig {
   // TD-GRPCSCHEMA-2: record mode at create (REST parity; before, a gRPC-created
   // collection could never enable it).
   optional bool enable_proxima_record = 9;
+  // TD-TIER-1 SC1: desired storage class, "economy" | "balanced" (default) |
+  // "performance". Echoes the resolved policy; observed status is NOT carried
+  // here (v1 classes other than balanced are accepted-but-inactive).
+  optional string storage_class = 10;
+}
+
+// TD-TIER-1 SC1: observed storage-class status (read-side projection of the
+// desired policy; never an input). Mirrors the v1 `StorageClassStatus`.
+message V2StorageClassStatus {
+  // "active" (balanced in effect) | "not_active" (policy persisted, dependency
+  // not implemented — the collection serves balanced behavior).
+  string state = 1;
+  // Names the missing dependency when state is not_active; empty when active.
+  string reason = 2;
+  // Monotonic generation of the desired policy: 0 = never set (pre-SC1
+  // records), 1 = set at create. The class is immutable after create in v1,
+  // so generation does not advance yet.
+  uint64 policy_generation = 3;
+  // Reserved bytes under residency admission (SC3). 0 until then.
+  uint64 reserved_bytes = 4;
+  // Bytes resident in the serving cache (SC4). 0 until then.
+  uint64 resident_bytes = 5;
+  // Bytes covered by the READY coverage set (SC4). 0 until then.
+  uint64 covered_bytes = 6;
 }
 
 message V2Collection {
@@ -764,6 +788,9 @@ message V2Collection {
   V2CollectionConfig config = 2;
   int64 created_at = 3;
   int64 updated_at = 4;
+  // TD-TIER-1 SC1: observed status alongside the echoed desired class in
+  // `V2CollectionConfig.storage_class` — desired and observed are distinct.
+  optional V2StorageClassStatus storage_class_status = 5;
 }
 
 message V2GetCollectionRequest {

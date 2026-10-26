@@ -19,20 +19,10 @@ __author__ = "ProximaDB Contributors"
 # only the import timing moves to first access.
 
 # Authentication
-from .auth import (
-    AuthConfig,
-    AuthMethod,
-    AuthResult,
-    Permission,
-    ProximaDBAuth,
-)
+from .auth import AuthConfig, AuthMethod, AuthResult, Permission, ProximaDBAuth
 
 # Builders
-from .builders import (
-    CollectionBuilder,
-    InsertBuilder,
-    SearchBuilder,
-)
+from .builders import CollectionBuilder, InsertBuilder, SearchBuilder
 from .client_v1 import ProximaDBClientV1
 from .config import (
     ClientConfig,
@@ -143,11 +133,7 @@ from .models import (
 )
 
 # v2 Models - ProximaRecord and typed schema support
-from .models_v2 import (
-    ColumnDataType,
-    ColumnDefinition,
-    FilterBuilderV2,
-)
+from .models_v2 import ColumnDataType, ColumnDefinition, FilterBuilderV2
 from .models_v2 import (
     FilterOperator as FilterOperatorV2,  # Core record type; Typed values; Text storage; Text column convenience functions; Schema; Typed filters; Search
 )
@@ -530,11 +516,7 @@ except ImportError:
 _streaming_available = False
 
 try:
-    from .cache import (
-        CacheMetrics,
-        CacheStrategy,
-        SmartCache,
-    )
+    from .cache import CacheMetrics, CacheStrategy, SmartCache
 
     _cache_available = True
 except ImportError:
@@ -825,9 +807,7 @@ except ImportError:
 
 # Time-Series Operations API (Metrics and monitoring)
 try:
-    from .timeseries import (
-        AggregatedMetric,
-    )
+    from .timeseries import AggregatedMetric
     from .timeseries import AggregationType as TSAggregationType
     from .timeseries import CompressionCodec as TSCompressionCodec
     from .timeseries import (

@@ -397,6 +397,7 @@ mod tests {
         });
 
         let collection = Arc::new(crate::proto::proximadb_v1::Collection {
+            storage_class_status: None,
             id: "test_collection".to_string(),
             config: Some(crate::proto::proximadb_v1::CollectionConfig {
                 name: "test_collection".to_string(),

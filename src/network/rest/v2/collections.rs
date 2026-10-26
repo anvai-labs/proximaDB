@@ -273,6 +273,15 @@ pub struct CreateCollectionV2Request {
     /// `index_configs` or force a route with `index_policy.mode` instead.
     #[schema(deprecated)]
     pub index_type: Option<String>,
+    /// Desired storage class (TD-TIER-1 SC1).
+    ///
+    /// Options: "balanced" (default) | "economy" | "performance". Omitted ⇒
+    /// balanced (pre-SC1 collections are unchanged). "performance" is admitted
+    /// only for an object-store-backed SST/PAX placement and reports
+    /// `not_active` until its residency dependency ships; economy likewise
+    /// persists intent only. Read `storage_class_status` on the GET response
+    /// for the observed truth — the class is never a claim.
+    pub storage_class: Option<String>,
 }
 
 /// REST input for the per-collection index routing policy (mirrors proto
@@ -896,6 +905,17 @@ async fn create_collection_v2_checked(
         }
     };
 
+    // TD-TIER-1 SC1: parse + validate the desired storage class (fail-closed
+    // on unknown strings — the TD-RESTGET-1 failure mode is a silent default).
+    let storage_class = match request.storage_class.take() {
+        None => None,
+        Some(raw) => {
+            let class = crate::services::collection::storage_class::parse_storage_class(&raw)
+                .map_err(|e| ApiError::InvalidArgument(e.to_string()))?;
+            (class != crate::proto::proximadb_v1::StorageClass::Unspecified).then(|| class as i32)
+        }
+    };
+
     // ADR-028: validate + map the optional index routing policy. Fail-closed on
     // nonsensical combinations (the mode×rehydrate/nprobe validity matrix) so a
     // bad policy is rejected at create rather than silently ignored at query time.
@@ -916,6 +936,7 @@ async fn create_collection_v2_checked(
         tags: request.tags.take().unwrap_or_default(),
         enable_proxima_record: Some(proxima_record_enabled),
         description: request.description.take(),
+        storage_class,
         ..Default::default()
     };
 
@@ -1012,6 +1033,13 @@ pub struct CollectionV2Response {
     /// (e.g. "EMBEDDING_PRECISION_FP16"). `None` when the collection didn't
     /// set a non-default (Unspecified/Fp32) precision.
     pub canonical_embedding_precision: Option<String>,
+    /// Resolved desired storage class (TD-TIER-1 SC1):
+    /// "economy" | "balanced" (default) | "performance".
+    pub storage_class: String,
+    /// Observed storage-class status — the truth about what SC1 delivers.
+    /// "balanced" ⇒ active; economy/performance persist intent and report
+    /// `not_active` with a reason naming the missing dependency (SC3/SC4).
+    pub storage_class_status: StorageClassStatusOutput,
     /// Schema definition (if defined)
     pub schema: Option<SchemaDefinition>,
     /// Collection statistics
@@ -1029,6 +1057,47 @@ pub struct CollectionV2Response {
     pub created_at: String,
     /// Last update timestamp
     pub updated_at: Option<String>,
+}
+
+/// REST output for the observed storage-class status (TD-TIER-1 SC1; mirrors
+/// proto `StorageClassStatus` — a read-side projection, never an input).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StorageClassStatusOutput {
+    /// "active" | "not_active" ("unspecified" never leaves the server).
+    pub state: String,
+    /// Human-readable reason when `state` is not active (names the missing
+    /// dependency); empty when active.
+    pub reason: String,
+    /// Monotonic generation of the desired policy: 0 = never set (pre-SC1
+    /// records), 1 = set at create; a policy-change surface will bump it.
+    pub policy_generation: u64,
+    /// Reserved bytes under the collection's residency admission (SC3). 0 until then.
+    pub reserved_bytes: u64,
+    /// Bytes resident in the serving cache (SC4). 0 until then.
+    pub resident_bytes: u64,
+    /// Bytes covered by the READY coverage set (SC4). 0 until then.
+    pub covered_bytes: u64,
+}
+
+impl StorageClassStatusOutput {
+    fn from_proto(status: crate::proto::proximadb_v1::StorageClassStatus) -> Self {
+        use crate::proto::proximadb_v1::storage_class_status::State;
+        let state = State::try_from(status.state)
+            .map(|s| match s {
+                State::Active => "active",
+                State::NotActive => "not_active",
+                State::Unspecified => "unspecified",
+            })
+            .unwrap_or("unspecified");
+        Self {
+            state: state.to_string(),
+            reason: status.reason,
+            policy_generation: status.policy_generation,
+            reserved_bytes: status.reserved_bytes,
+            resident_bytes: status.resident_bytes,
+            covered_bytes: status.covered_bytes,
+        }
+    }
 }
 
 /// REST output for a single index config (mirrors gRPC `V2IndexSpec`).
@@ -1271,6 +1340,25 @@ pub async fn get_collection_v2(
                 canonical_embedding_precision: collection_embedding_precision_label(
                     config.canonical_embedding_precision,
                 ),
+                // TD-TIER-1 SC1: echo the resolved desired class and the
+                // observed status (the handler's projection is authoritative;
+                // fall back to computing it from the config for callers whose
+                // Collection predates the field).
+                storage_class: crate::services::collection::storage_class::storage_class_label(
+                    crate::services::collection::storage_class::storage_class_or_balanced(&config),
+                )
+                .to_string(),
+                storage_class_status: collection
+                    .storage_class_status
+                    .clone()
+                    .map(StorageClassStatusOutput::from_proto)
+                    .unwrap_or_else(|| {
+                        StorageClassStatusOutput::from_proto(
+                            crate::services::collection::storage_class::storage_class_status(
+                                &config,
+                            ),
+                        )
+                    }),
                 schema,
                 stats: CollectionStatsV2 {
                     record_count,
@@ -3643,6 +3731,37 @@ mod tests {
         assert_eq!(schema.enforcement, Some("hybrid".to_string()));
     }
 
+    /// TD-TIER-1 SC1: `storage_class` round-trips through the strict request
+    /// DTO; an absent field stays `None` (⇒ balanced, never a silent default
+    /// string); the value is gated by `parse_storage_class` at the handler
+    /// (unknown strings are a 400 naming the valid labels); and a completely
+    /// unknown field still trips `deny_unknown_fields` (TD-RESTGET-1).
+    #[test]
+    fn test_create_request_storage_class_deserialization() {
+        let with_class = r#"{
+            "name": "tickets",
+            "dimension": 128,
+            "storage_class": "performance"
+        }"#;
+        let request: CreateCollectionV2Request = serde_json::from_str(with_class).unwrap();
+        assert_eq!(request.storage_class, Some("performance".to_string()));
+
+        let without_class = r#"{ "name": "tickets", "dimension": 128 }"#;
+        let request: CreateCollectionV2Request = serde_json::from_str(without_class).unwrap();
+        assert_eq!(request.storage_class, None);
+
+        // The gate itself: unknown label rejected naming the vocabulary.
+        let error = crate::services::collection::storage_class::parse_storage_class("balenced")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("balenced"), "{error}");
+        assert!(error.contains("balanced"), "{error}");
+
+        // Unknown top-level fields remain a deserialization failure.
+        let unknown_field = r#"{ "name": "t", "dimension": 8, "storage_classz": "x" }"#;
+        assert!(serde_json::from_str::<CreateCollectionV2Request>(unknown_field).is_err());
+    }
+
     #[test]
     fn test_schema_definition_serialization() {
         let schema = SchemaDefinition {
@@ -5105,6 +5224,10 @@ mod tests {
     #[test]
     fn get_response_serializes_index_specs_and_quantization() {
         let resp = CollectionV2Response {
+            storage_class: "balanced".into(),
+            storage_class_status: StorageClassStatusOutput::from_proto(
+                crate::proto::proximadb_v1::StorageClassStatus::default(),
+            ),
             collection_id: "c".into(),
             name: "c".into(),
             dimension: 128,

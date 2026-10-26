@@ -304,6 +304,7 @@ from .shortest_path_request import ShortestPathRequest
 from .sql_request import SqlRequest
 from .sql_response import SqlResponse
 from .sql_response_rows_item import SqlResponseRowsItem
+from .storage_class_status_output import StorageClassStatusOutput
 from .table_write_candidate_explanation import TableWriteCandidateExplanation
 from .table_write_cost_explanation import TableWriteCostExplanation
 from .table_write_data_movement_explanation import TableWriteDataMovementExplanation
@@ -635,6 +636,7 @@ __all__ = (
     "SqlRequest",
     "SqlResponse",
     "SqlResponseRowsItem",
+    "StorageClassStatusOutput",
     "TableWriteCandidateExplanation",
     "TableWriteCostExplanation",
     "TableWriteDataMovementExplanation",

@@ -7,6 +7,7 @@ pub mod manager;
 pub mod owner_backfill;
 pub mod recall_target;
 pub mod security;
+pub mod storage_class;
 
 pub use manager::{
     CollectionService as Collections, CollectionServiceBuilder as Builder,

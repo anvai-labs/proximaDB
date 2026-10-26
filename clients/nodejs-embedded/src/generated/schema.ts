@@ -2550,6 +2550,17 @@ export interface components {
              *     set a non-default (Unspecified/Fp32) precision.
              */
             canonical_embedding_precision?: string | null;
+            /**
+             * @description Resolved desired storage class (TD-TIER-1 SC1):
+             *     "economy" | "balanced" (default) | "performance".
+             */
+            storage_class: string;
+            /**
+             * @description Observed storage-class status — the truth about what SC1 delivers.
+             *     "balanced" ⇒ active; economy/performance persist intent and report
+             *     `not_active` with a reason naming the missing dependency (SC3/SC4).
+             */
+            storage_class_status: components["schemas"]["StorageClassStatusOutput"];
             schema?: null | components["schemas"]["SchemaDefinition"];
             /** @description Collection statistics */
             stats: components["schemas"]["CollectionStatsV2"];
@@ -2695,6 +2706,17 @@ export interface components {
              *     `index_configs` or force a route with `index_policy.mode` instead.
              */
             index_type?: string | null;
+            /**
+             * @description Desired storage class (TD-TIER-1 SC1).
+             *
+             *     Options: "balanced" (default) | "economy" | "performance". Omitted ⇒
+             *     balanced (pre-SC1 collections are unchanged). "performance" is admitted
+             *     only for an object-store-backed SST/PAX placement and reports
+             *     `not_active` until its residency dependency ships; economy likewise
+             *     persists intent only. Read `storage_class_status` on the GET response
+             *     for the observed truth — the class is never a claim.
+             */
+            storage_class?: string | null;
         };
         /** @description Response for collection creation */
         CreateCollectionV2Response: {
@@ -3461,6 +3483,40 @@ export interface components {
             /** Format: int64 */
             execution_time_ms: number;
             request_id: string;
+        };
+        /**
+         * @description REST output for the observed storage-class status (TD-TIER-1 SC1; mirrors
+         *     proto `StorageClassStatus` — a read-side projection, never an input).
+         */
+        StorageClassStatusOutput: {
+            /** @description "active" | "not_active" ("unspecified" never leaves the server). */
+            state: string;
+            /**
+             * @description Human-readable reason when `state` is not active (names the missing
+             *     dependency); empty when active.
+             */
+            reason: string;
+            /**
+             * Format: int64
+             * @description Monotonic generation of the desired policy: 0 = never set (pre-SC1
+             *     records), 1 = set at create; a policy-change surface will bump it.
+             */
+            policy_generation: number;
+            /**
+             * Format: int64
+             * @description Reserved bytes under the collection's residency admission (SC3). 0 until then.
+             */
+            reserved_bytes: number;
+            /**
+             * Format: int64
+             * @description Bytes resident in the serving cache (SC4). 0 until then.
+             */
+            resident_bytes: number;
+            /**
+             * Format: int64
+             * @description Bytes covered by the READY coverage set (SC4). 0 until then.
+             */
+            covered_bytes: number;
         };
         /**
          * @description Input format for TEXT fields

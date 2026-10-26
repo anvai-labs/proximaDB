@@ -21,6 +21,7 @@ impl MockCollectionService {
         collections.insert(
             "products".to_string(),
             crate::proto::proximadb_v1::Collection {
+                storage_class_status: None,
                 id: "uuid-products".to_string(),
                 config: Some(crate::proto::proximadb_v1::CollectionConfig {
                     name: "products".to_string(),

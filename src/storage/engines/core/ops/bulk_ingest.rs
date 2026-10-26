@@ -32,6 +32,7 @@ pub fn build_bulk_flush_parameters(
     engine_label: &str,
 ) -> anyhow::Result<FlushParameters> {
     let collection_config = Some(Collection {
+        storage_class_status: None,
         id: collection_id.to_string(),
         config: None,
         stats: None,

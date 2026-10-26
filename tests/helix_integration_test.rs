@@ -155,6 +155,7 @@ mod helix_integration_tests {
         });
 
         let collection = Arc::new(Collection {
+            storage_class_status: None,
             id: "test_collection".to_string(),
             config: Some(proximadb::proto::proximadb_v1::CollectionConfig {
                 name: "test_collection".to_string(),
@@ -273,6 +274,7 @@ mod helix_integration_tests {
         });
 
         let collection = Arc::new(Collection {
+            storage_class_status: None,
             id: "test_collection".to_string(),
             config: Some(proximadb::proto::proximadb_v1::CollectionConfig {
                 name: "test_collection".to_string(),
@@ -411,6 +413,7 @@ mod helix_integration_tests {
         });
 
         let collection = Arc::new(Collection {
+            storage_class_status: None,
             id: "test_collection".to_string(),
             config: Some(proximadb::proto::proximadb_v1::CollectionConfig {
                 name: "test_collection".to_string(),
@@ -602,6 +605,7 @@ mod helix_integration_tests {
         });
 
         let collection = Arc::new(Collection {
+            storage_class_status: None,
             id: "test_collection".to_string(),
             config: Some(proximadb::proto::proximadb_v1::CollectionConfig {
                 name: "test_collection".to_string(),

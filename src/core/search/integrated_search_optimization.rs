@@ -373,6 +373,7 @@ impl AdvancedSearchOptimizer {
     ) -> Result<Vec<OptimizedSearchRecord>> {
         // Create a StorageQueryContext from the parameters
         let collection = Arc::new(crate::proto::proximadb_v1::Collection {
+            storage_class_status: None,
             id: collection_id.to_string(),
             config: None,
             stats: None,

@@ -44,10 +44,7 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import (
-    Any,
-    Protocol,
-)
+from typing import Any, Protocol
 
 from .document_processor import (
     DocumentProcessor,

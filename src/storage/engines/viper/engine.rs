@@ -3088,8 +3088,10 @@ mod minimal_compaction_tests {
 
         // Create collection config with dimension and storage assignment for flush
         let collection_config = Some(crate::proto::proximadb_v1::Collection {
+            storage_class_status: None,
             id: collection_id.to_string(),
             config: Some(crate::proto::proximadb_v1::CollectionConfig {
+                storage_class: None,
                 name: collection_id.to_string(),
                 embedding_config: None,
                 dimension: 128,
