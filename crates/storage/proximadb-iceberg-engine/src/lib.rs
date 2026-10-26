@@ -465,6 +465,18 @@ impl IcebergObjectStoreBridge {
         let parent_location = parent.map(|v| self.object_uri(&committer.metadata_location(v)));
         let lineage =
             iceberg::Lineage::from_parent(parent_json.as_deref(), parent_location.as_deref())?;
+        // ADR-097 D3 format policy: a table's format version never goes down. The
+        // caller's `format_version` is a floor for a new table; once a snapshot
+        // commits v3, every successor commits v3 even when the requested schema
+        // would pick v2 — a republication must not implicitly downgrade an
+        // upgraded table. (Upgrades stay caller-driven: a v2 parent with a v3
+        // request publishes v3.)
+        let format_version = match lineage.parent_format_version {
+            Some(parent_v) if parent_v > format_version.as_i32() => {
+                iceberg::FormatVersion::from_i32(parent_v).unwrap_or(format_version)
+            }
+            _ => format_version,
+        };
 
         // 3. The Avro manifest + manifest list, named by the metadata version they are
         //    committed under, so two generations (or two publishers racing for one slot)
@@ -1270,6 +1282,54 @@ mod tests {
         assert_eq!(
             b.read_iceberg_snapshot("t/metadata", 1).await.unwrap(),
             vec![winner]
+        );
+    }
+
+    /// ADR-097 D3 format policy: the requested version is a floor — a v2 request
+    /// onto a v3 table commits v3, so a republication never downgrades an upgrade.
+    #[tokio::test]
+    async fn publish_iceberg_files_never_downgrades_a_v3_table() {
+        let b = bridge();
+        let first = write_age_part(&b, "t/data/a.parquet", &[1]).await;
+        b.publish_iceberg_files(
+            std::slice::from_ref(&first),
+            None,
+            "t/metadata",
+            "uuid-fmt",
+            "memory:///t",
+            &age_field(),
+            1,
+            1,
+            iceberg::FormatVersion::V3,
+        )
+        .await
+        .unwrap();
+
+        let second = write_age_part(&b, "t/data/b.parquet", &[2]).await;
+        let v1 = b
+            .publish_iceberg_files(
+                std::slice::from_ref(&second),
+                Some(0),
+                "t/metadata",
+                "uuid-fmt",
+                "memory:///t",
+                &age_field(),
+                2,
+                2,
+                iceberg::FormatVersion::V2,
+            )
+            .await
+            .unwrap();
+        let meta = b.read_table_metadata("t/metadata", v1).await.unwrap();
+        let mj: serde_json::Value = serde_json::from_slice(&meta).unwrap();
+        assert_eq!(
+            mj["format-version"], 3,
+            "a v2 request onto a v3 table commits v3"
+        );
+        // The upgrade direction stays caller-driven: v2 parent + v3 request ⇒ v3.
+        assert_eq!(
+            b.read_table_metadata("t/metadata", 0).await.unwrap(),
+            b.read_table_metadata("t/metadata", 0).await.unwrap()
         );
     }
 

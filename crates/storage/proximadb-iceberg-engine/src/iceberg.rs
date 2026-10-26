@@ -654,6 +654,16 @@ impl FormatVersion {
             FormatVersion::V3 => 3,
         }
     }
+
+    /// Parse a metadata document's `format-version` (2 or 3); anything else is
+    /// not a version this writer knows, so callers keep their requested one.
+    pub fn from_i32(v: i32) -> Option<Self> {
+        match v {
+            2 => Some(FormatVersion::V2),
+            3 => Some(FormatVersion::V3),
+            _ => None,
+        }
+    }
 }
 
 /// Iceberg schema JSON (`schema-id` 0) for `fields`. Shared by the table metadata
@@ -697,6 +707,9 @@ pub struct Lineage {
     pub parent_snapshot_id: Option<i64>,
     /// v3 row lineage: first row id for the new snapshot's added rows.
     pub first_row_id: i64,
+    /// The parent document's `format-version` (2 or 3), when there is a parent.
+    /// Drives the never-downgrade floor in `commit_iceberg_snapshot`.
+    pub parent_format_version: Option<i32>,
     /// The previous metadata log, extended with the previous metadata file.
     metadata_log: Vec<serde_json::Value>,
 }
@@ -721,6 +734,11 @@ impl Lineage {
             .get("last-sequence-number")
             .and_then(|x| x.as_i64())
             .unwrap_or(0);
+        let parent_format_version = v
+            .get("format-version")
+            .and_then(|x| x.as_i64())
+            .and_then(|x| i32::try_from(x).ok())
+            .filter(|x| FormatVersion::from_i32(*x).is_some());
         let parent_snapshot_id = v
             .get("current-snapshot-id")
             .and_then(|x| x.as_i64())
@@ -741,6 +759,7 @@ impl Lineage {
             sequence_number: last_seq + 1,
             parent_snapshot_id,
             first_row_id,
+            parent_format_version,
             metadata_log,
         })
     }

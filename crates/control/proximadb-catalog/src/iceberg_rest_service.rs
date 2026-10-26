@@ -868,6 +868,13 @@ impl IcebergRestService {
         if let Some(published) = engine_published_metadata(schema).await {
             return Ok(published);
         }
+        // The DataFusion bulk-append executor commits to the same engine metadata
+        // log without a ProjectionPublication layout stamp; discover it from the
+        // table's base path before considering the legacy `_manifests` tree
+        // (which receives no new commits since TD-SEAM-1 slice 2).
+        if let Some(published) = engine_metadata_at_table_base(schema).await {
+            return Ok(published);
+        }
         let mut md = self.catalog_schema_to_iceberg_metadata(identifier, schema);
         let ns = identifier.namespace.join("\x1f");
         let default_location = format!(
@@ -1492,7 +1499,6 @@ fn uuid_from_name(name: &str) -> String {
 async fn engine_published_metadata(
     schema: &CatalogTableSchema,
 ) -> Option<(IcebergTableMetadata, String)> {
-    const METADATA_DIR: &str = "metadata";
     let location = schema.storage_layouts.iter().rev().find_map(|l| {
         (l.authority == crate::CatalogAuthorityMode::ProjectionPublication
             && l.physical_format == crate::CatalogPhysicalFormat::Parquet)
@@ -1503,6 +1509,47 @@ async fn engine_published_metadata(
         return None;
     }
     let table_root = location.trim_end_matches('/').strip_suffix("/data")?;
+    engine_metadata_at_root(table_root).await
+}
+
+/// Engine-written Iceberg metadata for a table without a ProjectionPublication
+/// layout stamp (the bulk-append executor's fallback prefixes): the table base
+/// path is the data directory or the table root, and the engine log sits at its
+/// sibling `metadata/`. Same verbatim serving as [`engine_published_metadata`].
+///
+/// The selection mirrors [`table_base_path`] but keeps the RAW location: that
+/// helper normalizes the scheme away, and the probe needs a URL to open. A
+/// scheme-less local path has no engine log to probe.
+async fn engine_metadata_at_table_base(
+    schema: &CatalogTableSchema,
+) -> Option<(IcebergTableMetadata, String)> {
+    let primary = schema
+        .storage_layouts
+        .iter()
+        .rev()
+        .find(|l| l.name == "primary")
+        .or_else(|| schema.storage_layouts.first());
+    let base = primary
+        .and_then(|l| match l.physical_format {
+            crate::CatalogPhysicalFormat::Iceberg | crate::CatalogPhysicalFormat::Parquet => {
+                l.location.as_deref()
+            }
+            _ => None,
+        })
+        .or(schema.location.as_deref())?;
+    if !base.contains("://") {
+        return None;
+    }
+    let table_root = base
+        .trim_end_matches('/')
+        .strip_suffix("/data")
+        .unwrap_or(base);
+    engine_metadata_at_root(table_root).await
+}
+
+/// Read the latest engine-committed `v*.metadata.json` under `{table_root}/metadata`.
+async fn engine_metadata_at_root(table_root: &str) -> Option<(IcebergTableMetadata, String)> {
+    const METADATA_DIR: &str = "metadata";
     let bridge = proximadb_iceberg_engine::IcebergObjectStoreBridge::from_url(table_root).ok()?;
     let version = bridge.latest_metadata_version(METADATA_DIR).await.ok()??;
     let bytes = bridge
@@ -1668,6 +1715,69 @@ mod tests {
         let json = serde_json::to_string(&err).unwrap();
         assert!(json.contains("NoSuchTableException"));
         assert!(json.contains("404"));
+    }
+
+    /// TD-SEAM-1 slice 2: a table without a ProjectionPublication layout (the
+    /// bulk-append executor's fallback prefixes) still serves its engine-written
+    /// metadata verbatim, discovered from the table base path's sibling
+    /// `metadata/` log — before the retired `_manifests` synthesis is consulted.
+    #[tokio::test]
+    async fn engine_metadata_is_discovered_from_the_table_base_path() {
+        use proximadb_iceberg_engine::IcebergObjectStoreBridge;
+        use proximadb_iceberg_engine::iceberg::{FormatVersion, IcebergField};
+        use proximadb_records::{ProximaRecord, ProximaValue};
+        use proximadb_storage_common::object_store_bridge::ObjectStoreBridge;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let table_root = tmp.path().join("facts");
+        let root_url = format!("file://{}", table_root.display());
+
+        // Publish one real snapshot through the engine writer at {root}/metadata.
+        let bridge = IcebergObjectStoreBridge::from_url(&root_url).unwrap();
+        let mut record = ProximaRecord::default();
+        record.oid = "r1".to_string();
+        record.props.insert(
+            "age".to_string(),
+            proximadb_records::ProximaTreeNode::Value(ProximaValue::Int64(41)),
+        );
+        let part = object_store::path::Path::from("data/p-0.parquet");
+        bridge
+            .write_records_to_parquet(&part, std::slice::from_ref(&record), None)
+            .await
+            .unwrap();
+        bridge
+            .publish_iceberg_files(
+                std::slice::from_ref(&part),
+                None,
+                "metadata",
+                "uuid-discover",
+                &root_url,
+                &[IcebergField {
+                    id: 1,
+                    name: "oid".to_string(),
+                    type_name: "string".to_string(),
+                    required: true,
+                }],
+                1,
+                1,
+                FormatVersion::V2,
+            )
+            .await
+            .unwrap();
+
+        // A schema whose only path is the data directory (no layout stamp): the
+        // probe derives the table root by stripping the trailing `/data`.
+        let mut schema = CatalogTableSchema::new("facts");
+        schema.location = Some(format!("file://{}/facts/data", tmp.path().display()));
+        let (md, location) = engine_metadata_at_table_base(&schema)
+            .await
+            .expect("the engine metadata log is discovered from the base path");
+        assert_eq!(md.format_version, 2);
+        assert!(
+            location.ends_with("facts/metadata/v00000000000000000000.metadata.json"),
+            "served verbatim from the engine's file: {location}"
+        );
+        assert!(md.current_snapshot_id.is_some(), "one committed snapshot");
     }
 
     #[test]

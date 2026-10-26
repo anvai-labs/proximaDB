@@ -405,63 +405,6 @@ impl RelationalPredicateTree {
 
 /// Map an Arrow column type (the materialized Parquet's physical type) to the Iceberg
 /// primitive type name for the published `TableMetadata` schema. Kept in lock-step with
-/// the Parquet physical types so an external Iceberg reader's schema matches the file.
-/// Timestamps map to the v3 nanosecond types (ProximaDB is nanosecond-native).
-fn iceberg_type_for(arrow: &arrow_schema::DataType) -> String {
-    use arrow_schema::{DataType as D, TimeUnit};
-    match arrow {
-        D::Boolean => "boolean".into(),
-        D::Int8 | D::Int16 | D::Int32 => "int".into(),
-        D::Int64 | D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64 => "long".into(),
-        D::Float16 | D::Float32 => "float".into(),
-        D::Float64 => "double".into(),
-        D::Date32 | D::Date64 => "date".into(),
-        D::Decimal128(p, s) | D::Decimal256(p, s) => format!("decimal({p},{s})"),
-        // Iceberg's v2 `timestamp` is microseconds; nanoseconds need v3's `_ns` types
-        // (see `iceberg_format_version_for`).
-        D::Timestamp(TimeUnit::Nanosecond, Some(_)) => "timestamptz_ns".into(),
-        D::Timestamp(TimeUnit::Nanosecond, None) => "timestamp_ns".into(),
-        D::Timestamp(_, Some(_)) => "timestamptz".into(),
-        D::Timestamp(_, None) => "timestamp".into(),
-        D::Utf8 | D::LargeUtf8 => "string".into(),
-        D::FixedSizeBinary(n) => format!("fixed[{n}]"),
-        D::Binary | D::LargeBinary => "binary".into(),
-        // JSON columns materialize as Utf8 today; v3 `variant` is a follow-up.
-        _ => "string".into(),
-    }
-}
-
-/// ADR-097 D3: publish Iceberg **v2** — the version external readers (PyIceberg,
-/// DuckDB, Trino) verifiably read — unless a column needs a v3-only type
-/// (nanosecond timestamps). v3 deletion vectors / row lineage / `variant` follow
-/// once an external v3 reader is in the read-back gate.
-fn iceberg_needs_v3(
-    fields: &[proximadb_storage_common::object_store_bridge::IcebergSnapshotField],
-) -> bool {
-    fields.iter().any(|f| f.type_name.ends_with("_ns"))
-}
-
-/// A stable, well-formed UUID string derived deterministically from the table's object
-/// prefix, so an Iceberg table keeps the same `table-uuid` across re-materializations
-/// (no `uuid` v5 dependency; two seeded hashes fill the 16 bytes).
-fn deterministic_table_uuid(prefix: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h1 = std::collections::hash_map::DefaultHasher::new();
-    prefix.hash(&mut h1);
-    let a = h1.finish();
-    let mut h2 = std::collections::hash_map::DefaultHasher::new();
-    (prefix, 0x50524f58_4944425fu64).hash(&mut h2); // "PROX_IDB_" salt
-    let b = h2.finish();
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        (a >> 32) as u32,
-        (a >> 16) as u16,
-        a as u16,
-        (b >> 48) as u16,
-        b & 0x0000_ffff_ffff_ffff
-    )
-}
-
 /// Parse a SQL literal into a JSON value for the pushdown filter: integers and
 /// floats become JSON numbers (so i64/f64 zone-map pruning fires); everything
 /// else stays a string (string-equality hash pruning).
@@ -3108,23 +3051,11 @@ impl DmlService {
         //    manifest (they no longer list `data/`), and so do external Iceberg
         //    engines, so a failure here fails the MATERIALIZE: the parts are
         //    removed and the previous publication stays current.
-        let iceberg_fields: Vec<
-            proximadb_storage_common::object_store_bridge::IcebergSnapshotField,
-        > = schema
-            .to_arrow_schema()
-            .fields()
-            .iter()
-            .enumerate()
-            .map(
-                |(i, f)| proximadb_storage_common::object_store_bridge::IcebergSnapshotField {
-                    id: (i + 1) as i32,
-                    name: f.name().clone(),
-                    type_name: iceberg_type_for(f.data_type()),
-                    required: !f.is_nullable(),
-                },
-            )
-            .collect();
-        let table_uuid = deterministic_table_uuid(&prefix);
+        let iceberg_fields = proximadb_storage_common::object_store_bridge::iceberg_snapshot_fields(
+            &schema.to_arrow_schema(),
+        );
+        let table_uuid =
+            proximadb_storage_common::object_store_bridge::deterministic_table_uuid(&prefix);
         // The Iceberg table `location` is the table ROOT (`data/` and `metadata/` are
         // its children), unlike the catalog layout location below, which is the
         // directory of the data files.
@@ -3147,7 +3078,7 @@ impl DmlService {
                 &iceberg_fields,
                 now_ms, // snapshot id (unique per materialize)
                 now_ms, // timestamp ms
-                iceberg_needs_v3(&iceberg_fields),
+                proximadb_storage_common::object_store_bridge::iceberg_needs_v3(&iceberg_fields),
             )
             .await;
         let version = match committed {
