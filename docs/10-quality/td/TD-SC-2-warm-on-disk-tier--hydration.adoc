@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open, not started** (filed 2026-10-26 from ADR-035 citations; ADR-035 is Proposed — the design and its reconciliation live there, and this lane is gated on its acceptance).
+| Status | **In progress — partial implementation.** WarmDiskStore exists and is optionally composed below the hot cache; tenant/durable-version and rollout acceptance remains.
 | Priority | TBD when picked up
 | Component | (see scope)
 | Relates to | ADR-035 D2, ADR-084
@@ -14,3 +14,12 @@
 == Scope
 
 On-disk warm cache for the per-tenant system catalog, inserted between the hot cache and object storage by composition. Code comments already cite this id.
+
+== Implementation evidence and remaining gate (2026-10-26)
+
+`WarmDiskStore` is implemented in `crates/control/proximadb-catalog/src/syscat_warm.rs`.
+`CollectionService::with_catalog_manager` inserts it when a builder directory or
+`PROXIMADB_SYSCAT_WARM_DIR` is configured. Tests cover warm integration/hydration. This is
+not proof of the complete per-tenant or multi-pod contract: verify durable version identity,
+restart invalidation and tenant isolation before broad rollout. Coordinate TD-SC-5 instead
+of treating process-local corpus stamps as a shared durable authority.

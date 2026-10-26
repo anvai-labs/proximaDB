@@ -53,3 +53,30 @@ strict-link validation remain enabled; no baseline inflation or weakened check i
 
 Merge/CI state is determined by GitHub, not this historical record. The consolidation is
 complete only when #2250 merges; current implementation work remains with its owning lanes.
+
+== Resumed-session audit (later on 2026-10-26)
+
+This appendix preserves the later observation; earlier entries above remain point-in-time facts.
+#2250 merged the current/history consolidation. #2252 (5f1274b51) and #2254 (f62cf6522) merged
+the native-engine literature/source review and per-engine strength/crossover test contracts,
+after green CI and clean adversarial review. These are completed design investigations;
+NE implementation and comparative benchmarks remain planned in the current lakehouse plan.
+
+#2253 merged concurrently during the later audit at 23:34:08 UTC as 17a6f1e28. It filed missing
+TD references and corrected citation/comment drift. A subsequent status review found existing
+hot/warm cache and provisioning implementations mislabeled not started. The central follow-up
+corrects those three TDs to partial implementation and preserves their actual remaining gates;
+it does not declare full per-tenant/signup correctness or restart the lanes from zero.
+
+PR #2255 at f27a21548 received a blocked adversarial verdict: result/optimum claims, CLI
+forwarding, telemetry failure handling and evidence placement require owner corrections.
+Detailed actionable work stays in the current tracker, not a second historical queue.
+
+The original P2 source remains 51cefaaf2 with the same two dirty changes incorporated into the
+Codex reader continuation (#2256). Its incremental Git bundle was verified against prerequisite
+d929d7993; dirty-patch SHA-256 is
+`194ce951df770038620632be28cb30ed5893b5a4fc3b7367f63a2a33fb47fa5e`.
+Archive: `/tmp/proximadb-p24-complete/archive-glm-source/`. The only ignored source-worktree
+content at audit was `target/`; no source worktree was removed before merge. Other active GLM
+worktrees were read only. User direction now assigns implementation/refinement to resumed GLM
+sessions and central guidance/review/merge coordination to Codex.

@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open, not started** (filed 2026-10-26 from ADR-035 citations; ADR-035 is Proposed — the design and its reconciliation live there, and this lane is gated on its acceptance).
+| Status | **In progress — partial implementation.** HotSysCatCache exists and is wired; per-tenant rollout/coherence acceptance remains. ADR-035 is still Proposed; that does not make existing code unimplemented.
 | Priority | TBD when picked up
 | Component | (see scope)
 | Relates to | ADR-035 D2
@@ -14,3 +14,12 @@
 == Scope
 
 Per-tenant system-catalog read accelerator (hot tier). Code comments already cite this id.
+
+== Implementation evidence and remaining gate (2026-10-26)
+
+`HotSysCatCache` is implemented in `crates/control/proximadb-catalog/src/syscat_cache.rs`.
+`CollectionService::with_catalog_manager` constructs it in `src/services/collection/manager.rs`;
+read use is gated to single-tenant/name-key cases. Existing tests cover cache integration.
+Before claiming the full ADR-035 per-tenant contract, verify tenant-key isolation/admission,
+version invalidation and multi-pod coherence with TD-SC-5. Reuse this implementation; do not
+start a second hot cache merely because this TD was newly filed.

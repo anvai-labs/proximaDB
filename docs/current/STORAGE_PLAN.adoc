@@ -263,7 +263,8 @@ E0 at each new run: inventory available source/binary, dataset, hardware, active
 reference, cache paths and real read call sites. Record hashes and commit; never log secrets.
 Use task-owned data/config/prefixes/ports. No modification of another session's benchmark bed.
 
-E1 remaining gate (#2249 is only a geometry-confounded pilot): fixed-object query cap sweep on local S3-compatible MinIO plus owned Toxiproxy latency
+E1 remaining gate (#2249 is only a geometry-confounded pilot; #2255 is under correction,
+not an accepted optimum/default result — see tracker review blockers): fixed-object query cap sweep on local S3-compatible MinIO plus owned Toxiproxy latency
 profile; ds3 is an alternative only after its endpoint/access is known. Baseline 4 MiB, then
 16/40; refine 8/32/64 when informative. First restart with L2 absent, then L2 warm with new
 queries and result-cache bypass. Keep actual server path, not an adapter-only microbenchmark.
