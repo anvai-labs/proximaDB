@@ -9,7 +9,7 @@
 [cols="1,3"]
 |===
 | Purpose | The resumable status of record for executing link:LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] (the plan: Parts A–D, phases P0–P6) under link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097]. Any engineer or agent session picks up from here **and nothing else**: what is merged, what is in flight, what is next, and how the work is done.
-| Updated | 2026-10-25, against `develop` @ `56bd798b1` (#2231, #2234, #2238, #2240 merged; #2241 open). Reconciliation pass: the previous update predated twelve merges and over-claimed P1/P5a while under-claiming P2.4/P3/P5b.
+| Updated | 2026-10-25, against `develop` @ `56bd798b1` (#2231, #2234, #2238, #2240, #2241 merged). Reconciliation pass: the previous update predated twelve merges and over-claimed P1/P5a while under-claiming P2.4/P3/P5b.
 | Rule | Update this file in the same PR that lands, opens or re-plans a slice. A slice is **done** only when merged to `develop` with its gate green. Detail lives in the TD files; this file holds status, links and order.
 |===
 
@@ -75,9 +75,9 @@
      P2.4 streaming MATERIALIZE (SF1, no OOM)    [##########..] ~90%  slices 1–6 Done, SF1 gate PASSED 2026-10-24; incremental append #2222 #2234; DV infra #2238; delete readers/writer remain
  P3  S5/S6/S9 format-independent SQL, ANN op     [###.........] ~29%  P3.1 ~95%; P3.2a Done #2229 (ungoverned only); P3.2b declined for now; P3.3–P3.5 open
  P4  Modalities onto the seams                   [............]   0%
- P5  Vector tier economics                       [#######.....] ~60%
+ P5  Vector tier economics                       [#######.....] ~62%
      P5a defaults                                [#########...] ~80%  #2078; L2-cache default open (TD-SEAM-11)
-     P5b centroid directory + cluster compaction [##########..] ~85%  D1–D3 #2127 #2148 #2152 #2183, D5 #2196, D6 #2232, D7 #2240 (gate PASS); D4 deferred; D8 open PR #2241
+     P5b centroid directory + cluster compaction [##########..] ~90%  D1–D3 #2127 #2148 #2152 #2183, D5 #2196, D6 #2232, D7 #2240 (gate PASS); D4 deferred; D8 merged #2241 (defaults ON)
      P5c HNSW as persisted PAX projection        [##..........]  15%  design #2088
  P6  Proof (TPC-DS SF1/10, multimodal bench)     [###.........] ~25%  SF1 load+publication gate green (via P2.4); query correctness, SF10, multimodal bench open
  OVERALL                                         [######......]  ~57%  (unweighted mean of P0–P6)
@@ -143,7 +143,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | P3.4 SBBF probe for join runtime filters; P3.5 facade passes `vector_ops`/`graph_ops` | Open | — |
 | P4 observability / graph / documents / TE-4 delete onto the seams | Open | — | Gates in the plan §6 P4.
 | P5a SST default for unspecified vector collections; PAX exact-gate footer facts | Done (2 of 3) | #2078 | TD-ENGSEL-1, TD-PAXMETA-1. L2-cache default-on when a scratch volume is configured remains open (TD-SEAM-11).
-| P5b collection-global centroid directory + cluster-contiguous compaction | **Track D**; D1–D3, D5–D7 Done; D4 deferred (owner decision); D8 open PR #2241 (CI green — branch evidence) | #2120 #2127 #2148 #2152 #2183 #2196 #2232 #2240 | Cold gate PASSED at #2240 HEAD (SIFT1M, MinIO + 50 ms RTT): recall@10 0.9818, 3 waves, 18.82 req/q, p50 224 ms. **Narrowed:** warm measured 2 waves, so the warm gate was restated to ≤ 1 wave beyond discovery (TD-PAXDIR-2); evidence is 128-d, concurrency-1 — BIGANN 10M, filtered, fragmented-segment, 768-d and concurrent-ingest gates remain. Review findings on #2127 (merged unaddressed) were taken up in #2148 (not re-reviewed by the lead): (1) `retain_into_builder` inherits `dim = 0` from a directory that covered nothing, after which every trained segment is rejected — coverage silently off for good; inherit `dim` only from a base with a model. (2) `rank_cells` sorts with `total_cmp` and nothing rejects non-finite model/centroid values — a negative NaN sorts first and can evict the true nearest cells from nprobe; reject non-finite values at parse/build. (3) `parse` ignores the flags/reserved bytes and the format drops the design's `metric` byte — reject unknown flags; restore `metric` so D2 can check the score suits the collection.
+| P5b collection-global centroid directory + cluster-contiguous compaction | **Track D**; D1–D3, D5–D8 Done; D4 deferred (owner decision) | #2120 #2127 #2148 #2152 #2183 #2196 #2232 #2240 #2241 | D8 merged #2241: defaults ON as kill-switches, k_G cell sizing, AXIS IVF disk placeholder deleted; measured 0.9822 recall, 3 waves, 19.55 req/q, 107 ms p50 @ ~11.4 ms RTT (kill-switch off: 8 waves, 20.62 req/q). Remaining: TD-PAXDIR-2 warm LIST removal, BIGANN 10M / filtered / fragmented / 768-d gates.83 #2196 #2232 #2240 | Cold gate PASSED at #2240 HEAD (SIFT1M, MinIO + 50 ms RTT): recall@10 0.9818, 3 waves, 18.82 req/q, p50 224 ms. **Narrowed:** warm measured 2 waves, so the warm gate was restated to ≤ 1 wave beyond discovery (TD-PAXDIR-2); evidence is 128-d, concurrency-1 — BIGANN 10M, filtered, fragmented-segment, 768-d and concurrent-ingest gates remain. Review findings on #2127 (merged unaddressed) were taken up in #2148 (not re-reviewed by the lead): (1) `retain_into_builder` inherits `dim = 0` from a directory that covered nothing, after which every trained segment is rejected — coverage silently off for good; inherit `dim` only from a base with a model. (2) `rank_cells` sorts with `total_cmp` and nothing rejects non-finite model/centroid values — a negative NaN sorts first and can evict the true nearest cells from nprobe; reject non-finite values at parse/build. (3) `parse` ignores the flags/reserved bytes and the format drops the design's `metric` byte — reject unknown flags; restore `metric` so D2 can check the score suits the collection.
 | P5c HNSW (AXIS) as a persisted, stamped, rebuildable projection of PAX | Design done | #2088 | TD-SEAM-13. Prerequisite: TD-PAXPREC-1 (fp16 exact tier).
 | P6 TPC-DS SF1/SF10 cross-engine; multimodal benchmark (TE-1/TE-3/TE-6) | Open (SF1 load+publication leg green via P2.4) | — | `TPCDS_RATCHET` is still 18 (`tests/tpcds_pgwire_e2e.rs`); the P2.4 SF1 run loaded 22/22 tables, so raising the ratchet is evidence-backed but unclaimed. No pricing claims before the P5b scale gates pass (cold gate passed; warm/scale open).
 |===
@@ -157,7 +157,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | `lead/default-on` | #2146 | Done.
 | `lead/next` | (lead) | Done (#2162): WAL entry format frozen.
 | `lead/frame-pin` | (lead) | Frame header pinned (`format_2_frames_still_decode_and_todays_writer_emits_the_same_header`, frozen v1 + group frames built by an independent oracle) + tracker refresh.
-| `feat/paxdir-d8-defaults-on` | #2241 | Open PR, `CI Success` green — **branch evidence until merged**: defaults-on confirmation at ~11.4 ms measured RTT (0.9822 recall, 3 waves, 19.55 req/q, 107 ms p50). Next: review, then merge.
+| `feat/paxdir-d8-defaults-on` | #2241 | **Merged** (c18bb630e): P5b defaults ON as kill-switches, k_G cell sizing, AXIS IVF disk placeholder deleted; measured 0.9822 recall, 3 waves, 19.55 req/q, 107 ms p50 @ ~11.4 ms RTT., then merge.
 | `docs/seam-status-reconcile` | (this PR) | Tracker/ledger/TD reconciliation to `develop` `56bd798b1` (M1 rebase); files TD-SEAM-14/15. |
 |===
 
@@ -174,7 +174,7 @@ tracks report through a "Tracker update" paragraph in each PR body.
 | A | Durable branch merge-base, §5.2 (6 commits) | Done: #2124 #2125 #2144 #2161 #2166 (slices 5–6)
 | B | P2.4 streaming MATERIALIZE, §5.3 PRs 1–7 incl. the SF1 no-OOM gate | #2126 #2149 #2150 #2151 #2155 #2156 #2160 #2222 #2234 #2238 merged; SF1 gate passed 2026-10-24; remaining: delete-aware readers → external delete read-back → delete writer
 | C | P3.1 LayerATableProvider, §5.4 PRs 0 and 2–5 | PRs 0–7b and 9 merged (#2128 #2133 #2136 #2153 #2158 #2159 #2167 #2185 #2199 #2211 #2217) + P3.2a (#2229); next: row-count stats, mixed tables (PR 8), soak, default-ON flip (PR 10)
-| D | P5b PAX centroid directory + cluster-contiguous compaction: design, then 2 slices | Design #2120 (TD-PAXDIR-1); D1 #2127 #2148, D2 #2152, D3 #2183, D5 #2196, D6 #2232, D7 #2240 merged — cold gate PASS; D8 open as #2241; TD-PAXDIR-2 filed (warm LIST removal)
+| D | P5b PAX centroid directory + cluster-contiguous compaction: design, then 2 slices | Design #2120 (TD-PAXDIR-1); D1 #2127 #2148, D2 #2152, D3 #2183, D5 #2196, D6 #2232, D7 #2240 merged — cold gate PASS; D8 merged #2241 (defaults ON) #2241; TD-PAXDIR-2 filed (warm LIST removal)
 |===
 
 == 5. Next-work queue (in order)
@@ -206,7 +206,7 @@ Slices in order (one PR each; detail in the TD rows):
 . **P4 vertical: observability** through every seam (WAL → time-partitioned Layer A → publish
   → `ObsTimeTable` → retention), including the query read-token/snapshot semantics — the gate
   is a join that stays correct while publication and compaction race it (TD-SEAM-7).
-. **Vector rollout alongside** — merge D8 (#2241), TD-PAXDIR-2 warm segment-set cache, then
+. **Vector rollout alongside** — D8 merged (#2241); next: TD-PAXDIR-2 warm segment-set cache, then
   the scale/filter gates (BIGANN 10M, filtered, fragmented, 768-d, concurrent ingest);
   persisted HNSW stays behind TD-PAXPREC-1; pricing claims stay deferred.
 
