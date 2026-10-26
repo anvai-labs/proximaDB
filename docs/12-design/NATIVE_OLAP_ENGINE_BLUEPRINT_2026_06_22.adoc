@@ -4,6 +4,15 @@
 :toc: macro
 :icons: font
 
+[NOTE]
+====
+Historical analysis. ADR-054 subsequently reopened evidence-gated native physical operators;
+ADR-097 retains DataFusion as the logical IR with native adapters. Earlier ADR-052 retirement
+language below describes its historical decision, not the current prohibition. Current native
+investment and proposed admission experiments are in
+link:../current/LAKEHOUSE_PLAN.adoc#native-execution-research[the consolidated lakehouse plan].
+====
+
 Blueprint for ProximaDB's **native, Rust-built columnar OLAP engine** whose natural scan
 input is the **PAX column-stripe format** (not Parquet). It is the bridge document
 referenced by ADR-027 (PAX as the single internal format) and is consistent with the
