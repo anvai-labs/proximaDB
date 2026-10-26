@@ -865,7 +865,9 @@ struct ManifestSelection {
 /// readers that consume URIs (the DuckDB view applies the positions in SQL).
 #[derive(Debug)]
 pub struct ManifestReadSource {
+    /// Absolute URIs of the data files in the selected snapshot.
     pub uris: Vec<String>,
+    /// Absolute data-file URI and deleted physical positions for that file.
     pub deletions: Vec<(String, Vec<u64>)>,
 }
 
@@ -970,25 +972,37 @@ impl ObjectStoreParquetTable {
     pub async fn manifest_selected_snapshot(
         location: &str,
     ) -> DFResult<Option<ManifestReadSource>> {
-        Ok(Self::manifest_selected_files(location)
-            .await?
-            .map(|selected| ManifestReadSource {
-                uris: selected
-                    .paths
-                    .iter()
-                    .map(|p| selected.bridge.object_uri(p.as_ref()))
-                    .collect(),
-                deletions: selected
-                    .deletions
-                    .iter()
-                    .map(|(full, deletes)| {
+        let Some(selected) = Self::manifest_selected_files(location).await? else {
+            return Ok(None);
+        };
+        // Bound expansion before allocating row IDs for DuckDB's SQL predicate.
+        let total: u64 = selected.deletions.values().map(|d| d.cardinality()).sum();
+        if total > 1_000_000 {
+            return Err(df_err(
+                "DuckDB snapshot",
+                "deleted position count exceeds SQL predicate cap (1000000)",
+            ));
+        }
+        Ok(Some(ManifestReadSource {
+            uris: selected
+                .paths
+                .iter()
+                .map(|p| selected.bridge.object_uri(p.as_ref()))
+                .collect(),
+            deletions: selected
+                .paths
+                .iter()
+                .filter_map(|relative| {
+                    let full = selected.bridge.full_object_path(relative);
+                    selected.deletions.get(full.as_ref()).map(|deletes| {
                         (
-                            selected.bridge.object_uri(full.as_str()),
+                            selected.bridge.object_uri(relative.as_ref()),
                             deletes.positions(),
                         )
                     })
-                    .collect(),
-            }))
+                })
+                .collect(),
+        }))
     }
 
     async fn open_bridge_base(location: &str) -> DFResult<Self> {
@@ -1102,6 +1116,13 @@ impl ObjectStoreParquetTable {
             let builder = ParquetRecordBatchStreamBuilder::new(reader)
                 .await
                 .map_err(|e| df_err(&format!("parquet metadata {path}"), e))?;
+            if let Some(deleted) = deletions.get(path.as_ref()) {
+                let rows = u64::try_from(builder.metadata().file_metadata().num_rows())
+                    .map_err(|e| df_err("negative parquet row count", e))?;
+                if deleted.count_range(0, rows) != deleted.cardinality() {
+                    return Err(df_err("open deletion vector", "position outside data file"));
+                }
+            }
             let file_schema = builder.schema().clone();
             if schema.is_none() {
                 schema = Some(Self::normalize_schema_for_planning(file_schema));
@@ -1196,6 +1217,11 @@ impl ObjectStoreParquetTable {
         })
     }
 
+    /// Whether this pinned snapshot requires physical row-position deletes.
+    pub fn has_deletion_vectors(&self) -> bool {
+        !self.deletions.is_empty()
+    }
+
     /// TD-OLAP-4 shadow probe: the raw inputs a native
     /// [`ParquetScanOperator`](crate::query::execution::native_parquet_scan::ParquetScanOperator)
     /// needs to read the SAME external parquet this DataFusion table reads — the
@@ -1204,9 +1230,14 @@ impl ObjectStoreParquetTable {
     /// does not yet do row-group zone-map pruning, so a native sample built from
     /// this is an upper bound on selective-filter queries (documented caveat for
     /// the engine-dimension trace).
+    /// Returns `None` when file-only native scans cannot preserve visibility.
+    /// The native footer/count shortcut and scanner do not yet apply DVs.
     pub fn native_scan_inputs(
         &self,
-    ) -> (Arc<dyn ObjectStore>, Vec<(Path, Option<u64>)>, SchemaRef) {
+    ) -> Option<(Arc<dyn ObjectStore>, Vec<(Path, Option<u64>)>, SchemaRef)> {
+        if !self.deletions.is_empty() {
+            return None;
+        }
         let mut seen = std::collections::BTreeSet::new();
         let mut files: Vec<(Path, Option<u64>)> = Vec::new();
         for split in &self.splits {
@@ -1215,7 +1246,7 @@ impl ObjectStoreParquetTable {
                 files.push((Path::from(split.file_path.as_str()), size));
             }
         }
-        (self.store.clone(), files, self.schema.clone())
+        Some((self.store.clone(), files, self.schema.clone()))
     }
 
     /// Attach the registered table name (keys the ADR-037 statistics registry
@@ -1305,7 +1336,8 @@ impl ObjectStoreParquetTable {
     }
 
     /// P2.4 slice 3b: adjust footer-derived statistics for the snapshot's
-    /// deletion vectors. The footer counts EVERY physical row; the vectors hide
+    /// deletion vectors, restricted to the `surviving` splits. The footer
+    /// counts EVERY physical row; the vectors hide
     /// some of them. `COUNT(*)` elides off `num_rows` (both the provider path
     /// and the scan-exec statistics the aggregate rewrite actually reads), so
     /// it must be the post-delete count; and a deleted row may have held a
@@ -1313,18 +1345,46 @@ impl ObjectStoreParquetTable {
     /// null_count/min/max/distinct are demoted to inexact (the values remain
     /// bounds, just not guaranteed post-delete exact ones). No-op without
     /// deletions — a clean snapshot's statistics are untouched.
-    fn apply_deletion_statistics(&self, stats: &mut Statistics) {
+    /// `surviving` are the splits the statistics were computed over: the
+    /// provider passes every split, the scan path passes its predicate-PRUNED
+    /// set — subtracting a pruned file's deletions from statistics that no
+    /// longer count its rows would under-count.
+    fn apply_deletion_statistics(
+        deletions: &HashMap<String, Arc<PositionDeletes>>,
+        all_splits: &[FileSplit],
+        surviving: &[FileSplit],
+        stats: &mut Statistics,
+    ) {
         use datafusion_common::stats::Precision;
-        if self.deletions.is_empty() {
+        if deletions.is_empty() || surviving.is_empty() {
             return;
         }
-        let deleted: u64 = self.deletions.values().map(|d| d.cardinality()).sum();
+        let kept: std::collections::HashSet<&str> =
+            surviving.iter().map(|s| s.split_id.as_str()).collect();
+        // open_files emits each file's row groups in physical order. Use all
+        // groups to advance the physical offset, including predicate-pruned ones.
+        let mut offsets: HashMap<&str, u64> = HashMap::new();
+        let mut deleted = 0_u64;
+        for split in all_splits {
+            let Some(vector) = deletions.get(&split.file_path) else {
+                continue;
+            };
+            let offset = offsets.entry(split.file_path.as_str()).or_default();
+            let rows = split.statistics.row_count.unwrap_or(0);
+            if kept.contains(split.split_id.as_str()) {
+                deleted += vector.count_range(*offset, *offset + rows);
+            }
+            *offset += rows;
+        }
+        if deleted == 0 {
+            return;
+        }
         if let Precision::Exact(rows) = stats.num_rows {
             stats.num_rows = Precision::Exact(rows.saturating_sub(deleted as usize));
         }
         fn demote<T: std::fmt::Debug + Clone + Eq + PartialOrd>(p: &mut Precision<T>) {
-            if let Precision::Exact(v) = std::mem::replace(p, Precision::Absent) {
-                *p = Precision::Inexact(v);
+            if let Precision::Exact(v) = p {
+                *p = Precision::Inexact(v.clone());
             }
         }
         for cs in &mut stats.column_statistics {
@@ -1333,6 +1393,7 @@ impl ObjectStoreParquetTable {
             }
             demote(&mut cs.min_value);
             demote(&mut cs.max_value);
+            demote(&mut cs.sum_value);
             if let Precision::Exact(n) = cs.distinct_count {
                 cs.distinct_count = Precision::Inexact(n);
             }
@@ -1748,7 +1809,7 @@ impl TableProvider for ObjectStoreParquetTable {
             df_stats_value_bounds_enabled(),
             self.stats_trust,
         );
-        self.apply_deletion_statistics(&mut stats);
+        Self::apply_deletion_statistics(&self.deletions, &self.splits, &self.splits, &mut stats);
         Some(stats)
     }
 
@@ -1787,7 +1848,7 @@ impl TableProvider for ObjectStoreParquetTable {
             ),
             projection.map(|p| p.as_slice()),
         );
-        self.apply_deletion_statistics(&mut scan_stats);
+        Self::apply_deletion_statistics(&self.deletions, &self.splits, &pruned, &mut scan_stats);
         let exec = ProximaScanExec::builder()
             .schema(self.schema.clone())
             .splits(pruned)
@@ -2073,7 +2134,15 @@ pub async fn open_object_store_parquet_location(
     // Statistics are looked up under the tenant-qualified key MATERIALIZE
     // publishes them under.
     let stats_key = crate::core::statistics::table_statistics_key(tenant, name);
-    if let Some(disc) = super::table_open_cache::get(tenant, location) {
+    // A location-only key cannot pin an Iceberg snapshot: another writer can
+    // publish a DV without changing any data path or calling local invalidation.
+    // Bypass this optional cache for every potentially manifest-managed base,
+    // including one that gains its first metadata after an earlier open.
+    let cacheable = ObjectStoreParquetTable::table_base_of(location).is_none();
+    if let Some(disc) = cacheable
+        .then(|| super::table_open_cache::get(tenant, location))
+        .flatten()
+    {
         let table = Arc::new(
             ObjectStoreParquetTable::from_cached(&disc, location)?
                 .with_table_name(stats_key.clone())
@@ -2089,7 +2158,9 @@ pub async fn open_object_store_parquet_location(
             .with_table_name(stats_key)
             .with_stats_trust(stats_trust),
     );
-    super::table_open_cache::insert(tenant, location, table.discovery());
+    if cacheable {
+        super::table_open_cache::insert(tenant, location, table.discovery());
+    }
     crate::observability::io_trace::record_table_open(false);
     Ok(table)
 }
@@ -2165,8 +2236,7 @@ pub(crate) mod tests {
         assert_eq!(normalized.metadata(), &file_meta);
     }
 
-    #[tokio::test]
-    async fn opens_bridge_base_prefix_and_discovers_data_parquet() {
+    async fn open_two_row_group_table() -> (tempfile::TempDir, ObjectStoreParquetTable) {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir(&data_dir).unwrap();
@@ -2174,6 +2244,12 @@ pub(crate) mod tests {
 
         let location = format!("file://{}", tmp.path().display());
         let table = ObjectStoreParquetTable::open(&location).await.unwrap();
+        (tmp, table)
+    }
+
+    #[tokio::test]
+    async fn opens_bridge_base_prefix_and_discovers_data_parquet() {
+        let (_tmp, table) = open_two_row_group_table().await;
         assert_eq!(table.split_count(), 2);
         assert_eq!(table.schema().fields().len(), 2);
     }
@@ -2259,6 +2335,10 @@ pub(crate) mod tests {
     /// (`b,101`). Returns the table's base URL. Shared by the DataFusion-leaf
     /// and DuckDB-view delete tests so both routes prove the same snapshot.
     pub(crate) async fn publish_snapshot_with_deletion_vector(root: &std::path::Path) -> String {
+        publish_snapshot_with_positions(root, &[0, 3]).await
+    }
+
+    async fn publish_snapshot_with_positions(root: &std::path::Path, positions: &[u64]) -> String {
         use proximadb_iceberg_engine::deletion_vector::PositionDeletes;
         use proximadb_iceberg_engine::iceberg;
         use proximadb_storage_common::object_store_bridge::ObjectStoreBridge;
@@ -2271,8 +2351,9 @@ pub(crate) mod tests {
         let bridge = IcebergObjectStoreBridge::from_url(&base_url).unwrap();
         let data_file = Path::from("data/part-0.parquet");
         let mut dv = PositionDeletes::new();
-        dv.insert(0);
-        dv.insert(3);
+        for &position in positions {
+            dv.insert(position);
+        }
         let metas = bridge
             .write_deletion_vectors(&Path::from("data/dv-0.puffin"), &[(data_file.clone(), &dv)])
             .await
@@ -2306,6 +2387,39 @@ pub(crate) mod tests {
             .await
             .expect("publish snapshot with deletes");
         base_url
+    }
+
+    #[test]
+    fn deletion_statistics_subtract_only_surviving_row_groups() {
+        use datafusion_common::stats::Precision;
+        let all = vec![
+            FileSplit::new_row_group("a.parquet".into(), 0, 0, 100, 5),
+            FileSplit::new_row_group("a.parquet".into(), 1, 100, 100, 5),
+            FileSplit::new_row_group("b.parquet".into(), 0, 0, 100, 5),
+        ];
+        let mut a = PositionDeletes::new();
+        for pos in [0, 1, 6] {
+            a.insert(pos);
+        }
+        let mut b = PositionDeletes::new();
+        b.insert(0);
+        let deletions = HashMap::from([
+            ("a.parquet".into(), Arc::new(a)),
+            ("b.parquet".into(), Arc::new(b)),
+        ]);
+        for (surviving, physical, expected) in [
+            (all.as_slice(), 15, 11),
+            (&all[1..2], 5, 4),
+            (&all[2..], 5, 4),
+            (&all[0..0], 0, 0),
+        ] {
+            let mut stats = Statistics::new_unknown(&Schema::empty());
+            stats.num_rows = Precision::Exact(physical);
+            ObjectStoreParquetTable::apply_deletion_statistics(
+                &deletions, &all, surviving, &mut stats,
+            );
+            assert_eq!(stats.num_rows, Precision::Exact(expected));
+        }
     }
 
     /// P2.4 slice 3b: the snapshot's deletion vectors are applied on the
@@ -2402,6 +2516,10 @@ pub(crate) mod tests {
         let table = ObjectStoreParquetTable::open(&format!("{base_url}/data"))
             .await
             .unwrap();
+        assert!(
+            table.native_scan_inputs().is_none(),
+            "native file-only scan must decline a DV snapshot"
+        );
         let stats = datafusion::catalog::TableProvider::statistics(&table)
             .expect("footer-backed statistics");
         use datafusion_common::stats::Precision;
@@ -2410,6 +2528,73 @@ pub(crate) mod tests {
             stats.column_statistics[0].null_count,
             Precision::Inexact(0),
             "exact null_count demoted under deletions"
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_vector_positions_must_belong_to_the_data_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = publish_snapshot_with_positions(tmp.path(), &[4]).await;
+        let error = ObjectStoreParquetTable::open(&format!("{base}/data"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("position outside data file"));
+    }
+
+    #[tokio::test]
+    async fn deletion_vectors_preserve_counts_for_empty_projections_and_all_deleted_files() {
+        for (positions, expected) in [(vec![0, 3], 2), (vec![0, 1, 2, 3], 0)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = publish_snapshot_with_positions(tmp.path(), &positions).await;
+            let table = ObjectStoreParquetTable::open(&format!("{base}/data"))
+                .await
+                .unwrap();
+            let reader = table.reader(
+                &[],
+                SpecPruneConfig {
+                    page_prune: true,
+                    bloom_read: true,
+                },
+            );
+            let mut rows = 0;
+            for split in &table.splits {
+                let mut batches = reader.read_split(split, Some(&[]), 1).await.unwrap();
+                while let Some(batch) = batches.next().await {
+                    let batch = batch.unwrap();
+                    assert_eq!(batch.num_columns(), 0);
+                    rows += batch.num_rows();
+                }
+            }
+            assert_eq!(rows, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_tables_ignore_a_stale_path_only_cache_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = publish_snapshot_with_deletion_vector(tmp.path()).await;
+        let location = format!("{base}/data");
+        let table = ObjectStoreParquetTable::open(&location).await.unwrap();
+        let mut stale = table.discovery();
+        stale.deletions.clear();
+        // With PROXIMADB_OLAP_TABLE_CACHE=1 this simulates a pre-DV cached open.
+        super::super::table_open_cache::insert(None, &location, stale);
+        let reopened = open_object_store_parquet_location(
+            "t",
+            &location,
+            None,
+            proximadb_data_model::StatsTrust::Trusted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reopened.deletions.len(), 1);
+        let selected = ObjectStoreParquetTable::manifest_selected_snapshot(&location)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected.deletions[0].0, selected.uris[0],
+            "DuckDB DV URI must match the data URI"
         );
     }
 
@@ -2489,13 +2674,7 @@ pub(crate) mod tests {
     async fn aggregate_numeric_bounds_reduces_min_max_across_row_groups() {
         // Two row groups: x = [1,2] and [100,101]. Footer elision must reduce to
         // min-of-mins=1, max-of-maxes=101 across BOTH splits (not just the first).
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir(&data_dir).unwrap();
-        write_two_row_group_parquet(&data_dir.join("part-0.parquet"));
-
-        let location = format!("file://{}", tmp.path().display());
-        let table = ObjectStoreParquetTable::open(&location).await.unwrap();
+        let (_tmp, table) = open_two_row_group_table().await;
         assert_eq!(table.split_count(), 2, "two row groups");
 
         let (min, max, nulls) = table.aggregate_numeric_bounds("x").expect("numeric bounds");
@@ -2516,16 +2695,12 @@ pub(crate) mod tests {
     async fn native_scan_inputs_yields_distinct_files_with_sizes_and_schema() {
         // Two row groups live in ONE file → the native scan (whole-file) must see a
         // single distinct file, with a footer byte size and the full 2-column schema.
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir(&data_dir).unwrap();
-        write_two_row_group_parquet(&data_dir.join("part-0.parquet"));
-
-        let location = format!("file://{}", tmp.path().display());
-        let table = ObjectStoreParquetTable::open(&location).await.unwrap();
+        let (_tmp, table) = open_two_row_group_table().await;
         assert_eq!(table.split_count(), 2, "two row groups");
 
-        let (_store, files, schema) = table.native_scan_inputs();
+        let (_store, files, schema) = table
+            .native_scan_inputs()
+            .expect("delete-free native input");
         assert_eq!(
             files.len(),
             1,

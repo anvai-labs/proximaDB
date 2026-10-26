@@ -1368,15 +1368,7 @@ mod tests {
             version: u64,
         ) -> std::result::Result<IcebergSnapshotFiles, StorageError> {
             Ok(IcebergSnapshotFiles {
-                data_files: self
-                    .iceberg_commits
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|c| c.0 == metadata_prefix)
-                    .nth(version as usize)
-                    .map(|c| c.2.clone())
-                    .unwrap_or_default(),
+                data_files: self.read_iceberg_table(metadata_prefix, version).await?,
                 deletion_vectors: self
                     .snapshot_deletes
                     .lock()

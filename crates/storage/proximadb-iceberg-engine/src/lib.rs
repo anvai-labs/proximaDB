@@ -1048,7 +1048,7 @@ mod tests {
     use arrow_array::{Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field};
     use object_store::memory::InMemory;
-    use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaTreeNode, ProximaValue};
+    use proximadb_records::{EmbeddingCell, ProximaTreeNode, ProximaValue};
 
     fn bridge() -> IcebergObjectStoreBridge {
         IcebergObjectStoreBridge::new(ProximaObjectStore::new(Arc::new(InMemory::new())))

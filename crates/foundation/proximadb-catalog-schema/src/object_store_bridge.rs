@@ -384,27 +384,16 @@ pub trait ObjectStoreBridge: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     async fn publish_iceberg_files_deleting(
         &self,
-        files: &[Path],
-        deletes: &[IcebergSnapshotDeletion],
-        parent: Option<u64>,
-        metadata_prefix: &str,
-        table_uuid: &str,
-        table_location: &str,
-        fields: &[IcebergSnapshotField],
-        snapshot_id: i64,
-        timestamp_ms: i64,
+        _files: &[Path],
+        _deletes: &[IcebergSnapshotDeletion],
+        _parent: Option<u64>,
+        _metadata_prefix: &str,
+        _table_uuid: &str,
+        _table_location: &str,
+        _fields: &[IcebergSnapshotField],
+        _snapshot_id: i64,
+        _timestamp_ms: i64,
     ) -> Result<u64, StorageError> {
-        let _ = (
-            files,
-            deletes,
-            parent,
-            metadata_prefix,
-            table_uuid,
-            table_location,
-            fields,
-            snapshot_id,
-            timestamp_ms,
-        );
         Err(StorageError::Serialization(
             "publish_iceberg_files_deleting not supported".into(),
         ))

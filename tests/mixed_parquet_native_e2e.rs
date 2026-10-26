@@ -111,34 +111,24 @@ async fn a_query_mixing_parquet_and_native_tables_runs_on_datafusion() {
     assert_eq!(got, aggregate_want);
 
     // A native table over the row cap with no streaming provider (Layer A off)
-    // cannot be registered: the mixed aggregate falls back to Volcano and is
-    // still answered, never failed or truncated.
+    // cannot be registered. Switching the published input to native storage
+    // would change its visibility authority, so both shapes must refuse.
     // SAFETY: see above.
     unsafe {
         std::env::set_var("PROXIMADB_NATIVE_TABLE_LAYER_A", "0");
         std::env::set_var("PROXIMADB_NATIVE_TABLE_ROW_CAP", "2");
     }
-    let got = rows(
-        &client
-            .simple_query(aggregate)
+    for sql in [aggregate, mixed] {
+        let err = client
+            .simple_query(sql)
             .await
-            .unwrap_or_else(|e| panic!("over the row cap: {}", pg_server::db_err(&e))),
-    );
-    assert_eq!(
-        got, aggregate_want,
-        "over the row cap the mixed query is still answered, exactly"
-    );
-    // And it is Volcano that answered: the window over the same join declines
-    // there, while DataFusion would have served it.
-    let err = client
-        .simple_query(mixed)
-        .await
-        .expect_err("over the row cap: Volcano, which declines the window");
-    assert!(
-        pg_server::db_err(&err).contains("0A000"),
-        "{}",
-        pg_server::db_err(&err)
-    );
+            .expect_err("row-cap decline must not switch a published table to native storage");
+        assert!(
+            pg_server::db_err(&err).contains("cannot fall back to native storage"),
+            "{}",
+            pg_server::db_err(&err)
+        );
+    }
 
     drop(client);
     server.shutdown().await;

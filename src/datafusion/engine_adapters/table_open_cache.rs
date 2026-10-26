@@ -22,6 +22,8 @@
 //! assembles the table from the cached metadata.
 //!
 //! ## Correctness / freshness
+//! Manifest-managed `/data` bases bypass this cache until its keys include a
+//! snapshot identity; external delete publications cannot rely on local invalidation.
 //! External parquet is immutable, so a cache entry is valid until the snapshot
 //! changes. `ALTER TABLE … MATERIALIZE` republishes a table's base and MUST
 //! [`invalidate_location`] it (wired in the DDL handler). Keyed by
