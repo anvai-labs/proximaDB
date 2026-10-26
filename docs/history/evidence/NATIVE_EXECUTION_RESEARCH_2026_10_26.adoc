@@ -157,6 +157,120 @@ snapshot-bound locator translation and resource ownership; an opaque execute-que
 or an eager MemTable boundary would lose much of the benefit. Reusing Tantivy is an option to
 measure against our existing index work, not an instruction to clone Quickwit's complete service.
 
+== Follow-up: pinned source inspection (2026-10-26)
+
+A shallow, sparse checkout is useful because it exposes the cost and semantic guards behind
+an optimization. This review inspected code; it did not build or benchmark either engine.
+The snapshots are development heads, *not claims about released/default behavior*:
+
+* Quickwit `a34311570785509837a90ff384f3dfe25d39835a` (2026-10-26): search, directories,
+  indexing, storage, query and document-mapper modules. Sparse checkout about 8 MiB.
+* ClickHouse `5e648963228d84aded99a081b3f517fb8873e0f6` (2026-10-26): MergeTree,
+  processors/query-plan, interpreters, core and I/O. Sparse checkout about 81 MiB.
+
+Local inspection copies are under `/tmp/proximadb-engine-source-review/`; the immutable
+upstream links below are the durable evidence. These mechanisms are prior art. A source
+comment explaining intent is not proof that a runtime estimate or memory bound is sound.
+
+:qwsrc: https://github.com/quickwit-oss/quickwit/blob/a34311570785509837a90ff384f3dfe25d39835a/quickwit
+:chsrc: https://github.com/ClickHouse/ClickHouse/blob/5e648963228d84aded99a081b3f517fb8873e0f6/src
+
+[cols="2,4,4",options="header"]
+|===
+| Source seam | Observed mechanism | Tradeoff and ProximaDB consequence (inference)
+| {qwsrc}/quickwit-search/src/leaf.rs[Quickwit leaf warmup]
+| The synchronous Tantivy search phase follows asynchronous warmup of query/collector dependencies. Fast-field warmup reads the selected column file slices; certain operations request entire dictionaries or postings. A required term proven absent can cancel other warmup work, with a single-segment guard for split-wide absence.
+| Separating I/O from CPU helps scheduling, but broad queries can warm substantially more data than a top-k result suggests. Reuse the async/CPU separation; compare bounded demand reads with upfront warmup. Negative caches need immutable generation and predicate/analyzer identity, not a mutable collection name.
+| {qwsrc}/quickwit-search/src/search_permit_provider.rs[Quickwit permits] and {qwsrc}/quickwit-search/src/cost.rs[cost estimates]
+| Admission reserves download slots and estimated memory; actual warmup memory updates the reservation. Priority and estimated query cost order work. The leaf creates an unbounded request-local byte cache and warns when warmup exceeds its initial allocation.
+| A reservation estimate is not a hard allocation ceiling. ProximaDB must acquire additional byte permits before growing buffers, with bounded batches/cancellation or an explicit decline. Query-shape constants are useful initial estimates, not portable pricing or latency coefficients.
+| {qwsrc}/quickwit-search/src/root.rs[Quickwit root], {qwsrc}/quickwit-search/src/fetch_docs.rs[fetch] and {qwsrc}/quickwit-search/src/search_job_placer.rs[placement]
+| Partial-hit search precedes document fetch. Fetch groups hits by split and orders document addresses. Placement combines split affinity and estimated load; an explicit path skips load probing to save a round trip.
+| Late hydration saves payload I/O but adds a phase and can scatter reads. Affinity can conflict with queueing. Preserve output order after physical grouping, account coordination RTTs, and compare scattered winners against a scan. Carry versioned oids alongside projection-local addresses.
+| {qwsrc}/quickwit-indexing/src/merge_policy/const_write_amplification.rs[Quickwit merge policy] and {qwsrc}/quickwit-indexing/src/actors/publisher.rs[publisher]
+| One available policy caps merge generations instead of repeatedly driving tiny tenant splits toward a uniform document target. Publication includes replacement split IDs, checkpoint delta and publish token; successful publication precedes the truncation suggestion.
+| A single large-object target can overcharge small tenants for compaction. Decide merge work using avoided future read cost versus write/CPU cost and visibility constraints. Retain ProximaDB's stricter all-consumer WAL retirement rule; a search indexer's checkpoint alone is insufficient for multimodal consumers.
+| {chsrc}/Storages/MergeTree/MergeTreeReaderTextIndex.cpp[ClickHouse text reader] and {chsrc}/Processors/QueryPlan/Optimizations/optimizeDirectReadFromTextIndex.cpp[direct-read rewrite]
+| The text path distinguishes exact replacement from hints requiring residual predicates. It can fall back to source evaluation for pattern/phrase cases when dictionary or position work is unattractive. Analyzer, materialization and query-shape checks govern eligibility.
+| Model exactness separately from cost. A cardinality estimate may choose a slower exact path, but must never justify discarding possible answers. Common phrases, absent tokens under OR, incomplete indexes and analyzer mismatches belong in the oracle suite. No universal selectivity threshold follows from this code.
+| {chsrc}/Storages/MergeTree/MergeTreeSplitPrewhereIntoReadSteps.cpp[ClickHouse PREWHERE steps] and {chsrc}/Processors/QueryPlan/Optimizations/lazyFrontier.h[lazy frontier]
+| Predicate steps group shared physical columns/index readers. The source tracks potentially throwing/expensive expressions and order. Lazy planning distinguishes values computed early, carried, deferred or recomputed, including null-padded join sides.
+| Avoid decoding the same column twice, but do not move volatile/throwing expressions or outer-join defaults across filters/limits without equivalence. Deferred payload work needs explicit lineage and semantics, not just an oid column. The source itself notes limits of its can-throw oracle; do not copy that heuristic as a proof.
+| {chsrc}/Processors/Transforms/LazyMaterializingTransform.cpp[ClickHouse lazy transform] and {chsrc}/Processors/QueryPlan/Optimizations/optimizeLazyMaterialization.cpp[eligibility]
+| This transform gathers its main branch before requesting late columns; the inspected optimizer path checks LIMIT, WITH TIES and supported source/shape constraints. Other lazy optimizer paths also exist.
+| Lazy does not mean streaming or constant memory. Bound selected references and sort/join state, and decline or spill a large survivor set. Test duplicate matches, ties, missing-side rows and no/small/large LIMIT; do not infer one path's restrictions apply to every ClickHouse implementation.
+| {chsrc}/Processors/IProcessor.h[ClickHouse processor], {chsrc}/Storages/MergeTree/MergeTreePrefetchedReadPool.cpp[prefetch pool] and {chsrc}/Interpreters/Aggregator.cpp[aggregator]
+| Processors expose readiness/backpressure and asynchronous work separately from CPU work. Prefetch refines ranges before reads and has memory controls. Aggregation includes two-level/adaptive state and external spilling paths.
+| Begin with existing async streams and DataFusion resource hooks. Add measured missing reservations and cancellation propagation; do not clone a scheduler first. Broad aggregation is an essential negative control: inverted indexes cannot remove work when most rows qualify.
+|===
+
+=== Revised tradeoff model
+
+Use two predictions, not one opaque score: critical-path latency and fully allocated cost.
+A useful first approximation is `queue + sum(dependent I/O waves) + CPU critical path`, with
+I/O/CPU overlap measured rather than charged twice. GET count determines request charges;
+sequential dependency depth determines latency. Bytes, concurrency, cache state, metadata
+requests and scattered hydration all matter. The weights in ProximaDB's current route model
+are neutral heuristic units, not dollar prices.
+
+For an optional projection over a declared planning horizon:
+
+----
+ avoided query work * expected query count
+     > build + incremental maintenance + merge + extra storage + recovery
+----
+
+Evaluate both sides at equal correctness/freshness/p99; include idle reservations and uncertainty.
+A performance-oriented tenant may accept more maintenance for lower latency. An economy tenant
+may accept more read amplification within its SLO. Keep one authority and semantic contract;
+change projection coverage, physical layout and admitted resource budget. Do not turn these
+observations into a blanket 40 MiB read cap or a mandatory copy of every field into every index.
+
+Four source-driven extensions fit existing experiments rather than creating another roadmap:
+
+. NE-7: sweep rare/common/absent tokens, phrases and broad histograms; vary selected fast-field
+  width. Compare postings, staged column scans and hybrid execution, including upfront versus
+  bounded demand I/O. Assert exact results before comparing latency.
+. NE-2/3: scattered winners, large LIMIT, duplicate/outer joins, WITH TIES and guarded invalid
+  casts. Race compaction/deletion between references and hydration. Prove equivalent output
+  and bounded memory, including cancellation while a payload fetch is pending.
+. NE-4: launch many broad warmups with underestimated memory plus small latency-sensitive
+  queries. Measure peak reserved/actual bytes and starvation; fail any unaccounted allocation
+  growth. Compare affinity-only placement with load-aware placement including probe RTTs.
+. NE-6: tiny and large tenants with different ingest/query ratios. Compare compaction policies
+  over a fixed horizon, including cache invalidation and index rebuild, and retain losing cases.
+
+The next implementation remains NE-0 instrumentation and one narrow NE-1/NE-7 adapter
+prototype. These source reads strengthen capability, resource and selection contracts; they
+do not justify replacing the logical IR or building a generic native warehouse executor.
+
+== Additional baseline-test sources (2026-10-26)
+
+The current plan now assigns strength and crossover cases to each core baseline, under the
+existing NE experiments. These are test specifications, not executed tests or new performance
+claims. In addition to the sources above:
+
+* https://www.postgresql.org/docs/current/indexes-index-only-scans.html[PostgreSQL covering scans]
+  explains heap visibility checks and visibility-map dependence; an index containing all query
+  columns does not guarantee no heap fetches under write churn.
+* https://www.postgresql.org/docs/current/transaction-iso.html[PostgreSQL isolation]
+  supplies the transaction semantics to test, including serializable abort/retry handling.
+  Matching SQL syntax or final counts does not prove matching isolation.
+* https://docs.aws.amazon.com/redshift/latest/dg/c_ato-enabling-disabling-monitoring.html[Redshift ATO]
+  describes workload-driven sort/distribution changes and their observation period. An untrained
+  AUTO table is not evidence of steady-state optimized warehouse performance.
+* https://docs.snowflake.com/en/user-guide/warehouses-multicluster[Snowflake multi-cluster]
+  addresses concurrent demand; test burst/idle behavior and disclose edition and scaling policy.
+* https://docs.snowflake.com/en/user-guide/dynamic-tables/best-practices[Snowflake dynamic-table lag]
+  distinguishes the staleness target from a guaranteed latency bound or fixed refresh schedule.
+  Compare measured freshness and maintenance cost, not configuration labels alone.
+
+For Spark use AQE/cache/layout-aware controls, for Trino dynamic filtering and separate
+interactive versus fault-tolerant task-retry arms, and for DataFusion/DuckDB use their current
+pushdown/spill implementations. Managed warehouse internals are not open-source equivalents:
+validate documented behavior, plans/profiles and actual runs rather than inventing a source
+inspection or extrapolating local performance into a managed-service result.
+
 == Research that constrains a novelty claim
 
 * https://www.microsoft.com/en-us/research/publication/vbase-unifying-online-vector-similarity-search-and-relational-queries-via-relaxed-monotonicity/[VBASE, OSDI 2023]: fixed top-k interfaces impede complex vector/relational execution; relaxed-monotonicity techniques support more compositional retrieval. Candidate continuation is prior art.
