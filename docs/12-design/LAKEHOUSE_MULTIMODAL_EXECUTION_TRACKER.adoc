@@ -9,7 +9,7 @@
 [cols="1,3"]
 |===
 | Purpose | The resumable status of record for executing link:LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] (the plan: Parts A–D, phases P0–P6) under link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097]. Any engineer or agent session picks up from here **and nothing else**: what is merged, what is in flight, what is next, and how the work is done.
-| Updated | 2026-10-26, against `develop` @ `ad6d48157` (#2243, #2244, #2245 merged). Post-merge refresh: P1 closed by #2245; SC track opened (SC0 landed #2244).
+| Updated | 2026-10-26, against fetched `origin/develop` @ `69ddbd91b` (#2249). Source, PR and local-WIP audit: link:../_internal/status/ROADMAP_WORKTREE_RECONCILIATION_2026_10_26.adoc[worktree reconciliation].
 | Rule | Update this file in the same PR that lands, opens or re-plans a slice. A slice is **done** only when merged to `develop` with its gate green. Detail lives in the TD files; this file holds status, links and order.
 |===
 
@@ -46,7 +46,7 @@
 * **TD bookkeeping.**
 ** A TD id lives either as a row in `docs/10-quality/TECHNICAL_DEBT.adoc` or as its own file under `docs/10-quality/td/`, never both. `check_td_adr_unique` fails otherwise.
 ** Every new env gate is registered in `docs/12-design/ENV_GATE_REGISTRY.adoc`.
-* **Progress reports:** an ASCII roadmap with per-phase percentages (format in §2).
+* **Progress reports:** an ASCII roadmap with merged / WIP / gated states (format in §2); effort estimates are not closure evidence.
 
 === Build and CI notes (small dev boxes)
 
@@ -66,30 +66,37 @@
 == 2. Dashboard
 
 ----
- P0  Decisions (seams doc, ADR-097, doc fixes)   [############] 100%  merged #2075
- P1  S4 Iceberg single writer + ext. read-back   [############] 100%  #2075 + #2245; the wiring-time REST-key residual stays on TD-SEAM-1
- P2  S1/S2/S3 one write path                     [############] ~97%
-     P2.1 segmented WAL + per-segment index      [############] 100%  #2079
-     P2.2 Layer A (spill) in production          [############] 100%  #2085…#2146; default ON; WAL format frozen #2162; object-store placement #2231
-     P2.3 WAL truncation                         [############] 100%  default ON #2146; merge-base 6/6 #2124 #2125 #2144 #2161 #2166
-     P2.4 streaming MATERIALIZE (SF1, no OOM)    [##########..] ~90%  slices 1–6 Done, SF1 gate PASSED 2026-10-24; incremental append #2222 #2234; DV infra #2238; delete readers/writer remain
- P3  S5/S6/S9 format-independent SQL, ANN op     [###.........] ~29%  P3.1 ~97%; P3.2a Done #2229 (ungoverned only); P3.2b declined for now; P3.3–P3.5 open
- P4  Modalities onto the seams                   [............]   0%
- P5  Vector tier economics                       [#######.....] ~62%
-     P5a defaults                                [#########...] ~80%  #2078; L2-cache default open (TD-SEAM-11)
-     P5b centroid directory + cluster compaction [##########..] ~90%  D1–D3 #2127 #2148 #2152 #2183, D5 #2196, D6 #2232, D7 #2240 (gate PASS); D4 deferred; D8 merged #2241 (defaults ON)
-     P5c HNSW as persisted PAX projection        [##..........]  15%  design #2088
- P6  Proof (TPC-DS SF1/10, multimodal bench)     [###.........] ~25%  SF1 load+publication gate green (via P2.4); query correctness, SF10, multimodal bench open
- OVERALL                                         [#######.....]  ~59%  (unweighted mean of P0–P6)
+ P0   ADR-097 direction                  LANDED; v3-first owner decision reaffirmed
+ P1   single writer / MATERIALIZE gate   LANDED #2075/#2245; production bulk route GATED
+      tenant REST-key / nested schema   OPEN; no phase-wide 100% claim
+ P2   WAL / spill / truncation          LANDED, default ON; object placement OPT-IN
+      streaming + append + SF1 memory   LANDED / MEASURED (not SF1 query parity)
+      v3 DV engine                     LANDED #2238
+      delete readers + read-back       LOCAL WIP: feat/p24-delete-readers
+      v3 activation + delete publisher OPEN; ownership/recovery TD-SEAM-14 OPEN
+ P3   Layer A / mixed / streamed merge  LANDED behind gates; default rollout OPEN
+      governed ANN + safe PAX scan      OPEN; UDTF-only is ungoverned scope
+ P4   observability / graph / erasure   OPEN; subject identity TD-SEAM-15 OPEN
+ P5   D1-D3,D5-D8 / defaults            LANDED; D4 DEFERRED
+      zero-remote warm / broad scale   OPEN; HNSW projection OPEN
+ P6   SF1 load+publish memory           PASS; SF1/SF10 queries / multimodal proof OPEN
+ SC0  design/harness + cap pilot       MERGED #2244/#2249; controlled E1 gate OPEN
+ SC1  desired policy / inactive status LOCAL WIP: feat/sc1-storage-policy
+ SC2  authorized resolved placement    PARTIAL local WIP; authorization gate OPEN
+ SC3-6 reservation / coverage / proof  OPEN
 ----
 
-Percentages are effort estimates, not test counts. A phase is the mean of its rows; OVERALL is the unweighted mean of P0–P6; bars show ⌊pct × 12 / 100⌋.
+A merged primitive is not a completed facade or release. #2245 migrated the bulk executor
+but its production wiring and tenant-scoped REST metadata key remain gated (TD-SEAM-1).
+V3-first is decided; current caller defaults are not yet changed. Cap-pilot geometry varies,
+so #2249 does not complete the fixed-object E1 experiment or justify a default flip.
+The original percentages mixed effort and gates; use the states above for pickup/closure.
 
 == 3. Slices by phase
 
 Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no PR) · **Next** · **Open**.
 
-=== P0–P1 (done)
+=== P0–P1 (writer components landed; production-route closure remains)
 
 [cols="3,1,1,3",options="header"]
 |===
@@ -105,17 +112,17 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 [cols="3,1,1,3",options="header"]
 |===
 | Slice | Status | PR | Gate / notes
-| P2.1 Segmented canonical WAL: rotation, per-segment LSN summary, range reads | Done | #2079 | `tests/canonical_wal_segments_test.rs`. Rotation is opt-in (`PROXIMADB_CANONICAL_WAL_SEGMENT_BYTES`). TD-SEAM-2.
+| P2.1 Segmented canonical WAL: rotation, per-segment LSN summary, range reads | Done | #2079 | `tests/canonical_wal_segments_test.rs`. Initially opt-in; rotation defaults ON since #2146 (`PROXIMADB_CANONICAL_WAL_SEGMENT_BYTES`). TD-SEAM-2.
 | One appender per WAL file (`open_shared`); branch merge no longer reissues sequences | Done | #2086 | `graph_branch_merge_integration_test`.
 | TD-USUB-15 generation-checked spill eviction | Done | #2081 | `record_spill` lib tests.
 | TD-USUB-20 replayed DROP purges spill objects | Done | #2082 | `record_store` lib tests.
 | Record-tier truncation floor (`min_unflushed_lsn` aggregator; non-spill stores refuse) | Done | #2083 | TD-SEAM-2.
 | PAX retirement ledger fail-closed | Done | #2084 | TD-COMPACT-13.
-| Layer A production wiring (`open_for_server`, shutdown `flush_partitions`) + DROP purge-obligation drain | Done | #2085 | Spill gate `PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT`, default OFF. TD-SEAM-3, TD-USUB-1.
+| Layer A production wiring (`open_for_server`, shutdown `flush_partitions`) + DROP purge-obligation drain | Done | #2085 | Spill gate `PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT`, initially OFF; default ON since #2146. TD-SEAM-3, TD-USUB-1.
 | Untenanted (`""`) partitions spill via `SpillRecordStorage::untenanted()` | Done | #2092 | `an_untenanted_partition_persists_its_deletes`, `an_empty_tenant_partition_spills_and_persists_deletes`.
 | P2.2a truncation primitives: durable floor marker, `truncate_below`, reader retry, in-flight reservations | Done | #2089 | `tests/wal_truncation_test.rs`. TD-SEAM-12.
 | P2.2b rank-profile and SQL-function WAL checkpoints; change feed 410 Gone; reader starvation fix | Done | #2090 | `tests/wal_system_catalog_checkpoint_test.rs`.
-| P2.2c scheduled truncator (`src/services/wal_truncator.rs`) + MATERIALIZE snapshot-LSN pin | Done | #2095 | `tests/wal_truncator_test.rs` (7). Off by default (`PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS`).
+| P2.2c scheduled truncator (`src/services/wal_truncator.rs`) + MATERIALIZE snapshot-LSN pin | Done | #2095 | `tests/wal_truncator_test.rs` (7). Initially OFF; default ON since #2146 (`PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS`).
 | Spill segments written with `ParquetWritePolicy`, oid-sorted | Done | #2097 | `segments_are_written_with_the_warehouse_layout_policy`.
 | Spill encoder uses the catalog schema; non-fitting rows held resident (no silent NULL); timestamp decode | Done | #2099 | Tests listed in the TD-SEAM-3 row. Hardened before merge: un-materializable catalog types are dropped from the encode schema (rows on them held), int→float mantissa check.
 | Seed spill schema hints at boot (before WAL replay) | Done | #2114 | `CatalogManager::table_schemas` (native + OLTP catalogs; also backs the truncator's snapshot floor); per-collection fallback, none for an ambiguous key. `boot_seeded_schemas_reach_replayed_partitions_unless_ambiguous`, `table_schemas_walks_nested_namespaces_of_selected_catalogs`.
@@ -127,7 +134,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | Durable branch merge-base | **Track A** (design §5.2); Done (6/6) | #2124 #2125 #2144 #2161 #2166 | Slice 1: per-segment branch summary, tenant-keyed truncation marks, `collections_below`, branch fence (re-checked under the append lock; refusal reported as `Refused`). Slice 2 (#2125) merged after its review blocker was fixed (images record folded forks; main-line deletes and drops fold in). Slice 3 (#2144): durable merge-base images in the canonical WAL. Until the merge-base lands: merge refuses (410) once any WAL history is truncated (correction 2026-10-21, `merge_endpoint_refuses_when_wal_history_was_truncated`).
 | Object-store placement of spill segments (`PROXIMADB_RELATIONAL_SPILL_URL`: deterministic prefix, boot-fenced by placement + owner-epoch markers, data format 3) | Done | #2231 | Closes the catalog-prefix item. Open follow-ups (runtime owner fence, rollback high-water) → TD-SEAM-14.
 | MATERIALIZE LSN capture via the per-collection high-water | Done in #2095 | #2095 | Superseded by `capture_snapshot_lsn` with a WAL pin.
-| P2.4 streaming / incremental MATERIALIZE publisher | **Track B**; slices 1–6 Done; SF1 gate **passed** (2026-10-24); incremental append landed (#2222 #2234); DV infrastructure landed (#2238) | #2126 #2149 #2150 #2151 #2155 #2156 #2160 #2222 #2234 #2238 | Slice 1: Parquet readers (DuckDB, DataFusion, native-over-Parquet) read only the snapshot manifest's files and fail closed on any manifest error (no directory listing beside a metadata log). SF1 gate: load 1,655 s, MATERIALIZE 225 s (22/22 tables), peak RSS 10,773 MiB, no OOM — evidence `docs/_internal/status/P24_SF1_GATE_EVIDENCE_2026_10_23.adoc`. **Narrowed:** proves load + publication memory, not SF1 query correctness or SF10. #2238 landed the DV v1 codec, Puffin files and DV-bearing delete manifests/snapshots, but the writer does not select them yet (published tables stay v2, `iceberg_needs_v3`) — delete-aware readers, external delete read-back and the delete writer remain, and updates still take the full-rewrite path. TD-USUB-10, TD-OLAPFMT-3.
+| P2.4 streaming / incremental MATERIALIZE publisher | **Track B**; slices 1–6 Done; SF1 gate **passed** (2026-10-24); incremental append landed (#2222 #2234); DV infrastructure landed (#2238) | #2126 #2149 #2150 #2151 #2155 #2156 #2160 #2222 #2234 #2238 | Slice 1: Parquet readers (DuckDB, DataFusion, native-over-Parquet) read only the snapshot manifest's files and fail closed on any manifest error (no directory listing beside a metadata log). SF1 gate: load 1,655 s, MATERIALIZE 225 s (22/22 tables), peak RSS 10,773 MiB, no OOM — evidence `docs/_internal/status/P24_SF1_GATE_EVIDENCE_2026_10_23.adoc`. **Narrowed:** proves load + publication memory, not SF1 query correctness or SF10. #2238 landed the DV v1 codec, Puffin files and DV-bearing delete manifests/snapshots, but the writer does not select them yet (callers request v2 unless their schema needs v3, while the engine preserves a v3 parent) — delete-aware readers and external read-back are local WIP in `feat/p24-delete-readers`; the live delete writer remains open, and updates still take the full-rewrite path. TD-USUB-10, TD-OLAPFMT-3.
 | Turn rotation, truncation and the spill on by default, with a data-format guard | Done | #2146 | Gate: the soak (#2145). Defaults: 64 MiB segments, truncator every 300 s (newest 1M entries kept), spill at 65 536 resident rows; `0`/`off` disables each (`services::storage_format::default_on_gate`). `{data_dir}/pgwire/DATA_FORMAT` records format 2 before anything is opened; a newer marker or an unreadable one refuses boot. Turning the spill off over existing spill state, or failing to open it, refuses boot instead of serving from memory. Rolling back across format 1 → 2 is unsupported (older binaries cannot read the marker). Independent review before merge: 1 blocker (truncation after an incomplete recovery) + 3 should-fixes, all fixed. Wire-format evolution rules frozen by `proximadb-storage-common/tests/wal_format_compat.rs` (golden format-2 bytes; add fields only with `serde(default)`), which replaces the planned "first `serde(default)` field" item.
 |===
 
@@ -143,30 +150,38 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | P3.4 SBBF probe for join runtime filters; P3.5 facade passes `vector_ops`/`graph_ops` | Open | — |
 | P4 observability / graph / documents / TE-4 delete onto the seams | Open | — | Gates in the plan §6 P4.
 | P5a SST default for unspecified vector collections; PAX exact-gate footer facts | Done (2 of 3) | #2078 | TD-ENGSEL-1, TD-PAXMETA-1. L2-cache default-on when a scratch volume is configured remains open (TD-SEAM-11).
-| P5b collection-global centroid directory + cluster-contiguous compaction | **Track D**; D1–D3, D5–D8 Done; D4 deferred (owner decision) | #2120 #2127 #2148 #2152 #2183 #2196 #2232 #2240 #2241 | D8 merged #2241: defaults ON as kill-switches, k_G cell sizing, AXIS IVF disk placeholder deleted; measured 0.9822 recall, 3 waves, 19.55 req/q, 107 ms p50 @ ~11.4 ms RTT (kill-switch off: 8 waves, 20.62 req/q). Remaining: TD-PAXDIR-2 warm LIST removal, BIGANN 10M / filtered / fragmented / 768-d gates.83 #2196 #2232 #2240 | Cold gate PASSED at #2240 HEAD (SIFT1M, MinIO + 50 ms RTT): recall@10 0.9818, 3 waves, 18.82 req/q, p50 224 ms. **Narrowed:** warm measured 2 waves, so the warm gate was restated to ≤ 1 wave beyond discovery (TD-PAXDIR-2); evidence is 128-d, concurrency-1 — BIGANN 10M, filtered, fragmented-segment, 768-d and concurrent-ingest gates remain. Review findings on #2127 (merged unaddressed) were taken up in #2148 (not re-reviewed by the lead): (1) `retain_into_builder` inherits `dim = 0` from a directory that covered nothing, after which every trained segment is rejected — coverage silently off for good; inherit `dim` only from a base with a model. (2) `rank_cells` sorts with `total_cmp` and nothing rejects non-finite model/centroid values — a negative NaN sorts first and can evict the true nearest cells from nprobe; reject non-finite values at parse/build. (3) `parse` ignores the flags/reserved bytes and the format drops the design's `metric` byte — reject unknown flags; restore `metric` so D2 can check the score suits the collection.
+| P5b collection-global centroid directory + cluster-contiguous compaction | **Track D**; D1–D3, D5–D8 Done; D4 deferred (owner decision) | #2120 #2127 #2148 #2152 #2183 #2196 #2232 #2240 #2241 | D8 merged #2241: defaults ON as kill-switches, k_G cell sizing, AXIS IVF disk placeholder deleted; measured 0.9822 recall, 3 waves, 19.55 req/q, 107 ms p50 @ ~11.4 ms RTT (kill-switch off: 8 waves, 20.62 req/q). Remaining: TD-PAXDIR-2 warm LIST removal, BIGANN 10M / filtered / fragmented / 768-d gates.3 #2196 #2232 #2240 | Cold gate PASSED at #2240 HEAD (SIFT1M, MinIO + 50 ms RTT): recall@10 0.9818, 3 waves, 18.82 req/q, p50 224 ms. **Narrowed:** warm measured 2 waves, so the warm gate was restated to ≤ 1 wave beyond discovery (TD-PAXDIR-2); evidence is 128-d, concurrency-1 — BIGANN 10M, filtered, fragmented-segment, 768-d and concurrent-ingest gates remain. Review findings on #2127 (merged unaddressed) were taken up in #2148 (not re-reviewed by the lead): (1) `retain_into_builder` inherits `dim = 0` from a directory that covered nothing, after which every trained segment is rejected — coverage silently off for good; inherit `dim` only from a base with a model. (2) `rank_cells` sorts with `total_cmp` and nothing rejects non-finite model/centroid values — a negative NaN sorts first and can evict the true nearest cells from nprobe; reject non-finite values at parse/build. (3) `parse` ignores the flags/reserved bytes and the format drops the design's `metric` byte — reject unknown flags; restore `metric` so D2 can check the score suits the collection.
 | P5c HNSW (AXIS) as a persisted, stamped, rebuildable projection of PAX | Design done | #2088 | TD-SEAM-13. Prerequisite: TD-PAXPREC-1 (fp16 exact tier).
 | P6 TPC-DS SF1/SF10 cross-engine; multimodal benchmark (TE-1/TE-3/TE-6) | Open (SF1 load+publication leg green via P2.4) | — | `TPCDS_RATCHET` is still 18 (`tests/tpcds_pgwire_e2e.rs`); the P2.4 SF1 run loaded 22/22 tables, so raising the ratchet is evidence-backed but unclaimed. No pricing claims before the P5b scale gates pass (cold gate passed; warm/scale open).
 |===
 
-== 4. In flight
+== 4. In flight — audited 2026-10-26
 
-[cols="2,1,3",options="header"]
+Worktree/branch names identify the owning local lane, not a claim that a process is live.
+Do not start duplicate work, rebase another session, or prune on clean status alone.
+Detailed locations, evidence and pickup nudges:
+link:../_internal/status/ROADMAP_WORKTREE_RECONCILIATION_2026_10_26.adoc[central worktree audit].
+
+[cols="2,2,3",options="header"]
 |===
-| Branch | PR | State and next action
-| `lead/wal-soak` | #2145 | Done.
-| `lead/default-on` | #2146 | Done.
-| `lead/next` | (lead) | Done (#2162): WAL entry format frozen.
-| `lead/frame-pin` | (lead) | Frame header pinned (`format_2_frames_still_decode_and_todays_writer_emits_the_same_header`, frozen v1 + group frames built by an independent oracle) + tracker refresh.
-| `feat/paxdir-d8-defaults-on` | #2241 | **Merged** (c18bb630e): P5b defaults ON as kill-switches, k_G cell sizing, AXIS IVF disk placeholder deleted; measured 0.9822 recall, 3 waves, 19.55 req/q, 107 ms p50 @ ~11.4 ms RTT.
-| `docs/seam-status-reconcile` | #2243 | **Merged** (cd685f5d8): tracker/ledger/TD reconciliation to the M1 rebase; TD-SEAM-14/15 filed.
-| `feat/p1-single-writer` | #2245 | **Merged** (ad6d48157): bulk-append onto the single Iceberg writer + never-downgrade format floor (TD-SEAM-1 slice 2); two adversarial review rounds; blocking wiring residual recorded on the TD row.
+| Branch | State / plan | Next gate
+| `feat/p24-delete-readers` | Local uncommitted WIP; Track B / P2.4 slice 3b; no PR found | Internal DV correctness, carry-through, external value read-back; v3-first activation follows, no new v2 delete path.
+| `feat/sc1-storage-policy` | Local uncommitted WIP; Track E / SC1 + partial SC2; no PR found | Correct generation on updates, actual authorized resolved placement, facade/status and generated-contract parity; NOT_ACTIVE until residency exists.
+| `fix/panic-scope-workspace` | Open #2248; CI Success failed at audit | Resolve current-head checks; separate quality lane.
+| `fix/audit-zstd-advisories` | One local commit, no PR found | Independently review proposed advisory exceptions/removal triggers; not a dependency fix.
+| `docs/release-notes-v040` | Dormant/unresolved; 11 unmerged commits, no PR found | Reconcile unique docs against #1960 and later releases before cleanup; preserve checkout.
+| `docs/roadmap-session-reconcile` | This central docs reconciliation | Doc guards, review and integration; no implementation ownership transfer.
 |===
+
+Prior lanes #2241 (D8), #2243 (M1 reconciliation), #2244 (SC0/harness), #2245
+(writer migration), #2246 (tracker), #2247 (packaging) and #2249 (cap pilot) are merged.
+Do not list them as open work. SC0's full experiment gate remains distinct from PR merge.
 
 === 4.1 Parallel tracks (since 2026-10-22)
 
 Each track is a separate cloud session that owns its milestone end to end (implement →
-build → test → PR → merge) under the conventions above. Only the lead edits this file;
-tracks report through a "Tracker update" paragraph in each PR body.
+build → test → PR → merge) under the conventions above. The reconciliation owner edits this file;
+tracks report branch/head, gate evidence, residuals and next action in each PR body.
 
 [cols="1,3,2",options="header"]
 |===
@@ -176,7 +191,7 @@ tracks report through a "Tracker update" paragraph in each PR body.
 | B | P2.4 streaming MATERIALIZE, §5.3 PRs 1–7 incl. the SF1 no-OOM gate | #2126 #2149 #2150 #2151 #2155 #2156 #2160 #2222 #2234 #2238 merged; SF1 gate passed 2026-10-24; remaining: delete-aware readers → external delete read-back → delete writer
 | C | P3.1 LayerATableProvider, §5.4 PRs 0 and 2–5 | PRs 0–9 merged (#2128 #2133 #2136 #2153 #2158 #2159 #2167 #2185 #2199 #2211 #2212 #2217) + P3.2a (#2229); next: row-count stats, soak, default-ON flip (PR 10)
 | D | P5b PAX centroid directory + cluster-contiguous compaction: design, then 2 slices | Design #2120 (TD-PAXDIR-1); D1 #2127 #2148, D2 #2152, D3 #2183, D5 #2196, D6 #2232, D7 #2240 merged — cold gate PASS; D8 merged #2241 (defaults ON); TD-PAXDIR-2 filed (warm LIST removal)
-| E | Storage classes SC0–SC6 (TD-TIER-1; design + roadmap: STORAGE_CLASS_SEAMS_REVIEW_2026_10_25) | SC0 Done #2244 (review, media evidence, harness range-cap seam with tests); SC1(+SC2) policy/status next; SC3 reservation later |
+| E | Storage classes SC0–SC6 (TD-TIER-1; design + roadmap: STORAGE_CLASS_SEAMS_REVIEW_2026_10_25) | SC0 design/harness #2244 and cap pilot #2249 merged; fixed-object E1/recording gate open. SC1 + partial SC2 local WIP `feat/sc1-storage-policy`; SC3/4 not implemented |
 |===
 
 == 5. Next-work queue (in order)
@@ -191,20 +206,20 @@ TE-3 firehose ingesting concurrently; durability + snapshot semantics written do
 
 Slices in order (one PR each; detail in the TD rows):
 
-. **P1 slice 2 — Done (#2245)**: bulk append no longer writes the `_manifests` tree (the legacy
+. **P1 writer migration — merged, production closure still gated (#2245)**: bulk append no longer writes the `_manifests` tree (the legacy
   reader stays for pre-migration trees — mixed-read-safe); the engine has a
   never-downgrade format floor (the base of the v3-first ladder). Remaining on TD-SEAM-1:
   nested/list → `string`, the e2e interop extension, and the blocking REST-key residual for
   the lane's eventual production wiring.
-. **Incremental deletion safely** — delete-aware readers → external delete read-back → delete
-  writer; TE-4 gates split four ways: current-query invisibility, historical-snapshot
+. **V3-first publication / incremental deletion** — resume `feat/p24-delete-readers`: internal
+  readers and external deleted-value read-back, then explicit v3 table-version/upgrade policy
+  and live DV writer. Keep legacy v2 reads; no new v2 delete implementation; TE-4 gates split four ways: current-query invisibility, historical-snapshot
   accessibility, snapshot expiry, physical erasure (TD-SEAM-4).
 . **P3.1 default ON** — soak, EXPLAIN/route-reason alignment, ABAC coverage for a default-on
-  world, delta-memory bounds, then the flip; attempt `TPCDS_RATCHET` 18→22 on the SF1
-  evidence (file a TD for any query that cannot hold).
-. **`FilteredAnnExec`** — first complete multimodal operator: `ExecutionPlan` node (not a
-  `PhysicalOptimizerRule` — none exist; ADR-054 v3 moved away from per-operator
-  substitution), emits canonical `oid`, ABAC before candidate selection, filter/limit/
+  world, delta-memory bounds, then the flip. Raise `TPCDS_RATCHET` only from passing query-result evidence;
+  loading/publishing 22 tables is not evidence for passing 22 query cases.
+. **`FilteredAnnExec`** — first complete multimodal operator: `ExecutionPlan` adapter under ADR-097; verify actual planner wiring instead of
+  treating either older ADR-054 prose or a proposed optimizer rule as existing code, emits canonical `oid`, ABAC before candidate selection, filter/limit/
   dynamic-filter pushdown (TD-SEAM-6).
 . **P4 vertical: observability** through every seam (WAL → time-partitioned Layer A → publish
   → `ObsTimeTable` → retention), including the query read-token/snapshot semantics — the gate
@@ -292,7 +307,7 @@ Ordered PRs:
   `memory.peak` per phase; run the SF1 gate (spill gate on) and record peak RSS.
 . Slice 2: hidden `__proxima_oid` in published files, explicit key SBBF,
   insert-only incremental append classified by manifest bounds + SBBF, full-rewrite
-  fallback. Slice 3: Iceberg v2 position deletes, writer and readers together.
+  fallback. Slice 3: superseded by the v3-first decision — DVs, readers/read-back before writer activation.
 
 Layer A segments are **not** reused as Iceberg data files in P2.4: local disk,
 overlapping versions, persisted tombstones, per-segment schemas, no field ids.
@@ -348,5 +363,6 @@ exec (retire the second MemTable); (10) default-ON flip after a soak.
 | 2026-10-20 | Spill segments use the warehouse `ParquetWritePolicy`, sorted by `__proxima_oid`. Layer A files are lakehouse files, not Arrow-default blobs.
 | 2026-10-22 | Every track PR gets an independent, diff-only adversarial review from the lead, posted as a PR comment, before merge. Merges need green CI, a clean review (or its should-fixes answered) and the owning lane's go-ahead.
 | 2026-10-22 | (Owner decision) Rotation, truncation and the spill default ON, shipped with a durable data-format marker so this and later binaries refuse a newer-format directory. The format 1 → 2 transition itself cannot be rolled back and is release-noted.
+| 2026-10-26 | Owner reaffirmed v3-first: no new v2 delete writer; legacy reads + atomic upgrade. Reconciliation records active WIP separately from merged work, P1 production blockers, and #2249 as a geometry-confounded pilot, not completed E1. |
 | 2026-10-25 | Rebase review @ `develop` `56bd798b1`: the architectural direction holds; completion claims narrowed — SF1 proves load+publication memory (not SF1 query correctness or SF10); the P5b **cold** gate passed but the warm gate was restated to ≤ 1 wave beyond discovery (TD-PAXDIR-2); #2238 landed deletion-vector *infrastructure* while published tables stay format v2 (`iceberg_needs_v3`) pending an explicit format policy. **Next milestone M1:** one governed, end-to-end multimodal query (TE-1 shape) over the new foundation. TD-SEAM-14 (object-store recovery/ownership boundary) and TD-SEAM-15 (record-vs-subject identity) filed.
 |===

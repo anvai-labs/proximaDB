@@ -96,11 +96,20 @@ metadata tree, its own identity) is a defect against this ADR.
 * `proximadb-iceberg-engine` is the single Iceberg writer. The REST catalog
   (`/iceberg/v1`, ADR-007) serves that writer's latest `metadata.json` verbatim; it does not
   synthesise schemas, partitions or manifests of its own.
-* The writer emits **format v2** until external v3 readers (pyiceberg, DuckDB, Spark/Trino) are
-  verified against our output. v3 features (deletion vectors, `variant`, row lineage) are
-  adopted per feature once read back by an external reader in CI. The one exception is a
-  table whose columns need a v3-only type (nanosecond timestamps): v2 cannot represent it, so
-  it is published as v3 (`iceberg_needs_v3` in `src/services/dml/mod.rs`).
+* **Owner decision 2026-10-25, reaffirmed 2026-10-26: v3-first.** One v3 write
+  target for new development. Existing v2 tables retain legacy reads and an explicit atomic
+  upgrade before their next v3 publication. No new v2 position-delete writer, parallel v2
+  feature implementation, or silent downgrade fallback. Reuse compatible existing files;
+  a metadata-version upgrade alone does not require a blanket data rewrite.
+* This is the target, not a claim that activation is shipped. At `69ddbd91b`, callers still
+  use `iceberg_needs_v3` in `proximadb-catalog-schema::object_store_bridge`; #2245 added
+  the engine's never-downgrade floor. Replace schema-dependent selection with persisted
+  table-version/upgrade policy. Verify row-lineage allocation, parent/sequence inheritance,
+  restart and competing commits, not just the JSON version label.
+* Internal delete-aware readers and required pinned external value read-back precede DV
+  publisher activation. Unsupported reader features fail explicitly, never silently ignore
+  deletes. Optional v3 types such as variant have their own feature tests; reader support
+  gates activation, not another cycle of v2 development.
 * CI reads published tables back with an external reader and compares values with pgwire
   (TD-SEAM-1).
 
@@ -181,7 +190,7 @@ read back by an external reader. Two writers mean two sets of snapshot ids for o
 
 == Not decided here
 
-* When to switch the Iceberg writer to format v3 (gated on external readers, per D3).
+* The exact v3 activation/upgrade rollout after D3 gates; v3-first itself is decided.
 * The exact shape of the `subject` system column and the cross-modal delete protocol
   (TD-SEAM-9).
 * Whether `MultiModelPlan` and UQL are lowered or deleted; each is decided in its P3 slice.

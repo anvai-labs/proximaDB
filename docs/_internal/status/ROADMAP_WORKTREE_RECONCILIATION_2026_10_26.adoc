@@ -1,0 +1,135 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= Roadmap and worktree reconciliation — 2026-10-26
+// status-as-of: 2026-10-26
+
+== Authority and evidence
+
+Snapshot against `origin/develop` `69ddbd91b` (#2249), after fetching remote refs.
+The shared checkout remained at `d929d7993`; it was not reset, switched or edited.
+This is a status and direction audit, not an approval of uncommitted implementations.
+Read live execution state in
+link:../../12-design/LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc[the central tracker];
+release scope remains in link:../roadmap/STRATEGIC_ROADMAP.adoc[the strategic roadmap].
+
+Evidence: commit ancestry and PR API; every registered worktree's HEAD, dirty paths and
+ignored-file inventory; selected WIP diffs; production caller checks; all three cap-sweep
+result JSONs under `/home/vsingh/bench-beds/p5b-runs/sweep-cap{4,16,40}`. Process visibility
+is namespace-limited: no visible process is NOT evidence that another session is idle.
+No active worktree, ignored build cache or unmerged branch may be removed on that basis.
+
+== Central ownership map
+
+Paths below are local checkout locations, not portable artifact dependencies. No PR is
+reported for a branch unless one was found through the repository API at this snapshot.
+
+[cols="2,2,3,3",options="header"]
+|===
+| Branch / worktree | Observed state | Plan mapping | Disposition / next action
+| `develop` at `/home/vsingh/code/proximaDB`
+| Clean; six commits behind remote at audit
+| Shared integration checkout
+| Leave alone. New work is based on the fetched remote, not this checkout's stale HEAD.
+| `feat/p24-delete-readers` at `/home/vsingh/code/proximaDB.worktrees/feat-p24-delete-readers`
+| HEAD `d929d7993`; 12 dirty files, no PR found
+| Track B, TD-SEAM-4 / TD-USUB-10 slice 3b
+| KEEP. DV-aware internal reads, carry-through and external read-back are WIP. Writer activation and v3-default policy are separate remaining gates; do not mark landed from local tests or prose.
+| `feat/sc1-storage-policy` at `/home/vsingh/code/proximaDB.worktrees/feat-sc1-storage-policy`
+| HEAD `d929d7993`; dirty proto/API/catalog/manager changes plus new `storage_class.rs`; no PR found
+| Track E, TD-TIER-1 SC1 + partial SC2
+| KEEP. Desired-policy/status scaffold is WIP; scheme/engine validation is not complete authorized placement. Preserve NOT_ACTIVE semantics; see concrete review nudges below.
+| `fix/panic-scope-workspace` at `/home/vsingh/code/proximaDB.worktrees/fix-panic-scope-workspace`
+| HEAD `1e707fb1b`, clean; open PR #2248; CI Success failed at audit
+| Quality guard / TD-PANICSCOPE-1, cross-cutting prerequisite
+| KEEP. Diagnose failing checks on the current head; do not weaken the guard or count it merged. Coordinate advisory-gate changes separately.
+| `fix/audit-zstd-advisories` at `/home/vsingh/code/proximaDB.worktrees/fix-audit-zstd-advisories`
+| HEAD `2b4a2ce9e`, clean; one unmerged commit, no PR found
+| TD-AUDITGATE-1 follow-up; security dependency lane
+| KEEP. Proposed advisory exceptions are not a completed dependency upgrade or an approved security disposition. Retain per-advisory rationale and an independently reviewed removal trigger before publication.
+| `docs/release-notes-v040` at `/home/vsingh/code/proximaDB.worktrees/docs-release-notes-v040`
+| HEAD `b448e4acc`, clean; 11 commits not ancestry/patch-equivalent to develop; generated `site/` present; no branch PR found
+| Release/docs-site backlog; overlaps older guide work merged as #1960 under a different head
+| KEEP, classify dormant/unresolved. Age and partial overlap do not prove supersession. Extract/reconcile unique release-note changes before any cleanup; do not merge its old branch wholesale.
+| `docs/storage-class-seams-review` at `/tmp/proximadb-storage-class-review/docs-storage-class-seams-review`
+| Old HEAD `c18bb630e`, dirty review documents, no implementation code
+| Prior review largely absorbed by #2243/#2244; v3 ADR amendment was not absorbed
+| ARCHIVED AND REMOVED by this reconciliation. Branch retained; all 16 modified/untracked files verified before removal. Missing v3 decision carried into the current ADR; newer merged documents were not replaced with old copies.
+| `docs/roadmap-session-reconcile` at `/tmp/proximadb-roadmap-reconcile/docs-roadmap-session-reconcile`
+| This documentation change, based on `69ddbd91b`
+| Central reconciliation and session handoff
+| Owns tracker/roadmap synchronization only. Implementation worktrees remain untouched.
+|===
+
+Open dependency PRs #2225–#2228 and #2242 have no registered local worktree in this audit.
+Track them under the dependency lane, not as M1 delivery. No unregistered directories were
+found under `/home/vsingh/code/proximaDB.worktrees` at the inventory point.
+
+== Direction corrections and session nudges
+
+These are durable pickup instructions. There is no verified live-session messaging channel
+in this environment; recording them here does not claim they were delivered to a running agent.
+
+=== Track B — keep v3-first and close the read/write contract
+
+* The observed WIP is aligned with readers-before-writer: Parquet/DataFusion and DuckDB
+  reads apply DVs, successor append carries DVs, and the new interop test publishes DVs
+  test-side. None of that is merged or a live incremental-delete publisher yet.
+* Verify file-position masks before filter/limit, offset accounting after row-group pruning,
+  hidden columns, count/statistics, cache invalidation, old snapshots and append races.
+  Keep carry-through tests: publishing inherited data files without their DVs resurrects rows.
+* ADR-097 now records the owner's v3-first direction. `iceberg_needs_v3` moved to
+  `proximadb-catalog-schema::object_store_bridge`; the never-downgrade floor landed in
+  #2245, but default v3/upgrade activation remains unimplemented. Do not add a new v2
+  delete writer; prove v3 row lineage and external update/delete read-back before activation.
+* TD-SEAM-1's tenant-scoped REST metadata-key blocker and production facade reachability
+  still gate the bulk-append lane. Engine tests do not close this caller-level gate.
+
+=== Track E — SC1 scaffold is not complete SC2 admission
+
+* The WIP's NOT_ACTIVE status for economy/performance is aligned with the roadmap.
+  Its TD text says "landed" and generated SDKs complete before a PR/merge exists;
+  change those claims to WIP and attach the actual validation evidence at publication.
+* `check_performance_admission` currently checks SST and a recognized URL scheme using
+  the request's `storage_path`. That is neither an authorization check against configured
+  operator targets nor a check of the final resolved assignment. Cover allowed configured
+  defaults, rejected arbitrary tenant prefixes, restart and immutable-placement updates.
+  Call this partial SC2 until those tests pass; don't move location authorization to SC3.
+* `storage_class_status` computes generation as 0/1 from field presence while the WIP
+  already allows policy updates. Persist and increment the generation on accepted changes,
+  or explicitly defer updates; don't expose a monotonic-generation contract with constant 1.
+* At the audit point, generated OpenAPI/SDK diffs were absent from the dirty-file list.
+  Verify each facade's desired policy AND inactive status, especially the v2 read model
+  that currently echoes only a class string. An inactive performance policy must not look active.
+* Retain one config owner and compatibility tests. SC3 quota/reservation and SC4 protected
+  coverage remain separate; schema/API churn is not permission to claim resident capacity.
+
+=== Experiment lane — keep the pilot, repair the causal claim
+
+#2249 measured 20.005 / 10.514 / 10.282 cold requests per query for caps 4/16/40 MiB.
+All recalls exceed 0.98; p50 waves are 3 and p95 waves 4. The arms used 21/25/26 cells,
+fresh beds, and one trial each. Therefore they are measurements at three configurations,
+not a fixed-object causal estimate. A percent change in rows cannot bound a nonlinear
+coalescing/request-count confound. Median latency increased 107 → 129 ms at 16 MiB;
+without repeats it is neither proven regression nor proven neutrality.
+
+Next: reuse identical objects/model/ETags and query IDs, change only cap, repeat arms and
+record missing CPU/RSS/p99/in-flight bytes/useful-vs-overread/request sizes. Preserve the
+4 MiB request-gate failure; don't round it into a pass. No default flip. TD-PAXDIR-2 remains
+an independent next lever, subject to coherent discovery rather than a TTL-only shortcut.
+
+== Closure and cleanup rules
+
+* Dirty, unpublished, open-PR and unresolved-overlap worktrees stay. A branch at develop
+  with zero unique commits can still be an active benchmark/implementation session.
+* A merged PR is evidence only for its head and contents. For squash merges, establish
+  content coverage; a similar title or old shared ancestor is insufficient.
+* Preserve ignored evidence/config separately from disposable build artifacts. Do not run
+  broad `worktree clean`, `gc --all` or cache deletion while other sessions are active.
+* Completed cleanup: the superseded review checkout's binary diff, exact 16 files and
+  HEAD/status manifest are archived at
+  `/tmp/proximadb-roadmap-reconcile/archives/storage-class-review-2026-10-26.tar.gz`.
+  SHA256: `7a6f6e8165a6db573b91cfc269426c043b4d0e8b2a83fc930422783b3dedff9c`.
+  Archive entries and unchanged live file hashes were checked before removing only that
+  checkout. The branch is retained. No other checkout qualified for safe cleanup.
+* Every implementation PR updates the central tracker with branch, head, exact gate,
+  remaining work and next owner. Pending code is never promoted to "landed" by a TD edit.

@@ -25,7 +25,9 @@ it does not change it.
 
 == 2. Where the vision is ahead of the code
 
-The survey found five gaps. Each is a premise for a phase in §6.
+The 2026-10-18 survey below is historical motivation, not current status. Consult the
+execution tracker before implementing a gap; many prerequisites have landed. The active
+publication direction is v3-first (owner reaffirmed 2026-10-26, ADR-097 D3).
 
 . **Two disjoint Iceberg metadata trees.**
 ** The REST tree has dangling manifest URLs, a synthetic schema, a `commit_table` stub, and is
@@ -92,8 +94,7 @@ Layer A for append-only modalities; retention = `RecordPartitionDrop` + snapshot
 published snapshots
 | `oid` namespaces differ per modality. MATERIALIZE sets `oid` to the row index
 (`src/services/dml/mod.rs:2317`). Iceberg has no deletes. HNSW delete is O(E).
-| **S1:** one identity scheme plus an entity/subject key system column. **S4:** position
-deletes (v2), then deletion vectors (v3).
+| **S1:** one identity scheme plus an entity/subject key system column. **S4:** v3 deletion vectors directly; legacy v2 reads and atomic upgrade only.
 
 | TE-5
 | **Cold start at 100M × 768d**
@@ -200,8 +201,7 @@ D1). Append-only collections are time-partitioned.
 schema; the `""` tenant never spills; no obligation drain
 
 | S4 Publish
-| One writer produces spec-valid Iceberg (v2 now; v3 deletion vectors / variant / row lineage
-when external readers support them). REST `load_table` returns the writer's latest
+| One writer targets spec-valid Iceberg v3 (ADR-097 D3); legacy v2 reads and explicit atomic upgrade remain. Reader correctness gates activation. REST `load_table` returns the writer's latest
 `metadata.json`. Publication is incremental and fenced.
 | `publish_iceberg_snapshot` (`crates/storage/proximadb-iceberg-engine/src/lib.rs:158`);
 `write_manifest*` / `build_table_metadata` (`crates/storage/proximadb-iceberg-engine/src/iceberg.rs:296-512`);
@@ -401,7 +401,8 @@ path
 
 == 6. Part D — Phased implementation (PR-sized slices, each with a gate)
 
-Dependencies: P1 ∥ P5a can start now. P2 → P3 → P4. P6 runs throughout.
+Historical dependency structure: P1 ∥ P5a; P2 → P3 → P4, with P6 throughout. Resume
+remaining gates from the execution tracker; do not restart landed slices.
 
 [cols="1,2,1", options="header"]
 |===
@@ -431,7 +432,7 @@ Dependencies: P1 ∥ P5a can start now. P2 → P3 → P4. P6 runs throughout.
 ** Fix spec defects in `iceberg.rs`: absolute `s3://` / `file://` URIs in `file_path`; Avro
    header metadata (`schema`, `partition-spec`, `format-version`, `content`);
    `parent-snapshot-id`; non-zero sequence numbers; operation `overwrite` vs `append`.
-** Emit **format v2** until external v3 readers are verified.
+** Target **format v3** directly; verify metadata/row lineage and external readers before activation. No new v2 delete writer or silent downgrade fallback.
 . **Point REST at the writer's metadata.**
 ** `IcebergRestService::ensure_table_metadata` resolves the table root (not `…/data`) and
    serves the latest `v{N}.metadata.json` written by the engine.
@@ -502,8 +503,8 @@ every selectivity band; the TE-1 query runs over pgwire with `EXPLAIN` showing p
 ** *Gate:* TD-XMODAL-10 pgwire reachability test.
 * **Documents:** retire `document_wal`; shredded columns + JSON residual (TD-USUB-6); ranged
   reads.
-* **TE-4 delete:** add a `subject` system column; position deletes in Iceberg v2; deletion
-  vectors on the PAX cascade.
+* **TE-4 delete:** add a `subject` system column; deletion vectors in Iceberg v3 and
+  on the PAX cascade (no new v2 delete implementation).
   *Gate:* an end-to-end test where a delete removes the subject from every modality and from
   the next published snapshot.
 
