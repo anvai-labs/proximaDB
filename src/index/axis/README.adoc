@@ -160,7 +160,6 @@ src/index/axis/
 │   ├── recovery.rs                 # Index recovery
 │   ├── format_strategy.rs          # Format selection
 │   ├── universal_index_storage.rs  # Unified storage backend
-│   └── ivf_posting_list_storage.rs # IVF-specific storage
 │
 ├── integration/                    # System Integration
 │   ├── mod.rs                      # Integration exports

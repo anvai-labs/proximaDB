@@ -1,0 +1,49 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SEAM-15: record identity vs subject identity (S1)
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-25 from the M1 rebase review (contract refinement: separate record identity from subject identity).
+| Priority | MED. Prerequisite for the TE-4 cross-modal delete gates and for cross-modal operator outputs that can name what they matched.
+| Component | `ProximaRecord` (`crates/foundation/proximadb-records`), Layer A system columns (`__proxima_*`), published Parquet/Iceberg schema, PAX segment columns; feeds TD-SEAM-9.
+| Relates to | TD-SEAM-9 (cross-modal subject delete), ADR-097 S1 (identity seam), TD-142 (cross-modal alias resolution, Partial)
+|===
+
+== Problem
+
+S1 today conflates two different keys:
+
+* **Record identity** — `ProximaRecord.oid`, one per record, but *namespaced per modality*
+  (ADR-097's own code survey), so a customer row, its document, its graph edges and its log
+  events carry oids from different spaces (and the UDTF bridges still return
+  modality-specific string ids).
+* **Subject identity** — the entity key TE-4 actually targets ("forget this user" across
+  rows, vectors, edges, documents and logs). No `subject` key exists: there is no
+  `__proxima_subject` column anywhere in the codebase.
+
+A customer, a document, an edge and a log event are *distinct records*. Collapsing them into
+one identity (or re-keying `oid` by entity) would break newest-wins merges, tombstone
+matching and per-record MVCC — the fix is a second, optional key, not a new oid scheme.
+
+== Plan
+
+. Keep `oid` exactly as it is: per-record identity, never re-keyed from the subject.
+. Add an optional `subject` (entity key) to `ProximaRecord`, surfaced as a
+  `__proxima_subject` system column in Layer A segments and published Parquet/Iceberg files
+  (and in PAX segments when set) — same carriage pattern as `__proxima_residual`.
+. Subject-driven delete = an index/lookup over `__proxima_subject` that enumerates the
+  subject's records and issues per-record deletes through each modality's normal delete path
+  (feeds TD-SEAM-9); it must not bypass record-level tombstones.
+. Cross-modal operator outputs (starting with the P3 UDTF bridges) become able to name both
+  `oid` and `subject` — the join key for TE-1-class queries and the audit key for TE-4.
+
+== Acceptance
+
+* TE-4 end-to-end with the four split gates (current-query invisibility, historical-snapshot
+  accessibility, snapshot expiry, physical erasure) driven by a subject key.
+* A query can select both `__proxima_oid` and `__proxima_subject` from a published table and
+  a Layer A segment, and the two never alias.
+* Record-level semantics are unchanged: an update/delete of one record of a subject leaves
+  the subject's other records untouched.

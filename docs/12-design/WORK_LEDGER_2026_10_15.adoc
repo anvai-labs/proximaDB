@@ -112,17 +112,17 @@ P1 and P5a can start now; P2 → P3 → P4; P6 (benchmarks) runs throughout.
 |===
 | TD | Phase | Scope | Status
 | TD-SEAM-1 | P1 | Iceberg single writer (`proximadb-iceberg-engine`) + external read-back CI gate | In Progress
-| TD-SEAM-2 | P2 | Segmented canonical WAL, per-collection index, truncation at `min_unflushed_lsn` | In Progress (P2.1 rotation + range reads landed; P2.2 truncation open)
-| TD-SEAM-3 | P2 | Layer A production wiring with `ParquetWritePolicy` + `__proxima_*` system columns | Open
-| TD-SEAM-4 | P2 | Streaming MATERIALIZE / incremental publisher (TD-OLAPFMT-3, TD-USUB-10) | Open
-| TD-SEAM-5 | P3 | Streaming `LayerATableProvider` + `PaxTableProvider` wiring | Open
+| TD-SEAM-2 | P2 | Segmented canonical WAL, per-collection index, truncation at `min_unflushed_lsn` | In Progress (P2.1 + P2.2 landed; truncation default ON #2146; merge-base 6/6; detail in the TD row)
+| TD-SEAM-3 | P2 | Layer A production wiring with `ParquetWritePolicy` + `__proxima_*` system columns | In Progress (wiring, policy, catalog schema, residual and object-store placement #2231 landed; TD-SEAM-14 follow-ups open)
+| TD-SEAM-4 | P2 | Streaming MATERIALIZE / incremental publisher (TD-OLAPFMT-3, TD-USUB-10) | In Progress (SF1 gate passed 2026-10-24; incremental append #2222 #2234; DV infra #2238; delete readers/writer remain)
+| TD-SEAM-5 | P3 | Streaming `LayerATableProvider` + `PaxTableProvider` wiring | In Progress (P3.1 PRs 0–9 landed; P3.2a #2229; P3.2b declined for now; default-ON flip open)
 | TD-SEAM-6 | P3 | `FilteredAnnExec` with filter/limit/dynamic-filter pushdown, returns `oid` | Open
 | TD-SEAM-7 | P4 | Observability onto the canonical WAL + time-partitioned Layer A | Open
 | TD-SEAM-8 | P4 | Graph `RecordUpsert` emission + edges table; ORION as a projection | Open
 | TD-SEAM-9 | P4 | Cross-modal subject delete | Open
-| TD-SEAM-10 | P5b | PAX collection-global centroid directory + cluster-contiguous compaction | Open
+| TD-SEAM-10 | P5b | PAX collection-global centroid directory + cluster-contiguous compaction | In Progress via TD-PAXDIR-1 (D1–D7 done, cold gate PASS #2240; D8 open PR #2241)
 | TD-SEAM-11 | P5a | TD-ENGSEL-1 default, `.pax` `segment_vector_count`, L2 cache default | In Progress (default + `.pax` facts landed #2078; L2 cache default open)
-| TD-SEAM-12 | P2.2 gate | Canonical-WAL truncation floor across all twelve consumers (four have no low-water mark) | Open
+| TD-SEAM-12 | P2.2 gate | Canonical-WAL truncation floor across all twelve consumers (four have no low-water mark) | In Progress (P2.2a–c + default ON #2146 landed; residual branch-merge gaps refuse 410 — see the TD file)
 | TD-SEAM-13 | P5c | HNSW on AXIS as a persisted, stamped projection of PAX; ground-up rebuild = repair; needs TD-PAXPREC-1 | Open (design decided 2026-10-19)
 |===
 
