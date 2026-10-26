@@ -73,7 +73,7 @@
      P2.2 Layer A (spill) in production          [############] 100%  #2085…#2146; default ON; WAL format frozen #2162; object-store placement #2231
      P2.3 WAL truncation                         [############] 100%  default ON #2146; merge-base 6/6 #2124 #2125 #2144 #2161 #2166
      P2.4 streaming MATERIALIZE (SF1, no OOM)    [##########..] ~90%  slices 1–6 Done, SF1 gate PASSED 2026-10-24; incremental append #2222 #2234; DV infra #2238; delete readers/writer remain
- P3  S5/S6/S9 format-independent SQL, ANN op     [###.........] ~29%  P3.1 ~95%; P3.2a Done #2229 (ungoverned only); P3.2b declined for now; P3.3–P3.5 open
+ P3  S5/S6/S9 format-independent SQL, ANN op     [###.........] ~29%  P3.1 ~97%; P3.2a Done #2229 (ungoverned only); P3.2b declined for now; P3.3–P3.5 open
  P4  Modalities onto the seams                   [............]   0%
  P5  Vector tier economics                       [#######.....] ~62%
      P5a defaults                                [#########...] ~80%  #2078; L2-cache default open (TD-SEAM-11)
@@ -136,7 +136,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 [cols="3,1,1,3",options="header"]
 |===
 | Slice | Status | PR | Gate / notes
-| P3.1 `LayerATableProvider`: streaming, pushdown, ABAC, WAL-tail union (replaces `MemTable` and the 1M-row cap) | **Track C**; §5.4 PRs 0–7b and 9 Done (streaming provider no-cap, pruning, residual-aware pruning, dynamic filters, oid-range partitions, streamed OLAP read-merge); row-count statistics, mixed Parquet + native (PR 8) and the default-ON flip (PR 10) remain | #2122 #2128 #2133 #2136 #2153 #2158 #2159 #2167 #2185 #2199 #2211 #2217 | `native_table_capability_parity_e2e`, `layer_a_spill_sql_e2e`, `pgwire_olap_delta_merge_e2e` (CI pgwire-accuracy lane).
+| P3.1 `LayerATableProvider`: streaming, pushdown, ABAC, WAL-tail union (replaces `MemTable` and the 1M-row cap) | **Track C**; §5.4 PRs 0–9 Done (streaming provider no-cap, pruning, residual-aware pruning, dynamic filters, oid-range partitions, streamed OLAP read-merge, mixed Parquet + native #2212); row-count statistics and the default-ON flip (PR 10) remain | #2122 #2128 #2133 #2136 #2153 #2158 #2159 #2167 #2185 #2199 #2211 #2212 #2217 | `native_table_capability_parity_e2e`, `layer_a_spill_sql_e2e`, `pgwire_olap_delta_merge_e2e` (CI pgwire-accuracy lane).
 | P3.2a UDTF-only queries go to DataFusion (pgwire; aggregate/window/CTE/join shapes) | Done | #2229 | `udtf_only_datafusion_e2e`. **Narrowed:** admitted only for ungoverned sessions (the UDTFs apply no relational ABAC row filter; the router guard stays fail-closed) — governed admission waits on S9 in-provider enforcement. EXPLAIN/route-reason alignment open.
 | P3.2b Register `PaxTableProvider` | Declined for now | — | Reads flushed `.pax` segments only — no WAL tail, MVCC/tombstone filtering or ABAC; waits on TD-OLAP-1 prerequisites (TD-SEAM-5 records the decision).
 | P3.3 `FilteredAnnExec` (filter/limit/dynamic-filter pushdown, emits `oid`) | Open | — | `filtered_ann_recall_bands` ≥ 0.95 in every band.
@@ -173,7 +173,7 @@ tracks report through a "Tracker update" paragraph in each PR body.
 | Lead | Coordination, this tracker, P2.2 recovery gate and default-on; independent adversarial review of every track PR (posted as a PR comment) before merge | #2119, #2122, #2129, #2132, #2145, #2146, #2162 merged
 | A | Durable branch merge-base, §5.2 (6 commits) | Done: #2124 #2125 #2144 #2161 #2166 (slices 5–6)
 | B | P2.4 streaming MATERIALIZE, §5.3 PRs 1–7 incl. the SF1 no-OOM gate | #2126 #2149 #2150 #2151 #2155 #2156 #2160 #2222 #2234 #2238 merged; SF1 gate passed 2026-10-24; remaining: delete-aware readers → external delete read-back → delete writer
-| C | P3.1 LayerATableProvider, §5.4 PRs 0 and 2–5 | PRs 0–7b and 9 merged (#2128 #2133 #2136 #2153 #2158 #2159 #2167 #2185 #2199 #2211 #2217) + P3.2a (#2229); next: row-count stats, mixed tables (PR 8), soak, default-ON flip (PR 10)
+| C | P3.1 LayerATableProvider, §5.4 PRs 0 and 2–5 | PRs 0–9 merged (#2128 #2133 #2136 #2153 #2158 #2159 #2167 #2185 #2199 #2211 #2212 #2217) + P3.2a (#2229); next: row-count stats, soak, default-ON flip (PR 10)
 | D | P5b PAX centroid directory + cluster-contiguous compaction: design, then 2 slices | Design #2120 (TD-PAXDIR-1); D1 #2127 #2148, D2 #2152, D3 #2183, D5 #2196, D6 #2232, D7 #2240 merged — cold gate PASS; D8 merged #2241 (defaults ON) #2241; TD-PAXDIR-2 filed (warm LIST removal)
 |===
 
@@ -294,7 +294,7 @@ Ordered PRs:
 Layer A segments are **not** reused as Iceberg data files in P2.4: local disk,
 overlapping versions, persisted tombstones, per-segment schemas, no field ids.
 
-=== 5.4 P3.1 `LayerATableProvider` — design 2026-10-21 (PRs 0–7b and 9 landed; PRs 8 and 10 remain)
+=== 5.4 P3.1 `LayerATableProvider` — design 2026-10-21 (PRs 0–9 landed; PR 10 remains)
 
 Today native SQL goes `try_run_select` → `route_select_inner` (`DataFusionLocal`, gate
 `PROXIMADB_NATIVE_TABLE_PROVIDER`, default OFF) → `prepare_dataframe`
