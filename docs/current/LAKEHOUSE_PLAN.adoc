@@ -350,6 +350,93 @@ LanceDB/Vespa/turbopuffer for supported retrieval subqueries. For a multi-servic
 include assembly and synchronization costs on both sides and disclose unsupported semantics.
 Vendor published numbers are context, never same-hardware experimental results.
 
+=== Baseline strength and crossover suites (all planned)
+
+Test the workloads each engine is designed to handle well, as well as the crossover where
+that feature becomes expensive. These strengths are not exclusive inventions. Case IDs below
+are parameters of NE-0..7, not another roadmap or a claim of runnable/green tests. Reuse the
+TPC/ClickBench ledger harness and add focused fixtures; do not replace their coverage ratchets.
+
+[cols="1,3,4,3",options="header"]
+|===
+| Baseline / cases | Positive control and required baseline feature | Crossover / failure experiment | Native decision / evidence
+| DataFusion DF-1/2 (NE-0/2/5)
+| Wide Parquet latest-k with dynamic TopK filters; selective dimension join with runtime filters and provider pruning. Compare direct DataFusion, current ProximaDB adapter and native region on identical files.
+| Sorted/reversed/shuffled row groups; selective/broad predicates; late-arriving runtime filters; missing stats and deletes. Separate startup/registration/planning from execution.
+| Attribute rows/pages pruned, bytes decoded and filter-arrival time. Fix provider gaps first; a native replacement needs a remaining measured ceiling. Exact results with ties/nulls and deletes.
+| DuckDB DU-1/2 (NE-2/5)
+| Embedded multiway joins, grouped aggregates, ORDER BY/windows with configured memory and temporary disk. Test both Parquet access and its native table layout as separate arms, charging native load/storage cost.
+| Data and intermediate state above RAM; skew, high-cardinality grouping, wide strings and concurrent queries. Include repeated-session and fresh-process runs.
+| Measure RSS beyond the configured buffer limit, spill bytes/time and end-to-end latency. Keep a mature relational path if native kernels lose. No claim that the memory_limit alone bounds total process RSS.
+| Spark SP-1/2 (NE-4/5)
+| Large skewed batch join/aggregate with AQE, adaptive broadcast/skew handling; compatible storage-partition join arm. Repeated transform DAG with cache enabled and its population cost counted.
+| Mismatched partition layouts, changed join keys, many small files; evict cached partitions and kill one executor during a long job. Compare task/recompute work and skewed tail latency, not just average scan speed.
+| Measure shuffle bytes, spills, task-size distribution, startup and recovery. A local ProximaDB query does not prove distributed batch parity. Exchange/recovery additions remain gated on a demonstrated distributed product need.
+| Trino TR-1/2 (NE-4/5)
+| Interactive star join on Iceberg with dynamic filters and connector pushdown; federation over frozen source versions. Verify EXPLAIN/runtime counters show the intended pushdown rather than assuming it.
+| Slow build-side filter arrival, selective-to-broad sweep, source latency/skew. Test interactive retry policy separately from task-retry/spooled-exchange mode; kill a worker in the latter.
+| Measure coordinator planning, splits avoided, remote bytes, exchange and recovered work. Snapshot consistency across independent connectors is a separate requirement; unsupported distributed snapshots are not silently treated as equivalent.
+| PostgreSQL PG-1 (NE-2/5)
+| PK lookup, small ordered range and selective secondary-index lookup, including covering-index and bitmap-scan opportunities. Maintain statistics; record visibility-map state and VACUUM work.
+| Warm/cold index and heap; payload width; sustained updates reducing index-only opportunities; scan selectivity crossover. Compare native point lookup to a correctly indexed database, not to a full table scan.
+| p99/throughput, heap fetches, buffer reads, WAL and maintenance. Require tenant isolation and identical visible versions. Decide when PK/index projection beats PAX/Parquet scan; avoid bringing broad OLAP machinery onto every point read.
+| PostgreSQL PG-2 (NE-3/4)
+| Conditional update, transfer between two accounts, unique-key conflict and concurrent reader under explicitly selected isolation/durability settings.
+| Contended hot keys; lost-update/write-skew schedules; abort/retry; crash after acknowledged commit. Preserve sum-of-balances, nonnegative balances where required, uniqueness and the declared isolation guarantees.
+| Validate operation histories and crash recovery, not only final row counts. Count successful logical transactions including retry cost. If ProximaDB lacks matching semantics, record UNSUPPORTED; faster weaker transactions are not a win or automatic scope expansion.
+| Redshift RS-1/2 (NE-5/6)
+| Star join/aggregate with suitable sort/distribution keys; AUTO/ATO as a separate trained arm with optimization actions recorded. Test selective time scans and colocated joins.
+| Hot-key skew and an alternate join key that breaks collocation; ingestion and layout adaptation during repeated queries. Separate provisioned/serverless and native/Spectrum arms where used.
+| Measure redistribution, scanned bytes, spill, queue time, maintenance and allocated cost. Wait for or report ATO convergence; compare ProximaDB secondary projections including their build/maintenance costs. No local Redshift emulator substitutes for managed measurements.
+| Snowflake SF-1/2 (NE-3/4/6)
+| Pruned scan/selective lookup with eligible search optimization; concurrent dashboard burst using appropriate warehouse/multi-cluster policy. Incremental derived-table refresh as a separately priced arm.
+| Resume/cold cache, broad joins and spill, burst/idle cycle, high update fraction and actual refresh lag. Separate result-cache hits from fresh execution; disclose edition/features and cluster min/max.
+| Measure p99/queue time, credits, idle/resume time, storage and maintenance. Multi-cluster improves concurrency, not necessarily one query. Target lag is a target, not a guaranteed freshness bound; compare observed staleness at equal requirements.
+| ClickHouse CH-1/2 (NE-2/5/7)
+| Sorted/compressed column scans, PREWHERE, lazy top-N and text-index exact reads. Include an in-order aggregate and an eligible preaggregate/projection arm with build cost.
+| Common phrases, high-cardinality aggregate, disorder/small parts, large LIMIT and sustained writes; force the sparse/dense crossover and measure compaction.
+| Use the pinned-source constraints above; compare raw-query and maintained-projection arms separately. Preserve update/delete semantics explicitly; engine/layout-specific merge behavior is not assumed equivalent to OLTP isolation.
+| Quickwit QW-1/2 (NE-4/6/7)
+| Rare term plus time/tenant restriction, latest-k document fetch and fast-field histogram with metadata-warm and cold cases separated.
+| Common/absent/phrase terms, broad/high-cardinality aggregation, wide warmup fields, tiny-tenant splits and concurrent cold queries.
+| Measure warmup versus CPU/fetch time, permit estimates versus actual bytes, split fanout and merge amplification. Match exactness/completeness; ranked top-k and approximate bucket selection cannot stand in for an exact SQL aggregate.
+|===
+
+Adjacent systems already in the research catalog receive the same discipline when they are
+part of a product claim: Photon uses SP-1/2 with acceleration and fallback operators disclosed;
+Velox uses repeated-build/cache and spill tests inside a named host engine (not a fictitious
+standalone database); StarRocks uses star joins, supported materialized-view rewrites and
+shared-data cache-loss/compaction tests. Vector baselines (LanceDB, Vespa, turbopuffer and S3
+Vectors) keep NE-1/3/6 selectivity/correlation/recall/freshness and full context-assembly cost.
+Unsupported operators require a disclosed composition or UNSUPPORTED, never an invented score.
+
+==== Fixture, oracle and run contract
+
+. Start with enumerable customers/events/typed payloads and accounts/transfer histories.
+  Hash logical input values separately from physical files. Scale dimensions independently:
+  selectivity, key skew, payload width, update rate, retained history, tenant count and concurrency.
+  Reuse immutable Parquet files for comparable scan arms; native-layout arms may optimize their
+  own storage but must report preprocessing, indexes, extra storage and ongoing maintenance.
+. Exact relational cases compare values and multiplicity, with deterministic tie breakers,
+  NULL/decimal/time-zone rules and declared floating-point tolerances. Use a simple independent
+  oracle for small fixtures and cross-engine checks at scale. Hashes/counts alone are insufficient
+  for the small oracle. Approximate retrieval has separate recall/error/completeness gates.
+. Transaction cases record invocation/response histories, committed/aborted operations and
+  retry identity. Check the requested isolation model and durability at acknowledged commit.
+  Schema-level invariant checks supplement that history; they do not prove serializability.
+. Every run records engine/build/extensions, SQL/config, physical plan and actual route,
+  dataset/query/model hashes, isolation, storage, hardware/region, cache preparation, memory,
+  concurrency/arrival process, failure schedule, maintenance and all excluded work. Distinguish
+  cold metadata, cold data, warm bytes and result-cache hits. Randomize repeated arm order.
+. Report latency distributions, completed throughput, queue time, peak RSS/reservations, CPU,
+  bytes read/decoded/spilled/shuffled, GET waves/count, maintenance, freshness and total cost.
+  Load and index build are separate phases and also enter amortized cost. Managed services
+  require real runs at recorded region/date/prices; local MinIO tests only establish mechanisms.
+. Status per case is PLANNED, RUNNABLE, PASSED, FAILED, UNSUPPORTED or BLOCKED with evidence.
+  Start local CI with small semantic/route probes (DF/DU/PG and native). Run scale, distributed
+  fault tests and managed-service cost experiments in dedicated environments, not every PR.
+  No performance promotion until a chosen case and its losing/crossover controls both run.
+
 === Small implementation sequence and stop rules
 
 . *NE-0: evidence harness and route audit.* Reuse P6 ledgers, io_trace and native execution

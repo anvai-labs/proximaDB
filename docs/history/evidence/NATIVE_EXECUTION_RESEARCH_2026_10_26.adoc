@@ -244,6 +244,33 @@ The next implementation remains NE-0 instrumentation and one narrow NE-1/NE-7 ad
 prototype. These source reads strengthen capability, resource and selection contracts; they
 do not justify replacing the logical IR or building a generic native warehouse executor.
 
+== Additional baseline-test sources (2026-10-26)
+
+The current plan now assigns strength and crossover cases to each core baseline, under the
+existing NE experiments. These are test specifications, not executed tests or new performance
+claims. In addition to the sources above:
+
+* https://www.postgresql.org/docs/current/indexes-index-only-scans.html[PostgreSQL covering scans]
+  explains heap visibility checks and visibility-map dependence; an index containing all query
+  columns does not guarantee no heap fetches under write churn.
+* https://www.postgresql.org/docs/current/transaction-iso.html[PostgreSQL isolation]
+  supplies the transaction semantics to test, including serializable abort/retry handling.
+  Matching SQL syntax or final counts does not prove matching isolation.
+* https://docs.aws.amazon.com/redshift/latest/dg/c_ato-enabling-disabling-monitoring.html[Redshift ATO]
+  describes workload-driven sort/distribution changes and their observation period. An untrained
+  AUTO table is not evidence of steady-state optimized warehouse performance.
+* https://docs.snowflake.com/en/user-guide/warehouses-multicluster[Snowflake multi-cluster]
+  addresses concurrent demand; test burst/idle behavior and disclose edition and scaling policy.
+* https://docs.snowflake.com/en/user-guide/dynamic-tables/best-practices[Snowflake dynamic-table lag]
+  distinguishes the staleness target from a guaranteed latency bound or fixed refresh schedule.
+  Compare measured freshness and maintenance cost, not configuration labels alone.
+
+For Spark use AQE/cache/layout-aware controls, for Trino dynamic filtering and separate
+interactive versus fault-tolerant task-retry arms, and for DataFusion/DuckDB use their current
+pushdown/spill implementations. Managed warehouse internals are not open-source equivalents:
+validate documented behavior, plans/profiles and actual runs rather than inventing a source
+inspection or extrapolating local performance into a managed-service result.
+
 == Research that constrains a novelty claim
 
 * https://www.microsoft.com/en-us/research/publication/vbase-unifying-online-vector-similarity-search-and-relational-queries-via-relaxed-monotonicity/[VBASE, OSDI 2023]: fixed top-k interfaces impede complex vector/relational execution; relaxed-monotonicity techniques support more compositional retrieval. Candidate continuation is prior art.
