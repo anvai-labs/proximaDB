@@ -1350,3 +1350,19 @@ hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB; MinIO single drive + 
 date = "2026-10-25"
 version = "feat/paxdir-d8-defaults @ 78e99d2c1 (release-server --features aws, built in-worktree)"
 notes = "The 'default' arm leaves all six gates unset (proving the defaults; the shared-model gate's first gate-run evidence — D7's arms did not set it). Waves and requests are latency-independent; p50 re-prices per profile (at 10 ms the non-wave compute residual of ~74 ms dominates). k_G sizes for the default RaBitQ+SQ8 geometry; pre-D8 collections retrain their coarse model once (k 15 -> ~34 exceeds the 2x growth trigger). Single-machine emulator evidence, not an SLA or a cloud-latency claim."
+
+[[claims]]
+id = "tier1_sc0_range_cap_sweep_sift1m"
+claim = "TD-TIER-1 SC0/E1 fixed-geometry range-cap sweep on the D8 canonical bed (SIFT1M, MinIO + Toxiproxy 5+5 ms, P5b defaults on, recall >= 0.98 held): raising the remote read coalescing cap from 4 MiB to 16 MiB halves object-cold requests per query (20.005 -> 10.514; GETs 19.005 -> 9.514) at unchanged recall (0.9817 -> 0.9824), unchanged wave depth (p50 3, p95 4), and ~unchanged bytes (~58 MB/q); 40 MiB adds ~nothing (10.282) at this geometry. Warm requests also drop (6.008 -> 4.583). Derived at S3 list rates: cold request cost $12.60/M (this sweep's 4 MiB units) -> $8.81/M, after which the discovery LIST is 57% of the bill. Caveat: the 16 MiB arm probed 10.8% fewer rows (422,805 vs 474,122; cells probed pinned ~10 by nprobe in both arms), which plausibly biases modestly in favor of the halving; the -50% request effect dwarfs that channel."
+metric = "requests_per_query + gets_per_query + waves p50/p95 + recall@10 + bytes/query + latency p50/p95 + qps + warm requests + probed rows/cells, object-cold and local-disk-warm, one cap variable"
+status = "measured"
+asserted_in = [
+  "docs/10-quality/td/TD-TIER-1-collection-storage-policy-and-residency.adoc",
+]
+bench_source = "scripts/bench/sift1m_get_reduction.py"
+bench_command = "systemd-run --user --scope -p MemoryMax=64G python3 scripts/bench/sift1m_get_reduction.py --root <root> --binary target/release-server/proximadb-server --sift-dir <sift1m> --rows 1000000 --queries 1000 --top-k 10 --min-recall 0.98 --object-cold-max-requests 20 --object-cold-max-waves 3 --warm-max-waves 2 --training-compaction-min-mb 1 --max-segments 3 --s3-endpoint http://<toxiproxy 5+5 ms> --storage-url s3://<bucket>/<arm> --read-ranges-inflight 16 --coalesce-range-mb <4|16|40> --centroid-directory default"
+artifact = "docs/_internal/status/TIER1_SC0_RANGE_CAP_SWEEP_2026_10_26.adoc"
+hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB; MinIO single drive + Toxiproxy 2.12.0 on the same host; arms serialized on an idle box"
+date = "2026-10-26"
+version = "bench/tier1-cap-sweep @ 41ac7d439 (empty anchor over develop d929d7993; byte-identical release-server --features aws across arms, sha256 30a670c5)"
+notes = "The sweep gates (recall, requests, waves) were armed on every arm; the 4 MiB arm failed the requests gate by 0.005 (20.005 vs 20) — bed variance at the boundary, recall held; the sweep's binding constraint is recall per the design. Design-E1's full recording protocol (p99, CPU, peak RSS, in-flight bytes, overread split, request-size distribution) was NOT captured by the harness and the result files are local-only — recorded as a harness follow-up, disclosed in the artifact. Geometry approximately fixed (settled cells 21/25/26; probed cells ~10 by nprobe). Production posture unchanged: IopsBudget::S3 already targets 8 MiB ranges; a default change requires the fragmented/filters/10M/768d finalists per the design stop rule. Single-machine emulator evidence, not an SLA."
