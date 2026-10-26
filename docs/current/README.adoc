@@ -36,6 +36,10 @@ projection authority and v3 publication; ADR-062/065 ranged reads; TD-AUTHZ-1 te
 TD-PGWIRE-AUTH-1 pgwire authentication; TD-LEASE-INFRA-1 leases; TD-DECOMP-* workspace seams.
 Older conflicting prose is historical input, never authority to reverse a newer decision.
 
+Naming distinction: storage phases `SC0`–`SC6` belong to TD-TIER-1 and the storage plan.
+The older `TD-SC-1`–`TD-SC-5` IDs describe system-catalog caching/provisioning/coherence.
+They are different workstreams; matching numbers do not transfer status or ownership.
+
 == Pickup and handoff (all implementers, including Claude / GLM plan mode)
 
 . Read the tracker row; inspect the named branch/PR before starting overlapping work.
