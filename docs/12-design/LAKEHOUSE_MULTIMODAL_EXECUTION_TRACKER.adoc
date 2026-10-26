@@ -4,12 +4,12 @@
 :toc: left
 :toclevels: 2
 :icons: font
-// status-as-of: 2026-10-25
+// status-as-of: 2026-10-26
 
 [cols="1,3"]
 |===
 | Purpose | The resumable status of record for executing link:LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] (the plan: Parts A–D, phases P0–P6) under link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097]. Any engineer or agent session picks up from here **and nothing else**: what is merged, what is in flight, what is next, and how the work is done.
-| Updated | 2026-10-25, against `develop` @ `56bd798b1` (#2231, #2234, #2238, #2240, #2241 merged). Reconciliation pass: the previous update predated twelve merges and over-claimed P1/P5a while under-claiming P2.4/P3/P5b.
+| Updated | 2026-10-26, against `develop` @ `ad6d48157` (#2243, #2244, #2245 merged). Post-merge refresh: P1 closed by #2245; SC track opened (SC0 landed #2244).
 | Rule | Update this file in the same PR that lands, opens or re-plans a slice. A slice is **done** only when merged to `develop` with its gate green. Detail lives in the TD files; this file holds status, links and order.
 |===
 
@@ -67,7 +67,7 @@
 
 ----
  P0  Decisions (seams doc, ADR-097, doc fixes)   [############] 100%  merged #2075
- P1  S4 Iceberg single writer + ext. read-back   [##########..] ~85%  slice 1 merged #2075; slice 2 (bulk-append `_manifests` tree) open
+ P1  S4 Iceberg single writer + ext. read-back   [############] 100%  #2075 + #2245; the wiring-time REST-key residual stays on TD-SEAM-1
  P2  S1/S2/S3 one write path                     [############] ~97%
      P2.1 segmented WAL + per-segment index      [############] 100%  #2079
      P2.2 Layer A (spill) in production          [############] 100%  #2085…#2146; default ON; WAL format frozen #2162; object-store placement #2231
@@ -80,7 +80,7 @@
      P5b centroid directory + cluster compaction [##########..] ~90%  D1–D3 #2127 #2148 #2152 #2183, D5 #2196, D6 #2232, D7 #2240 (gate PASS); D4 deferred; D8 merged #2241 (defaults ON)
      P5c HNSW as persisted PAX projection        [##..........]  15%  design #2088
  P6  Proof (TPC-DS SF1/10, multimodal bench)     [###.........] ~25%  SF1 load+publication gate green (via P2.4); query correctness, SF10, multimodal bench open
- OVERALL                                         [######......]  ~57%  (unweighted mean of P0–P6)
+ OVERALL                                         [#######.....]  ~59%  (unweighted mean of P0–P6)
 ----
 
 Percentages are effort estimates, not test counts. A phase is the mean of its rows; OVERALL is the unweighted mean of P0–P6; bars show ⌊pct × 12 / 100⌋.
@@ -96,7 +96,7 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | Slice | Status | PR | Gate / notes
 | Seams doc, ADR-097, doc-contradiction fixes | Done | #2075 | Docs only.
 | One Iceberg writer; REST serves the engine's `metadata.json`; DECIMAL end to end | Done (slice 1) | #2075 | `tests/iceberg_interop_e2e.rs` (pyiceberg + DuckDB values equal pgwire across two snapshots), in CI's storage lane. TD-SEAM-1.
-| P1 slice 2: bulk-append `_manifests` tree onto `publish_iceberg_snapshot`; nested/list column mapping; explicit Iceberg format policy (v2 rewrite-fallback vs v3 upgrade, no implicit downgrade; DVs only with delete-aware readers + read-back) | Open | — | Residual visible at `src/query/table_write_executor.rs:869`. TD-SEAM-1.
+| P1 slice 2: bulk-append `_manifests` tree onto the single writer; format-policy floor | Done | #2245 | Commits through `publish_iceberg_files` into the table's one engine log (warehouse-prefix key, refuse-without-prefix on URL layouts), carries prior snapshot files, legacy-seed cutover, engine never-downgrade floor, bridge-based REST probe, guarded `/data` strip, non-advancing snapshot-id rejection. Two adversarial review rounds (2 blockers fixed). Remaining (TD-SEAM-1 row): nested/list → `string`; e2e interop extension when pgwire routing is observable in the harness; **blocking before the lane is production-wired** — the REST bridge probe cannot derive the tenant-scoped log key (fix: persist the prefix or resolve DrPath REST-side).
 | Spec Parquet layout (`ParquetWritePolicy`: page index, SBBF, sorting) for MATERIALIZE; WAL change-feed fast path | Done | #2069 | DataFusion TPC-DS 11.8 s → 33 ms median. TD-OLAPFMT-2/3/6.
 |===
 
@@ -157,8 +157,9 @@ Status: **Done** (merged, gate green) · **Open PR** · **Branch** (pushed, no P
 | `lead/default-on` | #2146 | Done.
 | `lead/next` | (lead) | Done (#2162): WAL entry format frozen.
 | `lead/frame-pin` | (lead) | Frame header pinned (`format_2_frames_still_decode_and_todays_writer_emits_the_same_header`, frozen v1 + group frames built by an independent oracle) + tracker refresh.
-| `feat/paxdir-d8-defaults-on` | #2241 | **Merged** (c18bb630e): P5b defaults ON as kill-switches, k_G cell sizing, AXIS IVF disk placeholder deleted; measured 0.9822 recall, 3 waves, 19.55 req/q, 107 ms p50 @ ~11.4 ms RTT., then merge.
-| `docs/seam-status-reconcile` | (this PR) | Tracker/ledger/TD reconciliation to `develop` `56bd798b1` (M1 rebase); files TD-SEAM-14/15. |
+| `feat/paxdir-d8-defaults-on` | #2241 | **Merged** (c18bb630e): P5b defaults ON as kill-switches, k_G cell sizing, AXIS IVF disk placeholder deleted; measured 0.9822 recall, 3 waves, 19.55 req/q, 107 ms p50 @ ~11.4 ms RTT.
+| `docs/seam-status-reconcile` | #2243 | **Merged** (cd685f5d8): tracker/ledger/TD reconciliation to the M1 rebase; TD-SEAM-14/15 filed.
+| `feat/p1-single-writer` | #2245 | **Merged** (ad6d48157): bulk-append onto the single Iceberg writer + never-downgrade format floor (TD-SEAM-1 slice 2); two adversarial review rounds; blocking wiring residual recorded on the TD row.
 |===
 
 === 4.1 Parallel tracks (since 2026-10-22)
@@ -174,7 +175,8 @@ tracks report through a "Tracker update" paragraph in each PR body.
 | A | Durable branch merge-base, §5.2 (6 commits) | Done: #2124 #2125 #2144 #2161 #2166 (slices 5–6)
 | B | P2.4 streaming MATERIALIZE, §5.3 PRs 1–7 incl. the SF1 no-OOM gate | #2126 #2149 #2150 #2151 #2155 #2156 #2160 #2222 #2234 #2238 merged; SF1 gate passed 2026-10-24; remaining: delete-aware readers → external delete read-back → delete writer
 | C | P3.1 LayerATableProvider, §5.4 PRs 0 and 2–5 | PRs 0–9 merged (#2128 #2133 #2136 #2153 #2158 #2159 #2167 #2185 #2199 #2211 #2212 #2217) + P3.2a (#2229); next: row-count stats, soak, default-ON flip (PR 10)
-| D | P5b PAX centroid directory + cluster-contiguous compaction: design, then 2 slices | Design #2120 (TD-PAXDIR-1); D1 #2127 #2148, D2 #2152, D3 #2183, D5 #2196, D6 #2232, D7 #2240 merged — cold gate PASS; D8 merged #2241 (defaults ON) #2241; TD-PAXDIR-2 filed (warm LIST removal)
+| D | P5b PAX centroid directory + cluster-contiguous compaction: design, then 2 slices | Design #2120 (TD-PAXDIR-1); D1 #2127 #2148, D2 #2152, D3 #2183, D5 #2196, D6 #2232, D7 #2240 merged — cold gate PASS; D8 merged #2241 (defaults ON); TD-PAXDIR-2 filed (warm LIST removal)
+| E | Storage classes SC0–SC6 (TD-TIER-1; design + roadmap: STORAGE_CLASS_SEAMS_REVIEW_2026_10_25) | SC0 Done #2244 (review, media evidence, harness range-cap seam with tests); SC1(+SC2) policy/status next; SC3 reservation later |
 |===
 
 == 5. Next-work queue (in order)
@@ -189,10 +191,11 @@ TE-3 firehose ingesting concurrently; durability + snapshot semantics written do
 
 Slices in order (one PR each; detail in the TD rows):
 
-. **P1 slice 2** — migrate the bulk-append `_manifests` tree onto `publish_iceberg_snapshot`,
-  extend the interop gate to that path, and pin an explicit Iceberg format policy (v2
-  rewrite-fallback vs v3 upgrade, no implicit downgrade, DVs only with delete-aware readers +
-  read-back) (TD-SEAM-1).
+. **P1 slice 2 — Done (#2245)**: bulk append no longer writes the `_manifests` tree (the legacy
+  reader stays for pre-migration trees — mixed-read-safe); the engine has a
+  never-downgrade format floor (the base of the v3-first ladder). Remaining on TD-SEAM-1:
+  nested/list → `string`, the e2e interop extension, and the blocking REST-key residual for
+  the lane's eventual production wiring.
 . **Incremental deletion safely** — delete-aware readers → external delete read-back → delete
   writer; TE-4 gates split four ways: current-query invisibility, historical-snapshot
   accessibility, snapshot expiry, physical erasure (TD-SEAM-4).
