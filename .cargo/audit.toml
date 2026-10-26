@@ -70,6 +70,48 @@ ignore = [
     # 0.16 release at baseline time; re-check on every lru point release.
     "RUSTSEC-2026-0253",
 
+    # zstd 0.13.3 + zstd-safe 7.2.4, published 2026-10-26 (13 advisories:
+    # 0391 is zstd itself; 0395-0406 are zstd-safe). cargo-audit classes 3 as
+    # vulnerabilities — 0391 (abandoned-stream data leak into the NEXT stream
+    # on a REUSED context), 0398 (Seekable OOB), 0403 (streaming uninit on a
+    # failed legacy frame) — and 10 as unsound warnings on the
+    # streaming/seekable/buffer APIs. No lock-level fix exists: patched floors
+    # are zstd >=0.14.3 / zstd-safe >=8.2.0; zstd ^0.13 is required by
+    # arrow-ipc 59 / parquet 59, and zstd-safe 7.x is ALSO co-pinned by
+    # compression-codecs 0.4.38 (via async-compression <- tower-http
+    # "compression-full"/"decompression-full"). Clearing 0391 takes an arrow
+    # major; the 12 zstd-safe IDs additionally take a tower-http /
+    # async-compression move. RETIREMENT TRIGGER: both.
+    #
+    # Exposure today — three surfaces, all checked:
+    # (1) our own call sites are one-shot: encode_all/decode_all (io_trace,
+    #     codecs) and zstd::bulk::compress/decompress (metrics store) — fresh
+    #     context per call, no reuse, no dictionaries; 0391's precondition
+    #     never holds.
+    # (2) vendored arrow-ipc reuses a bulk::Compressor context — no ignored
+    #     advisory covers the bulk API (0400 requires a dictionary).
+    # (3) tower-http compiles the zstd STREAMING codec into the server (0403's
+    #     scope is exactly DCtx::decompress_stream), but it is inert today:
+    #     only the response-side DecompressionLayer is wired (its comment says
+    #     "requests" — a pre-existing mis-wiring; no RequestDecompressionLayer
+    #     exists anywhere), REST compression defaults OFF, and reqwest has no
+    #     zstd feature. FUTURE WARNING: "fixing" request decompression by
+    #     switching to RequestDecompressionLayer would activate 0403 on
+    #     attacker-supplied bodies — drop this ignore first.
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0395",
+    "RUSTSEC-2026-0396",
+    "RUSTSEC-2026-0397",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0399",
+    "RUSTSEC-2026-0400",
+    "RUSTSEC-2026-0401",
+    "RUSTSEC-2026-0402",
+    "RUSTSEC-2026-0403",
+    "RUSTSEC-2026-0404",
+    "RUSTSEC-2026-0405",
+    "RUSTSEC-2026-0406",
+
     # --- yanked ---
     # Excluded as a class via --no-yanked (see header): spin 0.9.8 (flume
     # 0.12) and wide 1.6.0 (simba 0.10) are yanked with no parent bump that
