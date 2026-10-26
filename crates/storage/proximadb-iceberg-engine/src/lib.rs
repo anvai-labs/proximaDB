@@ -465,6 +465,18 @@ impl IcebergObjectStoreBridge {
         let parent_location = parent.map(|v| self.object_uri(&committer.metadata_location(v)));
         let lineage =
             iceberg::Lineage::from_parent(parent_json.as_deref(), parent_location.as_deref())?;
+        // Snapshot ids must advance past the parent's current snapshot: an equal id
+        // would make the snapshot its own ancestor and a lower one rewinds history.
+        // Same-millisecond publishers (ids derived from a clock) hit this; a real
+        // collision surfaces here instead of corrupting the lineage.
+        if let Some(parent_snapshot_id) = lineage.parent_snapshot_id
+            && snapshot_id <= parent_snapshot_id
+        {
+            return Err(StorageError::Serialization(format!(
+                "iceberg-engine: snapshot id {snapshot_id} must exceed the parent snapshot \
+                 {parent_snapshot_id} under {metadata_prefix}"
+            )));
+        }
         // ADR-097 D3 format policy: a table's format version never goes down. The
         // caller's `format_version` is a floor for a new table; once a snapshot
         // commits v3, every successor commits v3 even when the requested schema
@@ -1326,10 +1338,80 @@ mod tests {
             mj["format-version"], 3,
             "a v2 request onto a v3 table commits v3"
         );
-        // The upgrade direction stays caller-driven: v2 parent + v3 request ⇒ v3.
+        // The parent itself committed v3 (this is a floor, not a rewrite of v0),
+        // and the upgrade direction stays caller-driven: a NEW table requested as
+        // v2 starts v2, then adopts v3 when a successor requests it.
+        let v0_meta = b.read_table_metadata("t/metadata", 0).await.unwrap();
+        let v0_json: serde_json::Value = serde_json::from_slice(&v0_meta).unwrap();
+        assert_eq!(v0_json["format-version"], 3);
+        let c1 = write_age_part(&b, "t2/data/c1.parquet", &[3]).await;
+        b.publish_iceberg_files(
+            std::slice::from_ref(&c1),
+            None,
+            "t2/metadata",
+            "uuid-fmt2",
+            "memory:///t2",
+            &age_field(),
+            1,
+            1,
+            iceberg::FormatVersion::V2,
+        )
+        .await
+        .unwrap();
+        let fresh_meta = b.read_table_metadata("t2/metadata", 0).await.unwrap();
+        let fresh: serde_json::Value = serde_json::from_slice(&fresh_meta).unwrap();
         assert_eq!(
-            b.read_table_metadata("t/metadata", 0).await.unwrap(),
-            b.read_table_metadata("t/metadata", 0).await.unwrap()
+            fresh["format-version"], 2,
+            "a new v2-requested table starts v2"
+        );
+        let c2 = write_age_part(&b, "t2/data/c2.parquet", &[4]).await;
+        b.publish_iceberg_files(
+            std::slice::from_ref(&c2),
+            Some(0),
+            "t2/metadata",
+            "uuid-fmt2",
+            "memory:///t2",
+            &age_field(),
+            2,
+            2,
+            iceberg::FormatVersion::V3,
+        )
+        .await
+        .unwrap();
+        let upgraded_meta = b.read_table_metadata("t2/metadata", 1).await.unwrap();
+        let upgraded: serde_json::Value = serde_json::from_slice(&upgraded_meta).unwrap();
+        assert_eq!(
+            upgraded["format-version"], 3,
+            "a v3 request upgrades a v2 table"
+        );
+    }
+
+    /// Snapshot ids must advance past the parent's current snapshot: an equal id
+    /// is its own ancestor, a lower one rewinds history (same-millisecond
+    /// publishers hit this; the collision surfaces instead of corrupting lineage).
+    #[tokio::test]
+    async fn publish_iceberg_files_rejects_a_non_advancing_snapshot_id() {
+        let b = bridge();
+        let first = write_age_part(&b, "t/data/a.parquet", &[1]).await;
+        publish_files(&b, std::slice::from_ref(&first), None, 10)
+            .await
+            .unwrap();
+        let second = write_age_part(&b, "t/data/b.parquet", &[2]).await;
+        for bad_id in [10, 9] {
+            let err = publish_files(&b, std::slice::from_ref(&second), Some(0), bad_id)
+                .await
+                .expect_err("a non-advancing snapshot id must be rejected");
+            assert!(
+                err.to_string().contains("must exceed the parent snapshot"),
+                "{err:?}"
+            );
+        }
+        // An id past the parent still commits.
+        assert_eq!(
+            publish_files(&b, std::slice::from_ref(&second), Some(0), 11)
+                .await
+                .unwrap(),
+            1
         );
     }
 

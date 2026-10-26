@@ -56,6 +56,14 @@ pub struct TableWriteExecutionRequest<'a> {
     pub routed_plan: RoutedExecutionPlan,
     /// Tenant context for execution, used for path isolation and billing attribution.
     pub tenant_context: Option<&'a crate::storage::tenant::context::TenantContext>,
+    /// The warehouse-root-relative object prefix MATERIALIZE publishes this table
+    /// under (`data/{tenant}/{namespace_id}/{table}`), resolved by the caller
+    /// through the same resolver. The bulk-append lane keys its Iceberg metadata
+    /// log with it — the one-log-per-table invariant — because a layout URL's
+    /// scheme-stripped path is a *different physical key* than the root-relative
+    /// log. `None` (tests, direct executor use) derives the root from the
+    /// schema's own paths; a scheme-carrying location then refuses.
+    pub warehouse_prefix: Option<&'a str>,
 }
 
 /// Result returned by a table-write executor implementation.
@@ -690,6 +698,65 @@ fn normalize_object_path_prefix(location: &str) -> String {
     without_scheme.trim_matches('/').to_string()
 }
 
+/// The bridge-relative key of the table's engine metadata log root (the parent
+/// of its `metadata/` directory), for the bulk-append commit.
+///
+/// Precedence: (1) the caller-resolved warehouse prefix — the same
+/// root-relative prefix MATERIALIZE publishes under, which is the only key that
+/// can be derived for a scheme-carrying layout location (its scheme-stripped
+/// path is a *different physical key*, so using it would write a second log for
+/// the table — refuse instead). (2) The schema's own paths: a storage-layout
+/// location ending in `/data` is the data directory, so the root is its parent;
+/// a `schema.location` (the dml-stamped warehouse prefix) or a fallback base is
+/// already a table root and is NEVER stripped — two tables whose path ends in
+/// `data` must not share their parent's log.
+fn engine_metadata_root(
+    request: &TableWriteExecutionRequest<'_>,
+    fallback_base: &str,
+) -> Result<String> {
+    if let Some(prefix) = request.warehouse_prefix {
+        return Ok(normalize_object_path_prefix(prefix));
+    }
+    let layout = primary_layout(request.target_schema).and_then(|l| match l.physical_format {
+        CatalogPhysicalFormat::Iceberg | CatalogPhysicalFormat::Parquet => l.location.as_deref(),
+        _ => None,
+    });
+    if let Some(location) = layout {
+        if location.contains("://") {
+            return Err(anyhow!(
+                "DataFusion bulk append for '{}' cannot key its engine metadata log from the \
+                 URL location '{location}' without the warehouse prefix (refusing rather than \
+                 writing a second log for the table)",
+                request.target_schema.name
+            ));
+        }
+        let normalized = normalize_object_path_prefix(location);
+        return Ok(normalized
+            .strip_suffix("/data")
+            .unwrap_or(normalized.as_str())
+            .to_string());
+    }
+    if request
+        .target_schema
+        .location
+        .as_deref()
+        .is_some_and(|l| l.contains("://"))
+    {
+        return Err(anyhow!(
+            "DataFusion bulk append for '{}' cannot key its engine metadata log from the URL \
+             location '{}' without the warehouse prefix (refusing rather than writing a second \
+             log for the table)",
+            request.target_schema.name,
+            request
+                .target_schema
+                .location
+                .as_deref()
+                .unwrap_or_default()
+        ));
+    }
+    Ok(fallback_base.to_string())
+}
+
 fn sanitize_object_path_segment(value: &str) -> String {
     value
         .chars()
@@ -870,23 +937,27 @@ impl TableWriteExecutor for DataFusionTableWriteExecutor {
                 request.tenant_context.map(|tc| tc.tenant_id.as_str()),
             );
             // One Iceberg writer, one metadata log per table (ADR-097 D3 /
-            // TD-SEAM-1 slice 2): a materialized table's layout location is the
-            // data directory (`{root}/data`); a fallback prefix is the table root
-            // itself. Both shapes commit through the engine writer at
-            // `{table_root}/metadata` — the log MATERIALIZE publishes to — so REST
-            // serves the engine's metadata verbatim and the legacy `_manifests`
-            // tree receives no new commits (pre-migration trees stay readable;
-            // mixed-read-safe).
-            let table_root = base.strip_suffix("/data").unwrap_or(&base).to_string();
+            // TD-SEAM-1 slice 2). The log key is the warehouse-root-relative
+            // prefix MATERIALIZE publishes under when the caller resolved one
+            // (a layout URL's scheme-stripped path is a different physical key,
+            // so it must NOT be used); without it the root is derived from the
+            // schema's own paths, refusing a scheme-carrying location rather
+            // than silently writing a second log.
+            let table_root = engine_metadata_root(&request, &base)?;
             let metadata_prefix = format!("{table_root}/metadata");
             let data_dir = format!("{base}/data");
             let table_uuid = deterministic_table_uuid(&table_root);
             let fields = iceberg_snapshot_fields(&request.target_schema.to_arrow_schema());
             let v3 = iceberg_needs_v3(&fields);
-            let now_ms = SystemTime::now()
+            // Snapshot ids must advance past the parent (the engine rejects
+            // non-advancing ids), so derive them from the same nanosecond clock
+            // the part names use — two statements in one millisecond cannot
+            // collide — plus the attempt for rebased retries.
+            let now_ns = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
+                .map(|d| d.as_nanos() as i64)
                 .unwrap_or_default();
+            let now_ms = now_ns / 1_000_000;
 
             // Optimistic-concurrency commit: rebase onto the latest metadata
             // version and retry on conflict, bounded so a persistent conflict
@@ -956,7 +1027,7 @@ impl TableWriteExecutor for DataFusionTableWriteExecutor {
                         &table_uuid,
                         &table_root,
                         &fields,
-                        now_ms + attempt as i64,
+                        now_ns + attempt as i64,
                         now_ms,
                         v3,
                     )
@@ -1128,6 +1199,10 @@ mod tests {
         /// Refuse the next `publish_iceberg_files` with `AlreadyExists` exactly
         /// once, then let it commit (the rebase-then-retry path).
         conflict_once: std::sync::atomic::AtomicBool,
+        /// When the `conflict_once` refusal fires, first commit this part as a
+        /// COMPETING publisher winning the slot (the executor's retry must
+        /// rebase onto it and carry its file).
+        competitor_part: Mutex<Option<Path>>,
         /// Keys `list_objects` reports besides the in-memory store (the mock's
         /// parquet writes only record, so the legacy-seed path sees these).
         planted_parquet: Mutex<Vec<Path>>,
@@ -1142,6 +1217,7 @@ mod tests {
                 iceberg_attempts: Mutex::new(0),
                 always_conflict: false,
                 conflict_once: std::sync::atomic::AtomicBool::new(false),
+                competitor_part: Mutex::new(None),
                 planted_parquet: Mutex::new(Vec::new()),
             }
         }
@@ -1157,6 +1233,14 @@ mod tests {
             let b = Self::new();
             b.conflict_once
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            b
+        }
+
+        /// The one-shot conflict loses to a competitor that commits `part`
+        /// before us, so the retry path rebase-and-carry is observable.
+        fn new_conflict_once_losing_to(part: Path) -> Self {
+            let b = Self::new_conflict_once();
+            *b.competitor_part.lock().unwrap() = Some(part);
             b
         }
     }
@@ -1267,6 +1351,14 @@ mod tests {
                     .conflict_once
                     .swap(false, std::sync::atomic::Ordering::SeqCst)
             {
+                // The configured competitor wins the slot first: its commit
+                // lands before our refusal, so the executor's retry must rebase
+                // onto it and carry its file.
+                if let Some(part) = self.competitor_part.lock().unwrap().take() {
+                    let mut commits = self.iceberg_commits.lock().unwrap();
+                    let version = commits.iter().filter(|c| c.0 == metadata_prefix).count() as u64;
+                    commits.push((metadata_prefix.to_string(), parent, vec![part]));
+                }
                 return Err(StorageError::AlreadyExists(
                     "mock: lost the successor slot".into(),
                 ));
@@ -1355,6 +1447,7 @@ mod tests {
                 target_schema: &schema,
                 source_schema: None,
                 routed_plan: routed,
+                warehouse_prefix: None,
                 tenant_context: None,
             })
             .await
@@ -1402,6 +1495,7 @@ mod tests {
                     ..routed
                 },
                 tenant_context: None,
+                warehouse_prefix: None,
             })
             .await
             .unwrap_err();
@@ -1488,6 +1582,7 @@ mod tests {
                 target_schema: &schema,
                 source_schema: None,
                 routed_plan: routed,
+                warehouse_prefix: None,
                 tenant_context: None,
             })
             .await
@@ -1653,6 +1748,7 @@ mod tests {
                 source_schema: None,
                 routed_plan: fk_routed_plan(&schema),
                 tenant_context: None,
+                warehouse_prefix: None,
             })
             .await
             .unwrap();
@@ -1674,6 +1770,7 @@ mod tests {
                 source_schema: None,
                 routed_plan: fk_routed_plan(&schema),
                 tenant_context: None,
+                warehouse_prefix: None,
             })
             .await
             .unwrap_err();
@@ -1699,6 +1796,7 @@ mod tests {
                 source_schema: None,
                 routed_plan: fk_routed_plan(&schema),
                 tenant_context: None,
+                warehouse_prefix: None,
             })
             .await
             .unwrap();
@@ -1766,6 +1864,7 @@ mod tests {
                 target_schema: &schema,
                 source_schema: None,
                 routed_plan: routed,
+                warehouse_prefix: None,
                 tenant_context: None,
             })
             .await
@@ -1861,6 +1960,7 @@ mod tests {
             source_schema: None,
             routed_plan: routed,
             tenant_context: None,
+            warehouse_prefix: None,
         })
         .await
         .unwrap_err();
@@ -1934,6 +2034,7 @@ mod tests {
             source_schema: None,
             routed_plan: routed,
             tenant_context: None,
+            warehouse_prefix: None,
         })
         .await
         .unwrap();
@@ -1966,6 +2067,7 @@ mod tests {
             source_schema: None,
             routed_plan: routed,
             tenant_context: None,
+            warehouse_prefix: None,
         })
         .await
         .unwrap_err();
@@ -2008,6 +2110,7 @@ mod tests {
             source_schema: None,
             routed_plan: routed,
             tenant_context: None,
+            warehouse_prefix: None,
         })
         .await
         .unwrap_err();
@@ -2045,6 +2148,7 @@ mod tests {
                 target_schema: &schema,
                 source_schema: None,
                 routed_plan: routed,
+                warehouse_prefix: None,
                 tenant_context: None,
             })
             .await
@@ -2099,6 +2203,7 @@ mod tests {
             source_schema: None,
             routed_plan: routed,
             tenant_context: None,
+            warehouse_prefix: None,
         })
         .await
         .unwrap();
@@ -2152,6 +2257,7 @@ mod tests {
             source_schema: None,
             routed_plan: routed,
             tenant_context: None,
+            warehouse_prefix: None,
         })
         .await
         .unwrap_err();
@@ -2203,6 +2309,7 @@ mod tests {
             source_schema: None,
             routed_plan: routed,
             tenant_context: None,
+            warehouse_prefix: None,
         })
         .await
         .unwrap();
@@ -2273,6 +2380,7 @@ mod tests {
             source_schema: None,
             routed_plan: routed,
             tenant_context: None,
+            warehouse_prefix: None,
         })
         .await
         .unwrap_err();
@@ -2293,12 +2401,24 @@ mod tests {
         bridge: Arc<B>,
         batch: Vec<ProximaRecord>,
     ) -> Result<TableWriteExecutionResult> {
+        run_bulk_append_as(bridge, "warehouse/facts", None, batch).await
+    }
+
+    /// Same, with an explicit primary-layout location (raw, as the catalog
+    /// records it) and warehouse prefix (as dml resolves it), for the
+    /// metadata-log key-derivation cases.
+    async fn run_bulk_append_as<B: ObjectStoreBridge + 'static>(
+        bridge: Arc<B>,
+        layout_location: &str,
+        warehouse_prefix: Option<&str>,
+        batch: Vec<ProximaRecord>,
+    ) -> Result<TableWriteExecutionResult> {
         let schema = CatalogTableSchema::new("facts")
             .with_workload_profile(CatalogWorkloadProfile::Olap)
             .with_storage_layout(CatalogStorageLayout::projection_publication(
                 "primary",
                 CatalogPhysicalFormat::Iceberg,
-                "warehouse/facts",
+                layout_location,
             ))
             .with_storage_specialization(CatalogStorageSpecialization::ColumnarAnalytics);
         let plan =
@@ -2328,6 +2448,7 @@ mod tests {
             source_schema: None,
             routed_plan: routed,
             tenant_context: None,
+            warehouse_prefix,
         })
         .await
     }
@@ -2388,16 +2509,160 @@ mod tests {
     }
 
     /// Losing the successor slot once is not an error: the executor rebases onto
-    /// the winner and retries with a fresh parent and carried set.
+    /// the WINNER (a competitor that committed while we raced) and retries with a
+    /// fresh parent and carried set — the competitor's file must be carried, not
+    /// dropped by the rebase.
     #[tokio::test]
     async fn datafusion_bulk_append_retries_after_a_conflict() {
-        let bridge = Arc::new(CapturingObjectStoreBridge::new_conflict_once());
+        let bridge = Arc::new(CapturingObjectStoreBridge::new_conflict_once_losing_to(
+            Path::from("warehouse/facts/data/competitor-0.parquet"),
+        ));
         let result = run_bulk_append(bridge.clone(), vec![test_record("r1")])
             .await
             .unwrap();
         assert_eq!(result.status, TableWriteExecutionStatus::Completed);
         assert_eq!(*bridge.iceberg_attempts.lock().unwrap(), 2);
-        assert_eq!(bridge.iceberg_commits.lock().unwrap().len(), 1);
+
+        let commits = bridge.iceberg_commits.lock().unwrap();
+        assert_eq!(commits.len(), 2, "the competitor's commit, then ours");
+        assert_eq!(commits[0].1, None, "the competitor committed first");
+        assert_eq!(commits[0].2.len(), 1);
+        assert_eq!(
+            commits[1].1,
+            Some(0),
+            "our retry rebased onto the competitor's version"
+        );
+        assert_eq!(commits[1].2.len(), 2, "carried winner + our part");
+        assert!(
+            commits[1]
+                .2
+                .iter()
+                .any(|p| p.as_ref().contains("competitor-0.parquet"))
+        );
+    }
+
+    /// A scheme-carrying layout location keys its log from the warehouse prefix
+    /// (the same root-relative key MATERIALIZE uses), never from the
+    /// scheme-stripped URL path — that is a different physical key, and using it
+    /// would write a second log for the table. Real engine writer.
+    #[tokio::test]
+    async fn datafusion_bulk_append_keys_the_log_from_the_warehouse_prefix() {
+        use proximadb_iceberg_engine::IcebergObjectStoreBridge;
+        use proximadb_object_store::ProximaObjectStore;
+
+        let bridge = Arc::new(IcebergObjectStoreBridge::new(ProximaObjectStore::new(
+            Arc::new(InMemory::new()),
+        )));
+        run_bulk_append_as(
+            bridge.clone(),
+            "file:///wh/data/acme/ns1/facts/data",
+            Some("data/acme/ns1/facts"),
+            vec![test_record("r1")],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            bridge
+                .latest_metadata_version("data/acme/ns1/facts/metadata")
+                .await
+                .unwrap(),
+            Some(0),
+            "the log is keyed by the warehouse-root-relative prefix"
+        );
+        assert_eq!(
+            bridge
+                .latest_metadata_version("wh/data/acme/ns1/facts/metadata")
+                .await
+                .unwrap(),
+            None,
+            "the URL-path-derived key (the pre-fix derivation) stays empty — no second log"
+        );
+    }
+
+    /// The same URL layout WITHOUT a warehouse prefix cannot be keyed at all:
+    /// refuse the statement rather than silently forking the table's log.
+    #[tokio::test]
+    async fn datafusion_bulk_append_refuses_a_url_location_without_the_warehouse_prefix() {
+        let bridge = Arc::new(CapturingObjectStoreBridge::new());
+        let err = run_bulk_append_as(
+            bridge.clone(),
+            "file:///wh/data/acme/ns1/facts/data",
+            None,
+            vec![test_record("r1")],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("without the warehouse prefix (refusing rather than writing a second"),
+            "{err}"
+        );
+        assert!(
+            bridge.iceberg_commits.lock().unwrap().is_empty(),
+            "nothing committed"
+        );
+    }
+
+    /// A fallback base that merely ENDS in `/data` (a table named "data") is a
+    /// table root, not a data directory: its log sits at `{root}/metadata`, never
+    /// stripped to the parent — sibling tables must not share one log.
+    #[tokio::test]
+    async fn datafusion_bulk_append_does_not_strip_a_data_suffixed_fallback_root() {
+        let schema = CatalogTableSchema::new("data")
+            .with_workload_profile(CatalogWorkloadProfile::Olap)
+            .with_storage_specialization(CatalogStorageSpecialization::ColumnarAnalytics);
+        let plan =
+            CopyIntoPlan::insert_select(LogicalTableRef::new("data"), "SELECT * FROM staging");
+        let overrides = WriteIntentOverrides {
+            row_count_hint: Some(DEFAULT_BULK_ROW_THRESHOLD),
+            batch_local_constraints_sufficient: Some(true),
+            ..Default::default()
+        };
+        let routed = TableWriteRouter.route(crate::query::table_write_plan::RoutingContext {
+            target_schema: &schema,
+            target_stats: None,
+            source_schema: None,
+            source_stats: None,
+            write_intent_overrides: Some(&overrides),
+            plan: &plan,
+        });
+        let bridge = Arc::new(CapturingObjectStoreBridge::new());
+        DataFusionTableWriteExecutor::new(
+            Arc::new(VecSourceReader::new(vec![vec![test_record("r1")]])),
+            Arc::new(CapturingRecordStore {
+                writes: Mutex::new(Vec::new()),
+            }),
+        )
+        .with_object_store_bridge(bridge.clone())
+        .execute(TableWriteExecutionRequest {
+            target_schema: &schema,
+            source_schema: None,
+            routed_plan: routed,
+            tenant_context: None,
+            warehouse_prefix: None,
+        })
+        .await
+        .unwrap();
+
+        let commits = bridge.iceberg_commits.lock().unwrap();
+        assert_eq!(
+            commits.len(),
+            1,
+            "the fallback table named 'data' commits exactly once"
+        );
+        assert_eq!(
+            commits[0].0, "tables/data/metadata",
+            "the fallback root is used as-is — no /data strip to the parent 'tables'"
+        );
+        assert!(
+            commits[0]
+                .2
+                .iter()
+                .all(|p| p.as_ref().starts_with("tables/data/data/")),
+            "parts still land under the table's own data dir: {:?}",
+            commits[0].2
+        );
     }
 
     /// End to end through the REAL engine writer (no mock): parts written by the

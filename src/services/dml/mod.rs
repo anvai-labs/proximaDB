@@ -4000,8 +4000,8 @@ impl DmlService {
         // primary-layout location keeps precedence in the executor → no
         // double-prefix). Set on the local, non-persisted schema copy.
         let mut table_schema = table_schema;
+        let mut warehouse_prefix: Option<String> = None;
         if routed.write_lane_decision.lane == WriteLane::BulkAppendCommit
-            && table_schema.location.is_none()
             && let Some(prefix) = self
                 .resolve_warehouse_object_prefix(
                     &plan.target.qualified_name(),
@@ -4009,7 +4009,15 @@ impl DmlService {
                 )
                 .await?
         {
-            table_schema.location = Some(prefix);
+            // The prefix keys part placement when nothing is pinned (a
+            // materialize-set layout keeps precedence → no double-prefix), and
+            // ALWAYS keys the engine metadata log: one log per table, at the
+            // same root-relative prefix MATERIALIZE publishes under — the only
+            // correct key for a scheme-carrying layout URL (TD-SEAM-1 slice 2).
+            if table_schema.location.is_none() {
+                table_schema.location = Some(prefix.clone());
+            }
+            warehouse_prefix = Some(prefix);
         }
 
         let execution = self
@@ -4019,6 +4027,7 @@ impl DmlService {
                 source_schema,
                 routed_plan: routed,
                 tenant_context,
+                warehouse_prefix: warehouse_prefix.as_deref(),
             })
             .await?;
 
