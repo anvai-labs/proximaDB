@@ -2544,6 +2544,29 @@ def post_flush_compaction_observation(
     }
 
 
+def create_collection(server: str, base_path: Path, base_format: str) -> str:
+    """Create the (empty) benchmark collection and return its id — the same
+    call ingest() makes, without inserting vectors. TD-TIER-1 E1 --skip-ingest
+    uses it to register the collection in a fresh server's catalog so the
+    object prefix a prior run built (which contains <id>/data/...) resolves."""
+    _, dimension, _ = vector_source_geometry(base_path, base_format)
+    response = request_json(
+        server + "/api/v2/collections",
+        method="POST",
+        body={
+            "name": "sift1m_get_reduction",
+            "dimension": dimension,
+            "engine": "sst",
+            "enable_proxima_record": True,
+            "distance_metric": "euclidean",
+        },
+    )
+    collection_id = str(response.get("collection_id") or response.get("id") or "")
+    if not collection_id:
+        raise RuntimeError(f"create response has no collection id: {response}")
+    return collection_id
+
+
 def ingest(
     server: str,
     base_path: Path,
@@ -3600,9 +3623,18 @@ def main() -> int:
             )
             resource_sampler.start()
         if args.skip_ingest:
-            # TD-TIER-1 E1: reuse the settled collection a prior run built —
-            # identical objects, model and query IDs across cap arms.
-            collection_id = args.collection_id
+            # TD-TIER-1 E1: reuse the settled OBJECT PREFIX a prior run built —
+            # identical objects, model and query IDs across cap arms. The
+            # catalog is per-run, so the collection must be registered in THIS
+            # server too; its id must reproduce the fixture's (objects live
+            # under <id>/data/) — a fresh catalog assigns the same first id;
+            # anything else fails closed rather than querying a wrong prefix.
+            collection_id = create_collection(server_url, base_path, args.base_format)
+            if collection_id != args.collection_id:
+                raise RuntimeError(
+                    "skip-ingest id mismatch: fixture collection "
+                    f"{args.collection_id}, this catalog assigned {collection_id}"
+                )
             result["collection_id"] = collection_id
             result["ingest"] = {"skipped": True, "source_collection_id": collection_id}
             geometry = wait_for_materialization(
