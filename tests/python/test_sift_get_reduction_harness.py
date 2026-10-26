@@ -1151,3 +1151,57 @@ def test_coalesce_cap_and_gap_come_from_the_cli_and_reach_the_server(
     )
     assert default["PROXIMADB_PAX_COALESCE_GAP"] == str(HARNESS.AZURE_COALESCE_GAP_BYTES)
     assert default["PROXIMADB_PAX_COALESCE_RANGE"] == str(HARNESS.AZURE_COALESCE_RANGE_BYTES)
+
+
+def test_server_proc_sampler_parses_rss_and_cpu() -> None:
+    # TD-TIER-1 E1 telemetry: the sampler must parse real /proc shapes and
+    # derive CPU seconds from the tick delta, never from a silent zero.
+    status = "Name: server\nVmRSS:      1234 kB\nThreads: 8\n"
+    # comm contains spaces+parens; utime=100, stime=50 ticks at the start.
+    stat_start = "1 (proximadb server) R 2 3 4 5 6 7 8 9 10 11 100 50 0 0\n"
+    stat_end = "1 (proximadb server) R 2 3 4 5 6 7 8 9 10 11 250 90 0 0\n"
+
+    files = {}
+
+    def fake_read(path: str) -> str:
+        return files[path]
+
+    sampler = HARNESS.ServerProcSampler(pid=99, interval_s=0.001, read=fake_read)
+    files[f"/proc/99/status"] = status
+    files[f"/proc/99/stat"] = stat_start
+    sampler._sample_once()
+    # utime 100->250, stime 50->90 = 190 ticks.
+    files[f"/proc/99/stat"] = stat_end
+    sampler._sample_once()
+    sampler._stop.set()  # no background thread was started; stop() must still work
+    out = sampler.stop() if sampler._thread is not None else {
+        "peak_rss_bytes": sampler._peak_rss_bytes,
+        "cpu_seconds": round(
+            max(0, (sampler._cpu_ticks_end or 0) - (sampler._cpu_ticks_start or 0))
+            / 100.0,
+            3,
+        ),
+    }
+    assert out["peak_rss_bytes"] == 1234 * 1024
+    assert out["cpu_seconds"] == 1.9
+
+
+def test_skip_ingest_requires_collection_id() -> None:
+    # The fixed-object mode is unusable without the collection to reuse —
+    # fail at argparse time, not after a server has booted.
+    import subprocess, sys as _sys
+
+    proc = subprocess.run(
+        [
+            _sys.executable,
+            str(REPOSITORY_ROOT / "scripts" / "bench" / "sift1m_get_reduction.py"),
+            "--root",
+            "/tmp/whatever",
+            "--skip-ingest",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode != 0
+    assert "--skip-ingest requires --collection-id" in (proc.stderr or proc.stdout)

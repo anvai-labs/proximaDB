@@ -1551,6 +1551,81 @@ def metric_delta(before: dict, after: dict, name: str) -> float:
     return delta
 
 
+def _parse_proc_status_rss(text: str) -> int | None:
+    for line in text.splitlines():
+        if line.startswith("VmRSS:"):
+            return int(line.split()[1]) * 1024  # kB -> bytes
+    return None
+
+
+def _parse_proc_stat_cpu_ticks(text: str) -> int | None:
+    # Fields after the paren-wrapped comm; utime is field 14, stime 15 (1-indexed
+    # over the whole line), i.e. items 11 and 12 after "(comm) rest".
+    try:
+        rest = text.rsplit(")", 1)[1].split()
+        return int(rest[11]) + int(rest[12])
+    except (IndexError, ValueError):
+        return None
+
+
+class ServerProcSampler:
+    """Samples a server process's RSS (peak) and CPU (ticks delta) while a
+    query phase runs (TD-TIER-1 E1 telemetry; the #2249 pilot lacked both).
+    `read` is injectable for tests."""
+
+    def __init__(
+        self,
+        pid: int,
+        interval_s: float = 0.25,
+        read=lambda path: open(path, encoding="utf-8").read(),
+    ):
+        self._pid = pid
+        self._interval_s = interval_s
+        self._read = read
+        self._peak_rss_bytes = 0
+        self._cpu_ticks_start: int | None = None
+        self._cpu_ticks_end: int | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _sample_once(self) -> None:
+        try:
+            rss = _parse_proc_status_rss(self._read(f"/proc/{self._pid}/status"))
+            if rss is not None and rss > self._peak_rss_bytes:
+                self._peak_rss_bytes = rss
+            ticks = _parse_proc_stat_cpu_ticks(self._read(f"/proc/{self._pid}/stat"))
+            if ticks is not None:
+                if self._cpu_ticks_start is None:
+                    self._cpu_ticks_start = ticks
+                self._cpu_ticks_end = ticks
+        except OSError:
+            pass  # process may have exited between phases; keep last values
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_s):
+            self._sample_once()
+
+    def start(self) -> None:
+        self._sample_once()
+        self._thread = threading.Thread(target=self._run, name="server-proc-sampler")
+        self._thread.start()
+
+    def stop(self) -> dict:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        ticks_per_second = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100.0
+        cpu_seconds = 0.0
+        if self._cpu_ticks_start is not None and self._cpu_ticks_end is not None:
+            cpu_seconds = (
+                max(0, self._cpu_ticks_end - self._cpu_ticks_start) / ticks_per_second
+            )
+        return {
+            "peak_rss_bytes": self._peak_rss_bytes,
+            "cpu_seconds": round(cpu_seconds, 3),
+        }
+
+
 def percentile(sorted_values: list[float], quantile: float) -> float:
     rank = max(0, math.ceil(quantile * len(sorted_values)) - 1)
     return sorted_values[rank]
@@ -1580,6 +1655,7 @@ def prefix_quality_checkpoints(
                 "latency_ms": {
                     "p50": percentile(prefix_latencies, 0.50),
                     "p95": percentile(prefix_latencies, 0.95),
+                    "p99": percentile(prefix_latencies, 0.99),
                     "mean": sum(prefix_latencies) / query_count,
                 },
             }
@@ -1623,9 +1699,13 @@ def run_query_sweep(
     groundtruth_format: str = "ivecs",
     progress_guard=None,
     concurrency: int = 1,
+    server_pid: int | None = None,
 ) -> dict:
     if concurrency <= 0:
         raise RuntimeError("query concurrency must be positive")
+    sampler = ServerProcSampler(server_pid) if server_pid is not None else None
+    if sampler is not None:
+        sampler.start()
     queries = read_vectors(query_path, query_format, query_start, query_count)
     groundtruth = read_truth_ids(
         groundtruth_path, groundtruth_format, query_start, query_count
@@ -1705,6 +1785,9 @@ def run_query_sweep(
         recalls.append(recall_hits / top_k)
     if progress_guard is not None:
         progress_guard()
+    server_proc: dict = {}
+    if sampler is not None:
+        server_proc = sampler.stop()
     after = scrape(server)
     quality_checkpoints = prefix_quality_checkpoints(recalls, latencies)
     latencies.sort()
@@ -1791,8 +1874,11 @@ def run_query_sweep(
         "latency_ms": {
             "p50": percentile(latencies, 0.50),
             "p95": percentile(latencies, 0.95),
+            # TD-TIER-1 E1 telemetry: p99 was missing from the #2249 pilot.
+            "p99": percentile(latencies, 0.99),
             "mean": sum(latencies) / len(latencies),
         },
+        "server_process": server_proc,
         "physical_gets": gets,
         "gets_per_query": gets / query_count,
         # TD-PAXDIR-1 D7: GET + LIST + HEAD per query (design §4.2 G3) and
@@ -2839,6 +2925,21 @@ def main() -> int:
         ),
     )
     parser.add_argument("--queries", type=int, default=1_000)
+    parser.add_argument(
+        "--skip-ingest",
+        action="store_true",
+        help=(
+            "TD-TIER-1 E1 fixed-object mode: assume the collection named by "
+            "--collection-id already exists at --storage-url with settled "
+            "segments (built by a prior full run); skip ingest — the settle "
+            "wait still validates geometry. Runs cap arms against "
+            "byte-identical objects/model/query IDs"
+        ),
+    )
+    parser.add_argument(
+        "--collection-id",
+        help="collection id for --skip-ingest runs (the build run records it in result.json)",
+    )
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--settle-timeout-secs", type=int, default=1_200)
     parser.add_argument(
@@ -3016,6 +3117,8 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+    if args.skip_ingest and not args.collection_id:
+        raise SystemExit("--skip-ingest requires --collection-id")
     if not (
         args.coalesce_gap_mb >= 0
         and args.coalesce_range_mb > 0
@@ -3251,7 +3354,7 @@ def main() -> int:
         remote_geometry = S3PaxGeometry(
             storage_url, root / "s3-pax-snapshot", args.s3_endpoint, args.s3_region
         )
-    if remote_geometry is not None:
+    if remote_geometry is not None and not args.skip_ingest:
         remote_geometry.require_empty_prefix()
     # Epoch proof for --explicit-flush-every-rows: remote readers use object
     # identity; a local (file://) bed proves the same epochs from the PAX
@@ -3487,6 +3590,7 @@ def main() -> int:
             coalesce_range_bytes=int(args.coalesce_range_mb * 1024 * 1024),
         )
         active.start()
+        active_pid = active.process.pid if active.process is not None else None
         if args.compaction_spill:
             if active.process is None:
                 raise RuntimeError("spill resource sampling requires a live server")
@@ -3495,32 +3599,51 @@ def main() -> int:
                 spill_directory,
             )
             resource_sampler.start()
-        (
-            collection_id,
-            ingest_seconds,
-            retry_status_counts,
-            explicit_flushes,
-            explicit_compaction,
-        ) = ingest(
-            server_url,
-            base_path,
-            args.base_format,
-            args.rows,
-            args.batch_size,
-            "127.0.0.1",
-            args.port,
-            args.ingest_transport,
-            args.explicit_flush_every_rows,
-            epoch_geometry,
-        )
-        result["collection_id"] = collection_id
-        result["ingest"] = {
-            "seconds": ingest_seconds,
-            "vectors_per_second": args.rows / ingest_seconds,
-            "retry_status_counts": retry_status_counts,
-            "explicit_flushes": explicit_flushes,
-            "explicit_compaction": explicit_compaction,
-        }
+        if args.skip_ingest:
+            # TD-TIER-1 E1: reuse the settled collection a prior run built —
+            # identical objects, model and query IDs across cap arms.
+            collection_id = args.collection_id
+            result["collection_id"] = collection_id
+            result["ingest"] = {"skipped": True, "source_collection_id": collection_id}
+            geometry = wait_for_materialization(
+                root / "data" / "sst",
+                server_url,
+                collection_id,
+                args.rows,
+                args.max_segments,
+                args.settle_timeout_secs,
+                args.stable_secs,
+                remote_geometry,
+                required_layout_version=args.require_layout_version,
+            )
+            result["settled_geometry"] = geometry
+        else:
+            (
+                collection_id,
+                ingest_seconds,
+                retry_status_counts,
+                explicit_flushes,
+                explicit_compaction,
+            ) = ingest(
+                server_url,
+                base_path,
+                args.base_format,
+                args.rows,
+                args.batch_size,
+                "127.0.0.1",
+                args.port,
+                args.ingest_transport,
+                args.explicit_flush_every_rows,
+                epoch_geometry,
+            )
+            result["collection_id"] = collection_id
+            result["ingest"] = {
+                "seconds": ingest_seconds,
+                "vectors_per_second": args.rows / ingest_seconds,
+                "retry_status_counts": retry_status_counts,
+                "explicit_flushes": explicit_flushes,
+                "explicit_compaction": explicit_compaction,
+            }
         geometry = wait_for_materialization(
             root / "data" / "sst",
             server_url,
@@ -3613,6 +3736,7 @@ def main() -> int:
             "post_write",
             args.query_format,
             args.groundtruth_format,
+            server_pid=active_pid,
         )
         result["phases"]["post_write"] = post_write
         failures.extend(
@@ -3648,6 +3772,7 @@ def main() -> int:
             coalesce_range_bytes=int(args.coalesce_range_mb * 1024 * 1024),
         )
         active.start()
+        active_pid = active.process.pid if active.process is not None else None
         local_warm = run_query_sweep(
             server_url,
             collection_id,
@@ -3659,6 +3784,7 @@ def main() -> int:
             "local_disk_warm",
             args.query_format,
             args.groundtruth_format,
+            server_pid=active_pid,
         )
         result["phases"]["local_disk_warm"] = local_warm
         failures.extend(
@@ -3695,6 +3821,7 @@ def main() -> int:
             coalesce_range_bytes=int(args.coalesce_range_mb * 1024 * 1024),
         )
         active.start()
+        active_pid = active.process.pid if active.process is not None else None
         object_cold = run_query_sweep(
             server_url,
             collection_id,
@@ -3706,6 +3833,7 @@ def main() -> int:
             "object_cold",
             args.query_format,
             args.groundtruth_format,
+            server_pid=active_pid,
         )
         result["phases"]["object_cold"] = object_cold
         failures.extend(
