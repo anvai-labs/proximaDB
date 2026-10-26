@@ -356,6 +356,59 @@ pub trait ObjectStoreBridge: Send + Sync {
         let _ = (metadata_prefix, version);
         Ok(Vec::new())
     }
+
+    /// The current snapshot's data files **and the deletion vectors that apply to
+    /// them**, as one view (the snapshot's rows are its data files minus each
+    /// file's deleted positions).
+    ///
+    /// The default keeps the pre-delete behavior of bridges that never publish
+    /// vectors: the data files of [`read_iceberg_table`](Self::read_iceberg_table)
+    /// and no deletions. A bridge that CAN publish vectors must override this and
+    /// refuse a snapshot carrying them if it cannot represent them — never return
+    /// the deleted rows as live.
+    async fn read_iceberg_snapshot_files(
+        &self,
+        metadata_prefix: &str,
+        version: u64,
+    ) -> Result<IcebergSnapshotFiles, StorageError> {
+        Ok(IcebergSnapshotFiles {
+            data_files: self.read_iceberg_table(metadata_prefix, version).await?,
+            deletion_vectors: Vec::new(),
+        })
+    }
+
+    /// [`publish_iceberg_files`](Self::publish_iceberg_files) carrying `deletes`:
+    /// the committed snapshot is `files` with each vector's positions deleted.
+    /// Format v3 only; the engine validates that every vector references one of
+    /// `files` and no file has two. Default: unsupported.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_iceberg_files_deleting(
+        &self,
+        files: &[Path],
+        deletes: &[IcebergSnapshotDeletion],
+        parent: Option<u64>,
+        metadata_prefix: &str,
+        table_uuid: &str,
+        table_location: &str,
+        fields: &[IcebergSnapshotField],
+        snapshot_id: i64,
+        timestamp_ms: i64,
+    ) -> Result<u64, StorageError> {
+        let _ = (
+            files,
+            deletes,
+            parent,
+            metadata_prefix,
+            table_uuid,
+            table_location,
+            fields,
+            snapshot_id,
+            timestamp_ms,
+        );
+        Err(StorageError::Serialization(
+            "publish_iceberg_files_deleting not supported".into(),
+        ))
+    }
 }
 
 /// Storage-common-local descriptor of one Iceberg schema field (the trait can't reference
@@ -367,6 +420,42 @@ pub struct IcebergSnapshotField {
     pub name: String,
     pub type_name: String,
     pub required: bool,
+}
+
+/// One deletion vector of a published snapshot, resolved to bridge-relative keys
+/// (foundation-local mirror of the engine's descriptor — same pattern as
+/// [`IcebergSnapshotField`]: the trait cannot name the engine's types). A reader
+/// applies it by hiding `data_file`'s positions named by the vector's blob in
+/// `puffin_file`; a re-publisher passes it back to
+/// [`ObjectStoreBridge::publish_iceberg_files_deleting`] to carry the deletes forward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IcebergSnapshotDeletion {
+    /// The data file whose rows it deletes (one of the snapshot's data files).
+    pub data_file: Path,
+    /// The Puffin file holding the vector, and its blob's byte range + size there.
+    pub puffin_file: Path,
+    pub content_offset: u64,
+    pub content_size_in_bytes: u64,
+    /// The Puffin file's full size (the delete-manifest entry's `file_size_in_bytes`).
+    pub puffin_file_size_in_bytes: u64,
+    /// The number of deleted positions.
+    pub cardinality: u64,
+}
+
+/// A published snapshot's data files and the deletion vectors that apply to them
+/// (its rows are the data files minus each vector's positions).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IcebergSnapshotFiles {
+    pub data_files: Vec<Path>,
+    pub deletion_vectors: Vec<IcebergSnapshotDeletion>,
+}
+
+impl IcebergSnapshotFiles {
+    /// True when the snapshot carries deletion vectors — a reader that cannot
+    /// apply them must refuse rather than serve the deleted rows.
+    pub fn has_deletions(&self) -> bool {
+        !self.deletion_vectors.is_empty()
+    }
 }
 
 /// Map an Arrow schema to the Iceberg snapshot fields, ids 1..n in arrow order

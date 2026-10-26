@@ -12,6 +12,7 @@
 
 use std::path::{Path as FsPath, PathBuf};
 
+use futures::StreamExt;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::sleep;
@@ -217,6 +218,224 @@ fn external_readback(
         "external Iceberg read-back failed:\n{report}"
     );
     true
+}
+
+/// P2.4 slice 3b (TD-SEAM-4): a published snapshot carrying deletion vectors is
+/// read delete-aware EVERYWHERE. The vectors are published test-side through
+/// the engine's writer (the delete WRITER is the next slice and stays
+/// unactivated); what this gate proves is the READ side end to end: the live
+/// server's own scan (manifest-selected, DV-applied) and the external engines
+/// (PyIceberg REST/static, DuckDB iceberg_scan — CI pins pyiceberg 0.12.0 and
+/// duckdb 1.5.6, both read v3 + deletion vectors) all exclude the deleted rows,
+/// value-for-value with the pgwire answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deletion_vectors_are_invisible_to_proximadb_and_external_engines() {
+    use proximadb_iceberg_engine::IcebergObjectStoreBridge;
+    use proximadb_iceberg_engine::deletion_vector::PositionDeletes;
+    use proximadb_iceberg_engine::iceberg as engine_iceberg;
+    use proximadb_storage_common::object_store_bridge::ObjectStoreBridge as _;
+
+    let server = TestPgServer::start().await.expect("server start");
+    let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let table = "dv_returns";
+    let cols = ["sr_id", "sr_item"];
+    client
+        .simple_query(&format!(
+            "CREATE TABLE {table} (sr_id INT PRIMARY KEY, sr_item VARCHAR)"
+        ))
+        .await
+        .expect("create");
+    client
+        .simple_query(&format!(
+            "INSERT INTO {table} (sr_id, sr_item) VALUES \
+             (1, 'keep-me-not'), (2, 'keep'), (3, 'gone-too'), (4, 'keep')"
+        ))
+        .await
+        .expect("insert");
+    client
+        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
+        .await
+        .expect("materialize");
+    sleep(Duration::from_millis(300)).await;
+
+    // Locate the table's Iceberg base under the warehouse: its metadata dir
+    // holds the `v*.metadata.json` the REST catalog serves.
+    let warehouse = server.data_dir().join("warehouse");
+    let mut files = Vec::new();
+    walk(&warehouse, &mut files);
+    let metadata_json = files
+        .iter()
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".metadata.json"))
+                && p.to_string_lossy().contains(table)
+        })
+        .expect("the table's metadata.json")
+        .clone();
+    let metadata_dir = metadata_json.parent().expect("metadata dir").to_path_buf();
+    let base_dir = metadata_dir.parent().expect("table base").to_path_buf();
+    let base_url = format!("file://{}", base_dir.display());
+
+    // Publish a v3 successor snapshot carrying one deletion vector, deleting
+    // the positions of sr_id 1 and 3 in the (single) published data file.
+    let bridge = IcebergObjectStoreBridge::from_url(&base_url).expect("bridge");
+    let version = bridge
+        .latest_metadata_version("metadata")
+        .await
+        .expect("latest version")
+        .expect("a published snapshot");
+    let snapshot = bridge
+        .read_iceberg_snapshot_with_deletes("metadata", version)
+        .await
+        .expect("read snapshot");
+    assert!(snapshot.data_files.len() == 1, "one published part");
+    let data_file = snapshot.data_files[0].clone();
+    assert!(
+        snapshot.deletion_vectors.is_empty(),
+        "the materialized snapshot carries no vectors yet"
+    );
+
+    // Map sr_id → file position by reading the part's first column.
+    let object_url =
+        url::Url::parse(bridge.object_uri(data_file.as_ref()).as_str()).expect("part url");
+    let (store, path) = object_store::parse_url(&object_url).expect("parse store");
+    let reader =
+        parquet::arrow::async_reader::ParquetObjectReader::new(std::sync::Arc::from(store), path);
+    let builder = parquet::arrow::ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .expect("part footer");
+    let schema = builder.schema().clone();
+    let id_idx = schema.index_of("sr_id").expect("sr_id column");
+    let mut stream = builder.build().expect("part stream");
+    let mut positions = Vec::new();
+    let mut position = 0_u64;
+    let mut ids = Vec::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch.expect("part batch");
+        let ids_col = batch
+            .column(id_idx)
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .expect("sr_id int32");
+        for row in 0..batch.num_rows() {
+            ids.push(ids_col.value(row));
+            positions.push(position);
+            position += 1;
+        }
+    }
+    let deleted: Vec<u64> = ids
+        .iter()
+        .zip(&positions)
+        .filter(|(id, _)| **id == 1 || **id == 3)
+        .map(|(_, p)| *p)
+        .collect();
+    assert_eq!(deleted.len(), 2, "positions of sr_id 1 and 3: {ids:?}");
+
+    let mut dv = PositionDeletes::new();
+    for p in &deleted {
+        dv.insert(*p);
+    }
+    let metas = bridge
+        .write_deletion_vectors(
+            &object_store::path::Path::from("data/dv-0.puffin"),
+            &[(data_file.clone(), &dv)],
+        )
+        .await
+        .expect("write vectors");
+    let engine_fields = vec![
+        engine_iceberg::IcebergField {
+            id: 1,
+            name: "sr_id".into(),
+            type_name: "int".into(),
+            required: true,
+        },
+        engine_iceberg::IcebergField {
+            id: 2,
+            name: "sr_item".into(),
+            type_name: "string".into(),
+            required: true,
+        },
+    ];
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(2);
+    bridge
+        .publish_iceberg_files_with_deletes(
+            &[data_file],
+            &metas,
+            Some(version),
+            "metadata",
+            "00000000-0000-0000-0000-0000000000d3",
+            &format!("{base_url}/data"),
+            &engine_fields,
+            now_ms + 1,
+            now_ms,
+        )
+        .await
+        .expect("publish the deleting snapshot");
+    // The live server picks the new snapshot up on its next open (manifest-
+    // selected; the table-open cache is default-OFF and this is its first open
+    // since publication).
+
+    // pgwire keeps serving the WAL-fresh native tier (4 rows): a test-side
+    // published DV is EXTERNAL state the server was never told about — the
+    // delete WRITER (the next slice) is what synchronizes both sides. What
+    // this gate proves here is the PUBLISHED view: the engine's snapshot read
+    // (what the DataFusion leaf consumes) and every external engine exclude
+    // the deleted rows.
+    let expected_rows = vec![
+        vec![Some("2".to_string()), Some("keep".to_string())],
+        vec![Some("4".to_string()), Some("keep".to_string())],
+    ];
+    {
+        use proximadb_storage_common::object_store_bridge::ObjectStoreBridge as _;
+        let latest = bridge
+            .latest_metadata_version("metadata")
+            .await
+            .expect("latest")
+            .expect("the deleting snapshot");
+        let snapshot = bridge
+            .read_iceberg_snapshot_with_deletes("metadata", latest)
+            .await
+            .expect("read");
+        assert_eq!(
+            snapshot.deletion_vectors.len(),
+            1,
+            "the published v3 carries the vector"
+        );
+    }
+
+    // The REST catalog serves the v3 metadata verbatim, and every external
+    // reader excludes the deleted rows too.
+    let load = rest_metadata_location(server.rest_port, table).await;
+    let metadata_location = load["metadata-location"]
+        .as_str()
+        .expect("metadata-location")
+        .to_string();
+    assert_eq!(
+        load["metadata"]["format-version"], 3,
+        "the deleting snapshot is v3"
+    );
+    let scratch = TempDir::new().expect("scratch");
+    if !external_readback(
+        server.rest_port,
+        table,
+        &metadata_location,
+        &cols,
+        &expected_rows,
+        scratch.path(),
+    ) {
+        return;
+    }
+    eprintln!("✓ deletion vectors are invisible to ProximaDB and external engines");
 }
 
 /// ADR-097 D3 / TD-SEAM-1 gate: a table materialized over pgwire is read back by

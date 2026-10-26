@@ -34,6 +34,7 @@ use std::sync::{Arc, OnceLock};
 
 use arrow_schema::SchemaRef;
 use parking_lot::RwLock;
+use proximadb_iceberg_engine::deletion_vector::PositionDeletes;
 use proximadb_storage_common::format_splits::FileSplit;
 
 /// Immutable footer-derived discovery result for one parquet base/object: the
@@ -47,6 +48,11 @@ pub struct TableOpenDiscovery {
     pub splits: Vec<FileSplit>,
     /// Per-file byte sizes, keyed by the full object path.
     pub file_sizes: HashMap<String, u64>,
+    /// The snapshot's decoded deletion vectors, keyed by the full data-file
+    /// path (empty for snapshots without vectors). Part of the same immutable
+    /// discovery as the splits — a cache hit without them would serve deleted
+    /// rows.
+    pub deletions: HashMap<String, Arc<PositionDeletes>>,
 }
 
 /// Cache key: tenant identity (fail-closed to `""` when single-tenant) + the
@@ -124,6 +130,7 @@ mod tests {
             schema: Arc::new(arrow_schema::Schema::empty()),
             splits: Vec::new(),
             file_sizes: HashMap::new(),
+            deletions: HashMap::new(),
         }
     }
 
