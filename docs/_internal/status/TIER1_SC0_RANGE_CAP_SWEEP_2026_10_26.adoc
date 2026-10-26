@@ -1,0 +1,47 @@
+= TD-TIER-1 SC0 / E1: fixed-geometry range-cap sweep (4 / 16 / 40 MiB)
+
+**Date:** 2026-10-26 · **Branch:** `bench/tier1-cap-sweep` @ `41ac7d439` (empty anchor over develop `d929d7993`; binary built in-worktree at that HEAD) · **TD:** link:../../10-quality/td/TD-TIER-1-collection-storage-policy-and-residency.adoc[TD-TIER-1] SC0 / design §5–§7 (E1).
+
+== Bed
+
+Same as the D8 canonical profile: MinIO single drive behind Toxiproxy 5 + 5 ms (measured ~13 ms RTT through the proxy), SIFT1M 1M × 128, full-corpus ground truth, top-10, 1,000 queries per phase (disjoint per phase, identical across arms), concurrency 1, `--read-ranges-inflight 16`, `--training-compaction-min-mb 1 --max-segments 3`, `--centroid-directory default` (P5b defaults on, all gates unset), memory-capped (`MemoryMax=64G`), arms sequential on an idle box. The only inter-arm variable: `--coalesce-range-mb` 4 / 16 / 40 (the SC0-exposed flag; gap fixed at the historical 1 MiB). Every arm's result.json records its cap (the `coalescing` and `range_planner` blocks agree — the SC0 review fix).
+
+== Result (`object_cold`)
+
+[cols="2,1,1,1",options="header"]
+|===
+| | 4 MiB | 16 MiB | 40 MiB
+| requests/q (GET+LIST+HEAD) | 20.00 | **10.51** | 10.28
+| GETs/q | 19.00 | 9.51 | 9.28
+| waves p50 (p95 = 4 in all) | 3 | 3 | 3
+| recall@10 | 0.9817 | 0.9824 | 0.9825
+| MB/q | 58.7 | 57.8 | 56.6
+| p50 / p95 ms | 107 / 149 | 129 / 181 | 113 / 172
+| qps (c=1) | 9.22 | 7.61 | 8.52
+| warm (`local_disk_warm`) req/q | 6.01 | 4.58 | 4.73
+| settled cells / segments | 21 / 1 | 25 / 1 | 26 / 1
+| ivf fetch rounds/q | 4.08 | 2.67 | 3.37
+|===
+
+All values [M] from the three result.json files (`~/bench-beds/p5b-runs/sweep-cap{4,16,40}/`).
+
+== Findings
+
+. **4 → 16 MiB halves requests at unchanged recall and wave depth** (20.00 → 10.51 req/q; recall +0.0007; waves p50 3 in all arms). The added transfer time does not add a wave. Warm requests drop too (6.01 → 4.58). This confirms the pre-sweep model: the D8 trace showed ~10.5 of 18.55 GETs were full 4 MiB Region-B ranges that larger caps merge.
+. **16 → 40 MiB is the plateau** (10.51 → 10.28): the remaining GETs are extents that a 16 MiB cap already merges or that widening cannot — disjoint useful bytes, not a cap artifact. The knee the design predicted sits at or before 16 MiB at this geometry. [M]
+. **Geometry was approximately, not exactly, fixed**: settled coarse cells 21 / 25 / 26 across arms (training samples the compaction input rows, which vary per fresh bed). This works *against* the 16/40 arms (more cells ⇒ more probe requests), so the measured request reduction is a conservative bound, not inflated by geometry. Recorded, not smoothed away. [M]
+. **The 4 MiB arm tripped the ≤ 20 requests gate by 0.0004** (20.0004, displayed 20.00): bed-shape variance at the gate boundary, recall held. Sweep arms' binding constraint is recall (≥ 0.98, held in all arms per the design); the gate trip is recorded, not excused. [M]
+. **Latency is a wash within bed variance** (p50 107–129 ms band across arms; per-arm beds differ in cells and rounds). No arm regressed waves, which is the latency term the profile controls. [M]
+
+== Cost read [D — derived, S3 us-east-1 list rates on the measured units]
+
+Cold request cost at 1M scale: 4 MiB ≈ $12.4/M queries → 16 MiB ≈ $8.8/M (9.51 GET × $0.40/M + 1 LIST × $5.00/M). After the halving, **the discovery LIST is 57% of the cold request bill** — TD-PAXDIR-2 (listing cache) is the dominant remaining request lever, ahead of any further cap change.
+
+== Production posture (no default change made)
+
+The harness's historical 4 MiB pin understates production: `IopsBudget::S3` targets 8 MiB per range (16 MiB max) for S3/GCS paths, 4 MiB for Azure, 1 MiB local — so production S3 deployments already sit between the 4 and 16 arms without any env var. No production default changes in this PR. Per the design's stop rule, a default change would first require the finalist caps on fragmented segments, filtered queries, 10M rows and 768d before any global flip.
+
+== Provenance
+
+* Result files (local, not checked in): `~/bench-beds/p5b-runs/sweep-cap{4,16,40}/result.json` + logs `cap-sweep2.log`; first launch lost to the worktree-clean incident (see the anchor-commit memory/ADR note; no measurement was taken from it).
+* Single-machine emulator evidence, not an SLA or a cloud-latency claim.
