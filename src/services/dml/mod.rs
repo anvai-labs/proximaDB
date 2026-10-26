@@ -2872,16 +2872,15 @@ impl DmlService {
         // A rewrite from that state would resurrect hidden rows. Until the live
         // writer establishes that synchronization, refuse before writing parts,
         // regardless of whether incremental append is enabled.
-        if let Some(version) = parent {
-            if bridge
+        if let Some(version) = parent
+            && bridge
                 .read_iceberg_snapshot_files(&metadata_prefix, version)
                 .await?
                 .has_deletions()
-            {
-                anyhow::bail!(
-                    "MATERIALIZE {table_name}: published snapshot has deletion vectors; native-state synchronization is required before republication"
-                );
-            }
+        {
+            anyhow::bail!(
+                "MATERIALIZE {table_name}: published snapshot has deletion vectors; native-state synchronization is required before republication"
+            );
         }
         let successor = parent.map_or(0, |p| p.saturating_add(1));
         let now_ms = std::time::SystemTime::now()
