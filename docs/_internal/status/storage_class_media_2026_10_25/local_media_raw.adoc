@@ -1,0 +1,227 @@
+= Raw measurement evidence
+
+[source,json]
+----
+{
+  "kind": "WSL/VHD direct I/O diagnostic, host cache not controlled",
+  "file_bytes": 1073741824,
+  "arms": [
+    {
+      "qd": 1,
+      "range_mib": 4,
+      "pattern": "sequential",
+      "reads": 64,
+      "mib_per_s": 3674.016566233659,
+      "p50_ms": 1.006238511763513,
+      "p95_ms": 1.1138530098833144
+    },
+    {
+      "qd": 1,
+      "range_mib": 4,
+      "pattern": "random",
+      "reads": 64,
+      "mib_per_s": 3907.0166079500973,
+      "p50_ms": 0.9667075064498931,
+      "p95_ms": 1.0294000094290823
+    },
+    {
+      "qd": 1,
+      "range_mib": 8,
+      "pattern": "sequential",
+      "reads": 64,
+      "mib_per_s": 4292.8372333447205,
+      "p50_ms": 1.7619279969949275,
+      "p95_ms": 1.932973973453045
+    },
+    {
+      "qd": 1,
+      "range_mib": 8,
+      "pattern": "random",
+      "reads": 64,
+      "mib_per_s": 4273.117686228869,
+      "p50_ms": 1.7623530002310872,
+      "p95_ms": 2.0224029722157866
+    },
+    {
+      "qd": 1,
+      "range_mib": 16,
+      "pattern": "sequential",
+      "reads": 64,
+      "mib_per_s": 5142.235308222536,
+      "p50_ms": 3.0145104974508286,
+      "p95_ms": 3.2603559957351536
+    },
+    {
+      "qd": 1,
+      "range_mib": 16,
+      "pattern": "random",
+      "reads": 64,
+      "mib_per_s": 4842.304879996522,
+      "p50_ms": 3.1073005084181204,
+      "p95_ms": 3.4576450125314295
+    },
+    {
+      "qd": 1,
+      "range_mib": 32,
+      "pattern": "sequential",
+      "reads": 32,
+      "mib_per_s": 5089.712748278125,
+      "p50_ms": 5.44715448631905,
+      "p95_ms": 7.88228798774071
+    },
+    {
+      "qd": 1,
+      "range_mib": 32,
+      "pattern": "random",
+      "reads": 32,
+      "mib_per_s": 5014.439087242844,
+      "p50_ms": 5.846814005053602,
+      "p95_ms": 7.032288005575538
+    },
+    {
+      "qd": 1,
+      "range_mib": 40,
+      "pattern": "sequential",
+      "reads": 25,
+      "mib_per_s": 5143.138401880218,
+      "p50_ms": 7.0028500049375,
+      "p95_ms": 8.211385982576758
+    },
+    {
+      "qd": 1,
+      "range_mib": 40,
+      "pattern": "random",
+      "reads": 25,
+      "mib_per_s": 4794.497435851781,
+      "p50_ms": 7.519559992942959,
+      "p95_ms": 9.35363900498487
+    },
+    {
+      "qd": 1,
+      "range_mib": 64,
+      "pattern": "sequential",
+      "reads": 16,
+      "mib_per_s": 4378.225513091267,
+      "p50_ms": 12.614885010407306,
+      "p95_ms": 33.624652976868674
+    },
+    {
+      "qd": 1,
+      "range_mib": 64,
+      "pattern": "random",
+      "reads": 16,
+      "mib_per_s": 5095.666764329683,
+      "p50_ms": 10.710140006267466,
+      "p95_ms": 31.265402998542413
+    },
+    {
+      "qd": 8,
+      "range_mib": 4,
+      "pattern": "sequential",
+      "reads": 64,
+      "mib_per_s": 5833.533558638915,
+      "p50_ms": 4.5588950015371665,
+      "p95_ms": 7.135089981602505
+    },
+    {
+      "qd": 8,
+      "range_mib": 4,
+      "pattern": "random",
+      "reads": 64,
+      "mib_per_s": 6180.673400565603,
+      "p50_ms": 4.557305495836772,
+      "p95_ms": 4.940386017551646
+    },
+    {
+      "qd": 8,
+      "range_mib": 8,
+      "pattern": "sequential",
+      "reads": 64,
+      "mib_per_s": 6356.879852146233,
+      "p50_ms": 9.091711501241662,
+      "p95_ms": 10.549025988439098
+    },
+    {
+      "qd": 8,
+      "range_mib": 8,
+      "pattern": "random",
+      "reads": 64,
+      "mib_per_s": 6347.661704619469,
+      "p50_ms": 9.114661006606184,
+      "p95_ms": 10.578898014500737
+    },
+    {
+      "qd": 8,
+      "range_mib": 16,
+      "pattern": "sequential",
+      "reads": 64,
+      "mib_per_s": 6653.3015011506495,
+      "p50_ms": 18.19651501136832,
+      "p95_ms": 18.437460996210575
+    },
+    {
+      "qd": 8,
+      "range_mib": 16,
+      "pattern": "random",
+      "reads": 64,
+      "mib_per_s": 6662.091163078882,
+      "p50_ms": 18.168540991609916,
+      "p95_ms": 18.457950005540624
+    },
+    {
+      "qd": 8,
+      "range_mib": 32,
+      "pattern": "sequential",
+      "reads": 32,
+      "mib_per_s": 5858.503467691605,
+      "p50_ms": 40.07966149947606,
+      "p95_ms": 52.991599979577586
+    },
+    {
+      "qd": 8,
+      "range_mib": 32,
+      "pattern": "random",
+      "reads": 32,
+      "mib_per_s": 5852.345248968366,
+      "p50_ms": 40.22689250996336,
+      "p95_ms": 54.31924801087007
+    },
+    {
+      "qd": 8,
+      "range_mib": 40,
+      "pattern": "sequential",
+      "reads": 25,
+      "mib_per_s": 6513.584278613202,
+      "p50_ms": 44.09325498272665,
+      "p95_ms": 50.25577198830433
+    },
+    {
+      "qd": 8,
+      "range_mib": 40,
+      "pattern": "random",
+      "reads": 25,
+      "mib_per_s": 6479.8271576752495,
+      "p50_ms": 41.086320008616894,
+      "p95_ms": 49.13619800936431
+    },
+    {
+      "qd": 8,
+      "range_mib": 64,
+      "pattern": "sequential",
+      "reads": 16,
+      "mib_per_s": 6357.640116807168,
+      "p50_ms": 61.28849201195408,
+      "p95_ms": 76.45732999662869
+    },
+    {
+      "qd": 8,
+      "range_mib": 64,
+      "pattern": "random",
+      "reads": 16,
+      "mib_per_s": 6154.538650461405,
+      "p50_ms": 68.70650649943855,
+      "p95_ms": 78.6032120231539
+    }
+  ]
+}
+----

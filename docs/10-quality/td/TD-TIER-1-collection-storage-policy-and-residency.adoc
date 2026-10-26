@@ -1,0 +1,62 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-TIER-1: Collection storage policy, admitted residency and tier-aware usage
+// status-as-of: 2026-10-25
+
+[cols="1,3",options="header"]
+|===
+| Field | Value
+| Status | Open — design reviewed; proposed roadmap, no storage-class implementation claimed.
+| Priority | MED — explicit storage economics without changing durability or query correctness.
+| Component | Collection config/catalog/API; storage placement; persistent PAX L2; consumption metrics and durable metering.
+| Design | link:../../12-design/STORAGE_CLASS_SEAMS_REVIEW_2026_10_25.adoc[Review, thought experiments, contracts, financial model and roadmap].
+| Relates to | ADR-033, ADR-036, ADR-085, ADR-094, ADR-097; TD-CACHE-9; TD-PAXDIR-2; TD-IOTRACE-4.
+| Baseline | `origin/develop` at `c18bb630e`, reviewed 2026-10-25. D8 #2241 is merged; measured scope remains limited.
+|===
+
+== Finding
+
+The original handoff proposes economy/balanced/performance policies, but conflates desired class,
+durable location, local cache priority, guaranteed capacity and provider access tier. There is
+no per-collection admitted-residency lifecycle in the surveyed code. Existing cache and storage
+primitives should be connected rather than duplicated.
+
+== Premise corrections
+
+* SST `CacheTier::evict_priority` is not the persistent store's reservation mechanism.
+  `PersistentByteStore` has its own budget and evictable L2 classes.
+* Write-time `all` warming does not cover every result/exact/control range.
+* Zero total remote requests depends on coherent discovery (TD-PAXDIR-2), which remains
+  separately owned; until then report data and control requests separately.
+* GCS access-tier writes and `ProximaObjectStore::put_with_tier` already exist; verify callers.
+* A PAX footer cannot have a different provider tier from its containing object.
+* Query trace meters do not establish idle reservation time or physical object inventory.
+* Additional EBS capacity does not replace the retained S3 bill. Original cost arithmetic,
+  CPU attribution and namespace-size conversion require the corrections in the design.
+
+== Proposed slices
+
+[cols="1,3,1",options="header"]
+|===
+| Slice | Scope | State
+| SC0 | Premise/evidence and fixed-geometry range/local-media experiments | **In review** — design review, implementer plan prompt, TD and dated media/minio/D8-extract evidence filed (from the 2026-10-25 external review, baseline `c18bb630e`); harness `--coalesce-{gap,range}-mb` exposed and recorded in result.json (was hard-coded 1 MiB/4 MiB per arm) with tests; ADR-036's stale "GCS absent" residual corrected in the same PR. No production code, no tuning default changed.
+| SC1 | Additive desired policy and truthful observed status | Open
+| SC2 | Authorized placement and supported capability checks | Open
+| SC3 | Atomic reservation/protection and durable usage lifecycle | Open
+| SC4 | Production residency read path and reconciliation | Open
+| SC5 | Optional future-PUT online access tier | Open
+| SC6 | Integrated proof, competitive cost worksheet and opt-in rollout | Open
+|===
+
+== Acceptance
+
+The design's SC-TE1–SC-TE16 are planned acceptance scenarios, not claims of existing tests.
+Each implementation PR records actual test identifiers and evidence. Required invariants:
+balanced compatibility; authorized paths; no capacity overcommit; truthful readiness;
+correct fallback after disk loss; publication/retirement ordering; query freshness and deletes;
+idle reservation accounting; per-operation/tier usage; recall and memory bounds.
+
+No new manifest authority, distributed quota service, automatic lifecycle manager, object
+location migration, global 40 MiB range default, or AnvaiOps rate-card implementation belongs
+in this TD. Other modalities adopt the same contract only after their read-set and correctness
+dependencies are proven; the initial implementation scope is object-backed SST/PAX.

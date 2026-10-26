@@ -1104,3 +1104,50 @@ def test_unready_segments_name_untrained_tails_and_wrong_layouts() -> None:
     assert HARNESS.unready_segments(parsed, 1) == [
         "L0_b.pax: untrained (no coarse A0; 2,950,953 bytes)"
     ]
+
+
+def test_coalesce_cap_and_gap_come_from_the_cli_and_reach_the_server(
+    tmp_path: Path,
+) -> None:
+    # TD-TIER-1 SC0: the range cap/gap were hard-coded constants in every
+    # arm; they are experiment inputs now, so a sweep arm must actually
+    # change what the server sees (and result.json must record it).
+    process = SimpleNamespace(poll=lambda: None)
+
+    def environment(gap_mb: float, range_mb: float) -> dict:
+        server = HARNESS.OwnedServer(
+            tmp_path / "proximadb-server",
+            tmp_path / "benchmark.toml",
+            "http://127.0.0.1:5790",
+            tmp_path / "server.log",
+            None,
+            coalesce_gap_bytes=int(gap_mb * 1024 * 1024),
+            coalesce_range_bytes=int(range_mb * 1024 * 1024),
+        )
+        with (
+            patch.object(HARNESS.subprocess, "Popen", return_value=process) as popen,
+            patch.object(HARNESS, "request_json", return_value={}),
+        ):
+            server.start()
+        return popen.call_args.kwargs["env"]
+
+    arm = environment(0.5, 16.0)
+    for name in (
+        "PROXIMADB_PAX_VECTOR_COALESCE_GAP",
+        "PROXIMADB_PAX_COALESCE_GAP",
+    ):
+        assert arm[name] == str(int(0.5 * 1024 * 1024)), name
+    for name in (
+        "PROXIMADB_PAX_VECTOR_COALESCE_RANGE",
+        "PROXIMADB_PAX_COALESCE_RANGE",
+    ):
+        assert arm[name] == str(int(16.0 * 1024 * 1024)), name
+
+    # The default arm keeps the historical 1 MiB / 4 MiB constants, so old
+    # arms reproduce byte-for-byte until a sweep opts in.
+    default = environment(
+        HARNESS.AZURE_COALESCE_GAP_BYTES / (1024 * 1024),
+        HARNESS.AZURE_COALESCE_RANGE_BYTES / (1024 * 1024),
+    )
+    assert default["PROXIMADB_PAX_COALESCE_GAP"] == str(HARNESS.AZURE_COALESCE_GAP_BYTES)
+    assert default["PROXIMADB_PAX_COALESCE_RANGE"] == str(HARNESS.AZURE_COALESCE_RANGE_BYTES)
