@@ -2855,7 +2855,9 @@ def main() -> int:
             "Remote read coalescing gap (MiB) bridged between adjacent ranges "
             "(PROXIMADB_PAX_{VECTOR_,}COALESCE_GAP). TD-TIER-1 SC0: previously "
             "hard-coded to 1 MiB in every arm; exposed so the fixed-geometry "
-            "range-cap sweep can vary it and every result records its value"
+            "range-cap sweep can vary it and every result records its value. "
+            "Inert under --adaptive-read-strategy (the chooser owns planning "
+            "there; these env vars are only set on the non-adaptive path)"
         ),
     )
     parser.add_argument(
@@ -2866,7 +2868,8 @@ def main() -> int:
             "Remote read coalescing range cap (MiB) per physical GET "
             "(PROXIMADB_PAX_{VECTOR_,}COALESCE_RANGE). Previously hard-coded "
             "to 4 MiB; the sweep arms (4/16/40 first) vary it with geometry "
-            "otherwise pinned"
+            "otherwise pinned. Inert under --adaptive-read-strategy (see "
+            "--coalesce-gap-mb)"
         ),
     )
     parser.add_argument(
@@ -3013,7 +3016,13 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
-    if args.coalesce_gap_mb < 0 or args.coalesce_range_mb <= 0:
+    if not (
+        args.coalesce_gap_mb >= 0
+        and args.coalesce_range_mb > 0
+        # NaN fails every comparison; inf would overflow the int() cast.
+        and args.coalesce_gap_mb < float("inf")
+        and args.coalesce_range_mb < float("inf")
+    ):
         raise SystemExit(
             "--coalesce-gap-mb must be >= 0 and --coalesce-range-mb > 0"
         )
@@ -3372,8 +3381,11 @@ def main() -> int:
             "local_disk_path": str(local_disk),
             "range_planner": {
                 "profile": "azure",
-                "max_gap_bytes": AZURE_COALESCE_GAP_BYTES,
-                "max_range_bytes": AZURE_COALESCE_RANGE_BYTES,
+                # TD-TIER-1 SC0: derive from the CLI args — this block predates
+                # the exposed cap/gap and downstream extracts read it; leaving
+                # the constants here would record a stale planner in sweep arms.
+                "max_gap_bytes": int(args.coalesce_gap_mb * 1024 * 1024),
+                "max_range_bytes": int(args.coalesce_range_mb * 1024 * 1024),
             },
             "note": filesystem_note,
         },

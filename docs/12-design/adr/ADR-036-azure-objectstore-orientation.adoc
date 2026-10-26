@@ -81,7 +81,7 @@ per cloud at the I/O boundary.
 | `AzureBlobFileSystem::write` | Now honors `options`: when a tier resolves, `put_opts` with `Attribute::StorageClass(tier.as_azure_access_tier())` → `x-ms-access-tier`; else the plain `put` (default tier). Module doc rewritten to the Blob-endpoint/HNS-off truth.
 | `AwsS3FileSystem::write` | Symmetric: `Attribute::StorageClass(tier.as_s3_storage_class())` → `x-amz-storage-class`.
 | `FilesystemFactory` (Azure registration) | Canonical-first scheme order (`az`,`azure`,`adls`,`abfs`) + doc + one-time `INFO` log stating the aliasing and the Blob-endpoint/HNS-off posture. `extract_bucket_from_url` now treats `az`/`azure` as host=container (matching the backend's flat parse).
-| GCS, `ProximaObjectStore::put` | **Deferred (TD-173).** GCS Simple media upload cannot carry a storage class (needs a metadata/resumable upload); `ProximaObjectStore` is backend-agnostic and does not track its scheme post-build, so canonical→native mapping there needs backend awareness it lacks, and has no tier-setting caller yet. Both carry doc notes; neither is the Azure MVP path.
+| GCS, `ProximaObjectStore::put` | **Closed (TD-173 + TD-RUSTDEP-1 #2016; corrected 2026-10-25, TD-TIER-1 SC0).** GCS Simple and multipart uploads set the storage class (`gcs_store.rs`, `ObjectAccessTier::as_gcs_storage_class`); `ProximaObjectStore` captures its backend kind at construction and exposes `put_with_tier`, with production callers (graph cold-payload/segment stores, io_trace sink). Residual: caller coverage of every atomic/multipart/compaction path — not missing GCS support.
 |===
 
 == Cross-cuts
@@ -106,9 +106,9 @@ per cloud at the I/O boundary.
 * The `adls`/`abfs` aliases stay for compatibility but are no longer *misleading*:
   the code and an operator-visible log state they are Blob-endpoint writes, so no
   one assumes DFS/HNS semantics from a scheme name.
-* GCS and `ProximaObjectStore` tier support remain open (TD-173) — explicitly
-  scoped out rather than half-wired, since neither is the Azure MVP path and both
-  need backend-aware mapping that would be speculative today.
+* GCS and `ProximaObjectStore` tier support exist (corrected 2026-10-25; see the
+  Applied table). The open TD-173 residual is caller coverage of every
+  atomic/multipart/compaction write path, tracked by TD-TIER-1 SC5.
 
 == Verification
 
