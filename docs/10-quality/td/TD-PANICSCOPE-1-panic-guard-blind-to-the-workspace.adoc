@@ -1,0 +1,53 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PANICSCOPE-1: the panic-policy guard is blind to the workspace (`crates/`, `apps/`)
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved (2026-10-26).** `count_panic_patterns.sh` gains a `--scope workspace` mode: every `crates/<layer>/<crate>` and `apps/<app>` is its own module group, discovered from the tree, ratcheted by a fresh baseline (`PANIC_POLICY_WORKSPACE_BASELINE.json`, measured at 312 sites on 2026-10-26). It runs in the CI `Panic Policy No Regression` job and in `work-commit-check` (`panic-policy-workspace-no-regression`). The legacy scope is unchanged: same seven modules, same baseline, same semantics — **src-wide totals included** (files under `src/` outside the seven modules count toward totals, attributed to no module; A/B-verified identical to the previous script on the same tree: totals and per-module counts byte-equal, 32 vs 32). Round-1 review caught the first draft restricting legacy totals to the seven modules, which silently unguarded 11 `src/` production files. Pinned by `tests/scripts/test_count_panic_patterns.py` (8 black-box tests on a fixture repo).
+| Priority | **MEDIUM** — every production panic site outside the seven legacy root-crate modules merged unguarded.
+| Component | `scripts/count_panic_patterns.sh`; `.github/workflows/ci.yml` (panic-policy jobs); `Makefile`
+| Relates to | mandate #4 (no unwrap/expect/panic); PR #2238's review (found it); TD-PROTO-2 / the duplication ratchet (the fresh-baseline pattern)
+|===
+
+== Problem
+
+The guard's scope was a hardcoded seven-module list under `src/` — `storage`, `graph`, `query`,
+`services`, `network/rest`, `api_handlers`, `core` — with `source_root: src` recorded in its own
+output. It was built when production code was the monolithic root crate. The workspace
+decomposition moved new production code into `crates/` and `apps/`, and the guard was never
+extended: nothing decided to exclude them, and no check asserted the guard's coverage of the
+workspace, so the gap was invisible by construction.
+
+Consequences:
+
+* ~312 production `.unwrap()`/`.expect()` sites (2026-10-26 measurement) sat outside every
+  ratchet.
+* PR #2238 merged four new `expect`/`unreachable!` sites green. They are provably unreachable
+  today, but had they been reachable bugs, no gate would have fired.
+* `clippy::unwrap_used`/`expect_used` are not enabled anywhere either (the root crate relies on
+  the scanner), so no other mechanism covered the gap.
+
+== Fix
+
+As described in the Status cell. Design notes:
+
+* **Fresh baseline, not a widened one.** Pointing the existing ratchet at the workspace would
+  have failed every PR against the 36-site legacy baseline. The workspace scope gets its own
+  baseline at today's measured counts, so it ratchets from 312 downward while the legacy
+  ratchet's meaning is untouched. Same pattern as the duplication ratchet and TD-PROTO-2's
+  ledger burn.
+* **Per-crate module groups**, discovered from `crates/*/*/Cargo.toml` and `apps/*/Cargo.toml`.
+  A module absent from the baseline with any site is a **hard violation in `no-regression`
+  itself** — not merely an implicit-0 entry in the sum — so a new crate's first panic site is a
+  regression even when a cleanup in the same PR compensates the total (pinned by a test).
+* **Same exclusions as legacy** — `#[cfg(test)]` blocks, `*_tests.rs`/test/benchmark/example
+  file names — applied by the shared `include_file`/`strip_cfg_test_blocks` code.
+
+== Follow-ups (not fixed here)
+
+* The 312 sites are ratcheted, not fixed. Reductions are always allowed by the ratchet;
+  a cleanup program would be a separate effort.
+* `clippy::unwrap_used`/`expect_used` in `[lints]` remain the better steady state for **new**
+  crates (per-crate opt-in, compiler-enforced); the scanner is the fleet-wide floor.
