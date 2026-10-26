@@ -1,0 +1,191 @@
+= Lakehouse and multimodal implementation plan
+:toc:
+:toclevels: 2
+
+This is the remaining implementation contract, governed by
+link:../12-design/adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097].
+Status, branch ownership and ordering at pickup: link:TRACKER.adoc[tracker].
+The original investigation and completed slice designs are in
+link:../history/planning/LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[design history] and
+link:../history/planning/LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc[execution history].
+Historical code-gap descriptions must be rechecked before implementation.
+
+== Architecture and invariants
+
+----
+ pgwire / REST / gRPC / Flight / Iceberg REST / OTLP / graph facades
+                               |
+ S6 PLAN   DataFusion LogicalPlan; native ExecutionPlan adapters
+                               |
+ S5 SCAN   streaming providers + authorization + snapshot/WAL-tail view
+                               |
+ S7 INDEX  rebuildable, snapshot/LSN-stamped projections
+                               |
+ S4 PUBLISH  one Iceberg v3 writer and fenced catalog publication
+                               |
+ S3 LAND   catalog-schema Parquet; vector PAX; time-partitioned append data
+                               |
+ S2 DURABLE  canonical segmented WAL; all-consumer retirement floor
+                               |
+ S1 IDENTITY  stable record oid; explicit tenant, version and subject semantics
+
+ S8 COST: measured critical-path depth / fan-out / bytes / CPU
+ S9 GOVERN: row/column policy at every provider and modality operator
+----
+
+[cols="1,4",options="header"]
+|===
+| Seam | Required contract and residual design boundary
+| S1 | Preserve real oid through files and operator output. Record identity and subject/entity identity differ (TD-SEAM-15); a graph edge has its own oid and references endpoint oids. Define tenant, valid_to and version/LSN encoding consistently. Do not assume every proposed system column exists; add encoder/decoder together when needed.
+| S2 | WAL append precedes engine apply. RecordUpsert/Delete/PartitionDrop must replay idempotently. Retirement is the minimum of every consumer floor, including readers, branches and publication; unknown/non-spill refusal cannot authorize truncation.
+| S3 | Layer A uses catalog schema and ParquetWritePolicy, with residuals for schema drift. PAX remains vector authority. Local spill is not automatically durable after node loss; resolve owner/reattach semantics before remote placement defaults (TD-SEAM-14).
+| S4 | One engine owns immutable manifests and metadata; REST exposes the same committed snapshot. Fence publication before catalog advance; fail closed on broken metadata. No parallel REST metadata tree or prefix listing as silent recovery from manifest failure.
+| S5 | Stream bounded batches with visibility/version merge, projection/filter/limit pushdown and ABAC. Pin a coherent snapshot plus WAL-tail boundary; deduplicate updates/deletes. A streaming UNION without reconciliation is incorrect.
+| S6 | Lower modality operations to DataFusion LogicalPlan; native physical operators live behind src/datafusion/ adapters, respecting ADR-039. Existing UQL/federated/other IRs lower or retire; no parallel semantic authority.
+| S7 | Cataloged index projections carry source snapshot/LSN/schema stamps and rebuild from authoritative records. No AXIS disk IVF authority. A stale HNSW/CSR/directory is repairable and cannot hide a visible write/delete.
+| S8 | Extend the ADR-033 cost spine. Distinguish sequential waves from total GETs, bytes from useful bytes and cache hits from discovery. Calibrate exact/ANN/prefilter and tier selection on measured workload facts.
+| S9 | Tenant admission and ABAC precede candidate selection where required, including UDTFs and direct facade paths. No query-shape guard may bypass policy; column policy survives join/projection.
+|===
+
+A coherent read token is a required contract, not a claim that all modalities already share
+one transactional snapshot. Specify publication generation, WAL high-water/visibility boundary,
+projection stamp and authorization context. Pin required history while a query runs; reject or
+repair inconsistent projections. Test concurrent publish/compact/update, not only static joins.
+
+== Thought experiments become acceptance tests
+
+These are intended gates; a test name below is not evidence that a runnable test exists.
+
+[cols="1,2,4",options="header"]
+|===
+| ID | Workload | Proof / decision
+| TE-1 | Similar tickets + churned customers + session error logs, grouped by plan | One pgwire query with EXPLAIN showing pushed filters and lazy ANN; canonical oid joins, ABAC negatives, read-token correctness while publication races it. This is M1, not just a vector benchmark.
+| TE-2 | External engines read published tables | Real facade create/insert/MATERIALIZE; REST catalog and pinned external readers agree with pgwire values across two snapshots, updates and deletes. Document feature/version matrix and honest unsupported cases.
+| TE-3 | 50k OTLP rows/s, <=2s freshness, 30-day retention | Release build, bounded memory/WAL, time partitions and partition drops; retention visibility and snapshot expiry separately observed. No synthetic throughput claim from an isolated storage primitive.
+| TE-4 | Forget a subject across modalities | Shared subject lookup, record-specific deletes, graph incident edges and document/log references; test current-query invisibility, historical-snapshot accessibility, expiry and physical erasure as four separate guarantees. A new snapshot cannot revoke old copies already exported.
+| TE-5 | Cold start at 100M x 768d | PAX authority with lazy centroid access; optional stamped HNSW load/rebuild. Measure restart memory, request waves, recall and availability during repair; do not extrapolate 100K HNSW calibration to this scale.
+| TE-6 | Two-hop citation aggregate + vector predicate | Graph nodes/edges return canonical identity, traversal composes with SQL and authorization; compare recursive join vs GraphExpandExec costs, verify pgwire reachability (TD-XMODAL-10).
+| TE-7 | Drifting nested JSON + facets | Typed shredded columns plus JSON residual preserve values; ranged reads avoid whole-segment fetch. Activate v3 variant only with reader evidence, independently of v3 table format.
+| TE-8 | Write at t, SQL at t+1s on 50M rows | Streaming snapshot+WAL-tail reconciliation stays bounded and fresh under flush/compaction; update/delete/limit/window results match the canonical read.
+| TE-9 | Scale analytical publication and queries | Reuse bounded multipart publisher; release SF1/SF10 peak RSS plus value-compared query results, not row-count-only equality. Separate compiler OOM from process publication OOM.
+|===
+
+== P1 and P2: close publication and delete correctness
+
+=== P1 production authority and external gate
+
+Reuse `proximadb-iceberg-engine`; audit its current callers instead of implementing another
+writer. Resolve the tenant-scoped REST metadata-key mismatch and production reachability of
+the bulk TableWriteExecutor route. Preserve catalog field IDs/nested types; a string fallback
+must not claim external schema fidelity. REST returns the writer's committed metadata and
+valid absolute object URIs; manifests, sequence numbers and parent chains must be spec-valid.
+
+Exercise pgwire→MATERIALIZE→REST load_table→external read through production wiring. Compare
+values and schema against pgwire after a second publication, plus tenant-negative cases.
+Pinned pyiceberg/DuckDB versions must support each exercised v3 feature; unsupported features
+stay gated and visible in the support matrix. Spark/Trino certification is a later expansion,
+not a reason to silently emit v2 from a new v3-first table.
+
+=== V3 activation ladder (TD-USUB-10 slice 3)
+
+. Finish internal DV reads and append carry-through before activating the delete writer.
+  Apply file-position masks before filters/limits, accounting for row-group pruning; cover
+  aggregates/statistics, cache invalidation, inherited data files and append races.
+. Define explicit new-table v3 policy and atomic legacy-v2 upgrade. Keep legacy reads;
+  never downgrade, never silently fall back to a v2 writer. Preserve field IDs and history.
+. Prove required v3 metadata/row-lineage allocation, sequence/parent chains and DV encoding
+  against pinned external readers; fail closed on unsupported or inconsistent metadata.
+. Activate incremental update/delete publication with explicit referenced files, correct
+  DV inheritance, fence/conflict handling and crash recovery. Test inserted/updated/deleted
+  values across snapshots through the real facade, not just test-side DV construction.
+. Roll out only after internal/external gates; record a compatibility/rollback boundary
+  (a format upgrade may require forward recovery, not an older binary opening new data).
+
+Variant and other v3 features each require their own compatibility gate; v3-first does not
+mean enabling every optional feature at once. No new v2 position-delete implementation.
+
+=== Recovery and materialization residuals
+
+TD-SEAM-14 must specify durable owner, lease/epoch, replacement recovery, spill/object
+visibility and WAL retention until safe ownership transfer. A local Layer A checkpoint is
+not remote machine-loss durability. Keep all-consumer floors fail closed, including branch
+merge bases and pinned snapshots; resolve branch residuals without broad truncation shortcuts.
+
+Reuse bounded multipart and manifest-driven publication. Classify incremental insert versus
+update against published key bounds/SBBF, not retained WAL history. Preserve real oid; do not
+reuse Layer A segments as published files unless versions, tombstones, field IDs and placement
+are normalized. No whole-table MemTable or directory-list fallback reintroduced by a new lane.
+
+== P3: governed format-independent SQL
+
+=== Provider default-on gate
+
+Complete LayerATableProvider soak, stats and EXPLAIN reason parity, default-on ABAC negatives,
+window correctness (including lag), mixed layouts and bounded delta memory. Preserve newest
+version semantics during row-group pruning; residual/type/null-key cases may need conservative
+fallback. Runtime join filters must not prune the newest visible version through an older key.
+
+Register PaxTableProvider only when it shares the same WAL tail, liveness and policy contract;
+its existence is insufficient admission. UDTF-only queries need DataFusion routing without a
+tenant-policy bypass. Probe SBBF for runtime filters in the real split reader.
+
+=== FilteredAnnExec
+
+Create the ExecutionPlan adapter with projection, filter, limit and DynamicFilterPhysicalExpr
+support. Reuse lower_vector_filter and ProximaScanExec patterns. Emit oid, metric and score;
+resolve ties/deduplication and metric ordering consistently. ABAC cannot be deferred until
+filtered candidate selection has leaked unauthorized membership or produced wrong top-k.
+
+Wire vector_ops/graph_ops from the facade. Lower federated VECTOR_SEARCH/LOGS/METRICS to the
+same providers. A Sort(distance)+Limit optimizer substitution must preserve metric, predicate,
+null, limit and exactness semantics; expose approximate/fallback decisions in EXPLAIN.
+Gate native_table_capability_parity_e2e, filtered recall >=0.95 in every selectivity band and
+the complete TE-1 pgwire query; do not infer these from isolated ANN tests.
+
+== P4: one vertical, then the remaining modalities
+
+First deliver observability end to end: canonical appender, time-partitioned Layer A, Iceberg
+publication, ObsTimeTable/TimeBucketExec, service/time sorting and partition-drop retention.
+SBBF for trace_id and inverted/BM25 log-body projections are rebuildable; metric rollups are
+materialized views (TD-OLAP-8). Prove TE-3 and M1 with the read-token contract.
+
+Graph writes RecordUpsert before ORION apply; sort edge rows by (src,label,dst), with CSR
+rebuild at checkpoint_lsn. Recursive joins are the initial candidate for shallow traversal
+(<=3 hops); deeper GraphExpandExec uses CSR. Choose by measured fan-out as well as depth,
+and gate pgwire reachability, cycles, deletes, duplicates and authorization.
+
+Documents retire the independent document_wal only after canonical recovery parity. Use typed
+shredding plus JSON residual, ranged reads and JSON-path/inverted projections; preserve drifting
+values. Publish residual as JSON string until variant compatibility is proven.
+
+Subject deletion follows TD-SEAM-15's identity contract. Define subject association and graph
+incident-edge policy explicitly; coordinate table/PAX deletion visibility with historical
+snapshot expiry and physical retirement. Pinned cache bytes never override deletion visibility.
+
+== P5: vector residuals, without rebuilding delivered infrastructure
+
+PAX is authority; collection-global centroid projections and shared-model directory work are
+reuse points. Close TD-PAXDIR-2 coherent warm segment-set discovery; a TTL does not guarantee
+freshness after a remote writer. Report discovery separately from payload waves, and cold/warm
+separately from result-cache hits. Confirm configured local L2 behavior at real call sites.
+
+Physical cluster-contiguous A+B co-location (D4) remains conditional: implement only if measured
+critical-path or byte cost justifies it after current directory/cache improvements. Keep exact
+WAL-tail merge and DV visibility. Extend gates to BIGANN 10M, filtered/fragmented data, 768d,
+concurrent ingest and resource bounds before a broad scale or pricing claim.
+
+HNSW remains AXIS but becomes a persisted hot projection after TD-PAXPREC-1: source/schema/
+precision stamp, load on match, apply delta when safe, otherwise background repair from PAX.
+The query remains correct during rebuild. Do not resurrect independent disk IVF posting storage.
+Optional external Parquet vectors preserve values under the agreed precision contract; codes
+remain PAX-only and extra copies require a measured cost justification.
+
+== P6: proof and release boundaries
+
+Use release builds for SF1/SF10, value comparison across engines, bounded memory and peak RSS.
+Raise ratchets only for passing query cases; loaded table counts are not query counts. Benchmark
+TE-1/TE-6/TE-3 against declared equivalent workflows, distinguishing measured competitor runs
+from cited reference figures. SIFT cold requests and p95 waves are independent gates.
+Store commands, commit, parameters, raw results, limitations and negative results in history;
+register claimable numbers in the evidence ledger. No pricing promise before integrated cost
+and correctness gates in link:STORAGE_PLAN.adoc[storage plan].

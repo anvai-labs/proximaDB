@@ -4,6 +4,15 @@
 :toc: macro
 :icons: font
 
+
+[IMPORTANT]
+====
+Historical planning snapshot archived 2026-10-26; statements of "current", "open" or
+"done" below describe the source document at its recorded date, not current delivery.
+Current work: link:../../current/PLATFORM_PLAN.adoc[the consolidated plan/tracker].
+Preserved as design rationale and evidence; do not resume its old task list verbatim.
+====
+
 Read-only audit of the ADR-026 / ADR-027 rollout (PRs #331 #335 #341 #343 #349 #350
 #351 #353 #356) and the implementation-ready design plan for the fixes it surfaced.
 *No product code is changed by this document* — it tracks the spec/sequencing edits and

@@ -35,6 +35,9 @@ exclude_docs: |
   # Font license ships in the repo beside the font; not a page (TD-DOCSITE-1 guard).
   stylesheets/fonts/Inter-OFL.txt
   _internal/
+  # Repository planning and frozen evidence, not customer documentation pages.
+  current/
+  history/
   06-internals/
   10-quality/
   12-design/

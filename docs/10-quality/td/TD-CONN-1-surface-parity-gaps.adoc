@@ -8,7 +8,7 @@
 | Status | **Open; specced from the 2026-07-21 connectivity reconnaissance sweep** of `src/network/`. Anchors are read-confirmed unless marked (inferred). Each slice re-verifies its anchor before touching code.
 | Priority | **P2** — connectivity is the mature axis; these are parity holes, not correctness defects. Sequenced *after* the M0 substrate slices (see `../../12-design/CONNECTIVITY_AND_MODALITY_COMPLETION_TRACKER_2026_07_21.adoc` §8).
 | Component | `src/network/rest/v2/graphs.rs` (read-only today), `src/network/grpc/v2/` (no timeseries service), `src/network/postgres/protocol.rs` (COPY partial, txns stubbed).
-| Relates to | link:../../12-design/CONNECTIVITY_AND_MODALITY_COMPLETION_TRACKER_2026_07_21.adoc[Completion tracker] (Track C), link:../../12-design/adr/ADR-053-cross-modal-query-fabric.adoc[ADR-053], link:../../12-design/adr/ADR-018-pgwire-sql-parity-roadmap.adoc[ADR-018], TD-TS-1 (timeseries REST — owned there), TD-MCP-1 (MCP checkpoint — owned there), TD-126/TD-SDK (SDK codegen — owned there).
+| Relates to | link:../../history/planning/CONNECTIVITY_AND_MODALITY_COMPLETION_TRACKER_2026_07_21.adoc[Completion tracker] (Track C), link:../../12-design/adr/ADR-053-cross-modal-query-fabric.adoc[ADR-053], link:../../12-design/adr/ADR-018-pgwire-sql-parity-roadmap.adoc[ADR-018], TD-TS-1 (timeseries REST — owned there), TD-MCP-1 (MCP checkpoint — owned there), TD-126/TD-SDK (SDK codegen — owned there).
 |===
 
 == The finding (sweep, 2026-07-21)

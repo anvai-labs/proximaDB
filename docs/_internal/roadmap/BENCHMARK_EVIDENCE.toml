@@ -526,7 +526,7 @@ artifact = "docs/_internal/status/PAX_RECALL_RATCHET_2026_06_25.adoc"
 hardware = "Apple M1 Max, 64 GB, macOS 26.2 (shared dev machine — indicative, not an SLA)"
 date = "2026-06-25"
 version = "v0.2"
-notes = "qa-gate ratchet (develop→qa promotion). Deterministic seeded LCG corpus (DIM=64). N=1000 REFINE=100 mean recall@10 = 0.9340; N=100000 REFINE=1000 mean recall@10 = 0.9320. Both >= 0.90 ratchet (only goes up, #10). Proves the RaBitQ->SQ8 cascade (stage-1 binary rank -> stage-2 SQ8 rerank, no f32 GET) holds recall at this scale -- a prerequisite for flipping PAX quant default-on (rollout Phase 2). NOTE: REFINE=200 at N=100k gave 0.708; a 1000-wide stage-1 pool (1% of corpus) recovers to 0.932. REPRESENTATIVENESS CAVEAT (audit 2026-06-25, PAX_SUBSTRATE_DESIGN_PLAN_2026_06_25.adoc): this is a DIM=64 synthetic corpus, N<=100k, with a FIXED absolute REFINE=1000 (=1% only at 100k; <0.1% at 1M). It is a fast CI floor, NOT representative of production high-dim embeddings or N>=1M -- the default-on flip (TD-150) is GATED on an additional real-embedding (e.g. SIFT1M / 768-d) N>=1M recall artifact (WS8). Indicative local run, not an SLA."
+notes = "qa-gate ratchet (develop→qa promotion). Deterministic seeded LCG corpus (DIM=64). N=1000 REFINE=100 mean recall@10 = 0.9340; N=100000 REFINE=1000 mean recall@10 = 0.9320. Both >= 0.90 ratchet (only goes up, #10). Proves the RaBitQ->SQ8 cascade (stage-1 binary rank -> stage-2 SQ8 rerank, no f32 GET) holds recall at this scale -- a prerequisite for flipping PAX quant default-on (rollout Phase 2). NOTE: REFINE=200 at N=100k gave 0.708; a 1000-wide stage-1 pool (1% of corpus) recovers to 0.932. REPRESENTATIVENESS CAVEAT (audit 2026-06-25, docs/history/planning/PAX_SUBSTRATE_DESIGN_PLAN_2026_06_25.adoc): this is a DIM=64 synthetic corpus, N<=100k, with a FIXED absolute REFINE=1000 (=1% only at 100k; <0.1% at 1M). It is a fast CI floor, NOT representative of production high-dim embeddings or N>=1M -- the default-on flip (TD-150) is GATED on an additional real-embedding (e.g. SIFT1M / 768-d) N>=1M recall artifact (WS8). Indicative local run, not an SLA."
 
 [[claims]]
 id = "pax_rabitq_sq8_sift1m_recall_at_10"
@@ -1328,7 +1328,7 @@ asserted_in = [
 ]
 bench_source = "scripts/bench/sift1m_get_reduction.py"
 bench_command = "systemd-run --user --scope -p MemoryMax=64G python3 scripts/bench/sift1m_get_reduction.py --root <root> --binary target/release-server/proximadb-server --sift-dir <sift1m> --rows 1000000 --queries 1000 --top-k 10 --min-recall 0.98 --object-cold-max-requests 20 --object-cold-max-waves 3 --warm-max-waves 1 --training-compaction-min-mb 1 --max-segments 3 --s3-endpoint http://<toxiproxy 25+25 ms> --storage-url s3://<bucket>/<arm> --read-ranges-inflight 16 --centroid-directory on --ivf-k 32"
-artifact = "docs/_internal/status/P5B_D7_SIFT1M_GATE_RUN_2026_10_25.adoc"
+artifact = "docs/history/evidence/P5B_D7_SIFT1M_GATE_RUN_2026_10_25.adoc"
 hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB; MinIO single drive + Toxiproxy 2.12.0 on the same host; arms serialized on an idle box"
 date = "2026-10-25"
 version = "feat/paxdir-d7-measurement @ b000d6275, the PR HEAD (release-server --features aws, built in-worktree)"
@@ -1345,7 +1345,7 @@ asserted_in = [
 ]
 bench_source = "scripts/bench/sift1m_get_reduction.py"
 bench_command = "systemd-run --user --scope -p MemoryMax=64G python3 scripts/bench/sift1m_get_reduction.py --root <root> --binary target/release-server/proximadb-server --sift-dir <sift1m> --rows 1000000 --queries 1000 --top-k 10 --min-recall 0.98 --object-cold-max-requests 20 --object-cold-max-waves 3 --warm-max-waves 2 --training-compaction-min-mb 1 --max-segments 3 --s3-endpoint http://<toxiproxy 5+5 ms> --storage-url s3://<bucket>/<arm> --read-ranges-inflight 16 --centroid-directory default"
-artifact = "docs/_internal/status/P5B_D8_DEFAULTS_CONFIRMATION_2026_10_25.adoc"
+artifact = "docs/history/evidence/P5B_D8_DEFAULTS_CONFIRMATION_2026_10_25.adoc"
 hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB; MinIO single drive + Toxiproxy 2.12.0 on the same host; arms serialized on an idle box"
 date = "2026-10-25"
 version = "feat/paxdir-d8-defaults @ 78e99d2c1 (release-server --features aws, built in-worktree)"
@@ -1353,16 +1353,16 @@ notes = "The 'default' arm leaves all six gates unset (proving the defaults; the
 
 [[claims]]
 id = "tier1_sc0_range_cap_sweep_sift1m"
-claim = "TD-TIER-1 SC0/E1 fixed-geometry range-cap sweep on the D8 canonical bed (SIFT1M, MinIO + Toxiproxy 5+5 ms, P5b defaults on, recall >= 0.98 held): raising the remote read coalescing cap from 4 MiB to 16 MiB halves object-cold requests per query (20.005 -> 10.514; GETs 19.005 -> 9.514) at unchanged recall (0.9817 -> 0.9824), unchanged wave depth (p50 3, p95 4), and ~unchanged bytes (~58 MB/q); 40 MiB adds ~nothing (10.282) at this geometry. Warm requests also drop (6.008 -> 4.583). Derived at S3 list rates: cold request cost $12.60/M (this sweep's 4 MiB units) -> $8.81/M, after which the discovery LIST is 57% of the bill. Caveat: the 16 MiB arm probed 10.8% fewer rows (422,805 vs 474,122; cells probed pinned ~10 by nprobe in both arms), which plausibly biases modestly in favor of the halving; the -50% request effect dwarfs that channel."
-metric = "requests_per_query + gets_per_query + waves p50/p95 + recall@10 + bytes/query + latency p50/p95 + qps + warm requests + probed rows/cells, object-cold and local-disk-warm, one cap variable"
+claim = "SC0/E1 pilot, SIFT1M/MinIO: cold requests/q 20.005 / 10.514 / 10.282 at 4/16/40 MiB, recall 0.9817 / 0.9824 / 0.9825, waves p50=3 and p95=4. Geometry differs (21/25/26 cells), one trial each: no isolated causal halving, latency-neutrality or default-change claim. At 16 MiB p50/p95 latency and QPS were worse than the 4 MiB arm; repeated same-object trials are needed to attribute the difference. Derived request-only costs at the stated rate assumptions are $12.60/M and $8.81/M, excluding compute and other COGS."
+metric = "requests_per_query + gets_per_query + waves p50/p95 + recall@10 + bytes/query + latency p50/p95 + qps + warm requests + probed rows/cells, object-cold and local-disk-warm; cap and fresh-bed geometry differ"
 status = "measured"
 asserted_in = [
   "docs/10-quality/td/TD-TIER-1-collection-storage-policy-and-residency.adoc",
 ]
 bench_source = "scripts/bench/sift1m_get_reduction.py"
 bench_command = "systemd-run --user --scope -p MemoryMax=64G python3 scripts/bench/sift1m_get_reduction.py --root <root> --binary target/release-server/proximadb-server --sift-dir <sift1m> --rows 1000000 --queries 1000 --top-k 10 --min-recall 0.98 --object-cold-max-requests 20 --object-cold-max-waves 3 --warm-max-waves 2 --training-compaction-min-mb 1 --max-segments 3 --s3-endpoint http://<toxiproxy 5+5 ms> --storage-url s3://<bucket>/<arm> --read-ranges-inflight 16 --coalesce-range-mb <4|16|40> --centroid-directory default"
-artifact = "docs/_internal/status/TIER1_SC0_RANGE_CAP_SWEEP_2026_10_26.adoc"
+artifact = "docs/history/evidence/TIER1_SC0_RANGE_CAP_SWEEP_2026_10_26.adoc"
 hardware = "aiserver1: WSL2 Ubuntu 24.04, 16 vCPU, 125 GB; MinIO single drive + Toxiproxy 2.12.0 on the same host; arms serialized on an idle box"
 date = "2026-10-26"
 version = "bench/tier1-cap-sweep @ 41ac7d439 (empty anchor over develop d929d7993; byte-identical release-server --features aws across arms, sha256 30a670c5)"
-notes = "The sweep gates (recall, requests, waves) were armed on every arm; the 4 MiB arm failed the requests gate by 0.005 (20.005 vs 20) — bed variance at the boundary, recall held; the sweep's binding constraint is recall per the design. Design-E1's full recording protocol (p99, CPU, peak RSS, in-flight bytes, overread split, request-size distribution) was NOT captured by the harness and the result files are local-only — recorded as a harness follow-up, disclosed in the artifact. Geometry approximately fixed (settled cells 21/25/26; probed cells ~10 by nprobe). Production posture unchanged: IopsBudget::S3 already targets 8 MiB ranges; a default change requires the fragmented/filters/10M/768d finalists per the design stop rule. Single-machine emulator evidence, not an SLA."
+notes = "Pilot PR #2249 merged; full E1 gate remains open. The 4 MiB arm failed the request gate (20.005 > 20). Missing p99, CPU, peak RSS, in-flight bytes, useful/overread split and request-size distribution; raw results local-only. Repeat on identical objects/model/ETags with full telemetry, then scale/filter/fragmentation finalists. No production default changed. Single-host emulator evidence, not an SLA or measured EBS performance."

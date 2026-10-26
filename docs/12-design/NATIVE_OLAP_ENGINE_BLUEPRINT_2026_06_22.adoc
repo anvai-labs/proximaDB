@@ -126,4 +126,4 @@ but the durable *internal* OLAP scan format becomes PAX once P1–P3 land. See A
 * `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` (co-design cost spine)
 * `DATA_WAREHOUSE_AND_ENGINEERING_COURSE_CORRECTION_2026_06_04.adoc` (multi-engine routing)
 * `PAX_RANGED_READ_MULTICLOUD_COST_2026_06_25.adoc` (geometry per modality)
-* `docs/_internal/review/PAX_SUBSTRATE_DESIGN_PLAN_2026_06_25.adoc` (audit + TD plan)
+* `docs/history/planning/PAX_SUBSTRATE_DESIGN_PLAN_2026_06_25.adoc` (audit + TD plan)

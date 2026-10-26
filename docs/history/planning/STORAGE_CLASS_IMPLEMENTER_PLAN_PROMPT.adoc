@@ -2,11 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 = ProximaDB storage classes — Claude / GLM5.3 plan-mode handoff
 
+
+[IMPORTANT]
+====
+Historical planning snapshot archived 2026-10-26; statements of "current", "open" or
+"done" below describe the source document at its recorded date, not current delivery.
+Current work: link:../../current/README.adoc[the consolidated plan/tracker].
+Preserved as design rationale and evidence; do not resume its old task list verbatim.
+====
+
 Start in PLAN MODE. This is a design/implementation planning request, not authorization
 to immediately execute every slice. Produce a concrete implementation plan, then wait
 for its approval before production code. Do not claim proposed decisions are accepted ADRs.
 
-Read in this order:
+Read live ownership first: docs/12-design/LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc
+and docs/_internal/status/ROADMAP_WORKTREE_RECONCILIATION_2026_10_26.adoc. Resume
+existing work; do not create duplicate SC1 or delete-reader implementations.
+
+Then read in this order:
 1. docs/12-design/STORAGE_CLASS_SEAMS_REVIEW_2026_10_25.adoc
 2. docs/10-quality/td/TD-TIER-1-collection-storage-policy-and-residency.adoc
 3. docs/12-design/HOW_TO_FILE_TD_AND_ADR.adoc and applicable repository rules
@@ -15,12 +28,14 @@ Read in this order:
 
 The review supersedes the unsafe implementation details in the original handoff at
 /home/vsingh/code/handoff-storage-class-seams-codex.md. Re-verify current source: the
-review baseline is develop c18bb630e. D8 #2241 is merged; retain the original measurement binary hash and source revision.
+live reconciliation baseline is develop 69ddbd91b (2026-10-26). Keep each historical measurement
+attached to its original binary hash/source; do not relabel it as a current-head run.
 Reuse this TD if present; do not file a second TD-TIER-1 declaration.
 
 Reconciled starting point:
 - Do not restart P0/P1. MATERIALIZE read-back exists as iceberg_interop_e2e, but
-  table_write_executor's bulk-append _manifests route still needs migration.
+  #2245 migrated the bulk executor. Tenant-scoped REST-key and production facade
+  reachability still block that lane; do not redo the engine migration.
 - WAL/spill/truncation, SF1 load/publication memory proof, insert-only append, mixed
   Parquet/native and streamed merge have landed. SF1 query parity is not proven by loading.
 - Production Iceberg format is v2 unless fields need v3-only nanosecond types; the
@@ -31,8 +46,12 @@ Reconciled starting point:
   activating DV publication. Reuse compatible data files; no blanket upgrade rewrite.
 - D8 defaults and unused IVF disk retirement are merged. D4 and physical A+B
   co-location remain deferred; zero-total-request warm and broad scale proof remain open.
-- Open PR #2243 owns broader reconciliation and proposed TD-SEAM-14/15. Reuse it
-  when landed; correct any stale D8/mixed-table claims against current source.
+- #2243 is merged and TD-SEAM-14/15 exist. #2244 added the harness cap CLI.
+- #2249 is a cap pilot with different cell geometry, not the completed fixed-object
+  E1 gate. Reuse its data; repeat on identical objects with full missing telemetry.
+- feat/sc1-storage-policy owns local SC1/partial SC2 WIP; feat/p24-delete-readers
+  owns internal reader/read-back WIP. Neither was merged at this audit. See the
+  central nudges for generation updates, actual placement authorization and v3 gates.
 - Record identity != subject identity. Define cross-table read-token consistency and
   four deletion gates (current visibility, historical access, expiry, physical erasure).
 
@@ -84,9 +103,9 @@ Evidence and hardware:
   NVMe under WSL ext4/VHD, not an HDD despite guest ROTA=1. Measure the actual path.
 - Test 4/8/16/32/40/64 MiB caps in stages, fixed geometry first. 8 MiB can be random
   between extents and sequential within one. Do not globally adopt 40 MiB.
-- Current harness exposes the cap in OwnedServer but not CLI arm plumbing/reporting;
-  fix that small experimental seam first. Verify effective request sizes and unchanged
-  segment hashes/cells rather than trusting an env flag.
+- The cap/gap CLI and reporting already landed in #2244. Do not rebuild it.
+  For the remaining controlled gate, verify unchanged segment hashes/model/ETags,
+  repeat arms and collect missing p99/CPU/RSS/in-flight/useful-byte telemetry.
 - Measure useful/fetched bytes, GET/HEAD/LIST, waves, p50/p95/p99, recall, CPU, RSS and
   throughput. Result-cache hits and adapter-only tests do not prove production warmth.
 - Compare gp3/gp2/st1/sc1 and local NVMe with capacity, sustained throughput, IOPS,

@@ -62,4 +62,4 @@ rows are durable in a segment and the floor moves up to the next partition's.
 Gates: `a_lagging_partition_is_flushed_so_it_stops_pinning_the_floor`,
 `a_purged_partition_is_not_flushed_until_written_again`, `a_failed_lag_flush_is_retried_on_the_next_run`,
 `a_lag_flush_that_frees_nothing_waits_a_lag_window`, plus the SF1 run in
-`docs/_internal/status/P24_SF1_GATE_EVIDENCE_2026_10_23.adoc`.
+`docs/history/evidence/P24_SF1_GATE_EVIDENCE_2026_10_23.adoc`.

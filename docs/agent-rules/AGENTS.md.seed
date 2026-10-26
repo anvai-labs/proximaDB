@@ -3,9 +3,9 @@
 This document acts as the index and unified trajectory guide for all Autonomous AI Agents operating in the ProximaDB workspace.
 
 ## Product Direction
-ProximaDB is a SQL-first context engine on object storage (ADR-096): pgwire is the front door, vectors/JSON/graph are first-class inside SQL, and every data model is a projection of one canonical record. Take direction from `docs/12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc` and pick work from the current release in `docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc`.
+ProximaDB is a SQL-first context engine on object storage (ADR-096): pgwire is the front door, vectors/JSON/graph are first-class inside SQL, and every data model is a projection of one canonical record. Take direction from `docs/12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc` and pick work from the current release in `docs/current/ROADMAP.adoc`.
 
-**In-flight architecture work (ADR-097 lakehouse seams):** before starting or resuming any P0–P6 slice, read `docs/12-design/LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc` — the resumable status of record (merged / open PR / pushed branch per slice, next-work queue, working conventions, decisions log). Update it in the same PR that lands, opens or re-plans a slice.
+**In-flight architecture work (ADR-097 lakehouse seams):** before starting or resuming any P0–P6 slice, read `docs/current/TRACKER.adoc` — the live queue (remaining gates, active branches and pickup handoffs; completed detail is in history). Update it in the same PR that lands, opens or re-plans a slice.
 
 ## Primary Instructions
 Depending on your identity, read the corresponding mandate file first:
@@ -63,3 +63,11 @@ ProximaDB is undergoing a massive architectural shift to support a robust SaaS M
 For specific agentic workflows, refer to the documents in `docs/11-usecases/`:
 *   `AGENTIC_AI_API_CONTRACTS_V2_2026_05_12.md`
 *   `AGENTIC_AI_BACKING_STORE_MVP_2026_05_12.md`
+
+## Planning context budget
+
+Start at `docs/current/README.adoc`, then `docs/current/TRACKER.adoc` and only the relevant plan.
+Use the tracker for live ownership and handoffs. Completed details go to `docs/history/`;
+do not preload history or create another roadmap, work ledger or model-specific handoff.
+When rebasing an older branch, migrate unique open work to the current successor instead of
+resurrecting a retired planning path. ADR/TD/spec IDs remain stable reference contracts.

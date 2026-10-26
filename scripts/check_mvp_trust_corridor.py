@@ -141,7 +141,7 @@ def validate_repository(data: dict) -> list[str]:
     required_fragments = {
         "README.adoc": [positioning, "MVP trust corridor", "scripts/mvp_smoke.py"],
         "docs/SUPPORTED_SURFACE.adoc": ["MVP Trust Corridor", "MVP_TRUST_CORRIDOR.toml"],
-        "docs/00-product/VISION.adoc": [positioning, "MVP_TRUST_CORRIDOR.toml"],
+        "docs/current/VISION.adoc": [positioning, "MVP_TRUST_CORRIDOR.toml"],
         "docs/00-product/COMPETITIVE_LANDSCAPE.adoc": [
             "direct category competitor",
             "economic proof",
@@ -180,7 +180,7 @@ def validate_repository(data: dict) -> list[str]:
         _text(relative)
         for relative in (
             "README.adoc",
-            "docs/00-product/VISION.adoc",
+            "docs/current/VISION.adoc",
             "docs/00-product/COMPETITIVE_LANDSCAPE.adoc",
             "docs/01-quick-start/CONTEXT_SERVING_MVP.adoc",
         )

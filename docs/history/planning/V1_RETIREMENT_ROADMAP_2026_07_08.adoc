@@ -4,12 +4,21 @@
 :icons: font
 :last-updated: 2026-10-15
 
+
+[IMPORTANT]
+====
+Historical planning snapshot archived 2026-10-26; statements of "current", "open" or
+"done" below describe the source document at its recorded date, not current delivery.
+Current work: link:../../current/PLATFORM_PLAN.adoc[the consolidated plan/tracker].
+Preserved as design rationale and evidence; do not resume its old task list verbatim.
+====
+
 [cols="1,1,3", options="header"]
 |===
 | Tier | State (reconciled 2026-10-15) | Evidence
 | Tier 0 — free deletes | **Done (rolling)** | #750 (`TypeSafeFilterEvaluator`); later dead `VectorRecord` carriers (#1508), dead `SstEntry` (#1452).
 | Tier 1 — gateable surfaces | **Done** | REST v1 flipped to 410-by-default (#814, 2026-07-09). Then **removed** entirely: the `v1_sunset` middleware is deleted and `/api/v1/*` answers 404 with the v2 replacement (TD-V1SUNSET-1 RESOLVED 2026-08-29, #1773). The gRPC v1 compat services are deleted (no `enable_grpc_v1_compat` remains). Below, the Tier 1 "remaining cutover" steps 2–3 are history.
-| Tier 2 — deprecated-engine v1 usage | **Partial** | link:../10-quality/td/TD-ENGINE-1-deprecated-engine-removal-entanglement.adoc[TD-ENGINE-1]: CHRONO/TITAN removed (#702). SWIFT/RAPTOR/SEQUOIA/CEDAR relocation is open.
+| Tier 2 — deprecated-engine v1 usage | **Partial** | link:../../10-quality/td/TD-ENGINE-1-deprecated-engine-removal-entanglement.adoc[TD-ENGINE-1]: CHRONO/TITAN removed (#702). SWIFT/RAPTOR/SEQUOIA/CEDAR relocation is open.
 | Tier 3 — internal domain model | **Open (long pole)** | v1-proto ratchet today: **2,681 refs** (src 1,889 · crates 367 · tests 376 · clients 49), down from 2,913. TD-104 root-handler retirement is done (#761), removing the ~141-ref `request_handlers.rs`. `VectorRecord` → `ProximaRecord` (TD-V1SUNSET-2) is scoped but not started. The `SqlValue` bridge and slice 1 are done; the residue is sequenced behind V1SUNSET-2 (TD-V1SUNSET-3).
 |===
 
@@ -23,7 +32,7 @@ instead of a big-bang break.
 [IMPORTANT]
 ====
 **The mechanism already exists and is CI-blocking:** the v1-proto ratchet
-(link:../10-quality/TECHNICAL_DEBT.adoc[TD-123], `scripts/check_v1_proto_usage.py`) is downward-only
+(link:../../10-quality/TECHNICAL_DEBT.adoc[TD-123], `scripts/check_v1_proto_usage.py`) is downward-only
 and blocks `ci-success`. It *is* "let compilation/tests find tangled references," applied one green,
 forward-only PR at a time. This roadmap sequences what goes through that ratchet, in risk order.
 **Do not** big-bang-disable load-bearing v1 shapes to "discover" coupling — that produces a broken
@@ -89,7 +98,7 @@ Remaining Tier 1 work is the **cutover** (not the gate), in order:
 
 `MetadataValue` is used across `storage/engines/{raptor,swift}` (experimental/deprecated) and `axis`.
 These refs retire when the deprecated engines are removed
-(link:../10-quality/td/TD-ENGINE-1-deprecated-engine-removal-entanglement.adoc[TD-ENGINE-1]) — not
+(link:../../10-quality/td/TD-ENGINE-1-deprecated-engine-removal-entanglement.adoc[TD-ENGINE-1]) — not
 before.
 
 === Tier 3 — Load-bearing internal domain model (the long pole; NOT disable-able)
@@ -98,7 +107,7 @@ The ~2400 `src` refs are v1 proto used as the *internal domain model*. Retire on
 migration + phased decomposition — never by disabling:
 
 * `VectorRecord` (~92 prod files) — deeply embedded. Migrates to `ProximaRecord` under
-  link:adr/ADR-024-single-canonical-data-type-and-schema.adoc[ADR-024] (the RichRecord/`ProximaRecord`
+  link:../../12-design/adr/ADR-024-single-canonical-data-type-and-schema.adoc[ADR-024] (the RichRecord/`ProximaRecord`
   work; TD-104 Phase 0 "RichRecord* relocate" is the unblocking step).
 * `core/conversions.rs` (~86) — the v1↔v2 bridge. Shrinks as callers move to v2; deletes when v1 is
   gone.

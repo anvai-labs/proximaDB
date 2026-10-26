@@ -2,7 +2,7 @@
 
 Part of the build/workspace/isolation plan (`golden-stirring-meadow`). This is
 the actionable scoping for P2; it feeds the broader
-`WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc`.
+`docs/history/planning/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc`.
 
 ## The finding (why P2 is not a quick "move the tests")
 

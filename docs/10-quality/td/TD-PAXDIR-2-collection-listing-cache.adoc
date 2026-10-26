@@ -18,7 +18,7 @@ Every vector query lists the collection data directory to find its segments
 (SIFT1M, MinIO + 50 ms RTT) that LIST is a full sequential wave, so a warm
 query — every byte it needs already cached — still takes the LIST plus at
 least one wave: measured 2 waves at p50, against the design's 0–1
-(link:../../_internal/status/P5B_D7_SIFT1M_GATE_RUN_2026_10_25.adoc[artifact]).
+(link:../../history/evidence/P5B_D7_SIFT1M_GATE_RUN_2026_10_25.adoc[artifact]).
 
 == Why it is not a simple cache
 

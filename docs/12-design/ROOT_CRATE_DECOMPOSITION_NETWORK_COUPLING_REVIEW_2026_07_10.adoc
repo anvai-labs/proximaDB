@@ -6,7 +6,7 @@
 |===
 | Field | Value
 | Status | **Partial (reconciled 2026-10-15).** Finding 1 (test-module extraction) is done (#873, #874). Finding 4 is resolved by other work: `rest/v1` was renamed `rest::canonical` (#829) and the v1 surface was removed (TD-V1SUNSET-1). Findings 2, 3, 5 and 6 are open: `shared_services.rs` is still 4,031 lines and `multi_server.rs` 2,085.
-| Relates to | link:ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan] (umbrella), link:ROOT_CRATE_DECOMPOSITION_SERVICES_COUPLING_REVIEW_2026_07_10.adoc[services review], link:TD104_HANDLER_CONVERGENCE_PLAN_2026_06_03.adoc[TD-104 handler convergence] (done)
+| Relates to | link:../history/planning/ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan] (umbrella), link:ROOT_CRATE_DECOMPOSITION_SERVICES_COUPLING_REVIEW_2026_07_10.adoc[services review], link:../history/planning/TD104_HANDLER_CONVERGENCE_PLAN_2026_06_03.adoc[TD-104 handler convergence] (done)
 |===
 
 [abstract]
@@ -14,7 +14,7 @@ Evidence-driven coupling/cohesion/duplication review of `src/network/` — the m
 hotspot-dense subsystem in the root crate (9 of the global top-20 hotspots, including the
 #1 file `shared_services.rs`). Second in the per-subsystem pass after
 `ROOT_CRATE_DECOMPOSITION_SERVICES_COUPLING_REVIEW_2026_07_10.adoc`; same method and a
-companion to `ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc`. All numbers come from the code
+companion to `docs/history/planning/ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc`. All numbers come from the code
 graph in `.victor/project.db` (1.05M nodes / 3.2M edges; `graph_module_metric` Martin metrics).
 
 toc::[]

@@ -47,7 +47,7 @@
   63/63 only after the empty-result fix in the same change (56/63 before), native 40/63 (17
   comma-joined `FROM` lists, 4 derived tables, 2 plan/scan expression errors — the same failures
   in both arms). Value comparison across engines is P6 work in
-  link:../../12-design/LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10].
+  link:../../current/LAKEHOUSE_PLAN.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10].
 * Written but **not run here**: the root-crate unit tests
   (`object_store_parquet_reader` SBBF INT32 probe + page pruning through `scan()`,
   `native_parquet_scan` row-group/page pruning). Compiling the root crate's `--lib` test

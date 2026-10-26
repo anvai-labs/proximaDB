@@ -1093,7 +1093,7 @@ link:RELATIONAL_PGWIRE_DML_COMPUTE_BLUEPRINT_2026_05_20.adoc[the pgwire/DML blue
 * [ ] Replace remaining REST/gRPC/embedded insert and streaming shims with v2 `ProximaRecord`/`ProximaValue` contracts below protocol compatibility adapters.
 ** Legacy v1 `VectorRecord`, metadata maps, `SqlValue`, and `SqlObject` may remain only as adapter inputs/outputs until the v1 compatibility surface is retired.
 ** Direction: do not maintain dual write APIs. Build the record-native v2 implementation as the only target, keep v1 names only as migration aliases, then remove old v1 vector-shaped routes/clients and promote/rename the record-native API as the stable v1 surface.
-** [x] *(shipped, summarized)* The v1 `VectorRecord` → `ProximaRecord` conversion is centralized in the proto compatibility adapter. REST batch, service-level v1 batch and gRPC streaming ingestion route through it. Every SDK writer posts `ProximaRecord` batches to `/api/v2/collections/{collection}/records/batch` or the v2 gRPC `InsertRecords`/`UpsertRecords`. That covers the Python REST/gRPC/unified/embedded/batching/builder/chunking/CLI/`client_v1` paths, all optional Python framework integrations, and the Rust, Node-embedded and Go adapters. `VectorRecord` remains only as deprecated compatibility aliases. /api/v1 itself was removed (TD-V1SUNSET-1, #1773); see link:V1_RETIREMENT_ROADMAP_2026_07_08.adoc[v1 retirement roadmap] Tier 3 for the remaining internal `VectorRecord` usage.
+** [x] *(shipped, summarized)* The v1 `VectorRecord` → `ProximaRecord` conversion is centralized in the proto compatibility adapter. REST batch, service-level v1 batch and gRPC streaming ingestion route through it. Every SDK writer posts `ProximaRecord` batches to `/api/v2/collections/{collection}/records/batch` or the v2 gRPC `InsertRecords`/`UpsertRecords`. That covers the Python REST/gRPC/unified/embedded/batching/builder/chunking/CLI/`client_v1` paths, all optional Python framework integrations, and the Rust, Node-embedded and Go adapters. `VectorRecord` remains only as deprecated compatibility aliases. /api/v1 itself was removed (TD-V1SUNSET-1, #1773); see link:../history/planning/V1_RETIREMENT_ROADMAP_2026_07_08.adoc[v1 retirement roadmap] Tier 3 for the remaining internal `VectorRecord` usage.
 * [ ] Add pandas/numpy/Arrow embedded normalization tests that prove dict/object, DataFrame, ndarray/vector, graph, document, and observability inputs normalize to xCatalog-validated canonical records.
 ** [x] Add embedded Python `ProximaRecord` normalization helpers and coverage for mapping/dict, NumPy matrix, pandas DataFrame, pyarrow Table, document, graph node, and observability event inputs.
 ** [x] Add embedded Python `insert_records` / `upsert_records` helpers that accept the modern record shape and route through the normalizer before reaching the current native batch boundary.
@@ -1178,7 +1178,7 @@ mandate as authority and adds layer-specific implementation detail.
 
 * `roadmap/MULTIMODAL_OVERHAUL_SPEC_2026_05_08.adoc`
 * `docs/12-design/DATA_AI_PLATFORM_ARCHITECTURE_ANCHOR_2026_05_12.adoc`
-* `roadmap/techdebt/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc`
+* `docs/history/planning/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc`
 * `docs/06-internals/architecture-decisions.md`
 * SQL:2023 SQL/PGQ property graph queries
 * Jindal, Madden, Deshpande, Stonebraker: Vertexica

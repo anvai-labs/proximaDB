@@ -29,9 +29,9 @@ DRIFT_RULES = {
     "distributed_consensus_runtime": {
         "doc_rules": [
             {
-                "path": "docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc",
+                "path": "docs/SUPPORTED_SURFACE.adoc",
                 "required_substrings": [
-                    "| Raft Consensus",  # Just check it exists, don't enforce exact status
+                    "| Raft internals, shard planning, and routing foundations exist.",
                 ],
             },
         ],
@@ -39,9 +39,9 @@ DRIFT_RULES = {
     "mtls_identity_chain": {
         "doc_rules": [
             {
-                "path": "docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc",
+                "path": "docs/SUPPORTED_SURFACE.adoc",
                 "required_substrings": [
-                    "| mTLS",  # Just check it exists, don't enforce exact status
+                    "mTLS identity are present; certificate revocation is not checked",
                 ],
             },
         ],
@@ -94,10 +94,10 @@ DRIFT_RULES = {
                 ],
             },
             {
-                "path": "docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc",
+                "path": "docs/SUPPORTED_SURFACE.adoc",
                 "required_substrings": [
-                    "| PULSAR Engine",  # Just check it exists
-                    "| QUASAR Engine",  # Just check it exists
+                    "| PULSAR and QUASAR graph engine names",
+                    "Separate PULSAR and QUASAR engine code, feature flags, REST routes, and dedicated tests have been removed.",
                 ],
                 "forbidden_substrings": [
                     "| PULSAR Engine | ✅ Complete",
@@ -141,7 +141,7 @@ MATURITY_CONTRACT_RULES = [
         ],
     },
     {
-        "path": "docs/00-product/VISION.adoc",
+        "path": "docs/current/VISION.adoc",
         "required_substrings": [
             "This document states the *broad, durable vision*",
         ],

@@ -289,9 +289,13 @@ published row rewrites; counts and sums correct throughout),
 
 === P2.4 slice 3a: deletion vectors in the Iceberg engine (2026-10-25)
 
-Slice 3 lets a republication delete published rows instead of rewriting the table. Published
-tables are format v3, so the mechanism is the v3 **deletion vector** (a Puffin blob of deleted
+Slice 3 lets a republication delete published rows instead of rewriting the table. The target mechanism is the v3 **deletion vector** (a Puffin blob of deleted
 row positions per data file), not v2 position-delete files, which v3 writers may no longer add.
+Owner decision: v3-first (ADR-097 D3, reaffirmed 2026-10-26); no new v2 delete writer.
+At `69ddbd91b`, schema-driven caller selection still requests v2 except for v3-only types,
+and the engine preserves a v3 parent (#2245). Default v3 and legacy atomic upgrade remain
+activation work; delete-reader/read-back changes are local WIP in `feat/p24-delete-readers`,
+not merged. Validate row lineage, external values and delete carry-through before the live writer.
 It lands in three PRs, readers before the writer, so no reader ever meets a delete it ignores:
 3a (this: format and engine), 3b (the DataFusion and DuckDB readers apply vectors), 3c
 (MATERIALIZE writes vectors for updates and deletes).

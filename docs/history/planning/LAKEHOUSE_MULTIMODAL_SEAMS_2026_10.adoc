@@ -6,13 +6,22 @@
 :icons: font
 // status-as-of: 2026-10-18
 
+
+[IMPORTANT]
+====
+Historical planning snapshot archived 2026-10-26; statements of "current", "open" or
+"done" below describe the source document at its recorded date, not current delivery.
+Current work: link:../../current/LAKEHOUSE_PLAN.adoc[the consolidated plan/tracker].
+Preserved as design rationale and evidence; do not resume its old task list verbatim.
+====
+
 [cols="1,3"]
 |===
-| Status | **Accepted direction (owner decision 2026-10-18); implementation In Progress.** The decisions are recorded in link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097]. Each phase below is tracked by a `TD-SEAM-*` item (§6); live per-slice status, in-flight branches and the next-work queue are in link:LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc[LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER].
+| Status | **Accepted direction (owner decision 2026-10-18); implementation In Progress.** The decisions are recorded in link:../../12-design/adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097]. Each phase below is tracked by a `TD-SEAM-*` item (§6); live per-slice status, in-flight branches and the next-work queue are in link:LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc[LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER].
 | Date | 2026-10-18
 | Deciders | Vijaykumar Singh
-| Evidence base | Code survey of `develop` @ `1db3a05` (three parallel explorations). File:line citations are to that commit; line numbers drift, so re-verify before implementing (link:HOW_TO_FILE_TD_AND_ADR.adoc[HOW_TO_FILE_TD_AND_ADR] "Premise verification").
-| Relates to | link:adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096] (product direction), link:adr/ADR-094-unified-storage-substrate-and-compute-seam.adoc[ADR-094] (one substrate, format follows modality), link:adr/ADR-054-native-execution-engine-progressive-cutover.adoc[ADR-054] (native operator plane), link:adr/ADR-052-analytics-execution-competitiveness-codesign.adoc[ADR-052] (DataFusion OLAP), link:adr/ADR-020-canonical-wal-authority.adoc[ADR-020] (canonical WAL authority), link:adr/ADR-055-document-canonical-format-declaration-and-legacy-retirement.adoc[ADR-055] (document canonical format), link:adr/ADR-026-pax-canonical-vector-path.adoc[ADR-026] (PAX canonical vector path), link:adr/ADR-007-iceberg-rest-catalog-server.adoc[ADR-007] (Iceberg REST catalog), link:RELATIONAL_DOCUMENT_GRAPH_CONVERGENCE_2026_05_14.adoc[RELATIONAL_DOCUMENT_GRAPH_CONVERGENCE_2026_05_14] (stacked durability, projections)
+| Evidence base | Code survey of `develop` @ `1db3a05` (three parallel explorations). File:line citations are to that commit; line numbers drift, so re-verify before implementing (link:../../12-design/HOW_TO_FILE_TD_AND_ADR.adoc[HOW_TO_FILE_TD_AND_ADR] "Premise verification").
+| Relates to | link:../../12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096] (product direction), link:../../12-design/adr/ADR-094-unified-storage-substrate-and-compute-seam.adoc[ADR-094] (one substrate, format follows modality), link:../../12-design/adr/ADR-054-native-execution-engine-progressive-cutover.adoc[ADR-054] (native operator plane), link:../../12-design/adr/ADR-052-analytics-execution-competitiveness-codesign.adoc[ADR-052] (DataFusion OLAP), link:../../12-design/adr/ADR-020-canonical-wal-authority.adoc[ADR-020] (canonical WAL authority), link:../../12-design/adr/ADR-055-document-canonical-format-declaration-and-legacy-retirement.adoc[ADR-055] (document canonical format), link:../../12-design/adr/ADR-026-pax-canonical-vector-path.adoc[ADR-026] (PAX canonical vector path), link:../../12-design/adr/ADR-007-iceberg-rest-catalog-server.adoc[ADR-007] (Iceberg REST catalog), link:../../12-design/RELATIONAL_DOCUMENT_GRAPH_CONVERGENCE_2026_05_14.adoc[RELATIONAL_DOCUMENT_GRAPH_CONVERGENCE_2026_05_14] (stacked durability, projections)
 |===
 
 == 1. Positioning this document executes
@@ -25,7 +34,9 @@ it does not change it.
 
 == 2. Where the vision is ahead of the code
 
-The survey found five gaps. Each is a premise for a phase in §6.
+The 2026-10-18 survey below is historical motivation, not current status. Consult the
+execution tracker before implementing a gap; many prerequisites have landed. The active
+publication direction is v3-first (owner reaffirmed 2026-10-26, ADR-097 D3).
 
 . **Two disjoint Iceberg metadata trees.**
 ** The REST tree has dangling manifest URLs, a synthetic schema, a `commit_table` stub, and is
@@ -55,8 +66,8 @@ The survey found five gaps. Each is a premise for a phase in §6.
 ** AXIS IVF on disk/cloud is a placeholder
    (`src/index/axis/storage/ivf_posting_list_storage.rs:339`).
 ** A vector collection created without an index defaults to HELIX, which measured 2% recall
-   (link:../10-quality/td/TD-ENGSEL-1-auto-selected-engine-is-beta-helix.adoc[TD-ENGSEL-1],
-   link:../10-quality/td/TD-HELIX-3-multi-engine-benchmark-low-recall-helix-swift.adoc[TD-HELIX-3]).
+   (link:../../10-quality/td/TD-ENGSEL-1-auto-selected-engine-is-beta-helix.adoc[TD-ENGSEL-1],
+   link:../../10-quality/td/TD-HELIX-3-multi-engine-benchmark-low-recall-helix-swift.adoc[TD-HELIX-3]).
 
 == 3. Part A — Thought experiments (each one decides a seam)
 
@@ -92,15 +103,14 @@ Layer A for append-only modalities; retention = `RecordPartitionDrop` + snapshot
 published snapshots
 | `oid` namespaces differ per modality. MATERIALIZE sets `oid` to the row index
 (`src/services/dml/mod.rs:2317`). Iceberg has no deletes. HNSW delete is O(E).
-| **S1:** one identity scheme plus an entity/subject key system column. **S4:** position
-deletes (v2), then deletion vectors (v3).
+| **S1:** one identity scheme plus an entity/subject key system column. **S4:** v3 deletion vectors directly; legacy v2 reads and atomic upgrade only.
 
 | TE-5
 | **Cold start at 100M × 768d**
 | HNSW at ~620 B/vector plus fp32 vectors is about 370 GB of RAM, with a full rebuild on
 restart. AXIS IVF disk is a placeholder. The PAX cascade at 10M already costs 52.9 GET/query
 and p50 417 ms
-(link:../_internal/status/BIGANN_NPROBE_GEOMETRY_COMPLETE_2026_08_06.adoc[BIGANN_NPROBE_GEOMETRY_COMPLETE]:67-75).
+(link:../../_internal/status/BIGANN_NPROBE_GEOMETRY_COMPLETE_2026_08_06.adoc[BIGANN_NPROBE_GEOMETRY_COMPLETE]:67-75).
 | **S7:** the object-store centroid tier is the scale answer. HNSW is an optional hot
 projection rebuilt from it, never the authority.
 
@@ -109,7 +119,7 @@ projection rebuilt from it, never the authority.
 semantically near Y"
 | `graph_traverse` runs one Cypher query per depth into a `MemTable`, returns a string
 `node_id`, and its pgwire reachability is unverified
-(link:../10-quality/td/TD-XMODAL-10-graph-traverse-udtf-pgwire-reachability-unverified.adoc[TD-XMODAL-10]).
+(link:../../10-quality/td/TD-XMODAL-10-graph-traverse-udtf-pgwire-reachability-unverified.adoc[TD-XMODAL-10]).
 ORION is not WAL-authoritative.
 | **S3/S7:** edges are a Layer A table sorted `(src, label, dst)`, with ORION CSR as a
 rebuildable index. Traversal ≤ 3 hops = recursive join; deeper = `GraphExpandExec` over CSR.
@@ -131,7 +141,7 @@ turbopuffer uses for its unindexed WAL tail).
 | TE-9
 | **Double the data:** TPC-DS SF 0.05
 | MATERIALIZE runs out of memory (whole-table batch): OOM-killed at 13.7 GB RSS on a 15 GB host
-(link:../_internal/status/TPC_DS_SPEC_PRUNING_EVIDENCE_2026_10_18.adoc[TPC_DS_SPEC_PRUNING_EVIDENCE]:32-33).
+(link:../../_internal/status/TPC_DS_SPEC_PRUNING_EVIDENCE_2026_10_18.adoc[TPC_DS_SPEC_PRUNING_EVIDENCE]:32-33).
 The same figure was also quoted for an unrelated rustc OOM in TD-OLAPFMT-2; that attribution
 is corrected (§7) and the peak should be re-measured.
 | **S3/S4:** streaming, multi-part, bounded-memory publication.
@@ -200,8 +210,7 @@ D1). Append-only collections are time-partitioned.
 schema; the `""` tenant never spills; no obligation drain
 
 | S4 Publish
-| One writer produces spec-valid Iceberg (v2 now; v3 deletion vectors / variant / row lineage
-when external readers support them). REST `load_table` returns the writer's latest
+| One writer targets spec-valid Iceberg v3 (ADR-097 D3); legacy v2 reads and explicit atomic upgrade remain. Reader correctness gates activation. REST `load_table` returns the writer's latest
 `metadata.json`. Publication is incremental and fenced.
 | `publish_iceberg_snapshot` (`crates/storage/proximadb-iceberg-engine/src/lib.rs:158`);
 `write_manifest*` / `build_table_metadata` (`crates/storage/proximadb-iceberg-engine/src/iceberg.rs:296-512`);
@@ -264,7 +273,7 @@ predicate *into* the search, which is the property TD-OLAP-13 needed. See ADR-09
 
 [cols="1,2,2,2,2", options="header"]
 |===
-| | **turbopuffer** (published reference figures, link:../_internal/status/OBJECT_ECONOMY_BENCH_REPORT_2026_05_28.adoc[OBJECT_ECONOMY_BENCH_REPORT]:182-190) | **Memory HNSW** (AXIS) | **Large IVF** (AXIS `UnifiedIvfIndex`) | **ProximaDB PAX cascade (today)**
+| | **turbopuffer** (published reference figures, link:../../_internal/status/OBJECT_ECONOMY_BENCH_REPORT_2026_05_28.adoc[OBJECT_ECONOMY_BENCH_REPORT]:182-190) | **Memory HNSW** (AXIS) | **Large IVF** (AXIS `UnifiedIvfIndex`) | **ProximaDB PAX cascade (today)**
 
 | Authority
 | Object store (WAL + index on S3/GCS)
@@ -332,7 +341,7 @@ bench report, for orientation only. They are not a positioning or pricing claim;
 === Closing the depth gap
 
 Target: cold ≤ 3 sequential waves and ≤ 20 GET/query at 1M; warm 0–1 wave.
-The design, gates and PR slices are in link:P5B_PAX_CENTROID_DIRECTORY_DESIGN.adoc[P5B_PAX_CENTROID_DIRECTORY_DESIGN] (TD-PAXDIR-1).
+The design, gates and PR slices are in link:../../12-design/P5B_PAX_CENTROID_DIRECTORY_DESIGN.adoc[P5B_PAX_CENTROID_DIRECTORY_DESIGN] (TD-PAXDIR-1).
 
 . **Collection-global centroid directory (wave 0, cached).** Compaction emits a small
   `centroids.pax` per collection snapshot, published as an S7 projection. Queries pick nprobe
@@ -401,7 +410,8 @@ path
 
 == 6. Part D — Phased implementation (PR-sized slices, each with a gate)
 
-Dependencies: P1 ∥ P5a can start now. P2 → P3 → P4. P6 runs throughout.
+Historical dependency structure: P1 ∥ P5a; P2 → P3 → P4, with P6 throughout. Resume
+remaining gates from the execution tracker; do not restart landed slices.
 
 [cols="1,2,1", options="header"]
 |===
@@ -418,7 +428,7 @@ Dependencies: P1 ∥ P5a can start now. P2 → P3 → P4. P6 runs throughout.
 === P0 — Decisions on record (docs only)
 
 * This document (Parts A–D).
-* link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097] "Seams S1–S9 + single
+* link:../../12-design/adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097] "Seams S1–S9 + single
   logical IR (DataFusion) with native physical operators". It supersedes the TD-OLAP-13
   premise and amends the ADR-052 niche statement.
 * ADR-096 amended with the positioning line.
@@ -431,7 +441,7 @@ Dependencies: P1 ∥ P5a can start now. P2 → P3 → P4. P6 runs throughout.
 ** Fix spec defects in `iceberg.rs`: absolute `s3://` / `file://` URIs in `file_path`; Avro
    header metadata (`schema`, `partition-spec`, `format-version`, `content`);
    `parent-snapshot-id`; non-zero sequence numbers; operation `overwrite` vs `append`.
-** Emit **format v2** until external v3 readers are verified.
+** Target **format v3** directly; verify metadata/row lineage and external readers before activation. No new v2 delete writer or silent downgrade fallback.
 . **Point REST at the writer's metadata.**
 ** `IcebergRestService::ensure_table_metadata` resolves the table root (not `…/data`) and
    serves the latest `v{N}.metadata.json` written by the engine.
@@ -502,8 +512,8 @@ every selectivity band; the TE-1 query runs over pgwire with `EXPLAIN` showing p
 ** *Gate:* TD-XMODAL-10 pgwire reachability test.
 * **Documents:** retire `document_wal`; shredded columns + JSON residual (TD-USUB-6); ranged
   reads.
-* **TE-4 delete:** add a `subject` system column; position deletes in Iceberg v2; deletion
-  vectors on the PAX cascade.
+* **TE-4 delete:** add a `subject` system column; deletion vectors in Iceberg v3 and
+  on the PAX cascade (no new v2 delete implementation).
   *Gate:* an end-to-end test where a delete removes the subject from every modality and from
   the next published snapshot.
 
@@ -516,7 +526,7 @@ every selectivity band; the TE-1 query runs over pgwire with `EXPLAIN` showing p
 * **P5b:**
 ** Collection-global centroid directory as an S7 projection.
 ** Cluster-contiguous compaction with A+B co-located.
-** Design and slices: link:P5B_PAX_CENTROID_DIRECTORY_DESIGN.adoc[P5B_PAX_CENTROID_DIRECTORY_DESIGN].
+** Design and slices: link:../../12-design/P5B_PAX_CENTROID_DIRECTORY_DESIGN.adoc[P5B_PAX_CENTROID_DIRECTORY_DESIGN].
 ** *Gate:* SIFT1M on MinIO with injected latency reaches ≤ 3 sequential waves, ≤ 20 GET/query,
    recall ≥ 0.98; BIGANN 10M is re-measured.
 * **P5c:** HNSW as a persisted hot projection (TD-112) built from PAX, on the AXIS engine — lifecycle in TD-SEAM-13 (stamped projection, delta on boot, ground-up rebuild as repair, exact-tier prerequisite TD-PAXPREC-1); AXIS IVF disk path
@@ -529,7 +539,7 @@ every selectivity band; the TE-1 query runs over pgwire with `EXPLAIN` showing p
 * Publish a **multimodal analytics benchmark** (TE-1 / TE-6 / TE-3 query set) against
   DuckDB + pgvector, LanceDB, and the turbopuffer reference numbers.
 * No pricing claims until the P5b gates pass, per
-  link:SIFT1M_ADMISSION_FIRST_GET_REDUCTION_BLUEPRINT_2026_07_29.adoc[SIFT1M_ADMISSION_FIRST_GET_REDUCTION_BLUEPRINT]:715-725.
+  link:../../12-design/SIFT1M_ADMISSION_FIRST_GET_REDUCTION_BLUEPRINT_2026_07_29.adoc[SIFT1M_ADMISSION_FIRST_GET_REDUCTION_BLUEPRINT]:715-725.
 
 == 7. Documentation corrections made with this document (P0)
 
@@ -537,17 +547,17 @@ every selectivity band; the TE-1 query runs over pgwire with `EXPLAIN` showing p
 |===
 | Document | Claimed | What is true (verified 2026-10-18)
 
-| link:../10-quality/td/TD-OLAPFMT-2-spec-parquet-layout-and-pruning.adoc[TD-OLAPFMT-2]
+| link:../../10-quality/td/TD-OLAPFMT-2-spec-parquet-layout-and-pruning.adoc[TD-OLAPFMT-2]
 | TPC-DS A/B "row-identical across all 63 queries × 3 engines"
 | Per the evidence doc: DataFusion 63/63, DuckDB 63/63 only after the empty-result fix
 (56/63 before), native 40/63. The comparison was of row counts, not values.
 
-| link:../10-quality/td/TD-OLAPFMT-2-spec-parquet-layout-and-pruning.adoc[TD-OLAPFMT-2]
+| link:../../10-quality/td/TD-OLAPFMT-2-spec-parquet-layout-and-pruning.adoc[TD-OLAPFMT-2]
 | The rustc `--lib` test build is OOM-killed "at ~13.7 GB RSS"
 | 13.7 GB is the figure the evidence doc records for the SF 0.05 MATERIALIZE OOM. The rustc
 peak was not separately measured; marked "re-measure".
 
-| link:../10-quality/td/TD-OLAPFMT-3-incremental-parquet-publication.adoc[TD-OLAPFMT-3]
+| link:../../10-quality/td/TD-OLAPFMT-3-incremental-parquet-publication.adoc[TD-OLAPFMT-3]
 | "On develop the WAL is truncated behind manifest durability (TD-USUB-1)"
 | Not built. The table record WAL is never truncated: slice 2b does not exist,
 `SpillRecordStorage::min_unflushed_lsn` (`src/services/record_spill.rs:1055`) has no

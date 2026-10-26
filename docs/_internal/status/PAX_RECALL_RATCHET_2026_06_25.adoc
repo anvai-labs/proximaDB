@@ -30,7 +30,7 @@ goes up (#10).
 
 [NOTE]
 ====
-**Representativeness caveat (audit 2026-06-25, `PAX_SUBSTRATE_DESIGN_PLAN_2026_06_25.adoc`).**
+**Representativeness caveat (audit 2026-06-25, `docs/history/planning/PAX_SUBSTRATE_DESIGN_PLAN_2026_06_25.adoc`).**
 This corpus is **DIM=64 seeded-LCG synthetic**, N≤100k, with a **fixed absolute** REFINE=1000
 (=1% of corpus only at N=100k; <0.1% at N=1M). RaBitQ recall is dimension- and
 distribution-dependent, so this is a **fast CI floor**, *not* a guarantee for production

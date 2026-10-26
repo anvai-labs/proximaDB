@@ -25,7 +25,7 @@ search (the pattern already exists in `ProximaScanExec`, `src/datafusion/proxima
 The operators below are kept, re-homed as native `ExecutionPlan` adapters under
 `src/datafusion/` (ADR-039 no-leakage unchanged), not as a separate per-query native plane. The
 vector operator is tracked as TD-SEAM-6 (`FilteredAnnExec`); see
-link:../../12-design/LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10]
+link:../../current/LAKEHOUSE_PLAN.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10]
 §4 (S6). The status and text below are otherwise unchanged history.
 ====
 

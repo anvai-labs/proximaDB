@@ -5,6 +5,15 @@
 :toclevels: 2
 // status-as-of: 2026-10-25
 
+
+[IMPORTANT]
+====
+Historical planning snapshot archived 2026-10-26; statements of "current", "open" or
+"done" below describe the source document at its recorded date, not current delivery.
+Current work: link:../../current/STORAGE_PLAN.adoc[the consolidated plan/tracker].
+Preserved as design rationale and evidence; do not resume its old task list verbatim.
+====
+
 == Status and scope
 
 *Proposed implementation contract; design review, not a release or an accepted ADR.*
@@ -16,7 +25,7 @@ This review supersedes their proposed implementation order and the specific prem
 corrected below. Preserve their product intent: object-backed collections with selectable
 cost/residency policies, metered capacity, and rate cards outside the storage engine.
 
-Tracking: link:../10-quality/td/TD-TIER-1-collection-storage-policy-and-residency.adoc[TD-TIER-1].
+Tracking: link:../../10-quality/td/TD-TIER-1-collection-storage-policy-and-residency.adoc[TD-TIER-1].
 Plan-mode entry point: link:STORAGE_CLASS_IMPLEMENTER_PLAN_PROMPT.adoc[implementation planning prompt].
 The SC labels below are storage-class work packages, not ADR-097's foundational S1–S9.
 
@@ -24,7 +33,27 @@ User additions incorporated: compare S3 Vectors and turbopuffer; evaluate gp3/gp
 test 8 MiB versus 40 MiB+ reads; use local MinIO (or ds3); inspect physical hardware
 through WSL interop and label extrapolations separately from measurements.
 
-== 0. Reconciliation of the October 18 plan with current code
+== Current pickup overlay — 2026-10-26
+
+This review's 2026-10-25 audit below is retained as history. Current baseline is
+`69ddbd91b`; link:LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc[the central tracker]
+and link:ROADMAP_WORKTREE_RECONCILIATION_2026_10_26.adoc[worktree audit]
+control live status/ownership. Do not reimplement from stale findings in §0.
+
+* #2243 merged the M1 reconciliation and TD-SEAM-14/15.
+* #2244 merged this review and the cap/gap CLI/reporting seam; that harness work is done.
+* #2245 migrated bulk append to the engine and added a never-downgrade floor. The route's
+  tenant REST-key and facade reachability still gate production wiring; P1 is not universally closed.
+* #2249 supplies a measured 4/16/40 MiB pilot. Cell geometry differs (21/25/26), one trial
+  per cap; full E1 telemetry and same-object repeats remain open. Do not infer a proven
+  causal halving, latency neutrality or a global default from those measurements.
+* `feat/sc1-storage-policy` owns local SC1/partial SC2 WIP. Scheme validation alone does not
+  prove authorized resolved placement; policy updates need a real generation. SC3–SC6 remain open.
+* `feat/p24-delete-readers` owns local internal DV reader/read-back WIP. Owner reaffirmed
+  v3-first on 2026-10-26; ADR-097 is aligned. Live v3-default/upgrade/DV publisher activation
+  remains gated, with no new v2 delete implementation.
+
+== 0. Reconciliation of the October 18 plan with code at the 2026-10-25 review
 
 Do not restart P0/P1 or implement the old gap list literally. Some gaps are closed, some
 are narrower, and several completion claims in the tracker were premature. This is a
@@ -103,7 +132,7 @@ Foundational refinements for the next multimodal milestone:
   slice. Do not equate the storage-class API or an ANN microbenchmark with multimodal delivery.
 
 Measured hardware/emulator evidence:
-link:../_internal/status/STORAGE_CLASS_MEDIA_EVIDENCE_2026_10_25.adoc[local NVMe, MinIO and EBS bounds].
+link:../evidence/STORAGE_CLASS_MEDIA_EVIDENCE_2026_10_25.adoc[local NVMe, MinIO and EBS bounds].
 
 === V3-first implementation decision (owner amendment, 2026-10-25)
 
@@ -589,13 +618,13 @@ E0: inventory available source/binary, dataset, hardware, active services, crede
 reference, cache paths and real read call sites. Record hashes and commit; never log secrets.
 Use task-owned data/config/prefixes/ports. No modification of another session's benchmark bed.
 
-E1: fixed-geometry query cap sweep on local S3-compatible MinIO plus owned Toxiproxy latency
+E1 remaining gate (#2249 is only a geometry-confounded pilot): fixed-object query cap sweep on local S3-compatible MinIO plus owned Toxiproxy latency
 profile; ds3 is an alternative only after its endpoint/access is known. Baseline 4 MiB, then
 16/40; refine 8/32/64 when informative. First restart with L2 absent, then L2 warm with new
 queries and result-cache bypass. Keep actual server path, not an adapter-only microbenchmark.
-The existing harness's `OwnedServer` accepts a cap, but its CLI currently hard-codes the
-4 MiB cap into arms and reporting. Expose/record/verify cap and gap in one harness-only change
-before running a claimed CLI sweep; inherited env variables are scrubbed and cannot override it.
+The cap/gap CLI and effective reporting already landed in #2244. Use those flags and
+verify actual sizes; inherited env variables are scrubbed. Preserve identical objects/model
+and run repeats; add the telemetry missing from #2249 before claiming E1 complete.
 
 E2: direct local range tests (sequential/random, 4–64 MiB, queue depths 1 and 8), then
 application traces. Guest direct I/O does not prove Windows host cache coldness. These tests

@@ -19,10 +19,15 @@ This document states the *broad, durable vision*. The direction it describes was
 link:../12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096]; changing
 it takes a new ADR. What may be *claimed* today is decided by
 link:../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE.adoc], and the exact adoption promise is
-machine-checked in link:MVP_TRUST_CORRIDOR.toml[MVP_TRUST_CORRIDOR.toml]: a capability outside
+machine-checked in link:../00-product/MVP_TRUST_CORRIDOR.toml[MVP_TRUST_CORRIDOR.toml]: a capability outside
 that corridor is not an MVP or GA claim merely because code for it exists. Sequencing lives in
-the link:../_internal/roadmap/STRATEGIC_ROADMAP.adoc[roadmap].
+the link:ROADMAP.adoc[roadmap].
 ====
+
+The long-term positioning is the *lakehouse system of record for AI context*: one catalog,
+record identity and coherent read boundary across modalities. Open-table interoperability
+and multimodal analytics prove that direction; PAX remains vector authority with an optional
+Parquet projection (ADR-094/097).
 
 == The problem
 
@@ -127,7 +132,7 @@ single-process use cases.
 * **Not a message queue or a distributed ledger.** It consumes events through CDC and keeps
   immutable logs for audit, not for pub/sub fan-out or consensus.
 
-== Durable outcomes
+== Durable outcomes (targets, not current support claims)
 
 The roadmap sequences these by release; this list does not carry dates.
 
@@ -167,14 +172,17 @@ Go-to-market sequence; the engineering sequence is the roadmap.
 
 * link:../12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096] — the
   direction decision this vision states.
-* link:PRD.adoc[Product Requirements Document] — positioning, personas and prioritised
+* link:../00-product/PRD.adoc[Product Requirements Document] — positioning, personas and prioritised
   requirements.
-* link:COMPETITIVE_LANDSCAPE.adoc[Competitive Landscape].
-* link:../_internal/roadmap/STRATEGIC_ROADMAP.adoc[Strategic Roadmap] — release-by-release plan.
+* link:../00-product/COMPETITIVE_LANDSCAPE.adoc[Competitive Landscape].
+* link:ROADMAP.adoc[Strategic Roadmap] — release-by-release plan.
 * link:../12-design/SYSTEM_MAP_2026_05_30.adoc[System Map] — how the system is built today.
 
-'''
-_Last Updated_: 2026-10-17 — rewritten for ADR-096. Removed: the engine table with unledgered
-latency numbers (VIPER is deprecated, ADR-093), the ibkrtrading anchor section, and the Year 1–3
-milestone lists and Gantt chart (dates now live only in the roadmap). Earlier text is in git
-history.
+
+== Decision boundary
+
+Iceberg is v3-first (ADR-097 D3): preserve legacy v2 reads and atomic upgrade, without
+building a new v2 delete writer. DataFusion LogicalPlan is the logical IR; native physical
+operators remain adapters. HNSW is a persisted hot projection of PAX.
+
+Earlier rationale: link:../history/planning/VISION.adoc[vision snapshot].

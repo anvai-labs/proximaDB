@@ -5,7 +5,7 @@
 [abstract]
 Firm interface contracts for decoupling `src/storage` from `src/index` (AXIS) and
 `src/compute`, designed *before* any extraction. This is the next phase of the root-crate
-decomposition (`ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc`) after the mechanical leaf
+decomposition (`docs/history/planning/ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc`) after the mechanical leaf
 slices (kv/optimization/strategy/tenant). Status: **Partial (reconciled 2026-10-15)**. Shipped:
 `proximadb-index-types` (A3), `proximadb-distance-kernel` and `proximadb-quantization-kernel`
 (Part B, #194, #229), `src/storage/compute_bridge/`, and the ISP traits `IndexQuery`/`IndexIngest`/

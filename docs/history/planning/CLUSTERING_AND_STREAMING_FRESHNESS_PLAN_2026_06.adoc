@@ -1,12 +1,21 @@
 = P4: Adaptive Clustering + Relational Streaming Freshness — Plan
 :toc: macro
+
+[IMPORTANT]
+====
+Historical planning snapshot archived 2026-10-26; statements of "current", "open" or
+"done" below describe the source document at its recorded date, not current delivery.
+Current work: link:../../current/PLATFORM_PLAN.adoc[the consolidated plan/tracker].
+Preserved as design rationale and evidence; do not resume its old task list verbatim.
+====
+
 2026-06-19
 
 [cols="1,3", options="header"]
 |===
 | Field | Value
 | Status | **Partial (verified 2026-10-15).** Shipped: the B1 building block `ReadFreshnessSla::should_scan_delta` (`src/query/read_route.rs`, `c1499c02d`). Open: A1–A3 (relational `cluster_by` is still defined with no DDL parse or flush consumer), the B1 router signal (`QueryShape` carries no `freshness`; `route_select` is not freshness-aware), B2 (deferred). Note: *vector* block clustering shipped separately (TD-RDSTRAT-5 S1 sign-Gray sort + PCA/IVF re-cluster, default ON since TD-WLP-4) — that is not this plan's relational `CLUSTER BY`.
-| Relates to | link:FORMAT_STRATEGY_ICEBERG_DELTA_LANCE_2026_06.adoc[FORMAT_STRATEGY_ICEBERG_DELTA_LANCE] (origin of both gaps), link:adr/ADR-094-unified-storage-substrate-and-compute-seam.adoc[ADR-094] (overlap: DataFusion-route freshness via the native table provider / bound memtable — check before building B2)
+| Relates to | link:../../12-design/FORMAT_STRATEGY_ICEBERG_DELTA_LANCE_2026_06.adoc[FORMAT_STRATEGY_ICEBERG_DELTA_LANCE] (origin of both gaps), link:../../12-design/adr/ADR-094-unified-storage-substrate-and-compute-seam.adoc[ADR-094] (overlap: DataFusion-route freshness via the native table provider / bound memtable — check before building B2)
 |===
 
 toc::[]

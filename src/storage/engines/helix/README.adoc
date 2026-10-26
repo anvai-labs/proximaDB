@@ -1149,7 +1149,7 @@ pca_retrain_interval_hours = 48     # Less frequent training
 
 == Future Enhancements
 
-**Planned Features** (see link:../../../../docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc[Roadmap]):
+**Planned Features** (see link:../../../../docs/current/ROADMAP.adoc[Roadmap]):
 
 * **Multi-Resolution Hilbert Curves**: Adaptive resolution based on data density
 * **Online PCA Updates**: Incremental PCA without full retraining

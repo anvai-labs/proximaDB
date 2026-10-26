@@ -9,7 +9,7 @@
 |===
 | Status | **Proposed (design, 2026-10-22); implementation tracked in link:../10-quality/td/TD-PAXDIR-1-collection-global-centroid-directory.adoc[TD-PAXDIR-1].** No code ships with this document.
 | Date | 2026-10-22
-| Parent | link:LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] Part C "Closing the depth gap" and §6 P5b; TD-SEAM-10 (legacy row in link:../10-quality/TECHNICAL_DEBT.adoc[TECHNICAL_DEBT]).
+| Parent | link:../current/LAKEHOUSE_PLAN.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] Part C "Closing the depth gap" and §6 P5b; TD-SEAM-10 (legacy row in link:../10-quality/TECHNICAL_DEBT.adoc[TECHNICAL_DEBT]).
 | Evidence base | Code survey of `develop` @ `d628f3cd`. File:line citations drift; re-verify before implementing.
 | Relates to | link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097] D2 (PAX is the vector authority; the AXIS IVF disk path retires in favour of this directory), link:adr/ADR-026-pax-canonical-vector-path.adoc[ADR-026] (RaBitQ → SQ8 → rows cascade, range coalescing), link:adr/ADR-094-unified-storage-substrate-and-compute-seam.adoc[ADR-094] D4 (promote rebuildable serving metadata to collapse the cold GET chain), TD-RDSTRAT-8 (per-segment Region A0), TD-FPRUNE-1 (partitioned layout), TD-PAXMETA-1 (collection-level segment facts), TD-SEAM-13 (HNSW projection; same stamp discipline), TD-PAXPREC-1
 |===
@@ -362,7 +362,7 @@ evidence ledger (seams doc §6 P6).
 half the write target) instead of the SQ8-only estimate that sized SIFT1M at ~15 cells/1M rows.
 The AXIS IVF disk posting-list placeholder is deleted (ADR-097 D2).
 
-*As measured (D7, 2026-10-25,* link:../_internal/status/P5B_D7_SIFT1M_GATE_RUN_2026_10_25.adoc[artifact]*):*
+*As measured (D7, 2026-10-25,* link:../history/evidence/P5B_D7_SIFT1M_GATE_RUN_2026_10_25.adoc[artifact]*):*
 with the directory on and 32 coarse cells, G1, G2-cold and G3 pass (recall 0.9823, 3 waves, 18.86
 requests per query); G2-warm does not (2 waves), because every query lists the collection. The
 default per-segment cell rule gives about 15 cells per 1M rows, half the passing geometry. The
