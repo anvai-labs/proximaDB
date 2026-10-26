@@ -978,24 +978,29 @@ impl TableWriteExecutor for DataFusionTableWriteExecutor {
                             request.target_schema.name
                         )
                     })?;
-                // The carried set: the latest engine snapshot's files when one
-                // exists; otherwise the retired list-based publisher's semantics —
-                // every `*.parquet` in the data dir except this statement's own
-                // parts — which adopts stray parts of failed statements and
-                // pre-migration trees. A failed listing is an error, never an
-                // empty set: an empty seed would publish a snapshot that drops
-                // every existing file.
-                let mut snapshot_keys = match parent {
-                    Some(version) => bridge
-                        .read_iceberg_table(&metadata_prefix, version)
-                        .await
-                        .map_err(|err| {
-                            anyhow!(
-                                "DataFusion bulk append for '{}' failed to read snapshot \
-                                 v{version} at '{metadata_prefix}': {err}",
-                                request.target_schema.name
-                            )
-                        })?,
+                // The carried set: the latest engine snapshot's files (and its
+                // deletion vectors — P2.4 slice 3b: a successor that names the
+                // carried files without their vectors resurrects every deleted
+                // row) when one exists; otherwise the retired list-based
+                // publisher's semantics — every `*.parquet` in the data dir
+                // except this statement's own parts — which adopts stray parts
+                // of failed statements and pre-migration trees. A failed listing
+                // is an error, never an empty set: an empty seed would publish a
+                // snapshot that drops every existing file.
+                let (mut snapshot_keys, carried_deletes) = match parent {
+                    Some(version) => {
+                        let snapshot = bridge
+                            .read_iceberg_snapshot_files(&metadata_prefix, version)
+                            .await
+                            .map_err(|err| {
+                                anyhow!(
+                                    "DataFusion bulk append for '{}' failed to read snapshot \
+                                     v{version} at '{metadata_prefix}': {err}",
+                                    request.target_schema.name
+                                )
+                            })?;
+                        (snapshot.data_files, snapshot.deletion_vectors)
+                    }
                     None => {
                         let listed = bridge
                             .list_objects(&Path::from(data_dir.as_str()))
@@ -1007,20 +1012,23 @@ impl TableWriteExecutor for DataFusionTableWriteExecutor {
                                     request.target_schema.name
                                 )
                             })?;
-                        listed
-                            .into_iter()
-                            .filter(|key| {
-                                key.as_ref().ends_with(".parquet") && !part_keys.contains(key)
-                            })
-                            .collect()
+                        (
+                            listed
+                                .into_iter()
+                                .filter(|key| {
+                                    key.as_ref().ends_with(".parquet") && !part_keys.contains(key)
+                                })
+                                .collect(),
+                            Vec::new(),
+                        )
                     }
                 };
                 snapshot_keys.extend(part_keys.iter().cloned());
                 snapshot_keys.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
                 snapshot_keys.dedup_by(|a, b| a.as_ref() == b.as_ref());
 
-                match bridge
-                    .publish_iceberg_files(
+                let publish = if carried_deletes.is_empty() {
+                    bridge.publish_iceberg_files(
                         &snapshot_keys,
                         parent,
                         &metadata_prefix,
@@ -1031,8 +1039,20 @@ impl TableWriteExecutor for DataFusionTableWriteExecutor {
                         now_ms,
                         v3,
                     )
-                    .await
-                {
+                } else {
+                    bridge.publish_iceberg_files_deleting(
+                        &snapshot_keys,
+                        &carried_deletes,
+                        parent,
+                        &metadata_prefix,
+                        &table_uuid,
+                        &table_root,
+                        &fields,
+                        now_ns + attempt as i64,
+                        now_ms,
+                    )
+                };
+                match publish.await {
                     Ok(_) => {
                         committed = true;
                         break;
@@ -1117,7 +1137,7 @@ mod tests {
     use proximadb_kernel::error::StorageError;
     use proximadb_storage_common::object_store_bridge::{
         BridgeInMemoryObjectStore as InMemory, BridgeObjectStore as ObjectStore,
-        IcebergSnapshotField, ObjectStoreBridge,
+        IcebergSnapshotDeletion, IcebergSnapshotField, IcebergSnapshotFiles, ObjectStoreBridge,
     };
     use std::sync::Mutex;
 
@@ -1206,6 +1226,13 @@ mod tests {
         /// Keys `list_objects` reports besides the in-memory store (the mock's
         /// parquet writes only record, so the legacy-seed path sees these).
         planted_parquet: Mutex<Vec<Path>>,
+        /// Per-version deletion vectors `read_iceberg_snapshot_files` reports
+        /// (indexed like the engine-log versions); empty by default.
+        snapshot_deletes: Mutex<Vec<Vec<IcebergSnapshotDeletion>>>,
+        /// `publish_iceberg_files_deleting` commits (carry observability):
+        /// (metadata_prefix, parent, files, carried deletes).
+        deleting_commits:
+            Mutex<Vec<(String, Option<u64>, Vec<Path>, Vec<IcebergSnapshotDeletion>)>>,
     }
 
     impl CapturingObjectStoreBridge {
@@ -1219,6 +1246,8 @@ mod tests {
                 conflict_once: std::sync::atomic::AtomicBool::new(false),
                 competitor_part: Mutex::new(None),
                 planted_parquet: Mutex::new(Vec::new()),
+                snapshot_deletes: Mutex::new(Vec::new()),
+                deleting_commits: Mutex::new(Vec::new()),
             }
         }
 
@@ -1333,6 +1362,31 @@ mod tests {
                 .unwrap_or_default())
         }
 
+        async fn read_iceberg_snapshot_files(
+            &self,
+            metadata_prefix: &str,
+            version: u64,
+        ) -> std::result::Result<IcebergSnapshotFiles, StorageError> {
+            Ok(IcebergSnapshotFiles {
+                data_files: self
+                    .iceberg_commits
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| c.0 == metadata_prefix)
+                    .nth(version as usize)
+                    .map(|c| c.2.clone())
+                    .unwrap_or_default(),
+                deletion_vectors: self
+                    .snapshot_deletes
+                    .lock()
+                    .unwrap()
+                    .get(version as usize)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+        }
+
         async fn publish_iceberg_files(
             &self,
             files: &[Path],
@@ -1366,6 +1420,40 @@ mod tests {
             let mut commits = self.iceberg_commits.lock().unwrap();
             let version = commits.iter().filter(|c| c.0 == metadata_prefix).count() as u64;
             commits.push((metadata_prefix.to_string(), parent, files.to_vec()));
+            Ok(version)
+        }
+
+        async fn publish_iceberg_files_deleting(
+            &self,
+            files: &[Path],
+            deletes: &[IcebergSnapshotDeletion],
+            parent: Option<u64>,
+            metadata_prefix: &str,
+            _table_uuid: &str,
+            _table_location: &str,
+            _fields: &[IcebergSnapshotField],
+            _snapshot_id: i64,
+            _timestamp_ms: i64,
+        ) -> std::result::Result<u64, StorageError> {
+            let version = self
+                .publish_iceberg_files(
+                    files,
+                    parent,
+                    metadata_prefix,
+                    "",
+                    "",
+                    &[],
+                    _snapshot_id,
+                    _timestamp_ms,
+                    true,
+                )
+                .await?;
+            self.deleting_commits.lock().unwrap().push((
+                metadata_prefix.to_string(),
+                parent,
+                files.to_vec(),
+                deletes.to_vec(),
+            ));
             Ok(version)
         }
     }
@@ -2476,6 +2564,52 @@ mod tests {
                 .any(|p| p.as_ref().contains("-00000.parquet")),
             "the first statement's part is carried: {:?}",
             commits[1].2
+        );
+    }
+
+    /// P2.4 slice 3b: when the parent snapshot carries deletion vectors, the
+    /// successor publish must go through `publish_iceberg_files_deleting` and
+    /// name the carried vectors — a snapshot that carries the files but not
+    /// their vectors resurrects every deleted row.
+    #[tokio::test]
+    async fn datafusion_bulk_append_carries_previous_snapshot_deletes() {
+        let bridge = Arc::new(CapturingObjectStoreBridge::new());
+        run_bulk_append(bridge.clone(), vec![test_record("r1"), test_record("r2")])
+            .await
+            .unwrap();
+        // v0 now carries a deletion vector on its (recorded) part, as if a
+        // delete had been published against it.
+        let carried_file = bridge.iceberg_commits.lock().unwrap()[0]
+            .2
+            .first()
+            .cloned()
+            .expect("v0 names its part");
+        *bridge.snapshot_deletes.lock().unwrap() = vec![vec![IcebergSnapshotDeletion {
+            data_file: carried_file.clone(),
+            puffin_file: Path::from("warehouse/facts/data/dv-0.puffin"),
+            content_offset: 0,
+            content_size_in_bytes: 64,
+            puffin_file_size_in_bytes: 128,
+            cardinality: 2,
+        }]];
+
+        run_bulk_append(bridge.clone(), vec![test_record("r3")])
+            .await
+            .unwrap();
+
+        let deleting = bridge.deleting_commits.lock().unwrap();
+        assert_eq!(
+            deleting.len(),
+            1,
+            "the successor publish carries deletes: {deleting:?}"
+        );
+        assert_eq!(deleting[0].1, Some(0), "committed on the DV snapshot");
+        assert_eq!(deleting[0].3.len(), 1, "the parent's vector is carried");
+        assert_eq!(deleting[0].3[0].data_file, carried_file);
+        assert!(
+            deleting[0].2.len() >= 2,
+            "carried files + the new part: {:?}",
+            deleting[0].2
         );
     }
 
