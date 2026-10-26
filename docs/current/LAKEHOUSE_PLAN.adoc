@@ -296,6 +296,39 @@ profile proves that kernel is the remaining bottleneck. Read the dated research 
 vendor claim conditions and older benchmark caveats. "Seamless" means composable contracts
 without a second authority, not zero integration work or guaranteed matching performance.
 
+=== Source-driven constraints for the native prototype
+
+The pinned Quickwit/ClickHouse source inspection is recorded in
+link:../history/evidence/NATIVE_EXECUTION_RESEARCH_2026_10_26.adoc[research evidence].
+It is development-head code inspection, not measured parity or a release-support claim.
+Keep the existing NE-0..7 sequence; refine its contracts before implementing:
+
+* Separate exact index replacement from a pruning hint with an exact residual. Selectivity
+  estimates choose work, never result completeness. Extend NE-7 with common phrases, absent
+  tokens under OR, partial projection coverage and analyzer changes.
+* Separate async I/O readiness from CPU execution within current stream adapters. Reserve
+  bytes *before* warmup/decode growth, bound in-flight reads and release on cancellation.
+  NE-4 must deliberately underestimate warmup size; post-hoc accounting alone fails the gate.
+* Make late hydration optional by cost and semantics. Carry compact, versioned references,
+  group physical reads and restore logical order. Bound or spill survivor state; test wide
+  payloads, large LIMIT, WITH TIES, duplicate/outer joins and guarded invalid casts (NE-2/3).
+  An eager native-to-Arrow conversion at every boundary defeats this prototype; Arrow at
+  the adapter boundary remains compatible with native encoded selections internally.
+* Stage predicates by shared physical columns and index readers where equivalence permits;
+  volatile/throwing expressions, null padding and version/delete resolution constrain reorder.
+  Do not transplant another engine's heuristic as a semantic proof.
+* Predict latency and allocated cost separately in S8. Count dependent waves, total requests,
+  useful/overread bytes, CPU and queueing; avoid double-counting overlapped work. NE-6 must
+  price index build/maintenance/storage, compaction and idle resources over a fixed horizon.
+  Compare tiny/large tenants and ingest/query ratios before choosing compaction or read caps.
+
+Native `ExecutionOperator` already supports async batch streams and source splitting;
+S5/DataFusion adapters remain the integration boundary. First add the missing capability,
+visibility and resource descriptors around one TextMatchExec or FilteredAnnExec region.
+Only propose a scheduler replacement after a profile demonstrates that these contracts cannot
+be implemented efficiently within the existing boundary. Keep broad scan/aggregate paths as
+negative controls and select them when indexing or scattered hydration costs more.
+
 === Experiments before promotion
 
 [cols="1,3,4",options="header"]
