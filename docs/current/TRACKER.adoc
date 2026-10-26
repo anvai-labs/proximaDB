@@ -41,8 +41,8 @@ No active checkout is modified by this documentation consolidation.
 [cols="2,2,3",options="header"]
 |===
 | Branch / observed head | State | Ownership / next action
-| feat/p24-delete-readers / d929d7993 | Dirty, no PR found | P2 readers; retain and coordinate before new work.
-| feat/sc1-storage-policy / d929d7993 | Dirty, no PR found | SC1/partial SC2; retain and apply review nudges.
+| feat/p24-delete-readers / d929d7993 (dirty WIP preserved; same-session fork) | Paused at the API usage limit (resets 2026-10-27 00:58 UTC). Pre-pause: engine suite 114/114 green incl. the delete round-trip; remaining executor/leaf/duckdb/dml suites + interop e2e + commit queued. | P2 readers (this session owns; resume after reset): apply the P2 nudges below, then commit -> independent adversarial review -> PR. Next gate: external deleted-value read-back equals the server view across a snapshot chain.
+| feat/sc1-storage-policy / d929d7993 (dirty WIP preserved; same-session fork) | Paused at the API usage limit mid-repair of collection_builder.rs (duplicate/stray lines from a partial proto regen); uncommitted tree intact. | SC1/partial SC2 (this session owns; resume after reset): apply the SC1 nudges below — replace the request-storage_path premise with operator-configured-target authorization + the final resolved assignment, monotonic policy generation (or defer updates), NOT_ACTIVE status across REST/gRPC/OpenAPI/SDK regens, WIP-not-landed claims. Next gate: facade/SDK parity + restart + immutable-placement tests.
 | fix/panic-scope-workspace / 1e707fb1b | Open #2248; CI Success failed at audit | Cross-cutting guard; diagnose current checks without weakening scope.
 | fix/audit-zstd-advisories / 2b4a2ce9e | Clean, one unmerged commit, no PR found | Dependency lane; advisory exceptions need rationale/removal trigger, not a claim of upgrade.
 | docs/release-notes-v040 / b448e4acc | Dormant/unresolved; 11 unique commits and generated site | Reconcile unique release changes before cleanup. Partial overlap with #1960 does not prove supersession.
