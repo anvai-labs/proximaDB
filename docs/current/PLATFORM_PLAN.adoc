@@ -106,7 +106,11 @@ and mixed-format recovery evidence before any precision rollout. TD-PAXPREC-1 st
 Before claiming installs or compatibility, run published Docker/RPM/DEB/MSI write/restart/read
 checks and JDBC/asyncpg/psycopg smoke against the release image. Packaging merges alone do not
 close those gates. Tenant admission and pgwire SCRAM/ABAC need parity before the SQL corridor
-expands. Security dependency exceptions require per-advisory rationale and removal criteria.
+expands. Security dependency exceptions require per-advisory rationale and removal criteria. The zstd
+exceptions merged in #2251 must be retired when both Arrow and tower-http/async-compression
+dependency constraints permit the patched versions; recheck exposure if request decompression
+is enabled. #2248 guards workspace panic sites; reducing existing sites and adopting per-crate
+compiler lints are separate maintenance work. Closure evidence lives in history.
 
 Old ledger governance findings require a fresh check, especially ADR-021/P9, TD-181 citation
 collision, unfiled TD-XMODAL/TD-SC references and comments disagreeing with defaults. Fix extant

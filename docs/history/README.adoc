@@ -98,6 +98,8 @@ link:../_internal/roadmap/BENCHMARK_EVIDENCE.toml[evidence ledger]. Other existi
 under _internal/status remain reference artifacts; this migration moves the active program's
 cited proof, not unrelated operational documentation or stable TD/ADR contracts.
 
+* link:evidence/INTEGRATION_RECONCILIATION_2026_10_26.adoc[Post-consolidation integration: #2248/#2251 closure and active-lane handoff]
+
 == Adding history
 
 Store one dated completion/evidence record per coherent milestone, including source commit,

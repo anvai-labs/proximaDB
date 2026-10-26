@@ -3,8 +3,9 @@
 :toc:
 :toclevels: 2
 
-Evidence baseline: fetched origin/develop `69ddbd91b` (#2249); this consolidation is draft
-PR https://github.com/anvai-labs/proximaDB/pull/2250[#2250]. Local WIP is explicitly separate.
+Evidence baseline: fetched origin/develop `c4ffc0af9` (#2248/#2251), 2026-10-26.
+Planning source: https://github.com/anvai-labs/proximaDB/pull/2250[#2250]. Local WIP and
+owner-reported tests/pauses are explicitly separate from merged delivery.
 Refresh branch heads/checks at pickup; this is a dated observation, not a live GitHub mirror.
 Release order: link:ROADMAP.adoc[roadmap]. Contracts: link:LAKEHOUSE_PLAN.adoc[lakehouse],
 link:STORAGE_PLAN.adoc[storage], link:PLATFORM_PLAN.adoc[platform].
@@ -25,12 +26,13 @@ merged-slice evidence is there. v3-first is the accepted direction, not yet a co
 | P4 M1 / TD-SEAM-7/15 | Planned; after P3 contracts | Observability WAL→time partition→publish→ObsTimeTable; shared read token and record/subject identity. TE-1 join remains correct during publication/compaction; TE-3 50k rows/s, <=2s freshness.
 | P4 modalities / TD-SEAM-8/9, DOC-RETIRE-1 | Planned; after M1 contracts | Graph canonical writes/CSR recovery, document residual/ranged reads; subject delete across modalities with separate visibility/history/expiry/erasure gates.
 | P5 / TD-SEAM-10/11/13, PAXDIR-2 | In progress; unassigned | Coherent warm segment discovery; broad 10M/filter/fragmentation/768d/ingest gates; configured L2 default residual; HNSW persisted projection after TD-PAXPREC-1. D4 physical co-location remains deferred until measured need.
-| SC0 E1 / TD-TIER-1 | Open; unassigned | Fixed-object repeated cap sweep with missing telemetry; #2249 pilot changed geometry. No cap default or price claim from it.
+| SC0 E1 / TD-TIER-1 | In progress: bench/tier1-e1-fixed | Reuse harness + p99/RSS/CPU instrumentation committed locally; validate immutable object/model/query identity and finish repeated sweep/telemetry. No PR or completed E1 evidence found; #2249 pilot does not justify a default or price claim.
 | SC1 + partial SC2 / TD-TIER-1 | WIP: feat/sc1-storage-policy | Policy generation, facade parity and authorized resolved placement; config-only status stays NOT_ACTIVE. See branch nudges below.
 | SC3–6 / TD-TIER-1 | Planned; after SC1/2 gates | Atomic reservations + idle usage, resident coverage prototype, optional future-PUT access tiers, integrated correctness/cost proof before rollout.
 | P6 | Open, continuous | Value-compared SF1/SF10 query gates and multimodal benchmark; retain existing ratchets. Load/publication memory is not query coverage.
+| Dependency/security residuals | Planned; dependency lane | Track #2225–#2228/#2242; retire zstd advisory exceptions only with the documented dependency upgrades/exposure checks. #2251 is an accepted exception disposition, not a patched dependency. Workspace panic-site reduction/per-crate compiler lints remain separate from the completed coverage guard.
 | Platform release gates | Open/needs per-TD pickup | Published-image install/restart and driver proof, surface parity, workspace residuals and security/CI lanes: platform plan. No inference of completion from old plans.
-| Governance residuals | Planned verification; unassigned | Recheck old ledger's ADR-021/P9, TD-181 citation collision, unfiled TD-XMODAL-1/2/3/5 and TD-SC-1..5, stale default comments. File/correct only defects still present; old claims are not a new verified bug list.
+| Governance residuals | Pickup: fix/gov-ledger-filings | Recheck old ledger's ADR-021/P9, TD-181 citation collision, unfiled TD-XMODAL-1/2/3/5 and TD-SC-1..5, stale default comments. File/correct only defects still present; old claims are not a new verified bug list.
 |===
 
 == Active and retained branches
@@ -41,17 +43,18 @@ No active checkout is modified by this documentation consolidation.
 [cols="2,2,3",options="header"]
 |===
 | Branch / observed head | State | Ownership / next action
-| feat/p24-delete-readers / d929d7993 (dirty WIP preserved; same-session fork) | Paused at the API usage limit (resets 2026-10-27 00:58 UTC). Pre-pause: engine suite 114/114 green incl. the delete round-trip; remaining executor/leaf/duckdb/dml suites + interop e2e + commit queued. | P2 readers (this session owns; resume after reset): apply the P2 nudges below, then commit -> independent adversarial review -> PR. Next gate: external deleted-value read-back equals the server view across a snapshot chain.
-| feat/sc1-storage-policy / d929d7993 (dirty WIP preserved; same-session fork) | Paused at the API usage limit mid-repair of collection_builder.rs (duplicate/stray lines from a partial proto regen); uncommitted tree intact. | SC1/partial SC2 (this session owns; resume after reset): apply the SC1 nudges below — replace the request-storage_path premise with operator-configured-target authorization + the final resolved assignment, monotonic policy generation (or defer updates), NOT_ACTIVE status across REST/gRPC/OpenAPI/SDK regens, WIP-not-landed claims. Next gate: facade/SDK parity + restart + immutable-placement tests.
-| fix/panic-scope-workspace / 1e707fb1b | Open #2248; CI Success failed at audit | Cross-cutting guard; diagnose current checks without weakening scope.
-| fix/audit-zstd-advisories / 2b4a2ce9e | Clean, one unmerged commit, no PR found | Dependency lane; advisory exceptions need rationale/removal trigger, not a claim of upgrade.
+| feat/p24-delete-readers / d929d7993 | 12 dirty files, no PR; owner reported a usage-limit pause in commit 6bc7b0b7e | P2 readers/carry-through; preserve WIP. Owner reports engine 114/114 tests passed; not independently rerun here. Remaining reader/executor/DuckDB/DML suites, external interop and commit/review gate. Resume with the owning session.
+| feat/sc1-storage-policy / d929d7993 | Dirty proto/API/catalog/manager work, no PR; owner-reported pause during collection_builder repair | SC1/partial SC2. Latest WIP checks resolved base location and makes class immutable; authorization still uses a tenant-path heuristic. Verify configured-target authorization, facade/SDK generation and repair/tests before commit.
+| bench/tier1-e1-fixed / eb1dd04e2 | Clean; three local commits, no PR | E1 fixed-object harness: skip-ingest, p99/server resource telemetry and collection-id assertion. Preserve benchmark target/cache; finish immutable-fixture checks and controlled repeats before claiming results.
+| fix/gov-ledger-filings / c4ffc0af9 | New clean checkout at develop; no PR at audit | Governance queue pickup, not completed/superseded merely because there are no unique commits yet. Coordinate ADR/TD findings and add validation evidence when filed.
 | docs/release-notes-v040 / b448e4acc | Dormant/unresolved; 11 unique commits and generated site | Reconcile unique release changes before cleanup. Partial overlap with #1960 does not prove supersession.
-| docs/roadmap-session-reconcile | Draft #2250; /tmp/proximadb-roadmap-reconcile/docs-roadmap-session-reconcile | This consolidation; update references on merge, then retire only its own worktree.
+| docs/roadmap-session-reconcile | #2250; /tmp/proximadb-roadmap-reconcile/docs-roadmap-session-reconcile | Consolidation/CI repair. On merge this lane closes; retain local evidence before retiring this checkout. Implementation ownership stays with the rows above.
 |===
 
 Shared develop at `/home/vsingh/code/proximaDB` was clean at d929d7993; leave it untouched.
-Dependency PRs #2225–#2228/#2242 are a separate lane, not M1. Detailed inventory and completed
-cleanup: link:../history/planning/ROADMAP_WORKTREE_RECONCILIATION_2026_10_26.adoc[audit].
+Completed #2248/#2251 lanes and updated inventory evidence:
+link:../history/evidence/INTEGRATION_RECONCILIATION_2026_10_26.adoc[integration record].
+Earlier cleanup: link:../history/planning/ROADMAP_WORKTREE_RECONCILIATION_2026_10_26.adoc[audit].
 No live-session message delivery is claimed; these are durable pickup nudges.
 
 == Branch pickup nudges
@@ -67,13 +70,17 @@ reader compatibility and external update/delete values. P1 REST/facade blockers 
 
 === SC1 policy
 
-The observed WIP checks SST and URL scheme from request storage_path. Replace that premise
-with authorization of configured operator targets AND the final resolved assignment; allow
-configured remote defaults, reject another tenant's prefix, test restart and immutable placement.
-Field presence producing generation 0/1 cannot represent accepted policy updates: persist a
-monotonic generation or defer updates. Verify desired policy and NOT_ACTIVE status across
-REST/gRPC/OpenAPI/SDKs; a class string alone is insufficient. Change premature local "landed"
-and generated-client claims to WIP until actual merge/evidence. SC3/4 remain separate gates.
+Latest WIP now passes the resolved base location into admission and rejects changing the
+class after create. The earlier request-only/generation criticism is partly addressed: generation
+0/1 is coherent only while policy is immutable, with omitted/same-value updates proven safe.
+Do not reimplement that fix; verify its facade/restart tests and keep mutable policy deferred.
+
+Remaining authorization gap: rejecting an explicit `/tenants/{other}` segment does not prove
+that an arbitrary bucket/prefix is an operator-authorized target. Validate the final assignment
+against configured location capabilities and canonical tenant/account identity; test paths with
+no tenant segment, alternate schemes/encodings and configured defaults. Keep NOT_ACTIVE for
+unimplemented economy/performance. The local TD still contains premature "landed" and generated
+client claims; no OpenAPI/SDK diffs were observed. Reconcile those claims to actual artifacts/tests.
 
 === Experiment pickup
 

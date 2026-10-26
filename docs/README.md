@@ -1,7 +1,8 @@
 # ProximaDB Documentation
 
 **The context database** — vectors, documents, graphs and relational SQL over object storage,
-behind standard interfaces (Postgres wire, REST, gRPC, Arrow Flight).
+behind standard interfaces (Postgres wire, REST, gRPC and experimental general-purpose
+Arrow Flight transport; canonical Flight vector_search has its own supported contract).
 
 For what ProximaDB is, how to install it and a first query, start at the
 [project README](../README.adoc). This page is the map of the documentation.

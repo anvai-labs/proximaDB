@@ -1,0 +1,55 @@
+= Integration reconciliation — 2026-10-26
+
+Point-in-time evidence, not a live task queue. Current ownership and remaining gates are in
+link:../../current/TRACKER.adoc[the tracker]. Source: fetched develop c4ffc0af9, GitHub PR
+metadata, registered worktrees and selected read-only WIP diffs. No foreign worktree was edited.
+
+== Newly completed lanes
+
+[cols="1,2,3",options="header"]
+|===
+| PR | Integration evidence | Completed scope and limits
+| https://github.com/anvai-labs/proximaDB/pull/2248[#2248]
+| Merged 2026-10-26 19:04:32 UTC; merge c4ffc0af9, implementation ab89d158a
+| TD-PANICSCOPE-1: workspace panic-policy discovery/ratchet, 312-site starting baseline, eight fixture tests; legacy src-wide semantics preserved. This closes guard coverage, not the existing panic sites or compiler lint adoption.
+| https://github.com/anvai-labs/proximaDB/pull/2251[#2251]
+| Merged 2026-10-26 18:37:52 UTC; merge 36a0d7193, implementation 6aa512a58
+| TD-AUDITGATE-1 follow-up: 13 zstd/zstd-safe advisory exceptions with rationale/exposure analysis and removal triggers. This is a reviewed exception disposition, not a dependency patch or absence of vulnerabilities. Arrow and tower-http/async-compression constraints remain relevant to retirement.
+|===
+
+Both former worktrees (`fix/panic-scope-workspace`, `fix/audit-zstd-advisories`) were already
+absent from the registered inventory. This audit did not remove them and cannot attest to
+another session's cache/ignored-file cleanup. Their completed rows were removed from current;
+remaining dependency and panic-reduction work stays in the current platform contract.
+
+== Ownership observations
+
+* `feat/p24-delete-readers` remained at d929d7993 with 12 dirty files. The owner contributed
+  tracker commit 6bc7b0b7e reporting a usage-limit pause and 114/114 engine tests, with reader,
+  executor, DuckDB, DML and external interop checks still outstanding. Those test results are
+  owner-reported, not independently rerun by this audit. Preserve that session's WIP.
+* `feat/sc1-storage-policy` remained dirty at d929d7993. Read-only diff review confirms resolved
+  base-location admission and immutable-after-create class changes. A tenant-path substring
+  check still does not establish configured-target authorization; generated OpenAPI/SDK claims
+  remain unverified. These are pending pickup corrections, not completed SC1/SC2 delivery.
+* New `bench/tier1-e1-fixed`, clean at eb1dd04e2: commits 3b643fdd4/f5aef1b0b/eb1dd04e2 add
+  fixed-object reuse and p99/RSS/CPU instrumentation, then fix fresh-catalog collection creation
+  with a collection-id assertion. No PR or completed controlled-repeat evidence was found.
+* New `fix/gov-ledger-filings`, initially clean at c4ffc0af9: active governance pickup. Zero
+  unique commits do not prove it is disposable. Preserve it and coordinate through the tracker.
+* `docs/release-notes-v040`, b448e4acc, still has 11 commits not in develop and ignored `site/`.
+  No branch PR found. Partial overlap with #1960 remains insufficient proof of supersession.
+* Shared develop stayed clean at d929d7993. All unmerged implementation/benchmark/docs worktrees
+  were retained. No additional checkout qualified for verified supersession cleanup.
+
+== Consolidation integration checks
+
+PR #2250's remote owner-status commit was preserved before rebasing onto c4ffc0af9. Previous
+CI passed the Rust/unit/storage/platform lanes but failed two documentation checks: the docs
+index lacked the experimental general-Flight caveat; mkdocs treated current/history as site
+content. The repair restores the support caveat and explicitly excludes engineering planning/
+history from the customer site, matching the existing ADR/TD/internal scope. Coverage and
+strict-link validation remain enabled; no baseline inflation or weakened check is needed.
+
+Merge/CI state is determined by GitHub, not this historical record. The consolidation is
+complete only when #2250 merges; current implementation work remains with its owning lanes.
