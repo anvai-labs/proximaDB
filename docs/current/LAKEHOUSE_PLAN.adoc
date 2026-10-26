@@ -189,3 +189,157 @@ from cited reference figures. SIFT cold requests and p95 waves are independent g
 Store commands, commit, parameters, raw results, limitations and negative results in history;
 register claimable numbers in the evidence ledger. No pricing promise before integrated cost
 and correctness gates in link:STORAGE_PLAN.adoc[storage plan].
+
+[[native-execution-research]]
+== Native execution: differentiation before expansion
+
+Owner request 2026-10-26: native execution must solve a demonstrated workload problem, not
+reimplement another engine because it uses Arrow or Rust. The dated
+link:../history/evidence/NATIVE_EXECUTION_RESEARCH_2026_10_26.adoc[research catalog]
+records existing remedies in Spark/Photon, Trino, Redshift, Snowflake, DataFusion, DuckDB,
+ClickHouse, Velox, StarRocks, turbopuffer, S3 Vectors, LanceDB/Vespa and relevant papers.
+The experiments below are *proposed, unrun admission gates*, not benchmark claims or a
+replacement for ADR-054/097. The accepted logical IR remains DataFusion; native physical
+operators and fused regions remain ours. No generic HashJoin/HashAgg/Sort rewrite is implied.
+
+=== Candidate advantage
+
+Reduce the work required to produce *fresh, authorized multimodal context*: propagate compact
+versioned record references through relational eligibility, ANN and graph expansion; hydrate
+payloads late; reconcile the WAL tail and index projections under one read contract; schedule
+query and maintenance work within a common resource budget. Compare this combination against
+existing late materialization, filtered search and adaptive execution, all of which are prior art.
+
+----
+ SQL / context request
+          |
+ semantic plan + exact/approximate contract (DataFusion LogicalPlan)
+          |
+ pinned visibility + authorization + resource context
+          |
+ +-------- native physical region -------------------------+
+ | relational eligibility <-> resumable ANN / graph search |
+ |     compact versioned IDs + scores + multiplicity       |
+ |     bounded scheduling, dynamic filters, tail merge     |
+ |     snapshot-bound payload fetch only when required     |
+ +--------------------------------------------------------+
+          |
+ Arrow batches -> existing relational operators / output
+          |
+ cost + quality + freshness + p99 evidence
+----
+
+The physical region is a candidate design, not a new mandatory executor. If existing
+ExecutionPlan adapters achieve the same result, retain them. A separate native scheduler or
+whole-query backend requires evidence that adapter/materialization boundaries are the limiting
+cost and that simpler improvements cannot remove it. DuckDB stays a comparison baseline and
+existing optional route; no investment in its general-purpose internals is part of this lane.
+
+=== Contracts to decide through experiments
+
+* *Visibility:* a token identifies table snapshot(s), a consistent committed WAL boundary,
+  projection generations and authorization context. Multiple table snapshots do not become
+  atomic merely by placing their IDs in a struct; define acquisition/validation and pinning.
+  Sharded logs may need a boundary vector rather than one scalar LSN. Reject or reconcile
+  incompatible sources. Explicit revocation policy decides abort/restart of in-flight reads.
+* *Candidates:* use tenant + record oid + version and a snapshot-bound locator; optional score,
+  metric, tie-break and multiplicity. Oids are not file positions. Compaction may invalidate
+  locators, never logical identity. Intermediate Arrow batches may carry these fields; reuse
+  existing contracts before introducing another batch representation.
+* *Continuation:* request bounded additional candidates with observable work and cancellation.
+  Never assume arbitrary ANN iteration is monotone or a score bound proves exactness.
+  Exact SQL requires a sound termination proof or exact fallback. Approximate results require
+  explicit query semantics and eligible-set recall measurement; no silent mode switch.
+* *Relational semantics:* top-k before a join is not generally top-k after it. Define distinct
+  entities versus joined-row multiplicities; preserve NULLs, ties, outer/anti-join behavior and
+  graph path/cycle semantics. Dynamic allow-sets may prune only where logically sound.
+* *Resources:* one accountable budget for candidate state, joins, decode buffers, tail merge,
+  pinned cache, in-flight reads and spill. Share reservations rather than counting shared bytes
+  repeatedly. Backpressure/cancellation must reach object fetch and search loops. Refusal is
+  explicit; never truncate exact results to satisfy a time budget.
+* *Fallback:* choose exact scan, native fused execution or existing relational operators by
+  measured cost and valid capability. Adaptive switching after emitting rows needs a defined
+  reconciliation protocol; otherwise choose before emission. Keep snapshot and ABAC unchanged.
+
+=== Search and columnar execution must compose (Quickwit / ClickHouse)
+
+Both access patterns belong inside S5/S6/S7; do not create an independent logs engine with
+its own visibility or billing authority. Quickwit-style indexed retrieval and ClickHouse-style
+columnar aggregation are compatible capabilities, and modern ClickHouse also has inverted
+text indexes. Supporting them structurally does not establish performance parity.
+
+[cols="2,4",options="header"]
+|===
+| Contract | Required behavior
+| Access-path capabilities | Describe supported predicates and exactness, ordering, projection, candidate continuation, row-reference lookup, statistics and snapshot/LSN coverage. The planner chooses postings, range/index lookup, dense scan or a valid combination. An unsupported predicate remains an exact residual or a declared rejection.
+| Identity / selection | Map split-local doc IDs or row offsets to versioned oids under the pinned projection generation. Compact selection buffers can cross native operators without eager payload conversion. Dictionary IDs are local to an encoding unless their domain equivalence is proved; never join unrelated dictionaries by integer code.
+| Text semantics | Version analyzers/tokenizers, normalization, phrase positions and scoring statistics. Token matching is not automatically equivalent to SQL substring/regex. Exact aggregation consumes all qualified rows, not only ranked top-k. Global BM25 semantics need compatible corpus statistics; local scores cannot be merged blindly.
+| Columnar fast path | Keep useful encodings/dictionaries and typed batches through filters/aggregation where supported; bound decode buffers by bytes as well as rows. Dense selections use sequential column scans; sparse ones use selective reads only when cheaper. Arrow output compatibility must not force every internal value to become a row object.
+| Aggregate / exchange | Reuse mergeable partial aggregate states with explicit type/version and memory limits. DISTINCT, order-sensitive and holistic aggregates cannot assume the same bounded merge contract as count/sum. Cross-node exchange is a later seam; it does not require durable shuffle after every local operator.
+| Cache / scheduler | Cache immutable data by object identity and index generation; derived results also include snapshot and policy context. Account index headers, postings, fast fields, payload blocks and query state under common reservations. Preserve backpressure, cancellation and fair admission through all access paths.
+| Projection maintenance | Build immutable inverted/columnar projections from the canonical records and publish coverage atomically. Compaction preserves identity and visibility; stale/missing projections fall back or fail explicitly. Price indexing, merge amplification and duplicate storage; no blanket copy of every column into every index.
+|===
+
+Add *NE-7* to the experiment harness: the same immutable log corpus with rare terms, frequent
+terms, phrase/token predicates, time+tenant restrictions, latest-k hydration, broad time
+histograms and high-cardinality grouped counts. Then join matching logs to relational/vector
+context. Compare index off/on and sparse/dense native paths against Quickwit and current
+ClickHouse text-index/columnar paths on equivalent predicates and aggregate guarantees.
+Bounded distributed top-bucket results require disclosed error/completeness semantics; do not
+compare them to exact SQL GROUP BY as equivalent answers. Report cold metadata/data,
+metadata-warm, fully warm and restart cases separately; include ingest freshness, index size,
+merge cost and concurrent queries. An indexed top-ten hit does not measure a full scan.
+
+NE-7 starts with TextMatchExec feeding selected typed columns into existing aggregate operators,
+with S5 visibility/ABAC and S7 coverage stamps. Only specialize native aggregation after a
+profile proves that kernel is the remaining bottleneck. Read the dated research catalog for
+vendor claim conditions and older benchmark caveats. "Seamless" means composable contracts
+without a second authority, not zero integration work or guaranteed matching performance.
+
+=== Experiments before promotion
+
+[cols="1,3,4",options="header"]
+|===
+| ID / links | Experiment | Acceptance and falsifier
+| NE-1 / TE-1, TD-SEAM-6 | Correlated eligibility: 1M and then 10M tickets; customer predicates at 100%, 10%, 1%, 0.1%, 0.01%; aligned, independent and anti-correlated embeddings. Compare exact eligible-set scan, stock plan, pushed-filter adapter and native fused region. | Same explicit semantics, exact value oracle, and approximate recall >=0.95 in every required band (retain stricter P5 gates where applicable). Record candidate count, intermediate bytes and p99. Fixed oversampling that misses qualified winners fails even if fast. Test duplicate join matches and fewer than k eligible entities.
+| NE-2 / TE-6, S5/S7 | Sweep payload width and graph frontier fanout independently, with clustered and scattered winners. | Measure bytes fetched/decoded versus useful result bytes, object waves and frontier state. Compare late fetch to scan and existing lazy-materialization baselines. Native must fall back when random hydration or frontier growth loses; hop count alone cannot choose the path.
+| NE-3 / TE-4/8, TD-SEAM-4/15 | Pause between candidate generation and hydration; race update/delete, policy change, compaction and index publication. Grow the unindexed tail. | Exact visible rows/versions and declared authorization boundary; no resurrected rows, stale payload/score pairing or omitted writes. Include crash/retry and stale-cache tests. A shared token without a valid acquisition protocol fails.
+| NE-4 / SC0–4, P5 | Concurrent small tenants plus a broad scan and compaction; cold/warm cache, bursty arrivals and node/cache loss. | Measure admission, p50/p95/p99, useful/overread bytes, dependent waves, peak memory, spill and resource release after cancellation. Fix arrival distribution and cache preparation. Local MinIO tests show mechanisms; real-cloud calibration is required for cloud-price claims.
+| NE-5 / P6, TD-OLAP-10/11/12 | Broad scans, high-cardinality aggregates, skewed joins and windows remove the selective-index advantage. | Keep existing value/coverage ratchets. Compare best supported native and mature fallback paths under equal resources. Reject general default promotion if weighted throughput/cost regresses materially; retain per-shape routing rather than hiding losing queries.
+| NE-6 / S8, SC6 | Price the complete workload at fixed correctness, recall, freshness and p99, including ingestion and maintenance. | Include reserved idle capacity, object operations, transfers, cache media, write amplification and recovery. Report marginal and allocated cost separately. Different vendor billing units remain distinct. No pricing claim based on a warm ANN microbenchmark or local-disk extrapolation alone.
+|===
+
+Start with an exact fixture small enough to enumerate every eligible answer, then scale fixed
+inputs. Publish dataset/model/query hashes, build and feature settings, seeds, cache state,
+concurrency/arrival process, hardware and all exclusions. Compare current optimized baselines:
+Spark AQE/layout-aware joins; Trino dynamic filtering; suitable warehouse access paths; and
+LanceDB/Vespa/turbopuffer for supported retrieval subqueries. For a multi-service composition,
+include assembly and synchronization costs on both sides and disclose unsupported semantics.
+Vendor published numbers are context, never same-hardware experimental results.
+
+=== Small implementation sequence and stop rules
+
+. *NE-0: evidence harness and route audit.* Reuse P6 ledgers, io_trace and native execution
+  contracts. Record the operator actually executed; attribute planning, scan, search, join,
+  decode, tail merge and queueing separately. Fix integration defects before alleging an
+  upstream ceiling. This can start with controlled fixtures while P2/P3 correctness closes.
+. *NE-1 prototype:* one native relational-eligibility + resumable-vector + late-fetch region
+  behind a flag, using existing PAX search and ADR-097 adapters. First close candidate, tie,
+  multiplicity and exactness semantics. Do not simultaneously build a new planner, shuffle
+  service, storage format or generic function library.
+. *NE-2/3 admission:* prove payload/frontier crossovers and concurrent visibility. Production
+  routing waits for P2 deletion readers and S5 visibility/ABAC guarantees. Reject candidates
+  from incompatible projections rather than treating index freshness as optional.
+. *NE-4/6 resource/cost admission:* integrate bounded work with SC reservations and P5 I/O
+  measurements. A low isolated latency does not establish tenant isolation or profitable p99.
+. *Promotion:* propose thresholds before running the benchmark. Suggested starting criterion
+  is >=2x lower p95 *or* >=30% lower fully allocated cost at the same p99/quality/freshness,
+  on a declared representative workload, without weakening NE-5 or correctness gates.
+  These thresholds are proposed, not yet ratified. Publish losing cases and variance.
+. *Stop or narrow:* if a tuned existing adapter matches the fused path, keep the adapter.
+  If advantages vanish after maintenance/idle cost or under realistic selectivity, stop broad
+  native expansion and retain only winning shapes. Existing sunk code is not an admission gate.
+
+A standalone native engine or changed logical IR would need a separately reviewed ADR with
+measured evidence. This research does not silently reverse ADR-097 or retire existing native
+operators that already have a demonstrated, correctly routed use case.

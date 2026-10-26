@@ -32,6 +32,10 @@ v0.6 FilteredAnnExec -> observability M1                  v
                               v1.0 supported SQL promise
 ----
 
+Native differentiation is evaluated through link:LAKEHOUSE_PLAN.adoc#native-execution-research[NE-0..7]
+within P3/P5/P6: selective multimodal execution, visibility and full-workload cost. These are
+proposed experiments, not another release or authorization for a whole-engine rewrite.
+
 Completed foundation: link:../history/README.adoc[history index]. No completed slice is a
 new implementation target merely because an old release table mentioned it.
 
