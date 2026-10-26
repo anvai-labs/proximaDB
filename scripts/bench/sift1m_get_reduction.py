@@ -3598,27 +3598,31 @@ def main() -> int:
     resource_sampler: ProcessScratchSampler | None = None
     failures: list[str] = []
     try:
-        active = OwnedServer(
-            binary=binary,
-            config=config,
-            server=server_url,
-            log_path=root / "server-ingest.log",
-            local_disk_path=local_disk,
-            ivf_k=args.ivf_k,
-            n_comp=args.n_comp,
-            nprobe=args.nprobe,
-            training_compaction_min_mb=args.training_compaction_min_mb,
-            azure_emulator=args.azurite,
-            s3_endpoint=args.s3_endpoint,
-            s3_region=args.s3_region,
-            rank_degree=args.rank_degree,
-            read_ranges_inflight=args.read_ranges_inflight,
-            read_ranges_wave_split_mb=args.read_ranges_wave_split_mb,
-            adaptive_read_strategy=args.adaptive_read_strategy,
-            centroid_directory=args.centroid_directory,
-            coalesce_gap_bytes=int(args.coalesce_gap_mb * 1024 * 1024),
-            coalesce_range_bytes=int(args.coalesce_range_mb * 1024 * 1024),
-        )
+        # The three phase servers differ only in log name and disk tier; one
+        # builder keeps them identical (dup-ratchet).
+        def spawn_server(log_name: str, disk) -> OwnedServer:
+            return OwnedServer(
+                binary=binary,
+                config=config,
+                server=server_url,
+                log_path=root / log_name,
+                local_disk_path=disk,
+                ivf_k=args.ivf_k,
+                nprobe=args.nprobe,
+                training_compaction_min_mb=args.training_compaction_min_mb,
+                azure_emulator=args.azurite,
+                s3_endpoint=args.s3_endpoint,
+                s3_region=args.s3_region,
+                rank_degree=args.rank_degree,
+                read_ranges_inflight=args.read_ranges_inflight,
+                read_ranges_wave_split_mb=args.read_ranges_wave_split_mb,
+                adaptive_read_strategy=args.adaptive_read_strategy,
+                centroid_directory=args.centroid_directory,
+                coalesce_gap_bytes=int(args.coalesce_gap_mb * 1024 * 1024),
+                coalesce_range_bytes=int(args.coalesce_range_mb * 1024 * 1024),
+            )
+
+        active = spawn_server("server-ingest.log", local_disk)
         active.start()
         active_pid = active.process.pid if active.process is not None else None
         if args.compaction_spill:
@@ -3764,19 +3768,24 @@ def main() -> int:
                 "proximadb_compaction_spill_total",
             )
         }
-        post_write = run_query_sweep(
-            server_url,
-            collection_id,
-            query_path,
-            groundtruth_path,
-            0,
-            args.queries,
-            args.top_k,
-            "post_write",
-            args.query_format,
-            args.groundtruth_format,
-            server_pid=active_pid,
-        )
+        # The three phase sweeps share every argument except the window and
+        # name; one closure keeps them from drifting apart (dup-ratchet).
+        def phase_sweep(phase: str, start: int):
+            return run_query_sweep(
+                server_url,
+                collection_id,
+                query_path,
+                groundtruth_path,
+                start,
+                args.queries,
+                args.top_k,
+                phase,
+                args.query_format,
+                args.groundtruth_format,
+                server_pid=active_pid,
+            )
+
+        post_write = phase_sweep("post_write", 0)
         result["phases"]["post_write"] = post_write
         failures.extend(
             gate_failures(
@@ -3790,41 +3799,10 @@ def main() -> int:
         )
         active.stop()
 
-        active = OwnedServer(
-            binary=binary,
-            config=config,
-            server=server_url,
-            log_path=root / "server-local-disk-warm.log",
-            local_disk_path=local_disk,
-            ivf_k=args.ivf_k,
-            nprobe=args.nprobe,
-            training_compaction_min_mb=args.training_compaction_min_mb,
-            azure_emulator=args.azurite,
-            s3_endpoint=args.s3_endpoint,
-            s3_region=args.s3_region,
-            rank_degree=args.rank_degree,
-            read_ranges_inflight=args.read_ranges_inflight,
-            read_ranges_wave_split_mb=args.read_ranges_wave_split_mb,
-            adaptive_read_strategy=args.adaptive_read_strategy,
-            centroid_directory=args.centroid_directory,
-            coalesce_gap_bytes=int(args.coalesce_gap_mb * 1024 * 1024),
-            coalesce_range_bytes=int(args.coalesce_range_mb * 1024 * 1024),
-        )
+        active = spawn_server("server-local-disk-warm.log", local_disk)
         active.start()
         active_pid = active.process.pid if active.process is not None else None
-        local_warm = run_query_sweep(
-            server_url,
-            collection_id,
-            query_path,
-            groundtruth_path,
-            args.queries,
-            args.queries,
-            args.top_k,
-            "local_disk_warm",
-            args.query_format,
-            args.groundtruth_format,
-            server_pid=active_pid,
-        )
+        local_warm = phase_sweep("local_disk_warm", args.queries)
         result["phases"]["local_disk_warm"] = local_warm
         failures.extend(
             gate_failures(
@@ -3839,41 +3817,10 @@ def main() -> int:
         )
         active.stop()
 
-        active = OwnedServer(
-            binary=binary,
-            config=config,
-            server=server_url,
-            log_path=root / "server-object-cold.log",
-            local_disk_path=None,
-            ivf_k=args.ivf_k,
-            nprobe=args.nprobe,
-            training_compaction_min_mb=args.training_compaction_min_mb,
-            azure_emulator=args.azurite,
-            s3_endpoint=args.s3_endpoint,
-            s3_region=args.s3_region,
-            rank_degree=args.rank_degree,
-            read_ranges_inflight=args.read_ranges_inflight,
-            read_ranges_wave_split_mb=args.read_ranges_wave_split_mb,
-            adaptive_read_strategy=args.adaptive_read_strategy,
-            centroid_directory=args.centroid_directory,
-            coalesce_gap_bytes=int(args.coalesce_gap_mb * 1024 * 1024),
-            coalesce_range_bytes=int(args.coalesce_range_mb * 1024 * 1024),
-        )
+        active = spawn_server("server-object-cold.log", None)
         active.start()
         active_pid = active.process.pid if active.process is not None else None
-        object_cold = run_query_sweep(
-            server_url,
-            collection_id,
-            query_path,
-            groundtruth_path,
-            args.queries * 2,
-            args.queries,
-            args.top_k,
-            "object_cold",
-            args.query_format,
-            args.groundtruth_format,
-            server_pid=active_pid,
-        )
+        object_cold = phase_sweep("object_cold", args.queries * 2)
         result["phases"]["object_cold"] = object_cold
         failures.extend(
             gate_failures(
