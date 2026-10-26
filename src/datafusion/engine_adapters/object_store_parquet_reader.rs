@@ -1305,7 +1305,8 @@ impl ObjectStoreParquetTable {
     }
 
     /// P2.4 slice 3b: adjust footer-derived statistics for the snapshot's
-    /// deletion vectors. The footer counts EVERY physical row; the vectors hide
+    /// deletion vectors, restricted to the `surviving` splits. The footer
+    /// counts EVERY physical row; the vectors hide
     /// some of them. `COUNT(*)` elides off `num_rows` (both the provider path
     /// and the scan-exec statistics the aggregate rewrite actually reads), so
     /// it must be the post-delete count; and a deleted row may have held a
@@ -1313,12 +1314,29 @@ impl ObjectStoreParquetTable {
     /// null_count/min/max/distinct are demoted to inexact (the values remain
     /// bounds, just not guaranteed post-delete exact ones). No-op without
     /// deletions — a clean snapshot's statistics are untouched.
-    fn apply_deletion_statistics(&self, stats: &mut Statistics) {
+    /// `surviving` are the splits the statistics were computed over: the
+    /// provider passes every split, the scan path passes its predicate-PRUNED
+    /// set — subtracting a pruned file's deletions from statistics that no
+    /// longer count its rows would under-count.
+    fn apply_deletion_statistics(
+        deletions: &HashMap<String, Arc<PositionDeletes>>,
+        surviving: &[FileSplit],
+        stats: &mut Statistics,
+    ) {
         use datafusion_common::stats::Precision;
-        if self.deletions.is_empty() {
+        if deletions.is_empty() || surviving.is_empty() {
             return;
         }
-        let deleted: u64 = self.deletions.values().map(|d| d.cardinality()).sum();
+        let kept: std::collections::HashSet<&str> =
+            surviving.iter().map(|s| s.file_path.as_str()).collect();
+        let deleted: u64 = deletions
+            .iter()
+            .filter(|(file, _)| kept.contains(file.as_str()))
+            .map(|(_, d)| d.cardinality())
+            .sum();
+        if deleted == 0 {
+            return;
+        }
         if let Precision::Exact(rows) = stats.num_rows {
             stats.num_rows = Precision::Exact(rows.saturating_sub(deleted as usize));
         }
@@ -1748,7 +1766,7 @@ impl TableProvider for ObjectStoreParquetTable {
             df_stats_value_bounds_enabled(),
             self.stats_trust,
         );
-        self.apply_deletion_statistics(&mut stats);
+        Self::apply_deletion_statistics(&self.deletions, &self.splits, &mut stats);
         Some(stats)
     }
 
@@ -1787,7 +1805,7 @@ impl TableProvider for ObjectStoreParquetTable {
             ),
             projection.map(|p| p.as_slice()),
         );
-        self.apply_deletion_statistics(&mut scan_stats);
+        Self::apply_deletion_statistics(&self.deletions, &pruned, &mut scan_stats);
         let exec = ProximaScanExec::builder()
             .schema(self.schema.clone())
             .splits(pruned)
@@ -2306,6 +2324,53 @@ pub(crate) mod tests {
             .await
             .expect("publish snapshot with deletes");
         base_url
+    }
+
+    /// Review fix (stats arithmetic): only the SURVIVING splits' deletions are
+    /// subtracted from pruned statistics — a predicate-pruned DV-bearing file's
+    /// deletions must not under-count the answer's row statistics.
+    #[test]
+    fn deletion_statistics_subtract_only_surviving_splits() {
+        use datafusion_common::stats::Precision;
+
+        let split = |file: &str| FileSplit {
+            file_path: file.to_string(),
+            ..make_split("data/part-0.parquet")
+        };
+        let mut deletions = HashMap::new();
+        let mut pruned_file = PositionDeletes::new();
+        pruned_file.insert(0);
+        pruned_file.insert(1);
+        let mut kept_file = PositionDeletes::new();
+        kept_file.insert(0);
+        deletions.insert(
+            "file:///base/data/pruned.parquet".to_string(),
+            Arc::new(pruned_file),
+        );
+        deletions.insert(
+            "file:///base/data/kept.parquet".to_string(),
+            Arc::new(kept_file),
+        );
+
+        let mut stats = Statistics::new_not_null(Statistics::new_unknown());
+        stats.num_rows = Precision::Exact(10);
+        let surviving = vec![split("file:///base/data/kept.parquet")];
+        ObjectStoreParquetTable::apply_deletion_statistics(&deletions, &surviving, &mut stats);
+        assert_eq!(
+            stats.num_rows,
+            Precision::Exact(9),
+            "only the surviving file's 1 deleted row is subtracted, not 3"
+        );
+
+        // Provider path (all splits): every deletion applies.
+        let mut stats = Statistics::new_not_null(Statistics::new_unknown());
+        stats.num_rows = Precision::Exact(10);
+        let all = vec![
+            split("file:///base/data/pruned.parquet"),
+            split("file:///base/data/kept.parquet"),
+        ];
+        ObjectStoreParquetTable::apply_deletion_statistics(&deletions, &all, &mut stats);
+        assert_eq!(stats.num_rows, Precision::Exact(7));
     }
 
     /// P2.4 slice 3b: the snapshot's deletion vectors are applied on the

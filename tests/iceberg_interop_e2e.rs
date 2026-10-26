@@ -220,14 +220,17 @@ fn external_readback(
     true
 }
 
-/// P2.4 slice 3b (TD-SEAM-4): a published snapshot carrying deletion vectors is
-/// read delete-aware EVERYWHERE. The vectors are published test-side through
-/// the engine's writer (the delete WRITER is the next slice and stays
-/// unactivated); what this gate proves is the READ side end to end: the live
-/// server's own scan (manifest-selected, DV-applied) and the external engines
-/// (PyIceberg REST/static, DuckDB iceberg_scan — CI pins pyiceberg 0.12.0 and
-/// duckdb 1.5.6, both read v3 + deletion vectors) all exclude the deleted rows,
-/// value-for-value with the pgwire answer.
+/// P2.4 slice 3b (TD-SEAM-4): the PUBLISHED view of a snapshot carrying
+/// deletion vectors is read delete-aware. The vectors are published test-side
+/// through the engine's writer (the delete WRITER is the next slice and stays
+/// unactivated); what this gate proves is that the published v3 snapshot
+/// serves its post-delete rows — through the engine's snapshot read (the same
+/// read the DataFusion leaf consumes; the leaf and the DuckDB view are
+/// unit-tested over a real open) and through the external engines (PyIceberg
+/// REST/static, DuckDB iceberg_scan — CI pins pyiceberg 0.12.0 and duckdb
+/// 1.5.6, both read v3 + deletion vectors, and requires all three). pgwire is
+/// deliberately NOT asserted here: it serves the WAL-fresh native tier, and
+/// synchronizing that with the published snapshot is the writer slice's job.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deletion_vectors_are_invisible_to_proximadb_and_external_engines() {
     use proximadb_iceberg_engine::IcebergObjectStoreBridge;
