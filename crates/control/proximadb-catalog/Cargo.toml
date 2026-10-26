@@ -98,6 +98,9 @@ uuid = { version = "1.0", features = ["v4"] }  # opaque server-issued namespace_
 # single Iceberg writer, opened at the table's own root URL. The engine depends only
 # on storage-common/catalog-schema (no edge back into this crate).
 proximadb-iceberg-engine = { workspace = true }
+# The bridge trait's snapshot-field descriptor (test-side publish through the
+# engine writer); same layer as the engine dependency above.
+proximadb-storage-common = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

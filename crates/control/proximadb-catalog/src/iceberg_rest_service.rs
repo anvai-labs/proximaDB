@@ -868,6 +868,16 @@ impl IcebergRestService {
         if let Some(published) = engine_published_metadata(schema).await {
             return Ok(published);
         }
+        // The DataFusion bulk-append executor commits to the same engine metadata
+        // log with a BRIDGE-RELATIVE key (its fallback prefixes carry no URL), so
+        // probe through the configured bridge — the one the writer committed
+        // through — before considering the legacy `_manifests` tree (which
+        // receives no new commits since TD-SEAM-1 slice 2).
+        if let Some(bridge) = self.object_store_bridge.as_ref()
+            && let Some(published) = engine_metadata_via_configured_bridge(bridge, schema).await
+        {
+            return Ok(published);
+        }
         let mut md = self.catalog_schema_to_iceberg_metadata(identifier, schema);
         let ns = identifier.namespace.join("\x1f");
         let default_location = format!(
@@ -1492,7 +1502,6 @@ fn uuid_from_name(name: &str) -> String {
 async fn engine_published_metadata(
     schema: &CatalogTableSchema,
 ) -> Option<(IcebergTableMetadata, String)> {
-    const METADATA_DIR: &str = "metadata";
     let location = schema.storage_layouts.iter().rev().find_map(|l| {
         (l.authority == crate::CatalogAuthorityMode::ProjectionPublication
             && l.physical_format == crate::CatalogPhysicalFormat::Parquet)
@@ -1503,6 +1512,75 @@ async fn engine_published_metadata(
         return None;
     }
     let table_root = location.trim_end_matches('/').strip_suffix("/data")?;
+    engine_metadata_at_root(table_root).await
+}
+
+/// Engine-written Iceberg metadata for a table the bulk-append executor
+/// publishes (fallback prefixes and dml-stamped warehouse prefixes, which carry
+/// NO URL): the engine log is keyed bridge-relatively at `{table root}/metadata`
+/// — the same key the writer committed under — so it is probed through the
+/// CONFIGURED bridge, not a URL. Same verbatim serving as
+/// [`engine_published_metadata`].
+///
+/// Root derivation: a storage-layout location ending in `/data` is the data
+/// directory, so the root is its parent; `schema.location` (a warehouse-root
+/// prefix) and other bases are already table roots and are NEVER stripped —
+/// sibling tables must not share one log. A scheme-carrying base is not
+/// bridge-keyable and is left to [`engine_published_metadata`].
+async fn engine_metadata_via_configured_bridge(
+    bridge: &Arc<dyn ObjectStoreBridge>,
+    schema: &CatalogTableSchema,
+) -> Option<(IcebergTableMetadata, String)> {
+    let primary = schema
+        .storage_layouts
+        .iter()
+        .rev()
+        .find(|l| l.name == "primary")
+        .or_else(|| schema.storage_layouts.first());
+    let (raw, from_layout) = match primary.and_then(|l| match l.physical_format {
+        crate::CatalogPhysicalFormat::Iceberg | crate::CatalogPhysicalFormat::Parquet => {
+            l.location.as_deref()
+        }
+        _ => None,
+    }) {
+        Some(location) => (location, true),
+        None => (schema.location.as_deref()?, false),
+    };
+    if raw.contains("://") {
+        return None;
+    }
+    let trimmed = raw.trim_end_matches('/');
+    let table_root = if from_layout {
+        trimmed.strip_suffix("/data").unwrap_or(trimmed)
+    } else {
+        trimmed
+    };
+    let metadata_prefix = format!("{table_root}/metadata");
+    let version = bridge
+        .latest_metadata_version(&metadata_prefix)
+        .await
+        .ok()??;
+    let bytes = bridge
+        .read_table_metadata(&metadata_prefix, version)
+        .await
+        .ok()?;
+    match serde_json::from_slice::<IcebergTableMetadata>(&bytes) {
+        Ok(md) => Some((
+            md,
+            // Bridge-relative identifier; the absolute URI form is only
+            // derivable on the concrete engine bridge (the from_url path).
+            format!("{table_root}/metadata/v{version:020}.metadata.json"),
+        )),
+        Err(err) => {
+            debug!("iceberg: engine metadata under {metadata_prefix} is unreadable: {err}");
+            None
+        }
+    }
+}
+
+/// Read the latest engine-committed `v*.metadata.json` under `{table_root}/metadata`.
+async fn engine_metadata_at_root(table_root: &str) -> Option<(IcebergTableMetadata, String)> {
+    const METADATA_DIR: &str = "metadata";
     let bridge = proximadb_iceberg_engine::IcebergObjectStoreBridge::from_url(table_root).ok()?;
     let version = bridge.latest_metadata_version(METADATA_DIR).await.ok()??;
     let bytes = bridge
@@ -1668,6 +1746,102 @@ mod tests {
         let json = serde_json::to_string(&err).unwrap();
         assert!(json.contains("NoSuchTableException"));
         assert!(json.contains("404"));
+    }
+
+    /// TD-SEAM-1 slice 2: the bulk-append executor commits its engine log under
+    /// a BRIDGE-RELATIVE key (fallback/stamped prefixes carry no URL), so REST
+    /// discovers it through the CONFIGURED bridge — the same bridge the writer
+    /// committed through — serving the engine's metadata verbatim before the
+    /// retired `_manifests` synthesis is consulted.
+    #[tokio::test]
+    async fn engine_metadata_is_served_via_the_configured_bridge() {
+        use crate::{CatalogPhysicalFormat, CatalogStorageLayout};
+        use proximadb_iceberg_engine::IcebergObjectStoreBridge;
+        use proximadb_iceberg_engine::iceberg::{FormatVersion, IcebergField};
+        use proximadb_records::{ProximaRecord, ProximaValue};
+        use proximadb_storage_common::object_store_bridge::ObjectStoreBridge;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root_url = format!("file://{}/wh", tmp.path().display());
+
+        // One real snapshot through the engine writer, keyed bridge-relatively
+        // at facts/metadata (a warehouse-root-scoped bridge, as in production).
+        let writer = IcebergObjectStoreBridge::from_url(&root_url).unwrap();
+        let mut record = ProximaRecord::default();
+        record.oid = "r1".to_string();
+        record.props.insert(
+            "age".to_string(),
+            proximadb_records::ProximaTreeNode::Value(ProximaValue::Int64(41)),
+        );
+        let part = object_store::path::Path::from("facts/data/p-0.parquet");
+        writer
+            .write_records_to_parquet(&part, std::slice::from_ref(&record), None)
+            .await
+            .unwrap();
+        writer
+            .publish_iceberg_files(
+                std::slice::from_ref(&part),
+                None,
+                "facts/metadata",
+                "uuid-discover",
+                &format!("{root_url}/facts"),
+                &[IcebergField {
+                    id: 1,
+                    name: "oid".to_string(),
+                    type_name: "string".to_string(),
+                    required: true,
+                }],
+                1,
+                1,
+                FormatVersion::V2,
+            )
+            .await
+            .unwrap();
+
+        // The configured bridge shares the same store (both open the same root).
+        let bridge: Arc<dyn ObjectStoreBridge> =
+            Arc::new(IcebergObjectStoreBridge::from_url(&root_url).unwrap());
+
+        // (a) The dml-stamped warehouse prefix (schema.location, no layout): a
+        // table ROOT — used as-is, never stripped.
+        let mut stamped = CatalogTableSchema::new("facts");
+        stamped.location = Some("facts".to_string());
+        let (md, location) = engine_metadata_via_configured_bridge(&bridge, &stamped)
+            .await
+            .expect("the stamped-prefix table's engine log is served");
+        assert_eq!(md.format_version, 2);
+        assert_eq!(
+            location, "facts/metadata/v00000000000000000000.metadata.json",
+            "served verbatim under the bridge-relative key"
+        );
+        assert!(md.current_snapshot_id.is_some(), "one committed snapshot");
+
+        // (b) A storage layout pointing at the data directory (`/data` suffix):
+        // the root is its parent.
+        let layout = CatalogTableSchema::new("facts").with_storage_layout(
+            CatalogStorageLayout::projection_publication(
+                "primary",
+                CatalogPhysicalFormat::Parquet,
+                "facts/data",
+            ),
+        );
+        assert!(
+            engine_metadata_via_configured_bridge(&bridge, &layout)
+                .await
+                .is_some(),
+            "a /data-suffixed layout location resolves to the parent root"
+        );
+
+        // (c) A scheme-carrying base is not bridge-keyable (URL-addressed tables
+        // are served by the engine_published_metadata probe instead).
+        let mut url_pinned = CatalogTableSchema::new("facts");
+        url_pinned.location = Some(format!("{root_url}/facts/data"));
+        assert!(
+            engine_metadata_via_configured_bridge(&bridge, &url_pinned)
+                .await
+                .is_none(),
+            "URL bases are skipped by the bridge probe"
+        );
     }
 
     #[test]

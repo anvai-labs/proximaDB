@@ -7628,6 +7628,7 @@ dependencies = [
  "proximadb-proto",
  "proximadb-quantization-types",
  "proximadb-records",
+ "proximadb-storage-common",
  "proximadb-storage-filesystem-types",
  "proximadb-tenant",
  "rand 0.8.6",

@@ -368,3 +368,77 @@ pub struct IcebergSnapshotField {
     pub type_name: String,
     pub required: bool,
 }
+
+/// Map an Arrow schema to the Iceberg snapshot fields, ids 1..n in arrow order
+/// (the single mapping every publisher uses — MATERIALIZE and the DataFusion
+/// bulk-append executor must not drift apart on field ids or type names).
+pub fn iceberg_snapshot_fields(schema: &arrow_schema::Schema) -> Vec<IcebergSnapshotField> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| IcebergSnapshotField {
+            id: (i + 1) as i32,
+            name: f.name().clone(),
+            type_name: iceberg_type_for(f.data_type()),
+            required: !f.is_nullable(),
+        })
+        .collect()
+}
+
+/// The Arrow → Iceberg type-name mapping, chosen to keep external Iceberg readers'
+/// schema aligned with the Parquet physical types. Timestamps map to the v3
+/// nanosecond types (ProximaDB is nanosecond-native).
+pub fn iceberg_type_for(arrow: &arrow_schema::DataType) -> String {
+    use arrow_schema::{DataType as D, TimeUnit};
+    match arrow {
+        D::Boolean => "boolean".into(),
+        D::Int8 | D::Int16 | D::Int32 => "int".into(),
+        D::Int64 | D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64 => "long".into(),
+        D::Float16 | D::Float32 => "float".into(),
+        D::Float64 => "double".into(),
+        D::Date32 | D::Date64 => "date".into(),
+        D::Decimal128(p, s) | D::Decimal256(p, s) => format!("decimal({p},{s})"),
+        // Iceberg's v2 `timestamp` is microseconds; nanoseconds need v3's `_ns` types
+        // (see `iceberg_needs_v3`).
+        D::Timestamp(TimeUnit::Nanosecond, Some(_)) => "timestamptz_ns".into(),
+        D::Timestamp(TimeUnit::Nanosecond, None) => "timestamp_ns".into(),
+        D::Timestamp(_, Some(_)) => "timestamptz".into(),
+        D::Timestamp(_, None) => "timestamp".into(),
+        D::Utf8 | D::LargeUtf8 => "string".into(),
+        D::FixedSizeBinary(n) => format!("fixed[{n}]"),
+        D::Binary | D::LargeBinary => "binary".into(),
+        // JSON columns materialize as Utf8 today; v3 `variant` is a follow-up.
+        _ => "string".into(),
+    }
+}
+
+/// ADR-097 D3: publish Iceberg **v2** — the version external readers (PyIceberg,
+/// DuckDB, Trino) verifiably read — unless a column needs a v3-only type
+/// (nanosecond timestamps). v3 deletion vectors / row lineage / `variant` follow
+/// once an external v3 reader is in the read-back gate. This is the *requested*
+/// version; the engine additionally refuses to downgrade an already-v3 table.
+pub fn iceberg_needs_v3(fields: &[IcebergSnapshotField]) -> bool {
+    fields.iter().any(|f| f.type_name.ends_with("_ns"))
+}
+
+/// A stable, well-formed UUID string derived deterministically from the table's object
+/// prefix, so an Iceberg table keeps the same `table-uuid` across re-materializations
+/// (no `uuid` v5 dependency; two seeded hashes fill the 16 bytes).
+pub fn deterministic_table_uuid(prefix: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h1 = std::collections::hash_map::DefaultHasher::new();
+    prefix.hash(&mut h1);
+    let a = h1.finish();
+    let mut h2 = std::collections::hash_map::DefaultHasher::new();
+    (prefix, 0x50524f58_4944425fu64).hash(&mut h2); // "PROX_IDB_" salt
+    let b = h2.finish();
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (a >> 32) as u32,
+        (a >> 16) as u16,
+        a as u16,
+        (b >> 48) as u16,
+        b & 0x0000_ffff_ffff_ffff
+    )
+}
