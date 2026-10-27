@@ -2281,6 +2281,11 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         // TD-GRPCSCHEMA-2: record mode at create (REST parity).
         let mut v1_config = v1_config;
         v1_config.enable_proxima_record = cfg.enable_proxima_record;
+        // TD-TIER-1 SC1 (review round 1): the v2 create MUST NOT silently drop
+        // the desired storage class — an unknown label is an actionable
+        // InvalidArgument here, and a known label flows into the v1 config so
+        // manager admission applies identically to REST, gRPC and Flight.
+        v1_config.storage_class = v2_storage_class_field(&cfg)?;
 
         let req = CollectionRequest {
             operation: CollectionOperation::CollectionCreate as i32,
@@ -2580,6 +2585,27 @@ fn v2_storage_class_status_from(
     }
 }
 
+/// TD-TIER-1 SC1: parse the v2 create request's `storage_class` label onto
+/// the v1 config discriminant. `None` (absent/empty/unspecified) ⇒ the manager
+/// resolves and persists BALANCED; a known label maps to its enum value so
+/// admission applies; anything else is an `InvalidArgument` naming the valid
+/// labels — never the silent default the strict REST surface already rejects
+/// (TD-RESTGET-1 class).
+fn v2_storage_class_field(cfg: &proximadb_v2::V2CollectionConfig) -> Result<Option<i32>, Status> {
+    match cfg.storage_class.as_deref() {
+        None | Some("") | Some("unspecified") => Ok(None),
+        Some(raw) => {
+            let class = crate::services::collection::storage_class::parse_storage_class(raw)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            if class == crate::proto::proximadb_v1::StorageClass::Unspecified {
+                Ok(None)
+            } else {
+                Ok(Some(class as i32))
+            }
+        }
+    }
+}
+
 fn collection_to_v2(c: crate::proto::proximadb_v1::Collection) -> V2Collection {
     let cfg = c.config.unwrap_or_default();
     let distance_metric = cfg
@@ -2660,6 +2686,55 @@ fn check_search_top_k(top_k: u32) -> Result<(), Status> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TD-TIER-1 SC1 (review round 1): the v2 create MUST read
+    /// `V2CollectionConfig.storage_class` — before, a client setting
+    /// "performance" silently got balanced (the TD-RESTGET-1 silent-default
+    /// class). Absent/empty/unspecified ⇒ `None` (the manager resolves and
+    /// persists BALANCED); known labels map onto the v1 discriminants so
+    /// manager admission applies identically to REST, gRPC and Flight;
+    /// anything else is an actionable InvalidArgument naming the vocabulary.
+    #[test]
+    fn v2_create_storage_class_is_mapped_not_dropped() {
+        let cfg = |class: Option<&str>| proximadb_v2::V2CollectionConfig {
+            storage_class: class.map(ToString::to_string),
+            ..Default::default()
+        };
+
+        for absent in [None, Some(""), Some("unspecified")] {
+            assert_eq!(
+                v2_storage_class_field(&cfg(absent)).unwrap(),
+                None,
+                "absent/unspecified must resolve to None"
+            );
+        }
+
+        assert_eq!(
+            v2_storage_class_field(&cfg(Some("performance"))).unwrap(),
+            Some(crate::proto::proximadb_v1::StorageClass::Performance as i32)
+        );
+        assert_eq!(
+            v2_storage_class_field(&cfg(Some("ECONOMY"))).unwrap(),
+            Some(crate::proto::proximadb_v1::StorageClass::Economy as i32)
+        );
+        // The proto enum-name form parses too (parity with the REST surface).
+        assert_eq!(
+            v2_storage_class_field(&cfg(Some("storage_class_balanced"))).unwrap(),
+            Some(crate::proto::proximadb_v1::StorageClass::Balanced as i32)
+        );
+
+        let error = v2_storage_class_field(&cfg(Some("perfromance")))
+            .expect_err("an unknown label must be rejected, not defaulted");
+        assert_eq!(
+            error.code(),
+            tonic::Code::InvalidArgument,
+            "{}",
+            error.message()
+        );
+        let message = error.message();
+        assert!(message.contains("perfromance"), "{message}");
+        assert!(message.contains("balanced"), "{message}");
+    }
 
     #[test]
     fn v2_config_to_canonical_columns_emits_embedding_plus_filterable_scalars() {

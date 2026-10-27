@@ -172,6 +172,23 @@ pub fn check_performance_admission(
             resolved_engine
         ));
     }
+    // An explicit path must be scheme-carrying or absolute, in every context:
+    // a RELATIVE path ("tenants/x/...") resolves against process state, so it
+    // is rejected outright rather than slipping the tenant-prefix parse.
+    if let Some(explicit) = config
+        .storage_config
+        .as_ref()
+        .and_then(|storage| storage.storage_path.as_deref())
+        .filter(|p| !p.is_empty())
+        && !explicit.contains("://")
+        && !explicit.starts_with('/')
+    {
+        return Err(anyhow::anyhow!(
+            "storage_class 'performance' placement '{explicit}' must be an \
+             absolute path or carry a storage scheme (s3://, gs://, az:// ...); \
+             relative paths are not admissible"
+        ));
+    }
     // Cross-tenant authorization on an explicit path (configured defaults are
     // operator-authorized by construction and carry no tenant segment).
     if let (Some(current_tenant), Some(explicit)) = (
@@ -200,7 +217,8 @@ pub fn check_performance_admission(
     {
         return Err(anyhow::anyhow!(
             "storage_class 'performance' requires an object-store-backed placement \
-             (s3://, gs:// or az-adls://); the resolved location '{}' is not one. \
+             (s3://, gs://, az:// — or the adls/abfs/azure aliases; https:// for \
+             S3-compatible endpoints); the resolved location '{}' is not one. \
              Configure a remote storage location, or use the 'balanced' class",
             if resolved_base_location.is_empty() {
                 "<unset>"
@@ -419,6 +437,25 @@ mod tests {
             None,
         )
         .unwrap();
+
+        // A RELATIVE explicit path is rejected in every context — it resolves
+        // against process state and would slip the tenant-prefix parse
+        // ("tenants/other/..." with no scheme or leading '/').
+        config.storage_config = Some(StorageConfig {
+            storage_path: Some("tenants/other-tenant/coll".to_string()),
+            ..Default::default()
+        });
+        for tenant in [Some("acme"), None] {
+            let error = check_performance_admission(
+                &config,
+                StorageEngine::Sst,
+                "tenants/other-tenant/coll",
+                tenant,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("relative"), "{error}");
+        }
 
         // Balanced/economy never trigger the check.
         config.storage_class = Some(StorageClass::Balanced as i32);
