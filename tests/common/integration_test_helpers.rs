@@ -324,6 +324,7 @@ impl UnifiedTestEnvironment {
         };
 
         Collection {
+            storage_class_status: None,
             id: self.collection_id.clone(),
             config: Some(config),
             stats: Some(stats),
@@ -672,6 +673,7 @@ impl UnifiedTestEnvironment {
         };
 
         Collection {
+            storage_class_status: None,
             id: name.to_string(),
             config: Some(config),
             stats: Some(stats),
@@ -1136,6 +1138,7 @@ pub fn create_test_collection_with_storage(name: &str, base_location: String) ->
     };
 
     Collection {
+        storage_class_status: None,
         id: name.to_string(),
         config: Some(config),
         stats: Some(stats),

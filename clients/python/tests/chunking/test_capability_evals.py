@@ -25,10 +25,7 @@ from proximadb_sdk.chunking_strategies.capabilities import (
     ParentLinkagePass,
 )
 from proximadb_sdk.chunking_strategies.conformance.corpus import by_name
-from proximadb_sdk.chunking_strategies.conformance.evals import (
-    STANDARD_CASES,
-    run_eval,
-)
+from proximadb_sdk.chunking_strategies.conformance.evals import STANDARD_CASES, run_eval
 from proximadb_sdk.chunking_strategies.passes import (
     CHUNK_TYPE_PARENT,
     PARENT_ID_KEY,

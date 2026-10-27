@@ -1221,6 +1221,14 @@ type CollectionV2Response struct {
 	// Stats Collection statistics for v2 API
 	Stats CollectionStatsV2 `json:"stats"`
 
+	// StorageClass Resolved desired storage class (TD-TIER-1 SC1):
+	// "economy" | "balanced" (default) | "performance".
+	StorageClass string `json:"storage_class"`
+
+	// StorageClassStatus REST output for the observed storage-class status (TD-TIER-1 SC1; mirrors
+	// proto `StorageClassStatus` — a read-side projection, never an input).
+	StorageClassStatus StorageClassStatusOutput `json:"storage_class_status"`
+
 	// UpdatedAt Last update timestamp
 	UpdatedAt *string `json:"updated_at,omitempty"`
 }
@@ -1344,6 +1352,16 @@ type CreateCollectionV2Request struct {
 	//
 	// Defines the typed columns and enforcement rules for ProximaRecord support.
 	Schema *SchemaDefinition `json:"schema,omitempty"`
+
+	// StorageClass Desired storage class (TD-TIER-1 SC1).
+	//
+	// Options: "balanced" (default) | "economy" | "performance". Omitted ⇒
+	// balanced (pre-SC1 collections are unchanged). "performance" is admitted
+	// only for an object-store-backed SST/PAX placement and reports
+	// `not_active` until its residency dependency ships; economy likewise
+	// persists intent only. Read `storage_class_status` on the GET response
+	// for the observed truth — the class is never a claim.
+	StorageClass *string `json:"storage_class,omitempty"`
 
 	// Tags Operator metadata tags, e.g. `"recall_target:0.95"`,
 	// `"target_vector_count:1000"`, `"modalities:text,image"`. Consumed by the
@@ -2880,6 +2898,30 @@ type SqlResponse struct {
 	Rows            []map[string]interface{} `json:"rows"`
 	RowsReturned    int64                    `json:"rows_returned"`
 	RowsScanned     int64                    `json:"rows_scanned"`
+}
+
+// StorageClassStatusOutput REST output for the observed storage-class status (TD-TIER-1 SC1; mirrors
+// proto `StorageClassStatus` — a read-side projection, never an input).
+type StorageClassStatusOutput struct {
+	// CoveredBytes Bytes covered by the READY coverage set (SC4). 0 until then.
+	CoveredBytes int64 `json:"covered_bytes"`
+
+	// PolicyGeneration Monotonic generation of the desired policy: 0 = never set (pre-SC1
+	// records), 1 = set at create; a policy-change surface will bump it.
+	PolicyGeneration int64 `json:"policy_generation"`
+
+	// Reason Human-readable reason when `state` is not active (names the missing
+	// dependency); empty when active.
+	Reason string `json:"reason"`
+
+	// ReservedBytes Reserved bytes under the collection's residency admission (SC3). 0 until then.
+	ReservedBytes int64 `json:"reserved_bytes"`
+
+	// ResidentBytes Bytes resident in the serving cache (SC4). 0 until then.
+	ResidentBytes int64 `json:"resident_bytes"`
+
+	// State "active" | "not_active" ("unspecified" never leaves the server).
+	State string `json:"state"`
 }
 
 // TableWriteCandidateExplanation defines model for TableWriteCandidateExplanation.

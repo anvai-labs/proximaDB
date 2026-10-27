@@ -11,12 +11,7 @@ import numpy as np
 import pytest
 from sentence_transformers import SentenceTransformer
 
-from proximadb_sdk import (
-    CollectionConfig,
-    ProximaDBError,
-    connect_grpc,
-    connect_rest,
-)
+from proximadb_sdk import CollectionConfig, ProximaDBError, connect_grpc, connect_rest
 
 from .test_helpers import COLLECTION_NAMES
 

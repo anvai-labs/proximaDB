@@ -592,6 +592,13 @@ pub(crate) fn collection_from_catalog_schema(
         })
     };
 
+    // TD-TIER-1 SC1: the observed status is a pure read-side projection of the
+    // desired policy (services::collection::storage_class) — computed here so
+    // every read surface (REST v2, gRPC, catalog) reports the same truth.
+    // Never persisted, never an input.
+    let storage_class_status =
+        crate::services::collection::storage_class::storage_class_status(&config);
+
     Ok(Some(Collection {
         id,
         config: Some(config),
@@ -615,6 +622,7 @@ pub(crate) fn collection_from_catalog_schema(
         created_at: schema.created_at_ms * 1000,
         updated_at: schema.updated_at_ms * 1000,
         storage_assignment,
+        storage_class_status: Some(storage_class_status),
     }))
 }
 

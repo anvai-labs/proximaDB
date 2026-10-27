@@ -171,6 +171,7 @@ async fn test_sst_collection_with_proper_routing() -> anyhow::Result<()> {
     };
 
     let collection = std::sync::Arc::new(proximadb::proto::proximadb_v1::Collection {
+        storage_class_status: None,
         id: collection_id.to_string(),
         config: Some(collection_config),
         stats: None,

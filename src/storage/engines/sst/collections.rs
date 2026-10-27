@@ -41,6 +41,7 @@ impl SstEngine {
         use crate::proto::proximadb_v1::{CollectionConfig, CollectionStats};
 
         let config = CollectionConfig {
+            storage_class: None,
             name: collection_id.to_string(),
             embedding_config: None,
             dimension: 1536,          // Default dimension
@@ -74,7 +75,10 @@ impl SstEngine {
             data_size_bytes: 0,
         };
 
+        let storage_class_status =
+            crate::services::collection::storage_class::storage_class_status(&config);
         Ok(Collection {
+            storage_class_status: Some(storage_class_status),
             id: collection_id.to_string(),
             config: Some(config),
             stats: Some(stats),

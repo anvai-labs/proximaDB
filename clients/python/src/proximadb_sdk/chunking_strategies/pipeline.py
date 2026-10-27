@@ -25,21 +25,12 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import (
-    Any,
-    Generic,
-    Protocol,
-    TypeVar,
-)
+from typing import Any, Generic, Protocol, TypeVar
 
 from .base import ChunkingConfig, ChunkingStrategy, TextChunk, config_kwargs
 from .code import CodeChunkingConfig
 from .factory import ChunkingStrategyFactory
-from .parser_utils import (
-    ConfigValidator,
-    ParserMetrics,
-    get_metrics_collector,
-)
+from .parser_utils import ConfigValidator, ParserMetrics, get_metrics_collector
 
 logger = logging.getLogger(__name__)
 

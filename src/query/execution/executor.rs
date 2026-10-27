@@ -2325,6 +2325,7 @@ mod executor_tests {
         // Create the test collection before creating the vector service
         use crate::proto::proximadb_v1::{CollectionConfig, DistanceMetric, StorageEngine};
         let config = CollectionConfig {
+            storage_class: None,
             name: "test_collection".to_string(),
             embedding_config: None,
             dimension: 3, // Match the test vector dimensions

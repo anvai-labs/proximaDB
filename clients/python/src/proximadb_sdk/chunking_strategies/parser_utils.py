@@ -24,9 +24,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import wraps
-from typing import (
-    Any,
-)
+from typing import Any
 
 # Configure logging
 logger = logging.getLogger(__name__)

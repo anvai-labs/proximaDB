@@ -111,8 +111,10 @@ mod tests {
         use crate::proto::proximadb_v1::{Collection, CollectionConfig, StorageAssignment};
 
         Collection {
+            storage_class_status: None,
             id: collection_id.to_string(),
             config: Some(CollectionConfig {
+                storage_class: None,
                 name: collection_id.to_string(),
                 embedding_config: None,
                 dimension: 128,           // Match actual test vector dimension

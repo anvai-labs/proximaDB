@@ -33,6 +33,7 @@ mod helix_cold_search_recall {
     /// Create a collection config for testing
     fn create_collection(collection_id: &str, temp_dir: &TempDir, engine_type: i32) -> Collection {
         Collection {
+            storage_class_status: None,
             id: collection_id.to_string(),
             config: Some(proximadb::proto::proximadb_v1::CollectionConfig {
                 name: collection_id.to_string(),

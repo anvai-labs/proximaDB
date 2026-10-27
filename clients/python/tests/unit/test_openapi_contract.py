@@ -939,6 +939,15 @@ def test_create_collection_request_matches_spec(
         "dimension": 128,
         "engine": "viper",
         "proxima_record_enabled": True,
+        "storage_class": "balanced",
+        "storage_class_status": {
+            "state": "ACTIVE",
+            "reason": "",
+            "policy_generation": 0,
+            "reserved_bytes": 0,
+            "resident_bytes": 0,
+            "covered_bytes": 0,
+        },
         "created_at": "2026-05-23T00:00:00Z",
     }
     client, captured = _patched_client(monkeypatch, response_body)

@@ -69,12 +69,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import (
-    Any,
-    Optional,
-    Protocol,
-    runtime_checkable,
-)
+from typing import Any, Optional, Protocol, runtime_checkable
 
 # Socket file names MUST match the Rust constants in
 # crates/platform/proximadb-runtime/src/bootstrap_config.rs.
@@ -2245,10 +2240,7 @@ prefetch_budget = 4
             await self.start()
 
         # Import here to avoid circular imports
-        from .multimodal_query import (
-            CrossModalReranker,
-            MultiModalQueryResult,
-        )
+        from .multimodal_query import CrossModalReranker, MultiModalQueryResult
 
         # Create embedded executor
         executor = EmbeddedMultiModalQueryExecutor(self)
