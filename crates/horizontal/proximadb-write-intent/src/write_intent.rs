@@ -131,6 +131,17 @@ pub struct WriteIntent {
     pub requires_row_level_semantics: bool,
     pub batch_local_constraints_sufficient: bool,
 
+    /// The table's published (Iceberg) parent snapshot carries deletion
+    /// vectors. The bulk-append lane takes a successor slot without the
+    /// publish lock and never records the catalog layout flip, so running it
+    /// above a DV-carrying parent strands every later publication's
+    /// (version, LSN) pairing — the visibility fence contract's
+    /// forbid-or-fence decision for the bulk lane is FORBID
+    /// (PUBLICATION_WAL_VISIBILITY_FENCE_2026_10_27.adoc). The DML service
+    /// sets this from the metadata log; `false` when the table has no
+    /// published snapshot.
+    pub published_parent_has_deletes: bool,
+
     /// Fencing generation from the DML lock guard that authorizes this
     /// write (A6 boundary seam). `None` for non-DML/legacy writes. The
     /// storage writer validates this against the current durable lease
@@ -156,6 +167,7 @@ impl WriteIntent {
             estimated_bytes: None,
             requires_row_level_semantics,
             batch_local_constraints_sufficient: false,
+            published_parent_has_deletes: false,
             fencing_generation: None,
         }
     }
@@ -212,6 +224,11 @@ impl WriteIntent {
 
     pub fn with_batch_local_constraints_sufficient(mut self, sufficient: bool) -> Self {
         self.batch_local_constraints_sufficient = sufficient;
+        self
+    }
+
+    pub fn with_published_parent_has_deletes(mut self, has_deletes: bool) -> Self {
+        self.published_parent_has_deletes = has_deletes;
         self
     }
 
@@ -445,7 +462,8 @@ impl WriteLaneRouter {
         );
         let can_bulk_append = direct_allowed
             && intent.batch_local_constraints_sufficient
-            && intent.has_bulk_hint(&self.config);
+            && intent.has_bulk_hint(&self.config)
+            && !intent.published_parent_has_deletes;
 
         if can_bulk_append {
             let mut guards = vec![
@@ -490,6 +508,13 @@ impl WriteLaneRouter {
             rejected.push(RejectedWriteLane::new(
                 WriteLane::BulkAppendCommit,
                 "write is below configured bulk row and byte thresholds",
+            ));
+        }
+        if intent.published_parent_has_deletes {
+            rejected.push(RejectedWriteLane::new(
+                WriteLane::BulkAppendCommit,
+                "published parent snapshot carries deletion vectors; the bulk lane \
+                 cannot record the layout flip the visibility fence requires",
             ));
         }
 
@@ -580,6 +605,28 @@ mod tests {
                 .required_guards
                 .contains(&WriteGuard::BatchLocalConstraintCheck)
         );
+    }
+
+    #[test]
+    fn write_intent_router_refuses_bulk_above_deletion_vector_parent() {
+        // The visibility fence contract's forbid decision (review finding 1):
+        // the bulk lane takes a successor slot without the publish lock and
+        // never records the layout flip, so it must not run above a
+        // DV-carrying published parent.
+        let intent = WriteIntent::new("public.events", WriteOperationKind::Append)
+            .with_durability(WriteDurabilityRequirement::DirectCommitAllowed)
+            .with_row_count_hint(DEFAULT_BULK_ROW_THRESHOLD)
+            .with_batch_local_constraints_sufficient(true)
+            .with_idempotency_key("load-43")
+            .with_published_parent_has_deletes(true);
+
+        let decision = WriteLaneRouter::new().route(&intent);
+
+        assert_eq!(decision.lane, WriteLane::WalCurrentState);
+        assert!(decision.rejected_lanes.iter().any(|rejected| {
+            rejected.lane == WriteLane::BulkAppendCommit
+                && rejected.reason.contains("deletion vectors")
+        }));
     }
 
     #[test]

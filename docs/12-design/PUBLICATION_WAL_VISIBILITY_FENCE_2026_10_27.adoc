@@ -67,6 +67,16 @@ against a DV-carrying base and the reader REFUSES — gate 1 then tests the refu
 the hide, and the unordered-delta relaxation condition (suppress-set covers every DV
 tombstone) is unstateable. The value is part of the fence, not an implementation detail.
 
+Completeness precondition (writer slice, round 2): an EMPTY changed-set at the recorded
+LSN is only correct when the successor IS a complete state at that LSN. The live publisher
+writes no data files — its base is the parent's files (the state at the parent's capture
+LSN) minus the DVs — so it must REFUSE unless (a) the parent is the publication the layout
+recorded (an externally published parent's capture LSN is unknown), and (b) the changed-set
+since the parent's recorded `snapshot_lsn` is exactly the tombstones this delete is
+publishing. Any other changed oid is in neither the parent's files nor the replayed delta:
+publishing would hide it from BOTH views. A refused fence leaves the standing gap (WAL
+dead, published stale) until the next full publication reconciles.
+
 Ordering rule: phase 3 publishes ONLY oids whose tombstones are already durable (phase 2
 completed). A reader that sees snapshot S-prime and then reads the WAL at LSN at or above
 its tombstone LSNs sees the row dead in both. A reader that reads the WAL first (row dead)
@@ -148,6 +158,18 @@ The fence therefore guarantees:
   LAYOUT FLIP (the next publication or the next plan_append observation), not a
   re-publication; until it flips, appends classify the layout as stale and fall to
   rewrite, which the entry guard then gates on the DV condition above.
+* **The bulk-append lane (`WriteLane::BulkAppendCommit`):** FORBIDDEN above a
+  DV-carrying parent (the writer slice's forbid-or-fence decision). That lane
+  commits a successor without the `publish_lock` and never records the catalog
+  layout flip, so running it above a DV parent strands every later
+  publication's (metadata version, snapshot LSN) pairing — both the guard's
+  relaxation and the publisher's completeness precondition would refuse
+  forever, and after any later WAL delete every read of a nonempty delta
+  against the DV base refuses. The DML routing reads the parent's DV state
+  BEFORE the lane is chosen (a commit-time refusal would strand the written
+  parts) and demotes the statement to the WAL lane; the bulk lane's snapshot
+  ids join MATERIALIZE's millisecond scale, bumped past the parent's, so the
+  lane can no longer starve later publications of valid ids.
 * **Concurrent publisher (MATERIALIZE racing a DELETE):** both hold the `publish_lock`;
   the loser retries against the new parent. If MATERIALIZE wins, the delete re-maps
   positions against the NEW file set (its rows may now live in rewritten files) and

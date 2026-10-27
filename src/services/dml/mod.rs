@@ -2868,19 +2868,40 @@ impl DmlService {
         //    below loses its create-only CAS rather than racing GC.
         let metadata_prefix = format!("{prefix}/metadata");
         let parent = bridge.latest_metadata_version(&metadata_prefix).await?;
-        // Native state is not yet synchronized with externally published DVs.
-        // A rewrite from that state would resurrect hidden rows. Until the live
-        // writer establishes that synchronization, refuse before writing parts,
-        // regardless of whether incremental append is enabled.
+        // Native state is not synchronized with externally published DVs: a
+        // rewrite whose native read predates the DVs would resurrect hidden
+        // rows. The ONE safe relaxation (the visibility fence contract's
+        // guarantee 1): the rewrite may proceed when the DV parent IS the
+        // publication that recorded the layout's (metadata version, snapshot
+        // LSN) pair — the live delete publisher's own output — and the
+        // captured LSN is at or above the recorded one: every DV'd oid's
+        // tombstone is visible in the native read, so the rewritten parts
+        // cannot contain it. Any other DV parent (vectors published
+        // externally, or a publication whose layout flip did not land)
+        // leaves the recorded pair stale, and the refusal stands.
         if let Some(version) = parent
             && bridge
                 .read_iceberg_snapshot_files(&metadata_prefix, version)
                 .await?
                 .has_deletions()
         {
-            anyhow::bail!(
-                "MATERIALIZE {table_name}: published snapshot has deletion vectors; native-state synchronization is required before republication"
-            );
+            let recorded = catalog
+                .get_table(&table_id)
+                .await
+                .ok()
+                .and_then(|t| materialize_stream::recorded_publication(&t.storage_layouts));
+            let synchronized = recorded.is_some_and(|(recorded_version, recorded_lsn)| {
+                recorded_version == version && snapshot_lsn >= recorded_lsn
+            });
+            if !synchronized {
+                anyhow::bail!(
+                    "MATERIALIZE {table_name}: published snapshot has deletion vectors and \
+                     the native state is not synchronized with them (the DV parent is not \
+                     the recorded publication, or the captured LSN {snapshot_lsn} predates \
+                     its snapshot_lsn); native-state synchronization is required before \
+                     republication"
+                );
+            }
         }
         let successor = parent.map_or(0, |p| p.saturating_add(1));
         let now_ms = std::time::SystemTime::now()
@@ -4052,6 +4073,15 @@ impl DmlService {
             .await?;
         let source_schema = source_metadata.as_ref().map(|(schema, _)| schema);
         let source_stats = source_metadata.as_ref().map(|(_, stats)| stats);
+        // The bulk-append lane must refuse above a DV-carrying parent BEFORE
+        // the executor writes any Parquet (a commit-time refusal strands the
+        // parts; review finding 1). Tenant-scoped like the write itself.
+        let parent_has_deletes = self
+            .published_parent_has_deletes(
+                &plan.target.qualified_name(),
+                tenant_context.map(|tc| tc.tenant_id.as_str()),
+            )
+            .await;
         let routed = self.route_table_write_with_schemas(
             plan,
             target_columns,
@@ -4060,6 +4090,7 @@ impl DmlService {
             source_schema,
             source_stats,
             None,
+            parent_has_deletes,
         )?;
 
         // Fold the namespace/DrPath-aware prefix into the warehouse bulk-append write
@@ -4121,6 +4152,80 @@ impl DmlService {
         }
     }
 
+    /// The bulk-append lane must not run above a DV-carrying published parent
+    /// (the visibility fence contract's FORBID decision; adversarial review
+    /// finding 1): that lane commits a successor without the publish lock and
+    /// never records the catalog layout flip, so it would strand every later
+    /// publication's (version, LSN) pairing — and after any later WAL delete,
+    /// every read of a nonempty delta against the DV base refuses, permanently.
+    /// `false` when the table has no published layout or parent snapshot (the
+    /// common OLTP case — two catalog reads and no object-store I/O); read
+    /// failures demote to the WAL lane (fail-closed), which is always safe.
+    ///
+    /// Residual TOCTOU (round-4 review, MINOR-3): serialized by the table's
+    /// DML write lock in normal deployments (both this read and the delete's
+    /// publication hold it for their whole critical section), but when the
+    /// lock service is ABSENT (`acquire_table_dml_lock` yields `None`, the
+    /// deliberately fail-open wiring) an INSERT's clean eligibility read can
+    /// race a concurrent delete's publication — the INSERT's executor then
+    /// commits a DV-carrying successor with no layout flip, and the table
+    /// wedges until a MATERIALIZE. The contract's gate 3 (race forcing + the
+    /// lease fence) owns closing this; see
+    /// PUBLICATION_WAL_VISIBILITY_FENCE_2026_10_27.adoc.
+    async fn published_parent_has_deletes(&self, table_name: &str, tenant: Option<&str>) -> bool {
+        use proximadb_iceberg_engine::IcebergObjectStoreBridge;
+        use proximadb_storage_common::object_store_bridge::ObjectStoreBridge as _;
+
+        let Ok((catalog, table_id)) = self
+            .catalog_manager
+            .resolve_table_scoped(table_name, tenant)
+            .await
+        else {
+            return false; // routing fails on the missing table anyway
+        };
+        let Ok(table) = catalog.get_table(&table_id).await else {
+            return false;
+        };
+        let Some(location) = table
+            .storage_layouts
+            .iter()
+            .find(|l| l.name == "parquet-snapshot")
+            .and_then(|l| l.location.clone())
+        else {
+            return false; // not published: nothing to carry, nothing to fence
+        };
+        let Some(table_root) = location
+            .trim_end_matches('/')
+            .strip_suffix("/data")
+            .map(str::to_string)
+        else {
+            return false;
+        };
+        let metadata_prefix = "metadata".to_string();
+        let Ok(bridge) = IcebergObjectStoreBridge::from_url(&table_root) else {
+            warn!(table = %table_name, "bulk-lane eligibility: bridge open failed; demoting");
+            return true;
+        };
+        let version = match bridge.latest_metadata_version(&metadata_prefix).await {
+            Ok(Some(version)) => version,
+            Ok(None) => return false, // no parent: the first publication carries nothing
+            Err(e) => {
+                warn!(table = %table_name, error = %e, "bulk-lane eligibility: metadata read failed; demoting");
+                return true;
+            }
+        };
+        match bridge
+            .read_iceberg_snapshot_files(&metadata_prefix, version)
+            .await
+        {
+            Ok(snapshot) => !snapshot.deletion_vectors.is_empty(),
+            Err(e) => {
+                warn!(table = %table_name, error = %e, "bulk-lane eligibility: snapshot read failed; demoting");
+                true
+            }
+        }
+    }
+
     async fn route_table_write_plan_with_overrides(
         &self,
         plan: &CopyIntoPlan,
@@ -4136,6 +4241,12 @@ impl DmlService {
         let source_metadata = self.resolve_table_write_source_metadata(plan, None).await?;
         let source_schema = source_metadata.as_ref().map(|(schema, _)| schema);
         let source_stats = source_metadata.as_ref().map(|(_, stats)| stats);
+        // Computed once per statement, before routing: the lane decision must
+        // refuse the bulk path for a DV-carrying parent BEFORE the executor
+        // writes any Parquet (a commit-time refusal would strand the parts).
+        let parent_has_deletes = self
+            .published_parent_has_deletes(&target_table_name, None)
+            .await;
         self.route_table_write_with_schemas(
             plan,
             target_columns,
@@ -4144,6 +4255,7 @@ impl DmlService {
             source_schema,
             source_stats,
             write_intent_overrides,
+            parent_has_deletes,
         )
     }
 
@@ -4231,9 +4343,11 @@ impl DmlService {
         source_schema: Option<&CatalogTableSchema>,
         source_stats: Option<&CatalogTableStatistics>,
         write_intent_overrides: Option<&WriteIntentOverrides>,
+        parent_has_deletes: bool,
     ) -> Result<RoutedExecutionPlan> {
         DmlWritePlanner::default().plan(DmlWritePlanRequest {
             target_schema,
+            published_parent_has_deletes: parent_has_deletes,
             target_stats,
             source_schema,
             source_stats,
@@ -5116,6 +5230,461 @@ impl DmlService {
         Ok((catalog, table_id))
     }
 
+    /// Whether the live incremental delete publisher is armed (default OFF;
+    /// the fence contract's activation rung). Unset ⇒ the delete is a pure
+    /// WAL delete and the published view goes stale until the next full
+    /// publication, exactly as before the writer slice.
+    fn live_delete_publisher_enabled() -> bool {
+        std::env::var_os("PROXIMADB_LIVE_DELETE_PUBLISHER").is_some_and(|v| {
+            matches!(
+                v.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    }
+
+    /// TD-USUB-10 3c — the fence contract's phase 3: publish a deletion-vector
+    /// successor for the oids a DELETE just tombstoned. Best-effort-with-
+    /// accounting per the contract (docs/12-design/PUBLICATION_WAL_VISIBILITY_FENCE_2026_10_27.adoc): phase 2 (the
+    /// WAL write) has already committed when this runs, so a failure here
+    /// leaves the fence gap open (WAL dead, published stale) — it is logged
+    /// and counted, never returned as a delete error. Synchronous phase 3
+    /// (the lock-lifetime choice the slice states).
+    async fn publish_live_deletes(
+        &self,
+        table_name: &str,
+        deleted_oids: &[String],
+        tenant_id: Option<&str>,
+        max_tombstone_lsn: u64,
+    ) {
+        if deleted_oids.is_empty() || !Self::live_delete_publisher_enabled() {
+            return;
+        }
+        let result = self
+            .publish_live_deletes_inner(table_name, deleted_oids, tenant_id, max_tombstone_lsn)
+            .await;
+        match result {
+            Ok(()) => {}
+            Err(e) => {
+                warn!(
+                    table = %table_name,
+                    "live-delete publication refused (the WAL delete stands; the fence gap stays open until the next publication): {e:#}"
+                );
+            }
+        }
+    }
+
+    async fn publish_live_deletes_inner(
+        &self,
+        table_name: &str,
+        deleted_oids: &[String],
+        tenant_id: Option<&str>,
+        max_tombstone_lsn: u64,
+    ) -> anyhow::Result<()> {
+        use crate::query::execution::olap_delta_merge::OlapDeltaSource as _;
+        use proximadb_iceberg_engine::IcebergObjectStoreBridge;
+        use proximadb_iceberg_engine::deletion_vector::PositionDeletes;
+        use proximadb_storage_common::object_store_bridge::ObjectStoreBridge as _;
+
+        // COST (stated per the co-design mandate, and the contract): a live
+        // delete reads the ENTIRE __proxima_oid column of every published
+        // file and decodes every parent vector — O(published oid bytes) of
+        // I/O, synchronously under the DML locks. The footer/sidecar index
+        // (TD-FPRUNE-1 pattern) is the follow-up that removes it.
+        let (catalog, table_id) = self
+            .catalog_manager
+            .resolve_table_scoped(table_name, tenant_id)
+            .await
+            .map_err(|e| anyhow!("live delete: resolving the table: {e}"))?;
+        let table = catalog
+            .get_table(&table_id)
+            .await
+            .map_err(|e| anyhow!("live delete: catalog read: {e}"))?;
+        let Some(layout) = table
+            .storage_layouts
+            .iter()
+            .find(|l| l.name == "parquet-snapshot")
+        else {
+            return Ok(()); // no published layout: a pure WAL delete
+        };
+        // The layout location is the DATA directory ({table_root}/data); the
+        // engine's metadata log and every working consumer live at the TABLE
+        // ROOT (round-1 review caught the no-op: a bridge rooted at the data
+        // dir with a full-URL key finds nothing).
+        let data_location = layout
+            .location
+            .clone()
+            .ok_or_else(|| anyhow!("the published layout has no location"))?;
+        let Some(table_root) = data_location
+            .trim_end_matches('/')
+            .strip_suffix("/data")
+            .map(str::to_string)
+        else {
+            return Ok(()); // not a parquet-snapshot location shape
+        };
+        let bridge = IcebergObjectStoreBridge::from_url(&table_root)
+            .map_err(|e| anyhow!("live delete: opening the bridge: {e}"))?;
+        // Bridge-relative, matching engine_metadata_at_root / every consumer.
+        let metadata_prefix = "metadata".to_string();
+
+        // The recorded fence LSN must sit at or above EVERY published
+        // tombstone (the contract's load-bearing rule). A fresh capture
+        // ALONE does not guarantee that (round-4 review, MAJOR-1): the
+        // capture subtracts the STORE-GLOBAL inflight floor, which a
+        // concurrent write on ANY other table can lower below this table's
+        // just-applied tombstones — recording that would durably refuse
+        // every OLAP read (nonempty delta against the DV base). The clamp
+        // uses the batch's max durable LSN, the contract's sanctioned
+        // alternative; both bounds are at or below the WAL head, and the
+        // completeness precondition below keeps the base a complete state
+        // at the max of them.
+        let fence_lsn = self
+            .record_store
+            .capture_snapshot_lsn(table_name)
+            .await
+            .map_err(|e| anyhow!("live delete: capturing the fence LSN: {e}"))?
+            .lsn
+            .max(max_tombstone_lsn);
+
+        // The fence: the publish lock FIRST (the parent read and the commit
+        // both inside it — round-1 review: reading the parent outside the
+        // lock makes CAS loss the common case), one bounded retry on a lost
+        // race (re-read the parent, re-map: positions are file-relative and
+        // the file set is parent-dependent).
+        let _guard = materialize_stream::publish_lock(tenant_id, table_name).await;
+        for _attempt in 0..2 {
+            let Some(parent) = bridge
+                .latest_metadata_version(&metadata_prefix)
+                .await
+                .map_err(|e| anyhow!("live delete: latest version: {e}"))?
+            else {
+                return Ok(()); // nothing published yet: nothing to fence
+            };
+            // The parent's own table-uuid and location: the successor must
+            // carry them VERBATIM (a re-derived uuid diverges from the log —
+            // round-1 review's spec-violation finding).
+            let parent_json_bytes = bridge
+                .read_table_metadata(&metadata_prefix, parent)
+                .await
+                .map_err(|e| anyhow!("live delete: parent metadata: {e}"))?;
+            let parent_meta: serde_json::Value = serde_json::from_slice(&parent_json_bytes)
+                .map_err(|e| anyhow!("live delete: parsing the parent metadata: {e}"))?;
+            let parent_uuid = parent_meta
+                .get("table-uuid")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("the parent metadata has no table-uuid"))?
+                .to_string();
+            let parent_location = parent_meta
+                .get("location")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&table_root)
+                .to_string();
+
+            // The publication this fence produces must be a COMPLETE state at
+            // fence_lsn (the contract's recorded-snapshot_lsn rule): the
+            // OLAP delta-merge serves a DV-carrying base bare only when
+            // NOTHING changed after the recorded LSN, so any oid that changed
+            // since the parent's capture — other than the tombstones this
+            // delete is publishing — would be in neither the base nor the
+            // replayed delta: hidden from both views. Refuse instead (the
+            // WAL delete stands; the next full publication reconciles). The
+            // parent must also BE the publication the layout recorded: an
+            // externally published parent's capture LSN is unknown.
+            let recorded = materialize_stream::recorded_publication(
+                &catalog
+                    .get_table(&table_id)
+                    .await
+                    .map_err(|e| anyhow!("live delete: layout re-read: {e}"))?
+                    .storage_layouts,
+            );
+            let Some((recorded_version, recorded_lsn)) = recorded else {
+                anyhow::bail!(
+                    "live delete: the layout records no (metadata version, \
+                     snapshot LSN) pair for the parent publication; leaving \
+                     the fence gap open"
+                );
+            };
+            if recorded_version != parent {
+                anyhow::bail!(
+                    "live delete: the parent publication v{parent} is not the layout's \
+                     recorded v{recorded_version} (an external publication owns \
+                     the parent; its capture LSN is unknown); leaving the fence gap \
+                     open"
+                );
+            }
+            let deleted: std::collections::HashSet<&str> =
+                deleted_oids.iter().map(String::as_str).collect();
+            let changed: Vec<String> = self
+                .changed_oids_since(table_name, recorded_lsn, tenant_id)
+                .await
+                .map_err(|e| anyhow!("live delete: the changed-set read: {e}"))?;
+            // The changed-set proves completeness only if every write
+            // reaches the feed (round-3 finding 8, made unconditional by
+            // round 4: in the nonempty-and-exactly-deleted leg the proof
+            // silently assumed it) — else the precondition is vacuous and
+            // publishing could hide rows from both views.
+            {
+                let (schema, _) = self
+                    .resolve_select_table(table_name, tenant_id)
+                    .await
+                    .map_err(|e| anyhow!("live delete: schema resolve: {e}"))?;
+                if !self.record_store.has_change_feed(&schema) {
+                    anyhow::bail!(
+                        "live delete: cannot prove the changed-set is complete \
+                         (no change feed for this table); leaving the fence gap \
+                         open"
+                    );
+                }
+            }
+            // The feed is name-keyed (legacy entries union a bare-name
+            // partition that is not namespace-unique), so this filter runs on
+            // a SUPERSET: a same-named table's oid can refuse a state that is
+            // actually complete. That direction is the safe one — filtering
+            // it down would risk publishing an incomplete state.
+            let unexpected: Vec<String> = changed
+                .into_iter()
+                .filter(|oid| !deleted.contains(oid.as_str()))
+                .collect();
+            if !unexpected.is_empty() {
+                anyhow::bail!(
+                    "live delete: {} oid(s) changed since the parent snapshot that this \
+                     delete is not publishing (e.g. {:?}); publishing would hide \
+                     them from both views; leaving the fence gap open until the \
+                     next full publication",
+                    unexpected.len(),
+                    unexpected.iter().take(3).collect::<Vec<_>>()
+                );
+            }
+
+            // The delete-aware snapshot: its vectors are the set the
+            // successor must carry forward.
+            let snapshot = bridge
+                .read_iceberg_snapshot_with_deletes(&metadata_prefix, parent)
+                .await
+                .map_err(|e| anyhow!("live delete: snapshot read: {e}"))?;
+            let files: Vec<object_store::path::Path> = snapshot.data_files.clone();
+            if files.is_empty() {
+                return Ok(());
+            }
+            let oid_strs: Vec<&str> = deleted_oids.iter().map(String::as_str).collect();
+            let mapping = bridge
+                .published_positions_of(&files, &oid_strs)
+                .await
+                .map_err(|e| anyhow!("live delete: position mapping: {e}"))?;
+            if mapping.per_file.is_empty() {
+                return Ok(()); // never-published oids only: WAL-only rows
+            }
+
+            // Per-file DV UNION (guarantee 1): the parent's vectors plus
+            // this delete's positions, and the parent's vectors re-carried
+            // untouched — a writer publishing only its own positions
+            // resurrects every previously deleted row.
+            let mut all_entries: Vec<(object_store::path::Path, PositionDeletes)> = Vec::new();
+            for file_positions in &mapping.per_file {
+                let mut positions = PositionDeletes::new();
+                for p in &file_positions.positions {
+                    positions.insert(*p as u64);
+                }
+                for parent_dv in &snapshot.deletion_vectors {
+                    if parent_dv.data_file == file_positions.file {
+                        let decoded = bridge
+                            .read_deletion_vector(parent_dv)
+                            .await
+                            .map_err(|e| anyhow!("live delete: decoding a parent vector: {e}"))?;
+                        for p in decoded.positions() {
+                            positions.insert(p);
+                        }
+                    }
+                }
+                all_entries.push((file_positions.file.clone(), positions));
+            }
+            let touched: std::collections::HashSet<_> =
+                mapping.per_file.iter().map(|m| m.file.clone()).collect();
+            for parent_dv in &snapshot.deletion_vectors {
+                if !touched.contains(&parent_dv.data_file) {
+                    let decoded = bridge
+                        .read_deletion_vector(parent_dv)
+                        .await
+                        .map_err(|e| anyhow!("live delete: decoding a parent vector: {e}"))?;
+                    all_entries.push((parent_dv.data_file.clone(), decoded));
+                }
+            }
+            let borrowed: Vec<(object_store::path::Path, &PositionDeletes)> =
+                all_entries.iter().map(|(f, d)| (f.clone(), d)).collect();
+            // The snapshot id shares MATERIALIZE's millisecond scale — the
+            // engine requires a successor id to EXCEED its parent's, and a
+            // nanosecond-scale id would starve every later MATERIALIZE of a
+            // valid id — bumped past the parent snapshot when the clock does
+            // not move, so two publications in one millisecond stay
+            // monotone. The Puffin key keeps nanoseconds: object keys carry
+            // no ordering constraint, only uniqueness, and ns keeps
+            // same-millisecond deletes from silently sharing a file.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or_default();
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or_default();
+            let parent_snap_id = parent_meta
+                .get("current-snapshot-id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let snapshot_id = now_ms.max(parent_snap_id.saturating_add(1));
+            let puffin_key =
+                object_store::path::Path::from(format!("data/dv-live-{now_ns}.puffin"));
+            let metas = bridge
+                .write_deletion_vectors(&puffin_key, &borrowed)
+                .await
+                .map_err(|e| anyhow!("live delete: writing the vectors: {e}"))?;
+
+            let view_fields =
+                proximadb_storage_common::object_store_bridge::iceberg_snapshot_fields(
+                    &table.to_arrow_schema(),
+                );
+            // Review round 3 (finding 3): the successor carries the PARENT's
+            // files but derives its schema from the CURRENT catalog schema —
+            // field ids are positional, so a post-publication ALTER
+            // (DROP/ADD COLUMN) renumbers every following id and external
+            // readers would resolve the carried files' columns to the wrong
+            // ids. Refuse when the derived names no longer match the parent's
+            // recorded schema (a re-MATERIALIZE republishes first); a parent
+            // metadata with no parsable schema also refuses — fail-closed.
+            let parent_field_names: Option<Vec<String>> = parent_meta
+                .get("schemas")
+                .and_then(|schemas| schemas.as_array())
+                .and_then(|schemas| {
+                    let id = parent_meta
+                        .get("current-schema-id")
+                        .and_then(|v| v.as_i64())?;
+                    schemas
+                        .iter()
+                        .find(|sc| sc.get("schema-id").and_then(|v| v.as_i64()) == Some(id))
+                        .and_then(|sc| sc.get("fields").and_then(|f| f.as_array()))
+                        .map(|fields| {
+                            fields
+                                .iter()
+                                .filter_map(|f| f.get("name").and_then(|n| n.as_str()))
+                                .map(String::from)
+                                .collect()
+                        })
+                });
+            let derived_names: Vec<String> = view_fields.iter().map(|f| f.name.clone()).collect();
+            let schema_matches_parent = parent_field_names
+                .clone()
+                .is_some_and(|names| names == derived_names);
+            if !schema_matches_parent {
+                anyhow::bail!(
+                    "live delete: the catalog schema drifted from the parent \
+                     publication (or the parent schema is unparsable): derived \
+                     fields {derived_names:?} vs the parent's {parent_field_names:?}; \
+                     re-MATERIALIZE to republish the new schema first"
+                );
+            }
+            let (engine_fields, _) =
+                proximadb_iceberg_engine::iceberg_fields_of(&view_fields, false);
+            match bridge
+                .publish_iceberg_files_with_deletes(
+                    &files,
+                    &metas,
+                    Some(parent),
+                    &metadata_prefix,
+                    &parent_uuid,
+                    &parent_location,
+                    &engine_fields,
+                    snapshot_id,
+                    now_ms,
+                )
+                .await
+            {
+                Ok(version) => {
+                    // The contract's recorded snapshot_lsn (load-bearing): a
+                    // value at or above every published tombstone, flipped
+                    // into the layout forward-only like MATERIALIZE's. The
+                    // catalog is re-read here on purpose: the layout map is
+                    // read-modify-write, so the flip must start from the
+                    // freshest state, not the pre-lock snapshot above.
+                    let mut layouts = catalog
+                        .get_table(&table_id)
+                        .await
+                        .map_err(|e| anyhow!("live delete: layout re-read: {e}"))?
+                        .storage_layouts;
+                    match layouts.iter_mut().find(|l| l.name == "parquet-snapshot") {
+                        Some(l) => {
+                            // Forward-only (review finding 7): an external
+                            // flip could have recorded a NEWER version between
+                            // our commit and this re-read — never move the
+                            // layout (and its snapshot_lsn) back.
+                            let recorded_version = l
+                                .properties
+                                .get(materialize_stream::METADATA_VERSION_PROPERTY)
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .unwrap_or(0);
+                            if version < recorded_version {
+                                warn!(
+                                    table = %table_name,
+                                    version,
+                                    recorded_version,
+                                    "live delete: a newer publication already flipped the \
+                                     catalog; keeping it (the publication stands, the fence \
+                                     gap stays open until it is recorded)"
+                                );
+                            } else {
+                                l.properties.insert(
+                                    materialize_stream::METADATA_VERSION_PROPERTY.to_string(),
+                                    version.to_string(),
+                                );
+                                l.properties
+                                    .insert("snapshot_lsn".to_string(), fence_lsn.to_string());
+                                catalog
+                                    .set_storage_layouts(&table_id, layouts)
+                                    .await
+                                    .map_err(|e| anyhow!("live delete: the layout flip: {e}"))?;
+                                info!(
+                                    table = %table_name,
+                                    version,
+                                    files = files.len(),
+                                    vectors = metas.len(),
+                                    "live delete crossed the visibility fence"
+                                );
+                            }
+                        }
+                        None => {
+                            // The layout vanished between the publication and
+                            // the flip (review finding 7): never claim the
+                            // fence closed. The publication stands; the gap
+                            // stays open until the next publication records a
+                            // layout (fail-closed, like the crash gap).
+                            warn!(
+                                table = %table_name,
+                                version,
+                                "live delete: the parquet-snapshot layout vanished before \
+                                 the flip; the publication stands, the fence gap stays open"
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if msg.contains("moved past") || msg.contains("AlreadyExists") {
+                        warn!(
+                            table = %table_name,
+                            "live delete lost the successor race; retrying from the new parent: {e}"
+                        );
+                        continue; // the bounded retry re-maps from the new parent
+                    }
+                    return Err(anyhow!("live delete: the successor commit: {e}"));
+                }
+            }
+        }
+        Err(anyhow!(
+            "live delete: lost the successor race twice; the fence gap stays open until \
+             the next publication"
+        ))
+    }
+
     async fn execute_delete(
         &self,
         table_name: &str,
@@ -5288,6 +5857,19 @@ impl DmlService {
                     .unwrap_or_else(|| "unknown error".to_string())
             ));
         }
+
+        // TD-USUB-10 3c, the visibility fence contract's phase 3: publish the
+        // deletion-vector successor (best-effort; the WAL write above is the
+        // authority and already stands). Default OFF.
+        let deleted_oids: Vec<String> = ids_to_delete.to_vec();
+        let max_tombstone_lsn = batch_result.max_lsn.unwrap_or(0);
+        self.publish_live_deletes(
+            table_name,
+            &deleted_oids,
+            tenant_context.map(|t| t.tenant_id.as_str()),
+            max_tombstone_lsn,
+        )
+        .await;
 
         // F5 (ADR-072): keep the fenced ConditionalKeyStore consistent with the
         // delete — tombstone each removed row's PK Identity so FK existence

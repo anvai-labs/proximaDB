@@ -949,15 +949,15 @@ impl TableWriteExecutor for DataFusionTableWriteExecutor {
             let table_uuid = deterministic_table_uuid(&table_root);
             let fields = iceberg_snapshot_fields(&request.target_schema.to_arrow_schema());
 
-            // Snapshot ids must advance past the parent (the engine rejects
-            // non-advancing ids), so derive them from the same nanosecond clock
-            // the part names use — two statements in one millisecond cannot
-            // collide — plus the attempt for rebased retries.
-            let now_ns = SystemTime::now()
+            // Part names keep the nanosecond clock (uniqueness is all they
+            // need). Snapshot ids join the MILLISECOND scale — the engine
+            // requires a successor id to exceed its parent's, MATERIALIZE
+            // mints millisecond ids, and a nanosecond id here would starve
+            // every later MATERIALIZE of a valid id (review finding 4).
+            let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos() as i64)
+                .map(|d| d.as_millis() as i64)
                 .unwrap_or_default();
-            let now_ms = now_ns / 1_000_000;
 
             // Optimistic-concurrency commit: rebase onto the latest metadata
             // version and retry on conflict, bounded so a persistent conflict
@@ -978,6 +978,22 @@ impl TableWriteExecutor for DataFusionTableWriteExecutor {
                             request.target_schema.name
                         )
                     })?;
+                // Bumped past the parent's current snapshot id when the clock
+                // does not move (two publications in one millisecond stay
+                // monotone; the attempt adds margin for rebased retries). An
+                // unparseable parent reads as 0 and the engine's own
+                // advancement check remains the backstop.
+                let parent_snap_id = match parent {
+                    Some(version) => bridge
+                        .read_table_metadata(&metadata_prefix, version)
+                        .await
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        .and_then(|meta| meta.get("current-snapshot-id").and_then(|v| v.as_i64()))
+                        .unwrap_or(0),
+                    None => 0,
+                };
+                let snapshot_id = now_ms.max(parent_snap_id.saturating_add(1)) + attempt as i64;
                 // The carried set: the latest engine snapshot's files (and its
                 // deletion vectors — P2.4 slice 3b: a successor that names the
                 // carried files without their vectors resurrects every deleted
@@ -1036,7 +1052,7 @@ impl TableWriteExecutor for DataFusionTableWriteExecutor {
                         &table_uuid,
                         &table_root,
                         &fields,
-                        now_ns + attempt as i64,
+                        snapshot_id,
                         now_ms,
                         v3,
                     )
@@ -1049,7 +1065,7 @@ impl TableWriteExecutor for DataFusionTableWriteExecutor {
                         &table_uuid,
                         &table_root,
                         &fields,
-                        now_ns + attempt as i64,
+                        snapshot_id,
                         now_ms,
                     )
                 };
@@ -1173,6 +1189,30 @@ mod tests {
         writes: Mutex<Vec<TableRecordMutation>>,
     }
 
+    /// Test-only `TableRecordWriteResult` constructors (the four mocks below
+    /// shared one literal until `max_lsn` grew the clone pairs past the
+    /// duplication ratchet).
+    fn mock_write_result(record_ids: Vec<String>) -> TableRecordWriteResult {
+        TableRecordWriteResult {
+            max_lsn: None,
+            success: true,
+            record_ids,
+            metrics: OperationMetrics::default(),
+            errors: Vec::new(),
+            error_code: None,
+        }
+    }
+
+    fn mock_write_failure() -> TableRecordWriteResult {
+        TableRecordWriteResult {
+            max_lsn: None,
+            success: false,
+            record_ids: Vec::new(),
+            metrics: OperationMetrics::default(),
+            errors: vec!["simulated write failure".to_string()],
+            error_code: None,
+        }
+    }
     #[async_trait]
     impl TableRecordStore for CapturingRecordStore {
         async fn write_mutations(
@@ -1186,13 +1226,7 @@ mod tests {
                 .map(|mutation| mutation.record.oid.clone())
                 .collect::<Vec<_>>();
             self.writes.lock().unwrap().extend(mutations);
-            Ok(TableRecordWriteResult {
-                success: true,
-                record_ids: ids,
-                metrics: OperationMetrics::default(),
-                errors: Vec::new(),
-                error_code: None,
-            })
+            Ok(mock_write_result(ids))
         }
 
         async fn get_by_key(
@@ -1463,13 +1497,7 @@ mod tests {
             _mutations: Vec<TableRecordMutation>,
             _tenant_context: Option<&TenantContext>,
         ) -> Result<TableRecordWriteResult> {
-            Ok(TableRecordWriteResult {
-                success: true,
-                record_ids: Vec::new(),
-                metrics: OperationMetrics::default(),
-                errors: Vec::new(),
-                error_code: None,
-            })
+            Ok(mock_write_result(Vec::new()))
         }
 
         async fn get_by_key(
@@ -1720,13 +1748,7 @@ mod tests {
                 .map(|mutation| mutation.record.oid.clone())
                 .collect::<Vec<_>>();
             self.writes.lock().unwrap().extend(mutations);
-            Ok(TableRecordWriteResult {
-                success: true,
-                record_ids: ids,
-                metrics: OperationMetrics::default(),
-                errors: Vec::new(),
-                error_code: None,
-            })
+            Ok(mock_write_result(ids))
         }
 
         async fn get_by_key(
@@ -2059,13 +2081,7 @@ mod tests {
             _mutations: Vec<TableRecordMutation>,
             _tenant_context: Option<&TenantContext>,
         ) -> Result<TableRecordWriteResult> {
-            Ok(TableRecordWriteResult {
-                success: false,
-                record_ids: Vec::new(),
-                metrics: OperationMetrics::default(),
-                errors: vec!["simulated write failure".to_string()],
-                error_code: None,
-            })
+            Ok(mock_write_failure())
         }
 
         async fn get_by_key(

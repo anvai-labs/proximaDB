@@ -36,6 +36,50 @@ fn walk(dir: &FsPath, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Every file name under the server's published warehouse — the
+/// artifact-assertion view shared by the live-delete gates.
+fn warehouse_file_names(server: &TestPgServer) -> Vec<String> {
+    let warehouse = server.data_dir().join("warehouse");
+    let mut files = Vec::new();
+    walk(&warehouse, &mut files);
+    files
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
+        .collect()
+}
+
+/// The table's (k, v) rows over pgwire, sorted — the WAL-view assertion
+/// shared by the live-delete gates.
+async fn sorted_kv_rows(client: &tokio_postgres::Client, table: &str) -> Vec<(i32, String)> {
+    let rows = pg_rows(client, table, &["k", "v"]).await;
+    let mut out: Vec<(i32, String)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].as_deref()
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .unwrap_or(0),
+                r[1].clone().unwrap_or_default(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The live-delete publication artifact exists (round-1 lesson: assert the
+/// fence FIRED, not just the outcome — a silent no-op passes outcome-only
+/// gates).
+fn assert_live_delete_artifact(server: &TestPgServer) {
+    let names = warehouse_file_names(server);
+    assert!(
+        names
+            .iter()
+            .any(|n| n.starts_with("dv-live-") && n.ends_with(".puffin")),
+        "the live delete published a deletion-vector Puffin: {names:?}"
+    );
+}
+
 async fn connect_pg(server: &TestPgServer) -> tokio_postgres::Client {
     let (client, connection) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
         .await
@@ -977,4 +1021,230 @@ async fn check_v3_default_publication() {
         return;
     }
     eprintln!("✓ v3-default first publication: v3 + row lineage + external read-back");
+}
+
+/// TD-USUB-10 3c writer, gate 1 of the visibility fence contract
+/// (docs/12-design/PUBLICATION_WAL_VISIBILITY_FENCE_2026_10_27.adoc): a live
+/// DELETE over pgwire crosses the fence — the row is hidden from pgwire (the
+/// phase-2 leg: the WAL hides it regardless) AND from an external reader (the
+/// fence-specific leg: the DV-carrying successor snapshot served bare). The
+/// publisher is default-OFF; this test arms it in an isolated child.
+#[test]
+fn live_delete_publishes_and_both_views_hide_the_row() {
+    if std::env::var_os("PROXIMADB_LIVE_DEL_CHILD").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "live_delete_publishes_and_both_views_hide_the_row",
+                "--nocapture",
+            ])
+            .env("PROXIMADB_LIVE_DEL_CHILD", "1")
+            .env("PROXIMADB_LIVE_DELETE_PUBLISHER", "1")
+            .status()
+            .expect("launch isolated live-delete child");
+        assert!(status.success(), "live-delete child failed: {status}");
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(check_live_delete_gate1());
+}
+
+async fn check_live_delete_gate1() {
+    let server = TestPgServer::start().await.expect("server start");
+    let client = connect_pg(&server).await;
+
+    let table = "live_del";
+    client
+        .simple_query(&format!(
+            "CREATE TABLE {table} (k INT PRIMARY KEY, v VARCHAR)"
+        ))
+        .await
+        .expect("create");
+    client
+        .simple_query(&format!(
+            "INSERT INTO {table} (k, v) VALUES (1, 'keep'), (2, 'kill-me'), (3, 'also-keep')"
+        ))
+        .await
+        .expect("insert");
+    client
+        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
+        .await
+        .expect("materialize");
+    sleep(Duration::from_millis(300)).await;
+
+    // The fence: the live delete (publisher armed) publishes a DV successor.
+    client
+        .simple_query(&format!("DELETE FROM {table} WHERE v = 'kill-me'"))
+        .await
+        .expect("delete");
+    sleep(Duration::from_millis(300)).await;
+
+    // Phase-2 leg: pgwire hides the row (WAL-authoritative regardless).
+    let k1 = sorted_kv_rows(&client, &table).await;
+    assert_eq!(
+        k1,
+        vec![(1, "keep".to_string()), (3, "also-keep".to_string())],
+        "pgwire (WAL view) hides the deleted row"
+    );
+
+    // Round-1 review (blocker 1): assert the PUBLICATION ARTIFACTS locally —
+    // the fence actually fired, not a silent no-op: a new metadata version and
+    // the live-delete Puffin exist under the table's metadata/data dirs.
+    assert_live_delete_artifact(&server);
+    let names = warehouse_file_names(&server);
+    assert!(
+        names
+            .iter()
+            .filter(|n| n.ends_with(".metadata.json"))
+            .count()
+            >= 2,
+        "the live delete published a successor metadata version: {names:?}"
+    );
+
+    // Fence-specific leg: the external reader serves the DV-carrying successor
+    // bare — the deleted row is gone from the PUBLISHED view too.
+    let load = rest_metadata_location(server.rest_port, &table).await;
+    let location = load["metadata-location"]
+        .as_str()
+        .expect("metadata-location")
+        .to_string();
+    let scratch = FsPath::new(env!("CARGO_MANIFEST_DIR")).join("target/iceberg-live-del");
+    std::fs::create_dir_all(&scratch).expect("scratch dir");
+    let expected: Vec<Vec<Option<String>>> = vec![
+        vec![Some("1".into()), Some("keep".into())],
+        vec![Some("3".into()), Some("also-keep".into())],
+    ];
+    if !external_readback(
+        server.rest_port,
+        &table,
+        &location,
+        &["k", "v"],
+        &expected,
+        &scratch,
+    ) {
+        eprintln!("SKIP external leg (no reader installed locally); CI requires it");
+        return;
+    }
+    eprintln!("✓ live delete crossed the fence: both views hide the row");
+}
+
+/// TD-USUB-10 3c writer, gate 2 of the fence contract: the fence HOLDS across
+/// a successor — after the live delete publishes the DV snapshot, a subsequent
+/// append + re-publication carries the vectors forward; the deleted row stays
+/// hidden in the newest snapshot (guarantee 1: no resurrection).
+#[test]
+fn live_delete_survives_a_successor_publication() {
+    if std::env::var_os("PROXIMADB_LIVE_DEL2_CHILD").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "live_delete_survives_a_successor_publication",
+                "--nocapture",
+            ])
+            .env("PROXIMADB_LIVE_DEL2_CHILD", "1")
+            .env("PROXIMADB_LIVE_DELETE_PUBLISHER", "1")
+            .status()
+            .expect("launch isolated live-delete-2 child");
+        assert!(status.success(), "live-delete-2 child failed: {status}");
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(check_live_delete_gate2());
+}
+
+async fn check_live_delete_gate2() {
+    let server = TestPgServer::start().await.expect("server start");
+    let client = connect_pg(&server).await;
+
+    let table = "live_del2";
+    client
+        .simple_query(&format!(
+            "CREATE TABLE {table} (k INT PRIMARY KEY, v VARCHAR)"
+        ))
+        .await
+        .expect("create");
+    client
+        .simple_query(&format!(
+            "INSERT INTO {table} (k, v) VALUES (1, 'keep'), (2, 'kill-me')"
+        ))
+        .await
+        .expect("insert");
+    client
+        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
+        .await
+        .expect("materialize");
+    sleep(Duration::from_millis(300)).await;
+
+    client
+        .simple_query(&format!("DELETE FROM {table} WHERE v = 'kill-me'"))
+        .await
+        .expect("delete");
+    sleep(Duration::from_millis(300)).await;
+
+    // The successor publication: an insert + re-MATERIALIZE. Review round 3
+    // (finding 5): plan_append refuses a DV-carrying parent, so this
+    // re-MATERIALIZE takes the REWRITE path — the relaxed guard admits it
+    // (its capture LSN is at or above the recorded fence LSN, so the
+    // tombstone is visible to the dead-filtered native scan) and the row
+    // stays dead by native filtering, not by DV carry-through. The
+    // no-resurrection OUTCOME across a successor is what this gate pins;
+    // the append-carry branch itself is exercised by the bulk-lane suite.
+    client
+        .simple_query(&format!("INSERT INTO {table} (k, v) VALUES (3, 'later')"))
+        .await
+        .expect("insert 2");
+    client
+        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
+        .await
+        .expect("materialize 2");
+    sleep(Duration::from_millis(300)).await;
+
+    // Round-1 review (minor 1): prove THIS test's live publication fired
+    // (the dv-live Puffin exists) so the carry assertion below is
+    // non-vacuous — without it, gate 2 passes WAL-only even if the
+    // publisher never publishes.
+    assert_live_delete_artifact(&server);
+
+    let got = sorted_kv_rows(&client, &table).await;
+    assert_eq!(
+        got,
+        vec![(1, "keep".to_string()), (3, "later".to_string())],
+        "the deleted row stays dead across the successor publication"
+    );
+
+    // Round-4 review (minor 2): the gate's property is about the PUBLISHED
+    // view — the WAL view hides the row regardless of any resurrection, so
+    // the leg above alone cannot fail on the defect this gate exists to
+    // pin. Read the successor snapshot back through the external reader.
+    let load = rest_metadata_location(server.rest_port, &table).await;
+    let location = load["metadata-location"]
+        .as_str()
+        .expect("metadata-location")
+        .to_string();
+    let scratch = FsPath::new(env!("CARGO_MANIFEST_DIR")).join("target/iceberg-live-del2");
+    std::fs::create_dir_all(&scratch).expect("scratch dir");
+    let expected: Vec<Vec<Option<String>>> = vec![
+        vec![Some("1".into()), Some("keep".into())],
+        vec![Some("3".into()), Some("later".into())],
+    ];
+    if !external_readback(
+        server.rest_port,
+        &table,
+        &location,
+        &["k", "v"],
+        &expected,
+        &scratch,
+    ) {
+        eprintln!("SKIP external leg (no reader installed locally); CI requires it");
+        return;
+    }
+    eprintln!("✓ gate 2: the successor's published view keeps the row dead");
 }

@@ -1336,6 +1336,10 @@ pub async fn explain_table_write_route(
     let routed = DmlWritePlanner::default()
         .plan(DmlWritePlanRequest {
             target_schema: &target_schema,
+            // The explain path does not resolve the fence eligibility (the
+            // executed route is authoritative); the explained lane may show
+            // bulk where execution would demote to WAL above a DV parent.
+            published_parent_has_deletes: false,
             target_stats: Some(&target_stats),
             source_schema: source_schema.as_ref(),
             source_stats: source_stats.as_ref(),

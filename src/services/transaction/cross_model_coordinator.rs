@@ -557,6 +557,7 @@ mod tests {
             _tenant_context: Option<&TenantContext>,
         ) -> Result<TableRecordWriteResult> {
             Ok(TableRecordWriteResult {
+                max_lsn: None,
                 success: true,
                 record_ids: Vec::new(),
                 metrics: Default::default(),
