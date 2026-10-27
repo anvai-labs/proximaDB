@@ -45,6 +45,43 @@ async fn part(b: &IcebergObjectStoreBridge, key: &str, ages: &[i64]) -> Path {
     path
 }
 
+/// A published file the way MATERIALIZE writes it: the hidden `__proxima_oid`
+/// column rides every row (P2.4 slice 2a). The engine's plain
+/// `write_records_to_parquet` does NOT append it — the system-column
+/// conversion does.
+async fn part_with_oid(b: &IcebergObjectStoreBridge, key: &str, ages: &[i64]) -> Path {
+    let records: Vec<ProximaRecord> = ages
+        .iter()
+        .map(|a| {
+            let mut r = ProximaRecord {
+                oid: format!("r{a}"),
+                ..Default::default()
+            };
+            r.props.insert(
+                "age".into(),
+                ProximaTreeNode::Value(ProximaValue::Int64(*a)),
+            );
+            r
+        })
+        .collect();
+    let schema = proximadb_storage_common::proxima_arrow::infer_proxima_schema_strict(&records)
+        .expect("infer schema");
+    let batch = proximadb_storage_common::proxima_arrow::proxima_records_to_record_batch_with_system_columns(&records, &schema)
+        .expect("batch with oid column");
+    let bytes = proximadb_storage_common::proxima_parquet::record_batches_to_parquet_bytes(
+        std::slice::from_ref(&batch),
+        batch.schema(),
+        None,
+    )
+    .expect("parquet bytes");
+    let path = Path::from(key);
+    b.store
+        .put_if_absent(&path, bytes::Bytes::from(bytes))
+        .await
+        .expect("put part");
+    path
+}
+
 fn deletes(positions: &[u64]) -> PositionDeletes {
     let mut d = PositionDeletes::new();
     for p in positions {
@@ -513,5 +550,138 @@ async fn a_v2_parent_upgrades_to_v3_atomically_when_it_carries_deletes() {
         read.positions(),
         &[2],
         "position 2 is hidden on the v3 child"
+    );
+}
+
+/// TD-USUB-10 3c (live writer, foundation): map deleted OIDs to their
+/// per-file row positions in a PUBLISHED snapshot. The hidden `__proxima_oid`
+/// column is written with every published file (P2.4 slice 2a); the delete
+/// writer keys on oids and the Puffin DV keys on positions — this is the
+/// bridge. Reuses the immutable `OidPositionResolver` primitive.
+#[tokio::test]
+async fn deleted_oids_map_to_published_positions() {
+    let b = bridge();
+    // Two files with distinct oids; positions are per-file write order.
+    let a = part_with_oid(&b, "t/data/map-a.parquet", &[10, 11, 12]).await;
+    let c = part_with_oid(&b, "t/data/map-c.parquet", &[20, 21]).await;
+    let _version = b
+        .publish_iceberg_files(
+            &[a.clone(), c.clone()],
+            None,
+            META,
+            "uuid-map",
+            "memory:///t",
+            &fields(),
+            42,
+            42,
+            iceberg::FormatVersion::V3,
+        )
+        .await
+        .expect("publish");
+
+    // part() writes oid = r{age}; the mapping is per file, position = write
+    // order within that file.
+    let mapping = b
+        .published_positions_of(&[a.clone(), c.clone()], &["r11", "r20", "r99"])
+        .await
+        .expect("map oids to positions");
+    assert_eq!(
+        mapping.per_file.len(),
+        2,
+        "one entry per file that holds a deleted oid"
+    );
+    assert_eq!(
+        mapping.oids_missing,
+        vec!["r99".to_string()],
+        "a never-published oid is surfaced top-level, never silently skipped"
+    );
+    let by_file: std::collections::HashMap<_, _> = mapping
+        .per_file
+        .into_iter()
+        .map(|m| (m.file.clone(), m))
+        .collect();
+    let in_a = by_file.get(&a).expect("r11 lives in map-a");
+    assert_eq!(in_a.positions, &[1], "r11 is the second row of map-a");
+    assert_eq!(in_a.oids_found, vec!["r11".to_string()]);
+    let in_c = by_file.get(&c).expect("r20 lives in map-c");
+    assert_eq!(in_c.positions, &[0], "r20 is the first row of map-c");
+}
+
+/// Round-1 review: a file written WITHOUT the hidden oid column (a pre-2a
+/// part carried forward by an append) must be an ERROR naming the file, not a
+/// panic on a 0-column batch.
+#[tokio::test]
+async fn a_file_without_the_oid_column_is_an_error_not_a_panic() {
+    let b = bridge();
+    let legacy = part(&b, "t/data/legacy.parquet", &[1, 2]).await; // no oid column
+    let err = b
+        .published_positions_of(std::slice::from_ref(&legacy), &["r1"])
+        .await
+        .expect_err("pre-oid-column files must fail closed");
+    assert!(
+        err.to_string().contains("__proxima_oid"),
+        "the error names the missing column: {err}"
+    );
+    assert!(
+        err.to_string().contains("legacy"),
+        "the error names the file: {err}"
+    );
+}
+
+/// Round-1 review: positions must hold across ROW GROUPS — production
+/// MATERIALIZE files are multi-row-group, and a basis bug would bite exactly
+/// there. Write a two-row-group file and map an oid in the second group.
+#[tokio::test]
+async fn positions_span_row_groups() {
+    use arrow_array::RecordBatch;
+    use arrow_array::{ArrayRef, Int64Array, StringArray};
+    use std::sync::Arc;
+
+    let b = bridge();
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("__proxima_oid", arrow_schema::DataType::Utf8, false),
+        arrow_schema::Field::new("age", arrow_schema::DataType::Int64, false),
+    ]));
+    let b1 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["r1", "r2"])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+        ],
+    )
+    .expect("batch 1");
+    let b2 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["r3", "r4"])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![3, 4])) as ArrayRef,
+        ],
+    )
+    .expect("batch 2");
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_max_row_group_row_count(Some(2))
+        .build();
+    let bytes = proximadb_storage_common::proxima_parquet::record_batches_to_parquet_bytes(
+        &[b1, b2],
+        schema,
+        Some(props),
+    )
+    .expect("two-row-group parquet");
+    let path = Path::from("t/data/multi-rg.parquet");
+    b.store
+        .put_if_absent(&path, bytes::Bytes::from(bytes))
+        .await
+        .expect("put");
+
+    let mapping = b
+        .published_positions_of(std::slice::from_ref(&path), &["r3"])
+        .await
+        .expect("map across row groups");
+    assert_eq!(mapping.oids_missing, Vec::<String>::new());
+    assert_eq!(mapping.per_file.len(), 1);
+    assert_eq!(
+        mapping.per_file[0].positions,
+        &[2],
+        "r3 is the first row of the SECOND row group — file position 2"
     );
 }

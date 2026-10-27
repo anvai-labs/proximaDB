@@ -224,6 +224,135 @@ impl IcebergObjectStoreBridge {
     }
 }
 
+/// TD-USUB-10 3c (live writer, foundation): where each deleted OID sits in a
+/// published data file. The delete path keys on the canonical OID while a
+/// Puffin deletion vector keys on the row's position within its file; the
+/// hidden `__proxima_oid` column (written with every published file, P2.4
+/// slice 2a) is the bridge. Positions are the file's write order — exactly
+/// what `write_deletion_vectors` then encodes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PublishedOidPositions {
+    /// One entry per file that holds at least one asked oid.
+    pub per_file: Vec<PublishedPositions>,
+    /// The asked oids found in NO file — top-level, never silently skipped:
+    /// a delete keyed on a never-published oid may still be live in the WAL.
+    pub oids_missing: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedPositions {
+    /// The data file the positions belong to (bridge-relative key).
+    pub file: Path,
+    /// Row positions of the found oids, ascending (the DV is a set).
+    pub positions: Vec<u32>,
+    /// The oids found in this file, sorted (NOT index-aligned with
+    /// `positions` — the pairing is not recoverable from this shape).
+    pub oids_found: Vec<String>,
+}
+
+impl IcebergObjectStoreBridge {
+    /// Map `oids` to their per-file row positions across `files`. The union of
+    /// every file's `oids_missing` (deduplicated) rides the LAST entry so the
+    /// caller sees never-published oids once.
+    pub async fn published_positions_of(
+        &self,
+        files: &[Path],
+        oids: &[&str],
+    ) -> Result<PublishedOidPositions, StorageError> {
+        // COST (co-design mandate, stated honestly): this reads the ENTIRE
+        // `__proxima_oid` column of EVERY file — O(published oid bytes) of
+        // network I/O per call, plus every oid materialized as a String
+        // in memory. No row-group pruning, no cache. A footer/sidecar index
+        // (TD-FPRUNE-1 pattern; the OidPositionResolver persistence slices)
+        // is the known follow-up. Reachability note: this is an INHERENT
+        // method; the DML delete path holds `&dyn ObjectStoreBridge` and
+        // reaches the concrete type the way the DataFusion reader does
+        // (`IcebergObjectStoreBridge::from_url`) or via a later trait method.
+        use arrow_array::Array;
+        use proximadb_storage_common::object_store_bridge::ObjectStoreBridge as _;
+        use proximadb_storage_common::proxima_arrow::SYS_COL_OID;
+
+        let asked: std::collections::HashSet<&str> = oids.iter().copied().collect();
+        let mut found_all: std::collections::HashSet<&str> = Default::default();
+        let mut per_file = Vec::new();
+        for file in files {
+            // Project just the oid column; only that column is decoded.
+            let oid_field =
+                arrow_schema::Field::new(SYS_COL_OID, arrow_schema::DataType::Utf8, false);
+            let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![oid_field]));
+            let mut stream = self
+                .read_parquet_batches(file, schema, 8192, None)
+                .await
+                .map_err(|e| invalid(format!("opening {file:?} oid column: {e}")))?;
+            use futures::TryStreamExt;
+            let mut rows: Vec<String> = Vec::new();
+            while let Some(batch) = stream
+                .try_next()
+                .await
+                .map_err(|e| invalid(format!("reading {file:?} oid column: {e}")))?
+            {
+                // Round-1 review: a file written before the hidden oid column
+                // (pre-P2.4-2a parts carried forward by appends) yields an
+                // EMPTY projection — 0-column batches with row counts — and
+                // a column access would PANIC. Fail closed with the file
+                // named instead.
+                if batch.num_columns() == 0 {
+                    return Err(invalid(format!(
+                        "{file:?}: no {SYS_COL_OID} column (written before the hidden \
+                         oid column existed); the delete writer cannot map positions \
+                         in this file"
+                    )));
+                }
+                let column = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .ok_or_else(|| {
+                        invalid(format!("{file:?}: the {SYS_COL_OID} column is not utf8"))
+                    })?;
+                for i in 0..column.len() {
+                    // A null oid cell (a foreign writer's shape; ours are
+                    // non-null) can never match an asked oid — skip it.
+                    if !column.is_null(i) {
+                        rows.push(column.value(i).to_string());
+                    }
+                }
+            }
+            let resolver =
+                proximadb_storage_common::oid_position_resolver::OidPositionResolver::from_stream_order(rows);
+            let mut positions = Vec::new();
+            let mut oids_found = Vec::new();
+            for oid in &asked {
+                if let Some(position) = resolver.position_of(oid) {
+                    positions.push(position);
+                    oids_found.push((*oid).to_string());
+                    found_all.insert(oid);
+                }
+            }
+            if !oids_found.is_empty() {
+                positions.sort_unstable();
+                positions.dedup();
+                oids_found.sort();
+                per_file.push(PublishedPositions {
+                    file: file.clone(),
+                    positions,
+                    oids_found,
+                });
+            }
+        }
+        let mut oids_missing: Vec<String> = asked
+            .iter()
+            .filter(|o| !found_all.contains(*o))
+            .map(|o| o.to_string())
+            .collect();
+        oids_missing.sort();
+        Ok(PublishedOidPositions {
+            per_file,
+            oids_missing,
+        })
+    }
+}
+
 #[cfg(test)]
 #[path = "snapshot_deletes_tests.rs"]
 mod tests;
