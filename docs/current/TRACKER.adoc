@@ -45,10 +45,9 @@ GLM sessions own implementation/refinement. Codex owns review/merge coordination
 |===
 | Branch / observed head | State | Ownership / next action
 | fix/p24-delete-readers-complete / 9cd63699f | PR #2256; clean adversarial review, hosted integration/feature gates pending | Codex finishes merge coordination only. Local engine 116/116 and interop/mixed 4/4 pass. Live writer/v3 activation stay separate GLM pickups.
-| feat/p24-delete-readers / 51cefaaf2 | Preserved source, two dirty fixes captured in #2256 | Do not resume a duplicate reader implementation. Source commit bundle and exact dirty patch archived; retain until #2256 merges and ownership cleanup is safe.
-| feat/sc1-storage-policy / cfa69704a | Clean local commit; no PR at audit | GLM owns refinement: configured-target authorization, facade/SDK generation validation, restart/placement tests. Generated SDK diffs exist; config-only classes remain NOT_ACTIVE.
+| feat/p24-delete-readers / 2a01cac26 | PR #2258 superseded by #2256; pending merge/closure | Exact-head source/test comparison found no unique valid work to port. #2256 also fixes surviving-row-group DV statistics. Preserve the active GLM checkout until owner cleanup is safe; do not merge the duplicate.
+| feat/sc1-storage-policy / 671706827 | Clean local commit; no PR at audit | GLM owns refinement: configured-target authorization, facade/SDK generation validation, restart/placement tests. Generated SDK diffs exist; config-only classes remain NOT_ACTIVE.
 | bench/tier1-e1-fixed / f27a21548 | Open #2255; adversarial review blocked | GLM owns corrections below. Preserve raw runs and caches; request a fresh review on the corrected head before merge.
-| fix/gov-ledger-filings / 9351e25ec | #2253 merged as 17a6f1e28; retained checkout | Status-only follow-up is centralized here. No new implementation lane inferred; owner can retire this clean checkout after evidence/active-session check.
 | docs/release-notes-v040 / b448e4acc | Dormant/unresolved; 11 unique commits and generated site | Reconcile unique release changes before cleanup. Partial overlap with #1960 does not prove supersession.
 |===
 
@@ -81,7 +80,7 @@ that an arbitrary bucket/prefix is an operator-authorized target. Validate the f
 against configured location capabilities and canonical tenant/account identity; test paths with
 no tenant segment, alternate schemes/encodings and configured defaults. Keep NOT_ACTIVE for
 unimplemented economy/performance. The local TD still contains premature "landed" and generated
-client claims; SDK diffs now exist at cfa69704a. Validate them against the final API and reconcile the claims to actual tests.
+client claims; SDK diffs exist since cfa69704a; 671706827 fixes nested tenant parsing to use the outermost segment. Neither proves configured-target authorization. Validate generated clients against the final API and reconcile claims to actual tests.
 
 === Experiment pickup
 
