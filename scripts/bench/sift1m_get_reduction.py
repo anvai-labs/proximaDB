@@ -1571,7 +1571,13 @@ def _parse_proc_stat_cpu_ticks(text: str) -> int | None:
 class ServerProcSampler:
     """Samples a server process's RSS (peak) and CPU (ticks delta) while a
     query phase runs (TD-TIER-1 E1 telemetry; the #2249 pilot lacked both).
-    `read` is injectable for tests."""
+    `read` is injectable for tests.
+
+    Failure semantics (tracker correction): an UNREADABLE process counter is
+    reported as unavailable (`None` fields, `complete: false`), never as a
+    plausible zero/stale value. `stop()` takes one terminal sample before
+    computing the result. Callers must invoke `stop()` on every exit path —
+    wrap the measured section in try/finally."""
 
     def __init__(
         self,
@@ -1582,16 +1588,19 @@ class ServerProcSampler:
         self._pid = pid
         self._interval_s = interval_s
         self._read = read
-        self._peak_rss_bytes = 0
+        self._peak_rss_bytes: int | None = None
         self._cpu_ticks_start: int | None = None
         self._cpu_ticks_end: int | None = None
+        self._read_failures = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     def _sample_once(self) -> None:
         try:
             rss = _parse_proc_status_rss(self._read(f"/proc/{self._pid}/status"))
-            if rss is not None and rss > self._peak_rss_bytes:
+            if rss is not None and (
+                self._peak_rss_bytes is None or rss > self._peak_rss_bytes
+            ):
                 self._peak_rss_bytes = rss
             ticks = _parse_proc_stat_cpu_ticks(self._read(f"/proc/{self._pid}/stat"))
             if ticks is not None:
@@ -1599,7 +1608,9 @@ class ServerProcSampler:
                     self._cpu_ticks_start = ticks
                 self._cpu_ticks_end = ticks
         except OSError:
-            pass  # process may have exited between phases; keep last values
+            # The process may have exited; the result must say so instead of
+            # presenting stale or zero counters as measurements.
+            self._read_failures += 1
 
     def _run(self) -> None:
         while not self._stop.wait(self._interval_s):
@@ -1619,15 +1630,22 @@ class ServerProcSampler:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+        self._sample_once()  # terminal sample: the tail is measured too
         ticks_per_second = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100.0
-        cpu_seconds = 0.0
-        if self._cpu_ticks_start is not None and self._cpu_ticks_end is not None:
-            cpu_seconds = (
-                max(0, self._cpu_ticks_end - self._cpu_ticks_start) / ticks_per_second
+        have_cpu = self._cpu_ticks_start is not None and self._cpu_ticks_end is not None
+        cpu_seconds = None
+        if have_cpu:
+            cpu_seconds = round(
+                max(0, self._cpu_ticks_end - self._cpu_ticks_start) / ticks_per_second,
+                3,
             )
         return {
+            # None = never readable (unavailable), never a plausible zero.
             "peak_rss_bytes": self._peak_rss_bytes,
-            "cpu_seconds": round(cpu_seconds, 3),
+            "cpu_seconds": cpu_seconds,
+            "complete": self._read_failures == 0
+            and self._peak_rss_bytes is not None
+            and have_cpu,
         }
 
 
@@ -1753,49 +1771,58 @@ def run_query_sweep(
 
     wall_started = time.perf_counter()
     indexed_queries = list(enumerate(queries))
-    if concurrency == 1:
-        outcomes = [execute_query(item) for item in indexed_queries]
-    else:
-        with ThreadPoolExecutor(
-            max_workers=concurrency,
-            thread_name_prefix="pax-query",
-        ) as executor:
-            # Map returns in input order. Recall and result hashes therefore
-            # remain tied to query index, not nondeterministic completion order.
-            outcomes = list(executor.map(execute_query, indexed_queries))
-    wall_seconds = time.perf_counter() - wall_started
+    # try/finally (tracker correction): the sampler must stop with its
+    # terminal sample on read/HTTP/guard failures too, not only on success.
+    try:
+        if concurrency == 1:
+            outcomes = [execute_query(item) for item in indexed_queries]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=concurrency,
+                thread_name_prefix="pax-query",
+            ) as executor:
+                # Map returns in input order. Recall and result hashes
+                # therefore remain tied to query index, not nondeterministic
+                # completion order.
+                outcomes = list(executor.map(execute_query, indexed_queries))
+        wall_seconds = time.perf_counter() - wall_started
 
-    for expected_offset, (offset, latency_ms, response) in enumerate(outcomes):
-        if offset != expected_offset:
-            raise RuntimeError(f"{phase}: concurrent query order was not preserved")
-        latencies.append(latency_ms)
-        response_results = response.get("results")
-        if not isinstance(response_results, list):
-            raise RuntimeError(f"{phase}: query {offset} returned no result list")
-        returned_ids = []
-        for item in response_results:
-            oid = item.get("id") if isinstance(item, dict) else None
-            if not isinstance(oid, str):
+        for expected_offset, (offset, latency_ms, response) in enumerate(outcomes):
+            if offset != expected_offset:
                 raise RuntimeError(
-                    f"{phase}: query {offset} returned a result without a string id"
+                    f"{phase}: concurrent query order was not preserved"
                 )
-            returned_ids.append(oid)
-        identity = query_result_identity(returned_ids)
-        ordered_result_digests.append(identity["ordered_ids_sha256"])
-        set_result_digests.append(identity["set_ids_sha256"])
-        result_counts.append(identity["result_count"])
-        unique_result_counts.append(identity["unique_result_count"])
-        returned = set(returned_ids)
-        expected = {f"v{row}" for row in groundtruth[offset][:top_k]}
-        recall_hits = len(returned & expected)
-        recall_hits_by_query.append(recall_hits)
-        recalls.append(recall_hits / top_k)
-    if progress_guard is not None:
-        progress_guard()
-    after = scrape(server)
-    server_proc: dict = {}
-    if sampler is not None:
-        server_proc = sampler.stop()
+            latencies.append(latency_ms)
+            response_results = response.get("results")
+            if not isinstance(response_results, list):
+                raise RuntimeError(
+                    f"{phase}: query {offset} returned no result list"
+                )
+            returned_ids = []
+            for item in response_results:
+                oid = item.get("id") if isinstance(item, dict) else None
+                if not isinstance(oid, str):
+                    raise RuntimeError(
+                        f"{phase}: query {offset} returned a result without a string id"
+                    )
+                returned_ids.append(oid)
+            identity = query_result_identity(returned_ids)
+            ordered_result_digests.append(identity["ordered_ids_sha256"])
+            set_result_digests.append(identity["set_ids_sha256"])
+            result_counts.append(identity["result_count"])
+            unique_result_counts.append(identity["unique_result_count"])
+            returned = set(returned_ids)
+            expected = {f"v{row}" for row in groundtruth[offset][:top_k]}
+            recall_hits = len(returned & expected)
+            recall_hits_by_query.append(recall_hits)
+            recalls.append(recall_hits / top_k)
+        if progress_guard is not None:
+            progress_guard()
+        after = scrape(server)
+    finally:
+        server_proc: dict = {}
+        if sampler is not None:
+            server_proc = sampler.stop()
     quality_checkpoints = prefix_quality_checkpoints(recalls, latencies)
     latencies.sort()
     gets = metric_delta(before, after, "proximadb_object_store_gets_total")
@@ -3608,6 +3635,7 @@ def main() -> int:
                 log_path=root / log_name,
                 local_disk_path=disk,
                 ivf_k=args.ivf_k,
+                n_comp=args.n_comp,
                 nprobe=args.nprobe,
                 training_compaction_min_mb=args.training_compaction_min_mb,
                 azure_emulator=args.azurite,

@@ -1174,9 +1174,35 @@ def test_server_proc_sampler_parses_rss_and_cpu() -> None:
     files[f"/proc/99/stat"] = stat_end
     import time as _time
     _time.sleep(0.01)  # let the thread observe the end state
+    files[f"/proc/99/stat"] = stat_end  # terminal sample sees the same end
     out = sampler.stop()
     assert out["peak_rss_bytes"] == 1234 * 1024
     assert out["cpu_seconds"] == 1.9
+    assert out["complete"] is True
+
+
+def test_server_proc_sampler_reports_unavailable_not_zero() -> None:
+    # Tracker correction: an unreadable process counter must surface as
+    # unavailable (None / complete=false), never as a plausible zero.
+    def always_failing(path: str) -> str:
+        raise FileNotFoundError(path)  # an OSError subclass
+
+    sampler = HARNESS.ServerProcSampler(pid=404, interval_s=0.001, read=always_failing)
+    sampler.start()
+    out = sampler.stop()
+    assert out["peak_rss_bytes"] is None
+    assert out["cpu_seconds"] is None
+    assert out["complete"] is False
+
+
+def test_server_proc_sampler_stop_without_start_returns_unavailable() -> None:
+    # stop() on a never-started sampler must not crash (failure paths in
+    # run_query_sweep can reach it) and must not invent values.
+    sampler = HARNESS.ServerProcSampler(pid=1, interval_s=0.001, read=lambda p: "")
+    out = sampler.stop()
+    assert out["complete"] is False
+    assert out["peak_rss_bytes"] is None or out["peak_rss_bytes"] is None
+    assert "cpu_seconds" in out
 
 
 def test_skip_ingest_requires_collection_id() -> None:
