@@ -743,7 +743,47 @@ impl Lineage {
             .get("current-snapshot-id")
             .and_then(|x| x.as_i64())
             .filter(|id| *id >= 0);
-        let first_row_id = v.get("next-row-id").and_then(|x| x.as_i64()).unwrap_or(0);
+        // TD-USUB-10 3c rung 2 — row lineage is fail-closed on INCONSISTENT
+        // metadata, never defaulted: a v3 parent without a valid next-row-id
+        // would unwrap_or(0) and RE-ISSUE row ids the parent already handed
+        // out (silent corruption). NOTE: this is ENGINE policy, not the spec's
+        // (row lineage is opt-in per Iceberg v3); it holds because this
+        // engine's own v3 publications always carry lineage, and next-row-id on
+        // a v2 table IS spec-invalid (row lineage is v3-only). Revisit at any
+        // future foreign-parent adoption seam (see lineage_fail_closed_tests).
+        let first_row_id = match v.get("next-row-id") {
+            None | Some(serde_json::Value::Null) => {
+                if parent_format_version == Some(3) {
+                    return Err(ser_err(
+                        "parent metadata row lineage",
+                        "a format-version 3 table must carry next-row-id",
+                    ));
+                }
+                0
+            }
+            Some(value) => {
+                let id = value.as_i64().ok_or_else(|| {
+                    ser_err(
+                        "parent metadata row lineage",
+                        "next-row-id is not an integer",
+                    )
+                })?;
+                if id < 0 {
+                    return Err(ser_err(
+                        "parent metadata row lineage",
+                        "next-row-id must be non-negative",
+                    ));
+                }
+                if parent_format_version != Some(3) {
+                    return Err(ser_err(
+                        "parent metadata row lineage",
+                        "next-row-id requires a format-version 3 parent (the parent's \
+                         format-version is missing or not 3)",
+                    ));
+                }
+                id
+            }
+        };
         let mut metadata_log = v
             .get("metadata-log")
             .and_then(|x| x.as_array())
@@ -1220,5 +1260,99 @@ mod tests {
                 content: ManifestContent::Data,
             }]
         );
+    }
+}
+
+#[cfg(test)]
+mod lineage_fail_closed_tests {
+    use super::*;
+
+    /// TD-USUB-10 3c rung 2 — fail closed on inconsistent lineage metadata.
+    /// A v3 parent whose `next-row-id` is missing (or junk) would default to 0
+    /// and RE-ISSUE row ids the parent already handed out: silent corruption,
+    /// not an error. (Engine policy — our v3 publications always carry lineage;
+    /// the Iceberg spec makes lineage opt-in, so revisit if foreign v3 parents
+    /// are ever adopted.)
+    #[test]
+    fn a_v3_parent_without_next_row_id_is_an_error() {
+        let parent = serde_json::json!({
+            "format-version": 3,
+            "last-sequence-number": 4,
+            "current-snapshot-id": 77,
+        });
+        let err = Lineage::from_parent(Some(parent.to_string().as_str()), None)
+            .expect_err("a v3 table missing next-row-id must fail closed");
+        assert!(
+            err.to_string().contains("next-row-id"),
+            "the error names the field: {err}"
+        );
+    }
+
+    #[test]
+    fn a_v3_parent_with_a_non_integer_next_row_id_is_an_error() {
+        let parent = serde_json::json!({
+            "format-version": 3,
+            "last-sequence-number": 1,
+            "current-snapshot-id": 2,
+            "next-row-id": "many",
+        });
+        assert!(
+            Lineage::from_parent(Some(parent.to_string().as_str()), None).is_err(),
+            "junk next-row-id must fail closed, not unwrap_or(0)"
+        );
+    }
+
+    #[test]
+    fn a_v3_parent_with_a_negative_next_row_id_is_an_error() {
+        let parent = serde_json::json!({
+            "format-version": 3,
+            "last-sequence-number": 1,
+            "current-snapshot-id": 2,
+            "next-row-id": -5,
+        });
+        assert!(Lineage::from_parent(Some(parent.to_string().as_str()), None).is_err());
+    }
+
+    /// v2 tables carry no row lineage (the engine's own v2 writer omits it);
+    /// a v2 parent without `next-row-id` stays valid, and a foreign writer
+    /// grafting `next-row-id` onto v2 is unsupported metadata — refused too.
+    #[test]
+    fn v2_parents_keep_todays_semantics_and_reject_grafted_lineage() {
+        let v2_ok = serde_json::json!({
+            "format-version": 2,
+            "last-sequence-number": 9,
+            "current-snapshot-id": 12,
+        });
+        let lineage = Lineage::from_parent(Some(v2_ok.to_string().as_str()), None)
+            .expect("a v2 parent without next-row-id is valid");
+        assert_eq!(lineage.first_row_id, 0);
+
+        let v2_grafted = serde_json::json!({
+            "format-version": 2,
+            "last-sequence-number": 9,
+            "current-snapshot-id": 12,
+            "next-row-id": 50,
+        });
+        assert!(
+            Lineage::from_parent(Some(v2_grafted.to_string().as_str()), None).is_err(),
+            "next-row-id on a v2 table is unsupported metadata (the spec puts row lineage in v3 only)"
+        );
+    }
+
+    /// A well-formed v3 parent still reads exactly as before.
+    #[test]
+    fn a_v3_parent_with_next_row_id_reads_as_before() {
+        let parent = serde_json::json!({
+            "format-version": 3,
+            "last-sequence-number": 3,
+            "current-snapshot-id": 40,
+            "next-row-id": 150,
+        });
+        let lineage =
+            Lineage::from_parent(Some(parent.to_string().as_str()), None).expect("valid v3 parent");
+        assert_eq!(lineage.first_row_id, 150);
+        assert_eq!(lineage.sequence_number, 4);
+        assert_eq!(lineage.parent_snapshot_id, Some(40));
+        assert_eq!(lineage.parent_format_version, Some(3));
     }
 }

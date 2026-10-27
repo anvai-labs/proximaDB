@@ -773,3 +773,208 @@ async fn materialized_table_reads_back_in_external_iceberg_engines() {
     }
     eprintln!("✓ external Iceberg engines read back both snapshots value-for-value");
 }
+
+/// TD-USUB-10 3c rung 2 — a **plain v3 table through the rung-1 knob**: the
+/// first publication commits format-version 3 with row lineage, no deletes, no
+/// `_ns` columns — and pinned external readers (pyiceberg static+REST; DuckDB
+/// when installed) read the values back. The knob runs in a child process
+/// (the same isolation pattern as the DV test) so no process-global env leaks.
+#[test]
+fn v3_default_first_publication_reads_back_externally() {
+    if std::env::var_os("PROXIMADB_V3_CHILD").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "v3_default_first_publication_reads_back_externally",
+                "--nocapture",
+            ])
+            .env("PROXIMADB_V3_CHILD", "1")
+            .env("PROXIMADB_ICEBERG_V3_DEFAULT", "1")
+            .status()
+            .expect("launch isolated v3-default child");
+        assert!(status.success(), "v3-default child failed: {status}");
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(check_v3_default_publication());
+}
+
+async fn check_v3_default_publication() {
+    let server = TestPgServer::start().await.expect("server start");
+    let client = connect_pg(&server).await;
+
+    let table = "v3_plain";
+    client
+        .simple_query(&format!(
+            "CREATE TABLE {table} (k INT PRIMARY KEY, v VARCHAR)"
+        ))
+        .await
+        .expect("create");
+    client
+        .simple_query(&format!(
+            "INSERT INTO {table} (k, v) VALUES (1, 'one'), (2, 'two'), (3, 'three')"
+        ))
+        .await
+        .expect("insert");
+    client
+        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
+        .await
+        .expect("materialize");
+    sleep(Duration::from_millis(300)).await;
+
+    // 1. The published metadata is v3 with row lineage allocated.
+    let warehouse = server.data_dir().join("warehouse");
+    let mut files = Vec::new();
+    walk(&warehouse, &mut files);
+    let metadata_json: Vec<&PathBuf> = files
+        .iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".metadata.json"))
+        })
+        .filter(|p| {
+            // this test's table only (the server owns a fresh tempdir, but the
+            // filter keeps the walk honest if a fixture ever shares it)
+            std::fs::read_to_string(p)
+                .unwrap_or_default()
+                .contains("v3_plain")
+        })
+        .collect();
+    assert!(
+        !metadata_json.is_empty(),
+        "the v3_plain table published metadata.json; files walked={:?}",
+        files.len()
+    );
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(metadata_json[0]).expect("read metadata.json"))
+            .expect("parse metadata.json");
+    assert_eq!(
+        meta["format-version"], 3,
+        "the knob made the FIRST publication v3"
+    );
+    assert!(
+        meta["next-row-id"].as_i64().is_some_and(|v| v > 0),
+        "row lineage allocated: next-row-id={} (was allocated, not defaulted)",
+        meta["next-row-id"]
+    );
+
+    // 2. A second publication (append) chains onto the parent and stays v3.
+    client
+        .simple_query(&format!("INSERT INTO {table} (k, v) VALUES (4, 'four')"))
+        .await
+        .expect("insert 2");
+    client
+        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
+        .await
+        .expect("materialize 2");
+    sleep(Duration::from_millis(300)).await;
+
+    // 3. The SECOND metadata document chains correctly (the ladder's
+    // sequence/parent-chain proof): parent-snapshot-id is the first
+    // publication's snapshot, the sequence advanced, and row lineage grew.
+    let mut files2 = Vec::new();
+    walk(&warehouse, &mut files2);
+    let mut v3_docs: Vec<serde_json::Value> = files2
+        .iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".metadata.json"))
+        })
+        .filter_map(|p| -> Option<serde_json::Value> {
+            let bytes = std::fs::read(p).ok()?;
+            serde_json::from_slice(&bytes).ok()
+        })
+        .filter(|m: &serde_json::Value| m.to_string().contains("v3_plain"))
+        .collect();
+    assert_eq!(
+        v3_docs.len(),
+        2,
+        "two metadata versions after two publications"
+    );
+    v3_docs.sort_by_key(|m| m["last-updated-ms"].as_i64().unwrap_or(0));
+    let (first_doc, second_doc) = (&v3_docs[0], &v3_docs[1]);
+    let parent_snapshot = first_doc["current-snapshot-id"].clone();
+    let second_snapshot = second_doc["snapshots"]
+        .as_array()
+        .and_then(|snaps| snaps.last())
+        .cloned()
+        .expect("the second snapshot is listed");
+    assert_eq!(
+        second_snapshot["parent-snapshot-id"], parent_snapshot,
+        "the second snapshot chains onto the first"
+    );
+    assert!(
+        second_doc["last-sequence-number"].as_i64().unwrap_or(0)
+            > first_doc["last-sequence-number"].as_i64().unwrap_or(0),
+        "the sequence number advanced"
+    );
+    assert!(
+        second_doc["next-row-id"].as_i64().unwrap_or(0)
+            > first_doc["next-row-id"].as_i64().unwrap_or(0),
+        "row lineage grew with the appended rows"
+    );
+    assert_eq!(second_doc["format-version"], 3, "the successor stays v3");
+
+    // 4. pgwire sees every value after two publications.
+    let rows = pg_rows(&client, &table, &["k", "v"]).await;
+    let mut got: Vec<(i32, String)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].as_deref()
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .unwrap_or(0),
+                r[1].clone().unwrap_or_default(),
+            )
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            (1, "one".to_string()),
+            (2, "two".to_string()),
+            (3, "three".to_string()),
+            (4, "four".to_string()),
+        ],
+        "pgwire sees all four rows after two publications"
+    );
+
+    // 4. A pinned external reader reads the knob-published v3 table back.
+    let load = rest_metadata_location(server.rest_port, &table).await;
+    let location = load["metadata-location"]
+        .as_str()
+        .expect("metadata-location")
+        .to_string();
+    let scratch = FsPath::new(env!("CARGO_MANIFEST_DIR")).join("target/iceberg-v3-plain");
+    std::fs::create_dir_all(&scratch).expect("scratch dir");
+    let rows_out: Vec<Vec<Option<String>>> = vec![
+        vec![Some("1".into()), Some("one".into())],
+        vec![Some("2".into()), Some("two".into())],
+        vec![Some("3".into()), Some("three".into())],
+        vec![Some("4".into()), Some("four".into())],
+    ];
+    // The reader gate is skipped (returns false) when no reader is installed
+    // locally and none is REQUIRED — CI sets the REQUIRE env so the gate is
+    // binding there, matching the sibling tests' pattern.
+    if !external_readback(
+        server.rest_port,
+        &table,
+        &location,
+        &["k", "v"],
+        &rows_out,
+        &scratch,
+    ) {
+        eprintln!(
+            "SKIP external read-back (no reader installed): v3 metadata + lineage assertions still ran"
+        );
+        return;
+    }
+    eprintln!("✓ v3-default first publication: v3 + row lineage + external read-back");
+}
