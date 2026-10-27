@@ -1,9 +1,9 @@
 = Central execution tracker
-// status-as-of: 2026-10-26
+// status-as-of: 2026-10-27
 :toc:
 :toclevels: 2
 
-Evidence baseline: fetched origin/develop `e45cc3943` (#2250/#2252/#2254/#2253/#2256 merged), 2026-10-26.
+Evidence baseline: fetched origin/develop `b3bf8a28b` (#2260/#2261/#2262 P2 delete rungs 1–3; #2259 SC1+SC2 merged; #2264 visibility-fence contract docs), 2026-10-27.
 Planning source: https://github.com/anvai-labs/proximaDB/pull/2250[#2250]. Local WIP and
 owner-reported tests/pauses are explicitly separate from merged delivery.
 Refresh branch heads/checks at pickup; this is a dated observation, not a live GitHub mirror.
@@ -19,7 +19,7 @@ merged-slice evidence is there. v3-first is the accepted direction, not yet a co
 |===
 | Track / IDs | State / owner | Next work and closure gate
 | P1 / TD-SEAM-1 | In progress; pickup unassigned | Resolve tenant-scoped REST metadata key, wire the production bulk route (currently PlannedOnlyTableWriteExecutor), preserve nested/list schema; external value read-back through real facade after two snapshots. Writer-unit proof alone is insufficient.
-| P2 delete / TD-SEAM-4, TD-USUB-10 | Rungs 1–2 landed: #2260 (`iceberg_publishes_v3` new-table policy, default-OFF `PROXIMADB_ICEBERG_V3_DEFAULT`, registered; atomic v2→v3 delete-carry pinned) and rung 2 (p24/v3-lineage-proof: knob-published v3 read back by pinned external readers incl. sequence/parent-chain + lineage-growth assertions; `Lineage::from_parent` fails closed on inconsistent lineage — v3 parent without a valid next-row-id, or next-row-id on v2; NOTE: engine policy, not spec — revisit at any foreign-parent seam; historical v3-without-lineage tables from the Jun–Oct window now fail closed on re-MATERIALIZE, pre-GA no-back-compat). Remaining: live incremental delete writer, shared publication/WAL visibility fence. Reader evidence is in history; preserve its cache/refusal guards. No new v2 delete writer. |
+| P2 delete / TD-SEAM-4, TD-USUB-10 | Rungs 1–3 landed: rung 1 #2260 (`iceberg_publishes_v3` new-table policy, default-OFF `PROXIMADB_ICEBERG_V3_DEFAULT`, registered; atomic v2→v3 delete-carry pinned); rung 2 #2261 (knob-published v3 read back by pinned external readers incl. sequence/parent-chain + lineage-growth assertions; `Lineage::from_parent` fails closed on inconsistent lineage — v3 parent without a valid next-row-id, or next-row-id on v2; NOTE: engine policy, not spec — revisit at any foreign-parent seam; historical v3-without-lineage tables from the Jun–Oct window now fail closed on re-MATERIALIZE, pre-GA no-back-compat); rung 3 #2262 (`IcebergObjectStoreBridge::published_positions_of` oid↔row-position bridge, fail-closed on pre-2a parts carried forward, top-level missing-oid set, position basis pinned against row-group-sum application). Reader evidence is in history; preserve its cache/refusal guards. No new v2 delete writer. The earlier parallel 4a worktree (`feat/p24-v3-format-policy`, a property-surface approach) closed as superseded by the landed env-gate approach — no unique valid work to port. Remaining: live incremental delete writer (DV write + fenced successor publish), shared publication/WAL visibility fence. |
 | Recovery / TD-SEAM-12/14 | Open residual; unassigned | All consumer floors and branch-merge residuals; object-store owner/reattach boundary before placement becomes default. Refusal is safer than silent history loss.
 | P3 provider / TD-SEAM-5, USUB-2/3 | In progress; unassigned | Default-on soak, stats and EXPLAIN parity, ABAC and bounded delta memory. Admit PAX only after visibility/WAL/ABAC proof; ungoverned UDTF routing is not governed parity.
 | Native differentiation / S6/S8, TD-SEAM-6, TD-OLAP-10/11/12 | Design/source review merged (#2252/#2254); implementation unassigned | NE-0..7 and per-engine strength/crossover tests are specified in the lakehouse plan; benchmarks remain PLANNED. First audit actual routes and build exact eligible-set oracle; prototype one fused native region only after defining semantics. No new generic engine rewrite or performance claims from desk research.
@@ -27,8 +27,8 @@ merged-slice evidence is there. v3-first is the accepted direction, not yet a co
 | P4 M1 / TD-SEAM-7/15 | Planned; after P3 contracts | Observability WAL→time partition→publish→ObsTimeTable; shared read token and record/subject identity. TE-1 join remains correct during publication/compaction; TE-3 50k rows/s, <=2s freshness.
 | P4 modalities / TD-SEAM-8/9, DOC-RETIRE-1 | Planned; after M1 contracts | Graph canonical writes/CSR recovery, document residual/ranged reads; subject delete across modalities with separate visibility/history/expiry/erasure gates.
 | P5 / TD-SEAM-10/11/13, PAXDIR-2 | In progress; unassigned | Coherent warm segment discovery; broad 10M/filter/fragmentation/768d/ingest gates; configured L2 default residual; HNSW persisted projection after TD-PAXPREC-1. D4 physical co-location remains deferred until measured need.
-| SC0 E1 / TD-TIER-1 | PR #2255; GLM owner, three review rounds + scale-arm review applied | Evidence commit `f56b6ff8e` carries all five round-3 corrections (claim/determinism/CPU-attribution, n_comp forwarding, sampler semantics, ETag/bounded-evidence disclosure, history move) plus the SIFT3M/SIFT10M fixed-object scale arms (n=1/cap, learn-split corpus; ledger `tier1_e1_scale_cap_sweep`): cap effect strengthens single-segment (3M 4->16 MiB -34.97%, wave 5->4), saturates under 3-segment fan-out (10M tiered -5.54%); 1-segment 10M fixture not producible (compaction floor, verbatim error recorded); geometric nprobe under-covers at scale (0.98 gate fails, disclosed; nprobe calibration is the product-gate follow-up). Run serialization verified; binary sha256-anchored (built at f5aef1b0b, see artifact provenance). Next gate: green CI on the corrected head, then merge. No default or pricing promotion.
-| SC1 + partial SC2 / TD-TIER-1 | WIP: feat/sc1-storage-policy | Policy generation, facade parity and authorized resolved placement; config-only status stays NOT_ACTIVE. See branch nudges below.
+| SC0 E1 / TD-TIER-1 | PR #2255; GLM owner, review blocked | Preserve measured request reduction; correct optimum/determinism/CPU-attribution claims, CLI forwarding and sampler failure behavior before re-review. Detailed blockers below. No default or pricing promotion.
+| SC1 + partial SC2 / TD-TIER-1 | **Landed (#2259, merge `b3bf8a28b`)** | Config-only SC1+SC2: two GLM review rounds + one adversarial round (APPROVE, zero blockers); facade parity (REST v2 request+response, gRPC v1/v2, OpenAPI, SDKs); NOT_ACTIVE status truthful; class immutable after create (policy generation 0/1 only). Two doc-only review residuals (defensive-coercion comment, update-preservation comment) recorded on the TD-TIER-1 SC1 row for SC3 pickup. SC3 gates now unblocked.
 | SC3–6 / TD-TIER-1 | Planned; after SC1/2 gates | Atomic reservations + idle usage, resident coverage prototype, optional future-PUT access tiers, integrated correctness/cost proof before rollout.
 | P6 | Open, continuous | Value-compared SF1/SF10 query gates and multimodal benchmark; retain existing ratchets. Load/publication memory is not query coverage.
 | Dependency/security residuals | Planned; dependency lane | Track #2225–#2228/#2242; retire zstd advisory exceptions only with the documented dependency upgrades/exposure checks. #2251 is an accepted exception disposition, not a patched dependency. Workspace panic-site reduction/per-crate compiler lints remain separate from the completed coverage guard.
@@ -45,8 +45,8 @@ GLM sessions own implementation/refinement. Codex owns review/merge coordination
 |===
 | Branch / observed head | State | Ownership / next action
 | feat/p24-delete-readers / 2a01cac26 | #2258 closed as superseded by merged #2256; retained for owner cleanup | No unique valid source/test work to port at reviewed head. Preserve the active GLM checkout until owner cleanup is safe; start the writer residual from current develop.
-| feat/sc1-storage-policy / 671706827 | Clean local commit; no PR at audit | GLM owns refinement: configured-target authorization, facade/SDK generation validation, restart/placement tests. Generated SDK diffs exist; config-only classes remain NOT_ACTIVE.
-| bench/tier1-e1-fixed / PR #2255 (scale evidence `f56b6ff8e`) | Open #2255; corrections applied, scale arms reviewed | Three harness review rounds applied; the scale-arm docs addition passed a fresh adversarial review whose two provenance MAJORs (undisclosed rebase; binary build-revision misstated as run-time HEAD) are fixed and disclosed in the artifact's provenance. Branch rebased onto develop 9c2a91460 2026-10-27 (patch-identical chain; force-push - pre-rebase hashes are worktree provenance, anchor to binary sha256 11b6a8a1...). Preserve raw runs (seven 1M roots: e1-build + six arms; nine scale roots) and caches.
+| feat/sc1-storage-policy / 6e8bbc991 | **Merged (#2259, `b3bf8a28b`)**; branch/worktree eligible for cleanup | SC1+SC2 landed after rebase onto `57a4db1d5` (only TD-TIER-1 adoc conflicted) and a clean adversarial round. Residuals (configured-target authorization, mutable policy surface, two doc comments) are on the TD-TIER-1 rows for SC3 follow-up.
+| bench/tier1-e1-fixed / f27a21548 | Open #2255; adversarial review blocked | GLM owns corrections below. Preserve raw runs and caches; request a fresh review on the corrected head before merge.
 | docs/release-notes-v040 / b448e4acc | Dormant/unresolved; 11 unique commits and generated site | Reconcile unique release changes before cleanup. Partial overlap with #1960 does not prove supersession.
 |===
 
@@ -58,29 +58,34 @@ No live-session message delivery is claimed; these are durable pickup nudges.
 
 == Branch pickup nudges
 
-=== P2 writer pickup after completed readers
+=== P2 writer pickup after completed readers + rungs 1–3
 
 Reader implementation/review/validation is complete in #2256:
 link:../history/evidence/P24_DELETION_READER_REVIEW_2026_10_26.adoc[evidence].
-Start from current develop; do not replay #2258. Retain snapshot cache bypasses and explicit
-refusal of unordered native deltas/materialization until a shared visibility fence is proven.
-The never-downgrade floor does not switch default v2 callers to v3. Locate the current format
-helper in catalog-schema's object_store_bridge; gate v3 activation on lineage, reader
-compatibility and external update/delete values. P1 REST/facade blockers still apply.
+The v3 activation ladder's rungs 1–3 are merged (#2260 policy + atomic v2→v3 upgrade; #2261
+lineage proof + fail-closed lineage; #2262 oid↔position bridge for the writer). Retain snapshot
+cache bypasses and explicit refusal of unordered native deltas/materialization until a shared
+visibility fence is proven. The never-downgrade floor does not switch default v2 callers to v3;
+the env-gated `PROXIMADB_ICEBERG_V3_DEFAULT` (default OFF) arms v3 for new tables only.
+The landed `IcebergObjectStoreBridge::published_positions_of` is the additive primitive the
+writer builds on — every call reads the entire oid column of every file (known cost, stated).
+Start the writer residual from current develop; do not replay #2258 or the closed
+`feat/p24-v3-format-policy` property-surface approach (superseded by the env-gate design).
 
 === SC1 policy
 
-Latest WIP now passes the resolved base location into admission and rejects changing the
-class after create. The earlier request-only/generation criticism is partly addressed: generation
-0/1 is coherent only while policy is immutable, with omitted/same-value updates proven safe.
-Do not reimplement that fix; verify its facade/restart tests and keep mutable policy deferred.
+PR #2259 is open at `2cf2651fc`, CI green. Latest WIP passes the resolved base location into
+admission and rejects changing the class after create. The earlier request-only/generation
+criticism is partly addressed: generation 0/1 is coherent only while policy is immutable,
+with omitted/same-value updates proven safe. Do not reimplement that fix; verify its
+facade/restart tests and keep mutable policy deferred.
 
-Remaining authorization gap: rejecting an explicit `/tenants/{other}` segment does not prove
-that an arbitrary bucket/prefix is an operator-authorized target. Validate the final assignment
-against configured location capabilities and canonical tenant/account identity; test paths with
-no tenant segment, alternate schemes/encodings and configured defaults. Keep NOT_ACTIVE for
-unimplemented economy/performance. The local TD still contains premature "landed" and generated
-client claims; SDK diffs exist since cfa69704a; 671706827 fixes nested tenant parsing to use the outermost segment. Neither proves configured-target authorization. Validate generated clients against the final API and reconcile claims to actual tests.
+Remaining authorization gap (NOT in this PR — deferred to SC3): rejecting an explicit
+`/tenants/{other}` segment does not prove that an arbitrary bucket/prefix is an
+operator-authorized target. Validate the final assignment against configured location
+capabilities and canonical tenant/account identity; test paths with no tenant segment,
+alternate schemes/encodings and configured defaults. Keep NOT_ACTIVE for unimplemented
+economy/performance.
 
 === Experiment pickup
 
@@ -91,7 +96,7 @@ Warm coherent discovery is a separate lever; a TTL alone is not a multiwriter fr
 
 === E1 review corrections for the owning GLM session
 
-Review applied to #2255 heads `f27a21548` -> `248f214f2` (all five items addressed there). The scale-arm addition `f56b6ff8e` is docs-only; its fresh adversarial review found two provenance MAJORs (undisclosed rebase; binary build-revision misstated) - fixed and disclosed in the artifact's provenance. The branch was rebased onto develop 9c2a91460 on 2026-10-27 (patch-identical, force-push); pre-rebase hashes are worktree provenance - anchor to binary sha256 11b6a8a1.... Preserve the seven 1M roots (e1-build + six arms) and nine scale roots.
+Review applies to #2255 head `f27a21548`; recheck after owner changes. Preserve the six raw runs.
 
 * The observed 4-to-16 MiB request reduction is about 28.67%, while bytes increase 4.50%.
   The two repeats have overlapping latency/CPU results; 40 MiB has fewer requests. Report
