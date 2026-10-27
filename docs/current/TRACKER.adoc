@@ -3,7 +3,7 @@
 :toc:
 :toclevels: 2
 
-Evidence baseline: fetched origin/develop `17a6f1e28` (#2250/#2252/#2254/#2253 merged), 2026-10-26.
+Evidence baseline: fetched origin/develop `e45cc3943` (#2250/#2252/#2254/#2253/#2256 merged), 2026-10-26.
 Planning source: https://github.com/anvai-labs/proximaDB/pull/2250[#2250]. Local WIP and
 owner-reported tests/pauses are explicitly separate from merged delivery.
 Refresh branch heads/checks at pickup; this is a dated observation, not a live GitHub mirror.
@@ -19,7 +19,7 @@ merged-slice evidence is there. v3-first is the accepted direction, not yet a co
 |===
 | Track / IDs | State / owner | Next work and closure gate
 | P1 / TD-SEAM-1 | In progress; pickup unassigned | Resolve tenant-scoped REST metadata key, wire the production bulk route (currently PlannedOnlyTableWriteExecutor), preserve nested/list schema; external value read-back through real facade after two snapshots. Writer-unit proof alone is insufficient.
-| P2 delete / TD-SEAM-4, TD-USUB-10 | PR #2256; Codex merge coordination | Internal DV readers/carry-through and external deleted-value read-back; then v3-default/atomic-upgrade policy, lineage and live incremental delete writer. No new v2 delete writer.
+| P2 delete / TD-SEAM-4, TD-USUB-10 | Reader slice merged #2256; writer pickup unassigned (GLM) | Define v3-default/atomic-upgrade policy, lineage and live incremental delete writer with a shared publication/WAL visibility fence. Reader evidence is in history; preserve its cache/refusal guards. No new v2 delete writer.
 | Recovery / TD-SEAM-12/14 | Open residual; unassigned | All consumer floors and branch-merge residuals; object-store owner/reattach boundary before placement becomes default. Refusal is safer than silent history loss.
 | P3 provider / TD-SEAM-5, USUB-2/3 | In progress; unassigned | Default-on soak, stats and EXPLAIN parity, ABAC and bounded delta memory. Admit PAX only after visibility/WAL/ABAC proof; ungoverned UDTF routing is not governed parity.
 | Native differentiation / S6/S8, TD-SEAM-6, TD-OLAP-10/11/12 | Design/source review merged (#2252/#2254); implementation unassigned | NE-0..7 and per-engine strength/crossover tests are specified in the lakehouse plan; benchmarks remain PLANNED. First audit actual routes and build exact eligible-set oracle; prototype one fused native region only after defining semantics. No new generic engine rewrite or performance claims from desk research.
@@ -33,7 +33,7 @@ merged-slice evidence is there. v3-first is the accepted direction, not yet a co
 | P6 | Open, continuous | Value-compared SF1/SF10 query gates and multimodal benchmark; retain existing ratchets. Load/publication memory is not query coverage.
 | Dependency/security residuals | Planned; dependency lane | Track #2225–#2228/#2242; retire zstd advisory exceptions only with the documented dependency upgrades/exposure checks. #2251 is an accepted exception disposition, not a patched dependency. Workspace panic-site reduction/per-crate compiler lints remain separate from the completed coverage guard.
 | Platform release gates | Open/needs per-TD pickup | Published-image install/restart and driver proof, surface parity, workspace residuals and security/CI lanes: platform plan. No inference of completion from old plans.
-| Governance residuals | #2253 merged; status correction in this docs lane | TD-SC-1/2/4 have existing implementations; track their actual tenant/coherence/signup/write-guard residuals, not new implementations from zero. Per-TD acceptance still governs completion.
+| Governance residuals | Partial implementation; per-TD GLM pickup | TD-SC-1/2/4 have existing implementations; track their actual tenant/coherence/signup/write-guard residuals, not new implementations from zero. Per-TD acceptance still governs completion.
 |===
 
 == Active and retained branches
@@ -44,8 +44,7 @@ GLM sessions own implementation/refinement. Codex owns review/merge coordination
 [cols="2,2,3",options="header"]
 |===
 | Branch / observed head | State | Ownership / next action
-| fix/p24-delete-readers-complete / 9cd63699f | PR #2256; clean adversarial review, hosted integration/feature gates pending | Codex finishes merge coordination only. Local engine 116/116 and interop/mixed 4/4 pass. Live writer/v3 activation stay separate GLM pickups.
-| feat/p24-delete-readers / 2a01cac26 | PR #2258 superseded by #2256; pending merge/closure | Exact-head source/test comparison found no unique valid work to port. #2256 also fixes surviving-row-group DV statistics. Preserve the active GLM checkout until owner cleanup is safe; do not merge the duplicate.
+| feat/p24-delete-readers / 2a01cac26 | #2258 closed as superseded by merged #2256; retained for owner cleanup | No unique valid source/test work to port at reviewed head. Preserve the active GLM checkout until owner cleanup is safe; start the writer residual from current develop.
 | feat/sc1-storage-policy / 671706827 | Clean local commit; no PR at audit | GLM owns refinement: configured-target authorization, facade/SDK generation validation, restart/placement tests. Generated SDK diffs exist; config-only classes remain NOT_ACTIVE.
 | bench/tier1-e1-fixed / f27a21548 | Open #2255; adversarial review blocked | GLM owns corrections below. Preserve raw runs and caches; request a fresh review on the corrected head before merge.
 | docs/release-notes-v040 / b448e4acc | Dormant/unresolved; 11 unique commits and generated site | Reconcile unique release changes before cleanup. Partial overlap with #1960 does not prove supersession.
@@ -59,14 +58,15 @@ No live-session message delivery is claimed; these are durable pickup nudges.
 
 == Branch pickup nudges
 
-=== P2 readers
+=== P2 writer pickup after completed readers
 
-Apply file-position DVs before filter/limit, respecting row-group offsets and hidden columns.
-Verify count/statistics, cache invalidation, old snapshots, append races and inherited DVs;
-an append that loses the DV resurrects deleted rows. Test-side DV publication is not a live
-publisher. The never-downgrade floor does not switch default v2 callers to v3. Locate the
-current format helper in catalog-schema's object_store_bridge; gate v3 activation on lineage,
-reader compatibility and external update/delete values. P1 REST/facade blockers still apply.
+Reader implementation/review/validation is complete in #2256:
+link:../history/evidence/P24_DELETION_READER_REVIEW_2026_10_26.adoc[evidence].
+Start from current develop; do not replay #2258. Retain snapshot cache bypasses and explicit
+refusal of unordered native deltas/materialization until a shared visibility fence is proven.
+The never-downgrade floor does not switch default v2 callers to v3. Locate the current format
+helper in catalog-schema's object_store_bridge; gate v3 activation on lineage, reader
+compatibility and external update/delete values. P1 REST/facade blockers still apply.
 
 === SC1 policy
 

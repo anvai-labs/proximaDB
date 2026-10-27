@@ -88,9 +88,10 @@ not a reason to silently emit v2 from a new v3-first table.
 
 === V3 activation ladder (TD-USUB-10 slice 3)
 
-. Finish internal DV reads and append carry-through before activating the delete writer.
-  Apply file-position masks before filters/limits, accounting for row-group pruning; cover
-  aggregates/statistics, cache invalidation, inherited data files and append races.
+Internal published DV reads, append carry-through and external deleted-value read-back landed
+in #2256; link:../history/evidence/P24_DELETION_READER_REVIEW_2026_10_26.adoc[evidence and limits].
+Preserve its cache bypasses and explicit refusals until the writer proves shared publication/WAL
+visibility. Remaining activation work:
 . Define explicit new-table v3 policy and atomic legacy-v2 upgrade. Keep legacy reads;
   never downgrade, never silently fall back to a v2 writer. Preserve field IDs and history.
 . Prove required v3 metadata/row-lineage allocation, sequence/parent chains and DV encoding
@@ -448,7 +449,7 @@ Unsupported operators require a disclosed composition or UNSUPPORTED, never an i
   multiplicity and exactness semantics. Do not simultaneously build a new planner, shuffle
   service, storage format or generic function library.
 . *NE-2/3 admission:* prove payload/frontier crossovers and concurrent visibility. Production
-  routing waits for P2 deletion readers and S5 visibility/ABAC guarantees. Reject candidates
+  routing must preserve the landed P2 deletion guards and prove S5 visibility/ABAC guarantees. Reject candidates
   from incompatible projections rather than treating index freshness as optional.
 . *NE-4/6 resource/cost admission:* integrate bounded work with SC reservations and P5 I/O
   measurements. A low isolated latency does not establish tenant isolation or profitable p99.

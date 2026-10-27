@@ -93,3 +93,16 @@ source; its second commits the two previously archived dirty fixes. #2256 streng
 statistics subtract deletions within surviving row-group ranges, not a whole file's deletion
 cardinality whenever any one group survives. Duplicate closure waits for the replacement merge;
 the active GLM worktree is retained for its owner's cleanup.
+
+== Reader integration and duplicate disposition
+
+#2256 merged on 2026-10-27 at 00:12:06 UTC (2026-10-26 Chicago), as e45cc3943.
+Exact implementation head 9cd63699ff243e36f59f83d13a204483ebcf33e5 had clean independent
+adversarial review and all applicable CI green, including root unit tests, integration groups
+and enterprise-catalog runtime tests/Clippy. Local engine 116/116 and interop/mixed 4/4 validation
+is recorded in link:P24_DELETION_READER_REVIEW_2026_10_26.adoc[the reader evidence].
+The authorized adversarial-review proxy was used to merge; the live writer was not activated.
+
+#2258 was then closed as superseded at reviewed head 2a01cac26. Its branch/worktree remains
+with the GLM owner. No foreign active checkout or generated evidence was deleted. The completed
+reader lane leaves only the writer/visibility/v3-activation residual in current planning.

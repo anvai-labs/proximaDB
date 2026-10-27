@@ -1,7 +1,8 @@
 = P2.4 deletion readers: implementation and review evidence
 
 Date: 2026-10-26. Base: develop `2f5b1ee7d`.
-Status: local implementation/review evidence; merge status belongs to
+Status: merged in #2256 as e45cc3943 on 2026-10-27 UTC (October 26 Chicago), after green
+applicable CI and clean exact-head adversarial review at 9cd63699f. Remaining work belongs to
 link:../../current/TRACKER.adoc[the central tracker]. This does not activate the live delete writer.
 
 == Provenance and bounded scope
@@ -51,8 +52,9 @@ semantics. A common publication/WAL visibility fence remains required for the wr
   unsupported fallback, unordered delta merge, provider values and MATERIALIZE refusal.
 * Reader pins: pyiceberg[pyarrow] 0.12.0 and Python duckdb 1.5.6. The optional in-process DuckDB
   adapter is separately exercised; it is not the external iceberg_scan path.
-* Root library unit suite is reserved for CI due local memory limits. No TPC/SF1 performance
-  remeasurement is claimed by this reader-correctness slice.
+* Root library unit suite and applicable integration/feature suites passed in CI; the root
+  unit suite was not run locally due memory limits. No TPC/SF1 performance remeasurement
+  is claimed by this reader-correctness slice.
 
 Commands (run from the continuation worktree):
 
