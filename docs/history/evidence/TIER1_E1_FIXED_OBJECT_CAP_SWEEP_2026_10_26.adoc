@@ -1,0 +1,39 @@
+= TD-TIER-1 E1: fixed-object repeated range-cap sweep (4 / 16 / 40 MiB)
+
+**Date:** 2026-10-26 · **Branch:** `bench/tier1-e1-fixed` @ `eb1dd04e2` (binary built in-worktree at `f5aef1b0b`; the two later commits are harness/tests-only; evidence file since moved to history) · **TD:** link:../../10-quality/td/TD-TIER-1-collection-storage-policy-and-residency.adoc[TD-TIER-1] SC0/E1 · **A workload-specific tradeoff, not an optimum claim (n=2):** link:TIER1_SC0_RANGE_CAP_SWEEP_2026_10_26.adoc[the #2249 pilot] measured fresh beds per arm (21/25/26 cells) and overstated the cap effect; this run eliminates that confound.
+
+== Protocol (the E1 gate from STORAGE_PLAN §E1)
+
+One bed built **once** (`sift1m_get_reduction.py` full run: 1M×128 SIFT1M, settle flags, MinIO + Toxiproxy 5+5 ms ≈ 13 ms RTT); its prefix — one 1M-row PAX segment, **36 coarse cells**, and the centroid directory (the 4-object prefix: segment, 2 directory generations, warm-cache sidecar) — is the **fixture**, ETag-fingerprinted before and verified unchanged after all arms (only the `_cache/warm_cache.json` sidecar rewrote: cache state, not fixture data). This ETag check is operator-managed identity verification at run time — an ETag is an identity validator, not a content hash, and no automated immutable-fixture guarantee is claimed. Each arm runs `--skip-ingest` (the harness mode this slice adds): a fresh server registers the collection against the same prefix — **failing closed if its catalog assigns an id other than the fixture's** — and measures the identical 1,000 query IDs (object_cold phase, concurrency 1, `--read-ranges-inflight 16`, P5b defaults on, sweep gates armed). Two repeats per cap; the only variable is `--coalesce-range-mb`.
+
+== Result (`object_cold`, n=2 per cap)
+
+[cols="1,1,1,1,1,1,1,1",options="header"]
+|===
+| Arm | requests/q | waves p50 | recall@10 | p50 ms | p95 ms | p99 ms | CPU s / peak RSS
+| cap4-r1 | 18.462 | 3 | 0.9825 | 111 | 162 | 229 | 114.7 / 5.0 GB
+| cap4-r2 | 18.462 | 3 | 0.9822 | 108 | 145 | 168 | 107.8 / 5.1 GB
+| cap16-r1 | 13.169 | 3 | 0.9822 | 114 | 157 | 185 | 114.0 / 5.1 GB
+| cap16-r2 | 13.169 | 3 | 0.9824 | 109 | 145 | 170 | 109.1 / 5.2 GB
+| cap40-r1 | 12.880 | 3 | 0.9822 | 144 | 233 | 283 | 139.6 / 5.2 GB
+| cap40-r2 | 12.880 | 3 | 0.9824 | 112 | 153 | 173 | 112.2 / 5.2 GB
+|===
+
+All values [M] from the six arm result.json files (`e1-cap{4,16,40}-r{1,2}`); the build run's `e1-build/result.json` is provenance and fingerprint, not a comparison arm (seven 1M roots exist on disk). The reuse-mode `post_write`/`local_disk_warm` phases measure cache re-warming from a fixed prefix (there is no ingest to warm from) — informative, but **not** comparable to the build run's phases or the pilot's; only `object_cold` is compared here.
+
+== Findings
+
+. **Request counts are plan-deterministic; results are not fully deterministic:** every repeat reproduced its arm's request count exactly (18.462/18.462, 13.169/13.169, 12.880/12.880) across independent servers and cold caches — the fetch plan is a pure function of (cap, objects, queries). But 2–6 of 1,000 queries returned different result sets between repeats (set-digest comparison; recall 0.9822–0.9825 varies with them), so wall-clock is not the only observed variation and per-query determinism of returned IDs is NOT claimed. [M]
+. **4 → 16 MiB cuts requests 28.67%** (18.462 → 13.169): the honest magnitude; bytes rise 4.50% — the trade, stated as a trade. The pilot's fresh-bed design measured −50%; on identical objects the geometry confound accounted for the difference. Recall and waves (p50 3, p95 4) unchanged; bytes **+4.5%** (50,746,626 → 53,030,980 B/q, identical within arm — the coalescing overread, not noise). [M]
+. **16 → 40 MiB saves fewer requests and costs more wall time:** 0.289 requests saved (13.169 → 12.880) while observed p50/p99/CPU rise in the noisy r1 repeat (144/283/139.6) and overlap in r2 (112/173/112.2). With two repeats these distributions overlap; we report the direction, not a proven optimum. [M]
+. **Tail behavior:** cap4 and cap16 have near-identical p50s (109.3 vs 111.5 mean); p99 favors cap16 in r1 (185 vs 229) and is a wash in r2 (170 vs 168 — cap4 marginally better), and cap40-r1's 283 is the noisy outlier. With n=2, no p99 ordering is established; the request-count, CPU and byte findings are the load-bearing ones. [M]
+
+== What this run does NOT establish (per the design's stop rule)
+
+Fragmented segments, filtered queries, 10M rows and 768d remain unmeasured — no production default change and no pricing claim rides on this run (production S3 already targets 8 MiB ranges via `IopsBudget`; a default change needs the finalist arms). The warm phases under fixture reuse need re-definition before they can gate anything. Missing telemetry still: request-size distribution and useful/fetched/overread byte split (server-side instrumentation, separate slice); p99/RSS/CPU landed here.
+
+== Provenance
+
+* Result files (local, not checked in): `~/bench-beds/p5b-runs/e1/{e1-build,e1-cap{4,16,40}-r{1,2}}/result.json`, `fixture-objects.txt` (ETag fingerprint), chain logs `arms.log`, `fixed-chain.log`. Fixture: `s3://p5b-gate/e1-build` (collection 1).
+* The first launch of the reuse arms failed with a 404 (per-run catalog had no collection) — root-caused and fixed by create-and-assert in `eb1dd04e2`; the fixture was rebuilt once before the fixed protocol ran. No measurement from the failed launch is used.
+* Single-machine emulator evidence, not an SLA or a cloud-latency claim.

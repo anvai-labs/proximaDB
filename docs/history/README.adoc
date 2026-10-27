@@ -90,6 +90,8 @@ migration and superseded WAL-heap plans are reference history only.
 * link:evidence/P5B_D7_SIFT1M_GATE_RUN_2026_10_25.adoc[P5B_D7_SIFT1M_GATE_RUN_2026_10_25]
 * link:evidence/P5B_D8_DEFAULTS_CONFIRMATION_2026_10_25.adoc[P5B_D8_DEFAULTS_CONFIRMATION_2026_10_25]
 * link:evidence/TIER1_SC0_RANGE_CAP_SWEEP_2026_10_26.adoc[TIER1_SC0_RANGE_CAP_SWEEP_2026_10_26]
+* link:evidence/TIER1_E1_FIXED_OBJECT_CAP_SWEEP_2026_10_26.adoc[TIER1_E1_FIXED_OBJECT_CAP_SWEEP_2026_10_26]
+* link:evidence/TIER1_E1_SCALE_CAP_SWEEP_2026_10_27.adoc[TIER1_E1_SCALE_CAP_SWEEP_2026_10_27]
 * link:evidence/STORAGE_CLASS_MEDIA_EVIDENCE_2026_10_25.adoc[STORAGE_CLASS_MEDIA_EVIDENCE_2026_10_25]
 * link:evidence/storage_class_media_2026_10_25/d8_existing_result_extract.adoc[d8_existing_result_extract]
 * link:evidence/storage_class_media_2026_10_25/local_media_raw.adoc[local_media_raw]

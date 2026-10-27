@@ -1551,6 +1551,104 @@ def metric_delta(before: dict, after: dict, name: str) -> float:
     return delta
 
 
+def _parse_proc_status_rss(text: str) -> int | None:
+    for line in text.splitlines():
+        if line.startswith("VmRSS:"):
+            return int(line.split()[1]) * 1024  # kB -> bytes
+    return None
+
+
+def _parse_proc_stat_cpu_ticks(text: str) -> int | None:
+    # Fields after the paren-wrapped comm; utime is field 14, stime 15 (1-indexed
+    # over the whole line), i.e. items 11 and 12 after "(comm) rest".
+    try:
+        rest = text.rsplit(")", 1)[1].split()
+        return int(rest[11]) + int(rest[12])
+    except (IndexError, ValueError):
+        return None
+
+
+class ServerProcSampler:
+    """Samples a server process's RSS (peak) and CPU (ticks delta) while a
+    query phase runs (TD-TIER-1 E1 telemetry; the #2249 pilot lacked both).
+    `read` is injectable for tests.
+
+    Failure semantics (tracker correction): an UNREADABLE process counter is
+    reported as unavailable (`None` fields, `complete: false`), never as a
+    plausible zero/stale value. `stop()` takes one terminal sample before
+    computing the result. Callers must invoke `stop()` on every exit path —
+    wrap the measured section in try/finally."""
+
+    def __init__(
+        self,
+        pid: int,
+        interval_s: float = 0.25,
+        read=lambda path: open(path, encoding="utf-8").read(),
+    ):
+        self._pid = pid
+        self._interval_s = interval_s
+        self._read = read
+        self._peak_rss_bytes: int | None = None
+        self._cpu_ticks_start: int | None = None
+        self._cpu_ticks_end: int | None = None
+        self._read_failures = 0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _sample_once(self) -> None:
+        try:
+            rss = _parse_proc_status_rss(self._read(f"/proc/{self._pid}/status"))
+            if rss is not None and (
+                self._peak_rss_bytes is None or rss > self._peak_rss_bytes
+            ):
+                self._peak_rss_bytes = rss
+            ticks = _parse_proc_stat_cpu_ticks(self._read(f"/proc/{self._pid}/stat"))
+            if ticks is not None:
+                if self._cpu_ticks_start is None:
+                    self._cpu_ticks_start = ticks
+                self._cpu_ticks_end = ticks
+        except OSError:
+            # The process may have exited; the result must say so instead of
+            # presenting stale or zero counters as measurements.
+            self._read_failures += 1
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_s):
+            self._sample_once()
+
+    def start(self) -> None:
+        self._sample_once()
+        # Daemon per mandate #11 and the ProcessScratchSampler convention:
+        # a phase that raises must not leave a live non-daemon thread hanging
+        # the interpreter at exit.
+        self._thread = threading.Thread(
+            target=self._run, name="server-proc-sampler", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> dict:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        self._sample_once()  # terminal sample: the tail is measured too
+        ticks_per_second = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100.0
+        have_cpu = self._cpu_ticks_start is not None and self._cpu_ticks_end is not None
+        cpu_seconds = None
+        if have_cpu:
+            cpu_seconds = round(
+                max(0, self._cpu_ticks_end - self._cpu_ticks_start) / ticks_per_second,
+                3,
+            )
+        return {
+            # None = never readable (unavailable), never a plausible zero.
+            "peak_rss_bytes": self._peak_rss_bytes,
+            "cpu_seconds": cpu_seconds,
+            "complete": self._read_failures == 0
+            and self._peak_rss_bytes is not None
+            and have_cpu,
+        }
+
+
 def percentile(sorted_values: list[float], quantile: float) -> float:
     rank = max(0, math.ceil(quantile * len(sorted_values)) - 1)
     return sorted_values[rank]
@@ -1580,6 +1678,7 @@ def prefix_quality_checkpoints(
                 "latency_ms": {
                     "p50": percentile(prefix_latencies, 0.50),
                     "p95": percentile(prefix_latencies, 0.95),
+                    "p99": percentile(prefix_latencies, 0.99),
                     "mean": sum(prefix_latencies) / query_count,
                 },
             }
@@ -1623,14 +1722,13 @@ def run_query_sweep(
     groundtruth_format: str = "ivecs",
     progress_guard=None,
     concurrency: int = 1,
+    server_pid: int | None = None,
 ) -> dict:
     if concurrency <= 0:
         raise RuntimeError("query concurrency must be positive")
-    queries = read_vectors(query_path, query_format, query_start, query_count)
-    groundtruth = read_truth_ids(
-        groundtruth_path, groundtruth_format, query_start, query_count
-    )
-    before = scrape(server)
+    sampler = ServerProcSampler(server_pid) if server_pid is not None else None
+    if sampler is not None:
+        sampler.start()
     latencies = []
     recalls = []
     ordered_result_digests = []
@@ -1664,48 +1762,68 @@ def run_query_sweep(
             with in_flight_lock:
                 in_flight -= 1
 
-    wall_started = time.perf_counter()
-    indexed_queries = list(enumerate(queries))
-    if concurrency == 1:
-        outcomes = [execute_query(item) for item in indexed_queries]
-    else:
-        with ThreadPoolExecutor(
-            max_workers=concurrency,
-            thread_name_prefix="pax-query",
-        ) as executor:
-            # Map returns in input order. Recall and result hashes therefore
-            # remain tied to query index, not nondeterministic completion order.
-            outcomes = list(executor.map(execute_query, indexed_queries))
-    wall_seconds = time.perf_counter() - wall_started
+    # try/finally (tracker correction): the sampler must stop with its
+    # terminal sample on read/HTTP/guard failures too, not only on success.
+    # The try covers EVERYTHING after sampler.start() — the query/groundtruth
+    # reads and the before-scrape (both raise) included — so no start-then-
+    # raise path can leak the sampler thread.
+    try:
+        queries = read_vectors(query_path, query_format, query_start, query_count)
+        groundtruth = read_truth_ids(
+            groundtruth_path, groundtruth_format, query_start, query_count
+        )
+        before = scrape(server)
+        wall_started = time.perf_counter()
+        indexed_queries = list(enumerate(queries))
+        if concurrency == 1:
+            outcomes = [execute_query(item) for item in indexed_queries]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=concurrency,
+                thread_name_prefix="pax-query",
+            ) as executor:
+                # Map returns in input order. Recall and result hashes
+                # therefore remain tied to query index, not nondeterministic
+                # completion order.
+                outcomes = list(executor.map(execute_query, indexed_queries))
+        wall_seconds = time.perf_counter() - wall_started
 
-    for expected_offset, (offset, latency_ms, response) in enumerate(outcomes):
-        if offset != expected_offset:
-            raise RuntimeError(f"{phase}: concurrent query order was not preserved")
-        latencies.append(latency_ms)
-        response_results = response.get("results")
-        if not isinstance(response_results, list):
-            raise RuntimeError(f"{phase}: query {offset} returned no result list")
-        returned_ids = []
-        for item in response_results:
-            oid = item.get("id") if isinstance(item, dict) else None
-            if not isinstance(oid, str):
+        for expected_offset, (offset, latency_ms, response) in enumerate(outcomes):
+            if offset != expected_offset:
                 raise RuntimeError(
-                    f"{phase}: query {offset} returned a result without a string id"
+                    f"{phase}: concurrent query order was not preserved"
                 )
-            returned_ids.append(oid)
-        identity = query_result_identity(returned_ids)
-        ordered_result_digests.append(identity["ordered_ids_sha256"])
-        set_result_digests.append(identity["set_ids_sha256"])
-        result_counts.append(identity["result_count"])
-        unique_result_counts.append(identity["unique_result_count"])
-        returned = set(returned_ids)
-        expected = {f"v{row}" for row in groundtruth[offset][:top_k]}
-        recall_hits = len(returned & expected)
-        recall_hits_by_query.append(recall_hits)
-        recalls.append(recall_hits / top_k)
-    if progress_guard is not None:
-        progress_guard()
-    after = scrape(server)
+            latencies.append(latency_ms)
+            response_results = response.get("results")
+            if not isinstance(response_results, list):
+                raise RuntimeError(
+                    f"{phase}: query {offset} returned no result list"
+                )
+            returned_ids = []
+            for item in response_results:
+                oid = item.get("id") if isinstance(item, dict) else None
+                if not isinstance(oid, str):
+                    raise RuntimeError(
+                        f"{phase}: query {offset} returned a result without a string id"
+                    )
+                returned_ids.append(oid)
+            identity = query_result_identity(returned_ids)
+            ordered_result_digests.append(identity["ordered_ids_sha256"])
+            set_result_digests.append(identity["set_ids_sha256"])
+            result_counts.append(identity["result_count"])
+            unique_result_counts.append(identity["unique_result_count"])
+            returned = set(returned_ids)
+            expected = {f"v{row}" for row in groundtruth[offset][:top_k]}
+            recall_hits = len(returned & expected)
+            recall_hits_by_query.append(recall_hits)
+            recalls.append(recall_hits / top_k)
+        if progress_guard is not None:
+            progress_guard()
+        after = scrape(server)
+    finally:
+        server_proc: dict = {}
+        if sampler is not None:
+            server_proc = sampler.stop()
     quality_checkpoints = prefix_quality_checkpoints(recalls, latencies)
     latencies.sort()
     gets = metric_delta(before, after, "proximadb_object_store_gets_total")
@@ -1791,8 +1909,11 @@ def run_query_sweep(
         "latency_ms": {
             "p50": percentile(latencies, 0.50),
             "p95": percentile(latencies, 0.95),
+            # TD-TIER-1 E1 telemetry: p99 was missing from the #2249 pilot.
+            "p99": percentile(latencies, 0.99),
             "mean": sum(latencies) / len(latencies),
         },
+        "server_process": server_proc,
         "physical_gets": gets,
         "gets_per_query": gets / query_count,
         # TD-PAXDIR-1 D7: GET + LIST + HEAD per query (design §4.2 G3) and
@@ -2458,6 +2579,29 @@ def post_flush_compaction_observation(
     }
 
 
+def create_collection(server: str, base_path: Path, base_format: str) -> str:
+    """Create the (empty) benchmark collection and return its id — the same
+    call ingest() makes, without inserting vectors. TD-TIER-1 E1 --skip-ingest
+    uses it to register the collection in a fresh server's catalog so the
+    object prefix a prior run built (which contains <id>/data/...) resolves."""
+    _, dimension, _ = vector_source_geometry(base_path, base_format)
+    response = request_json(
+        server + "/api/v2/collections",
+        method="POST",
+        body={
+            "name": "sift1m_get_reduction",
+            "dimension": dimension,
+            "engine": "sst",
+            "enable_proxima_record": True,
+            "distance_metric": "euclidean",
+        },
+    )
+    collection_id = str(response.get("collection_id") or response.get("id") or "")
+    if not collection_id:
+        raise RuntimeError(f"create response has no collection id: {response}")
+    return collection_id
+
+
 def ingest(
     server: str,
     base_path: Path,
@@ -2839,6 +2983,21 @@ def main() -> int:
         ),
     )
     parser.add_argument("--queries", type=int, default=1_000)
+    parser.add_argument(
+        "--skip-ingest",
+        action="store_true",
+        help=(
+            "TD-TIER-1 E1 fixed-object mode: assume the collection named by "
+            "--collection-id already exists at --storage-url with settled "
+            "segments (built by a prior full run); skip ingest — the settle "
+            "wait still validates geometry. Runs cap arms against "
+            "byte-identical objects/model/query IDs"
+        ),
+    )
+    parser.add_argument(
+        "--collection-id",
+        help="collection id for --skip-ingest runs (the build run records it in result.json)",
+    )
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--settle-timeout-secs", type=int, default=1_200)
     parser.add_argument(
@@ -3016,6 +3175,8 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+    if args.skip_ingest and not args.collection_id:
+        raise SystemExit("--skip-ingest requires --collection-id")
     if not (
         args.coalesce_gap_mb >= 0
         and args.coalesce_range_mb > 0
@@ -3251,7 +3412,7 @@ def main() -> int:
         remote_geometry = S3PaxGeometry(
             storage_url, root / "s3-pax-snapshot", args.s3_endpoint, args.s3_region
         )
-    if remote_geometry is not None:
+    if remote_geometry is not None and not args.skip_ingest:
         remote_geometry.require_empty_prefix()
     # Epoch proof for --explicit-flush-every-rows: remote readers use object
     # identity; a local (file://) bed proves the same epochs from the PAX
@@ -3465,28 +3626,34 @@ def main() -> int:
     resource_sampler: ProcessScratchSampler | None = None
     failures: list[str] = []
     try:
-        active = OwnedServer(
-            binary=binary,
-            config=config,
-            server=server_url,
-            log_path=root / "server-ingest.log",
-            local_disk_path=local_disk,
-            ivf_k=args.ivf_k,
-            n_comp=args.n_comp,
-            nprobe=args.nprobe,
-            training_compaction_min_mb=args.training_compaction_min_mb,
-            azure_emulator=args.azurite,
-            s3_endpoint=args.s3_endpoint,
-            s3_region=args.s3_region,
-            rank_degree=args.rank_degree,
-            read_ranges_inflight=args.read_ranges_inflight,
-            read_ranges_wave_split_mb=args.read_ranges_wave_split_mb,
-            adaptive_read_strategy=args.adaptive_read_strategy,
-            centroid_directory=args.centroid_directory,
-            coalesce_gap_bytes=int(args.coalesce_gap_mb * 1024 * 1024),
-            coalesce_range_bytes=int(args.coalesce_range_mb * 1024 * 1024),
-        )
+        # The three phase servers differ only in log name and disk tier; one
+        # builder keeps them identical (dup-ratchet).
+        def spawn_server(log_name: str, disk) -> OwnedServer:
+            return OwnedServer(
+                binary=binary,
+                config=config,
+                server=server_url,
+                log_path=root / log_name,
+                local_disk_path=disk,
+                ivf_k=args.ivf_k,
+                n_comp=args.n_comp,
+                nprobe=args.nprobe,
+                training_compaction_min_mb=args.training_compaction_min_mb,
+                azure_emulator=args.azurite,
+                s3_endpoint=args.s3_endpoint,
+                s3_region=args.s3_region,
+                rank_degree=args.rank_degree,
+                read_ranges_inflight=args.read_ranges_inflight,
+                read_ranges_wave_split_mb=args.read_ranges_wave_split_mb,
+                adaptive_read_strategy=args.adaptive_read_strategy,
+                centroid_directory=args.centroid_directory,
+                coalesce_gap_bytes=int(args.coalesce_gap_mb * 1024 * 1024),
+                coalesce_range_bytes=int(args.coalesce_range_mb * 1024 * 1024),
+            )
+
+        active = spawn_server("server-ingest.log", local_disk)
         active.start()
+        active_pid = active.process.pid if active.process is not None else None
         if args.compaction_spill:
             if active.process is None:
                 raise RuntimeError("spill resource sampling requires a live server")
@@ -3495,32 +3662,60 @@ def main() -> int:
                 spill_directory,
             )
             resource_sampler.start()
-        (
-            collection_id,
-            ingest_seconds,
-            retry_status_counts,
-            explicit_flushes,
-            explicit_compaction,
-        ) = ingest(
-            server_url,
-            base_path,
-            args.base_format,
-            args.rows,
-            args.batch_size,
-            "127.0.0.1",
-            args.port,
-            args.ingest_transport,
-            args.explicit_flush_every_rows,
-            epoch_geometry,
-        )
-        result["collection_id"] = collection_id
-        result["ingest"] = {
-            "seconds": ingest_seconds,
-            "vectors_per_second": args.rows / ingest_seconds,
-            "retry_status_counts": retry_status_counts,
-            "explicit_flushes": explicit_flushes,
-            "explicit_compaction": explicit_compaction,
-        }
+        if args.skip_ingest:
+            # TD-TIER-1 E1: reuse the settled OBJECT PREFIX a prior run built —
+            # identical objects, model and query IDs across cap arms. The
+            # catalog is per-run, so the collection must be registered in THIS
+            # server too; its id must reproduce the fixture's (objects live
+            # under <id>/data/) — a fresh catalog assigns the same first id;
+            # anything else fails closed rather than querying a wrong prefix.
+            collection_id = create_collection(server_url, base_path, args.base_format)
+            if collection_id != args.collection_id:
+                raise RuntimeError(
+                    "skip-ingest id mismatch: fixture collection "
+                    f"{args.collection_id}, this catalog assigned {collection_id}"
+                )
+            result["collection_id"] = collection_id
+            result["ingest"] = {"skipped": True, "source_collection_id": collection_id}
+            geometry = wait_for_materialization(
+                root / "data" / "sst",
+                server_url,
+                collection_id,
+                args.rows,
+                args.max_segments,
+                args.settle_timeout_secs,
+                args.stable_secs,
+                remote_geometry,
+                required_layout_version=args.require_layout_version,
+            )
+            result["settled_geometry"] = geometry
+        else:
+            (
+                collection_id,
+                ingest_seconds,
+                retry_status_counts,
+                explicit_flushes,
+                explicit_compaction,
+            ) = ingest(
+                server_url,
+                base_path,
+                args.base_format,
+                args.rows,
+                args.batch_size,
+                "127.0.0.1",
+                args.port,
+                args.ingest_transport,
+                args.explicit_flush_every_rows,
+                epoch_geometry,
+            )
+            result["collection_id"] = collection_id
+            result["ingest"] = {
+                "seconds": ingest_seconds,
+                "vectors_per_second": args.rows / ingest_seconds,
+                "retry_status_counts": retry_status_counts,
+                "explicit_flushes": explicit_flushes,
+                "explicit_compaction": explicit_compaction,
+            }
         geometry = wait_for_materialization(
             root / "data" / "sst",
             server_url,
@@ -3602,18 +3797,24 @@ def main() -> int:
                 "proximadb_compaction_spill_total",
             )
         }
-        post_write = run_query_sweep(
-            server_url,
-            collection_id,
-            query_path,
-            groundtruth_path,
-            0,
-            args.queries,
-            args.top_k,
-            "post_write",
-            args.query_format,
-            args.groundtruth_format,
-        )
+        # The three phase sweeps share every argument except the window and
+        # name; one closure keeps them from drifting apart (dup-ratchet).
+        def phase_sweep(phase: str, start: int):
+            return run_query_sweep(
+                server_url,
+                collection_id,
+                query_path,
+                groundtruth_path,
+                start,
+                args.queries,
+                args.top_k,
+                phase,
+                args.query_format,
+                args.groundtruth_format,
+                server_pid=active_pid,
+            )
+
+        post_write = phase_sweep("post_write", 0)
         result["phases"]["post_write"] = post_write
         failures.extend(
             gate_failures(
@@ -3627,39 +3828,10 @@ def main() -> int:
         )
         active.stop()
 
-        active = OwnedServer(
-            binary=binary,
-            config=config,
-            server=server_url,
-            log_path=root / "server-local-disk-warm.log",
-            local_disk_path=local_disk,
-            ivf_k=args.ivf_k,
-            nprobe=args.nprobe,
-            training_compaction_min_mb=args.training_compaction_min_mb,
-            azure_emulator=args.azurite,
-            s3_endpoint=args.s3_endpoint,
-            s3_region=args.s3_region,
-            rank_degree=args.rank_degree,
-            read_ranges_inflight=args.read_ranges_inflight,
-            read_ranges_wave_split_mb=args.read_ranges_wave_split_mb,
-            adaptive_read_strategy=args.adaptive_read_strategy,
-            centroid_directory=args.centroid_directory,
-            coalesce_gap_bytes=int(args.coalesce_gap_mb * 1024 * 1024),
-            coalesce_range_bytes=int(args.coalesce_range_mb * 1024 * 1024),
-        )
+        active = spawn_server("server-local-disk-warm.log", local_disk)
         active.start()
-        local_warm = run_query_sweep(
-            server_url,
-            collection_id,
-            query_path,
-            groundtruth_path,
-            args.queries,
-            args.queries,
-            args.top_k,
-            "local_disk_warm",
-            args.query_format,
-            args.groundtruth_format,
-        )
+        active_pid = active.process.pid if active.process is not None else None
+        local_warm = phase_sweep("local_disk_warm", args.queries)
         result["phases"]["local_disk_warm"] = local_warm
         failures.extend(
             gate_failures(
@@ -3674,39 +3846,10 @@ def main() -> int:
         )
         active.stop()
 
-        active = OwnedServer(
-            binary=binary,
-            config=config,
-            server=server_url,
-            log_path=root / "server-object-cold.log",
-            local_disk_path=None,
-            ivf_k=args.ivf_k,
-            nprobe=args.nprobe,
-            training_compaction_min_mb=args.training_compaction_min_mb,
-            azure_emulator=args.azurite,
-            s3_endpoint=args.s3_endpoint,
-            s3_region=args.s3_region,
-            rank_degree=args.rank_degree,
-            read_ranges_inflight=args.read_ranges_inflight,
-            read_ranges_wave_split_mb=args.read_ranges_wave_split_mb,
-            adaptive_read_strategy=args.adaptive_read_strategy,
-            centroid_directory=args.centroid_directory,
-            coalesce_gap_bytes=int(args.coalesce_gap_mb * 1024 * 1024),
-            coalesce_range_bytes=int(args.coalesce_range_mb * 1024 * 1024),
-        )
+        active = spawn_server("server-object-cold.log", None)
         active.start()
-        object_cold = run_query_sweep(
-            server_url,
-            collection_id,
-            query_path,
-            groundtruth_path,
-            args.queries * 2,
-            args.queries,
-            args.top_k,
-            "object_cold",
-            args.query_format,
-            args.groundtruth_format,
-        )
+        active_pid = active.process.pid if active.process is not None else None
+        object_cold = phase_sweep("object_cold", args.queries * 2)
         result["phases"]["object_cold"] = object_cold
         failures.extend(
             gate_failures(

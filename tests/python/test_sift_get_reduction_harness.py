@@ -1151,3 +1151,118 @@ def test_coalesce_cap_and_gap_come_from_the_cli_and_reach_the_server(
     )
     assert default["PROXIMADB_PAX_COALESCE_GAP"] == str(HARNESS.AZURE_COALESCE_GAP_BYTES)
     assert default["PROXIMADB_PAX_COALESCE_RANGE"] == str(HARNESS.AZURE_COALESCE_RANGE_BYTES)
+
+
+def test_server_proc_sampler_parses_rss_and_cpu() -> None:
+    # TD-TIER-1 E1 telemetry: the sampler must parse real /proc shapes and
+    # derive CPU seconds from the tick delta, never from a silent zero.
+    status = "Name: server\nVmRSS:      1234 kB\nThreads: 8\n"
+    # comm contains spaces+parens; utime=100, stime=50 ticks at the start.
+    stat_start = "1 (proximadb server) R 2 3 4 5 6 7 8 9 10 11 100 50 0 0\n"
+    stat_end = "1 (proximadb server) R 2 3 4 5 6 7 8 9 10 11 250 90 0 0\n"
+
+    files = {}
+
+    def fake_read(path: str) -> str:
+        return files[path]
+
+    sampler = HARNESS.ServerProcSampler(pid=99, interval_s=0.001, read=fake_read)
+    files[f"/proc/99/status"] = status
+    files[f"/proc/99/stat"] = stat_start
+    sampler.start()  # real background thread (daemon); start samples once
+    # utime 100->250, stime 50->90 = 190 ticks.
+    files[f"/proc/99/stat"] = stat_end
+    import time as _time
+    _time.sleep(0.01)  # let the thread observe the end state
+    files[f"/proc/99/stat"] = stat_end  # terminal sample sees the same end
+    out = sampler.stop()
+    assert out["peak_rss_bytes"] == 1234 * 1024
+    assert out["cpu_seconds"] == 1.9
+    assert out["complete"] is True
+
+
+def test_server_proc_sampler_reports_unavailable_not_zero() -> None:
+    # Tracker correction: an unreadable process counter must surface as
+    # unavailable (None / complete=false), never as a plausible zero.
+    def always_failing(path: str) -> str:
+        raise FileNotFoundError(path)  # an OSError subclass
+
+    sampler = HARNESS.ServerProcSampler(pid=404, interval_s=0.001, read=always_failing)
+    sampler.start()
+    out = sampler.stop()
+    assert out["peak_rss_bytes"] is None
+    assert out["cpu_seconds"] is None
+    assert out["complete"] is False
+
+
+def test_server_proc_sampler_stop_without_start_returns_unavailable() -> None:
+    # stop() on a never-started sampler must not crash (failure paths in
+    # run_query_sweep can reach it) and must not invent values.
+    sampler = HARNESS.ServerProcSampler(pid=1, interval_s=0.001, read=lambda p: "")
+    out = sampler.stop()
+    assert out["complete"] is False
+    assert out["peak_rss_bytes"] is None
+    assert out["cpu_seconds"] is None
+
+
+def test_skip_ingest_requires_collection_id() -> None:
+    # The fixed-object mode is unusable without the collection to reuse —
+    # fail at argparse time, not after a server has booted.
+    import subprocess, sys as _sys
+
+    proc = subprocess.run(
+        [
+            _sys.executable,
+            str(REPOSITORY_ROOT / "scripts" / "bench" / "sift1m_get_reduction.py"),
+            "--root",
+            "/tmp/whatever",
+            "--skip-ingest",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode != 0
+    assert "--skip-ingest requires --collection-id" in (proc.stderr or proc.stdout)
+
+
+def test_query_sweep_stops_sampler_when_reads_fail() -> None:
+    # Tracker correction: run_query_sweep must stop the sampler on the
+    # read/HTTP failure paths too. A query file that cannot be read raises
+    # inside the try; the sampler's stop() must have run (terminal sample
+    # taken) by the time the exception propagates.
+    import tempfile
+    sampler_calls: list[dict] = []
+
+    class RecordingSampler:
+        def __init__(self, pid: int, interval_s: float = 0.25, read=None):
+            self.pid = pid
+
+        def start(self) -> None:
+            sampler_calls.append({"event": "start"})
+
+        def stop(self) -> dict:
+            sampler_calls.append({"event": "stop"})
+            return {"peak_rss_bytes": None, "cpu_seconds": None, "complete": False}
+
+    with tempfile.NamedTemporaryFile(suffix=".missing", delete=True) as fh:
+        missing = Path(fh.name)
+        with patch.object(HARNESS, "ServerProcSampler", RecordingSampler):
+            with pytest.raises(Exception):
+                HARNESS.run_query_sweep(
+                    "http://127.0.0.1:1",
+                    "1",
+                    missing,
+                    missing,
+                    0,
+                    1,
+                    1,
+                    "fvecs",
+                    "ivecs",
+                    server_pid=123,
+                )
+    assert sampler_calls[0]["event"] == "start"
+    assert sampler_calls[-1]["event"] == "stop", (
+        "sampler.stop() must run on the read-failure path"
+    )
+    assert sampler_calls.count({"event": "stop"}) == 1
