@@ -3,7 +3,7 @@
 :toc:
 :toclevels: 2
 
-Evidence baseline: fetched origin/develop `c4ffc0af9` (#2248/#2251), 2026-10-26.
+Evidence baseline: fetched origin/develop `2f5b1ee7d` (#2250 merged), 2026-10-26.
 Planning source: https://github.com/anvai-labs/proximaDB/pull/2250[#2250]. Local WIP and
 owner-reported tests/pauses are explicitly separate from merged delivery.
 Refresh branch heads/checks at pickup; this is a dated observation, not a live GitHub mirror.
@@ -19,7 +19,7 @@ merged-slice evidence is there. v3-first is the accepted direction, not yet a co
 |===
 | Track / IDs | State / owner | Next work and closure gate
 | P1 / TD-SEAM-1 | In progress; pickup unassigned | Resolve tenant-scoped REST metadata key, wire the production bulk route (currently PlannedOnlyTableWriteExecutor), preserve nested/list schema; external value read-back through real facade after two snapshots. Writer-unit proof alone is insufficient.
-| P2 delete / TD-SEAM-4, TD-USUB-10 | WIP: feat/p24-delete-readers | Internal DV readers/carry-through and external deleted-value read-back; then v3-default/atomic-upgrade policy, lineage and live incremental delete writer. No new v2 delete writer.
+| P2 delete / TD-SEAM-4, TD-USUB-10 | In progress: Codex, fix/p24-delete-readers-complete | Internal DV readers/carry-through and external deleted-value read-back; then v3-default/atomic-upgrade policy, lineage and live incremental delete writer. No new v2 delete writer.
 | Recovery / TD-SEAM-12/14 | Open residual; unassigned | All consumer floors and branch-merge residuals; object-store owner/reattach boundary before placement becomes default. Refusal is safer than silent history loss.
 | P3 provider / TD-SEAM-5, USUB-2/3 | In progress; unassigned | Default-on soak, stats and EXPLAIN parity, ABAC and bounded delta memory. Admit PAX only after visibility/WAL/ABAC proof; ungoverned UDTF routing is not governed parity.
 | Native differentiation / S6/S8, TD-SEAM-6, TD-OLAP-10/11/12 | Research/proposed gates: docs/native-execution-research; implementation unassigned | Catalog and thought experiments in lakehouse plan NE-0..7. First audit actual routes and build exact eligible-set oracle; prototype one fused native region only after defining semantics. No new generic engine rewrite or performance claims from desk research.
@@ -39,17 +39,17 @@ merged-slice evidence is there. v3-first is the accepted direction, not yet a co
 == Active and retained branches
 
 Worktrees under `/home/vsingh/code/proximaDB.worktrees/` unless otherwise stated.
-No active checkout is modified by this documentation consolidation.
+Continuation work is isolated; other sessions’ checkouts remain untouched.
 
 [cols="2,2,3",options="header"]
 |===
 | Branch / observed head | State | Ownership / next action
-| feat/p24-delete-readers / d929d7993 | 12 dirty files, no PR; owner reported a usage-limit pause in commit 6bc7b0b7e | P2 readers/carry-through; preserve WIP. Owner reports engine 114/114 tests passed; not independently rerun here. Remaining reader/executor/DuckDB/DML suites, external interop and commit/review gate. Resume with the owning session.
-| feat/sc1-storage-policy / d929d7993 | Dirty proto/API/catalog/manager work, no PR; owner-reported pause during collection_builder repair | SC1/partial SC2. Latest WIP checks resolved base location and makes class immutable; authorization still uses a tenant-path heuristic. Verify configured-target authorization, facade/SDK generation and repair/tests before commit.
+| fix/p24-delete-readers-complete / continuation of 51cefaaf2 | Active Codex continuation at /tmp/proximadb-p24-complete/fix-p24-delete-readers-complete | Owns P2 reader/carry-through completion and external read-back. PR #2256: reader/carry-through and facade safeguards; local 116 unit + 4 integration tests pass, adversarial review clean, hosted CI pending. Evidence: link:../history/evidence/P24_DELETION_READER_REVIEW_2026_10_26.adoc[review]. Writer activation remains separate.
+| feat/p24-delete-readers / 51cefaaf2 | Preserved GLM source; two dirty review fixes copied to continuation | Ownership transferred to the continuation above. Do not resume a competing implementation; original checkout retained intact until completion/reconciliation.
+| feat/sc1-storage-policy / cfa69704a | Local commits include generated SDKs; no merge observed | SC1/partial SC2. Latest WIP checks resolved base location and makes class immutable; authorization still uses a tenant-path heuristic. Verify configured-target authorization, facade/SDK generation and repair/tests before commit.
 | bench/tier1-e1-fixed / eb1dd04e2 | Clean; three local commits, no PR | E1 fixed-object harness: skip-ingest, p99/server resource telemetry and collection-id assertion. Preserve benchmark target/cache; finish immutable-fixture checks and controlled repeats before claiming results.
-| fix/gov-ledger-filings / c4ffc0af9 | New clean checkout at develop; no PR at audit | Governance queue pickup, not completed/superseded merely because there are no unique commits yet. Coordinate ADR/TD findings and add validation evidence when filed.
+| fix/gov-ledger-filings / 9351e25ec | Open PR #2253; clean checkout at audit | Governance findings filed in its own lane. Review CI and residual corrections there; do not duplicate or prune active work.
 | docs/release-notes-v040 / b448e4acc | Dormant/unresolved; 11 unique commits and generated site | Reconcile unique release changes before cleanup. Partial overlap with #1960 does not prove supersession.
-| docs/roadmap-session-reconcile | #2250; /tmp/proximadb-roadmap-reconcile/docs-roadmap-session-reconcile | Consolidation/CI repair. On merge this lane closes; retain local evidence before retiring this checkout. Implementation ownership stays with the rows above.
 |===
 
 Shared develop at `/home/vsingh/code/proximaDB` was clean at d929d7993; leave it untouched.
@@ -81,7 +81,7 @@ that an arbitrary bucket/prefix is an operator-authorized target. Validate the f
 against configured location capabilities and canonical tenant/account identity; test paths with
 no tenant segment, alternate schemes/encodings and configured defaults. Keep NOT_ACTIVE for
 unimplemented economy/performance. The local TD still contains premature "landed" and generated
-client claims; no OpenAPI/SDK diffs were observed. Reconcile those claims to actual artifacts/tests.
+client claims; generated SDK changes are now present at cfa69704a; validate them against the final contract. Reconcile those claims to actual artifacts/tests.
 
 === Experiment pickup
 

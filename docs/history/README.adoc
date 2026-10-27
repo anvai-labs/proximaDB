@@ -84,6 +84,8 @@ migration and superseded WAL-heap plans are reference history only.
 
 == Measurement artifacts
 
+* link:evidence/P24_DELETION_READER_REVIEW_2026_10_26.adoc[P2.4 reader review and validation]
+
 * link:evidence/P24_SF1_GATE_EVIDENCE_2026_10_23.adoc[P24_SF1_GATE_EVIDENCE_2026_10_23]
 * link:evidence/P5B_D7_SIFT1M_GATE_RUN_2026_10_25.adoc[P5B_D7_SIFT1M_GATE_RUN_2026_10_25]
 * link:evidence/P5B_D8_DEFAULTS_CONFIRMATION_2026_10_25.adoc[P5B_D8_DEFAULTS_CONFIRMATION_2026_10_25]

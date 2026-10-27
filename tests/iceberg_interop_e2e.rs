@@ -12,6 +12,7 @@
 
 use std::path::{Path as FsPath, PathBuf};
 
+use futures::StreamExt;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::sleep;
@@ -35,15 +36,20 @@ fn walk(dir: &FsPath, out: &mut Vec<PathBuf>) {
     }
 }
 
+async fn connect_pg(server: &TestPgServer) -> tokio_postgres::Client {
+    let (client, connection) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
+        .await
+        .expect("pgwire connection");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn materialize_emits_readable_iceberg_table() {
     let server = TestPgServer::start().await.expect("server start");
-    let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-        .await
-        .expect("connect");
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
+    let client = connect_pg(&server).await;
 
     let _ = client.simple_query("DROP TABLE IF EXISTS region").await;
     client
@@ -96,9 +102,10 @@ async fn materialize_emits_readable_iceberg_table() {
     );
     assert!(has_manifest, "wrote an Avro manifest; files={names:?}");
 
-    // The metadata is Iceberg format-version 2 (ADR-097 D3: v2 until an external v3
-    // reader is in the read-back gate; no v3-only column types here) and references a
-    // manifest list.
+    // This legacy caller still selects Iceberg format-version 2. ADR-097's
+    // v3-first activation is a separate gate after reader compatibility, not a
+    // decision to develop new v2 features. The separate deletion test proves
+    // external v3 readers; this fixture checks the legacy metadata/manifest chain.
     let meta_bytes = std::fs::read(metadata_json[0]).expect("read metadata.json");
     let meta: serde_json::Value = serde_json::from_slice(&meta_bytes).expect("parse metadata.json");
     assert_eq!(meta["format-version"], 2, "Iceberg v2 for external readers");
@@ -219,6 +226,436 @@ fn external_readback(
     true
 }
 
+/// P2.4 slice 3b (TD-SEAM-4): the PUBLISHED view of a snapshot carrying
+/// deletion vectors is read delete-aware. The vectors are published test-side
+/// through the engine's writer (the delete WRITER is the next slice and stays
+/// unactivated); what this gate proves is that the published v3 snapshot
+/// serves its post-delete rows — through the engine's snapshot read (the same
+/// read the DataFusion leaf consumes; the leaf and the DuckDB view are
+/// unit-tested over a real open) and through the external engines (PyIceberg
+/// REST/static, DuckDB iceberg_scan — CI pins pyiceberg 0.12.0 and duckdb
+/// 1.5.6, both read v3 + deletion vectors, and requires all three). Pgwire
+/// aggregate paths are asserted too: cache/fallback/merge must preserve published
+/// visibility or explicitly refuse when native and published ordering is unknown.
+#[test]
+fn deletion_vectors_are_invisible_to_proximadb_and_external_engines() {
+    // Configure a child before its runtime starts: no process-global environment
+    // mutation racing other tests or server workers. Exercise both caches and a
+    // low native-provider cap through the real pgwire facade.
+    if std::env::var_os("PROXIMADB_DV_FACADE_CHILD").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "deletion_vectors_are_invisible_to_proximadb_and_external_engines",
+                "--nocapture",
+            ])
+            .env("PROXIMADB_DV_FACADE_CHILD", "1")
+            .env("PROXIMADB_QUERY_RESULT_CACHE", "1")
+            .env("PROXIMADB_OLAP_TABLE_CACHE", "1")
+            .env("PROXIMADB_NATIVE_TABLE_PROVIDER", "1")
+            .env("PROXIMADB_NATIVE_TABLE_ROW_CAP", "1")
+            .env("PROXIMADB_NATIVE_TABLE_LAYER_A", "0")
+            .env("PROXIMADB_NATIVE_ROUTE", "1")
+            .status()
+            .expect("launch isolated facade regression");
+        assert!(status.success(), "deletion-vector child failed: {status}");
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(check_deletion_vector_readers());
+}
+
+async fn check_deletion_vector_readers() {
+    use proximadb_iceberg_engine::IcebergObjectStoreBridge;
+    use proximadb_iceberg_engine::deletion_vector::PositionDeletes;
+    use proximadb_iceberg_engine::iceberg as engine_iceberg;
+    use proximadb_storage_common::object_store_bridge::ObjectStoreBridge as _;
+
+    let server = TestPgServer::start().await.expect("server start");
+    let client = connect_pg(&server).await;
+
+    let table = "dv_returns";
+    let cols = ["sr_id", "sr_item"];
+    client
+        .simple_query(&format!(
+            "CREATE TABLE {table} (sr_id INT PRIMARY KEY, sr_item VARCHAR)"
+        ))
+        .await
+        .expect("create");
+    client
+        .simple_query(&format!(
+            "INSERT INTO {table} (sr_id, sr_item) VALUES \
+             (1, 'keep-me-not'), (2, 'keep'), (3, 'gone-too'), (4, 'keep')"
+        ))
+        .await
+        .expect("insert");
+    client
+        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
+        .await
+        .expect("materialize");
+    sleep(Duration::from_millis(300)).await;
+
+    client
+        .simple_query("CREATE TABLE dv_native (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO dv_native (id) VALUES (1), (2)")
+        .await
+        .unwrap();
+    let count_sql = format!("SELECT COUNT(*) FROM {table}");
+    let count = |messages: Vec<tokio_postgres::SimpleQueryMessage>| {
+        messages
+            .into_iter()
+            .find_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
+                _ => None,
+            })
+            .expect("aggregate row")
+    };
+    assert_eq!(count(client.simple_query(&count_sql).await.unwrap()), "4");
+
+    // Locate the table's Iceberg base under the warehouse: its metadata dir
+    // holds the `v*.metadata.json` the REST catalog serves.
+    let warehouse = server.data_dir().join("warehouse");
+    let mut files = Vec::new();
+    walk(&warehouse, &mut files);
+    let metadata_json = files
+        .iter()
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".metadata.json"))
+                && p.to_string_lossy().contains(table)
+        })
+        .expect("the table's metadata.json")
+        .clone();
+    let metadata_dir = metadata_json.parent().expect("metadata dir").to_path_buf();
+    let base_dir = metadata_dir.parent().expect("table base").to_path_buf();
+    let base_url = format!("file://{}", base_dir.display());
+
+    // Publish a v3 successor snapshot carrying one deletion vector, deleting
+    // the positions of sr_id 1 and 3 in the (single) published data file.
+    let bridge = IcebergObjectStoreBridge::from_url(&base_url).expect("bridge");
+    let version = bridge
+        .latest_metadata_version("metadata")
+        .await
+        .expect("latest version")
+        .expect("a published snapshot");
+    let snapshot = bridge
+        .read_iceberg_snapshot_with_deletes("metadata", version)
+        .await
+        .expect("read snapshot");
+    assert!(snapshot.data_files.len() == 1, "one published part");
+    let data_file = snapshot.data_files[0].clone();
+    assert!(
+        snapshot.deletion_vectors.is_empty(),
+        "the materialized snapshot carries no vectors yet"
+    );
+
+    // Map sr_id → file position by reading the part's first column.
+    let object_url =
+        url::Url::parse(bridge.object_uri(data_file.as_ref()).as_str()).expect("part url");
+    let (store, path) = object_store::parse_url(&object_url).expect("parse store");
+    // The workspace uses this object_store adapter until its AsyncFileReader
+    // replacement lands (same compatibility boundary as the production reader).
+    #[allow(deprecated)]
+    let reader =
+        parquet::arrow::async_reader::ParquetObjectReader::new(std::sync::Arc::from(store), path);
+    let builder = parquet::arrow::ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .expect("part footer");
+    let schema = builder.schema().clone();
+    let id_idx = schema.index_of("sr_id").expect("sr_id column");
+    let mut stream = builder.build().expect("part stream");
+    let mut positions = Vec::new();
+    let mut position = 0_u64;
+    let mut ids = Vec::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch.expect("part batch");
+        let ids_col = batch
+            .column(id_idx)
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .expect("sr_id int32");
+        for row in 0..batch.num_rows() {
+            ids.push(ids_col.value(row));
+            positions.push(position);
+            position += 1;
+        }
+    }
+    let deleted: Vec<u64> = ids
+        .iter()
+        .zip(&positions)
+        .filter(|(id, _)| **id == 1 || **id == 3)
+        .map(|(_, p)| *p)
+        .collect();
+    assert_eq!(deleted.len(), 2, "positions of sr_id 1 and 3: {ids:?}");
+
+    let mut dv = PositionDeletes::new();
+    for p in &deleted {
+        dv.insert(*p);
+    }
+    let metas = bridge
+        .write_deletion_vectors(
+            &object_store::path::Path::from("data/dv-0.puffin"),
+            &[(data_file.clone(), &dv)],
+        )
+        .await
+        .expect("write vectors");
+    let engine_fields = vec![
+        engine_iceberg::IcebergField {
+            id: 1,
+            name: "sr_id".into(),
+            type_name: "int".into(),
+            required: true,
+        },
+        engine_iceberg::IcebergField {
+            id: 2,
+            name: "sr_item".into(),
+            type_name: "string".into(),
+            required: true,
+        },
+    ];
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(2);
+    bridge
+        .publish_iceberg_files_with_deletes(
+            std::slice::from_ref(&data_file),
+            &metas,
+            Some(version),
+            "metadata",
+            "00000000-0000-0000-0000-0000000000d3",
+            &format!("{base_url}/data"),
+            &engine_fields,
+            now_ms + 1,
+            now_ms,
+        )
+        .await
+        .expect("publish the deleting snapshot");
+    // No WAL write occurred between these identical aggregate queries. A cache
+    // keyed by WAL LSN alone would still return four, and native COUNT shortcuts
+    // would trust the pre-delete footer. Published visibility must win.
+    assert_eq!(count(client.simple_query(&count_sql).await.unwrap()), "2");
+    let mixed_error = client
+        .simple_query("SELECT COUNT(*) FROM dv_returns d JOIN dv_native n ON d.sr_id = n.id")
+        .await
+        .expect_err("row-cap fallback must not change published visibility");
+    assert!(
+        pg_server::db_err(&mixed_error).contains("cannot fall back to native storage"),
+        "{mixed_error:?}"
+    );
+
+    let expected_rows = vec![
+        vec![Some("2".to_string()), Some("keep".to_string())],
+        vec![Some("4".to_string()), Some("keep".to_string())],
+    ];
+    {
+        use proximadb_storage_common::object_store_bridge::ObjectStoreBridge as _;
+        let latest = bridge
+            .latest_metadata_version("metadata")
+            .await
+            .expect("latest")
+            .expect("the deleting snapshot");
+        let snapshot = bridge
+            .read_iceberg_snapshot_with_deletes("metadata", latest)
+            .await
+            .expect("read");
+        assert_eq!(
+            snapshot.deletion_vectors.len(),
+            1,
+            "the published v3 carries the vector"
+        );
+    }
+
+    // Exercise the actual DataFusion provider, not just the manifest decoder.
+    let ctx = datafusion::prelude::SessionContext::new();
+    proximadb::datafusion::engine_adapters::register_object_store_parquet_location(
+        &ctx,
+        "dv_published",
+        &format!("{base_url}/data"),
+        None,
+        proximadb_data_model::StatsTrust::Trusted,
+    )
+    .await
+    .expect("register deleting snapshot");
+    let actual = ctx
+        .sql("SELECT sr_id FROM dv_published ORDER BY sr_id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ids: Vec<i32> = actual
+        .iter()
+        .flat_map(|batch| {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap();
+            (0..batch.num_rows())
+                .map(|i| col.value(i))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(ids, vec![2, 4]);
+
+    // Exercise our optional DuckDB comparison route as well as the external
+    // iceberg_scan reader. They have different file-selection adapters.
+    #[cfg(feature = "duckdb")]
+    {
+        use proximadb::query::execution::{
+            duckdb_engine::DuckDbLocalEngine,
+            engine::{ExecutionEngine, QueryExecutionContext},
+        };
+        // Publish a separate fixture with a consistently encoded root. Changing
+        // only an existing manifest's URL spelling is not a supported alias.
+        let encoded_tmp = TempDir::new().unwrap();
+        let encoded_dir = encoded_tmp.path().join("encoded root");
+        std::fs::create_dir_all(encoded_dir.join("data")).unwrap();
+        std::fs::copy(
+            base_dir.join(data_file.as_ref()),
+            encoded_dir.join(data_file.as_ref()),
+        )
+        .unwrap();
+        let encoded_url = url::Url::from_directory_path(&encoded_dir)
+            .unwrap()
+            .to_string();
+        let encoded_bridge = IcebergObjectStoreBridge::from_url(&encoded_url).unwrap();
+        let encoded_deletes = encoded_bridge
+            .write_deletion_vectors(
+                &object_store::path::Path::from("data/dv.puffin"),
+                &[(data_file.clone(), &dv)],
+            )
+            .await
+            .unwrap();
+        encoded_bridge
+            .publish_iceberg_files_with_deletes(
+                std::slice::from_ref(&data_file),
+                &encoded_deletes,
+                None,
+                "metadata",
+                "00000000-0000-0000-0000-0000000000e3",
+                &format!("{}data", encoded_url),
+                &engine_fields,
+                now_ms + 10,
+                now_ms,
+            )
+            .await
+            .unwrap();
+        for location in [format!("{base_url}/data"), format!("{encoded_url}data")] {
+            for (sql, expected) in [
+                (
+                    "SELECT CAST(sr_id AS BIGINT) FROM t ORDER BY sr_id",
+                    vec![2, 4],
+                ),
+                (
+                    "SELECT CAST(sr_id AS BIGINT) FROM t WHERE sr_id > 2 LIMIT 1",
+                    vec![4],
+                ),
+                ("SELECT COUNT(*) FROM t", vec![2]),
+            ] {
+                let result = DuckDbLocalEngine
+                    .execute_sql(
+                        sql,
+                        QueryExecutionContext {
+                            parquet_tables: vec![("t".into(), location.clone())],
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("DuckDB comparison view");
+                let values: Vec<i64> = result
+                    .rows
+                    .iter()
+                    .map(|row| match row.first() {
+                        Some(proximadb_records::ProximaValue::Int64(value)) => *value,
+                        other => panic!("expected BIGINT, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(values, expected, "{sql}");
+            }
+        }
+    }
+
+    // Republishing unsynchronized native state must not resurrect hidden rows.
+    let err = client
+        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
+        .await
+        .expect_err("refuse native rewrite of externally deleted snapshot");
+    assert!(
+        err.as_db_error()
+            .unwrap()
+            .message()
+            .contains("deletion vectors"),
+        "{err:?}"
+    );
+    assert_eq!(
+        bridge.latest_metadata_version("metadata").await.unwrap(),
+        Some(version + 1)
+    );
+
+    // A native update predating a newer external DV publication must not be
+    // appended back onto that snapshot by the default-on WAL-tail merge.
+    client
+        .simple_query("UPDATE dv_returns SET sr_item = 'updated-before-delete' WHERE sr_id = 1")
+        .await
+        .unwrap();
+    bridge
+        .publish_iceberg_files_with_deletes(
+            std::slice::from_ref(&data_file),
+            &metas,
+            Some(version + 1),
+            "metadata",
+            "00000000-0000-0000-0000-0000000000d3",
+            &format!("{base_url}/data"),
+            &engine_fields,
+            now_ms + 2,
+            now_ms + 1,
+        )
+        .await
+        .expect("publish DV after native update");
+    let merge_error = client
+        .simple_query(&count_sql)
+        .await
+        .expect_err("unordered delta cannot resurrect DV-hidden rows");
+    assert!(
+        pg_server::db_err(&merge_error).contains("nonempty WAL delta cannot be ordered"),
+        "{merge_error:?}"
+    );
+
+    // The REST catalog serves the v3 metadata verbatim, and every external
+    // reader excludes the deleted rows too.
+    let load = rest_metadata_location(server.rest_port, table).await;
+    let metadata_location = load["metadata-location"]
+        .as_str()
+        .expect("metadata-location")
+        .to_string();
+    assert_eq!(
+        load["metadata"]["format-version"], 3,
+        "the deleting snapshot is v3"
+    );
+    let scratch = TempDir::new().expect("scratch");
+    if !external_readback(
+        server.rest_port,
+        table,
+        &metadata_location,
+        &cols,
+        &expected_rows,
+        scratch.path(),
+    ) {
+        return;
+    }
+    eprintln!("✓ deletion vectors are invisible to ProximaDB and external engines");
+}
+
 /// ADR-097 D3 / TD-SEAM-1 gate: a table materialized over pgwire is read back by
 /// engines that are not ProximaDB — through the Iceberg REST catalog and from the
 /// metadata file — and every value matches what ProximaDB returns. A second
@@ -227,12 +664,7 @@ fn external_readback(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn materialized_table_reads_back_in_external_iceberg_engines() {
     let server = TestPgServer::start().await.expect("server start");
-    let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-        .await
-        .expect("connect");
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
+    let client = connect_pg(&server).await;
 
     // DECIMAL(10,2) exercises the exact-decimal path end to end: catalog
     // precision/scale → Decimal128 Parquet → Iceberg `decimal(10,2)` + bounds.

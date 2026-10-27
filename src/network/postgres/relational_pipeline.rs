@@ -913,34 +913,6 @@ pub async fn try_run_select(
         return None;
     }
 
-    // OLAP result cache lookup (ADR-051 D2 / mandate #16c). Strong freshness:
-    // a hit is served ONLY when the entry was computed at the current canonical
-    // WAL LSN, so any write since → guaranteed miss → read-after-write correct.
-    // `cache_ctx` carries the (key, lsn) pair so the real-data success paths
-    // below can stamp the result without recomputing it.
-    let cache_ctx: Option<(StructuralKey, u64)> = if relational_abac_required {
-        None
-    } else if let Some(cache) = result_cache {
-        let current_lsn = current_canonical_lsn().await;
-        let skey = StructuralKey::new(
-            tenant.unwrap_or(""),
-            namespace.unwrap_or(""),
-            QueryKey::from_sql(sql),
-        );
-        if let Some(cached) = cache.get_fresh(&skey, &VectorFreshnessMode::Strong, current_lsn) {
-            tracing::debug!(
-                target: "proximadb::pgwire::result_cache",
-                tenant = tenant.unwrap_or(""),
-                lsn = current_lsn,
-                "OLAP result cache hit — short-circuiting route + execution"
-            );
-            return Some(Ok(cached.result.clone()));
-        }
-        Some((skey, current_lsn))
-    } else {
-        None
-    };
-
     // TD-OLAP-4 result-path probe: time ALL of `try_run_select` before execution
     // — including the path-1 engine-catalog `lower_sql` attempt below, which a
     // DataFusion-routed query pays and fails before reaching the path-2 setup.
@@ -1049,6 +1021,41 @@ pub async fn try_run_select(
             }
         }
     }
+
+    #[cfg(feature = "datafusion-integration")]
+    let publication_backed = !parquet_loc_by_key.is_empty();
+    #[cfg(not(feature = "datafusion-integration"))]
+    let publication_backed = false;
+
+    // OLAP result cache lookup (ADR-051 D2 / mandate #16c). Strong freshness:
+    // WAL freshness alone cannot detect an independently published snapshot.
+    // Resolve dependencies first and bypass this cache for published inputs
+    // until its key includes their pinned snapshot identities.
+    // `cache_ctx` carries the (key, lsn) pair so the real-data success paths
+    // below can stamp the result without recomputing it.
+    let cache_ctx: Option<(StructuralKey, u64)> = if relational_abac_required || publication_backed
+    {
+        None
+    } else if let Some(cache) = result_cache {
+        let current_lsn = current_canonical_lsn().await;
+        let skey = StructuralKey::new(
+            tenant.unwrap_or(""),
+            namespace.unwrap_or(""),
+            QueryKey::from_sql(sql),
+        );
+        if let Some(cached) = cache.get_fresh(&skey, &VectorFreshnessMode::Strong, current_lsn) {
+            tracing::debug!(
+                target: "proximadb::pgwire::result_cache",
+                tenant = tenant.unwrap_or(""),
+                lsn = current_lsn,
+                "OLAP result cache hit — short-circuiting route + execution"
+            );
+            return Some(Ok(cached.result.clone()));
+        }
+        Some((skey, current_lsn))
+    } else {
+        None
+    };
 
     // Course-correction §5: compute the per-query Parquet-backed signal — only ever
     // true under `datafusion-integration`, where the DataFusion destination is
@@ -1396,8 +1403,8 @@ pub async fn try_run_select(
             graph_ops,
             identity: identity.clone(),
             // ADR-025: reconcile opted-in parquet-backed tables with their
-            // post-snapshot WAL delta at scan time. `None` (no opted-in table)
-            // keeps the legacy bare-Parquet read (default-OFF).
+            // post-snapshot WAL delta at scan time (default-ON for eligible
+            // tables). `None` keeps the bare-Parquet read.
             // TD-USUB-2: native relational tables registered with the DataFusion
             // floor (and its `ctx.sql` fallback). `None` whenever the gate is off or
             // no table is native. A mixed query registers only its non-Parquet
@@ -1492,27 +1499,19 @@ pub async fn try_run_select(
                 }
                 return Some(Ok(result));
             }
-            // A mixed query naming a native table over the row cap (no streaming
-            // provider for it) is served on Volcano below, as it was before mixed
-            // queries reached DataFusion — never failed, never truncated.
+            // Switching a published input to the native record store changes
+            // its visibility authority. A row-cap decline cannot authorize that
+            // fallback, even if opening the latest metadata found no DVs: a
+            // concurrent publication could change that before the native scan.
             Err(e)
                 if mixed_registerable
                     && e.to_string().contains(
                         crate::query::execution::native_table_provider::MIXED_QUERY_ROW_CAP_DECLINE,
                     ) =>
             {
-                tracing::debug!(
-                    target: "proximadb::compute_route",
-                    error = %e,
-                    "mixed Parquet+native query over the native row cap; Volcano serves"
-                );
-                // Volcano serves, not the DataFusion route stamped above (TD-ROUTE-3).
-                crate::observability::io_trace::record_route(
-                    &crate::query::route_cost_model::shape_class(&shape),
-                    &crate::query::compute_scheduler::backend_label(
-                        &crate::query::table_write_plan::ComputeBackend::Native,
-                    ),
-                );
+                return Some(Err(format!(
+                    "{e}; cannot fall back to native storage for published inputs without a shared snapshot"
+                )));
             }
             Err(e) => return Some(Err(e.to_string())),
         }
@@ -2102,7 +2101,9 @@ async fn try_native_over_parquet(
             return None;
         }
     };
-    let (store, files, file_schema) = table.native_scan_inputs();
+    // The native file-only scanner/metadata shortcut cannot apply DVs yet.
+    // Decline to the delete-aware provider before any raw footer elision.
+    let (store, files, file_schema) = table.native_scan_inputs()?;
     // Metadata elision (TD-OLAP-4): unfiltered MIN/MAX/COUNT answered from the
     // parquet FOOTER — zero column I/O, flat cost. The single biggest native win at
     // scale (q07 MIN/MAX: a full-column vectorized scan → a footer read). Emits the

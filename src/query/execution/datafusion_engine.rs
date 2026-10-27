@@ -210,7 +210,7 @@ impl DataFusionLocalEngine {
                 // then fails with an explicit unresolved-table error, which the caller
                 // surfaces. Registering a truncated scan would be a silently wrong answer.
                 // In a query that also reads Parquet tables, decline with the marker so
-                // the caller serves it on Volcano instead (ADR-097 P3.1 PR 8).
+                // the caller reports an explicit refusal to change visibility authority.
                 let Some((schema, records)) = scanned else {
                     if !context.parquet_tables.is_empty() {
                         return Err(ExecutionError::Planning(format!(
@@ -1032,6 +1032,14 @@ async fn register_merged_olap_table(
     )
     .await
     .map_err(|e| ExecutionError::Context(format!("olap-merge base open {name}: {e}")))?;
+    // The catalog WAL boundary does not order an independently published DV
+    // snapshot. Appending native rows could resurrect records deleted by that
+    // newer snapshot. Refuse until the writer supplies a shared visibility fence.
+    if base.has_deletion_vectors() {
+        return Err(ExecutionError::Context(format!(
+            "olap-merge {name}: nonempty WAL delta cannot be ordered against a deletion-vector snapshot"
+        )));
+    }
     let base_schema = datafusion::datasource::TableProvider::schema(base.as_ref());
 
     // 3. The current live rows for the changed oids, encoded with the same

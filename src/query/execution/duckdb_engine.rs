@@ -56,7 +56,7 @@ impl ExecutionEngine for DuckDbLocalEngine {
         // source here, before the blocking hop.
         let mut views = Vec::with_capacity(context.parquet_tables.len());
         for (name, location) in &context.parquet_tables {
-            views.push((name.clone(), read_parquet_source(location).await?));
+            views.push((name.clone(), read_parquet_view_source(location).await?));
         }
         // DuckDB is synchronous + CPU-bound (CBO + vectorized joins). Run it on
         // the blocking pool so it never holds a tokio worker thread.
@@ -74,26 +74,92 @@ impl ExecutionEngine for DuckDbLocalEngine {
     }
 }
 
-/// The `read_parquet` argument for a table `location`: the files its published
-/// Iceberg snapshot selects, chosen by the SAME helper as the DataFusion reader
-/// so both engines read one generation. Only a table with no metadata log keeps
-/// the directory form; unreadable metadata fails the query instead of reading
-/// whatever parquet happens to be present.
-async fn read_parquet_source(location: &str) -> Result<String, ExecutionError> {
+/// The view body for a table `location`: its published Iceberg snapshot's files
+/// (chosen by the SAME helper as the DataFusion reader, so both engines read one
+/// generation) with the snapshot's deletion vectors applied — deleted rows must
+/// not surface on this route any more than on DataFusion's. Only a table with no
+/// metadata log keeps the plain directory form; unreadable metadata fails the
+/// query instead of reading whatever parquet happens to be present.
+async fn read_parquet_view_source(location: &str) -> Result<String, ExecutionError> {
     use crate::datafusion::engine_adapters::ObjectStoreParquetTable;
-    let selected = ObjectStoreParquetTable::manifest_selected_uris(location)
+    let selected = ObjectStoreParquetTable::manifest_selected_snapshot(location)
         .await
         .map_err(|e| ExecutionError::Execution(format!("duckdb select files {location}: {e}")))?;
     Ok(match selected {
-        Some(files) => {
-            let quoted: Vec<String> = files
+        Some(source) => {
+            let quoted: Vec<String> = source
+                .uris
                 .iter()
-                .map(|f| sql_string_literal(f.as_str()))
-                .collect();
-            format!("[{}]", quoted.join(", "))
+                .map(|f| duckdb_file_name(f).map(|name| sql_string_literal(&name)))
+                .collect::<Result<_, _>>()?;
+            let files = format!("[{}]", quoted.join(", "));
+            match deletion_predicate(&source.deletions)? {
+                // filename/file_row_number are read_parquet's per-row file
+                // provenance; EXCLUDE keeps them out of the view's output.
+                Some(predicate) => format!(
+                    "(SELECT * EXCLUDE (filename, file_row_number) FROM \
+                     read_parquet({files}, union_by_name = true, filename = true, \
+                     file_row_number = true) WHERE {predicate})"
+                ),
+                None => format!("read_parquet({files}, union_by_name = true)"),
+            }
         }
-        None => sql_string_literal(location.trim_end_matches('/')),
+        None => format!(
+            "read_parquet({}, union_by_name = true)",
+            sql_string_literal(location.trim_end_matches('/'))
+        ),
     })
+}
+
+/// The WHERE clause hiding `deletions` (per-URI deleted row numbers) in a
+/// `read_parquet(..., filename = true, file_row_number = true)` scan: `None`
+/// when there is nothing to hide. Fail-closed: a set too large to express as a
+/// SQL literal is an error, never a silent read of deleted rows.
+fn deletion_predicate(deletions: &[(String, Vec<u64>)]) -> Result<Option<String>, ExecutionError> {
+    const MAX_POSITIONS: usize = 1_000_000;
+    let non_empty: Vec<&(String, Vec<u64>)> = deletions
+        .iter()
+        .filter(|(_, positions)| !positions.is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        return Ok(None);
+    }
+    let total: usize = non_empty.iter().map(|(_, p)| p.len()).sum();
+    if total > MAX_POSITIONS {
+        return Err(ExecutionError::Execution(format!(
+            "duckdb view: {total} deleted positions exceed the SQL predicate cap \
+             ({MAX_POSITIONS}); refusing to serve possibly-deleted rows"
+        )));
+    }
+    let mut clauses = Vec::with_capacity(non_empty.len());
+    for (uri, positions) in non_empty {
+        let list = positions
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!(
+            "(filename = {} AND file_row_number IN ({list}))",
+            sql_string_literal(&duckdb_file_name(uri)?)
+        ));
+    }
+    Ok(Some(format!("NOT ({})", clauses.join(" OR "))))
+}
+
+/// Match the bridge's URL decoding and DuckDB's local filename provenance.
+/// Both the open path and DV predicate must name the same physical file.
+fn duckdb_file_name(uri: &str) -> Result<String, ExecutionError> {
+    if !uri.starts_with("file://") {
+        return Ok(uri.to_owned());
+    }
+    let url = url::Url::parse(uri)
+        .map_err(|e| ExecutionError::Execution(format!("duckdb local URL: {e}")))?;
+    let path = url.to_file_path().map_err(|_| {
+        ExecutionError::Execution("duckdb local URL is not an absolute local path".into())
+    })?;
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| ExecutionError::Execution("duckdb local path is not UTF-8".into()))
 }
 
 /// A SQL single-quoted string literal (`'` doubled), for object paths/URIs.
@@ -122,7 +188,7 @@ fn run_duckdb(
         // view; `union_by_name` lets a snapshot mix files written before them.
         let ddl = format!(
             "CREATE VIEW \"{name}\" AS SELECT COLUMNS(lambda c: NOT starts_with(c, '__proxima_')) \
-             FROM read_parquet({source}, union_by_name = true)"
+             FROM {source}"
         );
         conn.execute_batch(&ddl)
             .map_err(|e| ExecutionError::Execution(format!("duckdb register {name}: {e}")))?;
@@ -217,6 +283,14 @@ fn ffi_batch_58_to_59(
 mod tests {
     use super::*;
     use crate::datafusion::engine_adapters::object_store_parquet_reader::tests::publish_snapshot_then_add_stale_part;
+    use crate::datafusion::engine_adapters::object_store_parquet_reader::tests::publish_snapshot_with_deletion_vector;
+
+    fn parquet_context(base: &str) -> QueryExecutionContext {
+        QueryExecutionContext {
+            parquet_tables: vec![("t".into(), format!("{base}/data"))],
+            ..Default::default()
+        }
+    }
 
     /// The view must read the snapshot's files, not the directory: a stale
     /// parquet beside the manifest-listed one would otherwise be unioned in.
@@ -224,16 +298,74 @@ mod tests {
     async fn view_reads_manifest_files_only() {
         let tmp = tempfile::tempdir().unwrap();
         let base_url = publish_snapshot_then_add_stale_part(tmp.path()).await;
-        let context = QueryExecutionContext {
-            parquet_tables: vec![("t".to_string(), format!("{base_url}/data"))],
-            ..Default::default()
-        };
+        let context = parquet_context(&base_url);
         let result = DuckDbLocalEngine
             .execute_sql("SELECT x FROM t", context)
             .await
             .unwrap();
         // part-0 holds 4 rows; reading the directory would add the stale part's 4.
         assert_eq!(result.rows.len(), 4);
+    }
+
+    /// P2.4 slice 3b: the view applies the snapshot's deletion vectors —
+    /// deleted rows (positions 0 and 3 of part-0: x=1 and x=101) must not
+    /// surface on the DuckDB route either.
+    #[tokio::test]
+    async fn view_hides_deletion_vector_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_url = publish_snapshot_with_deletion_vector(tmp.path()).await;
+        let context = parquet_context(&base_url);
+        let result = DuckDbLocalEngine
+            .execute_sql("SELECT x FROM t ORDER BY x", context)
+            .await
+            .unwrap();
+        let xs: Vec<i64> = result
+            .rows
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(proximadb_records::ProximaValue::Int64(i)) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(xs, vec![2, 100], "deleted 1 and 101 stay invisible");
+    }
+
+    #[test]
+    fn deletion_predicate_joins_files_and_caps_size() {
+        // Nothing to hide → no predicate.
+        assert!(deletion_predicate(&[]).unwrap().is_none());
+        assert!(
+            deletion_predicate(&[("file:///a.parquet".into(), vec![])])
+                .unwrap()
+                .is_none()
+        );
+        let predicate = deletion_predicate(&[
+            ("file:///a'x.parquet".into(), vec![3, 1]),
+            ("file:///b.parquet".into(), vec![0]),
+        ])
+        .unwrap()
+        .expect("a predicate");
+        assert_eq!(
+            predicate,
+            "NOT ((filename = '/a''x.parquet' AND file_row_number IN (3, 1)) OR \
+             (filename = '/b.parquet' AND file_row_number IN (0)))"
+        );
+        // Fail closed past the SQL-literal cap: never serve possibly-deleted rows.
+        let huge = vec![(String::from("file:///a.parquet"), vec![1_u64; 1_000_001])];
+        assert!(deletion_predicate(&huge).is_err());
+    }
+
+    #[test]
+    fn local_file_provenance_decodes_urls_and_rejects_remote_authorities() {
+        assert_eq!(
+            duckdb_file_name("file:///tmp/a%20b/x%25.parquet").unwrap(),
+            "/tmp/a b/x%.parquet"
+        );
+        assert_eq!(
+            duckdb_file_name("s3://bucket/a%20b").unwrap(),
+            "s3://bucket/a%20b"
+        );
+        assert!(duckdb_file_name("file://remote-host/tmp/x.parquet").is_err());
     }
 
     #[test]

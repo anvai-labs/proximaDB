@@ -125,8 +125,11 @@ pub(super) async fn check_commit(
     if latest.is_none_or(|latest| latest < successor) {
         return CommitCheck::NotLanded;
     }
-    match bridge.read_iceberg_table(metadata_prefix, successor).await {
-        Ok(files) if files.contains(first) => CommitCheck::Landed(successor),
+    match bridge
+        .read_iceberg_snapshot_files(metadata_prefix, successor)
+        .await
+    {
+        Ok(snapshot) if snapshot.data_files.contains(first) => CommitCheck::Landed(successor),
         Ok(_) => CommitCheck::NotLanded,
         Err(_) => CommitCheck::Unknown,
     }

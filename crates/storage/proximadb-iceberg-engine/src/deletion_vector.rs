@@ -201,6 +201,41 @@ impl PositionDeletes {
         self.containers.values().map(Container::cardinality).sum()
     }
 
+    /// Count deleted physical row positions in the half-open range `[start, end)`.
+    /// Whole containers use their cardinality; only the two boundary containers
+    /// need a partial count. This does not expand a dense vector into row IDs.
+    pub fn count_range(&self, start: u64, end: u64) -> u64 {
+        if start >= end {
+            return 0;
+        }
+        self.containers
+            .range((start >> 16)..=((end - 1) >> 16))
+            .map(|(&key, container)| {
+                let base = key << 16;
+                let low = start.saturating_sub(base).min(65536) as usize;
+                let high = end.saturating_sub(base).min(65536) as usize;
+                if low == 0 && high == 65536 {
+                    return container.cardinality();
+                }
+                match container {
+                    Container::Array(values) => {
+                        (values.partition_point(|v| usize::from(*v) < high)
+                            - values.partition_point(|v| usize::from(*v) < low))
+                            as u64
+                    }
+                    Container::Bitmap(words, _) => (low / 64..high.div_ceil(64))
+                        .map(|i| {
+                            let lower = low.saturating_sub(i * 64).min(64);
+                            let upper = high.saturating_sub(i * 64).min(64);
+                            let mask = (u64::MAX << lower) & (u64::MAX >> (64 - upper));
+                            u64::from((words[i] & mask).count_ones())
+                        })
+                        .sum(),
+                }
+            })
+            .sum()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.cardinality() == 0
     }
@@ -477,3 +512,34 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 #[path = "deletion_vector_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod range_tests {
+    use super::PositionDeletes;
+
+    #[test]
+    fn count_ranges_matches_physical_positions_across_container_types() {
+        let mut deletes = PositionDeletes::new();
+        let positions: Vec<u64> = (0..140_000)
+            .filter(|p| p % 3 != 0)
+            .chain([1_u64 << 32])
+            .collect();
+        for &p in &positions {
+            deletes.insert(p);
+        }
+        for (start, end) in [
+            (0, 0),
+            (0, 64),
+            (63, 65),
+            (65535, 65537),
+            (17, 139999),
+            (0, u64::MAX),
+            (1_u64 << 32, (1_u64 << 32) + 1),
+        ] {
+            assert_eq!(
+                deletes.count_range(start, end),
+                positions.iter().filter(|&&p| p >= start && p < end).count() as u64
+            );
+        }
+    }
+}

@@ -40,6 +40,7 @@ use parquet::file::metadata::ParquetMetaData;
 use parquet::file::statistics::Statistics as ParquetStatistics;
 use proximadb_bloom::{BloomFilterBuilder, BloomFilterStrategy, CoreBloomFilterConfig};
 use proximadb_iceberg_engine::IcebergObjectStoreBridge;
+use proximadb_iceberg_engine::deletion_vector::PositionDeletes;
 use proximadb_storage_common::format_splits::{
     ColumnBounds, FileSplit, ScalarPredicate, ScalarValue, SplitStatistics, SplitType,
 };
@@ -574,6 +575,11 @@ pub struct ObjectStoreParquetSplitReader {
     schema: SchemaRef,
     store: Arc<dyn ObjectStore>,
     file_sizes: HashMap<String, u64>,
+    /// The snapshot's deletion vectors, keyed by the split's full file path.
+    /// A split whose file appears here is read WITHOUT page pruning (page-level
+    /// row elision would break the physical-position alignment the position
+    /// filter needs) and every decoded batch is masked against the vector.
+    deletions: HashMap<String, Arc<PositionDeletes>>,
     /// Conjunctive WHERE predicates pushed into this scan, evaluated against the
     /// page index of each row group read (empty = no page pruning).
     static_predicates: Vec<(String, ScalarPredicate)>,
@@ -617,7 +623,13 @@ impl SplitReader for ObjectStoreParquetSplitReader {
         let path = Path::from(split.file_path.as_str());
         let file_size = self.file_sizes.get(&split.file_path).copied();
         let reader = parquet_reader(self.store.clone(), path, file_size);
-        let predicates: Vec<(String, ScalarPredicate)> = if self.page_prune {
+        // Deletion-vector application (P2.4 slice 3b): this file's deleted
+        // positions, decoded once at table open. When present, page pruning is
+        // disabled for the split — eliding rows inside the Parquet reader would
+        // break the physical-position alignment the position filter needs; the
+        // exact predicate still filters above the scan.
+        let deleted = self.deletions.get(&split.file_path).cloned();
+        let predicates: Vec<(String, ScalarPredicate)> = if self.page_prune && deleted.is_none() {
             self.static_predicates
                 .iter()
                 .chain(runtime.iter())
@@ -639,6 +651,28 @@ impl SplitReader for ObjectStoreParquetSplitReader {
             .map_err(|e| df_err("parquet open", e))?;
 
         let out_schema = project_schema(&self.schema, projection);
+
+        // Physical row offset of this row group within its file (0 for the
+        // first): deletion-vector positions are FILE positions, not row-group
+        // ones. Computed while the builder still owns its footer metadata.
+        let deleted_base: Option<u64> = match &deleted {
+            Some(_) => {
+                let base: i64 = builder
+                    .metadata()
+                    .row_groups()
+                    .iter()
+                    .take(row_group_index)
+                    .map(|g| g.num_rows())
+                    .sum();
+                u64::try_from(base).map(Some).map_err(|_| {
+                    df_err(
+                        "deletion vector",
+                        format!("row offset underflow for {}", split.file_path),
+                    )
+                })?
+            }
+            None => None,
+        };
 
         if !predicates.is_empty() {
             let file_schema = builder.schema().clone();
@@ -719,6 +753,10 @@ impl SplitReader for ObjectStoreParquetSplitReader {
             .build()
             .map_err(|e| df_err("parquet reader build", e))?;
 
+        // Position filter state: the first physical row of the first decoded
+        // batch is `deleted_base` (page pruning is off for deleted files, so
+        // decoded rows map 1:1 onto physical positions in order).
+        let mut next_position = deleted_base.unwrap_or(0);
         let mut batches = Vec::new();
         while let Some(batch) = stream.next().await {
             let batch = batch.map_err(|e| df_err("parquet decode", e))?;
@@ -731,6 +769,31 @@ impl SplitReader for ObjectStoreParquetSplitReader {
                     let opts = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
                     RecordBatch::try_new_with_options(out_schema.clone(), cols, &opts)
                         .map_err(|e| df_err("projection reorder", e))?
+                }
+                None => batch,
+            };
+            let batch = match &deleted {
+                Some(deletes) => {
+                    let start = next_position;
+                    next_position = next_position
+                        .checked_add(batch.num_rows() as u64)
+                        .ok_or_else(|| {
+                            df_err("deletion vector", "row position overflow mid-batch")
+                        })?;
+                    let mask: arrow_array::BooleanArray = (0..batch.num_rows())
+                        .map(|r| !deletes.contains(start + r as u64))
+                        .collect();
+                    let kept = mask.true_count();
+                    if batch.num_columns() == 0 {
+                        // `filter_record_batch` rejects zero-column batches;
+                        // carry the surviving row count explicitly.
+                        let opts = RecordBatchOptions::new().with_row_count(Some(kept));
+                        RecordBatch::try_new_with_options(out_schema.clone(), Vec::new(), &opts)
+                            .map_err(|e| df_err("deletion vector filter", e))?
+                    } else {
+                        arrow::compute::filter_record_batch(&batch, &mask)
+                            .map_err(|e| df_err("deletion vector filter", e))?
+                    }
                 }
                 None => batch,
             };
@@ -762,6 +825,11 @@ pub struct ObjectStoreParquetTable {
     store: Arc<dyn ObjectStore>,
     splits: Vec<FileSplit>,
     file_sizes: HashMap<String, u64>,
+    /// The snapshot's deletion vectors, decoded once at open (each is a small
+    /// ranged read), keyed by the FULL object path of the data file they delete
+    /// from — the same key form `splits` carry. Empty for tables whose published
+    /// snapshot carries no vectors: those read exactly as before.
+    deletions: HashMap<String, Arc<PositionDeletes>>,
     location: String,
     /// Registered table/collection name — keys the ADR-037 statistics
     /// registry for the NDV overlay in [`TableProvider::statistics`].
@@ -784,6 +852,24 @@ pub struct ObjectStoreParquetTable {
 /// Metadata subdirectory beneath the table base, matching the writer's
 /// `format!("{prefix}/metadata")` in `materialize_table_to_parquet`.
 const METADATA_SUBPREFIX: &str = "metadata";
+
+/// The manifest-selected read of one location: its bridge, data files and the
+/// decoded deletion vectors that apply to them (keyed by full data-file path).
+struct ManifestSelection {
+    bridge: Arc<IcebergObjectStoreBridge>,
+    paths: Vec<Path>,
+    deletions: HashMap<String, Arc<PositionDeletes>>,
+}
+
+/// The same selection as absolute URIs plus each file's deleted positions, for
+/// readers that consume URIs (the DuckDB view applies the positions in SQL).
+#[derive(Debug)]
+pub struct ManifestReadSource {
+    /// Absolute URIs of the data files in the selected snapshot.
+    pub uris: Vec<String>,
+    /// Absolute data-file URI and deleted physical positions for that file.
+    pub deletions: Vec<(String, Vec<u64>)>,
+}
 
 impl ObjectStoreParquetTable {
     /// Open either a ProximaDB base-prefix location (`data/*.parquet`) or a
@@ -827,9 +913,12 @@ impl ObjectStoreParquetTable {
     /// metadata existed. Once a `v*.metadata.json` exists, failing to read it
     /// (or a snapshot naming no data files) is an `Err`: listing then could
     /// silently mix generations, so the open fails closed instead.
-    async fn manifest_selected_files(
-        location: &str,
-    ) -> DFResult<Option<(Arc<IcebergObjectStoreBridge>, Vec<Path>)>> {
+    ///
+    /// Delete-aware (P2.4 slice 3b): the snapshot is read WITH its deletion
+    /// vectors, and each vector is decoded here (one small ranged read per
+    /// vector) into the table's `deletions` map. A snapshot whose vectors
+    /// cannot be decoded is an `Err` — never a silent read of deleted rows.
+    async fn manifest_selected_files(location: &str) -> DFResult<Option<ManifestSelection>> {
         let Some(base) = Self::table_base_of(location) else {
             return Ok(None);
         };
@@ -844,10 +933,12 @@ impl ObjectStoreParquetTable {
         else {
             return Ok(None);
         };
-        let mut paths: Vec<Path> = bridge
-            .read_iceberg_snapshot(METADATA_SUBPREFIX, version)
+        let snapshot = bridge
+            .read_iceberg_snapshot_with_deletes(METADATA_SUBPREFIX, version)
             .await
-            .map_err(manifest_err)?
+            .map_err(manifest_err)?;
+        let mut paths: Vec<Path> = snapshot
+            .data_files
             .into_iter()
             .filter(|p| p.as_ref().ends_with(".parquet"))
             .collect();
@@ -858,28 +949,73 @@ impl ObjectStoreParquetTable {
             ));
         }
         paths.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
-        Ok(Some((bridge, paths)))
+        let mut deletions = HashMap::with_capacity(snapshot.deletion_vectors.len());
+        for vector in &snapshot.deletion_vectors {
+            let decoded = bridge
+                .read_deletion_vector(vector)
+                .await
+                .map_err(manifest_err)?;
+            let full = bridge.full_object_path(&vector.data_file);
+            deletions.insert(full.as_ref().to_string(), Arc::new(decoded));
+        }
+        Ok(Some(ManifestSelection {
+            bridge,
+            paths,
+            deletions,
+        }))
     }
 
-    /// The manifest-selected data files of `location` as absolute URIs, for
-    /// readers outside DataFusion (the DuckDB view) so every route reads the
-    /// same snapshot. Same `Ok(None)`/`Err` contract as `manifest_selected_files`.
-    pub async fn manifest_selected_uris(location: &str) -> DFResult<Option<Vec<String>>> {
-        Ok(Self::manifest_selected_files(location)
-            .await?
-            .map(|(bridge, paths)| {
-                paths
-                    .iter()
-                    .map(|p| bridge.object_uri(p.as_ref()))
-                    .collect()
-            }))
+    /// The manifest-selected data files of `location` as absolute URIs, with the
+    /// deleted positions of each (the DuckDB view applies them so every route
+    /// reads the same post-delete snapshot). Same `Ok(None)`/`Err` contract as
+    /// [`manifest_selected_files`](Self::manifest_selected_files).
+    pub async fn manifest_selected_snapshot(
+        location: &str,
+    ) -> DFResult<Option<ManifestReadSource>> {
+        let Some(selected) = Self::manifest_selected_files(location).await? else {
+            return Ok(None);
+        };
+        // Bound expansion before allocating row IDs for DuckDB's SQL predicate.
+        let total: u64 = selected.deletions.values().map(|d| d.cardinality()).sum();
+        if total > 1_000_000 {
+            return Err(df_err(
+                "DuckDB snapshot",
+                "deleted position count exceeds SQL predicate cap (1000000)",
+            ));
+        }
+        Ok(Some(ManifestReadSource {
+            uris: selected
+                .paths
+                .iter()
+                .map(|p| selected.bridge.object_uri(p.as_ref()))
+                .collect(),
+            deletions: selected
+                .paths
+                .iter()
+                .filter_map(|relative| {
+                    let full = selected.bridge.full_object_path(relative);
+                    selected.deletions.get(full.as_ref()).map(|deletes| {
+                        (
+                            selected.bridge.object_uri(relative.as_ref()),
+                            deletes.positions(),
+                        )
+                    })
+                })
+                .collect(),
+        }))
     }
 
     async fn open_bridge_base(location: &str) -> DFResult<Self> {
         // Manifest first; listing only when the table has no metadata log
         // (see `manifest_selected_files`).
-        if let Some((bridge, paths)) = Self::manifest_selected_files(location).await? {
-            return Self::open_relative(bridge, paths, location).await;
+        if let Some(selected) = Self::manifest_selected_files(location).await? {
+            return Self::open_relative(
+                selected.bridge,
+                selected.paths,
+                selected.deletions,
+                location,
+            )
+            .await;
         }
 
         let bridge = Arc::new(
@@ -916,16 +1052,18 @@ impl ObjectStoreParquetTable {
             ));
         }
 
-        Self::open_relative(bridge, parquet_paths, location).await
+        Self::open_relative(bridge, parquet_paths, HashMap::new(), location).await
     }
 
     /// Resolve bridge-relative parquet paths to full keys and open them.
     ///
     /// Shared by the manifest and listing paths so both resolve identically —
-    /// the only difference between them is WHICH files were chosen.
+    /// the only difference between them is WHICH files were chosen (and,
+    /// manifest-only, the snapshot's deletion vectors).
     async fn open_relative(
         bridge: Arc<IcebergObjectStoreBridge>,
         parquet_paths: Vec<Path>,
+        deletions: HashMap<String, Arc<PositionDeletes>>,
         location: &str,
     ) -> DFResult<Self> {
         // Wrap the store so footer + row-group reads land in the per-query
@@ -942,7 +1080,7 @@ impl ObjectStoreParquetTable {
                 .size;
             files.push((full, Some(size)));
         }
-        Self::open_files(store, files, location.to_string()).await
+        Self::open_files(store, files, deletions, location.to_string()).await
     }
 
     async fn open_direct_object(location: &str) -> DFResult<Self> {
@@ -955,12 +1093,19 @@ impl ObjectStoreParquetTable {
             .await
             .map_err(|e| df_err(&format!("head {path}"), e))?
             .size;
-        Self::open_files(store, vec![(path, Some(size))], location.to_string()).await
+        Self::open_files(
+            store,
+            vec![(path, Some(size))],
+            HashMap::new(),
+            location.to_string(),
+        )
+        .await
     }
 
     async fn open_files(
         store: Arc<dyn ObjectStore>,
         files: Vec<(Path, Option<u64>)>,
+        deletions: HashMap<String, Arc<PositionDeletes>>,
         location: String,
     ) -> DFResult<Self> {
         let mut schema = None;
@@ -971,6 +1116,13 @@ impl ObjectStoreParquetTable {
             let builder = ParquetRecordBatchStreamBuilder::new(reader)
                 .await
                 .map_err(|e| df_err(&format!("parquet metadata {path}"), e))?;
+            if let Some(deleted) = deletions.get(path.as_ref()) {
+                let rows = u64::try_from(builder.metadata().file_metadata().num_rows())
+                    .map_err(|e| df_err("negative parquet row count", e))?;
+                if deleted.count_range(0, rows) != deleted.cardinality() {
+                    return Err(df_err("open deletion vector", "position outside data file"));
+                }
+            }
             let file_schema = builder.schema().clone();
             if schema.is_none() {
                 schema = Some(Self::normalize_schema_for_planning(file_schema));
@@ -987,6 +1139,7 @@ impl ObjectStoreParquetTable {
             store,
             splits,
             file_sizes,
+            deletions,
             location,
             table_name: None,
             split_key_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -1003,6 +1156,7 @@ impl ObjectStoreParquetTable {
             schema: self.schema.clone(),
             splits: self.splits.clone(),
             file_sizes: self.file_sizes.clone(),
+            deletions: self.deletions.clone(),
         }
     }
 
@@ -1052,6 +1206,7 @@ impl ObjectStoreParquetTable {
             store,
             splits: disc.splits.clone(),
             file_sizes: disc.file_sizes.clone(),
+            deletions: disc.deletions.clone(),
             location: location.to_string(),
             table_name: None,
             split_key_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -1062,6 +1217,11 @@ impl ObjectStoreParquetTable {
         })
     }
 
+    /// Whether this pinned snapshot requires physical row-position deletes.
+    pub fn has_deletion_vectors(&self) -> bool {
+        !self.deletions.is_empty()
+    }
+
     /// TD-OLAP-4 shadow probe: the raw inputs a native
     /// [`ParquetScanOperator`](crate::query::execution::native_parquet_scan::ParquetScanOperator)
     /// needs to read the SAME external parquet this DataFusion table reads — the
@@ -1070,9 +1230,14 @@ impl ObjectStoreParquetTable {
     /// does not yet do row-group zone-map pruning, so a native sample built from
     /// this is an upper bound on selective-filter queries (documented caveat for
     /// the engine-dimension trace).
+    /// Returns `None` when file-only native scans cannot preserve visibility.
+    /// The native footer/count shortcut and scanner do not yet apply DVs.
     pub fn native_scan_inputs(
         &self,
-    ) -> (Arc<dyn ObjectStore>, Vec<(Path, Option<u64>)>, SchemaRef) {
+    ) -> Option<(Arc<dyn ObjectStore>, Vec<(Path, Option<u64>)>, SchemaRef)> {
+        if !self.deletions.is_empty() {
+            return None;
+        }
         let mut seen = std::collections::BTreeSet::new();
         let mut files: Vec<(Path, Option<u64>)> = Vec::new();
         for split in &self.splits {
@@ -1081,7 +1246,7 @@ impl ObjectStoreParquetTable {
                 files.push((Path::from(split.file_path.as_str()), size));
             }
         }
-        (self.store.clone(), files, self.schema.clone())
+        Some((self.store.clone(), files, self.schema.clone()))
     }
 
     /// Attach the registered table name (keys the ADR-037 statistics registry
@@ -1170,6 +1335,71 @@ impl ObjectStoreParquetTable {
         self.prune_splits(filters, SemijoinConfig::from_env()).len()
     }
 
+    /// P2.4 slice 3b: adjust footer-derived statistics for the snapshot's
+    /// deletion vectors, restricted to the `surviving` splits. The footer
+    /// counts EVERY physical row; the vectors hide
+    /// some of them. `COUNT(*)` elides off `num_rows` (both the provider path
+    /// and the scan-exec statistics the aggregate rewrite actually reads), so
+    /// it must be the post-delete count; and a deleted row may have held a
+    /// column's extreme value or its only NULL, so per-column EXACT
+    /// null_count/min/max/distinct are demoted to inexact (the values remain
+    /// bounds, just not guaranteed post-delete exact ones). No-op without
+    /// deletions — a clean snapshot's statistics are untouched.
+    /// `surviving` are the splits the statistics were computed over: the
+    /// provider passes every split, the scan path passes its predicate-PRUNED
+    /// set — subtracting a pruned file's deletions from statistics that no
+    /// longer count its rows would under-count.
+    fn apply_deletion_statistics(
+        deletions: &HashMap<String, Arc<PositionDeletes>>,
+        all_splits: &[FileSplit],
+        surviving: &[FileSplit],
+        stats: &mut Statistics,
+    ) {
+        use datafusion_common::stats::Precision;
+        if deletions.is_empty() || surviving.is_empty() {
+            return;
+        }
+        let kept: std::collections::HashSet<&str> =
+            surviving.iter().map(|s| s.split_id.as_str()).collect();
+        // open_files emits each file's row groups in physical order. Use all
+        // groups to advance the physical offset, including predicate-pruned ones.
+        let mut offsets: HashMap<&str, u64> = HashMap::new();
+        let mut deleted = 0_u64;
+        for split in all_splits {
+            let Some(vector) = deletions.get(&split.file_path) else {
+                continue;
+            };
+            let offset = offsets.entry(split.file_path.as_str()).or_default();
+            let rows = split.statistics.row_count.unwrap_or(0);
+            if kept.contains(split.split_id.as_str()) {
+                deleted += vector.count_range(*offset, *offset + rows);
+            }
+            *offset += rows;
+        }
+        if deleted == 0 {
+            return;
+        }
+        if let Precision::Exact(rows) = stats.num_rows {
+            stats.num_rows = Precision::Exact(rows.saturating_sub(deleted as usize));
+        }
+        fn demote<T: std::fmt::Debug + Clone + Eq + PartialOrd>(p: &mut Precision<T>) {
+            if let Precision::Exact(v) = p {
+                *p = Precision::Inexact(v.clone());
+            }
+        }
+        for cs in &mut stats.column_statistics {
+            if let Precision::Exact(n) = cs.null_count {
+                cs.null_count = Precision::Inexact(n);
+            }
+            demote(&mut cs.min_value);
+            demote(&mut cs.max_value);
+            demote(&mut cs.sum_value);
+            if let Precision::Exact(n) = cs.distinct_count {
+                cs.distinct_count = Precision::Inexact(n);
+            }
+        }
+    }
+
     fn reader(
         &self,
         filters: &[Expr],
@@ -1179,6 +1409,7 @@ impl ObjectStoreParquetTable {
             schema: self.schema.clone(),
             store: self.store.clone(),
             file_sizes: self.file_sizes.clone(),
+            deletions: self.deletions.clone(),
             static_predicates: if spec.page_prune {
                 conjunctive_predicates(filters)
             } else {
@@ -1571,13 +1802,15 @@ impl TableProvider for ObjectStoreParquetTable {
         // ADR-050 D2 / TD-DFR-1: footer-derived, zero-new-scan column
         // statistics so the planner stops planning blind. Typed min/max value
         // bounds are opt-in (default OFF) — see `df_stats_value_bounds_enabled`.
-        Some(statistics_from_splits(
+        let mut stats = statistics_from_splits(
             &self.splits,
             &self.schema,
             self.table_name.as_deref(),
             df_stats_value_bounds_enabled(),
             self.stats_trust,
-        ))
+        );
+        Self::apply_deletion_statistics(&self.deletions, &self.splits, &self.splits, &mut stats);
+        Some(stats)
     }
 
     async fn scan(
@@ -1605,7 +1838,7 @@ impl TableProvider for ObjectStoreParquetTable {
         );
         // Post-prune stats, narrowed to the projection: `partition_statistics`
         // requires the vector to match the exec's PROJECTED schema width.
-        let scan_stats = project_statistics(
+        let mut scan_stats = project_statistics(
             &statistics_from_splits(
                 &pruned,
                 &self.schema,
@@ -1615,6 +1848,7 @@ impl TableProvider for ObjectStoreParquetTable {
             ),
             projection.map(|p| p.as_slice()),
         );
+        Self::apply_deletion_statistics(&self.deletions, &self.splits, &pruned, &mut scan_stats);
         let exec = ProximaScanExec::builder()
             .schema(self.schema.clone())
             .splits(pruned)
@@ -1900,7 +2134,15 @@ pub async fn open_object_store_parquet_location(
     // Statistics are looked up under the tenant-qualified key MATERIALIZE
     // publishes them under.
     let stats_key = crate::core::statistics::table_statistics_key(tenant, name);
-    if let Some(disc) = super::table_open_cache::get(tenant, location) {
+    // A location-only key cannot pin an Iceberg snapshot: another writer can
+    // publish a DV without changing any data path or calling local invalidation.
+    // Bypass this optional cache for every potentially manifest-managed base,
+    // including one that gains its first metadata after an earlier open.
+    let cacheable = ObjectStoreParquetTable::table_base_of(location).is_none();
+    if let Some(disc) = cacheable
+        .then(|| super::table_open_cache::get(tenant, location))
+        .flatten()
+    {
         let table = Arc::new(
             ObjectStoreParquetTable::from_cached(&disc, location)?
                 .with_table_name(stats_key.clone())
@@ -1916,7 +2158,9 @@ pub async fn open_object_store_parquet_location(
             .with_table_name(stats_key)
             .with_stats_trust(stats_trust),
     );
-    super::table_open_cache::insert(tenant, location, table.discovery());
+    if cacheable {
+        super::table_open_cache::insert(tenant, location, table.discovery());
+    }
     crate::observability::io_trace::record_table_open(false);
     Ok(table)
 }
@@ -1992,8 +2236,7 @@ pub(crate) mod tests {
         assert_eq!(normalized.metadata(), &file_meta);
     }
 
-    #[tokio::test]
-    async fn opens_bridge_base_prefix_and_discovers_data_parquet() {
+    async fn open_two_row_group_table() -> (tempfile::TempDir, ObjectStoreParquetTable) {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir(&data_dir).unwrap();
@@ -2001,6 +2244,12 @@ pub(crate) mod tests {
 
         let location = format!("file://{}", tmp.path().display());
         let table = ObjectStoreParquetTable::open(&location).await.unwrap();
+        (tmp, table)
+    }
+
+    #[tokio::test]
+    async fn opens_bridge_base_prefix_and_discovers_data_parquet() {
+        let (_tmp, table) = open_two_row_group_table().await;
         assert_eq!(table.split_count(), 2);
         assert_eq!(table.schema().fields().len(), 2);
     }
@@ -2081,6 +2330,274 @@ pub(crate) mod tests {
         base_url
     }
 
+    /// Publish a snapshot carrying one deletion vector over `part-0.parquet`
+    /// (4 rows in 2 row groups) deleting file positions 0 (`a,1`) and 3
+    /// (`b,101`). Returns the table's base URL. Shared by the DataFusion-leaf
+    /// and DuckDB-view delete tests so both routes prove the same snapshot.
+    pub(crate) async fn publish_snapshot_with_deletion_vector(root: &std::path::Path) -> String {
+        publish_snapshot_with_positions(root, &[0, 3]).await
+    }
+
+    async fn publish_snapshot_with_positions(root: &std::path::Path, positions: &[u64]) -> String {
+        use proximadb_iceberg_engine::deletion_vector::PositionDeletes;
+        use proximadb_iceberg_engine::iceberg;
+        use proximadb_storage_common::object_store_bridge::ObjectStoreBridge;
+
+        let data_dir = root.join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        write_two_row_group_parquet(&data_dir.join("part-0.parquet"));
+
+        let base_url = format!("file://{}", root.display());
+        let bridge = IcebergObjectStoreBridge::from_url(&base_url).unwrap();
+        let data_file = Path::from("data/part-0.parquet");
+        let mut dv = PositionDeletes::new();
+        for &position in positions {
+            dv.insert(position);
+        }
+        let metas = bridge
+            .write_deletion_vectors(&Path::from("data/dv-0.puffin"), &[(data_file.clone(), &dv)])
+            .await
+            .expect("write deletion vector");
+        let fields = vec![
+            iceberg::IcebergField {
+                id: 1,
+                name: "k".into(),
+                type_name: "string".into(),
+                required: true,
+            },
+            iceberg::IcebergField {
+                id: 2,
+                name: "x".into(),
+                type_name: "long".into(),
+                required: true,
+            },
+        ];
+        bridge
+            .publish_iceberg_files_with_deletes(
+                &[data_file],
+                &metas,
+                None,
+                METADATA_SUBPREFIX,
+                "00000000-0000-0000-0000-000000000002",
+                &format!("{base_url}/data"),
+                &fields,
+                1,
+                1,
+            )
+            .await
+            .expect("publish snapshot with deletes");
+        base_url
+    }
+
+    #[test]
+    fn deletion_statistics_subtract_only_surviving_row_groups() {
+        use datafusion_common::stats::Precision;
+        let all = vec![
+            FileSplit::new_row_group("a.parquet".into(), 0, 0, 100, 5),
+            FileSplit::new_row_group("a.parquet".into(), 1, 100, 100, 5),
+            FileSplit::new_row_group("b.parquet".into(), 0, 0, 100, 5),
+        ];
+        let mut a = PositionDeletes::new();
+        for pos in [0, 1, 6] {
+            a.insert(pos);
+        }
+        let mut b = PositionDeletes::new();
+        b.insert(0);
+        let deletions = HashMap::from([
+            ("a.parquet".into(), Arc::new(a)),
+            ("b.parquet".into(), Arc::new(b)),
+        ]);
+        for (surviving, physical, expected) in [
+            (all.as_slice(), 15, 11),
+            (&all[1..2], 5, 4),
+            (&all[2..], 5, 4),
+            (&all[0..0], 0, 0),
+        ] {
+            let mut stats = Statistics::new_unknown(&Schema::empty());
+            stats.num_rows = Precision::Exact(physical);
+            ObjectStoreParquetTable::apply_deletion_statistics(
+                &deletions, &all, surviving, &mut stats,
+            );
+            assert_eq!(stats.num_rows, Precision::Exact(expected));
+        }
+    }
+
+    /// P2.4 slice 3b: the snapshot's deletion vectors are applied on the
+    /// DataFusion route — deleted rows are invisible to the scan, both with and
+    /// without a WHERE predicate (the predicate path disables page pruning for
+    /// deleted files so positions stay aligned), and COUNT(*) sees the
+    /// post-delete row count.
+    #[tokio::test]
+    async fn deletion_vectors_hide_their_rows_from_the_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_url = publish_snapshot_with_deletion_vector(tmp.path()).await;
+
+        let ctx = SessionContext::new();
+        register_object_store_parquet_location(
+            &ctx,
+            "t",
+            &format!("{base_url}/data"),
+            None,
+            proximadb_data_model::StatsTrust::Trusted,
+        )
+        .await
+        .expect("register");
+
+        let all = ctx
+            .sql("SELECT k, x FROM t ORDER BY x")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let rows: Vec<(String, i64)> = all
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows()).map(move |r| {
+                    (
+                        b.column(0)
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                            .value(r)
+                            .to_string(),
+                        b.column(1)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .value(r),
+                    )
+                })
+            })
+            .collect();
+        // positions 0 (a,1) and 3 (b,101) deleted by the vector.
+        assert_eq!(rows, vec![("a".into(), 2), ("b".into(), 100)]);
+
+        let filtered = ctx
+            .sql("SELECT x FROM t WHERE x > 50")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let xs: Vec<i64> = filtered
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows()).map(move |r| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(r)
+                })
+            })
+            .collect();
+        assert_eq!(xs, vec![100], "deleted 101 stays invisible under a filter");
+
+        let count = ctx
+            .sql("SELECT COUNT(*) FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let n: i64 = count[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 2, "COUNT(*) sees the post-delete row count");
+
+        // The footer-derived statistics are delete-adjusted on BOTH the
+        // provider path and the scan-exec path the aggregate rewrite reads:
+        // num_rows is the post-delete count, and per-column EXACT stats are
+        // demoted (a deleted row may have held the extreme or the only NULL).
+        let table = ObjectStoreParquetTable::open(&format!("{base_url}/data"))
+            .await
+            .unwrap();
+        assert!(
+            table.native_scan_inputs().is_none(),
+            "native file-only scan must decline a DV snapshot"
+        );
+        let stats = datafusion::catalog::TableProvider::statistics(&table)
+            .expect("footer-backed statistics");
+        use datafusion_common::stats::Precision;
+        assert_eq!(stats.num_rows, Precision::Exact(2), "post-delete num_rows");
+        assert_eq!(
+            stats.column_statistics[0].null_count,
+            Precision::Inexact(0),
+            "exact null_count demoted under deletions"
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_vector_positions_must_belong_to_the_data_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = publish_snapshot_with_positions(tmp.path(), &[4]).await;
+        let error = ObjectStoreParquetTable::open(&format!("{base}/data"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("position outside data file"));
+    }
+
+    #[tokio::test]
+    async fn deletion_vectors_preserve_counts_for_empty_projections_and_all_deleted_files() {
+        for (positions, expected) in [(vec![0, 3], 2), (vec![0, 1, 2, 3], 0)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = publish_snapshot_with_positions(tmp.path(), &positions).await;
+            let table = ObjectStoreParquetTable::open(&format!("{base}/data"))
+                .await
+                .unwrap();
+            let reader = table.reader(
+                &[],
+                SpecPruneConfig {
+                    page_prune: true,
+                    bloom_read: true,
+                },
+            );
+            let mut rows = 0;
+            for split in &table.splits {
+                let mut batches = reader.read_split(split, Some(&[]), 1).await.unwrap();
+                while let Some(batch) = batches.next().await {
+                    let batch = batch.unwrap();
+                    assert_eq!(batch.num_columns(), 0);
+                    rows += batch.num_rows();
+                }
+            }
+            assert_eq!(rows, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_tables_ignore_a_stale_path_only_cache_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = publish_snapshot_with_deletion_vector(tmp.path()).await;
+        let location = format!("{base}/data");
+        let table = ObjectStoreParquetTable::open(&location).await.unwrap();
+        let mut stale = table.discovery();
+        stale.deletions.clear();
+        // With PROXIMADB_OLAP_TABLE_CACHE=1 this simulates a pre-DV cached open.
+        super::super::table_open_cache::insert(None, &location, stale);
+        let reopened = open_object_store_parquet_location(
+            "t",
+            &location,
+            None,
+            proximadb_data_model::StatsTrust::Trusted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reopened.deletions.len(), 1);
+        let selected = ObjectStoreParquetTable::manifest_selected_snapshot(&location)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected.deletions[0].0, selected.uris[0],
+            "DuckDB DV URI must match the data URI"
+        );
+    }
+
     /// Fail closed: once a metadata log exists, an unreadable `metadata.json`
     /// must fail the open. Falling back to listing here would read the stale
     /// part beside the current one and return two generations of rows.
@@ -2107,7 +2624,7 @@ pub(crate) mod tests {
             err.to_string().contains("snapshot manifest"),
             "unexpected error: {err}"
         );
-        let err = ObjectStoreParquetTable::manifest_selected_uris(&location)
+        let err = ObjectStoreParquetTable::manifest_selected_snapshot(&location)
             .await
             .expect_err("the shared selection helper fails closed too");
         assert!(err.to_string().contains("snapshot manifest"), "{err}");
@@ -2157,13 +2674,7 @@ pub(crate) mod tests {
     async fn aggregate_numeric_bounds_reduces_min_max_across_row_groups() {
         // Two row groups: x = [1,2] and [100,101]. Footer elision must reduce to
         // min-of-mins=1, max-of-maxes=101 across BOTH splits (not just the first).
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir(&data_dir).unwrap();
-        write_two_row_group_parquet(&data_dir.join("part-0.parquet"));
-
-        let location = format!("file://{}", tmp.path().display());
-        let table = ObjectStoreParquetTable::open(&location).await.unwrap();
+        let (_tmp, table) = open_two_row_group_table().await;
         assert_eq!(table.split_count(), 2, "two row groups");
 
         let (min, max, nulls) = table.aggregate_numeric_bounds("x").expect("numeric bounds");
@@ -2184,16 +2695,12 @@ pub(crate) mod tests {
     async fn native_scan_inputs_yields_distinct_files_with_sizes_and_schema() {
         // Two row groups live in ONE file → the native scan (whole-file) must see a
         // single distinct file, with a footer byte size and the full 2-column schema.
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir(&data_dir).unwrap();
-        write_two_row_group_parquet(&data_dir.join("part-0.parquet"));
-
-        let location = format!("file://{}", tmp.path().display());
-        let table = ObjectStoreParquetTable::open(&location).await.unwrap();
+        let (_tmp, table) = open_two_row_group_table().await;
         assert_eq!(table.split_count(), 2, "two row groups");
 
-        let (_store, files, schema) = table.native_scan_inputs();
+        let (_store, files, schema) = table
+            .native_scan_inputs()
+            .expect("delete-free native input");
         assert_eq!(
             files.len(),
             1,

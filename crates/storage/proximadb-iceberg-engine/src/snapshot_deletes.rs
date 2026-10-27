@@ -27,6 +27,9 @@ pub struct SnapshotDeletionVector {
     pub puffin_file: Path,
     pub content_offset: u64,
     pub content_size_in_bytes: u64,
+    /// The Puffin file's full size (the delete-manifest entry's `file_size_in_bytes`),
+    /// so a re-publisher can carry the vector without re-reading the object.
+    pub puffin_file_size_in_bytes: u64,
     /// The number of deleted positions.
     pub cardinality: u64,
 }
@@ -110,6 +113,7 @@ impl IcebergObjectStoreBridge {
                 puffin_file: resolve(&v.file_path),
                 content_offset: to_u64(v.content_offset, "content_offset")?,
                 content_size_in_bytes: to_u64(v.content_size_in_bytes, "content_size_in_bytes")?,
+                puffin_file_size_in_bytes: to_u64(v.file_size_in_bytes, "file_size_in_bytes")?,
                 cardinality: to_u64(v.record_count, "record_count")?,
             });
         }

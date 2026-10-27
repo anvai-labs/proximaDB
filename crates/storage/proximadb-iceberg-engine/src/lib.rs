@@ -54,6 +54,9 @@ use parquet::arrow::async_reader::ParquetObjectReader;
 use proximadb_kernel::error::StorageError;
 use proximadb_object_store::ProximaObjectStore;
 use proximadb_records::ProximaRecord;
+use proximadb_storage_common::object_store_bridge::IcebergSnapshotDeletion as DeletionView;
+use proximadb_storage_common::object_store_bridge::IcebergSnapshotField as FieldView;
+use proximadb_storage_common::object_store_bridge::IcebergSnapshotFiles as FilesView;
 use proximadb_storage_common::object_store_bridge::{CommitOutcome, ObjectStoreBridge};
 use proximadb_storage_common::parquet_write_policy::{ParquetLayoutHints, ParquetWritePolicy};
 use proximadb_storage_common::proxima_arrow::infer_proxima_schema_strict;
@@ -963,6 +966,80 @@ impl ObjectStoreBridge for IcebergObjectStoreBridge {
     ) -> Result<Vec<Path>, StorageError> {
         self.read_iceberg_snapshot(metadata_prefix, version).await
     }
+
+    async fn read_iceberg_snapshot_files(
+        &self,
+        metadata_prefix: &str,
+        version: u64,
+    ) -> Result<FilesView, StorageError> {
+        let snapshot = self
+            .read_iceberg_snapshot_with_deletes(metadata_prefix, version)
+            .await?;
+        Ok(FilesView {
+            data_files: snapshot.data_files,
+            deletion_vectors: snapshot
+                .deletion_vectors
+                .into_iter()
+                .map(|v| DeletionView {
+                    data_file: v.data_file,
+                    puffin_file: v.puffin_file,
+                    content_offset: v.content_offset,
+                    content_size_in_bytes: v.content_size_in_bytes,
+                    puffin_file_size_in_bytes: v.puffin_file_size_in_bytes,
+                    cardinality: v.cardinality,
+                })
+                .collect(),
+        })
+    }
+
+    async fn publish_iceberg_files_deleting(
+        &self,
+        files: &[Path],
+        deletes: &[DeletionView],
+        parent: Option<u64>,
+        metadata_prefix: &str,
+        table_uuid: &str,
+        table_location: &str,
+        fields: &[FieldView],
+        snapshot_id: i64,
+        timestamp_ms: i64,
+    ) -> Result<u64, StorageError> {
+        // Map the carried view entries back to delete-manifest metas. A carried
+        // vector names its files by the URI recorded when it was published;
+        // `object_uri` of the bridge-relative key reproduces exactly that form.
+        let overflow = |what: &str| {
+            StorageError::Serialization(format!("iceberg-engine: carried {what} overflows i64"))
+        };
+        let metas: Vec<iceberg::DeleteFileMeta> = deletes
+            .iter()
+            .map(|d| {
+                Ok(iceberg::DeleteFileMeta {
+                    file_path: self.object_uri(d.puffin_file.as_ref()),
+                    file_size_in_bytes: i64::try_from(d.puffin_file_size_in_bytes)
+                        .map_err(|_| overflow("puffin size"))?,
+                    referenced_data_file: self.object_uri(d.data_file.as_ref()),
+                    content_offset: i64::try_from(d.content_offset)
+                        .map_err(|_| overflow("content_offset"))?,
+                    content_size_in_bytes: i64::try_from(d.content_size_in_bytes)
+                        .map_err(|_| overflow("content_size_in_bytes"))?,
+                    record_count: i64::try_from(d.cardinality)
+                        .map_err(|_| overflow("cardinality"))?,
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        self.publish_iceberg_files_with_deletes(
+            files,
+            &metas,
+            parent,
+            metadata_prefix,
+            table_uuid,
+            table_location,
+            &iceberg_fields_of(fields, false).0,
+            snapshot_id,
+            timestamp_ms,
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -971,7 +1048,7 @@ mod tests {
     use arrow_array::{Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field};
     use object_store::memory::InMemory;
-    use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaTreeNode, ProximaValue};
+    use proximadb_records::{EmbeddingCell, ProximaTreeNode, ProximaValue};
 
     fn bridge() -> IcebergObjectStoreBridge {
         IcebergObjectStoreBridge::new(ProximaObjectStore::new(Arc::new(InMemory::new())))

@@ -2868,6 +2868,20 @@ impl DmlService {
         //    below loses its create-only CAS rather than racing GC.
         let metadata_prefix = format!("{prefix}/metadata");
         let parent = bridge.latest_metadata_version(&metadata_prefix).await?;
+        // Native state is not yet synchronized with externally published DVs.
+        // A rewrite from that state would resurrect hidden rows. Until the live
+        // writer establishes that synchronization, refuse before writing parts,
+        // regardless of whether incremental append is enabled.
+        if let Some(version) = parent
+            && bridge
+                .read_iceberg_snapshot_files(&metadata_prefix, version)
+                .await?
+                .has_deletions()
+        {
+            anyhow::bail!(
+                "MATERIALIZE {table_name}: published snapshot has deletion vectors; native-state synchronization is required before republication"
+            );
+        }
         let successor = parent.map_or(0, |p| p.saturating_add(1));
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3068,19 +3082,59 @@ impl DmlService {
                 "MATERIALIZE {table_name}: publish fence refused the commit"
             )));
         }
-        let committed = bridge
-            .publish_iceberg_files(
-                &snapshot_keys,
-                parent,
-                &metadata_prefix,
-                &table_uuid,
-                &table_root,
-                &iceberg_fields,
-                now_ms, // snapshot id (unique per materialize)
-                now_ms, // timestamp ms
-                proximadb_storage_common::object_store_bridge::iceberg_needs_v3(&iceberg_fields),
-            )
-            .await;
+        // P2.4 slice 3b: an APPEND (carried non-empty) must carry the parent
+        // snapshot's deletion vectors into the new one — a snapshot that names
+        // the carried files without their vectors resurrects every deleted row.
+        // Under the entry guard, full rewrites proceed only for delete-free parents.
+        let carried_deletes: Vec<
+            proximadb_storage_common::object_store_bridge::IcebergSnapshotDeletion,
+        > = if carried.is_empty() {
+            Vec::new()
+        } else {
+            match parent {
+                Some(previous) => {
+                    bridge
+                        .read_iceberg_snapshot_files(&metadata_prefix, previous)
+                        .await
+                        .map_err(|e| {
+                            anyhow!("MATERIALIZE {table_name}: reading carried deletes: {e}")
+                        })?
+                        .deletion_vectors
+                }
+                None => Vec::new(),
+            }
+        };
+        let committed = if carried_deletes.is_empty() {
+            bridge
+                .publish_iceberg_files(
+                    &snapshot_keys,
+                    parent,
+                    &metadata_prefix,
+                    &table_uuid,
+                    &table_root,
+                    &iceberg_fields,
+                    now_ms, // snapshot id (unique per materialize)
+                    now_ms, // timestamp ms
+                    proximadb_storage_common::object_store_bridge::iceberg_needs_v3(
+                        &iceberg_fields,
+                    ),
+                )
+                .await
+        } else {
+            bridge
+                .publish_iceberg_files_deleting(
+                    &snapshot_keys,
+                    &carried_deletes,
+                    parent,
+                    &metadata_prefix,
+                    &table_uuid,
+                    &table_root,
+                    &iceberg_fields,
+                    now_ms,
+                    now_ms,
+                )
+                .await
+        };
         let version = match committed {
             Ok(version) => version,
             Err(e) => {
@@ -3191,13 +3245,18 @@ impl DmlService {
         let keep_current: std::collections::HashSet<String> =
             snapshot_keys.iter().map(|p| p.to_string()).collect();
         let keep_previous: std::collections::HashSet<String> = match parent {
-            Some(previous) => match bridge.read_iceberg_table(&metadata_prefix, previous).await {
-                Ok(files) => files.iter().map(|p| p.to_string()).collect(),
-                Err(e) => {
-                    warn!(table = %table_name, "MATERIALIZE GC skipped: {e}");
-                    return Ok(location);
+            Some(previous) => {
+                match bridge
+                    .read_iceberg_snapshot_files(&metadata_prefix, previous)
+                    .await
+                {
+                    Ok(snapshot) => snapshot.data_files.iter().map(|p| p.to_string()).collect(),
+                    Err(e) => {
+                        warn!(table = %table_name, "MATERIALIZE GC skipped: {e}");
+                        return Ok(location);
+                    }
                 }
-            },
+            }
             None => Default::default(),
         };
         match materialize_stream::gc_older_generations(
@@ -3359,10 +3418,21 @@ impl DmlService {
                 Vec::new(),
             ));
         }
-        let files = bridge
-            .read_iceberg_table(metadata_prefix, previous)
+        // Delete-aware (P2.4 slice 3b): a snapshot carrying deletion vectors
+        // cannot be probed file-list-only — a DV-hidden oid would look present
+        // and be classified an update. The publication entry point refuses
+        // this case until native-state synchronization is available.
+        let snapshot = bridge
+            .read_iceberg_snapshot_files(metadata_prefix, previous)
             .await
             .map_err(|e| anyhow!("reading the published snapshot: {e}"))?;
+        if snapshot.has_deletions() {
+            return Ok((
+                AppendPlan::Rewrite("the published snapshot carries deletion vectors"),
+                Vec::new(),
+            ));
+        }
+        let files = snapshot.data_files;
         if files.len() >= materialize_append::APPEND_MAX_FILES {
             return Ok((
                 AppendPlan::Rewrite("the snapshot has many parts; a rewrite compacts them"),
