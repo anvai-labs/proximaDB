@@ -15,10 +15,7 @@ import pytest
 # Test imports and availability
 def test_arrow_export_imports():
     """Test that Arrow export module can be imported."""
-    from proximadb_sdk.arrow_export import (
-        ArrowExportClient,
-        FileFormat,
-    )
+    from proximadb_sdk.arrow_export import ArrowExportClient, FileFormat
 
     assert ArrowExportClient is not None
     assert FileFormat is not None

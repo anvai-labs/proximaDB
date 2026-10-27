@@ -21,14 +21,10 @@ from proximadb_sdk.embedding_providers.core import (
 )
 
 # Mixins
-from proximadb_sdk.embedding_providers.mixins import (
-    NormalizationMixin,
-)
+from proximadb_sdk.embedding_providers.mixins import NormalizationMixin
 
 # Import the new provider
-from proximadb_sdk.embedding_providers.providers.local.gte_qwen import (
-    GTEQwenProvider,
-)
+from proximadb_sdk.embedding_providers.providers.local.gte_qwen import GTEQwenProvider
 
 
 # ---------------------------------------------------------------------------

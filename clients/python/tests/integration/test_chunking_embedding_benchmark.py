@@ -19,11 +19,7 @@ from proximadb_sdk.chunking import (
     chunk_and_embed_text,
 )
 from proximadb_sdk.embedding_providers import get_embedding_provider
-from proximadb_sdk.models import (
-    CollectionConfig,
-    DistanceMetric,
-    StorageEngine,
-)
+from proximadb_sdk.models import CollectionConfig, DistanceMetric, StorageEngine
 
 
 @dataclass

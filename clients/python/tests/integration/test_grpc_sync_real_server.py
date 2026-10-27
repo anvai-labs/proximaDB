@@ -17,10 +17,7 @@ from ..embedding_utils import embed_seed
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.base_test import BaseProximaDBTest
 
-from proximadb_sdk import (
-    ProximaDBError,
-    VectorRecord,
-)
+from proximadb_sdk import ProximaDBError, VectorRecord
 from proximadb_sdk.protocols.grpc_sync import ProximaDBSyncGrpcClient
 
 

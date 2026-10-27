@@ -427,9 +427,7 @@ class TestBackwardCompatibility:
     def test_imports_work(self):
         """Test that old imports still work"""
         # These imports should work due to backward compatibility
-        from proximadb_sdk.protocol_selector import (
-            ProtocolSelector,
-        )
+        from proximadb_sdk.protocol_selector import ProtocolSelector
 
         # Create router using old interface
         config = RoutingConfig(health_check_interval_seconds=0)

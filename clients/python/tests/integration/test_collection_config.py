@@ -28,13 +28,7 @@ from proximadb_sdk import (
 )
 
 # Import index configs directly from models
-from proximadb_sdk.models import (
-    FlatConfig,
-    HnswConfig,
-    IvfConfig,
-    LshConfig,
-    PqConfig,
-)
+from proximadb_sdk.models import FlatConfig, HnswConfig, IvfConfig, LshConfig, PqConfig
 
 logger = logging.getLogger(__name__)
 

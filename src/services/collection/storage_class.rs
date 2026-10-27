@@ -198,17 +198,15 @@ pub fn check_performance_admission(
             .as_ref()
             .and_then(|storage| storage.storage_path.as_deref())
             .filter(|p| !p.is_empty()),
-    ) {
-        if let Some(owner) = tenant_segment_of(explicit)
-            && owner != current_tenant
-        {
-            return Err(anyhow::anyhow!(
-                "storage_class 'performance' placement '{explicit}' is under another \
-                 tenant's prefix (tenants/{owner}); requesting tenant is \
-                 '{current_tenant}'. Use an operator-configured location or this \
-                 tenant's own prefix"
-            ));
-        }
+    ) && let Some(owner) = tenant_segment_of(explicit)
+        && owner != current_tenant
+    {
+        return Err(anyhow::anyhow!(
+            "storage_class 'performance' placement '{explicit}' is under another \
+             tenant's prefix (tenants/{owner}); requesting tenant is \
+             '{current_tenant}'. Use an operator-configured location or this \
+             tenant's own prefix"
+        ));
     }
     if proximadb_storage_filesystem_types::object_store_scheme::ObjectStoreScheme::of(
         resolved_base_location,

@@ -21,11 +21,7 @@ import time
 import pytest
 import requests
 
-from proximadb_sdk import (
-    CollectionConfig,
-    EmbeddingPrecision,
-    ProximaDBClient,
-)
+from proximadb_sdk import CollectionConfig, EmbeddingPrecision, ProximaDBClient
 
 _server_process: subprocess.Popen | None = None
 

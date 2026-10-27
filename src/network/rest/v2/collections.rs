@@ -912,7 +912,7 @@ async fn create_collection_v2_checked(
         Some(raw) => {
             let class = crate::services::collection::storage_class::parse_storage_class(&raw)
                 .map_err(|e| ApiError::InvalidArgument(e.to_string()))?;
-            (class != crate::proto::proximadb_v1::StorageClass::Unspecified).then(|| class as i32)
+            (class != crate::proto::proximadb_v1::StorageClass::Unspecified).then_some(class as i32)
         }
     };
 

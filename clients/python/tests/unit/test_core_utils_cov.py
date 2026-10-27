@@ -14,10 +14,7 @@ import importlib
 import pytest
 
 from proximadb_sdk.config import ClientConfig, Protocol
-from proximadb_sdk.exceptions import (
-    NetworkError,
-    ServerError,
-)
+from proximadb_sdk.exceptions import NetworkError, ServerError
 from proximadb_sdk.exceptions import TimeoutError as PDBTimeoutError
 
 # NOTE: the package __init__ re-exports a `circuit_breaker` *function*, which
