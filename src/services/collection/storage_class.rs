@@ -215,8 +215,16 @@ pub fn check_performance_admission(
 /// The tenant id named by a `{base}/tenants/{id}` path segment, if any
 /// (read-only parse of the same convention `StoragePath::tenant_root_path`
 /// writes; never constructs keys).
+///
+/// Parses the OUTERMOST `/tenants/` occurrence: a nested path such as
+/// `tenants/victim/collections/tenants/attacker` must resolve to `victim`
+/// (the prefix's actual owner). Parsing the innermost occurrence would let a
+/// requesting tenant authorize itself into another tenant's subtree. The cost
+/// is a false reject when an operator's configured base itself ends in
+/// `tenants` (a doubled segment) — fail-closed is the correct side of that
+/// trade.
 fn tenant_segment_of(path: &str) -> Option<&str> {
-    let idx = path.rfind("/tenants/")? + "/tenants/".len();
+    let idx = path.find("/tenants/")? + "/tenants/".len();
     path[idx..]
         .split('/')
         .next()
@@ -378,6 +386,26 @@ mod tests {
             Some("acme"),
         )
         .unwrap();
+
+        // A NESTED `tenants/` segment cannot smuggle authorization: the path
+        // lives under the victim's prefix, so parsing the innermost segment
+        // would name the requesting tenant and pass the check while writing
+        // into the victim's subtree. The outermost owner is authoritative.
+        config.storage_config = Some(StorageConfig {
+            storage_path: Some(
+                "s3://bench/tenants/other-tenant/collections/tenants/acme/coll".to_string(),
+            ),
+            ..Default::default()
+        });
+        let error = check_performance_admission(
+            &config,
+            StorageEngine::Sst,
+            "s3://bench/tenants/other-tenant/collections/tenants/acme/coll",
+            Some("acme"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("other-tenant"), "{error}");
 
         // No tenant context (operator/internal path) skips the tenant check.
         config.storage_config = Some(StorageConfig {
