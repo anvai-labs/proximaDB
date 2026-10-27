@@ -1201,8 +1201,8 @@ def test_server_proc_sampler_stop_without_start_returns_unavailable() -> None:
     sampler = HARNESS.ServerProcSampler(pid=1, interval_s=0.001, read=lambda p: "")
     out = sampler.stop()
     assert out["complete"] is False
-    assert out["peak_rss_bytes"] is None or out["peak_rss_bytes"] is None
-    assert "cpu_seconds" in out
+    assert out["peak_rss_bytes"] is None
+    assert out["cpu_seconds"] is None
 
 
 def test_skip_ingest_requires_collection_id() -> None:
@@ -1224,3 +1224,45 @@ def test_skip_ingest_requires_collection_id() -> None:
     )
     assert proc.returncode != 0
     assert "--skip-ingest requires --collection-id" in (proc.stderr or proc.stdout)
+
+
+def test_query_sweep_stops_sampler_when_reads_fail() -> None:
+    # Tracker correction: run_query_sweep must stop the sampler on the
+    # read/HTTP failure paths too. A query file that cannot be read raises
+    # inside the try; the sampler's stop() must have run (terminal sample
+    # taken) by the time the exception propagates.
+    import tempfile
+    sampler_calls: list[dict] = []
+
+    class RecordingSampler:
+        def __init__(self, pid: int, interval_s: float = 0.25, read=None):
+            self.pid = pid
+
+        def start(self) -> None:
+            sampler_calls.append({"event": "start"})
+
+        def stop(self) -> dict:
+            sampler_calls.append({"event": "stop"})
+            return {"peak_rss_bytes": None, "cpu_seconds": None, "complete": False}
+
+    with tempfile.NamedTemporaryFile(suffix=".missing", delete=True) as fh:
+        missing = Path(fh.name)
+        with patch.object(HARNESS, "ServerProcSampler", RecordingSampler):
+            with pytest.raises(Exception):
+                HARNESS.run_query_sweep(
+                    "http://127.0.0.1:1",
+                    "1",
+                    missing,
+                    missing,
+                    0,
+                    1,
+                    1,
+                    "fvecs",
+                    "ivecs",
+                    server_pid=123,
+                )
+    assert sampler_calls[0]["event"] == "start"
+    assert sampler_calls[-1]["event"] == "stop", (
+        "sampler.stop() must run on the read-failure path"
+    )
+    assert sampler_calls.count({"event": "stop"}) == 1

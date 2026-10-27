@@ -1729,13 +1729,6 @@ def run_query_sweep(
     sampler = ServerProcSampler(server_pid) if server_pid is not None else None
     if sampler is not None:
         sampler.start()
-    queries = read_vectors(query_path, query_format, query_start, query_count)
-    groundtruth = read_truth_ids(
-        groundtruth_path, groundtruth_format, query_start, query_count
-    )
-    before = scrape(server)
-    # The sampler must stop on EVERY exit (read error, HTTP failure, guard
-    # abort) — not only success; try/finally around the measured section.
     latencies = []
     recalls = []
     ordered_result_digests = []
@@ -1769,11 +1762,19 @@ def run_query_sweep(
             with in_flight_lock:
                 in_flight -= 1
 
-    wall_started = time.perf_counter()
-    indexed_queries = list(enumerate(queries))
     # try/finally (tracker correction): the sampler must stop with its
     # terminal sample on read/HTTP/guard failures too, not only on success.
+    # The try covers EVERYTHING after sampler.start() — the query/groundtruth
+    # reads and the before-scrape (both raise) included — so no start-then-
+    # raise path can leak the sampler thread.
     try:
+        queries = read_vectors(query_path, query_format, query_start, query_count)
+        groundtruth = read_truth_ids(
+            groundtruth_path, groundtruth_format, query_start, query_count
+        )
+        before = scrape(server)
+        wall_started = time.perf_counter()
+        indexed_queries = list(enumerate(queries))
         if concurrency == 1:
             outcomes = [execute_query(item) for item in indexed_queries]
         else:
