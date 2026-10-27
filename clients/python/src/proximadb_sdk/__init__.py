@@ -133,7 +133,11 @@ from .models import (
 )
 
 # v2 Models - ProximaRecord and typed schema support
-from .models_v2 import ColumnDataType, ColumnDefinition, FilterBuilderV2
+from .models_v2 import (
+    ColumnDataType,
+    ColumnDefinition,
+    FilterBuilderV2,
+)
 from .models_v2 import (
     FilterOperator as FilterOperatorV2,  # Core record type; Typed values; Text storage; Text column convenience functions; Schema; Typed filters; Search
 )
@@ -807,7 +811,9 @@ except ImportError:
 
 # Time-Series Operations API (Metrics and monitoring)
 try:
-    from .timeseries import AggregatedMetric
+    from .timeseries import (
+        AggregatedMetric,
+    )
     from .timeseries import AggregationType as TSAggregationType
     from .timeseries import CompressionCodec as TSCompressionCodec
     from .timeseries import (
