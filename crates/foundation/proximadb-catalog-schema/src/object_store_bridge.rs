@@ -493,11 +493,36 @@ pub fn iceberg_type_for(arrow: &arrow_schema::DataType) -> String {
 
 /// ADR-097 D3: publish Iceberg **v2** — the version external readers (PyIceberg,
 /// DuckDB, Trino) verifiably read — unless a column needs a v3-only type
-/// (nanosecond timestamps). v3 deletion vectors / row lineage / `variant` follow
-/// once an external v3 reader is in the read-back gate. This is the *requested*
+/// (nanosecond timestamps). This is the *requested*
 /// version; the engine additionally refuses to downgrade an already-v3 table.
 pub fn iceberg_needs_v3(fields: &[IcebergSnapshotField]) -> bool {
     fields.iter().any(|f| f.type_name.ends_with("_ns"))
+}
+
+/// TD-USUB-10 3c rung 1 — the **new-table v3 policy**, the activation ladder's
+/// controllable rung. A table publishes v3 when a column needs a v3-only type
+/// (any table, any snapshot) OR the operator armed the default
+/// (`PROXIMADB_ICEBERG_V3_DEFAULT`, unset ⇒ v2) **and this is the table's
+/// first publication**.
+///
+/// The first-publication guard is what makes the knob unable to touch existing
+/// tables — the engine floor alone does not: the floor is one-way against
+/// DOWNgrades, but it honors a caller-driven v3 request onto a v2 parent (an
+/// upgrade). Without the guard, arming the knob would silently upgrade every
+/// existing v2 table at its next publication. With it, an existing table only
+/// moves to v3 through `_ns` types or the atomic delete-carry commit (pinned by
+/// `a_v2_parent_upgrades_to_v3_atomically_when_it_carries_deletes`). Deletion
+/// vectors always require v3 at the engine seam regardless. Flipping the
+/// default on is gated on the ladder's lineage/external read-back proofs.
+pub fn iceberg_publishes_v3(fields: &[IcebergSnapshotField], first_publication: bool) -> bool {
+    iceberg_needs_v3(fields)
+        || (first_publication
+            && std::env::var_os("PROXIMADB_ICEBERG_V3_DEFAULT").is_some_and(|v| {
+                matches!(
+                    v.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            }))
 }
 
 /// A stable, well-formed UUID string derived deterministically from the table's object
@@ -519,4 +544,104 @@ pub fn deterministic_table_uuid(prefix: &str) -> String {
         (b >> 48) as u16,
         b & 0x0000_ffff_ffff_ffff
     )
+}
+
+#[cfg(test)]
+mod v3_policy_tests {
+    use super::*;
+    // edition-2024 marks env mutation unsafe. The policy reads the var per
+    // call; these tests are its only mutators. CI runs them under nextest
+    // (one process per test), but a local `cargo test --lib` shares one
+    // process across parallel tests — serialize on a mutex so the env is
+    // never observed mid-mutation locally either.
+    use std::env;
+    use std::sync::{Mutex, OnceLock};
+
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set(name: &str, value: &str) {
+        // SAFETY: test-only; no parallel reader of this var exists here.
+        unsafe { env::set_var(name, value) }
+    }
+    fn unset(name: &str) {
+        // SAFETY: test-only; no parallel reader of this var exists here.
+        unsafe { env::remove_var(name) }
+    }
+
+    fn plain() -> Vec<IcebergSnapshotField> {
+        vec![IcebergSnapshotField {
+            id: 1,
+            name: "age".into(),
+            type_name: "long".into(),
+            required: false,
+        }]
+    }
+    fn ns() -> Vec<IcebergSnapshotField> {
+        vec![IcebergSnapshotField {
+            id: 1,
+            name: "at".into(),
+            type_name: "timestamp_ns".into(),
+            required: false,
+        }]
+    }
+
+    /// TD-USUB-10 3c rung 1: the knob is default-OFF — plain fields stay v2
+    /// (today's external-reader-verified behavior) and _ns keeps forcing v3.
+    #[test]
+    fn new_table_policy_defaults_to_v2() {
+        let _guard = lock();
+        unset("PROXIMADB_ICEBERG_V3_DEFAULT");
+        assert!(!iceberg_publishes_v3(&plain(), true));
+        assert!(iceberg_publishes_v3(&ns(), true), "_ns always needs v3");
+        assert!(
+            iceberg_publishes_v3(&ns(), false),
+            "_ns needs v3 on any snapshot"
+        );
+    }
+
+    /// Armed, a NEW plain table publishes v3 (the activation rung). The knob
+    /// only affects the REQUEST: existing tables follow the engine floor.
+    #[test]
+    fn armed_default_publishes_new_tables_as_v3() {
+        let _guard = lock();
+        set("PROXIMADB_ICEBERG_V3_DEFAULT", "1");
+        assert!(iceberg_publishes_v3(&plain(), true));
+        unset("PROXIMADB_ICEBERG_V3_DEFAULT");
+        assert!(!iceberg_publishes_v3(&plain(), true), "unset restores v2");
+    }
+
+    /// Round-1 review finding: the engine floor honors a caller-driven v3
+    /// request onto a v2 parent (an upgrade), so WITHOUT the first-publication
+    /// guard, arming the knob would silently upgrade every existing v2 table
+    /// at its next publication.
+    #[test]
+    fn the_armed_default_never_touches_an_existing_table() {
+        let _guard = lock();
+        set("PROXIMADB_ICEBERG_V3_DEFAULT", "1");
+        assert!(
+            !iceberg_publishes_v3(&plain(), false),
+            "a successor publication keeps requesting v2 even with the knob armed"
+        );
+        unset("PROXIMADB_ICEBERG_V3_DEFAULT");
+    }
+
+    /// Only truthy spellings arm it: `=0` is an explicit OFF, matching the
+    /// env-gate convention (PAXRG-1's kill-switch spelling).
+    #[test]
+    fn zero_and_falsy_spellings_do_not_arm_it() {
+        let _guard = lock();
+        for value in ["0", "false", "no", "off", ""] {
+            set("PROXIMADB_ICEBERG_V3_DEFAULT", value);
+            assert!(
+                !iceberg_publishes_v3(&plain(), true),
+                "={value} must not arm v3"
+            );
+        }
+        unset("PROXIMADB_ICEBERG_V3_DEFAULT");
+    }
 }
