@@ -53,3 +53,56 @@ strict-link validation remain enabled; no baseline inflation or weakened check i
 
 Merge/CI state is determined by GitHub, not this historical record. The consolidation is
 complete only when #2250 merges; current implementation work remains with its owning lanes.
+
+== Resumed-session audit (later on 2026-10-26)
+
+This appendix preserves the later observation; earlier entries above remain point-in-time facts.
+#2250 merged the current/history consolidation. #2252 (5f1274b51) and #2254 (f62cf6522) merged
+the native-engine literature/source review and per-engine strength/crossover test contracts,
+after green CI and clean adversarial review. These are completed design investigations;
+NE implementation and comparative benchmarks remain planned in the current lakehouse plan.
+
+#2253 merged concurrently during the later audit at 23:34:08 UTC as 17a6f1e28. It filed missing
+TD references and corrected citation/comment drift. A subsequent status review found existing
+hot/warm cache and provisioning implementations mislabeled not started. The central follow-up
+corrects those three TDs to partial implementation and preserves their actual remaining gates;
+it does not declare full per-tenant/signup correctness or restart the lanes from zero.
+
+PR #2255 at f27a21548 received a blocked adversarial verdict: result/optimum claims, CLI
+forwarding, telemetry failure handling and evidence placement require owner corrections.
+Detailed actionable work stays in the current tracker, not a second historical queue.
+
+The original P2 source remains 51cefaaf2 with the same two dirty changes incorporated into the
+Codex reader continuation (#2256). Its incremental Git bundle was verified against prerequisite
+d929d7993; dirty-patch SHA-256 is
+`194ce951df770038620632be28cb30ed5893b5a4fc3b7367f63a2a33fb47fa5e`.
+Archive: `/tmp/proximadb-p24-complete/archive-glm-source/`. The only ignored source-worktree
+content at audit was `target/`; no source worktree was removed before merge. Other active GLM
+worktrees were read only. User direction now assigns implementation/refinement to resumed GLM
+sessions and central guidance/review/merge coordination to Codex.
+
+The next inventory refresh found the governance checkout already absent; this session did not
+remove it. SC1 advanced to 671706827 with an outermost-tenant-segment parsing fix; configured
+target authorization remains an independent gate. The original P2 source was rebased/committed
+by its resumed session as PR #2258 at 2a01cac26, overlapping #2256. The earlier archive above
+preserves its pre-resumption state, not a claim that the live checkout is still at 51cefaaf2.
+
+Independent exact-head comparison of #2258 (2a01cac26) against #2256 (9cd63699f) found
+no unique valid source/test behavior to port. Its first commit reproduces the original reader
+source; its second commits the two previously archived dirty fixes. #2256 strengthens both:
+statistics subtract deletions within surviving row-group ranges, not a whole file's deletion
+cardinality whenever any one group survives. Duplicate closure waits for the replacement merge;
+the active GLM worktree is retained for its owner's cleanup.
+
+== Reader integration and duplicate disposition
+
+#2256 merged on 2026-10-27 at 00:12:06 UTC (2026-10-26 Chicago), as e45cc3943.
+Exact implementation head 9cd63699ff243e36f59f83d13a204483ebcf33e5 had clean independent
+adversarial review and all applicable CI green, including root unit tests, integration groups
+and enterprise-catalog runtime tests/Clippy. Local engine 116/116 and interop/mixed 4/4 validation
+is recorded in link:P24_DELETION_READER_REVIEW_2026_10_26.adoc[the reader evidence].
+The authorized adversarial-review proxy was used to merge; the live writer was not activated.
+
+#2258 was then closed as superseded at reviewed head 2a01cac26. Its branch/worktree remains
+with the GLM owner. No foreign active checkout or generated evidence was deleted. The completed
+reader lane leaves only the writer/visibility/v3-activation residual in current planning.

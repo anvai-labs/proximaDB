@@ -36,6 +36,10 @@ projection authority and v3 publication; ADR-062/065 ranged reads; TD-AUTHZ-1 te
 TD-PGWIRE-AUTH-1 pgwire authentication; TD-LEASE-INFRA-1 leases; TD-DECOMP-* workspace seams.
 Older conflicting prose is historical input, never authority to reverse a newer decision.
 
+Naming distinction: storage phases `SC0`–`SC6` belong to TD-TIER-1 and the storage plan.
+The older `TD-SC-1`–`TD-SC-5` IDs describe system-catalog caching/provisioning/coherence.
+They are different workstreams; matching numbers do not transfer status or ownership.
+
 == Pickup and handoff (all implementers, including Claude / GLM plan mode)
 
 . Read the tracker row; inspect the named branch/PR before starting overlapping work.
@@ -46,7 +50,9 @@ Older conflicting prose is historical input, never authority to reverse a newer 
   Distinguish observed code, unmerged WIP, planned tests and unknowns. No new handoff document.
 . Implement only the authorized slice. Preserve tenant checks, durability, v3-first and
   existing format/version fences; record changes of direction in the controlling ADR.
-. Run affected guards/tests and required CI. Update the tracker with branch, head/PR,
+. Run affected guards/tests and required CI; require clean adversarial review on the exact
+  proposed head before merge. GLM sessions own implementation/refinement; Codex coordinates
+  review/merge and central guidance. Update the tracker with branch, head/PR,
   evidence, exact residual gate and next owner. A local test is not a merged delivery.
 . Recheck pending gate semantics after merge. Archive completed implementation detail once,
   with source commit, commands/results, limitations and links; retain a short history pointer
