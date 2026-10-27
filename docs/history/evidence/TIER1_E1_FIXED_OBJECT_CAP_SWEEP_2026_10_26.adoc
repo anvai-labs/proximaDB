@@ -1,6 +1,6 @@
 = TD-TIER-1 E1: fixed-object repeated range-cap sweep (4 / 16 / 40 MiB)
 
-**Date:** 2026-10-26 · **Branch:** `bench/tier1-e1-fixed` @ `eb1dd04e2` (binary built in-worktree at `f5aef1b0b`; the two later commits are harness/tests-only; evidence file since moved to history) · **TD:** link:../../../10-quality/td/TD-TIER-1-collection-storage-policy-and-residency.adoc[TD-TIER-1] SC0/E1 · **A workload-specific tradeoff, not an optimum claim (n=2):** link:TIER1_SC0_RANGE_CAP_SWEEP_2026_10_26.adoc[the #2249 pilot] measured fresh beds per arm (21/25/26 cells) and overstated the cap effect; this run eliminates that confound.
+**Date:** 2026-10-26 · **Branch:** `bench/tier1-e1-fixed` @ `eb1dd04e2` (binary built in-worktree at `f5aef1b0b`; the two later commits are harness/tests-only; evidence file since moved to history) · **TD:** link:../../10-quality/td/TD-TIER-1-collection-storage-policy-and-residency.adoc[TD-TIER-1] SC0/E1 · **A workload-specific tradeoff, not an optimum claim (n=2):** link:TIER1_SC0_RANGE_CAP_SWEEP_2026_10_26.adoc[the #2249 pilot] measured fresh beds per arm (21/25/26 cells) and overstated the cap effect; this run eliminates that confound.
 
 == Protocol (the E1 gate from STORAGE_PLAN §E1)
 
@@ -19,7 +19,7 @@ One bed built **once** (`sift1m_get_reduction.py` full run: 1M×128 SIFT1M, sett
 | cap40-r2 | 12.880 | 3 | 0.9824 | 112 | 153 | 173 | 112.2 / 5.2 GB
 |===
 
-All values [M] from the six result.json files (`~/bench-beds/p5b-runs/e1/`). The reuse-mode `post_write`/`local_disk_warm` phases measure cache re-warming from a fixed prefix (there is no ingest to warm from) — informative, but **not** comparable to the build run's phases or the pilot's; only `object_cold` is compared here.
+All values [M] from the six arm result.json files (`e1-cap{4,16,40}-r{1,2}`); the build run's `e1-build/result.json` is provenance and fingerprint, not a comparison arm (seven 1M roots exist on disk). The reuse-mode `post_write`/`local_disk_warm` phases measure cache re-warming from a fixed prefix (there is no ingest to warm from) — informative, but **not** comparable to the build run's phases or the pilot's; only `object_cold` is compared here.
 
 == Findings
 
