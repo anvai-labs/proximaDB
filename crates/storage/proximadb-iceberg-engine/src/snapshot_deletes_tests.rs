@@ -236,7 +236,7 @@ async fn carried_deletion_vectors_survive_a_successor_publication() {
         .write_deletion_vectors(&Path::from("t/data/dv-1.puffin"), &[(a.clone(), &d)])
         .await
         .expect("write vectors");
-    let v1 = publish(&b, &[a.clone()], &dvs, None, 11)
+    let v1 = publish(&b, std::slice::from_ref(&a), &dvs, None, 11)
         .await
         .expect("publish v1");
 
@@ -352,4 +352,166 @@ async fn a_v2_table_stays_v2_without_an_explicit_upgrade() {
             "v2 stays v2 without an explicit upgrade (v{version})"
         );
     }
+}
+
+/// TD-USUB-10 3c rung 1: a **v2 parent** that carries deletion vectors into its
+/// successor is upgraded to v3 ATOMICALLY — one metadata CAS commits the new
+/// snapshot AND the format-version advance. The upgrade must preserve the
+/// parent chain, the schema's field ids, and the carried data file's path;
+/// new files gain row lineage, the carried v2-era file legitimately has none.
+#[tokio::test]
+async fn a_v2_parent_upgrades_to_v3_atomically_when_it_carries_deletes() {
+    use proximadb_storage_common::object_store_bridge::ObjectStoreBridge as _;
+
+    let b = bridge();
+    let a = part(&b, "t/data/a.parquet", &[10, 11, 12, 13]).await;
+    // The parent commits as v2 (no _ns columns, no deletes, no v3 request).
+    let parent = b
+        .publish_iceberg_files(
+            std::slice::from_ref(&a),
+            None,
+            META,
+            "uuid-upg",
+            "memory:///t",
+            &fields(),
+            100,
+            100,
+            iceberg::FormatVersion::V2,
+        )
+        .await
+        .expect("publish the v2 parent");
+    let parent_json = b
+        .read_table_metadata(META, parent)
+        .await
+        .expect("parent metadata");
+    let parent_doc: serde_json::Value = serde_json::from_slice(&parent_json).expect("parent json");
+    assert_eq!(
+        parent_doc["format-version"], 2,
+        "precondition: parent is v2"
+    );
+
+    // A deletion vector for the v2-era file, carried into a successor append.
+    let d = deletes(&[2]);
+    let dvs = b
+        .write_deletion_vectors(&Path::from("t/data/dv-upg.puffin"), &[(a.clone(), &d)])
+        .await
+        .expect("write vectors");
+    // The engine writes DeleteFileMeta; the trait carries the view struct.
+    // One vector, one puffin file: mirror it field by field.
+    let carried: Vec<proximadb_storage_common::object_store_bridge::IcebergSnapshotDeletion> = dvs
+        .iter()
+        .map(
+            |m| proximadb_storage_common::object_store_bridge::IcebergSnapshotDeletion {
+                data_file: a.clone(),
+                puffin_file: Path::from("t/data/dv-upg.puffin"),
+                content_offset: m.content_offset as u64,
+                content_size_in_bytes: m.content_size_in_bytes as u64,
+                puffin_file_size_in_bytes: m.file_size_in_bytes as u64,
+                cardinality: m.record_count as u64,
+            },
+        )
+        .collect();
+    // The trait's deleting publish takes the bridge view descriptors.
+    let view_fields = vec![
+        proximadb_storage_common::object_store_bridge::IcebergSnapshotField {
+            id: 1,
+            name: "age".into(),
+            type_name: "long".into(),
+            required: false,
+        },
+    ];
+    let extra = part(&b, "t/data/extra-upg.parquet", &[40]).await;
+    let child = b
+        .publish_iceberg_files_deleting(
+            &[a.clone(), extra.clone()],
+            &carried,
+            Some(parent),
+            META,
+            "uuid-upg",
+            "memory:///t",
+            &view_fields,
+            200,
+            200,
+        )
+        .await
+        .expect("publish the carrying successor");
+
+    let child_json = b
+        .read_table_metadata(META, child)
+        .await
+        .expect("child metadata");
+    let child_doc: serde_json::Value = serde_json::from_slice(&child_json).expect("child json");
+    assert_eq!(
+        child_doc["format-version"], 3,
+        "deletes force the v3 upgrade"
+    );
+    // Atomicity means the SAME commit advanced the version and the snapshot:
+    // the child's snapshot chain names the parent's snapshot, and no version
+    // exists between them.
+    let parent_snapshot_id = parent_doc["current-snapshot-id"].clone();
+    let child_snapshot = child_doc["snapshots"]
+        .as_array()
+        .expect("child snapshots")
+        .iter()
+        .find(|snap| snap["snapshot-id"] == child_doc["current-snapshot-id"])
+        .expect("the current snapshot is listed");
+    assert_eq!(
+        child_snapshot["parent-snapshot-id"], parent_snapshot_id,
+        "the upgrade commit chains directly onto the parent snapshot"
+    );
+    assert_eq!(
+        child_doc["current-snapshot-id"], 200,
+        "the child's own snapshot"
+    );
+    // Field ids survive the upgrade unchanged.
+    let parent_ids: Vec<i64> = parent_doc["schemas"][0]["fields"]
+        .as_array()
+        .expect("parent fields")
+        .iter()
+        .map(|f| f["id"].as_i64().expect("id"))
+        .collect();
+    let child_ids: Vec<i64> = child_doc["schemas"][0]["fields"]
+        .as_array()
+        .expect("child fields")
+        .iter()
+        .map(|f| f["id"].as_i64().expect("id"))
+        .collect();
+    assert_eq!(
+        parent_ids, child_ids,
+        "field ids are preserved by the upgrade"
+    );
+    assert!(
+        child_doc.get("next-row-id").is_some(),
+        "v3 allocates row lineage"
+    );
+
+    // Versions are dense (successor = parent + 1) and this was ONE commit:
+    // the child is exactly the parent's successor, pinning one CAS per publish.
+    assert_eq!(
+        child,
+        parent + 1,
+        "the upgrade is a single successor commit"
+    );
+
+    // The carried v2-era data file is still referenced at its original path,
+    // and the deleted position stays deleted through the upgraded child —
+    // not just as carried metadata but to the row-reading entry point.
+    let view = b
+        .read_iceberg_snapshot_files(META, child)
+        .await
+        .expect("child view");
+    assert!(view.data_files.contains(&a), "carried file keeps its path");
+    assert_eq!(view.deletion_vectors.len(), 1);
+    let snapshot = b
+        .read_iceberg_snapshot_with_deletes(META, child)
+        .await
+        .expect("read the upgraded child");
+    let vector = &snapshot.deletion_vectors[0];
+    assert_eq!(&vector.data_file, &a);
+    let read = b.read_deletion_vector(vector).await.expect("read vector");
+    assert_eq!(
+        read.positions(),
+        &[2],
+        "position 2 is hidden on the v3 child"
+    );
 }

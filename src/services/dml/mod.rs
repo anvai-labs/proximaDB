@@ -3115,8 +3115,9 @@ impl DmlService {
                     &iceberg_fields,
                     now_ms, // snapshot id (unique per materialize)
                     now_ms, // timestamp ms
-                    proximadb_storage_common::object_store_bridge::iceberg_needs_v3(
+                    proximadb_storage_common::object_store_bridge::iceberg_publishes_v3(
                         &iceberg_fields,
+                        parent.is_none(),
                     ),
                 )
                 .await

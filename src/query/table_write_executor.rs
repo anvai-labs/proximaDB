@@ -24,7 +24,7 @@ use proximadb_catalog::{
 use proximadb_kernel::error::StorageError;
 use proximadb_records::ProximaRecord;
 use proximadb_storage_common::object_store_bridge::{
-    BridgeObjectPath as Path, ObjectStoreBridge, deterministic_table_uuid, iceberg_needs_v3,
+    BridgeObjectPath as Path, ObjectStoreBridge, deterministic_table_uuid, iceberg_publishes_v3,
     iceberg_snapshot_fields,
 };
 
@@ -948,7 +948,7 @@ impl TableWriteExecutor for DataFusionTableWriteExecutor {
             let data_dir = format!("{base}/data");
             let table_uuid = deterministic_table_uuid(&table_root);
             let fields = iceberg_snapshot_fields(&request.target_schema.to_arrow_schema());
-            let v3 = iceberg_needs_v3(&fields);
+
             // Snapshot ids must advance past the parent (the engine rejects
             // non-advancing ids), so derive them from the same nanosecond clock
             // the part names use — two statements in one millisecond cannot
@@ -1027,6 +1027,7 @@ impl TableWriteExecutor for DataFusionTableWriteExecutor {
                 snapshot_keys.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
                 snapshot_keys.dedup_by(|a, b| a.as_ref() == b.as_ref());
 
+                let v3 = iceberg_publishes_v3(&fields, parent.is_none());
                 let publish = if carried_deletes.is_empty() {
                     bridge.publish_iceberg_files(
                         &snapshot_keys,
