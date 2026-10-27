@@ -1,0 +1,90 @@
+= TD-TIER-1 E1 fragment ladder: SIFT3M settled-segment-count cap sweep
+
+**Date:** 2026-10-27 · **Branch:** `bench/tier1-e1-frag` — runs executed at worktree HEAD `cc9789e80` with the **binary sha256 `48d4aaaf…` (built from the `cc9789e80` tree 2026-10-27 13:39, never rebuilt; built with `--features aws` — see Provenance)**; this time `binary.source_revision` *does* equal the build tree (the anchor commit is zero-change over develop `98faebd8a`) · **TD:** link:../../10-quality/td/TD-TIER-1-collection-storage-policy-and-residency.adoc[TD-TIER-1] SC0/E1 · **Companion to** link:TIER1_E1_SCALE_CAP_SWEEP_2026_10_27.adoc[the E1 scale arms].
+
+== Design correction: the fragmentation dial
+
+The planned dial was wrong. `--max-segments` in the harness is **only the settle gate** (`wait_for_materialization`: `segment_count <= max`) — it configures nothing on the server. The scouting run proved it: a 3M corpus with `--max-segments 12` settled at **one** 741,332,209-byte segment (`e1f-sift3m-m12-build`) because the whole corpus fits the default compaction admission budget.
+
+The real dial is `--compaction-max-memory-mb` → server config `[storage.compaction_config] max_memory_mb` → `StorageConfig::effective_sst_config()` → the compaction **admission ceiling**: `max_input_bytes = min(total×0.25, avail×0.5, max_memory_mb) / 12.0`. Compaction is leveled — L0 holds untrained flush outputs (the TD-COMPACT-5 training arm merges whatever fits into a trained v3/A0 segment at L1+), and higher levels merge **pairs that fit** (`higher_level_file_threshold = 2`; "oversized files remain horizontal"). A settled bed is therefore stable exactly when **no pair of segments fits `max_input`** — every segment ∈ (max_input/2, max_input].
+
+== Protocol
+
+Fixed 3M corpus (the same ANN_SIFT1B learn split prefix as the 3M scale arms), fixed binary, fixed query IDs; **only the admission ceiling varies across beds** (settled segment count 1/2/3/4), and only the coalescing cap (4 → 16 MiB) varies within each bed. Per fresh point: a build run (cap 4 baseline, full phases) plus one cap16 reuse arm via `--skip-ingest` — identical objects, model and query IDs. The m1 point reuses the scouting bed as its cap4 build. **Every reuse arm passes the same `--compaction-max-memory-mb` as its build** — an arm server with the default (auto) budget would merge the settled geometry mid-measurement. Corpus and ground truth identical to the 3M scale arms (learn split disclosed there). **n=1 per cell** (exploratory, consistent with the scale arms).
+
+== Results (`object_cold`, n=1 per cell)
+
+[cols="1,1,1,1,1,1",options="header"]
+|===
+| | m1 (auto) | m2 (6000 MB) | m3 (4200 MB) | m4 (3000 MB)
+| settled segments | 1 × 3.00M (57c) | 1.61M + 1.39M (58c+58c) | 0.14M + 1.46M + 1.40M (52c×3) | 0.66M+0.88M+0.68M+0.78M (23+23+24+28c)
+| bed bytes | 741,332,209 | 741,373,098 | 741,423,739 | 741,375,500
+| cells/q probed | 16.00 | 32.00 | 45.00 | 23.61
+| cap4 requests/q | 36.73 | 49.39 | 58.63 | 48.66
+| cap16 requests/q | **24.56** | **42.74** | **50.93** | **40.68**
+| Δ requests | **−33.1%** | **−13.5%** | **−13.1%** | **−16.4%**
+| Δ bytes/q | +1.9% | +1.6% | +3.6% | +0.5%
+| waves p50 (cap4 → cap16) | 5 → 4 | 4 → 4 | 4 → 4 | 4 → 4
+| recall@10 (both caps) | 0.9736 | 0.9795 | 0.9799 | 0.9777
+| p50 ms (cap4 → cap16) | 182 → 176 | 202 → 213 | 217 → 221 | 247 → 226
+|===
+
+All values [M] from the result.json files (`~/bench-beds/p5b-runs/e1/e1f-sift3m-*/`). Within every bed, recall and the probe plan are **identical across caps** — the fixed-object protocol's identical-probe-plan property holds on every rung. `requests/q − gets/q = 1.00` in every run (a per-query constant request term independent of cap and geometry).
+
+*Gate status (disclosed):* as at 3M/10M scale, these runs carry the harness's default `--min-recall 0.98` and **failed it in every phase of every run** (0.9736–0.9799, recorded in each result.json `gate_failures`) — the geometric-nprobe under-coverage already disclosed in the scale arms; recall is identical across caps within each bed, so the cap comparisons are unaffected.
+
+== Findings
+
+. **The cap lever collapses at first fragmentation, then plateaus.** 4 → 16 MiB cuts object-store requests **−33.1%** on the single-segment bed but only **−13.5% / −13.1% / −16.4%** on the 2/3/4-segment beds. One fragmentation step erases ~55–60% of the lever's power; beyond that the effect is flat within n=1 noise. This is the fixed-corpus, single-dial confirmation of the scale arms' inference: under segment fan-out each segment issues its own probe ranges — a per-segment request floor the coalescing cap cannot merge across. [M]
+. **Segment count alone does not explain the 10M saturation.** The 10M 3-segment bed measured −5.5% (scale arms) — *below* this ladder's 3-segment rung (−13.1%) at a 3.3× smaller corpus. The second factor is probe density: at 3M the ladder's beds probe 16–45 cells over 741 MB; at 10M the bed probes 43 cells over 2.47 GB — sparser probes leave fewer adjacent ranges for the cap to merge. Cap benefit tracks probe density, which falls with both segment count and corpus size. [M]
+. **Cross-binary reproduction (parity check):** the m1 rung reproduces the e1s 3M family within n=1 noise — cap4 36.73 vs 36.342 req/q, cap16 24.56 vs 23.634, Δ −33.1% vs −34.97%, same 5→4 wave drop, recall 0.9736 vs 0.9740 — on a different binary (`48d4aaaf…` vs `11b6a8a1…`) built from a different base tree. The single-segment finding is not binary-specific. [M]
+. **Cells/q co-varies with geometry, not just segment count.** Per-segment IVF cell counts scale with segment rows (3.0M→57c, 1.4–1.6M→52–58c, 0.66–0.88M→23–28c), and the directory planner's total probed cells per query came out 16 / 32 / 45 / 23.6 across the rungs — non-monotone. Absolute cross-rung request counts are therefore mediated by the probe plan and are **not** presented as a curve; the cap Δ within each rung controls it (identical probe plan within a bed). [M]
+. **Warm-phase numbers are protocol-asymmetric and excluded from the cap comparison.** Build-run warm phases (`post_write`, `local_disk_warm`) run cache-hot from ingest (`PROXIMADB_CACHE_ON_WRITE=all`); reuse-arm warm phases run on a cold-boot server — visible in the e1s family too (cap4 build 10.17 req/q vs cap4 *arm* 35.56 req/q at the same cap). Only `object_cold` is protocol-comparable across build-vs-arm; it is the only phase used for the cap claims. Full per-phase values in the appendix for the record. [M]
+
+== Non-producibility: the 6-segment rung (and the flush floor)
+
+A 6-segment bed is **not producible** with this single-dial protocol. The m6 attempt (ceiling 1620 MB → 135 MiB `max_input`) settled at four **untrained** L0 segments and never quiesced: the measured flush outputs at 3M are **140.5 / 208.2 / 159.8 / 198.5 MiB** (`flush_floor_predicted_mb = 128` — not the ~24.7 MiB the 100k-vector flush threshold would suggest), so a 135 MiB ceiling is below even the smallest flush output and no L0 segment can ever be trained or merged (server log: the TD-COMPACT-5 arm fires every ~30 s, `⏸️ L0 remains horizontal because no file pair fits the current memory budget`, `max_input_bytes=141557760`). Untrained beds are not comparable (~180 GETs/q measured stake per TD-COMPACT-5). The run was killed at diagnosis; the settle timeout would have fired at 3600 s. The producible ceiling window for N segments at 3M is **[largest flush, smallest pair sum) = [208.2, 300.3) MiB → 4 segments is the ladder's top rung**; more fragmentation requires a second write-path knob (lower `flush_floor_predicted_mb`), which would break the vary-one-dial design. Same treatment as the 10M single-segment non-producibility in the scale arms: a policy floor, recorded as the blocker. [M]
+
+== What this does NOT establish
+
+n=1 per cell (no repeats) — directions, not distributions. The corpus is the learn split, not the base split. The ladder tops at 4 segments at 3M; no fragment ladder was run at 10M (its 3-segment bed exists, but the corpus-size factor is unseparated there). No warm-phase cap claims (protocol asymmetry above). **No default change and no pricing claim rides on this run** — production S3 already targets 8 MiB ranges; this ladder *reinforces* the scale arms' conclusion that the cap lever is weak under fan-out, and keeps TD-PAXDIR-2 (LIST cache) as the top request lever at scale.
+
+== Provenance
+
+* Result files (local, not checked in): `~/bench-beds/p5b-runs/e1/e1f-sift3m-{m12-build,m1seg-cap16,m2seg-build,m2seg-cap16,m3seg-build,m3seg-cap16,m6seg-build,m4seg-build,m4seg-cap16}/result.json` (the m6 root has no result.json — killed at diagnosis; its server log documents the untrainable bed). Beds: `s3://p5b-gate/e1f-sift3m-*` in MinIO behind toxiproxy :12002 (the canonical 5+5 ms intra-region profile). Datasets identical to the scale arms (`~/sift10m/sift3m_*`).
+* **Run serialization verified from run-root directory births** (the scale arms' authority): all nine roots chain strictly sequentially, each birth at (or 1 s after) the previous run's end — m12-build 18:49:18 UTC → m1seg-cap16 19:19:03 → m2seg-build 19:36:52 → m2seg-cap16 19:47:43 → m3seg-build 20:08:14 → m3seg-cap16 20:19:47 → m6seg-build 20:42:22 (killed 20:57:53) → m4seg-build 20:59:10 → m4seg-cap16 21:12:55 → ends 21:33:54, Oct 27. No overlaps.
+* **Binary:** built once at 13:39 CDT from the worktree HEAD `cc9789e80` (an anchor commit with zero source change over develop `98faebd8a`), sha256 `48d4aaaf3e7606b75419d4eef64825242a38318e1f48c16c24b01c451ede0d6e`, never rebuilt; every result.json records the same sha256 and `source_revision = cc9789e80` (build tree = run tree — no rebase-range caveat this time). **Build-features trap (disclosed):** the first build attempt (`cargo build --profile release-server -p proximadb-server --bin proximadb-server`) omitted the `aws` feature — the `proximadb-server` package defaults the root crate's cloud backends off, so no S3 filesystem registered and collection create failed with HTTP 500 in 79 µs (`UnsupportedScheme("s3")` → `create_storage_directories`'s only `?`). The measured binary was rebuilt with `cargo build --profile release-server --features aws -p proximadb-server --bin proximadb-server` (the release workflow's shape; `cloud-full = aws+azure+gcp`). The 500-failure scout attempt was discarded wholesale and re-run clean.
+* The scouting run (`--max-segments 12`, default ceiling) doubles as the m1 cap4 build; its geometry (1 × 741 MiB) and metrics are recorded in its own result.json and are the m1 column above.
+* **Rebase disclosure:** the branch was rebased onto develop `7fe1fa5c1` (2026-10-27) after SC1+SC2 (#2259) and the tracker refresh (#2263) landed mid-flight and conflicted on the TD/tracker rows; the pre-rebase hashes cited here (`cc9789e80` run HEAD / anchor, the first docs commit) are worktree provenance and will not be reachable from the merged PR — **anchor audits to the binary sha256 `48d4aaaf…`** (never rebuilt; identical in every result.json).
+* Single-machine emulator evidence, not an SLA or a cloud-latency claim.
+
+== Appendix: full per-phase values (for the record; not cap-comparable across build-vs-arm — see finding 5)
+
+[cols="1,1,1,1,1,1,1",options="header"]
+|===
+| run | phase | req/q | GET/q | bytes/q MiB | recall@10 | p50 ms
+| m1-cap4 (build) | post_write | 10.00 | 9.00 | 19.87 | 0.9766 | 103
+| m1-cap4 (build) | local_disk_warm | 10.07 | 9.07 | 20.03 | 0.9770 | 157
+| m1-cap4 (build) | object_cold | 36.73 | 35.73 | 117.97 | 0.9736 | 182
+| m1-cap16 (arm) | post_write | 23.73 | 22.73 | 118.51 | 0.9766 | 367
+| m1-cap16 (arm) | local_disk_warm | 24.40 | 23.40 | 119.89 | 0.9770 | 417
+| m1-cap16 (arm) | object_cold | 24.56 | 23.56 | 120.27 | 0.9736 | 176
+| m2-cap4 (build) | post_write | 15.64 | 14.64 | 26.67 | 0.9773 | 125
+| m2-cap4 (build) | local_disk_warm | 15.68 | 14.68 | 26.50 | 0.9799 | 164
+| m2-cap4 (build) | object_cold | 49.39 | 48.38 | 136.89 | 0.9795 | 202
+| m2-cap16 (arm) | post_write | 41.49 | 40.49 | 137.29 | 0.9773 | 461
+| m2-cap16 (arm) | local_disk_warm | 43.22 | 42.21 | 139.14 | 0.9799 | 465
+| m2-cap16 (arm) | object_cold | 42.74 | 41.74 | 139.01 | 0.9795 | 213
+| m3-cap4 (build) | post_write | 18.38 | 17.38 | 30.36 | 0.9798 | 131
+| m3-cap4 (build) | local_disk_warm | 18.18 | 17.18 | 29.92 | 0.9790 | 184
+| m3-cap4 (build) | object_cold | 58.63 | 57.62 | 144.92 | 0.9799 | 217
+| m3-cap16 (arm) | post_write | 49.39 | 48.39 | 147.75 | 0.9798 | 537
+| m3-cap16 (arm) | local_disk_warm | 48.69 | 47.69 | 149.40 | 0.9790 | 552
+| m3-cap16 (arm) | object_cold | 50.93 | 49.93 | 150.15 | 0.9799 | 221
+| m4-cap4 (build) | post_write | 18.66 | 17.65 | 36.61 | 0.9754 | 184
+| m4-cap4 (build) | local_disk_warm | 18.46 | 17.46 | 36.26 | 0.9756 | 217
+| m4-cap4 (build) | object_cold | 48.66 | 47.66 | 134.47 | 0.9777 | 247
+| m4-cap16 (arm) | post_write | 40.17 | 39.17 | 133.22 | 0.9754 | 502
+| m4-cap16 (arm) | local_disk_warm | 40.03 | 39.03 | 133.57 | 0.9756 | 462
+| m4-cap16 (arm) | object_cold | 40.68 | 39.68 | 135.08 | 0.9777 | 226
+|===
