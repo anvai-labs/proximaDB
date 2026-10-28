@@ -9,6 +9,7 @@ from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import runtime_version as _runtime_version
 from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
+
 _runtime_version.ValidateProtobufRuntimeVersion(
     _runtime_version.Domain.PUBLIC,
     6,
@@ -23,7 +24,6 @@ _sym_db = _symbol_database.Default()
 
 
 from proximadb_sdk.v1 import vector_types_pb2 as proximadb_dot_v1_dot_vector__types__pb2
-
 
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x19proximadb/v1/vector.proto\x12\x0cproximadb.v1\x1a\x1fproximadb/v1/vector_types.proto2\x8b\x03\n\rVectorService\x12[\n\x0bVectorBatch\x12 .proximadb.v1.VectorBatchRequest\x1a%.proximadb.v1.VectorOperationResponse\"\x03\x88\x02\x01\x12]\n\x0cVectorSearch\x12!.proximadb.v1.VectorSearchRequest\x1a%.proximadb.v1.VectorOperationResponse\"\x03\x88\x02\x01\x12W\n\tVectorGet\x12\x1e.proximadb.v1.VectorGetRequest\x1a%.proximadb.v1.VectorOperationResponse\"\x03\x88\x02\x01\x12`\n\x12VectorSearchStream\x12!.proximadb.v1.VectorSearchRequest\x1a .proximadb.v1.SearchVectorRecord\"\x03\x88\x02\x01\x30\x01\x1a\x03\x88\x02\x01\x62\x06proto3')
 

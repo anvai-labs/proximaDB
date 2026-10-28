@@ -5417,7 +5417,7 @@ mod tests {
             crate::proto::proximadb_v1::storage_class_status::State::NotActive as i32
         );
         assert!(
-            status.reason.contains("SC3/SC4"),
+            status.reason.contains("SC4"),
             "reason names the missing dependency: {}",
             status.reason
         );

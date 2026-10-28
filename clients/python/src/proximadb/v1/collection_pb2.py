@@ -9,6 +9,7 @@ from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import runtime_version as _runtime_version
 from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
+
 _runtime_version.ValidateProtobufRuntimeVersion(
     _runtime_version.Domain.PUBLIC,
     6,
@@ -22,8 +23,9 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 _sym_db = _symbol_database.Default()
 
 
-from proximadb.v1 import collection_types_pb2 as proximadb_dot_v1_dot_collection__types__pb2
-
+from proximadb.v1 import (
+    collection_types_pb2 as proximadb_dot_v1_dot_collection__types__pb2,
+)
 
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1dproximadb/v1/collection.proto\x12\x0cproximadb.v1\x1a#proximadb/v1/collection_types.proto2\x8c\x03\n\x11\x43ollectionService\x12Q\n\x10\x43reateCollection\x12\x1e.proximadb.v1.CollectionConfig\x1a\x18.proximadb.v1.Collection\"\x03\x88\x02\x01\x12R\n\rGetCollection\x12\".proximadb.v1.GetCollectionRequest\x1a\x18.proximadb.v1.Collection\"\x03\x88\x02\x01\x12\x63\n\x0fListCollections\x12$.proximadb.v1.ListCollectionsRequest\x1a%.proximadb.v1.ListCollectionsResponse\"\x03\x88\x02\x01\x12\x66\n\x10\x44\x65leteCollection\x12%.proximadb.v1.DeleteCollectionRequest\x1a&.proximadb.v1.DeleteCollectionResponse\"\x03\x88\x02\x01\x1a\x03\x88\x02\x01\x62\x06proto3')
 
