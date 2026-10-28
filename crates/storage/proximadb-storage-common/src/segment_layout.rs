@@ -472,6 +472,35 @@ const EXACT_REGION_SECTION_LEN: usize = 16;
 /// stays single-version — layout versioning lives in the header-prefix.
 const SECTION_COARSE_DIRECTORY: u8 = 3;
 const SECTION_VERSION_V1: u8 = 1;
+const SECTION_VERSION_V2: u8 = 2;
+
+/// P5 slice 3 stable wire tags for a shred column's declared physical type.
+const SHRED_TAG_UNTYPED: u8 = 0;
+const SHRED_TAG_INT64: u8 = 1;
+const SHRED_TAG_FLOAT64: u8 = 2;
+const SHRED_TAG_STRING: u8 = 3;
+
+fn shred_type_tag(t: Option<&proximadb_data_model::ProximaType>) -> u8 {
+    use proximadb_data_model::ProximaType;
+    match t {
+        Some(ProximaType::Int64) => SHRED_TAG_INT64,
+        Some(ProximaType::Float64) => SHRED_TAG_FLOAT64,
+        Some(ProximaType::String) => SHRED_TAG_STRING,
+        _ => SHRED_TAG_UNTYPED,
+    }
+}
+
+fn shred_type_from_tag(tag: u8) -> Option<proximadb_data_model::ProximaType> {
+    use proximadb_data_model::ProximaType;
+    match tag {
+        SHRED_TAG_INT64 => Some(ProximaType::Int64),
+        SHRED_TAG_FLOAT64 => Some(ProximaType::Float64),
+        SHRED_TAG_STRING => Some(ProximaType::String),
+        // Unknown/future tags decode UNTYPED: fail-open (complete tail on
+        // rewrite), never a wrong typed reconstruction.
+        _ => None,
+    }
+}
 const FOOTER_V1: u8 = 1;
 /// `[a0_off u64][a0_len u64]`.
 const COARSE_DIRECTORY_SECTION_LEN: usize = 16;
@@ -588,7 +617,7 @@ pub struct SegmentFooterIndex {
     /// without a catalog lookup (the segment self-describes its shredded
     /// columns). Empty (legacy/no-shred segments) ⇒ user-tag footer-pruning is a
     /// no-op. Serialized as an optional trailing section (absent ⇒ byte-unchanged).
-    pub shred_field_map: Vec<(String, i32)>,
+    pub shred_field_map: Vec<proximadb_block_format::ShredColumn>,
 }
 
 /// `[footer_len u64][SEGMENT_MAGIC 8B]` — the 16 B tail that locates the footer.
@@ -997,8 +1026,23 @@ impl SegmentFooterIndex {
             }
             sections.push((SECTION_BLOCK_FILTERABLE_STATS, payload));
         }
+        let field_map_typed = !self.shred_field_map.is_empty()
+            && self
+                .shred_field_map
+                .iter()
+                .any(|c| c.declared_type.is_some());
         if !self.shred_field_map.is_empty() {
-            sections.push((SECTION_SHRED_FIELD_MAP, self.shred_field_map_payload()?));
+            sections.push((
+                SECTION_SHRED_FIELD_MAP,
+                // TD-FPRUNE-1 P5 slice 3: v2 (with per-entry type tags) only
+                // when a typed entry exists — an all-untyped map emits the
+                // byte-identical v1 payload (two-version pattern).
+                if field_map_typed {
+                    self.shred_field_map_payload_v2()?
+                } else {
+                    self.shred_field_map_payload()?
+                },
+            ));
         }
         if !sections.is_empty() {
             let section_count = u16::try_from(sections.len())
@@ -1006,7 +1050,11 @@ impl SegmentFooterIndex {
             buf.extend_from_slice(&section_count.to_le_bytes());
             for (tag, payload) in sections {
                 buf.push(tag);
-                buf.push(SECTION_VERSION_V1);
+                buf.push(if tag == SECTION_SHRED_FIELD_MAP && field_map_typed {
+                    SECTION_VERSION_V2
+                } else {
+                    SECTION_VERSION_V1
+                });
                 let section_len = u32::try_from(payload.len())
                     .map_err(|_| anyhow::anyhow!("footer section exceeds u32"))?;
                 buf.extend_from_slice(&section_len.to_le_bytes());
@@ -1022,7 +1070,8 @@ impl SegmentFooterIndex {
             .map_err(|_| anyhow::anyhow!("shred field-map count exceeds u16"))?;
         let mut payload = Vec::with_capacity(2 + self.shred_field_map.len() * 16);
         payload.extend_from_slice(&n.to_le_bytes());
-        for (name, col_id) in &self.shred_field_map {
+        for col in &self.shred_field_map {
+            let (name, col_id) = (&col.key, col.column_id);
             let name_len = u16::try_from(name.len())
                 .map_err(|_| anyhow::anyhow!("shred field name exceeds u16 bytes"))?;
             payload.extend_from_slice(&name_len.to_le_bytes());
@@ -1032,7 +1081,19 @@ impl SegmentFooterIndex {
         Ok(payload)
     }
 
-    fn parse_shred_field_map(section: &[u8]) -> Result<Vec<(String, i32)>> {
+    /// P5 slice 3: v2 appends a per-entry physical type tag.
+    /// {0=Untyped, 1=Int64, 2=Float64, 3=String} — exactly the set the flush
+    /// spec produces; unknown tags decode as UNTYPED (fail-open: the
+    /// complete-tail rewrite, never wrong).
+    fn shred_field_map_payload_v2(&self) -> Result<Vec<u8>> {
+        let mut payload = self.shred_field_map_payload()?;
+        for c in &self.shred_field_map {
+            payload.push(shred_type_tag(c.declared_type.as_ref()));
+        }
+        Ok(payload)
+    }
+
+    fn parse_shred_field_map(section: &[u8]) -> Result<Vec<proximadb_block_format::ShredColumn>> {
         let mut p = 0usize;
         let n = read_u16(section, &mut p)? as usize;
         let mut out = Vec::with_capacity(n);
@@ -1048,8 +1109,38 @@ impl SegmentFooterIndex {
                 .map_err(|_| anyhow::anyhow!("shred field-map name is not UTF-8"))?;
             p += name_len;
             let col_id = read_i32(section, &mut p)?;
-            out.push((name, col_id));
+            out.push(proximadb_block_format::ShredColumn::untyped(name, col_id));
         }
+        Ok(out)
+    }
+
+    /// P5 slice 3: `[v1 payload] + [type_tag u8] * n` — one walk, entries
+    /// then tags (the tag block trails the last v1 entry).
+    fn parse_shred_field_map_v2(
+        section: &[u8],
+    ) -> Result<Vec<proximadb_block_format::ShredColumn>> {
+        let mut p = 0usize;
+        let n = read_u16(section, &mut p)? as usize;
+        let mut out: Vec<proximadb_block_format::ShredColumn> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let name_len = read_u16(section, &mut p)? as usize;
+            ensure_remaining(
+                section,
+                p,
+                name_len,
+                "shred field-map name overruns section",
+            )?;
+            let name = String::from_utf8(section[p..p + name_len].to_vec())
+                .map_err(|_| anyhow::anyhow!("shred field-map name is not UTF-8"))?;
+            p += name_len;
+            let col_id = read_i32(section, &mut p)?;
+            out.push(proximadb_block_format::ShredColumn::untyped(name, col_id));
+        }
+        for c in out.iter_mut() {
+            let tag = read_u8(section, &mut p)?;
+            c.declared_type = shred_type_from_tag(tag);
+        }
+        ensure_remaining(section, p, 0, "shred field-map v2 trailing bytes")?;
         Ok(out)
     }
 
@@ -1246,10 +1337,13 @@ impl SegmentFooterIndex {
                         q += len;
                     }
                 } else if tag == SECTION_SHRED_FIELD_MAP {
-                    if version != SECTION_VERSION_V1 {
+                    if version == SECTION_VERSION_V1 {
+                        shred_field_map = Self::parse_shred_field_map(section)?;
+                    } else if version == SECTION_VERSION_V2 {
+                        shred_field_map = Self::parse_shred_field_map_v2(section)?;
+                    } else {
                         bail!("unsupported shred field-map section version {version}");
                     }
-                    shred_field_map = Self::parse_shred_field_map(section)?;
                 }
             }
             if p != body.len() {
@@ -1472,7 +1566,10 @@ mod tests {
             block_stats: vec![None, None],
             // TD-FPRUNE-1 P2: two shredded user columns, to exercise the
             // self-describing footer field-map section round-trip.
-            shred_field_map: vec![("partition".to_string(), 100), ("lang".to_string(), 101)],
+            shred_field_map: vec![
+                proximadb_block_format::ShredColumn::untyped("partition", 100),
+                proximadb_block_format::ShredColumn::untyped("lang", 101),
+            ],
         }
     }
 
@@ -1818,6 +1915,63 @@ mod tests {
     /// depends on: the on-disk version byte is 3 (not 1), and a strict
     /// `version == 1` check therefore fails.
 
+    /// TD-FPRUNE-1 P5 slice 3: the shred field-map section round-trips with
+    /// declared types (v2), an all-untyped map stays byte-identical v1, an
+    /// unknown type tag decodes as UNTYPED (fail-open), and compaction's
+    /// read→rewrite path can therefore preserve residual outputs.
+    #[test]
+    fn footer_shred_field_map_typed_round_trips() {
+        use proximadb_block_format::ShredColumn;
+        use proximadb_data_model::ProximaType;
+
+        // Typed map → v2 section → parses back with the exact types.
+        let mut typed = sample_footer();
+        typed.shred_field_map = vec![
+            ShredColumn::typed("category", 100, ProximaType::Int64),
+            ShredColumn::typed("score", 101, ProximaType::Float64),
+            ShredColumn::typed("lang", 102, ProximaType::String),
+            ShredColumn::untyped("opaque", 103),
+        ];
+        let bytes = typed.to_bytes().unwrap();
+        let parsed = SegmentFooterIndex::parse(&bytes).unwrap();
+        assert_eq!(parsed.shred_field_map, typed.shred_field_map);
+
+        // All-untyped map → the v1 payload, byte-identical to a pre-P5 writer
+        // (mixed-read: old segments and old readers both unchanged).
+        let mut untyped = sample_footer();
+        untyped.shred_field_map = vec![
+            ShredColumn::untyped("partition", 100),
+            ShredColumn::untyped("lang", 101),
+        ];
+        let v1_bytes = untyped.to_bytes().unwrap();
+        let v1_parsed = SegmentFooterIndex::parse(&v1_bytes).unwrap();
+        assert_eq!(v1_parsed.shred_field_map, untyped.shred_field_map);
+        // and the same names/ids emitted as a PRE-P5 (name, id) list produce
+        // the identical section bytes — prove no gratuitous v1 drift.
+        let legacy = {
+            let mut f = sample_footer();
+            f.shred_field_map = vec![
+                ShredColumn::untyped("partition", 100),
+                ShredColumn::untyped("lang", 101),
+            ];
+            f
+        };
+        assert_eq!(legacy.to_bytes().unwrap(), v1_bytes);
+
+        // Unknown/future type tag → UNTYPED (fail-open: complete-tail rewrite,
+        // never a wrong typed reconstruction). Forge a v2 payload with tag 9.
+        let mut forged = typed.to_bytes().unwrap();
+        // The last byte of the section is the final entry's tag; flip it.
+        let last = forged.len() - 1;
+        forged[last] = 9;
+        let parsed_forged = SegmentFooterIndex::parse(&forged).unwrap();
+        assert_eq!(parsed_forged.shred_field_map[3].declared_type, None);
+        assert_eq!(
+            parsed_forged.shred_field_map[0].declared_type,
+            Some(ProximaType::Int64)
+        );
+    }
+
     #[test]
     fn footer_coarse_directory_section_round_trips() {
         let mut footer = sample_footer();
@@ -1918,7 +2072,10 @@ mod tests {
         // TD-FPRUNE-1 P2: the self-describing shred field-map survives round-trip.
         assert_eq!(
             parsed.shred_field_map,
-            vec![("partition".to_string(), 100), ("lang".to_string(), 101)]
+            vec![
+                proximadb_block_format::ShredColumn::untyped("partition", 100),
+                proximadb_block_format::ShredColumn::untyped("lang", 101),
+            ]
         );
     }
 

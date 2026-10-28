@@ -1252,8 +1252,11 @@ pub(crate) async fn pax_filtered_row_allow(
     // resolver closure can be a per-call `&dyn Fn` temporary at each
     // `evaluate_block` (a `&dyn Fn` held across `.await` would make the future
     // `!Send`); the `HashMap` itself is `Send`.
-    let user_field_map: std::collections::HashMap<String, i32> =
-        footer.shred_field_map.iter().cloned().collect();
+    let user_field_map: std::collections::HashMap<String, i32> = footer
+        .shred_field_map
+        .iter()
+        .map(|c| (c.key.clone(), c.column_id))
+        .collect();
     let resolve_field = |field: &str| -> Option<i32> {
         pax_field_to_col(field).or_else(|| user_field_map.get(field).copied())
     };

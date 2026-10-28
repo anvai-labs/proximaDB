@@ -3291,16 +3291,12 @@ impl Compaction {
             if let Ok(Some(footer)) = SegmentFooterIndex::locate_in_segment(&bytes)
                 && !footer.shred_field_map.is_empty()
             {
-                // TD-FPRUNE-1 P5 slice 2: the footer field-map carries
-                // (name, col-id) only today — types arrive with the v2
-                // section (slice 3). Until then compaction re-shreds the
-                // columns UNTYPED: correct (complete tail, nothing dropped),
-                // at the cost of re-paying the double-write on rewrite.
-                return footer
-                    .shred_field_map
-                    .into_iter()
-                    .map(|(key, id)| proximadb_block_format::ShredColumn::untyped(key, id))
-                    .collect();
+                // TD-FPRUNE-1 P5 slice 3: the v2 field-map carries the
+                // declared types, so compaction preserves residual outputs
+                // (typed re-shred) instead of regressing to the complete
+                // tail on rewrite. A v1 map (untyped, all-legacy) parses as
+                // untyped columns — the conservative complete-tail rewrite.
+                return footer.shred_field_map;
             }
         }
         Vec::new()

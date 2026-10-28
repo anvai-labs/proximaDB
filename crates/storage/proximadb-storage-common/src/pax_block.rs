@@ -1964,16 +1964,17 @@ impl PaxSegmentWriter {
             // TD-FPRUNE-1 P2: self-describe the shredded user columns so a
             // filtered read resolves a user-tag field name → col-id with no
             // catalog lookup. Gated with the footer stats (useless without them).
-            shred_field_map: if footer_stats_enabled() {
-                // The SEGMENT footer's map is (name -> col_id) only; the exact
-                // declared type lives in the per-BLOCK shred directory, which is
-                // ungated and self-contained.
-                self.shred_spec
-                    .iter()
-                    .map(|c| (c.key.clone(), c.column_id))
-                    .collect()
-            } else {
+            // TD-FPRUNE-1 P5 slice 3: the segment footer map carries the
+            // FULL typed column (v2 section when any entry is typed) and is
+            // emitted whenever a shred spec exists — compaction needs the
+            // types to preserve residual outputs on rewrite, so gating the
+            // map with the (default-OFF) footer-stats env would silently
+            // undo P5 at every compaction. Tens of bytes; old readers skip
+            // the section (mixed-read-safe).
+            shred_field_map: if self.shred_spec.is_empty() {
                 Vec::new()
+            } else {
+                self.shred_spec.clone()
             },
         };
         let footer_body = footer.to_bytes()?;
@@ -2490,16 +2491,17 @@ impl PaxSegmentWriter {
             c_len,
             // TD-FPRUNE-1 P2: self-describe shredded user columns (see the other
             // footer builder). Gated with the footer stats.
-            shred_field_map: if footer_stats_enabled() {
-                // The SEGMENT footer's map is (name -> col_id) only; the exact
-                // declared type lives in the per-BLOCK shred directory, which is
-                // ungated and self-contained.
-                self.shred_spec
-                    .iter()
-                    .map(|c| (c.key.clone(), c.column_id))
-                    .collect()
-            } else {
+            // TD-FPRUNE-1 P5 slice 3: the segment footer map carries the
+            // FULL typed column (v2 section when any entry is typed) and is
+            // emitted whenever a shred spec exists — compaction needs the
+            // types to preserve residual outputs on rewrite, so gating the
+            // map with the (default-OFF) footer-stats env would silently
+            // undo P5 at every compaction. Tens of bytes; old readers skip
+            // the section (mixed-read-safe).
+            shred_field_map: if self.shred_spec.is_empty() {
                 Vec::new()
+            } else {
+                self.shred_spec.clone()
             },
         };
         let footer_body = footer.to_bytes()?;

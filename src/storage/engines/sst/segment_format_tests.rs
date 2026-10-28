@@ -2776,7 +2776,7 @@ async fn stage_f_user_tag_footer_prune_via_self_describing_segment() {
         footer
             .shred_field_map
             .iter()
-            .any(|(n, c)| n == "partition" && *c == 100),
+            .any(|col| col.key == "partition" && col.column_id == 100),
         "footer must self-describe the shredded partition column, got {:?}",
         footer.shred_field_map
     );
