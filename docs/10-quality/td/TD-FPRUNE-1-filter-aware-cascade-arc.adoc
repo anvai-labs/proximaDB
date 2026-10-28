@@ -1,14 +1,14 @@
 // Copyright (C) 2025 ProximaDB
 // SPDX-License-Identifier: Apache-2.0
 = TD-FPRUNE-1: filter-aware PAX cascade — phased arc (ADR-089)
-:status: Partial — P1+P2 shipped, FILTERED_CASCADE default-ON; FOOTER_STATS default-OFF; corridor-benchmark gate, P3, P4 open
+:status: Partial — P1+P2 shipped, FILTERED_CASCADE default-ON; FOOTER_STATS evidence precondition met 2026-10-28 (D-fetch dominance measured at 3M), gate flip + footer byte-delta still open; P3, P4, P5-P7 open; 3M corridor-class evidence landed
 :dim: D3/D5 (compute-per-modality, object storage)
 :pillar: PERF
 
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Partial: P1 (allow-aware cascade) and P2 (footer-resident block stats, self-describing shred field map, flush/compaction shredding, filtered coarse probe, tag-aware layout) shipped; `PROXIMADB_PAX_FILTERED_CASCADE` flipped default-ON 2026-08-31 (#1778 and follow-up flip commit `221b23c27`). Open: `PROXIMADB_PAX_FOOTER_STATS` stays default-OFF pending its own evidence; corridor-benchmark evidence gate; P1 D-resolve residual check; P3 per-cell stats; P4 selectivity policy.**
+| Status | **Partial: P1 (allow-aware cascade) and P2 (footer-resident block stats, self-describing shred field map, flush/compaction shredding, filtered coarse probe, tag-aware layout) shipped; `PROXIMADB_PAX_FILTERED_CASCADE` flipped default-ON 2026-08-31 (#1778 and follow-up flip commit `221b23c27`). 2026-10-28: the E1 filter family (link:../../history/evidence/TIER1_E1_FILTERED_QUERIES_2026_10_28.adoc[artifact]) measured the shipped stack at 3M — filtered object_cold 277.55 req/q, 936.93 MB/q, p50 6.02 s vs unfiltered 52.74 / ~150 MB / 0.27 s, with the byte sink pinned by counters: the Stage-F whole-D fetch is 89% of filtered bytes (the FOOTER_STATS gate's stated precondition, now evidenced). Open: FOOTER_STATS default flip + its footer byte-delta measurement; the 20k/80k Qdrant corridor shape; P1 D-resolve residual check; P3 per-cell stats; P4 selectivity policy; P5 residual-tail; P6 filter-aware directory; P7 cell-scoped Stage F.**
 | Component | `src/storage/engines/sst/{search,segment_format}`, `proximadb-block-format`, `proximadb-storage-common` footer
 | Relates to | ADR-089 (decision + evidence); link:TD-PAXRG-1-row-group-region-d.adoc[TD-PAXRG-1] (overlap: both claim footer stats space — coexist via separate sections); link:TD-FPRUNE-2-record-scan-materializes-before-filtering.adoc[TD-FPRUNE-2] (overlap: same stats, record-scan surface); link:TD-RDSTRAT-8-two-level-ivf-coarse-probe.adoc[TD-RDSTRAT-8]; TD-CTXCORR-1; TD-073
 | Pillar | PERF
@@ -57,13 +57,21 @@ C1 integrated filtered stack **4.2× byte cut** at recall parity (correlated dat
   criterion of its own, read-inert while the cascade was off, unmeasured footer byte
   cost paid by every collection) until the cascade records io_trace evidence that
   the D-block fetch dominates and a footer byte-delta measurement lands.
-* **Evidence gate (OPEN — deferred with rationale):** the corridor
+  **2026-10-28: the dominance precondition is MET** — the E1 filter artifact's
+  counters attribute 89% of filtered bytes (834 of 936.93 MB/q at 3M, n=1000) to
+  the Stage-F whole-D fetch, with the cascade clean (whole_region_fallbacks=0).
+  Remaining for the flip: the footer byte-delta measurement (one gated re-ingest
+  arm on the e1p protocol — harness landed with the artifact).
+* **Evidence gate (PARTIAL — 3M leg landed 2026-10-28):** the corridor
   benchmark (filtered p50/p99 at 20k/80k/1M vs the recorded Qdrant 8.0/52.3
   ms baseline, synthetic partition + Wikipedia `lang`, io_trace
-  `object_gets`/`bytes_read` per filtered query) has NOT been run — it needs
-  the corridor harness + corpora and belongs in the flip-ON decision. The
-  in-module C1 measurement (4.2× byte cut at recall parity on correlated data)
-  is the interim evidence.
+  `object_gets`/`bytes_read` per filtered query) has NOT been run at those
+  scales — but the E1 filter family supplies the same evidence class at 3M
+  through the real dispatch: filtered p50 6.02 s / 277.55 req/q / 936.93 MB/q
+  vs unfiltered 0.27 s / 52.74 / ~150 MB (n=1000, MinIO+toxiproxy, full
+  per-query counters in result.json). The in-module C1 measurement (4.2× byte
+  cut at recall parity on correlated data) remains the interim flip evidence;
+  the Qdrant-corridor shape stays open.
 * **P3 — per-cell stats (prune before any Region-A byte).** Optional
   footer/A0 section with per-cell dictionary/zone summaries for filterable
   columns; intersect with the geometric nprobe cut
@@ -77,6 +85,32 @@ C1 integrated filtered stack **4.2× byte cut** at recall parity (correlated dat
   unselective ⇒ cascade + residual only. This is the real auto
   `AnnFilteringMode` (closes the TD-073 deferral) and subsumes the AXIS
   PreFilter/Inline/PostFilter modes as policy over capability.
+* **P5 — residual-tail store-once** *(new 2026-10-28; measured rationale: the D
+  region itself is 89% of filtered bytes and ~170 B/row for three int props —
+  msgpack named-map keys repeated per row, values duplicated into shreds when
+  `filterable_columns` are declared, residual-tail mode default-OFF)*. Flip
+  `PROXIMADB_PAX_RESIDUAL_TAIL` to unset=ON (kill-switch opt-out): shredded
+  values stop being duplicated into the props tail; the reader-side merge is
+  already ungated (`record.rs:604-637`). Arithmetic target from the 3M
+  measurement: D 834 → ~140 MB/q, total ~242 MB/q. Gates: round-trip prop
+  equality; no change without declared filterable columns.
+* **P6 — filter-aware directory planning** *(new; the filter still excludes the
+  centroid directory end-to-end — `mod.rs:2116` + the probe-internal drop
+  `segment_format.rs:3505-3517` and the `probed = cells` override
+  `:3559-3561` — so filtered queries lose segment skipping and decode keys)*.
+  Gate `PROXIMADB_PAX_FILTERED_DIRECTORY`: remove ONLY the
+  `filter_expression.is_some()` half of the exclusion (`force_exact` stays —
+  exact-mode contract); the directory choice becomes a stable order-prior on
+  the M3 walk and never overrides the `nprobe && matched >= target` stop
+  condition (the measured 0.974 filtered recall already includes cell
+  skipping — no new miss class).
+* **P7 — cell-scoped lazy Stage F** *(new; composes P3+P6)*. Refactor
+  `pax_filtered_row_allow` into a lazy `AllowSource`: per walked cell,
+  range-GET only its D blocks' filter data, extend the allow bitmap, check the
+  stop condition (blocks nest inside cells — assert, fall back). Invariant:
+  lazy allow bitmap byte-identical to eager for the same filter; every error
+  falls back to today's eager path. Arithmetic target: total ~138 MB/q ≈
+  unfiltered parity (~150 MB).
 
 == Gates (per phase)
 
