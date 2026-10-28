@@ -1458,6 +1458,61 @@ mod tests {
         );
     }
 
+    // Verification round 3 (B5 residual): the protects-only stress above
+    // cannot fail on a membership-only refund; the actual arbitration is
+    // protect vs the LOCK-FREE remove. Churn protects against concurrent
+    // removes and assert the invariant that arbitration defends:
+    // protected_bytes never exceeds the armed budget — a double-decrement
+    // wraps to ~2^64 and blows straight past it.
+    #[tokio::test]
+    async fn protect_vs_remove_stress_never_breaks_accounting() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
+        let budget = 64 * 1024u64;
+        store.set_reserved_budget(budget);
+        let payload = payload(4 * 1024);
+
+        for round in 0..64 {
+            store
+                .put(&format!("k{round}"), L2Class::Survivor, payload.clone())
+                .await
+                .expect("put");
+            let key = format!("k{round}");
+            let mut handles = Vec::new();
+            for i in 0..8 {
+                let store = store.clone();
+                let key = key.clone();
+                handles.push(tokio::spawn(async move {
+                    if i % 2 == 0 {
+                        let _ = store.protect(&key).await;
+                    } else {
+                        let _ = store.unprotect(&key).await;
+                    }
+                }));
+            }
+            // The lock-free invalidator races the pins.
+            let remover = store.clone();
+            let remove_key = key.clone();
+            let ((), _) = tokio::join!(
+                async {
+                    for handle in handles {
+                        let _ = handle.await;
+                    }
+                },
+                async move {
+                    let _ = remover.remove(&remove_key);
+                }
+            );
+            assert!(
+                store.protected_bytes() <= budget,
+                "round {round}: protected_bytes {} exceeds the armed budget {} \
+                 (arithmetic wrapped or double-decremented)",
+                store.protected_bytes(),
+                budget
+            );
+        }
+    }
+
     // Protection is runtime state by design: the index rebuild drops it and
     // SC4's coverage reconciliation re-derives pins from the grant ledger.
     #[tokio::test]

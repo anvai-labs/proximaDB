@@ -439,6 +439,7 @@ impl ReservationAuthority {
         tenant_id: &str,
         collection_id: &str,
         bytes: u64,
+        now_unix_secs: i64,
     ) -> Result<(Grant, Vec<ReservationUsageInterval>), ReservationError> {
         if kill_switch_armed() {
             return Err(ReservationError::KillSwitch);
@@ -454,17 +455,11 @@ impl ReservationAuthority {
                 return Ok((existing.clone(), Vec::new()));
             }
             return self
-                .resize_prospective(
-                    &mut guard,
-                    tenant_id,
-                    collection_id,
-                    bytes,
-                    current_unix_secs(),
-                )
+                .resize_prospective(&mut guard, tenant_id, collection_id, bytes, now_unix_secs)
                 .await;
         }
         let grant = self
-            .admit_prospective(&mut guard, tenant_id, collection_id, bytes)
+            .admit_prospective(&mut guard, tenant_id, collection_id, bytes, now_unix_secs)
             .await?;
         Ok((grant, Vec::new()))
     }
@@ -650,12 +645,13 @@ impl ReservationAuthority {
         tenant_id: &str,
         collection_id: &str,
         bytes: u64,
+        now_unix_secs: i64,
     ) -> Result<Grant, ReservationError> {
         let mut prospective = (*guard).clone();
         let effective = self.config.effective_bytes(bytes);
         self.ensure_capacity(&prospective, bytes, effective, 0)?;
         self.ensure_tenant_limit(&prospective, tenant_id, bytes, None)?;
-        let now = current_unix_secs();
+        let now = now_unix_secs;
         let grant = Grant {
             id: new_grant_id(),
             tenant_id: tenant_id.to_string(),
@@ -792,6 +788,10 @@ fn kill_switch_armed() -> bool {
     }
 }
 
+/// Wall-clock helper. Test-only today: every production mutation takes an
+/// explicit `now_unix_secs` (billing instants are caller-pinned); SC3-2's
+/// create-path wiring will promote this to its production caller.
+#[cfg(test)]
 fn current_unix_secs() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -1086,8 +1086,8 @@ mod tests {
         let a = auth.clone();
         let b = auth.clone();
         let (ra, rb) = tokio::join!(
-            a.reserve("t1", "c1", 40 * 1024 * 1024 * 1024),
-            b.reserve("t2", "c2", 40 * 1024 * 1024 * 1024),
+            a.reserve("t1", "c1", 40 * 1024 * 1024 * 1024, current_unix_secs()),
+            b.reserve("t2", "c2", 40 * 1024 * 1024 * 1024, current_unix_secs()),
         );
         let winners = usize::from(ra.is_ok()) + usize::from(rb.is_ok());
         assert_eq!(winners, 1, "exactly one concurrent admission may win");
@@ -1116,7 +1116,7 @@ mod tests {
         for i in 0..32 {
             let a = auth.clone();
             handles.push(tokio::spawn(async move {
-                a.reserve("tn", &format!("c{i}"), 2 * 1024 * 1024)
+                a.reserve("tn", &format!("c{i}"), 2 * 1024 * 1024, current_unix_secs())
                     .await
                     .is_ok()
             }));
@@ -1136,8 +1136,14 @@ mod tests {
     async fn retry_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let auth = ReservationAuthority::open(pool(&dir)).await.unwrap();
-        let (g1, _closed) = auth.reserve("t1", "c1", 1024).await.unwrap();
-        let (g2, _) = auth.reserve("t1", "c1", 1024).await.unwrap();
+        let (g1, _closed) = auth
+            .reserve("t1", "c1", 1024, current_unix_secs())
+            .await
+            .unwrap();
+        let (g2, _) = auth
+            .reserve("t1", "c1", 1024, current_unix_secs())
+            .await
+            .unwrap();
         assert_eq!(g1.id, g2.id, "retry returns the same grant");
         let grants = auth.grants_snapshot().await;
         assert_eq!(
@@ -1164,7 +1170,10 @@ mod tests {
         tokio::fs::create_dir(dir.path().join("reservations.tmp"))
             .await
             .unwrap();
-        let err = auth.reserve("t1", "c1", 1024).await.unwrap_err();
+        let err = auth
+            .reserve("t1", "c1", 1024, current_unix_secs())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ReservationError::Io(_)), "{err:?}");
         // No live grant in memory and nothing on disk.
         assert!(
@@ -1176,7 +1185,10 @@ mod tests {
         tokio::fs::remove_dir(dir.path().join("reservations.tmp"))
             .await
             .unwrap();
-        let (retried, _) = auth.reserve("t1", "c1", 1024).await.unwrap();
+        let (retried, _) = auth
+            .reserve("t1", "c1", 1024, current_unix_secs())
+            .await
+            .unwrap();
         assert_eq!(retried.bytes, 1024, "retry re-attempts the admission");
     }
 
@@ -1187,8 +1199,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = pool(&dir);
         let auth = ReservationAuthority::open(cfg.clone()).await.unwrap();
-        let _ = auth.reserve("t1", "c1", 1024).await.unwrap();
         let t0 = current_unix_secs();
+        let _ = auth.reserve("t1", "c1", 1024, t0).await.unwrap();
         let epoch_before = auth.take_usage_intervals(t0 + 1).await.unwrap()[0].producer_epoch;
         drop(auth); // no release: "crash"
 
@@ -1210,7 +1222,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = pool(&dir);
         let auth = ReservationAuthority::open(cfg.clone()).await.unwrap();
-        let _ = auth.reserve("t1", "c1", 1024).await.unwrap();
+        let _ = auth
+            .reserve("t1", "c1", 1024, current_unix_secs())
+            .await
+            .unwrap();
         drop(auth);
         tokio::fs::write(ledger_path(dir.path()), b"{ not json")
             .await
@@ -1328,8 +1343,9 @@ mod tests {
     async fn release_returns_tail_interval_and_stops_accrual() {
         let dir = tempfile::tempdir().unwrap();
         let auth = ReservationAuthority::open(pool(&dir)).await.unwrap();
-        let _ = auth.reserve("t1", "c1", 1024).await.unwrap();
-        let t0 = current_unix_secs() + 1; // strictly after the reserve stamp
+        let t_start = current_unix_secs();
+        let _ = auth.reserve("t1", "c1", 1024, t_start).await.unwrap();
+        let t0 = t_start + 1; // strictly after the reserve stamp
         let i1 = auth.take_usage_intervals(t0).await.unwrap();
         assert_eq!(i1.len(), 1);
         let tail = auth.release("t1", "c1", t0 + 5).await.unwrap();
@@ -1352,7 +1368,10 @@ mod tests {
     async fn resize_splits_billing_levels() {
         let dir = tempfile::tempdir().unwrap();
         let auth = ReservationAuthority::open(pool(&dir)).await.unwrap();
-        let _ = auth.reserve("t1", "c1", 1000).await.unwrap();
+        let _ = auth
+            .reserve("t1", "c1", 1000, current_unix_secs())
+            .await
+            .unwrap();
         let t0 = current_unix_secs() + 1;
         let first = auth.take_usage_intervals(t0).await.unwrap();
         assert_eq!(first[0].reserved_bytes, 1000);
@@ -1374,11 +1393,23 @@ mod tests {
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].interval_start_unix_secs, t0 + 5);
         assert_eq!(after[0].reserved_bytes, 4000, "new level after the split");
-        // reserve-as-resize is the same contract (verification round 2): the
-        // closed interval is RETURNED, never silently dropped.
-        let (grant, closed2) = auth.reserve("t1", "c1", 2000).await.unwrap();
+        // reserve-as-resize is the same contract (verification round 3: the
+        // prior leg was vacuous — a future checkpoint made the internal clock
+        // strictly earlier, so the close always no-oped). The split instant is
+        // explicit now: [t0+10, t0+15) closes at the 4000 level, returned.
+        let (grant, closed2) = auth.reserve("t1", "c1", 2000, t0 + 15).await.unwrap();
         assert_eq!(grant.bytes, 2000);
-        let _ = closed2; // span length is wall-clock dependent; return is the contract
+        assert_eq!(
+            closed2.len(),
+            1,
+            "reserve-as-resize returns the interval it closed: {closed2:?}"
+        );
+        assert_eq!(closed2[0].interval_start_unix_secs, t0 + 10);
+        assert_eq!(closed2[0].interval_end_unix_secs, t0 + 15);
+        assert_eq!(
+            closed2[0].reserved_bytes, 4000,
+            "old level of the re-resize"
+        );
     }
 
     // SC-TE9 dedup: the accrual checkpoint is durably persisted with the
@@ -1390,8 +1421,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = pool(&dir);
         let auth = ReservationAuthority::open(cfg.clone()).await.unwrap();
-        let _ = auth.reserve("t1", "c1", 1024).await.unwrap();
-        let t0 = current_unix_secs() + 1; // strictly after the reserve stamp
+        let t_start = current_unix_secs();
+        let _ = auth.reserve("t1", "c1", 1024, t_start).await.unwrap();
+        let t0 = t_start + 1; // strictly after the reserve stamp
         let first = auth.take_usage_intervals(t0).await.unwrap();
         assert_eq!(first.len(), 1);
         drop(auth); // crash between persist and metering sink
@@ -1419,15 +1451,21 @@ mod tests {
         let mut cfg = pool(&dir);
         cfg.tenant_limit_bytes = Some(2048);
         let auth = ReservationAuthority::open(cfg).await.unwrap();
-        let _ = auth.reserve("t1", "c1", 1024).await.unwrap();
+        let _ = auth
+            .reserve("t1", "c1", 1024, current_unix_secs())
+            .await
+            .unwrap();
         let err = auth
-            .reserve("t1", "c2", 2048)
+            .reserve("t1", "c2", 2048, current_unix_secs())
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("tenant 't1' reservation limit"), "{err}");
         // Another tenant is unaffected.
-        let _ = auth.reserve("t2", "c1", 2048).await.unwrap();
+        let _ = auth
+            .reserve("t2", "c1", 2048, current_unix_secs())
+            .await
+            .unwrap();
     }
 
     // Kill switch: reserve refuses with a named reason; the ledger survives.
@@ -1435,11 +1473,14 @@ mod tests {
     async fn kill_switch_refuses_without_amnesia() {
         let dir = tempfile::tempdir().unwrap();
         let auth = ReservationAuthority::open(pool(&dir)).await.unwrap();
-        let _ = auth.reserve("t1", "c1", 1024).await.unwrap();
+        let _ = auth
+            .reserve("t1", "c1", 1024, current_unix_secs())
+            .await
+            .unwrap();
         // Env tests must not race other policy tests reading the same var.
         let guard = env_lock::scoped_set(RESERVATIONS_KILL_SWITCH_ENV, "1");
         let err = auth
-            .reserve("t1", "c2", 1024)
+            .reserve("t1", "c2", 1024, current_unix_secs())
             .await
             .unwrap_err()
             .to_string();
@@ -1521,7 +1562,10 @@ mod tests {
         cfg.allocatable_bytes = 1 << 30;
         let auth = ReservationAuthority::open(cfg.clone()).await.unwrap();
         for i in 0..(MAX_RETAINED_RELEASED + 8) {
-            let _ = auth.reserve("t1", &format!("c{i}"), 64).await.unwrap();
+            let _ = auth
+                .reserve("t1", &format!("c{i}"), 64, current_unix_secs())
+                .await
+                .unwrap();
             auth.release("t1", &format!("c{i}"), current_unix_secs() + 1)
                 .await
                 .unwrap();
