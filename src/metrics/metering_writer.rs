@@ -139,7 +139,11 @@ impl ReservationUsageRecord {
 
 /// Resolve the durable object URL for one reservation-usage record. The dedup
 /// identity `(epoch, sequence)` lives in the key, so replay overwrites:
-/// `…/_metering/reservations/{pool}/usage-{epoch}-{sequence}.json`.
+/// `…/_metering/reservations/{pool}/usage-{epoch}-{sequence}.json`. The pool
+/// id enters the object key, so it carries the same charset discipline as the
+/// tenant id — a traversal pool id is rejected here, structurally, before any
+/// write (review S1; the config validator rejects it first, this is the
+/// last-line guard for every caller).
 pub fn reservation_usage_object_url(
     base_url: &str,
     account_id: Option<&str>,
@@ -148,6 +152,11 @@ pub fn reservation_usage_object_url(
     producer_epoch: u64,
     sequence: u64,
 ) -> anyhow::Result<String> {
+    if !crate::services::collection::reservation::valid_pool_id(pool_id) {
+        anyhow::bail!(
+            "invalid reservation pool id '{pool_id}': must be 1-64 chars of [A-Za-z0-9_-]"
+        );
+    }
     let resolved = DrPathBuilder::build_tenant_system(account_id, tenant_id)
         .map_err(|e| anyhow::anyhow!("invalid tenant id for metering path: {e}"))?;
     let prefix = resolved.metering_subprefix();
@@ -429,8 +438,14 @@ mod tests {
             url,
             "file:///srv/data/data/t1/_metering/reservations/nvme-1/usage-3-7.json"
         );
-        // Fail-closed on a traversal tenant id, like the KSU URL.
+        // Fail-closed on traversal TENANT and POOL ids alike — both enter the
+        // object key (review S1).
         assert!(reservation_usage_object_url("file:///srv/data", None, "../x", "p", 1, 1).is_err());
+        assert!(
+            reservation_usage_object_url("file:///srv/data", None, "t1", "../../other", 1, 1)
+                .is_err()
+        );
+        assert!(reservation_usage_object_url("file:///srv/data", None, "t1", "a/b", 1, 1).is_err());
     }
 
     /// A replayed emission (same epoch + sequence) overwrites the SAME object

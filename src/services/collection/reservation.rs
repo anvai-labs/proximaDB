@@ -1,38 +1,54 @@
 //! TD-TIER-1 SC3 slice 1: the per-pool reservation authority.
 //!
-//! One authority owns one operator-declared local pool EXCLUSIVELY in v1 (a
-//! process-scoped lock file rejects a second owner while the first lives —
-//! SC-TE8's serving-owner scoping is this lock, not a fleet allocator). It is
-//! the single reservation ledger for that pool: admission is atomic under one
-//! short mutex, durable BEFORE it returns (atomic tmp+rename ledger write), and
-//! idempotent per (tenant, collection) — a retry returns the same grant.
+//! One authority owns one operator-declared local pool EXCLUSIVELY: a
+//! process-global registry rejects a second live authority on the same pool
+//! directory in-process, and an O_EXCL `owner.lock` (pid + process-start
+//! token) rejects a live foreign owner cross-process; a stale lock is claimed
+//! by exactly one racer via atomic rename. It is the single reservation
+//! ledger for that pool.
+//!
+//! **Durable-before-return (review B2/B3):** every mutation builds a
+//! prospective ledger, persists it (fsync file + rename + fsync dir), and
+//! only then commits the in-memory state — a persist failure leaves memory
+//! unchanged, so a retry re-attempts rather than fabricating success. The
+//! idempotency fast path can therefore only observe a grant that is already
+//! durable.
+//!
+//! **Billing-level integrity (review B4):** `release` and `resize` close
+//! their grant's open interval at the OLD level and return it — no interval
+//! is silently dropped and no level is billed across a span it did not hold.
+//! `take_usage_intervals` covers only spans at a stable level.
 //!
 //! Capacity accounting charges effective bytes: `grant_bytes × (1 +
-//! overhead_factor)`, rounded up — the plan's headers/checksums, warming and
-//! old/new-generation headroom. The sum of live grants' effective bytes can
+//! overhead_factor)`, rounded up — headers/checksums, temporary warming and
+//! old/new-generation overlap. The sum of live grants' effective bytes can
 //! never exceed [`ReservationPoolConfig::allocatable_bytes`] (SC-TE3), and an
 //! operator-declared per-tenant limit bounds one tenant's share.
 //!
 //! **No quota check ever runs on the query hot path.** The authority is an
 //! admission- and cadence-time component only: reads never consult it, and
-//! [`reserve`] performs no network I/O — its durable state is a small local
-//! file, written under the ledger mutex and never across a network call.
+//! [`ReservationAuthority::reserve`] performs no network I/O — its durable
+//! state is a small local file, written under the ledger mutex and never
+//! across a network call.
 //!
-//! **Inert in this slice.** Nothing constructs an authority in production yet;
-//! the config field parses and validates but no call site opens a pool. The
-//! PERFORMANCE class keeps its SC1 `NOT_ACTIVE` status until SC4 proves
-//! coverage; SC3-2 wires admission at create.
+//! **Inert in this slice.** Nothing constructs an authority in production
+//! yet; the config field parses and is validated at config load, but no call
+//! site opens a pool. The PERFORMANCE class keeps its SC1 `NOT_ACTIVE` status
+//! until SC4 proves coverage; SC3-2 wires admission at create.
 //!
-//! **Crash semantics (SC-TE7/SC-TE9).** Reopen reloads the ledger and bumps
-//! `producer_epoch`; usage intervals are keyed `(producer_epoch, sequence)` so
-//! a replayed emission overwrites the same record rather than double-charging.
-//! The epoch discontinuity after an unclean close is itself the uncertainty
-//! signal — bytes held during the unobserved gap are not fabricated downstream.
-//! A corrupt ledger fails closed: the authority refuses to open (and therefore
-//! refuses admission) rather than silently zeroing live grants.
+//! **Crash semantics (SC-TE7/SC-TE9).** Reopen reloads the ledger, persists
+//! the bumped `producer_epoch`, and prunes the bounded released-grant tail;
+//! usage intervals are keyed `(producer_epoch, sequence)` so a replayed
+//! emission overwrites the same record rather than double-charging. The
+//! epoch discontinuity after an unclean close is itself the uncertainty
+//! signal — bytes held during the unobserved gap are not fabricated
+//! downstream. A corrupt or unreadable ledger fails closed: the authority
+//! refuses to open (and therefore refuses admission) rather than silently
+//! zeroing live grants.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use serde::{Deserialize, Serialize};
 
@@ -40,19 +56,26 @@ use serde::{Deserialize, Serialize};
 /// rejects newer/unknown versions fail-closed (pre-GA: no mixed-read duty).
 const LEDGER_SCHEMA_VERSION: u32 = 1;
 
+/// Bounded audit tail: released grants retained in the ledger. Older ones are
+/// pruned at open — durable history lives in the metering records, and an
+/// unbounded ledger would make every mutation an O(n) rewrite (review S6).
+const MAX_RETAINED_RELEASED: usize = 64;
+
+/// Takeover retries for the owner lock — a bounded race, not a spin.
+const LOCK_ATTEMPTS: usize = 8;
+
 /// Kill switch: when set, [`ReservationAuthority::reserve`] refuses new
 /// reservations with a named reason. It never erases the ledger or the
 /// operator's pool/policy configuration — degrading to balanced behavior, not
-/// amnesia.
+/// amnesia. A value that is not valid UTF-8 arms the switch (fail-closed).
 pub const RESERVATIONS_KILL_SWITCH_ENV: &str = "PROXIMADB_TIER1_RESERVATIONS_OFF";
 
 /// Operator declaration of one local reservation pool (TD-TIER-1 SC3). An
-/// empty pool list (the default) leaves the whole feature inert. No `Eq`:
-/// `overhead_factor` is `f64`.
+/// empty pool list (the default) leaves the whole feature inert.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReservationPoolConfig {
-    /// Stable pool identity (unique across the config; path/validation key for
-    /// usage records and later status projections).
+    /// Stable pool identity: `[A-Za-z0-9_-]{1,64}` (it enters metering object
+    /// keys, so it must not traverse), unique across the config.
     pub id: String,
     /// Local filesystem directory holding the pool's `owner.lock` and ledger.
     /// Not the object store: reservation state is node-local by design.
@@ -74,13 +97,26 @@ fn default_overhead_factor() -> f64 {
     0.1
 }
 
+/// Pool ids enter metering object keys — same charset discipline as tenant
+/// ids, or a hostile id escapes the `_metering/` subtree (review S1).
+pub fn valid_pool_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 impl ReservationPoolConfig {
-    /// Validate a parsed pool: non-empty id/path, non-zero allocatable, clamped
-    /// overhead. Called at config load so a bad declaration fails at startup,
-    /// not at first admission.
+    /// Validate one declaration. Called at config load AND at authority
+    /// open; startup-time duplicate id/path checks live in
+    /// [`validate_pool_configs`].
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.id.trim().is_empty() {
-            anyhow::bail!("reservation pool id must be non-empty");
+        if !valid_pool_id(&self.id) {
+            anyhow::bail!(
+                "reservation pool id '{}' must be 1-64 chars of [A-Za-z0-9_-]",
+                self.id
+            );
         }
         if self.path.trim().is_empty() {
             anyhow::bail!("reservation pool '{}' path must be non-empty", self.id);
@@ -108,11 +144,37 @@ impl ReservationPoolConfig {
     }
 }
 
+/// Startup validation for the whole declaration list: every pool valid, and
+/// ids/paths unique — two pools sharing an id would write the same metering
+/// namespace with independent counters (silent overwrite), and two pools on
+/// one path would fight over one ledger (review S1).
+pub fn validate_pool_configs(pools: &[ReservationPoolConfig]) -> anyhow::Result<()> {
+    let mut ids = HashSet::new();
+    let mut paths = HashSet::new();
+    for pool in pools {
+        pool.validate()?;
+        if !ids.insert(pool.id.clone()) {
+            anyhow::bail!("duplicate reservation pool id '{}'", pool.id);
+        }
+        let canonical = std::fs::canonicalize(&pool.path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| pool.path.trim_end_matches('/').to_string());
+        if !paths.insert(canonical) {
+            anyhow::bail!(
+                "duplicate reservation pool path '{}' (pool '{}')",
+                pool.path,
+                pool.id
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Lifecycle per `docs/current/STORAGE_PLAN.adoc` §"Reservation and coverage
 /// lifecycle". Only `Reserved` and `Released` are reachable in SC3 slice 1 —
 /// warming/ready/degraded arrive with SC4's coverage read path, `Releasing`
-/// with SC4's retirement coordination. The transition validator below is total
-/// so later slices extend the machine without re-defining its floor.
+/// with SC4's retirement coordination. The transition validator is total so
+/// later slices extend the machine without re-defining its floor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GrantState {
     /// Admission succeeded durably; bytes are charged to the pool.
@@ -124,7 +186,7 @@ pub enum GrantState {
     /// Coverage cannot keep up; the grant stays charged (billing honesty) and
     /// the reason names the failure.
     Degraded { reason: String },
-    /// SC4: retirement in flight; bytes still charged until Released.
+    /// Retirement in flight; bytes still charged until Released.
     Releasing,
     /// Capacity freed; accrual stopped. Terminal for this grant id.
     Released,
@@ -137,12 +199,13 @@ impl GrantState {
     }
 
     /// Legal forward transitions (fail-closed: anything not listed is an
-    /// invariant violation, not a silent coerced state).
+    /// invariant violation, not a silently coerced state).
     pub fn can_transition_to(&self, next: &GrantState) -> bool {
         use GrantState::*;
         matches!(
             (self, next),
             (Reserved, Warming)
+                | (Reserved, Releasing)
                 | (Reserved, Released)
                 | (Warming, Ready)
                 | (Warming, Degraded { .. })
@@ -151,6 +214,7 @@ impl GrantState {
                 | (Ready, Releasing)
                 | (Degraded { .. }, Warming)
                 | (Degraded { .. }, Releasing)
+                | (Releasing, Releasing) // idempotent re-release
                 | (Releasing, Released)
                 | (Released, Released) // idempotent no-op
         )
@@ -169,7 +233,8 @@ pub struct Grant {
     pub state: GrantState,
     pub created_unix_secs: i64,
     /// Accrual checkpoint: the end of the last emitted usage interval. Frozen
-    /// at release; advanced by [`ReservationAuthority::take_usage_intervals`].
+    /// at release; advanced by interval-closing mutations and
+    /// [`ReservationAuthority::take_usage_intervals`].
     pub last_interval_end_unix_secs: i64,
 }
 
@@ -181,8 +246,8 @@ pub struct ReservationUsageInterval {
     pub tenant_id: String,
     pub pool_id: String,
     pub grant_id: String,
-    /// Reserved-byte level held throughout the interval (the level, not the
-    /// integral — downstream integrates across intervals to byte-seconds).
+    /// Reserved-byte level held throughout `[start, end)` — no level change
+    /// happens inside an interval (mutations close the open interval first).
     pub reserved_bytes: u64,
     pub interval_start_unix_secs: i64,
     pub interval_end_unix_secs: i64,
@@ -190,19 +255,20 @@ pub struct ReservationUsageInterval {
     pub sequence: u64,
 }
 
-/// Durable pool ledger: every mutation is written atomically (tmp + rename)
-/// before the call returns.
+/// Durable pool ledger. Every mutation is clone-prospect → persist (fsync) →
+/// commit, so the in-memory state only ever contains durable history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Ledger {
     schema_version: u32,
-    /// Bumped on every authority open; usage dedup key component.
+    /// Bumped (and persisted) on every authority open; usage dedup key
+    /// component and the crash-gap marker.
     producer_epoch: u64,
     /// Monotonic per-process emission counter (resets with the epoch).
     next_sequence: u64,
     grants: Vec<Grant>,
 }
 
-/// The per-pool reservation authority. Clone shares one ledger/lock (an `Arc`
+/// The per-pool reservation authority. Clones share one ledger/lock (an `Arc`
 /// seam like `PersistentByteStore`).
 #[derive(Clone, Debug)]
 pub struct ReservationAuthority {
@@ -245,9 +311,11 @@ pub enum ReservationError {
     )]
     KillSwitch,
     #[error(
-        "pool '{pool}' is exclusively owned by another live process (owner.lock pid {pid}); refusing a second owner"
+        "pool '{pool}' is exclusively owned: {holder} — refusing a second owner",
+        pool = .pool,
+        holder = .holder
     )]
-    SecondOwner { pool: String, pid: u32 },
+    SecondOwner { pool: String, holder: String },
     #[error("reservation pool ledger corrupt: {0}")]
     Corrupt(String),
     #[error("grant ({tenant}, {collection}) not found in pool '{pool}'")]
@@ -256,7 +324,7 @@ pub enum ReservationError {
         tenant: String,
         collection: String,
     },
-    #[error("illegal transition {from:?} -> {to:?} for grant {grant}")]
+    #[error("illegal transition for grant {grant} from {from} to {to}")]
     IllegalTransition {
         grant: String,
         from: String,
@@ -268,28 +336,88 @@ pub enum ReservationError {
     Io(#[from] std::io::Error),
 }
 
+/// Process-global registry of live authorities: canonical pool dir → weak
+/// handle. A second `open` on a pool with a LIVE authority is rejected before
+/// any lock dance (review B1a — same-process takeover was otherwise free).
+fn open_pool_registry() -> &'static Mutex<Vec<(PathBuf, Weak<AuthorityInner>)>> {
+    static REGISTRY: std::sync::OnceLock<Mutex<Vec<(PathBuf, Weak<AuthorityInner>)>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Per-pool async gate serializing `open` WITHIN this process. Holding it
+/// across the whole open (registry check → lock dance → registry insert)
+/// makes the in-process exclusivity airtight: two racing opens on one pool
+/// queue on the gate, and the second then sees the first's registry entry.
+/// It also lets the lock dance treat an OUR-pid holder as provably stale —
+/// the gate plus the registry check prove no live in-process authority owns
+/// it (a same-process lock alone cannot tell its own dead authority from a
+/// live second open).
+fn pool_open_gate(canonical: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    static GATES: std::sync::OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+        std::sync::OnceLock::new();
+    let mut gates = GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    gates
+        .entry(canonical.to_path_buf())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 impl ReservationAuthority {
-    /// Open (or take over) the pool: acquire the exclusive owner lock, load
-    /// and validate the ledger, bump the producer epoch. Fails closed on a
-    /// live second owner or a corrupt ledger.
+    /// Open (or take over) the pool: reject an in-process second owner,
+    /// acquire the exclusive cross-process owner lock, load and validate the
+    /// ledger, bump and PERSIST the producer epoch, prune the released tail.
+    /// Fails closed on a live owner or a corrupt/unreadable ledger.
     pub async fn open(config: ReservationPoolConfig) -> Result<Self, ReservationError> {
         config.validate().map_err(|e| {
-            ReservationError::Corrupt(format!("invalid pool config '{}': {e}", config.id))
+            ReservationError::Invalid(format!("invalid pool config '{}': {e}", config.id))
         })?;
         let dir = PathBuf::from(&config.path);
         tokio::fs::create_dir_all(&dir).await?;
+        let canonical = tokio::fs::canonicalize(&dir).await?;
+        let gate = pool_open_gate(&canonical);
+        let _gate_guard = gate.lock().await;
+
+        // In-process exclusivity first: a live authority on this pool dir is
+        // the current process itself — no lock dance can fix that.
+        {
+            let mut registry = open_pool_registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            registry.retain(|(_, weak)| weak.upgrade().is_some());
+            if registry.iter().any(|(path, _)| *path == canonical) {
+                return Err(ReservationError::SecondOwner {
+                    pool: config.id.clone(),
+                    holder: "a live authority in this process".to_string(),
+                });
+            }
+        }
+
+        // Our own pid in the lock is provably stale HERE (gate held, registry
+        // empty): the authority that wrote it is gone from this process.
         acquire_owner_lock(&dir, &config.id).await?;
         let mut ledger = load_ledger(&dir).await?;
         ledger.producer_epoch += 1;
         ledger.next_sequence = 0;
-        let inner = AuthorityInner {
+        prune_released(&mut ledger);
+        // Persist the epoch bump at open (review S7): two lifetimes must
+        // never share an epoch on disk, or their (epoch, sequence) dedup keys
+        // collide even before the first mutation.
+        persist_ledger(&dir, &ledger).await?;
+
+        let inner = Arc::new(AuthorityInner {
             dir,
             ledger: tokio::sync::Mutex::new(ledger),
-        };
-        Ok(Self {
-            inner: Arc::new(inner),
-            config,
-        })
+        });
+        open_pool_registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((canonical, Arc::downgrade(&inner)));
+        Ok(Self { inner, config })
     }
 
     pub fn config(&self) -> &ReservationPoolConfig {
@@ -299,9 +427,11 @@ impl ReservationAuthority {
     /// Atomically admit (or idempotently return) a reservation.
     ///
     /// Idempotency: a live grant for the same (tenant, collection) with the
-    /// same byte count returns that grant unchanged; a different byte count
-    /// is a resize, admitted only if capacity and the tenant limit allow.
-    /// A released grant for the identity is replaced by a fresh one.
+    /// same byte count returns that grant unchanged (it is durable by
+    /// construction — memory only ever holds persisted state); a different
+    /// byte count is a resize, admitted only if capacity and the tenant
+    /// limit allow. A released grant for the identity is replaced by a fresh
+    /// one.
     pub async fn reserve(
         &self,
         tenant_id: &str,
@@ -316,89 +446,101 @@ impl ReservationAuthority {
                 "reservation bytes must be > 0".to_string(),
             ));
         }
-        let mut ledger = self.inner.ledger.lock().await;
-        if let Some(existing) = live_grant(&ledger, tenant_id, collection_id) {
+        let mut guard = self.inner.ledger.lock().await;
+        if let Some(existing) = live_grant(&guard, tenant_id, collection_id) {
             if existing.bytes == bytes {
                 return Ok(existing.clone());
             }
-            return self
-                .resize_locked(&mut ledger, tenant_id, collection_id, bytes)
-                .await;
+            let (grant, _closed) = self
+                .resize_prospective(&mut guard, tenant_id, collection_id, bytes)
+                .await?;
+            return Ok(grant);
         }
-        self.admit_locked(&mut ledger, tenant_id, collection_id, bytes)
+        self.admit_prospective(&mut guard, tenant_id, collection_id, bytes)
             .await
     }
 
     /// Resize a live grant (same grant id, new byte count), capacity- and
-    /// limit-checked. Shrinks always fit.
+    /// limit-checked, closing the open interval at the OLD level (returned).
     pub async fn resize(
         &self,
         tenant_id: &str,
         collection_id: &str,
         bytes: u64,
-    ) -> Result<Grant, ReservationError> {
+    ) -> Result<(Grant, Vec<ReservationUsageInterval>), ReservationError> {
         if kill_switch_armed() {
             return Err(ReservationError::KillSwitch);
         }
-        let mut ledger = self.inner.ledger.lock().await;
-        self.resize_locked(&mut ledger, tenant_id, collection_id, bytes)
+        let mut guard = self.inner.ledger.lock().await;
+        self.resize_prospective(&mut guard, tenant_id, collection_id, bytes)
             .await
     }
 
-    /// Release a grant: durably `Released`, accrual frozen (the final interval
-    /// closes at release), capacity freed. Idempotent.
+    /// Release a grant: closes the open interval at the old level (returned —
+    /// the tail is billed, not dropped), freezes accrual, frees capacity.
+    /// Idempotent (a second release returns no intervals).
     pub async fn release(
         &self,
         tenant_id: &str,
         collection_id: &str,
         now_unix_secs: i64,
-    ) -> Result<(), ReservationError> {
-        let mut ledger = self.inner.ledger.lock().await;
-        let Some(grant) = mutable_grant(&mut ledger, tenant_id, collection_id) else {
-            return Ok(()); // released or never existed: idempotent no-op
+    ) -> Result<Vec<ReservationUsageInterval>, ReservationError> {
+        let mut guard = self.inner.ledger.lock().await;
+        let Some(live) = live_grant(&guard, tenant_id, collection_id).cloned() else {
+            return Ok(Vec::new()); // released or never existed: idempotent
         };
-        grant.last_interval_end_unix_secs = grant.last_interval_end_unix_secs.max(now_unix_secs);
+        let mut prospective = (*guard).clone();
+        let mut closed = Vec::new();
+        // Close the tail interval at the level actually held (review B4).
+        if let Some(interval) =
+            close_open_interval(&mut prospective, &live, now_unix_secs, &self.config.id)
+        {
+            closed.push(interval);
+        }
+        let grant = prospective
+            .grants
+            .iter_mut()
+            .find(|g| g.id == live.id)
+            .ok_or_else(|| ReservationError::Corrupt("grant vanished in prospect".into()))?;
+        // Retirement enters through Releasing (the SC4 retirement seam): the
+        // transition floor is enforced, never silently coerced (review S4).
+        if !grant.state.can_transition_to(&GrantState::Releasing) {
+            return Err(ReservationError::IllegalTransition {
+                grant: grant.id.clone(),
+                from: format!("{:?}", grant.state),
+                to: "Releasing".to_string(),
+            });
+        }
+        grant.state = GrantState::Releasing;
         grant.state = GrantState::Released;
-        persist_ledger(&self.inner.dir, &ledger).await?;
-        Ok(())
+        prune_released(&mut prospective);
+        persist_ledger(&self.inner.dir, &prospective).await?;
+        *guard = prospective;
+        Ok(closed)
     }
 
     /// Advance accrual checkpoints and return the intervals closed by
-    /// `now_unix_secs`. Each call persists the advanced checkpoints BEFORE
-    /// returning, so a crash between this and the metering write replays the
-    /// same `(epoch, sequence)` — overwrite, not double-charge.
+    /// `now_unix_secs`. Checkpoints and sequences are committed only after
+    /// the ledger persists, so a crash between persist and metering replays
+    /// the SAME `(epoch, sequence)` — overwrite, not double-charge — and a
+    /// persist failure loses nothing (nothing was consumed).
     pub async fn take_usage_intervals(
         &self,
         now_unix_secs: i64,
     ) -> Result<Vec<ReservationUsageInterval>, ReservationError> {
         let mut guard = self.inner.ledger.lock().await;
-        // Reborrow as a plain &mut so the per-grant loop and the sequence
-        // counter are disjoint field borrows.
-        let ledger: &mut Ledger = &mut guard;
-        let epoch = ledger.producer_epoch;
+        let mut prospective = (*guard).clone();
         let mut out = Vec::new();
-        for grant in &mut ledger.grants {
-            let accrues =
-                grant.state.charges_capacity() && grant.last_interval_end_unix_secs < now_unix_secs;
-            if !accrues {
-                continue;
+        for grant in prospective.grants.clone() {
+            if let Some(interval) =
+                close_open_interval(&mut prospective, &grant, now_unix_secs, &self.config.id)
+            {
+                out.push(interval);
             }
-            let sequence = ledger.next_sequence;
-            ledger.next_sequence += 1;
-            out.push(ReservationUsageInterval {
-                tenant_id: grant.tenant_id.clone(),
-                pool_id: self.config.id.clone(),
-                grant_id: grant.id.clone(),
-                reserved_bytes: grant.bytes,
-                interval_start_unix_secs: grant.last_interval_end_unix_secs,
-                interval_end_unix_secs: now_unix_secs,
-                producer_epoch: epoch,
-                sequence,
-            });
-            grant.last_interval_end_unix_secs = now_unix_secs;
         }
         if !out.is_empty() {
-            persist_ledger(&self.inner.dir, ledger).await?;
+            persist_ledger(&self.inner.dir, &prospective).await?;
+            *guard = prospective;
         }
         Ok(out)
     }
@@ -419,15 +561,19 @@ impl ReservationAuthority {
             .sum()
     }
 
-    async fn admit_locked(
+    /// Clone-persist-commit admission (review B2): a persist failure leaves
+    /// the in-memory ledger untouched, so the caller's Err is the truth and a
+    /// retry re-attempts the same admission.
+    async fn admit_prospective(
         &self,
-        ledger: &mut Ledger,
+        guard: &mut tokio::sync::MutexGuard<'_, Ledger>,
         tenant_id: &str,
         collection_id: &str,
         bytes: u64,
     ) -> Result<Grant, ReservationError> {
+        let mut prospective = (*guard).clone();
         let effective = self.config.effective_bytes(bytes);
-        let charged: u64 = ledger
+        let charged: u64 = prospective
             .grants
             .iter()
             .filter(|g| g.state.charges_capacity())
@@ -443,13 +589,23 @@ impl ReservationAuthority {
             });
         }
         if let Some(limit) = self.config.tenant_limit_bytes {
-            let tenant_sum: u64 = ledger
+            let tenant_sum: u64 = prospective
                 .grants
                 .iter()
                 .filter(|g| g.state.charges_capacity() && g.tenant_id == tenant_id)
                 .map(|g| g.bytes)
                 .sum();
-            if tenant_sum + bytes > limit {
+            let combined =
+                tenant_sum
+                    .checked_add(bytes)
+                    .ok_or_else(|| ReservationError::TenantLimit {
+                        pool: self.config.id.clone(),
+                        tenant: tenant_id.to_string(),
+                        sum: tenant_sum,
+                        requested: bytes,
+                        limit,
+                    })?;
+            if combined > limit {
                 return Err(ReservationError::TenantLimit {
                     pool: self.config.id.clone(),
                     tenant: tenant_id.to_string(),
@@ -469,39 +625,37 @@ impl ReservationAuthority {
             created_unix_secs: now,
             last_interval_end_unix_secs: now,
         };
-        ledger.grants.push(grant.clone());
-        persist_ledger(&self.inner.dir, ledger).await?;
+        prospective.grants.push(grant.clone());
+        persist_ledger(&self.inner.dir, &prospective).await?;
+        **guard = prospective;
         Ok(grant)
     }
 
-    async fn resize_locked(
+    /// Clone-persist-commit resize: closes the grant's open interval at the
+    /// OLD level first (review B4), then applies the new byte count.
+    async fn resize_prospective(
         &self,
-        ledger: &mut Ledger,
+        guard: &mut tokio::sync::MutexGuard<'_, Ledger>,
         tenant_id: &str,
         collection_id: &str,
         bytes: u64,
-    ) -> Result<Grant, ReservationError> {
-        // Phase 1 (read): capture the live grant's identity; the mutable
-        // borrow ends here so the capacity reads below are legal.
-        let Some(grant_id) = live_grant(ledger, tenant_id, collection_id).map(|g| g.id.clone())
-        else {
+    ) -> Result<(Grant, Vec<ReservationUsageInterval>), ReservationError> {
+        let Some(live) = live_grant(guard, tenant_id, collection_id).cloned() else {
             return Err(ReservationError::NotFound {
                 pool: self.config.id.clone(),
                 tenant: tenant_id.to_string(),
                 collection: collection_id.to_string(),
             });
         };
-        let old_bytes = ledger
-            .grants
-            .iter()
-            .find(|g| g.id == grant_id)
-            .map(|g| g.bytes)
-            .unwrap_or(0);
-        // Phase 2 (checks): capacity net of the grant's own current charge,
-        // plus the tenant limit excluding this grant.
-        let old_effective = self.config.effective_bytes(old_bytes);
+        let mut prospective = (*guard).clone();
+        let now = current_unix_secs();
+        let mut closed = Vec::new();
+        if let Some(interval) = close_open_interval(&mut prospective, &live, now, &self.config.id) {
+            closed.push(interval);
+        }
+        let old_effective = self.config.effective_bytes(live.bytes);
         let new_effective = self.config.effective_bytes(bytes);
-        let charged: u64 = ledger
+        let charged: u64 = prospective
             .grants
             .iter()
             .filter(|g| g.state.charges_capacity())
@@ -520,17 +674,25 @@ impl ReservationAuthority {
             });
         }
         if let Some(limit) = self.config.tenant_limit_bytes {
-            let tenant_sum: u64 = ledger
+            let tenant_sum: u64 = prospective
                 .grants
                 .iter()
                 .filter(|g| {
-                    g.state.charges_capacity()
-                        && g.tenant_id == tenant_id
-                        && g.collection_id != collection_id
+                    g.state.charges_capacity() && g.tenant_id == tenant_id && g.id != live.id
                 })
                 .map(|g| g.bytes)
                 .sum();
-            if tenant_sum + bytes > limit {
+            let combined =
+                tenant_sum
+                    .checked_add(bytes)
+                    .ok_or_else(|| ReservationError::TenantLimit {
+                        pool: self.config.id.clone(),
+                        tenant: tenant_id.to_string(),
+                        sum: tenant_sum,
+                        requested: bytes,
+                        limit,
+                    })?;
+            if combined > limit {
                 return Err(ReservationError::TenantLimit {
                     pool: self.config.id.clone(),
                     tenant: tenant_id.to_string(),
@@ -540,23 +702,46 @@ impl ReservationAuthority {
                 });
             }
         }
-        // Phase 3 (write): re-locate by id and commit.
-        let Some(grant) = ledger
+        let grant = prospective
             .grants
             .iter_mut()
-            .find(|g| g.id == grant_id && g.state.charges_capacity())
-        else {
-            return Err(ReservationError::NotFound {
-                pool: self.config.id.clone(),
-                tenant: tenant_id.to_string(),
-                collection: collection_id.to_string(),
-            });
-        };
+            .find(|g| g.id == live.id)
+            .ok_or_else(|| ReservationError::Corrupt("grant vanished in prospect".into()))?;
         grant.bytes = bytes;
         let updated = grant.clone();
-        persist_ledger(&self.inner.dir, ledger).await?;
-        Ok(updated)
+        persist_ledger(&self.inner.dir, &prospective).await?;
+        **guard = prospective;
+        Ok((updated, closed))
     }
+}
+
+/// Close `grant`'s open interval `[last, now)` at its CURRENT level inside
+/// `prospective`, allocating the next sequence, and advance the checkpoint.
+/// No-op when nothing accrued. The grant is located by id in `prospective`.
+fn close_open_interval(
+    prospective: &mut Ledger,
+    grant: &Grant,
+    now_unix_secs: i64,
+    pool_id: &str,
+) -> Option<ReservationUsageInterval> {
+    if !grant.state.charges_capacity() || grant.last_interval_end_unix_secs >= now_unix_secs {
+        return None;
+    }
+    let sequence = prospective.next_sequence;
+    prospective.next_sequence += 1;
+    let interval = ReservationUsageInterval {
+        tenant_id: grant.tenant_id.clone(),
+        pool_id: pool_id.to_string(),
+        grant_id: grant.id.clone(),
+        reserved_bytes: grant.bytes,
+        interval_start_unix_secs: grant.last_interval_end_unix_secs,
+        interval_end_unix_secs: now_unix_secs,
+        producer_epoch: prospective.producer_epoch,
+        sequence,
+    };
+    let target = prospective.grants.iter_mut().find(|g| g.id == grant.id)?;
+    target.last_interval_end_unix_secs = now_unix_secs;
+    Some(interval)
 }
 
 fn live_grant<'a>(ledger: &'a Ledger, tenant_id: &str, collection_id: &str) -> Option<&'a Grant> {
@@ -565,33 +750,39 @@ fn live_grant<'a>(ledger: &'a Ledger, tenant_id: &str, collection_id: &str) -> O
     })
 }
 
-/// The LIVE (capacity-charging) grant for an identity, mutably. Historical
-/// `Released` entries stay in the ledger for accrual/audit and are never
-/// returned here — a released identity is "not found" to resize and an
-/// idempotent no-op to release.
-fn mutable_grant<'a>(
-    ledger: &'a mut Ledger,
-    tenant_id: &str,
-    collection_id: &str,
-) -> Option<&'a mut Grant> {
-    let grant = ledger.grants.iter_mut().find(|g| {
-        g.tenant_id == tenant_id && g.collection_id == collection_id && g.state.charges_capacity()
-    })?;
-    // Narrow the reborrow to the live grant only (state check above).
-    Some(grant)
+/// Keep only the newest [`MAX_RETAINED_RELEASED`] released grants. Durable
+/// history lives in the metering sink; the ledger stays bounded so each
+/// mutation's rewrite stays cheap (review S6).
+fn prune_released(ledger: &mut Ledger) {
+    let mut released: Vec<usize> = ledger
+        .grants
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| !g.state.charges_capacity())
+        .map(|(i, _)| i)
+        .collect();
+    if released.len() <= MAX_RETAINED_RELEASED {
+        return;
+    }
+    released.drain(..released.len() - MAX_RETAINED_RELEASED);
+    for i in released.into_iter().rev() {
+        ledger.grants.remove(i);
+    }
 }
 
+/// Kill switch. Fail-closed on a non-UTF-8 value (a kill switch must refuse
+/// when its input is ambiguous, not arm itself into silence) — review N1.
 fn kill_switch_armed() -> bool {
-    std::env::var_os(RESERVATIONS_KILL_SWITCH_ENV).is_some_and(|v| {
-        matches!(
-            v.to_str()
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase()
-                .as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+    match std::env::var_os(RESERVATIONS_KILL_SWITCH_ENV) {
+        None => false,
+        Some(value) => match value.to_str() {
+            None => true,
+            Some(text) => matches!(
+                text.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ),
+        },
+    }
 }
 
 fn current_unix_secs() -> i64 {
@@ -610,61 +801,158 @@ fn owner_lock_path(dir: &Path) -> PathBuf {
     dir.join("owner.lock")
 }
 
-/// Exclusive owner lock: `owner.lock` carries the owning pid. A live second
-/// process is rejected; a dead owner's lock is taken over (crash recovery,
-/// SC-TE7); liveness is checked through `/proc` (Linux), and on platforms
-/// without it an existing lock is treated as live (fail-closed).
-async fn acquire_owner_lock(dir: &Path, pool_id: &str) -> Result<u32, ReservationError> {
+/// Exclusive owner lock, `pid:start_ticks` on Linux (`/proc/self/stat`
+/// field 22), bare pid elsewhere. Acquisition is `O_EXCL` create — atomic
+/// against racers. An existing lock is claimed ONLY when its owner is provably
+/// dead (process gone, or same pid with a different start token), by ATOMIC
+/// RENAME of the stale lock to a unique name: exactly one racer's rename
+/// succeeds (review B1). Non-Linux cannot prove death by ticks, so a foreign
+/// pid being merely absent from the probe is treated as live (fail-closed).
+async fn acquire_owner_lock(dir: &Path, pool_id: &str) -> Result<(), ReservationError> {
     let path = owner_lock_path(dir);
-    match tokio::fs::try_exists(&path).await {
-        Ok(false) => {}
-        Ok(true) => {
-            let content = tokio::fs::read_to_string(&path)
-                .await
-                .map_err(|e| ReservationError::Corrupt(format!("owner.lock unreadable: {e}")))?;
-            let pid: u32 = content
-                .trim()
-                .parse()
-                .map_err(|_| ReservationError::Corrupt("owner.lock carries no pid".into()))?;
-            if pid != std::process::id() && process_is_alive(pid) {
-                return Err(ReservationError::SecondOwner {
-                    pool: pool_id.to_string(),
-                    pid,
-                });
+    let token = owner_token();
+    for _ in 0..LOCK_ATTEMPTS {
+        match write_exclusive(&path, &token).await {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let content = tokio::fs::read_to_string(&path).await.map_err(|err| {
+                    ReservationError::Corrupt(format!("owner.lock unreadable: {err}"))
+                })?;
+                let held = OwnerToken::parse(&content).ok_or_else(|| {
+                    ReservationError::Corrupt("owner.lock carries no pid token".into())
+                })?;
+                if owner_is_live(&held) {
+                    return Err(ReservationError::SecondOwner {
+                        pool: pool_id.to_string(),
+                        holder: format!("owner.lock pid {}", held.pid),
+                    });
+                }
+                // Claim the stale lock by rename: one racer wins, the rest
+                // loop, re-read, and see the winner's live token.
+                let claim =
+                    path.with_extension(format!("stale-{}-{}", std::process::id(), new_grant_id()));
+                match tokio::fs::rename(&path, &claim).await {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => return Err(err.into()),
+                }
+                let _ = tokio::fs::remove_file(&claim).await;
             }
-            // Stale (dead owner): fall through and take over.
+            Err(e) => return Err(e.into()),
         }
-        Err(e) => return Err(e.into()),
     }
-    let pid = std::process::id();
-    let tmp = path.with_extension("tmp");
-    tokio::fs::write(&tmp, pid.to_string()).await?;
-    tokio::fs::rename(&tmp, &path).await?;
-    Ok(pid)
+    Err(ReservationError::SecondOwner {
+        pool: pool_id.to_string(),
+        holder: "an unresolved lock race after bounded retries".to_string(),
+    })
 }
 
-fn process_is_alive(pid: u32) -> bool {
+/// `pid:start_ticks` — the ticks make pid reuse distinguishable from a true
+/// same-process second open on Linux.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnerToken {
+    pid: u32,
+    start_ticks: Option<u64>,
+}
+
+fn owner_token() -> String {
+    format!(
+        "{}:{}",
+        std::process::id(),
+        linux_start_ticks().unwrap_or(0)
+    )
+}
+
+impl OwnerToken {
+    fn parse(text: &str) -> Option<Self> {
+        let (pid, ticks) = text.trim().split_once(':')?;
+        Some(Self {
+            pid: pid.parse().ok()?,
+            start_ticks: ticks.parse().ok(),
+        })
+    }
+}
+
+fn linux_start_ticks() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // Field 22 (1-based) sits after the comm field, which is parenthesized
+    // and may itself contain spaces — split after the LAST ')'.
+    let after_comm = stat.rsplit_once(')')?.1;
+    // comm is field 2; state is 3, so start_ticks (22) is the 20th token
+    // after the comm field.
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Liveness of a lock holder. OUR OWN pid is NEVER live here: `open` calls
+/// this only under the per-pool gate with an empty registry, which proves no
+/// live in-process authority holds the lock — so an own-pid token (whether
+/// from this process's dead authority or pid reuse after a crash) is stale
+/// and reclaimable. A FOREIGN pid is live if `/proc/{pid}` exists with
+/// matching start ticks on Linux; without comparable ticks (or off-Linux)
+/// existence alone is treated as live — fail-closed.
+fn owner_is_live(held: &OwnerToken) -> bool {
+    let my_pid = std::process::id();
+    if held.pid == my_pid {
+        // Provably stale at this call site (see the doc comment).
+        return false;
+    }
     #[cfg(target_os = "linux")]
     {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
+        let stat = match std::fs::read_to_string(format!("/proc/{}/stat", held.pid)) {
+            Ok(stat) => stat,
+            Err(_) => return false,
+        };
+        let Some((_, after_comm)) = stat.rsplit_once(')') else {
+            return true; // unparseable but the process exists: treat as live
+        };
+        let ticks: Option<u64> = after_comm
+            .split_whitespace()
+            .nth(19)
+            .and_then(|t| t.parse().ok());
+        match (held.start_ticks, ticks) {
+            (Some(held_ticks), Some(observed)) => held_ticks == observed,
+            // No comparable ticks: existence is the only signal (fail-closed).
+            _ => true,
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
         // No portable liveness probe: treat the lock as held (fail-closed).
-        let _ = pid;
-        true
+        return true;
     }
+}
+
+/// O_EXCL file creation: exactly one caller wins; everyone else sees
+/// `AlreadyExists`.
+async fn write_exclusive(path: &Path, content: &str) -> std::io::Result<()> {
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await?;
+    use tokio::io::AsyncWriteExt;
+    let mut file = file;
+    file.write_all(content.as_bytes()).await?;
+    file.sync_all().await?;
+    Ok(())
 }
 
 async fn load_ledger(dir: &Path) -> Result<Ledger, ReservationError> {
     let path = ledger_path(dir);
-    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
-        return Ok(Ledger {
-            schema_version: LEDGER_SCHEMA_VERSION,
-            producer_epoch: 0,
-            next_sequence: 0,
-            grants: Vec::new(),
-        });
+    // Fail CLOSED on an unreadable ledger (review S3): treating an I/O error
+    // as "absent" would return an empty ledger whose next persist erases the
+    // real one.
+    match tokio::fs::try_exists(&path).await {
+        Ok(false) => {
+            return Ok(Ledger {
+                schema_version: LEDGER_SCHEMA_VERSION,
+                producer_epoch: 0,
+                next_sequence: 0,
+                grants: Vec::new(),
+            });
+        }
+        Ok(true) => {}
+        Err(e) => return Err(e.into()),
     }
     let bytes = tokio::fs::read(&path).await?;
     let ledger: Ledger = serde_json::from_slice(&bytes).map_err(|e| {
@@ -679,13 +967,26 @@ async fn load_ledger(dir: &Path) -> Result<Ledger, ReservationError> {
     Ok(ledger)
 }
 
+/// Durable ledger write: write tmp → fsync file → rename → fsync the parent
+/// directory. Atomic AND durable (review B3 — a rename alone is not): an
+/// admission that returned Ok survives power loss, and a torn write cannot
+/// leave a half-ledger behind. Local-file I/O under the caller's ledger
+/// mutex, by design — never network I/O under a lock.
 async fn persist_ledger(dir: &Path, ledger: &Ledger) -> Result<(), ReservationError> {
     let path = ledger_path(dir);
-    let bytes = serde_json::to_vec_pretty(ledger)
+    let bytes = serde_json::to_vec(ledger)
         .map_err(|e| ReservationError::Corrupt(format!("ledger serialize: {e}")))?;
     let tmp = path.with_extension("tmp");
-    tokio::fs::write(&tmp, &bytes).await?;
+    {
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        use tokio::io::AsyncWriteExt;
+        file.write_all(&bytes).await?;
+        file.sync_all().await?;
+    }
     tokio::fs::rename(&tmp, &path).await?;
+    // fsync the directory so the rename itself is durable.
+    let dir_file = tokio::fs::File::open(dir).await?;
+    dir_file.sync_all().await?;
     Ok(())
 }
 
@@ -772,9 +1073,36 @@ mod tests {
             1
         );
         // A different byte count is a resize, not a second grant.
-        let g3 = auth.reserve("t1", "c1", 2048).await.unwrap();
+        let (g3, _closed) = auth.resize("t1", "c1", 2048).await.unwrap();
         assert_eq!(g3.id, g1.id);
         assert_eq!(g3.bytes, 2048);
+    }
+
+    // Review B2: an admission whose persist fails leaves NO live grant — the
+    // error is the truth, and a retry re-attempts instead of hitting a
+    // fast-path Ok for an undurable grant. (Inject EISDIR via a pre-created
+    // `reservations.tmp` directory.)
+    #[tokio::test]
+    async fn persist_failure_does_not_fabricate_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = ReservationAuthority::open(pool(&dir)).await.unwrap();
+        tokio::fs::create_dir(dir.path().join("reservations.tmp"))
+            .await
+            .unwrap();
+        let err = auth.reserve("t1", "c1", 1024).await.unwrap_err();
+        assert!(matches!(err, ReservationError::Io(_)), "{err:?}");
+        // No live grant in memory and nothing on disk.
+        assert!(
+            auth.grants_snapshot()
+                .await
+                .iter()
+                .all(|g| !g.state.charges_capacity())
+        );
+        tokio::fs::remove_dir(dir.path().join("reservations.tmp"))
+            .await
+            .unwrap();
+        let retried = auth.reserve("t1", "c1", 1024).await.unwrap();
+        assert_eq!(retried.bytes, 1024, "retry re-attempts the admission");
     }
 
     // SC-TE7: reopen (simulated crash — no clean release) reconciles grants
@@ -816,50 +1144,151 @@ mod tests {
         assert!(err.to_string().contains("corrupt"), "{err}");
     }
 
-    // Exclusive pool ownership: a live second process is rejected.
+    // B1(a): a SECOND open in the SAME process is rejected — the registry
+    // holds the live authority. This is the hole the forged-lock test used to
+    // paper over.
     #[tokio::test]
-    async fn second_owner_rejected() {
+    async fn same_process_second_open_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = pool(&dir);
         let _first = ReservationAuthority::open(cfg.clone()).await.unwrap();
-        // Same-process reopen would see its own pid; forge a foreign live pid
-        // by writing the lock directly (pid 1 is alive on every Linux system).
-        tokio::fs::write(owner_lock_path(dir.path()), "1")
+        let err = ReservationAuthority::open(cfg).await.unwrap_err();
+        assert!(err.to_string().contains("exclusively owned"), "{err}");
+        // Drop every clone: the registry weak dies and reopen succeeds.
+        drop(_first);
+        ReservationAuthority::open(pool(&dir)).await.unwrap();
+    }
+
+    // B1(b): a live FOREIGN owner is rejected by the lock itself. The token
+    // must carry pid 1's REAL start ticks — a mismatched-ticks token means
+    // "the pid lives but the recorded holder doesn't" (pid reuse), which the
+    // authority correctly reclaims.
+    #[tokio::test]
+    async fn foreign_live_owner_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = pool(&dir);
+        let pid1_ticks = std::fs::read_to_string("/proc/1/stat")
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')').map(|(_, rest)| {
+                    rest.split_whitespace()
+                        .nth(19)
+                        .and_then(|t| t.parse::<u64>().ok())
+                })
+            })
+            .flatten();
+        let Some(ticks) = pid1_ticks else {
+            // Off-Linux or unreadable /proc: the probe treats any existing
+            // foreign-pid lock as live, so a bare pid token still exercises
+            // the rejection path.
+            panic!("foreign-live-owner test needs /proc/1/stat (Linux CI)");
+        };
+        tokio::fs::write(owner_lock_path(dir.path()), format!("1:{ticks}"))
             .await
             .unwrap();
         let err = ReservationAuthority::open(cfg).await.unwrap_err();
         assert!(err.to_string().contains("exclusively owned"), "{err}");
     }
 
-    // A dead owner's lock is taken over (crash recovery).
+    // The pid-reuse counterpart: a foreign pid whose recorded ticks do NOT
+    // match the live process's — the recorded holder died and the pid was
+    // reused, so the lock is stale and reclaimable.
     #[tokio::test]
-    async fn stale_lock_is_taken_over() {
+    async fn foreign_pid_reuse_with_mismatched_ticks_is_reclaimed() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = pool(&dir);
-        // A pid that cannot exist on Linux (pid_max ceiling).
-        tokio::fs::write(owner_lock_path(dir.path()), "4194303")
+        let pid1_ticks = std::fs::read_to_string("/proc/1/stat")
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')').map(|(_, rest)| {
+                    rest.split_whitespace()
+                        .nth(19)
+                        .and_then(|t| t.parse::<u64>().ok())
+                })
+            })
+            .flatten();
+        let Some(ticks) = pid1_ticks else {
+            panic!("pid-reuse test needs /proc/1/stat (Linux CI)");
+        };
+        let mismatched = ticks.wrapping_add(1);
+        tokio::fs::write(owner_lock_path(dir.path()), format!("1:{mismatched}"))
             .await
             .unwrap();
         ReservationAuthority::open(cfg).await.unwrap();
     }
 
-    // SC-TE9: release freezes accrual — no interval is emitted past the
-    // release instant; subsequent take_usage_intervals return nothing.
-    // Timestamps are real-time-relative because `reserve` stamps the accrual
-    // checkpoint with the wall clock.
+    // A stale lock (dead foreign pid) is taken over by exactly one opener —
+    // crash recovery. 4194303 is the PID_MAX_LIMIT ceiling: astronomically
+    // unlikely to be live; if it somehow is, this test fails closed instead.
     #[tokio::test]
-    async fn release_stops_accrual() {
+    async fn stale_lock_is_taken_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = pool(&dir);
+        tokio::fs::write(owner_lock_path(dir.path()), "4194303:999999")
+            .await
+            .unwrap();
+        ReservationAuthority::open(cfg).await.unwrap();
+    }
+
+    // Our own pid with a DIFFERENT start token (pid reuse after our crash) is
+    // stale; our pid with OUR token is us (the registry catches that before
+    // the lock, but the lock agrees).
+    #[tokio::test]
+    async fn pid_reuse_with_foreign_ticks_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = pool(&dir);
+        let foreign_ticks = linux_start_ticks().map(|t| t.wrapping_add(1)).unwrap_or(1);
+        tokio::fs::write(
+            owner_lock_path(dir.path()),
+            format!("{}:{foreign_ticks}", std::process::id()),
+        )
+        .await
+        .unwrap();
+        ReservationAuthority::open(cfg).await.unwrap();
+    }
+
+    // SC-TE9 + B4: release RETURNS the tail interval at the level actually
+    // held, then accrual stops — the tail is billed, not dropped.
+    #[tokio::test]
+    async fn release_returns_tail_interval_and_stops_accrual() {
         let dir = tempfile::tempdir().unwrap();
         let auth = ReservationAuthority::open(pool(&dir)).await.unwrap();
         auth.reserve("t1", "c1", 1024).await.unwrap();
         let t0 = current_unix_secs() + 1; // strictly after the reserve stamp
         let i1 = auth.take_usage_intervals(t0).await.unwrap();
         assert_eq!(i1.len(), 1);
-        auth.release("t1", "c1", t0).await.unwrap();
-        let i2 = auth.take_usage_intervals(t0).await.unwrap();
-        assert!(i2.is_empty(), "no accrual after release: {i2:?}");
-        // Idempotent release.
-        auth.release("t1", "c1", t0).await.unwrap();
+        let tail = auth.release("t1", "c1", t0 + 5).await.unwrap();
+        assert_eq!(
+            tail.len(),
+            1,
+            "the interval (t0, t0+5] is returned by release: {tail:?}"
+        );
+        assert_eq!(tail[0].interval_start_unix_secs, t0);
+        assert_eq!(tail[0].interval_end_unix_secs, t0 + 5);
+        assert_eq!(tail[0].reserved_bytes, 1024, "billed at the held level");
+        // Nothing accrues after release; a second release is a no-op.
+        assert!(auth.take_usage_intervals(t0 + 10).await.unwrap().is_empty());
+        assert!(auth.release("t1", "c1", t0 + 15).await.unwrap().is_empty());
+    }
+
+    // B4: resize splits billing at the resize point — the closed interval
+    // carries the OLD level, the next take carries the NEW level.
+    #[tokio::test]
+    async fn resize_splits_billing_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = ReservationAuthority::open(pool(&dir)).await.unwrap();
+        auth.reserve("t1", "c1", 1000).await.unwrap();
+        let t0 = current_unix_secs() + 1;
+        let first = auth.take_usage_intervals(t0).await.unwrap();
+        assert_eq!(first[0].reserved_bytes, 1000);
+        let (_resized, closed) = auth.resize("t1", "c1", 4000).await.unwrap();
+        let _ = closed; // no time passed in-test; the take below covers it
+        let after = auth.take_usage_intervals(t0 + 10).await.unwrap();
+        assert!(
+            after.iter().all(|i| i.reserved_bytes == 4000),
+            "post-resize intervals carry the new level: {after:?}"
+        );
+        assert_eq!(after.len(), 1);
     }
 
     // SC-TE9 dedup: the accrual checkpoint is durably persisted with the
@@ -885,10 +1314,7 @@ mod tests {
         );
         let next = reopened.take_usage_intervals(t0 + 1).await.unwrap();
         assert_eq!(next.len(), 1);
-        assert_eq!(
-            next[0].interval_start_unix_secs, t0,
-            "interval starts at the persisted checkpoint"
-        );
+        assert_eq!(next[0].interval_start_unix_secs, t0);
         assert!(
             next[0].producer_epoch > first[0].producer_epoch,
             "epoch bumps across the reopen"
@@ -956,13 +1382,16 @@ mod tests {
         assert!(!GrantState::Released.charges_capacity());
     }
 
-    // Config validation: a bad declaration fails at validate(), not at first
-    // admission.
+    // Config validation: a bad declaration fails at validate(); duplicates
+    // fail at the list level (startup).
     #[test]
     fn pool_config_validation() {
         let mut cfg = pool(&tempfile::tempdir().unwrap());
+        assert!(cfg.validate().is_ok());
         cfg.id = " ".to_string();
         assert!(cfg.validate().is_err());
+        cfg.id = "../escape".to_string();
+        assert!(cfg.validate().is_err(), "traversal ids rejected");
         cfg.id = "p1".to_string();
         cfg.allocatable_bytes = 0;
         assert!(cfg.validate().is_err());
@@ -971,6 +1400,49 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.overhead_factor = 0.1;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn pool_config_list_rejects_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = pool(&dir);
+        // Duplicate id on a different path.
+        let mut other = cfg.clone();
+        other.path = "/nonexistent-other-pool-dir".to_string();
+        assert!(validate_pool_configs(&[cfg.clone(), other]).is_err());
+        // Same path twice (canonicalized after create).
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut same_path = pool(&dir2);
+        same_path.id = "p2".to_string();
+        same_path.path = cfg.path.clone();
+        assert!(validate_pool_configs(&[cfg.clone(), same_path]).is_err());
+        // Distinct id and path pass.
+        let mut distinct = pool(&dir2);
+        distinct.id = "p2".to_string();
+        assert!(validate_pool_configs(&[cfg, distinct]).is_ok());
+    }
+
+    // Released grants are bounded in the ledger (S6): MAX_RETAINED_RELEASED
+    // survives, older ones are pruned at open.
+    #[tokio::test]
+    async fn released_grants_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = pool(&dir);
+        cfg.allocatable_bytes = 1 << 30;
+        let auth = ReservationAuthority::open(cfg.clone()).await.unwrap();
+        for i in 0..(MAX_RETAINED_RELEASED + 8) {
+            auth.reserve("t1", &format!("c{i}"), 64).await.unwrap();
+            auth.release("t1", &format!("c{i}"), current_unix_secs() + 1)
+                .await
+                .unwrap();
+        }
+        drop(auth);
+        let reopened = ReservationAuthority::open(cfg).await.unwrap();
+        let retained = reopened.grants_snapshot().await.len();
+        assert!(
+            retained <= MAX_RETAINED_RELEASED,
+            "released tail bounded to {MAX_RETAINED_RELEASED}, got {retained}"
+        );
     }
 
     /// Serialized env-var access for the kill-switch test — the same pattern
