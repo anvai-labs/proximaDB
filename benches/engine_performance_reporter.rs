@@ -148,6 +148,7 @@ async fn benchmark_engine_configuration(
     };
 
     let collection_proto = proximadb::proto::proximadb_v1::Collection {
+        storage_class_status: None, // SC1 (#2259) field; None = NOT_ACTIVE
         id: collection_id.clone(),
         config: Some(proximadb::proto::proximadb_v1::CollectionConfig {
             name: collection_id.clone(),

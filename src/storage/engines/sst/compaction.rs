@@ -3279,7 +3279,7 @@ impl Compaction {
     async fn extract_shred_spec_from_inputs(
         factory: &Arc<dyn proximadb_storage_ports::FilesystemPort>,
         input_files: &[PathBuf],
-    ) -> Vec<(String, i32)> {
+    ) -> Vec<proximadb_block_format::ShredColumn> {
         use proximadb_storage_common::segment_layout::SegmentFooterIndex;
         for input in input_files {
             let url = input.to_string_lossy();
@@ -3291,7 +3291,16 @@ impl Compaction {
             if let Ok(Some(footer)) = SegmentFooterIndex::locate_in_segment(&bytes)
                 && !footer.shred_field_map.is_empty()
             {
-                return footer.shred_field_map;
+                // TD-FPRUNE-1 P5 slice 2: the footer field-map carries
+                // (name, col-id) only today — types arrive with the v2
+                // section (slice 3). Until then compaction re-shreds the
+                // columns UNTYPED: correct (complete tail, nothing dropped),
+                // at the cost of re-paying the double-write on rewrite.
+                return footer
+                    .shred_field_map
+                    .into_iter()
+                    .map(|(key, id)| proximadb_block_format::ShredColumn::untyped(key, id))
+                    .collect();
             }
         }
         Vec::new()

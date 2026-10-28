@@ -242,7 +242,7 @@ pub fn write_pax_segment_full_with_layout(
     f32_tier: bool,
     target_block: Option<usize>,
     rg_layout: bool,
-    shred_spec: &[(String, i32)],
+    shred_spec: &[proximadb_block_format::ShredColumn],
     destination_url: Option<&str>,
 ) -> Result<SegmentMeta> {
     Ok(write_pax_segment_full_internal(
@@ -276,7 +276,7 @@ pub fn write_pax_segment_full_with_cache_seed_and_layout(
     target_block: Option<usize>,
     rg_layout: bool,
     include_sq8: bool,
-    shred_spec: &[(String, i32)],
+    shred_spec: &[proximadb_block_format::ShredColumn],
     destination_url: Option<&str>,
 ) -> Result<proximadb_storage_common::pax_block::PaxSegmentWrite> {
     write_pax_segment_full_internal(
@@ -336,7 +336,7 @@ fn write_pax_segment_full_internal(
     target_block: Option<usize>,
     rg_layout: bool,
     capture_sq8: Option<bool>,
-    shred_spec: &[(String, i32)],
+    shred_spec: &[proximadb_block_format::ShredColumn],
     destination_url: Option<&str>,
 ) -> Result<proximadb_storage_common::pax_block::PaxSegmentWrite> {
     // TD-RDSTRAT-5 S1 / TD-WLP-4 (default ON, kill-switch
@@ -481,7 +481,7 @@ pub fn write_pax_segment_compacted_shredded(
     rerank_quant: VectorQuant,
     f32_tier: bool,
     target_block: Option<usize>,
-    shred_spec: &[(String, i32)],
+    shred_spec: &[proximadb_block_format::ShredColumn],
     destination_url: Option<&str>,
     rg_layout: Option<bool>,
 ) -> Result<SegmentMeta> {
@@ -522,7 +522,7 @@ pub fn write_pax_segment_compacted_with_cache_seed_shredded(
     f32_tier: bool,
     target_block: Option<usize>,
     include_sq8: bool,
-    shred_spec: &[(String, i32)],
+    shred_spec: &[proximadb_block_format::ShredColumn],
     destination_url: Option<&str>,
     rg_layout: Option<bool>,
 ) -> Result<proximadb_storage_common::pax_block::PaxSegmentWrite> {
@@ -554,7 +554,7 @@ fn write_pax_segment_compacted_internal(
     target_block: Option<usize>,
     rg_layout: bool,
     capture_sq8: Option<bool>,
-    shred_spec: &[(String, i32)],
+    shred_spec: &[proximadb_block_format::ShredColumn],
     destination_url: Option<&str>,
 ) -> Result<proximadb_storage_common::pax_block::PaxSegmentWrite> {
     use crate::storage::engines::sst::block_cluster;
@@ -580,7 +580,8 @@ fn write_pax_segment_compacted_internal(
             let two_level = block_cluster::partition_layout_enabled()
                 .then(|| shred_spec.first())
                 .flatten()
-                .and_then(|(tag, _)| {
+                .and_then(|col: &proximadb_block_format::ShredColumn| {
+                    let tag = &col.key;
                     block_cluster::cluster_plan_ivf_probe_partitioned(
                         records,
                         0,
@@ -705,7 +706,7 @@ fn write_pax_segment_ordered(
     plan: Option<crate::storage::engines::sst::block_cluster::ClusterPlan>,
     two_level: Option<proximadb_storage_common::coarse_directory::CoarseModel>,
     capture_sq8: Option<bool>,
-    shred_spec: &[(String, i32)],
+    shred_spec: &[proximadb_block_format::ShredColumn],
 ) -> Result<proximadb_storage_common::pax_block::PaxSegmentWrite> {
     let lossless_clustered = lossless_clustered_enabled() && plan.is_some();
     let lossless_scalar = lossless_scalar_enabled();
@@ -723,7 +724,7 @@ fn write_pax_segment_ordered(
     .with_rerank_quant(rerank_quant)
     .with_lossless_clustered(lossless_clustered)
     .with_lossless_scalar(lossless_scalar)
-    .with_shred_spec(shred_spec.to_vec())
+    .with_shred_columns(shred_spec.to_vec())
     .with_block_centroids(cluster)
     // ADR-062 / TD-RDSTRAT-6: hoist the RaBitQ binary tier into a coalesced
     // file-level header region for RaBitQ-quantized writes (default ON per the

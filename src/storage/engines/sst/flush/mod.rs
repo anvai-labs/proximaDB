@@ -1499,24 +1499,58 @@ fn declares_fp32_canonical_precision(
 /// the segment's SELF-DESCRIBING footer field-map, so any consistent id works;
 /// matching the catalog assignment is just tidy. Empty spec (non-document
 /// collection, or no filterable columns) ⇒ byte-identical, mixed-read-safe.
+/// Map the proto's coarse `FilterableDataType` to the exact `ProximaType` a
+/// typed shred column can be declared with (TD-FPRUNE-1 P5 slice 2). Only
+/// types with an exact physical shred class are mapped; everything else stays
+/// `untyped` — such columns can never be authoritative, so their values keep
+/// the complete msgpack tail (fail-safe by construction).
+fn filterable_shred_column(
+    col: &crate::proto::proximadb_v1::FilterableColumnSpec,
+    idx: usize,
+) -> proximadb_block_format::ShredColumn {
+    use proximadb_block_format::ShredColumn;
+    use proximadb_data_model::ProximaType;
+    let column_id = 100 + idx as i32;
+    let data_type = crate::proto::proximadb_v1::FilterableDataType::try_from(col.data_type)
+        .unwrap_or(crate::proto::proximadb_v1::FilterableDataType::Unspecified);
+    let declared = match data_type {
+        crate::proto::proximadb_v1::FilterableDataType::FilterableInteger => {
+            Some(ProximaType::Int64)
+        }
+        crate::proto::proximadb_v1::FilterableDataType::FilterableFloat => {
+            Some(ProximaType::Float64)
+        }
+        crate::proto::proximadb_v1::FilterableDataType::FilterableString => {
+            Some(ProximaType::String)
+        }
+        // Boolean/Datetime/Array types have no exact single physical class —
+        // untyped keeps the tail complete for them (conservative).
+        _ => None,
+    };
+    match declared {
+        Some(t) => ShredColumn::typed(&col.name, column_id, t),
+        None => ShredColumn::untyped(&col.name, column_id),
+    }
+}
+
 fn resolve_flush_shred_spec(
     collection_config: Option<&crate::proto::proximadb_v1::Collection>,
-) -> Vec<(String, i32)> {
+) -> Vec<proximadb_block_format::ShredColumn> {
     let Some(config) = collection_config.and_then(|c| c.config.as_ref()) else {
         return Vec::new();
     };
     if config.enable_proxima_record != Some(true) {
         return Vec::new();
     }
-    let spec: Vec<(String, i32)> = config
+    let spec: Vec<proximadb_block_format::ShredColumn> = config
         .filterable_columns
         .iter()
         .enumerate()
         .filter(|(_, col)| !col.name.is_empty())
-        .map(|(idx, col)| (col.name.clone(), 100 + idx as i32))
+        .map(|(idx, col)| filterable_shred_column(col, idx))
         .collect();
     if !spec.is_empty() {
-        tracing::debug!("TD-FPRUNE-1 M1: flush shred spec = {:?}", spec);
+        tracing::debug!("TD-FPRUNE-1 M1/P5: flush shred spec = {:?}", spec);
     }
     spec
 }
@@ -1764,14 +1798,26 @@ mod tests {
     }
 
     // TD-FPRUNE-1 M1: the flush-side shred spec reconstructs the SAME
-    // `(name, 100+idx)` pairs the catalog schema assigns, gated on
+    // `(name, 100+idx)` columns the catalog schema assigns, gated on
     // `enable_proxima_record`. This is what makes footer filter-pruning fire for
     // vector collections (the write path previously shredded nothing).
+    // P5 slice 2: columns whose coarse proto type maps to an exact ProximaType
+    // are TYPED (residual-eligible); everything else stays untyped (complete
+    // tail, fail-safe).
     #[test]
     fn resolve_flush_shred_spec_from_filterable_columns() {
-        use crate::proto::proximadb_v1::{Collection, CollectionConfig, FilterableColumnSpec};
+        use crate::proto::proximadb_v1::{
+            Collection, CollectionConfig, FilterableColumnSpec, FilterableDataType,
+        };
+        use proximadb_block_format::ShredColumn;
+        use proximadb_data_model::ProximaType;
         let col = |name: &str| FilterableColumnSpec {
             name: name.to_string(),
+            ..Default::default()
+        };
+        let typed_col = |name: &str, t: i32| FilterableColumnSpec {
+            name: name.to_string(),
+            data_type: t,
             ..Default::default()
         };
         let mk = |enable: Option<bool>, cols: Vec<FilterableColumnSpec>| Collection {
@@ -1783,18 +1829,42 @@ mod tests {
             ..Default::default()
         };
 
-        // enable_proxima_record + two filterable columns → (name, 100+idx).
+        // enable_proxima_record + two unspecified-type columns → untyped
+        // (name, 100+idx) — same as pre-P5, never residual-eligible.
         let c = mk(Some(true), vec![col("partition"), col("lang")]);
         assert_eq!(
             resolve_flush_shred_spec(Some(&c)),
-            vec![("partition".to_string(), 100), ("lang".to_string(), 101)]
+            vec![
+                ShredColumn::untyped("partition", 100),
+                ShredColumn::untyped("lang", 101)
+            ]
+        );
+        // Exact-type columns carry their declared ProximaType (P5 slice 2).
+        let c = mk(
+            Some(true),
+            vec![
+                typed_col("category", FilterableDataType::FilterableInteger as i32),
+                typed_col("score", FilterableDataType::FilterableFloat as i32),
+                typed_col("lang", FilterableDataType::FilterableString as i32),
+                typed_col("flag", FilterableDataType::FilterableBoolean as i32),
+            ],
+        );
+        assert_eq!(
+            resolve_flush_shred_spec(Some(&c)),
+            vec![
+                ShredColumn::typed("category", 100, ProximaType::Int64),
+                ShredColumn::typed("score", 101, ProximaType::Float64),
+                ShredColumn::typed("lang", 102, ProximaType::String),
+                // Boolean has no exact physical class → untyped (tail kept).
+                ShredColumn::untyped("flag", 103),
+            ]
         );
         // Empty column names are skipped but still advance the index (mirrors
         // catalog_schema_from_collection's enumerate-then-skip).
         let c = mk(Some(true), vec![col(""), col("lang")]);
         assert_eq!(
             resolve_flush_shred_spec(Some(&c)),
-            vec![("lang".to_string(), 101)]
+            vec![ShredColumn::untyped("lang", 101)]
         );
         // Not a document collection ⇒ no shredding (byte-identical write).
         assert!(

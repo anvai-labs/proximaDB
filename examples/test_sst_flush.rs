@@ -60,6 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create collection config
     let collection = Collection {
+        storage_class_status: None, // SC1 (#2259) field; None = NOT_ACTIVE
         id: "test_collection".to_string(),
         config: Some(CollectionConfig {
             name: "test_collection".to_string(),

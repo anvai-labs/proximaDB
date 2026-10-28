@@ -1290,6 +1290,7 @@ fn print_dist(label: &str, samples: &[u64]) {
 
 fn make_collection(temp_dir: &TempDir, dim: usize, metric: DistanceMetric) -> Collection {
     Collection {
+        storage_class_status: None, // SC1 (#2259) field; None = NOT_ACTIVE
         id: "bench_warm_profile".to_string(),
         config: Some(CollectionConfig {
             dimension: dim as u32,

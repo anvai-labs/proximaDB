@@ -385,6 +385,7 @@ fn bench_compression_with_search(c: &mut Criterion) {
                 ];
 
                 let collection = Collection {
+                    storage_class_status: None, // SC1 (#2259) field; None = NOT_ACTIVE
                     id: collection_id.clone(),
                     config: Some(CollectionConfig {
                         name: collection_id.clone(),
@@ -598,6 +599,7 @@ fn bench_compression_with_search(c: &mut Criterion) {
                         ];
 
                         let collection = Arc::new(Collection {
+                            storage_class_status: None, // SC1 (#2259) field; None = NOT_ACTIVE
                             id: collection_id.clone(),
                             config: Some(CollectionConfig {
                                 name: collection_id.clone(),
@@ -727,6 +729,7 @@ fn bench_compression_with_search(c: &mut Criterion) {
                         ];
 
                         let collection = Arc::new(Collection {
+                            storage_class_status: None, // SC1 (#2259) field; None = NOT_ACTIVE
                             id: collection_id.clone(),
                             config: Some(CollectionConfig {
                                 name: collection_id.clone(),
@@ -999,6 +1002,7 @@ fn bench_large_scale_search(c: &mut Criterion) {
 
                 runtime.block_on(async {
                     let collection = Collection {
+                        storage_class_status: None, // SC1 (#2259) field; None = NOT_ACTIVE
                         id: collection_id.clone(),
                         config: Some(CollectionConfig {
                             name: collection_id.clone(),
@@ -1055,6 +1059,7 @@ fn bench_large_scale_search(c: &mut Criterion) {
                             });
 
                             let collection = Arc::new(Collection {
+                                storage_class_status: None, // SC1 (#2259) field; None = NOT_ACTIVE
                                 id: collection_id.clone(),
                                 config: Some(CollectionConfig {
                                     name: collection_id.clone(),
@@ -1185,6 +1190,7 @@ fn bench_insertion_performance(c: &mut Criterion) {
                     let _ = fs.remove_dir_all(&base_path).await;
 
                     let collection = Collection {
+                        storage_class_status: None, // SC1 (#2259) field; None = NOT_ACTIVE
                         id: collection_id.clone(),
                         config: Some(CollectionConfig {
                             name: collection_id.clone(),
