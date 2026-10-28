@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In progress.** Streaming/multipart and incremental append landed (#2222/#2234); DV infrastructure landed (#2238). Delete-aware reader continuation is under review; live incremental update/delete publication and explicit v3 activation remain open. Current assignment/gates: link:../../current/TRACKER.adoc[tracker].
+| Status | **In progress.** Streaming/multipart and incremental append landed (#2222/#2234); DV infrastructure landed (#2238). Delete-aware readers (#2256), gated v3 policy/lineage (#2260/#2261), oid mapping (#2262) and the default-OFF live-delete publisher (#2266) landed. Fence gates/recovery, incremental updates and rollout remain open. Current assignment/gates: link:../../current/TRACKER.adoc[tracker].
 | Priority | MEDIUM — a correctness-adjacent scaling limit, and a hard prerequisite for any automated publication policy.
 | Component | `src/services/dml/mod.rs` (`materialize_table_to_parquet`), `crates/storage/proximadb-iceberg-engine/src/manifest.rs`
 | Relates to | ADR-094 (Decision 1 rationale), ADR-062 (fresh-name + atomic manifest advance), TD-USUB-4 (additive layouts), TD-USUB-9

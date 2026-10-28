@@ -88,17 +88,19 @@ not a reason to silently emit v2 from a new v3-first table.
 
 === V3 activation ladder (TD-USUB-10 slice 3)
 
-Internal published DV reads, append carry-through and external deleted-value read-back landed
-in #2256; link:../history/evidence/P24_DELETION_READER_REVIEW_2026_10_26.adoc[evidence and limits].
-Preserve its cache bypasses and explicit refusals until the writer proves shared publication/WAL
-visibility. Remaining activation work:
-. Define explicit new-table v3 policy and atomic legacy-v2 upgrade. Keep legacy reads;
-  never downgrade, never silently fall back to a v2 writer. Preserve field IDs and history.
-. Prove required v3 metadata/row-lineage allocation, sequence/parent chains and DV encoding
-  against pinned external readers; fail closed on unsupported or inconsistent metadata.
-. Activate incremental update/delete publication with explicit referenced files, correct
-  DV inheritance, fence/conflict handling and crash recovery. Test inserted/updated/deleted
-  values across snapshots through the real facade, not just test-side DV construction.
+Published DV readers, v3 new-table policy/upgrade, lineage proof, oid-position mapping and the
+live-delete publisher have landed (#2256/#2260–#2262/#2266). See
+link:../history/evidence/INTEGRATION_RECONCILIATION_2026_10_28.adoc[completed scope and limits].
+Both `PROXIMADB_ICEBERG_V3_DEFAULT` and `PROXIMADB_LIVE_DELETE_PUBLISHER` remain default OFF.
+Remaining activation work:
+
+. Complete the visibility contract's race, lease, crash-gap recovery and reader-standing gates
+  through the real facade. The active fence-gates branch is not merged acceptance evidence.
+. Preserve DV inheritance, schema checks, external-parent refusal and shared publication/WAL
+  ordering. Prove replay/recovery across successor CAS and catalog layout update before relaxing
+  refusals; do not assume successful WAL acknowledgement implies published-view freshness.
+. Finish incremental update/upsert semantics and the P1 facade/schema/tenant gates. The landed
+  tombstone publisher is not a general incremental update publisher.
 . Roll out only after internal/external gates; record a compatibility/rollback boundary
   (a format upgrade may require forward recovery, not an older binary opening new data).
 

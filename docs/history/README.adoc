@@ -104,6 +104,8 @@ cited proof, not unrelated operational documentation or stable TD/ADR contracts.
 
 * link:evidence/INTEGRATION_RECONCILIATION_2026_10_26.adoc[Post-consolidation integration: #2248/#2251 closure and active-lane handoff]
 
+* link:evidence/INTEGRATION_RECONCILIATION_2026_10_28.adoc[October 28: publication, reservation and E1 merged slices; active worktree reconciliation]
+
 == Research evidence
 
 * link:evidence/NATIVE_EXECUTION_RESEARCH_2026_10_26.adoc[Native execution: competitive constraints, prior art and falsifiable hypotheses]. Desk research only; pending experiments remain in the current lakehouse plan.
