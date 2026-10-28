@@ -270,6 +270,7 @@ impl ReservationRegistry {
             )
             .await?;
         self.park_intervals(closed);
+        self.sync_residency_budget().await;
         Ok(grant)
     }
 
@@ -346,6 +347,7 @@ impl ReservationRegistry {
                 ),
             }
         }
+        self.sync_residency_budget().await;
     }
 
     /// One metering tick: drain parked release-tails plus each pool's accrued
@@ -371,6 +373,18 @@ impl ReservationRegistry {
             }
         }
         out
+    }
+
+    /// TD-TIER-1 SC4-1: push the live charged budget (all pools, effective
+    /// bytes) into the residency-budget bridge, arming whichever process
+    /// store is registered. Called after every grant mutation; the bridge is
+    /// order-independent (late store registration pulls the current cell).
+    async fn sync_residency_budget(&self) {
+        let mut total = 0u64;
+        for (_, authority) in self.pools.values() {
+            total = total.saturating_add(authority.charged_effective_bytes().await);
+        }
+        proximadb_cache::set_process_reserved_budget(total);
     }
 
     fn park_intervals(&self, closed: Vec<ReservationUsageInterval>) {
@@ -1800,6 +1814,51 @@ mod tests {
         assert!(
             retained <= MAX_RETAINED_RELEASED,
             "released tail bounded to {MAX_RETAINED_RELEASED}, got {retained}"
+        );
+    }
+
+    // ---- SC4-1: the residency-budget bridge ----
+
+    /// Grants arm the process store's protection budget through the bridge,
+    /// and releases disarm it. Serialized: the budget cell is process-global.
+    #[tokio::test]
+    async fn grants_arm_the_process_residency_budget() {
+        let budget_gate = std::sync::Mutex::new(());
+        let _guard = budget_gate.lock().unwrap_or_else(|p| p.into_inner());
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            proximadb_cache::PersistentByteStore::open(store_dir.path(), 1 << 20).unwrap(),
+        );
+        assert!(proximadb_cache::register_process_store(store.clone()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = pool_config(&dir, "p1", 0);
+        cfg.overhead_factor = 0.0;
+        cfg.default_grant_bytes = 4096;
+        let pools = [cfg];
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .unwrap();
+
+        registry
+            .reserve_for_performance("t1", "c-budget-1", current_unix_secs())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.reserved_budget(),
+            4096,
+            "a live grant arms the store budget through the bridge"
+        );
+
+        registry
+            .release_for_collection("t1", "c-budget-1", current_unix_secs())
+            .await;
+        assert_eq!(
+            store.reserved_budget(),
+            0,
+            "release disarms the store budget"
         );
     }
 

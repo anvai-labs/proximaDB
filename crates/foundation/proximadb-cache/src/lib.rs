@@ -35,6 +35,57 @@ mod persistent_l2;
 
 pub use persistent_l2::{L2Class, PersistentByteStore};
 
+/// TD-TIER-1 SC4-1: the process-wide residency-budget bridge.
+///
+/// The reservation registry (service layer) and the production persistent
+/// L2 store (SST engine singleton) are constructed in opposite order and
+/// never see each other directly; this module is their only meeting point.
+/// A single cell holds the authoritative budget (the live sum of charged
+/// grants across pools); setting it also arms whichever store is already
+/// registered, and a store registering later picks up the current cell —
+/// order-independent by construction.
+mod residency_budget {
+    use std::sync::Arc;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::PersistentByteStore;
+
+    static REGISTERED_STORE: OnceLock<Arc<PersistentByteStore>> = OnceLock::new();
+    static CELL: AtomicU64 = AtomicU64::new(0);
+
+    /// Register the process's shared persistent store (first registration
+    /// wins — the SST engine's singleton). Applies the current budget.
+    pub fn register_process_store(store: Arc<PersistentByteStore>) -> bool {
+        let applied = REGISTERED_STORE.set(store.clone()).is_ok();
+        store.set_reserved_budget(CELL.load(Ordering::Acquire));
+        applied
+    }
+
+    /// The registered shared store, if any.
+    pub fn process_store() -> Option<Arc<PersistentByteStore>> {
+        REGISTERED_STORE.get().cloned()
+    }
+
+    /// Set the authoritative residency budget (live charged grant bytes
+    /// across all pools) and arm the registered store, if any.
+    pub fn set_process_reserved_budget(bytes: u64) {
+        CELL.store(bytes, Ordering::Release);
+        if let Some(store) = REGISTERED_STORE.get() {
+            store.set_reserved_budget(bytes);
+        }
+    }
+
+    /// The current budget cell (diagnostics/tests).
+    pub fn process_reserved_budget() -> u64 {
+        CELL.load(Ordering::Acquire)
+    }
+}
+
+pub use residency_budget::{
+    process_reserved_budget, process_store, register_process_store, set_process_reserved_budget,
+};
+
 /// The category of a cached artifact. Drives key-namespacing and per-kind stats;
 /// extend as new consumers adopt the cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
@@ -1072,6 +1123,27 @@ mod tests {
 
     fn key(tenant: &str, k: &str) -> CacheKey {
         CacheKey::new(tenant, CacheKind::Footer, k)
+    }
+
+    // ---- TD-TIER-1 SC4-1: the residency-budget bridge ----
+
+    /// The bridge is order-independent: setting a budget BEFORE any store is
+    /// registered parks it in the cell; a late registration picks it up.
+    #[tokio::test]
+    async fn late_store_registration_picks_up_the_cell_budget() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        set_process_reserved_budget(4096);
+        assert_eq!(process_reserved_budget(), 4096);
+        let store = Arc::new(PersistentByteStore::open(dir.path(), 1 << 20).expect("open"));
+        assert!(register_process_store(store.clone()));
+        assert_eq!(
+            store.reserved_budget(),
+            4096,
+            "a late registration applies the current cell"
+        );
+        // A later budget update arms the registered store immediately.
+        set_process_reserved_budget(8192);
+        assert_eq!(store.reserved_budget(), 8192);
     }
 
     #[tokio::test]
