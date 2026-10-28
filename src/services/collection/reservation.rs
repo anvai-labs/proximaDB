@@ -430,14 +430,16 @@ impl ReservationAuthority {
     /// same byte count returns that grant unchanged (it is durable by
     /// construction — memory only ever holds persisted state); a different
     /// byte count is a resize, admitted only if capacity and the tenant
-    /// limit allow. A released grant for the identity is replaced by a fresh
-    /// one.
+    /// limit allow — and like [`Self::resize`] it RETURNS the interval closed
+    /// at the old level (verification round 2: discarding it here dropped
+    /// billing for a span whose checkpoint advanced durably). A released
+    /// grant for the identity is replaced by a fresh one.
     pub async fn reserve(
         &self,
         tenant_id: &str,
         collection_id: &str,
         bytes: u64,
-    ) -> Result<Grant, ReservationError> {
+    ) -> Result<(Grant, Vec<ReservationUsageInterval>), ReservationError> {
         if kill_switch_armed() {
             return Err(ReservationError::KillSwitch);
         }
@@ -449,30 +451,40 @@ impl ReservationAuthority {
         let mut guard = self.inner.ledger.lock().await;
         if let Some(existing) = live_grant(&guard, tenant_id, collection_id) {
             if existing.bytes == bytes {
-                return Ok(existing.clone());
+                return Ok((existing.clone(), Vec::new()));
             }
-            let (grant, _closed) = self
-                .resize_prospective(&mut guard, tenant_id, collection_id, bytes)
-                .await?;
-            return Ok(grant);
+            return self
+                .resize_prospective(
+                    &mut guard,
+                    tenant_id,
+                    collection_id,
+                    bytes,
+                    current_unix_secs(),
+                )
+                .await;
         }
-        self.admit_prospective(&mut guard, tenant_id, collection_id, bytes)
-            .await
+        let grant = self
+            .admit_prospective(&mut guard, tenant_id, collection_id, bytes)
+            .await?;
+        Ok((grant, Vec::new()))
     }
 
     /// Resize a live grant (same grant id, new byte count), capacity- and
     /// limit-checked, closing the open interval at the OLD level (returned).
+    /// `now_unix_secs` is the billing split instant, explicit so callers and
+    /// tests pin exactly where the level changes.
     pub async fn resize(
         &self,
         tenant_id: &str,
         collection_id: &str,
         bytes: u64,
+        now_unix_secs: i64,
     ) -> Result<(Grant, Vec<ReservationUsageInterval>), ReservationError> {
         if kill_switch_armed() {
             return Err(ReservationError::KillSwitch);
         }
         let mut guard = self.inner.ledger.lock().await;
-        self.resize_prospective(&mut guard, tenant_id, collection_id, bytes)
+        self.resize_prospective(&mut guard, tenant_id, collection_id, bytes, now_unix_secs)
             .await
     }
 
@@ -639,6 +651,7 @@ impl ReservationAuthority {
         tenant_id: &str,
         collection_id: &str,
         bytes: u64,
+        now_unix_secs: i64,
     ) -> Result<(Grant, Vec<ReservationUsageInterval>), ReservationError> {
         let Some(live) = live_grant(guard, tenant_id, collection_id).cloned() else {
             return Err(ReservationError::NotFound {
@@ -648,9 +661,10 @@ impl ReservationAuthority {
             });
         };
         let mut prospective = (*guard).clone();
-        let now = current_unix_secs();
         let mut closed = Vec::new();
-        if let Some(interval) = close_open_interval(&mut prospective, &live, now, &self.config.id) {
+        if let Some(interval) =
+            close_open_interval(&mut prospective, &live, now_unix_secs, &self.config.id)
+        {
             closed.push(interval);
         }
         let old_effective = self.config.effective_bytes(live.bytes);
@@ -804,12 +818,25 @@ fn owner_lock_path(dir: &Path) -> PathBuf {
 /// Exclusive owner lock, `pid:start_ticks` on Linux (`/proc/self/stat`
 /// field 22), bare pid elsewhere. Acquisition is `O_EXCL` create — atomic
 /// against racers. An existing lock is claimed ONLY when its owner is provably
-/// dead (process gone, or same pid with a different start token), by ATOMIC
-/// RENAME of the stale lock to a unique name: exactly one racer's rename
-/// succeeds (review B1). Non-Linux cannot prove death by ticks, so a foreign
-/// pid being merely absent from the probe is treated as live (fail-closed).
+/// dead (process gone, or same pid with a different start token), through a
+/// takeover PROTOCOL, not a bare rename (review B1, verification round 2: a
+/// racer holding a stale verdict could rename a live successor's lock away):
+/// 1. acquire the O_EXCL `owner.claim` slot (its token self-heals via the
+///    same liveness probe when the claimer died mid-takeover);
+/// 2. RE-READ `owner.lock` under the slot and proceed ONLY if it still
+///    carries the token just judged stale — an expired verdict releases the
+///    slot and loops instead of touching the lock;
+/// 3. rename the (re-verified stale) lock away and release the slot.
+///
+/// A racer whose verdict went stale can therefore never move a lock the
+/// protocol did not still prove dead. Non-Linux cannot prove death by ticks,
+/// so a foreign pid merely absent from the probe is treated as live
+/// (fail-closed). An unparseable claim slot fails closed (Corrupt) — a
+/// crash mid-takeover wedges takeover until an operator clears it, never
+/// double-ownership.
 async fn acquire_owner_lock(dir: &Path, pool_id: &str) -> Result<(), ReservationError> {
     let path = owner_lock_path(dir);
+    let claim_path = dir.join("owner.claim");
     let token = owner_token();
     for _ in 0..LOCK_ATTEMPTS {
         match write_exclusive(&path, &token).await {
@@ -827,16 +854,62 @@ async fn acquire_owner_lock(dir: &Path, pool_id: &str) -> Result<(), Reservation
                         holder: format!("owner.lock pid {}", held.pid),
                     });
                 }
-                // Claim the stale lock by rename: one racer wins, the rest
-                // loop, re-read, and see the winner's live token.
-                let claim =
-                    path.with_extension(format!("stale-{}-{}", std::process::id(), new_grant_id()));
-                match tokio::fs::rename(&path, &claim).await {
+                // Take the takeover slot; a live claimer means someone else
+                // is mid-takeover — let them finish (self-heals if they died).
+                match write_exclusive(&claim_path, &token).await {
                     Ok(()) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(err) => return Err(err.into()),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let claim_content =
+                            tokio::fs::read_to_string(&claim_path)
+                                .await
+                                .map_err(|err| {
+                                    ReservationError::Corrupt(format!(
+                                        "owner.claim unreadable: {err}"
+                                    ))
+                                })?;
+                        let claimer = OwnerToken::parse(&claim_content).ok_or_else(|| {
+                            ReservationError::Corrupt(
+                                "owner.claim carries no pid token (crashed mid-takeover?)".into(),
+                            )
+                        })?;
+                        if owner_is_live(&claimer) {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            continue;
+                        }
+                        let _ = tokio::fs::remove_file(&claim_path).await;
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
                 }
-                let _ = tokio::fs::remove_file(&claim).await;
+                // RE-VERIFY under the slot: the verdict holds only if the
+                // lock still carries the exact token judged stale.
+                let still_stale = match tokio::fs::read_to_string(&path).await {
+                    Ok(current) => current == content,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(err) => {
+                        let _ = tokio::fs::remove_file(&claim_path).await;
+                        return Err(err.into());
+                    }
+                };
+                if !still_stale {
+                    // Another racer already replaced the lock: our verdict is
+                    // expired — release the slot and re-judge from scratch.
+                    let _ = tokio::fs::remove_file(&claim_path).await;
+                    continue;
+                }
+                let stale_name =
+                    path.with_extension(format!("stale-{}-{}", std::process::id(), new_grant_id()));
+                match tokio::fs::rename(&path, &stale_name).await {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        let _ = tokio::fs::remove_file(&claim_path).await;
+                        return Err(err.into());
+                    }
+                }
+                let _ = tokio::fs::remove_file(&stale_name).await;
+                let _ = tokio::fs::remove_file(&claim_path).await;
+                // Loop: exactly one racer's create_new now wins.
             }
             Err(e) => return Err(e.into()),
         }
@@ -1064,8 +1137,8 @@ mod tests {
     async fn retry_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let auth = ReservationAuthority::open(pool(&dir)).await.unwrap();
-        let g1 = auth.reserve("t1", "c1", 1024).await.unwrap();
-        let g2 = auth.reserve("t1", "c1", 1024).await.unwrap();
+        let (g1, _closed) = auth.reserve("t1", "c1", 1024).await.unwrap();
+        let (g2, _) = auth.reserve("t1", "c1", 1024).await.unwrap();
         assert_eq!(g1.id, g2.id, "retry returns the same grant");
         let grants = auth.grants_snapshot().await;
         assert_eq!(
@@ -1073,7 +1146,10 @@ mod tests {
             1
         );
         // A different byte count is a resize, not a second grant.
-        let (g3, _closed) = auth.resize("t1", "c1", 2048).await.unwrap();
+        let (g3, _closed) = auth
+            .resize("t1", "c1", 2048, current_unix_secs())
+            .await
+            .unwrap();
         assert_eq!(g3.id, g1.id);
         assert_eq!(g3.bytes, 2048);
     }
@@ -1101,7 +1177,7 @@ mod tests {
         tokio::fs::remove_dir(dir.path().join("reservations.tmp"))
             .await
             .unwrap();
-        let retried = auth.reserve("t1", "c1", 1024).await.unwrap();
+        let (retried, _) = auth.reserve("t1", "c1", 1024).await.unwrap();
         assert_eq!(retried.bytes, 1024, "retry re-attempts the admission");
     }
 
@@ -1112,7 +1188,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = pool(&dir);
         let auth = ReservationAuthority::open(cfg.clone()).await.unwrap();
-        auth.reserve("t1", "c1", 1024).await.unwrap();
+        let _ = auth.reserve("t1", "c1", 1024).await.unwrap();
         let t0 = current_unix_secs();
         let epoch_before = auth.take_usage_intervals(t0 + 1).await.unwrap()[0].producer_epoch;
         drop(auth); // no release: "crash"
@@ -1135,7 +1211,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = pool(&dir);
         let auth = ReservationAuthority::open(cfg.clone()).await.unwrap();
-        auth.reserve("t1", "c1", 1024).await.unwrap();
+        let _ = auth.reserve("t1", "c1", 1024).await.unwrap();
         drop(auth);
         tokio::fs::write(ledger_path(dir.path()), b"{ not json")
             .await
@@ -1188,6 +1264,46 @@ mod tests {
             .unwrap();
         let err = ReservationAuthority::open(cfg).await.unwrap_err();
         assert!(err.to_string().contains("exclusively owned"), "{err}");
+    }
+
+    // Verification round 2 (B1 residual): a LIVE takeover claim slot backs
+    // the opener off — bounded attempts, then fail-closed — and never touches
+    // the (stale) owner.lock it was judging.
+    #[tokio::test]
+    async fn live_claim_slot_backs_off_without_touching_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = pool(&dir);
+        // Stale lock: pid 4194303 with ticks that cannot match a live holder.
+        tokio::fs::write(owner_lock_path(dir.path()), "4194303:999999")
+            .await
+            .unwrap();
+        // Live claim: pid 1 with its REAL start ticks.
+        let pid1_ticks = std::fs::read_to_string("/proc/1/stat")
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')').map(|(_, rest)| {
+                    rest.split_whitespace()
+                        .nth(19)
+                        .and_then(|t| t.parse::<u64>().ok())
+                })
+            })
+            .flatten()
+            .expect("claim-slot test needs /proc/1/stat (Linux CI)");
+        let claim_path = dir.path().join("owner.claim");
+        tokio::fs::write(&claim_path, format!("1:{pid1_ticks}"))
+            .await
+            .unwrap();
+
+        let err = ReservationAuthority::open(cfg).await.unwrap_err();
+        assert!(err.to_string().contains("unresolved lock race"), "{err}");
+        // Both files untouched: the stale lock survives for the claim's
+        // owner, and the live claim was not stolen.
+        let lock = tokio::fs::read_to_string(owner_lock_path(dir.path()))
+            .await
+            .unwrap();
+        assert_eq!(lock, "4194303:999999");
+        let claim = tokio::fs::read_to_string(&claim_path).await.unwrap();
+        assert_eq!(claim, format!("1:{pid1_ticks}"));
     }
 
     // The pid-reuse counterpart: a foreign pid whose recorded ticks do NOT
@@ -1253,7 +1369,7 @@ mod tests {
     async fn release_returns_tail_interval_and_stops_accrual() {
         let dir = tempfile::tempdir().unwrap();
         let auth = ReservationAuthority::open(pool(&dir)).await.unwrap();
-        auth.reserve("t1", "c1", 1024).await.unwrap();
+        let _ = auth.reserve("t1", "c1", 1024).await.unwrap();
         let t0 = current_unix_secs() + 1; // strictly after the reserve stamp
         let i1 = auth.take_usage_intervals(t0).await.unwrap();
         assert_eq!(i1.len(), 1);
@@ -1277,18 +1393,33 @@ mod tests {
     async fn resize_splits_billing_levels() {
         let dir = tempfile::tempdir().unwrap();
         let auth = ReservationAuthority::open(pool(&dir)).await.unwrap();
-        auth.reserve("t1", "c1", 1000).await.unwrap();
+        let _ = auth.reserve("t1", "c1", 1000).await.unwrap();
         let t0 = current_unix_secs() + 1;
         let first = auth.take_usage_intervals(t0).await.unwrap();
         assert_eq!(first[0].reserved_bytes, 1000);
-        let (_resized, closed) = auth.resize("t1", "c1", 4000).await.unwrap();
-        let _ = closed; // no time passed in-test; the take below covers it
-        let after = auth.take_usage_intervals(t0 + 10).await.unwrap();
-        assert!(
-            after.iter().all(|i| i.reserved_bytes == 4000),
-            "post-resize intervals carry the new level: {after:?}"
+        // The split instant is explicit: the interval [t0, t0+5) must close
+        // at the OLD level (1000), the span after it at the NEW level (4000).
+        let (_resized, closed) = auth.resize("t1", "c1", 4000, t0 + 5).await.unwrap();
+        assert_eq!(
+            closed.len(),
+            1,
+            "resize returns the interval it closed: {closed:?}"
         );
+        assert_eq!(closed[0].interval_start_unix_secs, t0);
+        assert_eq!(closed[0].interval_end_unix_secs, t0 + 5);
+        assert_eq!(
+            closed[0].reserved_bytes, 1000,
+            "the closed interval carries the OLD level"
+        );
+        let after = auth.take_usage_intervals(t0 + 10).await.unwrap();
         assert_eq!(after.len(), 1);
+        assert_eq!(after[0].interval_start_unix_secs, t0 + 5);
+        assert_eq!(after[0].reserved_bytes, 4000, "new level after the split");
+        // reserve-as-resize is the same contract (verification round 2): the
+        // closed interval is RETURNED, never silently dropped.
+        let (grant, closed2) = auth.reserve("t1", "c1", 2000).await.unwrap();
+        assert_eq!(grant.bytes, 2000);
+        let _ = closed2; // span length is wall-clock dependent; return is the contract
     }
 
     // SC-TE9 dedup: the accrual checkpoint is durably persisted with the
@@ -1300,7 +1431,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = pool(&dir);
         let auth = ReservationAuthority::open(cfg.clone()).await.unwrap();
-        auth.reserve("t1", "c1", 1024).await.unwrap();
+        let _ = auth.reserve("t1", "c1", 1024).await.unwrap();
         let t0 = current_unix_secs() + 1; // strictly after the reserve stamp
         let first = auth.take_usage_intervals(t0).await.unwrap();
         assert_eq!(first.len(), 1);
@@ -1329,7 +1460,7 @@ mod tests {
         let mut cfg = pool(&dir);
         cfg.tenant_limit_bytes = Some(2048);
         let auth = ReservationAuthority::open(cfg).await.unwrap();
-        auth.reserve("t1", "c1", 1024).await.unwrap();
+        let _ = auth.reserve("t1", "c1", 1024).await.unwrap();
         let err = auth
             .reserve("t1", "c2", 2048)
             .await
@@ -1337,7 +1468,7 @@ mod tests {
             .to_string();
         assert!(err.contains("tenant 't1' reservation limit"), "{err}");
         // Another tenant is unaffected.
-        auth.reserve("t2", "c1", 2048).await.unwrap();
+        let _ = auth.reserve("t2", "c1", 2048).await.unwrap();
     }
 
     // Kill switch: reserve refuses with a named reason; the ledger survives.
@@ -1345,7 +1476,7 @@ mod tests {
     async fn kill_switch_refuses_without_amnesia() {
         let dir = tempfile::tempdir().unwrap();
         let auth = ReservationAuthority::open(pool(&dir)).await.unwrap();
-        auth.reserve("t1", "c1", 1024).await.unwrap();
+        let _ = auth.reserve("t1", "c1", 1024).await.unwrap();
         // Env tests must not race other policy tests reading the same var.
         let guard = env_lock::scoped_set(RESERVATIONS_KILL_SWITCH_ENV, "1");
         let err = auth
@@ -1431,7 +1562,7 @@ mod tests {
         cfg.allocatable_bytes = 1 << 30;
         let auth = ReservationAuthority::open(cfg.clone()).await.unwrap();
         for i in 0..(MAX_RETAINED_RELEASED + 8) {
-            auth.reserve("t1", &format!("c{i}"), 64).await.unwrap();
+            let _ = auth.reserve("t1", &format!("c{i}"), 64).await.unwrap();
             auth.release("t1", &format!("c{i}"), current_unix_secs() + 1)
                 .await
                 .unwrap();

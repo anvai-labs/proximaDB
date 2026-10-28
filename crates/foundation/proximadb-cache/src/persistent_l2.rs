@@ -204,12 +204,16 @@ impl PersistentByteStore {
         }
         meta.protected.store(true, Ordering::Release);
         // `remove` is lock-free: if it won the race between the map read and
-        // here, it already decremented (flag was false for it) and our claim
-        // would leak forever — refund and report nothing pinned.
+        // here, the SWAP arbitrates the single decrement — whoever's swap
+        // observes true refunds/removes; a false observation means the other
+        // party already did (verification round 2: refunding on map membership
+        // alone double-decremented when remove's swap followed our store).
         if !self.inner.entries.contains_key(key) {
-            self.inner
-                .protected_bytes
-                .fetch_sub(meta.file_len, Ordering::AcqRel);
+            if meta.protected.swap(false, Ordering::AcqRel) {
+                self.inner
+                    .protected_bytes
+                    .fetch_sub(meta.file_len, Ordering::AcqRel);
+            }
             return Ok(false);
         }
         Ok(true)
