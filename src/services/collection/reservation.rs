@@ -260,24 +260,7 @@ impl ReservationRegistry {
                 "reservation tenant id must not be empty".to_string(),
             ));
         }
-        let pool_id = self.default_pool.as_deref().ok_or_else(|| {
-            ReservationError::Invalid(
-                "multiple reservation pools are declared but none is marked is_default; \
-                 PERFORMANCE admission cannot pick one"
-                    .to_string(),
-            )
-        })?;
-        let (config, authority) = self
-            .pools
-            .get(pool_id)
-            .ok_or_else(|| ReservationError::Corrupt("default pool missing".into()))?;
-        if config.default_grant_bytes == 0 {
-            return Err(ReservationError::Invalid(format!(
-                "reservation pool '{pool_id}' declares no default_grant_bytes; \
-                 PERFORMANCE admission is not armed (set default_grant_bytes in \
-                 [storage.reservation_pools])"
-            )));
-        }
+        let (config, authority) = self.armed_default_pool()?;
         let (grant, closed) = authority
             .reserve(
                 tenant_id,
@@ -290,11 +273,12 @@ impl ReservationRegistry {
         Ok(grant)
     }
 
-    /// Side-effect-free admission peek: would a PERFORMANCE create/admission
-    /// succeed right now? (Default pool resolvable, grant size armed, kill
-    /// switch off.) Used by the policy-mutation surface BEFORE the config
-    /// persists so a refusal keeps the old policy unchanged.
-    pub async fn peek_performance_admission(&self) -> Result<(), ReservationError> {
+    /// The default pool and its config, refusing an unresolvable default
+    /// (shared by the admission peek and the reserve — the dup-ratchet
+    /// exists for exactly this twin).
+    fn armed_default_pool(
+        &self,
+    ) -> Result<&(ReservationPoolConfig, ReservationAuthority), ReservationError> {
         let pool_id = self.default_pool.as_deref().ok_or_else(|| {
             ReservationError::Invalid(
                 "multiple reservation pools are declared but none is marked is_default; \
@@ -302,19 +286,43 @@ impl ReservationRegistry {
                     .to_string(),
             )
         })?;
-        let (config, _) = self
+        let entry = self
             .pools
             .get(pool_id)
             .ok_or_else(|| ReservationError::Corrupt("default pool missing".into()))?;
-        if config.default_grant_bytes == 0 {
+        if entry.0.default_grant_bytes == 0 {
             return Err(ReservationError::Invalid(format!(
                 "reservation pool '{pool_id}' declares no default_grant_bytes; \
                  PERFORMANCE admission is not armed (set default_grant_bytes in \
                  [storage.reservation_pools])"
             )));
         }
-        // Kill-switch and tenant checks run in the real reserve; the peek
-        // only needs to answer "would the armed surface accept this".
+        Ok(entry)
+    }
+
+    /// Side-effect-free admission peek: would a PERFORMANCE admission
+    /// succeed right now? Checks the SAME gates the reserve enforces where
+    /// they are observable without side effects — default pool resolvable,
+    /// grant size armed, kill switch off, capacity headroom for one default
+    /// grant. Used by the policy-mutation surface BEFORE the config
+    /// persists so a refusal keeps the old policy unchanged; the residual
+    /// peek→reserve window (a concurrent reserve taking the headroom) is
+    /// the recorded SC4 reconciliation seam.
+    pub async fn peek_performance_admission(&self) -> Result<(), ReservationError> {
+        if kill_switch_armed() {
+            return Err(ReservationError::KillSwitch);
+        }
+        let (config, authority) = self.armed_default_pool()?;
+        let needed = config.effective_bytes(config.default_grant_bytes);
+        let charged = authority.charged_effective_bytes().await;
+        if needed > config.allocatable_bytes.saturating_sub(charged) {
+            return Err(ReservationError::Capacity {
+                pool: config.id.clone(),
+                requested: config.default_grant_bytes,
+                effective: needed,
+                free: config.allocatable_bytes.saturating_sub(charged),
+            });
+        }
         Ok(())
     }
 
@@ -1917,6 +1925,93 @@ mod tests {
             registry.take_metering_intervals(800).await.is_empty(),
             "drained: no double-emission"
         );
+    }
+
+    // SF4 (2b review): the peek checks the same gates the reserve enforces
+    // where observable — armed/unarmed, kill switch, capacity headroom.
+    #[tokio::test]
+    async fn peek_refuses_unarmed_and_unresolvable_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let pools = [pool_config(&dir, "p1", 0)];
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .unwrap();
+        let err = registry
+            .peek_performance_admission()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("default_grant_bytes"), "{err}");
+
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let mut pools = [
+            pool_config(&dir_a, "pa", 4096),
+            pool_config(&dir_b, "pb", 4096),
+        ];
+        drop(registry);
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .unwrap();
+        let err = registry
+            .peek_performance_admission()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is_default"), "{err}");
+        pools[1].is_default = true;
+        drop(registry);
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .unwrap();
+        registry.peek_performance_admission().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn peek_refuses_when_capacity_headroom_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = pool_config(&dir, "p1", 0);
+        cfg.allocatable_bytes = 5000;
+        cfg.overhead_factor = 0.0;
+        cfg.default_grant_bytes = 4000;
+        let pools = [cfg];
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .unwrap();
+        registry.peek_performance_admission().await.unwrap();
+        registry
+            .reserve_for_performance("t1", "c-uuid-1", current_unix_secs())
+            .await
+            .unwrap();
+        // 4000 charged of 5000: a second default grant no longer fits.
+        let err = registry
+            .peek_performance_admission()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("capacity exceeded"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn peek_refuses_under_the_kill_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let pools = [pool_config(&dir, "p1", 4096)];
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .unwrap();
+        let guard = env_lock::scoped_set(RESERVATIONS_KILL_SWITCH_ENV, "1");
+        let err = registry
+            .peek_performance_admission()
+            .await
+            .unwrap_err()
+            .to_string();
+        drop(guard);
+        assert!(err.contains("kill switch"), "{err}");
     }
 
     // SF2: an empty tenant id must be refused at admission — the metering

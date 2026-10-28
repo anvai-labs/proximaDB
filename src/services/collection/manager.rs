@@ -2014,6 +2014,11 @@ impl CollectionService {
         vector_delta: i64,
         size_delta: i64,
     ) -> Result<()> {
+        // SF2 (SC3-2b review): this is a full-record read-modify-write of the
+        // catalog asset — without the RMW lock it interleaves with
+        // update_collection's policy mutation and silently reverts a
+        // persisted class change while its grant stays live.
+        let _rmw = COLLECTION_CONFIG_RMW.lock().await;
         debug!(
             "📊 Updating stats for {}: vectors={:+}, size={:+}",
             collection_name, vector_delta, size_delta
@@ -2131,6 +2136,9 @@ impl CollectionService {
         // `Some(true)` = reserve after persist, `Some(false)` = release.
         // Applied only after the durable upsert succeeds.
         let mut policy_side_effect: Option<bool> = None;
+        // SF1: a post-persist reserve failure surfaces here (policy durable,
+        // grant missing) instead of a quiet success.
+        let mut reservation_pending: Option<String> = None;
 
         // Apply updates using native proto types
         if let Some(new_config) = config_update {
@@ -2323,7 +2331,16 @@ impl CollectionService {
                 }
                 // Add other fields as needed
             } else {
-                // No existing config, use the new one
+                // No existing config: use the new one, but a storage class
+                // cannot ride this defensive branch — it would bypass the
+                // entire policy surface (SC2 floor, registry peek,
+                // generation, grant effects). Refuse it explicitly.
+                if new_config.storage_class.is_some_and(|class| class != 0) {
+                    return Err(anyhow::anyhow!(
+                        "storage_class cannot be set on a record without a \
+                         recorded config; recreate the collection instead"
+                    ));
+                }
                 record.config = Some(new_config);
             }
         }
@@ -2368,10 +2385,15 @@ impl CollectionService {
                     .reserve_for_performance(&tenant, &collection_id, now)
                     .await
                 {
+                    // The policy is durable but unreserved (peek→reserve
+                    // window): the caller must SEE it, not just the log —
+                    // success stays true (the update persisted) with an
+                    // explicit error_code.
                     warn!(
                         "TD-TIER-1 SC3: post-persist reserve failed for {collection_id}: \
                          {error} (policy recorded; SC4 reconciliation re-admits)"
                     );
+                    reservation_pending = Some(error.to_string());
                 }
             } else {
                 if let Some(owner) = owner.as_deref() {
@@ -2411,6 +2433,13 @@ impl CollectionService {
                 .await;
         }
 
+        // NIT6: recompute the status projection so the response carries the
+        // NEW class's status, not the read-time snapshot.
+        if let Some(config) = record.config.as_ref() {
+            record.storage_class_status =
+                Some(crate::services::collection::storage_class::storage_class_status(config));
+        }
+
         // Record is already a proto Collection, no conversion needed
         let collection = record;
 
@@ -2419,7 +2448,8 @@ impl CollectionService {
             collection: Some(collection),
             storage_path: None,
             // error_message removed -  None,
-            error_code: None,
+            error_code: reservation_pending
+                .map(|message| format!("RESERVATION_ADMISSION_PENDING: {message}")),
             processing_time_us: start_time.elapsed().as_micros() as i64,
         })
     }
@@ -2478,6 +2508,10 @@ impl CollectionService {
         compression: &crate::proto::proximadb_v1::CompressionConfig,
     ) -> Result<CollectionServiceResponse> {
         let start_time = std::time::Instant::now();
+        // SF2 (SC3-2b review): same full-record RMW discipline as
+        // update_stats/update_collection — the policy mutation's ordering
+        // contract rests on one writer at a time.
+        let _rmw = COLLECTION_CONFIG_RMW.lock().await;
 
         // Get existing collection
         let collection = match self.collection(identifier).await? {
