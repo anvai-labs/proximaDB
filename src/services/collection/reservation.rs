@@ -509,11 +509,7 @@ impl ReservationAuthority {
         {
             closed.push(interval);
         }
-        let grant = prospective
-            .grants
-            .iter_mut()
-            .find(|g| g.id == live.id)
-            .ok_or_else(|| ReservationError::Corrupt("grant vanished in prospect".into()))?;
+        let grant = grant_by_id_mut(&mut prospective, &live.id)?;
         // Retirement enters through Releasing (the SC4 retirement seam): the
         // transition floor is enforced, never silently coerced (review S4).
         if !grant.state.can_transition_to(&GrantState::Releasing) {
@@ -565,12 +561,84 @@ impl ReservationAuthority {
     /// Effective bytes charged against the pool right now (invariant input).
     pub async fn charged_effective_bytes(&self) -> u64 {
         let ledger = self.inner.ledger.lock().await;
+        self.charged_effective(&ledger)
+    }
+
+    /// Clone-persist-commit admission (review B2): a persist failure leaves
+    /// the in-memory ledger untouched, so the caller's Err is the truth and a
+    /// Effective bytes currently charged to the pool by live grants.
+    fn charged_effective(&self, ledger: &Ledger) -> u64 {
         ledger
             .grants
             .iter()
             .filter(|g| g.state.charges_capacity())
             .map(|g| self.config.effective_bytes(g.bytes))
             .sum()
+    }
+
+    /// Capacity gate shared by admission and resize (the dup-ratchet caught
+    /// these twins drifting). `credit` is an effective charge refunded to the
+    /// pool before the check — a resize credits the grant's own current
+    /// charge, so shrinking always fits.
+    fn ensure_capacity(
+        &self,
+        ledger: &Ledger,
+        requested: u64,
+        effective: u64,
+        credit: u64,
+    ) -> Result<(), ReservationError> {
+        let charged = self.charged_effective(ledger);
+        let free = self
+            .config
+            .allocatable_bytes
+            .saturating_sub(charged.saturating_sub(credit));
+        if effective > free {
+            return Err(ReservationError::Capacity {
+                pool: self.config.id.clone(),
+                requested,
+                effective,
+                free,
+            });
+        }
+        Ok(())
+    }
+
+    /// Tenant-limit gate shared by admission and resize. `exclude` omits the
+    /// grant being resized from the tenant's existing sum. `checked_add`:
+    /// an overflowing sum cannot sneak under the limit.
+    fn ensure_tenant_limit(
+        &self,
+        ledger: &Ledger,
+        tenant_id: &str,
+        bytes: u64,
+        exclude: Option<&str>,
+    ) -> Result<(), ReservationError> {
+        let Some(limit) = self.config.tenant_limit_bytes else {
+            return Ok(());
+        };
+        let tenant_sum: u64 = ledger
+            .grants
+            .iter()
+            .filter(|g| {
+                g.state.charges_capacity()
+                    && g.tenant_id == tenant_id
+                    && Some(g.id.as_str()) != exclude
+            })
+            .map(|g| g.bytes)
+            .sum();
+        if tenant_sum
+            .checked_add(bytes)
+            .is_none_or(|combined| combined > limit)
+        {
+            return Err(ReservationError::TenantLimit {
+                pool: self.config.id.clone(),
+                tenant: tenant_id.to_string(),
+                sum: tenant_sum,
+                requested: bytes,
+                limit,
+            });
+        }
+        Ok(())
     }
 
     /// Clone-persist-commit admission (review B2): a persist failure leaves
@@ -585,48 +653,8 @@ impl ReservationAuthority {
     ) -> Result<Grant, ReservationError> {
         let mut prospective = (*guard).clone();
         let effective = self.config.effective_bytes(bytes);
-        let charged: u64 = prospective
-            .grants
-            .iter()
-            .filter(|g| g.state.charges_capacity())
-            .map(|g| self.config.effective_bytes(g.bytes))
-            .sum();
-        let free = self.config.allocatable_bytes.saturating_sub(charged);
-        if effective > free {
-            return Err(ReservationError::Capacity {
-                pool: self.config.id.clone(),
-                requested: bytes,
-                effective,
-                free,
-            });
-        }
-        if let Some(limit) = self.config.tenant_limit_bytes {
-            let tenant_sum: u64 = prospective
-                .grants
-                .iter()
-                .filter(|g| g.state.charges_capacity() && g.tenant_id == tenant_id)
-                .map(|g| g.bytes)
-                .sum();
-            let combined =
-                tenant_sum
-                    .checked_add(bytes)
-                    .ok_or_else(|| ReservationError::TenantLimit {
-                        pool: self.config.id.clone(),
-                        tenant: tenant_id.to_string(),
-                        sum: tenant_sum,
-                        requested: bytes,
-                        limit,
-                    })?;
-            if combined > limit {
-                return Err(ReservationError::TenantLimit {
-                    pool: self.config.id.clone(),
-                    tenant: tenant_id.to_string(),
-                    sum: tenant_sum,
-                    requested: bytes,
-                    limit,
-                });
-            }
-        }
+        self.ensure_capacity(&prospective, bytes, effective, 0)?;
+        self.ensure_tenant_limit(&prospective, tenant_id, bytes, None)?;
         let now = current_unix_secs();
         let grant = Grant {
             id: new_grant_id(),
@@ -669,58 +697,10 @@ impl ReservationAuthority {
         }
         let old_effective = self.config.effective_bytes(live.bytes);
         let new_effective = self.config.effective_bytes(bytes);
-        let charged: u64 = prospective
-            .grants
-            .iter()
-            .filter(|g| g.state.charges_capacity())
-            .map(|g| self.config.effective_bytes(g.bytes))
-            .sum();
-        let free_after = self
-            .config
-            .allocatable_bytes
-            .saturating_sub(charged - old_effective);
-        if new_effective > free_after {
-            return Err(ReservationError::Capacity {
-                pool: self.config.id.clone(),
-                requested: bytes,
-                effective: new_effective,
-                free: free_after,
-            });
-        }
-        if let Some(limit) = self.config.tenant_limit_bytes {
-            let tenant_sum: u64 = prospective
-                .grants
-                .iter()
-                .filter(|g| {
-                    g.state.charges_capacity() && g.tenant_id == tenant_id && g.id != live.id
-                })
-                .map(|g| g.bytes)
-                .sum();
-            let combined =
-                tenant_sum
-                    .checked_add(bytes)
-                    .ok_or_else(|| ReservationError::TenantLimit {
-                        pool: self.config.id.clone(),
-                        tenant: tenant_id.to_string(),
-                        sum: tenant_sum,
-                        requested: bytes,
-                        limit,
-                    })?;
-            if combined > limit {
-                return Err(ReservationError::TenantLimit {
-                    pool: self.config.id.clone(),
-                    tenant: tenant_id.to_string(),
-                    sum: tenant_sum,
-                    requested: bytes,
-                    limit,
-                });
-            }
-        }
-        let grant = prospective
-            .grants
-            .iter_mut()
-            .find(|g| g.id == live.id)
-            .ok_or_else(|| ReservationError::Corrupt("grant vanished in prospect".into()))?;
+        // Credit the grant's own current charge first: shrinking always fits.
+        self.ensure_capacity(&prospective, bytes, new_effective, old_effective)?;
+        self.ensure_tenant_limit(&prospective, tenant_id, bytes, Some(live.id.as_str()))?;
+        let grant = grant_by_id_mut(&mut prospective, &live.id)?;
         grant.bytes = bytes;
         let updated = grant.clone();
         persist_ledger(&self.inner.dir, &prospective).await?;
@@ -756,6 +736,19 @@ fn close_open_interval(
     let target = prospective.grants.iter_mut().find(|g| g.id == grant.id)?;
     target.last_interval_end_unix_secs = now_unix_secs;
     Some(interval)
+}
+
+/// The grant with `id` in `prospective`, mutably — both interval-closing
+/// mutations re-locate by id after building their prospect.
+fn grant_by_id_mut<'a>(
+    ledger: &'a mut Ledger,
+    id: &str,
+) -> Result<&'a mut Grant, ReservationError> {
+    ledger
+        .grants
+        .iter_mut()
+        .find(|g| g.id == id)
+        .ok_or_else(|| ReservationError::Corrupt("grant vanished in prospect".into()))
 }
 
 fn live_grant<'a>(ledger: &'a Ledger, tenant_id: &str, collection_id: &str) -> Option<&'a Grant> {
@@ -947,13 +940,19 @@ impl OwnerToken {
 }
 
 fn linux_start_ticks() -> Option<u64> {
-    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
-    // Field 22 (1-based) sits after the comm field, which is parenthesized
-    // and may itself contain spaces — split after the LAST ')'.
-    let after_comm = stat.rsplit_once(')')?.1;
-    // comm is field 2; state is 3, so start_ticks (22) is the 20th token
-    // after the comm field.
-    after_comm.split_whitespace().nth(19)?.parse().ok()
+    start_ticks_of(&std::fs::read_to_string("/proc/self/stat").ok()?)
+}
+
+/// Field 22 (1-based) sits after the comm field, which is parenthesized and
+/// may itself contain spaces — split after the LAST ')' and take the 20th
+/// token (comm is field 2; state is 3; start_ticks is 22).
+fn start_ticks_of(stat: &str) -> Option<u64> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
 }
 
 /// Liveness of a lock holder. OUR OWN pid is NEVER live here: `open` calls
@@ -975,16 +974,10 @@ fn owner_is_live(held: &OwnerToken) -> bool {
             Ok(stat) => stat,
             Err(_) => return false,
         };
-        let Some((_, after_comm)) = stat.rsplit_once(')') else {
-            return true; // unparseable but the process exists: treat as live
-        };
-        let ticks: Option<u64> = after_comm
-            .split_whitespace()
-            .nth(19)
-            .and_then(|t| t.parse().ok());
-        match (held.start_ticks, ticks) {
+        match (held.start_ticks, start_ticks_of(&stat)) {
             (Some(held_ticks), Some(observed)) => held_ticks == observed,
-            // No comparable ticks: existence is the only signal (fail-closed).
+            // Unparseable stat or no comparable ticks: existence is the only
+            // signal — treat as live (fail-closed).
             _ => true,
         }
     }
@@ -1066,6 +1059,12 @@ async fn persist_ledger(dir: &Path, ledger: &Ledger) -> Result<(), ReservationEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A foreign pid's REAL start ticks (from /proc), for forging live
+    /// holders in lock tests. None if /proc is unreadable (non-Linux).
+    fn foreign_start_ticks(pid: u32) -> Option<u64> {
+        start_ticks_of(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+    }
 
     fn pool(dir: &tempfile::TempDir) -> ReservationPoolConfig {
         ReservationPoolConfig {
@@ -1240,30 +1239,26 @@ mod tests {
     // "the pid lives but the recorded holder doesn't" (pid reuse), which the
     // authority correctly reclaims.
     #[tokio::test]
-    async fn foreign_live_owner_rejected() {
+    async fn foreign_live_owner_rejected_and_pid_reuse_reclaimed() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = pool(&dir);
-        let pid1_ticks = std::fs::read_to_string("/proc/1/stat")
-            .ok()
-            .and_then(|stat| {
-                stat.rsplit_once(')').map(|(_, rest)| {
-                    rest.split_whitespace()
-                        .nth(19)
-                        .and_then(|t| t.parse::<u64>().ok())
-                })
-            })
-            .flatten();
-        let Some(ticks) = pid1_ticks else {
-            // Off-Linux or unreadable /proc: the probe treats any existing
-            // foreign-pid lock as live, so a bare pid token still exercises
-            // the rejection path.
-            panic!("foreign-live-owner test needs /proc/1/stat (Linux CI)");
+        let Some(ticks) = foreign_start_ticks(1) else {
+            panic!("foreign-owner tests need /proc/1/stat (Linux CI)");
         };
+        // REAL ticks: pid 1 is alive and it is the recorded holder → reject.
         tokio::fs::write(owner_lock_path(dir.path()), format!("1:{ticks}"))
             .await
             .unwrap();
-        let err = ReservationAuthority::open(cfg).await.unwrap_err();
+        let err = ReservationAuthority::open(pool(&dir)).await.unwrap_err();
         assert!(err.to_string().contains("exclusively owned"), "{err}");
+        // MISMATCHED ticks: the recorded holder died and pid 1 was reused →
+        // the lock is stale and the next open reclaims it.
+        tokio::fs::write(
+            owner_lock_path(dir.path()),
+            format!("1:{}", ticks.wrapping_add(1)),
+        )
+        .await
+        .unwrap();
+        ReservationAuthority::open(pool(&dir)).await.unwrap();
     }
 
     // Verification round 2 (B1 residual): a LIVE takeover claim slot backs
@@ -1278,17 +1273,8 @@ mod tests {
             .await
             .unwrap();
         // Live claim: pid 1 with its REAL start ticks.
-        let pid1_ticks = std::fs::read_to_string("/proc/1/stat")
-            .ok()
-            .and_then(|stat| {
-                stat.rsplit_once(')').map(|(_, rest)| {
-                    rest.split_whitespace()
-                        .nth(19)
-                        .and_then(|t| t.parse::<u64>().ok())
-                })
-            })
-            .flatten()
-            .expect("claim-slot test needs /proc/1/stat (Linux CI)");
+        let pid1_ticks =
+            foreign_start_ticks(1).expect("claim-slot test needs /proc/1/stat (Linux CI)");
         let claim_path = dir.path().join("owner.claim");
         tokio::fs::write(&claim_path, format!("1:{pid1_ticks}"))
             .await
@@ -1304,33 +1290,6 @@ mod tests {
         assert_eq!(lock, "4194303:999999");
         let claim = tokio::fs::read_to_string(&claim_path).await.unwrap();
         assert_eq!(claim, format!("1:{pid1_ticks}"));
-    }
-
-    // The pid-reuse counterpart: a foreign pid whose recorded ticks do NOT
-    // match the live process's — the recorded holder died and the pid was
-    // reused, so the lock is stale and reclaimable.
-    #[tokio::test]
-    async fn foreign_pid_reuse_with_mismatched_ticks_is_reclaimed() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = pool(&dir);
-        let pid1_ticks = std::fs::read_to_string("/proc/1/stat")
-            .ok()
-            .and_then(|stat| {
-                stat.rsplit_once(')').map(|(_, rest)| {
-                    rest.split_whitespace()
-                        .nth(19)
-                        .and_then(|t| t.parse::<u64>().ok())
-                })
-            })
-            .flatten();
-        let Some(ticks) = pid1_ticks else {
-            panic!("pid-reuse test needs /proc/1/stat (Linux CI)");
-        };
-        let mismatched = ticks.wrapping_add(1);
-        tokio::fs::write(owner_lock_path(dir.path()), format!("1:{mismatched}"))
-            .await
-            .unwrap();
-        ReservationAuthority::open(cfg).await.unwrap();
     }
 
     // A stale lock (dead foreign pid) is taken over by exactly one opener —
