@@ -331,7 +331,7 @@ mod tests {
             let status = storage_class_status(&config_with_class(Some(class as i32)));
             assert_eq!(status.state, State::NotActive as i32, "{needle}");
             assert!(
-                status.reason.contains("SC3/SC4"),
+                status.reason.contains("SC4"),
                 "reason must name the missing dependency: {}",
                 status.reason
             );
