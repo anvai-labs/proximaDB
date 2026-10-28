@@ -1248,3 +1248,284 @@ async fn check_live_delete_gate2() {
     }
     eprintln!("✓ gate 2: the successor's published view keeps the row dead");
 }
+
+/// Gate 3 of the fence contract (race), forced deterministically: the
+/// debug-only competitor hook commits a legitimate no-change successor from
+/// the same parent and flips the layout BEFORE the publisher's CAS — the
+/// state a concurrent publisher that completed first leaves. The publisher's
+/// REAL CAS then fires against the taken slot and must LOSE it (the engine's
+/// AlreadyExists/"moved past" path — the retry's error detection, exercised
+/// for real), and the bounded retry must re-read the new parent, re-map
+/// positions, and still close the fence. The WAL view is asserted directly;
+/// the published view is inferred from the ARTIFACTS (>= 3 metadata versions
+/// — materialize, competitor, final — plus the dv-live Puffin) — no sleeps,
+/// no true concurrency.
+#[test]
+fn live_delete_loses_a_cas_race_and_the_retry_closes_the_fence() {
+    if std::env::var_os("PROXIMADB_LIVE_DEL3_CHILD").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "live_delete_loses_a_cas_race_and_the_retry_closes_the_fence",
+                "--nocapture",
+            ])
+            .env("PROXIMADB_LIVE_DEL3_CHILD", "1")
+            .env("PROXIMADB_LIVE_DELETE_PUBLISHER", "1")
+            .env("PROXIMADB_TEST_FENCE_INJECT_COMPETITOR", "1")
+            .status()
+            .expect("launch isolated gate-3 child");
+        assert!(status.success(), "gate-3 child failed: {status}");
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(check_live_delete_gate3());
+}
+
+async fn check_live_delete_gate3() {
+    let server = TestPgServer::start().await.expect("server start");
+    let client = connect_pg(&server).await;
+
+    let table = "live_del3";
+    client
+        .simple_query(&format!(
+            "CREATE TABLE {table} (k INT PRIMARY KEY, v VARCHAR)"
+        ))
+        .await
+        .expect("create");
+    client
+        .simple_query(&format!(
+            "INSERT INTO {table} (k, v) VALUES (1, 'keep'), (2, 'kill-me')"
+        ))
+        .await
+        .expect("insert");
+    client
+        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
+        .await
+        .expect("materialize");
+    sleep(Duration::from_millis(300)).await;
+
+    client
+        .simple_query(&format!("DELETE FROM {table} WHERE v = 'kill-me'"))
+        .await
+        .expect("delete");
+    sleep(Duration::from_millis(300)).await;
+
+    // The retry path ran: the competitor and the final successor are BOTH
+    // committed after the materialize (>= 3 metadata versions total).
+    assert_live_delete_artifact(&server);
+    let names = warehouse_file_names(&server);
+    assert!(
+        names
+            .iter()
+            .filter(|n| n.ends_with(".metadata.json"))
+            .count()
+            >= 3,
+        "the competitor AND the retried successor committed: {names:?}"
+    );
+
+    let got = sorted_kv_rows(&client, &table).await;
+    assert_eq!(
+        got,
+        vec![(1, "keep".to_string())],
+        "the fence closes across the lost race: the row stays hidden"
+    );
+}
+
+/// Gate 5 of the fence contract (crash-gap): the test fault lands the
+/// successor CAS and skips the layout flip — the state a pod crash between
+/// the two leaves. The wedge must be FAIL-CLOSED (reads refuse rather than
+/// serve wrong data), and a later MATERIALIZE must ADOPT the orphaned
+/// publication (its dv-live Puffin proves it is ours; its tombstones are
+/// durable by the contract's phase ordering) and heal the table.
+#[test]
+fn crash_gap_is_fail_closed_and_materialize_adopts() {
+    if std::env::var_os("PROXIMADB_LIVE_DEL4_CHILD").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "crash_gap_is_fail_closed_and_materialize_adopts",
+                "--nocapture",
+            ])
+            .env("PROXIMADB_LIVE_DEL4_CHILD", "1")
+            .env("PROXIMADB_LIVE_DELETE_PUBLISHER", "1")
+            .env("PROXIMADB_TEST_FENCE_CRASH_BEFORE_FLIP", "1")
+            .status()
+            .expect("launch isolated gate-5 child");
+        assert!(status.success(), "gate-5 child failed: {status}");
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(check_live_delete_gate5());
+}
+
+async fn check_live_delete_gate5() {
+    let server = TestPgServer::start().await.expect("server start");
+    let client = connect_pg(&server).await;
+
+    let table = "live_del4";
+    client
+        .simple_query(&format!(
+            "CREATE TABLE {table} (k INT PRIMARY KEY, v VARCHAR)"
+        ))
+        .await
+        .expect("create");
+    client
+        .simple_query(&format!(
+            "INSERT INTO {table} (k, v) VALUES (1, 'keep'), (2, 'kill-me')"
+        ))
+        .await
+        .expect("insert");
+    client
+        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
+        .await
+        .expect("materialize");
+    sleep(Duration::from_millis(300)).await;
+
+    // The publication lands; the fault skips the flip (the crash window).
+    client
+        .simple_query(&format!("DELETE FROM {table} WHERE v = 'kill-me'"))
+        .await
+        .expect("delete");
+    sleep(Duration::from_millis(300)).await;
+    assert_live_delete_artifact(&server);
+
+    // The wedge is fail-closed: the layout still records the pre-delete
+    // publication, the delta is nonempty (the tombstone), and the base
+    // carries DVs — the OLAP read REFUSES rather than guess.
+    let err = client
+        .simple_query(&format!("SELECT COUNT(*) FROM {table}"))
+        .await
+        .expect_err("the crash-gap wedge must refuse reads");
+    assert!(
+        format!("{err:?}").contains("deletion-vector")
+            || format!("{err:?}").contains("deletion vectors"),
+        "the refusal names the unordered-delta condition: {err:?}"
+    );
+
+    // Recovery: a MATERIALIZE adopts the orphaned publication (the dv-live
+    // Puffin proves it is ours) and heals the table.
+    client
+        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
+        .await
+        .expect("materialize adopts the orphaned publication");
+    sleep(Duration::from_millis(300)).await;
+
+    let got = sorted_kv_rows(&client, &table).await;
+    assert_eq!(
+        got,
+        vec![(1, "keep".to_string())],
+        "adoption heals the wedge and the row stays dead"
+    );
+}
+
+/// Gate 6 of the fence contract (reader guards stand): after a live delete
+/// closes the fence, a subsequent WAL write makes the delta nonempty against
+/// the DV-carrying base — the OLAP read REFUSES (never serves an unordered
+/// delta) until a full publication reconciles. Pins the #2256 guard in the
+/// fence's presence.
+#[test]
+fn unordered_delta_refusal_stands_across_the_fence() {
+    if std::env::var_os("PROXIMADB_LIVE_DEL5_CHILD").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "unordered_delta_refusal_stands_across_the_fence",
+                "--nocapture",
+            ])
+            .env("PROXIMADB_LIVE_DEL5_CHILD", "1")
+            .env("PROXIMADB_LIVE_DELETE_PUBLISHER", "1")
+            .status()
+            .expect("launch isolated gate-6 child");
+        assert!(status.success(), "gate-6 child failed: {status}");
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(check_live_delete_gate6());
+}
+
+async fn check_live_delete_gate6() {
+    let server = TestPgServer::start().await.expect("server start");
+    let client = connect_pg(&server).await;
+
+    let table = "live_del5";
+    client
+        .simple_query(&format!(
+            "CREATE TABLE {table} (k INT PRIMARY KEY, v VARCHAR)"
+        ))
+        .await
+        .expect("create");
+    client
+        .simple_query(&format!(
+            "INSERT INTO {table} (k, v) VALUES (1, 'keep'), (2, 'kill-me')"
+        ))
+        .await
+        .expect("insert");
+    client
+        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
+        .await
+        .expect("materialize");
+    sleep(Duration::from_millis(300)).await;
+
+    client
+        .simple_query(&format!("DELETE FROM {table} WHERE v = 'kill-me'"))
+        .await
+        .expect("delete closes the fence");
+    sleep(Duration::from_millis(300)).await;
+    assert_live_delete_artifact(&server);
+    // Empty delta against the DV base: served bare, the row hidden. The
+    // leg uses an AGGREGATE so the query routes to the DataFusion/OLAP
+    // path (the delta merge) — a plain projection can take the native/WAL
+    // scan, which never consults the DV base.
+    let n = scalar_count(&client, &table).await;
+    assert_eq!(
+        n, 1,
+        "the bare DV base hides the deleted row (delta-merge path)"
+    );
+
+    // A post-fence WAL write makes the delta nonempty: the guard REFUSES.
+    client
+        .simple_query(&format!("INSERT INTO {table} (k, v) VALUES (3, 'later')"))
+        .await
+        .expect("insert");
+    let err = client
+        .simple_query(&format!("SELECT COUNT(*) FROM {table}"))
+        .await
+        .expect_err("a nonempty delta against a DV base must refuse");
+    assert!(
+        format!("{err:?}").contains("deletion-vector")
+            || format!("{err:?}").contains("deletion vectors"),
+        "the refusal names the unordered-delta condition: {err:?}"
+    );
+
+    // The next full publication reconciles and serves the correct state.
+    client
+        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
+        .await
+        .expect("materialize reconciles");
+    sleep(Duration::from_millis(300)).await;
+    let n = scalar_count(&client, &table).await;
+    assert_eq!(n, 2, "reconciliation serves the full correct state");
+}
+
+/// COUNT(*) over pgwire as an i64 — the OLAP-shaped probe gate 6 uses to
+/// force the DataFusion/delta-merge path.
+async fn scalar_count(client: &tokio_postgres::Client, table: &str) -> i64 {
+    let rows = pg_rows(client, table, &["COUNT(*)"]).await;
+    rows.first()
+        .and_then(|r| r.first())
+        .and_then(|v| v.as_deref())
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(-1)
+}

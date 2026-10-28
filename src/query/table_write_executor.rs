@@ -989,7 +989,7 @@ impl TableWriteExecutor for DataFusionTableWriteExecutor {
                         .await
                         .ok()
                         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                        .and_then(|meta| meta.get("current-snapshot-id").and_then(|v| v.as_i64()))
+                        .and_then(|meta| proximadb_iceberg_engine::current_snapshot_id_of(&meta))
                         .unwrap_or(0),
                     None => 0,
                 };

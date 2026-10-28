@@ -151,6 +151,15 @@ pub fn iceberg_fields_of(
     (mapped, format_version)
 }
 
+/// The `current-snapshot-id` of an already-parsed Iceberg TableMetadata
+/// json, the id a successor snapshot must exceed. Shared by every in-repo
+/// publisher (MATERIALIZE, the bulk-append lane, the live delete publisher)
+/// so their id-minting cannot drift (round-5 triage, finding 3). `None`
+/// when the metadata carries no current snapshot (callers treat 0).
+pub fn current_snapshot_id_of(meta: &serde_json::Value) -> Option<i64> {
+    meta.get("current-snapshot-id").and_then(|v| v.as_i64())
+}
+
 /// An [`ObjectStoreBridge`] backed by a [`ProximaObjectStore`] (any `object_store` backend:
 /// local `file://`, `memory://`, or cloud `s3://`/`gs://`/`az://` when the F1 crate's cloud
 /// features are enabled). One bridge serves an entire store/bucket; paths select the object.

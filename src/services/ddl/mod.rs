@@ -680,36 +680,17 @@ impl DdlService {
     /// table-scoped operations; the post-operation check detects displacement
     /// before success/catalog-cache publication.
     async fn check_lease_for_write(&self, tenant: Option<&str>, collection_id: &str) -> Result<()> {
-        use crate::cluster::primary_pod_registry::{
-            WriteRoutingDecision, consult_for_write_leased,
-        };
-        // Inert unless a registry + pod id are wired (the essentials for any
-        // routing decision). The lease manager is optional: present ⇒ lease
-        // acquire/renew; absent ⇒ in-memory registry lookup only.
-        let (registry, pod_id) = match (&self.primary_pod_registry, &self.self_pod_id) {
-            (Some(r), Some(p)) => (r, p),
-            _ => return Ok(()),
-        };
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let decision = consult_for_write_leased(
-            registry,
-            self.partition_lease_manager.as_deref(),
-            pod_id,
-            tenant.unwrap_or("default"),
-            collection_id,
-            now_ms,
+        // The shared write-lease authority (src/services/write_lease.rs): the
+        // same logic the live delete publisher consults before its successor
+        // CAS (the fence contract's gate 4), extracted so DDL and DML cannot
+        // drift on who may publish.
+        crate::services::write_lease::WriteLeaseAuthority::new(
+            self.partition_lease_manager.clone(),
+            self.primary_pod_registry.clone(),
+            self.self_pod_id.clone(),
         )
+        .check("DDL", tenant, collection_id)
         .await
-        .map_err(|e| anyhow!("DDL lease check failed: {e}"))?;
-        match decision {
-            WriteRoutingDecision::Allow => Ok(()),
-            WriteRoutingDecision::Misrouted { target_pod } => Err(anyhow!(
-                "DDL misrouted: write for collection '{collection_id}' must go to pod '{target_pod}'"
-            )),
-        }
     }
 
     /// Execute a DDL statement

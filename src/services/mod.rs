@@ -210,6 +210,7 @@ pub mod spill_placement;
 pub mod storage_format;
 pub mod txn_staging;
 pub mod wal_truncator;
+pub mod write_lease;
 pub mod writer_fence;
 pub use proximadb_scan_cursor::scan_cursor;
 pub mod schema;

@@ -497,6 +497,29 @@ impl PostgresServer {
                 pipeline.function_store,
             );
         }
+        // Fence contract gate 4: attach the publish lease BEFORE the
+        // materializer wiring clones the per-connection DmlService Arc into
+        // DdlTableMaterializer — after that clone escapes, Arc::get_mut
+        // no-ops and the attach silently fails on every connection (round-2
+        // review, MAJOR-1; the with_abac_enforcer ordering rule).
+        if let (Some(manager), Some(registry), Some(pod_id)) = (
+            partition_lease_manager.clone(),
+            primary_pod_registry.clone(),
+            self_pod_id.clone(),
+        ) {
+            // Gated on the manager exactly like with_ddl_lease_manager below:
+            // the SAME authority DDL consults — without the manager DDL stays
+            // inert (its registry/pod fields are only set with a manager), and
+            // fencing DML alone would make the two lanes diverge (round-3
+            // review, MINOR-2).
+            protocol = protocol.with_dml_publish_lease(Arc::new(
+                crate::services::write_lease::WriteLeaseAuthority::new(
+                    Some(manager),
+                    Some(registry),
+                    Some(pod_id),
+                ),
+            ));
+        }
         // Wire the warehouse materializer LAST so it augments the fully-assembled
         // (catalog + rank) DdlService rather than being clobbered by a later rebuild.
         if let Some(warehouse_root_url) = warehouse_root_url {
@@ -507,8 +530,9 @@ impl PostgresServer {
         // gate, legacy behavior) rather than silently misconfigured.
         if let (Some(registry), Some(pod_id)) = (primary_pod_registry, self_pod_id) {
             protocol = protocol.with_primary_pod_gate(registry.clone(), pod_id.clone());
-            if let Some(manager) = partition_lease_manager {
-                protocol = protocol.with_ddl_lease_manager(manager, registry, pod_id);
+            if let Some(manager) = partition_lease_manager.clone() {
+                protocol =
+                    protocol.with_ddl_lease_manager(manager, registry.clone(), pod_id.clone());
             }
         }
         // E0: apply the shared per-IP rate limiter (subject = this peer's IP) so

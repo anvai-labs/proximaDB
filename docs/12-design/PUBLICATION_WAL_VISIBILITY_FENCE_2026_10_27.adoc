@@ -232,6 +232,38 @@ The writer slice picks one and states it; both are conforming.
 6. **The reader guards stand:** the unordered-delta refusal and snapshot cache bypasses
    remain in force and tested.
 
+=== Gate status (2026-10-28, the gates slice)
+
+All six are implemented and pinned by e2e through the real pgwire facade
+(`tests/iceberg_interop_e2e.rs`, publisher armed in isolated children):
+
+1. DONE — `live_delete_publishes_and_both_views_hide_the_row` (artifact
+   assertions prove the publication fired; the external leg is CI-required).
+2. DONE — `live_delete_survives_a_successor_publication` (both the WAL and
+   the published view).
+3. DONE — `live_delete_loses_a_cas_race_and_the_retry_closes_the_fence`. The
+   forcing mechanism is a DETERMINISTIC competitor injection
+   (`PROXIMADB_TEST_FENCE_INJECT_COMPETITOR`), not a lock barrier: the hook
+   commits a legitimate no-change successor from the same parent and flips
+   the layout, so the real CAS loses and the bounded retry re-reads, re-maps,
+   and re-unions against the new parent — the same interleaving the barrier
+   forces, without sleeps or true concurrency.
+4. DONE — the publisher consults the shared `WriteLeaseAuthority` (the same
+   value DDL consults) immediately before every CAS attempt; unit tests pin
+   allow/inert/misrouted at the authority (real displacement cannot be forced
+   single-pod; the seam is the contract's surface).
+5. DONE — `crash_gap_is_fail_closed_and_materialize_adopts`
+   (`PROXIMADB_TEST_FENCE_CRASH_BEFORE_FLIP` skips the flip after the CAS):
+   the wedge refuses reads fail-closed, and the MATERIALIZE guard ADOPTS the
+   orphaned publication — its `dv-live-*` Puffin proves it is ours and the
+   phase ordering proves its tombstones durable — healing the table.
+6. DONE — `unordered_delta_refusal_stands_across_the_fence`: a post-fence
+   WAL write makes the delta nonempty against the DV base and the read
+   refuses until the next full publication reconciles.
+
+The activation flip of `PROXIMADB_LIVE_DELETE_PUBLISHER` remains gated on
+these six plus soak evidence; the knob stays default-OFF.
+
 == Filing
 
 This contract is the design record for the P2 writer pickup's fence requirement

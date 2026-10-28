@@ -114,6 +114,21 @@ static ICEBERG_PUBLISH_FAILURES: std::sync::LazyLock<Option<prometheus::IntCount
         Some(counter)
     });
 
+/// Live-delete publications that refused or failed (the fence gap the
+/// contract's best-effort-with-accounting phase 3 leaves behind: the WAL
+/// delete stands, the published view stays stale until the next full
+/// publication). Same registration posture as the materialize counter.
+static LIVE_DELETE_PUBLISH_FAILURES: std::sync::LazyLock<Option<prometheus::IntCounter>> =
+    std::sync::LazyLock::new(|| {
+        let counter = prometheus::IntCounter::new(
+            "proximadb_warehouse_live_delete_publish_failures_total",
+            "Live-delete deletion-vector publications that failed or refused (fence gaps)",
+        )
+        .ok()?;
+        let _ = prometheus::register(Box::new(counter.clone()));
+        Some(counter)
+    });
+
 /// Placeholder tenant used by warehouse materialization when no `TenantContext`
 /// reaches it. This path does NOT yet enforce tenant isolation (see the note in
 /// [`DmlService::materialize_table_to_parquet`]); the placeholder is named and
@@ -928,6 +943,12 @@ pub struct DmlService {
     /// a store is wired only at the composition root under the `oltp-integrity`
     /// feature, so default builds are behaviorally unchanged.
     conditional_key_store: Option<Arc<dyn proximadb_storage_ports::ConditionalKeyStore>>,
+    /// The write-lease authority the live delete publisher consults
+    /// immediately before its successor CAS (the visibility fence contract's
+    /// phase-3 lease, gate 4: a pod that lost its lease cannot publish).
+    /// `None` (the default) ⇒ no lease check — embedded and single-pod
+    /// deployments, the same posture as DDL's inert wiring.
+    publish_lease: Option<Arc<crate::services::write_lease::WriteLeaseAuthority>>,
     /// FA-c Phase 2: optional ABAC enforcer. When present (behind `abac-policy`)
     /// and a client subject is supplied at a read boundary, relational scans
     /// filter rows by the subject's policy. Absent by default.
@@ -1334,6 +1355,7 @@ impl DmlService {
             table_write_executor,
             dml_lock_service: None,
             conditional_key_store: None,
+            publish_lease: None,
             #[cfg(feature = "abac-policy")]
             abac_enforcer: None,
             held_op_locks: None,
@@ -1359,6 +1381,7 @@ impl DmlService {
             table_write_executor: self.table_write_executor.clone(),
             dml_lock_service: self.dml_lock_service.clone(),
             conditional_key_store: self.conditional_key_store.clone(),
+            publish_lease: self.publish_lease.clone(),
             #[cfg(feature = "abac-policy")]
             abac_enforcer: self.abac_enforcer.clone(),
             held_op_locks: Some(Arc::new(held_op_locks)),
@@ -1585,6 +1608,29 @@ impl DmlService {
     ) -> Self {
         self.conditional_key_store = Some(store);
         self
+    }
+
+    /// Wire the write-lease authority the live delete publisher consults
+    /// before its successor CAS (the fence contract's gate 4). The SAME
+    /// authority value DDL consults, so the publication lanes cannot
+    /// disagree about who may publish.
+    pub fn with_publish_lease(
+        mut self,
+        lease: Arc<crate::services::write_lease::WriteLeaseAuthority>,
+    ) -> Self {
+        self.publish_lease = Some(lease);
+        self
+    }
+
+    /// Mutating setter for the publish lease — pgwire builds a fresh
+    /// per-connection `DmlService` and attaches the authority after
+    /// assembly (mirroring `DdlService::set_write_lease_authority`); the
+    /// connection owns the Arc uniquely, so `Arc::get_mut` applies.
+    pub fn set_publish_lease(
+        &mut self,
+        lease: Arc<crate::services::write_lease::WriteLeaseAuthority>,
+    ) {
+        self.publish_lease = Some(lease);
     }
 
     /// TD-DML-3: the fenced-store identity of a primary-key tuple, scoped by
@@ -2880,10 +2926,10 @@ impl DmlService {
         // externally, or a publication whose layout flip did not land)
         // leaves the recorded pair stale, and the refusal stands.
         if let Some(version) = parent
-            && bridge
+            && let parent_snapshot = bridge
                 .read_iceberg_snapshot_files(&metadata_prefix, version)
                 .await?
-                .has_deletions()
+            && !parent_snapshot.deletion_vectors.is_empty()
         {
             let recorded = catalog
                 .get_table(&table_id)
@@ -2893,13 +2939,58 @@ impl DmlService {
             let synchronized = recorded.is_some_and(|(recorded_version, recorded_lsn)| {
                 recorded_version == version && snapshot_lsn >= recorded_lsn
             });
+            // Gate 5 (crash-gap recovery — the contract's "recovery is the
+            // LAYOUT FLIP, not a re-publication"): a publication whose CAS
+            // landed but whose flip was lost leaves the recorded pair one
+            // version behind and every later publication refusing forever.
+            // The adoption invariant (round-1 review, finding 4 — the
+            // stem is a MINTER proof, not a publication-identity proof): a
+            // `dv-live-*` Puffin is minted ONLY by this publisher's
+            // `write_deletion_vectors` call, and every vector it holds was
+            // published under the contract's phase ordering — phase 2 (the
+            // WAL tombstones) durable BEFORE the CAS that named it. A
+            // snapshot REFERENCE to such a Puffin can be acquired later
+            // (MATERIALIZE's append path re-carries DV manifests by
+            // reference; an external conformant engine could too), but the
+            // referenced vectors' deaths are WAL-durable regardless — so a
+            // rewrite captured now scans them dead in native state and
+            // adoption cannot resurrect. An external parent carrying ONLY
+            // its own (non-dv-live) vectors keeps the refusal.
+            // Round-3 review (MAJOR-1): the predicate is ALL, not ANY — a
+            // MIXED parent (our dv-live vector re-referenced beside a
+            // foreign engine's own positional deletes) must keep the
+            // refusal: the foreign deletes have no WAL tombstones, so the
+            // adoption rewrite would resurrect them. Every legitimate
+            // adoption case carries ONLY dv-live vectors (this publisher's
+            // own snapshots mint exactly one unioned Puffin; the gate-3
+            // competitor and DV-manifest re-carries reference dv-live
+            // entries only).
+            let ours_orphaned = parent_snapshot
+                .deletion_vectors
+                .iter()
+                .all(|dv| dv.puffin_file.as_ref().contains("dv-live-"));
+            // The version-matched case (recorded == parent, captured LSN
+            // below the recorded one — the same store-global inflight floor
+            // can lower THIS capture) is adoption-safe by the identical
+            // argument: the parent is ours, its tombstones are durable.
+            let ours_recorded =
+                recorded.is_some_and(|(recorded_version, _)| recorded_version == version);
             if !synchronized {
-                anyhow::bail!(
-                    "MATERIALIZE {table_name}: published snapshot has deletion vectors and \
-                     the native state is not synchronized with them (the DV parent is not \
-                     the recorded publication, or the captured LSN {snapshot_lsn} predates \
-                     its snapshot_lsn); native-state synchronization is required before \
-                     republication"
+                if !(ours_orphaned || ours_recorded) {
+                    anyhow::bail!(
+                        "MATERIALIZE {table_name}: published snapshot has deletion vectors \
+                         and the native state is not synchronized with them (the DV parent \
+                         is not the recorded publication, or the captured LSN {snapshot_lsn} \
+                         predates its snapshot_lsn); native-state synchronization is \
+                         required before republication"
+                    );
+                }
+                info!(
+                    table = %table_name,
+                    parent_version = version,
+                    "MATERIALIZE: adopting the orphaned live-delete publication (its layout \
+                     flip was lost; its tombstones are durable by the fence's phase \
+                     ordering)"
                 );
             }
         }
@@ -3125,6 +3216,29 @@ impl DmlService {
                 None => Vec::new(),
             }
         };
+        // Round-5 triage (finding 5): the snapshot id must advance past the
+        // parent's CURRENT SNAPSHOT id, not just the clock — a live-delete
+        // publication in the same millisecond would otherwise fail the
+        // engine's advancement check once (client-retryable, but avoidable).
+        // Unparseable parent metadata reads as 0 and the engine's own
+        // advancement check remains the backstop.
+        let parent_snap_id = match parent {
+            Some(version) => bridge
+                .read_table_metadata(&metadata_prefix, version)
+                .await
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|meta| proximadb_iceberg_engine::current_snapshot_id_of(&meta))
+                .unwrap_or_else(|| {
+                    tracing::debug!(
+                        "MATERIALIZE: the parent snapshot id was unreadable; minting from \
+                         the clock (the engine's advancement check backstops)"
+                    );
+                    0
+                }),
+            None => 0,
+        };
+        let snapshot_id = now_ms.max(parent_snap_id.saturating_add(1));
         let committed = if carried_deletes.is_empty() {
             bridge
                 .publish_iceberg_files(
@@ -3134,7 +3248,7 @@ impl DmlService {
                     &table_uuid,
                     &table_root,
                     &iceberg_fields,
-                    now_ms, // snapshot id (unique per materialize)
+                    snapshot_id,
                     now_ms, // timestamp ms
                     proximadb_storage_common::object_store_bridge::iceberg_publishes_v3(
                         &iceberg_fields,
@@ -3152,7 +3266,7 @@ impl DmlService {
                     &table_uuid,
                     &table_root,
                     &iceberg_fields,
-                    now_ms,
+                    snapshot_id,
                     now_ms,
                 )
                 .await
@@ -5255,7 +5369,7 @@ impl DmlService {
         table_name: &str,
         deleted_oids: &[String],
         tenant_id: Option<&str>,
-        max_tombstone_lsn: u64,
+        max_tombstone_lsn: Option<u64>,
     ) {
         if deleted_oids.is_empty() || !Self::live_delete_publisher_enabled() {
             return;
@@ -5266,6 +5380,9 @@ impl DmlService {
         match result {
             Ok(()) => {}
             Err(e) => {
+                if let Some(counter) = LIVE_DELETE_PUBLISH_FAILURES.as_ref() {
+                    counter.inc();
+                }
                 warn!(
                     table = %table_name,
                     "live-delete publication refused (the WAL delete stands; the fence gap stays open until the next publication): {e:#}"
@@ -5279,7 +5396,7 @@ impl DmlService {
         table_name: &str,
         deleted_oids: &[String],
         tenant_id: Option<&str>,
-        max_tombstone_lsn: u64,
+        max_tombstone_lsn: Option<u64>,
     ) -> anyhow::Result<()> {
         use crate::query::execution::olap_delta_merge::OlapDeltaSource as _;
         use proximadb_iceberg_engine::IcebergObjectStoreBridge;
@@ -5338,6 +5455,21 @@ impl DmlService {
         // alternative; both bounds are at or below the WAL head, and the
         // completeness precondition below keeps the base a complete state
         // at the max of them.
+        // Round-5 triage (finding 1): a missing max-LSN binding must REFUSE,
+        // not silently degrade the clamp — `unwrap_or(0)` would re-open the
+        // round-4 harm (recording below the tombstones) whenever the
+        // appender skipped the LSN association (count mismatch) or a store
+        // forgets to bind it. Unreachable on the production wiring (the
+        // WAL-backed store always binds; count mismatches poison the store),
+        // but the refusal is cheap and the failure mode it prevents is the
+        // worst class.
+        let max_tombstone_lsn = max_tombstone_lsn.ok_or_else(|| {
+            anyhow!(
+                "live delete: the tombstone batch reported no LSN binding; cannot \
+                 prove a fence LSN at or above the published tombstones; leaving \
+                 the fence gap open"
+            )
+        })?;
         let fence_lsn = self
             .record_store
             .capture_snapshot_lsn(table_name)
@@ -5474,76 +5606,19 @@ impl DmlService {
             if mapping.per_file.is_empty() {
                 return Ok(()); // never-published oids only: WAL-only rows
             }
-
-            // Per-file DV UNION (guarantee 1): the parent's vectors plus
-            // this delete's positions, and the parent's vectors re-carried
-            // untouched — a writer publishing only its own positions
-            // resurrects every previously deleted row.
-            let mut all_entries: Vec<(object_store::path::Path, PositionDeletes)> = Vec::new();
-            for file_positions in &mapping.per_file {
-                let mut positions = PositionDeletes::new();
-                for p in &file_positions.positions {
-                    positions.insert(*p as u64);
-                }
-                for parent_dv in &snapshot.deletion_vectors {
-                    if parent_dv.data_file == file_positions.file {
-                        let decoded = bridge
-                            .read_deletion_vector(parent_dv)
-                            .await
-                            .map_err(|e| anyhow!("live delete: decoding a parent vector: {e}"))?;
-                        for p in decoded.positions() {
-                            positions.insert(p);
-                        }
-                    }
-                }
-                all_entries.push((file_positions.file.clone(), positions));
-            }
-            let touched: std::collections::HashSet<_> =
-                mapping.per_file.iter().map(|m| m.file.clone()).collect();
-            for parent_dv in &snapshot.deletion_vectors {
-                if !touched.contains(&parent_dv.data_file) {
-                    let decoded = bridge
-                        .read_deletion_vector(parent_dv)
-                        .await
-                        .map_err(|e| anyhow!("live delete: decoding a parent vector: {e}"))?;
-                    all_entries.push((parent_dv.data_file.clone(), decoded));
-                }
-            }
-            let borrowed: Vec<(object_store::path::Path, &PositionDeletes)> =
-                all_entries.iter().map(|(f, d)| (f.clone(), d)).collect();
-            // The snapshot id shares MATERIALIZE's millisecond scale — the
-            // engine requires a successor id to EXCEED its parent's, and a
-            // nanosecond-scale id would starve every later MATERIALIZE of a
-            // valid id — bumped past the parent snapshot when the clock does
-            // not move, so two publications in one millisecond stay
-            // monotone. The Puffin key keeps nanoseconds: object keys carry
-            // no ordering constraint, only uniqueness, and ns keeps
-            // same-millisecond deletes from silently sharing a file.
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or_default();
-            let now_ns = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or_default();
-            let parent_snap_id = parent_meta
-                .get("current-snapshot-id")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let snapshot_id = now_ms.max(parent_snap_id.saturating_add(1));
-            let puffin_key =
-                object_store::path::Path::from(format!("data/dv-live-{now_ns}.puffin"));
-            let metas = bridge
-                .write_deletion_vectors(&puffin_key, &borrowed)
-                .await
-                .map_err(|e| anyhow!("live delete: writing the vectors: {e}"))?;
-
+            // Round-5 triage (finding 4) placed this guard before the
+            // position mapping; round-2 review (MINOR-3) moved it AFTER the
+            // never-published early return — a WAL-only delete on a drifted
+            // table must stay a benign no-op, not a counted fence gap. It
+            // still precedes the Puffin write, so a drifted table never
+            // orphans a Puffin; it does pay the O(published oid bytes)
+            // mapping once per refused delete — correctness of the gap
+            // accounting over the micro-cost.
             let view_fields =
                 proximadb_storage_common::object_store_bridge::iceberg_snapshot_fields(
                     &table.to_arrow_schema(),
                 );
-            // Review round 3 (finding 3): the successor carries the PARENT's
+            // Review round 3 (finding 3), hoisted: the successor carries the PARENT's
             // files but derives its schema from the CURRENT catalog schema —
             // field ids are positional, so a post-publication ALTER
             // (DROP/ADD COLUMN) renumbers every following id and external
@@ -5584,6 +5659,162 @@ impl DmlService {
             }
             let (engine_fields, _) =
                 proximadb_iceberg_engine::iceberg_fields_of(&view_fields, false);
+
+            // Gate 3's forcing hook (test-only, deterministic): on the first
+            // attempt, commit a LEGITIMATE no-change successor from this
+            // parent (the same files, the parent's vectors re-carried) and
+            // record its layout flip — exactly the state a concurrent
+            // publisher that completed first leaves behind. `continue` re-
+            // enters the loop; the real CAS then loses the successor slot to
+            // the injected competitor and the bounded retry exercises the
+            // re-read/re-map/re-union path for real (no race, no sleeps).
+            if _attempt == 0
+                && cfg!(debug_assertions)
+                && std::env::var_os("PROXIMADB_TEST_FENCE_INJECT_COMPETITOR")
+                    .is_some_and(|v| v == "1")
+            {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or_default();
+                let competitor_id = now_ms.max(
+                    proximadb_iceberg_engine::current_snapshot_id_of(&parent_meta).unwrap_or(0) + 1,
+                );
+                // Re-carry the parent's vectors in their MANIFEST form
+                // (IcebergSnapshotDeletion — what the deleting publish takes),
+                // not the decoded form the union below uses.
+                let parent_manifest = bridge
+                    .read_iceberg_snapshot_files(&metadata_prefix, parent)
+                    .await
+                    .map_err(|e| anyhow!("live delete: FENCE TEST competitor parent read: {e}"))?;
+                let competitor_version = bridge
+                    .publish_iceberg_files_deleting(
+                        &files,
+                        &parent_manifest.deletion_vectors,
+                        Some(parent),
+                        &metadata_prefix,
+                        &parent_uuid,
+                        &parent_location,
+                        &view_fields,
+                        competitor_id,
+                        now_ms,
+                    )
+                    .await
+                    .map_err(|e| anyhow!("live delete: FENCE TEST competitor injection: {e:#}"))?;
+                // Round-2 review (MINOR-2): the competitor is a complete
+                // state only at the PARENT's recorded LSN — the state a real
+                // winning publisher leaves. Recording a fresh capture here
+                // would claim completeness ABOVE the delete's tombstones
+                // while the killed rows are live-and-un-DV'd in the
+                // competitor: an orderable-looking wrong state until the
+                // retry lands.
+                let hook_lsn = recorded_lsn;
+                let mut layouts = catalog
+                    .get_table(&table_id)
+                    .await
+                    .map_err(|e| anyhow!("live delete: FENCE TEST competitor layout read: {e}"))?
+                    .storage_layouts;
+                if let Some(l) = layouts.iter_mut().find(|l| l.name == "parquet-snapshot") {
+                    l.properties.insert(
+                        materialize_stream::METADATA_VERSION_PROPERTY.to_string(),
+                        competitor_version.to_string(),
+                    );
+                    l.properties
+                        .insert("snapshot_lsn".to_string(), hook_lsn.to_string());
+                    catalog
+                        .set_storage_layouts(&table_id, layouts)
+                        .await
+                        .map_err(|e| {
+                            anyhow!("live delete: FENCE TEST competitor layout flip: {e}")
+                        })?;
+                }
+                // Fall through WITHOUT re-reading: the attempt's stale
+                // parent makes the REAL CAS below fire against the slot the
+                // competitor took — the engine's AlreadyExists("moved past")
+                // path the retry's error detection matches on, exercised for
+                // real (round-1 review, finding 3: a `continue` here would
+                // test only the re-read mechanics, never the loss branch).
+                warn!(
+                    table = %table_name,
+                    competitor_version,
+                    "FENCE TEST: injected a competing successor; the real CAS below must \
+                     LOSE the slot and the bounded retry must re-map from the new parent"
+                );
+            }
+
+            // Per-file DV UNION (guarantee 1): the parent's vectors plus
+            // this delete's positions, and the parent's vectors re-carried
+            // untouched — a writer publishing only its own positions
+            // resurrects every previously deleted row.
+            let mut all_entries: Vec<(object_store::path::Path, PositionDeletes)> = Vec::new();
+            for file_positions in &mapping.per_file {
+                let mut positions = PositionDeletes::new();
+                for p in &file_positions.positions {
+                    positions.insert(*p as u64);
+                }
+                for parent_dv in &snapshot.deletion_vectors {
+                    if parent_dv.data_file == file_positions.file {
+                        let decoded = bridge
+                            .read_deletion_vector(parent_dv)
+                            .await
+                            .map_err(|e| anyhow!("live delete: decoding a parent vector: {e}"))?;
+                        for p in decoded.positions() {
+                            positions.insert(p);
+                        }
+                    }
+                }
+                all_entries.push((file_positions.file.clone(), positions));
+            }
+            let touched: std::collections::HashSet<_> =
+                mapping.per_file.iter().map(|m| m.file.clone()).collect();
+            for parent_dv in &snapshot.deletion_vectors {
+                if !touched.contains(&parent_dv.data_file) {
+                    let decoded = bridge
+                        .read_deletion_vector(parent_dv)
+                        .await
+                        .map_err(|e| anyhow!("live delete: decoding a parent vector: {e}"))?;
+                    all_entries.push((parent_dv.data_file.clone(), decoded));
+                }
+            }
+            // Gate 4 (the fence contract's phase-3 lease): checked immediately
+            // before the CAS, per attempt — a pod that lost its lease between
+            // attempts cannot publish the retried successor either. A refusal
+            // is a fence gap (warned + counted by the wrapper), never a
+            // delete error.
+            if let Some(lease) = &self.publish_lease {
+                lease
+                    .check("live delete", tenant_id, table_name)
+                    .await
+                    .map_err(|e| anyhow!("live delete: the publish lease refused: {e:#}"))?;
+            }
+            let borrowed: Vec<(object_store::path::Path, &PositionDeletes)> =
+                all_entries.iter().map(|(f, d)| (f.clone(), d)).collect();
+            // The snapshot id shares MATERIALIZE's millisecond scale — the
+            // engine requires a successor id to EXCEED its parent's, and a
+            // nanosecond-scale id would starve every later MATERIALIZE of a
+            // valid id — bumped past the parent snapshot when the clock does
+            // not move, so two publications in one millisecond stay
+            // monotone. The Puffin key keeps nanoseconds: object keys carry
+            // no ordering constraint, only uniqueness, and ns keeps
+            // same-millisecond deletes from silently sharing a file.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or_default();
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or_default();
+            let parent_snap_id =
+                proximadb_iceberg_engine::current_snapshot_id_of(&parent_meta).unwrap_or(0);
+            let snapshot_id = now_ms.max(parent_snap_id.saturating_add(1));
+            let puffin_key =
+                object_store::path::Path::from(format!("data/dv-live-{now_ns}.puffin"));
+            let metas = bridge
+                .write_deletion_vectors(&puffin_key, &borrowed)
+                .await
+                .map_err(|e| anyhow!("live delete: writing the vectors: {e}"))?;
+
             match bridge
                 .publish_iceberg_files_with_deletes(
                     &files,
@@ -5599,6 +5830,24 @@ impl DmlService {
                 .await
             {
                 Ok(version) => {
+                    // Gate 5's fault point (test-only, the crash matrix's
+                    // CAS-landed/flip-lost window): armed, the publication
+                    // stands and the layout flip is SKIPPED — the state a pod
+                    // crash between the two leaves. Recovery is the guard's
+                    // orphan adoption above (a later MATERIALIZE re-records);
+                    // reads stay correct through the metadata log.
+                    if cfg!(debug_assertions)
+                        && std::env::var_os("PROXIMADB_TEST_FENCE_CRASH_BEFORE_FLIP")
+                            .is_some_and(|v| v == "1")
+                    {
+                        warn!(
+                            table = %table_name,
+                            version,
+                            "FENCE TEST FAULT: skipping the layout flip after the successor \
+                             CAS (crash-gap simulation)"
+                        );
+                        return Ok(());
+                    }
                     // The contract's recorded snapshot_lsn (load-bearing): a
                     // value at or above every published tombstone, flipped
                     // into the layout forward-only like MATERIALIZE's. The
@@ -5622,6 +5871,9 @@ impl DmlService {
                                 .and_then(|v| v.parse::<u64>().ok())
                                 .unwrap_or(0);
                             if version < recorded_version {
+                                if let Some(counter) = LIVE_DELETE_PUBLISH_FAILURES.as_ref() {
+                                    counter.inc();
+                                }
                                 warn!(
                                     table = %table_name,
                                     version,
@@ -5651,6 +5903,9 @@ impl DmlService {
                             }
                         }
                         None => {
+                            if let Some(counter) = LIVE_DELETE_PUBLISH_FAILURES.as_ref() {
+                                counter.inc();
+                            }
                             // The layout vanished between the publication and
                             // the flip (review finding 7): never claim the
                             // fence closed. The publication stands; the gap
@@ -5862,12 +6117,11 @@ impl DmlService {
         // deletion-vector successor (best-effort; the WAL write above is the
         // authority and already stands). Default OFF.
         let deleted_oids: Vec<String> = ids_to_delete.to_vec();
-        let max_tombstone_lsn = batch_result.max_lsn.unwrap_or(0);
         self.publish_live_deletes(
             table_name,
             &deleted_oids,
             tenant_context.map(|t| t.tenant_id.as_str()),
-            max_tombstone_lsn,
+            batch_result.max_lsn,
         )
         .await;
 
