@@ -80,6 +80,92 @@ impl MeteringRecord {
     }
 }
 
+/// Record kind discriminant for TD-TIER-1 SC3 reservation usage.
+pub const RESERVATION_USAGE_KIND: &str = "tier1_reservation_usage";
+
+/// One durable reservation-usage interval (TD-TIER-1 SC3) — the additive
+/// second meter kind beside the KSU snapshot.
+///
+/// The record carries the reserved-byte *level* held across
+/// `[interval_start, interval_end]`; the control plane integrates successive
+/// intervals into byte-seconds, exactly as it does for KSU snapshots. Dedup
+/// identity is `(tenant_id, pool_id, producer_epoch, sequence)` — it is
+/// embedded in the object key, so a replayed emission (crash between the
+/// authority's ledger checkpoint and this sink) overwrites the same object
+/// rather than double-charging. A `producer_epoch` jump between consecutive
+/// records for a grant marks an unobserved crash gap: do not fabricate usage
+/// across it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReservationUsageRecord {
+    pub schema_version: u32,
+    pub kind: String,
+    pub tenant_id: String,
+    /// Owning pool identity (stable operator-declared id).
+    pub pool_id: String,
+    /// The grant the interval accrues for (audit linkage).
+    pub grant_id: String,
+    /// Reserved bytes held throughout the interval (the level, not the
+    /// integral).
+    pub reserved_bytes: u64,
+    pub unit: String,
+    pub interval_start_unix_secs: i64,
+    pub interval_end_unix_secs: i64,
+    /// Bumped on every authority reopen; dedup key + crash-gap marker.
+    pub producer_epoch: u64,
+    /// Monotonic within an epoch; dedup key.
+    pub sequence: u64,
+}
+
+impl ReservationUsageRecord {
+    /// Build a record from one authority-emitted interval.
+    pub fn from_interval(
+        interval: &crate::services::collection::reservation::ReservationUsageInterval,
+    ) -> Self {
+        Self {
+            schema_version: METERING_RECORD_SCHEMA_VERSION,
+            kind: RESERVATION_USAGE_KIND.to_string(),
+            tenant_id: interval.tenant_id.clone(),
+            pool_id: interval.pool_id.clone(),
+            grant_id: interval.grant_id.clone(),
+            reserved_bytes: interval.reserved_bytes,
+            unit: "bytes".to_string(),
+            interval_start_unix_secs: interval.interval_start_unix_secs,
+            interval_end_unix_secs: interval.interval_end_unix_secs,
+            producer_epoch: interval.producer_epoch,
+            sequence: interval.sequence,
+        }
+    }
+}
+
+/// Resolve the durable object URL for one reservation-usage record. The dedup
+/// identity `(epoch, sequence)` lives in the key, so replay overwrites:
+/// `…/_metering/reservations/{pool}/usage-{epoch}-{sequence}.json`. The pool
+/// id enters the object key, so it carries the same charset discipline as the
+/// tenant id — a traversal pool id is rejected here, structurally, before any
+/// write (review S1; the config validator rejects it first, this is the
+/// last-line guard for every caller).
+pub fn reservation_usage_object_url(
+    base_url: &str,
+    account_id: Option<&str>,
+    tenant_id: &str,
+    pool_id: &str,
+    producer_epoch: u64,
+    sequence: u64,
+) -> anyhow::Result<String> {
+    if !crate::services::collection::reservation::valid_pool_id(pool_id) {
+        anyhow::bail!(
+            "invalid reservation pool id '{pool_id}': must be 1-64 chars of [A-Za-z0-9_-]"
+        );
+    }
+    let resolved = DrPathBuilder::build_tenant_system(account_id, tenant_id)
+        .map_err(|e| anyhow::anyhow!("invalid tenant id for metering path: {e}"))?;
+    let prefix = resolved.metering_subprefix();
+    let base = base_url.trim_end_matches('/');
+    Ok(format!(
+        "{base}/{prefix}reservations/{pool_id}/usage-{producer_epoch}-{sequence}.json"
+    ))
+}
+
 /// Resolve the durable object URL for one tenant's KSU storage snapshot.
 ///
 /// `base_url` is the configured storage root (e.g. `file:///…/data` or
@@ -182,6 +268,38 @@ impl DurableMeteringWriter {
             .map_err(|e| anyhow::anyhow!("write metering record to {url}: {e}"))?;
         Ok(())
     }
+
+    /// Persist one reservation-usage interval (TD-TIER-1 SC3) under the same
+    /// per-tenant `_metering/` isolation subtree, keyed for idempotent replay
+    /// (dedup identity `(epoch, sequence)` in the object key). Unlike the KSU
+    /// snapshot sweep this surfaces per-record errors: reservation billing
+    /// correctness must not silently drop intervals.
+    pub async fn write_reservation_usage(
+        &self,
+        record: &ReservationUsageRecord,
+        account_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let url = reservation_usage_object_url(
+            &self.base_url,
+            account_id,
+            &record.tenant_id,
+            &record.pool_id,
+            record.producer_epoch,
+            record.sequence,
+        )?;
+        let bytes = serde_json::to_vec(record)
+            .map_err(|e| anyhow::anyhow!("serialize reservation usage record: {e}"))?;
+        let options = FileOptions {
+            overwrite: true,
+            create_dirs: true,
+            ..Default::default()
+        };
+        self.factory
+            .write(&url, &bytes, Some(options))
+            .await
+            .map_err(|e| anyhow::anyhow!("write reservation usage to {url}: {e}"))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -282,5 +400,74 @@ mod tests {
 
         // The key lands under the per-tenant `_metering/` isolation subtree.
         assert!(url.contains("/data/tenant_a/_metering/storage/"));
+    }
+
+    // ---- TD-TIER-1 SC3: reservation usage records ----
+
+    fn interval(
+        epoch: u64,
+        sequence: u64,
+    ) -> crate::services::collection::reservation::ReservationUsageInterval {
+        crate::services::collection::reservation::ReservationUsageInterval {
+            tenant_id: "tenant_a".to_string(),
+            pool_id: "nvme-1".to_string(),
+            grant_id: "g1".to_string(),
+            reserved_bytes: 4096,
+            interval_start_unix_secs: 1000,
+            interval_end_unix_secs: 2000,
+            producer_epoch: epoch,
+            sequence,
+        }
+    }
+
+    #[test]
+    fn reservation_record_round_trips_with_dedup_identity() {
+        let rec = ReservationUsageRecord::from_interval(&interval(3, 7));
+        assert_eq!(rec.kind, RESERVATION_USAGE_KIND);
+        assert_eq!(rec.schema_version, METERING_RECORD_SCHEMA_VERSION);
+        let json = serde_json::to_vec(&rec).unwrap();
+        let back: ReservationUsageRecord = serde_json::from_slice(&json).unwrap();
+        assert_eq!(rec, back);
+    }
+
+    #[test]
+    fn reservation_url_embeds_dedup_identity() {
+        let url =
+            reservation_usage_object_url("file:///srv/data", None, "t1", "nvme-1", 3, 7).unwrap();
+        assert_eq!(
+            url,
+            "file:///srv/data/data/t1/_metering/reservations/nvme-1/usage-3-7.json"
+        );
+        // Fail-closed on traversal TENANT and POOL ids alike — both enter the
+        // object key (review S1).
+        assert!(reservation_usage_object_url("file:///srv/data", None, "../x", "p", 1, 1).is_err());
+        assert!(
+            reservation_usage_object_url("file:///srv/data", None, "t1", "../../other", 1, 1)
+                .is_err()
+        );
+        assert!(reservation_usage_object_url("file:///srv/data", None, "t1", "a/b", 1, 1).is_err());
+    }
+
+    /// A replayed emission (same epoch + sequence) overwrites the SAME object
+    /// key — the overwrite-not-double-charge contract.
+    #[tokio::test]
+    async fn replayed_reservation_usage_overwrites_same_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = format!("file://{}", dir.path().display());
+        let factory = Arc::new(FilesystemFactory::create_default().await.unwrap());
+        let writer = DurableMeteringWriter::new(factory.clone(), base.clone());
+
+        let rec = ReservationUsageRecord::from_interval(&interval(2, 5));
+        writer.write_reservation_usage(&rec, None).await.unwrap();
+        // Replay: same identity, perhaps after a crash between ledger persist
+        // and sink — must land on the same key.
+        writer.write_reservation_usage(&rec, None).await.unwrap();
+
+        let url = reservation_usage_object_url(&base, None, "tenant_a", "nvme-1", 2, 5).unwrap();
+        let bytes = factory.read(&url).await.unwrap();
+        let back: ReservationUsageRecord = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.reserved_bytes, 4096);
+        assert_eq!(back.producer_epoch, 2);
+        assert_eq!(back.sequence, 5);
     }
 }

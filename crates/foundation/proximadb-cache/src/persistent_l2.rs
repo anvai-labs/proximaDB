@@ -11,7 +11,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crc32fast::Hasher as Crc32;
 use dashmap::DashMap;
@@ -61,6 +61,16 @@ struct EntryMeta {
     value_crc: u32,
     chunk_crcs: Arc<[u32]>,
     class: L2Class,
+    /// TD-TIER-1 SC3: residency pin, orthogonal to [`L2Class`]. `L2Class` is
+    /// the *eviction order* under ordinary pressure; `protected` removes the
+    /// entry from the ordinary-pressure victim set entirely and charges its
+    /// bytes against [`StoreInner::reserved_budget`]. Explicit invalidation
+    /// (`remove`/`remove_where`) still removes protected entries — pins
+    /// protect immutable bytes, never visibility (SC-TE6). Runtime state only:
+    /// intentionally NOT persisted in the entry file; the index rebuild drops
+    /// protection and SC4's coverage reconciliation re-derives it from the
+    /// grant ledger.
+    protected: AtomicBool,
     touch: AtomicU64,
 }
 
@@ -70,6 +80,11 @@ struct StoreInner {
     max_bytes: u64,
     resident_bytes: AtomicU64,
     class_resident_bytes: [AtomicU64; 2],
+    /// TD-TIER-1 SC3: byte ceiling for protected entries. `0` (the default)
+    /// makes every `protect` fail closed — the protection seam is inert until
+    /// the reservation authority arms it (SC3-2 wiring).
+    reserved_budget: AtomicU64,
+    protected_bytes: AtomicU64,
     clock: AtomicU64,
     entries: DashMap<String, Arc<EntryMeta>>,
     mutation: tokio::sync::Mutex<()>,
@@ -99,6 +114,8 @@ impl PersistentByteStore {
             max_bytes,
             resident_bytes: AtomicU64::new(0),
             class_resident_bytes: [AtomicU64::new(0), AtomicU64::new(0)],
+            reserved_budget: AtomicU64::new(0),
+            protected_bytes: AtomicU64::new(0),
             clock: AtomicU64::new(1),
             entries: DashMap::new(),
             mutation: tokio::sync::Mutex::new(()),
@@ -116,6 +133,115 @@ impl PersistentByteStore {
 
     pub fn resident_bytes_for(&self, class: L2Class) -> u64 {
         self.inner.class_resident_bytes[class as usize].load(Ordering::Relaxed)
+    }
+
+    /// Arm the protection budget (TD-TIER-1 SC3). The reservation authority
+    /// sets this to its admitted grant bytes; `0` — the default — keeps the
+    /// protection seam inert (every [`Self::protect`] fails closed). Shrinking
+    /// below the current protected total does not evict: existing pins stand,
+    /// and new protects fail until headroom exists.
+    pub fn set_reserved_budget(&self, bytes: u64) {
+        self.inner.reserved_budget.store(bytes, Ordering::Release);
+    }
+
+    /// The armed protection budget.
+    pub fn reserved_budget(&self) -> u64 {
+        self.inner.reserved_budget.load(Ordering::Acquire)
+    }
+
+    /// Bytes currently held by protected entries.
+    pub fn protected_bytes(&self) -> u64 {
+        self.inner.protected_bytes.load(Ordering::Acquire)
+    }
+
+    /// Pin one entry against ordinary eviction pressure (SC-TE4).
+    ///
+    /// Fails closed when pinning would exceed the armed budget: an oversize
+    /// pin is rejected at admission, never silently dropped later. Returns
+    /// `Ok(false)` when the key is not indexed (nothing to pin), `Ok(true)`
+    /// when pinned (including an already-protected idempotent re-pin). The
+    /// pin is advisory against *pressure* only — explicit invalidation via
+    /// [`Self::remove`] / [`Self::remove_where`] still applies (SC-TE6).
+    ///
+    /// Serialized on the mutation mutex (review B5): protect is admission-
+    /// cadence, not query-path, and lock-free check-then-act measurably
+    /// double-charged `protected_bytes` under concurrent same-key protects —
+    /// a phantom that no API could refund. The CAS loop remains as belt-and-
+    /// braces against the lock-free `remove` path, with a refund if the entry
+    /// vanishes mid-pin.
+    pub async fn protect(&self, key: &str) -> std::io::Result<bool> {
+        let _guard = self.inner.mutation.lock().await;
+        let Some(meta) = self.inner.entries.get(key).map(|entry| entry.clone()) else {
+            return Ok(false);
+        };
+        if meta.protected.load(Ordering::Acquire) {
+            return Ok(true);
+        }
+        // Claim file_len against the budget atomically.
+        let mut current = self.inner.protected_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(meta.file_len) else {
+                return Err(budget_error("protected-bytes overflow"));
+            };
+            if next > self.inner.reserved_budget.load(Ordering::Acquire) {
+                return Err(budget_error(&format!(
+                    "protecting key of {} bytes exceeds the reserved budget {} \
+                     (already protected: {}); raise the reservation or unprotect first",
+                    meta.file_len,
+                    self.inner.reserved_budget.load(Ordering::Acquire),
+                    current
+                )));
+            }
+            match self.inner.protected_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+        meta.protected.store(true, Ordering::Release);
+        // `remove` is lock-free: if it won the race between the map read and
+        // here, the SWAP arbitrates the single decrement — whoever's swap
+        // observes true refunds/removes; a false observation means the other
+        // party already did (verification round 2: refunding on map membership
+        // alone double-decremented when remove's swap followed our store).
+        if !self.inner.entries.contains_key(key) {
+            if meta.protected.swap(false, Ordering::AcqRel) {
+                self.inner
+                    .protected_bytes
+                    .fetch_sub(meta.file_len, Ordering::AcqRel);
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Drop one entry's pin. Returns whether the entry was protected.
+    /// Serialized on the mutation mutex for the same reason as
+    /// [`Self::protect`].
+    pub async fn unprotect(&self, key: &str) -> bool {
+        let _guard = self.inner.mutation.lock().await;
+        let Some(meta) = self.inner.entries.get(key).map(|entry| entry.clone()) else {
+            return false;
+        };
+        if !meta.protected.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        self.inner
+            .protected_bytes
+            .fetch_sub(meta.file_len, Ordering::AcqRel);
+        true
+    }
+
+    /// True when the entry is currently pinned (status projection helper).
+    pub fn is_protected(&self, key: &str) -> bool {
+        self.inner
+            .entries
+            .get(key)
+            .is_some_and(|meta| meta.protected.load(Ordering::Acquire))
     }
 
     /// Number of indexed entries.
@@ -417,10 +543,15 @@ impl PersistentByteStore {
 
     fn evict_blocking(&self) {
         while self.resident_bytes() > self.inner.max_bytes {
+            // Ordinary pressure never touches protected entries (SC-TE4). If
+            // nothing evictable remains, stop over-budget rather than deleting
+            // a pin — over-budget is an observable degradation the authority
+            // reports, not something the cache silently resolves.
             let victim = self
                 .inner
                 .entries
                 .iter()
+                .filter(|entry| !entry.value().protected.load(Ordering::Acquire))
                 .min_by_key(|entry| {
                     (
                         entry.value().class,
@@ -441,6 +572,11 @@ impl PersistentByteStore {
         let Some((_, meta)) = self.inner.entries.remove(key) else {
             return false;
         };
+        if meta.protected.swap(false, Ordering::AcqRel) {
+            self.inner
+                .protected_bytes
+                .fetch_sub(meta.file_len, Ordering::AcqRel);
+        }
         let _ =
             self.inner
                 .resident_bytes
@@ -527,6 +663,7 @@ fn write_entry_file(
             value_crc,
             chunk_crcs: Arc::from(chunk_crcs),
             class,
+            protected: AtomicBool::new(false),
             touch: AtomicU64::new(1),
         }))
     })();
@@ -648,6 +785,7 @@ fn write_entry_file_range(
             value_crc,
             chunk_crcs: Arc::from(chunk_crcs),
             class,
+            protected: AtomicBool::new(false),
             touch: AtomicU64::new(1),
         }))
     })();
@@ -752,6 +890,7 @@ fn read_entry_metadata(path: &Path) -> std::io::Result<(String, EntryMeta)> {
             value_crc,
             chunk_crcs: Arc::from(chunk_crcs),
             class,
+            protected: AtomicBool::new(false),
             touch: AtomicU64::new(1),
         },
     ))
@@ -900,6 +1039,13 @@ fn is_rebuildable_miss(error: &std::io::Error) -> bool {
         std::io::ErrorKind::NotFound
             | std::io::ErrorKind::InvalidData
             | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+fn budget_error(message: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::ResourceBusy, /* semantically: admission refused */
+        format!("TD-TIER-1 SC3 protection budget exceeded: {message}"),
     )
 }
 
@@ -1130,6 +1276,265 @@ mod tests {
                 .await
                 .expect("get b")
                 .is_some()
+        );
+    }
+
+    // ---- TD-TIER-1 SC3: protection (orthogonal to L2Class) ----
+
+    fn payload(len: usize) -> Arc<[u8]> {
+        Arc::from(vec![7u8; len].into_boxed_slice())
+    }
+
+    // SC-TE4: an armed pin survives ordinary eviction pressure; unprotected
+    // neighbors are the ones evicted.
+    #[tokio::test]
+    async fn protected_entry_survives_pressure() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store = PersistentByteStore::open(dir.path(), 8 * 1024).expect("open");
+        store.set_reserved_budget(8 * 1024);
+
+        store
+            .put("pinned", L2Class::Survivor, payload(4 * 1024))
+            .await
+            .expect("put pinned");
+        assert!(store.protect("pinned").await.expect("protect pinned"));
+        assert!(store.is_protected("pinned"));
+
+        // Churn past the store budget: each put triggers eviction; the pinned
+        // entry must never be the victim while unpinned peers are evictable.
+        for i in 0..8 {
+            store
+                .put(&format!("churn-{i}"), L2Class::Survivor, payload(4 * 1024))
+                .await
+                .expect("put churn");
+        }
+        assert!(
+            store.get("pinned").await.expect("get pinned").is_some(),
+            "the pin survives the pressure"
+        );
+        assert!(store.protected_bytes() > 0);
+    }
+
+    // SC-TE4 admission half: an oversize pin is rejected at admission
+    // (fail-closed), never silently granted and dropped later.
+    #[tokio::test]
+    async fn protect_beyond_reservation_fails_closed() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
+        store
+            .put("entry", L2Class::Survivor, payload(4 * 1024))
+            .await
+            .expect("put");
+
+        store.set_reserved_budget(1024);
+        let error = store
+            .protect("entry")
+            .await
+            .expect_err("oversize pin refused");
+        assert!(error.to_string().contains("reserved budget"), "{error}");
+        assert!(!store.is_protected("entry"));
+        assert_eq!(store.protected_bytes(), 0);
+
+        // Unpinning accounting: arm full budget, pin, unpin, pin again.
+        store.set_reserved_budget(1 << 20);
+        assert!(store.protect("entry").await.expect("protect"));
+        assert!(store.unprotect("entry").await);
+        assert_eq!(store.protected_bytes(), 0);
+        assert!(store.protect("entry").await.expect("re-protect"));
+    }
+
+    // SC-TE4: with every survivor pinned, ordinary pressure has no pin to
+    // delete — an over-budget newcomer evicts ITSELF and the loop terminates
+    // (no spin, no pin deletion). Over-budget is reported state, not something
+    // the cache silently resolves at the pins' expense.
+    #[tokio::test]
+    async fn all_protected_over_budget_terminates() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store = PersistentByteStore::open(dir.path(), 16 * 1024).expect("open");
+        store.set_reserved_budget(64 * 1024);
+        for i in 0..4 {
+            store
+                .put(&format!("pin-{i}"), L2Class::Survivor, payload(2 * 1024))
+                .await
+                .expect("put");
+            assert!(store.protect(&format!("pin-{i}")).await.expect("protect"));
+        }
+
+        // An over-budget newcomer: only it is evictable, so it evicts itself
+        // and eviction terminates rather than touching any pin.
+        store
+            .put("newcomer", L2Class::Survivor, payload(32 * 1024))
+            .await
+            .expect("put completes (self-evicting)");
+
+        for i in 0..4 {
+            assert!(store.is_protected(&format!("pin-{i}")));
+            assert!(
+                store.get(&format!("pin-{i}")).await.expect("get").is_some(),
+                "no pin deleted to 'fix' the over-budget state"
+            );
+        }
+        assert!(
+            store.get("newcomer").await.expect("get").is_none(),
+            "the unpinned newcomer self-evicted"
+        );
+        assert!(store.resident_bytes() <= 16 * 1024);
+    }
+
+    // SC-TE6: explicit invalidation removes a protected entry — pins protect
+    // immutable bytes, never visibility — and the accounting follows.
+    #[tokio::test]
+    async fn explicit_remove_still_removes_protected() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
+        store.set_reserved_budget(1 << 20);
+        store
+            .put("entry", L2Class::Survivor, payload(4 * 1024))
+            .await
+            .expect("put");
+        assert!(store.protect("entry").await.expect("protect"));
+        let pinned_bytes = store.protected_bytes();
+        assert!(pinned_bytes > 0);
+
+        assert!(store.remove("entry"));
+        assert_eq!(store.protected_bytes(), 0, "pin accounting released");
+        assert!(store.get("entry").await.expect("get").is_none());
+    }
+
+    // The protection seam is inert until armed: default budget 0 refuses
+    // every pin.
+    #[tokio::test]
+    async fn zero_budget_keeps_protection_inert() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
+        store
+            .put("entry", L2Class::Survivor, payload(64))
+            .await
+            .expect("put");
+        assert_eq!(store.reserved_budget(), 0);
+        let error = store
+            .protect("entry")
+            .await
+            .expect_err("unarmed budget must refuse");
+        assert!(error.to_string().contains("reserved budget"), "{error}");
+        // A missing key is a no-op, not an error.
+        assert!(!store.protect("absent").await.expect("absent key"));
+    }
+
+    // Review B5 regression: concurrent same-key protects must charge the
+    // entry's bytes exactly ONCE — the pre-fix check-then-act race charged
+    // twice (and the phantom was unclearable by any API).
+    #[tokio::test]
+    async fn concurrent_same_key_protects_charge_once() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
+        store.set_reserved_budget(1 << 20);
+        store
+            .put("entry", L2Class::Survivor, payload(4 * 1024))
+            .await
+            .expect("put");
+        let entry_bytes = store.protected_bytes();
+        let _ = entry_bytes;
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move { store.protect("entry").await }));
+        }
+        for handle in handles {
+            assert!(handle.await.expect("join").expect("protect"));
+        }
+        let after = store.protected_bytes();
+        let file_len = store.resident_bytes(); // single entry store
+        assert_eq!(
+            after, file_len,
+            "16 concurrent protects charge exactly the entry's bytes once"
+        );
+        assert!(store.unprotect("entry").await);
+        assert_eq!(
+            store.protected_bytes(),
+            0,
+            "a single unprotect clears the full charge — no phantom"
+        );
+    }
+
+    // Verification round 3 (B5 residual): the protects-only stress above
+    // cannot fail on a membership-only refund; the actual arbitration is
+    // protect vs the LOCK-FREE remove. Churn protects against concurrent
+    // removes and assert the invariant that arbitration defends:
+    // protected_bytes never exceeds the armed budget — a double-decrement
+    // wraps to ~2^64 and blows straight past it.
+    #[tokio::test]
+    async fn protect_vs_remove_stress_never_breaks_accounting() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
+        let budget = 64 * 1024u64;
+        store.set_reserved_budget(budget);
+        let payload = payload(4 * 1024);
+
+        for round in 0..64 {
+            store
+                .put(&format!("k{round}"), L2Class::Survivor, payload.clone())
+                .await
+                .expect("put");
+            let key = format!("k{round}");
+            let mut handles = Vec::new();
+            for i in 0..8 {
+                let store = store.clone();
+                let key = key.clone();
+                handles.push(tokio::spawn(async move {
+                    if i % 2 == 0 {
+                        let _ = store.protect(&key).await;
+                    } else {
+                        let _ = store.unprotect(&key).await;
+                    }
+                }));
+            }
+            // The lock-free invalidator races the pins.
+            let remover = store.clone();
+            let remove_key = key.clone();
+            let ((), _) = tokio::join!(
+                async {
+                    for handle in handles {
+                        let _ = handle.await;
+                    }
+                },
+                async move {
+                    let _ = remover.remove(&remove_key);
+                }
+            );
+            assert!(
+                store.protected_bytes() <= budget,
+                "round {round}: protected_bytes {} exceeds the armed budget {} \
+                 (arithmetic wrapped or double-decremented)",
+                store.protected_bytes(),
+                budget
+            );
+        }
+    }
+
+    // Protection is runtime state by design: the index rebuild drops it and
+    // SC4's coverage reconciliation re-derives pins from the grant ledger.
+    #[tokio::test]
+    async fn rebuild_drops_protection() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
+        store.set_reserved_budget(1 << 20);
+        store
+            .put("entry", L2Class::Survivor, payload(64))
+            .await
+            .expect("put");
+        assert!(store.protect("entry").await.expect("protect"));
+        drop(store);
+
+        let reopened = PersistentByteStore::open(dir.path(), 1 << 20).expect("reopen");
+        assert!(
+            reopened.get("entry").await.expect("get").is_some(),
+            "value survives the rebuild"
+        );
+        assert!(
+            !reopened.is_protected("entry"),
+            "protection is re-derived by SC4, not persisted"
         );
     }
 }
