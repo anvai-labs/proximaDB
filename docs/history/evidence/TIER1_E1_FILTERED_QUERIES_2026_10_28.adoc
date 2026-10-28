@@ -6,7 +6,9 @@
 
 1. **The filter-path mechanism, traced and measured.** A metadata filter on a
    trained PAX/SST collection (no HNSW) does not change the probe *plan* (same
-   16-cell directory choice, same ~768k probed rows) but changes the read
+   effective 16 cells, same ~768k probed rows — the directory map is empty
+   for filtered queries; the cells come from the M3 nearest-first walk, and
+   the identity rests on the exactly-equal probed-row counters) but changes the read
    *shape*: the Stage-F allow-set fetch reads the **whole D region (props +
    scalar columns of every row) per query** before the filter-aware cascade
    runs. Measured at 3M: **834 MB of the 936.93 MB/query (89%) is the D
@@ -14,8 +16,9 @@
    cost. The exact fallback (`search_pax_file_exact`) never fired
    (`whole_region_fallbacks: 0`; cascade = 99.8% of wall).
 2. **The cost multiple.** Filtered vs unfiltered at 3M, same bed, same cap4,
-   n=1000: **277.55 vs 52.74 req/q, 936.93 vs ~150 MB/q, p50 6.02 vs 0.27 s**
-   (22×) in `object_cold`; `post_write`/warm within ~7% of cold (the 10 GB
+   n=1000: **277.55 vs 52.74 req/q, 936.93 vs ~150 MB/q, p50 6019 vs
+   214 ms (28×)** in `object_cold` (review correction: an earlier draft
+   cited 0.27 s — the cap16-unfilt MEAN, not a p50); `post_write`/warm within ~7% of cold (the 10 GB
    local disk cache cannot hold the D-region working set — cache-invariant).
 3. **Selectivity-independence, proven twice.** The 50k probe showed match-all
    filters behave identically to 10%/50%/2%; the static
@@ -69,7 +72,7 @@ completed on the 1-seg bed for matched geometry.
 | unfiltered cap16 | 1-seg | 35.42 | 153.42 MB | 199 ms | 0.9697 |
 | unfiltered cap4 @1-seg | 1-seg | 52.74 | 150.18 MB | 214 ms | 0.9697 |
 | **filtered cat3 cap4** | 1-seg | **277.55** | **936.93 MB** | **6019 ms** | **0.9747** |
-| filtered cat3 cap16 (n=250) | 1-seg | **100.01** | 896.94 MB | 4036 ms | 0.9748 |
+| filtered cat3 cap16 (n=250) | 1-seg | **100.01** | 940.51 MB | 4036 ms | 0.9748 |
 
 Filtered cap4 phase detail (n=1000): post_write 258.13 req/q / 921.69 MB /
 6.40 s; local_disk_warm 260.93 / 922.40 / 6.24 — cache-invariant. Filtered
@@ -77,7 +80,9 @@ recall 0.9740–0.9750 vs the exact filtered GT: the same nprobe under-coverage
 as unfiltered (the true filtered top-k can live in unprobed cells) — no
 additional filter-induced recall loss.
 
-**Byte sink (result.json counters, object_cold, per query):** stage-F whole-D
+**Byte sink (object_cold, per query; the D figure is derived — bytes/q −
+regionA − regionB counters — and doubly corroborated by the cap16 remainder
+834.1 MB and the 278 B/row × 3M arithmetic):** stage-F whole-D
 fetch ≈ **834 MB (89%)**; Region B SQ8 rerank 94.3 MB (770k probed rows × 128 B
 — the standard cascade cost, identical class to unfiltered); Region A 8.3 MB;
 rehydrate 0.39 s; Region D decode 27 ms (the cost is transfer, not decode —
@@ -99,8 +104,9 @@ geometry and matched cap is **5.26× requests (277.55/52.74) and 6.2× bytes
 
 Filtered cap4 → cap16 (n=1000 vs n=250 — asymmetry disclosed; req/q is a
 stable per-query metric): **277.55 → 100.01 req/q (−64.0%)**, GETs 275.55 →
-98.01, p50 6019 → 4036 ms (−33%), bytes 936.93 → 896.94 MB (−4%, as expected —
-the cap changes request count, not scan volume), recall 0.9747 → 0.9748,
+98.01, p50 6019 → 4036 ms (−33%), bytes 936.93 → 940.51 decimal MB
+(+0.4%, flat as expected — the cap changes request count, not scan volume;
+an earlier draft printed −4% by mixing decimal MB with MiB), recall 0.9747 → 0.9748,
 post_write/warm again cache-invariant (80.4/81.4 req/q). For filtered queries
 the range cap is the **dominant request lever** — a 64% cut where the
 unfiltered 2-seg baseline measured −33% and the fragment ladder measured
@@ -113,7 +119,10 @@ bytes (the 89% D-fetch) on top of it.
 One bed, one query vector, `debug:true` traces: unfiltered 8 GETs / 7.75 MB
 (directory probe at nprobe=2) vs filtered 24–35 GETs / 25–30 MB at
 selectivities 10%, 50%, 2%, **and match-all** — filter *presence*, not
-selectivity, flips the read path. Schema-declared `indexed`/`filterable`
+selectivity, flips the read path. (GET/byte figures are from the probe's
+debug-trace stdout, not retained in the transient tempdirs; the surviving
+final-run server logs corroborate the direction: unfiltered 14 ms vs
+49–52 ms flat across all four filtered cases.) Schema-declared `indexed`/`filterable`
 columns changed nothing. The whole-corpus read at 50k is compounded by
 `SearchMode::default()=Adaptive{100k}` + `EXACT_SCAN_MAX_BYTES=64 MiB` forcing
 exact scans at that scale for both arms. Probe script:
@@ -125,7 +134,7 @@ exact scans at that scale for both arms. Probe script:
    force_exact)` returns an **empty map** — filtered queries lose directory
    planning, D6 decode keys, and zero-read segment skipping
    (`src/storage/engines/sst/search/mod.rs:2116`,
-   `centroid_directory_reader.rs:37-38`).
+   `centroid_directory_reader.rs:44-47`).
 2. Stage F (`pax_filtered_row_allow`, `segment_format.rs:1213`) fetches **all
    D-block bodies for the whole segment, per query**, parses the msgpack
    props per row, and builds the `RowAllow` bitmap.
