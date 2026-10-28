@@ -2724,7 +2724,15 @@ async fn stage_f_user_tag_footer_prune_via_self_describing_segment() {
     // Shred "partition" into user col-id 100 (the P-Shred spec the production
     // flush path builds from the schema). write_pax_segment_ordered is the
     // module-internal writer that threads the spec.
-    let shred = vec![("partition".to_string(), 100i32)];
+    let shred = vec![proximadb_block_format::ShredColumn::typed(
+        "partition",
+        100,
+        // The fixture's partition values are STRINGS — declaring the exact
+        // type (String) is what makes them shred; an Int64 declaration would
+        // fail shreds_losslessly per value and keep the tail (the fail-safe
+        // this slice's exactness contract guarantees).
+        proximadb_data_model::ProximaType::String,
+    )];
     let cluster = crate::storage::engines::sst::block_cluster::block_cluster_enabled();
     let plan = if cluster {
         crate::storage::engines::sst::block_cluster::cluster_order_sq8_morton(&records, 0).map(
@@ -2768,7 +2776,7 @@ async fn stage_f_user_tag_footer_prune_via_self_describing_segment() {
         footer
             .shred_field_map
             .iter()
-            .any(|(n, c)| n == "partition" && *c == 100),
+            .any(|col| col.key == "partition" && col.column_id == 100),
         "footer must self-describe the shredded partition column, got {:?}",
         footer.shred_field_map
     );
@@ -4342,7 +4350,11 @@ async fn filtered_coarse_probe_holds_recall_and_cuts_bytes() {
         VectorQuant::Sq8,
         false,
         Some(16 * 1024),
-        &[("partition".to_string(), 100)],
+        &[proximadb_block_format::ShredColumn::typed(
+            "partition",
+            100,
+            proximadb_data_model::ProximaType::String,
+        )],
         None,
         None,
     )
@@ -4582,7 +4594,11 @@ async fn partition_layout_prunes_uncorrelated_tag() {
             VectorQuant::Sq8,
             false,
             Some(16 * 1024),
-            &[("partition".to_string(), 100)],
+            &[proximadb_block_format::ShredColumn::typed(
+                "partition",
+                100,
+                proximadb_data_model::ProximaType::String,
+            )],
             None,
             None,
         )
@@ -4775,7 +4791,11 @@ async fn filtered_stack_get_byte_breakdown() {
             VectorQuant::Sq8,
             false,
             Some(8 * 1024),
-            &[("partition".to_string(), 100)],
+            &[proximadb_block_format::ShredColumn::typed(
+                "partition",
+                100,
+                proximadb_data_model::ProximaType::String,
+            )],
             None,
             None,
         )
@@ -5022,7 +5042,13 @@ async fn m2_unfiltered_recall_neutral_vs_global() {
             VectorQuant::Sq8,
             false,
             Some(16 * 1024),
-            &[("partition".to_string(), 100)],
+            &[proximadb_block_format::ShredColumn::typed(
+                "partition",
+                100,
+                // fixture partition values are STRINGS ("p0".."p7") — the
+                // exact declared type; Int64 would never shred them.
+                proximadb_data_model::ProximaType::String,
+            )],
             None,
             None,
         )

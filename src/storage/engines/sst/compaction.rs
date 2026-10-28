@@ -3279,7 +3279,7 @@ impl Compaction {
     async fn extract_shred_spec_from_inputs(
         factory: &Arc<dyn proximadb_storage_ports::FilesystemPort>,
         input_files: &[PathBuf],
-    ) -> Vec<(String, i32)> {
+    ) -> Vec<proximadb_block_format::ShredColumn> {
         use proximadb_storage_common::segment_layout::SegmentFooterIndex;
         for input in input_files {
             let url = input.to_string_lossy();
@@ -3291,6 +3291,11 @@ impl Compaction {
             if let Ok(Some(footer)) = SegmentFooterIndex::locate_in_segment(&bytes)
                 && !footer.shred_field_map.is_empty()
             {
+                // TD-FPRUNE-1 P5 slice 3: the v2 field-map carries the
+                // declared types, so compaction preserves residual outputs
+                // (typed re-shred) instead of regressing to the complete
+                // tail on rewrite. A v1 map (untyped, all-legacy) parses as
+                // untyped columns — the conservative complete-tail rewrite.
                 return footer.shred_field_map;
             }
         }

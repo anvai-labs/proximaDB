@@ -159,6 +159,11 @@ fn bench_viper_flush(c: &mut Criterion) {
                 b.iter(|| {
                     runtime.block_on(async {
                         let collection = Collection {
+                            // SC1 (#2259) added the field; the literal
+                            // initializer here predates it and broke every
+                            // --all-targets check on develop (LIGHT CI does
+                            // not compile benches). None = NOT_ACTIVE truth.
+                            storage_class_status: None,
                             id: "bench-viper".to_string(),
                             config: Some(CollectionConfig {
                                 name: "bench-viper".to_string(),

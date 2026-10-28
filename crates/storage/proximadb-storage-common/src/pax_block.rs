@@ -1964,16 +1964,33 @@ impl PaxSegmentWriter {
             // TD-FPRUNE-1 P2: self-describe the shredded user columns so a
             // filtered read resolves a user-tag field name → col-id with no
             // catalog lookup. Gated with the footer stats (useless without them).
-            shred_field_map: if footer_stats_enabled() {
-                // The SEGMENT footer's map is (name -> col_id) only; the exact
-                // declared type lives in the per-BLOCK shred directory, which is
-                // ungated and self-contained.
+            // TD-FPRUNE-1 P5 slice 3: the segment footer map carries the
+            // FULL typed column (v2 section when any entry is typed) and is
+            // emitted whenever a shred spec exists — compaction needs the
+            // types to preserve residual outputs on rewrite, so gating the
+            // map with the (default-OFF) footer-stats env would silently
+            // undo P5 at every compaction.
+            //
+            // MIXED-READ (review MAJOR-1, corrected): develop-era readers
+            // BAIL on a v2 section version (they know the tag since P2 and
+            // reject unknown versions) — they do NOT skip it. A typed map is
+            // therefore only written when the residual gate is ON:
+            // `PROXIMADB_PAX_RESIDUAL_TAIL=0` strips the types (all-untyped
+            // ⇒ byte-identical v1 section) making the kill-switch a TRUE
+            // byte-level revert — safe for mixed-binary windows (rolling
+            // restart, rollback, replica skew over shared object storage).
+            // A develop-era binary that meets a v2 footer (only possible if
+            // a newer binary wrote it) fails CLOSED at the footer parse; it
+            // never returns wrong results from the section itself.
+            shred_field_map: if self.shred_spec.is_empty() {
+                Vec::new()
+            } else if proximadb_block_format::residual_tail_enabled() {
+                self.shred_spec.clone()
+            } else {
                 self.shred_spec
                     .iter()
-                    .map(|c| (c.key.clone(), c.column_id))
+                    .map(|c| proximadb_block_format::ShredColumn::untyped(&c.key, c.column_id))
                     .collect()
-            } else {
-                Vec::new()
             },
         };
         let footer_body = footer.to_bytes()?;
@@ -2490,16 +2507,33 @@ impl PaxSegmentWriter {
             c_len,
             // TD-FPRUNE-1 P2: self-describe shredded user columns (see the other
             // footer builder). Gated with the footer stats.
-            shred_field_map: if footer_stats_enabled() {
-                // The SEGMENT footer's map is (name -> col_id) only; the exact
-                // declared type lives in the per-BLOCK shred directory, which is
-                // ungated and self-contained.
+            // TD-FPRUNE-1 P5 slice 3: the segment footer map carries the
+            // FULL typed column (v2 section when any entry is typed) and is
+            // emitted whenever a shred spec exists — compaction needs the
+            // types to preserve residual outputs on rewrite, so gating the
+            // map with the (default-OFF) footer-stats env would silently
+            // undo P5 at every compaction.
+            //
+            // MIXED-READ (review MAJOR-1, corrected): develop-era readers
+            // BAIL on a v2 section version (they know the tag since P2 and
+            // reject unknown versions) — they do NOT skip it. A typed map is
+            // therefore only written when the residual gate is ON:
+            // `PROXIMADB_PAX_RESIDUAL_TAIL=0` strips the types (all-untyped
+            // ⇒ byte-identical v1 section) making the kill-switch a TRUE
+            // byte-level revert — safe for mixed-binary windows (rolling
+            // restart, rollback, replica skew over shared object storage).
+            // A develop-era binary that meets a v2 footer (only possible if
+            // a newer binary wrote it) fails CLOSED at the footer parse; it
+            // never returns wrong results from the section itself.
+            shred_field_map: if self.shred_spec.is_empty() {
+                Vec::new()
+            } else if proximadb_block_format::residual_tail_enabled() {
+                self.shred_spec.clone()
+            } else {
                 self.shred_spec
                     .iter()
-                    .map(|c| (c.key.clone(), c.column_id))
+                    .map(|c| proximadb_block_format::ShredColumn::untyped(&c.key, c.column_id))
                     .collect()
-            } else {
-                Vec::new()
             },
         };
         let footer_body = footer.to_bytes()?;

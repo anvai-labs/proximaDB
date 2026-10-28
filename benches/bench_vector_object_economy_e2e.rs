@@ -483,6 +483,7 @@ fn print_report(cfg: &BenchConfig, setup: &SetupResult, cold: &LatencyDist, warm
 
 fn make_collection(base_location: &str, dim: usize) -> Collection {
     Collection {
+        storage_class_status: None, // SC1 (#2259) field; None = NOT_ACTIVE
         id: "bench_voe_e2e".to_string(),
         config: Some(CollectionConfig {
             dimension: dim as u32,
