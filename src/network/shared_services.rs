@@ -2897,6 +2897,18 @@ impl SharedServices {
             Some(cks) => base_dml.with_conditional_key_store(cks.clone()),
             None => base_dml,
         };
+        // Fence contract gate 4: the SAME write-lease authority DDL consults
+        // below (registry + pod id + the write-gate lease manager) fences the
+        // live delete publisher's successor CAS.
+        let base_dml = base_dml.with_publish_lease(Arc::new(
+            crate::services::write_lease::WriteLeaseAuthority::new(
+                lease_manager_for_writes.clone(),
+                Some(primary_pod_registry.clone()),
+                Some(crate::cluster::primary_pod_registry::resolve_self_pod_id(
+                    None,
+                )),
+            ),
+        ));
         // TD-ABAC-2 (Phase 5b): construct the durable ABAC enforcer (authority +
         // policy binding store, both at <data_dir>/abac/) and DI it into the
         // DML read funnel. Fully behind `abac-policy` (default-OFF) ⇒ default

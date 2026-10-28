@@ -1385,6 +1385,23 @@ impl PostgresProtocol {
         self
     }
 
+    /// Fence the per-connection DML's live-delete publications on the SAME
+    /// write-lease authority DDL got (the fence contract's gate 4: a pod
+    /// displaced mid-DELETE cannot publish its DV successor).
+    pub fn with_dml_publish_lease(
+        mut self,
+        lease: Arc<crate::services::write_lease::WriteLeaseAuthority>,
+    ) -> Self {
+        if let Some(dml) = self.dml_service.as_mut().and_then(Arc::get_mut) {
+            dml.set_publish_lease(lease);
+        } else {
+            tracing::error!(
+                "pgwire DML publish lease could not be attached to the per-connection service"
+            );
+        }
+        self
+    }
+
     /// Attach catalog-backed DDL/DML services to an existing protocol handler.
     pub fn with_catalog_manager(mut self, catalog_manager: Arc<CatalogManager>) -> Self {
         let dml_service = Arc::new(DmlService::new(
