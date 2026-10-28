@@ -107,6 +107,8 @@ pub struct CollectionService {
     index_config_cache: Arc<dashmap::DashMap<String, crate::index::config::RuntimeIndexConfig>>,
     /// Global storage configuration for engine and WAL settings
     storage_config: StorageConfig,
+    /// TD-TIER-1 SC3-2: reservation pools opened at startup (None ⇒ inert).
+    reservations: Option<Arc<crate::services::collection::ReservationRegistry>>,
     /// xCatalog manager — the sole authoritative store for collection lifecycle
     /// metadata. When wired, collection reads/writes resolve through xCatalog.
     catalog_manager: Option<Arc<CatalogManager>>,
@@ -174,10 +176,23 @@ impl CollectionService {
                 .context("Failed to initialize filesystem factory")?,
         );
 
+        // TD-TIER-1 SC3-2: open the reservation pools declared in
+        // `[storage.reservation_pools]` (validated at config load). Empty
+        // list ⇒ None ⇒ every reservation seam is inert. A pool another
+        // process exclusively owns fails construction — an operator wants
+        // that at startup, not at first PERFORMANCE admission.
+        let reservations =
+            crate::services::collection::reservation::ReservationRegistry::open_from_config(
+                &storage_config.reservation_pools,
+            )
+            .await
+            .context("TD-TIER-1 SC3: reservation pool startup failed")?;
+
         Ok(Self {
             filesystem_factory,
             index_config_cache: Arc::new(dashmap::DashMap::new()),
             storage_config,
+            reservations,
             catalog_manager: None,
             syscat_cache: None,    // Built in `with_catalog_manager`.
             syscat_warm_dir: None, // Set via `with_syscat_warm_dir` / env.
@@ -187,6 +202,14 @@ impl CollectionService {
             #[cfg(feature = "experimental-turboquant")]
             turboquant_registry: None, // Will be set via with_turboquant_registry()
         })
+    }
+
+    /// TD-TIER-1 SC3-2: the shared reservation registry, when pools are
+    /// declared. The metering cadence ticks it (release tails + accrual).
+    pub fn reservations(
+        &self,
+    ) -> Option<&Arc<crate::services::collection::reservation::ReservationRegistry>> {
+        self.reservations.as_ref()
     }
 
     /// Attach a TurboQuant store registry (Phase P — Quantization Trait
@@ -755,6 +778,30 @@ impl CollectionService {
         };
 
         let response = self.delete_collection(collection_name).await?;
+        // TD-TIER-1 SC3-2: a successful delete releases the reservation keyed
+        // (tenant, collection uuid) — grants survive nothing their collection
+        // does not. Both the request tenant AND the anonymous key are tried:
+        // create may have run with or without a tenant context, release is
+        // idempotent, and the tail billing interval parks for the metering
+        // tick (never dropped — the SC3-1 billing contract holds at the seam).
+        if response.success
+            && let Some(registry) = &self.reservations
+        {
+            let now = chrono::Utc::now().timestamp();
+            let collection_id = &target.id;
+            registry
+                .release_for_collection(
+                    tenant_context
+                        .map(|ctx| ctx.tenant_id.as_str())
+                        .unwrap_or(""),
+                    collection_id,
+                    now,
+                )
+                .await;
+            registry
+                .release_for_collection("", collection_id, now)
+                .await;
+        }
         // The name-keyed cache is also keyed by id and by the name the caller
         // used; invalidate every key the deleted collection can be read by.
         if response.success {
@@ -1361,6 +1408,27 @@ impl CollectionService {
         let typed_identity = self
             .mint_typed_identity_for_collection(tenant_context, &enriched_config.name, &uuid)
             .await;
+
+        // TD-TIER-1 SC3-2: a PERFORMANCE create acquires its reservation from
+        // the default pool BEFORE any durable side effect (directories, catalog
+        // upsert): a refused admission leaves the request rejected with the old
+        // policy unchanged — the pool ledger is the durable record of what was
+        // granted, keyed (tenant, collection uuid). Kill-switch and pool
+        // misconfiguration surface as actionable errors here, never a silent
+        // zero-byte grant. Non-PERFORMANCE classes and an empty pool list skip
+        // this seam entirely.
+        if crate::services::collection::storage_class::storage_class_or_balanced(&enriched_config)
+            == crate::proto::proximadb_v1::StorageClass::Performance
+            && let Some(registry) = &self.reservations
+        {
+            let reservation_tenant = tenant_context
+                .map(|ctx| ctx.tenant_id.clone())
+                .unwrap_or_default();
+            registry
+                .reserve_for_performance(&reservation_tenant, &uuid, chrono::Utc::now().timestamp())
+                .await
+                .context("TD-TIER-1 SC3: PERFORMANCE admission refused")?;
+        }
 
         // Create storage directories (tenant-isolated if multi-tenant mode)
         let tenant_id = tenant_context.map(|ctx| ctx.tenant_id.as_str());

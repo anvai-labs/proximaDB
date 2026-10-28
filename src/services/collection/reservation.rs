@@ -91,6 +91,17 @@ pub struct ReservationPoolConfig {
     /// `0.1` ⇒ a 100 GiB grant charges 110 GiB. Clamped to `[0, 10]`.
     #[serde(default = "default_overhead_factor")]
     pub overhead_factor: f64,
+    /// SC3-2: bytes a PERFORMANCE collection create reserves from this pool
+    /// when the client supplies no entitlement (quota is operator policy).
+    /// `0` (the default) refuses PERFORMANCE creates on this pool with an
+    /// actionable error — the feature stays inert until the operator arms it.
+    #[serde(default)]
+    pub default_grant_bytes: u64,
+    /// SC3-2: the pool PERFORMANCE creates reserve from when several are
+    /// declared. At most one may be marked; a single-pool config needs no
+    /// marker (implied default).
+    #[serde(default)]
+    pub is_default: bool,
 }
 
 fn default_overhead_factor() -> f64 {
@@ -167,7 +178,157 @@ pub fn validate_pool_configs(pools: &[ReservationPoolConfig]) -> anyhow::Result<
             );
         }
     }
+    let defaults = pools.iter().filter(|p| p.is_default).count();
+    if defaults > 1 {
+        anyhow::bail!("at most one reservation pool may set is_default (found {defaults})");
+    }
     Ok(())
+}
+
+/// SC3-2: all configured pools, opened once at startup and shared with the
+/// collection service. `None`-able by construction — an empty pool list means
+/// the feature is inert and no call site needs to branch beyond `Option`.
+///
+/// The registry is also the single sink-side queue for billing intervals:
+/// `release` closes a tail interval at mutation time (the SC3-1 contract),
+/// and those tails park here until the (coalesced, cadence-driven) metering
+/// tick drains them — no interval is ever dropped, and none is written
+/// per-event (metering the bill must not become a line on the bill).
+#[derive(Debug)]
+pub struct ReservationRegistry {
+    pools: std::collections::HashMap<String, (ReservationPoolConfig, ReservationAuthority)>,
+    /// The pool PERFORMANCE creates reserve from: the explicit `is_default`
+    /// pool, or the single pool when only one is declared.
+    default_pool: Option<String>,
+    /// Release-closed tail intervals awaiting the metering tick (bounded by
+    /// grant turnover; the 64-entry released-tail cap keeps this small).
+    pending_intervals: Mutex<Vec<ReservationUsageInterval>>,
+}
+
+impl ReservationRegistry {
+    /// Open every declared pool. `Ok(None)` for an empty list (inert). A
+    /// pool that cannot be exclusively owned fails the whole construction —
+    /// startup, not first admission, is where an operator wants to learn
+    /// their pool is double-declared.
+    pub async fn open_from_config(
+        pools: &[ReservationPoolConfig],
+    ) -> anyhow::Result<Option<Arc<Self>>> {
+        if pools.is_empty() {
+            return Ok(None);
+        }
+        validate_pool_configs(pools)?;
+        let mut opened = std::collections::HashMap::new();
+        for pool in pools {
+            let authority = ReservationAuthority::open(pool.clone()).await?;
+            opened.insert(pool.id.clone(), (pool.clone(), authority));
+        }
+        let default_pool = pools
+            .iter()
+            .find(|p| p.is_default)
+            .map(|p| p.id.clone())
+            .or_else(|| (pools.len() == 1).then(|| pools[0].id.clone()));
+        Ok(Some(Arc::new(Self {
+            pools: opened,
+            default_pool,
+            pending_intervals: Mutex::new(Vec::new()),
+        })))
+    }
+
+    /// Reserve for a PERFORMANCE collection create. Fails with an actionable
+    /// error when no default pool is resolvable or the operator armed no
+    /// default grant size — never a silent zero-byte grant.
+    pub async fn reserve_for_performance(
+        &self,
+        tenant_id: &str,
+        collection_id: &str,
+        now_unix_secs: i64,
+    ) -> Result<Grant, ReservationError> {
+        let pool_id = self.default_pool.as_deref().ok_or_else(|| {
+            ReservationError::Invalid(
+                "multiple reservation pools are declared but none is marked is_default; \
+                 PERFORMANCE admission cannot pick one"
+                    .to_string(),
+            )
+        })?;
+        let (config, authority) = self
+            .pools
+            .get(pool_id)
+            .ok_or_else(|| ReservationError::Corrupt("default pool missing".into()))?;
+        if config.default_grant_bytes == 0 {
+            return Err(ReservationError::Invalid(format!(
+                "reservation pool '{pool_id}' declares no default_grant_bytes; \
+                 PERFORMANCE admission is not armed (set default_grant_bytes in \
+                 [storage.reservation_pools])"
+            )));
+        }
+        let (grant, closed) = authority
+            .reserve(
+                tenant_id,
+                collection_id,
+                config.default_grant_bytes,
+                now_unix_secs,
+            )
+            .await?;
+        self.park_intervals(closed);
+        Ok(grant)
+    }
+
+    /// Release every live grant for a collection identity across all pools
+    /// (idempotent where the identity never reserved). Tail intervals park
+    /// for the metering tick.
+    pub async fn release_for_collection(
+        &self,
+        tenant_id: &str,
+        collection_id: &str,
+        now_unix_secs: i64,
+    ) {
+        for (_, authority) in self.pools.values() {
+            match authority
+                .release(tenant_id, collection_id, now_unix_secs)
+                .await
+            {
+                Ok(closed) => self.park_intervals(closed),
+                Err(error) => tracing::warn!(
+                    "TD-TIER-1 SC3: release failed for ({tenant_id}, {collection_id}): {error}"
+                ),
+            }
+        }
+    }
+
+    /// One metering tick: drain parked release-tails plus each pool's accrued
+    /// intervals. The caller sinks the returned records durably; a record
+    /// lost AFTER this return is lost at-most-once (its checkpoint already
+    /// advanced), which under-bills rather than double-billing.
+    pub async fn take_metering_intervals(
+        &self,
+        now_unix_secs: i64,
+    ) -> Vec<ReservationUsageInterval> {
+        let mut out = self
+            .pending_intervals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain(..)
+            .collect::<Vec<_>>();
+        for (_, authority) in self.pools.values() {
+            match authority.take_usage_intervals(now_unix_secs).await {
+                Ok(mut intervals) => out.append(&mut intervals),
+                Err(error) => tracing::warn!(
+                    "TD-TIER-1 SC3: usage-interval take failed: {error} (intervals re-emit on the next tick)"
+                ),
+            }
+        }
+        out
+    }
+
+    fn park_intervals(&self, closed: Vec<ReservationUsageInterval>) {
+        if closed.is_empty() {
+            return;
+        }
+        self.pending_intervals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend(closed);
+    }
 }
 
 /// Lifecycle per `docs/current/STORAGE_PLAN.adoc` §"Reservation and coverage
@@ -1073,6 +1234,8 @@ mod tests {
             allocatable_bytes: 60 * 1024 * 1024 * 1024,
             tenant_limit_bytes: None,
             overhead_factor: 0.1,
+            default_grant_bytes: 0,
+            is_default: false,
         }
     }
 
@@ -1577,6 +1740,140 @@ mod tests {
             retained <= MAX_RETAINED_RELEASED,
             "released tail bounded to {MAX_RETAINED_RELEASED}, got {retained}"
         );
+    }
+
+    // ---- SC3-2: ReservationRegistry ----
+
+    fn pool_config(dir: &tempfile::TempDir, id: &str, grant_bytes: u64) -> ReservationPoolConfig {
+        ReservationPoolConfig {
+            id: id.to_string(),
+            path: dir.path().display().to_string(),
+            allocatable_bytes: 1 << 30,
+            tenant_limit_bytes: None,
+            overhead_factor: 0.1,
+            default_grant_bytes: grant_bytes,
+            is_default: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_inert_without_pools() {
+        let registry = ReservationRegistry::open_from_config(&[]).await.unwrap();
+        assert!(registry.is_none(), "no pools declared = no registry");
+    }
+
+    #[tokio::test]
+    async fn registry_reserves_from_single_implied_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let pools = [pool_config(&dir, "p1", 4096)];
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .unwrap();
+        let grant = registry
+            .reserve_for_performance("t1", "c-uuid-1", 1000)
+            .await
+            .unwrap();
+        assert_eq!(grant.bytes, 4096, "operator-declared default grant size");
+        let (config, authority) = registry.pools.get("p1").unwrap();
+        assert_eq!(config.id, "p1");
+        assert_eq!(authority.grants_snapshot().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn registry_refuses_unarmed_default_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let pools = [pool_config(&dir, "p1", 0)];
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .unwrap();
+        let err = registry
+            .reserve_for_performance("t1", "c-uuid-1", 1000)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("default_grant_bytes"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn registry_multi_pool_needs_explicit_default() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let mut pools = [
+            pool_config(&dir_a, "pa", 4096),
+            pool_config(&dir_b, "pb", 4096),
+        ];
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .unwrap();
+        let err = registry
+            .reserve_for_performance("t1", "c-uuid-1", 1000)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is_default"), "{err}");
+        // Arming one default makes admission deterministic.
+        pools[1].is_default = true;
+        drop(registry);
+        // pb's authority still holds its pool dir exclusively: close by
+        // dropping every Arc (the registry clones held nothing else).
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .unwrap();
+        let grant = registry
+            .reserve_for_performance("t1", "c-uuid-1", 1000)
+            .await
+            .unwrap();
+        assert_eq!(grant.bytes, 4096);
+        assert!(registry.pools.contains_key("pb"));
+    }
+
+    // The registry is the single sink for release tails: they park until the
+    // metering tick drains them — exactly once, never dropped.
+    #[tokio::test]
+    async fn release_tails_park_until_the_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let pools = [pool_config(&dir, "p1", 4096)];
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .unwrap();
+        registry
+            .reserve_for_performance("t1", "c-uuid-1", 500)
+            .await
+            .unwrap();
+        registry
+            .take_metering_intervals(600)
+            .await
+            .iter()
+            .for_each(|i| assert_eq!(i.reserved_bytes, 4096));
+        registry.release_for_collection("t1", "c-uuid-1", 700).await;
+
+        let tick = registry.take_metering_intervals(700).await;
+        assert_eq!(
+            tick.len(),
+            1,
+            "the release tail (600, 700] parks for exactly one tick"
+        );
+        assert_eq!(tick[0].interval_start_unix_secs, 600);
+        assert_eq!(tick[0].interval_end_unix_secs, 700);
+        assert!(
+            registry.take_metering_intervals(800).await.is_empty(),
+            "drained: no double-emission"
+        );
+    }
+
+    #[test]
+    fn two_explicit_defaults_rejected() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let mut pools = [pool_config(&dir_a, "pa", 1), pool_config(&dir_b, "pb", 1)];
+        pools[0].is_default = true;
+        pools[1].is_default = true;
+        assert!(validate_pool_configs(&pools).is_err());
     }
 
     /// Serialized env-var access for the kill-switch test — the same pattern
