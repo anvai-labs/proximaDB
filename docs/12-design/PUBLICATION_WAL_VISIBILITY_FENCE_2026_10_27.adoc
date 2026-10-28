@@ -249,7 +249,9 @@ All six are implemented and pinned by e2e through the real pgwire facade
    and re-unions against the new parent — the same interleaving the barrier
    forces, without sleeps or true concurrency.
 4. DONE — the publisher consults the shared `WriteLeaseAuthority` (the same
-   value DDL consults) immediately before every CAS attempt; unit tests pin
+   value DDL consults) twice per attempt: before any publication I/O (so a
+   displaced pod orphans nothing) and immediately before the CAS (the check is
+   point-in-time, so this bounds the displaced-pod window); unit tests pin
    allow/inert/misrouted at the authority (real displacement cannot be forced
    single-pod; the seam is the contract's surface).
 5. DONE — `crash_gap_is_fail_closed_and_materialize_adopts`
@@ -263,6 +265,21 @@ All six are implemented and pinned by e2e through the real pgwire facade
 
 The activation flip of `PROXIMADB_LIVE_DELETE_PUBLISHER` remains gated on
 these six plus soak evidence; the knob stays default-OFF.
+
+=== Soak evidence (2026-10-28)
+
+`soak_mixed_workload_holds_the_fence` runs a seeded mixed workload with the
+publisher armed. **Correctness holds:** the WAL view matches the model after
+every round, and the OLAP view reconciles to the model at every MATERIALIZE.
+**Reach is narrow:** under interleaved inserts the completeness precondition
+refuses every DV-only publication (45 deletes, 0 publications). A pending
+insert is in neither the parent's files nor a vector, so publishing would hide
+it from both views. In the eligible shape (deletes as the only writes since the
+last publication) every delete publishes (one Puffin and one metadata version
+each) and the OLAP view tracks it with no MATERIALIZE. An insert on top of the
+DV-carrying base then makes the OLAP read refuse the unordered delta, and a
+MATERIALIZE over the DV parent reconciles both views. The reach question is filed as TD-LIVEDEL-1 and is part of the
+activation decision.
 
 == Filing
 
