@@ -7,7 +7,7 @@ import grpc
 
 from proximadb_sdk.v2 import record_pb2 as proximadb_dot_v2_dot_record__pb2
 
-GRPC_GENERATED_VERSION = "1.80.0"
+GRPC_GENERATED_VERSION = "1.75.1"
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -23,7 +23,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f"The grpc package installed is at version {GRPC_VERSION},"
-        + " but the generated code in proximadb/v2/record_pb2_grpc.py depends on"
+        + f" but the generated code in proximadb/v2/record_pb2_grpc.py depends on"
         + f" grpcio>={GRPC_GENERATED_VERSION}."
         + f" Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}"
         + f" or downgrade your generated code using grpcio-tools<={GRPC_VERSION}."
@@ -258,12 +258,6 @@ class ProximaRecordServiceServicer(object):
         For bulk columnar results prefer Arrow Flight; for UQL/AQL/Federated (non-SQL)
         use /api/v2/query.
         """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details("Method not implemented!")
-        raise NotImplementedError("Method not implemented!")
-
-    def GetRecord(self, request, context):
-        """Point record get-by-id (v2 parity with v1 VectorService.VectorGet)"""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details("Method not implemented!")
         raise NotImplementedError("Method not implemented!")

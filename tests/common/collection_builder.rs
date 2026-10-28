@@ -166,6 +166,7 @@ impl TestCollectionBuilder {
             id,
             config: Some(CollectionConfig {
                 storage_class: None,
+                policy_generation: None,
                 name,
                 embedding_config: None,
                 dimension: self.dimension,
@@ -228,6 +229,7 @@ impl TestCollectionBuilder {
             id,
             config: Some(CollectionConfig {
                 storage_class: None,
+                policy_generation: None,
                 name,
                 embedding_config: None,
                 dimension: self.dimension,

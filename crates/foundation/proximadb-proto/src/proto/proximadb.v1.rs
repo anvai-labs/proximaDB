@@ -6682,6 +6682,14 @@ pub struct CollectionConfig {
     #[prost(enumeration = "StorageClass", optional, tag = "30")]
     #[serde(default)]
     pub storage_class: ::core::option::Option<i32>,
+    /// TD-TIER-1 SC3-2b: monotonic policy generation — bumped on every actual
+    /// storage-class change through the policy-mutation surface (re-admission
+    /// included); absent on legacy records (SC1-era heuristic then: 0 if the
+    /// class was never set, 1 if persisted at create). Same-value re-applies
+    /// do NOT bump. `serde(default)` keeps old persisted records readable.
+    #[prost(uint32, optional, tag = "31")]
+    #[serde(default)]
+    pub policy_generation: ::core::option::Option<u32>,
 }
 /// Per-collection storage class (TD-TIER-1 SC1). The DESIRED policy only —
 /// observed residency is reported separately via `StorageClassStatus` on the

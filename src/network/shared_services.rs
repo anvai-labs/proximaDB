@@ -1811,6 +1811,7 @@ impl SharedServices {
                 // Convert storage metadata to proto collection format
                 let collection_config = crate::proto::proximadb_v1::CollectionConfig {
                     storage_class: None,
+                    policy_generation: None,
                     name: metadata.name.clone(),
                     embedding_config: None,
                     dimension: metadata.dimension as u32,

@@ -60,6 +60,7 @@ async fn test_create_collection() -> Result<()> {
     // Create collection config
     let config = CollectionConfig {
         storage_class: None,
+        policy_generation: None,
         name: "test_collection".to_string(),
         embedding_config: None,
         dimension: 384,
@@ -101,6 +102,7 @@ async fn test_get_collection() -> Result<()> {
     // Create a collection first
     let config = CollectionConfig {
         storage_class: None,
+        policy_generation: None,
         name: "test_get".to_string(),
         embedding_config: None,
         dimension: 256,
@@ -150,6 +152,7 @@ async fn test_list_collections() -> Result<()> {
     for i in 0..3 {
         let config = CollectionConfig {
             storage_class: None,
+            policy_generation: None,
             name: format!("collection_{}", i),
             embedding_config: None,
             dimension: 128,
@@ -194,6 +197,7 @@ async fn test_delete_collection() -> Result<()> {
     // Create a collection
     let config = CollectionConfig {
         storage_class: None,
+        policy_generation: None,
         name: "test_delete".to_string(),
         embedding_config: None,
         dimension: 64,
@@ -243,6 +247,7 @@ async fn test_tenant_scoped_collection_access_and_delete() -> Result<()> {
 
     let config = CollectionConfig {
         storage_class: None,
+        policy_generation: None,
         name: "tenant_coll_one".to_string(),
         embedding_config: None,
         dimension: 128,
@@ -326,6 +331,7 @@ async fn test_collection_port_get_collection_is_tenant_scoped() -> Result<()> {
 
     let config = CollectionConfig {
         storage_class: None,
+        policy_generation: None,
         name: "scoped_vectors".to_string(),
         embedding_config: None,
         dimension: 8,
@@ -397,6 +403,7 @@ async fn test_tenant_collection_limit_enforced() -> Result<()> {
 
     let config_one = CollectionConfig {
         storage_class: None,
+        policy_generation: None,
         name: "tenant_lim_one".to_string(),
         embedding_config: None,
         dimension: 64,
@@ -455,6 +462,7 @@ async fn test_tenant_scoped_collection_listing() -> Result<()> {
 
     let config_a = CollectionConfig {
         storage_class: None,
+        policy_generation: None,
         name: "tenant_list_a".to_string(),
         embedding_config: None,
         dimension: 32,

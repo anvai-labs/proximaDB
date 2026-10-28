@@ -464,6 +464,7 @@ mod tests {
             id: id.to_string(),
             config: Some(CollectionConfig {
                 storage_class: None,
+                policy_generation: None,
                 name: name.to_string(),
                 embedding_config: None,
                 dimension: 128,
