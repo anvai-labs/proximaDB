@@ -4353,7 +4353,7 @@ async fn filtered_coarse_probe_holds_recall_and_cuts_bytes() {
         &[proximadb_block_format::ShredColumn::typed(
             "partition",
             100,
-            proximadb_data_model::ProximaType::Int64,
+            proximadb_data_model::ProximaType::String,
         )],
         None,
         None,
@@ -4597,7 +4597,7 @@ async fn partition_layout_prunes_uncorrelated_tag() {
             &[proximadb_block_format::ShredColumn::typed(
                 "partition",
                 100,
-                proximadb_data_model::ProximaType::Int64,
+                proximadb_data_model::ProximaType::String,
             )],
             None,
             None,

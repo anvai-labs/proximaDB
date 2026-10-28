@@ -1969,12 +1969,28 @@ impl PaxSegmentWriter {
             // emitted whenever a shred spec exists — compaction needs the
             // types to preserve residual outputs on rewrite, so gating the
             // map with the (default-OFF) footer-stats env would silently
-            // undo P5 at every compaction. Tens of bytes; old readers skip
-            // the section (mixed-read-safe).
+            // undo P5 at every compaction.
+            //
+            // MIXED-READ (review MAJOR-1, corrected): develop-era readers
+            // BAIL on a v2 section version (they know the tag since P2 and
+            // reject unknown versions) — they do NOT skip it. A typed map is
+            // therefore only written when the residual gate is ON:
+            // `PROXIMADB_PAX_RESIDUAL_TAIL=0` strips the types (all-untyped
+            // ⇒ byte-identical v1 section) making the kill-switch a TRUE
+            // byte-level revert — safe for mixed-binary windows (rolling
+            // restart, rollback, replica skew over shared object storage).
+            // A develop-era binary that meets a v2 footer (only possible if
+            // a newer binary wrote it) fails CLOSED at the footer parse; it
+            // never returns wrong results from the section itself.
             shred_field_map: if self.shred_spec.is_empty() {
                 Vec::new()
-            } else {
+            } else if proximadb_block_format::residual_tail_enabled() {
                 self.shred_spec.clone()
+            } else {
+                self.shred_spec
+                    .iter()
+                    .map(|c| proximadb_block_format::ShredColumn::untyped(&c.key, c.column_id))
+                    .collect()
             },
         };
         let footer_body = footer.to_bytes()?;
@@ -2496,12 +2512,28 @@ impl PaxSegmentWriter {
             // emitted whenever a shred spec exists — compaction needs the
             // types to preserve residual outputs on rewrite, so gating the
             // map with the (default-OFF) footer-stats env would silently
-            // undo P5 at every compaction. Tens of bytes; old readers skip
-            // the section (mixed-read-safe).
+            // undo P5 at every compaction.
+            //
+            // MIXED-READ (review MAJOR-1, corrected): develop-era readers
+            // BAIL on a v2 section version (they know the tag since P2 and
+            // reject unknown versions) — they do NOT skip it. A typed map is
+            // therefore only written when the residual gate is ON:
+            // `PROXIMADB_PAX_RESIDUAL_TAIL=0` strips the types (all-untyped
+            // ⇒ byte-identical v1 section) making the kill-switch a TRUE
+            // byte-level revert — safe for mixed-binary windows (rolling
+            // restart, rollback, replica skew over shared object storage).
+            // A develop-era binary that meets a v2 footer (only possible if
+            // a newer binary wrote it) fails CLOSED at the footer parse; it
+            // never returns wrong results from the section itself.
             shred_field_map: if self.shred_spec.is_empty() {
                 Vec::new()
-            } else {
+            } else if proximadb_block_format::residual_tail_enabled() {
                 self.shred_spec.clone()
+            } else {
+                self.shred_spec
+                    .iter()
+                    .map(|c| proximadb_block_format::ShredColumn::untyped(&c.key, c.column_id))
+                    .collect()
             },
         };
         let footer_body = footer.to_bytes()?;

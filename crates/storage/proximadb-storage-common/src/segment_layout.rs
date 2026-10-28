@@ -1946,17 +1946,38 @@ mod tests {
         let v1_bytes = untyped.to_bytes().unwrap();
         let v1_parsed = SegmentFooterIndex::parse(&v1_bytes).unwrap();
         assert_eq!(v1_parsed.shred_field_map, untyped.shred_field_map);
-        // and the same names/ids emitted as a PRE-P5 (name, id) list produce
-        // the identical section bytes — prove no gratuitous v1 drift.
-        let legacy = {
-            let mut f = sample_footer();
-            f.shred_field_map = vec![
-                ShredColumn::untyped("partition", 100),
-                ShredColumn::untyped("lang", 101),
-            ];
-            f
-        };
-        assert_eq!(legacy.to_bytes().unwrap(), v1_bytes);
+        // GOLDEN payload (review MINOR-1): the all-untyped section must be
+        // byte-identical to the PRE-P5 wire form — hardcoded, not compared to
+        // this PR's own serializer. [n=2 u16] then per entry [name_len u16]
+        // [utf-8 name] [col_id i32]; section header [tag 5][version 1][len u32].
+        let names: &[u8] = &[
+            0x02, 0x00, // n = 2 entries (u16 LE)
+            0x09, 0x00, // name_len 9 (u16 LE)
+            b'p', b'a', b'r', b't', b'i', b't', b'i', b'o', b'n', 0x64, 0x00, 0x00,
+            0x00, // col_id 100 (i32 LE)
+            0x04, 0x00, // name_len 4 (u16 LE)
+            b'l', b'a', b'n', b'g', 0x65, 0x00, 0x00, 0x00, // col_id 101 (i32 LE)
+        ];
+        let needle = [5u8, 1u8];
+        let mut sec_off = None;
+        let mut i = 0;
+        while i + 6 <= v1_bytes.len() {
+            if v1_bytes[i] == 5 && v1_bytes[i + 1] == 1 {
+                let len = u32::from_le_bytes(v1_bytes[i + 2..i + 6].try_into().unwrap()) as usize;
+                if i + 6 + len <= v1_bytes.len() && &v1_bytes[i + 6..i + 6 + len] == names {
+                    sec_off = Some((i, len));
+                    break;
+                }
+            }
+            i += 1;
+        }
+        let (_, slen) = sec_off.expect("v1 field-map section must appear with the golden payload");
+        assert_eq!(
+            slen,
+            names.len(),
+            "v1 payload length must equal the golden pre-P5 bytes"
+        );
+        assert_eq!(names.len(), 27); // 2 + (2+9+4) + (2+4+4)
 
         // Unknown/future type tag → UNTYPED (fail-open: complete-tail rewrite,
         // never a wrong typed reconstruction). Forge a v2 payload with tag 9.

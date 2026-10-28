@@ -1728,7 +1728,7 @@ fn residual_tail_decision(raw: Option<&str>) -> bool {
     )
 }
 
-fn residual_tail_enabled() -> bool {
+pub fn residual_tail_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED
         .get_or_init(|| residual_tail_decision(std::env::var(RESIDUAL_TAIL_ENV).ok().as_deref()))
