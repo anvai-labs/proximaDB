@@ -107,6 +107,8 @@ pub struct CollectionService {
     index_config_cache: Arc<dashmap::DashMap<String, crate::index::config::RuntimeIndexConfig>>,
     /// Global storage configuration for engine and WAL settings
     storage_config: StorageConfig,
+    /// TD-TIER-1 SC3-2: reservation pools opened at startup (None ⇒ inert).
+    reservations: Option<Arc<crate::services::collection::ReservationRegistry>>,
     /// xCatalog manager — the sole authoritative store for collection lifecycle
     /// metadata. When wired, collection reads/writes resolve through xCatalog.
     catalog_manager: Option<Arc<CatalogManager>>,
@@ -174,10 +176,23 @@ impl CollectionService {
                 .context("Failed to initialize filesystem factory")?,
         );
 
+        // TD-TIER-1 SC3-2: open the reservation pools declared in
+        // `[storage.reservation_pools]` (validated at config load). Empty
+        // list ⇒ None ⇒ every reservation seam is inert. A pool another
+        // process exclusively owns fails construction — an operator wants
+        // that at startup, not at first PERFORMANCE admission.
+        let reservations =
+            crate::services::collection::reservation::ReservationRegistry::open_from_config(
+                &storage_config.reservation_pools,
+            )
+            .await
+            .context("TD-TIER-1 SC3: reservation pool startup failed")?;
+
         Ok(Self {
             filesystem_factory,
             index_config_cache: Arc::new(dashmap::DashMap::new()),
             storage_config,
+            reservations,
             catalog_manager: None,
             syscat_cache: None,    // Built in `with_catalog_manager`.
             syscat_warm_dir: None, // Set via `with_syscat_warm_dir` / env.
@@ -187,6 +202,14 @@ impl CollectionService {
             #[cfg(feature = "experimental-turboquant")]
             turboquant_registry: None, // Will be set via with_turboquant_registry()
         })
+    }
+
+    /// TD-TIER-1 SC3-2: the shared reservation registry, when pools are
+    /// declared. The metering cadence ticks it (release tails + accrual).
+    pub fn reservations(
+        &self,
+    ) -> Option<&Arc<crate::services::collection::reservation::ReservationRegistry>> {
+        self.reservations.as_ref()
     }
 
     /// Attach a TurboQuant store registry (Phase P — Quantization Trait
@@ -755,6 +778,22 @@ impl CollectionService {
         };
 
         let response = self.delete_collection(collection_name).await?;
+        // TD-TIER-1 SC3-2: the inner delete is the authoritative release
+        // (keyed by the record it removed). This belt-and-braces release keys
+        // the REQUEST tenant against the outer-resolved target — idempotent
+        // where the inner path already released, and it covers an owner field
+        // that disagrees with the request tenant.
+        if response.success
+            && let Some(registry) = &self.reservations
+        {
+            registry
+                .release_for_collection(
+                    Self::version_tenant(tenant_context),
+                    &target.id,
+                    chrono::Utc::now().timestamp(),
+                )
+                .await;
+        }
         // The name-keyed cache is also keyed by id and by the name the caller
         // used; invalidate every key the deleted collection can be read by.
         if response.success {
@@ -1362,9 +1401,49 @@ impl CollectionService {
             .mint_typed_identity_for_collection(tenant_context, &enriched_config.name, &uuid)
             .await;
 
+        // TD-TIER-1 SC3-2: a PERFORMANCE create acquires its reservation from
+        // the default pool before any collection-KEYED durable side effect
+        // (directories, catalog upsert): a refused admission leaves the
+        // request rejected with the old policy unchanged — the pool ledger is
+        // the durable record of what was granted, keyed (tenant, collection
+        // uuid). The key tenant is the same default-folding `version_tenant`
+        // uses (never the empty string — an empty tenant id is rejected by the
+        // metering path resolver, so it must never reach a grant). Kill-switch
+        // and pool misconfiguration surface as actionable errors here, never a
+        // silent zero-byte grant. Non-PERFORMANCE classes and an empty pool
+        // list skip this seam entirely. If a later create step fails, the
+        // compensation below releases the grant: a leaked grant would charge
+        // capacity and accrue billing for a collection that never existed.
+        let mut reserved_grant: Option<(
+            std::sync::Arc<crate::services::collection::ReservationRegistry>,
+            String,
+        )> = None;
+        if crate::services::collection::storage_class::storage_class_or_balanced(&enriched_config)
+            == crate::proto::proximadb_v1::StorageClass::Performance
+            && let Some(registry) = &self.reservations
+        {
+            let reservation_tenant = Self::version_tenant(tenant_context).to_string();
+            registry
+                .reserve_for_performance(&reservation_tenant, &uuid, chrono::Utc::now().timestamp())
+                .await
+                .context("TD-TIER-1 SC3: PERFORMANCE admission refused")?;
+            reserved_grant = Some((registry.clone(), reservation_tenant));
+        }
+        // Compensating release for every early exit after a successful
+        // reserve (review B1: the grant must not outlive a failed create).
+        macro_rules! compensate_reservation {
+            () => {
+                if let Some((registry, tenant)) = reserved_grant.take() {
+                    registry
+                        .release_for_collection(&tenant, &uuid, chrono::Utc::now().timestamp())
+                        .await;
+                }
+            };
+        }
+
         // Create storage directories (tenant-isolated if multi-tenant mode)
         let tenant_id = tenant_context.map(|ctx| ctx.tenant_id.as_str());
-        let _storage_created = self
+        let _storage_created = match self
             .create_storage_directories(
                 &base_location,
                 &enriched_config.name,
@@ -1375,7 +1454,13 @@ impl CollectionService {
                 ),
             )
             .await
-            .context("Failed to create storage directories")?;
+        {
+            Ok(created) => created,
+            Err(e) => {
+                compensate_reservation!();
+                return Err(e.context("Failed to create storage directories"));
+            }
+        };
 
         // Build tenant-prefixed base location for storage assignment
         let tenant_base_location = match tenant_id {
@@ -1431,6 +1516,7 @@ impl CollectionService {
             .upsert_collection_catalog_asset(&proto_collection, typed_identity)
             .await
         {
+            compensate_reservation!();
             return Ok(CollectionServiceResponse::error(
                 format!("CATALOG_CREATE_FAILED: {}", e),
                 start_time.elapsed().as_micros() as i64,
@@ -1857,6 +1943,30 @@ impl CollectionService {
                     format!("CATALOG_DELETE_FAILED: {}", e),
                     start_time.elapsed().as_micros() as i64,
                 ));
+            }
+
+            // TD-TIER-1 SC3-2 (review SF3): release the reservation HERE —
+            // keyed by the record THIS delete actually removed, so every
+            // caller (the tenant-aware wrapper, the embedded bindings) is
+            // covered and a delete-vs-recreate race cannot key the wrong
+            // incarnation. Both the record's owner and the default tenant are
+            // released (idempotent): create folds its key the same way, and
+            // the tail billing interval parks for the metering tick.
+            if let Some(registry) = &self.reservations {
+                let now = chrono::Utc::now().timestamp();
+                let owner = record
+                    .config
+                    .as_ref()
+                    .and_then(|cfg| cfg.owner.clone())
+                    .filter(|owner| !owner.is_empty());
+                if let Some(owner) = owner.as_deref() {
+                    registry
+                        .release_for_collection(owner, &collection_uuid, now)
+                        .await;
+                }
+                registry
+                    .release_for_collection(Self::DEFAULT_VERSION_TENANT, &collection_uuid, now)
+                    .await;
             }
 
             let deleted = true;

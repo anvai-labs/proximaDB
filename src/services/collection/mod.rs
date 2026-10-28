@@ -14,6 +14,7 @@ pub use manager::{
     CollectionService as Collections, CollectionServiceBuilder as Builder,
     CollectionServiceResponse as Response,
 };
+pub use reservation::ReservationRegistry;
 pub use security::SecureCollectionService;
 
 /// Type alias for [`Collections`] (primary collection management service).
