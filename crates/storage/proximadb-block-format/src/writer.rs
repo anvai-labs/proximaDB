@@ -1704,17 +1704,34 @@ fn shred_class(v: &proximadb_data_model::ProximaValue) -> ShredClass {
     }
 }
 
-/// Gate for the residual tail (TD-USUB-6 2b). Unset ⇒ OFF, so the msgpack
-/// `PROPS` tail stays complete and block bytes are unchanged.
+/// Gate for the residual tail (TD-USUB-6 2b / TD-FPRUNE-1 P5). **FLIPPED
+/// default-ON 2026-10-28** — measured rationale (E1 filter family, 3M SIFT128,
+/// n=1000): a shredded prop costs its msgpack named-map entry ~170 B/row for
+/// three int props (key bytes repeated per row, no dictionary, serde-enum
+/// wrapper) while the typed stripe reproduces it exactly; the whole-D region
+/// is 89% of filtered-query bytes, so the double-write is the dominant
+/// metadata cost term. Losslessness holds per value by construction
+/// (`shreds_losslessly` requires exact equality post-reconstruction; anything
+/// the stripe cannot reproduce identically stays in the tail), a block whose
+/// tail became residual declares format v3, and readers that predate v3 keep
+/// working on v2 blocks. `PROXIMADB_PAX_RESIDUAL_TAIL=0|off|false|no` is the
+/// emergency kill-switch back to the complete-tail double-write.
 pub const RESIDUAL_TAIL_ENV: &str = "PROXIMADB_PAX_RESIDUAL_TAIL";
+
+/// Pure decision form of the P5 gate (default-ON kill-switch), factored so
+/// the default and every kill-switch spelling are testable without touching
+/// the process env (this crate forbids unsafe env mutation in tests).
+fn residual_tail_decision(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0" | "off" | "false" | "no")
+    )
+}
 
 fn residual_tail_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var(RESIDUAL_TAIL_ENV)
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    *ENABLED
+        .get_or_init(|| residual_tail_decision(std::env::var(RESIDUAL_TAIL_ENV).ok().as_deref()))
 }
 
 /// Physical stripe class implied by an EXACT declared type (TD-USUB-6 2b).
@@ -2770,6 +2787,23 @@ mod tests {
     /// * a value whose variant does NOT match its declared type, which must stay
     ///   in the tail rather than be silently coerced;
     /// * an untyped column, which can never be authoritative and keeps its tail.
+    #[test]
+    fn residual_tail_defaults_on_and_kills_switch_off() {
+        // P5 flip: unset ⇒ ON; every kill-switch spelling opts out (case and
+        // surrounding whitespace tolerant); explicit opt-ins stay ON; typos
+        // fall to the default-ON side (the safe direction for this gate).
+        assert!(
+            residual_tail_decision(None),
+            "unset must default ON after the P5 flip"
+        );
+        for off in ["0", "off", "false", "no", "OFF", "False", " false "] {
+            assert!(!residual_tail_decision(Some(off)), "{off:?} must opt out");
+        }
+        for on in ["1", "true", "on", "yes", "anything-else"] {
+            assert!(residual_tail_decision(Some(on)), "{on:?} must stay ON");
+        }
+    }
+
     #[test]
     fn residual_tail_round_trips_every_prop_exactly() {
         use crate::reader::PaxBlockReader;
