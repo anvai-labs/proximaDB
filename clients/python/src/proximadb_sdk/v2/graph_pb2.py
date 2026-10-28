@@ -4,157 +4,154 @@
 # source: proximadb/v2/graph.proto
 # Protobuf Python Version: 6.31.1
 """Generated protocol buffer code."""
+
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import runtime_version as _runtime_version
 from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
+
 _runtime_version.ValidateProtobufRuntimeVersion(
-    _runtime_version.Domain.PUBLIC,
-    6,
-    31,
-    1,
-    '',
-    'proximadb/v2/graph.proto'
+    _runtime_version.Domain.PUBLIC, 6, 31, 1, "", "proximadb/v2/graph.proto"
 )
 # @@protoc_insertion_point(imports)
 
 _sym_db = _symbol_database.Default()
 
 
-
-
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x18proximadb/v2/graph.proto\x12\x0cproximadb.v2\"\xab\x02\n\tGraphNode\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0e\n\x06labels\x18\x02 \x03(\t\x12;\n\nproperties\x18\x03 \x03(\x0b\x32\'.proximadb.v2.GraphNode.PropertiesEntry\x12\x34\n\tembedding\x18\x04 \x01(\x0b\x32\x1c.proximadb.v2.GraphEmbeddingH\x00\x88\x01\x01\x12\x15\n\rcreated_at_ms\x18\x05 \x01(\x03\x12\x15\n\rupdated_at_ms\x18\x06 \x01(\x03\x1aS\n\x0fPropertiesEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12/\n\x05value\x18\x02 \x01(\x0b\x32 .proximadb.v2.GraphPropertyValue:\x02\x38\x01\x42\x0c\n\n_embedding\"\xb4\x02\n\tGraphEdge\x12\n\n\x02id\x18\x01 \x01(\t\x12\x14\n\x0c\x66rom_node_id\x18\x02 \x01(\t\x12\x12\n\nto_node_id\x18\x03 \x01(\t\x12\x11\n\tedge_type\x18\x04 \x01(\t\x12;\n\nproperties\x18\x05 \x03(\x0b\x32\'.proximadb.v2.GraphEdge.PropertiesEntry\x12\x13\n\x06weight\x18\x06 \x01(\x01H\x00\x88\x01\x01\x12\x15\n\rcreated_at_ms\x18\x07 \x01(\x03\x12\x15\n\rupdated_at_ms\x18\x08 \x01(\x03\x1aS\n\x0fPropertiesEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12/\n\x05value\x18\x02 \x01(\x0b\x32 .proximadb.v2.GraphPropertyValue:\x02\x38\x01\x42\t\n\x07_weight\"\\\n\x0eGraphEmbedding\x12\x0e\n\x06vector\x18\x01 \x03(\x02\x12\x11\n\tdimension\x18\x02 \x01(\r\x12\x10\n\x08model_id\x18\x03 \x01(\t\x12\x15\n\rmodel_version\x18\x04 \x01(\t\"\xfd\x01\n\x12GraphPropertyValue\x12\x16\n\x0cstring_value\x18\x01 \x01(\tH\x00\x12\x13\n\tint_value\x18\x02 \x01(\x03H\x00\x12\x16\n\x0c\x64ouble_value\x18\x03 \x01(\x01H\x00\x12\x14\n\nbool_value\x18\x04 \x01(\x08H\x00\x12\x15\n\x0b\x62ytes_value\x18\x05 \x01(\x0cH\x00\x12\x37\n\x0b\x61rray_value\x18\x06 \x01(\x0b\x32 .proximadb.v2.GraphPropertyArrayH\x00\x12\x33\n\tmap_value\x18\x07 \x01(\x0b\x32\x1e.proximadb.v2.GraphPropertyMapH\x00\x42\x07\n\x05value\"F\n\x12GraphPropertyArray\x12\x30\n\x06values\x18\x01 \x03(\x0b\x32 .proximadb.v2.GraphPropertyValue\"\x9f\x01\n\x10GraphPropertyMap\x12:\n\x06\x66ields\x18\x01 \x03(\x0b\x32*.proximadb.v2.GraphPropertyMap.FieldsEntry\x1aO\n\x0b\x46ieldsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12/\n\x05value\x18\x02 \x01(\x0b\x32 .proximadb.v2.GraphPropertyValue:\x02\x38\x01\"\x90\x01\n\x13GraphPropertyFilter\x12\x0b\n\x03key\x18\x01 \x01(\t\x12;\n\x08operator\x18\x02 \x01(\x0e\x32).proximadb.v2.GraphPropertyFilterOperator\x12/\n\x05value\x18\x03 \x01(\x0b\x32 .proximadb.v2.GraphPropertyValue\"Q\n\x16\x43reateGraphNodeRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12%\n\x04node\x18\x02 \x01(\x0b\x32\x17.proximadb.v2.GraphNode\"Q\n\x16UpdateGraphNodeRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12%\n\x04node\x18\x02 \x01(\x0b\x32\x17.proximadb.v2.GraphNode\"8\n\x13GetGraphNodeRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x0f\n\x07node_id\x18\x02 \x01(\t\";\n\x16\x44\x65leteGraphNodeRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x0f\n\x07node_id\x18\x02 \x01(\t\"H\n\x11GraphNodeResponse\x12*\n\x04node\x18\x01 \x01(\x0b\x32\x17.proximadb.v2.GraphNodeH\x00\x88\x01\x01\x42\x07\n\x05_node\"_\n\x17\x44\x65leteGraphNodeResponse\x12\x0f\n\x07\x64\x65leted\x18\x01 \x01(\x08\x12*\n\x04node\x18\x02 \x01(\x0b\x32\x17.proximadb.v2.GraphNodeH\x00\x88\x01\x01\x42\x07\n\x05_node\"Q\n\x16\x43reateGraphEdgeRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12%\n\x04\x65\x64ge\x18\x02 \x01(\x0b\x32\x17.proximadb.v2.GraphEdge\"Q\n\x16UpdateGraphEdgeRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12%\n\x04\x65\x64ge\x18\x02 \x01(\x0b\x32\x17.proximadb.v2.GraphEdge\"8\n\x13GetGraphEdgeRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x0f\n\x07\x65\x64ge_id\x18\x02 \x01(\t\";\n\x16\x44\x65leteGraphEdgeRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x0f\n\x07\x65\x64ge_id\x18\x02 \x01(\t\"H\n\x11GraphEdgeResponse\x12*\n\x04\x65\x64ge\x18\x01 \x01(\x0b\x32\x17.proximadb.v2.GraphEdgeH\x00\x88\x01\x01\x42\x07\n\x05_edge\"_\n\x17\x44\x65leteGraphEdgeResponse\x12\x0f\n\x07\x64\x65leted\x18\x01 \x01(\x08\x12*\n\x04\x65\x64ge\x18\x02 \x01(\x0b\x32\x17.proximadb.v2.GraphEdgeH\x00\x88\x01\x01\x42\x07\n\x05_edge\"\xe4\x01\n\x16QueryGraphNodesRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x0e\n\x06labels\x18\x02 \x03(\t\x12\x32\n\x07\x66ilters\x18\x03 \x03(\x0b\x32!.proximadb.v2.GraphPropertyFilter\x12\x12\n\x05limit\x18\x04 \x01(\rH\x00\x88\x01\x01\x12\x13\n\x06offset\x18\x05 \x01(\rH\x01\x88\x01\x01\x12\x1f\n\x12\x63ontinuation_token\x18\x06 \x01(\tH\x02\x88\x01\x01\x42\x08\n\x06_limitB\t\n\x07_offsetB\x15\n\x13_continuation_token\"i\n\x17QueryGraphNodesResponse\x12&\n\x05nodes\x18\x01 \x03(\x0b\x32\x17.proximadb.v2.GraphNode\x12\x17\n\nnext_token\x18\x02 \x01(\tH\x00\x88\x01\x01\x42\r\n\x0b_next_token\"\xbc\x02\n\x16QueryGraphEdgesRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x19\n\x0c\x66rom_node_id\x18\x02 \x01(\tH\x00\x88\x01\x01\x12\x17\n\nto_node_id\x18\x03 \x01(\tH\x01\x88\x01\x01\x12\x12\n\nedge_types\x18\x04 \x03(\t\x12\x32\n\x07\x66ilters\x18\x05 \x03(\x0b\x32!.proximadb.v2.GraphPropertyFilter\x12\x12\n\x05limit\x18\x06 \x01(\rH\x02\x88\x01\x01\x12\x13\n\x06offset\x18\x07 \x01(\rH\x03\x88\x01\x01\x12\x1f\n\x12\x63ontinuation_token\x18\x08 \x01(\tH\x04\x88\x01\x01\x42\x0f\n\r_from_node_idB\r\n\x0b_to_node_idB\x08\n\x06_limitB\t\n\x07_offsetB\x15\n\x13_continuation_token\"i\n\x17QueryGraphEdgesResponse\x12&\n\x05\x65\x64ges\x18\x01 \x03(\x0b\x32\x17.proximadb.v2.GraphEdge\x12\x17\n\nnext_token\x18\x02 \x01(\tH\x00\x88\x01\x01\x42\r\n\x0b_next_token\"c\n\x18GetGraphNeighborsRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x0f\n\x07node_id\x18\x02 \x01(\t\x12\x16\n\tedge_type\x18\x03 \x01(\tH\x00\x88\x01\x01\x42\x0c\n\n_edge_type\"C\n\x19GetGraphNeighborsResponse\x12&\n\x05nodes\x18\x01 \x03(\x0b\x32\x17.proximadb.v2.GraphNode\"\xdb\x02\n\x14TraverseGraphRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x15\n\rstart_node_id\x18\x02 \x01(\t\x12\x11\n\tmax_depth\x18\x03 \x01(\r\x12\x12\n\nedge_types\x18\x04 \x03(\t\x12\x13\n\x0bnode_labels\x18\x05 \x03(\t\x12\x32\n\x07\x66ilters\x18\x06 \x03(\x0b\x32!.proximadb.v2.GraphPropertyFilter\x12\x38\n\talgorithm\x18\x07 \x01(\x0e\x32%.proximadb.v2.GraphTraversalAlgorithm\x12\x12\n\x05limit\x18\x08 \x01(\rH\x00\x88\x01\x01\x12\x17\n\ntimeout_ms\x18\t \x01(\rH\x01\x88\x01\x01\x12\x19\n\x0cmax_frontier\x18\n \x01(\rH\x02\x88\x01\x01\x42\x08\n\x06_limitB\r\n\x0b_timeout_msB\x0f\n\r_max_frontier\"\xc1\x01\n\x15TraverseGraphResponse\x12&\n\x05nodes\x18\x01 \x03(\x0b\x32\x17.proximadb.v2.GraphNode\x12&\n\x05\x65\x64ges\x18\x02 \x03(\x0b\x32\x17.proximadb.v2.GraphEdge\x12&\n\x05paths\x18\x03 \x03(\x0b\x32\x17.proximadb.v2.GraphPath\x12\x30\n\x05stats\x18\x04 \x01(\x0b\x32!.proximadb.v2.GraphTraversalStats\"\x1d\n\tGraphPath\x12\x10\n\x08node_ids\x18\x01 \x03(\t\"\x85\x01\n\x13GraphTraversalStats\x12\x15\n\rnodes_visited\x18\x01 \x01(\r\x12\x17\n\x0f\x65\x64ges_traversed\x18\x02 \x01(\r\x12\x19\n\x11max_depth_reached\x18\x03 \x01(\r\x12#\n\x1b\x65xecution_time_microseconds\x18\x04 \x01(\x04\"\xdf\x02\n\x18GraphShortestPathRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x15\n\rstart_node_id\x18\x02 \x01(\t\x12\x16\n\x0etarget_node_id\x18\x03 \x01(\t\x12\x16\n\tmax_depth\x18\x04 \x01(\rH\x00\x88\x01\x01\x12\x12\n\nedge_types\x18\x05 \x03(\t\x12@\n\talgorithm\x18\x06 \x01(\x0e\x32(.proximadb.v2.GraphShortestPathAlgorithmH\x01\x88\x01\x01\x12\x0e\n\x01k\x18\x07 \x01(\rH\x02\x88\x01\x01\x12\x1c\n\x0f\x65nable_prefetch\x18\x08 \x01(\x08H\x03\x88\x01\x01\x12\x1c\n\x0fprefetch_budget\x18\t \x01(\rH\x04\x88\x01\x01\x42\x0c\n\n_max_depthB\x0c\n\n_algorithmB\x04\n\x02_kB\x12\n\x10_enable_prefetchB\x12\n\x10_prefetch_budget\"h\n\x19GraphShortestPathResponse\x12\x10\n\x08node_ids\x18\x01 \x03(\t\x12\x19\n\x0ctotal_weight\x18\x02 \x01(\x01H\x00\x88\x01\x01\x12\r\n\x05\x66ound\x18\x03 \x01(\x08\x42\x0f\n\r_total_weight\"(\n\x14GetGraphStatsRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\"\xa5\x02\n\nGraphStats\x12\x13\n\x0btotal_nodes\x18\x01 \x01(\x04\x12\x13\n\x0btotal_edges\x18\x02 \x01(\x04\x12\x32\n\x0blabel_stats\x18\x03 \x03(\x0b\x32\x1d.proximadb.v2.GraphLabelStats\x12\x39\n\x0f\x65\x64ge_type_stats\x18\x04 \x03(\x0b\x32 .proximadb.v2.GraphEdgeTypeStats\x12\x18\n\x10total_properties\x18\x05 \x01(\x04\x12\x1a\n\x12memory_usage_bytes\x18\x06 \x01(\x04\x12\x16\n\x0e\x61verage_degree\x18\x07 \x01(\x01\x12\x12\n\nmax_degree\x18\x08 \x01(\r\x12\x1c\n\x14\x63onnected_components\x18\t \x01(\r\"/\n\x0fGraphLabelStats\x12\r\n\x05label\x18\x01 \x01(\t\x12\r\n\x05\x63ount\x18\x02 \x01(\x04\"6\n\x12GraphEdgeTypeStats\x12\x11\n\tedge_type\x18\x01 \x01(\t\x12\r\n\x05\x63ount\x18\x02 \x01(\x04\"\xdc\x01\n\x13GraphTraversalChunk\x12&\n\x05nodes\x18\x01 \x03(\x0b\x32\x17.proximadb.v2.GraphNode\x12&\n\x05\x65\x64ges\x18\x02 \x03(\x0b\x32\x17.proximadb.v2.GraphEdge\x12&\n\x05paths\x18\x03 \x03(\x0b\x32\x17.proximadb.v2.GraphPath\x12\x35\n\x05stats\x18\x04 \x01(\x0b\x32!.proximadb.v2.GraphTraversalStatsH\x00\x88\x01\x01\x12\x0c\n\x04\x64one\x18\x05 \x01(\x08\x42\x08\n\x06_stats\"3\n\x1fGraphConnectedComponentsRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\"T\n GraphConnectedComponentsResponse\x12\x30\n\ncomponents\x18\x01 \x03(\x0b\x32\x1c.proximadb.v2.GraphComponent\"\"\n\x0eGraphComponent\x12\x10\n\x08node_ids\x18\x01 \x03(\t\"(\n\x14GraphHasCycleRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\"*\n\x15GraphHasCycleResponse\x12\x11\n\thas_cycle\x18\x01 \x01(\x08\"Q\n\x1cGraphUniqueConstraintRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\r\n\x05label\x18\x02 \x01(\t\x12\x10\n\x08property\x18\x03 \x01(\t\"^\n\x1dGraphUniqueConstraintResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x1a\n\rerror_message\x18\x02 \x01(\tH\x00\x88\x01\x01\x42\x10\n\x0e_error_message\"X\n\x1c\x42\x61tchCreateGraphNodesRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12&\n\x05nodes\x18\x02 \x03(\x0b\x32\x17.proximadb.v2.GraphNode\"X\n\x1c\x42\x61tchCreateGraphEdgesRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12&\n\x05\x65\x64ges\x18\x02 \x03(\x0b\x32\x17.proximadb.v2.GraphEdge\"\x9d\x01\n\x1d\x42\x61tchCreateGraphNodesResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12&\n\x05nodes\x18\x02 \x03(\x0b\x32\x17.proximadb.v2.GraphNode\x12\x15\n\rcreated_count\x18\x03 \x01(\r\x12\x1a\n\rerror_message\x18\x04 \x01(\tH\x00\x88\x01\x01\x42\x10\n\x0e_error_message\"\x9d\x01\n\x1d\x42\x61tchCreateGraphEdgesResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12&\n\x05\x65\x64ges\x18\x02 \x03(\x0b\x32\x17.proximadb.v2.GraphEdge\x12\x15\n\rcreated_count\x18\x03 \x01(\r\x12\x1a\n\rerror_message\x18\x04 \x01(\tH\x00\x88\x01\x01\x42\x10\n\x0e_error_message\"\x97\x01\n\x18\x45xecuteGraphQueryRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x32\n\x08language\x18\x02 \x01(\x0e\x32 .proximadb.v2.GraphQueryLanguage\x12\r\n\x05query\x18\x03 \x01(\t\x12\x17\n\ntimeout_ms\x18\x04 \x01(\rH\x00\x88\x01\x01\x42\r\n\x0b_timeout_ms\"\xaa\x01\n\x14\x45xecuteGraphQueryRow\x12@\n\x07\x63olumns\x18\x01 \x03(\x0b\x32/.proximadb.v2.ExecuteGraphQueryRow.ColumnsEntry\x1aP\n\x0c\x43olumnsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12/\n\x05value\x18\x02 \x01(\x0b\x32 .proximadb.v2.GraphPropertyValue:\x02\x38\x01\"{\n\x19\x45xecuteGraphQueryResponse\x12\x30\n\x04rows\x18\x01 \x03(\x0b\x32\".proximadb.v2.ExecuteGraphQueryRow\x12\x1a\n\rerror_message\x18\x02 \x01(\tH\x00\x88\x01\x01\x42\x10\n\x0e_error_message*\xf2\x03\n\x1bGraphPropertyFilterOperator\x12.\n*GRAPH_PROPERTY_FILTER_OPERATOR_UNSPECIFIED\x10\x00\x12)\n%GRAPH_PROPERTY_FILTER_OPERATOR_EQUALS\x10\x01\x12-\n)GRAPH_PROPERTY_FILTER_OPERATOR_NOT_EQUALS\x10\x02\x12/\n+GRAPH_PROPERTY_FILTER_OPERATOR_GREATER_THAN\x10\x03\x12,\n(GRAPH_PROPERTY_FILTER_OPERATOR_LESS_THAN\x10\x04\x12\x30\n,GRAPH_PROPERTY_FILTER_OPERATOR_GREATER_EQUAL\x10\x05\x12-\n)GRAPH_PROPERTY_FILTER_OPERATOR_LESS_EQUAL\x10\x06\x12+\n\'GRAPH_PROPERTY_FILTER_OPERATOR_CONTAINS\x10\x07\x12.\n*GRAPH_PROPERTY_FILTER_OPERATOR_STARTS_WITH\x10\x08\x12,\n(GRAPH_PROPERTY_FILTER_OPERATOR_ENDS_WITH\x10\t*\xb6\x01\n\x17GraphTraversalAlgorithm\x12)\n%GRAPH_TRAVERSAL_ALGORITHM_UNSPECIFIED\x10\x00\x12!\n\x1dGRAPH_TRAVERSAL_ALGORITHM_BFS\x10\x01\x12!\n\x1dGRAPH_TRAVERSAL_ALGORITHM_DFS\x10\x02\x12*\n&GRAPH_TRAVERSAL_ALGORITHM_PARALLEL_BFS\x10\x03*\xa0\x01\n\x1aGraphShortestPathAlgorithm\x12-\n)GRAPH_SHORTEST_PATH_ALGORITHM_UNSPECIFIED\x10\x00\x12*\n&GRAPH_SHORTEST_PATH_ALGORITHM_DIJKSTRA\x10\x01\x12\'\n#GRAPH_SHORTEST_PATH_ALGORITHM_ASTAR\x10\x02*\x9e\x01\n\x12GraphQueryLanguage\x12$\n GRAPH_QUERY_LANGUAGE_UNSPECIFIED\x10\x00\x12\x1f\n\x1bGRAPH_QUERY_LANGUAGE_NATIVE\x10\x01\x12\x1f\n\x1bGRAPH_QUERY_LANGUAGE_CYPHER\x10\x02\x12 \n\x1cGRAPH_QUERY_LANGUAGE_GREMLIN\x10\x03\x32\xa5\x10\n\x13ProximaGraphService\x12S\n\nCreateNode\x12$.proximadb.v2.CreateGraphNodeRequest\x1a\x1f.proximadb.v2.GraphNodeResponse\x12M\n\x07GetNode\x12!.proximadb.v2.GetGraphNodeRequest\x1a\x1f.proximadb.v2.GraphNodeResponse\x12S\n\nUpdateNode\x12$.proximadb.v2.UpdateGraphNodeRequest\x1a\x1f.proximadb.v2.GraphNodeResponse\x12Y\n\nDeleteNode\x12$.proximadb.v2.DeleteGraphNodeRequest\x1a%.proximadb.v2.DeleteGraphNodeResponse\x12S\n\nCreateEdge\x12$.proximadb.v2.CreateGraphEdgeRequest\x1a\x1f.proximadb.v2.GraphEdgeResponse\x12M\n\x07GetEdge\x12!.proximadb.v2.GetGraphEdgeRequest\x1a\x1f.proximadb.v2.GraphEdgeResponse\x12S\n\nUpdateEdge\x12$.proximadb.v2.UpdateGraphEdgeRequest\x1a\x1f.proximadb.v2.GraphEdgeResponse\x12Y\n\nDeleteEdge\x12$.proximadb.v2.DeleteGraphEdgeRequest\x1a%.proximadb.v2.DeleteGraphEdgeResponse\x12Y\n\nQueryNodes\x12$.proximadb.v2.QueryGraphNodesRequest\x1a%.proximadb.v2.QueryGraphNodesResponse\x12Y\n\nQueryEdges\x12$.proximadb.v2.QueryGraphEdgesRequest\x1a%.proximadb.v2.QueryGraphEdgesResponse\x12_\n\x0cGetNeighbors\x12&.proximadb.v2.GetGraphNeighborsRequest\x1a\'.proximadb.v2.GetGraphNeighborsResponse\x12X\n\rTraverseGraph\x12\".proximadb.v2.TraverseGraphRequest\x1a#.proximadb.v2.TraverseGraphResponse\x12_\n\x0cShortestPath\x12&.proximadb.v2.GraphShortestPathRequest\x1a\'.proximadb.v2.GraphShortestPathResponse\x12M\n\rGetGraphStats\x12\".proximadb.v2.GetGraphStatsRequest\x1a\x18.proximadb.v2.GraphStats\x12Y\n\x0eStreamTraverse\x12\".proximadb.v2.TraverseGraphRequest\x1a!.proximadb.v2.GraphTraversalChunk0\x01\x12w\n\x16GetConnectedComponents\x12-.proximadb.v2.GraphConnectedComponentsRequest\x1a..proximadb.v2.GraphConnectedComponentsResponse\x12S\n\x08HasCycle\x12\".proximadb.v2.GraphHasCycleRequest\x1a#.proximadb.v2.GraphHasCycleResponse\x12n\n\x13\x41\x64\x64UniqueConstraint\x12*.proximadb.v2.GraphUniqueConstraintRequest\x1a+.proximadb.v2.GraphUniqueConstraintResponse\x12q\n\x16RemoveUniqueConstraint\x12*.proximadb.v2.GraphUniqueConstraintRequest\x1a+.proximadb.v2.GraphUniqueConstraintResponse\x12k\n\x10\x42\x61tchCreateNodes\x12*.proximadb.v2.BatchCreateGraphNodesRequest\x1a+.proximadb.v2.BatchCreateGraphNodesResponse\x12k\n\x10\x42\x61tchCreateEdges\x12*.proximadb.v2.BatchCreateGraphEdgesRequest\x1a+.proximadb.v2.BatchCreateGraphEdgesResponse\x12_\n\x0c\x45xecuteQuery\x12&.proximadb.v2.ExecuteGraphQueryRequest\x1a\'.proximadb.v2.ExecuteGraphQueryResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(
+    b'\n\x18proximadb/v2/graph.proto\x12\x0cproximadb.v2"\xab\x02\n\tGraphNode\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0e\n\x06labels\x18\x02 \x03(\t\x12;\n\nproperties\x18\x03 \x03(\x0b\x32\'.proximadb.v2.GraphNode.PropertiesEntry\x12\x34\n\tembedding\x18\x04 \x01(\x0b\x32\x1c.proximadb.v2.GraphEmbeddingH\x00\x88\x01\x01\x12\x15\n\rcreated_at_ms\x18\x05 \x01(\x03\x12\x15\n\rupdated_at_ms\x18\x06 \x01(\x03\x1aS\n\x0fPropertiesEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12/\n\x05value\x18\x02 \x01(\x0b\x32 .proximadb.v2.GraphPropertyValue:\x02\x38\x01\x42\x0c\n\n_embedding"\xb4\x02\n\tGraphEdge\x12\n\n\x02id\x18\x01 \x01(\t\x12\x14\n\x0c\x66rom_node_id\x18\x02 \x01(\t\x12\x12\n\nto_node_id\x18\x03 \x01(\t\x12\x11\n\tedge_type\x18\x04 \x01(\t\x12;\n\nproperties\x18\x05 \x03(\x0b\x32\'.proximadb.v2.GraphEdge.PropertiesEntry\x12\x13\n\x06weight\x18\x06 \x01(\x01H\x00\x88\x01\x01\x12\x15\n\rcreated_at_ms\x18\x07 \x01(\x03\x12\x15\n\rupdated_at_ms\x18\x08 \x01(\x03\x1aS\n\x0fPropertiesEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12/\n\x05value\x18\x02 \x01(\x0b\x32 .proximadb.v2.GraphPropertyValue:\x02\x38\x01\x42\t\n\x07_weight"\\\n\x0eGraphEmbedding\x12\x0e\n\x06vector\x18\x01 \x03(\x02\x12\x11\n\tdimension\x18\x02 \x01(\r\x12\x10\n\x08model_id\x18\x03 \x01(\t\x12\x15\n\rmodel_version\x18\x04 \x01(\t"\xfd\x01\n\x12GraphPropertyValue\x12\x16\n\x0cstring_value\x18\x01 \x01(\tH\x00\x12\x13\n\tint_value\x18\x02 \x01(\x03H\x00\x12\x16\n\x0c\x64ouble_value\x18\x03 \x01(\x01H\x00\x12\x14\n\nbool_value\x18\x04 \x01(\x08H\x00\x12\x15\n\x0b\x62ytes_value\x18\x05 \x01(\x0cH\x00\x12\x37\n\x0b\x61rray_value\x18\x06 \x01(\x0b\x32 .proximadb.v2.GraphPropertyArrayH\x00\x12\x33\n\tmap_value\x18\x07 \x01(\x0b\x32\x1e.proximadb.v2.GraphPropertyMapH\x00\x42\x07\n\x05value"F\n\x12GraphPropertyArray\x12\x30\n\x06values\x18\x01 \x03(\x0b\x32 .proximadb.v2.GraphPropertyValue"\x9f\x01\n\x10GraphPropertyMap\x12:\n\x06\x66ields\x18\x01 \x03(\x0b\x32*.proximadb.v2.GraphPropertyMap.FieldsEntry\x1aO\n\x0b\x46ieldsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12/\n\x05value\x18\x02 \x01(\x0b\x32 .proximadb.v2.GraphPropertyValue:\x02\x38\x01"\x90\x01\n\x13GraphPropertyFilter\x12\x0b\n\x03key\x18\x01 \x01(\t\x12;\n\x08operator\x18\x02 \x01(\x0e\x32).proximadb.v2.GraphPropertyFilterOperator\x12/\n\x05value\x18\x03 \x01(\x0b\x32 .proximadb.v2.GraphPropertyValue"Q\n\x16\x43reateGraphNodeRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12%\n\x04node\x18\x02 \x01(\x0b\x32\x17.proximadb.v2.GraphNode"Q\n\x16UpdateGraphNodeRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12%\n\x04node\x18\x02 \x01(\x0b\x32\x17.proximadb.v2.GraphNode"8\n\x13GetGraphNodeRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x0f\n\x07node_id\x18\x02 \x01(\t";\n\x16\x44\x65leteGraphNodeRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x0f\n\x07node_id\x18\x02 \x01(\t"H\n\x11GraphNodeResponse\x12*\n\x04node\x18\x01 \x01(\x0b\x32\x17.proximadb.v2.GraphNodeH\x00\x88\x01\x01\x42\x07\n\x05_node"_\n\x17\x44\x65leteGraphNodeResponse\x12\x0f\n\x07\x64\x65leted\x18\x01 \x01(\x08\x12*\n\x04node\x18\x02 \x01(\x0b\x32\x17.proximadb.v2.GraphNodeH\x00\x88\x01\x01\x42\x07\n\x05_node"Q\n\x16\x43reateGraphEdgeRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12%\n\x04\x65\x64ge\x18\x02 \x01(\x0b\x32\x17.proximadb.v2.GraphEdge"Q\n\x16UpdateGraphEdgeRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12%\n\x04\x65\x64ge\x18\x02 \x01(\x0b\x32\x17.proximadb.v2.GraphEdge"8\n\x13GetGraphEdgeRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x0f\n\x07\x65\x64ge_id\x18\x02 \x01(\t";\n\x16\x44\x65leteGraphEdgeRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x0f\n\x07\x65\x64ge_id\x18\x02 \x01(\t"H\n\x11GraphEdgeResponse\x12*\n\x04\x65\x64ge\x18\x01 \x01(\x0b\x32\x17.proximadb.v2.GraphEdgeH\x00\x88\x01\x01\x42\x07\n\x05_edge"_\n\x17\x44\x65leteGraphEdgeResponse\x12\x0f\n\x07\x64\x65leted\x18\x01 \x01(\x08\x12*\n\x04\x65\x64ge\x18\x02 \x01(\x0b\x32\x17.proximadb.v2.GraphEdgeH\x00\x88\x01\x01\x42\x07\n\x05_edge"\xe4\x01\n\x16QueryGraphNodesRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x0e\n\x06labels\x18\x02 \x03(\t\x12\x32\n\x07\x66ilters\x18\x03 \x03(\x0b\x32!.proximadb.v2.GraphPropertyFilter\x12\x12\n\x05limit\x18\x04 \x01(\rH\x00\x88\x01\x01\x12\x13\n\x06offset\x18\x05 \x01(\rH\x01\x88\x01\x01\x12\x1f\n\x12\x63ontinuation_token\x18\x06 \x01(\tH\x02\x88\x01\x01\x42\x08\n\x06_limitB\t\n\x07_offsetB\x15\n\x13_continuation_token"i\n\x17QueryGraphNodesResponse\x12&\n\x05nodes\x18\x01 \x03(\x0b\x32\x17.proximadb.v2.GraphNode\x12\x17\n\nnext_token\x18\x02 \x01(\tH\x00\x88\x01\x01\x42\r\n\x0b_next_token"\xbc\x02\n\x16QueryGraphEdgesRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x19\n\x0c\x66rom_node_id\x18\x02 \x01(\tH\x00\x88\x01\x01\x12\x17\n\nto_node_id\x18\x03 \x01(\tH\x01\x88\x01\x01\x12\x12\n\nedge_types\x18\x04 \x03(\t\x12\x32\n\x07\x66ilters\x18\x05 \x03(\x0b\x32!.proximadb.v2.GraphPropertyFilter\x12\x12\n\x05limit\x18\x06 \x01(\rH\x02\x88\x01\x01\x12\x13\n\x06offset\x18\x07 \x01(\rH\x03\x88\x01\x01\x12\x1f\n\x12\x63ontinuation_token\x18\x08 \x01(\tH\x04\x88\x01\x01\x42\x0f\n\r_from_node_idB\r\n\x0b_to_node_idB\x08\n\x06_limitB\t\n\x07_offsetB\x15\n\x13_continuation_token"i\n\x17QueryGraphEdgesResponse\x12&\n\x05\x65\x64ges\x18\x01 \x03(\x0b\x32\x17.proximadb.v2.GraphEdge\x12\x17\n\nnext_token\x18\x02 \x01(\tH\x00\x88\x01\x01\x42\r\n\x0b_next_token"c\n\x18GetGraphNeighborsRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x0f\n\x07node_id\x18\x02 \x01(\t\x12\x16\n\tedge_type\x18\x03 \x01(\tH\x00\x88\x01\x01\x42\x0c\n\n_edge_type"C\n\x19GetGraphNeighborsResponse\x12&\n\x05nodes\x18\x01 \x03(\x0b\x32\x17.proximadb.v2.GraphNode"\xdb\x02\n\x14TraverseGraphRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x15\n\rstart_node_id\x18\x02 \x01(\t\x12\x11\n\tmax_depth\x18\x03 \x01(\r\x12\x12\n\nedge_types\x18\x04 \x03(\t\x12\x13\n\x0bnode_labels\x18\x05 \x03(\t\x12\x32\n\x07\x66ilters\x18\x06 \x03(\x0b\x32!.proximadb.v2.GraphPropertyFilter\x12\x38\n\talgorithm\x18\x07 \x01(\x0e\x32%.proximadb.v2.GraphTraversalAlgorithm\x12\x12\n\x05limit\x18\x08 \x01(\rH\x00\x88\x01\x01\x12\x17\n\ntimeout_ms\x18\t \x01(\rH\x01\x88\x01\x01\x12\x19\n\x0cmax_frontier\x18\n \x01(\rH\x02\x88\x01\x01\x42\x08\n\x06_limitB\r\n\x0b_timeout_msB\x0f\n\r_max_frontier"\xc1\x01\n\x15TraverseGraphResponse\x12&\n\x05nodes\x18\x01 \x03(\x0b\x32\x17.proximadb.v2.GraphNode\x12&\n\x05\x65\x64ges\x18\x02 \x03(\x0b\x32\x17.proximadb.v2.GraphEdge\x12&\n\x05paths\x18\x03 \x03(\x0b\x32\x17.proximadb.v2.GraphPath\x12\x30\n\x05stats\x18\x04 \x01(\x0b\x32!.proximadb.v2.GraphTraversalStats"\x1d\n\tGraphPath\x12\x10\n\x08node_ids\x18\x01 \x03(\t"\x85\x01\n\x13GraphTraversalStats\x12\x15\n\rnodes_visited\x18\x01 \x01(\r\x12\x17\n\x0f\x65\x64ges_traversed\x18\x02 \x01(\r\x12\x19\n\x11max_depth_reached\x18\x03 \x01(\r\x12#\n\x1b\x65xecution_time_microseconds\x18\x04 \x01(\x04"\xdf\x02\n\x18GraphShortestPathRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x15\n\rstart_node_id\x18\x02 \x01(\t\x12\x16\n\x0etarget_node_id\x18\x03 \x01(\t\x12\x16\n\tmax_depth\x18\x04 \x01(\rH\x00\x88\x01\x01\x12\x12\n\nedge_types\x18\x05 \x03(\t\x12@\n\talgorithm\x18\x06 \x01(\x0e\x32(.proximadb.v2.GraphShortestPathAlgorithmH\x01\x88\x01\x01\x12\x0e\n\x01k\x18\x07 \x01(\rH\x02\x88\x01\x01\x12\x1c\n\x0f\x65nable_prefetch\x18\x08 \x01(\x08H\x03\x88\x01\x01\x12\x1c\n\x0fprefetch_budget\x18\t \x01(\rH\x04\x88\x01\x01\x42\x0c\n\n_max_depthB\x0c\n\n_algorithmB\x04\n\x02_kB\x12\n\x10_enable_prefetchB\x12\n\x10_prefetch_budget"h\n\x19GraphShortestPathResponse\x12\x10\n\x08node_ids\x18\x01 \x03(\t\x12\x19\n\x0ctotal_weight\x18\x02 \x01(\x01H\x00\x88\x01\x01\x12\r\n\x05\x66ound\x18\x03 \x01(\x08\x42\x0f\n\r_total_weight"(\n\x14GetGraphStatsRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t"\xa5\x02\n\nGraphStats\x12\x13\n\x0btotal_nodes\x18\x01 \x01(\x04\x12\x13\n\x0btotal_edges\x18\x02 \x01(\x04\x12\x32\n\x0blabel_stats\x18\x03 \x03(\x0b\x32\x1d.proximadb.v2.GraphLabelStats\x12\x39\n\x0f\x65\x64ge_type_stats\x18\x04 \x03(\x0b\x32 .proximadb.v2.GraphEdgeTypeStats\x12\x18\n\x10total_properties\x18\x05 \x01(\x04\x12\x1a\n\x12memory_usage_bytes\x18\x06 \x01(\x04\x12\x16\n\x0e\x61verage_degree\x18\x07 \x01(\x01\x12\x12\n\nmax_degree\x18\x08 \x01(\r\x12\x1c\n\x14\x63onnected_components\x18\t \x01(\r"/\n\x0fGraphLabelStats\x12\r\n\x05label\x18\x01 \x01(\t\x12\r\n\x05\x63ount\x18\x02 \x01(\x04"6\n\x12GraphEdgeTypeStats\x12\x11\n\tedge_type\x18\x01 \x01(\t\x12\r\n\x05\x63ount\x18\x02 \x01(\x04"\xdc\x01\n\x13GraphTraversalChunk\x12&\n\x05nodes\x18\x01 \x03(\x0b\x32\x17.proximadb.v2.GraphNode\x12&\n\x05\x65\x64ges\x18\x02 \x03(\x0b\x32\x17.proximadb.v2.GraphEdge\x12&\n\x05paths\x18\x03 \x03(\x0b\x32\x17.proximadb.v2.GraphPath\x12\x35\n\x05stats\x18\x04 \x01(\x0b\x32!.proximadb.v2.GraphTraversalStatsH\x00\x88\x01\x01\x12\x0c\n\x04\x64one\x18\x05 \x01(\x08\x42\x08\n\x06_stats"3\n\x1fGraphConnectedComponentsRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t"T\n GraphConnectedComponentsResponse\x12\x30\n\ncomponents\x18\x01 \x03(\x0b\x32\x1c.proximadb.v2.GraphComponent""\n\x0eGraphComponent\x12\x10\n\x08node_ids\x18\x01 \x03(\t"(\n\x14GraphHasCycleRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t"*\n\x15GraphHasCycleResponse\x12\x11\n\thas_cycle\x18\x01 \x01(\x08"Q\n\x1cGraphUniqueConstraintRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\r\n\x05label\x18\x02 \x01(\t\x12\x10\n\x08property\x18\x03 \x01(\t"^\n\x1dGraphUniqueConstraintResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x1a\n\rerror_message\x18\x02 \x01(\tH\x00\x88\x01\x01\x42\x10\n\x0e_error_message"X\n\x1c\x42\x61tchCreateGraphNodesRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12&\n\x05nodes\x18\x02 \x03(\x0b\x32\x17.proximadb.v2.GraphNode"X\n\x1c\x42\x61tchCreateGraphEdgesRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12&\n\x05\x65\x64ges\x18\x02 \x03(\x0b\x32\x17.proximadb.v2.GraphEdge"\x9d\x01\n\x1d\x42\x61tchCreateGraphNodesResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12&\n\x05nodes\x18\x02 \x03(\x0b\x32\x17.proximadb.v2.GraphNode\x12\x15\n\rcreated_count\x18\x03 \x01(\r\x12\x1a\n\rerror_message\x18\x04 \x01(\tH\x00\x88\x01\x01\x42\x10\n\x0e_error_message"\x9d\x01\n\x1d\x42\x61tchCreateGraphEdgesResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12&\n\x05\x65\x64ges\x18\x02 \x03(\x0b\x32\x17.proximadb.v2.GraphEdge\x12\x15\n\rcreated_count\x18\x03 \x01(\r\x12\x1a\n\rerror_message\x18\x04 \x01(\tH\x00\x88\x01\x01\x42\x10\n\x0e_error_message"\x97\x01\n\x18\x45xecuteGraphQueryRequest\x12\x10\n\x08graph_id\x18\x01 \x01(\t\x12\x32\n\x08language\x18\x02 \x01(\x0e\x32 .proximadb.v2.GraphQueryLanguage\x12\r\n\x05query\x18\x03 \x01(\t\x12\x17\n\ntimeout_ms\x18\x04 \x01(\rH\x00\x88\x01\x01\x42\r\n\x0b_timeout_ms"\xaa\x01\n\x14\x45xecuteGraphQueryRow\x12@\n\x07\x63olumns\x18\x01 \x03(\x0b\x32/.proximadb.v2.ExecuteGraphQueryRow.ColumnsEntry\x1aP\n\x0c\x43olumnsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12/\n\x05value\x18\x02 \x01(\x0b\x32 .proximadb.v2.GraphPropertyValue:\x02\x38\x01"{\n\x19\x45xecuteGraphQueryResponse\x12\x30\n\x04rows\x18\x01 \x03(\x0b\x32".proximadb.v2.ExecuteGraphQueryRow\x12\x1a\n\rerror_message\x18\x02 \x01(\tH\x00\x88\x01\x01\x42\x10\n\x0e_error_message*\xf2\x03\n\x1bGraphPropertyFilterOperator\x12.\n*GRAPH_PROPERTY_FILTER_OPERATOR_UNSPECIFIED\x10\x00\x12)\n%GRAPH_PROPERTY_FILTER_OPERATOR_EQUALS\x10\x01\x12-\n)GRAPH_PROPERTY_FILTER_OPERATOR_NOT_EQUALS\x10\x02\x12/\n+GRAPH_PROPERTY_FILTER_OPERATOR_GREATER_THAN\x10\x03\x12,\n(GRAPH_PROPERTY_FILTER_OPERATOR_LESS_THAN\x10\x04\x12\x30\n,GRAPH_PROPERTY_FILTER_OPERATOR_GREATER_EQUAL\x10\x05\x12-\n)GRAPH_PROPERTY_FILTER_OPERATOR_LESS_EQUAL\x10\x06\x12+\n\'GRAPH_PROPERTY_FILTER_OPERATOR_CONTAINS\x10\x07\x12.\n*GRAPH_PROPERTY_FILTER_OPERATOR_STARTS_WITH\x10\x08\x12,\n(GRAPH_PROPERTY_FILTER_OPERATOR_ENDS_WITH\x10\t*\xb6\x01\n\x17GraphTraversalAlgorithm\x12)\n%GRAPH_TRAVERSAL_ALGORITHM_UNSPECIFIED\x10\x00\x12!\n\x1dGRAPH_TRAVERSAL_ALGORITHM_BFS\x10\x01\x12!\n\x1dGRAPH_TRAVERSAL_ALGORITHM_DFS\x10\x02\x12*\n&GRAPH_TRAVERSAL_ALGORITHM_PARALLEL_BFS\x10\x03*\xa0\x01\n\x1aGraphShortestPathAlgorithm\x12-\n)GRAPH_SHORTEST_PATH_ALGORITHM_UNSPECIFIED\x10\x00\x12*\n&GRAPH_SHORTEST_PATH_ALGORITHM_DIJKSTRA\x10\x01\x12\'\n#GRAPH_SHORTEST_PATH_ALGORITHM_ASTAR\x10\x02*\x9e\x01\n\x12GraphQueryLanguage\x12$\n GRAPH_QUERY_LANGUAGE_UNSPECIFIED\x10\x00\x12\x1f\n\x1bGRAPH_QUERY_LANGUAGE_NATIVE\x10\x01\x12\x1f\n\x1bGRAPH_QUERY_LANGUAGE_CYPHER\x10\x02\x12 \n\x1cGRAPH_QUERY_LANGUAGE_GREMLIN\x10\x03\x32\xa5\x10\n\x13ProximaGraphService\x12S\n\nCreateNode\x12$.proximadb.v2.CreateGraphNodeRequest\x1a\x1f.proximadb.v2.GraphNodeResponse\x12M\n\x07GetNode\x12!.proximadb.v2.GetGraphNodeRequest\x1a\x1f.proximadb.v2.GraphNodeResponse\x12S\n\nUpdateNode\x12$.proximadb.v2.UpdateGraphNodeRequest\x1a\x1f.proximadb.v2.GraphNodeResponse\x12Y\n\nDeleteNode\x12$.proximadb.v2.DeleteGraphNodeRequest\x1a%.proximadb.v2.DeleteGraphNodeResponse\x12S\n\nCreateEdge\x12$.proximadb.v2.CreateGraphEdgeRequest\x1a\x1f.proximadb.v2.GraphEdgeResponse\x12M\n\x07GetEdge\x12!.proximadb.v2.GetGraphEdgeRequest\x1a\x1f.proximadb.v2.GraphEdgeResponse\x12S\n\nUpdateEdge\x12$.proximadb.v2.UpdateGraphEdgeRequest\x1a\x1f.proximadb.v2.GraphEdgeResponse\x12Y\n\nDeleteEdge\x12$.proximadb.v2.DeleteGraphEdgeRequest\x1a%.proximadb.v2.DeleteGraphEdgeResponse\x12Y\n\nQueryNodes\x12$.proximadb.v2.QueryGraphNodesRequest\x1a%.proximadb.v2.QueryGraphNodesResponse\x12Y\n\nQueryEdges\x12$.proximadb.v2.QueryGraphEdgesRequest\x1a%.proximadb.v2.QueryGraphEdgesResponse\x12_\n\x0cGetNeighbors\x12&.proximadb.v2.GetGraphNeighborsRequest\x1a\'.proximadb.v2.GetGraphNeighborsResponse\x12X\n\rTraverseGraph\x12".proximadb.v2.TraverseGraphRequest\x1a#.proximadb.v2.TraverseGraphResponse\x12_\n\x0cShortestPath\x12&.proximadb.v2.GraphShortestPathRequest\x1a\'.proximadb.v2.GraphShortestPathResponse\x12M\n\rGetGraphStats\x12".proximadb.v2.GetGraphStatsRequest\x1a\x18.proximadb.v2.GraphStats\x12Y\n\x0eStreamTraverse\x12".proximadb.v2.TraverseGraphRequest\x1a!.proximadb.v2.GraphTraversalChunk0\x01\x12w\n\x16GetConnectedComponents\x12-.proximadb.v2.GraphConnectedComponentsRequest\x1a..proximadb.v2.GraphConnectedComponentsResponse\x12S\n\x08HasCycle\x12".proximadb.v2.GraphHasCycleRequest\x1a#.proximadb.v2.GraphHasCycleResponse\x12n\n\x13\x41\x64\x64UniqueConstraint\x12*.proximadb.v2.GraphUniqueConstraintRequest\x1a+.proximadb.v2.GraphUniqueConstraintResponse\x12q\n\x16RemoveUniqueConstraint\x12*.proximadb.v2.GraphUniqueConstraintRequest\x1a+.proximadb.v2.GraphUniqueConstraintResponse\x12k\n\x10\x42\x61tchCreateNodes\x12*.proximadb.v2.BatchCreateGraphNodesRequest\x1a+.proximadb.v2.BatchCreateGraphNodesResponse\x12k\n\x10\x42\x61tchCreateEdges\x12*.proximadb.v2.BatchCreateGraphEdgesRequest\x1a+.proximadb.v2.BatchCreateGraphEdgesResponse\x12_\n\x0c\x45xecuteQuery\x12&.proximadb.v2.ExecuteGraphQueryRequest\x1a\'.proximadb.v2.ExecuteGraphQueryResponseb\x06proto3'
+)
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
-_builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'proximadb.v2.graph_pb2', _globals)
+_builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, "proximadb.v2.graph_pb2", _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
-  DESCRIPTOR._loaded_options = None
-  _globals['_GRAPHNODE_PROPERTIESENTRY']._loaded_options = None
-  _globals['_GRAPHNODE_PROPERTIESENTRY']._serialized_options = b'8\001'
-  _globals['_GRAPHEDGE_PROPERTIESENTRY']._loaded_options = None
-  _globals['_GRAPHEDGE_PROPERTIESENTRY']._serialized_options = b'8\001'
-  _globals['_GRAPHPROPERTYMAP_FIELDSENTRY']._loaded_options = None
-  _globals['_GRAPHPROPERTYMAP_FIELDSENTRY']._serialized_options = b'8\001'
-  _globals['_EXECUTEGRAPHQUERYROW_COLUMNSENTRY']._loaded_options = None
-  _globals['_EXECUTEGRAPHQUERYROW_COLUMNSENTRY']._serialized_options = b'8\001'
-  _globals['_GRAPHPROPERTYFILTEROPERATOR']._serialized_start=6464
-  _globals['_GRAPHPROPERTYFILTEROPERATOR']._serialized_end=6962
-  _globals['_GRAPHTRAVERSALALGORITHM']._serialized_start=6965
-  _globals['_GRAPHTRAVERSALALGORITHM']._serialized_end=7147
-  _globals['_GRAPHSHORTESTPATHALGORITHM']._serialized_start=7150
-  _globals['_GRAPHSHORTESTPATHALGORITHM']._serialized_end=7310
-  _globals['_GRAPHQUERYLANGUAGE']._serialized_start=7313
-  _globals['_GRAPHQUERYLANGUAGE']._serialized_end=7471
-  _globals['_GRAPHNODE']._serialized_start=43
-  _globals['_GRAPHNODE']._serialized_end=342
-  _globals['_GRAPHNODE_PROPERTIESENTRY']._serialized_start=245
-  _globals['_GRAPHNODE_PROPERTIESENTRY']._serialized_end=328
-  _globals['_GRAPHEDGE']._serialized_start=345
-  _globals['_GRAPHEDGE']._serialized_end=653
-  _globals['_GRAPHEDGE_PROPERTIESENTRY']._serialized_start=245
-  _globals['_GRAPHEDGE_PROPERTIESENTRY']._serialized_end=328
-  _globals['_GRAPHEMBEDDING']._serialized_start=655
-  _globals['_GRAPHEMBEDDING']._serialized_end=747
-  _globals['_GRAPHPROPERTYVALUE']._serialized_start=750
-  _globals['_GRAPHPROPERTYVALUE']._serialized_end=1003
-  _globals['_GRAPHPROPERTYARRAY']._serialized_start=1005
-  _globals['_GRAPHPROPERTYARRAY']._serialized_end=1075
-  _globals['_GRAPHPROPERTYMAP']._serialized_start=1078
-  _globals['_GRAPHPROPERTYMAP']._serialized_end=1237
-  _globals['_GRAPHPROPERTYMAP_FIELDSENTRY']._serialized_start=1158
-  _globals['_GRAPHPROPERTYMAP_FIELDSENTRY']._serialized_end=1237
-  _globals['_GRAPHPROPERTYFILTER']._serialized_start=1240
-  _globals['_GRAPHPROPERTYFILTER']._serialized_end=1384
-  _globals['_CREATEGRAPHNODEREQUEST']._serialized_start=1386
-  _globals['_CREATEGRAPHNODEREQUEST']._serialized_end=1467
-  _globals['_UPDATEGRAPHNODEREQUEST']._serialized_start=1469
-  _globals['_UPDATEGRAPHNODEREQUEST']._serialized_end=1550
-  _globals['_GETGRAPHNODEREQUEST']._serialized_start=1552
-  _globals['_GETGRAPHNODEREQUEST']._serialized_end=1608
-  _globals['_DELETEGRAPHNODEREQUEST']._serialized_start=1610
-  _globals['_DELETEGRAPHNODEREQUEST']._serialized_end=1669
-  _globals['_GRAPHNODERESPONSE']._serialized_start=1671
-  _globals['_GRAPHNODERESPONSE']._serialized_end=1743
-  _globals['_DELETEGRAPHNODERESPONSE']._serialized_start=1745
-  _globals['_DELETEGRAPHNODERESPONSE']._serialized_end=1840
-  _globals['_CREATEGRAPHEDGEREQUEST']._serialized_start=1842
-  _globals['_CREATEGRAPHEDGEREQUEST']._serialized_end=1923
-  _globals['_UPDATEGRAPHEDGEREQUEST']._serialized_start=1925
-  _globals['_UPDATEGRAPHEDGEREQUEST']._serialized_end=2006
-  _globals['_GETGRAPHEDGEREQUEST']._serialized_start=2008
-  _globals['_GETGRAPHEDGEREQUEST']._serialized_end=2064
-  _globals['_DELETEGRAPHEDGEREQUEST']._serialized_start=2066
-  _globals['_DELETEGRAPHEDGEREQUEST']._serialized_end=2125
-  _globals['_GRAPHEDGERESPONSE']._serialized_start=2127
-  _globals['_GRAPHEDGERESPONSE']._serialized_end=2199
-  _globals['_DELETEGRAPHEDGERESPONSE']._serialized_start=2201
-  _globals['_DELETEGRAPHEDGERESPONSE']._serialized_end=2296
-  _globals['_QUERYGRAPHNODESREQUEST']._serialized_start=2299
-  _globals['_QUERYGRAPHNODESREQUEST']._serialized_end=2527
-  _globals['_QUERYGRAPHNODESRESPONSE']._serialized_start=2529
-  _globals['_QUERYGRAPHNODESRESPONSE']._serialized_end=2634
-  _globals['_QUERYGRAPHEDGESREQUEST']._serialized_start=2637
-  _globals['_QUERYGRAPHEDGESREQUEST']._serialized_end=2953
-  _globals['_QUERYGRAPHEDGESRESPONSE']._serialized_start=2955
-  _globals['_QUERYGRAPHEDGESRESPONSE']._serialized_end=3060
-  _globals['_GETGRAPHNEIGHBORSREQUEST']._serialized_start=3062
-  _globals['_GETGRAPHNEIGHBORSREQUEST']._serialized_end=3161
-  _globals['_GETGRAPHNEIGHBORSRESPONSE']._serialized_start=3163
-  _globals['_GETGRAPHNEIGHBORSRESPONSE']._serialized_end=3230
-  _globals['_TRAVERSEGRAPHREQUEST']._serialized_start=3233
-  _globals['_TRAVERSEGRAPHREQUEST']._serialized_end=3580
-  _globals['_TRAVERSEGRAPHRESPONSE']._serialized_start=3583
-  _globals['_TRAVERSEGRAPHRESPONSE']._serialized_end=3776
-  _globals['_GRAPHPATH']._serialized_start=3778
-  _globals['_GRAPHPATH']._serialized_end=3807
-  _globals['_GRAPHTRAVERSALSTATS']._serialized_start=3810
-  _globals['_GRAPHTRAVERSALSTATS']._serialized_end=3943
-  _globals['_GRAPHSHORTESTPATHREQUEST']._serialized_start=3946
-  _globals['_GRAPHSHORTESTPATHREQUEST']._serialized_end=4297
-  _globals['_GRAPHSHORTESTPATHRESPONSE']._serialized_start=4299
-  _globals['_GRAPHSHORTESTPATHRESPONSE']._serialized_end=4403
-  _globals['_GETGRAPHSTATSREQUEST']._serialized_start=4405
-  _globals['_GETGRAPHSTATSREQUEST']._serialized_end=4445
-  _globals['_GRAPHSTATS']._serialized_start=4448
-  _globals['_GRAPHSTATS']._serialized_end=4741
-  _globals['_GRAPHLABELSTATS']._serialized_start=4743
-  _globals['_GRAPHLABELSTATS']._serialized_end=4790
-  _globals['_GRAPHEDGETYPESTATS']._serialized_start=4792
-  _globals['_GRAPHEDGETYPESTATS']._serialized_end=4846
-  _globals['_GRAPHTRAVERSALCHUNK']._serialized_start=4849
-  _globals['_GRAPHTRAVERSALCHUNK']._serialized_end=5069
-  _globals['_GRAPHCONNECTEDCOMPONENTSREQUEST']._serialized_start=5071
-  _globals['_GRAPHCONNECTEDCOMPONENTSREQUEST']._serialized_end=5122
-  _globals['_GRAPHCONNECTEDCOMPONENTSRESPONSE']._serialized_start=5124
-  _globals['_GRAPHCONNECTEDCOMPONENTSRESPONSE']._serialized_end=5208
-  _globals['_GRAPHCOMPONENT']._serialized_start=5210
-  _globals['_GRAPHCOMPONENT']._serialized_end=5244
-  _globals['_GRAPHHASCYCLEREQUEST']._serialized_start=5246
-  _globals['_GRAPHHASCYCLEREQUEST']._serialized_end=5286
-  _globals['_GRAPHHASCYCLERESPONSE']._serialized_start=5288
-  _globals['_GRAPHHASCYCLERESPONSE']._serialized_end=5330
-  _globals['_GRAPHUNIQUECONSTRAINTREQUEST']._serialized_start=5332
-  _globals['_GRAPHUNIQUECONSTRAINTREQUEST']._serialized_end=5413
-  _globals['_GRAPHUNIQUECONSTRAINTRESPONSE']._serialized_start=5415
-  _globals['_GRAPHUNIQUECONSTRAINTRESPONSE']._serialized_end=5509
-  _globals['_BATCHCREATEGRAPHNODESREQUEST']._serialized_start=5511
-  _globals['_BATCHCREATEGRAPHNODESREQUEST']._serialized_end=5599
-  _globals['_BATCHCREATEGRAPHEDGESREQUEST']._serialized_start=5601
-  _globals['_BATCHCREATEGRAPHEDGESREQUEST']._serialized_end=5689
-  _globals['_BATCHCREATEGRAPHNODESRESPONSE']._serialized_start=5692
-  _globals['_BATCHCREATEGRAPHNODESRESPONSE']._serialized_end=5849
-  _globals['_BATCHCREATEGRAPHEDGESRESPONSE']._serialized_start=5852
-  _globals['_BATCHCREATEGRAPHEDGESRESPONSE']._serialized_end=6009
-  _globals['_EXECUTEGRAPHQUERYREQUEST']._serialized_start=6012
-  _globals['_EXECUTEGRAPHQUERYREQUEST']._serialized_end=6163
-  _globals['_EXECUTEGRAPHQUERYROW']._serialized_start=6166
-  _globals['_EXECUTEGRAPHQUERYROW']._serialized_end=6336
-  _globals['_EXECUTEGRAPHQUERYROW_COLUMNSENTRY']._serialized_start=6256
-  _globals['_EXECUTEGRAPHQUERYROW_COLUMNSENTRY']._serialized_end=6336
-  _globals['_EXECUTEGRAPHQUERYRESPONSE']._serialized_start=6338
-  _globals['_EXECUTEGRAPHQUERYRESPONSE']._serialized_end=6461
-  _globals['_PROXIMAGRAPHSERVICE']._serialized_start=7474
-  _globals['_PROXIMAGRAPHSERVICE']._serialized_end=9559
+    DESCRIPTOR._loaded_options = None
+    _globals["_GRAPHNODE_PROPERTIESENTRY"]._loaded_options = None
+    _globals["_GRAPHNODE_PROPERTIESENTRY"]._serialized_options = b"8\001"
+    _globals["_GRAPHEDGE_PROPERTIESENTRY"]._loaded_options = None
+    _globals["_GRAPHEDGE_PROPERTIESENTRY"]._serialized_options = b"8\001"
+    _globals["_GRAPHPROPERTYMAP_FIELDSENTRY"]._loaded_options = None
+    _globals["_GRAPHPROPERTYMAP_FIELDSENTRY"]._serialized_options = b"8\001"
+    _globals["_EXECUTEGRAPHQUERYROW_COLUMNSENTRY"]._loaded_options = None
+    _globals["_EXECUTEGRAPHQUERYROW_COLUMNSENTRY"]._serialized_options = b"8\001"
+    _globals["_GRAPHPROPERTYFILTEROPERATOR"]._serialized_start = 6464
+    _globals["_GRAPHPROPERTYFILTEROPERATOR"]._serialized_end = 6962
+    _globals["_GRAPHTRAVERSALALGORITHM"]._serialized_start = 6965
+    _globals["_GRAPHTRAVERSALALGORITHM"]._serialized_end = 7147
+    _globals["_GRAPHSHORTESTPATHALGORITHM"]._serialized_start = 7150
+    _globals["_GRAPHSHORTESTPATHALGORITHM"]._serialized_end = 7310
+    _globals["_GRAPHQUERYLANGUAGE"]._serialized_start = 7313
+    _globals["_GRAPHQUERYLANGUAGE"]._serialized_end = 7471
+    _globals["_GRAPHNODE"]._serialized_start = 43
+    _globals["_GRAPHNODE"]._serialized_end = 342
+    _globals["_GRAPHNODE_PROPERTIESENTRY"]._serialized_start = 245
+    _globals["_GRAPHNODE_PROPERTIESENTRY"]._serialized_end = 328
+    _globals["_GRAPHEDGE"]._serialized_start = 345
+    _globals["_GRAPHEDGE"]._serialized_end = 653
+    _globals["_GRAPHEDGE_PROPERTIESENTRY"]._serialized_start = 245
+    _globals["_GRAPHEDGE_PROPERTIESENTRY"]._serialized_end = 328
+    _globals["_GRAPHEMBEDDING"]._serialized_start = 655
+    _globals["_GRAPHEMBEDDING"]._serialized_end = 747
+    _globals["_GRAPHPROPERTYVALUE"]._serialized_start = 750
+    _globals["_GRAPHPROPERTYVALUE"]._serialized_end = 1003
+    _globals["_GRAPHPROPERTYARRAY"]._serialized_start = 1005
+    _globals["_GRAPHPROPERTYARRAY"]._serialized_end = 1075
+    _globals["_GRAPHPROPERTYMAP"]._serialized_start = 1078
+    _globals["_GRAPHPROPERTYMAP"]._serialized_end = 1237
+    _globals["_GRAPHPROPERTYMAP_FIELDSENTRY"]._serialized_start = 1158
+    _globals["_GRAPHPROPERTYMAP_FIELDSENTRY"]._serialized_end = 1237
+    _globals["_GRAPHPROPERTYFILTER"]._serialized_start = 1240
+    _globals["_GRAPHPROPERTYFILTER"]._serialized_end = 1384
+    _globals["_CREATEGRAPHNODEREQUEST"]._serialized_start = 1386
+    _globals["_CREATEGRAPHNODEREQUEST"]._serialized_end = 1467
+    _globals["_UPDATEGRAPHNODEREQUEST"]._serialized_start = 1469
+    _globals["_UPDATEGRAPHNODEREQUEST"]._serialized_end = 1550
+    _globals["_GETGRAPHNODEREQUEST"]._serialized_start = 1552
+    _globals["_GETGRAPHNODEREQUEST"]._serialized_end = 1608
+    _globals["_DELETEGRAPHNODEREQUEST"]._serialized_start = 1610
+    _globals["_DELETEGRAPHNODEREQUEST"]._serialized_end = 1669
+    _globals["_GRAPHNODERESPONSE"]._serialized_start = 1671
+    _globals["_GRAPHNODERESPONSE"]._serialized_end = 1743
+    _globals["_DELETEGRAPHNODERESPONSE"]._serialized_start = 1745
+    _globals["_DELETEGRAPHNODERESPONSE"]._serialized_end = 1840
+    _globals["_CREATEGRAPHEDGEREQUEST"]._serialized_start = 1842
+    _globals["_CREATEGRAPHEDGEREQUEST"]._serialized_end = 1923
+    _globals["_UPDATEGRAPHEDGEREQUEST"]._serialized_start = 1925
+    _globals["_UPDATEGRAPHEDGEREQUEST"]._serialized_end = 2006
+    _globals["_GETGRAPHEDGEREQUEST"]._serialized_start = 2008
+    _globals["_GETGRAPHEDGEREQUEST"]._serialized_end = 2064
+    _globals["_DELETEGRAPHEDGEREQUEST"]._serialized_start = 2066
+    _globals["_DELETEGRAPHEDGEREQUEST"]._serialized_end = 2125
+    _globals["_GRAPHEDGERESPONSE"]._serialized_start = 2127
+    _globals["_GRAPHEDGERESPONSE"]._serialized_end = 2199
+    _globals["_DELETEGRAPHEDGERESPONSE"]._serialized_start = 2201
+    _globals["_DELETEGRAPHEDGERESPONSE"]._serialized_end = 2296
+    _globals["_QUERYGRAPHNODESREQUEST"]._serialized_start = 2299
+    _globals["_QUERYGRAPHNODESREQUEST"]._serialized_end = 2527
+    _globals["_QUERYGRAPHNODESRESPONSE"]._serialized_start = 2529
+    _globals["_QUERYGRAPHNODESRESPONSE"]._serialized_end = 2634
+    _globals["_QUERYGRAPHEDGESREQUEST"]._serialized_start = 2637
+    _globals["_QUERYGRAPHEDGESREQUEST"]._serialized_end = 2953
+    _globals["_QUERYGRAPHEDGESRESPONSE"]._serialized_start = 2955
+    _globals["_QUERYGRAPHEDGESRESPONSE"]._serialized_end = 3060
+    _globals["_GETGRAPHNEIGHBORSREQUEST"]._serialized_start = 3062
+    _globals["_GETGRAPHNEIGHBORSREQUEST"]._serialized_end = 3161
+    _globals["_GETGRAPHNEIGHBORSRESPONSE"]._serialized_start = 3163
+    _globals["_GETGRAPHNEIGHBORSRESPONSE"]._serialized_end = 3230
+    _globals["_TRAVERSEGRAPHREQUEST"]._serialized_start = 3233
+    _globals["_TRAVERSEGRAPHREQUEST"]._serialized_end = 3580
+    _globals["_TRAVERSEGRAPHRESPONSE"]._serialized_start = 3583
+    _globals["_TRAVERSEGRAPHRESPONSE"]._serialized_end = 3776
+    _globals["_GRAPHPATH"]._serialized_start = 3778
+    _globals["_GRAPHPATH"]._serialized_end = 3807
+    _globals["_GRAPHTRAVERSALSTATS"]._serialized_start = 3810
+    _globals["_GRAPHTRAVERSALSTATS"]._serialized_end = 3943
+    _globals["_GRAPHSHORTESTPATHREQUEST"]._serialized_start = 3946
+    _globals["_GRAPHSHORTESTPATHREQUEST"]._serialized_end = 4297
+    _globals["_GRAPHSHORTESTPATHRESPONSE"]._serialized_start = 4299
+    _globals["_GRAPHSHORTESTPATHRESPONSE"]._serialized_end = 4403
+    _globals["_GETGRAPHSTATSREQUEST"]._serialized_start = 4405
+    _globals["_GETGRAPHSTATSREQUEST"]._serialized_end = 4445
+    _globals["_GRAPHSTATS"]._serialized_start = 4448
+    _globals["_GRAPHSTATS"]._serialized_end = 4741
+    _globals["_GRAPHLABELSTATS"]._serialized_start = 4743
+    _globals["_GRAPHLABELSTATS"]._serialized_end = 4790
+    _globals["_GRAPHEDGETYPESTATS"]._serialized_start = 4792
+    _globals["_GRAPHEDGETYPESTATS"]._serialized_end = 4846
+    _globals["_GRAPHTRAVERSALCHUNK"]._serialized_start = 4849
+    _globals["_GRAPHTRAVERSALCHUNK"]._serialized_end = 5069
+    _globals["_GRAPHCONNECTEDCOMPONENTSREQUEST"]._serialized_start = 5071
+    _globals["_GRAPHCONNECTEDCOMPONENTSREQUEST"]._serialized_end = 5122
+    _globals["_GRAPHCONNECTEDCOMPONENTSRESPONSE"]._serialized_start = 5124
+    _globals["_GRAPHCONNECTEDCOMPONENTSRESPONSE"]._serialized_end = 5208
+    _globals["_GRAPHCOMPONENT"]._serialized_start = 5210
+    _globals["_GRAPHCOMPONENT"]._serialized_end = 5244
+    _globals["_GRAPHHASCYCLEREQUEST"]._serialized_start = 5246
+    _globals["_GRAPHHASCYCLEREQUEST"]._serialized_end = 5286
+    _globals["_GRAPHHASCYCLERESPONSE"]._serialized_start = 5288
+    _globals["_GRAPHHASCYCLERESPONSE"]._serialized_end = 5330
+    _globals["_GRAPHUNIQUECONSTRAINTREQUEST"]._serialized_start = 5332
+    _globals["_GRAPHUNIQUECONSTRAINTREQUEST"]._serialized_end = 5413
+    _globals["_GRAPHUNIQUECONSTRAINTRESPONSE"]._serialized_start = 5415
+    _globals["_GRAPHUNIQUECONSTRAINTRESPONSE"]._serialized_end = 5509
+    _globals["_BATCHCREATEGRAPHNODESREQUEST"]._serialized_start = 5511
+    _globals["_BATCHCREATEGRAPHNODESREQUEST"]._serialized_end = 5599
+    _globals["_BATCHCREATEGRAPHEDGESREQUEST"]._serialized_start = 5601
+    _globals["_BATCHCREATEGRAPHEDGESREQUEST"]._serialized_end = 5689
+    _globals["_BATCHCREATEGRAPHNODESRESPONSE"]._serialized_start = 5692
+    _globals["_BATCHCREATEGRAPHNODESRESPONSE"]._serialized_end = 5849
+    _globals["_BATCHCREATEGRAPHEDGESRESPONSE"]._serialized_start = 5852
+    _globals["_BATCHCREATEGRAPHEDGESRESPONSE"]._serialized_end = 6009
+    _globals["_EXECUTEGRAPHQUERYREQUEST"]._serialized_start = 6012
+    _globals["_EXECUTEGRAPHQUERYREQUEST"]._serialized_end = 6163
+    _globals["_EXECUTEGRAPHQUERYROW"]._serialized_start = 6166
+    _globals["_EXECUTEGRAPHQUERYROW"]._serialized_end = 6336
+    _globals["_EXECUTEGRAPHQUERYROW_COLUMNSENTRY"]._serialized_start = 6256
+    _globals["_EXECUTEGRAPHQUERYROW_COLUMNSENTRY"]._serialized_end = 6336
+    _globals["_EXECUTEGRAPHQUERYRESPONSE"]._serialized_start = 6338
+    _globals["_EXECUTEGRAPHQUERYRESPONSE"]._serialized_end = 6461
+    _globals["_PROXIMAGRAPHSERVICE"]._serialized_start = 7474
+    _globals["_PROXIMAGRAPHSERVICE"]._serialized_end = 9559
 # @@protoc_insertion_point(module_scope)

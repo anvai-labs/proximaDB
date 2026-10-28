@@ -221,6 +221,7 @@ mod performance_comparison_tests {
                 id: collection_id.to_string(),
                 config: Some(proximadb::proto::proximadb_v1::CollectionConfig {
                     storage_class: None,
+                    policy_generation: None,
                     name: collection_id.to_string(),
                     embedding_config: None,
                     dimension: VECTOR_DIMS as u32,
@@ -718,6 +719,7 @@ mod performance_comparison_tests {
                 id: "test_collection".to_string(),
                 config: Some(proximadb::proto::proximadb_v1::CollectionConfig {
                     storage_class: None,
+                    policy_generation: None,
                     name: "test_collection".to_string(),
                     embedding_config: None,
                     dimension: VECTOR_DIMS as u32,
@@ -964,6 +966,7 @@ mod performance_comparison_tests {
                             id: "test_collection".to_string(),
                             config: Some(proximadb::proto::proximadb_v1::CollectionConfig {
                                 storage_class: None,
+                                policy_generation: None,
                                 name: "test_collection".to_string(),
                                 embedding_config: None,
                                 dimension: VECTOR_DIMS as u32,
