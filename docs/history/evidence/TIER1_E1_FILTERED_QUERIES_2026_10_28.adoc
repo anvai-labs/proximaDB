@@ -174,4 +174,12 @@ predicted when the gate was relaxed.
   to 176 GB, clean relaunch; the failed attempt is not in any table.
 * The auto-budget merge (2-seg → 1-seg between build and arms) is disclosed
   above; run-root births serialize the family strictly sequentially.
+* **Rebase disclosure:** the branch was rebased onto develop after SC3 slice 1
+  (#2267) landed mid-review and conflicted on the TRACKER row (resolved:
+  this family's row + develop's SC3 row verbatim). Pre-rebase hashes cited
+  here (`57d6f7bdc` harness / run-time `source_revision` values) are
+  worktree provenance and are not reachable from the merged PR — **anchor
+  audits to the binary sha256 `8f81632d…`** (byte-identical in every
+  result.json; the post-rebase commits are docs/tracker-only deltas over the
+  measured tree).
 * Single-machine emulator evidence, not an SLA or a cloud-latency claim.
