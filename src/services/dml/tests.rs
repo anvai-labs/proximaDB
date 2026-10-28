@@ -245,6 +245,7 @@ impl TableRecordStore for ExplainOnlyRecordStore {
         _tenant_context: Option<&crate::storage::tenant::context::TenantContext>,
     ) -> Result<TableRecordWriteResult> {
         Ok(TableRecordWriteResult {
+            max_lsn: None,
             success: true,
             record_ids: mutations
                 .into_iter()

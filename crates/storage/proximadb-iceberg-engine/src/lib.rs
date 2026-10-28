@@ -128,7 +128,9 @@ struct SnapshotTarget<'a> {
 }
 
 /// Map storage-common Iceberg field descriptors (and the `v3` flag) to the engine's own.
-fn iceberg_fields_of(
+/// Public so callers of the inherent publish methods (the live delete writer)
+/// can convert the bridge view fields.
+pub fn iceberg_fields_of(
     fields: &[proximadb_storage_common::object_store_bridge::IcebergSnapshotField],
     v3: bool,
 ) -> (Vec<iceberg::IcebergField>, iceberg::FormatVersion) {

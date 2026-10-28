@@ -357,6 +357,14 @@ pub struct TableRecordWriteResult {
     pub errors: Vec<String>,
     /// Optional stable error code.
     pub error_code: Option<String>,
+    /// The maximum durable WAL LSN of this batch's entries, when the appender
+    /// bound them (a count mismatch disables the association — see
+    /// `write_mutations`). The live delete publisher uses it to clamp its
+    /// recorded fence LSN at or above the tombstones it publishes
+    /// (round-4 review, MAJOR-1: a fresh capture alone can sit BELOW them,
+    /// because `capture_snapshot_lsn` subtracts the STORE-GLOBAL inflight
+    /// floor, which a concurrent write on any other table lowers).
+    pub max_lsn: Option<u64>,
 }
 
 impl TableRecordWriteResult {
@@ -367,6 +375,7 @@ impl TableRecordWriteResult {
             metrics: OperationMetrics::default(),
             errors: Vec::new(),
             error_code: None,
+            max_lsn: None,
         }
     }
 
@@ -374,6 +383,7 @@ impl TableRecordWriteResult {
         Self {
             success: false,
             record_ids: Vec::new(),
+            max_lsn: None,
             metrics: OperationMetrics::default(),
             errors: vec![error.into()],
             error_code: Some(error_code.into()),
@@ -389,6 +399,7 @@ impl TableRecordWriteResult {
             metrics: result.metrics,
             errors: result.errors,
             error_code: result.error_code,
+            max_lsn: None,
         }
     }
 }
@@ -3700,7 +3711,9 @@ impl TableRecordStore for DirectWalTableRecordStore {
                 crate::services::txn_staging::CommitOutcomeUnknown(format!("{err:#}"))
             })?;
 
-        Ok(TableRecordWriteResult::success(record_ids))
+        let mut result = TableRecordWriteResult::success(record_ids);
+        result.max_lsn = lsns.as_ref().and_then(|v| v.iter().max().copied());
+        Ok(result)
     }
 
     /// ADR-095 D3 / TD-PGOLTP-1: make a whole transaction durable as ONE WAL
@@ -7894,6 +7907,7 @@ impl TableRecordStore for ObjectStoreIcebergRecordStore {
             })?;
 
         Ok(TableRecordWriteResult {
+            max_lsn: None,
             success: true,
             record_ids,
             metrics: OperationMetrics::default(),
@@ -8367,6 +8381,7 @@ impl TableRecordStore for ObjectStoreVectorRecordStore {
         }
 
         Ok(TableRecordWriteResult {
+            max_lsn: None,
             success: true,
             record_ids,
             metrics: OperationMetrics::default(),

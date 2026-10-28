@@ -322,6 +322,25 @@ fn metadata_version_of(layout: &proximadb_catalog::CatalogStorageLayout) -> Opti
         .and_then(|v| v.parse().ok())
 }
 
+/// The (metadata version, snapshot LSN) pair a table's parquet-snapshot
+/// layout recorded for its publication — the pair the MATERIALIZE entry
+/// guard's relaxation and the live delete publisher's completeness
+/// precondition key on. `None` when the layout records no complete pair
+/// (an externally published snapshot, or a publication whose flip did not
+/// land): both callers refuse on `None`, fail-closed.
+pub(super) fn recorded_publication(
+    layouts: &[proximadb_catalog::CatalogStorageLayout],
+) -> Option<(u64, u64)> {
+    layouts
+        .iter()
+        .find(|l| l.name == "parquet-snapshot")
+        .and_then(|l| {
+            let version = metadata_version_of(l)?;
+            let lsn = l.properties.get("snapshot_lsn")?.parse().ok()?;
+            Some((version, lsn))
+        })
+}
+
 /// Whether `existing` already holds a layout of `incoming`'s name that records
 /// a NEWER metadata version than `incoming` — then flipping to `incoming` would
 /// move the catalog backwards. A layout without a recorded version (published

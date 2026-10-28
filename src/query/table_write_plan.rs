@@ -528,6 +528,9 @@ pub struct WriteIntentOverrides {
 #[derive(Debug, Clone)]
 pub struct DmlWritePlanRequest<'a> {
     pub target_schema: &'a CatalogTableSchema,
+    /// The table's published parent snapshot carries deletion vectors — the
+    /// bulk-append lane must refuse (see write_intent.rs).
+    pub published_parent_has_deletes: bool,
     pub target_stats: Option<&'a CatalogTableStatistics>,
     pub source_schema: Option<&'a CatalogTableSchema>,
     pub source_stats: Option<&'a CatalogTableStatistics>,
@@ -551,14 +554,17 @@ impl DmlWritePlanner {
         validate_target_table(request.target_schema, request.plan)?;
         validate_target_columns(request.target_schema, request.target_columns)?;
 
-        Ok(self.router.route(RoutingContext {
-            target_schema: request.target_schema,
-            target_stats: request.target_stats,
-            source_schema: request.source_schema,
-            source_stats: request.source_stats,
-            write_intent_overrides: request.write_intent_overrides,
-            plan: request.plan,
-        }))
+        Ok(self.router.route_fenced(
+            RoutingContext {
+                target_schema: request.target_schema,
+                target_stats: request.target_stats,
+                source_schema: request.source_schema,
+                source_stats: request.source_stats,
+                write_intent_overrides: request.write_intent_overrides,
+                plan: request.plan,
+            },
+            request.published_parent_has_deletes,
+        ))
     }
 }
 
@@ -568,6 +574,20 @@ pub struct TableWriteRouter;
 
 impl TableWriteRouter {
     pub fn route(&self, context: RoutingContext<'_>) -> RoutedExecutionPlan {
+        self.route_fenced(context, false)
+    }
+
+    /// Route with the fence-eligibility fact the DML service computed from
+    /// the published state: when the published parent snapshot carries
+    /// deletion vectors, the bulk-append lane must refuse (the visibility
+    /// fence contract's FORBID — the intent fact named
+    /// `published_parent_has_deletes`). `route` keeps the plain signature so
+    /// the dozens of literal RoutingContext test constructions stay valid.
+    pub fn route_fenced(
+        &self,
+        context: RoutingContext<'_>,
+        parent_has_deletes: bool,
+    ) -> RoutedExecutionPlan {
         let mut candidate_paths = self.candidate_paths(&context);
         let rejected_paths = self.rejected_paths(&context);
         candidate_paths.sort_by(|left, right| {
@@ -580,7 +600,7 @@ impl TableWriteRouter {
             .first()
             .cloned()
             .unwrap_or_else(|| self.native_candidate(&context));
-        let write_intent = self.write_intent(&context);
+        let write_intent = self.write_intent(&context, parent_has_deletes);
         let write_lane_decision = WriteLaneRouter::new().route(&write_intent);
 
         RoutedExecutionPlan {
@@ -840,7 +860,7 @@ impl TableWriteRouter {
         estimate
     }
 
-    fn write_intent(&self, context: &RoutingContext<'_>) -> WriteIntent {
+    fn write_intent(&self, context: &RoutingContext<'_>, parent_has_deletes: bool) -> WriteIntent {
         let mut intent = WriteIntent::new(
             context.plan.target.qualified_name(),
             write_operation_kind(&context.plan.write_mode),
@@ -862,6 +882,10 @@ impl TableWriteRouter {
 
         if batch_local_constraints_sufficient(context) {
             intent = intent.with_batch_local_constraints_sufficient(true);
+        }
+
+        if parent_has_deletes {
+            intent = intent.with_published_parent_has_deletes(true);
         }
 
         if let Some(overrides) = context.write_intent_overrides {
@@ -1865,6 +1889,7 @@ mod tests {
         let err = DmlWritePlanner::default()
             .plan(DmlWritePlanRequest {
                 target_schema: &schema,
+                published_parent_has_deletes: false,
                 target_stats: None,
                 source_schema: None,
                 source_stats: None,
@@ -1888,6 +1913,7 @@ mod tests {
         let routed = DmlWritePlanner::default()
             .plan(DmlWritePlanRequest {
                 target_schema: &schema,
+                published_parent_has_deletes: false,
                 target_stats: None,
                 source_schema: None,
                 source_stats: None,
