@@ -12,7 +12,8 @@ metering; no alternative cache/manifest system. v3-first remains ADR-097's publi
 Past premise corrections, source citations and competitor worksheets:
 link:../history/planning/STORAGE_CLASS_SEAMS_REVIEW_2026_10_25.adoc[review].
 The geometry-confounded cap pilot is link:../history/evidence/TIER1_SC0_RANGE_CAP_SWEEP_2026_10_26.adoc[history],
-not completion of E1. SC1/partial SC2 WIP must be reconciled before implementing from this plan.
+not completion of E1. SC1 policy and SC3 authority/create wiring have since landed;
+link:TRACKER.adoc[the tracker] identifies mutation, placement and residency residuals.
 
 == Thought experiments that decide the contracts
 
@@ -263,14 +264,15 @@ E0 at each new run: inventory available source/binary, dataset, hardware, active
 reference, cache paths and real read call sites. Record hashes and commit; never log secrets.
 Use task-owned data/config/prefixes/ports. No modification of another session's benchmark bed.
 
-E1 remaining gate (#2249 is only a geometry-confounded pilot; #2255 is under correction,
-not an accepted optimum/default result — see tracker review blockers): fixed-object query cap sweep on local S3-compatible MinIO plus owned Toxiproxy latency
-profile; ds3 is an alternative only after its endpoint/access is known. Baseline 4 MiB, then
-16/40; refine 8/32/64 when informative. First restart with L2 absent, then L2 warm with new
-queries and result-cache bypass. Keep actual server path, not an adapter-only microbenchmark.
-The cap/gap CLI and effective reporting already landed in #2244. Use those flags and
-verify actual sizes; inherited env variables are scrubbed. Preserve identical objects/model
-and run repeats; add the telemetry missing from #2249 before claiming E1 complete.
+E1 fixed-object, scale, fragmentation and filter measurements have landed (#2255/#2265/#2268);
+link:../history/evidence/INTEGRATION_RECONCILIATION_2026_10_28.adoc[evidence index and limits].
+They establish workload-dependent cap/fragmentation tradeoffs and a Stage-F byte sink, not a
+universal 16 MiB optimum or default/pricing decision. Remaining acceptance: calibrated recall,
+controlled repeats, cold/warm symmetry, representative filtered/fragmented/768d workloads and
+application-path cost. Use local S3-compatible MinIO plus owned Toxiproxy latency; ds3 is an
+alternative only after its endpoint/access is known. Keep actual server paths and identical
+objects/model/query identity; scrub inherited knobs and report effective sizes. Run L2-absent
+and L2-warm arms with result-cache bypass. Test P5–P7 changes against the same oracle/fixtures.
 
 E2 extension when needed (initial local evidence archived): direct local range tests (sequential/random, 4–64 MiB, queue depths 1 and 8), then
 application traces. Guest direct I/O does not prove Windows host cache coldness. These tests
@@ -330,6 +332,7 @@ earlier effort has already been spent.
 | SC6 | Integrated MinIO release runs; phase-specific costs, metadata inventory, declared pool limits; independent comparison/financial worksheet; update SUPPORTED_SURFACE only for proven scope. | Same correctness/recall across classes; bounded resource use; all requested metrics; zero total requests only with coherent discovery and all read dependencies covered. No default-on flip without soak.
 |===
 
-SC1 and SC2 can share a coherent PR if an otherwise inert API would be misleading. SC3 is
+SC1 policy and initial SC2 checks landed together; remaining SC2 authorization/placement proof
+is separate from the SC3 mutation PR. SC3 is
 larger than an eviction tweak: split durable admission from cache integration if review size
 requires it, keeping the public feature inactive until the full contract is green.

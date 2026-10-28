@@ -1,9 +1,10 @@
 = Central execution tracker
-// status-as-of: 2026-10-27
+// status-as-of: 2026-10-28
 :toc:
 :toclevels: 2
 
-Evidence baseline: fetched origin/develop `b3bf8a28b` (#2260/#2261/#2262 P2 delete rungs 1–3; #2259 SC1+SC2 merged; #2264 visibility-fence contract docs), 2026-10-27.
+Evidence baseline: fetched origin/develop `74f7f0a83`, 2026-10-28; merged slices and limits
+are recorded in link:../history/evidence/INTEGRATION_RECONCILIATION_2026_10_28.adoc[the integration record].
 Planning source: https://github.com/anvai-labs/proximaDB/pull/2250[#2250]. Local WIP and
 owner-reported tests/pauses are explicitly separate from merged delivery.
 Refresh branch heads/checks at pickup; this is a dated observation, not a live GitHub mirror.
@@ -11,7 +12,7 @@ Release order: link:ROADMAP.adoc[roadmap]. Contracts: link:LAKEHOUSE_PLAN.adoc[l
 link:STORAGE_PLAN.adoc[storage], link:PLATFORM_PLAN.adoc[platform].
 
 Completed foundation is summarized once in link:../history/README.adoc[history]; detailed
-merged-slice evidence is there. v3-first is the accepted direction, not yet a completed activation.
+merged-slice evidence is there. v3-first remains accepted; new-table policy and live deletes are implemented behind default-OFF gates, not a completed rollout.
 
 == Delivery queue (only residual work)
 
@@ -19,7 +20,7 @@ merged-slice evidence is there. v3-first is the accepted direction, not yet a co
 |===
 | Track / IDs | State / owner | Next work and closure gate
 | P1 / TD-SEAM-1 | In progress; pickup unassigned | Resolve tenant-scoped REST metadata key, wire the production bulk route (currently PlannedOnlyTableWriteExecutor), preserve nested/list schema; external value read-back through real facade after two snapshots. Writer-unit proof alone is insufficient.
-| P2 delete / TD-SEAM-4, TD-USUB-10 | Rungs 1–3 landed: rung 1 #2260 (`iceberg_publishes_v3` new-table policy, default-OFF `PROXIMADB_ICEBERG_V3_DEFAULT`, registered; atomic v2→v3 delete-carry pinned); rung 2 #2261 (knob-published v3 read back by pinned external readers incl. sequence/parent-chain + lineage-growth assertions; `Lineage::from_parent` fails closed on inconsistent lineage — v3 parent without a valid next-row-id, or next-row-id on v2; NOTE: engine policy, not spec — revisit at any foreign-parent seam; historical v3-without-lineage tables from the Jun–Oct window now fail closed on re-MATERIALIZE, pre-GA no-back-compat); rung 3 #2262 (`IcebergObjectStoreBridge::published_positions_of` oid↔row-position bridge, fail-closed on pre-2a parts carried forward, top-level missing-oid set, position basis pinned against row-group-sum application). Reader evidence is in history; preserve its cache/refusal guards. No new v2 delete writer. The earlier parallel 4a worktree (`feat/p24-v3-format-policy`, a property-surface approach) closed as superseded by the landed env-gate approach — no unique valid work to port. Remaining: live incremental delete writer (DV write + fenced successor publish), shared publication/WAL visibility fence. |
+| P2 delete / TD-SEAM-4, TD-USUB-10 | Writer merged #2266; fence gates WIP (GLM) | Finish race/lease/crash-gap/reader-standing gates in p24/fence-gates; prove recovery before relaxing refusals or enabling defaults. Policy, lineage and oid mapping already landed. Update/upsert publication and rollout remain separate gates.
 | Recovery / TD-SEAM-12/14 | Open residual; unassigned | All consumer floors and branch-merge residuals; object-store owner/reattach boundary before placement becomes default. Refusal is safer than silent history loss.
 | P3 provider / TD-SEAM-5, USUB-2/3 | In progress; unassigned | Default-on soak, stats and EXPLAIN parity, ABAC and bounded delta memory. Admit PAX only after visibility/WAL/ABAC proof; ungoverned UDTF routing is not governed parity.
 | Native differentiation / S6/S8, TD-SEAM-6, TD-OLAP-10/11/12 | Design/source review merged (#2252/#2254); implementation unassigned | NE-0..7 and per-engine strength/crossover tests are specified in the lakehouse plan; benchmarks remain PLANNED. First audit actual routes and build exact eligible-set oracle; prototype one fused native region only after defining semantics. No new generic engine rewrite or performance claims from desk research.
@@ -27,10 +28,10 @@ merged-slice evidence is there. v3-first is the accepted direction, not yet a co
 | P4 M1 / TD-SEAM-7/15 | Planned; after P3 contracts | Observability WAL→time partition→publish→ObsTimeTable; shared read token and record/subject identity. TE-1 join remains correct during publication/compaction; TE-3 50k rows/s, <=2s freshness.
 | P4 modalities / TD-SEAM-8/9, DOC-RETIRE-1 | Planned; after M1 contracts | Graph canonical writes/CSR recovery, document residual/ranged reads; subject delete across modalities with separate visibility/history/expiry/erasure gates.
 | P5 / TD-SEAM-10/11/13, PAXDIR-2 | In progress; unassigned | Coherent warm segment discovery; broad 10M/filter/fragmentation/768d/ingest gates; configured L2 default residual; HNSW persisted projection after TD-PAXPREC-1. D4 physical co-location remains deferred until measured need.
-| SC0 E1 / TD-TIER-1 | PR #2255; GLM owner, three review rounds + scale-arm review applied | Evidence commit `f56b6ff8e` carries all five round-3 corrections (claim/determinism/CPU-attribution, n_comp forwarding, sampler semantics, ETag/bounded-evidence disclosure, history move) plus the SIFT3M/SIFT10M fixed-object scale arms (n=1/cap, learn-split corpus; ledger `tier1_e1_scale_cap_sweep`): cap effect strengthens single-segment (3M 4->16 MiB -34.97%, wave 5->4), saturates under 3-segment fan-out (10M tiered -5.54%); 1-segment 10M fixture not producible (compaction floor, verbatim error recorded); geometric nprobe under-covers at scale (0.98 gate fails, disclosed; nprobe calibration is the product-gate follow-up). Run serialization verified; binary sha256-anchored (built at f5aef1b0b, see artifact provenance). Merged #2255 -> develop 98faebd8a 2026-10-27. **Fragment ladder measured 2026-10-27 (this branch, bench/tier1-e1-frag)**: artifact `TIER1_E1_FRAGMENT_LADDER_2026_10_27.adoc`, ledger `tier1_e1_fragment_ladder` (n=1/cell, fixed 3M corpus/binary/query IDs): cap lever collapses at first fragmentation and plateaus (1 seg -33.1%; 2/3/4 segs -13.5%/-13.1%/-16.4%); segment count alone does not explain the 10M -5.54% (corpus-size probe density is the supported second factor); 6-seg bed not producible on the single-dial protocol (measured flush outputs 140.5-208.2 MiB > a 135 MiB ceiling makes L0 untrainable — 4 segs is the top rung); dial = --compaction-max-memory-mb admission ceiling (--max-segments is harness-side only); warm phases build-vs-arm asymmetric, object_cold only. Binary sha256 48d4aaaf (built --features aws at anchor cc9789e80; the featureless first build had no S3 backend — 500 on create, discarded). Next gate: fresh review + green CI, then merge. No default or pricing promotion.
-| SC1 + partial SC2 / TD-TIER-1 | **Landed (#2259, merge `b3bf8a28b`)** | Config-only SC1+SC2: two GLM review rounds + one adversarial round (APPROVE, zero blockers); facade parity (REST v2 request+response, gRPC v1/v2, OpenAPI, SDKs); NOT_ACTIVE status truthful; class immutable after create (policy generation 0/1 only). Two doc-only review residuals (defensive-coercion comment, update-preservation comment) recorded on the TD-TIER-1 SC1 row for SC3 pickup. SC3 gates now unblocked.
-| E1 filter family / TD-FPRUNE-1 | bench/tier1-e1-filter; GLM owner | **3M measured 2026-10-28** (artifact `TIER1_E1_FILTERED_QUERIES_2026_10_28.adoc`, ledger `tier1_e1_filtered_queries`): filter keeps the 16-cell plan but reads 936.93 MB/q vs ~150 unfiltered (277.55 vs 52.74 req/q; 28x p50) — byte sink = Stage-F whole-D fetch 89% (counters; exact fallback never fired); cap lever dominant for filtered requests (cap4->cap16 -64%); selectivity-independent (50k match-all); co-design plan approved and filed as TD-FPRUNE-1 P5-P7 (residual-tail, filter-aware directory, cell-scoped Stage F; FOOTER_STATS precondition evidenced). Next: review, CI, merge. No default or pricing change.
-| SC3–6 / TD-TIER-1 | SC3 slice 1 WIP: feat/sc3-reservations (GLM) — durable-admission authority, INERT | SC3-1: per-pool `ReservationAuthority` (exclusive owner, atomic idempotent admission, overhead-charged capacity, tenant limits, kill switch, crash-reconcile, epoch/sequence dedup'd usage intervals), `PersistentByteStore` protection orthogonal to `L2Class` (inert at budget 0), additive `tier1_reservation_usage` metering kind, config `storage.reservation_pools` (empty default). No production call site yet — slice 2 wires create-path admission + policy-change surface + the two SC1 doc residuals; PERFORMANCE stays NOT_ACTIVE until SC4. Gate: concurrent no-overcommit, crash/retry/release, idle dedup, no query-hot-path quota check. SC4–6 after.
+| SC0 E1 / TD-TIER-1 | Measurement slices merged; acceptance residual | Fixed-object, scale and fragment evidence is in history (#2255/#2265). Repeat representative cold/warm arms, calibrate recall and test fragmentation/filter effects; no universal cap optimum, default or pricing promotion.
+| SC2 placement residual / TD-TIER-1 | GLM follow-up after landed #2259 | Prove configured-target authorization and real object-store create/flush/restart/drop. Policy/status groundwork is complete; PERFORMANCE residency remains NOT_ACTIVE until SC4.
+| Filtered PAX / TD-FPRUNE-1 P5–P7 | Evidence merged #2268; P5 WIP (GLM) | Residual-tail store-once and typed shred/consumer proof in feat/pax-residual-tail; then filter-aware directory and cell-scoped Stage F. Gate with the same filtered workload and exact/recall oracle; default flip in WIP is not merged behavior.
+| SC3–6 / TD-TIER-1 | SC3 authority/wiring merged #2267/#2269; mutation PR #2270 blocked | Resolve exact-head review and CI failures below before merge. Prove mutation recovery and real facade/object-store admission; SC4 coverage/store-budget arming and SC5/6 remain planned. Reservation admission does not establish byte residency.
 | P6 | Open, continuous | Value-compared SF1/SF10 query gates and multimodal benchmark; retain existing ratchets. Load/publication memory is not query coverage.
 | Dependency/security residuals | Planned; dependency lane | Track #2225–#2228/#2242; retire zstd advisory exceptions only with the documented dependency upgrades/exposure checks. #2251 is an accepted exception disposition, not a patched dependency. Workspace panic-site reduction/per-crate compiler lints remain separate from the completed coverage guard.
 | Platform release gates | Open/needs per-TD pickup | Published-image install/restart and driver proof, surface parity, workspace residuals and security/CI lanes: platform plan. No inference of completion from old plans.
@@ -45,13 +46,15 @@ GLM sessions own implementation/refinement. Codex owns review/merge coordination
 [cols="2,2,3",options="header"]
 |===
 | Branch / observed head | State | Ownership / next action
-| feat/p24-delete-readers / 2a01cac26 | #2258 closed as superseded by merged #2256; retained for owner cleanup | No unique valid source/test work to port at reviewed head. Preserve the active GLM checkout until owner cleanup is safe; start the writer residual from current develop.
-| feat/sc1-storage-policy / 6e8bbc991 | **Merged (#2259, `b3bf8a28b`)**; branch/worktree eligible for cleanup | SC1+SC2 landed after rebase onto `57a4db1d5` (only TD-TIER-1 adoc conflicted) and a clean adversarial round. Residuals (configured-target authorization, mutable policy surface, two doc comments) are on the TD-TIER-1 rows for SC3 follow-up.
-| bench/tier1-e1-fixed / f27a21548 | Open #2255; adversarial review blocked | GLM owns corrections below. Preserve raw runs and caches; request a fresh review on the corrected head before merge.
+| p24/fence-gates / 82364e23d | Committed WIP plus dirty DML/pgwire refinements; no PR at audit | GLM owns completion/review of fence gates 3–6. Owner reports 9/9 interop; not independently rerun here and not merged proof.
+| feat/pax-residual-tail / 8d6b7e284 | Two P5 slices committed; dirty storage/compaction refinements; no PR at audit | GLM owns remaining consumer/layout proof and bounded filtered-read validation. Preserve live worktree and benchmark data.
+| feat/sc3-policy-mutation / 9baae280e | PR #2270; CI and adversarial review blocked; owner refining dirty files | Findings below apply to this committed head, not uncommitted fixes. New head needs fresh review and green CI.
 | docs/release-notes-v040 / b448e4acc | Dormant/unresolved; 11 unique commits and generated site | Reconcile unique release changes before cleanup. Partial overlap with #1960 does not prove supersession.
 |===
 
-Shared develop at `/home/vsingh/code/proximaDB` was clean at d929d7993; leave it untouched.
+Shared develop at `/home/vsingh/code/proximaDB` was clean at 2b2c56f27; leave it untouched.
+Previously completed reader, SC1, E1 and governance worktrees are absent from this inventory;
+this audit did not remove them. Do not recreate their implementation lanes.
 Completed #2248/#2251 lanes and updated inventory evidence:
 link:../history/evidence/INTEGRATION_RECONCILIATION_2026_10_26.adoc[integration record].
 Earlier cleanup: link:../history/planning/ROADMAP_WORKTREE_RECONCILIATION_2026_10_26.adoc[audit].
@@ -59,34 +62,37 @@ No live-session message delivery is claimed; these are durable pickup nudges.
 
 == Branch pickup nudges
 
-=== P2 writer pickup after completed readers + rungs 1–3
+=== P2 fence pickup
 
-Reader implementation/review/validation is complete in #2256:
-link:../history/evidence/P24_DELETION_READER_REVIEW_2026_10_26.adoc[evidence].
-The v3 activation ladder's rungs 1–3 are merged (#2260 policy + atomic v2→v3 upgrade; #2261
-lineage proof + fail-closed lineage; #2262 oid↔position bridge for the writer). Retain snapshot
-cache bypasses and explicit refusal of unordered native deltas/materialization until a shared
-visibility fence is proven. The never-downgrade floor does not switch default v2 callers to v3;
-the env-gated `PROXIMADB_ICEBERG_V3_DEFAULT` (default OFF) arms v3 for new tables only.
-The landed `IcebergObjectStoreBridge::published_positions_of` is the additive primitive the
-writer builds on — every call reads the entire oid column of every file (known cost, stated).
-Start the writer residual from current develop; do not replay #2258 or the closed
-`feat/p24-v3-format-policy` property-surface approach (superseded by the env-gate design).
+Reuse the merged reader, v3 policy/lineage, oid-position mapping and live-delete publisher;
+link:../history/evidence/INTEGRATION_RECONCILIATION_2026_10_28.adoc[completed slices].
+The fence-gates worktree owns deterministic race, displaced lease, CAS-to-layout crash recovery
+and standing reader guards. Its unmerged gate claims must survive review and CI through the
+real facade. Default-OFF v3/live-delete gates stay unchanged until the rollout decision.
+Preserve external-DV refusal and document exactly which native versus published reads each
+test exercises; test-side artifact creation alone does not prove read-surface convergence.
 
-=== SC1 policy
+=== SC3 mutation review and owner handoff
 
-PR #2259 is open at `2cf2651fc`, CI green. Latest WIP passes the resolved base location into
-admission and rejects changing the class after create. The earlier request-only/generation
-criticism is partly addressed: generation 0/1 is coherent only while policy is immutable,
-with omitted/same-value updates proven safe. Do not reimplement that fix; verify its
-facade/restart tests and keep mutable policy deferred.
+PR #2270 at `9baae280e` is blocked. The owner is actively refining this checkout; re-review
+the resulting committed head. Do not merge on the earlier PR-body review claim.
 
-Remaining authorization gap (NOT in this PR — deferred to SC3): rejecting an explicit
-`/tenants/{other}` segment does not prove that an arbitrary bucket/prefix is an
-operator-authorized target. Validate the final assignment against configured location
-capabilities and canonical tenant/account identity; test paths with no tenant segment,
-alternate schemes/encodings and configured defaults. Keep NOT_ACTIVE for unimplemented
-economy/performance.
+* Peek admission must use tenant/collection identity and enforce tenant quota before policy
+  persistence. Currently global capacity can pass while reserve rejects the tenant afterward.
+* Preserve `RESERVATION_ADMISSION_PENDING` through the real CollectionPort/runtime facade;
+  a successful collection payload currently discards the pending error code.
+* Make grant transitions recoverable after failure/restart. A logged release failure can keep
+  billing a downgraded collection; same-value retry currently skips repair for either direction.
+  Prove durable reconciliation, idempotent retry and the persist-to-grant crash windows.
+* Serialize or fence delete versus policy mutation: deletion between persistence and reserve
+  must not leave a billed grant without a collection. Add a deterministic interleaving gate.
+* Initialize generation as server-owned on create and reject exhaustion. Client-seeded
+  `u32::MAX` plus saturating increments must not accept different policies at one generation.
+
+Hosted CI at this head also fails Python lint (generated-file formatting) and the root unit
+`economy_persists_intent_and_performance_requires_object_backed_sst` reason assertion.
+Correct those without weakening the substantive acceptance gates. Real MinIO facade coverage,
+configured-target authorization and SC4 residency remain distinct from config/unit proof.
 
 === Experiment pickup
 
@@ -94,29 +100,6 @@ Keep object set/ETags/model/query IDs fixed; vary only cap, repeat arms, collect
 in-flight/useful/overread bytes and request sizes. Preserve the pilot's 4 MiB gate failure
 (20.005 requests/query), changed 21/25/26 cell geometry and p50/p95 wave distinction.
 Warm coherent discovery is a separate lever; a TTL alone is not a multiwriter freshness contract.
-
-=== E1 review corrections for the owning GLM session
-
-Review applies to #2255 head `f27a21548`; recheck after owner changes. Preserve the six raw runs.
-
-* The observed 4-to-16 MiB request reduction is about 28.67%, while bytes increase 4.50%.
-  The two repeats have overlapping latency/CPU results; 40 MiB has fewer requests. Report
-  a workload-specific tradeoff; two noisy repeats do not establish a 16 MiB optimum even
-  on this bed. Result-set hashes differ across
-  some repeats, so wall-clock variance is not the only observed variation. State recall and
-  determinism limits. Remove the unproven causal attribution of CPU time to useless tails.
-* Restore `n_comp=args.n_comp` forwarding in `spawn_server`; an accepted/reported override
-  cannot silently stop affecting the server.
-* `ServerProcSampler.stop` needs a terminal sample. Unreadable process counters must be
-  unavailable/error, not plausible zero CPU/RSS. Protect sampler lifetime with actual
-  try/finally and test short phases and read/HTTP/guard failure paths.
-* Binary hash, segment ETag and cell geometry match in inspected artifacts. That is bounded
-  evidence, not an automated immutable-fixture guarantee: pin/verify the complete object,
-  model/query identity and before/after validators, or explicitly disclose operator-managed
-  verification. An ETag is an identity validator, not assumed a content hash.
-* Move new run evidence to `docs/history/evidence/`, update current/history links and the
-  evidence ledger, and remove duplicate conflicting SC1/SC2 TD status rows. Do not restore
-  a live `_internal/status` tracker or rewrite old pilot evidence.
 
 === Resumed-session handoff
 
