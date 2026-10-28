@@ -2127,6 +2127,11 @@ impl CollectionService {
         };
         let previous_record = record.clone();
 
+        // TD-TIER-1 SC3-2b: pending grant side effect of a class change —
+        // `Some(true)` = reserve after persist, `Some(false)` = release.
+        // Applied only after the durable upsert succeeds.
+        let mut policy_side_effect: Option<bool> = None;
+
         // Apply updates using native proto types
         if let Some(new_config) = config_update {
             // Merge the new config with existing one to preserve unchanged fields
@@ -2191,13 +2196,19 @@ impl CollectionService {
                          the collection at the new location to migrate it"
                     ));
                 }
-                // TD-TIER-1 SC1 (v1 owner decision): the storage class is
-                // IMMUTABLE after create — a policy-change surface needs a
-                // monotonic generation and re-admission (SC3); until then a
-                // different class is rejected with an actionable message, an
-                // unknown enum number is rejected on every facade, and a
-                // same-value re-apply is an accepted no-op (idempotent). An
-                // omitted field (or UNSPECIFIED) preserves the recorded class.
+                // TD-TIER-1 SC3-2b: the policy-mutation surface. A different
+                // class is RE-ADMITTED, not rejected: entry to PERFORMANCE
+                // re-runs the SC2 placement floor on the EXISTING resolved
+                // placement and PEEKS the reservation registry (default pool
+                // resolvable + armed + kill switch off) BEFORE the config
+                // persists — a refused update keeps the old policy unchanged.
+                // The grant side effects (reserve/release) apply only AFTER
+                // the catalog upsert succeeds, so a failed update can never
+                // orphan a grant (the create-path lesson, applied here). A
+                // same-value re-apply is an idempotent no-op (no generation
+                // bump); an unknown enum number is rejected on every facade;
+                // an omitted field (or UNSPECIFIED) preserves the recorded
+                // class.
                 if let Some(raw_class) = new_config.storage_class
                     && raw_class != 0
                 {
@@ -2210,18 +2221,72 @@ impl CollectionService {
                             existing_config,
                         );
                     if resolved != recorded {
-                        return Err(anyhow::anyhow!(
-                            "storage_class is immutable after create in v1 (recorded \
-                             '{}', requested '{}'); recreate the collection with the \
-                             desired class. Policy changes with re-admission arrive \
-                             with the reservation surface (TD-TIER-1 SC3)",
-                            crate::services::collection::storage_class::storage_class_label(
-                                recorded
-                            ),
-                            crate::services::collection::storage_class::storage_class_label(
-                                resolved
-                            )
-                        ));
+                        if resolved == crate::proto::proximadb_v1::StorageClass::Performance {
+                            // SC2 floor on the existing placement: the same
+                            // checks create runs, against the placement this
+                            // collection already has (durable placement is
+                            // immutable, so create-time admissibility carries).
+                            let mut prospective_config = existing_config.clone();
+                            prospective_config.storage_class = Some(resolved as i32);
+                            let engine = previous_record
+                                .storage_assignment
+                                .as_ref()
+                                .and_then(|a| {
+                                    crate::proto::proximadb_v1::StorageEngine::try_from(a.engine)
+                                        .ok()
+                                })
+                                .or_else(|| {
+                                    existing_config.storage_engine.and_then(|e| {
+                                        crate::proto::proximadb_v1::StorageEngine::try_from(e).ok()
+                                    })
+                                })
+                                .unwrap_or(crate::proto::proximadb_v1::StorageEngine::Sst);
+                            let base = previous_record
+                                .storage_assignment
+                                .as_ref()
+                                .map(|a| a.base_location.clone())
+                                .unwrap_or_default();
+                            let owner = previous_record
+                                .config
+                                .as_ref()
+                                .and_then(|cfg| cfg.owner.clone())
+                                .filter(|owner| !owner.is_empty());
+                            let admission_tenant = owner.as_deref().map(str::to_string);
+                            crate::services::collection::storage_class::check_performance_admission(
+                                &prospective_config,
+                                engine,
+                                &base,
+                                admission_tenant.as_deref(),
+                            )?;
+                            // Registry peek (no side effects): an unarmed or
+                            // kill-switched pool refuses BEFORE the config
+                            // persists. `self.reservations = None` (no pools
+                            // declared) also refuses — PERFORMANCE without a
+                            // reservation admission would be a silent lie.
+                            match &self.reservations {
+                                Some(registry) => registry.peek_performance_admission().await?,
+                                None => {
+                                    return Err(anyhow::anyhow!(
+                                        "storage_class 'performance' requires a \
+                                         configured reservation pool: none is declared \
+                                         ([storage.reservation_pools]); the update is \
+                                         refused and the recorded policy is unchanged"
+                                    ));
+                                }
+                            }
+                        }
+                        // Commit the class change + monotonic generation bump
+                        // in-memory; the grant side effect applies after the
+                        // durable upsert below.
+                        let generation =
+                            crate::services::collection::storage_class::policy_generation_or_legacy(
+                                existing_config,
+                            );
+                        existing_config.policy_generation =
+                            Some(u32::try_from(generation.saturating_add(1)).unwrap_or(u32::MAX));
+                        existing_config.storage_class = Some(resolved as i32);
+                        policy_side_effect =
+                            Some(resolved == crate::proto::proximadb_v1::StorageClass::Performance);
                     }
                 }
                 if !new_config.tags.is_empty() {
@@ -2280,6 +2345,45 @@ impl CollectionService {
         self.upsert_collection_catalog_asset(&record, None)
             .await
             .context("Failed to update collection catalog metadata")?;
+
+        // TD-TIER-1 SC3-2b: the policy is durable — now apply the grant side
+        // effect. Entry's reserve failure here is a recorded SC4
+        // reconciliation residual (policy persisted as performance without a
+        // grant; status stays NOT_ACTIVE and re-admission heals it) — the
+        // inverse ordering (grant before persist) could ORPHAN a grant,
+        // which is strictly worse.
+        if let Some(to_performance) = policy_side_effect
+            && let Some(registry) = &self.reservations
+        {
+            let collection_id = previous_record.id.clone();
+            let owner = previous_record
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.owner.clone())
+                .filter(|owner| !owner.is_empty());
+            let now = chrono::Utc::now().timestamp();
+            if to_performance {
+                let tenant = owner.unwrap_or_else(|| Self::DEFAULT_VERSION_TENANT.to_string());
+                if let Err(error) = registry
+                    .reserve_for_performance(&tenant, &collection_id, now)
+                    .await
+                {
+                    warn!(
+                        "TD-TIER-1 SC3: post-persist reserve failed for {collection_id}: \
+                         {error} (policy recorded; SC4 reconciliation re-admits)"
+                    );
+                }
+            } else {
+                if let Some(owner) = owner.as_deref() {
+                    registry
+                        .release_for_collection(owner, &collection_id, now)
+                        .await;
+                }
+                registry
+                    .release_for_collection(Self::DEFAULT_VERSION_TENANT, &collection_id, now)
+                    .await;
+            }
+        }
 
         info!(
             "✅ Collection updated: {} in {}μs",
@@ -3363,6 +3467,7 @@ mod tests {
             index_policy: None,
             pax_vector_quant: None,
             storage_class: None,
+            policy_generation: None,
         }
     }
 
@@ -5477,8 +5582,12 @@ mod tests {
             Some(StorageClass::Economy as i32)
         );
 
-        // A DIFFERENT class is immutable after create (v1 owner decision), the
-        // recorded economy class survives.
+        // SC3-2b: a DIFFERENT class is re-admitted, not rejected. Entry to
+        // PERFORMANCE re-runs the SC2 floor first: this collection's local
+        // placement (file://) is inadmissible, so the update is refused
+        // BEFORE the config persists — the recorded economy class survives.
+        // (A pool-less deployment refuses one step later, at the registry
+        // peek — covered by the registry's own gates.)
         let perf = CollectionConfig {
             storage_class: Some(StorageClass::Performance as i32),
             ..Default::default()
@@ -5486,15 +5595,66 @@ mod tests {
         let error = svc
             .update_collection("sc_update", Some(perf))
             .await
-            .expect_err("storage-class changes are rejected after create in v1");
+            .expect_err("PERFORMANCE entry onto an inadmissible placement is refused");
         let message = error.to_string();
-        assert!(message.contains("immutable"), "{message}");
-        assert!(message.contains("economy"), "{message}");
+        assert!(message.contains("object-store-backed"), "{message}");
         let read_back = svc.collection("sc_update").await?.context("read")?;
         assert_eq!(
             read_back.config.context("config")?.storage_class,
             Some(StorageClass::Economy as i32),
-            "a rejected class change must not alter the recorded class"
+            "a refused class change must not alter the recorded class"
+        );
+
+        // economy → balanced: a real mutation through the surface — the
+        // class changes and the generation bumps monotonically (legacy
+        // heuristic is 1 for a class persisted at create ⇒ now 2).
+        let balanced = CollectionConfig {
+            storage_class: Some(StorageClass::Balanced as i32),
+            ..Default::default()
+        };
+        assert!(
+            svc.update_collection("sc_update", Some(balanced))
+                .await?
+                .success
+        );
+        let read_back = svc.collection("sc_update").await?.context("read")?;
+        let config = read_back.config.context("config")?;
+        assert_eq!(config.storage_class, Some(StorageClass::Balanced as i32));
+        assert_eq!(
+            config.policy_generation,
+            Some(2),
+            "an actual class change bumps the monotonic generation"
+        );
+
+        // balanced → economy: bumps again; same-value re-apply does not.
+        let economy = CollectionConfig {
+            storage_class: Some(StorageClass::Economy as i32),
+            ..Default::default()
+        };
+        assert!(
+            svc.update_collection("sc_update", Some(economy))
+                .await?
+                .success
+        );
+        let read_back = svc.collection("sc_update").await?.context("read")?;
+        assert_eq!(
+            read_back.config.context("config")?.policy_generation,
+            Some(3)
+        );
+        let same_again = CollectionConfig {
+            storage_class: Some(StorageClass::Economy as i32),
+            ..Default::default()
+        };
+        assert!(
+            svc.update_collection("sc_update", Some(same_again))
+                .await?
+                .success
+        );
+        let read_back = svc.collection("sc_update").await?.context("read")?;
+        assert_eq!(
+            read_back.config.context("config")?.policy_generation,
+            Some(3),
+            "a same-value re-apply does not bump the generation"
         );
 
         // Storage-path mutation: rejected as an immutable-placement change.

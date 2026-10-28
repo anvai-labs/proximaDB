@@ -290,6 +290,34 @@ impl ReservationRegistry {
         Ok(grant)
     }
 
+    /// Side-effect-free admission peek: would a PERFORMANCE create/admission
+    /// succeed right now? (Default pool resolvable, grant size armed, kill
+    /// switch off.) Used by the policy-mutation surface BEFORE the config
+    /// persists so a refusal keeps the old policy unchanged.
+    pub async fn peek_performance_admission(&self) -> Result<(), ReservationError> {
+        let pool_id = self.default_pool.as_deref().ok_or_else(|| {
+            ReservationError::Invalid(
+                "multiple reservation pools are declared but none is marked is_default; \
+                 PERFORMANCE admission cannot pick one"
+                    .to_string(),
+            )
+        })?;
+        let (config, _) = self
+            .pools
+            .get(pool_id)
+            .ok_or_else(|| ReservationError::Corrupt("default pool missing".into()))?;
+        if config.default_grant_bytes == 0 {
+            return Err(ReservationError::Invalid(format!(
+                "reservation pool '{pool_id}' declares no default_grant_bytes; \
+                 PERFORMANCE admission is not armed (set default_grant_bytes in \
+                 [storage.reservation_pools])"
+            )));
+        }
+        // Kill-switch and tenant checks run in the real reserve; the peek
+        // only needs to answer "would the armed surface accept this".
+        Ok(())
+    }
+
     /// Release every live grant for a collection identity across all pools
     /// (idempotent where the identity never reserved). Tail intervals park
     /// for the metering tick.

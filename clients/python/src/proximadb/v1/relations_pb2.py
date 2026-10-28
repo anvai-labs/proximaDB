@@ -9,7 +9,6 @@ from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import runtime_version as _runtime_version
 from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
-
 _runtime_version.ValidateProtobufRuntimeVersion(
     _runtime_version.Domain.PUBLIC,
     6,
@@ -24,8 +23,8 @@ _sym_db = _symbol_database.Default()
 
 
 from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
-
 from proximadb.v1 import entity_pb2 as proximadb_dot_v1_dot_entity__pb2
+
 
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1cproximadb/v1/relations.proto\x12\x0cproximadb.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x19proximadb/v1/entity.proto\"X\n\x15\x43reateRelationRequest\x12\x15\n\rcollection_id\x18\x01 \x01(\t\x12(\n\x08relation\x18\x02 \x01(\x0b\x32\x16.proximadb.v1.Relation\"y\n\x15\x44\x65leteRelationRequest\x12\x15\n\rcollection_id\x18\x01 \x01(\t\x12\x18\n\x10source_entity_id\x18\x02 \x01(\t\x12\x18\n\x10target_entity_id\x18\x03 \x01(\t\x12\x15\n\rrelation_type\x18\x04 \x01(\t\"@\n\x14ListRelationsRequest\x12\x15\n\rcollection_id\x18\x01 \x01(\t\x12\x11\n\tentity_id\x18\x02 \x01(\t\"B\n\x15ListRelationsResponse\x12)\n\trelations\x18\x01 \x03(\x0b\x32\x16.proximadb.v1.Relation\"^\n\tGraphPath\x12&\n\x08\x65ntities\x18\x01 \x03(\x0b\x32\x14.proximadb.v1.Entity\x12)\n\trelations\x18\x02 \x03(\x0b\x32\x16.proximadb.v1.Relation\"T\n\x0fTraverseRequest\x12\x15\n\rcollection_id\x18\x01 \x01(\t\x12\x17\n\x0fstart_entity_id\x18\x02 \x01(\t\x12\x11\n\tmax_depth\x18\x03 \x01(\r\":\n\x10TraverseResponse\x12&\n\x05paths\x18\x01 \x03(\x0b\x32\x17.proximadb.v1.GraphPath2\xda\x02\n\x10RelationsService\x12M\n\x0e\x43reateRelation\x12#.proximadb.v1.CreateRelationRequest\x1a\x16.proximadb.v1.Relation\x12M\n\x0e\x44\x65leteRelation\x12#.proximadb.v1.DeleteRelationRequest\x1a\x16.google.protobuf.Empty\x12X\n\rListRelations\x12\".proximadb.v1.ListRelationsRequest\x1a#.proximadb.v1.ListRelationsResponse\x12I\n\x08Traverse\x12\x1d.proximadb.v1.TraverseRequest\x1a\x1e.proximadb.v1.TraverseResponse\x1a\x03\x88\x02\x01\x42,Z*github.com/proximadb/proto/go/proximadb/v1b\x06proto3')
 

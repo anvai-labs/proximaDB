@@ -99,6 +99,13 @@ message CollectionConfig {
   // a NOT_ACTIVE status until SC3/SC4 land (read `Collection.storage_class_status`).
   // Unknown explicit values are rejected at admission.
   optional StorageClass storage_class = 30;
+
+  // TD-TIER-1 SC3-2b: monotonic policy generation. Bumped on every actual
+  // storage-class change through the policy-mutation surface (re-admission
+  // included); absent on legacy records, which report the SC1-era heuristic
+  // (0 if the class was never set, 1 if persisted at create). Same-value
+  // re-applies do NOT bump. Read-side projection: `Collection.storage_class_status`.
+  optional uint32 policy_generation = 31;
 }
 
 // Canonical scalar type for a collection's embedding column. Mirrors

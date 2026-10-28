@@ -42,6 +42,7 @@ impl SstEngine {
 
         let config = CollectionConfig {
             storage_class: None,
+            policy_generation: None,
             name: collection_id.to_string(),
             embedding_config: None,
             dimension: 1536,          // Default dimension

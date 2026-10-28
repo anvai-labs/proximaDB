@@ -98,18 +98,29 @@ pub fn storage_class_label(class: StorageClass) -> &'static str {
     }
 }
 
+/// The persisted monotonic generation, or the SC1-era heuristic for legacy
+/// records without the field (0 = class never set, 1 = persisted at create).
+pub fn policy_generation_or_legacy(config: &CollectionConfig) -> u64 {
+    match config.policy_generation {
+        Some(generation) => u64::from(generation),
+        None => u64::from(config.storage_class.is_some()),
+    }
+}
+
 /// The read-side observed status: a pure projection of the desired policy,
-/// truthful about what SC1 actually delivers.
+/// truthful about what is actually delivered.
 ///
 /// BALANCED (or an absent field) ⇒ ACTIVE. ECONOMY/PERFORMANCE ⇒ NOT_ACTIVE
-/// with a reason naming the missing dependency, because SC3 (reservations)
-/// and SC4 (residency coverage) are not implemented — the collection serves
-/// balanced behavior and no guarantee is implied. `policy_generation` is 0
-/// for pre-SC1 records (field absent) and 1 once any class is persisted at
-/// create; a policy-change surface will bump it.
+/// with a reason naming the missing dependency (SC4 residency coverage;
+/// SC3 admission itself is wired — it reserves pool capacity at create and
+/// at policy change, but no protected residency or coverage proof is
+/// active), so the collection serves balanced behavior and no guarantee is
+/// implied. `policy_generation` is the persisted monotonic counter (SC3-2b):
+/// bumped on every actual class change through the mutation surface;
+/// legacy records keep the SC1-era heuristic.
 pub fn storage_class_status(config: &CollectionConfig) -> StorageClassStatus {
     let class = storage_class_or_balanced(config);
-    let generation = if config.storage_class.is_some() { 1 } else { 0 };
+    let generation = policy_generation_or_legacy(config);
     match class {
         StorageClass::Balanced | StorageClass::Unspecified => StorageClassStatus {
             state: State::Active as i32,
@@ -121,7 +132,7 @@ pub fn storage_class_status(config: &CollectionConfig) -> StorageClassStatus {
         },
         StorageClass::Economy => StorageClassStatus {
             state: State::NotActive as i32,
-            reason: "economy residency is not implemented (TD-TIER-1 SC3/SC4): the \
+            reason: "economy residency is not implemented (TD-TIER-1 SC4): the \
                      collection serves balanced behavior"
                 .to_string(),
             policy_generation: generation,

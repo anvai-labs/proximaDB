@@ -489,6 +489,7 @@ impl MetadataStoreInterface for MetadataStore {
             if let Some(versioned) = self.write_buffer_manager.collection(collection_id).await? {
                 let config = CollectionConfig {
                     storage_class: None,
+                    policy_generation: None,
                     name: versioned.name.clone(),
                     embedding_config: None,
                     dimension: versioned.dimension as u32,
@@ -611,6 +612,7 @@ impl MetadataStoreInterface for MetadataStore {
                 .map(|versioned| {
                     let config = CollectionConfig {
                         storage_class: None,
+                        policy_generation: None,
                         name: versioned.name.clone(),
                         embedding_config: None,
                         dimension: versioned.dimension as u32,

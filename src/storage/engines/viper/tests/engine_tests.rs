@@ -115,6 +115,7 @@ mod tests {
             id: collection_id.to_string(),
             config: Some(CollectionConfig {
                 storage_class: None,
+                policy_generation: None,
                 name: collection_id.to_string(),
                 embedding_config: None,
                 dimension: 128,           // Match actual test vector dimension

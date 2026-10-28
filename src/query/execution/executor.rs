@@ -2326,6 +2326,7 @@ mod executor_tests {
         use crate::proto::proximadb_v1::{CollectionConfig, DistanceMetric, StorageEngine};
         let config = CollectionConfig {
             storage_class: None,
+            policy_generation: None,
             name: "test_collection".to_string(),
             embedding_config: None,
             dimension: 3, // Match the test vector dimensions
