@@ -131,9 +131,10 @@ pub fn storage_class_status(config: &CollectionConfig) -> StorageClassStatus {
         },
         StorageClass::Performance => StorageClassStatus {
             state: State::NotActive as i32,
-            reason: "performance residency requires an admitted reservation and \
-                     coverage (TD-TIER-1 SC3/SC4), not implemented: the collection \
-                     serves balanced behavior"
+            reason: "performance residency coverage is not implemented \
+                     (TD-TIER-1 SC4): admission reserves pool capacity at create, \
+                     but no protected residency or coverage proof is active — the \
+                     collection serves balanced behavior"
                 .to_string(),
             policy_generation: generation,
             reserved_bytes: 0,

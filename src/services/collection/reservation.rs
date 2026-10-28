@@ -64,6 +64,12 @@ const MAX_RETAINED_RELEASED: usize = 64;
 /// Takeover retries for the owner lock — a bounded race, not a spin.
 const LOCK_ATTEMPTS: usize = 8;
 
+/// Upper bound for parked release-tail intervals awaiting the metering tick.
+/// The tick normally drains every interval; when the durable sink is disabled
+/// (no storage location configured) or persistently failing, drop-oldest
+/// keeps the queue bounded instead of growing for the process lifetime.
+const MAX_PARKED_INTERVALS: usize = 1024;
+
 /// Kill switch: when set, [`ReservationAuthority::reserve`] refuses new
 /// reservations with a named reason. It never erases the ledger or the
 /// operator's pool/policy configuration — degrading to balanced behavior, not
@@ -200,8 +206,10 @@ pub struct ReservationRegistry {
     /// The pool PERFORMANCE creates reserve from: the explicit `is_default`
     /// pool, or the single pool when only one is declared.
     default_pool: Option<String>,
-    /// Release-closed tail intervals awaiting the metering tick (bounded by
-    /// grant turnover; the 64-entry released-tail cap keeps this small).
+    /// Release-closed tail intervals awaiting the metering tick, bounded by
+    /// [`MAX_PARKED_INTERVALS`] (drop-oldest): they park until the tick and
+    /// are lost at-most-once on sink failure — dropped after their checkpoint
+    /// advanced, so a loss under-bills and never double-bills.
     pending_intervals: Mutex<Vec<ReservationUsageInterval>>,
 }
 
@@ -243,6 +251,15 @@ impl ReservationRegistry {
         collection_id: &str,
         now_unix_secs: i64,
     ) -> Result<Grant, ReservationError> {
+        if tenant_id.is_empty() {
+            // The metering resolver rejects empty tenant ids, so an
+            // empty-keyed grant could accrue intervals that can never be
+            // written — refuse at admission instead (callers fold to the
+            // default tenant before this seam).
+            return Err(ReservationError::Invalid(
+                "reservation tenant id must not be empty".to_string(),
+            ));
+        }
         let pool_id = self.default_pool.as_deref().ok_or_else(|| {
             ReservationError::Invalid(
                 "multiple reservation pools are declared but none is marked is_default; \
@@ -324,10 +341,18 @@ impl ReservationRegistry {
         if closed.is_empty() {
             return;
         }
-        self.pending_intervals
+        let mut queue = self
+            .pending_intervals
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .extend(closed);
+            .unwrap_or_else(|p| p.into_inner());
+        queue.extend(closed);
+        if queue.len() > MAX_PARKED_INTERVALS {
+            let dropped = queue.len() - MAX_PARKED_INTERVALS;
+            queue.drain(..dropped);
+            tracing::warn!(
+                "TD-TIER-1 SC3: parked reservation intervals exceeded {MAX_PARKED_INTERVALS};                  dropped {dropped} oldest (durable sink disabled or persistently failing?)"
+            );
+        }
     }
 }
 
@@ -1864,6 +1889,24 @@ mod tests {
             registry.take_metering_intervals(800).await.is_empty(),
             "drained: no double-emission"
         );
+    }
+
+    // SF2: an empty tenant id must be refused at admission — the metering
+    // resolver rejects it, so an empty-keyed grant could never be billed.
+    #[tokio::test]
+    async fn empty_tenant_refused_at_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let pools = [pool_config(&dir, "p1", 4096)];
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .unwrap();
+        let err = registry
+            .reserve_for_performance("", "c-uuid-1", 1000)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tenant id must not be empty"), "{err}");
     }
 
     #[test]

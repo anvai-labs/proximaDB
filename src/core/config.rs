@@ -949,6 +949,9 @@ pub struct CoreStorageConfig {
     /// config load (`validate_pool_configs`: per-pool shape, duplicate
     /// id/path rejection) and each pool again when an authority opens it, so
     /// a bad declaration fails at startup rather than degrading silently.
+    /// Each pool is EXCLUSIVELY OWNED per process (and per host via the
+    /// owner.lock): a second in-process `CollectionService` construction or a
+    /// second process on the same pool directory fails startup by design.
     #[serde(default)]
     pub reservation_pools: Vec<crate::services::collection::reservation::ReservationPoolConfig>,
 }

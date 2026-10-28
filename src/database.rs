@@ -411,21 +411,26 @@ impl ProximaDB {
                         // configured): the durable record and pushed level cannot
                         // diverge by construction.
                         crate::observability::metering_otlp::record_storage_snapshot(&usage);
-                        // TD-TIER-1 SC3-2: reservation usage rides the same
-                        // coalesced cadence (parked release-tails + accrual
-                        // intervals; empty when no pools are declared). Per-record
-                        // errors surface — reservation billing must not silently
-                        // drop intervals.
-                        if let Some(registry) = cs.reservations() {
-                            for interval in registry.take_metering_intervals(now_secs).await {
-                                let record = crate::metrics::metering_writer::ReservationUsageRecord::from_interval(&interval);
-                                if let Err(error) =
-                                    writer.write_reservation_usage(&record, None).await
-                                {
-                                    tracing::warn!(
-                                        "TD-TIER-1 SC3: reservation usage write failed: {error}"
-                                    );
-                                }
+                    }
+                    // TD-TIER-1 SC3-2: reservation usage rides the same
+                    // coalesced cadence (parked release-tails + accrual
+                    // intervals; empty when no pools are declared), but does
+                    // NOT depend on the KSU snapshot succeeding — a catalog
+                    // listing failure must not also stall interval draining
+                    // (review SF4). Per-record errors surface: reservation
+                    // billing must not silently drop intervals.
+                    if let Some(registry) = cs.reservations() {
+                        let now_secs = chrono::Utc::now().timestamp();
+                        for interval in registry.take_metering_intervals(now_secs).await {
+                            let record =
+                                crate::metrics::metering_writer::ReservationUsageRecord::from_interval(
+                                    &interval,
+                                );
+                            if let Err(error) = writer.write_reservation_usage(&record, None).await
+                            {
+                                tracing::warn!(
+                                    "TD-TIER-1 SC3: reservation usage write failed: {error}"
+                                );
                             }
                         }
                     }
