@@ -475,14 +475,34 @@ def iter_u8bin_batches(path: Path, count: int, batch_size: int):
             yield batch
 
 
-def iter_vector_batches(path: Path, vector_format: str, count: int, batch_size: int):
+def iter_vector_batches(
+    path: Path,
+    vector_format: str,
+    count: int,
+    batch_size: int,
+    metadata_cols: dict[str, str] | None = None,
+):
+    # TD-TIER-1 E1 filter arm: attach deterministic metadata props per record
+    # index so a filtered phase has something server-side to filter on. The
+    # expressions are evaluated against the record index `i` only (no
+    # builtins) — they are bench-authored, not user input.
+    offset = 0
     if vector_format == "fvecs":
-        yield from iter_fvec_batches(path, count, batch_size)
-        return
-    if vector_format == "u8bin":
-        yield from iter_u8bin_batches(path, count, batch_size)
-        return
-    raise RuntimeError(f"unsupported vector format: {vector_format}")
+        source = iter_fvec_batches(path, count, batch_size)
+    elif vector_format == "u8bin":
+        source = iter_u8bin_batches(path, count, batch_size)
+    else:
+        raise RuntimeError(f"unsupported vector format: {vector_format}")
+    for batch in source:
+        if metadata_cols:
+            for k, record in enumerate(batch):
+                i = offset + k
+                record["props"] = {
+                    name: eval(expr, {"__builtins__": {}}, {"i": i})  # noqa: S307
+                    for name, expr in metadata_cols.items()
+                }
+        offset += len(batch)
+        yield batch
 
 
 def iter_vector_arrow_batches(
@@ -1723,6 +1743,7 @@ def run_query_sweep(
     progress_guard=None,
     concurrency: int = 1,
     server_pid: int | None = None,
+    search_filters: list[dict] | None = None,
 ) -> dict:
     if concurrency <= 0:
         raise RuntimeError("query concurrency must be positive")
@@ -1750,10 +1771,17 @@ def run_query_sweep(
             peak_in_flight = max(peak_in_flight, in_flight)
         try:
             started = time.perf_counter()
+            body = {"vector": query, "top_k": top_k}
+            if search_filters:
+                # TD-TIER-1 E1 filter arm: the typed-filter clause is the
+                # ONLY difference from the unfiltered phases — the probe
+                # showed filter presence (not selectivity) switches the
+                # read path, so the clause must be identical across phases.
+                body["filters"] = search_filters
             response = request_json(
                 f"{server}/api/v2/collections/{collection_id}/search",
                 method="POST",
-                body={"vector": query, "top_k": top_k},
+                body=body,
                 timeout=300,
             )
             latency_ms = (time.perf_counter() - started) * 1000
@@ -2613,6 +2641,7 @@ def ingest(
     ingest_transport: str,
     explicit_flush_every_rows: int | None,
     explicit_geometry: AzureCliPaxGeometry | None,
+    metadata_cols: dict[str, str] | None = None,
 ) -> tuple[str, float, dict[int, int], list[dict], dict | None]:
     _, dimension, _ = vector_source_geometry(base_path, base_format)
     response = request_json(
@@ -2641,11 +2670,18 @@ def ingest(
     explicit_flushes = []
     flight_stream = None
     if ingest_transport == "flight":
+        if metadata_cols:
+            raise RuntimeError(
+                "--metadata-cols requires --ingest-transport rest (the Flight "
+                "path carries no record props)"
+            )
         batches = iter_vector_arrow_batches(
             base_path, base_format, expected_rows, batch_size
         )
     elif ingest_transport == "rest":
-        batches = iter_vector_batches(base_path, base_format, expected_rows, batch_size)
+        batches = iter_vector_batches(
+            base_path, base_format, expected_rows, batch_size, metadata_cols
+        )
     else:
         raise RuntimeError(f"unsupported ingest transport: {ingest_transport}")
     for batch in batches:
@@ -2904,6 +2940,25 @@ def main() -> int:
         ),
     )
     parser.add_argument("--write-buffer-mb", type=int, default=4096)
+    parser.add_argument(
+        "--metadata-cols",
+        default=None,
+        help=(
+            "TD-TIER-1 E1 filter arm: comma-separated name:expr pairs "
+            "(e.g. 'category:i%10,half:i%2'); expr is evaluated on the "
+            "record index i and attached as record props at REST ingest"
+        ),
+    )
+    parser.add_argument(
+        "--search-filters",
+        default=None,
+        help=(
+            "TD-TIER-1 E1 filter arm: a single typed-filter clause "
+            "'field:op:value' (e.g. 'category:eq:3') applied to every query "
+            "phase. Value parsed as int when numeric. Pair with a "
+            "precomputed filtered ground-truth file via --groundtruth-path."
+        ),
+    )
     parser.add_argument(
         "--compaction-max-memory-mb",
         type=int,
@@ -3558,6 +3613,8 @@ def main() -> int:
                 args.training_compaction_min_mb
             ),
             "required_layout_version": args.require_layout_version,
+            "metadata_cols_override": args.metadata_cols,
+            "search_filters_override": args.search_filters,
         },
         "ingest_config": {
             "transport": args.ingest_transport,
@@ -3707,6 +3764,15 @@ def main() -> int:
                 args.ingest_transport,
                 args.explicit_flush_every_rows,
                 epoch_geometry,
+                metadata_cols=(
+                    dict(
+                        pair.split(":", 1)
+                        for pair in args.metadata_cols.split(",")
+                        if pair.strip()
+                    )
+                    if args.metadata_cols
+                    else None
+                ),
             )
             result["collection_id"] = collection_id
             result["ingest"] = {
@@ -3800,6 +3866,15 @@ def main() -> int:
         # The three phase sweeps share every argument except the window and
         # name; one closure keeps them from drifting apart (dup-ratchet).
         def phase_sweep(phase: str, start: int):
+            filters = None
+            if args.search_filters:
+                field, op, raw_value = args.search_filters.split(":", 2)
+                value: int | str = raw_value
+                try:
+                    value = int(raw_value)
+                except ValueError:
+                    pass
+                filters = [{"field": field, "op": op, "value": value}]
             return run_query_sweep(
                 server_url,
                 collection_id,
@@ -3812,6 +3887,7 @@ def main() -> int:
                 args.query_format,
                 args.groundtruth_format,
                 server_pid=active_pid,
+                search_filters=filters,
             )
 
         post_write = phase_sweep("post_write", 0)
