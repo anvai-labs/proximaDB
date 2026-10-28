@@ -67,7 +67,7 @@ completed on the 1-seg bed for matched geometry.
 |---|---|---|---|---|---|
 | unfiltered cap4 (build) | 2-seg | 52.74 | 150.18 MB | 202 ms | 0.9697 |
 | unfiltered cap16 | 1-seg | 35.42 | 153.42 MB | 199 ms | 0.9697 |
-| unfiltered cap4 @1-seg | 1-seg | *pending — re-running after a mid-chain worktree-dirty refusal (disclosed below)* | | | |
+| unfiltered cap4 @1-seg | 1-seg | 52.74 | 150.18 MB | 214 ms | 0.9697 |
 | **filtered cat3 cap4** | 1-seg | **277.55** | **936.93 MB** | **6019 ms** | **0.9747** |
 | filtered cat3 cap16 (n=250) | 1-seg | **100.01** | 896.94 MB | 4036 ms | 0.9748 |
 
@@ -82,6 +82,18 @@ fetch ≈ **834 MB (89%)**; Region B SQ8 rerank 94.3 MB (770k probed rows × 128
 — the standard cascade cost, identical class to unfiltered); Region A 8.3 MB;
 rehydrate 0.39 s; Region D decode 27 ms (the cost is transfer, not decode —
 "prunes DECODE, not fetch" confirmed byte-exactly).
+
+== Matched-geometry completion
+
+The re-run unfiltered cap4 @1-seg reference (after the mid-chain
+dirty-worktree refusal — the harness guards a clean tree at each arm start;
+the refusal burned nothing but wall-clock) measures **identically to the
+2-seg build's phases** (52.74 req/q / 150.18 MB / probed rows 769,131 to the
+digit) — unfiltered plan determinism holds across the auto-budget merge: the
+directory picked the same effective cells from either geometry. The matched
+1-seg family is complete; the filtered-vs-unfiltered multiplier at matched
+geometry and matched cap is **5.26× requests (277.55/52.74) and 6.2× bytes
+(936.93/150.18)**.
 
 == The cap lever on the filtered path (the inversion, confirmed)
 
@@ -133,7 +145,9 @@ n=1 per cell (exploratory; directions, not distributions); learn-split corpus;
 the 3M selectivity control arm was dropped (the 50k match-all probe
 establishes selectivity-independence; re-runnable in ~3 h if review demands);
 no default or pricing change; the design targets (242/138 MB) are arithmetic
-from measured constants, not yet measured implementations.
+from measured constants, not yet measured implementations. The 0.97 gate
+misses unfiltered object_cold by 0.0003 (0.9697) — the exact residual
+predicted when the gate was relaxed.
 
 == Provenance
 
