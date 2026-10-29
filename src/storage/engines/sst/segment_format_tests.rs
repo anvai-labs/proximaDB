@@ -2603,6 +2603,40 @@ async fn stage_f_row_allow_set_is_exact() {
     assert!(empty_allow.is_empty());
 }
 
+/// PR-D L1a: the Stage-F wave split is order-preserving, byte-bounded, puts
+/// an oversized fetch in a wave of its own, and yields nothing for no input.
+#[test]
+fn stage_f_waves_split_by_bytes_in_order() {
+    let fetch = |start: u64, len: u64| CoalescedFetch {
+        start,
+        end: start + len,
+        blocks: vec![start as usize],
+    };
+    assert!(stage_f_waves(&[], 100).is_empty());
+    let fetches = vec![
+        fetch(0, 40),
+        fetch(40, 40),
+        fetch(80, 40),   // 120 > 100 ⇒ new wave
+        fetch(120, 250), // oversized ⇒ its own wave
+        fetch(370, 10),
+    ];
+    let waves = stage_f_waves(&fetches, 100);
+    let starts: Vec<Vec<u64>> = waves
+        .iter()
+        .map(|w| w.iter().map(|f| f.start).collect())
+        .collect();
+    assert_eq!(starts, vec![vec![0, 40], vec![80], vec![120], vec![370]]);
+    let flat: Vec<u64> = waves
+        .iter()
+        .flat_map(|w| w.iter().map(|f| f.start))
+        .collect();
+    assert_eq!(
+        flat,
+        vec![0, 40, 80, 120, 370],
+        "order preserved, nothing lost"
+    );
+}
+
 /// PR-D L1a/L1b: Stage F reads its D ranges in bounded-concurrency waves
 /// and takes its header/footer from the invariants cache (warm) or skips the
 /// HEAD with a listed size (cold) — the allow-set is identical on every path,

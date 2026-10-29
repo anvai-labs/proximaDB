@@ -3557,6 +3557,22 @@ mod tests {
             .await;
             let snap = snap.expect("io_trace scope");
             assert!(!results.is_empty(), "filter={filter:?}: hits");
+            // The stashed blocks really rehydrated the rows: every hit carries
+            // its metadata (a swallowed rehydrate error would leave none), and
+            // filtered hits satisfy the predicate.
+            for r in &results {
+                let half = r.metadata.get("half").unwrap_or_else(|| {
+                    panic!("filter={filter:?}: hit {} was not rehydrated: {r:?}", r.id)
+                });
+                if filter.is_some() {
+                    assert_eq!(
+                        half,
+                        &proximadb_records::ProximaValue::Int64(1),
+                        "hit {} violates the filter",
+                        r.id
+                    );
+                }
+            }
             assert!(
                 snap.rehydrate_us > 0 && snap.tier_get_ops[CacheTier::ResultPayload as usize] > 0,
                 "filter={filter:?}: the cascade resolved OIDs and rehydrated: {:?}",

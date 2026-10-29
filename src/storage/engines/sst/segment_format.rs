@@ -1388,8 +1388,9 @@ pub(crate) async fn pax_filtered_row_allow(
         let ranges: Vec<std::ops::Range<u64>> = wave.iter().map(|f| f.start..f.end).collect();
         let bufs = match fs.read_ranges_prefetch_resident(path, ranges.clone()).await {
             Ok(bufs) => bufs,
-            Err(_) => {
+            Err(error) => {
                 // Defensive fallback to the sequential shape.
+                tracing::debug!(path, %error, "stage-F wave failed; reading serially");
                 let mut seq = Vec::with_capacity(ranges.len());
                 for range in &ranges {
                     seq.push(
@@ -1401,6 +1402,13 @@ pub(crate) async fn pax_filtered_row_allow(
                 seq
             }
         };
+        if bufs.len() != wave.len() {
+            anyhow::bail!(
+                "filtered stage-F {path}: wave returned {} buffers for {} ranges",
+                bufs.len(),
+                wave.len()
+            );
+        }
         // Metrics parity: one tier record per physical GET, at batch time.
         for range in &ranges {
             record_get_physical(CacheTier::FilterRowAllow, range.end - range.start, trace_on);
@@ -1410,16 +1418,19 @@ pub(crate) async fn pax_filtered_row_allow(
         fetch_us += decode_started.duration_since(fetch_started).as_micros() as u64;
         for (fetch, buf) in wave.iter().zip(bufs) {
             for &bi in &fetch.blocks {
-                let Some(b) = footer.blocks.get(bi) else {
-                    continue;
-                };
-                let Some(rel) = b.offset.checked_sub(fetch.start).map(|r| r as usize) else {
-                    continue;
-                };
-                let end = rel + b.size as usize;
-                let Some(block_bytes) = buf.get(rel..end) else {
-                    continue;
-                };
+                // Fail closed: a block missing from its fetch (short read, EOF
+                // clamp) would silently drop matching rows from the allow-set;
+                // an error sends the segment to the exact path instead.
+                let block_bytes = footer
+                    .blocks
+                    .get(bi)
+                    .and_then(|b| {
+                        let rel = usize::try_from(b.offset.checked_sub(fetch.start)?).ok()?;
+                        buf.get(rel..rel.checked_add(b.size as usize)?)
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("filtered stage-F {path}: block {bi} is outside its fetch")
+                    })?;
                 let reader = PaxBlockReader::open(block_bytes)
                     .map_err(|e| anyhow::anyhow!("filtered stage-F block open {path}: {e}"))?;
                 // Conservative stats prune: provably-no-match blocks skip decode.
@@ -1484,10 +1495,13 @@ pub(crate) async fn pax_filtered_row_allow(
     Ok(Some((allow, stats)))
 }
 
-/// PR-D L1a: per-wave byte bound for the Stage-F D fetch (mirrors the D4
-/// bound at the other wave sites) — one wave holds every buffer it fetched
-/// until decode, so this caps Stage F's peak memory per segment.
-const STAGE_F_WAVE_MAX_BYTES: u64 = 128 * 1024 * 1024;
+/// PR-D L1a: per-wave byte bound for the Stage-F D fetch. One wave holds
+/// every buffer it fetched until decode, and Stage F (unlike the top-k-sized
+/// wave sites) fills its bound on every large segment while segments scan in
+/// parallel — so it is bounded well below the 128 MiB D4 ceiling: one
+/// in-flight round at the object-store width (16) of the CLOUD/Azure 4 MiB
+/// IOP range, i.e. half a round at the S3/GCS 8 MiB target.
+const STAGE_F_WAVE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Split `fetches` into consecutive waves whose summed lengths stay within
 /// `max_bytes` (a single larger fetch forms its own wave). Order-preserving.
@@ -1658,8 +1672,9 @@ pub(crate) async fn read_records_by_positions(
             .await
         {
             Ok(bufs) => bufs,
-            Err(_) => {
+            Err(error) => {
                 // Defensive fallback to the sequential shape.
+                tracing::debug!(path, %error, "rehydrate wave failed; reading serially");
                 let mut seq = Vec::with_capacity(cold_ranges.len());
                 for range in &cold_ranges {
                     seq.push(
@@ -1682,7 +1697,9 @@ pub(crate) async fn read_records_by_positions(
     for (fetch, handed_blocks) in fetches.iter().zip(handed_per_fetch) {
         let buf = match &handed_blocks {
             Some(_) => Vec::new(),
-            None => cold_bufs.next().unwrap_or_default(),
+            None => cold_bufs.next().ok_or_else(|| {
+                anyhow::anyhow!("rehydrate {path}: fewer wave buffers than cold fetches")
+            })?,
         };
         for (i, &bi) in fetch.blocks.iter().enumerate() {
             let Some(b) = footer.blocks.get(bi) else {
@@ -5287,10 +5304,26 @@ pub async fn rabitq_search_segment_coalesced_allowed(
     });
     if let (Some(choice), Some(fetches)) = (handoff, handoff_fetches) {
         let ranges: Vec<std::ops::Range<u64>> = fetches.iter().map(|f| f.start..f.end).collect();
-        let bufs = fs
-            .read_ranges_prefetch_resident(path, ranges)
-            .await
-            .map_err(|e| anyhow::anyhow!("coalesced scan top-k blocks {path}: {e}"))?;
+        // PR-D L4: this arm now runs on every cascade query, so a transient
+        // wave error retries serially (like the chunk and legacy arms) rather
+        // than failing the cascade over to a whole-object exact scan.
+        let bufs = match fs.read_ranges_prefetch_resident(path, ranges.clone()).await {
+            Ok(bufs) => bufs,
+            Err(error) => {
+                tracing::debug!(path, %error, "top-k block wave failed; reading serially");
+                let mut seq = Vec::with_capacity(ranges.len());
+                for range in &ranges {
+                    seq.push(
+                        fs.read_range_resident(path, range.start, range.end - range.start)
+                            .await
+                            .map_err(|e| {
+                                anyhow::anyhow!("coalesced scan top-k blocks {path}: {e}")
+                            })?,
+                    );
+                }
+                seq
+            }
+        };
         crate::observability::io_trace::drain_and_forward_read_ranges_metrics();
         for (fetch, buf) in fetches.iter().zip(bufs) {
             record_get_physical(CacheTier::ResultPayload, fetch.end - fetch.start, trace_on);
