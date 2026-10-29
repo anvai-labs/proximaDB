@@ -1867,3 +1867,213 @@ async fn check_incremental_materialize() {
         "✓ incremental MATERIALIZE: carried parts + dv-mat vectors, both views + external agree"
     );
 }
+
+/// Soak evidence for flipping `PROXIMADB_MATERIALIZE_INCREMENTAL_DV` on: a
+/// seeded LCG drives 40 rounds of inserts, updates and deletes with a
+/// MATERIALIZE every 3rd round (incremental under the 20% bound, compacting
+/// past it). After every round the WAL view equals the model; after every
+/// MATERIALIZE, and between them over the DV-carrying base, the OLAP view
+/// agrees on the row count, the key sum and the count of updated values;
+/// after every MATERIALIZE the `dv-mat` Puffins on disk are EXACTLY those the
+/// current and previous snapshots name (superseded ones collected); the
+/// external engines read the final state.
+#[test]
+fn soak_incremental_materialize_holds_both_views() {
+    run_isolated(
+        "soak_incremental_materialize_holds_both_views",
+        "PROXIMADB_INCR_SOAK_CHILD",
+        &[
+            ("PROXIMADB_MATERIALIZE_INCREMENTAL_DV", "1"),
+            ("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1"),
+        ],
+        check_soak_incremental_materialize,
+    );
+}
+
+/// The OLAP view's `(COUNT(*), SUM(k), COUNT of updated values)`; updates
+/// write `a{round}` values, which sort below every inserted `v{k}`.
+async fn olap_fingerprint(client: &tokio_postgres::Client, table: &str) -> (i64, i64, i64) {
+    let int = |raw: Option<&Option<String>>| -> i64 {
+        raw.and_then(|v| v.as_deref())
+            .expect("a non-NULL aggregate")
+            .trim()
+            .parse()
+            .expect("integer aggregate")
+    };
+    let totals = pg_rows(client, table, &["COUNT(*)", "SUM(k)"]).await;
+    let updated = pg_rows(client, &format!("{table} WHERE v < 'b'"), &["COUNT(*)"]).await;
+    (
+        int(totals[0].first()),
+        int(totals[0].get(1)),
+        int(updated[0].first()),
+    )
+}
+
+/// The `dv-mat-*` Puffin file names on disk under the table's base, and the
+/// ones its latest and previous snapshots name (read through the engine).
+async fn dv_mat_puffins(
+    server: &TestPgServer,
+    table: &str,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    use proximadb_iceberg_engine::IcebergObjectStoreBridge;
+    use proximadb_storage_common::object_store_bridge::ObjectStoreBridge as _;
+
+    let mut files = Vec::new();
+    walk(&server.data_dir().join("warehouse"), &mut files);
+    let metadata_dir = files
+        .iter()
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".metadata.json"))
+                && p.to_string_lossy().contains(table)
+        })
+        .and_then(|p| p.parent())
+        .expect("the table's metadata dir")
+        .to_path_buf();
+    let base_dir = metadata_dir.parent().expect("table base");
+    let name_of = |p: &std::path::Path| p.file_name().and_then(|n| n.to_str()).map(String::from);
+    let on_disk = files
+        .iter()
+        .filter(|p| p.starts_with(base_dir))
+        .filter_map(|p| name_of(p))
+        .filter(|n| n.starts_with("dv-mat-") && n.ends_with(".puffin"))
+        .collect();
+    let bridge = IcebergObjectStoreBridge::from_url(&format!("file://{}", base_dir.display()))
+        .expect("bridge");
+    let latest = bridge
+        .latest_metadata_version("metadata")
+        .await
+        .expect("metadata log")
+        .expect("a published snapshot");
+    let mut referenced = std::collections::BTreeSet::new();
+    for version in [latest.saturating_sub(1), latest] {
+        let Ok(snapshot) = bridge
+            .read_iceberg_snapshot_files("metadata", version)
+            .await
+        else {
+            continue; // v0 / a pre-history version
+        };
+        for v in snapshot.deletion_vectors {
+            let name = v.puffin_file.filename().map(String::from);
+            if let Some(name) = name.filter(|n| n.starts_with("dv-mat-")) {
+                referenced.insert(name);
+            }
+        }
+    }
+    (on_disk, referenced)
+}
+
+fn model_fingerprint(model: &std::collections::BTreeMap<i32, String>) -> (i64, i64, i64) {
+    (
+        model.len() as i64,
+        model.keys().map(|k| *k as i64).sum(),
+        model.values().filter(|v| v.as_str() < "b").count() as i64,
+    )
+}
+
+async fn check_soak_incremental_materialize() {
+    let server = TestPgServer::start().await.expect("server start");
+    let client = connect_pg(&server).await;
+    let table = "incr_soak";
+    let exec = |sql: String| {
+        let client = &client;
+        async move {
+            client
+                .simple_query(&sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        }
+    };
+    exec(format!(
+        "CREATE TABLE {table} (k INT PRIMARY KEY, v VARCHAR)"
+    ))
+    .await;
+    let mut model: std::collections::BTreeMap<i32, String> = Default::default();
+    // A base large enough that most deltas stay under the 20% bound.
+    for k in 1..=40 {
+        exec(format!("INSERT INTO {table} (k, v) VALUES ({k}, 'v{k}')")).await;
+        model.insert(k, format!("v{k}"));
+    }
+    exec(format!("ALTER TABLE {table} MATERIALIZE")).await;
+    sleep(Duration::from_millis(300)).await;
+
+    let mut rng = SoakRng(0x1C4E_2026_1029);
+    let mut next_key: i32 = 41;
+    let (mut updates, mut deletes, mut materializes) = (0usize, 0usize, 1usize);
+    let mut max_dv_mat = 0usize;
+    let mut minted_any = false;
+    for round in 0..40u64 {
+        for _ in 0..rng.below(3) {
+            let k = next_key;
+            next_key += 1;
+            exec(format!("INSERT INTO {table} (k, v) VALUES ({k}, 'v{k}')")).await;
+            model.insert(k, format!("v{k}"));
+        }
+        for _ in 0..rng.below(3) {
+            let idx = rng.below(model.len() as u64) as usize;
+            let k = *model.keys().nth(idx).expect("indexed key");
+            let v = format!("a{round}");
+            exec(format!("UPDATE {table} SET v = '{v}' WHERE k = {k}")).await;
+            model.insert(k, v);
+            updates += 1;
+        }
+        for _ in 0..rng.below(2) {
+            if model.len() <= 10 {
+                break;
+            }
+            let idx = rng.below(model.len() as u64) as usize;
+            let k = *model.keys().nth(idx).expect("indexed key");
+            exec(format!("DELETE FROM {table} WHERE k = {k}")).await;
+            model.remove(&k);
+            deletes += 1;
+        }
+        assert_wal_matches(&client, table, &model, &format!("round {round}")).await;
+        // Between MATERIALIZEs the OLAP view merges the delta over the
+        // DV-carrying base (the ordered-DV-base read path).
+        assert_eq!(
+            olap_fingerprint(&client, table).await,
+            model_fingerprint(&model),
+            "round {round}: the OLAP view merged over the DV base"
+        );
+        if round % 3 == 2 {
+            exec(format!("ALTER TABLE {table} MATERIALIZE")).await;
+            materializes += 1;
+            sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                olap_fingerprint(&client, table).await,
+                model_fingerprint(&model),
+                "round {round}: the OLAP view reconciles after MATERIALIZE"
+            );
+            // Exact: the dv-mat Puffins on disk are the ones the current or
+            // the previous snapshot names — superseded ones are collected.
+            let (on_disk, referenced) = dv_mat_puffins(&server, table).await;
+            max_dv_mat = max_dv_mat.max(on_disk.len());
+            minted_any |= !on_disk.is_empty();
+            assert_eq!(
+                on_disk, referenced,
+                "round {round}: dv-mat Puffins on disk == those V and V-1 name"
+            );
+        }
+    }
+    assert!(minted_any, "the soak exercised the incremental path");
+
+    let rows: Vec<(String, String)> = model
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    let expected: Vec<(&str, &str)> = rows.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let external = external_leg_kv(server.rest_port, table, &expected, "iceberg-incr-soak").await;
+    eprintln!(
+        "incremental soak ok: {updates} updates, {deletes} deletes, {materializes} materializes, \
+         <= {max_dv_mat} dv-mat Puffins on disk (== those V and V-1 name); external leg {}",
+        if external {
+            "checked"
+        } else {
+            "SKIPPED (no reader locally)"
+        }
+    );
+}

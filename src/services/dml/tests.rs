@@ -4215,7 +4215,7 @@ fn an_incremental_republication_hides_old_versions_with_deletion_vectors() {
 
         // The same oid updated AGAIN: i0's copies now span two files — the
         // original (already hidden) and the part holding qty=100. Both are
-        // suspects; the original's vector is unchanged (re-hiding is a no-op)
+        // suspects; the original's vector still hides exactly {i0, i1, i2}
         // and the part gets its own vector hiding the qty=100 copy.
         let parts_before = published_data_files(&inv.bridge, &prefix).await;
         inv.exec("UPDATE inv SET qty = 200 WHERE id = 'i0';").await;
@@ -4252,6 +4252,41 @@ fn an_incremental_republication_hides_old_versions_with_deletion_vectors() {
             (19, 437),
             "i0 goes from 100 to 200 (337 - 100 + 200)"
         );
+
+        // Four incremental publications minted four dv-mat Puffins; GC keeps
+        // exactly the ones the current or the previous snapshot names.
+        let latest = inv
+            .bridge
+            .latest_metadata_version(&metadata_prefix)
+            .await
+            .expect("metadata log")
+            .expect("a committed snapshot");
+        let mut referenced = std::collections::BTreeSet::new();
+        for version in [latest - 1, latest] {
+            for v in inv
+                .bridge
+                .read_iceberg_snapshot_files(&metadata_prefix, version)
+                .await
+                .expect("snapshot")
+                .deletion_vectors
+            {
+                referenced.insert(v.puffin_file.to_string());
+            }
+        }
+        let on_disk: std::collections::BTreeSet<String> = inv
+            .bridge
+            .list_objects(&object_store::path::Path::from(prefix.as_str()))
+            .await
+            .expect("list")
+            .into_iter()
+            .filter(|k| k.filename().is_some_and(|n| n.starts_with("dv-mat-")))
+            .map(|k| k.to_string())
+            .collect();
+        assert_eq!(
+            on_disk, referenced,
+            "superseded dv-mat Puffins are collected; referenced ones survive"
+        );
+        assert!(on_disk.len() < 4, "GC collected something: {on_disk:?}");
     });
 }
 
