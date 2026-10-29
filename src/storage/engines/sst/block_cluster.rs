@@ -1098,7 +1098,7 @@ fn gate_value_on(value: Option<&str>) -> bool {
     })
 }
 
-/// Boolean gate read: truthy = `1|true|on|yes`.
+/// Kill-switch read: ON unless set to `0|off|false|no` (unset is ON).
 pub(crate) fn env_kill_switch_off(name: &str) -> bool {
     std::env::var(name)
         .map(|v| {
@@ -1655,6 +1655,15 @@ mod tests {
         ] {
             assert_eq!(gate_value_on(Some(value)), on, "{value:?}");
         }
+    }
+
+    /// TD-FPRUNE-3: pins the shipped default of the gate itself (not just
+    /// the parser) — unset is OFF. Env-touching; relies on nextest's
+    /// process-per-test isolation like the other gate tests here.
+    #[test]
+    fn partition_layout_gate_defaults_off() {
+        unsafe { std::env::remove_var("PROXIMADB_PAX_PARTITION_LAYOUT") };
+        assert!(!partition_layout_enabled());
     }
 
     #[test]
