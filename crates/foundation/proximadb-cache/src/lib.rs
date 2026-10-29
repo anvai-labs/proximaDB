@@ -43,22 +43,35 @@ pub use persistent_l2::{L2Class, PersistentByteStore};
 /// A single cell holds the authoritative budget (the live sum of charged
 /// grants across pools); setting it also arms whichever store is already
 /// registered, and a store registering later picks up the current cell —
-/// order-independent by construction.
+/// order-independent by construction; registration and setting share one
+/// mutex so no interleaving loses an update. ONE registry per process is
+/// assumed — the budget is a single number, so two registries with disjoint
+/// pools would each push their own Σ and clobber the other (production
+/// constructs exactly one; tests and embedded must respect the same rule).
 mod residency_budget {
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::PersistentByteStore;
 
     static REGISTERED_STORE: OnceLock<Arc<PersistentByteStore>> = OnceLock::new();
-    static CELL: AtomicU64 = AtomicU64::new(0);
+    static CELL: OnceLock<Mutex<u64>> = OnceLock::new();
+
+    fn cell() -> &'static Mutex<u64> {
+        CELL.get_or_init(|| Mutex::new(0))
+    }
 
     /// Register the process's shared persistent store (first registration
-    /// wins — the SST engine's singleton). Applies the current budget.
+    /// wins — the SST engine's singleton). The WINNER is armed with the
+    /// current budget under the cell mutex; a loser is left untouched (it
+    /// would otherwise be a live store armed once and never managed again).
     pub fn register_process_store(store: Arc<PersistentByteStore>) -> bool {
-        let applied = REGISTERED_STORE.set(store.clone()).is_ok();
-        store.set_reserved_budget(CELL.load(Ordering::Acquire));
+        let budget = cell().lock().unwrap_or_else(|p| p.into_inner());
+        let applied = REGISTERED_STORE.set(store).is_ok();
+        if applied && let Some(store) = REGISTERED_STORE.get() {
+            store.set_reserved_budget(*budget);
+        }
         applied
     }
 
@@ -68,9 +81,13 @@ mod residency_budget {
     }
 
     /// Set the authoritative residency budget (live charged grant bytes
-    /// across all pools) and arm the registered store, if any.
+    /// across all pools) and arm the registered store, if any. Registering
+    /// and setting share the cell mutex: their interleavings cannot lose an
+    /// update (review SF3 — a set-store/register-store race could otherwise
+    /// leave the cell and the store permanently disagreeing).
     pub fn set_process_reserved_budget(bytes: u64) {
-        CELL.store(bytes, Ordering::Release);
+        let mut budget = cell().lock().unwrap_or_else(|p| p.into_inner());
+        *budget = bytes;
         if let Some(store) = REGISTERED_STORE.get() {
             store.set_reserved_budget(bytes);
         }
@@ -78,7 +95,7 @@ mod residency_budget {
 
     /// The current budget cell (diagnostics/tests).
     pub fn process_reserved_budget() -> u64 {
-        CELL.load(Ordering::Acquire)
+        *cell().lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 

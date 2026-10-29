@@ -211,6 +211,11 @@ pub struct ReservationRegistry {
     /// are lost at-most-once on sink failure — dropped after their checkpoint
     /// advanced, so a loss under-bills and never double-bills.
     pending_intervals: Mutex<Vec<ReservationUsageInterval>>,
+    /// Serializes grant mutations WITH their budget sync (review SF1): a
+    /// sync reading Σ charged outside every ledger mutex could store a stale
+    /// total permanently — the gate makes mutation+read-Σ-store atomic at
+    /// registry scope, which is exactly the budget's granularity.
+    mutation_gate: tokio::sync::Mutex<()>,
 }
 
 impl ReservationRegistry {
@@ -235,11 +240,17 @@ impl ReservationRegistry {
             .find(|p| p.is_default)
             .map(|p| p.id.clone())
             .or_else(|| (pools.len() == 1).then(|| pools[0].id.clone()));
-        Ok(Some(Arc::new(Self {
+        let registry = Self {
             pools: opened,
             default_pool,
             pending_intervals: Mutex::new(Vec::new()),
-        })))
+            mutation_gate: tokio::sync::Mutex::new(()),
+        };
+        // SF2: push the reconciled charged budget at OPEN — a restart with
+        // live grants must not wait for the first mutation to arm the store
+        // (order-independent: the bridge holds the value for a late store).
+        registry.sync_residency_budget().await;
+        Ok(Some(Arc::new(registry)))
     }
 
     /// Reserve for a PERFORMANCE collection create. Fails with an actionable
@@ -260,6 +271,9 @@ impl ReservationRegistry {
                 "reservation tenant id must not be empty".to_string(),
             ));
         }
+        // Mutation + budget sync under one gate (SF1): the Σ read cannot
+        // interleave with a concurrent mutation's commit.
+        let _gate = self.mutation_gate.lock().await;
         let (config, authority) = self.armed_default_pool()?;
         let (grant, closed) = authority
             .reserve(
@@ -336,6 +350,9 @@ impl ReservationRegistry {
         collection_id: &str,
         now_unix_secs: i64,
     ) {
+        // Mutation + budget sync under one gate (SF1): the Σ read cannot
+        // interleave with a concurrent mutation's commit.
+        let _gate = self.mutation_gate.lock().await;
         for (_, authority) in self.pools.values() {
             match authority
                 .release(tenant_id, collection_id, now_unix_secs)
@@ -1819,12 +1836,24 @@ mod tests {
 
     // ---- SC4-1: the residency-budget bridge ----
 
+    /// SF4 (SC4-1 review): the budget cell is process-global — every test
+    /// whose reserve/release pushes it acquires this STATIC gate, so a
+    /// shared-process parallel run (make test-fast's --test-threads=6)
+    /// cannot land a sibling's write inside another's assert window.
+    /// (CI's nextest runs process-per-test; bare `cargo test --lib` is
+    /// RUST_TEST_THREADS=1 — this closes the remaining runner.)
+    static BUDGET_CELL_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn budget_cell_gate() -> std::sync::MutexGuard<'static, ()> {
+        BUDGET_CELL_GATE.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Grants arm the process store's protection budget through the bridge,
-    /// and releases disarm it. Serialized: the budget cell is process-global.
+    /// and releases disarm it — including the at-open sync for reconciled
+    /// grants (SF2). Serialized on the static cell gate.
     #[tokio::test]
     async fn grants_arm_the_process_residency_budget() {
-        let budget_gate = std::sync::Mutex::new(());
-        let _guard = budget_gate.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = budget_cell_gate();
 
         let store_dir = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(
@@ -1841,6 +1870,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // SF2: the at-open sync pushed the (zero) reconciled budget — a
+        // restart with live grants would arm the store before any mutation.
+        assert_eq!(
+            store.reserved_budget(),
+            0,
+            "open syncs the reconciled budget"
+        );
 
         registry
             .reserve_for_performance("t1", "c-budget-1", current_unix_secs())
@@ -1860,6 +1896,52 @@ mod tests {
             0,
             "release disarms the store budget"
         );
+    }
+
+    /// SF2: a restart with LIVE grants arms the store at open — no mutation
+    /// needed. (Drops the registry with a live grant, reopens on the same
+    /// pool, asserts the second registration-of-store... the bridge keeps
+    /// the FIRST registered store, so assert through the cell + a fresh
+    /// store reading it at registration.)
+    #[tokio::test]
+    async fn reopen_with_live_grants_arms_the_budget_at_open() {
+        let _guard = budget_cell_gate();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = pool_config(&dir, "p1", 0);
+        cfg.overhead_factor = 0.0;
+        cfg.default_grant_bytes = 2048;
+        let pools = [cfg.clone()];
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .unwrap();
+        registry
+            .reserve_for_performance("t1", "c-persist-1", current_unix_secs())
+            .await
+            .unwrap();
+        drop(registry); // "crash": the grant is durable in the pool ledger
+
+        let reopened = ReservationRegistry::open_from_config(&[cfg])
+            .await
+            .unwrap()
+            .unwrap();
+        // The at-open sync pushed the reconciled 2048 into the cell; a
+        // store registering NOW picks it up (order-independence both ways).
+        assert_eq!(
+            proximadb_cache::process_reserved_budget(),
+            2048,
+            "reopen pushes the reconciled charged budget"
+        );
+        let store_dir = tempfile::tempdir().unwrap();
+        let fresh = std::sync::Arc::new(
+            proximadb_cache::PersistentByteStore::open(store_dir.path(), 1 << 20).unwrap(),
+        );
+        // Note: registration may lose first-wins to the sibling test's store
+        // in a shared process — the CELL is the assertion that matters.
+        let _ = proximadb_cache::register_process_store(fresh);
+        assert_eq!(proximadb_cache::process_reserved_budget(), 2048);
+        let _ = reopened;
     }
 
     // ---- SC3-2: ReservationRegistry ----
@@ -1884,6 +1966,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_reserves_from_single_implied_default() {
+        let _cell_guard = budget_cell_gate();
         let dir = tempfile::tempdir().unwrap();
         let pools = [pool_config(&dir, "p1", 4096)];
         let registry = ReservationRegistry::open_from_config(&pools)
@@ -1902,6 +1985,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_refuses_unarmed_default_grant() {
+        let _cell_guard = budget_cell_gate();
         let dir = tempfile::tempdir().unwrap();
         let pools = [pool_config(&dir, "p1", 0)];
         let registry = ReservationRegistry::open_from_config(&pools)
@@ -1918,6 +2002,7 @@ mod tests {
 
     #[tokio::test]
     async fn registry_multi_pool_needs_explicit_default() {
+        let _cell_guard = budget_cell_gate();
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
         let mut pools = [
@@ -1955,6 +2040,7 @@ mod tests {
     // metering tick drains them — exactly once, never dropped.
     #[tokio::test]
     async fn release_tails_park_until_the_tick() {
+        let _cell_guard = budget_cell_gate();
         let dir = tempfile::tempdir().unwrap();
         let pools = [pool_config(&dir, "p1", 4096)];
         let registry = ReservationRegistry::open_from_config(&pools)
@@ -1990,6 +2076,7 @@ mod tests {
     // where observable — armed/unarmed, kill switch, capacity headroom.
     #[tokio::test]
     async fn peek_refuses_unarmed_and_unresolvable_defaults() {
+        let _cell_guard = budget_cell_gate();
         let dir = tempfile::tempdir().unwrap();
         let pools = [pool_config(&dir, "p1", 0)];
         let registry = ReservationRegistry::open_from_config(&pools)
@@ -2031,6 +2118,7 @@ mod tests {
 
     #[tokio::test]
     async fn peek_refuses_when_capacity_headroom_is_gone() {
+        let _cell_guard = budget_cell_gate();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = pool_config(&dir, "p1", 0);
         cfg.allocatable_bytes = 5000;
@@ -2057,6 +2145,7 @@ mod tests {
 
     #[tokio::test]
     async fn peek_refuses_under_the_kill_switch() {
+        let _cell_guard = budget_cell_gate();
         let dir = tempfile::tempdir().unwrap();
         let pools = [pool_config(&dir, "p1", 4096)];
         let registry = ReservationRegistry::open_from_config(&pools)
@@ -2077,6 +2166,7 @@ mod tests {
     // resolver rejects it, so an empty-keyed grant could never be billed.
     #[tokio::test]
     async fn empty_tenant_refused_at_admission() {
+        let _cell_guard = budget_cell_gate();
         let dir = tempfile::tempdir().unwrap();
         let pools = [pool_config(&dir, "p1", 4096)];
         let registry = ReservationRegistry::open_from_config(&pools)
