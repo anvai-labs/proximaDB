@@ -2576,18 +2576,81 @@ async fn stage_f_row_allow_set_is_exact() {
     assert!(empty_allow.is_empty());
 }
 
-/// ADR-089 / TD-FPRUNE-1 P2: with footer stats armed, a filtered query drops
-/// provably-empty blocks from the FETCH plan (zero body GET). Exercised on a
-/// CANONICAL column (`created_at_ns`) — the only fields Stage-F's
-/// `pax_field_to_col` resolves today. Footer-pruning of USER TAGS
-/// (partition/lang) is dark until the P-Shred-arming slice shreds filterable
-/// props into columns AND `pax_field_to_col` resolves them (see TD note): the
-/// footer-prune (`evaluate_block`/`pax_field_to_col` = canonical columns) and
-/// the row-match (`evaluate_filter_proxima` = props) currently read disjoint
-/// field namespaces. Soundness (never drops a matching block) is proven by
-/// the block-format `footer_prune_matches_body_prune_for_same_metas` unit.
+/// R5: Stage F evaluates the predicate against the record's PROPS
+/// (`evaluate_filter_proxima`), so pruning must use only columns that hold
+/// those prop values. A user prop that shares a canonical column's name
+/// (`created_at` here, alongside the record's real timestamp) must not be
+/// pruned on the canonical column's zone map — the canonical stats describe
+/// different data, and every block would be wrongly skipped.
 #[tokio::test]
-async fn stage_f_footer_stats_prune_blocks_from_fetch() {
+async fn stage_f_never_prunes_a_user_prop_on_a_same_named_canonical_column() {
+    enable_coalesced_rabitq();
+    unsafe {
+        std::env::set_var("PROXIMADB_PAX_FOOTER_STATS", "1");
+    }
+    use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
+
+    const DIM: usize = 16;
+    const N: usize = 600;
+    let records: Vec<ProximaRecord> = (0..N)
+        .map(|i| {
+            let v: Vec<f32> = (0..DIM)
+                .map(|d| (((i * 131 + d * 17) % 17) as f32) * 0.01)
+                .collect();
+            // Canonical created_at_ns = 1000+i; USER prop created_at = i % 7.
+            let mut r = rec(&format!("r{i}"), 1000 + i as i64, v);
+            r.props.insert(
+                "created_at".to_string(),
+                proximadb_records::ProximaTreeNode::Value(
+                    proximadb_data_model::ProximaValue::Int64((i % 7) as i64),
+                ),
+            );
+            r
+        })
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("seg.pax");
+    write_pax_segment(
+        &path,
+        &records,
+        "col",
+        1,
+        VectorQuant::RaBitQ,
+        Some(4 * 1024),
+        None,
+    )
+    .unwrap();
+    let fs = LocalFileSystem::new_with_encryption(LocalConfig::default(), None)
+        .await
+        .unwrap();
+    let filter = proximadb_filter_expression::FilterExpression::Comparison {
+        field: "created_at".to_string(),
+        operator: proximadb_filter_expression::ComparisonOperator::Equals,
+        value: serde_json::json!(3),
+    };
+    let (allow, _stats) = pax_filtered_row_allow(&fs, path.to_str().unwrap(), &filter)
+        .await
+        .unwrap()
+        .expect("coalesced segment must produce a stage-F allow-set");
+    let expected = (0..N).filter(|i| i % 7 == 3).count();
+    assert_eq!(
+        allow.len(),
+        expected,
+        "allow-set must equal the props-evaluated set ({expected} rows with created_at=3); \
+         pruning on the canonical CREATED_AT zone map skipped matching blocks"
+    );
+    unsafe {
+        std::env::remove_var("PROXIMADB_PAX_FOOTER_STATS");
+    }
+}
+
+/// ADR-089 / TD-FPRUNE-1 P2 + R5: with footer stats armed, Stage F must NOT
+/// prune on CANONICAL-column zone maps (`created_at_ns` here). The row match
+/// (`evaluate_filter_proxima`) reads only props, so canonical stats describe
+/// data the predicate never sees; user-tag zero-GET pruning is pinned by
+/// `stage_f_user_tag_footer_prune_via_self_describing_segment`.
+#[tokio::test]
+async fn stage_f_does_not_prune_on_canonical_column_stats() {
     enable_coalesced_rabitq();
     // Arm P2 footer-stats population at write. Process-global env is safe
     // under nextest's process-per-test isolation (the repo test standard).
@@ -2654,24 +2717,26 @@ async fn stage_f_footer_stats_prune_blocks_from_fetch() {
         operator: proximadb_filter_expression::ComparisonOperator::GreaterThanOrEqual,
         value: serde_json::json!(2000),
     };
-    let (_allow, stats) = pax_filtered_row_allow(&fs, p, &filter)
+    let (allow, stats) = pax_filtered_row_allow(&fs, p, &filter)
         .await
         .unwrap()
         .expect("coalesced segment must produce a stage-F allow-set");
 
-    // The zero-GET win: ≥1 block pruned from the FETCH plan by footer stats,
-    // and never all of them (the high-group blocks survive).
-    assert!(
-        stats.blocks_pruned_footer > 0,
-        "footer stats must prune ≥1 block from the fetch (got {} of {} blocks)",
-        stats.blocks_pruned_footer,
-        stats.blocks_total,
-    );
-    assert!(
-        stats.blocks_pruned_footer < stats.blocks_total,
-        "must not prune every block ({} of {})",
-        stats.blocks_pruned_footer,
-        stats.blocks_total,
+    // R5 contract (corrected): Stage F evaluates the predicate against PROPS,
+    // and these records carry no `created_at_ns` prop, so the filter matches
+    // nothing — the allow-set is the props-evaluated set (empty). Canonical
+    // zone maps describe different data than the evaluator reads, so Stage F
+    // must NOT prune on them: this test previously pinned a "zero-GET win"
+    // that only ever skipped blocks yielding nothing, and the same rule
+    // wrongly skipped matching blocks when a user prop shared the name
+    // (`stage_f_never_prunes_a_user_prop_on_a_same_named_canonical_column`).
+    // User-tag zero-GET pruning is pinned by
+    // `stage_f_user_tag_footer_prune_via_self_describing_segment`.
+    assert_eq!(allow.len(), 0, "no row carries a created_at_ns prop");
+    assert_eq!(
+        stats.blocks_pruned_footer, 0,
+        "Stage F must not prune on canonical-column stats ({} of {} pruned)",
+        stats.blocks_pruned_footer, stats.blocks_total,
     );
     unsafe {
         std::env::remove_var("PROXIMADB_PAX_FOOTER_STATS");

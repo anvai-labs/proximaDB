@@ -32,6 +32,21 @@
 * **Follow-up:** publication moves are themselves delete-sensitive (a transient staging-delete failure fails publication — fail-safe today, retry-worthy later).
 * **Follow-up (found 2026-10-19):** the sidecar is written with `std::fs` to `PathBuf::from(data_url)`. On an object-store deployment (`data_url = s3://…`), the "durable" ledger therefore lands under a LOCAL relative directory named `s3:/…`. It survives a restart only on the same host with the same working directory, and never reaches a replacement container. The fix is to make the ledger generic over `FileSystem` and write it beside the segments; a plain PUT is already atomic on object stores. The Layer A deletion-obligation drain (TD-USUB-1 item i) needs the same change before it reuses this ledger.
 
+* **Follow-up (found 2026-10-28, reader side — the mirror of this TD's writer-side race):**
+  compaction deletes its inputs immediately after publishing the output
+  (`retire_inputs_with_retry` → `delete_inputs_attempt`), with no grace period or
+  reader lease. A query that listed segments BEFORE the publish and reads an input
+  AFTER the delete gets a 404. Stage F's error falls through to the exact path,
+  which also 404s, and `handle_per_file_scan_failure`
+  (`src/storage/engines/sst/search/mod.rs`) then **drops the segment silently in
+  Approximate mode** (warn + `Ok(())`): those rows are missing from the result with
+  no error. Fix options: (a) retire after a grace window ≥ the maximum query
+  duration, or under a reader lease; (b) a typed "segment vanished" error that
+  triggers one re-discovery retry of the storage stage (the per-query
+  `DISCOVERY_MEMO` is scoped per search, so a retry re-lists). Either needs a
+  deterministic race test through the `PROXIMADB_TEST_FS_*` fault hooks (delete
+  between list and read). Code path verified; the timing window is unmeasured.
+
 == Hardening (2026-10-19)
 
 Found while assessing the ledger for reuse by the Layer A drain:

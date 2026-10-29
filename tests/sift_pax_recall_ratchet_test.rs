@@ -2420,6 +2420,15 @@ async fn run_sift_filtered_cascade_ratchet() {
             .await
             .expect("filtered search through the unified dispatch must succeed");
         assert!(!results.is_empty(), "partition {p} must yield hits");
+        // Result-count contract: a partition holds ~N/partitions ≫ TOP_K rows,
+        // so a filtered query must return a FULL top-k — a short result means
+        // the probe stopped early or dropped matching rows.
+        assert_eq!(
+            results.len(),
+            TOP_K,
+            "partition {p}: a filtered query over a well-populated partition must \
+             return exactly top_k hits"
+        );
 
         let gt_set: std::collections::HashSet<&str> = gt.iter().map(|s| s.as_str()).collect();
         let mut hits_in_gt = 0usize;
@@ -2483,4 +2492,23 @@ async fn sift_pax_filtered_cascade_recall_ratchet() {
     unsafe {
         std::env::remove_var("PROXIMADB_PAX_FOOTER_STATS");
     }
+}
+
+/// The filtered leg at the SHIPPED write defaults: footer stats stay at their
+/// default (OFF), so no footer-resident stats or shred field map is written
+/// unless another default carries it. The leg above pins FOOTER_STATS=1 and so
+/// never measured what production writes; this one does.
+#[tokio::test]
+async fn sift_pax_filtered_cascade_recall_ratchet_shipped_defaults() {
+    unsafe {
+        std::env::set_var("PROXIMADB_PAX_VECTOR_SEGMENTS", "1");
+        std::env::set_var("PROXIMADB_PAX_VECTOR_QUANT", "rabitq");
+        std::env::set_var("PROXIMADB_PAX_F32_TIER", "1");
+        std::env::set_var("PROXIMADB_PAX_WRITE_RG_LAYOUT", "0");
+        std::env::remove_var("PROXIMADB_PAX_FOOTER_STATS");
+    }
+    // Like the sibling leg, this relies on nextest's process-per-test
+    // isolation for the env writes above (the repo test standard); the vars
+    // set here are the same geometry the sibling pins, so no cleanup is needed.
+    run_sift_filtered_cascade_ratchet().await;
 }

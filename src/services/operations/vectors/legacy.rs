@@ -4489,18 +4489,24 @@ impl VectorOperationsService {
             "🔍 Stage 1: Searching WAL/memtable for collection {}",
             collection_id
         );
-        let wal_optimized_results = self
-            .wal_manager
-            .search_unflushed_vectors(
-                collection_id,
+        // One WAL snapshot feeds BOTH the WAL leg's scoring and the merge's
+        // reconciliation below, so no write can land between them.
+        let wal_snapshot = self.wal_manager.unflushed_snapshot(collection_id).await?;
+        let wal_index =
+            crate::storage::persistence::write_ahead_log::WriteAheadLogManager::freshest_unflushed_index(
+                &wal_snapshot,
+            );
+        let wal_optimized_results =
+            crate::storage::persistence::write_ahead_log::WriteAheadLogManager::score_unflushed(
+                &wal_snapshot,
+                &wal_index,
                 &query_vector,
                 candidates,
                 distance_metric,
                 filter.as_ref(),
                 true,
                 true,
-            )
-            .await?;
+            );
         debug!(
             "Stage 1 complete: {} WAL results",
             wal_optimized_results.len()
@@ -4611,7 +4617,31 @@ impl VectorOperationsService {
         // collections (no index_configs) the flushed data lives ONLY in storage segments,
         // so WAL alone is insufficient and storage must always be searched; otherwise the
         // entire flushed set is never seen and recall collapses to the tiny WAL window.
-        let total_indexed_results = wal_optimized_results.len() + axis_optimized_results.len();
+        // Count only hits GUARANTEED to survive reconciliation towards skipping
+        // the storage stage: live WAL hits, and AXIS hits whose OID has no
+        // unflushed version (an unflushed version — e.g. a delete, or an update
+        // out of the predicate — supersedes the AXIS copy). Counting droppable
+        // hits could return a short top-k with storage never consulted.
+        let skip_now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let total_indexed_results = wal_optimized_results
+            .iter()
+            .filter(|r| !r.is_dead(skip_now_ns))
+            .count()
+            + axis_optimized_results
+                .iter()
+                .filter(|r| {
+                    crate::storage::persistence::write_ahead_log::WriteAheadLogManager::unflushed_oid_state(
+                        &wal_snapshot,
+                        &wal_index,
+                        &r.id,
+                        skip_now_ns,
+                    )
+                    .is_none()
+                })
+                .count();
         let storage_results = if collection_has_axis_indexes && total_indexed_results >= candidates
         {
             debug!(
@@ -4624,7 +4654,7 @@ impl VectorOperationsService {
                 "Stage 3: Searching storage engine ({}) for {} (need {} more results)",
                 engine.format_name(),
                 collection_id,
-                candidates - total_indexed_results
+                candidates.saturating_sub(total_indexed_results)
             );
             engine.search_vectors_unified(&search_context).await?
         };
@@ -4640,36 +4670,36 @@ impl VectorOperationsService {
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
 
-        // Build map from results with priority: WAL > AXIS > Storage
-        let mut id_to_result: HashMap<String, crate::core::search::results::OptimizedSearchRecord> =
-            HashMap::new();
-
-        // WAL results have highest priority (fresher data). A dead record
-        // (tombstone/expired) wins over a live one for the same OID: in the
-        // insert-then-delete-before-flush case both copies are unflushed in
-        // the same WAL delta, and the tombstone must survive so the dead-record
-        // filter below removes the OID. Never let a live copy overwrite a dead
-        // record. Uses the canonical is_dead(valid_to_ns) — not expires_at.
-        for result in wal_optimized_results {
-            id_to_result
-                .entry(result.id.clone())
-                .and_modify(|existing| {
-                    if !existing.is_dead(now_ns) && result.is_dead(now_ns) {
-                        *existing = result.clone();
-                    }
-                })
-                .or_insert(result);
-        }
-
-        // AXIS HNSW results second priority (fast indexed search)
-        for result in axis_optimized_results {
-            id_to_result.entry(result.id.clone()).or_insert(result);
-        }
-
-        // Storage results as fallback
-        for result in storage_results {
-            id_to_result.entry(result.id.clone()).or_insert(result);
-        }
+        // MVCC merge against the WAL snapshot (the get-by-id rule, mandate 16;
+        // pick the winner, then dead-filter — PR #2063). WAL hits are the live,
+        // matching, FRESHEST version of each unflushed OID. A persisted or
+        // indexed copy of an OID with a live unflushed version is superseded
+        // (even when the query skipped that version as non-matching); against
+        // a dead unflushed version it survives only if strictly newer, so a
+        // stale retained tombstone no longer hides a newer flushed re-insert.
+        use crate::core::search::merge::{CandidateSource, reconcile_against_wal_state};
+        let wal_state = |oid: &str| {
+            crate::storage::persistence::write_ahead_log::WriteAheadLogManager::unflushed_oid_state(
+                &wal_snapshot,
+                &wal_index,
+                oid,
+                now_ns,
+            )
+        };
+        let id_to_result: HashMap<String, crate::core::search::results::OptimizedSearchRecord> =
+            reconcile_against_wal_state(
+                wal_optimized_results,
+                axis_optimized_results
+                    .into_iter()
+                    .map(|r| (CandidateSource::Axis, r))
+                    .chain(
+                        storage_results
+                            .into_iter()
+                            .map(|r| (CandidateSource::Storage, r)),
+                    ),
+                &wal_state,
+                now_ns,
+            );
 
         // Filter out dead records (tombstone valid_to_ns==Some(0) OR TTL-expired)
         // using the canonical predicate on valid_to_ns (ns) — immune to the

@@ -693,6 +693,13 @@ impl SstEngine {
                                         &full.props,
                                     );
                                 r.vector_id = Some(full.oid.clone());
+                                // Mandate 16a + MVCC: carry the version and
+                                // validity of the PERSISTED copy so the
+                                // service merge can (a) drop a TTL-expired
+                                // row via `is_dead` and (b) order this copy
+                                // against unflushed WAL versions by freshness
+                                // instead of by source priority.
+                                stamp_persisted_version(&mut r, &full);
                             }
                             r
                         })
@@ -3082,7 +3089,7 @@ self.try_pax_cascade(
             let similarity_result = SimilarityResult::new(raw_distance, distance_metric);
             let metadata = proximadb_records::conversions::proxima_tree_to_value_map(&record.props);
 
-            candidates.push(OptimizedSearchRecord {
+            let mut hit = OptimizedSearchRecord {
                 id: record.oid.clone(),
                 vector_id: Some(record.oid.clone()),
                 score: similarity_result.normalized_score,
@@ -3090,7 +3097,9 @@ self.try_pax_cascade(
                 vector: Some(Arc::new(embedding.values.to_fp32_owned())),
                 metadata,
                 ..Default::default()
-            });
+            };
+            stamp_persisted_version(&mut hit, record);
+            candidates.push(hit);
         }
 
         // Sort by score descending (higher normalized_score = more similar = better).
@@ -3104,6 +3113,24 @@ self.try_pax_cascade(
         debug!("📦 Exact PAX scan found {} candidates", candidates.len());
         Ok(candidates)
     }
+}
+
+/// Copy the MVCC/validity facts of a persisted record onto a storage search
+/// hit (mandate 16a + freshness merge). Without them a storage hit looked LIVE
+/// and infinitely old: a TTL-expired flushed row could never be dropped by the
+/// service's `is_dead` filter, and the WAL↔storage merge had to fall back to
+/// source priority (which lets a stale retained tombstone hide a newer flushed
+/// re-insert). Units mirror the WAL hit builder: ms for `timestamp` /
+/// `updated_at`, secs for display-only `expires_at`, ns for `valid_to_ns`.
+fn stamp_persisted_version(
+    hit: &mut OptimizedSearchRecord,
+    record: &proximadb_records::ProximaRecord,
+) {
+    hit.version = Some(record.record_version as u32);
+    hit.timestamp = Some(record.created_at_ns / 1_000_000);
+    hit.updated_at = Some(record.updated_at_ns / 1_000_000);
+    hit.valid_to_ns = record.valid_to_ns;
+    hit.expires_at = record.valid_to_ns.map(|ns| ns / 1_000_000_000);
 }
 
 #[cfg(test)]
@@ -3262,6 +3289,152 @@ mod tests {
             ids_seq, ids_par,
             "multi-core (degree=4) must return the same id-set as sequential (degree=1)"
         );
+    }
+
+    /// Mandate 16a (R3): a TTL-expired row that was flushed into a PAX segment
+    /// must never come back from storage looking LIVE. Before the fix the exact
+    /// path materialized it with `valid_to_ns: None` (so the service merge's
+    /// `is_dead` could never drop it) and the cascade hit build never copied
+    /// `valid_to_ns` from the rehydrated record. Covers both the default
+    /// (Adaptive → exact on a small bed) and the Approximate (cascade) modes.
+    #[tokio::test]
+    async fn ttl_expired_pax_rows_never_return_live() {
+        use crate::core::search::SearchParams;
+        use crate::proto::proximadb_v1::{
+            Collection, CollectionConfig, StorageAssignment, StorageConfig,
+        };
+        use crate::storage::persistence::filesystem::FilesystemConfig;
+        use crate::storage::traits::{FlushParameters, StorageQueryContext, StorageQueryMetadata};
+        use proximadb_records::{EmbeddingCell, ProximaRecord};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().to_str().unwrap().to_string();
+        std::mem::forget(temp_dir); // keep dir for the engine's lifetime
+        let mut fs_config = FilesystemConfig::default();
+        fs_config.default_fs = Some(format!("file://{}", base));
+        let filesystem = Arc::new(FilesystemFactory::create(fs_config).await.unwrap());
+        let mut sst_config = SstConfig::default();
+        sst_config.compaction_threshold = 100;
+        let distance_compute = Arc::new(UnifiedDistanceCompute::default());
+        let engine = SstEngine::new_with_config(sst_config, filesystem, distance_compute)
+            .await
+            .unwrap();
+
+        let dim = 16usize;
+        let cid = "ttl_expired_pax";
+        let collection = Collection {
+            id: cid.to_string(),
+            config: Some(CollectionConfig {
+                name: cid.to_string(),
+                dimension: dim as u32,
+                storage_config: Some(StorageConfig::default()),
+                ..Default::default()
+            }),
+            storage_assignment: Some(StorageAssignment {
+                primary_path: base.clone(),
+                base_location: base.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        // The expired row is the EXACT query vector, so it is the top hit
+        // whenever it is (wrongly) treated as live.
+        let query: Vec<f32> = (0..dim).map(|j| (j as f32) * 0.05).collect();
+        let mut recs: Vec<ProximaRecord> = (0..40usize)
+            .map(|idx| {
+                let id = format!("live_{idx}");
+                ProximaRecord {
+                    oid: id.clone(),
+                    local_id: Some(id),
+                    created_at_ns: 1_000,
+                    updated_at_ns: 1_000,
+                    record_version: 1,
+                    embeddings: vec![EmbeddingCell::new_fp32(
+                        "test",
+                        "dense_vector",
+                        dim as u32,
+                        (0..dim)
+                            .map(|j| 5.0 + (idx * dim + j) as f32 * 0.01)
+                            .collect(),
+                    )],
+                    ..ProximaRecord::default()
+                }
+            })
+            .collect();
+        recs.push(ProximaRecord {
+            oid: "expired".to_string(),
+            local_id: Some("expired".to_string()),
+            created_at_ns: 1_000,
+            updated_at_ns: 1_000,
+            record_version: 1,
+            // TTL elapsed one hour ago (not a tombstone: valid_to_ns != 0).
+            valid_to_ns: Some(now_ns - 3_600_000_000_000),
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "test",
+                "dense_vector",
+                dim as u32,
+                query.clone(),
+            )],
+            ..ProximaRecord::default()
+        });
+        let params = FlushParameters {
+            collection_id: Some(cid.to_string()),
+            vector_records: recs,
+            force: true,
+            synchronous: true,
+            collection_config: Some(collection.clone()),
+            ..Default::default()
+        };
+        assert!(
+            engine.do_flush(&params).await.unwrap().success,
+            "flush failed"
+        );
+
+        let engine = Arc::new(engine);
+        for mode in [
+            None,
+            Some(proximadb_search_types::search_params::SearchMode::Approximate { nprobe: None }),
+        ] {
+            let mut sp = SearchParams {
+                vector: Some(query.clone()),
+                top_k: Some(5),
+                ..Default::default()
+            };
+            if let Some(m) = mode.clone() {
+                sp.search_mode = m;
+            }
+            let ctx = StorageQueryContext {
+                search_params: Arc::new(sp),
+                collection: Arc::new(collection.clone()),
+                metadata: StorageQueryMetadata {
+                    collection_id: cid.to_string(),
+                    ..Default::default()
+                },
+                user_context: None,
+                tenant_context: None,
+            };
+            let results = engine
+                .clone()
+                .search_vectors_unified_arc(&ctx)
+                .await
+                .unwrap();
+            assert!(!results.is_empty(), "{mode:?}: live rows must be found");
+            for r in &results {
+                if r.id == "expired" {
+                    assert!(
+                        r.is_dead(now_ns),
+                        "{mode:?}: an expired PAX row came back LIVE (valid_to_ns={:?}) — \
+                         the service merge cannot drop it",
+                        r.valid_to_ns
+                    );
+                }
+            }
+        }
     }
 
     /// ADR-030 / TD-158: the SST `ComputeMsGuard` records elapsed compute to the

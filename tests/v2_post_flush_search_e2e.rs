@@ -1029,3 +1029,236 @@ async fn v2_fp32_point_read_is_byte_exact_after_compaction() {
         written.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Filtered vector search: read-after-write correctness (mandate 16a/16d).
+//
+// The filtered path merges the WAL leg with flushed PAX storage. The WAL leg
+// pre-prunes batches with a per-batch metadata bloom filter on conjunctive
+// `Equals` conditions, and evaluates the predicate per record. Tombstones
+// and superseding versions carry props that never match the queried value,
+// so a filtered query must still see them — otherwise the stale flushed copy
+// wins the merge. The reinsert test pins the opposite hazard: a stale
+// retained tombstone must not hide a newer flushed copy.
+// ---------------------------------------------------------------------------
+
+async fn create_filterable_collection(http: &reqwest::Client, base: &str, prefix: &str) -> String {
+    let name = format!(
+        "{prefix}_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let create = http
+        .post(format!("{base}/api/v2/collections"))
+        .json(&json!({
+            "name": name,
+            "dimension": 2,
+            "engine": "sst",
+            "enable_proxima_record": true,
+            "schema": {
+                "columns": [
+                    { "name": "cat", "data_type": "integer", "indexed": true, "filterable": true }
+                ],
+                "enforcement": "hybrid",
+                "allow_additional_fields": true
+            }
+        }))
+        .send()
+        .await
+        .expect("create");
+    let status = create.status();
+    let body = create.text().await.expect("create body");
+    assert!(status.is_success(), "create: {status} {body}");
+    name
+}
+
+async fn upsert(http: &reqwest::Client, base: &str, name: &str, records: serde_json::Value) {
+    let resp = http
+        .post(format!("{base}/api/v2/collections/{name}/records/batch"))
+        .json(&json!({ "records": records, "upsert": true }))
+        .send()
+        .await
+        .expect("upsert");
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert!(status.is_success(), "upsert: {status} {body}");
+}
+
+async fn filtered_search_ids(
+    http: &reqwest::Client,
+    base: &str,
+    name: &str,
+    cat: i64,
+) -> (BTreeSet<String>, serde_json::Value) {
+    let resp = http
+        .post(format!("{base}/api/v2/collections/{name}/search"))
+        .json(&json!({
+            "vector": [0.0, 0.0],
+            "top_k": 10,
+            "filters": [{ "field": "cat", "op": "eq", "value": cat }]
+        }))
+        .send()
+        .await
+        .expect("filtered search");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("search json");
+    assert!(status.is_success(), "filtered search: {status} {body}");
+    let hits = body
+        .get("results")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    (ids(&hits), body)
+}
+
+/// R1: a record deleted after flush must not reappear in a FILTERED search.
+/// The tombstone batch carries no props, so a metadata bloom built from props
+/// can never contain `cat=3`; skipping that batch hides the tombstone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filtered_search_hides_a_record_deleted_after_flush() {
+    let server = TestServer::start().await.expect("server start");
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .no_proxy()
+        .build()
+        .unwrap();
+    let base = server.base_url();
+    let name = create_filterable_collection(&http, &base, "flt_del").await;
+
+    upsert(
+        &http,
+        &base,
+        &name,
+        json!([
+            { "id": "keep", "vector": [0.0, 0.0], "props": { "cat": 3 } },
+            { "id": "gone", "vector": [0.0, 0.1], "props": { "cat": 3 } }
+        ]),
+    )
+    .await;
+    sleep(Duration::from_millis(500)).await;
+    server.force_flush(&name).await.expect("force flush");
+    assert!(
+        !server.persisted_pax_files().is_empty(),
+        "setup: flush must publish a PAX segment; files: {:?}",
+        server.persisted_files()
+    );
+
+    let delete = http
+        .delete(format!("{base}/api/v2/collections/{name}/records/gone"))
+        .send()
+        .await
+        .expect("delete");
+    assert!(delete.status().is_success(), "delete: {}", delete.status());
+
+    let (got, body) = filtered_search_ids(&http, &base, &name, 3).await;
+    assert_eq!(
+        got,
+        ["keep".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        "a record deleted after flush must not be resurrected by a FILTERED search: {body}"
+    );
+}
+
+/// R2: an update that moves a flushed record OUT of the predicate must hide
+/// the stale flushed copy from a filtered search. The newer WAL version does
+/// not match `cat=3`, so a per-record filter skips it, and the older flushed
+/// copy (which still matches) must not win the merge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filtered_search_hides_a_flushed_record_updated_out_of_the_predicate() {
+    let server = TestServer::start().await.expect("server start");
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .no_proxy()
+        .build()
+        .unwrap();
+    let base = server.base_url();
+    let name = create_filterable_collection(&http, &base, "flt_upd").await;
+
+    upsert(
+        &http,
+        &base,
+        &name,
+        json!([
+            { "id": "stay", "vector": [0.0, 0.0], "props": { "cat": 3 } },
+            { "id": "moved", "vector": [0.0, 0.1], "props": { "cat": 3 } }
+        ]),
+    )
+    .await;
+    sleep(Duration::from_millis(500)).await;
+    server.force_flush(&name).await.expect("force flush");
+
+    // Unflushed newer version of `moved` with cat=5.
+    upsert(
+        &http,
+        &base,
+        &name,
+        json!([{ "id": "moved", "vector": [0.0, 0.1], "props": { "cat": 5 } }]),
+    )
+    .await;
+    sleep(Duration::from_millis(300)).await;
+
+    let (got3, body3) = filtered_search_ids(&http, &base, &name, 3).await;
+    assert_eq!(
+        got3,
+        ["stay".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        "the stale flushed copy of an updated record must not match the old predicate: {body3}"
+    );
+    let (got5, body5) = filtered_search_ids(&http, &base, &name, 5).await;
+    assert_eq!(
+        got5,
+        ["moved".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        "the new version must match the new predicate: {body5}"
+    );
+}
+
+/// Guard for any R1/R2 fix: a STALE retained tombstone must not hide a newer
+/// flushed re-insert from a filtered search (flush retains tombstone-only
+/// batches — TD-USUB-1 — so after delete → re-insert → flush the memtable
+/// still holds the old tombstone).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filtered_search_returns_a_record_reinserted_after_delete_and_flush() {
+    let server = TestServer::start().await.expect("server start");
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .no_proxy()
+        .build()
+        .unwrap();
+    let base = server.base_url();
+    let name = create_filterable_collection(&http, &base, "flt_reins").await;
+
+    upsert(
+        &http,
+        &base,
+        &name,
+        json!([{ "id": "phoenix", "vector": [0.0, 0.0], "props": { "cat": 3 } }]),
+    )
+    .await;
+    sleep(Duration::from_millis(300)).await;
+    server.force_flush(&name).await.expect("flush 1");
+
+    let delete = http
+        .delete(format!("{base}/api/v2/collections/{name}/records/phoenix"))
+        .send()
+        .await
+        .expect("delete");
+    assert!(delete.status().is_success(), "delete: {}", delete.status());
+    sleep(Duration::from_millis(300)).await;
+
+    upsert(
+        &http,
+        &base,
+        &name,
+        json!([{ "id": "phoenix", "vector": [0.0, 0.0], "props": { "cat": 3 } }]),
+    )
+    .await;
+    sleep(Duration::from_millis(300)).await;
+    server.force_flush(&name).await.expect("flush 2");
+
+    let (got, body) = filtered_search_ids(&http, &base, &name, 3).await;
+    assert_eq!(
+        got,
+        ["phoenix".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        "a record re-inserted after delete and flush must be visible to a filtered search: {body}"
+    );
+}

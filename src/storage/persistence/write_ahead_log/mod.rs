@@ -2579,6 +2579,84 @@ impl WriteAheadLogManager {
             .await
     }
 
+    /// One consistent snapshot of a collection's unflushed batches (Arc-shared
+    /// records — no record copies). A search must score AND reconcile from the
+    /// SAME snapshot: two separate reads let a write land between them, so a
+    /// candidate could be dropped for a version that was never scored.
+    pub async fn unflushed_snapshot(
+        &self,
+        collection_id: &str,
+    ) -> Result<Vec<crate::storage::memtable::specialized::wal_behavior::WALVectorBatch>> {
+        self.default_wal_behavior()
+            .get_unflushed_batches(collection_id)
+            .await
+            .context("Failed to get unflushed batches from strategy WAL behavior")
+    }
+
+    /// Index every OID in `snapshot` to its FRESHEST unflushed version
+    /// (`(batch_idx, record_idx)`), tombstones and TTL-expired versions
+    /// included. Freshness is `updated_at_ns`, then a tombstone wins an exact
+    /// timestamp tie (mandate 16d — tombstones carry `record_version` 0, so
+    /// version must never outrank a same-instant delete), then
+    /// `record_version`. Keys borrow from the snapshot (no String copies).
+    pub fn freshest_unflushed_index(
+        snapshot: &[crate::storage::memtable::specialized::wal_behavior::WALVectorBatch],
+    ) -> std::collections::HashMap<&str, (usize, usize)> {
+        let total: usize = snapshot.iter().map(|b| b.vector_records.len()).sum();
+        let mut index: std::collections::HashMap<&str, (usize, usize)> =
+            std::collections::HashMap::with_capacity(total);
+        for (bi, batch) in snapshot.iter().enumerate() {
+            for (ri, record) in batch.vector_records.iter().enumerate() {
+                if record.oid.is_empty() {
+                    continue;
+                }
+                match index.get(record.oid.as_str()) {
+                    Some(&(cb, cr)) => {
+                        let current = &snapshot[cb].vector_records[cr];
+                        let wins = unflushed_supersedes(record, current)
+                            // A FULL tie (same instant, same tombstone status,
+                            // same version — only possible with client-supplied
+                            // timestamps) goes to the later-written batch, so the
+                            // winner never depends on HashMap iteration order.
+                            || (!unflushed_supersedes(current, record)
+                                && batch.timestamp > snapshot[cb].timestamp);
+                        if wins {
+                            index.insert(record.oid.as_str(), (bi, ri));
+                        }
+                    }
+                    None => {
+                        index.insert(record.oid.as_str(), (bi, ri));
+                    }
+                }
+            }
+        }
+        index
+    }
+
+    /// The reconciliation state of one OID in a snapshot: its freshest
+    /// unflushed version is live (authoritative over every other source — the
+    /// get-by-id rule) or dead (a persisted copy may still win, but only if it
+    /// is strictly newer, which is how a stale retained tombstone loses to a
+    /// flushed re-insert).
+    pub fn unflushed_oid_state(
+        snapshot: &[crate::storage::memtable::specialized::wal_behavior::WALVectorBatch],
+        index: &std::collections::HashMap<&str, (usize, usize)>,
+        oid: &str,
+        now_ns: i64,
+    ) -> Option<crate::core::search::merge::WalOidState> {
+        let &(bi, ri) = index.get(oid)?;
+        let record = &snapshot[bi].vector_records[ri];
+        Some(
+            if proximadb_records::is_record_dead(record.valid_to_ns, now_ns) {
+                crate::core::search::merge::WalOidState::Dead {
+                    updated_at_ms: record.updated_at_ns / 1_000_000,
+                }
+            } else {
+                crate::core::search::merge::WalOidState::Live
+            },
+        )
+    }
+
     /// TD-WLP-8 (ADR-061 D4): current resident **working-set bytes** for a
     /// collection — the sum of its unflushed WAL/memtable batch sizes. This is
     /// the same quantity `MemtableManager::get_collection_memory_usage` reports
@@ -2614,8 +2692,7 @@ impl WriteAheadLogManager {
         }
     }
 
-    /// Enhanced search with bloom filter optimization for WAL/memtable data
-    /// This is the PREFERRED method for searching unflushed vectors with metadata filtering
+    /// Search the unflushed delta (one snapshot). See [`Self::score_unflushed`].
     pub async fn search_unflushed_vectors(
         &self,
         collection_id: &str,
@@ -2626,158 +2703,109 @@ impl WriteAheadLogManager {
         include_vectors: bool,
         include_metadata: bool,
     ) -> Result<Vec<crate::core::search::results::OptimizedSearchRecord>> {
-        use proximadb_distance_kernel::engine::UnifiedDistanceCompute;
-
-        tracing::debug!(
-            "🔍 WAL: Enhanced search for collection {} with top_k={}, metric={:?}, filters={}",
-            collection_id,
+        let snapshot = self.unflushed_snapshot(collection_id).await?;
+        let index = Self::freshest_unflushed_index(&snapshot);
+        Ok(Self::score_unflushed(
+            &snapshot,
+            &index,
+            query_vector,
             top_k,
             distance_metric,
-            metadata_filters.is_some()
-        );
+            metadata_filters,
+            include_vectors,
+            include_metadata,
+        ))
+    }
 
-        // Step 1: Get unflushed batches through strategy (which accesses global memtable)
-        let wal_behavior = self.default_wal_behavior();
-        let batches = wal_behavior
-            .get_unflushed_batches(collection_id)
-            .await
-            .context("Failed to get unflushed batches from strategy WAL behavior")?;
-
-        if batches.is_empty() {
-            tracing::debug!(
-                "No unflushed batches found for collection {}",
-                collection_id
-            );
-            return Ok(vec![]);
+    /// Score the FRESHEST unflushed version of each OID (never an older one).
+    ///
+    /// * A dead freshest version (tombstone or TTL-expired) yields a zero-score
+    ///   suppression marker, EXEMPT from the top_k cut (TD-188).
+    /// * A live freshest version that fails the predicate yields nothing — the
+    ///   caller reconciles against [`Self::unflushed_oid_state`], so a stale
+    ///   persisted copy of that OID is still suppressed.
+    /// * The top_k cut is over DISTINCT live, matching OIDs. That is what makes
+    ///   "a cut OID cannot be in the global top-k" true: k better current
+    ///   matches exist. (Scoring every physical version, as before, could fill
+    ///   the cut with stale duplicates.)
+    ///
+    /// The metadata bloom only skips predicate evaluation for batches that
+    /// provably hold no match; it never hides a version from freshness
+    /// resolution, so a bloom-skipped newer version still supersedes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn score_unflushed(
+        snapshot: &[crate::storage::memtable::specialized::wal_behavior::WALVectorBatch],
+        index: &std::collections::HashMap<&str, (usize, usize)>,
+        query_vector: &[f32],
+        top_k: usize,
+        distance_metric: DistanceMetric,
+        metadata_filters: Option<&proximadb_filter_expression::FilterExpression>,
+        include_vectors: bool,
+        include_metadata: bool,
+    ) -> Vec<crate::core::search::results::OptimizedSearchRecord> {
+        use proximadb_distance_kernel::engine::UnifiedDistanceCompute;
+        if index.is_empty() {
+            return Vec::new();
         }
-
-        // Step 2: Apply bloom filter optimization if metadata filters exist
-        let filtered_batches = if let Some(filter_expr) = metadata_filters {
-            self.filter_batches_with_bloom(batches, filter_expr).await?
-        } else {
-            batches
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let bloom_may_match: Vec<bool> = match metadata_filters {
+            Some(filter_expr) => {
+                let conditions = Self::extract_filter_conditions(filter_expr);
+                snapshot
+                    .iter()
+                    .map(|batch| Self::batch_may_match(batch, &conditions))
+                    .collect()
+            }
+            None => vec![true; snapshot.len()],
         };
-
-        if filtered_batches.is_empty() {
-            tracing::debug!(
-                "No batches passed bloom filter for collection {}",
-                collection_id
-            );
-            return Ok(vec![]);
-        }
-
-        let batch_count = filtered_batches.len();
-        tracing::debug!(
-            "Found {} batches to search (after bloom filtering)",
-            batch_count
-        );
-
-        // Step 3: Create distance calculator once for efficiency
         let distance_calculator = UnifiedDistanceCompute::new(distance_metric);
 
-        // Step 4: score every candidate, but defer the expensive record
-        // materialization. Deletion tombstones (`valid_to_ns == Some(0)`) are
-        // cheap suppression markers kept in full and EXEMPT from the top_k cut
-        // (TD-188). For every other candidate we push only a lightweight
-        // (score, location) tuple; the full OptimizedSearchRecord — including the
-        // per-record metadata HashMap clone — is built ONLY for the ≤top_k
-        // survivors below, not for all N scanned records. The old
-        // materialize-all-then-truncate allocated (and immediately discarded) a
-        // metadata map + record for every record on every query — the per-query
-        // allocation firehose behind the concurrency collapse on a large
-        // unflushed tail. NOTE: a *live* (non-empty-vector) record with
-        // `valid_to_ns == Some(0)` — a malformed record that does not occur in
-        // practice — is treated here as a normal scored candidate, not exempt.
-        let mut tombstones: Vec<crate::core::search::results::OptimizedSearchRecord> = Vec::new();
-        // (score, batch_idx, record_idx, is_zero_score_marker).
-        let mut scored_cands: Vec<(f32, usize, usize, bool)> = Vec::new();
-
-        // Get current time for tombstone detection
-        let current_time_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        for (batch_idx, batch) in filtered_batches.iter().enumerate() {
-            for (record_idx, vector_record) in batch.vector_records.iter().enumerate() {
-                let embedding = vector_record.embeddings.first();
-                // Use `as_fp32_cow()` so non-fp32 variants (fp16/bf16/int8/etc.)
-                // are promoted to fp32 for the distance calculation. `as_fp32_slice`
-                // returns an empty slice for any non-fp32 variant, which caused
-                // fp16 collections' INSERTed records to be silently skipped here
-                // — surfaced 2026-05-28 by the v2 INSERT→SEARCH reconciliation.
-                let vec_values_cow = embedding
-                    .map(|e| e.as_fp32_cow())
-                    .unwrap_or_else(|| std::borrow::Cow::Borrowed(&[][..]));
-                let vec_values: &[f32] = vec_values_cow.as_ref();
-                let expires_at_secs = vector_record.valid_to_ns.map(|ns| ns / 1_000_000_000);
-
-                // Check if this is a tombstone (empty vector + valid_to in past)
-                let is_tombstone = vec_values.is_empty()
-                    && expires_at_secs.is_some_and(|e| e <= current_time_secs);
-
-                if is_tombstone {
-                    if vector_record.valid_to_ns == Some(0) {
-                        // Deletion tombstone: cheap suppression marker, EXEMPT
-                        // from the top_k cut (TD-188), kept in full.
-                        tracing::trace!("Returning tombstone marker for: {}", vector_record.oid);
-                        tombstones.push(Self::zero_score_marker(vector_record));
-                    } else {
-                        // TTL-expired empty: a score-0.0 candidate subject to the
-                        // cut (as the original scored is_tombstone records whose
-                        // valid_to_ns != Some(0)).
-                        scored_cands.push((0.0, batch_idx, record_idx, true));
-                    }
-                    continue;
-                }
-
-                // Skip empty vectors that aren't tombstones (malformed records)
-                if vec_values.is_empty() {
-                    continue;
-                }
-
-                // Apply fine-grained metadata filter if specified. Use the
-                // canonical, numeric-aware evaluator over the record's props so
-                // this path matches every other filter site (scan, relational,
-                // columnar) and supports the full operator set.
-                if let Some(filter_expr) = metadata_filters
-                    && !crate::core::search::sql_value_filter::evaluate_filter_proxima(
-                        filter_expr,
-                        &vector_record.props,
-                    )
-                {
-                    continue;
-                }
-
-                // Score now (cheap); defer record materialization to survivors.
-                let similarity_result = distance_calculator.calculate_distance(
-                    query_vector,
-                    vec_values,
-                    &distance_metric,
-                );
-                scored_cands.push((
-                    similarity_result.normalized_score,
-                    batch_idx,
-                    record_idx,
-                    false,
-                ));
+        let mut markers: Vec<crate::core::search::results::OptimizedSearchRecord> = Vec::new();
+        // (score, batch_idx, record_idx) for live, matching freshest versions.
+        let mut scored_cands: Vec<(f32, usize, usize)> = Vec::new();
+        for &(bi, ri) in index.values() {
+            let record = &snapshot[bi].vector_records[ri];
+            if proximadb_records::is_record_dead(record.valid_to_ns, now_ns) {
+                markers.push(Self::zero_score_marker(record));
+                continue;
             }
+            if !bloom_may_match[bi] {
+                continue;
+            }
+            if let Some(filter_expr) = metadata_filters
+                && !crate::core::search::sql_value_filter::evaluate_filter_proxima(
+                    filter_expr,
+                    &record.props,
+                )
+            {
+                continue;
+            }
+            let vec_values_cow = record
+                .embeddings
+                .first()
+                .map(|e| e.as_fp32_cow())
+                .unwrap_or_else(|| std::borrow::Cow::Borrowed(&[][..]));
+            let vec_values: &[f32] = vec_values_cow.as_ref();
+            if vec_values.is_empty() {
+                // Malformed live record without a vector — not a candidate.
+                continue;
+            }
+            let similarity_result =
+                distance_calculator.calculate_distance(query_vector, vec_values, &distance_metric);
+            scored_cands.push((similarity_result.normalized_score, bi, ri));
         }
 
-        // Step 5: cut the SCORED set to top_k (deletion tombstones are exempt and
-        // re-appended below; TD-188), then materialize the full record — the
-        // metadata HashMap clone and any vector copy — ONLY for the survivors.
+        // Cut the scored set to top_k (markers exempt), then materialize ONLY
+        // the survivors (the per-record metadata clone is the expensive part).
         scored_cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored_cands.truncate(top_k);
-
         let mut scored: Vec<crate::core::search::results::OptimizedSearchRecord> = scored_cands
             .into_iter()
-            .map(|(_score, batch_idx, record_idx, is_zero_marker)| {
-                let vector_record = &filtered_batches[batch_idx].vector_records[record_idx];
-                let expires_at_secs = vector_record.valid_to_ns.map(|ns| ns / 1_000_000_000);
-                if is_zero_marker {
-                    return Self::zero_score_marker(vector_record);
-                }
+            .map(|(_score, bi, ri)| {
+                let vector_record = &snapshot[bi].vector_records[ri];
                 let vec_values_cow = vector_record
                     .embeddings
                     .first()
@@ -2820,7 +2848,7 @@ impl WriteAheadLogManager {
                     version: Some(vector_record.record_version as u32),
                     timestamp: Some(vector_record.created_at_ns / 1_000_000),
                     updated_at: Some(vector_record.updated_at_ns / 1_000_000),
-                    expires_at: expires_at_secs,
+                    expires_at: vector_record.valid_to_ns.map(|ns| ns / 1_000_000_000),
                     valid_to_ns: vector_record.valid_to_ns,
                     source: None,
                     semantic_similarity: Some(similarity_result),
@@ -2828,76 +2856,33 @@ impl WriteAheadLogManager {
                 }
             })
             .collect();
-        scored.append(&mut tombstones);
-        let all_results = scored;
-
-        // Ranks are handled via score field in OptimizedSearchRecord
-        // They can be computed by the caller if needed
-
-        tracing::info!(
-            "✅ WAL search completed: {} results from {} batches with bloom filter optimization",
-            all_results.len(),
-            batch_count
+        scored.append(&mut markers);
+        tracing::debug!(
+            "WAL search: {} results over {} distinct unflushed OIDs ({} batches)",
+            scored.len(),
+            index.len(),
+            snapshot.len()
         );
-
-        Ok(all_results)
+        scored
     }
 
-    /// Filter batches using bloom filters for metadata efficiency
-    async fn filter_batches_with_bloom(
-        &self,
-        batches: Vec<crate::storage::memtable::specialized::wal_behavior::WALVectorBatch>,
-        metadata_filters: &proximadb_filter_expression::FilterExpression,
-    ) -> Result<Vec<crate::storage::memtable::specialized::wal_behavior::WALVectorBatch>> {
-        let mut filtered_batches = Vec::new();
-        let mut bloom_hits = 0;
-        let mut bloom_misses = 0;
-
-        // Extract field/value pairs from filter expression for bloom filter checking
-        let filter_conditions = self.extract_filter_conditions(metadata_filters);
-
-        for batch in batches {
-            let mut should_include = true;
-
-            // Check bloom filter if available
-            if let Some(ref bloom_filter) = batch.metadata_bloom_filter {
-                // Check each filter condition against bloom filter. The key
-                // format MUST match the build site — both go through the shared
-                // `metadata_bloom_key` helper so the separator can never drift.
-                for (field, value) in &filter_conditions {
-                    let key =
-                        crate::storage::memtable::specialized::wal_behavior::metadata_bloom_key(
-                            field, value,
-                        );
-                    if !bloom_filter.might_contain(key.as_bytes()) {
-                        should_include = false;
-                        bloom_misses += 1;
-                        break;
-                    }
-                }
-
-                if should_include {
-                    bloom_hits += 1;
-                    filtered_batches.push(batch);
-                }
-            } else {
-                // No bloom filter, must check manually - include for detailed checking
-                filtered_batches.push(batch);
-            }
-        }
-
-        tracing::debug!(
-            "🌸 Bloom filter optimization: {} hits, {} misses ({:.1}% filtered)",
-            bloom_hits,
-            bloom_misses,
-            if bloom_hits + bloom_misses > 0 {
-                (bloom_misses as f64 / (bloom_hits + bloom_misses) as f64) * 100.0
-            } else {
-                0.0
-            }
-        );
-
-        Ok(filtered_batches)
+    /// Can `batch` contain a record matching every conjunctive `field=value`
+    /// condition? `false` only when its metadata bloom proves absence; a batch
+    /// without a bloom may match. The key format MUST match the build site
+    /// (shared `metadata_bloom_key`).
+    fn batch_may_match(
+        batch: &crate::storage::memtable::specialized::wal_behavior::WALVectorBatch,
+        conditions: &[(String, String)],
+    ) -> bool {
+        let Some(ref bloom_filter) = batch.metadata_bloom_filter else {
+            return true;
+        };
+        conditions.iter().all(|(field, value)| {
+            let key = crate::storage::memtable::specialized::wal_behavior::metadata_bloom_key(
+                field, value,
+            );
+            bloom_filter.might_contain(key.as_bytes())
+        })
     }
 
     /// Extract the conjunction of exact `field=value` pairs that a batch's
@@ -2921,7 +2906,6 @@ impl WriteAheadLogManager {
     /// non-prunable siblings) stays sound: every record in a surviving batch
     /// must still satisfy those `Equals` legs.
     fn extract_filter_conditions(
-        &self,
         filter: &proximadb_filter_expression::FilterExpression,
     ) -> Vec<(String, String)> {
         use proximadb_filter_expression::{ComparisonOperator, FilterExpression};
@@ -2937,7 +2921,7 @@ impl WriteAheadLogManager {
                 .unwrap_or_default(),
             FilterExpression::And(exprs) => exprs
                 .iter()
-                .flat_map(|expr| self.extract_filter_conditions(expr))
+                .flat_map(Self::extract_filter_conditions)
                 .collect(),
             // Non-Equals comparisons, Or, and Not are not soundly prunable by an
             // exact-match bloom — fail open (no conditions ⇒ batch is kept).
@@ -4156,5 +4140,201 @@ mod td_flush_8_catalog_walk_tests {
                 .map(|collection| collection.id.clone())
                 .collect::<Vec<_>>()
         );
+    }
+}
+
+/// Does `candidate` supersede `current` as the freshest unflushed version of
+/// one OID? `updated_at_ns` first; on an exact tie a tombstone wins, then the
+/// higher `record_version`.
+pub(crate) fn unflushed_supersedes(
+    candidate: &proximadb_records::ProximaRecord,
+    current: &proximadb_records::ProximaRecord,
+) -> bool {
+    if candidate.updated_at_ns != current.updated_at_ns {
+        return candidate.updated_at_ns > current.updated_at_ns;
+    }
+    // Exact-instant tie: the tombstone wins BEFORE versions are compared —
+    // tombstones carry record_version 0, so a version-first rule would let a
+    // same-instant live copy (v>=1) beat its own delete (mandate 16d).
+    let tombstone = |r: &proximadb_records::ProximaRecord| r.valid_to_ns == Some(0);
+    if tombstone(candidate) != tombstone(current) {
+        return tombstone(candidate);
+    }
+    candidate.record_version > current.record_version
+}
+
+/// The WAL leg's freshest-version resolution and scoring (review round 2):
+/// pure functions over a hand-built snapshot — no server, no WAL manager.
+#[cfg(test)]
+mod freshest_unflushed_tests {
+    use super::{BatchId, WriteAheadLogManager};
+    use crate::storage::memtable::specialized::wal_behavior::WALVectorBatch;
+    use proximadb_data_model::ProximaValue;
+    use proximadb_distance_kernel::DistanceMetric;
+    use proximadb_filter_expression::{ComparisonOperator, FilterExpression};
+    use proximadb_records::{EmbeddingCell, ProximaRecord, ProximaTreeNode};
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+
+    fn rec(oid: &str, ts: i64, version: u64, cat: i64, v: f32) -> ProximaRecord {
+        let mut r = ProximaRecord {
+            oid: oid.to_string(),
+            updated_at_ns: ts,
+            created_at_ns: ts,
+            record_version: version,
+            embeddings: vec![EmbeddingCell::new_fp32("m", "dense", 2, vec![v, 0.0])],
+            ..Default::default()
+        };
+        r.props.insert(
+            "cat".to_string(),
+            ProximaTreeNode::Value(ProximaValue::Int64(cat)),
+        );
+        r
+    }
+
+    fn tombstone(oid: &str, ts: i64) -> ProximaRecord {
+        ProximaRecord {
+            oid: oid.to_string(),
+            updated_at_ns: ts,
+            created_at_ns: ts,
+            valid_to_ns: Some(0),
+            ..Default::default()
+        }
+    }
+
+    fn batch(records: Vec<ProximaRecord>, age_ms: u64) -> WALVectorBatch {
+        WALVectorBatch {
+            batch_id: BatchId::new(),
+            total_size_bytes: WALVectorBatch::estimate_records_size(&records),
+            vector_records: Arc::new(records),
+            timestamp: SystemTime::UNIX_EPOCH + Duration::from_millis(age_ms),
+            is_flushed: false,
+            metadata_bloom_filter: None,
+        }
+    }
+
+    fn cat_eq(v: i64) -> FilterExpression {
+        FilterExpression::Comparison {
+            field: "cat".to_string(),
+            operator: ComparisonOperator::Equals,
+            value: serde_json::json!(v),
+        }
+    }
+
+    fn ids(hits: &[crate::core::search::results::OptimizedSearchRecord]) -> Vec<String> {
+        let mut v: Vec<String> = hits
+            .iter()
+            .filter(|h| h.valid_to_ns.is_none())
+            .map(|h| h.id.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn score(
+        snapshot: &[WALVectorBatch],
+        filter: Option<&FilterExpression>,
+        k: usize,
+    ) -> Vec<crate::core::search::results::OptimizedSearchRecord> {
+        let index = WriteAheadLogManager::freshest_unflushed_index(snapshot);
+        WriteAheadLogManager::score_unflushed(
+            snapshot,
+            &index,
+            &[1.0, 0.0],
+            k,
+            DistanceMetric::Cosine,
+            filter,
+            false,
+            true,
+        )
+    }
+
+    /// One hit per OID, and it is the FRESHEST version (an older matching
+    /// version of an OID updated out of the predicate is never returned).
+    #[test]
+    fn one_hit_per_oid_and_a_newer_non_matching_version_suppresses() {
+        let snapshot = vec![
+            batch(vec![rec("a", 100, 1, 3, 1.0), rec("b", 100, 1, 3, 0.9)], 1),
+            batch(vec![rec("a", 200, 1, 5, 1.0)], 2), // a moved to cat=5
+        ];
+        let hits = score(&snapshot, Some(&cat_eq(3)), 10);
+        assert_eq!(ids(&hits), vec!["b".to_string()]);
+        let unfiltered = score(&snapshot, None, 10);
+        assert_eq!(ids(&unfiltered), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            unfiltered.iter().filter(|h| h.id == "a").count(),
+            1,
+            "one hit per OID"
+        );
+    }
+
+    /// Mandate 16d with production shapes: a version-0 tombstone at the same
+    /// instant as a version-2 live copy wins, in either batch order.
+    #[test]
+    fn same_instant_v0_tombstone_beats_v2_live_copy() {
+        for order in [0, 1] {
+            let mut batches = vec![
+                batch(vec![rec("x", 500, 2, 3, 1.0)], 1),
+                batch(vec![tombstone("x", 500)], 2),
+            ];
+            if order == 1 {
+                batches.reverse();
+            }
+            let index = WriteAheadLogManager::freshest_unflushed_index(&batches);
+            let state = WriteAheadLogManager::unflushed_oid_state(&batches, &index, "x", 1_000);
+            assert!(
+                matches!(
+                    state,
+                    Some(crate::core::search::merge::WalOidState::Dead { .. })
+                ),
+                "order {order}: the same-instant delete must win, got {state:?}"
+            );
+            assert!(ids(&score(&batches, None, 10)).is_empty());
+        }
+    }
+
+    /// A TTL-expired freshest version yields a marker, never a live hit.
+    #[test]
+    fn ttl_expired_freshest_version_is_a_marker() {
+        let mut expired = rec("e", 100, 1, 3, 1.0);
+        expired.valid_to_ns = Some(1); // long expired
+        let hits = score(&[batch(vec![expired], 1)], None, 10);
+        assert!(ids(&hits).is_empty());
+        assert_eq!(hits.len(), 1, "a suppression marker is emitted");
+    }
+
+    /// The top-k cut is over DISTINCT current OIDs: stale duplicates can no
+    /// longer fill the cut and push a current match out.
+    #[test]
+    fn top_k_counts_distinct_current_oids() {
+        let mut batches: Vec<WALVectorBatch> = (0..5)
+            .map(|i| batch(vec![rec("dup", 100 + i, 1, 3, 1.0)], i as u64))
+            .collect();
+        batches.push(batch(vec![rec("other", 100, 1, 3, 0.5)], 10));
+        let hits = score(&batches, Some(&cat_eq(3)), 2);
+        assert_eq!(ids(&hits), vec!["dup".to_string(), "other".to_string()]);
+    }
+
+    /// A full tie (same instant, same version) goes to the later batch,
+    /// independent of snapshot order.
+    #[test]
+    fn full_tie_goes_to_the_later_batch() {
+        for order in [0, 1] {
+            let mut batches = vec![
+                batch(vec![rec("t", 300, 1, 3, 1.0)], 1),
+                batch(vec![rec("t", 300, 1, 5, 1.0)], 2),
+            ];
+            if order == 1 {
+                batches.reverse();
+            }
+            assert!(
+                ids(&score(&batches, Some(&cat_eq(3)), 10)).is_empty(),
+                "order {order}"
+            );
+            assert_eq!(
+                ids(&score(&batches, Some(&cat_eq(5)), 10)),
+                vec!["t".to_string()]
+            );
+        }
     }
 }
