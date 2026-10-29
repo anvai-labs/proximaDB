@@ -271,7 +271,35 @@ impl ReservationRegistry {
     /// Reserve for a PERFORMANCE collection create. Fails with an actionable
     /// error when no default pool is resolvable or the operator armed no
     /// default grant size — never a silent zero-byte grant.
+    ///
+    /// Cancel-safe (TD-TIER-1 SC4-3): the mutation and its budget sync run
+    /// as one detached task, so a request future dropped mid-way (client
+    /// disconnect) cannot leave a committed grant with a stale budget or an
+    /// unregistered protection group — the task finishes regardless.
     pub async fn reserve_for_performance(
+        self: &Arc<Self>,
+        tenant_id: &str,
+        collection_id: &str,
+        now_unix_secs: i64,
+        residency_prefixes: &[String],
+    ) -> Result<Grant, ReservationError> {
+        let this = Arc::clone(self);
+        let tenant = tenant_id.to_string();
+        let collection = collection_id.to_string();
+        let prefixes = residency_prefixes.to_vec();
+        tokio::spawn(async move {
+            this.reserve_gated(&tenant, &collection, now_unix_secs, &prefixes)
+                .await
+        })
+        .await
+        .map_err(|error| {
+            ReservationError::Io(std::io::Error::other(format!(
+                "TD-TIER-1 SC4: reservation task failed: {error}"
+            )))
+        })?
+    }
+
+    async fn reserve_gated(
         &self,
         tenant_id: &str,
         collection_id: &str,
@@ -378,12 +406,31 @@ impl ReservationRegistry {
     /// Release every live grant for a collection identity across all pools
     /// (idempotent where the identity never reserved). Tail intervals park
     /// for the metering tick.
+    ///
+    /// Cancel-safe like [`Self::reserve_for_performance`]: release, unpin and
+    /// budget sync complete in a detached task even if the caller is dropped.
     pub async fn release_for_collection(
-        &self,
+        self: &Arc<Self>,
         tenant_id: &str,
         collection_id: &str,
         now_unix_secs: i64,
     ) {
+        let this = Arc::clone(self);
+        let tenant = tenant_id.to_string();
+        let collection = collection_id.to_string();
+        if let Err(error) = tokio::spawn(async move {
+            this.release_gated(&tenant, &collection, now_unix_secs)
+                .await;
+        })
+        .await
+        {
+            tracing::warn!(
+                "TD-TIER-1 SC4: release task for ({tenant_id}, {collection_id}) failed: {error}"
+            );
+        }
+    }
+
+    async fn release_gated(&self, tenant_id: &str, collection_id: &str, now_unix_secs: i64) {
         // Mutation + budget sync under one gate (SF1): the Σ read cannot
         // interleave with a concurrent mutation's commit.
         let _gate = self.mutation_gate.lock().await;
@@ -412,6 +459,18 @@ impl ReservationRegistry {
             proximadb_cache::unregister_protection_group(grant_id);
         }
         self.sync_residency_budget().await;
+    }
+
+    /// TD-TIER-1 SC4-3: the live grant for a collection id in any pool
+    /// (collection ids are catalog UUIDs, unique across tenants). Status
+    /// reads only — never the query path.
+    pub async fn live_grant_for_collection(&self, collection_id: &str) -> Option<Grant> {
+        for (_, authority) in self.pools.values() {
+            if let Some(grant) = authority.live_grant_by_collection(collection_id).await {
+                return Some(grant);
+            }
+        }
+        None
     }
 
     /// One metering tick: drain parked release-tails plus each pool's accrued
@@ -916,6 +975,16 @@ impl ReservationAuthority {
     /// Read-only snapshot (status projection input; no accrual side effect).
     pub async fn grants_snapshot(&self) -> Vec<Grant> {
         self.inner.ledger.lock().await.grants.clone()
+    }
+
+    /// The live grant for a collection id under any tenant (status reads).
+    pub async fn live_grant_by_collection(&self, collection_id: &str) -> Option<Grant> {
+        let guard = self.inner.ledger.lock().await;
+        guard
+            .grants
+            .iter()
+            .find(|g| g.collection_id == collection_id && g.state.charges_capacity())
+            .cloned()
     }
 
     /// The live grant for an identity, if any (release bookkeeping).
@@ -2069,6 +2138,48 @@ mod tests {
             2048,
             "reopen pushes the reconciled charged budget"
         );
+    }
+
+    /// SC4-3 cancel safety: a reserve whose request future is dropped after
+    /// its first poll (client disconnect) still commits AND syncs the budget
+    /// — the mutation runs in a detached task, so the committed grant can
+    /// never sit beside a stale budget.
+    #[tokio::test]
+    async fn dropped_reserve_future_still_commits_and_syncs_budget() {
+        let _guard = budget_cell_gate();
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = pool_config(&dir, "p1", 0);
+        cfg.overhead_factor = 0.0;
+        cfg.default_grant_bytes = 4096;
+        let registry = ReservationRegistry::open_from_config(std::slice::from_ref(&cfg))
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            let mut fut = Box::pin(registry.reserve_for_performance(
+                "t1",
+                "cancel-1",
+                current_unix_secs(),
+                &[],
+            ));
+            // One poll spawns the task; then the caller goes away.
+            let _ = futures::poll!(fut.as_mut());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while proximadb_cache::process_reserved_budget() != 4096 {
+            assert!(std::time::Instant::now() < deadline, "budget never synced");
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            registry
+                .live_grant_for_collection("cancel-1")
+                .await
+                .is_some()
+        );
+        registry
+            .release_for_collection("t1", "cancel-1", current_unix_secs())
+            .await;
+        assert_eq!(proximadb_cache::process_reserved_budget(), 0);
     }
 
     /// SC4-2 end to end through the real bridge and store: after a reserve,

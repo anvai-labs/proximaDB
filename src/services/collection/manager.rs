@@ -204,6 +204,48 @@ impl CollectionService {
         })
     }
 
+    /// TD-TIER-1 SC4-3: report a PERFORMANCE collection's live grant on its
+    /// status — reserved bytes from the ledger, resident and covered bytes
+    /// from the registered process store. The API GET surface (REST v2 and
+    /// gRPC v2 both resolve through the collection port) calls this; it is
+    /// never on the query path, and non-PERFORMANCE collections or an inert
+    /// registry return immediately.
+    pub async fn overlay_live_residency(&self, collection: &mut Collection) {
+        let Some(registry) = &self.reservations else {
+            return;
+        };
+        let Some(config) = collection.config.as_ref() else {
+            return;
+        };
+        if crate::services::collection::storage_class::storage_class_or_balanced(config)
+            != crate::proto::proximadb_v1::StorageClass::Performance
+        {
+            return;
+        }
+        let Some(grant) = registry.live_grant_for_collection(&collection.id).await else {
+            return;
+        };
+        let (resident, covered) = proximadb_cache::process_store()
+            .map(|store| {
+                (
+                    store.group_resident_bytes(&grant.id),
+                    store.covered_bytes(&grant.id),
+                )
+            })
+            .unwrap_or((0, 0));
+        let base = collection.storage_class_status.take().unwrap_or_else(|| {
+            crate::services::collection::storage_class::storage_class_status(config)
+        });
+        collection.storage_class_status = Some(
+            crate::services::collection::storage_class::with_live_residency(
+                base,
+                grant.bytes,
+                resident,
+                covered,
+            ),
+        );
+    }
+
     /// TD-TIER-1 SC3-2: the shared reservation registry, when pools are
     /// declared. The metering cadence ticks it (release tails + accrual).
     pub fn reservations(
@@ -5838,7 +5880,11 @@ impl proximadb_runtime::CollectionPort for CollectionService {
         identifier: &str,
         tenant_id: Option<&str>,
     ) -> anyhow::Result<Option<crate::proto::proximadb_v1::Collection>> {
-        self.collection_for_tenant(identifier, tenant_id).await
+        let mut collection = self.collection_for_tenant(identifier, tenant_id).await?;
+        if let Some(collection) = collection.as_mut() {
+            self.overlay_live_residency(collection).await;
+        }
+        Ok(collection)
     }
 
     async fn create_collection(
