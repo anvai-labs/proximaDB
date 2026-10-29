@@ -183,6 +183,31 @@ fn join_uri(root: &str, key: &str) -> String {
     }
 }
 
+/// The absolute URI of a path v0.4.1 (and earlier) recorded relative to the
+/// WAREHOUSE ROOT. Those releases wrote `location` as the absolute table data
+/// directory, `<warehouse>/<table-rel>/data`, and every recorded path as
+/// `<table-rel>/data/…` (data files) or `<table-rel>/metadata/…` (manifest
+/// list, manifests). So the warehouse root is `location` minus
+/// `/<table-rel>/data`, where `<table-rel>` is a leading run of the path's
+/// components that both makes that suffix match AND is followed by `data` or
+/// `metadata`. The second condition settles names that make the split
+/// ambiguous (a table named `data` under a warehouse ending in `data`: both
+/// `w` + `data/data` and `w/data` + `data` fit the location); the longest
+/// such run wins. `None` when nothing qualifies: such a path is not guessed at.
+fn legacy_warehouse_uri(location: &str, recorded: &str) -> Option<String> {
+    let location = location.trim_end_matches('/');
+    let parts: Vec<&str> = recorded.split('/').filter(|c| !c.is_empty()).collect();
+    (1..parts.len().saturating_sub(1)).rev().find_map(|k| {
+        if !matches!(parts[k], "data" | "metadata") {
+            return None;
+        }
+        let suffix = format!("/{}/data", parts[..k].join("/"));
+        location
+            .strip_suffix(suffix.as_str())
+            .map(|warehouse| join_uri(warehouse, &parts.join("/")))
+    })
+}
+
 impl IcebergObjectStoreBridge {
     /// Wrap an existing object-store handle. Published Iceberg metadata then uses
     /// bridge-relative paths; call [`with_root_url`](Self::with_root_url) to make
@@ -223,30 +248,62 @@ impl IcebergObjectStoreBridge {
     /// under the table `location` (but not under this bridge's root — e.g. the
     /// metadata was written through a warehouse-root bridge and is now read
     /// through a table-root bridge) is re-rooted at `table_prefix`, the
-    /// bridge-relative prefix of that table. Relative paths pass through.
+    /// bridge-relative prefix of that table. A relative path that v0.4.1-era
+    /// metadata recorded relative to the warehouse root (see
+    /// `legacy_warehouse_uri`) is rebuilt from `location` and accepted only
+    /// when it lies under this bridge's root; every other relative path
+    /// passes through.
     fn resolve_recorded_path(
         &self,
         recorded: &str,
         table_location: Option<&str>,
         table_prefix: &str,
     ) -> Path {
-        if let Some(root) = &self.root_url {
-            let root_prefix = join_uri(root, "");
-            if let Some(key) = recorded.strip_prefix(&root_prefix) {
-                return Path::from(key);
-            }
+        if let Some(key) = self.strip_known_roots(recorded, table_location, table_prefix) {
+            return key;
         }
-        if let Some(loc) = table_location {
-            let loc_prefix = join_uri(loc, "");
-            if let Some(rest) = recorded.strip_prefix(&loc_prefix) {
-                return if table_prefix.is_empty() {
-                    Path::from(rest)
-                } else {
-                    Path::from(format!("{table_prefix}/{rest}"))
-                };
-            }
+        // v0.4.1 and earlier recorded paths RELATIVE TO THE WAREHOUSE ROOT;
+        // rebuild the absolute URI from the document's own `location` and
+        // accept it only when it lies under THIS bridge's root. Never through
+        // the location re-rooting: a v0.4.1 `location` is the data directory,
+        // not the table base it assumes, so it would drop `/data` from a data
+        // file. A bridge rooted elsewhere keeps the recorded key as before.
+        if !recorded.contains("://")
+            && let Some(key) = table_location
+                .and_then(|loc| legacy_warehouse_uri(loc, recorded))
+                .and_then(|uri| self.strip_root(&uri))
+        {
+            return key;
         }
         Path::from(recorded)
+    }
+
+    /// `uri` as a key under this bridge when it is an absolute URI under the
+    /// bridge's root URL; `None` otherwise.
+    fn strip_root(&self, uri: &str) -> Option<Path> {
+        let root_prefix = join_uri(self.root_url.as_deref()?, "");
+        uri.strip_prefix(&root_prefix).map(Path::from)
+    }
+
+    /// `recorded` as a key under this bridge when it is an absolute URI under
+    /// the bridge's root, or under the table `location` (re-rooted at
+    /// `table_prefix`); `None` otherwise.
+    fn strip_known_roots(
+        &self,
+        recorded: &str,
+        table_location: Option<&str>,
+        table_prefix: &str,
+    ) -> Option<Path> {
+        if let Some(key) = self.strip_root(recorded) {
+            return Some(key);
+        }
+        let loc_prefix = join_uri(table_location?, "");
+        let rest = recorded.strip_prefix(&loc_prefix)?;
+        Some(if table_prefix.is_empty() {
+            Path::from(rest)
+        } else {
+            Path::from(format!("{table_prefix}/{rest}"))
+        })
     }
 
     /// Borrow the underlying [`ProximaObjectStore`].
@@ -1348,6 +1405,241 @@ mod tests {
                 .resolve_recorded_path("t/ns/tbl/data/x.parquet", None, "")
                 .as_ref(),
             "t/ns/tbl/data/x.parquet"
+        );
+    }
+
+    /// The v0.4.1 golden fixture (`testdata/v041`): the warehouse output of a
+    /// REAL v0.4.1 server after `CREATE TABLE inv (id TEXT NOT NULL, qty INT,
+    /// PRIMARY KEY (id))`, 20 INSERTs and `ALTER TABLE inv MATERIALIZE`. Bytes
+    /// are verbatim except `location`, whose absolute warehouse root is the
+    /// placeholder `file:///WAREHOUSE` (rewritten to a temp dir here).
+    const V041_TABLE: &str = "data/proximadb/ns_584d9462-e9cf-4c0a-a353-1c5db38a7fe9/inv";
+
+    fn v041_warehouse() -> (tempfile::TempDir, String) {
+        fn copy(src: &std::path::Path, dst: &std::path::Path) {
+            std::fs::create_dir_all(dst).unwrap();
+            for entry in std::fs::read_dir(src).unwrap() {
+                let path = entry.unwrap().path();
+                let target = dst.join(path.file_name().unwrap());
+                if path.is_dir() {
+                    copy(&path, &target);
+                } else {
+                    std::fs::copy(&path, &target).unwrap();
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/v041");
+        copy(&fixture, dir.path());
+        let root = format!("file://{}", dir.path().display());
+        let metadata = dir
+            .path()
+            .join(V041_TABLE)
+            .join("metadata/v00000000000000000000.metadata.json");
+        let json = std::fs::read_to_string(&metadata).unwrap();
+        assert_eq!(
+            json.matches("file:///WAREHOUSE").count(),
+            1,
+            "one placeholder"
+        );
+        std::fs::write(&metadata, json.replace("file:///WAREHOUSE", &root)).unwrap();
+        (dir, root)
+    }
+
+    /// v0.5.0 upgrade (both release blockers, on real v0.4.1 bytes): the
+    /// table-base reader (OLAP reads) resolves v0.4.1's warehouse-relative
+    /// paths instead of doubling them, the warehouse-root reader (MATERIALIZE)
+    /// still resolves them, its lineage-less v3 metadata is adopted, and a
+    /// successor commits onto it with lineage starting at 0.
+    #[tokio::test]
+    async fn a_real_v041_publication_reads_and_republishes() {
+        let (_dir, root) = v041_warehouse();
+        let table_meta = format!("{V041_TABLE}/metadata");
+
+        // OLAP reader: a bridge at the table base, metadata under `metadata`.
+        let table = IcebergObjectStoreBridge::from_url(&format!("{root}/{V041_TABLE}")).unwrap();
+        let selected = table
+            .read_iceberg_snapshot_with_deletes("metadata", 0)
+            .await
+            .expect("a v0.4.1 manifest decodes and resolves from the table base");
+        assert_eq!(selected.data_files, vec![Path::from("data/part-0.parquet")]);
+        assert!(selected.deletion_vectors.is_empty());
+        table
+            .object_store()
+            .get(&selected.data_files[0])
+            .await
+            .expect("the resolved data file exists");
+
+        // MATERIALIZE's bridge: the warehouse root.
+        let warehouse = IcebergObjectStoreBridge::from_url(&root).unwrap();
+        let files = warehouse
+            .read_iceberg_snapshot_files(&table_meta, 0)
+            .await
+            .expect("resolves from the warehouse root");
+        let part = Path::from(format!("{V041_TABLE}/data/part-0.parquet"));
+        assert_eq!(files.data_files, vec![part.clone()]);
+
+        // The real metadata is v3 without lineage, and is adopted at 0.
+        let meta = warehouse.read_table_metadata(&table_meta, 0).await.unwrap();
+        let parent: serde_json::Value = serde_json::from_slice(&meta).unwrap();
+        assert_eq!(parent["format-version"], 3);
+        assert!(
+            parent.get("next-row-id").is_none(),
+            "v0.4.1 wrote no lineage"
+        );
+        let fields: Vec<iceberg::IcebergField> = parent["schemas"][0]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| iceberg::IcebergField {
+                id: f["id"].as_i64().unwrap() as i32,
+                name: f["name"].as_str().unwrap().to_string(),
+                type_name: f["type"].as_str().unwrap().to_string(),
+                required: f["required"].as_bool().unwrap(),
+            })
+            .collect();
+
+        // A successor commits onto the v0.4.1 parent (carrying its file).
+        let v1 = warehouse
+            .publish_iceberg_files(
+                std::slice::from_ref(&part),
+                Some(0),
+                &table_meta,
+                parent["table-uuid"].as_str().unwrap(),
+                &format!("{root}/{V041_TABLE}"),
+                &fields,
+                parent["current-snapshot-id"].as_i64().unwrap() + 1,
+                parent["last-updated-ms"].as_i64().unwrap() + 1,
+                iceberg::FormatVersion::V3,
+            )
+            .await
+            .expect("a successor commits onto a real v0.4.1 parent");
+        assert_eq!(v1, 1);
+        let successor: serde_json::Value =
+            serde_json::from_slice(&warehouse.read_table_metadata(&table_meta, 1).await.unwrap())
+                .unwrap();
+        assert_eq!(successor["format-version"], 3);
+        assert_eq!(
+            successor["snapshots"][0]["first-row-id"], 0,
+            "lineage starts at 0"
+        );
+        assert_eq!(successor["snapshots"][0]["added-rows"], 20);
+        assert_eq!(successor["next-row-id"], 20);
+        // And the table-base reader follows the successor.
+        let next = table
+            .read_iceberg_snapshot_with_deletes("metadata", 1)
+            .await
+            .unwrap();
+        assert_eq!(next.data_files, vec![Path::from("data/part-0.parquet")]);
+    }
+
+    /// v0.5.0 upgrade: v0.4.1 recorded its manifest list, manifests and data
+    /// files RELATIVE TO THE WAREHOUSE ROOT (`t/ns/tbl/metadata/…`) while its
+    /// `location` is the absolute data directory (`<warehouse>/t/ns/tbl/data`).
+    /// A reader opened at the table base must not append that relative path to
+    /// its own root (doubling `t/ns/tbl`): the warehouse root is recovered from
+    /// `location` minus `/<table-rel>/data`, and every bridge resolves the path.
+    #[test]
+    fn legacy_warehouse_relative_paths_resolve_from_any_bridge_root() {
+        let location = "memory:///wh/t/ns/tbl/data";
+        let at = |root: &str| {
+            IcebergObjectStoreBridge::new(ProximaObjectStore::new(Arc::new(
+                object_store::memory::InMemory::new(),
+            )))
+            .with_root_url(root)
+        };
+        let table_base = at("memory:///wh/t/ns/tbl");
+        let warehouse = at("memory:///wh");
+        for (recorded, from_base, from_warehouse) in [
+            (
+                "t/ns/tbl/metadata/snap-1-list.avro",
+                "metadata/snap-1-list.avro",
+                "t/ns/tbl/metadata/snap-1-list.avro",
+            ),
+            (
+                "t/ns/tbl/metadata/1-m0.avro",
+                "metadata/1-m0.avro",
+                "t/ns/tbl/metadata/1-m0.avro",
+            ),
+            (
+                "t/ns/tbl/data/part-0.parquet",
+                "data/part-0.parquet",
+                "t/ns/tbl/data/part-0.parquet",
+            ),
+        ] {
+            assert_eq!(
+                table_base
+                    .resolve_recorded_path(recorded, Some(location), "")
+                    .as_ref(),
+                from_base,
+                "{recorded} from the table base"
+            );
+            assert_eq!(
+                warehouse
+                    .resolve_recorded_path(recorded, Some(location), "")
+                    .as_ref(),
+                from_warehouse,
+                "{recorded} from the warehouse root"
+            );
+        }
+        // A relative path that does not match the location's table prefix is
+        // not guessed at: it passes through as before.
+        assert_eq!(
+            table_base
+                .resolve_recorded_path("other/x.parquet", Some(location), "")
+                .as_ref(),
+            "other/x.parquet"
+        );
+        // A bridge rooted ELSEWHERE (the warehouse moved mounts across the
+        // upgrade) keeps the recorded warehouse-relative key: the rebuilt URI
+        // must never go through the location re-rooting, which assumes 0.5.0's
+        // table-base `location` and would drop `/data` from a v0.4.1 data file.
+        let elsewhere = at("memory:///moved");
+        for recorded in [
+            "t/ns/tbl/metadata/snap-1-list.avro",
+            "t/ns/tbl/metadata/1-m0.avro",
+            "t/ns/tbl/data/part-0.parquet",
+        ] {
+            assert_eq!(
+                elsewhere
+                    .resolve_recorded_path(recorded, Some(location), "t/ns/tbl")
+                    .as_ref(),
+                recorded,
+                "{recorded} from a bridge rooted elsewhere"
+            );
+        }
+        // Names containing `data`: a table named `data` under a warehouse
+        // whose root itself ends in `data` (one k matches).
+        let data_location = "memory:///wh/data/t/ns/data/data";
+        let data_base = at("memory:///wh/data/t/ns/data");
+        assert_eq!(
+            data_base
+                .resolve_recorded_path("t/ns/data/data/part-0.parquet", Some(data_location), "")
+                .as_ref(),
+            "data/part-0.parquet"
+        );
+        assert_eq!(
+            data_base
+                .resolve_recorded_path("t/ns/data/metadata/m.avro", Some(data_location), "")
+                .as_ref(),
+            "metadata/m.avro"
+        );
+        // An ambiguous split: warehouse `…/w/data` + table-rel `data` gives the
+        // location `…/w/data/data/data`, which `…/w` + table-rel `data/data`
+        // also fits. v0.4.1's layout settles it: a recorded path continues
+        // `<table-rel>/data/…` or `<table-rel>/metadata/…`, and only the
+        // `w/data` split leaves `data/part-0.parquet` after the table-rel.
+        let nested = at("memory:///w/data/data");
+        assert_eq!(
+            nested
+                .resolve_recorded_path(
+                    "data/data/part-0.parquet",
+                    Some("memory:///w/data/data/data"),
+                    ""
+                )
+                .as_ref(),
+            "data/part-0.parquet",
+            "the split whose remainder starts with data/ or metadata/ wins"
         );
     }
 
