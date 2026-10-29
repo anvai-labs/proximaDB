@@ -1951,12 +1951,10 @@ async fn dv_mat_puffins(
         .expect("a published snapshot");
     let mut referenced = std::collections::BTreeSet::new();
     for version in [latest.saturating_sub(1), latest] {
-        let Ok(snapshot) = bridge
+        let snapshot = bridge
             .read_iceberg_snapshot_files("metadata", version)
             .await
-        else {
-            continue; // v0 / a pre-history version
-        };
+            .unwrap_or_else(|e| panic!("read snapshot v{version}: {e}"));
         for v in snapshot.deletion_vectors {
             let name = v.puffin_file.filename().map(String::from);
             if let Some(name) = name.filter(|n| n.starts_with("dv-mat-")) {
@@ -2060,6 +2058,20 @@ async fn check_soak_incremental_materialize() {
         }
     }
     assert!(minted_any, "the soak exercised the incremental path");
+
+    // External engines read only PUBLISHED snapshots: the last rounds' writes
+    // are still WAL-only (ProximaDB's own views merged them above), so publish
+    // the final state before the external leg compares it to the model.
+    exec(format!("ALTER TABLE {table} MATERIALIZE")).await;
+    materializes += 1;
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        olap_fingerprint(&client, table).await,
+        model_fingerprint(&model),
+        "the final publication reconciles the OLAP view"
+    );
+    let (on_disk, referenced) = dv_mat_puffins(&server, table).await;
+    assert_eq!(on_disk, referenced, "the final publication's GC");
 
     let rows: Vec<(String, String)> = model
         .iter()
