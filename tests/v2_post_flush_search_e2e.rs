@@ -160,6 +160,25 @@ impl Drop for TestServer {
     }
 }
 
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .no_proxy()
+        .build()
+        .unwrap()
+}
+
+/// `{prefix}_{now_ns}` — a collection name unique per test run.
+fn unique_name(prefix: &str) -> String {
+    format!(
+        "{prefix}_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+
 fn ids(values: &[serde_json::Value]) -> BTreeSet<String> {
     values
         .iter()
@@ -186,19 +205,9 @@ async fn unflushed_batch_count(collection_id: &str) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_vector_search_survives_flush() {
     let server = TestServer::start().await.expect("server start");
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .no_proxy()
-        .build()
-        .unwrap();
+    let http = http_client();
     let base = server.base_url();
-    let name = format!(
-        "v2_flush_vec_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let name = unique_name("v2_flush_vec");
     let dim: usize = 8;
     let n: usize = 5;
 
@@ -326,19 +335,9 @@ async fn v2_vector_search_survives_flush() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_filtered_scan_survives_flush() {
     let server = TestServer::start().await.expect("server start");
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .no_proxy()
-        .build()
-        .unwrap();
+    let http = http_client();
     let base = server.base_url();
-    let name = format!(
-        "v2_flush_scan_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let name = unique_name("v2_flush_scan");
 
     let create = http
         .post(format!("{base}/api/v2/collections"))
@@ -464,19 +463,9 @@ async fn v2_filtered_scan_survives_flush() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_scan_hides_a_record_deleted_after_flush() {
     let server = TestServer::start().await.expect("server start");
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .no_proxy()
-        .build()
-        .unwrap();
+    let http = http_client();
     let base = server.base_url();
-    let name = format!(
-        "v2_flush_del_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let name = unique_name("v2_flush_del");
 
     let create = http
         .post(format!("{base}/api/v2/collections"))
@@ -592,19 +581,9 @@ async fn v2_scan_hides_a_record_deleted_after_flush() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_get_returns_a_record_reinserted_after_delete_and_flush() {
     let server = TestServer::start().await.expect("server start");
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .no_proxy()
-        .build()
-        .unwrap();
+    let http = http_client();
     let base = server.base_url();
-    let name = format!(
-        "v2_reinsert_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let name = unique_name("v2_reinsert");
     let create = http
         .post(format!("{base}/api/v2/collections"))
         .json(&json!({
@@ -695,19 +674,9 @@ async fn v2_get_returns_a_record_reinserted_after_delete_and_flush() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_get_returns_the_newer_of_two_flushed_versions() {
     let server = TestServer::start().await.expect("server start");
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .no_proxy()
-        .build()
-        .unwrap();
+    let http = http_client();
     let base = server.base_url();
-    let name = format!(
-        "v2_twover_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let name = unique_name("v2_twover");
     let create = http
         .post(format!("{base}/api/v2/collections"))
         .json(&json!({ "name": name, "dimension": 1, "engine": "sst", "enable_proxima_record": true }))
@@ -784,19 +753,9 @@ async fn v2_get_returns_the_newer_of_two_flushed_versions() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_fp32_point_read_is_byte_exact_after_flush() {
     let server = TestServer::start().await.expect("server start");
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .no_proxy()
-        .build()
-        .unwrap();
+    let http = http_client();
     let base = server.base_url();
-    let name = format!(
-        "v2_fp32_fid_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let name = unique_name("v2_fp32_fid");
     let dim: usize = 8;
     let n: usize = 6;
 
@@ -914,19 +873,9 @@ async fn v2_fp32_point_read_is_byte_exact_after_flush() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v2_fp32_point_read_is_byte_exact_after_compaction() {
     let server = TestServer::start().await.expect("server start");
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .no_proxy()
-        .build()
-        .unwrap();
+    let http = http_client();
     let base = server.base_url();
-    let name = format!(
-        "v2_fp32_cmp_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let name = unique_name("v2_fp32_cmp");
     let dim: usize = 8;
     let flushes: usize = 5;
     let per_flush: usize = 3;
@@ -1042,21 +991,17 @@ async fn v2_fp32_point_read_is_byte_exact_after_compaction() {
 // retained tombstone must not hide a newer flushed copy.
 // ---------------------------------------------------------------------------
 
-async fn create_filterable_collection(http: &reqwest::Client, base: &str, prefix: &str) -> String {
-    let name = format!(
-        "{prefix}_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+/// A fresh server plus a uniquely-named SST collection with a filterable
+/// integer `cat` column.
+async fn filterable_fixture(prefix: &str) -> (TestServer, reqwest::Client, String, String) {
+    let server = TestServer::start().await.expect("server start");
+    let http = http_client();
+    let base = server.base_url();
+    let name = unique_name(prefix);
     let create = http
         .post(format!("{base}/api/v2/collections"))
         .json(&json!({
-            "name": name,
-            "dimension": 2,
-            "engine": "sst",
-            "enable_proxima_record": true,
+            "name": name, "dimension": 2, "engine": "sst", "enable_proxima_record": true,
             "schema": {
                 "columns": [
                     { "name": "cat", "data_type": "integer", "indexed": true, "filterable": true }
@@ -1071,7 +1016,41 @@ async fn create_filterable_collection(http: &reqwest::Client, base: &str, prefix
     let status = create.status();
     let body = create.text().await.expect("create body");
     assert!(status.is_success(), "create: {status} {body}");
-    name
+    (server, http, base, name)
+}
+
+/// Upsert one `cat`-tagged record at `[0.0, y]`.
+async fn put(http: &reqwest::Client, base: &str, name: &str, id: &str, y: f32, cat: i64) {
+    upsert(
+        http,
+        base,
+        name,
+        json!([{ "id": id, "vector": [0.0, y], "props": { "cat": cat } }]),
+    )
+    .await;
+}
+
+async fn delete_record(http: &reqwest::Client, base: &str, name: &str, id: &str) {
+    let delete = http
+        .delete(format!("{base}/api/v2/collections/{name}/records/{id}"))
+        .send()
+        .await
+        .expect("delete");
+    assert!(delete.status().is_success(), "delete: {}", delete.status());
+}
+
+/// Assert a filtered `cat = cat` search returns exactly `want`.
+async fn assert_filtered(
+    http: &reqwest::Client,
+    base: &str,
+    name: &str,
+    cat: i64,
+    want: &[&str],
+    why: &str,
+) {
+    let (got, body) = filtered_search_ids(http, base, name, cat).await;
+    let want: BTreeSet<String> = want.iter().map(|s| s.to_string()).collect();
+    assert_eq!(got, want, "{why}: {body}");
 }
 
 async fn upsert(http: &reqwest::Client, base: &str, name: &str, records: serde_json::Value) {
@@ -1118,25 +1097,9 @@ async fn filtered_search_ids(
 /// can never contain `cat=3`; skipping that batch hides the tombstone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn filtered_search_hides_a_record_deleted_after_flush() {
-    let server = TestServer::start().await.expect("server start");
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .no_proxy()
-        .build()
-        .unwrap();
-    let base = server.base_url();
-    let name = create_filterable_collection(&http, &base, "flt_del").await;
-
-    upsert(
-        &http,
-        &base,
-        &name,
-        json!([
-            { "id": "keep", "vector": [0.0, 0.0], "props": { "cat": 3 } },
-            { "id": "gone", "vector": [0.0, 0.1], "props": { "cat": 3 } }
-        ]),
-    )
-    .await;
+    let (server, http, base, name) = filterable_fixture("flt_del").await;
+    put(&http, &base, &name, "keep", 0.0, 3).await;
+    put(&http, &base, &name, "gone", 0.1, 3).await;
     sleep(Duration::from_millis(500)).await;
     server.force_flush(&name).await.expect("force flush");
     assert!(
@@ -1144,20 +1107,16 @@ async fn filtered_search_hides_a_record_deleted_after_flush() {
         "setup: flush must publish a PAX segment; files: {:?}",
         server.persisted_files()
     );
-
-    let delete = http
-        .delete(format!("{base}/api/v2/collections/{name}/records/gone"))
-        .send()
-        .await
-        .expect("delete");
-    assert!(delete.status().is_success(), "delete: {}", delete.status());
-
-    let (got, body) = filtered_search_ids(&http, &base, &name, 3).await;
-    assert_eq!(
-        got,
-        ["keep".to_string()].into_iter().collect::<BTreeSet<_>>(),
-        "a record deleted after flush must not be resurrected by a FILTERED search: {body}"
-    );
+    delete_record(&http, &base, &name, "gone").await;
+    assert_filtered(
+        &http,
+        &base,
+        &name,
+        3,
+        &["keep"],
+        "a record deleted after flush must not be resurrected by a FILTERED search",
+    )
+    .await;
 }
 
 /// R2: an update that moves a flushed record OUT of the predicate must hide
@@ -1166,50 +1125,32 @@ async fn filtered_search_hides_a_record_deleted_after_flush() {
 /// copy (which still matches) must not win the merge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn filtered_search_hides_a_flushed_record_updated_out_of_the_predicate() {
-    let server = TestServer::start().await.expect("server start");
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .no_proxy()
-        .build()
-        .unwrap();
-    let base = server.base_url();
-    let name = create_filterable_collection(&http, &base, "flt_upd").await;
-
-    upsert(
-        &http,
-        &base,
-        &name,
-        json!([
-            { "id": "stay", "vector": [0.0, 0.0], "props": { "cat": 3 } },
-            { "id": "moved", "vector": [0.0, 0.1], "props": { "cat": 3 } }
-        ]),
-    )
-    .await;
+    let (server, http, base, name) = filterable_fixture("flt_upd").await;
+    put(&http, &base, &name, "stay", 0.0, 3).await;
+    put(&http, &base, &name, "moved", 0.1, 3).await;
     sleep(Duration::from_millis(500)).await;
     server.force_flush(&name).await.expect("force flush");
-
     // Unflushed newer version of `moved` with cat=5.
-    upsert(
+    put(&http, &base, &name, "moved", 0.1, 5).await;
+    sleep(Duration::from_millis(300)).await;
+    assert_filtered(
         &http,
         &base,
         &name,
-        json!([{ "id": "moved", "vector": [0.0, 0.1], "props": { "cat": 5 } }]),
+        3,
+        &["stay"],
+        "the stale flushed copy of an updated record must not match the old predicate",
     )
     .await;
-    sleep(Duration::from_millis(300)).await;
-
-    let (got3, body3) = filtered_search_ids(&http, &base, &name, 3).await;
-    assert_eq!(
-        got3,
-        ["stay".to_string()].into_iter().collect::<BTreeSet<_>>(),
-        "the stale flushed copy of an updated record must not match the old predicate: {body3}"
-    );
-    let (got5, body5) = filtered_search_ids(&http, &base, &name, 5).await;
-    assert_eq!(
-        got5,
-        ["moved".to_string()].into_iter().collect::<BTreeSet<_>>(),
-        "the new version must match the new predicate: {body5}"
-    );
+    assert_filtered(
+        &http,
+        &base,
+        &name,
+        5,
+        &["moved"],
+        "the new version must match the new predicate",
+    )
+    .await;
 }
 
 /// Guard for any R1/R2 fix: a STALE retained tombstone must not hide a newer
@@ -1218,47 +1159,22 @@ async fn filtered_search_hides_a_flushed_record_updated_out_of_the_predicate() {
 /// still holds the old tombstone).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn filtered_search_returns_a_record_reinserted_after_delete_and_flush() {
-    let server = TestServer::start().await.expect("server start");
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .no_proxy()
-        .build()
-        .unwrap();
-    let base = server.base_url();
-    let name = create_filterable_collection(&http, &base, "flt_reins").await;
-
-    upsert(
-        &http,
-        &base,
-        &name,
-        json!([{ "id": "phoenix", "vector": [0.0, 0.0], "props": { "cat": 3 } }]),
-    )
-    .await;
+    let (server, http, base, name) = filterable_fixture("flt_reins").await;
+    put(&http, &base, &name, "phoenix", 0.0, 3).await;
     sleep(Duration::from_millis(300)).await;
     server.force_flush(&name).await.expect("flush 1");
-
-    let delete = http
-        .delete(format!("{base}/api/v2/collections/{name}/records/phoenix"))
-        .send()
-        .await
-        .expect("delete");
-    assert!(delete.status().is_success(), "delete: {}", delete.status());
+    delete_record(&http, &base, &name, "phoenix").await;
     sleep(Duration::from_millis(300)).await;
-
-    upsert(
+    put(&http, &base, &name, "phoenix", 0.0, 3).await;
+    sleep(Duration::from_millis(300)).await;
+    server.force_flush(&name).await.expect("flush 2");
+    assert_filtered(
         &http,
         &base,
         &name,
-        json!([{ "id": "phoenix", "vector": [0.0, 0.0], "props": { "cat": 3 } }]),
+        3,
+        &["phoenix"],
+        "a record re-inserted after delete and flush must be visible to a filtered search",
     )
     .await;
-    sleep(Duration::from_millis(300)).await;
-    server.force_flush(&name).await.expect("flush 2");
-
-    let (got, body) = filtered_search_ids(&http, &base, &name, 3).await;
-    assert_eq!(
-        got,
-        ["phoenix".to_string()].into_iter().collect::<BTreeSet<_>>(),
-        "a record re-inserted after delete and flush must be visible to a filtered search: {body}"
-    );
 }

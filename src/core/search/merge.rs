@@ -73,10 +73,7 @@ pub fn merge_delta_with_directory_results(
     if top_k == 0 {
         return Vec::new();
     }
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0);
+    let now_ns = proximadb_kernel::time::now_unix_ns();
 
     // Resolve every OID to its FRESHEST copy (the delta wins exact ties, and
     // a tombstone wins an exact tie within the delta — mandate 16d). The old

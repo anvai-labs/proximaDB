@@ -2747,10 +2747,7 @@ impl WriteAheadLogManager {
         if index.is_empty() {
             return Vec::new();
         }
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
+        let now_ns = proximadb_kernel::time::now_unix_ns();
         let bloom_may_match: Vec<bool> = match metadata_filters {
             Some(filter_expr) => {
                 let conditions = Self::extract_filter_conditions(filter_expr);
@@ -2764,8 +2761,8 @@ impl WriteAheadLogManager {
         let distance_calculator = UnifiedDistanceCompute::new(distance_metric);
 
         let mut markers: Vec<crate::core::search::results::OptimizedSearchRecord> = Vec::new();
-        // (score, batch_idx, record_idx) for live, matching freshest versions.
-        let mut scored_cands: Vec<(f32, usize, usize)> = Vec::new();
+        // (similarity, batch_idx, record_idx) for live, matching freshest versions.
+        let mut scored_cands = Vec::new();
         for &(bi, ri) in index.values() {
             let record = &snapshot[bi].vector_records[ri];
             if proximadb_records::is_record_dead(record.valid_to_ns, now_ns) {
@@ -2795,28 +2792,21 @@ impl WriteAheadLogManager {
             }
             let similarity_result =
                 distance_calculator.calculate_distance(query_vector, vec_values, &distance_metric);
-            scored_cands.push((similarity_result.normalized_score, bi, ri));
+            scored_cands.push((similarity_result, bi, ri));
         }
 
         // Cut the scored set to top_k (markers exempt), then materialize ONLY
         // the survivors (the per-record metadata clone is the expensive part).
-        scored_cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored_cands.sort_by(|a, b| {
+            b.0.normalized_score
+                .partial_cmp(&a.0.normalized_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored_cands.truncate(top_k);
         let mut scored: Vec<crate::core::search::results::OptimizedSearchRecord> = scored_cands
             .into_iter()
-            .map(|(_score, bi, ri)| {
+            .map(|(similarity_result, bi, ri)| {
                 let vector_record = &snapshot[bi].vector_records[ri];
-                let vec_values_cow = vector_record
-                    .embeddings
-                    .first()
-                    .map(|e| e.as_fp32_cow())
-                    .unwrap_or_else(|| std::borrow::Cow::Borrowed(&[][..]));
-                let vec_values: &[f32] = vec_values_cow.as_ref();
-                let similarity_result = distance_calculator.calculate_distance(
-                    query_vector,
-                    vec_values,
-                    &distance_metric,
-                );
                 let metadata = if include_metadata {
                     use proximadb_records::ProximaTreeNode;
                     vector_record
@@ -2840,7 +2830,10 @@ impl WriteAheadLogManager {
                     score: ns,
                     similarity: Some(ns),
                     vector: if include_vectors {
-                        Some(Arc::new(vec_values.to_vec()))
+                        vector_record
+                            .embeddings
+                            .first()
+                            .map(|e| Arc::new(e.as_fp32_cow().into_owned()))
                     } else {
                         None
                     },

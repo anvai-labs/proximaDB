@@ -14,6 +14,15 @@ pub fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Current UNIX epoch time in nanoseconds (`0` before the epoch), the clock
+/// basis of `valid_to_ns` / `is_record_dead`.
+pub fn now_unix_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

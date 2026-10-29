@@ -4622,10 +4622,7 @@ impl VectorOperationsService {
         // unflushed version (an unflushed version — e.g. a delete, or an update
         // out of the predicate — supersedes the AXIS copy). Counting droppable
         // hits could return a short top-k with storage never consulted.
-        let skip_now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
+        let skip_now_ns = proximadb_kernel::time::now_unix_ns();
         let total_indexed_results = wal_optimized_results
             .iter()
             .filter(|r| !r.is_dead(skip_now_ns))

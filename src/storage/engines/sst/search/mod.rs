@@ -3153,6 +3153,50 @@ mod tests {
         assert_eq!(adaptive_degree(4, 0), 4, "0 in-flight: treated as 1");
     }
 
+    /// A file-backed SST engine (unique leaked tempdir, compaction effectively
+    /// off so every flush stays its own file) and a matching collection.
+    async fn file_backed_test_engine(
+        cid: &str,
+        dim: usize,
+        block_format: Option<&str>,
+    ) -> (SstEngine, crate::proto::proximadb_v1::Collection) {
+        use crate::proto::proximadb_v1::{
+            Collection, CollectionConfig, StorageAssignment, StorageConfig,
+        };
+        use crate::storage::persistence::filesystem::FilesystemConfig;
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = temp_dir.path().to_str().unwrap().to_string();
+        std::mem::forget(temp_dir); // keep dir for the engine's lifetime
+        let mut fs_config = FilesystemConfig::default();
+        fs_config.default_fs = Some(format!("file://{}", base));
+        let filesystem = Arc::new(FilesystemFactory::create(fs_config).await.unwrap());
+        let mut sst_config = SstConfig::default();
+        if let Some(f) = block_format {
+            sst_config.block_format = f.to_string();
+        }
+        sst_config.compaction_threshold = 100;
+        let distance_compute = Arc::new(UnifiedDistanceCompute::default());
+        let engine = SstEngine::new_with_config(sst_config, filesystem, distance_compute)
+            .await
+            .unwrap();
+        let collection = Collection {
+            id: cid.to_string(),
+            config: Some(CollectionConfig {
+                name: cid.to_string(),
+                dimension: dim as u32,
+                storage_config: Some(StorageConfig::default()),
+                ..Default::default()
+            }),
+            storage_assignment: Some(StorageAssignment {
+                primary_path: base.clone(),
+                base_location: base,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        (engine, collection)
+    }
+
     /// TD-SEARCH-2 S2: multi-core (`tokio::spawn`) inter-file search is
     /// recall-neutral vs sequential. Flushes 3 batches → 3 files (no compaction),
     /// then runs the SAME query through `search_vectors_unified_arc` at degree=1
@@ -3169,38 +3213,10 @@ mod tests {
         use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
         use tempfile::TempDir;
 
-        let temp_dir = TempDir::new().unwrap();
-        let base = temp_dir.path().to_str().unwrap().to_string();
-        std::mem::forget(temp_dir); // keep dir for the engine's lifetime
-        let mut fs_config = FilesystemConfig::default();
-        fs_config.default_fs = Some(format!("file://{}", base));
-        let filesystem = Arc::new(FilesystemFactory::create(fs_config).await.unwrap());
-
-        let mut sst_config = SstConfig::default();
-        sst_config.block_format = "ArrowBlock".to_string();
-        sst_config.compaction_threshold = 100; // keep 3 files (no compaction) → degree > 1
-        let distance_compute = Arc::new(UnifiedDistanceCompute::default());
-        let engine = SstEngine::new_with_config(sst_config, filesystem, distance_compute)
-            .await
-            .unwrap();
-
         let dim = 64usize;
         let cid = "s2_multicore_test";
-        let collection = Collection {
-            id: cid.to_string(),
-            config: Some(CollectionConfig {
-                name: cid.to_string(),
-                dimension: dim as u32,
-                storage_config: Some(StorageConfig::default()),
-                ..Default::default()
-            }),
-            storage_assignment: Some(StorageAssignment {
-                primary_path: base.clone(),
-                base_location: base.clone(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        // keep 3 files (no compaction) → degree > 1
+        let (engine, collection) = file_backed_test_engine(cid, dim, Some("ArrowBlock")).await;
 
         let mk_rec = |idx: usize| {
             let id = format!("b_{}", idx);
@@ -3308,36 +3324,9 @@ mod tests {
         use proximadb_records::{EmbeddingCell, ProximaRecord};
         use tempfile::TempDir;
 
-        let temp_dir = TempDir::new().unwrap();
-        let base = temp_dir.path().to_str().unwrap().to_string();
-        std::mem::forget(temp_dir); // keep dir for the engine's lifetime
-        let mut fs_config = FilesystemConfig::default();
-        fs_config.default_fs = Some(format!("file://{}", base));
-        let filesystem = Arc::new(FilesystemFactory::create(fs_config).await.unwrap());
-        let mut sst_config = SstConfig::default();
-        sst_config.compaction_threshold = 100;
-        let distance_compute = Arc::new(UnifiedDistanceCompute::default());
-        let engine = SstEngine::new_with_config(sst_config, filesystem, distance_compute)
-            .await
-            .unwrap();
-
         let dim = 16usize;
         let cid = "ttl_expired_pax";
-        let collection = Collection {
-            id: cid.to_string(),
-            config: Some(CollectionConfig {
-                name: cid.to_string(),
-                dimension: dim as u32,
-                storage_config: Some(StorageConfig::default()),
-                ..Default::default()
-            }),
-            storage_assignment: Some(StorageAssignment {
-                primary_path: base.clone(),
-                base_location: base.clone(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let (engine, collection) = file_backed_test_engine(cid, dim, None).await;
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64)

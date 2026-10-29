@@ -2608,21 +2608,7 @@ async fn stage_f_never_prunes_a_user_prop_on_a_same_named_canonical_column() {
             r
         })
         .collect();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("seg.pax");
-    write_pax_segment(
-        &path,
-        &records,
-        "col",
-        1,
-        VectorQuant::RaBitQ,
-        Some(4 * 1024),
-        None,
-    )
-    .unwrap();
-    let fs = LocalFileSystem::new_with_encryption(LocalConfig::default(), None)
-        .await
-        .unwrap();
+    let (_dir, path, fs) = small_rabitq_segment(&records).await;
     let filter = proximadb_filter_expression::FilterExpression::Comparison {
         field: "created_at".to_string(),
         operator: proximadb_filter_expression::ComparisonOperator::Equals,
@@ -2694,21 +2680,7 @@ async fn stage_f_does_not_prune_on_canonical_column_stats() {
             rec(&format!("r{i}"), ts, v)
         })
         .collect();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("seg.pax");
-    write_pax_segment(
-        &path,
-        &records,
-        "col",
-        1,
-        VectorQuant::RaBitQ,
-        Some(4 * 1024),
-        None,
-    )
-    .unwrap();
-    let fs = LocalFileSystem::new_with_encryption(LocalConfig::default(), None)
-        .await
-        .unwrap();
+    let (_dir, path, fs) = small_rabitq_segment(&records).await;
     let p = path.to_str().unwrap();
 
     // created_at_ns >= 2000 → provably excludes every low-group block.
@@ -5555,4 +5527,32 @@ fn rerank_ranges_never_cross_a_prefetched_extent() {
         3,
         "extent 1, extent 2, and the uncovered tail"
     );
+}
+
+/// Write `records` as a RaBitQ PAX segment with 4 KiB blocks into a fresh
+/// tempdir (returned so it outlives the test body) and open a local fs.
+async fn small_rabitq_segment(
+    records: &[ProximaRecord],
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    crate::storage::persistence::filesystem::local::LocalFileSystem,
+) {
+    use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("seg.pax");
+    write_pax_segment(
+        &path,
+        records,
+        "col",
+        1,
+        VectorQuant::RaBitQ,
+        Some(4 * 1024),
+        None,
+    )
+    .unwrap();
+    let fs = LocalFileSystem::new_with_encryption(LocalConfig::default(), None)
+        .await
+        .unwrap();
+    (dir, path, fs)
 }
