@@ -417,14 +417,20 @@ pub(super) fn layout_is_newer(
 /// Held for a whole publication of one table in this process.
 pub(super) type PublishGuard = tokio::sync::OwnedMutexGuard<()>;
 
-/// Serialize publications of `(tenant, table)` in this process: concurrent
-/// MATERIALIZEs of one table queue instead of racing for the same metadata
-/// version (the loser would fail its CAS and redo the whole rewrite).
-pub(super) async fn publish_lock(tenant: Option<&str>, table: &str) -> PublishGuard {
+/// Serialize every publisher of one table in this process — MATERIALIZE, the
+/// live delete publisher and the bulk-append lane: concurrent MATERIALIZEs
+/// queue instead of racing for the same metadata version (the loser would fail
+/// its CAS and redo the whole rewrite), and a bulk append can neither read a
+/// DV-free parent nor commit while a MATERIALIZE publishes deletion vectors.
+///
+/// Keyed on the RESOLVED catalog identity (the tenant is `namespace[0]` of a
+/// scoped resolve), never the SQL spelling: `t` and `ns.t` name one table, and
+/// a name-keyed lock would let their publishers race unserialized.
+pub(super) async fn publish_lock(table: &proximadb_catalog::TableIdentifier) -> PublishGuard {
     static LOCKS: std::sync::LazyLock<
         dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
     > = std::sync::LazyLock::new(dashmap::DashMap::new);
-    let key = format!("{}\u{0}{table}", tenant.unwrap_or_default());
+    let key = format!("{}\u{0}{}", table.namespace.join("\u{1}"), table.name);
     let lock = LOCKS.entry(key).or_default().clone();
     lock.lock_owned().await
 }
@@ -479,11 +485,19 @@ mod tests {
 
     #[tokio::test]
     async fn the_publish_lock_serializes_one_table_only() {
-        let held = publish_lock(Some("t"), "a").await;
-        // Another table, or the same name under another tenant, is not blocked.
-        drop(publish_lock(Some("t"), "b").await);
-        drop(publish_lock(Some("u"), "a").await);
-        let waiter = tokio::spawn(async { publish_lock(Some("t"), "a").await });
+        let id = |ns: &[&str], name: &str| proximadb_catalog::TableIdentifier {
+            namespace: ns.iter().map(|s| s.to_string()).collect(),
+            name: name.to_string(),
+        };
+        let held = publish_lock(&id(&["t", "default"], "a")).await;
+        // Another table, or the same name under another tenant namespace, is
+        // not blocked.
+        drop(publish_lock(&id(&["t", "default"], "b")).await);
+        drop(publish_lock(&id(&["u", "default"], "a")).await);
+        // Namespace segments cannot run together into another identity.
+        drop(publish_lock(&id(&["t", "defaulta"], "")).await);
+        let same = id(&["t", "default"], "a");
+        let waiter = tokio::spawn(async move { publish_lock(&same).await });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(!waiter.is_finished(), "the same table waits");
         drop(held);

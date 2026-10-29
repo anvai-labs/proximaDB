@@ -2,7 +2,7 @@
 :toc: left
 :toclevels: 2
 :icons: font
-:last-updated: 2026-10-17
+:last-updated: 2026-10-29
 // status-as-of: 2026-09-11
 // The status-as-of tag above is checked by scripts/check_status_as_of.py (wired into
 // `make work-commit-check`): re-verify the support tiers against HEAD, then bump it.
@@ -533,7 +533,12 @@ must not list them under "supported", "production", or "ready":
   spec-shaped Iceberg v3 table (`v*.metadata.json` referencing an Avro manifest list + manifest)
   to the warehouse so external Iceberg engines can read it (verified by `tests/iceberg_interop_e2e.rs`).
   One-way publish only; this is distinct from the hot-authority item above (still experimental), and
-  external read-back plus multi-writer coordination are unverified.
+  external read-back plus multi-writer coordination are unverified. Republication after UPDATE/DELETE is
+  incremental by default (carried files + one new part + `dv-mat-*` deletion vectors; a compacting rewrite
+  past 20% of rows or 500k positions deleted, or 64 parts), which upgrades the published table to Iceberg v3
+  at its first such republication; `PROXIMADB_MATERIALIZE_INCREMENTAL_DV=0` restores full rewrites. Rolling
+  back to an older release after that is unsafe (older binaries ignore the vectors): disarm and
+  re-MATERIALIZE first.
 * Columnar vector quantization (RaBitQ / SQ8) in PAX vector segments — _flag-gated, default OFF_.
   Enabled with `PROXIMADB_PAX_VECTOR_SEGMENTS=1` plus `PROXIMADB_PAX_VECTOR_QUANT=rabitq|sq8|auto`
   (deployment-level env selector; per-collection proto config is the productionization follow-up).

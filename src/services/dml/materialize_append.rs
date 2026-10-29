@@ -190,18 +190,16 @@ pub(crate) enum AppendPlan {
     },
 }
 
-/// `PROXIMADB_MATERIALIZE_INCREMENTAL_DV` (default OFF): an update or delete
-/// since the last publication republishes incrementally — after-images
-/// appended, old positions marked with deletion vectors — instead of
-/// rewriting the table. It changes the publication format (DVs force Iceberg
-/// v3), so it ships off until baked (the storage-format mandate).
+/// `PROXIMADB_MATERIALIZE_INCREMENTAL_DV` (default ON since 2026-10-29): an
+/// update or delete since the last publication republishes incrementally —
+/// after-images appended, old positions marked with deletion vectors — instead
+/// of rewriting the table. It changes the publication format (DVs force Iceberg
+/// v3); it shipped off until baked (the storage-format mandate) and was armed
+/// on the soak evidence (`soak_incremental_materialize_holds_both_views`).
+/// `0`/`off`/`false` restores the full-rewrite behavior.
 pub(crate) fn incremental_dv_enabled() -> bool {
-    std::env::var("PROXIMADB_MATERIALIZE_INCREMENTAL_DV").is_ok_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+    crate::services::storage_format::default_on_gate("PROXIMADB_MATERIALIZE_INCREMENTAL_DV", 1)
+        .is_some()
 }
 
 /// Classify `changed` (the oids written since the published snapshot) against

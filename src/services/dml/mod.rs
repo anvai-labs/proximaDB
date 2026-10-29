@@ -2853,11 +2853,13 @@ impl DmlService {
     ) -> Result<String> {
         use futures::{SinkExt, StreamExt};
 
-        let _publishing = materialize_stream::publish_lock(
-            tenant_context.map(|t| t.tenant_id.as_str()),
-            table_name,
-        )
-        .await;
+        // Serialized per RESOLVED table with every other publisher (the live
+        // delete publisher, the bulk-append lane): see `publish_lock`.
+        let (_, publishing_id) = self
+            .catalog_manager
+            .resolve_table_scoped(table_name, tenant_context.map(|t| t.tenant_id.as_str()))
+            .await?;
+        let _publishing = materialize_stream::publish_lock(&publishing_id).await;
 
         // ADR-025: capture the snapshot LSN BEFORE scanning, so any write landing
         // during/after the scan has a strictly greater LSN and is caught by the OLAP
@@ -4431,7 +4433,7 @@ impl DmlService {
                 tenant_context.map(|tc| tc.tenant_id.as_str()),
             )
             .await;
-        let routed = self.route_table_write_with_schemas(
+        let mut routed = self.route_table_write_with_schemas(
             plan,
             target_columns,
             &table_schema,
@@ -4441,6 +4443,43 @@ impl DmlService {
             None,
             parent_has_deletes,
         )?;
+        // The bulk lane commits a warehouse successor without the catalog
+        // layout flip, so it must be serialized with every publisher that
+        // writes deletion vectors (default-ON incremental MATERIALIZE, the live
+        // delete publisher): those hold the publish lock, NOT the DML lock this
+        // statement holds. Under the publish lock, re-read the parent — a
+        // MATERIALIZE that committed vectors since the unlocked read demotes
+        // this statement to the WAL lane — and hold the lock through the
+        // commit. WAL-lane writes never take it.
+        let _publishing = if routed.write_lane_decision.lane == WriteLane::BulkAppendCommit {
+            let guard = materialize_stream::publish_lock(&target_table_id).await;
+            if self
+                .published_parent_has_deletes(
+                    &plan.target.qualified_name(),
+                    tenant_context.map(|tc| tc.tenant_id.as_str()),
+                )
+                .await
+            {
+                // Demoted to the WAL lane, which needs no publish lock:
+                // release it rather than block MATERIALIZE for the statement.
+                drop(guard);
+                routed = self.route_table_write_with_schemas(
+                    plan,
+                    target_columns,
+                    &table_schema,
+                    Some(&target_stats),
+                    source_schema,
+                    source_stats,
+                    None,
+                    true,
+                )?;
+                None
+            } else {
+                Some(guard)
+            }
+        } else {
+            None
+        };
 
         // Fold the namespace/DrPath-aware prefix into the warehouse bulk-append write
         // so its object layout matches the materialize path
@@ -4511,15 +4550,14 @@ impl DmlService {
     /// common OLTP case — two catalog reads and no object-store I/O); read
     /// failures demote to the WAL lane (fail-closed), which is always safe.
     ///
-    /// Residual TOCTOU (round-4 review, MINOR-3): serialized by the table's
-    /// DML write lock in normal deployments (both this read and the delete's
-    /// publication hold it for their whole critical section), but when the
-    /// lock service is ABSENT (`acquire_table_dml_lock` yields `None`, the
-    /// deliberately fail-open wiring) an INSERT's clean eligibility read can
-    /// race a concurrent delete's publication — the INSERT's executor then
-    /// commits a DV-carrying successor with no layout flip, and the table
-    /// wedges until a MATERIALIZE. The contract's gate 3 (race forcing + the
-    /// lease fence) owns closing this; see
+    /// Serialization: the bulk lane re-reads this under the table's publish
+    /// lock (`materialize_stream::publish_lock`, keyed on the resolved table)
+    /// and holds that lock through its commit, so in one process neither a
+    /// MATERIALIZE (which does NOT take the DML lock) nor the live delete
+    /// publisher can commit vectors between this read and the bulk commit.
+    /// Residual: publishers in ANOTHER process are not covered by an
+    /// in-process lock; their CAS against the bulk commit is the contract's
+    /// gate 3 (race forcing + the lease fence) — see
     /// PUBLICATION_WAL_VISIBILITY_FENCE_2026_10_27.adoc.
     async fn published_parent_has_deletes(&self, table_name: &str, tenant: Option<&str>) -> bool {
         use proximadb_iceberg_engine::IcebergObjectStoreBridge;
@@ -5718,7 +5756,7 @@ impl DmlService {
         // lock makes CAS loss the common case), one bounded retry on a lost
         // race (re-read the parent, re-map: positions are file-relative and
         // the file set is parent-dependent).
-        let _guard = materialize_stream::publish_lock(tenant_id, table_name).await;
+        let _guard = materialize_stream::publish_lock(&table_id).await;
         for _attempt in 0..2 {
             let Some(parent) = bridge
                 .latest_metadata_version(&metadata_prefix)
