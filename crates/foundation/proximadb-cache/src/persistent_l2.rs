@@ -11,7 +11,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crc32fast::Hasher as Crc32;
 use dashmap::DashMap;
@@ -110,11 +110,11 @@ struct StoreInner {
     /// later cache hit can retry it (coverage self-heal). Cleared by a full
     /// reconcile that skipped nothing.
     heal_pending: AtomicBool,
-    /// Set whenever a pin is released (room freed); cleared by a hit-heal
-    /// attempt. A hit retries a skipped pin only when BOTH flags are set, so
-    /// a steadily over-budget grant costs one attempt per freed pin — not a
-    /// mutex per read (review S1).
-    room_freed: AtomicBool,
+    /// Bounded heal attempts left: each released group pin re-arms it to
+    /// [`HEAL_ATTEMPTS_PER_FREE`]; each hit-heal attempt spends one. Bounds
+    /// the read-path cost of a steadily over-budget grant (review S1); the
+    /// per-group `freed` flag decides whether an attempt can succeed.
+    heal_attempts: AtomicU32,
     /// Test-only hook run between victim selection and its re-check, to
     /// exercise the selection→pin race deterministically.
     #[cfg(test)]
@@ -163,7 +163,7 @@ impl PersistentByteStore {
             protection: std::sync::Mutex::new(ProtectionPolicy::default()),
             policy_active: AtomicBool::new(false),
             heal_pending: AtomicBool::new(false),
-            room_freed: AtomicBool::new(false),
+            heal_attempts: AtomicU32::new(0),
             #[cfg(test)]
             evict_hook: std::sync::Mutex::new(None),
             clock: AtomicU64::new(1),
@@ -358,8 +358,11 @@ impl PersistentByteStore {
             .fetch_sub(meta.file_len, Ordering::AcqRel);
         if let Some(group) = group {
             group.pinned.fetch_sub(meta.file_len, Ordering::AcqRel);
+            group.freed.store(true, Ordering::Release);
+            self.inner
+                .heal_attempts
+                .store(HEAL_ATTEMPTS_PER_FREE, Ordering::Release);
         }
-        self.inner.room_freed.store(true, Ordering::Release);
         true
     }
 
@@ -504,26 +507,52 @@ impl PersistentByteStore {
             .sum()
     }
 
-    /// Retry a skipped policy pin on a cache hit (SC4-3 self-heal). Runs
-    /// only when a pin was skipped AND room has freed since the last attempt,
-    /// and never waits: a contended protection mutex skips the attempt (the
-    /// next freed pin re-arms it). Reads otherwise take no lock.
+    /// Retry a skipped policy pin on a cache hit (SC4-3 self-heal). Only
+    /// after a pin was skipped AND a group pin has since been released, a
+    /// bounded number of hits ([`HEAL_ATTEMPTS_PER_FREE`] per release) try
+    /// it; each attempt pins only when the hit key's OWN group has freed
+    /// room, so an unrelated hit cannot consume another group's heal
+    /// (review S1). Never waits on the protection mutex; reads otherwise
+    /// take no lock and write no shared state.
     fn heal_on_hit(&self, key: &str, meta: &EntryMeta) {
         if !self.inner.heal_pending.load(Ordering::Acquire)
             || meta.protected.load(Ordering::Acquire)
-            || !self.inner.room_freed.swap(false, Ordering::AcqRel)
+            || self.inner.heal_attempts.load(Ordering::Acquire) == 0
+        {
+            return;
+        }
+        if self
+            .inner
+            .heal_attempts
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .is_err()
         {
             return;
         }
         let policy = match self.inner.protection.try_lock() {
             Ok(policy) => policy,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                self.inner.room_freed.store(true, Ordering::Release);
-                return;
-            }
+            Err(std::sync::TryLockError::WouldBlock) => return,
         };
-        self.pin_under_policy(&policy, key);
+        let Some(group) = policy.matching_group(key) else {
+            return;
+        };
+        if !group.counter.freed.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(current) = self.inner.entries.get(key).map(|entry| entry.clone()) else {
+            return;
+        };
+        if self
+            .pin_meta(key, &current, Some((&group.counter, group.budget)))
+            .is_err()
+        {
+            // The freed room does not fit this entry: stop paying for
+            // attempts in this group until another of its pins is released.
+            group.counter.freed.store(false, Ordering::Release);
+        }
     }
 
     /// Pin a just-admitted (or re-put) key when it falls under the policy.
@@ -1411,7 +1440,13 @@ pub struct ProtectionGroup {
 #[derive(Debug, Default)]
 struct GroupCounter {
     pinned: AtomicU64,
+    /// Set when one of this group's pins is released (its budget has room
+    /// again); cleared when a heal attempt finds the room insufficient.
+    freed: AtomicBool,
 }
+
+/// Hit-heal attempts granted per released group pin (SC4-3 review S1).
+const HEAL_ATTEMPTS_PER_FREE: u32 = 256;
 
 #[derive(Debug)]
 struct PolicyGroup {
@@ -2147,8 +2182,19 @@ mod tests {
         } else {
             (key_in(C1, "b"), key_in(C1, "a"))
         };
+        store
+            .put(key_in(C2, "other"), L2Class::Invariants, payload(64))
+            .await
+            .expect("put unrelated");
         assert!(store.remove(&pinned), "room frees");
         assert!(!store.is_protected(&skipped), "not healed until touched");
+        // Review S1: a hit on a key outside every group must not consume
+        // the heal that the freed room enables for g1.
+        store
+            .get(&key_in(C2, "other"))
+            .await
+            .expect("get unrelated")
+            .expect("hit unrelated");
         store.get(&skipped).await.expect("get").expect("hit");
         assert!(
             store.is_protected(&skipped),

@@ -1476,20 +1476,17 @@ impl CollectionService {
                 &uuid,
                 typed_identity,
             );
-            registry
-                .reserve_for_performance(
-                    &reservation_tenant,
-                    &uuid,
-                    chrono::Utc::now().timestamp(),
-                    &protect_prefixes,
-                )
-                .await
-                .context("TD-TIER-1 SC3: PERFORMANCE admission refused")?;
-            reserved_grant = crate::services::collection::reservation::GrantCompensation::armed(
-                registry.clone(),
+            reserved_grant = crate::services::collection::reservation::GrantCompensation::reserve(
+                registry,
                 reservation_tenant,
                 uuid.clone(),
+                chrono::Utc::now().timestamp(),
+                &protect_prefixes,
             );
+            reserved_grant
+                .committed()
+                .await
+                .context("TD-TIER-1 SC3: PERFORMANCE admission refused")?;
         }
         // Compensating release for every early exit after a successful
         // reserve (review B1: the grant must not outlive a failed create). A
