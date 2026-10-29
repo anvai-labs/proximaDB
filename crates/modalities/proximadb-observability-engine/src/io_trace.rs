@@ -140,9 +140,6 @@ impl IoOp {
     }
 }
 
-/// Per-query accumulator for the physical-dimension quantities the co-design
-/// cost model consumes. Held inside a [`tokio::task_local!`]; all counters are
-/// atomic so concurrent segment reads within one query aggregate correctly.
 /// Number of PAX cascade GET tiers in the per-tier attribution arrays
 /// ([`IoTrace::tier_get_ops`]); equals the SST `CacheTier` variant count.
 pub const PAX_TIER_COUNT: usize = 8;
@@ -164,6 +161,9 @@ where
     Ok(out)
 }
 
+/// Per-query accumulator for the physical-dimension quantities the co-design
+/// cost model consumes. Held inside a [`tokio::task_local!`]; all counters are
+/// atomic so concurrent segment reads within one query aggregate correctly.
 #[derive(Debug, Default)]
 pub struct IoTrace {
     get_ops: AtomicU64,

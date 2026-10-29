@@ -1304,7 +1304,11 @@ def test_request_cost_prices_lists_and_heads_separately() -> None:
     cost = HARNESS.request_cost_per_million_queries(
         gets=2770.0, requests=2786.0, lists=10.0, query_count=10
     )
-    assert cost["per_query"] == {"gets": 277.0, "heads": 0.6, "lists": 1.0}
+    assert cost["per_query"] == {
+        "ranged_gets": 277.0,
+        "heads_and_whole_gets": 0.6,
+        "lists": 1.0,
+    }
     assert cost["usd_per_million_queries"] == pytest.approx(277.0 * 0.40 + 0.6 * 0.40 + 5.0)
     assert cost["prices"]["as_of"] == "2026-10-29"
 

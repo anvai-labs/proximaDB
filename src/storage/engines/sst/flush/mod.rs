@@ -1086,7 +1086,11 @@ impl SstEngine {
         // early return here meant the training arm was never consulted: untrained
         // L0s stranded for good (measured on the 3M P5 bed — 4 untrained 57–61
         // MB L0s beside L1..L4). So the count arm is only the fallback; the
-        // training arm, when it fires, wins.
+        // training arm, when it fires, wins. Higher levels are deferred, not
+        // starved: the worker's follow-up re-evaluates at threshold 1
+        // (`training_follow_up_threshold`), and once L0 drains the builder
+        // falls through to the L1+ pair merges (the measured chain on the bed:
+        // L0 → L1 → L2 → L3 in one follow-up run).
         let count_due = (files.len() >= threshold).then_some(threshold);
         // TD-COMPACT-5 training arm — only meaningful when the A0-emitting
         // trainer is enabled (`PROXIMADB_PAX_WRITE_A0_TRAIN`, default ON).
@@ -1121,8 +1125,13 @@ impl SstEngine {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(32)
             .saturating_mul(1024 * 1024);
+        // Only L0 files: a threshold-1 task builds an L0 morsel, so an
+        // untrained L1+ file (block clustering off, a trainer fallback, a
+        // pre-trainer legacy file) could never self-clear and would re-arm a
+        // pointless training compaction on every flush. Skipping L1+ also
+        // keeps the per-flush header sniff to the few L0s.
         for path in &files {
-            if !path.url.ends_with(".pax") {
+            if !path.url.ends_with(".pax") || !is_l0_segment_url(&path.url) {
                 continue;
             }
             if let Ok(true) = self.segment_is_untrained(&path.url, min_bytes).await {
@@ -1157,6 +1166,18 @@ impl SstEngine {
             Err(_) => false,
         })
     }
+}
+
+/// Whether a segment URL names an L0 file, by the compaction executor's own
+/// rule (`CompactionFileNaming::parse_level`: an `L{n}_` basename prefix
+/// gives level `n`, anything else is level 0).
+fn is_l0_segment_url(url: &str) -> bool {
+    let name = url.rsplit('/').next().unwrap_or(url);
+    let level = name
+        .strip_prefix('L')
+        .and_then(|rest| rest.split_once('_'))
+        .and_then(|(digits, _)| digits.parse::<u32>().ok());
+    level.unwrap_or(0) == 0
 }
 
 /// L0 segment count at which compaction arms. Mirrors
@@ -2391,7 +2412,9 @@ mod tests {
             "a flush-written L0 carries no A0 directory (the premise)"
         );
         // A levelled ladder L1..L4 (one file each): the total reaches the
-        // default L0 threshold of 5, yet only one file is at L0.
+        // default L0 threshold of 5, yet only one file is at L0. The ladder
+        // files are byte copies, so they are untrained too — the block after
+        // this one proves only the L0 can arm the training arm.
         for level in 1..=4 {
             std::fs::copy(
                 &flushed,
@@ -2407,6 +2430,23 @@ mod tests {
             Some(1),
             "the training arm must win over the all-levels count arm"
         );
+
+        // Without the untrained L0, untrained L1+ files must NOT arm training
+        // (a threshold-1 L0 morsel cannot rewrite them, so the arm would
+        // re-fire every flush): only the count arm remains.
+        let parked = data_dir.join("parked.l0");
+        std::fs::rename(&flushed, &parked).unwrap();
+        std::fs::copy(&parked, data_dir.join("L1_ladder_5.pax")).unwrap();
+        assert_eq!(
+            engine
+                .should_trigger_compaction(storage_url, &tags)
+                .await
+                .unwrap(),
+            Some(L0_COMPACTION_THRESHOLD),
+            "untrained L1+ files alone fall back to the count arm"
+        );
+        std::fs::remove_file(data_dir.join("L1_ladder_5.pax")).unwrap();
+        std::fs::rename(&parked, &flushed).unwrap();
 
         // With a training compaction in flight the arm stays suppressed
         // (TD-COMPACT-8) and the count arm is the fallback, as before.
@@ -2426,6 +2466,19 @@ mod tests {
             std::env::remove_var("PROXIMADB_PAX_WRITE_A0_TRAIN");
             std::env::remove_var("PROXIMADB_TRAINING_COMPACTION_MIN_MB");
         }
+    }
+
+    #[test]
+    fn l0_segment_url_follows_the_executor_level_rule() {
+        assert!(is_l0_segment_url(
+            "s3://b/c/1/data/L0_20261029T000457_66765e2a.pax"
+        ));
+        assert!(is_l0_segment_url("/tmp/x/legacy_segment.pax"));
+        assert!(is_l0_segment_url("/tmp/x/Lfoo_bar.pax"));
+        assert!(!is_l0_segment_url(
+            "s3://b/c/1/data/L1_20261029T000435_7423d2ce.pax"
+        ));
+        assert!(!is_l0_segment_url("/tmp/x/L12_t_u.pax"));
     }
 
     fn collect_files_with_ext(dir: &std::path::Path, ext: &str, out: &mut Vec<std::path::PathBuf>) {

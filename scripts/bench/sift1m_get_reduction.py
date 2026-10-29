@@ -1639,16 +1639,18 @@ def request_cost_per_million_queries(
     gets: float, requests: float, lists: float, query_count: int
 ) -> dict[str, Any]:
     """Object-store request cost per million queries at ``REQUEST_PRICES``.
-    HEADs are the requests that are neither GETs nor LISTs."""
-    heads = max(requests - gets - lists, 0.0)
+    ``gets`` are the ranged GETs; every other non-LIST request (HEADs and
+    whole-object GETs, which the server does not split) is priced at the
+    HEAD rate, equal to the GET rate."""
+    other = max(requests - gets - lists, 0.0)
     per_query = {
-        "gets": gets / query_count,
-        "heads": heads / query_count,
+        "ranged_gets": gets / query_count,
+        "heads_and_whole_gets": other / query_count,
         "lists": lists / query_count,
     }
     usd = (
-        per_query["gets"] * REQUEST_PRICES["usd_per_million_get"]
-        + per_query["heads"] * REQUEST_PRICES["usd_per_million_head"]
+        per_query["ranged_gets"] * REQUEST_PRICES["usd_per_million_get"]
+        + per_query["heads_and_whole_gets"] * REQUEST_PRICES["usd_per_million_head"]
         + per_query["lists"] * REQUEST_PRICES["usd_per_million_list"]
     )
     return {

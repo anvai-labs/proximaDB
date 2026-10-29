@@ -23,5 +23,9 @@
   one new L0 reached 5, so each flush armed threshold 5; the executor, which counts L0s only, found too few
   and declined silently, and the training arm was never consulted. The 3M P5 schema bed stranded 4
   untrained 57–61 MB L0s this way and never settled. The training arm now runs first and wins; the count
-  arm is the fallback (also when the arm is suppressed in flight, TD-COMPACT-8). Test:
+  arm is the fallback (also when the arm is suppressed in flight, TD-COMPACT-8). The sniff now covers
+  L0 files only (by the executor's `L{n}_` level rule): a threshold-1 task builds an L0 morsel, so an
+  untrained L1+ file could never self-clear and would re-arm on every flush. Higher levels are deferred,
+  not starved: the training follow-up re-evaluates at threshold 1 and falls through to the L1+ pair
+  merges once L0 drains. Test:
   `training_arm_fires_even_when_all_level_count_reaches_threshold`.
