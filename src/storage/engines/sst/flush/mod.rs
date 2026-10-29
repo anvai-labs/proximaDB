@@ -1088,9 +1088,12 @@ impl SstEngine {
         // MB L0s beside L1..L4). So the count arm is only the fallback; the
         // training arm, when it fires, wins. Higher levels are deferred, not
         // starved: the worker's follow-up re-evaluates at threshold 1
-        // (`training_follow_up_threshold`), and once L0 drains the builder
-        // falls through to the L1+ pair merges (the measured chain on the bed:
-        // L0 → L1 → L2 → L3 in one follow-up run).
+        // (`training_follow_up_threshold`) and falls through to L1+ merges once
+        // L0 drains, and flushes landing during the chain see the retained
+        // in-flight guard, take the count arm below and enqueue L1+ merges whose
+        // inputs do not overlap the running L0 task. Bound: L1+ waits only while
+        // the L0 backlog stays >= threshold for the whole chain (ingest
+        // outrunning L0 compaction), the same bound the count arm had.
         let count_due = (files.len() >= threshold).then_some(threshold);
         // TD-COMPACT-5 training arm — only meaningful when the A0-emitting
         // trainer is enabled (`PROXIMADB_PAX_WRITE_A0_TRAIN`, default ON).
@@ -1168,16 +1171,17 @@ impl SstEngine {
     }
 }
 
-/// Whether a segment URL names an L0 file, by the compaction executor's own
-/// rule (`CompactionFileNaming::parse_level`: an `L{n}_` basename prefix
-/// gives level `n`, anything else is level 0).
+/// Whether a segment URL names an L0 file the compaction executor can act
+/// on, by the executor's OWN codec: its discovery admits only tiered names
+/// (`FilenameCodec::is_tiered_filename`) and reads their level with
+/// `parse_level`. A non-tiered `.pax` (e.g. `L0_recovery_*`) is invisible to
+/// the executor, so it must never arm the training arm either — no compaction
+/// could ever clear it.
 fn is_l0_segment_url(url: &str) -> bool {
+    use crate::storage::common::compaction_orchestrator::FilenameCodec;
+    static CODEC: std::sync::LazyLock<FilenameCodec> = std::sync::LazyLock::new(FilenameCodec::new);
     let name = url.rsplit('/').next().unwrap_or(url);
-    let level = name
-        .strip_prefix('L')
-        .and_then(|rest| rest.split_once('_'))
-        .and_then(|(digits, _)| digits.parse::<u32>().ok());
-    level.unwrap_or(0) == 0
+    CODEC.is_tiered_filename(name, "pax") && CODEC.parse_level(name) == 0
 }
 
 /// L0 segment count at which compaction arms. Mirrors
@@ -2418,7 +2422,7 @@ mod tests {
         for level in 1..=4 {
             std::fs::copy(
                 &flushed,
-                data_dir.join(format!("L{level}_ladder_{level}.pax")),
+                data_dir.join(format!("L{level}_20261029T00000{level}_0000000{level}.pax")),
             )
             .unwrap();
         }
@@ -2436,7 +2440,8 @@ mod tests {
         // re-fire every flush): only the count arm remains.
         let parked = data_dir.join("parked.l0");
         std::fs::rename(&flushed, &parked).unwrap();
-        std::fs::copy(&parked, data_dir.join("L1_ladder_5.pax")).unwrap();
+        let fifth = data_dir.join("L1_20261029T000005_00000005.pax");
+        std::fs::copy(&parked, &fifth).unwrap();
         assert_eq!(
             engine
                 .should_trigger_compaction(storage_url, &tags)
@@ -2445,7 +2450,7 @@ mod tests {
             Some(L0_COMPACTION_THRESHOLD),
             "untrained L1+ files alone fall back to the count arm"
         );
-        std::fs::remove_file(data_dir.join("L1_ladder_5.pax")).unwrap();
+        std::fs::remove_file(&fifth).unwrap();
         std::fs::rename(&parked, &flushed).unwrap();
 
         // With a training compaction in flight the arm stays suppressed
@@ -2469,16 +2474,18 @@ mod tests {
     }
 
     #[test]
-    fn l0_segment_url_follows_the_executor_level_rule() {
+    fn l0_segment_url_follows_the_executor_codec() {
         assert!(is_l0_segment_url(
             "s3://b/c/1/data/L0_20261029T000457_66765e2a.pax"
         ));
-        assert!(is_l0_segment_url("/tmp/x/legacy_segment.pax"));
-        assert!(is_l0_segment_url("/tmp/x/Lfoo_bar.pax"));
+        assert!(is_l0_segment_url("/tmp/x/L00_20261029T000457_66765e2a.pax"));
         assert!(!is_l0_segment_url(
             "s3://b/c/1/data/L1_20261029T000435_7423d2ce.pax"
         ));
-        assert!(!is_l0_segment_url("/tmp/x/L12_t_u.pax"));
+        // Not tiered ⇒ the executor never discovers it ⇒ never arms training.
+        assert!(!is_l0_segment_url("/tmp/x/L0_recovery_col1.pax"));
+        assert!(!is_l0_segment_url("/tmp/x/legacy_segment.pax"));
+        assert!(!is_l0_segment_url("/tmp/x/L0_20261029T000457_66765e2a.sst"));
     }
 
     fn collect_files_with_ext(dir: &std::path::Path, ext: &str, out: &mut Vec<std::path::PathBuf>) {

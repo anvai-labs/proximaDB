@@ -1298,7 +1298,7 @@ def test_tier_split_reads_each_tier_and_sums_region_d() -> None:
     assert set(split["tiers"]) == set(HARNESS.PAX_TIER_LABELS)
 
 
-def test_request_cost_prices_lists_and_heads_separately() -> None:
+def test_request_cost_prices_lists_separately_from_get_rate_requests() -> None:
     """$/M queries = GET and HEAD at the GET price, LIST at the LIST price;
     HEADs are requests that are neither GETs nor LISTs."""
     cost = HARNESS.request_cost_per_million_queries(

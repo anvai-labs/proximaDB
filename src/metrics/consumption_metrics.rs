@@ -77,7 +77,8 @@ lazy_static! {
     );
     /// TD-FPRUNE-1 PR-A: per-tenant physical object-store LISTs, the subset
     /// of [`OBJECT_STORE_REQUESTS_TOTAL`] priced per LIST rather than per GET
-    /// (HEADs = requests − GETs − LISTs). Neutral count only.
+    /// (requests − ranged GETs − LISTs = HEADs plus whole-object GETs, which
+    /// this surface does not split). Neutral count only.
     pub static ref OBJECT_STORE_LISTS_TOTAL: CounterVec = registered_counter_vec(
         "proximadb_object_store_lists_total",
         "Per-tenant physical object-store LIST requests (TD-FPRUNE-1 PR-A)",
