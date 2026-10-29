@@ -1,7 +1,7 @@
 //! Wall-clock helpers shared across the workspace.
 //!
 //! These exist so each subsystem does not re-implement (and drift on) the
-//! `SystemTime::now → UNIX epoch → millis` idiom.
+//! `SystemTime::now → UNIX epoch → millis/nanos` idiom.
 
 /// Current UNIX epoch time in milliseconds.
 ///
@@ -35,5 +35,14 @@ mod tests {
         assert!(b >= a, "clock must not go backwards: {a} -> {b}");
         // Sanity: later than 2020-01-01, earlier than 2100-01-01.
         assert!(a > 1_577_836_800_000 && a < 4_102_344_000_000);
+    }
+
+    #[test]
+    fn now_unix_ns_is_plausible_and_agrees_with_ms() {
+        let ns = now_unix_ns();
+        let ms = now_unix_ms();
+        // Later than 2020-01-01 in ns, and within a second of the ms clock.
+        assert!(ns > 1_577_836_800_000_000_000, "epoch nanos: {ns}");
+        assert!((ns / 1_000_000 - ms).abs() < 1_000, "ns {ns} vs ms {ms}");
     }
 }

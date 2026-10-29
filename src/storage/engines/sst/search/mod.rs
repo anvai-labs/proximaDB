@@ -3205,13 +3205,8 @@ mod tests {
     #[tokio::test]
     async fn s2_multicore_arc_matches_sequential() {
         use crate::core::search::SearchParams;
-        use crate::proto::proximadb_v1::{
-            Collection, CollectionConfig, StorageAssignment, StorageConfig,
-        };
-        use crate::storage::persistence::filesystem::FilesystemConfig;
         use crate::storage::traits::{FlushParameters, StorageQueryContext, StorageQueryMetadata};
         use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
-        use tempfile::TempDir;
 
         let dim = 64usize;
         let cid = "s2_multicore_test";
@@ -3316,21 +3311,13 @@ mod tests {
     #[tokio::test]
     async fn ttl_expired_pax_rows_never_return_live() {
         use crate::core::search::SearchParams;
-        use crate::proto::proximadb_v1::{
-            Collection, CollectionConfig, StorageAssignment, StorageConfig,
-        };
-        use crate::storage::persistence::filesystem::FilesystemConfig;
         use crate::storage::traits::{FlushParameters, StorageQueryContext, StorageQueryMetadata};
         use proximadb_records::{EmbeddingCell, ProximaRecord};
-        use tempfile::TempDir;
 
         let dim = 16usize;
         let cid = "ttl_expired_pax";
         let (engine, collection) = file_backed_test_engine(cid, dim, None).await;
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
+        let now_ns = proximadb_kernel::time::now_unix_ns();
         // The expired row is the EXACT query vector, so it is the top hit
         // whenever it is (wrongly) treated as live.
         let query: Vec<f32> = (0..dim).map(|j| (j as f32) * 0.05).collect();

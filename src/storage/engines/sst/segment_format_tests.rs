@@ -2588,7 +2588,6 @@ async fn stage_f_never_prunes_a_user_prop_on_a_same_named_canonical_column() {
     unsafe {
         std::env::set_var("PROXIMADB_PAX_FOOTER_STATS", "1");
     }
-    use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
 
     const DIM: usize = 16;
     const N: usize = 600;
@@ -2643,7 +2642,6 @@ async fn stage_f_does_not_prune_on_canonical_column_stats() {
     unsafe {
         std::env::set_var("PROXIMADB_PAX_FOOTER_STATS", "1");
     }
-    use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
 
     const DIM: usize = 32;
     const N: usize = 1200;
