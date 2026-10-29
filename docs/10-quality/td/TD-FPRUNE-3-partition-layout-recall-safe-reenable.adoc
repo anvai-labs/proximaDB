@@ -21,14 +21,19 @@ probe budget (~21 cells/query here) covers only one or two cells per group.
 Measured on the settled 3M SIFT128 e1p bed (MinIO + toxiproxy, object_cold, n=1000, same binary
 `08f25648a`, same harness args):
 
-[cols="3,2,1,1,1", options="header"]
+[cols="3,2,1,1,1,1", options="header"]
 |===
-| Arm | Cells | recall@10 | MB/q | Region-D MB/q
-| filterable columns declared, layout ON (the then default) | 10 + 100 | **0.855** | 149.9 | 69.7
-| same, residual tail OFF | 10 + 100 | 0.865 | 168.4 | 89.4
-| no filterable columns | 8 + 50 | 0.9706 | 171.4 | 69.5
-| filterable columns declared, layout OFF | 96 + 96 | **0.9716** | 133.2 | 44.0
+| Arm | Cells | Cells probed/q | recall@10 | MB/q | Region-D MB/q
+| filterable columns declared, layout ON (the then default) | 10 + 100 | 21 of 105 | **0.855** | 149.9 | 69.7
+| same, residual tail OFF | 10 + 100 | 21 of 105 | 0.865 | 168.4 | 89.4
+| no filterable columns | 8 + 50 | 16 of 58 | 0.9706 | 171.4 | 69.5
+| filterable columns declared, layout OFF | 96 + 96 | 40 of 192 | **0.9716** | 133.2 | 44.0
 |===
+
+The arms do not share a probe budget (the reader's nprobe follows the cell count), so the ON/OFF pair
+is not an equal-probe comparison. The conclusion does not rest on it: the no-schema arm reaches 0.9706
+at a smaller budget (16 of 58, ~28%) than the ON arm (21 of 105, ~20%), and both layout-ON arms sit
+at 0.855–0.865 regardless of the residual tail.
 
 The 100-cell segment is exactly 10 groups × 10 cells. The "unfiltered recall neutral (Δ=0.000)"
 evidence the flip-ON relied on was toy-scale (a 512-row unit corpus comparing *filtered* recall,
@@ -47,3 +52,15 @@ Re-enable the layout (default or per collection) only with a change that keeps u
 
 Gate: on the 3M schema bed, layout ON reaches recall@10 ≥ 0.97 unfiltered AND keeps C1's filtered
 byte cut (filtered cat3 bytes/q below the layout-OFF arm), n=1000, object_cold.
+
+== Open questions
+
+* *Filtered cost of the flip is unmeasured at 3M.* Turning the layout off gives up C1's filtered byte
+  cut for declared-schema collections; the filtered cat3 arm on the layout-OFF bed is the measurement.
+* *Layout-OFF geometry looks odd.* The layout-OFF schema bed settled at 96 + 96 cells, where the
+  smaller segment covers only 338,800 rows (~3.5k rows/cell) and reports `coarse_trained_rows`
+  2,661,200 — the larger segment's row count — while the no-schema bed settled at 8 + 50. Either a
+  harness reporting mix-up or a shared/collection model (TD-PAXDIR-1) being reused across segments;
+  check before any re-enable measurement leans on cell counts.
+* *Value semantics changed.* The gate used to treat anything except `0/off/false/no` as ON; it now
+  accepts only `1/true/on/yes`. Only an operator who enabled it with a non-standard value is affected.

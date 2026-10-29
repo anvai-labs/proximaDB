@@ -1086,6 +1086,18 @@ pub fn partition_layout_enabled() -> bool {
     env_gate_on("PROXIMADB_PAX_PARTITION_LAYOUT")
 }
 
+/// Pure parse of an opt-in gate value (shared by [`env_gate_on`]): only
+/// `1|true|on|yes` (trimmed, case-insensitive) is ON; unset or anything else
+/// is OFF.
+fn gate_value_on(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
 /// Boolean gate read: truthy = `1|true|on|yes`.
 pub(crate) fn env_kill_switch_off(name: &str) -> bool {
     std::env::var(name)
@@ -1099,15 +1111,7 @@ pub(crate) fn env_kill_switch_off(name: &str) -> bool {
 }
 
 pub(crate) fn env_gate_on(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
-            )
-        })
-        .unwrap_or(false)
+    gate_value_on(std::env::var(name).ok().as_deref())
 }
 
 /// The persisted IVF probe directory compaction plan (rev 3): the physical row
@@ -1636,9 +1640,7 @@ mod tests {
     /// engages it.
     #[test]
     fn partition_layout_is_opt_in() {
-        let key = "PROXIMADB_PAX_PARTITION_LAYOUT";
-        unsafe { std::env::remove_var(key) };
-        assert!(!partition_layout_enabled(), "unset must be OFF");
+        assert!(!gate_value_on(None), "unset must be OFF");
         for (value, on) in [
             ("1", true),
             ("on", true),
@@ -1648,11 +1650,11 @@ mod tests {
             ("off", false),
             ("", false),
             ("bogus", false),
+            ("enabled", false),
+            (" On ", true),
         ] {
-            unsafe { std::env::set_var(key, value) };
-            assert_eq!(partition_layout_enabled(), on, "{key}={value:?}");
+            assert_eq!(gate_value_on(Some(value)), on, "{value:?}");
         }
-        unsafe { std::env::remove_var(key) };
     }
 
     #[test]

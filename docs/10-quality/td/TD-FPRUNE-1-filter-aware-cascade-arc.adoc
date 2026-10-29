@@ -64,7 +64,7 @@ residual filter as the correctness backstop.
   serial rehydrate ~27 MB/q of the same top-k blocks) — the PR-D L4 target.
 
 *Evidence:* filtered recall@10 = **0.996** vs filtered brute force (floor 0.90, N=10k, 8 partitions);
-C1 integrated filtered stack **4.2× byte cut** at recall parity (correlated data); C2 unfiltered recall Δ=0.000.
+C1 integrated filtered stack **4.2× byte cut** at recall parity (correlated data); C2 unfiltered recall Δ=0.000 (toy scale; superseded at 3M by TD-FPRUNE-3, where the layout cost 0.855 vs 0.9716).
 
 == Open
 

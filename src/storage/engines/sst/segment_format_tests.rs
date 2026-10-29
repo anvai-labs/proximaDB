@@ -4835,8 +4835,8 @@ async fn filtered_stack_get_byte_breakdown() {
             // of the arm.
             std::env::set_var("PROXIMADB_PAX_FILTERED_CASCADE", "1");
             std::env::set_var("PROXIMADB_PAX_FOOTER_STATS", "1");
-            // Explicit "1"/"0" (layout is now default-on, C2): "0" pins the OFF
-            // arm to the global layout via the kill-switch.
+            // Explicit "1"/"0" (the layout is opt-in since TD-FPRUNE-3): "1"
+            // engages it for the ON arm, "0" pins the global layout.
             std::env::set_var(
                 "PROXIMADB_PAX_PARTITION_LAYOUT",
                 if m2_on { "1" } else { "0" },
@@ -5088,8 +5088,8 @@ async fn m2_unfiltered_recall_neutral_vs_global() {
             std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
             std::env::set_var("PROXIMADB_IVF_K", "64");
             // Explicit "1"/"0" (not present/absent) so this eval is robust to
-            // the default flip — the off case is the GLOBAL layout via the
-            // kill-switch, on is the partition layout.
+            // the default — "0" is the GLOBAL layout, "1" the opt-in
+            // partition layout.
             std::env::set_var(
                 "PROXIMADB_PAX_PARTITION_LAYOUT",
                 if m2_on { "1" } else { "0" },
