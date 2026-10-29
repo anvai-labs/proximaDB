@@ -1855,11 +1855,15 @@ mod tests {
     async fn grants_arm_the_process_residency_budget() {
         let _guard = budget_cell_gate();
 
+        // Registration is first-wins per process: in a shared-process run a
+        // sibling test (or an SST engine test) may already own it. Assert
+        // against WHICHEVER store is registered, never on winning.
         let store_dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(
+        let candidate = std::sync::Arc::new(
             proximadb_cache::PersistentByteStore::open(store_dir.path(), 1 << 20).unwrap(),
         );
-        assert!(proximadb_cache::register_process_store(store.clone()));
+        let _ = proximadb_cache::register_process_store(candidate);
+        let store = proximadb_cache::process_store().expect("a store is registered");
 
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = pool_config(&dir, "p1", 0);
@@ -1898,11 +1902,9 @@ mod tests {
         );
     }
 
-    /// SF2: a restart with LIVE grants arms the store at open — no mutation
-    /// needed. (Drops the registry with a live grant, reopens on the same
-    /// pool, asserts the second registration-of-store... the bridge keeps
-    /// the FIRST registered store, so assert through the cell + a fresh
-    /// store reading it at registration.)
+    /// SF2: a restart with LIVE grants arms the budget at open — no mutation
+    /// needed. Asserted through the process cell (the bridge applies the
+    /// cell to whichever store registers, whenever it registers).
     #[tokio::test]
     async fn reopen_with_live_grants_arms_the_budget_at_open() {
         let _guard = budget_cell_gate();
@@ -1922,26 +1924,21 @@ mod tests {
             .unwrap();
         drop(registry); // "crash": the grant is durable in the pool ledger
 
-        let reopened = ReservationRegistry::open_from_config(&[cfg])
+        // Overwrite the cell with a sentinel so ONLY the reopen's at-open
+        // sync can restore 2048 (without this, the first registry's reserve
+        // leaves 2048 behind and the assertion passes even with the at-open
+        // sync deleted — the verification round's vacuity finding).
+        proximadb_cache::set_process_reserved_budget(7);
+
+        let _reopened = ReservationRegistry::open_from_config(&[cfg])
             .await
             .unwrap()
             .unwrap();
-        // The at-open sync pushed the reconciled 2048 into the cell; a
-        // store registering NOW picks it up (order-independence both ways).
         assert_eq!(
             proximadb_cache::process_reserved_budget(),
             2048,
             "reopen pushes the reconciled charged budget"
         );
-        let store_dir = tempfile::tempdir().unwrap();
-        let fresh = std::sync::Arc::new(
-            proximadb_cache::PersistentByteStore::open(store_dir.path(), 1 << 20).unwrap(),
-        );
-        // Note: registration may lose first-wins to the sibling test's store
-        // in a shared process — the CELL is the assertion that matters.
-        let _ = proximadb_cache::register_process_store(fresh);
-        assert_eq!(proximadb_cache::process_reserved_budget(), 2048);
-        let _ = reopened;
     }
 
     // ---- SC3-2: ReservationRegistry ----
