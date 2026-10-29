@@ -140,6 +140,27 @@ impl IoOp {
     }
 }
 
+/// Number of PAX cascade GET tiers in the per-tier attribution arrays
+/// ([`IoTrace::tier_get_ops`]); equals the SST `CacheTier` variant count.
+pub const PAX_TIER_COUNT: usize = 8;
+
+/// Deserialize a per-tier array written by any build with `<= PAX_TIER_COUNT`
+/// tiers (snapshots before TD-FPRUNE-1 PR-A carry 6), zero-padding the tiers
+/// that build did not have. Mixed-read-safe: a fixed `[u64; N]` would reject
+/// every older snapshot. Extra entries (a newer build) fold into nothing and
+/// are dropped rather than failing the whole snapshot.
+fn de_tier_array<'de, D>(deserializer: D) -> Result<[u64; PAX_TIER_COUNT], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values: Vec<u64> = serde::Deserialize::deserialize(deserializer)?;
+    let mut out = [0u64; PAX_TIER_COUNT];
+    for (slot, value) in out.iter_mut().zip(values) {
+        *slot = value;
+    }
+    Ok(out)
+}
+
 /// Per-query accumulator for the physical-dimension quantities the co-design
 /// cost model consumes. Held inside a [`tokio::task_local!`]; all counters are
 /// atomic so concurrent segment reads within one query aggregate correctly.
@@ -214,13 +235,15 @@ pub struct IoTrace {
     /// TD-RDSTRAT-13 C1: per-tier physical-GET attribution for the SST PAX
     /// cascade. Index = the SST `CacheTier` declaration order (fixed contract):
     /// 0=InvariantIndex(IdxA), 1=SearchControl(Ctl), 2=InvariantMeta(Meta),
-    /// 3=ProbeIndex(ProbeA), 4=SurvivorPayload(Surv), 5=ResultPayload(OID).
+    /// 3=ProbeIndex(ProbeA), 4=SurvivorPayload(Surv), 5=ResultPayload(OID),
+    /// 6=FilterRowAllow(FiltD, the filtered Stage-F Region-D pass),
+    /// 7=Rehydrate(Rehyd, the top-k record rehydration pass).
     /// Always-on (like the `ivf_*` fields); recorded 1:1 with physical ranged
     /// GETs at the read sites, so `Σ tier_get_ops == range_gets` for a query
     /// whose GETs all come from the PAX cascade. Makes the "unwaved metadata
     /// GETs" the S3 campaign decomposed observable per query.
-    tier_get_ops: [AtomicU64; 6],
-    tier_get_bytes: [AtomicU64; 6],
+    tier_get_ops: [AtomicU64; PAX_TIER_COUNT],
+    tier_get_bytes: [AtomicU64; PAX_TIER_COUNT],
     /// Object-storage metadata ops (`fs.metadata` HEAD) on the search path
     /// (TD-RDSTRAT-13 C3 removes the per-segment HEAD; this counter is how the
     /// removal is proven — `metadata_ops == 0` on the known-size path).
@@ -900,12 +923,13 @@ impl IoTrace {
     }
 
     /// Record one physical ranged GET attributed to PAX cascade tier
-    /// `tier_idx` (contract: the SST `CacheTier` declaration order, 0..6 —
+    /// `tier_idx` (contract: the SST `CacheTier` declaration order,
+    /// `0..PAX_TIER_COUNT` —
     /// see the field docs). Out-of-range indices are dropped: a tier added on
     /// the SST side without widening this array must fail the drift test, not
     /// silently fold into another tier.
     pub fn record_tier_get(&self, tier_idx: usize, bytes: u64) {
-        if tier_idx < 6 {
+        if tier_idx < PAX_TIER_COUNT {
             self.tier_get_ops[tier_idx].fetch_add(1, Ordering::Relaxed);
             self.tier_get_bytes[tier_idx].fetch_add(bytes, Ordering::Relaxed);
         }
@@ -1299,10 +1323,10 @@ pub struct IoTraceSnapshot {
     pub read_ranges_fetch_rounds: u64,
     /// TD-RDSTRAT-13 C1: per-tier physical-GET attribution (index contract on
     /// [`IoTrace::tier_get_ops`]).
-    #[serde(default)]
-    pub tier_get_ops: [u64; 6],
-    #[serde(default)]
-    pub tier_get_bytes: [u64; 6],
+    #[serde(default, deserialize_with = "de_tier_array")]
+    pub tier_get_ops: [u64; PAX_TIER_COUNT],
+    #[serde(default, deserialize_with = "de_tier_array")]
+    pub tier_get_bytes: [u64; PAX_TIER_COUNT],
     /// Object-storage metadata ops (HEAD) on the search path (C3).
     #[serde(default)]
     pub metadata_ops: u64,
@@ -2856,6 +2880,33 @@ mod tests {
         obj.remove("survivor_l1_misses");
         let legacy: IoTraceSnapshot = serde_json::from_value(v).unwrap();
         assert_eq!((legacy.survivor_l1_hits, legacy.survivor_l1_misses), (0, 0));
+    }
+
+    /// TD-FPRUNE-1 PR-A widened the tier arrays from 6 to 8. A snapshot
+    /// written before that (6 entries) must still deserialize, with the new
+    /// tiers zeroed, and a round-trip must keep all 8.
+    #[test]
+    fn tier_arrays_deserialize_from_six_tier_legacy_json() {
+        let mut v = serde_json::to_value(IoTraceSnapshot::default()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.insert("tier_get_ops".into(), serde_json::json!([1, 2, 3, 4, 5, 6]));
+        obj.insert(
+            "tier_get_bytes".into(),
+            serde_json::json!([10, 20, 30, 40, 50, 60]),
+        );
+        let legacy: IoTraceSnapshot = serde_json::from_value(v).unwrap();
+        assert_eq!(legacy.tier_get_ops, [1, 2, 3, 4, 5, 6, 0, 0]);
+        assert_eq!(legacy.tier_get_bytes, [10, 20, 30, 40, 50, 60, 0, 0]);
+
+        let t = IoTrace::new();
+        t.record_tier_get(6, 100);
+        t.record_tier_get(7, 200);
+        t.record_tier_get(PAX_TIER_COUNT, 999); // out of range: dropped
+        let s = t.snapshot();
+        let back: IoTraceSnapshot =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.tier_get_ops, [0, 0, 0, 0, 0, 0, 1, 1]);
+        assert_eq!(back.tier_get_bytes, [0, 0, 0, 0, 0, 0, 100, 200]);
     }
 
     #[tokio::test]

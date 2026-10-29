@@ -1219,7 +1219,18 @@ pub(crate) async fn pax_filtered_row_allow(
     use proximadb_block_format::{PaxBlockReader, RowAllow, evaluate_block, record::FlatRow};
     use proximadb_storage_common::segment_layout::{SegmentFooterIndex, SegmentHeaderPrefix};
 
+    // TD-FPRUNE-1 PR-A: every GET here is attributed to the `FilterRowAllow`
+    // tier, and the wall is split into time awaiting reads (`fetch_us`) and
+    // time decoding + evaluating (`decode_us`). Reads are serial today, so
+    // `fetch_us` is the sum of their round trips.
+    let trace_on = get_trace_on();
+    let mut fetch_us = 0u64;
+    let mut decode_us = 0u64;
+    let fetch_started = std::time::Instant::now();
+
     // 1. Header prefix → coalesced? (mirrors the cascade's detection).
+    crate::observability::io_trace::record_metadata_op();
+    crate::storage::engines::sst::metrics::record_metadata_op();
     let size = fs
         .metadata(path)
         .await
@@ -1234,6 +1245,7 @@ pub(crate) async fn pax_filtered_row_allow(
         .read_range(path, 0, read_len)
         .await
         .map_err(|e| anyhow::anyhow!("filtered stage-F header {path}: {e}"))?;
+    record_get_physical(CacheTier::FilterRowAllow, read_len, trace_on);
     let header = match SegmentHeaderPrefix::parse(&header_bytes) {
         Ok(h) => h,
         Err(_) => return Ok(None), // not coalesced → exact fallback
@@ -1244,6 +1256,8 @@ pub(crate) async fn pax_filtered_row_allow(
         .read_range(path, header.footer_off, header.footer_len)
         .await
         .map_err(|e| anyhow::anyhow!("filtered stage-F footer {path}: {e}"))?;
+    record_get_physical(CacheTier::FilterRowAllow, header.footer_len, trace_on);
+    fetch_us += fetch_started.elapsed().as_micros() as u64;
     let footer = SegmentFooterIndex::parse(&footer_bytes)?;
     // TD-FPRUNE-1 P2 engagement: resolve filter field names → PAX col-ids via
     // the segment's self-describing shred field-map (written from the P-Shred
@@ -1341,11 +1355,16 @@ pub(crate) async fn pax_filtered_row_allow(
         },
     );
     let fetches = plan_coalesced_block_ranges(&footer, &candidate_blocks, &policy);
+    let mut rows_decoded = 0u64;
     for fetch in &fetches {
+        let fetch_started = std::time::Instant::now();
         let buf = fs
             .read_range(path, fetch.start, fetch.end - fetch.start)
             .await
             .map_err(|e| anyhow::anyhow!("filtered stage-F blocks {path}: {e}"))?;
+        record_get_physical(CacheTier::FilterRowAllow, fetch.end - fetch.start, trace_on);
+        let decode_started = std::time::Instant::now();
+        fetch_us += decode_started.duration_since(fetch_started).as_micros() as u64;
         for &bi in &fetch.blocks {
             let Some(b) = footer.blocks.get(bi) else {
                 continue;
@@ -1379,12 +1398,14 @@ pub(crate) async fn pax_filtered_row_allow(
                 let props = flat
                     .props_tree()
                     .map_err(|e| anyhow::anyhow!("filtered stage-F props {path}: {e}"))?;
+                rows_decoded += 1;
                 if crate::core::search::sql_value_filter::evaluate_filter_proxima(filter, &props) {
                     allow.insert(start_ordinal + local);
                     stats.rows_matched += 1;
                 }
             }
         }
+        decode_us += decode_started.elapsed().as_micros() as u64;
     }
     tracing::debug!(
         path,
@@ -1401,6 +1422,17 @@ pub(crate) async fn pax_filtered_row_allow(
     crate::observability::io_trace::record_pax_footer_prune(
         stats.blocks_total as u64,
         stats.blocks_pruned_footer as u64,
+    );
+    crate::storage::engines::sst::metrics::record_stage_f(
+        &crate::storage::engines::sst::metrics::StageFOutcome {
+            blocks_total: stats.blocks_total as u64,
+            blocks_pruned_footer: stats.blocks_pruned_footer as u64,
+            blocks_pruned_decode: stats.blocks_pruned as u64,
+            rows_decoded,
+            rows_matched: stats.rows_matched as u64,
+            fetch_us,
+            decode_us,
+        },
     );
     Ok(Some((allow, stats)))
 }
@@ -1431,6 +1463,7 @@ pub(crate) async fn read_records_by_positions(
     // TD-RDSTRAT-13 PR-B: attribute the whole rehydration pass (metadata +
     // header/footer + block fetches + decode) — the second Region-D read.
     let rehydrate_started = std::time::Instant::now();
+    let trace_on = get_trace_on();
     let mut out: Vec<Option<proximadb_records::ProximaRecord>> = vec![None; positions.len()];
     if positions.is_empty() {
         return Ok(out);
@@ -1458,6 +1491,8 @@ pub(crate) async fn read_records_by_positions(
                 }
             }
         } else {
+            crate::observability::io_trace::record_metadata_op();
+            crate::storage::engines::sst::metrics::record_metadata_op();
             let size = fs
                 .metadata(path)
                 .await
@@ -1471,12 +1506,14 @@ pub(crate) async fn read_records_by_positions(
                 .read_range(path, 0, read_len)
                 .await
                 .map_err(|e| anyhow::anyhow!("rehydrate header {path}: {e}"))?;
+            record_get_physical(CacheTier::Rehydrate, read_len, trace_on);
             let header = SegmentHeaderPrefix::parse(&header_bytes)
                 .map_err(|e| anyhow::anyhow!("rehydrate header parse {path}: {e}"))?;
             let footer_bytes = fs
                 .read_range(path, header.footer_off, header.footer_len)
                 .await
                 .map_err(|e| anyhow::anyhow!("rehydrate footer {path}: {e}"))?;
+            record_get_physical(CacheTier::Rehydrate, header.footer_len, trace_on);
             let footer = SegmentFooterIndex::parse(&footer_bytes)?;
             (header, footer)
         };
@@ -1532,10 +1569,14 @@ pub(crate) async fn read_records_by_positions(
         });
         let buf = match &handed_blocks {
             Some(_) => Vec::new(),
-            None => fs
-                .read_range(path, fetch.start, fetch.end - fetch.start)
-                .await
-                .map_err(|e| anyhow::anyhow!("rehydrate blocks {path}: {e}"))?,
+            None => {
+                let buf = fs
+                    .read_range(path, fetch.start, fetch.end - fetch.start)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("rehydrate blocks {path}: {e}"))?;
+                record_get_physical(CacheTier::Rehydrate, fetch.end - fetch.start, trace_on);
+                buf
+            }
         };
         for (i, &bi) in fetch.blocks.iter().enumerate() {
             let Some(b) = footer.blocks.get(bi) else {
@@ -2968,6 +3009,13 @@ pub enum CacheTier {
     SurvivorPayload,
     /// Region D OID ranges: variable, query-dependent.
     ResultPayload,
+    /// Filtered Stage-F Region-D pass (`pax_filtered_row_allow`): header,
+    /// footer and every candidate D block, per segment per filtered query.
+    FilterRowAllow,
+    /// Top-k record rehydration (`read_records_by_positions`): header, footer
+    /// and the blocks holding the hits, when not served from the cache or
+    /// the cascade's hand-off.
+    Rehydrate,
 }
 
 impl CacheTier {
@@ -2980,13 +3028,15 @@ impl CacheTier {
             Self::ProbeIndex => "ProbeA",
             Self::SurvivorPayload => "Surv",
             Self::ResultPayload => "OID",
+            Self::FilterRowAllow => "FiltD",
+            Self::Rehydrate => "Rehyd",
         }
     }
     /// Eviction priority (lower = evict first under memory pressure). Region A is
     /// pinned (a hit saves the most); query-dependent ranges are evicted first.
     pub fn evict_priority(self) -> u8 {
         match self {
-            Self::ProbeIndex | Self::SurvivorPayload => 0,
+            Self::ProbeIndex | Self::SurvivorPayload | Self::FilterRowAllow | Self::Rehydrate => 0,
             Self::ResultPayload => 1,
             Self::InvariantMeta => 2,
             Self::InvariantIndex | Self::SearchControl => 3,
@@ -3017,6 +3067,12 @@ fn record_get_physical(tier: CacheTier, len: u64, trace_on: bool) {
     if trace_on {
         record_get(tier, len);
     }
+}
+
+/// Whether the env-gated per-GET diagnostic trace (`record_get`) is on.
+fn get_trace_on() -> bool {
+    std::env::var_os("PROXIMADB_TRACE_GETS").is_some()
+        || std::env::var_os("PROXIMADB_TRACE_PAX_STAGES").is_some()
 }
 
 /// Drain the recorded per-GET (tier, size) pairs (empty when trace is off).
@@ -4284,8 +4340,7 @@ pub async fn rabitq_search_segment_coalesced_allowed(
     // is set, every read_range in this path records its on-disk byte length; the
     // eval drains it to print the distribution (GET count = the same-region
     // billing metric; GET sizes = the latency metric). Off by default (zero cost).
-    let trace_on = std::env::var_os("PROXIMADB_TRACE_GETS").is_some()
-        || std::env::var_os("PROXIMADB_TRACE_PAX_STAGES").is_some();
+    let trace_on = get_trace_on();
 
     // PR2: check the per-segment invariants cache. On hit, skip the 3
     // read_range calls (header + region + footer) → 3 GETs → 0 (hot path).

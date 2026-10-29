@@ -44,7 +44,8 @@ fn v4_header_get_fetches_88_bytes() {
 
 /// TD-RDSTRAT-13 C1: `record_get_physical` passes `tier as usize` into the
 /// io_trace/SST per-tier arrays, whose index order is a documented
-/// cross-crate contract (0=IdxA, 1=Ctl, 2=Meta, 3=ProbeA, 4=Surv, 5=OID).
+/// cross-crate contract (0=IdxA, 1=Ctl, 2=Meta, 3=ProbeA, 4=Surv, 5=OID,
+/// 6=FiltD, 7=Rehyd).
 /// Reordering the enum would silently fold one tier's GETs into another's
 /// counters — pin it.
 #[test]
@@ -55,18 +56,22 @@ fn cache_tier_discriminant_matches_tier_counter_contract() {
     assert_eq!(CacheTier::ProbeIndex as usize, 3);
     assert_eq!(CacheTier::SurvivorPayload as usize, 4);
     assert_eq!(CacheTier::ResultPayload as usize, 5);
+    assert_eq!(CacheTier::FilterRowAllow as usize, 6);
+    assert_eq!(CacheTier::Rehydrate as usize, 7);
     let labels = crate::storage::engines::sst::metrics::TIER_LABELS;
-    for (tier, label) in [
+    let tiers = [
         CacheTier::InvariantIndex,
         CacheTier::SearchControl,
         CacheTier::InvariantMeta,
         CacheTier::ProbeIndex,
         CacheTier::SurvivorPayload,
         CacheTier::ResultPayload,
-    ]
-    .into_iter()
-    .zip(labels)
-    {
+        CacheTier::FilterRowAllow,
+        CacheTier::Rehydrate,
+    ];
+    assert_eq!(tiers.len(), crate::observability::io_trace::PAX_TIER_COUNT);
+    assert_eq!(labels.len(), tiers.len());
+    for (tier, label) in tiers.into_iter().zip(labels) {
         assert_eq!(tier.label(), label);
     }
 }
@@ -2533,10 +2538,32 @@ async fn stage_f_row_allow_set_is_exact() {
     let p = path.to_str().unwrap();
 
     let filter = partition_filter("p3");
-    let (allow, stats) = pax_filtered_row_allow(&fs, p, &filter)
-        .await
-        .unwrap()
-        .expect("coalesced segment must produce a stage-F allow-set");
+    let ((allow, stats), snap) = crate::observability::io_trace::scope(async {
+        let built = pax_filtered_row_allow(&fs, p, &filter)
+            .await
+            .unwrap()
+            .expect("coalesced segment must produce a stage-F allow-set");
+        (built, crate::observability::io_trace::snapshot())
+    })
+    .await;
+    // TD-FPRUNE-1 PR-A: every Stage-F GET is attributed to the FiltD tier —
+    // per-tier ops/bytes reconcile exactly with the physical ranged reads,
+    // and no other tier is charged.
+    let snap = snap.expect("io_trace scope active");
+    let filt = CacheTier::FilterRowAllow as usize;
+    assert!(
+        snap.range_gets >= 3,
+        "header + footer + >=1 block: {snap:?}"
+    );
+    assert_eq!(snap.tier_get_ops[filt], snap.range_gets);
+    assert_eq!(snap.tier_get_bytes[filt], snap.bytes_read);
+    assert_eq!(
+        snap.tier_get_ops.iter().sum::<u64>(),
+        snap.tier_get_ops[filt],
+        "no other tier charged: {:?}",
+        snap.tier_get_ops
+    );
+    assert_eq!(snap.metadata_ops, 1, "one HEAD per Stage-F build");
 
     // Independent verification: decode every D-block row in file order and
     // recompute the expected ordinal set from each row's props.

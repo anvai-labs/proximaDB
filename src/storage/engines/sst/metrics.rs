@@ -94,6 +94,38 @@ lazy_static! {
         "proximadb_rehydrate_us_agg_total",
         "Cumulative top-k rehydration wall microseconds (TD-RDSTRAT-13 PR-B)",
     );
+    pub static ref STAGE_F_CALLS: IntCounter = counter(
+        "proximadb_stage_f_calls_agg_total",
+        "Filtered Stage-F row allow-set builds, one per coalesced segment per filtered query (TD-FPRUNE-1 PR-A)",
+    );
+    pub static ref STAGE_F_BLOCKS_TOTAL: IntCounter = counter(
+        "proximadb_stage_f_blocks_agg_total",
+        "Region-D blocks considered by filtered Stage F (TD-FPRUNE-1 PR-A)",
+    );
+    pub static ref STAGE_F_BLOCKS_PRUNED_FOOTER: IntCounter = counter(
+        "proximadb_stage_f_blocks_pruned_footer_agg_total",
+        "Stage-F D blocks pruned by footer-resident stats before any GET (TD-FPRUNE-1 P2 zero-GET prune)",
+    );
+    pub static ref STAGE_F_BLOCKS_PRUNED_DECODE: IntCounter = counter(
+        "proximadb_stage_f_blocks_pruned_decode_agg_total",
+        "Stage-F D blocks fetched but skipped before row decode by block ColumnMeta stats (TD-FPRUNE-1 P1)",
+    );
+    pub static ref STAGE_F_ROWS_DECODED: IntCounter = counter(
+        "proximadb_stage_f_rows_decoded_agg_total",
+        "Rows decoded and evaluated against the predicate by Stage F (TD-FPRUNE-1 PR-A)",
+    );
+    pub static ref STAGE_F_ROWS_MATCHED: IntCounter = counter(
+        "proximadb_stage_f_rows_matched_agg_total",
+        "Rows admitted to the Stage-F allow-set (TD-FPRUNE-1 PR-A)",
+    );
+    pub static ref STAGE_F_FETCH_US: IntCounter = counter(
+        "proximadb_stage_f_fetch_us_agg_total",
+        "Cumulative Stage-F wall microseconds awaiting object-store reads: HEAD, header, footer and D-block GETs (TD-FPRUNE-1 PR-A)",
+    );
+    pub static ref STAGE_F_DECODE_US: IntCounter = counter(
+        "proximadb_stage_f_decode_us_agg_total",
+        "Cumulative Stage-F wall microseconds decoding blocks and evaluating the predicate (TD-FPRUNE-1 PR-A)",
+    );
     pub static ref CASCADE_TOTAL_US: IntCounter = counter(
         "proximadb_cascade_total_us_agg_total",
         "Cumulative whole-cascade wall microseconds (TD-RDSTRAT-13 PR-B umbrella)",
@@ -102,8 +134,10 @@ lazy_static! {
 
 /// Tier label for the per-tier aggregate counters. Must stay in sync with the
 /// SST `CacheTier` declaration order (the io_trace `tier_get_ops` index
-/// contract): IdxA, Ctl, Meta, ProbeA, Surv, OID.
-pub const TIER_LABELS: [&str; 6] = ["IdxA", "Ctl", "Meta", "ProbeA", "Surv", "OID"];
+/// contract): IdxA, Ctl, Meta, ProbeA, Surv, OID, FiltD, Rehyd.
+pub const TIER_LABELS: [&str; crate::observability::io_trace::PAX_TIER_COUNT] = [
+    "IdxA", "Ctl", "Meta", "ProbeA", "Surv", "OID", "FiltD", "Rehyd",
+];
 
 /// Record a coarse-probe outcome to the aggregate operator surface. Mirrors the
 /// durable per-query record in `io_trace::record_ivf_coarse_probe` (which lands
@@ -162,6 +196,32 @@ pub fn record_region_d_fetch_decode_us(us: u64) {
 /// Record the top-k rehydration wall in microseconds (PR-B).
 pub fn record_rehydrate_us(us: u64) {
     REHYDRATE_US.inc_by(us);
+}
+
+/// One filtered Stage-F build's outcome (TD-FPRUNE-1 PR-A): the block
+/// prune split, rows decoded and matched, and the wall split between
+/// awaiting reads and decoding. Aggregate operator surface; the per-query
+/// footer-prune counts also land in io_trace (`record_pax_footer_prune`).
+pub struct StageFOutcome {
+    pub blocks_total: u64,
+    pub blocks_pruned_footer: u64,
+    pub blocks_pruned_decode: u64,
+    pub rows_decoded: u64,
+    pub rows_matched: u64,
+    pub fetch_us: u64,
+    pub decode_us: u64,
+}
+
+/// Record one filtered Stage-F build (TD-FPRUNE-1 PR-A).
+pub fn record_stage_f(outcome: &StageFOutcome) {
+    STAGE_F_CALLS.inc();
+    STAGE_F_BLOCKS_TOTAL.inc_by(outcome.blocks_total);
+    STAGE_F_BLOCKS_PRUNED_FOOTER.inc_by(outcome.blocks_pruned_footer);
+    STAGE_F_BLOCKS_PRUNED_DECODE.inc_by(outcome.blocks_pruned_decode);
+    STAGE_F_ROWS_DECODED.inc_by(outcome.rows_decoded);
+    STAGE_F_ROWS_MATCHED.inc_by(outcome.rows_matched);
+    STAGE_F_FETCH_US.inc_by(outcome.fetch_us);
+    STAGE_F_DECODE_US.inc_by(outcome.decode_us);
 }
 
 /// Record the whole-cascade umbrella wall in microseconds (PR-B).
