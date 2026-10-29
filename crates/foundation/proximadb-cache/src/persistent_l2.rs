@@ -186,7 +186,9 @@ impl PersistentByteStore {
     ///
     /// Serialized on the protection mutex (review B5: lock-free
     /// check-then-act double-charged `protected_bytes` under concurrent
-    /// same-key protects).
+    /// same-key protects). Manual pins share the store-wide budget with the
+    /// grant groups, so they can crowd groups out; production does not call
+    /// this today (grants pin through [`Self::set_protection_groups`]).
     pub async fn protect(&self, key: &str) -> std::io::Result<bool> {
         let _guard = self.protection_guard();
         let Some(meta) = self.inner.entries.get(key).map(|entry| entry.clone()) else {
@@ -268,12 +270,28 @@ impl PersistentByteStore {
                 meta.file_len
             )));
         }
-        *meta
-            .pin_group
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            group.map(|(counter, _)| counter.clone());
-        meta.protected.store(true, Ordering::Release);
+        // The `protected` flag and its owning group change together under
+        // the entry's `pin_group` lock (verification round: a release that
+        // swapped `protected` and THEN took the group could lose the old
+        // group's refund to a concurrent re-pin that overwrote it).
+        {
+            let mut owner = meta
+                .pin_group
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if meta.protected.load(Ordering::Acquire) {
+                drop(owner);
+                self.inner
+                    .protected_bytes
+                    .fetch_sub(meta.file_len, Ordering::AcqRel);
+                if let Some((counter, _)) = group {
+                    counter.pinned.fetch_sub(meta.file_len, Ordering::AcqRel);
+                }
+                return Ok(true);
+            }
+            *owner = group.map(|(counter, _)| counter.clone());
+            meta.protected.store(true, Ordering::Release);
+        }
         // `remove` is lock-free. Re-check that THIS entry (not merely the
         // key) is still indexed: a remove + re-put between our map read and
         // here would otherwise leave the old entry's bytes charged forever
@@ -293,17 +311,21 @@ impl PersistentByteStore {
     /// Release a pin exactly once: whoever wins the `protected` swap refunds
     /// the store-wide counter and the owning group's counter.
     fn release_pin(&self, meta: &EntryMeta) -> bool {
-        if !meta.protected.swap(false, Ordering::AcqRel) {
-            return false;
-        }
+        // Swap and take together under the entry's `pin_group` lock, so the
+        // owner refunded is exactly the owner of the pin being released.
+        let group = {
+            let mut owner = meta
+                .pin_group
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !meta.protected.swap(false, Ordering::AcqRel) {
+                return false;
+            }
+            owner.take()
+        };
         self.inner
             .protected_bytes
             .fetch_sub(meta.file_len, Ordering::AcqRel);
-        let group = meta
-            .pin_group
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
         if let Some(group) = group {
             group.pinned.fetch_sub(meta.file_len, Ordering::AcqRel);
         }
@@ -1302,15 +1324,19 @@ impl ProtectionPolicy {
 
 /// TD-TIER-1 SC4-2: canonical form for comparing locations embedded in cache
 /// keys (review S2). Azure scheme aliases (`abfs://`, `abfss://`, `adls://`,
-/// `azure://`) become the `az://` form the Azure listing emits, and runs of
+/// `azure://`) become the `az://` form the Azure listing emits, `gcs://`
+/// becomes `gs://`, and runs of
 /// `/` collapse to one except the `//` that follows a scheme's `:`, so a
 /// base written as `s3://b/x/` and keys listed as `s3://b/x/...` compare
-/// equal. Applied to both prefixes and keys.
+/// equal. Applied to both prefixes and keys. Known trade-off: two bases that
+/// differ only in a run of slashes (`s3://b/x//y/` vs `s3://b/x/y/`), which
+/// object stores treat as distinct keys, compare equal here.
 pub fn canonical_location(raw: &str) -> String {
     let mut text = raw.to_string();
     for alias in ["abfss://", "abfs://", "adls://", "azure://"] {
         text = text.replace(alias, "az://");
     }
+    text = text.replace("gcs://", "gs://");
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         if ch == '/' && out.ends_with('/') {

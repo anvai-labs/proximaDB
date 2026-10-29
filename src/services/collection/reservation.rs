@@ -256,6 +256,8 @@ impl ReservationRegistry {
         // whenever it registers.
         // Registration is keyed by grant id, so re-registering a grant that is
         // still registered (an in-process reopen) replaces, never doubles.
+        // Known gap (recorded): a group still registered for a grant that the
+        // reopened ledger no longer holds is not pruned here.
         for (_, authority) in registry.pools.values() {
             for grant in authority.grants_snapshot().await {
                 if grant.state.charges_capacity() && !grant.residency_prefixes.is_empty() {
@@ -289,6 +291,10 @@ impl ReservationRegistry {
         // interleave with a concurrent mutation's commit.
         let _gate = self.mutation_gate.lock().await;
         let (config, authority) = self.armed_default_pool()?;
+        let previous_bytes = authority
+            .live_grant_snapshot(tenant_id, collection_id)
+            .await
+            .map(|grant| grant.bytes);
         let (grant, closed) = authority
             .reserve_with_prefixes(
                 tenant_id,
@@ -299,10 +305,18 @@ impl ReservationRegistry {
             )
             .await?;
         self.park_intervals(closed);
-        // SC4-2: arm the budget BEFORE registering the grant's protection
-        // group — pins are admitted against the armed budget.
+        // SC4-2: pins are admitted against the armed budget, so a growing (or
+        // new) grant arms the budget BEFORE registering its group; a SHRINKING
+        // grant re-registers first — clamping its pins to the smaller group
+        // budget — and only then shrinks the store-wide budget, so protected
+        // bytes never exceed the armed budget.
+        let shrinking = previous_bytes.is_some_and(|previous| grant.bytes < previous);
+        let register = !grant.residency_prefixes.is_empty();
+        if shrinking && register {
+            proximadb_cache::register_protection_group(protection_group(&grant));
+        }
         self.sync_residency_budget().await;
-        if !grant.residency_prefixes.is_empty() {
+        if !shrinking && register {
             proximadb_cache::register_protection_group(protection_group(&grant));
         }
         Ok(grant)
