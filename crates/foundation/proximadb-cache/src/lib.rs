@@ -33,7 +33,9 @@ use moka::notification::RemovalCause;
 
 mod persistent_l2;
 
-pub use persistent_l2::{L2Class, PersistentByteStore};
+pub use persistent_l2::{
+    L2Class, PersistentByteStore, ProtectionGroup, ProtectionSweep, canonical_location,
+};
 
 /// TD-TIER-1 SC4-1: the process-wide residency-budget bridge.
 ///
@@ -49,28 +51,52 @@ pub use persistent_l2::{L2Class, PersistentByteStore};
 /// pools would each push their own Σ and clobber the other (production
 /// constructs exactly one; tests and embedded must respect the same rule).
 mod residency_budget {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::OnceLock;
 
-    use super::PersistentByteStore;
+    use super::{PersistentByteStore, ProtectionGroup};
+
+    /// The process residency state: the armed budget plus one protection
+    /// group per reservation grant, keyed by grant id. Keying by id makes
+    /// registration idempotent — re-registering a grant (an in-process
+    /// registry reopen) replaces it instead of double-counting (review S5).
+    /// One mutex guards both, so no register/set interleaving can lose an
+    /// update.
+    #[derive(Default)]
+    struct State {
+        budget: u64,
+        groups: BTreeMap<String, ProtectionGroup>,
+    }
+
+    impl State {
+        fn group_list(&self) -> Vec<ProtectionGroup> {
+            self.groups.values().cloned().collect()
+        }
+    }
 
     static REGISTERED_STORE: OnceLock<Arc<PersistentByteStore>> = OnceLock::new();
-    static CELL: OnceLock<Mutex<u64>> = OnceLock::new();
+    static CELL: OnceLock<Mutex<State>> = OnceLock::new();
 
-    fn cell() -> &'static Mutex<u64> {
-        CELL.get_or_init(|| Mutex::new(0))
+    fn cell() -> std::sync::MutexGuard<'static, State> {
+        CELL.get_or_init(|| Mutex::new(State::default()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// Register the process's shared persistent store (first registration
     /// wins — the SST engine's singleton). The WINNER is armed with the
-    /// current budget under the cell mutex; a loser is left untouched (it
-    /// would otherwise be a live store armed once and never managed again).
+    /// current budget AND the current protection groups (pinning entries
+    /// rebuilt from disk that a pre-restart grant covers); a loser is left
+    /// untouched (it would otherwise be a live store armed once and never
+    /// managed again).
     pub fn register_process_store(store: Arc<PersistentByteStore>) -> bool {
-        let budget = cell().lock().unwrap_or_else(|p| p.into_inner());
+        let state = cell();
         let applied = REGISTERED_STORE.set(store).is_ok();
         if applied && let Some(store) = REGISTERED_STORE.get() {
-            store.set_reserved_budget(*budget);
+            store.set_reserved_budget(state.budget);
+            store.set_protection_groups(state.group_list());
         }
         applied
     }
@@ -86,8 +112,8 @@ mod residency_budget {
     /// update (review SF3 — a set-store/register-store race could otherwise
     /// leave the cell and the store permanently disagreeing).
     pub fn set_process_reserved_budget(bytes: u64) {
-        let mut budget = cell().lock().unwrap_or_else(|p| p.into_inner());
-        *budget = bytes;
+        let mut state = cell();
+        state.budget = bytes;
         if let Some(store) = REGISTERED_STORE.get() {
             store.set_reserved_budget(bytes);
         }
@@ -95,12 +121,40 @@ mod residency_budget {
 
     /// The current budget cell (diagnostics/tests).
     pub fn process_reserved_budget() -> u64 {
-        *cell().lock().unwrap_or_else(|p| p.into_inner())
+        cell().budget
+    }
+
+    /// TD-TIER-1 SC4-2: add (or replace, by id) one grant's protection group
+    /// and reconcile the registered store — its already-resident matching
+    /// entries are pinned within the group's budget. Call AFTER arming the
+    /// budget that covers the grant.
+    pub fn register_protection_group(group: ProtectionGroup) {
+        let mut state = cell();
+        state.groups.insert(group.id.clone(), group);
+        if let Some(store) = REGISTERED_STORE.get() {
+            store.set_protection_groups(state.group_list());
+        }
+    }
+
+    /// TD-TIER-1 SC4-2: drop one grant's group and reconcile — its pins are
+    /// released. Call BEFORE shrinking the budget.
+    pub fn unregister_protection_group(group_id: &str) {
+        let mut state = cell();
+        state.groups.remove(group_id);
+        if let Some(store) = REGISTERED_STORE.get() {
+            store.set_protection_groups(state.group_list());
+        }
+    }
+
+    /// The ids of the registered protection groups (diagnostics/tests).
+    pub fn process_protection_group_ids() -> Vec<String> {
+        cell().groups.keys().cloned().collect()
     }
 }
 
 pub use residency_budget::{
-    process_reserved_budget, process_store, register_process_store, set_process_reserved_budget,
+    process_protection_group_ids, process_reserved_budget, process_store, register_process_store,
+    register_protection_group, set_process_reserved_budget, unregister_protection_group,
 };
 
 /// The category of a cached artifact. Drives key-namespacing and per-kind stats;
@@ -1161,6 +1215,22 @@ mod tests {
         // A later budget update arms the registered store immediately.
         set_process_reserved_budget(8192);
         assert_eq!(store.reserved_budget(), 8192);
+    }
+
+    /// Review S5: registration is keyed by grant id — registering the same
+    /// grant twice (an in-process registry reopen) and unregistering it once
+    /// leaves nothing behind.
+    #[test]
+    fn protection_group_registration_is_idempotent_by_id() {
+        let group = ProtectionGroup {
+            id: "grant-idem-1".to_string(),
+            prefixes: vec!["s3://b/idem/9/data/".to_string()],
+            budget_bytes: 1024,
+        };
+        register_protection_group(group.clone());
+        register_protection_group(group);
+        unregister_protection_group("grant-idem-1");
+        assert!(!process_protection_group_ids().contains(&"grant-idem-1".to_string()));
     }
 
     #[tokio::test]

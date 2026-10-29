@@ -1423,8 +1423,25 @@ impl CollectionService {
             && let Some(registry) = &self.reservations
         {
             let reservation_tenant = Self::version_tenant(tenant_context).to_string();
+            // SC4-2: the grant protects the collection's segment roots — built
+            // from the same tenant-scoped base the storage assignment records
+            // below, so the prefixes match what flush/compaction publish.
+            let protect_base = match tenant_context.map(|ctx| ctx.tenant_id.as_str()) {
+                Some(tid) => StoragePath::tenant_root_path(&base_location, tid),
+                None => base_location.clone(),
+            };
+            let protect_prefixes = crate::services::collection::storage_class::residency_prefixes(
+                &protect_base,
+                &uuid,
+                typed_identity,
+            );
             registry
-                .reserve_for_performance(&reservation_tenant, &uuid, chrono::Utc::now().timestamp())
+                .reserve_for_performance(
+                    &reservation_tenant,
+                    &uuid,
+                    chrono::Utc::now().timestamp(),
+                    &protect_prefixes,
+                )
                 .await
                 .context("TD-TIER-1 SC3: PERFORMANCE admission refused")?;
             reserved_grant = Some((registry.clone(), reservation_tenant));
@@ -2381,8 +2398,29 @@ impl CollectionService {
             let now = chrono::Utc::now().timestamp();
             if to_performance {
                 let tenant = owner.unwrap_or_else(|| Self::DEFAULT_VERSION_TENANT.to_string());
+                // SC4-2: protection prefixes from the record's own storage
+                // assignment (the exact base + typed triple flush uses).
+                let protect_prefixes = previous_record
+                    .storage_assignment
+                    .as_ref()
+                    .map(|sa| {
+                        crate::services::collection::storage_class::residency_prefixes(
+                            &sa.base_location,
+                            &collection_id,
+                            crate::storage::trait_components::path_resolver::typed_identity_from_storage_assignment(
+                                Some(sa),
+                            ),
+                        )
+                    })
+                    .unwrap_or_default();
+                if protect_prefixes.is_empty() {
+                    warn!(
+                        "TD-TIER-1 SC4: collection {collection_id} has no storage assignment; \
+                         its grant charges capacity but protects no cached data"
+                    );
+                }
                 if let Err(error) = registry
-                    .reserve_for_performance(&tenant, &collection_id, now)
+                    .reserve_for_performance(&tenant, &collection_id, now, &protect_prefixes)
                     .await
                 {
                     // The policy is durable but unreserved (peek→reserve
