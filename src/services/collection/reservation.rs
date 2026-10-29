@@ -250,6 +250,21 @@ impl ReservationRegistry {
         // live grants must not wait for the first mutation to arm the store
         // (order-independent: the bridge holds the value for a late store).
         registry.sync_residency_budget().await;
+        // SC4-2: re-register every live grant's protection prefixes AFTER the
+        // budget is armed, so a restart pins (within budget) what the grants
+        // covered before the crash — the bridge applies them to the store
+        // whenever it registers.
+        let mut live_prefixes = Vec::new();
+        for (_, authority) in registry.pools.values() {
+            for grant in authority.grants_snapshot().await {
+                if grant.state.charges_capacity() {
+                    live_prefixes.extend(grant.residency_prefixes);
+                }
+            }
+        }
+        if !live_prefixes.is_empty() {
+            proximadb_cache::register_protected_prefixes(&live_prefixes);
+        }
         Ok(Some(Arc::new(registry)))
     }
 
@@ -261,6 +276,7 @@ impl ReservationRegistry {
         tenant_id: &str,
         collection_id: &str,
         now_unix_secs: i64,
+        residency_prefixes: &[String],
     ) -> Result<Grant, ReservationError> {
         if tenant_id.is_empty() {
             // The metering resolver rejects empty tenant ids, so an
@@ -284,7 +300,21 @@ impl ReservationRegistry {
             )
             .await?;
         self.park_intervals(closed);
+        // SC4-2: persist the grant's protection prefixes, then arm the budget
+        // BEFORE registering them (pins are admitted against the budget). A
+        // crash between the reserve and this persist leaves a charged grant
+        // that protects nothing — coverage degrades, billing does not drift
+        // (a recorded slice-3 reconciliation residual).
+        let previous = authority
+            .set_residency_prefixes(tenant_id, collection_id, residency_prefixes)
+            .await?;
         self.sync_residency_budget().await;
+        if let Some(previous) = previous {
+            if !previous.is_empty() {
+                proximadb_cache::unregister_protected_prefixes(&previous);
+            }
+            proximadb_cache::register_protected_prefixes(residency_prefixes);
+        }
         Ok(grant)
     }
 
@@ -353,16 +383,28 @@ impl ReservationRegistry {
         // Mutation + budget sync under one gate (SF1): the Σ read cannot
         // interleave with a concurrent mutation's commit.
         let _gate = self.mutation_gate.lock().await;
+        let mut released_prefixes = Vec::new();
         for (_, authority) in self.pools.values() {
+            let prefixes = authority
+                .live_residency_prefixes(tenant_id, collection_id)
+                .await;
             match authority
                 .release(tenant_id, collection_id, now_unix_secs)
                 .await
             {
-                Ok(closed) => self.park_intervals(closed),
+                Ok(closed) => {
+                    self.park_intervals(closed);
+                    released_prefixes.extend(prefixes);
+                }
                 Err(error) => tracing::warn!(
                     "TD-TIER-1 SC3: release failed for ({tenant_id}, {collection_id}): {error}"
                 ),
             }
+        }
+        // SC4-2: unpin BEFORE shrinking the budget, so the store never holds
+        // more protected bytes than the armed budget covers.
+        if !released_prefixes.is_empty() {
+            proximadb_cache::unregister_protected_prefixes(&released_prefixes);
         }
         self.sync_residency_budget().await;
     }
@@ -489,6 +531,13 @@ pub struct Grant {
     /// at release; advanced by interval-closing mutations and
     /// [`ReservationAuthority::take_usage_intervals`].
     pub last_interval_end_unix_secs: i64,
+    /// TD-TIER-1 SC4-2: the collection's segment-root prefixes whose cache
+    /// keys this grant protects (both path layouts, so a restart that flips
+    /// `PROXIMADB_TYPED_PATHS` still matches). Persisted so a reopen
+    /// re-registers protection; `serde(default)` keeps pre-SC4-2 ledgers
+    /// readable (those grants simply protect nothing until re-admitted).
+    #[serde(default)]
+    pub residency_prefixes: Vec<String>,
 }
 
 /// A computed usage interval ready for the durable metering sink. The dedup
@@ -806,6 +855,43 @@ impl ReservationAuthority {
         self.inner.ledger.lock().await.grants.clone()
     }
 
+    /// TD-TIER-1 SC4-2: durably record the live grant's residency prefixes
+    /// (clone-persist-commit). Returns the PREVIOUS prefixes when they
+    /// changed, `None` when unchanged or when no live grant exists — so the
+    /// caller registers protection exactly once per distinct set.
+    pub async fn set_residency_prefixes(
+        &self,
+        tenant_id: &str,
+        collection_id: &str,
+        prefixes: &[String],
+    ) -> Result<Option<Vec<String>>, ReservationError> {
+        let mut guard = self.inner.ledger.lock().await;
+        let Some(live) = live_grant(&guard, tenant_id, collection_id).cloned() else {
+            return Ok(None);
+        };
+        if live.residency_prefixes == prefixes {
+            return Ok(None);
+        }
+        let mut prospective = (*guard).clone();
+        let grant = grant_by_id_mut(&mut prospective, &live.id)?;
+        grant.residency_prefixes = prefixes.to_vec();
+        persist_ledger(&self.inner.dir, &prospective).await?;
+        *guard = prospective;
+        Ok(Some(live.residency_prefixes))
+    }
+
+    /// The live grant's residency prefixes for an identity (empty if none).
+    pub async fn live_residency_prefixes(
+        &self,
+        tenant_id: &str,
+        collection_id: &str,
+    ) -> Vec<String> {
+        let guard = self.inner.ledger.lock().await;
+        live_grant(&guard, tenant_id, collection_id)
+            .map(|grant| grant.residency_prefixes.clone())
+            .unwrap_or_default()
+    }
+
     /// Effective bytes charged against the pool right now (invariant input).
     pub async fn charged_effective_bytes(&self) -> u64 {
         let ledger = self.inner.ledger.lock().await;
@@ -913,6 +999,7 @@ impl ReservationAuthority {
             state: GrantState::Reserved,
             created_unix_secs: now,
             last_interval_end_unix_secs: now,
+            residency_prefixes: Vec::new(),
         };
         prospective.grants.push(grant.clone());
         persist_ledger(&self.inner.dir, &prospective).await?;
@@ -1883,7 +1970,7 @@ mod tests {
         );
 
         registry
-            .reserve_for_performance("t1", "c-budget-1", current_unix_secs())
+            .reserve_for_performance("t1", "c-budget-1", current_unix_secs(), &[])
             .await
             .unwrap();
         assert_eq!(
@@ -1919,7 +2006,7 @@ mod tests {
             .unwrap()
             .unwrap();
         registry
-            .reserve_for_performance("t1", "c-persist-1", current_unix_secs())
+            .reserve_for_performance("t1", "c-persist-1", current_unix_secs(), &[])
             .await
             .unwrap();
         drop(registry); // "crash": the grant is durable in the pool ledger
@@ -1938,6 +2025,63 @@ mod tests {
             proximadb_cache::process_reserved_budget(),
             2048,
             "reopen pushes the reconciled charged budget"
+        );
+    }
+
+    /// SC4-2: a grant registers its protection prefixes after the budget is
+    /// armed; an idempotent re-reserve does not double-register (refcount
+    /// stays 1, so ONE release removes it); release unregisters; a reopen
+    /// re-registers the persisted prefixes of live grants.
+    #[tokio::test]
+    async fn grant_prefixes_register_release_and_reopen() {
+        let _guard = budget_cell_gate();
+        let prefix = "s3://b/tenants/t1/77/data/".to_string();
+        // Isolate from siblings: drop any registration of this prefix.
+        while proximadb_cache::process_protected_prefixes().contains(&prefix) {
+            proximadb_cache::unregister_protected_prefixes(std::slice::from_ref(&prefix));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = pool_config(&dir, "p1", 0);
+        cfg.overhead_factor = 0.0;
+        cfg.default_grant_bytes = 2048;
+        let registry = ReservationRegistry::open_from_config(&[cfg.clone()])
+            .await
+            .unwrap()
+            .unwrap();
+        let prefixes = vec![prefix.clone()];
+        registry
+            .reserve_for_performance("t1", "77", current_unix_secs(), &prefixes)
+            .await
+            .unwrap();
+        assert!(proximadb_cache::process_protected_prefixes().contains(&prefix));
+        // Idempotent re-reserve: same identity + bytes + prefixes.
+        registry
+            .reserve_for_performance("t1", "77", current_unix_secs(), &prefixes)
+            .await
+            .unwrap();
+
+        drop(registry); // "crash" with the grant live
+        proximadb_cache::unregister_protected_prefixes(&prefixes);
+        assert!(
+            !proximadb_cache::process_protected_prefixes().contains(&prefix),
+            "single registration: one unregister clears it (no double count)"
+        );
+        let reopened = ReservationRegistry::open_from_config(&[cfg])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            proximadb_cache::process_protected_prefixes().contains(&prefix),
+            "reopen re-registers the persisted prefixes of live grants"
+        );
+
+        reopened
+            .release_for_collection("t1", "77", current_unix_secs())
+            .await;
+        assert!(
+            !proximadb_cache::process_protected_prefixes().contains(&prefix),
+            "release unregisters the grant's prefixes"
         );
     }
 
@@ -1971,7 +2115,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let grant = registry
-            .reserve_for_performance("t1", "c-uuid-1", 1000)
+            .reserve_for_performance("t1", "c-uuid-1", 1000, &[])
             .await
             .unwrap();
         assert_eq!(grant.bytes, 4096, "operator-declared default grant size");
@@ -1990,7 +2134,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let err = registry
-            .reserve_for_performance("t1", "c-uuid-1", 1000)
+            .reserve_for_performance("t1", "c-uuid-1", 1000, &[])
             .await
             .unwrap_err()
             .to_string();
@@ -2011,7 +2155,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let err = registry
-            .reserve_for_performance("t1", "c-uuid-1", 1000)
+            .reserve_for_performance("t1", "c-uuid-1", 1000, &[])
             .await
             .unwrap_err()
             .to_string();
@@ -2026,7 +2170,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let grant = registry
-            .reserve_for_performance("t1", "c-uuid-1", 1000)
+            .reserve_for_performance("t1", "c-uuid-1", 1000, &[])
             .await
             .unwrap();
         assert_eq!(grant.bytes, 4096);
@@ -2045,7 +2189,7 @@ mod tests {
             .unwrap()
             .unwrap();
         registry
-            .reserve_for_performance("t1", "c-uuid-1", 500)
+            .reserve_for_performance("t1", "c-uuid-1", 500, &[])
             .await
             .unwrap();
         registry
@@ -2128,7 +2272,7 @@ mod tests {
             .unwrap();
         registry.peek_performance_admission().await.unwrap();
         registry
-            .reserve_for_performance("t1", "c-uuid-1", current_unix_secs())
+            .reserve_for_performance("t1", "c-uuid-1", current_unix_secs(), &[])
             .await
             .unwrap();
         // 4000 charged of 5000: a second default grant no longer fits.
@@ -2171,7 +2315,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let err = registry
-            .reserve_for_performance("", "c-uuid-1", 1000)
+            .reserve_for_performance("", "c-uuid-1", 1000, &[])
             .await
             .unwrap_err()
             .to_string();

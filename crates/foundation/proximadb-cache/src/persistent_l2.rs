@@ -85,6 +85,15 @@ struct StoreInner {
     /// the reservation authority arms it (SC3-2 wiring).
     reserved_budget: AtomicU64,
     protected_bytes: AtomicU64,
+    /// TD-TIER-1 SC4-2: the residency protection policy — collection
+    /// segment-root prefixes whose keys are pinned on admission and swept
+    /// when the set changes. The std mutex ALSO serializes every protect /
+    /// unprotect (review B5: concurrent same-key protects double-charged
+    /// `protected_bytes`), so protection is synchronous and callable from
+    /// inside `put` (which already holds `mutation`) and from the sync
+    /// residency bridge. Lock order: `mutation` → `protection`, never the
+    /// reverse.
+    protection: std::sync::Mutex<Vec<String>>,
     clock: AtomicU64,
     entries: DashMap<String, Arc<EntryMeta>>,
     mutation: tokio::sync::Mutex<()>,
@@ -116,6 +125,7 @@ impl PersistentByteStore {
             class_resident_bytes: [AtomicU64::new(0), AtomicU64::new(0)],
             reserved_budget: AtomicU64::new(0),
             protected_bytes: AtomicU64::new(0),
+            protection: std::sync::Mutex::new(Vec::new()),
             clock: AtomicU64::new(1),
             entries: DashMap::new(),
             mutation: tokio::sync::Mutex::new(()),
@@ -170,7 +180,12 @@ impl PersistentByteStore {
     /// braces against the lock-free `remove` path, with a refund if the entry
     /// vanishes mid-pin.
     pub async fn protect(&self, key: &str) -> std::io::Result<bool> {
-        let _guard = self.inner.mutation.lock().await;
+        let _guard = self.protection_guard();
+        self.protect_locked(key)
+    }
+
+    /// The protect body; the caller holds [`Self::protection_guard`].
+    fn protect_locked(&self, key: &str) -> std::io::Result<bool> {
         let Some(meta) = self.inner.entries.get(key).map(|entry| entry.clone()) else {
             return Ok(false);
         };
@@ -223,7 +238,12 @@ impl PersistentByteStore {
     /// Serialized on the mutation mutex for the same reason as
     /// [`Self::protect`].
     pub async fn unprotect(&self, key: &str) -> bool {
-        let _guard = self.inner.mutation.lock().await;
+        let _guard = self.protection_guard();
+        self.unprotect_locked(key)
+    }
+
+    /// The unprotect body; the caller holds [`Self::protection_guard`].
+    fn unprotect_locked(&self, key: &str) -> bool {
         let Some(meta) = self.inner.entries.get(key).map(|entry| entry.clone()) else {
             return false;
         };
@@ -242,6 +262,85 @@ impl PersistentByteStore {
             .entries
             .get(key)
             .is_some_and(|meta| meta.protected.load(Ordering::Acquire))
+    }
+
+    fn protection_guard(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+        self.inner
+            .protection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn matches_any(key: &str, prefixes: &[String]) -> bool {
+        prefixes.iter().any(|prefix| key.contains(prefix.as_str()))
+    }
+
+    /// TD-TIER-1 SC4-2: replace the protection policy and reconcile resident
+    /// entries against it. Membership is `key.contains(prefix)` — cache keys
+    /// embed the segment's published path mid-string (survivor keys are
+    /// `{namespace}/{scope}/{kind}:{path}:{off}:{len}`), and a prefix is a
+    /// full collection segment root ending in `/`, so containment cannot
+    /// match a sibling collection.
+    ///
+    /// Only keys matching an OLD or NEW prefix are touched: newly-matching
+    /// entries are pinned (best-effort — a pin that would exceed the armed
+    /// budget is skipped and counted, never forced), entries that matched a
+    /// removed prefix and no remaining one are unpinned. Pins made outside
+    /// the policy are left alone. O(entries) — admission cadence only.
+    pub fn set_protected_prefixes(&self, prefixes: Vec<String>) -> ProtectionSweep {
+        let mut policy = self.protection_guard();
+        let previous = std::mem::replace(&mut *policy, prefixes);
+        let mut sweep = ProtectionSweep::default();
+        let keys: Vec<String> = self
+            .inner
+            .entries
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in keys {
+            let now = Self::matches_any(&key, &policy);
+            if now {
+                if !self.is_protected(&key) {
+                    match self.protect_locked(&key) {
+                        Ok(true) => sweep.protected += 1,
+                        Ok(false) => {}
+                        Err(_) => sweep.skipped_over_budget += 1,
+                    }
+                }
+            } else if Self::matches_any(&key, &previous) && self.unprotect_locked(&key) {
+                sweep.unprotected += 1;
+            }
+        }
+        sweep
+    }
+
+    /// The current protection policy (diagnostics/tests).
+    pub fn protected_prefixes(&self) -> Vec<String> {
+        self.protection_guard().clone()
+    }
+
+    /// Bytes currently pinned for entries matching `prefix` — the coverage
+    /// a collection's grant has actually achieved (status/coverage input).
+    pub fn covered_bytes_matching(&self, prefix: &str) -> u64 {
+        self.inner
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.key().contains(prefix) && entry.value().protected.load(Ordering::Acquire)
+            })
+            .map(|entry| entry.value().file_len)
+            .sum()
+    }
+
+    /// Pin a just-admitted key when it falls under the policy. Called from
+    /// `put`/`put_file_range` BEFORE eviction runs, so a protected key cannot
+    /// be evicted in the window between its write and its pin. Best-effort:
+    /// an over-budget pin is skipped (coverage degrades; the write succeeds).
+    fn protect_on_admit(&self, key: &str) {
+        let policy = self.protection_guard();
+        if Self::matches_any(key, &policy) {
+            let _ = self.protect_locked(key);
+        }
     }
 
     /// Number of indexed entries.
@@ -263,6 +362,7 @@ impl PersistentByteStore {
                 "persistent cache key exceeds 16 MiB",
             ));
         }
+        let admit_key = key.clone();
         let _guard = self.inner.mutation.lock().await;
         if let Some(existing) = self.inner.entries.get(&key) {
             existing.touch.store(self.next_tick(), Ordering::Relaxed);
@@ -316,6 +416,7 @@ impl PersistentByteStore {
                 self.inner.entries.insert(key, Arc::new(meta));
             }
         }
+        self.protect_on_admit(&admit_key);
         self.evict_blocking();
         Ok(())
     }
@@ -343,6 +444,7 @@ impl PersistentByteStore {
                 "persistent cache key exceeds 16 MiB",
             ));
         }
+        let admit_key = key.clone();
         let _guard = self.inner.mutation.lock().await;
         if let Some(existing) = self.inner.entries.get(&key) {
             existing.touch.store(self.next_tick(), Ordering::Relaxed);
@@ -396,6 +498,7 @@ impl PersistentByteStore {
                 .fetch_add(meta.file_len, Ordering::Relaxed);
             self.inner.entries.insert(key, Arc::new(meta));
         }
+        self.protect_on_admit(&admit_key);
         self.evict_blocking();
         Ok(())
     }
@@ -1042,6 +1145,18 @@ fn is_rebuildable_miss(error: &std::io::Error) -> bool {
     )
 }
 
+/// Outcome of a [`PersistentByteStore::set_protected_prefixes`] reconcile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProtectionSweep {
+    /// Entries newly pinned under the policy.
+    pub protected: u64,
+    /// Entries unpinned because their prefix left the policy.
+    pub unprotected: u64,
+    /// Matching entries left unpinned because the armed budget was exhausted
+    /// (coverage degraded, never forced).
+    pub skipped_over_budget: u64,
+}
+
 fn budget_error(message: &str) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::ResourceBusy, /* semantically: admission refused */
@@ -1281,6 +1396,15 @@ mod tests {
 
     // ---- TD-TIER-1 SC3: protection (orthogonal to L2Class) ----
 
+    /// A 1 MiB store with a 1 MiB armed protection budget (the common
+    /// protection-test fixture). Keep the TempDir alive for the test.
+    fn armed_store() -> (tempfile::TempDir, PersistentByteStore) {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
+        store.set_reserved_budget(1 << 20);
+        (dir, store)
+    }
+
     fn payload(len: usize) -> Arc<[u8]> {
         Arc::from(vec![7u8; len].into_boxed_slice())
     }
@@ -1385,9 +1509,7 @@ mod tests {
     // immutable bytes, never visibility — and the accounting follows.
     #[tokio::test]
     async fn explicit_remove_still_removes_protected() {
-        let dir = tempfile::tempdir().expect("test tempdir");
-        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
-        store.set_reserved_budget(1 << 20);
+        let (_dir, store) = armed_store();
         store
             .put("entry", L2Class::Survivor, payload(4 * 1024))
             .await
@@ -1426,9 +1548,7 @@ mod tests {
     // twice (and the phantom was unclearable by any API).
     #[tokio::test]
     async fn concurrent_same_key_protects_charge_once() {
-        let dir = tempfile::tempdir().expect("test tempdir");
-        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
-        store.set_reserved_budget(1 << 20);
+        let (_dir, store) = armed_store();
         store
             .put("entry", L2Class::Survivor, payload(4 * 1024))
             .await
@@ -1513,13 +1633,107 @@ mod tests {
         }
     }
 
+    // ---- TD-TIER-1 SC4-2: the protection policy ----
+
+    const C1: &str = "s3://bucket/tenants/acme/12/data/";
+
+    fn c1_key(file: &str) -> String {
+        format!("invariants/region-a/s3://bucket/tenants/acme/12/data/{file}")
+    }
+
+    /// Keys under a registered prefix are pinned on admission; a sibling
+    /// collection whose decimal id shares the prefix digits (`123` vs `12`)
+    /// is NOT — the trailing `/` makes containment exact.
+    #[tokio::test]
+    async fn policy_pins_on_admission_with_exact_prefix_boundaries() {
+        let (_dir, store) = armed_store();
+        store.set_protected_prefixes(vec![C1.to_string()]);
+
+        store
+            .put(c1_key("L0_a.pax"), L2Class::Invariants, payload(1024))
+            .await
+            .expect("put c1");
+        let sibling = "invariants/region-a/s3://bucket/tenants/acme/123/data/L0_a.pax";
+        store
+            .put(sibling, L2Class::Invariants, payload(1024))
+            .await
+            .expect("put sibling");
+        // Survivor-shaped key: the path sits MID-string.
+        let survivor = format!("survivor/s/2:{}L0_a.pax:0:64", C1);
+        store
+            .put(survivor.clone(), L2Class::Survivor, payload(64))
+            .await
+            .expect("put survivor");
+
+        assert!(
+            store.is_protected(&c1_key("L0_a.pax")),
+            "c1 key pinned on admit"
+        );
+        assert!(store.is_protected(&survivor), "mid-string path is matched");
+        assert!(
+            !store.is_protected(sibling),
+            "id 123 must not match prefix 12/"
+        );
+        assert!(store.covered_bytes_matching(C1) > 0);
+    }
+
+    /// Registering a prefix pins already-resident matching entries
+    /// (retroactive sweep); removing it unpins them; a pin made OUTSIDE the
+    /// policy is left alone by both sweeps.
+    #[tokio::test]
+    async fn sweep_pins_resident_entries_and_unpins_on_removal() {
+        let (_dir, store) = armed_store();
+        store
+            .put(c1_key("L1_b.pax"), L2Class::Invariants, payload(512))
+            .await
+            .expect("put");
+        store
+            .put("manual/key", L2Class::Survivor, payload(256))
+            .await
+            .expect("put manual");
+        assert!(store.protect("manual/key").await.expect("manual pin"));
+
+        let sweep = store.set_protected_prefixes(vec![C1.to_string()]);
+        assert_eq!(sweep.protected, 1, "resident c1 entry pinned retroactively");
+        assert!(store.is_protected(&c1_key("L1_b.pax")));
+
+        let sweep = store.set_protected_prefixes(Vec::new());
+        assert_eq!(sweep.unprotected, 1);
+        assert!(
+            !store.is_protected(&c1_key("L1_b.pax")),
+            "removed prefix unpins"
+        );
+        assert!(
+            store.is_protected("manual/key"),
+            "a pin outside the policy is untouched"
+        );
+    }
+
+    /// Coverage degrades instead of forcing: matching entries beyond the
+    /// armed budget stay unpinned and are counted.
+    #[tokio::test]
+    async fn sweep_skips_pins_beyond_the_budget() {
+        let dir = tempfile::tempdir().expect("test tempdir");
+        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
+        for file in ["a", "b", "c"] {
+            store
+                .put(c1_key(file), L2Class::Invariants, payload(4 * 1024))
+                .await
+                .expect("put");
+        }
+        let one_entry = store.resident_bytes() / 3;
+        store.set_reserved_budget(one_entry);
+        let sweep = store.set_protected_prefixes(vec![C1.to_string()]);
+        assert_eq!(sweep.protected, 1, "the budget covers exactly one entry");
+        assert_eq!(sweep.skipped_over_budget, 2);
+        assert!(store.protected_bytes() <= store.reserved_budget());
+    }
+
     // Protection is runtime state by design: the index rebuild drops it and
     // SC4's coverage reconciliation re-derives pins from the grant ledger.
     #[tokio::test]
     async fn rebuild_drops_protection() {
-        let dir = tempfile::tempdir().expect("test tempdir");
-        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
-        store.set_reserved_budget(1 << 20);
+        let (dir, store) = armed_store();
         store
             .put("entry", L2Class::Survivor, payload(64))
             .await

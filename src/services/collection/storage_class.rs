@@ -240,6 +240,38 @@ pub fn check_performance_admission(
     Ok(())
 }
 
+/// TD-TIER-1 SC4-2: the segment-root prefixes a collection's published
+/// `.pax` objects live under — the persistent-L2 protection keys embed them.
+///
+/// Reconstructed with the SAME helper the SST flush and compaction paths use
+/// (`collection_data_path_typed` over the storage assignment's tenant-scoped
+/// `base_location`), for BOTH layouts: the legacy `{base}/{id}/data/` and,
+/// when the typed triple is present, `{base}/accounts/{a}/{n}/{c}/data/` —
+/// the layout follows the flusher's `PROXIMADB_TYPED_PATHS` at flush time,
+/// which a restart can flip. Each prefix ends in `/`, so containment cannot
+/// match a sibling collection whose id shares a decimal prefix (`.../12/`
+/// vs `.../123/`). The base's trailing `/` is trimmed first: normal flushes
+/// trim it, `Path::join` publishes do not.
+pub fn residency_prefixes(
+    base_location: &str,
+    collection_id: &str,
+    identity: Option<crate::core::stable_id::CollectionIdentity>,
+) -> Vec<String> {
+    use crate::storage::trait_components::path_resolver::collection_data_path_typed;
+    let base = base_location.trim_end_matches('/');
+    let mut prefixes = vec![format!(
+        "{}/",
+        collection_data_path_typed(base, collection_id, None)
+    )];
+    if let Some(identity) = identity {
+        prefixes.push(format!(
+            "{}/",
+            collection_data_path_typed(base, collection_id, Some(identity))
+        ));
+    }
+    prefixes
+}
+
 /// The tenant id named by a `{base}/tenants/{id}` path segment, if any
 /// (read-only parse of the same convention `StoragePath::tenant_root_path`
 /// writes; never constructs keys).
@@ -269,6 +301,29 @@ mod tests {
             storage_class: raw,
             ..Default::default()
         }
+    }
+
+    /// SC4-2: the prefixes are the flush/compaction segment roots, both
+    /// layouts, trailing `/`, with the base's own trailing `/` trimmed.
+    #[test]
+    fn residency_prefixes_match_both_segment_layouts() {
+        use crate::core::stable_id::CollectionIdentity;
+        let legacy_only = residency_prefixes("s3://b/tenants/acme/", "12", None);
+        assert_eq!(
+            legacy_only,
+            vec!["s3://b/tenants/acme/12/data/".to_string()]
+        );
+
+        let identity = CollectionIdentity {
+            account_id: 1,
+            namespace_id: 2,
+            collection_id: 3,
+        };
+        let both = residency_prefixes("s3://b/tenants/acme", "12", Some(identity));
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[0], "s3://b/tenants/acme/12/data/");
+        assert!(both[1].starts_with("s3://b/tenants/acme/accounts/"));
+        assert!(both[1].ends_with("/data/"));
     }
 
     #[test]

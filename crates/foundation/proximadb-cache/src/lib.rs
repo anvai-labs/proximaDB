@@ -33,7 +33,7 @@ use moka::notification::RemovalCause;
 
 mod persistent_l2;
 
-pub use persistent_l2::{L2Class, PersistentByteStore};
+pub use persistent_l2::{L2Class, PersistentByteStore, ProtectionSweep};
 
 /// TD-TIER-1 SC4-1: the process-wide residency-budget bridge.
 ///
@@ -49,28 +49,50 @@ pub use persistent_l2::{L2Class, PersistentByteStore};
 /// pools would each push their own Σ and clobber the other (production
 /// constructs exactly one; tests and embedded must respect the same rule).
 mod residency_budget {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::OnceLock;
 
     use super::PersistentByteStore;
 
-    static REGISTERED_STORE: OnceLock<Arc<PersistentByteStore>> = OnceLock::new();
-    static CELL: OnceLock<Mutex<u64>> = OnceLock::new();
+    /// The process residency state: the armed budget plus the refcounted set
+    /// of protected collection prefixes (two grants could register the same
+    /// prefix; only the last unregister removes it). One mutex guards both,
+    /// so no register/set interleaving can lose an update.
+    #[derive(Default)]
+    struct State {
+        budget: u64,
+        prefixes: BTreeMap<String, usize>,
+    }
 
-    fn cell() -> &'static Mutex<u64> {
-        CELL.get_or_init(|| Mutex::new(0))
+    impl State {
+        fn prefix_list(&self) -> Vec<String> {
+            self.prefixes.keys().cloned().collect()
+        }
+    }
+
+    static REGISTERED_STORE: OnceLock<Arc<PersistentByteStore>> = OnceLock::new();
+    static CELL: OnceLock<Mutex<State>> = OnceLock::new();
+
+    fn cell() -> std::sync::MutexGuard<'static, State> {
+        CELL.get_or_init(|| Mutex::new(State::default()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// Register the process's shared persistent store (first registration
     /// wins — the SST engine's singleton). The WINNER is armed with the
-    /// current budget under the cell mutex; a loser is left untouched (it
-    /// would otherwise be a live store armed once and never managed again).
+    /// current budget AND the current protection prefixes (pinning entries
+    /// rebuilt from disk that a pre-restart grant covers); a loser is left
+    /// untouched (it would otherwise be a live store armed once and never
+    /// managed again).
     pub fn register_process_store(store: Arc<PersistentByteStore>) -> bool {
-        let budget = cell().lock().unwrap_or_else(|p| p.into_inner());
+        let state = cell();
         let applied = REGISTERED_STORE.set(store).is_ok();
         if applied && let Some(store) = REGISTERED_STORE.get() {
-            store.set_reserved_budget(*budget);
+            store.set_reserved_budget(state.budget);
+            store.set_protected_prefixes(state.prefix_list());
         }
         applied
     }
@@ -86,8 +108,8 @@ mod residency_budget {
     /// update (review SF3 — a set-store/register-store race could otherwise
     /// leave the cell and the store permanently disagreeing).
     pub fn set_process_reserved_budget(bytes: u64) {
-        let mut budget = cell().lock().unwrap_or_else(|p| p.into_inner());
-        *budget = bytes;
+        let mut state = cell();
+        state.budget = bytes;
         if let Some(store) = REGISTERED_STORE.get() {
             store.set_reserved_budget(bytes);
         }
@@ -95,12 +117,50 @@ mod residency_budget {
 
     /// The current budget cell (diagnostics/tests).
     pub fn process_reserved_budget() -> u64 {
-        *cell().lock().unwrap_or_else(|p| p.into_inner())
+        cell().budget
+    }
+
+    /// TD-TIER-1 SC4-2: add collection segment-root prefixes to the
+    /// protection policy (refcounted) and reconcile the registered store —
+    /// already-resident matching entries are pinned, within the budget. Call
+    /// AFTER arming the budget that covers the grant.
+    pub fn register_protected_prefixes(prefixes: &[String]) {
+        let mut state = cell();
+        for prefix in prefixes {
+            *state.prefixes.entry(prefix.clone()).or_insert(0) += 1;
+        }
+        if let Some(store) = REGISTERED_STORE.get() {
+            store.set_protected_prefixes(state.prefix_list());
+        }
+    }
+
+    /// TD-TIER-1 SC4-2: drop prefixes from the policy (refcounted; a prefix
+    /// leaves only when its last registration goes) and reconcile — entries
+    /// under a removed prefix are unpinned. Call BEFORE shrinking the budget.
+    pub fn unregister_protected_prefixes(prefixes: &[String]) {
+        let mut state = cell();
+        for prefix in prefixes {
+            if let Some(count) = state.prefixes.get_mut(prefix) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    state.prefixes.remove(prefix);
+                }
+            }
+        }
+        if let Some(store) = REGISTERED_STORE.get() {
+            store.set_protected_prefixes(state.prefix_list());
+        }
+    }
+
+    /// The current protection prefixes (diagnostics/tests).
+    pub fn process_protected_prefixes() -> Vec<String> {
+        cell().prefix_list()
     }
 }
 
 pub use residency_budget::{
-    process_reserved_budget, process_store, register_process_store, set_process_reserved_budget,
+    process_protected_prefixes, process_reserved_budget, process_store, register_process_store,
+    register_protected_prefixes, set_process_reserved_budget, unregister_protected_prefixes,
 };
 
 /// The category of a cached artifact. Drives key-namespacing and per-kind stats;
