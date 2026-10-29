@@ -5660,6 +5660,19 @@ impl DmlService {
             let (engine_fields, _) =
                 proximadb_iceberg_engine::iceberg_fields_of(&view_fields, false);
 
+            // Gate 4, first check (the fence contract's phase-3 lease): after
+            // every benign no-op return (nothing published, no files, only
+            // never-published oids, schema drift) and before ANY publication
+            // I/O — the gate-3 hook's competitor commit and the Puffin write
+            // — so a pod already displaced orphans nothing, and WAL-only
+            // deletes on a displaced pod stay uncounted no-ops (#2275
+            // review, finding 2).
+            if let Some(lease) = &self.publish_lease {
+                lease
+                    .check("live delete", tenant_id, table_name)
+                    .await
+                    .map_err(|e| anyhow!("live delete: the publish lease refused: {e:#}"))?;
+            }
             // Gate 3's forcing hook (test-only, deterministic): on the first
             // attempt, commit a LEGITIMATE no-change successor from this
             // parent (the same files, the parent's vectors re-carried) and
@@ -5678,7 +5691,9 @@ impl DmlService {
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or_default();
                 let competitor_id = now_ms.max(
-                    proximadb_iceberg_engine::current_snapshot_id_of(&parent_meta).unwrap_or(0) + 1,
+                    proximadb_iceberg_engine::current_snapshot_id_of(&parent_meta)
+                        .unwrap_or(0)
+                        .saturating_add(1),
                 );
                 // Re-carry the parent's vectors in their MANIFEST form
                 // (IcebergSnapshotDeletion — what the deleting publish takes),
@@ -5776,17 +5791,6 @@ impl DmlService {
                     all_entries.push((parent_dv.data_file.clone(), decoded));
                 }
             }
-            // Gate 4 (the fence contract's phase-3 lease): checked immediately
-            // before the CAS, per attempt — a pod that lost its lease between
-            // attempts cannot publish the retried successor either. A refusal
-            // is a fence gap (warned + counted by the wrapper), never a
-            // delete error.
-            if let Some(lease) = &self.publish_lease {
-                lease
-                    .check("live delete", tenant_id, table_name)
-                    .await
-                    .map_err(|e| anyhow!("live delete: the publish lease refused: {e:#}"))?;
-            }
             let borrowed: Vec<(object_store::path::Path, &PositionDeletes)> =
                 all_entries.iter().map(|(f, d)| (f.clone(), d)).collect();
             // The snapshot id shares MATERIALIZE's millisecond scale — the
@@ -5815,6 +5819,21 @@ impl DmlService {
                 .await
                 .map_err(|e| anyhow!("live delete: writing the vectors: {e}"))?;
 
+            // Gate 4, second check — IMMEDIATELY before the CAS. The check is
+            // point-in-time (no token reaches the CAS), so its protection is
+            // the window between it and the commit; the first check alone
+            // left the O(published oid bytes) mapping inside that window, and
+            // a pod displaced mid-mapping could publish onto an unchanged
+            // parent (#2275 review, finding 1). The CAS stops forks, not a
+            // displaced pod. A lease lost between the Puffin PUT and this
+            // check orphans that Puffin — the contract's accepted "crash
+            // mid-phase 3" posture.
+            if let Some(lease) = &self.publish_lease {
+                lease
+                    .check("live delete", tenant_id, table_name)
+                    .await
+                    .map_err(|e| anyhow!("live delete: the publish lease refused: {e:#}"))?;
+            }
             match bridge
                 .publish_iceberg_files_with_deletes(
                     &files,

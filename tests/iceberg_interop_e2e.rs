@@ -67,6 +67,78 @@ async fn sorted_kv_rows(client: &tokio_postgres::Client, table: &str) -> Vec<(i3
     out
 }
 
+/// The gates' shared setup: a two-row (k, v) table — `(1,'keep')` and
+/// `(2,'kill-me')` — published by one MATERIALIZE.
+async fn create_materialized_kv(client: &tokio_postgres::Client, table: &str) {
+    for sql in [
+        format!("CREATE TABLE {table} (k INT PRIMARY KEY, v VARCHAR)"),
+        format!("INSERT INTO {table} (k, v) VALUES (1, 'keep'), (2, 'kill-me')"),
+        format!("ALTER TABLE {table} MATERIALIZE"),
+    ] {
+        client
+            .simple_query(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
+    sleep(Duration::from_millis(300)).await;
+}
+
+/// The gates' shared live delete of the `kill-me` row.
+async fn delete_kill_me(client: &tokio_postgres::Client, table: &str) {
+    client
+        .simple_query(&format!("DELETE FROM {table} WHERE v = 'kill-me'"))
+        .await
+        .expect("delete");
+    sleep(Duration::from_millis(300)).await;
+}
+
+/// The WAL view (pgwire, sorted) equals the model.
+async fn assert_wal_matches(
+    client: &tokio_postgres::Client,
+    table: &str,
+    model: &std::collections::BTreeMap<i32, String>,
+    label: &str,
+) {
+    let got = sorted_kv_rows(client, table).await;
+    let want: Vec<(i32, String)> = model.iter().map(|(k, v)| (*k, v.clone())).collect();
+    assert_eq!(got, want, "{label}: the WAL view must match the model");
+}
+
+/// The external-reader leg shared by the live-delete gates and the v3
+/// read-back test: resolve the table's current metadata location over the
+/// REST catalog and read the (k, v) rows back through a pinned external
+/// reader into `target/<scratch>`. Returns false (the leg skipped) only when
+/// no reader is installed locally and none is required — CI sets the
+/// REQUIRE env so the leg binds there.
+async fn external_leg_kv(
+    rest_port: u16,
+    table: &str,
+    rows: &[(&str, &str)],
+    scratch: &str,
+) -> bool {
+    let load = rest_metadata_location(rest_port, table).await;
+    let location = load["metadata-location"]
+        .as_str()
+        .expect("metadata-location")
+        .to_string();
+    let scratch = FsPath::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(scratch);
+    std::fs::create_dir_all(&scratch).expect("scratch dir");
+    let expected: Vec<Vec<Option<String>>> = rows
+        .iter()
+        .map(|(k, v)| vec![Some((*k).to_string()), Some((*v).to_string())])
+        .collect();
+    external_readback(
+        rest_port,
+        table,
+        &location,
+        &["k", "v"],
+        &expected,
+        &scratch,
+    )
+}
+
 /// The live-delete publication artifact exists (round-1 lesson: assert the
 /// fence FIRED, not just the outcome — a silent no-op passes outcome-only
 /// gates).
@@ -966,19 +1038,7 @@ async fn check_v3_default_publication() {
     assert_eq!(second_doc["format-version"], 3, "the successor stays v3");
 
     // 4. pgwire sees every value after two publications.
-    let rows = pg_rows(&client, &table, &["k", "v"]).await;
-    let mut got: Vec<(i32, String)> = rows
-        .iter()
-        .map(|r| {
-            (
-                r[0].as_deref()
-                    .and_then(|v| v.parse::<i32>().ok())
-                    .unwrap_or(0),
-                r[1].clone().unwrap_or_default(),
-            )
-        })
-        .collect();
-    got.sort();
+    let got = sorted_kv_rows(&client, &table).await;
     assert_eq!(
         got,
         vec![
@@ -991,30 +1051,17 @@ async fn check_v3_default_publication() {
     );
 
     // 4. A pinned external reader reads the knob-published v3 table back.
-    let load = rest_metadata_location(server.rest_port, &table).await;
-    let location = load["metadata-location"]
-        .as_str()
-        .expect("metadata-location")
-        .to_string();
-    let scratch = FsPath::new(env!("CARGO_MANIFEST_DIR")).join("target/iceberg-v3-plain");
-    std::fs::create_dir_all(&scratch).expect("scratch dir");
-    let rows_out: Vec<Vec<Option<String>>> = vec![
-        vec![Some("1".into()), Some("one".into())],
-        vec![Some("2".into()), Some("two".into())],
-        vec![Some("3".into()), Some("three".into())],
-        vec![Some("4".into()), Some("four".into())],
-    ];
     // The reader gate is skipped (returns false) when no reader is installed
     // locally and none is REQUIRED — CI sets the REQUIRE env so the gate is
     // binding there, matching the sibling tests' pattern.
-    if !external_readback(
+    if !external_leg_kv(
         server.rest_port,
         &table,
-        &location,
-        &["k", "v"],
-        &rows_out,
-        &scratch,
-    ) {
+        &[("1", "one"), ("2", "two"), ("3", "three"), ("4", "four")],
+        "iceberg-v3-plain",
+    )
+    .await
+    {
         eprintln!(
             "SKIP external read-back (no reader installed): v3 metadata + lineage assertions still ran"
         );
@@ -1077,11 +1124,7 @@ async fn check_live_delete_gate1() {
     sleep(Duration::from_millis(300)).await;
 
     // The fence: the live delete (publisher armed) publishes a DV successor.
-    client
-        .simple_query(&format!("DELETE FROM {table} WHERE v = 'kill-me'"))
-        .await
-        .expect("delete");
-    sleep(Duration::from_millis(300)).await;
+    delete_kill_me(&client, table).await;
 
     // Phase-2 leg: pgwire hides the row (WAL-authoritative regardless).
     let k1 = sorted_kv_rows(&client, &table).await;
@@ -1107,25 +1150,14 @@ async fn check_live_delete_gate1() {
 
     // Fence-specific leg: the external reader serves the DV-carrying successor
     // bare — the deleted row is gone from the PUBLISHED view too.
-    let load = rest_metadata_location(server.rest_port, &table).await;
-    let location = load["metadata-location"]
-        .as_str()
-        .expect("metadata-location")
-        .to_string();
-    let scratch = FsPath::new(env!("CARGO_MANIFEST_DIR")).join("target/iceberg-live-del");
-    std::fs::create_dir_all(&scratch).expect("scratch dir");
-    let expected: Vec<Vec<Option<String>>> = vec![
-        vec![Some("1".into()), Some("keep".into())],
-        vec![Some("3".into()), Some("also-keep".into())],
-    ];
-    if !external_readback(
+    if !external_leg_kv(
         server.rest_port,
         &table,
-        &location,
-        &["k", "v"],
-        &expected,
-        &scratch,
-    ) {
+        &[("1", "keep"), ("3", "also-keep")],
+        "iceberg-live-del",
+    )
+    .await
+    {
         eprintln!("SKIP external leg (no reader installed locally); CI requires it");
         return;
     }
@@ -1165,29 +1197,9 @@ async fn check_live_delete_gate2() {
     let client = connect_pg(&server).await;
 
     let table = "live_del2";
-    client
-        .simple_query(&format!(
-            "CREATE TABLE {table} (k INT PRIMARY KEY, v VARCHAR)"
-        ))
-        .await
-        .expect("create");
-    client
-        .simple_query(&format!(
-            "INSERT INTO {table} (k, v) VALUES (1, 'keep'), (2, 'kill-me')"
-        ))
-        .await
-        .expect("insert");
-    client
-        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
-        .await
-        .expect("materialize");
-    sleep(Duration::from_millis(300)).await;
+    create_materialized_kv(&client, table).await;
 
-    client
-        .simple_query(&format!("DELETE FROM {table} WHERE v = 'kill-me'"))
-        .await
-        .expect("delete");
-    sleep(Duration::from_millis(300)).await;
+    delete_kill_me(&client, table).await;
 
     // The successor publication: an insert + re-MATERIALIZE. Review round 3
     // (finding 5): plan_append refuses a DV-carrying parent, so this
@@ -1224,25 +1236,14 @@ async fn check_live_delete_gate2() {
     // view — the WAL view hides the row regardless of any resurrection, so
     // the leg above alone cannot fail on the defect this gate exists to
     // pin. Read the successor snapshot back through the external reader.
-    let load = rest_metadata_location(server.rest_port, &table).await;
-    let location = load["metadata-location"]
-        .as_str()
-        .expect("metadata-location")
-        .to_string();
-    let scratch = FsPath::new(env!("CARGO_MANIFEST_DIR")).join("target/iceberg-live-del2");
-    std::fs::create_dir_all(&scratch).expect("scratch dir");
-    let expected: Vec<Vec<Option<String>>> = vec![
-        vec![Some("1".into()), Some("keep".into())],
-        vec![Some("3".into()), Some("later".into())],
-    ];
-    if !external_readback(
+    if !external_leg_kv(
         server.rest_port,
         &table,
-        &location,
-        &["k", "v"],
-        &expected,
-        &scratch,
-    ) {
+        &[("1", "keep"), ("3", "later")],
+        "iceberg-live-del2",
+    )
+    .await
+    {
         eprintln!("SKIP external leg (no reader installed locally); CI requires it");
         return;
     }
@@ -1290,29 +1291,9 @@ async fn check_live_delete_gate3() {
     let client = connect_pg(&server).await;
 
     let table = "live_del3";
-    client
-        .simple_query(&format!(
-            "CREATE TABLE {table} (k INT PRIMARY KEY, v VARCHAR)"
-        ))
-        .await
-        .expect("create");
-    client
-        .simple_query(&format!(
-            "INSERT INTO {table} (k, v) VALUES (1, 'keep'), (2, 'kill-me')"
-        ))
-        .await
-        .expect("insert");
-    client
-        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
-        .await
-        .expect("materialize");
-    sleep(Duration::from_millis(300)).await;
+    create_materialized_kv(&client, table).await;
 
-    client
-        .simple_query(&format!("DELETE FROM {table} WHERE v = 'kill-me'"))
-        .await
-        .expect("delete");
-    sleep(Duration::from_millis(300)).await;
+    delete_kill_me(&client, table).await;
 
     // The retry path ran: the competitor and the final successor are BOTH
     // committed after the materialize (>= 3 metadata versions total).
@@ -1371,30 +1352,10 @@ async fn check_live_delete_gate5() {
     let client = connect_pg(&server).await;
 
     let table = "live_del4";
-    client
-        .simple_query(&format!(
-            "CREATE TABLE {table} (k INT PRIMARY KEY, v VARCHAR)"
-        ))
-        .await
-        .expect("create");
-    client
-        .simple_query(&format!(
-            "INSERT INTO {table} (k, v) VALUES (1, 'keep'), (2, 'kill-me')"
-        ))
-        .await
-        .expect("insert");
-    client
-        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
-        .await
-        .expect("materialize");
-    sleep(Duration::from_millis(300)).await;
+    create_materialized_kv(&client, table).await;
 
     // The publication lands; the fault skips the flip (the crash window).
-    client
-        .simple_query(&format!("DELETE FROM {table} WHERE v = 'kill-me'"))
-        .await
-        .expect("delete");
-    sleep(Duration::from_millis(300)).await;
+    delete_kill_me(&client, table).await;
     assert_live_delete_artifact(&server);
 
     // The wedge is fail-closed: the layout still records the pre-delete
@@ -1460,23 +1421,7 @@ async fn check_live_delete_gate6() {
     let client = connect_pg(&server).await;
 
     let table = "live_del5";
-    client
-        .simple_query(&format!(
-            "CREATE TABLE {table} (k INT PRIMARY KEY, v VARCHAR)"
-        ))
-        .await
-        .expect("create");
-    client
-        .simple_query(&format!(
-            "INSERT INTO {table} (k, v) VALUES (1, 'keep'), (2, 'kill-me')"
-        ))
-        .await
-        .expect("insert");
-    client
-        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
-        .await
-        .expect("materialize");
-    sleep(Duration::from_millis(300)).await;
+    create_materialized_kv(&client, table).await;
 
     client
         .simple_query(&format!("DELETE FROM {table} WHERE v = 'kill-me'"))
@@ -1520,12 +1465,243 @@ async fn check_live_delete_gate6() {
 }
 
 /// COUNT(*) over pgwire as an i64 — the OLAP-shaped probe gate 6 uses to
-/// force the DataFusion/delta-merge path.
+/// force the DataFusion/delta-merge path. A malformed result PANICS here
+/// (naming the real defect) rather than returning a sentinel.
 async fn scalar_count(client: &tokio_postgres::Client, table: &str) -> i64 {
     let rows = pg_rows(client, table, &["COUNT(*)"]).await;
-    rows.first()
+    let raw = rows
+        .first()
         .and_then(|r| r.first())
         .and_then(|v| v.as_deref())
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(-1)
+        .unwrap_or_else(|| panic!("COUNT(*) returned no scalar for {table}"));
+    raw.trim()
+        .parse::<i64>()
+        .unwrap_or_else(|_| panic!("COUNT(*) returned a non-integer: {raw:?}"))
+}
+
+/// A tiny deterministic LCG so the soak's operation mix is reproducible
+/// (no flaky randomness; every run issues the same sequence).
+struct SoakRng(u64);
+impl SoakRng {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// Soak evidence for the activation flip (the contract's "six gates plus
+/// soak"), with the publisher ARMED and a seeded LCG driving the mix:
+/// - Phase A, interleaved inserts/deletes with a MATERIALIZE every 4th
+///   round: the WAL view equals the model after every round, the OLAP view
+///   reconciles at every MATERIALIZE, and ZERO publications happen (the
+///   completeness precondition refuses every DV-only publication while an
+///   insert is pending — TD-LIVEDEL-1's regression baseline, pinned);
+/// - Phase B, a delete chain right after a reconciling MATERIALIZE: every
+///   delete publishes (one dv-live Puffin AND one metadata version each)
+///   and the OLAP view tracks it with no MATERIALIZE;
+/// - Phase C, an insert on top of the DV-carrying base: the OLAP read
+///   refuses the unordered delta, and a MATERIALIZE over the DV parent
+///   (the relaxed entry guard) reconciles both views — no resurrection.
+#[test]
+fn soak_mixed_workload_holds_the_fence() {
+    if std::env::var_os("PROXIMADB_SOAK_CHILD").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "soak_mixed_workload_holds_the_fence",
+                "--nocapture",
+            ])
+            .env("PROXIMADB_SOAK_CHILD", "1")
+            .env("PROXIMADB_LIVE_DELETE_PUBLISHER", "1")
+            .status()
+            .expect("launch isolated soak child");
+        assert!(status.success(), "soak child failed: {status}");
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(check_soak_mixed_workload());
+}
+
+async fn check_soak_mixed_workload() {
+    let server = TestPgServer::start().await.expect("server start");
+    let client = connect_pg(&server).await;
+
+    let table = "soak";
+    client
+        .simple_query(&format!(
+            "CREATE TABLE {table} (k INT PRIMARY KEY, v VARCHAR)"
+        ))
+        .await
+        .expect("create");
+    client
+        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
+        .await
+        .expect("initial materialize");
+    sleep(Duration::from_millis(300)).await;
+
+    let mut rng = SoakRng(0x5EED_2026_1028);
+    let mut model: std::collections::BTreeMap<i32, String> = Default::default();
+    let mut next_key: i32 = 1;
+    let mut live_deletes = 0usize;
+    let mut materializes = 1usize;
+
+    for round in 0..40u64 {
+        // Seeded insert batch (1..=3 new keys).
+        let inserts = 1 + rng.below(3);
+        for _ in 0..inserts {
+            let k = next_key;
+            next_key += 1;
+            let v = format!("v{k}");
+            client
+                .simple_query(&format!("INSERT INTO {table} (k, v) VALUES ({k}, '{v}')"))
+                .await
+                .expect("insert");
+            model.insert(k, v);
+        }
+
+        // Seeded delete batch (0..=2 live keys, when any exist).
+        let deletes = rng.below(3);
+        for _ in 0..deletes {
+            if model.is_empty() {
+                break;
+            }
+            let idx = rng.below(model.len() as u64) as usize;
+            let k = *model.keys().nth(idx).expect("indexed key");
+            client
+                .simple_query(&format!("DELETE FROM {table} WHERE k = {k}"))
+                .await
+                .expect("delete");
+            model.remove(&k);
+            live_deletes += 1;
+        }
+
+        // The WAL view equals the model after every round.
+        assert_wal_matches(&client, table, &model, &format!("round {round}")).await;
+        // Every 4th round: reconcile and assert BOTH views.
+        if round % 4 == 3 {
+            client
+                .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
+                .await
+                .expect("materialize");
+            materializes += 1;
+            sleep(Duration::from_millis(200)).await;
+            let n = scalar_count(&client, &table).await;
+            assert_eq!(
+                n,
+                model.len() as i64,
+                "round {round}: the OLAP view must reconcile to the model"
+            );
+        }
+    }
+
+    // Phase B — the live fence itself. Phase A's interleaved inserts make
+    // the completeness precondition refuse every DV-only publication (a
+    // pending insert is in neither the parent's files nor a DV), so the
+    // fence is exercised here in its eligible shape: right after a
+    // reconciling MATERIALIZE, a chain of deletes with no other writes.
+    // Each delete must publish (one dv-live Puffin per delete) and the
+    // OLAP view must track the model WITHOUT another MATERIALIZE.
+    client
+        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
+        .await
+        .expect("reconciling materialize");
+    sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        scalar_count(&client, &table).await as usize,
+        model.len(),
+        "phase B starts reconciled"
+    );
+    let count_files = |server: &TestPgServer, pred: fn(&str) -> bool| {
+        warehouse_file_names(server)
+            .iter()
+            .filter(|n| pred(n))
+            .count()
+    };
+    let is_puffin: fn(&str) -> bool = |n| n.starts_with("dv-live-") && n.ends_with(".puffin");
+    let is_version: fn(&str) -> bool = |n| n.ends_with(".metadata.json");
+    // Phase A published nothing (TD-LIVEDEL-1's regression baseline): every
+    // delete there had a pending insert in the changed-set.
+    assert_eq!(
+        count_files(&server, is_puffin),
+        0,
+        "phase A: interleaved inserts refuse every DV-only publication"
+    );
+    let puffins_before = count_files(&server, is_puffin);
+    let versions_before = count_files(&server, is_version);
+    let chain = model.len().min(5);
+    assert!(chain >= 3, "phase A left enough rows for a delete chain");
+    for step in 0..chain {
+        let k = *model.keys().next().expect("a live key");
+        client
+            .simple_query(&format!("DELETE FROM {table} WHERE k = {k}"))
+            .await
+            .expect("chained delete");
+        model.remove(&k);
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            count_files(&server, is_puffin),
+            puffins_before + step + 1,
+            "phase B step {step}: the delete wrote its own Puffin"
+        );
+        assert_eq!(
+            count_files(&server, is_version),
+            versions_before + step + 1,
+            "phase B step {step}: the delete committed its own metadata version"
+        );
+        assert_eq!(
+            scalar_count(&client, &table).await as usize,
+            model.len(),
+            "phase B step {step}: the OLAP view tracks the delete with no MATERIALIZE"
+        );
+        assert_wal_matches(&client, table, &model, &format!("phase B step {step}")).await;
+    }
+
+    // Phase C — an insert on top of the DV-carrying base: the delta is now
+    // nonempty against a base with vectors, so the OLAP read REFUSES; a
+    // MATERIALIZE over the DV parent (the relaxed entry guard) then
+    // reconciles both views — the vector-carrying reconciliation path.
+    let k = next_key;
+    client
+        .simple_query(&format!("INSERT INTO {table} (k, v) VALUES ({k}, 'v{k}')"))
+        .await
+        .expect("phase C insert");
+    model.insert(k, format!("v{k}"));
+    assert_wal_matches(&client, table, &model, "phase C after insert").await;
+    let err = client
+        .simple_query(&format!("SELECT COUNT(*) FROM {table}"))
+        .await
+        .expect_err("phase C: a nonempty delta against the DV base must refuse");
+    assert!(
+        format!("{err:?}").contains("deletion-vector")
+            || format!("{err:?}").contains("deletion vectors"),
+        "phase C: the refusal names the unordered-delta condition: {err:?}"
+    );
+    client
+        .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
+        .await
+        .expect("phase C: MATERIALIZE over the DV parent");
+    materializes += 1;
+    sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        scalar_count(&client, &table).await as usize,
+        model.len(),
+        "phase C: the OLAP view reconciles over the DV parent"
+    );
+    assert_wal_matches(&client, table, &model, "phase C after MATERIALIZE").await;
+    eprintln!(
+        "soak ok: phase A {live_deletes} deletes under interleaved writes (publication refused \
+         by the completeness precondition, both views exact); phase B {chain} chained deletes \
+         -> {chain} publications, OLAP view live without MATERIALIZE; phase C DV-base \
+         reconciliation; {materializes} materializes"
+    );
 }
