@@ -847,6 +847,12 @@ pub struct ObjectStoreParquetTable {
     /// DataFusion's `AggregateStatistics` elision. `Untrusted` (external/federated)
     /// ⇒ stats are surfaced as `Precision::Absent` so COUNT/MIN/MAX scan.
     stats_trust: proximadb_data_model::StatsTrust,
+    /// The Iceberg metadata version this table was opened at, when it was
+    /// selected through the snapshot manifest; `None` for listed or
+    /// table-OPEN-cached opens. The OLAP read merge compares it to the catalog
+    /// layout's recorded version: only a base that IS the recorded publication
+    /// may serve deletion vectors alongside a non-empty WAL delta.
+    snapshot_version: Option<u64>,
 }
 
 /// Metadata subdirectory beneath the table base, matching the writer's
@@ -856,6 +862,8 @@ const METADATA_SUBPREFIX: &str = "metadata";
 /// The manifest-selected read of one location: its bridge, data files and the
 /// decoded deletion vectors that apply to them (keyed by full data-file path).
 struct ManifestSelection {
+    /// The metadata version the selection was read at.
+    version: u64,
     bridge: Arc<IcebergObjectStoreBridge>,
     paths: Vec<Path>,
     deletions: HashMap<String, Arc<PositionDeletes>>,
@@ -959,6 +967,7 @@ impl ObjectStoreParquetTable {
             deletions.insert(full.as_ref().to_string(), Arc::new(decoded));
         }
         Ok(Some(ManifestSelection {
+            version,
             bridge,
             paths,
             deletions,
@@ -1014,6 +1023,7 @@ impl ObjectStoreParquetTable {
                 selected.paths,
                 selected.deletions,
                 location,
+                Some(selected.version),
             )
             .await;
         }
@@ -1052,7 +1062,7 @@ impl ObjectStoreParquetTable {
             ));
         }
 
-        Self::open_relative(bridge, parquet_paths, HashMap::new(), location).await
+        Self::open_relative(bridge, parquet_paths, HashMap::new(), location, None).await
     }
 
     /// Resolve bridge-relative parquet paths to full keys and open them.
@@ -1065,6 +1075,7 @@ impl ObjectStoreParquetTable {
         parquet_paths: Vec<Path>,
         deletions: HashMap<String, Arc<PositionDeletes>>,
         location: &str,
+        snapshot_version: Option<u64>,
     ) -> DFResult<Self> {
         // Wrap the store so footer + row-group reads land in the per-query
         // I/O trace (ADR-030/TD-158) — the DataFusion route's bytes-scanned
@@ -1080,7 +1091,9 @@ impl ObjectStoreParquetTable {
                 .size;
             files.push((full, Some(size)));
         }
-        Self::open_files(store, files, deletions, location.to_string()).await
+        let mut table = Self::open_files(store, files, deletions, location.to_string()).await?;
+        table.snapshot_version = snapshot_version;
+        Ok(table)
     }
 
     async fn open_direct_object(location: &str) -> DFResult<Self> {
@@ -1145,6 +1158,8 @@ impl ObjectStoreParquetTable {
             split_key_cache: Arc::new(Mutex::new(HashMap::new())),
             row_group_bloom_cache: Arc::new(Mutex::new(HashMap::new())),
             stats_trust: proximadb_data_model::StatsTrust::Trusted,
+            // Only the manifest path proves a version; `open_relative` stamps it.
+            snapshot_version: None,
         })
     }
 
@@ -1214,12 +1229,21 @@ impl ObjectStoreParquetTable {
             // immutable footer discovery, not these query-time bloom/key caches.
             row_group_bloom_cache: Arc::new(Mutex::new(HashMap::new())),
             stats_trust: proximadb_data_model::StatsTrust::Trusted,
+            // A cached discovery cannot prove which metadata version it read:
+            // never eligible for the ordered-DV merge (fail-closed).
+            snapshot_version: None,
         })
     }
 
     /// Whether this pinned snapshot requires physical row-position deletes.
     pub fn has_deletion_vectors(&self) -> bool {
         !self.deletions.is_empty()
+    }
+
+    /// The Iceberg metadata version this table was opened at, when it was
+    /// selected through the snapshot manifest (see the field).
+    pub fn snapshot_version(&self) -> Option<u64> {
+        self.snapshot_version
     }
 
     /// TD-OLAP-4 shadow probe: the raw inputs a native

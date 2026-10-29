@@ -987,6 +987,30 @@ fn measure_logical_geometry_inner(
     (max_depth, nodes, leaves, max_fanout, blocking, ops)
 }
 
+/// Whether a deletion-vector base may serve a NON-EMPTY WAL delta through the
+/// merge: only when the base was opened at exactly the metadata version the
+/// catalog layout records for its publication. Only ProximaDB's own publishers
+/// write that recorded version (MATERIALIZE's flip, `advance_snapshot_lsn`,
+/// the live-delete flip), each recording a base complete apart from the delta
+/// at its snapshot LSN, with every vector backed by a WAL-durable death — so
+/// the merge (base minus vectors, minus every changed oid, plus the current
+/// rows of the changed oids) is exact. Anything else refuses: an external DV
+/// commit or a crash-gap orphan (the latest version moved past the recorded
+/// one), a listed or cached open (no proven version), or no recorded version.
+/// Metadata versions only grow, so a publication racing this read makes the
+/// opened version NEWER than the recorded one — a refusal, never a wrong row.
+#[cfg(feature = "datafusion-integration")]
+fn dv_base_is_ordered(opened: Option<u64>, recorded: Option<u64>, enabled: bool) -> bool {
+    enabled && opened.is_some() && opened == recorded
+}
+
+/// `PROXIMADB_OLAP_ORDERED_DV_BASE` (default ON): `0`/`off` restores the
+/// unconditional refusal of a deletion-vector base with a non-empty delta.
+#[cfg(feature = "datafusion-integration")]
+fn ordered_dv_base_enabled() -> bool {
+    crate::services::storage_format::default_on_gate("PROXIMADB_OLAP_ORDERED_DV_BASE", 1).is_some()
+}
+
 #[cfg(feature = "datafusion-integration")]
 async fn register_merged_olap_table(
     ctx: &datafusion::prelude::SessionContext,
@@ -1033,9 +1057,18 @@ async fn register_merged_olap_table(
     .await
     .map_err(|e| ExecutionError::Context(format!("olap-merge base open {name}: {e}")))?;
     // The catalog WAL boundary does not order an independently published DV
-    // snapshot. Appending native rows could resurrect records deleted by that
-    // newer snapshot. Refuse until the writer supplies a shared visibility fence.
-    if base.has_deletion_vectors() {
+    // snapshot: appending native rows could resurrect records that snapshot
+    // deleted. Such a base is refused. A base that IS our recorded publication
+    // (see `dv_base_is_ordered`) is complete apart from the delta at the
+    // recorded LSN, its vectors ordered against the WAL — the merge below is
+    // exact over it, so it is served.
+    if base.has_deletion_vectors()
+        && !dv_base_is_ordered(
+            base.snapshot_version(),
+            table.recorded_metadata_version,
+            ordered_dv_base_enabled(),
+        )
+    {
         return Err(ExecutionError::Context(format!(
             "olap-merge {name}: nonempty WAL delta cannot be ordered against a deletion-vector snapshot"
         )));
@@ -1230,6 +1263,34 @@ fn arrow_cell_to_proxima(
             Err(_) => ProximaValue::Null,
         }
     })
+}
+
+#[cfg(all(test, feature = "datafusion-integration"))]
+mod ordered_dv_base_tests {
+    use super::dv_base_is_ordered;
+
+    /// Only a manifest-opened base at EXACTLY the recorded version, with the
+    /// kill switch on, may serve deletion vectors beside a non-empty delta.
+    #[test]
+    fn only_the_recorded_publication_is_an_ordered_dv_base() {
+        // (opened, recorded, enabled) -> ordered
+        let cases = [
+            ((Some(4), Some(4), true), true),
+            ((Some(5), Some(4), true), false), // a newer (external/orphan) snapshot
+            ((Some(3), Some(4), true), false), // an older base than recorded
+            ((None, Some(4), true), false),    // listed or cached open: unproven
+            ((Some(4), None, true), false),    // the layout records no version
+            ((None, None, true), false),       // None == None must not qualify
+            ((Some(4), Some(4), false), false), // the kill switch
+        ];
+        for ((opened, recorded, enabled), want) in cases {
+            assert_eq!(
+                dv_base_is_ordered(opened, recorded, enabled),
+                want,
+                "opened={opened:?} recorded={recorded:?} enabled={enabled}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
