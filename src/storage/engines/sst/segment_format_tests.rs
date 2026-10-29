@@ -4399,7 +4399,7 @@ async fn filtered_coarse_probe_holds_recall_and_cuts_bytes() {
         std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
         std::env::set_var("PROXIMADB_IVF_K", "16");
         // This test targets the GLOBAL single-directory probe; pin it off the
-        // now-default-on partition layout (C2) so its cell-count assertions hold.
+        // (opt-in) partition layout so its cell-count assertions hold.
         std::env::set_var("PROXIMADB_PAX_PARTITION_LAYOUT", "0");
     }
     // Compacted (v3, A0) + shredded so `partition` is a footer-resolvable column.
@@ -4640,8 +4640,8 @@ async fn partition_layout_prunes_uncorrelated_tag() {
         unsafe {
             std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
             std::env::set_var("PROXIMADB_IVF_K", "16");
-            // Explicit "1"/"0" (the layout is now default-on, C2): "0" is the
-            // kill-switch to the global layout for the OFF arm.
+            // Explicit "1"/"0" (the layout is opt-in since TD-FPRUNE-3): "1"
+            // engages it for the ON arm, "0" pins the global layout.
             std::env::set_var(
                 "PROXIMADB_PAX_PARTITION_LAYOUT",
                 if layout_on { "1" } else { "0" },
