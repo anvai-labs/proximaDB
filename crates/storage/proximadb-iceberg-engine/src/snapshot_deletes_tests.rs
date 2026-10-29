@@ -685,3 +685,121 @@ async fn positions_span_row_groups() {
         "r3 is the first row of the SECOND row group — file position 2"
     );
 }
+
+/// One file with an explicit, NULLABLE `__proxima_oid` column — a foreign
+/// writer's shape (ours are non-null) — so position alignment over null cells
+/// and duplicate oids can be pinned.
+async fn part_with_raw_oids(
+    b: &IcebergObjectStoreBridge,
+    key: &str,
+    oids: &[Option<&str>],
+) -> Path {
+    use arrow_array::RecordBatch;
+    use arrow_array::{ArrayRef, Int64Array, StringArray};
+    use std::sync::Arc;
+
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("__proxima_oid", arrow_schema::DataType::Utf8, true),
+        arrow_schema::Field::new("age", arrow_schema::DataType::Int64, false),
+    ]));
+    let ages: Vec<i64> = (0..oids.len() as i64).collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(oids.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(ages)) as ArrayRef,
+        ],
+    )
+    .expect("batch");
+    let bytes = proximadb_storage_common::proxima_parquet::record_batches_to_parquet_bytes(
+        &[batch],
+        schema,
+        None,
+    )
+    .expect("parquet");
+    let path = Path::from(key);
+    b.store
+        .put_if_absent(&path, bytes::Bytes::from(bytes))
+        .await
+        .expect("put");
+    path
+}
+
+/// The incremental MATERIALIZE marks EVERY old position of a changed oid, so
+/// the exact core must (a) return every occurrence, not the first, and
+/// (b) count null cells so later positions stay aligned with the file. The
+/// first-occurrence resolver behind `published_positions_of` gets both
+/// wrong on this file.
+#[tokio::test]
+async fn exact_positions_return_every_occurrence_aligned_over_nulls() {
+    let b = bridge();
+    let path = part_with_raw_oids(
+        &b,
+        "t/data/exact.parquet",
+        &[Some("r1"), None, Some("r2"), Some("r1")],
+    )
+    .await;
+    let exact = b
+        .oid_positions_exact(std::slice::from_ref(&path), &["r1", "r2", "r9"])
+        .await
+        .expect("exact positions");
+    assert_eq!(
+        exact,
+        vec![(path.clone(), vec![0, 2, 3])],
+        "r1 at 0 AND 3, r2 at 2 (the null at 1 still counts), r9 nowhere"
+    );
+    let none = b
+        .oid_positions_exact(std::slice::from_ref(&path), &["r9"])
+        .await
+        .expect("no matches");
+    assert!(
+        none.is_empty(),
+        "a file holding none of the oids is omitted"
+    );
+}
+
+#[tokio::test]
+async fn exact_positions_fail_closed_on_a_file_without_the_oid_column() {
+    let b = bridge();
+    let legacy = part(&b, "t/data/legacy-exact.parquet", &[1, 2]).await;
+    let err = b
+        .oid_positions_exact(std::slice::from_ref(&legacy), &["r1"])
+        .await
+        .expect_err("pre-oid-column files must fail closed");
+    assert!(err.to_string().contains("__proxima_oid"), "{err}");
+    assert!(err.to_string().contains("legacy-exact"), "{err}");
+}
+
+/// The port seam round-trips: positions written through the trait come back
+/// through the trait, and each vector names the caller's bridge-relative data
+/// file (mapped back by URI, not by output order).
+#[tokio::test]
+async fn the_deletion_vector_seam_round_trips_positions() {
+    use proximadb_storage_common::object_store_bridge::ObjectStoreBridge;
+
+    let b = bridge();
+    let a = Path::from("t/data/seam-a.parquet");
+    let c = Path::from("t/data/seam-c.parquet");
+    let written = b
+        .write_deletion_vector_positions(
+            &Path::from("t/data/dv-mat-seam.puffin"),
+            &[(c.clone(), vec![7, 1]), (a.clone(), vec![0, 3, 3])],
+        )
+        .await
+        .expect("write through the seam");
+    assert_eq!(written.len(), 2);
+    for vector in &written {
+        let positions = b
+            .read_deletion_vector_positions(vector)
+            .await
+            .expect("read through the seam");
+        let want: Vec<u64> = if vector.data_file == a {
+            vec![0, 3]
+        } else {
+            vec![1, 7]
+        };
+        assert_eq!(positions, want, "{:?}", vector.data_file);
+        assert_eq!(vector.cardinality, want.len() as u64);
+        assert_eq!(vector.puffin_file, Path::from("t/data/dv-mat-seam.puffin"));
+    }
+}

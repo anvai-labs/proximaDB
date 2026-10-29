@@ -287,6 +287,20 @@ All six are implemented and pinned by e2e through the real pgwire facade
 The activation flip of `PROXIMADB_LIVE_DELETE_PUBLISHER` remains gated on
 these six plus soak evidence; the knob stays default-OFF.
 
+=== MATERIALIZE as a fenced carry-through writer (2026-10-29)
+
+With `PROXIMADB_MATERIALIZE_INCREMENTAL_DV`, MATERIALIZE itself publishes updates
+and deletes incrementally, and it becomes the second writer of DV-bearing recorded
+versions. It upholds the writer contract (`recorded_publication`): its successor is
+complete by construction at the captured LSN. Every oid changed since the parent's
+LSN is either re-appended as its live after-image or has its old positions hidden;
+an oid unchanged since then is exact in the parent's files; one changed again after
+the capture is in the reader's delta. Every vector it mints (`dv-mat-*`) hides only
+a superseded or WAL-deleted row version. Guarantee 1 holds per file: a touched
+file's single vector is the parent's union the new positions, and untouched parent
+vectors are carried by reference. The crash-gap adoption recognizes `dv-mat-*` as
+self-minted, by file name, ungated.
+
 === Soak evidence (2026-10-28)
 
 `soak_mixed_workload_holds_the_fence` runs a seeded mixed workload with the

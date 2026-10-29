@@ -3025,10 +3025,14 @@ async fn published_data_files(
         .await
         .expect("metadata log")
         .expect("a committed snapshot");
+    // The DV-aware listing: an incremental publication's snapshot carries
+    // deletion vectors, which the strict `read_iceberg_snapshot` refuses.
+    // Its data files are the same either way.
     bridge
-        .read_iceberg_snapshot(&metadata_prefix, version)
+        .read_iceberg_snapshot_files(&metadata_prefix, version)
         .await
         .expect("read snapshot")
+        .data_files
 }
 
 /// P3.2: `materialize_table_to_parquet` snapshots the table's rows to a Parquet
@@ -3807,6 +3811,43 @@ fn published_files_carry_a_hidden_oid_column() {
     });
 }
 
+/// `(COUNT(*), SUM(qty))` of the `inv` test table read back through the
+/// published-location reader (deletion vectors applied) — the read-side check
+/// shared by the republication tests.
+#[cfg(feature = "datafusion-integration")]
+async fn inv_qty_sum(location: String) -> (i64, i64) {
+    use crate::datafusion::create_session_context;
+    use crate::datafusion::engine_adapters::register_object_store_parquet_location;
+
+    let ctx = create_session_context().expect("session ctx");
+    register_object_store_parquet_location(
+        &ctx,
+        "inv_parquet",
+        &location,
+        None,
+        proximadb_data_model::StatsTrust::Trusted,
+    )
+    .await
+    .expect("register parquet location");
+    let batches = ctx
+        .sql("SELECT COUNT(*) AS n, SUM(qty) AS s FROM inv_parquet")
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("collect");
+    let column = |name: &str| {
+        batches[0]
+            .column_by_name(name)
+            .expect("column")
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("int64")
+            .value(0)
+    };
+    (column("n"), column("s"))
+}
+
 /// P2.4 slice 2: an insert-only republication appends one part holding only
 /// the new rows and carries the published files forward; an unchanged table
 /// publishes nothing; an update (a changed oid that is already published)
@@ -3816,8 +3857,6 @@ fn published_files_carry_a_hidden_oid_column() {
 fn an_insert_only_republication_appends_and_an_update_rewrites() {
     let _bloom = EnvGuard::set("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1");
     crate::query::execution::test_runtime::run_with_timeout(30, async {
-        use crate::datafusion::create_session_context;
-        use crate::datafusion::engine_adapters::register_object_store_parquet_location;
         use proximadb_iceberg_engine::IcebergObjectStoreBridge;
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -3845,35 +3884,7 @@ fn an_insert_only_republication_appends_and_an_update_rewrites() {
         let root_url = format!("file://{}", store_dir.path().display());
         let bridge = Arc::new(IcebergObjectStoreBridge::from_url(&root_url).expect("bridge"));
         let materialize = || dml.materialize_table_to_parquet(&*bridge, &root_url, "inv", None);
-        let qty_sum = |location: String| async move {
-            let ctx = create_session_context().expect("session ctx");
-            register_object_store_parquet_location(
-                &ctx,
-                "inv_parquet",
-                &location,
-                None,
-                proximadb_data_model::StatsTrust::Trusted,
-            )
-            .await
-            .expect("register parquet location");
-            let batches = ctx
-                .sql("SELECT COUNT(*) AS n, SUM(qty) AS s FROM inv_parquet")
-                .await
-                .expect("plan")
-                .collect()
-                .await
-                .expect("collect");
-            let column = |name: &str| {
-                batches[0]
-                    .column_by_name(name)
-                    .expect("column")
-                    .as_any()
-                    .downcast_ref::<arrow_array::Int64Array>()
-                    .expect("int64")
-                    .value(0)
-            };
-            (column("n"), column("s"))
-        };
+        let qty_sum = inv_qty_sum;
 
         let location = materialize().await.expect("materialize 1");
         let prefix = location
@@ -3981,6 +3992,293 @@ fn an_insert_only_republication_appends_and_an_update_rewrites() {
         let v6 = published_data_files(&bridge, &prefix).await;
         assert!(v6.iter().all(|p| !v4.contains(p)), "a rewrite: {v6:?}");
         assert_eq!(qty_sum(location.clone()).await, (5, 1109));
+    });
+}
+/// The `inv (id, qty)` table the incremental republication tests share: `rows`
+/// rows `('i{n}', n)`, a DML service over a WAL-backed store, and a file-backed
+/// warehouse bridge in its own tempdir.
+#[cfg(feature = "datafusion-integration")]
+struct InvFixture {
+    _dirs: (tempfile::TempDir, tempfile::TempDir),
+    _manager: Arc<CatalogManager>,
+    dml: DmlService,
+    root_url: String,
+    bridge: Arc<proximadb_iceberg_engine::IcebergObjectStoreBridge>,
+}
+
+#[cfg(feature = "datafusion-integration")]
+impl InvFixture {
+    async fn new(wal: &str, rows: usize) -> Self {
+        let wal_dir = tempfile::tempdir().expect("tempdir");
+        let (manager, dml) = dml_over_wal_table(
+            wal_dir.path(),
+            "CREATE TABLE inv (id TEXT NOT NULL, qty INT, PRIMARY KEY (id));",
+            wal,
+        )
+        .await;
+        let store_dir = tempfile::tempdir().expect("store tempdir");
+        let root_url = format!("file://{}", store_dir.path().display());
+        let bridge = Arc::new(
+            proximadb_iceberg_engine::IcebergObjectStoreBridge::from_url(&root_url)
+                .expect("bridge"),
+        );
+        let fixture = Self {
+            _dirs: (wal_dir, store_dir),
+            _manager: manager,
+            dml,
+            root_url,
+            bridge,
+        };
+        for i in 0..rows {
+            fixture
+                .exec(&format!("INSERT INTO inv (id, qty) VALUES ('i{i}', {i});"))
+                .await;
+        }
+        fixture
+    }
+
+    async fn exec(&self, sql: &str) {
+        let statement = crate::query::sql_frontend::SqlFrontendParser::new()
+            .parse_dml(sql)
+            .expect("parse dml")
+            .expect("dml stmt");
+        self.dml
+            .execute(statement)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e:#}"));
+    }
+
+    async fn materialize(&self) -> String {
+        self.dml
+            .materialize_table_to_parquet(&*self.bridge, &self.root_url, "inv", None)
+            .await
+            .expect("materialize")
+    }
+
+    /// The published data prefix of a location, and its metadata prefix.
+    fn prefixes(&self, location: &str) -> (String, String) {
+        let prefix = location
+            .strip_prefix(&format!("{}/", self.root_url))
+            .expect("location under root")
+            .to_string();
+        let metadata = format!(
+            "{}/metadata",
+            prefix.strip_suffix("/data").expect("data location")
+        );
+        (prefix, metadata)
+    }
+
+    /// The latest published snapshot's deletion vectors.
+    async fn vectors(
+        &self,
+        metadata_prefix: &str,
+    ) -> Vec<proximadb_storage_common::object_store_bridge::IcebergSnapshotDeletion> {
+        let version = self
+            .bridge
+            .latest_metadata_version(metadata_prefix)
+            .await
+            .expect("metadata log")
+            .expect("a committed snapshot");
+        self.bridge
+            .read_iceberg_snapshot_files(metadata_prefix, version)
+            .await
+            .expect("snapshot")
+            .deletion_vectors
+    }
+}
+
+/// TD-USUB-10 / TD-LIVEDEL-1: with `PROXIMADB_MATERIALIZE_INCREMENTAL_DV`
+/// on, an UPDATE or DELETE republishes incrementally — the published files are
+/// carried, the changed rows' after-images land in one new part, and their OLD
+/// positions are hidden by `dv-mat-*` deletion vectors (one per touched file,
+/// unioned with the parent's) — instead of rewriting the table. Reads through
+/// the deletion-vector-applying reader see the right rows throughout.
+#[cfg(feature = "datafusion-integration")]
+#[test]
+fn an_incremental_republication_hides_old_versions_with_deletion_vectors() {
+    let _bloom = EnvGuard::set("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1");
+    let _gate = EnvGuard::set("PROXIMADB_MATERIALIZE_INCREMENTAL_DV", "1");
+    crate::query::execution::test_runtime::run_with_timeout(30, async {
+        // 20 rows: every step below stays within the 20% deleted-row
+        // compaction bound (a 3-row table would compact on the first update).
+        let inv = InvFixture::new("incremental.wal", 20).await;
+        let location = inv.materialize().await;
+        let (prefix, metadata_prefix) = inv.prefixes(&location);
+        let v1 = published_data_files(&inv.bridge, &prefix).await;
+        assert_eq!(v1.len(), 1);
+        assert_eq!(inv_qty_sum(location.clone()).await, (20, 190));
+
+        // UPDATE: the published file is carried, ONE new part holds the
+        // after-image, and the old version's position is hidden by a dv-mat
+        // vector on the carried file.
+        inv.exec("UPDATE inv SET qty = 100 WHERE id = 'i0';").await;
+        assert_eq!(inv.materialize().await, location);
+        let v2 = published_data_files(&inv.bridge, &prefix).await;
+        assert_eq!(v2.len(), 2, "carried + one after-image part: {v2:?}");
+        assert!(
+            v2.contains(&v1[0]),
+            "the published file is carried, not rewritten"
+        );
+        let dv2 = inv.vectors(&metadata_prefix).await;
+        assert_eq!(dv2.len(), 1, "one vector, on the carried file: {dv2:?}");
+        assert_eq!(dv2[0].data_file, v1[0]);
+        assert_eq!(dv2[0].cardinality, 1, "only i0's old position is hidden");
+        assert!(
+            dv2[0]
+                .puffin_file
+                .filename()
+                .is_some_and(|n| n.starts_with("dv-mat-")),
+            "minted by MATERIALIZE: {:?}",
+            dv2[0].puffin_file
+        );
+        assert_eq!(inv_qty_sum(location.clone()).await, (20, 290));
+
+        // A delete-only delta: no new part, and the carried file's ONE vector
+        // is rewritten to the union {i0, i1}.
+        inv.exec("DELETE FROM inv WHERE id = 'i1';").await;
+        inv.materialize().await;
+        assert_eq!(
+            published_data_files(&inv.bridge, &prefix).await,
+            v2,
+            "a delete-only delta writes no part"
+        );
+        let dv3 = inv.vectors(&metadata_prefix).await;
+        assert_eq!(dv3.len(), 1, "still one vector per file: {dv3:?}");
+        assert_eq!(dv3[0].data_file, v1[0]);
+        assert_eq!(
+            dv3[0].cardinality, 2,
+            "the parent's {{i0}} union the new {{i1}}"
+        );
+        assert_eq!(inv_qty_sum(location.clone()).await, (19, 289));
+
+        // A delete-only commit landed with NO new part, so check_commit (the
+        // recovery for a commit that errored after landing) must recognize it
+        // by its Puffin — or cleanup would delete a Puffin the snapshot names.
+        {
+            use super::materialize_stream::{CommitCheck, check_commit};
+            let version3 = inv
+                .bridge
+                .latest_metadata_version(&metadata_prefix)
+                .await
+                .expect("metadata log")
+                .expect("a committed snapshot");
+            let ours = dv3[0].puffin_file.clone();
+            assert_eq!(
+                check_commit(&*inv.bridge, &metadata_prefix, version3, &[], Some(&ours)).await,
+                CommitCheck::Landed(version3),
+                "the landed delete-only commit is found by its Puffin"
+            );
+            let foreign = object_store::path::Path::from(format!("{prefix}/dv-mat-other.puffin"));
+            assert_eq!(
+                check_commit(
+                    &*inv.bridge,
+                    &metadata_prefix,
+                    version3,
+                    &[],
+                    Some(&foreign)
+                )
+                .await,
+                CommitCheck::NotLanded,
+                "a Puffin the successor does not name did not land"
+            );
+            assert_eq!(
+                check_commit(
+                    &*inv.bridge,
+                    &metadata_prefix,
+                    version3 + 1,
+                    &[],
+                    Some(&ours)
+                )
+                .await,
+                CommitCheck::NotLanded,
+                "no successor at that version"
+            );
+        }
+
+        // Delete then re-insert of a published key between publications: the
+        // old position is hidden and the new value is appended.
+        inv.exec("DELETE FROM inv WHERE id = 'i2';").await;
+        inv.exec("INSERT INTO inv (id, qty) VALUES ('i2', 50);")
+            .await;
+        inv.materialize().await;
+        assert_eq!(
+            inv_qty_sum(location.clone()).await,
+            (19, 337),
+            "i2 goes from 2 to 50 (289 - 2 + 50); i1 stays deleted"
+        );
+        let dv4 = inv.vectors(&metadata_prefix).await;
+        assert_eq!(
+            dv4.iter().map(|v| v.cardinality).sum::<u64>(),
+            3,
+            "i0, i1 and i2's old positions are hidden, nothing else: {dv4:?}"
+        );
+
+        // The same oid updated AGAIN: i0's copies now span two files — the
+        // original (already hidden) and the part holding qty=100. Both are
+        // suspects; the original's vector is unchanged (re-hiding is a no-op)
+        // and the part gets its own vector hiding the qty=100 copy.
+        let parts_before = published_data_files(&inv.bridge, &prefix).await;
+        inv.exec("UPDATE inv SET qty = 200 WHERE id = 'i0';").await;
+        inv.materialize().await;
+        let parts_after = published_data_files(&inv.bridge, &prefix).await;
+        assert!(
+            parts_before.iter().all(|p| parts_after.contains(p)),
+            "every earlier part is carried: {parts_after:?}"
+        );
+        assert_eq!(
+            parts_after.len(),
+            parts_before.len() + 1,
+            "one new after-image part"
+        );
+        let dv5 = inv.vectors(&metadata_prefix).await;
+        let on = |file: &object_store::path::Path| {
+            dv5.iter()
+                .find(|v| &v.data_file == file)
+                .map(|v| v.cardinality)
+        };
+        assert_eq!(
+            on(&v1[0]),
+            Some(3),
+            "the original keeps {{i0, i1, i2}}: {dv5:?}"
+        );
+        let first_after_image = v2.iter().find(|p| !v1.contains(p)).expect("part 2");
+        assert_eq!(
+            on(first_after_image),
+            Some(1),
+            "the qty=100 copy of i0 is now hidden too: {dv5:?}"
+        );
+        assert_eq!(
+            inv_qty_sum(location.clone()).await,
+            (19, 437),
+            "i0 goes from 100 to 200 (337 - 100 + 200)"
+        );
+    });
+}
+
+/// Past the compaction bound (over 20% of rows deleted), the incremental
+/// plan falls back to a full rewrite: no deletion vectors, nothing carried.
+#[cfg(feature = "datafusion-integration")]
+#[test]
+fn an_incremental_republication_over_the_bound_compacts_instead() {
+    let _bloom = EnvGuard::set("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1");
+    let _gate = EnvGuard::set("PROXIMADB_MATERIALIZE_INCREMENTAL_DV", "1");
+    crate::query::execution::test_runtime::run_with_timeout(30, async {
+        let inv = InvFixture::new("compact.wal", 4).await;
+        let location = inv.materialize().await;
+        let (prefix, metadata_prefix) = inv.prefixes(&location);
+        let v1 = published_data_files(&inv.bridge, &prefix).await;
+        // 1 of 4 rows (25%) is over the 20% bound.
+        inv.exec("DELETE FROM inv WHERE id = 'i0';").await;
+        inv.materialize().await;
+        let v2 = published_data_files(&inv.bridge, &prefix).await;
+        assert!(
+            v2.iter().all(|p| !v1.contains(p)),
+            "a compacting rewrite: {v2:?}"
+        );
+        assert!(
+            inv.vectors(&metadata_prefix).await.is_empty(),
+            "a rewrite carries no vectors"
+        );
     });
 }
 
@@ -4264,17 +4562,17 @@ fn materialize_publishes_multi_part_generations_and_collects_old_ones() {
             prefix.strip_suffix("/data").expect("data location")
         );
         assert_eq!(
-            check_commit(&*bridge, &metadata_prefix, 2, &gen3).await,
+            check_commit(&*bridge, &metadata_prefix, 2, &gen3, None).await,
             CommitCheck::Landed(2),
             "version 2 names these parts: the error came after the commit"
         );
         assert_eq!(
-            check_commit(&*bridge, &metadata_prefix, 2, &gen2).await,
+            check_commit(&*bridge, &metadata_prefix, 2, &gen2, None).await,
             CommitCheck::NotLanded,
             "version 2 exists but names other parts"
         );
         assert_eq!(
-            check_commit(&*bridge, &metadata_prefix, 3, &gen3).await,
+            check_commit(&*bridge, &metadata_prefix, 3, &gen3, None).await,
             CommitCheck::NotLanded,
             "no version 3"
         );

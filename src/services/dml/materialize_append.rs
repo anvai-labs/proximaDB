@@ -39,6 +39,8 @@ pub(crate) fn configured_append_max_rows() -> Option<usize> {
 
 /// One published row group's oid bounds and (when it has one) Bloom filter.
 struct OidGroup {
+    /// Index into [`PublishedOids::files`] of the file this row group is in.
+    file: usize,
     min: Vec<u8>,
     max: Vec<u8>,
     bloom: Option<Sbbf>,
@@ -47,17 +49,45 @@ struct OidGroup {
 /// The published oids of one snapshot, as probe-able row-group summaries.
 pub(crate) struct PublishedOids {
     groups: Vec<OidGroup>,
+    /// The probed files and each one's row count, in `read` order.
+    files: Vec<(Path, u64)>,
+}
+
+impl OidGroup {
+    fn may_contain(&self, oid: &str) -> bool {
+        let key = oid.as_bytes();
+        self.min.as_slice() <= key
+            && key <= self.max.as_slice()
+            && self.bloom.as_ref().is_none_or(|b| b.check(oid))
+    }
 }
 
 impl PublishedOids {
     /// `false` only when no published file can hold `oid`.
     pub(crate) fn may_contain(&self, oid: &str) -> bool {
-        let key = oid.as_bytes();
-        self.groups.iter().any(|g| {
-            g.min.as_slice() <= key
-                && key <= g.max.as_slice()
-                && g.bloom.as_ref().is_none_or(|b| b.check(oid))
-        })
+        self.groups.iter().any(|g| g.may_contain(oid))
+    }
+
+    /// The files whose row groups may hold any of `oids` (min/max and Bloom
+    /// have no false negatives): the exact position scan reads only these.
+    pub(crate) fn suspect_files(&self, oids: &[String]) -> Vec<Path> {
+        let mut suspect = vec![false; self.files.len()];
+        for group in &self.groups {
+            if !suspect[group.file] && oids.iter().any(|oid| group.may_contain(oid)) {
+                suspect[group.file] = true;
+            }
+        }
+        self.files
+            .iter()
+            .zip(suspect)
+            .filter(|(_, is)| *is)
+            .map(|((file, _), _)| file.clone())
+            .collect()
+    }
+
+    /// Each probed file's row count.
+    pub(crate) fn file_rows(&self) -> std::collections::HashMap<Path, u64> {
+        self.files.iter().cloned().collect()
     }
 
     /// Read the summaries of `files` (bridge-relative keys). `Ok(None)` when a
@@ -72,7 +102,8 @@ impl PublishedOids {
     ) -> Result<Option<Self>> {
         let store = bridge.inner_store();
         let mut groups = Vec::new();
-        for file in files {
+        let mut file_list = Vec::with_capacity(files.len());
+        for (file_index, file) in files.iter().enumerate() {
             #[allow(deprecated)]
             let reader = ParquetObjectReader::new(store.clone(), bridge.object_store_path(file));
             let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
@@ -82,6 +113,8 @@ impl PublishedOids {
                 return Ok(None);
             }
             let metadata = builder.metadata().clone();
+            let rows = u64::try_from(metadata.file_metadata().num_rows()).unwrap_or(0);
+            file_list.push((file.clone(), rows));
             // The Parquet leaf index, which differs from the Arrow field index
             // once a nested column precedes the oid column.
             let Some(column) = metadata
@@ -113,13 +146,17 @@ impl PublishedOids {
                     None
                 };
                 groups.push(OidGroup {
+                    file: file_index,
                     min: min.data().to_vec(),
                     max: max.data().to_vec(),
                     bloom,
                 });
             }
         }
-        Ok(Some(Self { groups }))
+        Ok(Some(Self {
+            groups,
+            files: file_list,
+        }))
     }
 }
 
@@ -143,6 +180,28 @@ pub(crate) enum AppendPlan {
     Unchanged,
     /// Append these new oids to the published files.
     Append(Vec<String>),
+    /// Incremental update/delete (`PROXIMADB_MATERIALIZE_INCREMENTAL_DV`):
+    /// append the changed oids' after-images and mark their OLD positions in
+    /// `suspect_files` with deletion vectors.
+    Delta {
+        oids: Vec<String>,
+        suspect_files: Vec<Path>,
+        file_rows: std::collections::HashMap<Path, u64>,
+    },
+}
+
+/// `PROXIMADB_MATERIALIZE_INCREMENTAL_DV` (default OFF): an update or delete
+/// since the last publication republishes incrementally — after-images
+/// appended, old positions marked with deletion vectors — instead of
+/// rewriting the table. It changes the publication format (DVs force Iceberg
+/// v3), so it ships off until baked (the storage-format mandate).
+pub(crate) fn incremental_dv_enabled() -> bool {
+    std::env::var("PROXIMADB_MATERIALIZE_INCREMENTAL_DV").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 /// Classify `changed` (the oids written since the published snapshot) against
@@ -151,6 +210,7 @@ pub(crate) fn classify(
     changed: Vec<String>,
     published: &PublishedOids,
     max_rows: usize,
+    incremental: bool,
 ) -> AppendPlan {
     if changed.is_empty() {
         return AppendPlan::Unchanged;
@@ -159,7 +219,17 @@ pub(crate) fn classify(
         return AppendPlan::Rewrite("the delta exceeds the append bound");
     }
     if changed.iter().any(|oid| published.may_contain(oid)) {
-        return AppendPlan::Rewrite("a changed row may already be published (update or delete)");
+        if !incremental {
+            return AppendPlan::Rewrite(
+                "a changed row may already be published (update or delete)",
+            );
+        }
+        let suspect_files = published.suspect_files(&changed);
+        return AppendPlan::Delta {
+            oids: changed,
+            suspect_files,
+            file_rows: published.file_rows(),
+        };
     }
     AppendPlan::Append(changed)
 }
@@ -170,6 +240,7 @@ mod tests {
 
     fn group(min: &str, max: &str) -> OidGroup {
         OidGroup {
+            file: 0,
             min: min.as_bytes().to_vec(),
             max: max.as_bytes().to_vec(),
             bloom: None,
@@ -180,20 +251,55 @@ mod tests {
     fn classification_appends_only_rows_no_published_file_can_hold() {
         let published = PublishedOids {
             groups: vec![group("t:row:100", "t:row:199")],
+            files: vec![(Path::from("p0"), 100)],
         };
         let new = |oids: &[&str]| oids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(classify(vec![], &published, 10), AppendPlan::Unchanged);
         assert_eq!(
-            classify(new(&["t:row:200", "t:row:201"]), &published, 10),
+            classify(vec![], &published, 10, false),
+            AppendPlan::Unchanged
+        );
+        assert_eq!(
+            classify(new(&["t:row:200", "t:row:201"]), &published, 10, false),
             AppendPlan::Append(new(&["t:row:200", "t:row:201"]))
         );
         assert!(matches!(
-            classify(new(&["t:row:200", "t:row:150"]), &published, 10),
+            classify(new(&["t:row:200", "t:row:150"]), &published, 10, false),
             AppendPlan::Rewrite(_)
         ));
         assert!(matches!(
-            classify(new(&["t:row:200", "t:row:201"]), &published, 1),
+            classify(new(&["t:row:200", "t:row:201"]), &published, 1, false),
             AppendPlan::Rewrite(_)
+        ));
+    }
+
+    /// With the incremental gate, a changed oid that may be published is a
+    /// Delta — and the exact scan is narrowed to the files whose row groups
+    /// may hold a changed oid (the other file is never read).
+    #[test]
+    fn incremental_classification_narrows_the_scan_to_suspect_files() {
+        let mut far = group("t:row:500", "t:row:599");
+        far.file = 1;
+        let published = PublishedOids {
+            groups: vec![group("t:row:100", "t:row:199"), far],
+            files: vec![(Path::from("p0"), 100), (Path::from("p1"), 100)],
+        };
+        let changed = vec!["t:row:150".to_string(), "t:row:800".to_string()];
+        assert_eq!(
+            classify(changed.clone(), &published, 10, true),
+            AppendPlan::Delta {
+                oids: changed,
+                suspect_files: vec![Path::from("p0")],
+                file_rows: std::collections::HashMap::from([
+                    (Path::from("p0"), 100),
+                    (Path::from("p1"), 100),
+                ]),
+            },
+            "only p0 may hold t:row:150; t:row:800 is in no file's range"
+        );
+        // Pure inserts still append, gate or not.
+        assert!(matches!(
+            classify(vec!["t:row:900".to_string()], &published, 10, true),
+            AppendPlan::Append(_)
         ));
     }
 }

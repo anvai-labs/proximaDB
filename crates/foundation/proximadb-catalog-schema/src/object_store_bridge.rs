@@ -398,6 +398,55 @@ pub trait ObjectStoreBridge: Send + Sync {
             "publish_iceberg_files_deleting not supported".into(),
         ))
     }
+
+    /// EXACT row positions of `oids` in each of `files`, read from the hidden
+    /// `__proxima_oid` column: every occurrence, counted over every row (null
+    /// cells included, so positions stay aligned with the file). Files holding
+    /// none of the oids are omitted. A file without the oid column fails
+    /// closed. Default: unsupported.
+    async fn published_oid_positions(
+        &self,
+        _files: &[Path],
+        _oids: &[&str],
+    ) -> Result<Vec<FileOidPositions>, StorageError> {
+        Err(StorageError::Serialization(
+            "published_oid_positions not supported".into(),
+        ))
+    }
+
+    /// The deleted positions one published deletion vector holds. Default:
+    /// unsupported.
+    async fn read_deletion_vector_positions(
+        &self,
+        _vector: &IcebergSnapshotDeletion,
+    ) -> Result<Vec<u64>, StorageError> {
+        Err(StorageError::Serialization(
+            "read_deletion_vector_positions not supported".into(),
+        ))
+    }
+
+    /// Write one Puffin at `puffin_key` (create-only) holding one deletion
+    /// vector per `(data file, positions)` entry, returning their manifest
+    /// descriptors for `publish_iceberg_files_deleting`. Default: unsupported.
+    async fn write_deletion_vector_positions(
+        &self,
+        _puffin_key: &Path,
+        _vectors: &[(Path, Vec<u64>)],
+    ) -> Result<Vec<IcebergSnapshotDeletion>, StorageError> {
+        Err(StorageError::Serialization(
+            "write_deletion_vector_positions not supported".into(),
+        ))
+    }
+}
+
+/// The exact row positions some oids occupy in one published data file
+/// (see [`ObjectStoreBridge::published_oid_positions`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileOidPositions {
+    /// The data file, as the snapshot names it.
+    pub file: Path,
+    /// Sorted, de-duplicated row positions (0-based, in file order).
+    pub positions: Vec<u64>,
 }
 
 /// Storage-common-local descriptor of one Iceberg schema field (the trait can't reference

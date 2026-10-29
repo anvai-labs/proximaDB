@@ -1051,6 +1051,89 @@ impl ObjectStoreBridge for IcebergObjectStoreBridge {
         )
         .await
     }
+
+    async fn published_oid_positions(
+        &self,
+        files: &[Path],
+        oids: &[&str],
+    ) -> Result<Vec<proximadb_storage_common::object_store_bridge::FileOidPositions>, StorageError>
+    {
+        Ok(self
+            .oid_positions_exact(files, oids)
+            .await?
+            .into_iter()
+            .map(|(file, positions)| {
+                proximadb_storage_common::object_store_bridge::FileOidPositions { file, positions }
+            })
+            .collect())
+    }
+
+    async fn read_deletion_vector_positions(
+        &self,
+        vector: &DeletionView,
+    ) -> Result<Vec<u64>, StorageError> {
+        let engine_form = snapshot_deletes::SnapshotDeletionVector {
+            data_file: vector.data_file.clone(),
+            puffin_file: vector.puffin_file.clone(),
+            content_offset: vector.content_offset,
+            content_size_in_bytes: vector.content_size_in_bytes,
+            puffin_file_size_in_bytes: vector.puffin_file_size_in_bytes,
+            cardinality: vector.cardinality,
+        };
+        Ok(self.read_deletion_vector(&engine_form).await?.positions())
+    }
+
+    async fn write_deletion_vector_positions(
+        &self,
+        puffin_key: &Path,
+        vectors: &[(Path, Vec<u64>)],
+    ) -> Result<Vec<DeletionView>, StorageError> {
+        let encoded: Vec<(Path, deletion_vector::PositionDeletes)> = vectors
+            .iter()
+            .map(|(file, positions)| {
+                let mut deletes = deletion_vector::PositionDeletes::new();
+                for position in positions {
+                    deletes.insert(*position);
+                }
+                (file.clone(), deletes)
+            })
+            .collect();
+        let borrowed: Vec<(Path, &deletion_vector::PositionDeletes)> =
+            encoded.iter().map(|(file, d)| (file.clone(), d)).collect();
+        let metas = self.write_deletion_vectors(puffin_key, &borrowed).await?;
+        // Map each written vector back to the caller's bridge-relative data
+        // file by URI (never by output order).
+        let by_uri: std::collections::HashMap<String, &Path> = vectors
+            .iter()
+            .map(|(file, _)| (self.object_uri(file.as_ref()), file))
+            .collect();
+        let negative = |what: &str| {
+            StorageError::Serialization(format!("iceberg-engine: written {what} is negative"))
+        };
+        metas
+            .into_iter()
+            .map(|meta| {
+                let data_file = by_uri.get(&meta.referenced_data_file).ok_or_else(|| {
+                    StorageError::Serialization(format!(
+                        "iceberg-engine: a written vector names {} which was not asked for",
+                        meta.referenced_data_file
+                    ))
+                })?;
+                Ok(DeletionView {
+                    data_file: (*data_file).clone(),
+                    puffin_file: puffin_key.clone(),
+                    content_offset: u64::try_from(meta.content_offset)
+                        .map_err(|_| negative("content_offset"))?,
+                    content_size_in_bytes: u64::try_from(meta.content_size_in_bytes)
+                        .map_err(|_| negative("content_size_in_bytes"))?,
+                    puffin_file_size_in_bytes: u64::try_from(meta.file_size_in_bytes)
+                        .map_err(|_| negative("puffin size"))?,
+                    cardinality: u64::try_from(meta.record_count)
+                        .map_err(|_| negative("cardinality"))?,
+                })
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

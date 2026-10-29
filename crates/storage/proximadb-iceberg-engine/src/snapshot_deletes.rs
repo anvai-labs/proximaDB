@@ -251,6 +251,87 @@ pub struct PublishedPositions {
 }
 
 impl IcebergObjectStoreBridge {
+    /// Stream one data file's hidden `__proxima_oid` column, calling `visit`
+    /// with every row's 0-based position and its oid (`None` for a null
+    /// cell). Positions count EVERY row, so they stay aligned with the file.
+    /// Only the oid column is decoded. A file written before the hidden
+    /// column existed (pre-P2.4-2a parts carried forward by appends) yields
+    /// an empty projection, and fails closed with the file named rather than
+    /// panicking on a column access.
+    async fn scan_oid_column(
+        &self,
+        file: &Path,
+        mut visit: impl FnMut(u64, Option<&str>),
+    ) -> Result<(), StorageError> {
+        use arrow_array::Array;
+        use futures::TryStreamExt;
+        use proximadb_storage_common::object_store_bridge::ObjectStoreBridge as _;
+        use proximadb_storage_common::proxima_arrow::SYS_COL_OID;
+
+        let oid_field = arrow_schema::Field::new(SYS_COL_OID, arrow_schema::DataType::Utf8, false);
+        let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![oid_field]));
+        let mut stream = self
+            .read_parquet_batches(file, schema, 8192, None)
+            .await
+            .map_err(|e| invalid(format!("opening {file:?} oid column: {e}")))?;
+        let mut position: u64 = 0;
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .map_err(|e| invalid(format!("reading {file:?} oid column: {e}")))?
+        {
+            if batch.num_columns() == 0 {
+                return Err(invalid(format!(
+                    "{file:?}: no {SYS_COL_OID} column (written before the hidden oid \
+                         column existed); positions cannot be mapped in this file"
+                )));
+            }
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .ok_or_else(|| {
+                    invalid(format!("{file:?}: the {SYS_COL_OID} column is not utf8"))
+                })?;
+            for i in 0..column.len() {
+                let cell = (!column.is_null(i)).then(|| column.value(i));
+                visit(position, cell);
+                position += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// EXACT positions of `oids` in each of `files`: every occurrence of every
+    /// asked oid, over every row (null cells counted, never matched). Files
+    /// holding none are omitted; positions come back sorted. The incremental
+    /// MATERIALIZE marks these old positions with deletion vectors, so unlike
+    /// `published_positions_of` (first occurrence only, kept for the live
+    /// publisher) nothing may be missed. COST: the whole oid column of each
+    /// given file, matched in place (no per-row allocation); callers narrow
+    /// `files` with the min/max + Bloom index first.
+    pub async fn oid_positions_exact(
+        &self,
+        files: &[Path],
+        oids: &[&str],
+    ) -> Result<Vec<(Path, Vec<u64>)>, StorageError> {
+        let asked: std::collections::HashSet<&str> = oids.iter().copied().collect();
+        let mut out = Vec::new();
+        for file in files {
+            let mut positions = Vec::new();
+            self.scan_oid_column(file, |position, cell| {
+                if cell.is_some_and(|oid| asked.contains(oid)) {
+                    positions.push(position);
+                }
+            })
+            .await?;
+            if !positions.is_empty() {
+                out.push((file.clone(), positions));
+            }
+        }
+        Ok(out)
+    }
+
     /// Map `oids` to their per-file row positions across `files`. The union of
     /// every file's `oids_missing` (deduplicated) rides the LAST entry so the
     /// caller sees never-published oids once.
@@ -268,56 +349,19 @@ impl IcebergObjectStoreBridge {
         // method; the DML delete path holds `&dyn ObjectStoreBridge` and
         // reaches the concrete type the way the DataFusion reader does
         // (`IcebergObjectStoreBridge::from_url`) or via a later trait method.
-        use arrow_array::Array;
-        use proximadb_storage_common::object_store_bridge::ObjectStoreBridge as _;
-        use proximadb_storage_common::proxima_arrow::SYS_COL_OID;
-
         let asked: std::collections::HashSet<&str> = oids.iter().copied().collect();
         let mut found_all: std::collections::HashSet<&str> = Default::default();
         let mut per_file = Vec::new();
         for file in files {
-            // Project just the oid column; only that column is decoded.
-            let oid_field =
-                arrow_schema::Field::new(SYS_COL_OID, arrow_schema::DataType::Utf8, false);
-            let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![oid_field]));
-            let mut stream = self
-                .read_parquet_batches(file, schema, 8192, None)
-                .await
-                .map_err(|e| invalid(format!("opening {file:?} oid column: {e}")))?;
-            use futures::TryStreamExt;
             let mut rows: Vec<String> = Vec::new();
-            while let Some(batch) = stream
-                .try_next()
-                .await
-                .map_err(|e| invalid(format!("reading {file:?} oid column: {e}")))?
-            {
-                // Round-1 review: a file written before the hidden oid column
-                // (pre-P2.4-2a parts carried forward by appends) yields an
-                // EMPTY projection — 0-column batches with row counts — and
-                // a column access would PANIC. Fail closed with the file
-                // named instead.
-                if batch.num_columns() == 0 {
-                    return Err(invalid(format!(
-                        "{file:?}: no {SYS_COL_OID} column (written before the hidden \
-                         oid column existed); the delete writer cannot map positions \
-                         in this file"
-                    )));
+            self.scan_oid_column(file, |_, cell| {
+                // A null oid cell (a foreign writer's shape; ours are
+                // non-null) can never match an asked oid — skip it.
+                if let Some(oid) = cell {
+                    rows.push(oid.to_string());
                 }
-                let column = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow_array::StringArray>()
-                    .ok_or_else(|| {
-                        invalid(format!("{file:?}: the {SYS_COL_OID} column is not utf8"))
-                    })?;
-                for i in 0..column.len() {
-                    // A null oid cell (a foreign writer's shape; ours are
-                    // non-null) can never match an asked oid — skip it.
-                    if !column.is_null(i) {
-                        rows.push(column.value(i).to_string());
-                    }
-                }
-            }
+            })
+            .await?;
             let resolver =
                 proximadb_storage_common::oid_position_resolver::OidPositionResolver::from_stream_order(rows);
             let mut positions = Vec::new();
