@@ -1753,8 +1753,8 @@ async fn check_soak_mixed_workload() {
     );
 }
 
-/// TD-USUB-10 / TD-LIVEDEL-1: with `PROXIMADB_MATERIALIZE_INCREMENTAL_DV`, a
-/// MATERIALIZE after an UPDATE and a DELETE republishes INCREMENTALLY through
+/// TD-USUB-10 / TD-LIVEDEL-1: by default (`PROXIMADB_MATERIALIZE_INCREMENTAL_DV`
+/// unset), a MATERIALIZE after an UPDATE and a DELETE republishes INCREMENTALLY through
 /// the real pgwire facade: the published file is carried (not rewritten), the
 /// update's after-image lands in a new part, and both old row versions are
 /// hidden by one `dv-mat-*` deletion vector. Both views and the external
@@ -1766,10 +1766,9 @@ fn incremental_materialize_publishes_updates_and_deletes_as_vectors() {
     run_isolated(
         "incremental_materialize_publishes_updates_and_deletes_as_vectors",
         "PROXIMADB_INCR_MAT_CHILD",
-        &[
-            ("PROXIMADB_MATERIALIZE_INCREMENTAL_DV", "1"),
-            ("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1"),
-        ],
+        // No PROXIMADB_MATERIALIZE_INCREMENTAL_DV: this exercises the DEFAULT
+        // (ON since 2026-10-29) end to end through pgwire.
+        &[("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1")],
         check_incremental_materialize,
     );
 }

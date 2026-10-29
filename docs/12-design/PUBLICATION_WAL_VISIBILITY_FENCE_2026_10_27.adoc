@@ -162,6 +162,14 @@ The fence therefore guarantees:
      Metadata versions only grow, so a publication racing a read makes the opened
      version newer than the recorded one: a refusal, never a wrong row.
   ** Kill switch: `PROXIMADB_OLAP_ORDERED_DV_BASE=0` restores the unconditional refusal.
+     With incremental MATERIALIZE ON (the default), turning ONLY this off is an
+     outage: every table that took an incremental publication carries `dv-mat`
+     vectors, so every OLAP read with a nonempty delta refuses (`db error`) until
+     the next MATERIALIZE — and that MATERIALIZE stays incremental, so the
+     refusal returns with the next write. Disarm both together: set
+     `PROXIMADB_MATERIALIZE_INCREMENTAL_DV=0`, then re-MATERIALIZE each affected
+     table (the entry guard admits its own `dv-mat` parent and the rewrite drops
+     the vectors).
 
 == Crash and conflict
 
@@ -185,7 +193,19 @@ The fence therefore guarantees:
   forever, and after any later WAL delete every read of a nonempty delta
   against the DV base refuses. The DML routing reads the parent's DV state
   BEFORE the lane is chosen (a commit-time refusal would strand the written
-  parts) and demotes the statement to the WAL lane; the bulk lane's snapshot
+  parts) and demotes the statement to the WAL lane. Since incremental
+  MATERIALIZE (which publishes vectors and does NOT take the DML lock) is ON by
+  default, that read is repeated under the table's `publish_lock` once the bulk
+  lane is chosen, and the lock is held through the bulk commit: in one process
+  no publisher can commit vectors between the eligibility read and the bulk
+  commit (publishers in another process remain gate 3's CAS/lease fence). The
+  lock is keyed on the RESOLVED table identity, not the SQL spelling. Cost: a
+  bulk append waits for an in-flight MATERIALIZE (O(table)) and vice versa; the
+  DML lease (10 s, not renewed) can lapse during that wait, which is safe
+  because correctness rests on the publish lock, and a long wait raises the
+  chance a MATERIALIZE's lease fence refuses at commit (retry). A statement
+  demoted to the WAL lane releases the lock. The bulk
+  lane's snapshot
   ids join MATERIALIZE's millisecond scale, bumped past the parent's, so the
   lane can no longer starve later publications of valid ids.
 * **Concurrent publisher (MATERIALIZE racing a DELETE):** both hold the `publish_lock`;
@@ -289,7 +309,7 @@ these six plus soak evidence; the knob stays default-OFF.
 
 === MATERIALIZE as a fenced carry-through writer (2026-10-29)
 
-With `PROXIMADB_MATERIALIZE_INCREMENTAL_DV`, MATERIALIZE itself publishes updates
+With `PROXIMADB_MATERIALIZE_INCREMENTAL_DV` (default ON since 2026-10-29), MATERIALIZE itself publishes updates
 and deletes incrementally, and it becomes the second writer of DV-bearing recorded
 versions. It upholds the writer contract (`recorded_publication`): its successor is
 complete by construction at the captured LSN. Every oid changed since the parent's
@@ -334,5 +354,8 @@ both between publications (merged over the DV-carrying base) and after them.
 Deltas under the 20% bound publish incrementally; deltas past it compact.
 Superseded `dv-mat-*` Puffins are collected by the generation GC (bounded by
 the parts the current and previous snapshots name); the final state reads back
-through the external engines in CI. Local run: 41 updates, 20 deletes, 14
-MATERIALIZEs, at most 2 `dv-mat` Puffins on disk.
+through the external engines in CI (#2286). Run with CI's pinned readers
+required: 41 updates, 20 deletes, 15 MATERIALIZEs, at most 2 `dv-mat` Puffins on
+disk, pyiceberg (REST and static) and DuckDB exact. On that evidence the gate is
+ON by default from 2026-10-29; `PROXIMADB_MATERIALIZE_INCREMENTAL_DV=0` is the
+kill switch back to full rewrites.

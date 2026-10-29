@@ -3851,11 +3851,15 @@ async fn inv_qty_sum(location: String) -> (i64, i64) {
 /// P2.4 slice 2: an insert-only republication appends one part holding only
 /// the new rows and carries the published files forward; an unchanged table
 /// publishes nothing; an update (a changed oid that is already published)
-/// falls back to a full rewrite. Reads see the right rows throughout.
+/// falls back to a full rewrite. Reads see the right rows throughout. This
+/// pins the opt-out: with `PROXIMADB_MATERIALIZE_INCREMENTAL_DV=0` an update
+/// still rewrites (the default publishes it incrementally — see
+/// `an_incremental_republication_hides_old_versions_with_deletion_vectors`).
 #[cfg(feature = "datafusion-integration")]
 #[test]
 fn an_insert_only_republication_appends_and_an_update_rewrites() {
     let _bloom = EnvGuard::set("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1");
+    let _gate = EnvGuard::set("PROXIMADB_MATERIALIZE_INCREMENTAL_DV", "0");
     crate::query::execution::test_runtime::run_with_timeout(30, async {
         use proximadb_iceberg_engine::IcebergObjectStoreBridge;
 
@@ -4323,6 +4327,9 @@ fn an_incremental_republication_over_the_bound_compacts_instead() {
 /// republication rewrites instead of keeping the stale row as "unchanged".
 #[tokio::test]
 async fn an_update_under_object_id_keying_outside_default_rewrites() {
+    // Pins the full-rewrite path (the default publishes an update
+    // incrementally; 1 of 3 rows would also trip the 20% compaction bound).
+    let _gate = EnvGuard::set("PROXIMADB_MATERIALIZE_INCREMENTAL_DV", "0");
     let _keying = EnvGuard::set("PROXIMADB_WAL_OBJECT_ID_KEY", "1");
     let _bloom = EnvGuard::set("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1");
     use proximadb_iceberg_engine::IcebergObjectStoreBridge;
@@ -4383,6 +4390,33 @@ async fn an_update_under_object_id_keying_outside_default_rewrites() {
         v2.iter().all(|p| !v1.contains(p)),
         "the update must rewrite, not be skipped as unchanged: {v1:?} -> {v2:?}"
     );
+}
+
+/// Incremental MATERIALIZE is ON by default (armed 2026-10-29 on the soak's
+/// evidence): unset or empty arms it, and only an explicit off value disarms
+/// it — a typo keeps the default rather than silently reverting to rewrites.
+#[test]
+fn incremental_materialize_is_on_by_default_and_opts_out_explicitly() {
+    use super::materialize_append::incremental_dv_enabled;
+    const GATE: &str = "PROXIMADB_MATERIALIZE_INCREMENTAL_DV";
+    {
+        let _old = EnvGuard::set(GATE, "");
+        // SAFETY: test-only; lib tests are process-isolated (nextest) or serial.
+        unsafe { std::env::remove_var(GATE) };
+        assert!(incremental_dv_enabled(), "unset arms it");
+    }
+    for (value, on) in [
+        ("", true),
+        ("1", true),
+        ("on", true),
+        ("0", false),
+        ("off", false),
+        ("false", false),
+        ("disabled", false),
+    ] {
+        let _gate = EnvGuard::set(GATE, value);
+        assert_eq!(incremental_dv_enabled(), on, "{GATE}={value:?}");
+    }
 }
 
 /// Restores an environment variable when dropped (lib tests run one per process
