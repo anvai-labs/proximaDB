@@ -271,7 +271,44 @@ impl ReservationRegistry {
     /// Reserve for a PERFORMANCE collection create. Fails with an actionable
     /// error when no default pool is resolvable or the operator armed no
     /// default grant size — never a silent zero-byte grant.
+    ///
+    /// Cancel-safe (TD-TIER-1 SC4-3): the mutation and its budget sync run
+    /// as one detached task, so a request future dropped mid-way (client
+    /// disconnect) cannot leave a committed grant with a stale budget or an
+    /// unregistered protection group — the task finishes regardless.
     pub async fn reserve_for_performance(
+        self: &Arc<Self>,
+        tenant_id: &str,
+        collection_id: &str,
+        now_unix_secs: i64,
+        residency_prefixes: &[String],
+    ) -> Result<Grant, ReservationError> {
+        let handle =
+            self.spawn_reserve(tenant_id, collection_id, now_unix_secs, residency_prefixes);
+        join_reserve(handle).await
+    }
+
+    /// Start the detached reserve task and hand back its handle, so a caller
+    /// that must compensate a dropped create can own the outcome
+    /// ([`GrantCompensation::reserve`]).
+    fn spawn_reserve(
+        self: &Arc<Self>,
+        tenant_id: &str,
+        collection_id: &str,
+        now_unix_secs: i64,
+        residency_prefixes: &[String],
+    ) -> tokio::task::JoinHandle<Result<Grant, ReservationError>> {
+        let this = Arc::clone(self);
+        let tenant = tenant_id.to_string();
+        let collection = collection_id.to_string();
+        let prefixes = residency_prefixes.to_vec();
+        tokio::spawn(async move {
+            this.reserve_gated(&tenant, &collection, now_unix_secs, &prefixes)
+                .await
+        })
+    }
+
+    async fn reserve_gated(
         &self,
         tenant_id: &str,
         collection_id: &str,
@@ -378,12 +415,35 @@ impl ReservationRegistry {
     /// Release every live grant for a collection identity across all pools
     /// (idempotent where the identity never reserved). Tail intervals park
     /// for the metering tick.
+    ///
+    /// Cancel-safe like [`Self::reserve_for_performance`]: release, unpin and
+    /// budget sync complete in a detached task even if the caller is dropped.
+    /// Known residual (recorded): two detached tasks for the SAME collection
+    /// (a dropped release, then a new reserve) are not ordered — tokio's
+    /// mutex is fair only among already-queued waiters — so a late release
+    /// can remove the newer grant.
     pub async fn release_for_collection(
-        &self,
+        self: &Arc<Self>,
         tenant_id: &str,
         collection_id: &str,
         now_unix_secs: i64,
     ) {
+        let this = Arc::clone(self);
+        let tenant = tenant_id.to_string();
+        let collection = collection_id.to_string();
+        if let Err(error) = tokio::spawn(async move {
+            this.release_gated(&tenant, &collection, now_unix_secs)
+                .await;
+        })
+        .await
+        {
+            tracing::warn!(
+                "TD-TIER-1 SC4: release task for ({tenant_id}, {collection_id}) failed: {error}"
+            );
+        }
+    }
+
+    async fn release_gated(&self, tenant_id: &str, collection_id: &str, now_unix_secs: i64) {
         // Mutation + budget sync under one gate (SF1): the Σ read cannot
         // interleave with a concurrent mutation's commit.
         let _gate = self.mutation_gate.lock().await;
@@ -412,6 +472,18 @@ impl ReservationRegistry {
             proximadb_cache::unregister_protection_group(grant_id);
         }
         self.sync_residency_budget().await;
+    }
+
+    /// TD-TIER-1 SC4-3: the live grant for a collection id in any pool
+    /// (collection ids are catalog UUIDs, unique across tenants). Status
+    /// reads only — never the query path.
+    pub async fn live_grant_for_collection(&self, collection_id: &str) -> Option<Grant> {
+        for (_, authority) in self.pools.values() {
+            if let Some(grant) = authority.live_grant_by_collection(collection_id).await {
+                return Some(grant);
+            }
+        }
+        None
     }
 
     /// One metering tick: drain parked release-tails plus each pool's accrued
@@ -918,6 +990,16 @@ impl ReservationAuthority {
         self.inner.ledger.lock().await.grants.clone()
     }
 
+    /// The live grant for a collection id under any tenant (status reads).
+    pub async fn live_grant_by_collection(&self, collection_id: &str) -> Option<Grant> {
+        let guard = self.inner.ledger.lock().await;
+        guard
+            .grants
+            .iter()
+            .find(|g| g.collection_id == collection_id && g.state.charges_capacity())
+            .cloned()
+    }
+
     /// The live grant for an identity, if any (release bookkeeping).
     pub async fn live_grant_snapshot(&self, tenant_id: &str, collection_id: &str) -> Option<Grant> {
         let guard = self.inner.ledger.lock().await;
@@ -1118,6 +1200,141 @@ fn grant_by_id_mut<'a>(
         .iter_mut()
         .find(|g| g.id == id)
         .ok_or_else(|| ReservationError::Corrupt("grant vanished in prospect".into()))
+}
+
+/// Await a detached reserve task, folding a task failure into the error.
+async fn join_reserve(
+    handle: tokio::task::JoinHandle<Result<Grant, ReservationError>>,
+) -> Result<Grant, ReservationError> {
+    handle.await.map_err(reserve_task_failed)?
+}
+
+fn reserve_task_failed(error: tokio::task::JoinError) -> ReservationError {
+    ReservationError::Io(std::io::Error::other(format!(
+        "TD-TIER-1 SC4: reservation task failed: {error}"
+    )))
+}
+
+/// What a [`GrantCompensation`] still owes.
+enum Compensation {
+    /// Nothing reserved, or the create committed.
+    Nothing,
+    /// The reserve task is running; its outcome is not yet known.
+    Pending(tokio::task::JoinHandle<Result<Grant, ReservationError>>),
+    /// The reserve committed; the create has not.
+    Committed,
+}
+
+/// TD-TIER-1 SC4-3: compensating release for a create that reserves a grant
+/// (review S3). It owns the reserve from the moment it starts: the create
+/// path releases explicitly on every error exit, and if the create future is
+/// instead DROPPED (client disconnect) — even while the reserve is still
+/// running — `Drop` spawns a task that waits for the reserve's outcome and
+/// releases a committed grant. Waiting on the reserve orders the release
+/// after it, so the two can never land out of order. Disarm once the
+/// catalog record exists.
+///
+/// Recorded residual: a drop inside the catalog upsert await AFTER its
+/// write became durable releases the grant of a collection that now exists
+/// (PERFORMANCE but unreserved) — the slice's reconciliation scope.
+pub struct GrantCompensation {
+    owed: Compensation,
+    target: Option<(Arc<ReservationRegistry>, String, String)>,
+}
+
+impl GrantCompensation {
+    /// Nothing reserved.
+    pub fn none() -> Self {
+        Self {
+            owed: Compensation::Nothing,
+            target: None,
+        }
+    }
+
+    /// Start a PERFORMANCE reserve for (tenant, collection), owned by the
+    /// returned guard. Call [`Self::committed`] for the outcome.
+    pub fn reserve(
+        registry: &Arc<ReservationRegistry>,
+        tenant: String,
+        collection: String,
+        now_unix_secs: i64,
+        residency_prefixes: &[String],
+    ) -> Self {
+        let handle =
+            registry.spawn_reserve(&tenant, &collection, now_unix_secs, residency_prefixes);
+        Self {
+            owed: Compensation::Pending(handle),
+            target: Some((registry.clone(), tenant, collection)),
+        }
+    }
+
+    /// Wait for the reserve's outcome. On success the guard owes a release
+    /// until disarmed; on failure it owes nothing.
+    pub async fn committed(&mut self) -> Result<Grant, ReservationError> {
+        let Compensation::Pending(handle) = &mut self.owed else {
+            return Err(ReservationError::Invalid(
+                "no reservation is pending on this guard".to_string(),
+            ));
+        };
+        let outcome = handle
+            .await
+            .map_err(reserve_task_failed)
+            .and_then(|inner| inner);
+        self.owed = if outcome.is_ok() {
+            Compensation::Committed
+        } else {
+            Compensation::Nothing
+        };
+        outcome
+    }
+
+    /// Release now (an explicit error exit after [`Self::committed`]);
+    /// idempotent.
+    pub async fn release_now(&mut self) {
+        if let Compensation::Committed = std::mem::replace(&mut self.owed, Compensation::Nothing)
+            && let Some((registry, tenant, collection)) = &self.target
+        {
+            registry
+                .release_for_collection(tenant, collection, chrono::Utc::now().timestamp())
+                .await;
+        }
+    }
+
+    /// The create committed: keep the grant.
+    pub fn disarm(&mut self) {
+        self.owed = Compensation::Nothing;
+    }
+}
+
+impl Drop for GrantCompensation {
+    fn drop(&mut self) {
+        let owed = std::mem::replace(&mut self.owed, Compensation::Nothing);
+        let Some((registry, tenant, collection)) = self.target.take() else {
+            return;
+        };
+        let pending = match owed {
+            Compensation::Nothing => return,
+            Compensation::Pending(handle) => Some(handle),
+            Compensation::Committed => None,
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                "TD-TIER-1 SC4: create for ({tenant}, {collection}) was dropped outside a \
+                 runtime; its grant could not be released"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            if let Some(handle) = pending
+                && !matches!(handle.await, Ok(Ok(_)))
+            {
+                return; // the reserve failed: nothing to release
+            }
+            registry
+                .release_for_collection(&tenant, &collection, chrono::Utc::now().timestamp())
+                .await;
+        });
+    }
 }
 
 /// TD-TIER-1 SC4-2: a grant's protection share — its collection's segment
@@ -2069,6 +2286,112 @@ mod tests {
             2048,
             "reopen pushes the reconciled charged budget"
         );
+    }
+
+    /// SC4-3 cancel safety: a reserve whose request future is dropped after
+    /// its first poll (client disconnect) still commits AND syncs the budget
+    /// — the mutation runs in a detached task, so the committed grant can
+    /// never sit beside a stale budget.
+    #[tokio::test]
+    async fn dropped_reserve_future_still_commits_and_syncs_budget() {
+        let _guard = budget_cell_gate();
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = pool_config(&dir, "p1", 0);
+        cfg.overhead_factor = 0.0;
+        cfg.default_grant_bytes = 4096;
+        let registry = ReservationRegistry::open_from_config(std::slice::from_ref(&cfg))
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            let mut fut = Box::pin(registry.reserve_for_performance(
+                "t1",
+                "cancel-1",
+                current_unix_secs(),
+                &[],
+            ));
+            // One poll spawns the task; then the caller goes away.
+            let _ = futures::poll!(fut.as_mut());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while proximadb_cache::process_reserved_budget() != 4096 {
+            assert!(std::time::Instant::now() < deadline, "budget never synced");
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            registry
+                .live_grant_for_collection("cancel-1")
+                .await
+                .is_some()
+        );
+        registry
+            .release_for_collection("t1", "cancel-1", current_unix_secs())
+            .await;
+        assert_eq!(proximadb_cache::process_reserved_budget(), 0);
+    }
+
+    /// SC4-3 review S3: a create dropped while its reserve is still running,
+    /// or after it committed, releases the grant through the guard's Drop; a
+    /// disarmed guard keeps it.
+    #[tokio::test]
+    async fn dropped_compensation_releases_pending_and_committed_disarmed_keeps() {
+        let _guard = budget_cell_gate();
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = pool_config(&dir, "p1", 0);
+        cfg.overhead_factor = 0.0;
+        cfg.default_grant_bytes = 4096;
+        let registry = ReservationRegistry::open_from_config(std::slice::from_ref(&cfg))
+            .await
+            .unwrap()
+            .unwrap();
+        let start = |collection: &str| {
+            GrantCompensation::reserve(
+                &registry,
+                "t1".to_string(),
+                collection.to_string(),
+                current_unix_secs(),
+                &[],
+            )
+        };
+        // Dropped before the reserve's outcome was even observed.
+        drop(start("pending-1"));
+        // Dropped after the reserve committed.
+        let mut committed = start("committed-1");
+        committed.committed().await.unwrap();
+        drop(committed);
+        // Disarmed after the create committed.
+        let mut kept = start("kept-1");
+        kept.committed().await.unwrap();
+        kept.disarm();
+        drop(kept);
+        // A grant that was reserved and then released is in the ledger in a
+        // non-charging state; absence alone would also hold if the reserve
+        // had simply not run yet.
+        let released = |collection: &'static str| {
+            let registry = registry.clone();
+            async move {
+                let mut found = false;
+                for (_, authority) in registry.pools.values() {
+                    for grant in authority.grants_snapshot().await {
+                        if grant.collection_id == collection && grant.state.charges_capacity() {
+                            return false;
+                        }
+                        found |= grant.collection_id == collection;
+                    }
+                }
+                found
+            }
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !(released("pending-1").await && released("committed-1").await) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dropped guards never released"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(registry.live_grant_for_collection("kept-1").await.is_some());
+        assert_eq!(proximadb_cache::process_reserved_budget(), 4096);
     }
 
     /// SC4-2 end to end through the real bridge and store: after a reserve,

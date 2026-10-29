@@ -155,6 +155,28 @@ pub fn storage_class_status(config: &CollectionConfig) -> StorageClassStatus {
     }
 }
 
+/// TD-TIER-1 SC4-3: overlay the live residency figures of a PERFORMANCE
+/// collection's grant onto its status. The state stays `not_active`: bytes
+/// are reserved and (partly) protected, but no READY coverage proof exists
+/// yet, so no guarantee is implied — the reason says exactly how far the
+/// grant has got. `covered_bytes` ≤ `resident_bytes` by construction.
+pub fn with_live_residency(
+    mut status: StorageClassStatus,
+    reserved_bytes: u64,
+    resident_bytes: u64,
+    covered_bytes: u64,
+) -> StorageClassStatus {
+    status.reserved_bytes = reserved_bytes;
+    status.resident_bytes = resident_bytes;
+    status.covered_bytes = covered_bytes;
+    status.reason = format!(
+        "performance residency is reserved but not READY (TD-TIER-1 SC4): \
+         {reserved_bytes} bytes reserved; {covered_bytes} of {resident_bytes} cached \
+         bytes protected; no coverage proof yet — the collection serves balanced behavior"
+    );
+    status
+}
+
 /// SC2 admission check for the PERFORMANCE class, evaluated on the final
 /// RESOLVED placement (not the raw client request): the engine must be the
 /// PAX path (SST) and the resolved base location — the client's explicit
@@ -301,6 +323,23 @@ mod tests {
             storage_class: raw,
             ..Default::default()
         }
+    }
+
+    /// SC4-3: the status overlay reports the grant's bytes without claiming READY.
+    #[test]
+    fn live_residency_overlay_reports_bytes_and_stays_not_active() {
+        let base = storage_class_status(&config_with_class(Some(StorageClass::Performance as i32)));
+        let status = with_live_residency(base, 4096, 3000, 1000);
+        assert_eq!(status.state, State::NotActive as i32, "no READY proof yet");
+        assert_eq!(
+            (
+                status.reserved_bytes,
+                status.resident_bytes,
+                status.covered_bytes
+            ),
+            (4096, 3000, 1000)
+        );
+        assert!(status.reason.contains("1000 of 3000"), "{}", status.reason);
     }
 
     /// SC4-2: the prefixes are the flush/compaction segment roots, both

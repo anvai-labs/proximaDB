@@ -204,6 +204,49 @@ impl CollectionService {
         })
     }
 
+    /// TD-TIER-1 SC4-3: report a PERFORMANCE collection's live grant on its
+    /// status — reserved bytes from the ledger, resident and covered bytes
+    /// from the registered process store. Only the collection GET operation
+    /// (REST v2 and gRPC v2) calls this, through
+    /// `CollectionPort::enrich_collection_status` — never `get_collection`,
+    /// which every search resolves through (review B1). Non-PERFORMANCE
+    /// collections and an inert registry return immediately.
+    pub async fn overlay_live_residency(&self, collection: &mut Collection) {
+        let Some(registry) = &self.reservations else {
+            return;
+        };
+        let Some(config) = collection.config.as_ref() else {
+            return;
+        };
+        if crate::services::collection::storage_class::storage_class_or_balanced(config)
+            != crate::proto::proximadb_v1::StorageClass::Performance
+        {
+            return;
+        }
+        let Some(grant) = registry.live_grant_for_collection(&collection.id).await else {
+            return;
+        };
+        let (resident, covered) = proximadb_cache::process_store()
+            .map(|store| {
+                (
+                    store.group_resident_bytes(&grant.id),
+                    store.covered_bytes(&grant.id),
+                )
+            })
+            .unwrap_or((0, 0));
+        let base = collection.storage_class_status.take().unwrap_or_else(|| {
+            crate::services::collection::storage_class::storage_class_status(config)
+        });
+        collection.storage_class_status = Some(
+            crate::services::collection::storage_class::with_live_residency(
+                base,
+                grant.bytes,
+                resident,
+                covered,
+            ),
+        );
+    }
+
     /// TD-TIER-1 SC3-2: the shared reservation registry, when pools are
     /// declared. The metering cadence ticks it (release tails + accrual).
     pub fn reservations(
@@ -1414,10 +1457,8 @@ impl CollectionService {
         // list skip this seam entirely. If a later create step fails, the
         // compensation below releases the grant: a leaked grant would charge
         // capacity and accrue billing for a collection that never existed.
-        let mut reserved_grant: Option<(
-            std::sync::Arc<crate::services::collection::ReservationRegistry>,
-            String,
-        )> = None;
+        let mut reserved_grant =
+            crate::services::collection::reservation::GrantCompensation::none();
         if crate::services::collection::storage_class::storage_class_or_balanced(&enriched_config)
             == crate::proto::proximadb_v1::StorageClass::Performance
             && let Some(registry) = &self.reservations
@@ -1435,26 +1476,26 @@ impl CollectionService {
                 &uuid,
                 typed_identity,
             );
-            registry
-                .reserve_for_performance(
-                    &reservation_tenant,
-                    &uuid,
-                    chrono::Utc::now().timestamp(),
-                    &protect_prefixes,
-                )
+            reserved_grant = crate::services::collection::reservation::GrantCompensation::reserve(
+                registry,
+                reservation_tenant,
+                uuid.clone(),
+                chrono::Utc::now().timestamp(),
+                &protect_prefixes,
+            );
+            reserved_grant
+                .committed()
                 .await
                 .context("TD-TIER-1 SC3: PERFORMANCE admission refused")?;
-            reserved_grant = Some((registry.clone(), reservation_tenant));
         }
         // Compensating release for every early exit after a successful
-        // reserve (review B1: the grant must not outlive a failed create).
+        // reserve (review B1: the grant must not outlive a failed create). A
+        // DROPPED create future (client disconnect) releases too: the guard's
+        // Drop spawns the release (SC4-3 review S3); it is disarmed once the
+        // catalog record — the collection's existence — is durable.
         macro_rules! compensate_reservation {
             () => {
-                if let Some((registry, tenant)) = reserved_grant.take() {
-                    registry
-                        .release_for_collection(&tenant, &uuid, chrono::Utc::now().timestamp())
-                        .await;
-                }
+                reserved_grant.release_now().await;
             };
         }
 
@@ -1539,6 +1580,7 @@ impl CollectionService {
                 start_time.elapsed().as_micros() as i64,
             ));
         }
+        reserved_grant.disarm();
 
         // The catalog asset write above is the sole authoritative store for the
         // collection; the legacy metadata backend is no longer dual-written.
@@ -5839,6 +5881,13 @@ impl proximadb_runtime::CollectionPort for CollectionService {
         tenant_id: Option<&str>,
     ) -> anyhow::Result<Option<crate::proto::proximadb_v1::Collection>> {
         self.collection_for_tenant(identifier, tenant_id).await
+    }
+
+    async fn enrich_collection_status(
+        &self,
+        collection: &mut crate::proto::proximadb_v1::Collection,
+    ) {
+        self.overlay_live_residency(collection).await;
     }
 
     async fn create_collection(

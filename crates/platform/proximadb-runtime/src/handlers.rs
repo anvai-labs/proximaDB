@@ -454,10 +454,13 @@ impl ApiHandlersPort for UnifiedHandlers {
                 resp.collection = Some(col);
             }
             CollectionOperation::CollectionGet => {
-                let col = self
+                let mut col = self
                     .collection
                     .get_collection(collection_id, tenant_id)
                     .await?;
+                if let Some(collection) = col.as_mut() {
+                    self.collection.enrich_collection_status(collection).await;
+                }
                 resp.success = col.is_some();
                 resp.collection = col;
             }
