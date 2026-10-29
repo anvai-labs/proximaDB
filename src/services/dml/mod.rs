@@ -114,6 +114,31 @@ static ICEBERG_PUBLISH_FAILURES: std::sync::LazyLock<Option<prometheus::IntCount
         Some(counter)
     });
 
+/// Which plan each committed or advanced MATERIALIZE took — `rewrite`,
+/// `append`, `incremental_dv` or `unchanged`: the publication-cost dimension
+/// the incremental path moves (O(table) rewrites vs O(delta) publications),
+/// and how tests prove which path ran. Same registration posture as the
+/// failure counters.
+static MATERIALIZE_PLANS: std::sync::LazyLock<Option<prometheus::IntCounterVec>> =
+    std::sync::LazyLock::new(|| {
+        let counter = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "proximadb_warehouse_materialize_plans_total",
+                "MATERIALIZE publications by the plan they took",
+            ),
+            &["plan"],
+        )
+        .ok()?;
+        let _ = prometheus::register(Box::new(counter.clone()));
+        Some(counter)
+    });
+
+fn count_materialize_plan(plan: &str) {
+    if let Some(counter) = MATERIALIZE_PLANS.as_ref() {
+        counter.with_label_values(&[plan]).inc();
+    }
+}
+
 /// Live-delete publications that refused or failed (the fence gap the
 /// contract's best-effort-with-accounting phase 3 leaves behind: the WAL
 /// delete stands, the published view stays stale until the next full
@@ -2968,7 +2993,7 @@ impl DmlService {
             let ours_orphaned = parent_snapshot
                 .deletion_vectors
                 .iter()
-                .all(|dv| dv.puffin_file.as_ref().contains("dv-live-"));
+                .all(|dv| materialize_stream::is_self_minted_dv(&dv.puffin_file));
             // The version-matched case (recorded == parent, captured LSN
             // below the recorded one — the same store-global inflight floor
             // can lower THIS capture) is adoption-safe by the identical
@@ -3006,6 +3031,9 @@ impl DmlService {
         // instead of rewriting the table (see `materialize_append`).
         let mut carried: Vec<object_store::path::Path> = Vec::new();
         let mut appended_rows: Option<Vec<ProximaRecord>> = None;
+        // Incremental update/delete (`AppendPlan::Delta`): the successor's
+        // deletion vectors, planned before any part is written.
+        let mut dv_plan: Option<materialize_dv_plan::DvPlan> = None;
         if let (Some(previous), Some(max_rows)) =
             (parent, materialize_append::configured_append_max_rows())
         {
@@ -3050,6 +3078,7 @@ impl DmlService {
                                 fence,
                             )
                             .await?;
+                            count_materialize_plan("unchanged");
                             return Ok(location);
                         }
                         Ok((_, rows)) => {
@@ -3059,6 +3088,62 @@ impl DmlService {
                         Err(e) => warn!(
                             table = %table_name,
                             "MATERIALIZE: reading the appended rows failed, rewriting: {e:#}"
+                        ),
+                    }
+                }
+                Ok((
+                    materialize_append::AppendPlan::Delta {
+                        oids,
+                        suspect_files,
+                        file_rows,
+                    },
+                    files,
+                )) => {
+                    match self
+                        .plan_incremental_delta(
+                            bridge,
+                            table_name,
+                            &metadata_prefix,
+                            previous,
+                            &files,
+                            &oids,
+                            &suspect_files,
+                            &file_rows,
+                            scope_tenant,
+                        )
+                        .await
+                    {
+                        // Nothing to publish: no live after-image and no
+                        // published position to hide (the probe's candidates
+                        // were Bloom false positives, or every change was an
+                        // insert-then-delete) — the files are exact as of now.
+                        Ok(Some((rows, plan))) if rows.is_empty() && plan.rewrite.is_empty() => {
+                            self.advance_snapshot_lsn(
+                                &catalog,
+                                &table_id,
+                                previous,
+                                snapshot_lsn,
+                                &location,
+                                fence,
+                            )
+                            .await?;
+                            count_materialize_plan("unchanged");
+                            return Ok(location);
+                        }
+                        Ok(Some((rows, plan))) => {
+                            carried = files;
+                            appended_rows = Some(rows);
+                            dv_plan = Some(plan);
+                        }
+                        Ok(None) => {
+                            info!(
+                                table = %table_name,
+                                "MATERIALIZE: full rewrite (deleted rows over the compaction bound)"
+                            );
+                        }
+                        Err(e) => warn!(
+                            table = %table_name,
+                            "MATERIALIZE: incremental delta planning failed, rewriting: {e:#}"
                         ),
                     }
                 }
@@ -3075,6 +3160,7 @@ impl DmlService {
                         fence,
                     )
                     .await?;
+                    count_materialize_plan("unchanged");
                     return Ok(location);
                 }
                 Ok((materialize_append::AppendPlan::Rewrite(reason), _)) => {
@@ -3085,6 +3171,8 @@ impl DmlService {
                 }
             }
         }
+        let delta_without_rows =
+            dv_plan.is_some() && appended_rows.as_ref().is_some_and(|rows| rows.is_empty());
         let data_dir = format!("{prefix}/data");
         let full_columns = Self::resolve_select_projection(&schema, &[])?;
         let col_names: Vec<String> = full_columns.iter().map(|c| c.name.clone()).collect();
@@ -3171,7 +3259,15 @@ impl DmlService {
             let _ = writer.abort().await;
             return Err(e);
         }
-        let parts = writer.finish().await?;
+        let mut parts = writer.finish().await?;
+        // A delete-only delta wrote no after-image: `finish` still emits one
+        // empty part, which would only cost a file toward the compaction cap.
+        if delta_without_rows {
+            let empty: Vec<object_store::path::Path> =
+                parts.iter().map(|p| p.path.clone()).collect();
+            Self::delete_parts(bridge, &empty).await;
+            parts.clear();
+        }
         let part_keys: Vec<object_store::path::Path> =
             parts.iter().map(|p| p.path.clone()).collect();
         // The snapshot names the carried (already published) files too. Only
@@ -3194,10 +3290,40 @@ impl DmlService {
         // its children), unlike the catalog layout location below, which is the
         // directory of the data files.
         let table_root = format!("{}/{prefix}", warehouse_root_url.trim_end_matches('/'));
+        // Incremental delta: write the touched files' complete vectors into one
+        // new Puffin (create-only), named by this publication's generation.
+        let mut dv_written: Vec<
+            proximadb_storage_common::object_store_bridge::IcebergSnapshotDeletion,
+        > = Vec::new();
+        let dv_puffin: Option<object_store::path::Path> = match &dv_plan {
+            Some(plan) if !plan.rewrite.is_empty() => {
+                let key =
+                    object_store::path::Path::from(format!("{data_dir}/dv-mat-{stem}.puffin"));
+                match bridge
+                    .write_deletion_vector_positions(&key, &plan.rewrite)
+                    .await
+                {
+                    Ok(written) => {
+                        dv_written = written;
+                        Some(key)
+                    }
+                    Err(e) => {
+                        Self::delete_parts(bridge, &part_keys).await;
+                        return Err(anyhow!(
+                            "MATERIALIZE {table_name}: writing the deletion vectors: {e}"
+                        ));
+                    }
+                }
+            }
+            _ => None,
+        };
+        // This publication's own objects: a failure deletes only these.
+        let own_keys: Vec<object_store::path::Path> =
+            part_keys.iter().cloned().chain(dv_puffin.clone()).collect();
         // Fenced advance: the authority to publish is re-checked right before the
         // commit, which is the point after which the new snapshot is visible.
         if let Err(e) = fence.check().await {
-            Self::delete_parts(bridge, &part_keys).await;
+            Self::delete_parts(bridge, &own_keys).await;
             return Err(e.context(format!(
                 "MATERIALIZE {table_name}: publish fence refused the commit"
             )));
@@ -3205,10 +3331,14 @@ impl DmlService {
         // P2.4 slice 3b: an APPEND (carried non-empty) must carry the parent
         // snapshot's deletion vectors into the new one — a snapshot that names
         // the carried files without their vectors resurrects every deleted row.
-        // Under the entry guard, full rewrites proceed only for delete-free parents.
+        // A full rewrite from a DV parent proceeds only when the entry guard
+        // finds it synchronized (or adopts our own orphan); it never carries.
         let carried_deletes: Vec<
             proximadb_storage_common::object_store_bridge::IcebergSnapshotDeletion,
-        > = if carried.is_empty() {
+        > = if let Some(plan) = &dv_plan {
+            // Untouched parent vectors by reference, plus the new Puffin's.
+            plan.carry.iter().cloned().chain(dv_written).collect()
+        } else if carried.is_empty() {
             Vec::new()
         } else {
             match parent {
@@ -3292,6 +3422,7 @@ impl DmlService {
                     &metadata_prefix,
                     successor,
                     &part_keys,
+                    dv_puffin.as_ref(),
                 )
                 .await
                 {
@@ -3305,7 +3436,7 @@ impl DmlService {
                     }
                     check => {
                         if check == materialize_stream::CommitCheck::NotLanded {
-                            Self::delete_parts(bridge, &part_keys).await;
+                            Self::delete_parts(bridge, &own_keys).await;
                         }
                         return Err(anyhow!(
                             "MATERIALIZE {table_name}: Iceberg snapshot commit failed; the \
@@ -3315,6 +3446,16 @@ impl DmlService {
                 }
             }
         };
+
+        // A Delta plan whose candidates were all Bloom false positives wrote no
+        // vector: it was an append carrying the parent's vectors.
+        count_materialize_plan(if dv_puffin.is_some() {
+            "incremental_dv"
+        } else if appending {
+            "append"
+        } else {
+            "rewrite"
+        });
 
         // 6. Flip the catalog layout to a published Parquet projection at the location.
         // ADR-059 first-principles: the `location` is the directory where the
@@ -3575,7 +3716,12 @@ impl DmlService {
             .read_iceberg_snapshot_files(metadata_prefix, previous)
             .await
             .map_err(|e| anyhow!("reading the published snapshot: {e}"))?;
-        if snapshot.has_deletions() {
+        // With the incremental gate, a DV-carrying parent is planned exactly:
+        // a probed oid that a vector hides still classifies as possibly
+        // published, which routes it to the Delta plan, and the exact scan +
+        // per-file union make re-marking an already-hidden position a no-op.
+        let incremental = materialize_append::incremental_dv_enabled();
+        if snapshot.has_deletions() && !incremental {
             return Ok((
                 AppendPlan::Rewrite("the published snapshot carries deletion vectors"),
                 Vec::new(),
@@ -3606,9 +3752,69 @@ impl DmlService {
             .changed_oids_under(&schema.name, schema.object_id, snapshot_lsn, tenant)
             .await?;
         Ok((
-            materialize_append::classify(changed, &published, max_rows),
+            materialize_append::classify(changed, &published, max_rows, incremental),
             files,
         ))
+    }
+
+    /// The I/O half of an incremental update/delete (`AppendPlan::Delta`):
+    /// the exact old positions of the changed oids in the suspect files, the
+    /// parent's vectors (only the touched ones decoded), the planned successor
+    /// vectors, and the changed oids' live after-images. `Ok(None)` when the
+    /// successor would carry more deleted rows than the compaction bounds
+    /// allow — the caller rewrites (compacts) instead.
+    ///
+    /// Recording the captured LSN over this successor is sound even though
+    /// the after-images are read now (after the capture): every oid changed
+    /// since the parent's LSN is in `oids`; an oid not in it is exact in the
+    /// parent's files at the capture; one that changed again after the
+    /// capture is in the reader's delta and is suppressed and re-read.
+    #[allow(clippy::too_many_arguments)]
+    async fn plan_incremental_delta(
+        &self,
+        bridge: &dyn ObjectStoreBridge,
+        table_name: &str,
+        metadata_prefix: &str,
+        previous: u64,
+        files: &[object_store::path::Path],
+        oids: &[String],
+        suspect_files: &[object_store::path::Path],
+        file_rows: &HashMap<object_store::path::Path, u64>,
+        tenant: Option<&str>,
+    ) -> Result<Option<(Vec<ProximaRecord>, materialize_dv_plan::DvPlan)>> {
+        use crate::query::execution::olap_delta_merge::OlapDeltaSource;
+
+        let asked: Vec<&str> = oids.iter().map(String::as_str).collect();
+        let fresh: std::collections::BTreeMap<object_store::path::Path, Vec<u64>> = bridge
+            .published_oid_positions(suspect_files, &asked)
+            .await
+            .map_err(|e| anyhow!("mapping changed oids to published positions: {e}"))?
+            .into_iter()
+            .map(|found| (found.file, found.positions))
+            .collect();
+        let parent = bridge
+            .read_iceberg_snapshot_files(metadata_prefix, previous)
+            .await
+            .map_err(|e| anyhow!("reading the parent's deletion vectors: {e}"))?
+            .deletion_vectors;
+        let mut decoded = HashMap::new();
+        for vector in materialize_dv_plan::touched_parent_vectors(&parent, &fresh) {
+            let positions = bridge
+                .read_deletion_vector_positions(vector)
+                .await
+                .map_err(|e| anyhow!("decoding the parent vector of {}: {e}", vector.data_file))?;
+            decoded.insert(vector.data_file.clone(), positions);
+        }
+        let plan = materialize_dv_plan::plan_deletion_vectors(
+            files, &parent, &fresh, &decoded, file_rows,
+        )?;
+        let total_rows: u64 = file_rows.values().sum();
+        if !materialize_dv_plan::within_compaction_bounds(&plan, total_rows) {
+            return Ok(None);
+        }
+        let (_, rows) =
+            <Self as OlapDeltaSource>::current_records(self, table_name, oids, tenant).await?;
+        Ok(Some((rows, plan)))
     }
 
     /// Remove the parts of a publication that failed to commit (best effort:
@@ -10044,6 +10250,7 @@ impl crate::services::ddl::TableMaterializer for DmlTableMaterializer {
 }
 
 mod materialize_append;
+mod materialize_dv_plan;
 mod materialize_stream;
 /// The (metadata version, snapshot LSN) pair a table's `parquet-snapshot`
 /// layout records — shared with the OLAP read merge, which serves a

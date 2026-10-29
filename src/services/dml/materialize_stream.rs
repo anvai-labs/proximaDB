@@ -114,14 +114,18 @@ pub(super) async fn check_commit(
     metadata_prefix: &str,
     successor: u64,
     parts: &[Path],
+    puffin: Option<&Path>,
 ) -> CommitCheck {
     let latest = match bridge.latest_metadata_version(metadata_prefix).await {
         Ok(latest) => latest,
         Err(_) => return CommitCheck::Unknown,
     };
-    let Some(first) = parts.first() else {
+    // The evidence of OUR commit: its first new part, or — for a delete-only
+    // incremental delta, which writes no part — its new deletion-vector
+    // Puffin. Without either, nothing of ours can be named by the successor.
+    if parts.is_empty() && puffin.is_none() {
         return CommitCheck::NotLanded;
-    };
+    }
     if latest.is_none_or(|latest| latest < successor) {
         return CommitCheck::NotLanded;
     }
@@ -129,8 +133,22 @@ pub(super) async fn check_commit(
         .read_iceberg_snapshot_files(metadata_prefix, successor)
         .await
     {
-        Ok(snapshot) if snapshot.data_files.contains(first) => CommitCheck::Landed(successor),
-        Ok(_) => CommitCheck::NotLanded,
+        Ok(snapshot) => {
+            let landed = match parts.first() {
+                Some(first) => snapshot.data_files.contains(first),
+                None => puffin.is_some_and(|ours| {
+                    snapshot
+                        .deletion_vectors
+                        .iter()
+                        .any(|v| &v.puffin_file == ours)
+                }),
+            };
+            if landed {
+                CommitCheck::Landed(successor)
+            } else {
+                CommitCheck::NotLanded
+            }
+        }
         Err(_) => CommitCheck::Unknown,
     }
 }
@@ -322,17 +340,35 @@ fn metadata_version_of(layout: &proximadb_catalog::CatalogStorageLayout) -> Opti
         .and_then(|v| v.parse().ok())
 }
 
+/// Whether a deletion vector's Puffin was MINTED by one of ProximaDB's own
+/// publishers: the live delete publisher (`dv-live-…`) or the incremental
+/// MATERIALIZE (`dv-mat-…`). Every vector either mints hides only a row
+/// version the WAL has since deleted or superseded — a WAL-durable death, or
+/// a newer version of the same oid the native state holds — which is what
+/// makes adopting an orphaned publication safe: a rewrite from native state
+/// keeps the newer versions and drops the dead ones. Matched on the FILE
+/// NAME, never the full path: a table named `dv-live-x` must not pass a
+/// foreign Puffin under its prefix off as ours.
+pub(super) fn is_self_minted_dv(puffin: &Path) -> bool {
+    puffin
+        .filename()
+        .is_some_and(|name| name.starts_with("dv-live-") || name.starts_with("dv-mat-"))
+}
+
 /// The (metadata version, snapshot LSN) pair a table's parquet-snapshot
 /// layout recorded for its publication — the pair the MATERIALIZE entry
 /// guard's relaxation and the live delete publisher's completeness
 /// precondition key on. `None` when the layout records no complete pair
 /// (an externally published snapshot, or a publication whose flip did not
 /// land): both callers refuse on `None`, fail-closed.
+///
 /// CONTRACT for every writer of this pair (the OLAP merge trusts it — see
 /// `dv_base_is_ordered`): recording `(version, lsn)` asserts that the files of
 /// metadata `version`, minus their deletion vectors, are COMPLETE apart from
-/// the WAL delta after `lsn`, and that every vector in them is backed by a
-/// WAL-durable death. A new writer that cannot uphold that must not record.
+/// the WAL delta after `lsn`, and that every vector in them hides only a row
+/// version the WAL has deleted or superseded (a WAL-durable death, or an older
+/// version of an oid whose newer one is in the files or the delta). A new
+/// writer that cannot uphold that must not record.
 pub(crate) fn recorded_publication(
     layouts: &[proximadb_catalog::CatalogStorageLayout],
 ) -> Option<(u64, u64)> {
@@ -392,6 +428,19 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn self_minted_dvs_are_matched_on_the_file_name_only() {
+        assert!(is_self_minted_dv(&Path::from("w/t/data/dv-live-17.puffin")));
+        assert!(is_self_minted_dv(&Path::from(
+            "w/t/data/dv-mat-g00000000000000000003-ab.puffin"
+        )));
+        assert!(
+            !is_self_minted_dv(&Path::from("w/dv-live-x/data/foreign.puffin")),
+            "a table NAMED dv-live-x must not pass a foreign Puffin off as ours"
+        );
+        assert!(!is_self_minted_dv(&Path::from("w/t/data/dv-0.puffin")));
     }
 
     #[test]

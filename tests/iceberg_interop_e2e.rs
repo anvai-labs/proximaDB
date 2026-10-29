@@ -1752,3 +1752,118 @@ async fn check_soak_mixed_workload() {
          reconciliation; {materializes} materializes"
     );
 }
+
+/// TD-USUB-10 / TD-LIVEDEL-1: with `PROXIMADB_MATERIALIZE_INCREMENTAL_DV`, a
+/// MATERIALIZE after an UPDATE and a DELETE republishes INCREMENTALLY through
+/// the real pgwire facade: the published file is carried (not rewritten), the
+/// update's after-image lands in a new part, and both old row versions are
+/// hidden by one `dv-mat-*` deletion vector. Both views and the external
+/// engines agree; a later INSERT is merged over the DV-carrying base (the
+/// ordered-DV-base relaxation, #2277); an insert-only MATERIALIZE then
+/// appends while carrying the vectors.
+#[test]
+fn incremental_materialize_publishes_updates_and_deletes_as_vectors() {
+    run_isolated(
+        "incremental_materialize_publishes_updates_and_deletes_as_vectors",
+        "PROXIMADB_INCR_MAT_CHILD",
+        &[
+            ("PROXIMADB_MATERIALIZE_INCREMENTAL_DV", "1"),
+            ("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1"),
+        ],
+        check_incremental_materialize,
+    );
+}
+
+async fn check_incremental_materialize() {
+    let server = TestPgServer::start().await.expect("server start");
+    let client = connect_pg(&server).await;
+    let table = "incr_mat";
+    let exec = |sql: String| {
+        let client = &client;
+        async move {
+            client
+                .simple_query(&sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        }
+    };
+    exec(format!(
+        "CREATE TABLE {table} (k INT PRIMARY KEY, v VARCHAR)"
+    ))
+    .await;
+    // Ten rows: one update plus one delete is 20% — exactly the compaction
+    // bound, so the republication stays incremental.
+    let mut model: std::collections::BTreeMap<i32, String> = Default::default();
+    for k in 1..=10 {
+        exec(format!("INSERT INTO {table} (k, v) VALUES ({k}, 'v{k}')")).await;
+        model.insert(k, format!("v{k}"));
+    }
+    exec(format!("ALTER TABLE {table} MATERIALIZE")).await;
+    sleep(Duration::from_millis(300)).await;
+    let parquet = |server: &TestPgServer| -> Vec<String> {
+        warehouse_file_names(server)
+            .into_iter()
+            .filter(|n| n.ends_with(".parquet"))
+            .collect()
+    };
+    let first = parquet(&server);
+    assert_eq!(first.len(), 1, "one published part: {first:?}");
+
+    exec(format!("UPDATE {table} SET v = 'updated' WHERE k = 1")).await;
+    model.insert(1, "updated".to_string());
+    exec(format!("DELETE FROM {table} WHERE k = 2")).await;
+    model.remove(&2);
+    exec(format!("ALTER TABLE {table} MATERIALIZE")).await;
+    sleep(Duration::from_millis(300)).await;
+
+    let second = parquet(&server);
+    assert!(
+        second.contains(&first[0]),
+        "the published part is CARRIED, not rewritten: {second:?}"
+    );
+    assert_eq!(
+        second.len(),
+        2,
+        "carried + one after-image part: {second:?}"
+    );
+    let minted: Vec<String> = warehouse_file_names(&server)
+        .into_iter()
+        .filter(|n| n.starts_with("dv-mat-") && n.ends_with(".puffin"))
+        .collect();
+    assert_eq!(minted.len(), 1, "one dv-mat Puffin: {minted:?}");
+    assert_eq!(scalar_count(&client, table).await as usize, model.len());
+    assert_wal_matches(&client, table, &model, "after the incremental publication").await;
+
+    // A later write is MERGED over the DV-carrying base (no refusal).
+    exec(format!("INSERT INTO {table} (k, v) VALUES (11, 'v11')")).await;
+    model.insert(11, "v11".to_string());
+    assert_eq!(
+        scalar_count(&client, table).await as usize,
+        model.len(),
+        "the insert is merged over the incremental (DV-carrying) base"
+    );
+
+    // An insert-only MATERIALIZE appends and carries the vectors.
+    exec(format!("ALTER TABLE {table} MATERIALIZE")).await;
+    sleep(Duration::from_millis(300)).await;
+    let third = parquet(&server);
+    assert!(
+        second.iter().all(|p| third.contains(p)),
+        "the insert-only republication appends: {third:?}"
+    );
+    assert_eq!(scalar_count(&client, table).await as usize, model.len());
+    assert_wal_matches(&client, table, &model, "after the append").await;
+
+    let rows: Vec<(String, String)> = model
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    let expected: Vec<(&str, &str)> = rows.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    if !external_leg_kv(server.rest_port, table, &expected, "iceberg-incr-mat").await {
+        eprintln!("SKIP external leg (no reader installed locally); CI requires it");
+        return;
+    }
+    eprintln!(
+        "✓ incremental MATERIALIZE: carried parts + dv-mat vectors, both views + external agree"
+    );
+}
