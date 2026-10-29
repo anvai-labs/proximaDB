@@ -1216,45 +1216,69 @@ pub(crate) async fn pax_filtered_row_allow(
     fs: &dyn proximadb_storage_filesystem_types::FileSystem,
     path: &str,
     filter: &proximadb_filter_expression::FilterExpression,
+    cache: Option<&SegmentInvariantsCache>,
+    known_size: Option<u64>,
 ) -> Result<Option<(proximadb_block_format::RowAllow, FilteredRowAllowStats)>> {
     use proximadb_block_format::{PaxBlockReader, RowAllow, evaluate_block, record::FlatRow};
     use proximadb_storage_common::segment_layout::{SegmentFooterIndex, SegmentHeaderPrefix};
 
     // TD-FPRUNE-1 PR-A: every GET here is attributed to the `FilterRowAllow`
-    // tier, and the wall is split into time awaiting reads (`fetch_us`) and
-    // time decoding + evaluating (`decode_us`). Reads are serial today, so
-    // `fetch_us` is the sum of their round trips.
+    // tier, and the wall is split into time awaiting reads (`fetch_us`, the
+    // wall of each wave) and time decoding + evaluating (`decode_us`).
     let trace_on = get_trace_on();
     let mut fetch_us = 0u64;
     let mut decode_us = 0u64;
     let fetch_started = std::time::Instant::now();
 
-    // 1. Header prefix → coalesced? (mirrors the cascade's detection).
-    let size = fs
-        .object_size_resident(path)
-        .await
-        .map_err(|e| anyhow::anyhow!("filtered stage-F stat {path}: {e}"))?;
-    if size < (SEG_HEADER_PREFIX_LEN as u64 + SEGMENT_MAGIC.len() as u64) {
-        return Ok(None);
-    }
-    // TD-PAXRG-1: floor covers v4 (88 B) as well; parse branches on version.
-    let read_len = (coalesced_header_prefetch_floor() as u64).min(size);
-    let header_bytes = fs
-        .read_range_resident(path, 0, read_len)
-        .await
-        .map_err(|e| anyhow::anyhow!("filtered stage-F header {path}: {e}"))?;
-    record_get_physical(CacheTier::FilterRowAllow, read_len, trace_on);
-    let header = match SegmentHeaderPrefix::parse(&header_bytes) {
-        Ok(h) => h,
-        Err(_) => return Ok(None), // not coalesced → exact fallback
+    // 1–2. Header prefix + footer. PR-D L1b: a warm invariants-cache entry
+    // (admitted by the cascade, same segment) supplies both with no request
+    // at all; cold, the listed size skips the HEAD. A directory-decoded
+    // footer is never used here — it is ANN-only (no shred map / stats).
+    let cached = match cache {
+        Some(cache) => cache.get_or_promote(path).await.value(),
+        None => None,
     };
-
-    // 2. Footer → block table (+ cumulative start ordinals).
-    let footer_bytes = fs
-        .read_range_resident(path, header.footer_off, header.footer_len)
-        .await
-        .map_err(|e| anyhow::anyhow!("filtered stage-F footer {path}: {e}"))?;
-    record_get_physical(CacheTier::FilterRowAllow, header.footer_len, trace_on);
+    let cached_layout = cached.as_ref().and_then(|inv| {
+        let header = SegmentHeaderPrefix::parse(&inv.header_bytes).ok()?;
+        (inv.footer_bytes.len() as u64 == header.footer_len)
+            .then(|| (header, inv.footer_bytes.clone()))
+    });
+    let (_header, footer_bytes) = if let Some(layout) = cached_layout {
+        layout
+    } else {
+        let size = match known_size {
+            Some(size) => size,
+            None => fs
+                .object_size_resident(path)
+                .await
+                .map_err(|e| anyhow::anyhow!("filtered stage-F stat {path}: {e}"))?,
+        };
+        if size < (SEG_HEADER_PREFIX_LEN as u64 + SEGMENT_MAGIC.len() as u64) {
+            return Ok(None);
+        }
+        // TD-PAXRG-1: floor covers v4 (88 B) as well; parse branches on version.
+        let read_len = (coalesced_header_prefetch_floor() as u64).min(size);
+        let header_bytes = fs
+            .read_range_resident(path, 0, read_len)
+            .await
+            .map_err(|e| anyhow::anyhow!("filtered stage-F header {path}: {e}"))?;
+        record_get_physical(CacheTier::FilterRowAllow, read_len, trace_on);
+        let header = match SegmentHeaderPrefix::parse(&header_bytes) {
+            Ok(h) => h,
+            Err(_) => return Ok(None), // not coalesced → exact fallback
+        };
+        // TD-RDSTRAT-13 C3 stale-size guard (as in the cascade): a listed
+        // size that cannot contain the footer described another generation.
+        if known_size.is_some() && header.footer_off.saturating_add(header.footer_len) > size {
+            return Ok(None);
+        }
+        let footer_bytes = fs
+            .read_range_resident(path, header.footer_off, header.footer_len)
+            .await
+            .map_err(|e| anyhow::anyhow!("filtered stage-F footer {path}: {e}"))?;
+        record_get_physical(CacheTier::FilterRowAllow, header.footer_len, trace_on);
+        (header, footer_bytes)
+    };
     fetch_us += fetch_started.elapsed().as_micros() as u64;
     let footer = SegmentFooterIndex::parse(&footer_bytes)?;
     // TD-FPRUNE-1 P2 engagement: resolve filter field names → PAX col-ids via
@@ -1354,52 +1378,77 @@ pub(crate) async fn pax_filtered_row_allow(
     );
     let fetches = plan_coalesced_block_ranges(&footer, &candidate_blocks, &policy);
     let mut rows_decoded = 0u64;
-    for fetch in &fetches {
+    // PR-D L1a: the D ranges go out in bounded-concurrency waves
+    // (`read_ranges_prefetch`, `READ_RANGES_INFLIGHT`) instead of one serial
+    // round trip each — ~200 serial GETs per segment were most of the
+    // filtered p50. Waves are byte-bounded so peak memory stays capped; rows
+    // are still decoded in fetch order, so the allow-set is identical.
+    for wave in stage_f_waves(&fetches, STAGE_F_WAVE_MAX_BYTES) {
         let fetch_started = std::time::Instant::now();
-        let buf = fs
-            .read_range_resident(path, fetch.start, fetch.end - fetch.start)
-            .await
-            .map_err(|e| anyhow::anyhow!("filtered stage-F blocks {path}: {e}"))?;
-        record_get_physical(CacheTier::FilterRowAllow, fetch.end - fetch.start, trace_on);
+        let ranges: Vec<std::ops::Range<u64>> = wave.iter().map(|f| f.start..f.end).collect();
+        let bufs = match fs.read_ranges_prefetch_resident(path, ranges.clone()).await {
+            Ok(bufs) => bufs,
+            Err(_) => {
+                // Defensive fallback to the sequential shape.
+                let mut seq = Vec::with_capacity(ranges.len());
+                for range in &ranges {
+                    seq.push(
+                        fs.read_range_resident(path, range.start, range.end - range.start)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("filtered stage-F blocks {path}: {e}"))?,
+                    );
+                }
+                seq
+            }
+        };
+        // Metrics parity: one tier record per physical GET, at batch time.
+        for range in &ranges {
+            record_get_physical(CacheTier::FilterRowAllow, range.end - range.start, trace_on);
+        }
+        crate::observability::io_trace::drain_and_forward_read_ranges_metrics();
         let decode_started = std::time::Instant::now();
         fetch_us += decode_started.duration_since(fetch_started).as_micros() as u64;
-        for &bi in &fetch.blocks {
-            let Some(b) = footer.blocks.get(bi) else {
-                continue;
-            };
-            let Some(rel) = b.offset.checked_sub(fetch.start).map(|r| r as usize) else {
-                continue;
-            };
-            let end = rel + b.size as usize;
-            let Some(block_bytes) = buf.get(rel..end) else {
-                continue;
-            };
-            let reader = PaxBlockReader::open(block_bytes)
-                .map_err(|e| anyhow::anyhow!("filtered stage-F block open {path}: {e}"))?;
-            // Conservative stats prune: provably-no-match blocks skip decode.
-            // NOTE: `&resolve_field` is a per-call temporary — a `&dyn Fn`
-            // binding held across the fetch `.await` would make this future (and
-            // every async caller up to the REST handlers) `!Send`. `resolve_field`
-            // borrows the owned `user_field_map` (Send), which is fine to hold.
-            if evaluate_block(&reader, filter, &resolve_field)
-                == proximadb_block_format::PruneResult::Skip
-            {
-                stats.blocks_pruned += 1;
-                continue;
-            }
-            let start_ordinal = block_start[bi] as usize;
-            for (local, flat) in FlatRow::from_block_reader(&reader)
-                .map_err(|e| anyhow::anyhow!("filtered stage-F rows {path}: {e}"))?
-                .into_iter()
-                .enumerate()
-            {
-                let props = flat
-                    .props_tree()
-                    .map_err(|e| anyhow::anyhow!("filtered stage-F props {path}: {e}"))?;
-                rows_decoded += 1;
-                if crate::core::search::sql_value_filter::evaluate_filter_proxima(filter, &props) {
-                    allow.insert(start_ordinal + local);
-                    stats.rows_matched += 1;
+        for (fetch, buf) in wave.iter().zip(bufs) {
+            for &bi in &fetch.blocks {
+                let Some(b) = footer.blocks.get(bi) else {
+                    continue;
+                };
+                let Some(rel) = b.offset.checked_sub(fetch.start).map(|r| r as usize) else {
+                    continue;
+                };
+                let end = rel + b.size as usize;
+                let Some(block_bytes) = buf.get(rel..end) else {
+                    continue;
+                };
+                let reader = PaxBlockReader::open(block_bytes)
+                    .map_err(|e| anyhow::anyhow!("filtered stage-F block open {path}: {e}"))?;
+                // Conservative stats prune: provably-no-match blocks skip decode.
+                // NOTE: `&resolve_field` is a per-call temporary — a `&dyn Fn`
+                // binding held across the fetch `.await` would make this future (and
+                // every async caller up to the REST handlers) `!Send`. `resolve_field`
+                // borrows the owned `user_field_map` (Send), which is fine to hold.
+                if evaluate_block(&reader, filter, &resolve_field)
+                    == proximadb_block_format::PruneResult::Skip
+                {
+                    stats.blocks_pruned += 1;
+                    continue;
+                }
+                let start_ordinal = block_start[bi] as usize;
+                for (local, flat) in FlatRow::from_block_reader(&reader)
+                    .map_err(|e| anyhow::anyhow!("filtered stage-F rows {path}: {e}"))?
+                    .into_iter()
+                    .enumerate()
+                {
+                    let props = flat
+                        .props_tree()
+                        .map_err(|e| anyhow::anyhow!("filtered stage-F props {path}: {e}"))?;
+                    rows_decoded += 1;
+                    if crate::core::search::sql_value_filter::evaluate_filter_proxima(
+                        filter, &props,
+                    ) {
+                        allow.insert(start_ordinal + local);
+                        stats.rows_matched += 1;
+                    }
                 }
             }
         }
@@ -1433,6 +1482,32 @@ pub(crate) async fn pax_filtered_row_allow(
         },
     );
     Ok(Some((allow, stats)))
+}
+
+/// PR-D L1a: per-wave byte bound for the Stage-F D fetch (mirrors the D4
+/// bound at the other wave sites) — one wave holds every buffer it fetched
+/// until decode, so this caps Stage F's peak memory per segment.
+const STAGE_F_WAVE_MAX_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Split `fetches` into consecutive waves whose summed lengths stay within
+/// `max_bytes` (a single larger fetch forms its own wave). Order-preserving.
+fn stage_f_waves(fetches: &[CoalescedFetch], max_bytes: u64) -> Vec<&[CoalescedFetch]> {
+    let mut waves = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0u64;
+    for (i, fetch) in fetches.iter().enumerate() {
+        let len = fetch.end - fetch.start;
+        if i > start && bytes + len > max_bytes {
+            waves.push(&fetches[start..i]);
+            start = i;
+            bytes = 0;
+        }
+        bytes += len;
+    }
+    if start < fetches.len() {
+        waves.push(&fetches[start..]);
+    }
+    waves
 }
 
 /// TD-FPRUNE-1 cascade top-k rehydration: fetch FULL records — props included —
@@ -1548,30 +1623,66 @@ pub(crate) async fn read_records_by_positions(
     // 5. Decode the requested rows. TD-PAXDIR-1 D6: blocks the cascade
     // already fetched whole for this query are taken from its hand-off; a
     // fetch is read only when one of its blocks was not handed over.
-    let handed: Option<Arc<DirectoryChoice>> = DIRECTORY_CHOICE.try_with(Arc::clone).ok();
-    for fetch in &fetches {
-        let handed_blocks: Option<Vec<Arc<[u8]>>> = handed.as_ref().and_then(|choice| {
-            fetch
-                .blocks
-                .iter()
-                .map(|&bi| {
-                    let b = footer.blocks.get(bi)?;
-                    choice
-                        .take_block(b.offset)
-                        .filter(|bytes| bytes.len() == b.size as usize)
-                })
-                .collect()
-        });
+    let handed = TopkHandoff::current();
+    let handed_per_fetch: Vec<Option<Vec<Arc<[u8]>>>> = fetches
+        .iter()
+        .map(|fetch| {
+            handed.as_ref().and_then(|choice| {
+                fetch
+                    .blocks
+                    .iter()
+                    .map(|&bi| {
+                        let b = footer.blocks.get(bi)?;
+                        choice
+                            .take(b.offset)
+                            .filter(|bytes| bytes.len() == b.size as usize)
+                    })
+                    .collect()
+            })
+        })
+        .collect();
+    // PR-D L1c: every fetch not served by the hand-off goes out in ONE
+    // bounded-concurrency wave (`read_ranges_prefetch`), not one serial round
+    // trip per fetch. Decoding below is unchanged and in fetch order.
+    let cold_ranges: Vec<std::ops::Range<u64>> = fetches
+        .iter()
+        .zip(&handed_per_fetch)
+        .filter(|(_, handed)| handed.is_none())
+        .map(|(fetch, _)| fetch.start..fetch.end)
+        .collect();
+    let mut cold_bufs = if cold_ranges.is_empty() {
+        Vec::new()
+    } else {
+        let bufs = match fs
+            .read_ranges_prefetch_resident(path, cold_ranges.clone())
+            .await
+        {
+            Ok(bufs) => bufs,
+            Err(_) => {
+                // Defensive fallback to the sequential shape.
+                let mut seq = Vec::with_capacity(cold_ranges.len());
+                for range in &cold_ranges {
+                    seq.push(
+                        fs.read_range_resident(path, range.start, range.end - range.start)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("rehydrate blocks {path}: {e}"))?,
+                    );
+                }
+                seq
+            }
+        };
+        // Metrics parity: one tier record per physical GET, at batch time.
+        for range in &cold_ranges {
+            record_get_physical(CacheTier::Rehydrate, range.end - range.start, trace_on);
+        }
+        crate::observability::io_trace::drain_and_forward_read_ranges_metrics();
+        bufs
+    }
+    .into_iter();
+    for (fetch, handed_blocks) in fetches.iter().zip(handed_per_fetch) {
         let buf = match &handed_blocks {
             Some(_) => Vec::new(),
-            None => {
-                let buf = fs
-                    .read_range_resident(path, fetch.start, fetch.end - fetch.start)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("rehydrate blocks {path}: {e}"))?;
-                record_get_physical(CacheTier::Rehydrate, fetch.end - fetch.start, trace_on);
-                buf
-            }
+            None => cold_bufs.next().unwrap_or_default(),
         };
         for (i, &bi) in fetch.blocks.iter().enumerate() {
             let Some(b) = footer.blocks.get(bi) else {
@@ -3286,6 +3397,70 @@ pub(crate) async fn scope_directory_cells<F: std::future::Future>(
     match choice {
         Some(choice) => DIRECTORY_CHOICE.scope(choice, scan).await,
         None => scan.await,
+    }
+}
+
+/// PR-D L4: per-cascade stash of the top-k blocks the Region-D OID resolve
+/// fetched whole, handed to the same cascade's rehydration — so every query
+/// (not only directory-planned ones, and filtered ones too) pays ONE Region-D
+/// block wave for its top-k instead of an OID wave plus a rehydrate wave of
+/// the same blocks. Scoped by [`scope_topk_stash`] around one segment's
+/// cascade + rehydrate; bounded by the hand-off arm's 8 × IOP byte cap.
+#[derive(Debug, Default)]
+pub(crate) struct TopkBlockStash {
+    blocks: std::sync::Mutex<std::collections::HashMap<u64, Arc<[u8]>>>,
+}
+
+tokio::task_local! {
+    static TOPK_STASH: Arc<TopkBlockStash>;
+}
+
+/// Run one segment's cascade + rehydrate with a fresh [`TopkBlockStash`].
+pub(crate) async fn scope_topk_stash<F: std::future::Future>(scan: F) -> F::Output {
+    TOPK_STASH
+        .scope(Arc::new(TopkBlockStash::default()), scan)
+        .await
+}
+
+/// Where the cascade hands top-k blocks to its rehydration: the directory
+/// choice when the scan is directory-planned (TD-PAXDIR-1 D6, unchanged),
+/// else the per-cascade stash (PR-D L4), else nowhere.
+enum TopkHandoff {
+    Directory(Arc<DirectoryChoice>),
+    Stash(Arc<TopkBlockStash>),
+}
+
+impl TopkHandoff {
+    fn current() -> Option<Self> {
+        DIRECTORY_CHOICE
+            .try_with(Arc::clone)
+            .ok()
+            .map(Self::Directory)
+            .or_else(|| TOPK_STASH.try_with(Arc::clone).ok().map(Self::Stash))
+    }
+
+    fn stash(&self, offset: u64, bytes: Arc<[u8]>) {
+        match self {
+            Self::Directory(choice) => choice.stash_block(offset, bytes),
+            Self::Stash(stash) => {
+                stash
+                    .blocks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(offset, bytes);
+            }
+        }
+    }
+
+    fn take(&self, offset: u64) -> Option<Arc<[u8]>> {
+        match self {
+            Self::Directory(choice) => choice.take_block(offset),
+            Self::Stash(stash) => stash
+                .blocks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&offset),
+        }
     }
 }
 
@@ -5101,11 +5276,10 @@ pub async fn rabitq_search_segment_coalesced_allowed(
     // the gate run measured a warm invariants cache (hit ratio 0.999), under
     // which a decoded-only hand-off never fired and every query paid the
     // chunk wave and then the block wave.
-    let handoff = if row_allow.is_none() {
-        DIRECTORY_CHOICE.try_with(Arc::clone).ok()
-    } else {
-        None
-    };
+    // PR-D L4: any hand-off target — the directory choice, or the
+    // per-cascade stash every cascade now runs under — filtered or not; the
+    // rehydration that follows needs these exact blocks either way.
+    let handoff = TopkHandoff::current();
     let handoff_fetches: Option<Vec<CoalescedFetch>> = handoff.as_ref().and_then(|_| {
         let fetches = rehydrate_block_fetches(path, &footer, &topk_blocks);
         let total: u64 = fetches.iter().map(|f| f.end - f.start).sum();
@@ -5135,7 +5309,7 @@ pub async fn rabitq_search_segment_coalesced_allowed(
                         )
                     })?;
                 resolve_block_oids(path, bi, block, &block_rows, &block_start, &mut oid_of)?;
-                choice.stash_block(b.offset, Arc::from(block));
+                choice.stash(b.offset, Arc::from(block));
             }
         }
     } else if v4_chunk_fetch {

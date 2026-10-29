@@ -2539,7 +2539,7 @@ async fn stage_f_row_allow_set_is_exact() {
 
     let filter = partition_filter("p3");
     let ((allow, stats), snap) = crate::observability::io_trace::scope(async {
-        let built = pax_filtered_row_allow(&fs, p, &filter)
+        let built = pax_filtered_row_allow(&fs, p, &filter, None, None)
             .await
             .unwrap()
             .expect("coalesced segment must produce a stage-F allow-set");
@@ -2596,11 +2596,164 @@ async fn stage_f_row_allow_set_is_exact() {
     assert_eq!(stats.blocks_total, footer.blocks.len());
 
     // A predicate matching nothing yields an empty (but Some) allow-set.
-    let (empty_allow, _) = pax_filtered_row_allow(&fs, p, &partition_filter("p999"))
+    let (empty_allow, _) = pax_filtered_row_allow(&fs, p, &partition_filter("p999"), None, None)
         .await
         .unwrap()
         .expect("coalesced segment");
     assert!(empty_allow.is_empty());
+}
+
+/// PR-D L1a/L1b: Stage F reads its D ranges in bounded-concurrency waves
+/// and takes its header/footer from the invariants cache (warm) or skips the
+/// HEAD with a listed size (cold) — the allow-set is identical on every path,
+/// and the request counts shrink exactly by the elided reads.
+#[tokio::test]
+async fn stage_f_waves_cache_and_known_size_keep_the_allow_set_exact() {
+    enable_coalesced_rabitq();
+    // Waves only fire with an in-flight cap > 1; parsed once per process
+    // (nextest isolates each test), so set before the first read.
+    unsafe {
+        std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "4");
+    }
+    use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
+    use proximadb_storage_common::segment_layout::SegmentHeaderPrefix;
+
+    const DIM: usize = 32;
+    // The row-group layout floors D granules at 256 KiB, so the corpus must
+    // be large enough to span several D blocks (several ranges per wave).
+    const N: usize = 12_000;
+    let records: Vec<ProximaRecord> = (0..N)
+        .map(|i| {
+            let v: Vec<f32> = (0..DIM)
+                .map(|d| (((i * 131 + d * 17) % 251) as f32) * 0.01)
+                .collect();
+            rec_with_partition(i, v)
+        })
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("seg.pax");
+    write_pax_segment(
+        &path,
+        &records,
+        "col",
+        1,
+        VectorQuant::RaBitQ,
+        Some(4 * 1024),
+        None,
+    )
+    .unwrap();
+    // Tiny coalesce cap ⇒ many D ranges ⇒ more than one per wave.
+    unsafe {
+        std::env::set_var("PROXIMADB_PAX_COALESCE_RANGE", "4096");
+    }
+    let fs = LocalFileSystem::new_with_encryption(LocalConfig::default(), None)
+        .await
+        .unwrap();
+    let p = path.to_str().unwrap();
+    let filter = partition_filter("p3");
+    // Ordinals are in the segment's (cluster) row order: derive the
+    // expected set by an independent decode, as the exact test does.
+    let expected: Vec<usize> = {
+        use proximadb_block_format::{PaxBlockReader, record::FlatRow};
+        use proximadb_storage_common::segment_layout::SegmentFooterIndex;
+        let bytes = std::fs::read(&path).unwrap();
+        let header = SegmentHeaderPrefix::parse(&bytes).unwrap();
+        let off = header.footer_off as usize;
+        let footer =
+            SegmentFooterIndex::parse(&bytes[off..off + header.footer_len as usize]).unwrap();
+        let mut expected = Vec::new();
+        let mut g = 0usize;
+        for b in &footer.blocks {
+            let reader = PaxBlockReader::open(
+                &bytes[b.offset as usize..(b.offset + b.size as u64) as usize],
+            )
+            .unwrap();
+            for flat in FlatRow::from_block_reader(&reader).unwrap() {
+                let oid_index: usize = flat.oid.trim_start_matches('r').parse().unwrap();
+                if oid_index % 8 == 3 {
+                    expected.push(g);
+                }
+                g += 1;
+            }
+        }
+        assert_eq!(g, N);
+        expected
+    };
+    type Built = Option<(proximadb_block_format::RowAllow, FilteredRowAllowStats)>;
+    async fn run(
+        fs: &LocalFileSystem,
+        p: &str,
+        filter: &proximadb_filter_expression::FilterExpression,
+        cache: Option<&SegmentInvariantsCache>,
+        size: Option<u64>,
+    ) -> (
+        Built,
+        Option<crate::observability::io_trace::IoTraceSnapshot>,
+    ) {
+        crate::observability::io_trace::scope(async {
+            let built = pax_filtered_row_allow(fs, p, filter, cache, size)
+                .await
+                .unwrap();
+            (built, crate::observability::io_trace::snapshot())
+        })
+        .await
+    }
+    let allowed = |allow: &proximadb_block_format::RowAllow| -> Vec<usize> {
+        (0..N).filter(|&row| allow.contains(row)).collect()
+    };
+
+    // Cold, no listed size: HEAD + header + footer + waved D ranges.
+    let (cold, snap) = run(&fs, p, &filter, None, None).await;
+    let (cold_allow, _) = cold.expect("coalesced segment");
+    let cold_snap = snap.expect("io_trace scope");
+    assert_eq!(allowed(&cold_allow), expected, "waved allow-set is exact");
+    assert_eq!(cold_snap.metadata_ops, 1);
+    let d_ranges = cold_snap.range_gets - 2;
+    assert!(d_ranges > 1, "several D ranges: {cold_snap:?}");
+    assert!(
+        cold_snap.read_ranges_fetch_rounds > 0,
+        "the D ranges went out as a bounded-concurrency wave: {cold_snap:?}"
+    );
+    let filt = CacheTier::FilterRowAllow as usize;
+    assert_eq!(cold_snap.tier_get_ops[filt], cold_snap.range_gets);
+
+    // Cold with the listed size: same reads minus the HEAD.
+    let size = std::fs::metadata(&path).unwrap().len();
+    let (sized, snap) = run(&fs, p, &filter, None, Some(size)).await;
+    let snap = snap.expect("io_trace scope");
+    assert_eq!(allowed(&sized.expect("coalesced").0), expected);
+    assert_eq!(snap.metadata_ops, 0, "listed size skips the HEAD");
+    assert_eq!(snap.range_gets, cold_snap.range_gets);
+
+    // A listed size that cannot hold the footer fails closed (exact path).
+    let (stale, _) = run(&fs, p, &filter, None, Some(200)).await;
+    assert!(stale.is_none(), "stale listed size must decline");
+
+    // Warm: the invariants cache supplies header + footer — only D ranges.
+    let bytes = std::fs::read(&path).unwrap();
+    let header_len = coalesced_header_prefetch_floor().min(bytes.len());
+    let header = SegmentHeaderPrefix::parse(&bytes[..header_len]).unwrap();
+    let footer_off = header.footer_off as usize;
+    let cache = SegmentInvariantsCache::new(8 * 1024 * 1024);
+    cache.put(
+        p.to_string(),
+        std::sync::Arc::new(SegmentInvariants {
+            header_bytes: bytes[..header_len].to_vec(),
+            region_bytes: None,
+            footer_bytes: bytes[footer_off..footer_off + header.footer_len as usize].to_vec(),
+            a0_bytes: None,
+            rabitq_header_bytes: None,
+        }),
+    );
+    let (warm, snap) = run(&fs, p, &filter, Some(&cache), None).await;
+    let snap = snap.expect("io_trace scope");
+    assert_eq!(allowed(&warm.expect("coalesced").0), expected);
+    assert_eq!(snap.metadata_ops, 0, "warm: no HEAD");
+    assert_eq!(snap.range_gets, d_ranges, "warm: no header/footer GET");
+    unsafe {
+        std::env::remove_var("PROXIMADB_PAX_COALESCE_RANGE");
+        std::env::remove_var("PROXIMADB_READ_RANGES_INFLIGHT");
+    }
 }
 
 /// R5: Stage F evaluates the predicate against the record's PROPS
@@ -2640,7 +2793,7 @@ async fn stage_f_never_prunes_a_user_prop_on_a_same_named_canonical_column() {
         operator: proximadb_filter_expression::ComparisonOperator::Equals,
         value: serde_json::json!(3),
     };
-    let (allow, _stats) = pax_filtered_row_allow(&fs, path.to_str().unwrap(), &filter)
+    let (allow, _stats) = pax_filtered_row_allow(&fs, path.to_str().unwrap(), &filter, None, None)
         .await
         .unwrap()
         .expect("coalesced segment must produce a stage-F allow-set");
@@ -2714,7 +2867,7 @@ async fn stage_f_does_not_prune_on_canonical_column_stats() {
         operator: proximadb_filter_expression::ComparisonOperator::GreaterThanOrEqual,
         value: serde_json::json!(2000),
     };
-    let (allow, stats) = pax_filtered_row_allow(&fs, p, &filter)
+    let (allow, stats) = pax_filtered_row_allow(&fs, p, &filter, None, None)
         .await
         .unwrap()
         .expect("coalesced segment must produce a stage-F allow-set");
@@ -2843,7 +2996,7 @@ async fn stage_f_user_tag_footer_prune_via_self_describing_segment() {
         footer.shred_field_map
     );
 
-    let (allow, stats) = pax_filtered_row_allow(&fs, p, &partition_filter("pA"))
+    let (allow, stats) = pax_filtered_row_allow(&fs, p, &partition_filter("pA"), None, None)
         .await
         .unwrap()
         .expect("coalesced segment must produce a stage-F allow-set");
@@ -2925,7 +3078,7 @@ async fn filtered_cascade_matches_filtered_bruteforce() {
     let p = path.to_str().unwrap();
 
     let filter = partition_filter("p3");
-    let (allow, _) = pax_filtered_row_allow(&fs, p, &filter)
+    let (allow, _) = pax_filtered_row_allow(&fs, p, &filter, None, None)
         .await
         .unwrap()
         .expect("stage-F allow-set");
@@ -3082,7 +3235,7 @@ async fn p1_evidence_filtered_exact_vs_cascade() {
     for q in 0..QUERIES {
         let query = &corpus[(q * 5119) % N];
         let t = Instant::now();
-        let (allow, _stats) = pax_filtered_row_allow(&fs, p, &filter)
+        let (allow, _stats) = pax_filtered_row_allow(&fs, p, &filter, None, None)
             .await
             .unwrap()
             .expect("stage-F allow-set");
@@ -4444,7 +4597,7 @@ async fn filtered_coarse_probe_holds_recall_and_cuts_bytes() {
         p0.iter().take(K).map(|i| format!("r{i}")).collect();
 
     // Build the allow-set (partition==p0) from the segment's own footer.
-    let (allow, _stats) = pax_filtered_row_allow(&fs, p, &partition_filter("p0"))
+    let (allow, _stats) = pax_filtered_row_allow(&fs, p, &partition_filter("p0"), None, None)
         .await
         .unwrap()
         .expect("shredded v3 segment yields a stage-F allow-set");
@@ -4670,7 +4823,7 @@ async fn partition_layout_prunes_uncorrelated_tag() {
             std::env::remove_var("PROXIMADB_PAX_PARTITION_LAYOUT");
         }
         let p = path.to_str().unwrap();
-        let (allow, _s) = pax_filtered_row_allow(fs, p, &partition_filter("p0"))
+        let (allow, _s) = pax_filtered_row_allow(fs, p, &partition_filter("p0"), None, None)
             .await
             .unwrap()
             .expect("shredded v3 segment yields an allow-set");
@@ -4898,7 +5051,7 @@ async fn filtered_stack_get_byte_breakdown() {
 
         // Stage-F allow-set build (Region-D only), under its own trace scope.
         let (allow_res, allow_snap) = io_trace::scope(async {
-            let r = pax_filtered_row_allow(fs, p, &partition_filter("p0")).await;
+            let r = pax_filtered_row_allow(fs, p, &partition_filter("p0"), None, None).await;
             (r, io_trace::snapshot())
         })
         .await;
