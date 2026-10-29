@@ -1079,15 +1079,21 @@ impl SstEngine {
             .discover_sstable_files(storage_url)
             .await
             .unwrap_or_default();
-        if files.len() >= threshold {
-            return Ok(Some(threshold));
-        }
+        // R6 (TD-FPRUNE-1 liveness): `files` counts EVERY level, while the
+        // executor applies `threshold` to L0 files only. Once the levelled
+        // ladder holds `threshold - 1` files, every flush armed the count arm,
+        // the executor found too few L0s and declined (`Ok(false)`), and the
+        // early return here meant the training arm was never consulted: untrained
+        // L0s stranded for good (measured on the 3M P5 bed — 4 untrained 57–61
+        // MB L0s beside L1..L4). So the count arm is only the fallback; the
+        // training arm, when it fires, wins.
+        let count_due = (files.len() >= threshold).then_some(threshold);
         // TD-COMPACT-5 training arm — only meaningful when the A0-emitting
         // trainer is enabled (`PROXIMADB_PAX_WRITE_A0_TRAIN`, default ON).
         // Without it compaction outputs stay layout v1, the untrained condition
         // never self-clears, and the arm would fire on every flush.
         if !crate::storage::engines::sst::block_cluster::ivf_probe_enabled() {
-            return Ok(None);
+            return Ok(count_due);
         }
         // TD-COMPACT-8: skip re-arming while a training compaction is in-flight
         // for this collection (prevents the redundant re-training loop — up to
@@ -1106,7 +1112,7 @@ impl SstEngine {
                 "TD-COMPACT-8: training compaction already in-flight for \
                  {storage_url} — skipping arm"
             );
-            return Ok(None);
+            return Ok(count_due);
         }
         // Best-effort header sniffing (72 bytes/file); any error means "not
         // yet", never fails the flush.
@@ -1127,7 +1133,7 @@ impl SstEngine {
                 return Ok(Some(1));
             }
         }
-        Ok(None)
+        Ok(count_due)
     }
 
     /// TD-COMPACT-5: is this segment untrained (no A0 coarse directory) and
@@ -2345,6 +2351,95 @@ mod tests {
             "expected at least one flushed segment under {base_location}"
         );
         exts
+    }
+
+    /// R6 (TD-FPRUNE-1 liveness): an untrained L0 beside a levelled ladder
+    /// whose TOTAL file count reaches the L0 threshold must still arm the
+    /// training compaction (threshold 1). Before the fix the all-levels count
+    /// arm returned first with the L0 threshold, the executor (which counts
+    /// L0s only) found nothing due, and the untrained L0 stranded.
+    #[tokio::test]
+    async fn training_arm_fires_even_when_all_level_count_reaches_threshold() {
+        unsafe {
+            std::env::remove_var(PAX_VECTOR_SEGMENTS_DISABLE_ENV);
+            std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
+            std::env::set_var("PROXIMADB_TRAINING_COMPACTION_MIN_MB", "0");
+        }
+        let engine = create_test_engine().await;
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = temp_dir.path().to_str().unwrap();
+        let tags = vec![
+            "pax_vector_format:on".to_string(),
+            "compaction:on".to_string(),
+        ];
+        let records = (0..8)
+            .map(|i| create_test_vector(&format!("v{i}"), vec![i as f32, 1.0, 0.0, 0.0]))
+            .collect();
+        flush_segment_exts(&engine, "r6_liveness", base, tags.clone(), records).await;
+
+        let mut paxes = Vec::new();
+        collect_files_with_ext(std::path::Path::new(base), "pax", &mut paxes);
+        assert_eq!(paxes.len(), 1, "one flushed L0: {paxes:?}");
+        let flushed = paxes.remove(0);
+        let data_dir = flushed.parent().unwrap().to_path_buf();
+        let storage_url = data_dir.to_str().unwrap();
+        assert!(
+            engine
+                .segment_is_untrained(flushed.to_str().unwrap(), 0)
+                .await
+                .unwrap(),
+            "a flush-written L0 carries no A0 directory (the premise)"
+        );
+        // A levelled ladder L1..L4 (one file each): the total reaches the
+        // default L0 threshold of 5, yet only one file is at L0.
+        for level in 1..=4 {
+            std::fs::copy(
+                &flushed,
+                data_dir.join(format!("L{level}_ladder_{level}.pax")),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            engine
+                .should_trigger_compaction(storage_url, &tags)
+                .await
+                .unwrap(),
+            Some(1),
+            "the training arm must win over the all-levels count arm"
+        );
+
+        // With a training compaction in flight the arm stays suppressed
+        // (TD-COMPACT-8) and the count arm is the fallback, as before.
+        engine
+            .training_in_flight
+            .lock()
+            .unwrap()
+            .insert(storage_url.to_string());
+        assert_eq!(
+            engine
+                .should_trigger_compaction(storage_url, &tags)
+                .await
+                .unwrap(),
+            Some(L0_COMPACTION_THRESHOLD)
+        );
+        unsafe {
+            std::env::remove_var("PROXIMADB_PAX_WRITE_A0_TRAIN");
+            std::env::remove_var("PROXIMADB_TRAINING_COMPACTION_MIN_MB");
+        }
+    }
+
+    fn collect_files_with_ext(dir: &std::path::Path, ext: &str, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_files_with_ext(&path, ext, out);
+            } else if path.extension().is_some_and(|e| e == ext) {
+                out.push(path);
+            }
+        }
     }
 
     /// Staged adoption: with no PAX env set, a `pax_vector_format:on` tag opts

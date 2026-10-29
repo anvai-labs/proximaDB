@@ -18,3 +18,10 @@
 * Rejected alternative (still relevant): targeting via `proximadb_ivf_whole_region_fallback_total` — the counter is process-global and unlabeled, so it cannot say which segment is untrained.
 * Lesson: the probe-armed run first measured recall@10 0.9780 < the 0.984 ratchet; the nprobe sweep showed that was slice noise (default nprobe=8 measures 0.9860 on a fixed 100-query slice), and the reader gate went default-ON (#1210). Historical 20–51 GET bands assumed single-file beds.
 * Evidence: 1M all-trained bed with probe armed — 82.9 GETs / 77.5 MB per query, mean 76 ms / p95 90 ms (vs 179.7 GETs untrained).
+* *Liveness fix (2026-10-29, TD-FPRUNE-1 R6).* The count arm counted EVERY level's files against the
+  L0 threshold and returned before the training arm ran. A levelled ladder (L1..L4, one file each) plus
+  one new L0 reached 5, so each flush armed threshold 5; the executor, which counts L0s only, found too few
+  and declined silently, and the training arm was never consulted. The 3M P5 schema bed stranded 4
+  untrained 57–61 MB L0s this way and never settled. The training arm now runs first and wins; the count
+  arm is the fallback (also when the arm is suppressed in flight, TD-COMPACT-8). Test:
+  `training_arm_fires_even_when_all_level_count_reaches_threshold`.
