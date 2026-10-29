@@ -63,3 +63,27 @@ first record visited wins, because `is_newer` requires strictly greater values.
    delete of a `version = 2` row via REST or gRPC.
 
 Track before TD-PGOLTP-1 S3 (group commit) lands.
+
+== Search-path status (2026-10-28, `fix/filtered-path-correctness`)
+
+The vector search path no longer uses the memtable's winner rule. The WAL leg
+(`WriteAheadLogManager::freshest_unflushed_index` / `score_unflushed`) and the
+search merge (`core::search::merge`) order versions by `updated_at`, then a
+tombstone wins an exact timestamp tie (BEFORE versions are compared), then
+`record_version`, then the later batch. That closes failure mode 1 for search;
+point reads (`read.rs::is_fresher`) and the memtable's own rule still differ.
+
+Two related gaps found in review, still open:
+
+* **SQL UPDATE stamps millisecond-truncated time.** `dml/mod.rs` sets
+  `updated_at_ns = now.timestamp_millis() * 1_000_000` while INSERT stamps full
+  nanoseconds, so an INSERT followed by an UPDATE inside the same millisecond
+  orders the UPDATE as OLDER under every ns-first rule (search and get-by-id):
+  the update is invisible until another write. Fix: stamp nanoseconds, or
+  `max(now_ns, existing.updated_at_ns + 1)`.
+* **Search's dead-state rule compares milliseconds; get-by-id compares
+  nanoseconds.** `OptimizedSearchRecord` carries `updated_at` in ms, so the
+  search merge keeps a persisted copy over a dead unflushed version only if it
+  is strictly newer in MILLISECONDS. Delete → re-insert within one millisecond
+  → flush: search drops the record (fail-closed) while get-by-id returns it.
+  Fix: carry `updated_at_ns` on `OptimizedSearchRecord` and `WalOidState::Dead`.

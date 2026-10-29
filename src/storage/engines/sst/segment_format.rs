@@ -1245,9 +1245,9 @@ pub(crate) async fn pax_filtered_row_allow(
         .await
         .map_err(|e| anyhow::anyhow!("filtered stage-F footer {path}: {e}"))?;
     let footer = SegmentFooterIndex::parse(&footer_bytes)?;
-    // TD-FPRUNE-1 P2 engagement: resolve filter field names → PAX col-ids using
-    // canonical fields first, then the segment's self-describing shred field-map
-    // (written from the P-Shred spec). This lets a USER-TAG filter (e.g.
+    // TD-FPRUNE-1 P2 engagement: resolve filter field names → PAX col-ids via
+    // the segment's self-describing shred field-map (written from the P-Shred
+    // spec) — user shreds only, see R5 below. This lets a USER-TAG filter (e.g.
     // `partition`) prune blocks — without a catalog lookup. Owned map so the
     // resolver closure can be a per-call `&dyn Fn` temporary at each
     // `evaluate_block` (a `&dyn Fn` held across `.await` would make the future
@@ -1257,9 +1257,15 @@ pub(crate) async fn pax_filtered_row_allow(
         .iter()
         .map(|c| (c.key.clone(), c.column_id))
         .collect();
-    let resolve_field = |field: &str| -> Option<i32> {
-        pax_field_to_col(field).or_else(|| user_field_map.get(field).copied())
-    };
+    // R5: resolve ONLY to user shred columns. Stage F evaluates the
+    // predicate against the record's PROPS (`evaluate_filter_proxima`), so
+    // the only sound pruning stats are those of columns holding prop values.
+    // The canonical columns (`created_at`, `tenant_id`, `id`, …) describe
+    // different data: a user prop that shares a canonical name was pruned on
+    // the canonical zone map and every matching block was skipped, and a
+    // canonical-name filter with no such prop matches nothing anyway (props
+    // never hold the canonical fields), so canonical pruning bought nothing.
+    let resolve_field = |field: &str| -> Option<i32> { user_field_map.get(field).copied() };
     let mut block_start: Vec<u64> = Vec::with_capacity(footer.blocks.len());
     let mut acc = 0u64;
     for b in &footer.blocks {
