@@ -3817,7 +3817,10 @@ async fn coarse_probe_survivors(
     // at batch time.
     let mut cold_bytes: Vec<Option<Vec<u8>>> = vec![None; cold_ranges.len()];
     if !cold_ranges.is_empty() {
-        let batched = match fs.read_ranges_prefetch(path, cold_ranges.clone()).await {
+        let batched = match fs
+            .read_ranges_prefetch_resident(path, cold_ranges.clone())
+            .await
+        {
             Ok(bufs) => bufs,
             Err(_) => {
                 // Defensive fallback to the sequential baseline shape.
@@ -4721,7 +4724,10 @@ pub async fn rabitq_search_segment_coalesced_allowed(
             let chunk = iop_target;
             let split_ranges = plan_wave_split_ranges(header.sq8_off, header.sq8_len, chunk);
             let mut chunk_bytes: Vec<Option<Vec<u8>>> = vec![None; split_ranges.len()];
-            let batched = match fs.read_ranges_prefetch(path, split_ranges.clone()).await {
+            let batched = match fs
+                .read_ranges_prefetch_resident(path, split_ranges.clone())
+                .await
+            {
                 Ok(bufs) => bufs,
                 Err(_) => {
                     // Defensive fallback to the sequential baseline shape.
@@ -4897,7 +4903,10 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         // at batch time (Cold loaders below stay silent).
         let mut cold_bytes: Vec<Option<Vec<u8>>> = vec![None; cold_ranges.len()];
         if !cold_ranges.is_empty() {
-            let batched = match fs.read_ranges_prefetch(path, cold_ranges.clone()).await {
+            let batched = match fs
+                .read_ranges_prefetch_resident(path, cold_ranges.clone())
+                .await
+            {
                 Ok(bufs) => bufs,
                 Err(_) => {
                     // Defensive fallback to the sequential baseline shape.
@@ -5116,7 +5125,7 @@ pub async fn rabitq_search_segment_coalesced_allowed(
     if let (Some(choice), Some(fetches)) = (handoff, handoff_fetches) {
         let ranges: Vec<std::ops::Range<u64>> = fetches.iter().map(|f| f.start..f.end).collect();
         let bufs = fs
-            .read_ranges_prefetch(path, ranges)
+            .read_ranges_prefetch_resident(path, ranges)
             .await
             .map_err(|e| anyhow::anyhow!("coalesced scan top-k blocks {path}: {e}"))?;
         crate::observability::io_trace::drain_and_forward_read_ranges_metrics();
@@ -5223,7 +5232,7 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         let mut chunk_cold_bytes: Vec<Option<Vec<u8>>> = vec![None; chunk_cold_ranges.len()];
         if !chunk_cold_ranges.is_empty() {
             let batched = match fs
-                .read_ranges_prefetch(path, chunk_cold_ranges.clone())
+                .read_ranges_prefetch_resident(path, chunk_cold_ranges.clone())
                 .await
             {
                 Ok(bufs) => bufs,
@@ -5411,7 +5420,10 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         }
         let mut oid_cold_bytes: Vec<Option<Vec<u8>>> = vec![None; oid_cold_ranges.len()];
         if !oid_cold_ranges.is_empty() {
-            let batched = match fs.read_ranges_prefetch(path, oid_cold_ranges.clone()).await {
+            let batched = match fs
+                .read_ranges_prefetch_resident(path, oid_cold_ranges.clone())
+                .await
+            {
                 Ok(bufs) => bufs,
                 Err(_) => {
                     // Defensive fallback to the sequential baseline shape.

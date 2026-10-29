@@ -78,6 +78,39 @@ pub fn set_warm_tier_caches(
     let _ = GLOBAL_WARM_TIER_CACHES.set((invariants, survivor));
 }
 
+/// TD-TIER-1 SC4-4: backfill every registered grant's segment roots in the
+/// background (whole-object fetches, a few at a time). Runs once, when the
+/// process store registers. Skipped outside a runtime (logged).
+fn spawn_registered_residency_warm(filesystem: Arc<FilesystemFactory>) {
+    const CONCURRENCY: usize = 4;
+    let prefixes = proximadb_cache::process_protection_prefixes();
+    if prefixes.is_empty() {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!("TD-TIER-1 SC4: startup residency warm skipped outside a runtime");
+        return;
+    };
+    runtime.spawn(async move {
+        for prefix in prefixes {
+            let data_url = prefix.trim_end_matches('/').to_string();
+            let Ok(fs) = filesystem.get_filesystem(&data_url) else {
+                continue;
+            };
+            match crate::storage::engines::sst::segment_io::warm_collection(
+                fs.as_ref(),
+                &data_url,
+                CONCURRENCY,
+            )
+            .await
+            {
+                Ok(report) => tracing::debug!("TD-TIER-1 SC4: startup warm {data_url}: {report:?}"),
+                Err(error) => tracing::warn!("TD-TIER-1 SC4: startup warm {data_url}: {error}"),
+            }
+        }
+    });
+}
+
 /// The registered warm-tier caches, if any engine has armed them.
 pub fn get_warm_tier_caches() -> Option<(
     Arc<crate::storage::engines::sst::segment_format::SegmentInvariantsCache>,
@@ -636,7 +669,12 @@ impl SstEngine {
                             // cell, so construction order does not matter).
                             // First registration wins: a second engine
                             // construction in-process keeps the original.
-                            if !proximadb_cache::register_process_store(Arc::new(store.clone())) {
+                            if proximadb_cache::register_process_store(Arc::new(store.clone())) {
+                                // TD-TIER-1 SC4-4: grants restored at startup
+                                // registered their groups before this store
+                                // existed — backfill what they cover now.
+                                spawn_registered_residency_warm(filesystem.clone());
+                            } else {
                                 tracing::debug!(
                                     "TD-TIER-1 SC4-1: a persistent store was already \
                                      registered for this process; keeping the original"

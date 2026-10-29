@@ -1080,7 +1080,7 @@ impl SstEngine {
                 // Segments are the flush unit and small relative to query cost;
                 // a full read + index parse is the same cost class as the
                 // coarse-RaBitQ probe below.
-                let bytes = fs.read(file_path).await.ok()?;
+                let bytes = fs.read_resident(file_path).await.ok()?;
                 use proximadb_storage_common::pax_block::{PaxSegmentScanner, ScanPredicate};
                 let mut scanner =
                     PaxSegmentScanner::from_bytes(bytes, ScanPredicate::default()).ok()?;
@@ -1114,7 +1114,7 @@ impl SstEngine {
             let Ok(fs) = self.filesystem().get_filesystem(file) else {
                 return false; // can't open → don't skip; let the rebuild try
             };
-            let Ok(bytes) = fs.read(file).await else {
+            let Ok(bytes) = fs.read_resident(file).await else {
                 return false;
             };
             if !pax_segment_is_coarse_rabitq_without_f32_tier(&bytes) {

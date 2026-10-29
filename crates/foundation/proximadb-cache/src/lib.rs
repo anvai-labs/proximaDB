@@ -150,11 +150,23 @@ mod residency_budget {
     pub fn process_protection_group_ids() -> Vec<String> {
         cell().groups.keys().cloned().collect()
     }
+
+    /// TD-TIER-1 SC4-4: every registered group's prefixes — the backfill
+    /// input when the process store registers (grants restored at startup
+    /// register before the store exists).
+    pub fn process_protection_prefixes() -> Vec<String> {
+        cell()
+            .groups
+            .values()
+            .flat_map(|group| group.prefixes.iter().cloned())
+            .collect()
+    }
 }
 
 pub use residency_budget::{
-    process_protection_group_ids, process_reserved_budget, process_store, register_process_store,
-    register_protection_group, set_process_reserved_budget, unregister_protection_group,
+    process_protection_group_ids, process_protection_prefixes, process_reserved_budget,
+    process_store, register_process_store, register_protection_group, set_process_reserved_budget,
+    unregister_protection_group,
 };
 
 /// The category of a cached artifact. Drives key-namespacing and per-kind stats;

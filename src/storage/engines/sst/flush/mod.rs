@@ -807,6 +807,7 @@ impl SstEngine {
             && let Err(error) = crate::storage::engines::sst::segment_io::warm_object(
                 final_fs.as_ref(),
                 &final_file_path,
+                None,
             )
             .await
         {

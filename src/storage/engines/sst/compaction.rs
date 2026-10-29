@@ -3091,9 +3091,12 @@ impl Compaction {
         {
             let output = task.output_file.to_string_lossy().to_string();
             if let Ok(fs) = self.filesystem_factory.get_filesystem(&output)
-                && let Err(error) =
-                    crate::storage::engines::sst::segment_io::warm_object(fs.as_ref(), &output)
-                        .await
+                && let Err(error) = crate::storage::engines::sst::segment_io::warm_object(
+                    fs.as_ref(),
+                    &output,
+                    None,
+                )
+                .await
             {
                 warn!(output = %output, %error, "TD-TIER-1 SC4: output residency warm failed");
             }

@@ -205,11 +205,9 @@ impl CollectionService {
             #[cfg(feature = "experimental-turboquant")]
             turboquant_registry: None, // Will be set via with_turboquant_registry()
         };
-        // TD-TIER-1 SC4-4: after a restart, backfill what live grants cover
-        // (resident entries rebuilt from disk are skipped).
-        if let Some(registry) = &service.reservations {
-            service.spawn_residency_warm(registry.live_residency_prefixes().await);
-        }
+        // TD-TIER-1 SC4-4: the restart backfill runs when the SST engine
+        // registers the process store (`sst/core.rs`), not here — grants are
+        // restored before the store exists (review S4).
         Ok(service)
     }
 

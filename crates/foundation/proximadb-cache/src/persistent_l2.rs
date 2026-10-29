@@ -243,6 +243,40 @@ impl PersistentByteStore {
         self.inner.entries.get(key).map(|meta| meta.value_len)
     }
 
+    /// Whether any protection group is registered (lock-free). With none,
+    /// no grant asks for residency (SC4-4 read fast path).
+    pub fn policy_active(&self) -> bool {
+        self.inner.policy_active.load(Ordering::Acquire)
+    }
+
+    /// Whether pinning `len` more bytes under `key`'s group would fit — the
+    /// group's own budget, the store-wide reserved budget, and the store's
+    /// capacity (SC4-4 review: check BEFORE paying a whole-object GET, so an
+    /// over-budget object is neither fetched nor left unpinned to churn the
+    /// cache). Advisory: the pin itself re-checks under the mutex.
+    pub fn policy_headroom(&self, key: &str, len: u64) -> bool {
+        if !self.policy_active() || len > self.inner.max_bytes {
+            return false;
+        }
+        let policy = self.protection_guard();
+        let Some(group) = policy.matching_group(key) else {
+            return false;
+        };
+        let group_fits = group
+            .counter
+            .pinned
+            .load(Ordering::Acquire)
+            .checked_add(len)
+            .is_some_and(|next| next <= group.budget);
+        let store_fits = self
+            .inner
+            .protected_bytes
+            .load(Ordering::Acquire)
+            .checked_add(len)
+            .is_some_and(|next| next <= self.inner.reserved_budget.load(Ordering::Acquire));
+        group_fits && store_fits
+    }
+
     /// Whether the protection policy has a group covering `key` (SC4-4: a
     /// grant asks for this object to be resident). Free when no group is
     /// registered; otherwise takes the protection mutex, so call it at
@@ -1498,8 +1532,13 @@ impl ProtectionPolicy {
 /// region keys `invariants/control/{path}` follow the same convention). The
 /// path embeds the collection's segment root, so a grant's prefix protection
 /// pins the object automatically.
+///
+/// Canonicalized (review B2): flush seeds under its publish URL while readers
+/// and compaction use the LIST URL, which can spell the same object
+/// differently (`adls://` vs `az://`, slash runs); one canonical key keeps
+/// seed, read and forget on the same entry.
 pub fn object_key(path: &str) -> String {
-    format!("pax-object/{path}")
+    format!("pax-object/{}", canonical_location(path))
 }
 
 /// TD-TIER-1 SC4-2: canonical form for comparing locations embedded in cache
@@ -2313,6 +2352,24 @@ mod tests {
         assert!(
             store.is_protected(&key),
             "the object key is pinned by the prefix"
+        );
+    }
+
+    /// SC4-4 review B2: the publish URL and the LIST URL of one object map to
+    /// one whole-object key.
+    #[test]
+    fn object_key_is_canonical_across_spellings() {
+        assert_eq!(
+            object_key("adls://cont/tenants/t/12/data/L0.pax"),
+            object_key("az://cont/tenants/t/12/data/L0.pax")
+        );
+        assert_eq!(
+            object_key("s3://b/x//12/data/L0.pax"),
+            object_key("s3://b/x/12/data/L0.pax")
+        );
+        assert_ne!(
+            object_key("s3://b/12/data/L0.pax"),
+            object_key("s3://b/123/data/L0.pax")
         );
     }
 

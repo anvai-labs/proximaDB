@@ -474,20 +474,6 @@ impl ReservationRegistry {
         self.sync_residency_budget().await;
     }
 
-    /// TD-TIER-1 SC4-4: the residency prefixes of every live grant (startup
-    /// backfill input).
-    pub async fn live_residency_prefixes(&self) -> Vec<String> {
-        let mut prefixes = Vec::new();
-        for (_, authority) in self.pools.values() {
-            for grant in authority.grants_snapshot().await {
-                if grant.state.charges_capacity() {
-                    prefixes.extend(grant.residency_prefixes);
-                }
-            }
-        }
-        prefixes
-    }
-
     /// TD-TIER-1 SC4-3: the live grant for a collection id in any pool
     /// (collection ids are catalog UUIDs, unique across tenants). Status
     /// reads only — never the query path.
@@ -1237,6 +1223,17 @@ enum Compensation {
     Pending(tokio::task::JoinHandle<Result<Grant, ReservationError>>),
     /// The reserve committed; the create has not.
     Committed,
+}
+
+/// Test-only: the process-global residency state (budget cell, protection
+/// groups, the registered store) is shared by every test that touches it —
+/// reservation tests and the SST residency tests alike serialize on this
+/// one gate, so a shared-process runner (`cargo test`) cannot interleave
+/// them (nextest already isolates per process).
+#[cfg(test)]
+pub(crate) fn residency_test_gate() -> std::sync::MutexGuard<'static, ()> {
+    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// TD-TIER-1 SC4-3: compensating release for a create that reserves a grant
@@ -2203,10 +2200,8 @@ mod tests {
     /// cannot land a sibling's write inside another's assert window.
     /// (CI's nextest runs process-per-test; bare `cargo test --lib` is
     /// RUST_TEST_THREADS=1 — this closes the remaining runner.)
-    static BUDGET_CELL_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn budget_cell_gate() -> std::sync::MutexGuard<'static, ()> {
-        BUDGET_CELL_GATE.lock().unwrap_or_else(|p| p.into_inner())
+        super::residency_test_gate()
     }
 
     /// Grants arm the process store's protection budget through the bridge,
