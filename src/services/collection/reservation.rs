@@ -409,6 +409,10 @@ impl ReservationRegistry {
     ///
     /// Cancel-safe like [`Self::reserve_for_performance`]: release, unpin and
     /// budget sync complete in a detached task even if the caller is dropped.
+    /// Known residual (recorded): two detached tasks for the SAME collection
+    /// (a dropped release, then a new reserve) are not ordered — tokio's
+    /// mutex is fair only among already-queued waiters — so a late release
+    /// can remove the newer grant.
     pub async fn release_for_collection(
         self: &Arc<Self>,
         tenant_id: &str,
@@ -1187,6 +1191,68 @@ fn grant_by_id_mut<'a>(
         .iter_mut()
         .find(|g| g.id == id)
         .ok_or_else(|| ReservationError::Corrupt("grant vanished in prospect".into()))
+}
+
+/// TD-TIER-1 SC4-3: compensating release for a create that reserved a grant
+/// (review S3). The create path releases explicitly on every error exit; if
+/// the create future is instead DROPPED (client disconnect) while armed,
+/// `Drop` spawns the release, so a grant never outlives a create that did
+/// not reach its durable catalog record. Disarm once that record exists.
+pub struct GrantCompensation {
+    armed: Option<(Arc<ReservationRegistry>, String, String)>,
+}
+
+impl GrantCompensation {
+    /// Nothing reserved.
+    pub fn none() -> Self {
+        Self { armed: None }
+    }
+
+    /// A grant was reserved for (tenant, collection) on `registry`.
+    pub fn armed(registry: Arc<ReservationRegistry>, tenant: String, collection: String) -> Self {
+        Self {
+            armed: Some((registry, tenant, collection)),
+        }
+    }
+
+    /// Release now (an explicit error exit); idempotent.
+    pub async fn release_now(&mut self) {
+        if let Some((registry, tenant, collection)) = self.armed.take() {
+            registry
+                .release_for_collection(&tenant, &collection, chrono::Utc::now().timestamp())
+                .await;
+        }
+    }
+
+    /// The create committed: keep the grant.
+    pub fn disarm(&mut self) {
+        self.armed = None;
+    }
+}
+
+impl Drop for GrantCompensation {
+    fn drop(&mut self) {
+        let Some((registry, tenant, collection)) = self.armed.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    registry
+                        .release_for_collection(
+                            &tenant,
+                            &collection,
+                            chrono::Utc::now().timestamp(),
+                        )
+                        .await;
+                });
+            }
+            Err(_) => tracing::warn!(
+                "TD-TIER-1 SC4: create for ({tenant}, {collection}) was dropped outside a \
+                 runtime; its grant could not be released"
+            ),
+        }
+    }
 }
 
 /// TD-TIER-1 SC4-2: a grant's protection share — its collection's segment
@@ -2180,6 +2246,51 @@ mod tests {
             .release_for_collection("t1", "cancel-1", current_unix_secs())
             .await;
         assert_eq!(proximadb_cache::process_reserved_budget(), 0);
+    }
+
+    /// SC4-3 review S3: a create future dropped after its reserve committed
+    /// (client disconnect before the catalog record) releases the grant via
+    /// the compensation guard's Drop; a disarmed guard keeps it.
+    #[tokio::test]
+    async fn dropped_armed_compensation_releases_and_disarmed_keeps() {
+        let _guard = budget_cell_gate();
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = pool_config(&dir, "p1", 0);
+        cfg.overhead_factor = 0.0;
+        cfg.default_grant_bytes = 4096;
+        let registry = ReservationRegistry::open_from_config(std::slice::from_ref(&cfg))
+            .await
+            .unwrap()
+            .unwrap();
+        for collection in ["dropped-1", "kept-1"] {
+            registry
+                .reserve_for_performance("t1", collection, current_unix_secs(), &[])
+                .await
+                .unwrap();
+        }
+        drop(GrantCompensation::armed(
+            registry.clone(),
+            "t1".to_string(),
+            "dropped-1".to_string(),
+        ));
+        let mut kept =
+            GrantCompensation::armed(registry.clone(), "t1".to_string(), "kept-1".to_string());
+        kept.disarm();
+        drop(kept);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while registry
+            .live_grant_for_collection("dropped-1")
+            .await
+            .is_some()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dropped guard never released"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(registry.live_grant_for_collection("kept-1").await.is_some());
+        assert_eq!(proximadb_cache::process_reserved_budget(), 4096);
     }
 
     /// SC4-2 end to end through the real bridge and store: after a reserve,

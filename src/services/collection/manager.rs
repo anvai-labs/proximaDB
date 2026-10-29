@@ -206,10 +206,11 @@ impl CollectionService {
 
     /// TD-TIER-1 SC4-3: report a PERFORMANCE collection's live grant on its
     /// status — reserved bytes from the ledger, resident and covered bytes
-    /// from the registered process store. The API GET surface (REST v2 and
-    /// gRPC v2 both resolve through the collection port) calls this; it is
-    /// never on the query path, and non-PERFORMANCE collections or an inert
-    /// registry return immediately.
+    /// from the registered process store. Only the collection GET operation
+    /// (REST v2 and gRPC v2) calls this, through
+    /// `CollectionPort::enrich_collection_status` — never `get_collection`,
+    /// which every search resolves through (review B1). Non-PERFORMANCE
+    /// collections and an inert registry return immediately.
     pub async fn overlay_live_residency(&self, collection: &mut Collection) {
         let Some(registry) = &self.reservations else {
             return;
@@ -1456,10 +1457,8 @@ impl CollectionService {
         // list skip this seam entirely. If a later create step fails, the
         // compensation below releases the grant: a leaked grant would charge
         // capacity and accrue billing for a collection that never existed.
-        let mut reserved_grant: Option<(
-            std::sync::Arc<crate::services::collection::ReservationRegistry>,
-            String,
-        )> = None;
+        let mut reserved_grant =
+            crate::services::collection::reservation::GrantCompensation::none();
         if crate::services::collection::storage_class::storage_class_or_balanced(&enriched_config)
             == crate::proto::proximadb_v1::StorageClass::Performance
             && let Some(registry) = &self.reservations
@@ -1486,17 +1485,20 @@ impl CollectionService {
                 )
                 .await
                 .context("TD-TIER-1 SC3: PERFORMANCE admission refused")?;
-            reserved_grant = Some((registry.clone(), reservation_tenant));
+            reserved_grant = crate::services::collection::reservation::GrantCompensation::armed(
+                registry.clone(),
+                reservation_tenant,
+                uuid.clone(),
+            );
         }
         // Compensating release for every early exit after a successful
-        // reserve (review B1: the grant must not outlive a failed create).
+        // reserve (review B1: the grant must not outlive a failed create). A
+        // DROPPED create future (client disconnect) releases too: the guard's
+        // Drop spawns the release (SC4-3 review S3); it is disarmed once the
+        // catalog record — the collection's existence — is durable.
         macro_rules! compensate_reservation {
             () => {
-                if let Some((registry, tenant)) = reserved_grant.take() {
-                    registry
-                        .release_for_collection(&tenant, &uuid, chrono::Utc::now().timestamp())
-                        .await;
-                }
+                reserved_grant.release_now().await;
             };
         }
 
@@ -1581,6 +1583,7 @@ impl CollectionService {
                 start_time.elapsed().as_micros() as i64,
             ));
         }
+        reserved_grant.disarm();
 
         // The catalog asset write above is the sole authoritative store for the
         // collection; the legacy metadata backend is no longer dual-written.
@@ -5880,11 +5883,14 @@ impl proximadb_runtime::CollectionPort for CollectionService {
         identifier: &str,
         tenant_id: Option<&str>,
     ) -> anyhow::Result<Option<crate::proto::proximadb_v1::Collection>> {
-        let mut collection = self.collection_for_tenant(identifier, tenant_id).await?;
-        if let Some(collection) = collection.as_mut() {
-            self.overlay_live_residency(collection).await;
-        }
-        Ok(collection)
+        self.collection_for_tenant(identifier, tenant_id).await
+    }
+
+    async fn enrich_collection_status(
+        &self,
+        collection: &mut crate::proto::proximadb_v1::Collection,
+    ) {
+        self.overlay_live_residency(collection).await;
     }
 
     async fn create_collection(

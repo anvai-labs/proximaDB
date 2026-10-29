@@ -79,7 +79,10 @@ struct EntryMeta {
     touch: AtomicU64,
 }
 
-#[derive(Debug)]
+/// Test-only callback run on each selected eviction victim.
+#[cfg(test)]
+type EvictHook = Box<dyn Fn(&PersistentByteStore, &str) + Send + Sync>;
+
 struct StoreInner {
     base: PathBuf,
     max_bytes: u64,
@@ -104,14 +107,31 @@ struct StoreInner {
     /// does not take the protection mutex on every `put` (review S4).
     policy_active: AtomicBool,
     /// TD-TIER-1 SC4-3: set when a policy pin was skipped for budget, so a
-    /// later cache hit retries it (coverage self-heal once room frees, e.g.
-    /// after compaction retires a pinned segment). Cleared only by a full
-    /// reconcile that skipped nothing; while clear, hits never take the
-    /// protection mutex.
+    /// later cache hit can retry it (coverage self-heal). Cleared by a full
+    /// reconcile that skipped nothing.
     heal_pending: AtomicBool,
+    /// Set whenever a pin is released (room freed); cleared by a hit-heal
+    /// attempt. A hit retries a skipped pin only when BOTH flags are set, so
+    /// a steadily over-budget grant costs one attempt per freed pin — not a
+    /// mutex per read (review S1).
+    room_freed: AtomicBool,
+    /// Test-only hook run between victim selection and its re-check, to
+    /// exercise the selection→pin race deterministically.
+    #[cfg(test)]
+    evict_hook: std::sync::Mutex<Option<EvictHook>>,
     clock: AtomicU64,
     entries: DashMap<String, Arc<EntryMeta>>,
     mutation: tokio::sync::Mutex<()>,
+}
+
+impl std::fmt::Debug for StoreInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreInner")
+            .field("base", &self.base)
+            .field("max_bytes", &self.max_bytes)
+            .field("entries", &self.entries.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// A persistent raw-byte cache for a local filesystem.
@@ -143,6 +163,9 @@ impl PersistentByteStore {
             protection: std::sync::Mutex::new(ProtectionPolicy::default()),
             policy_active: AtomicBool::new(false),
             heal_pending: AtomicBool::new(false),
+            room_freed: AtomicBool::new(false),
+            #[cfg(test)]
+            evict_hook: std::sync::Mutex::new(None),
             clock: AtomicU64::new(1),
             entries: DashMap::new(),
             mutation: tokio::sync::Mutex::new(()),
@@ -336,6 +359,7 @@ impl PersistentByteStore {
         if let Some(group) = group {
             group.pinned.fetch_sub(meta.file_len, Ordering::AcqRel);
         }
+        self.inner.room_freed.store(true, Ordering::Release);
         true
     }
 
@@ -459,19 +483,20 @@ impl PersistentByteStore {
 
     /// Bytes resident in the store under one grant group's prefixes, pinned
     /// or not (status input; `covered_bytes` ≤ this). O(entries): status
-    /// reads only, never the query path.
+    /// reads only (the collection GET), never the query path.
     pub fn group_resident_bytes(&self, group_id: &str) -> u64 {
-        let policy = self.protection_guard();
-        let Some(group) = policy.groups.get(group_id) else {
-            return 0;
+        // Copy the prefixes, then scan WITHOUT the protection mutex, so a
+        // status read never blocks puts, eviction or pins.
+        let prefixes = match self.protection_guard().groups.get(group_id) {
+            Some(group) => group.prefixes.clone(),
+            None => return 0,
         };
         self.inner
             .entries
             .iter()
             .filter(|entry| {
                 let canonical = canonical_location(entry.key());
-                group
-                    .prefixes
+                prefixes
                     .iter()
                     .any(|prefix| canonical.contains(prefix.as_str()))
             })
@@ -479,14 +504,26 @@ impl PersistentByteStore {
             .sum()
     }
 
-    /// Retry a skipped policy pin on a cache hit (SC4-3 self-heal). Free
-    /// unless a pin was skipped for budget since the last clean reconcile.
+    /// Retry a skipped policy pin on a cache hit (SC4-3 self-heal). Runs
+    /// only when a pin was skipped AND room has freed since the last attempt,
+    /// and never waits: a contended protection mutex skips the attempt (the
+    /// next freed pin re-arms it). Reads otherwise take no lock.
     fn heal_on_hit(&self, key: &str, meta: &EntryMeta) {
-        if self.inner.heal_pending.load(Ordering::Acquire)
-            && !meta.protected.load(Ordering::Acquire)
+        if !self.inner.heal_pending.load(Ordering::Acquire)
+            || meta.protected.load(Ordering::Acquire)
+            || !self.inner.room_freed.swap(false, Ordering::AcqRel)
         {
-            self.protect_on_admit(key);
+            return;
         }
+        let policy = match self.inner.protection.try_lock() {
+            Ok(policy) => policy,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.inner.room_freed.store(true, Ordering::Release);
+                return;
+            }
+        };
+        self.pin_under_policy(&policy, key);
     }
 
     /// Pin a just-admitted (or re-put) key when it falls under the policy.
@@ -499,6 +536,12 @@ impl PersistentByteStore {
             return;
         }
         let policy = self.protection_guard();
+        self.pin_under_policy(&policy, key);
+    }
+
+    /// Pin `key` under its matching group; the caller holds the protection
+    /// mutex. A budget refusal marks a heal as pending.
+    fn pin_under_policy(&self, policy: &ProtectionPolicy, key: &str) {
         let Some(group) = policy.matching_group(key) else {
             return;
         };
@@ -852,14 +895,30 @@ impl PersistentByteStore {
             // A victim pinned or removed since selection is simply skipped:
             // the next pass re-selects (the pinned one is filtered out), so
             // the loop still terminates when nothing evictable remains.
-            let _guard = self.protection_guard();
-            let still_unprotected = self
+            #[cfg(test)]
+            if let Some(hook) = self
                 .inner
-                .entries
-                .get(&victim)
-                .is_some_and(|meta| !meta.protected.load(Ordering::Acquire));
-            if still_unprotected {
-                self.remove_indexed(&victim, true);
+                .evict_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+            {
+                hook(self, &victim);
+            }
+            // The unlink runs after the guard drops (review S4): no blocking
+            // file I/O under the protection mutex.
+            let unlink = {
+                let _guard = self.protection_guard();
+                let path = self
+                    .inner
+                    .entries
+                    .get(&victim)
+                    .filter(|meta| !meta.protected.load(Ordering::Acquire))
+                    .map(|meta| meta.path.clone());
+                path.filter(|_| self.remove_indexed(&victim, false))
+            };
+            if let Some(path) = unlink {
+                let _ = std::fs::remove_file(path);
             }
         }
     }
@@ -2120,43 +2179,48 @@ mod tests {
         assert_eq!(store.group_resident_bytes("absent"), 0);
     }
 
-    /// SC4-3: pressure never deletes a protected entry, including one pinned
-    /// by a reconcile racing the eviction loop (selection is re-checked
-    /// under the protection mutex).
+    /// SC4-3: an entry pinned AFTER eviction selected it (a registration
+    /// sweep racing the pressure loop) is not deleted. The hook pins the
+    /// selected victim between selection and the re-check — the exact window
+    /// the re-check closes; without it, pressure deletes the pin.
     #[tokio::test]
-    async fn pressure_with_concurrent_registration_never_evicts_a_pin() {
-        let (dir, store) = armed_store();
-        drop(store);
-        let store = std::sync::Arc::new(
-            PersistentByteStore::open(dir.path(), 64 * 1024).expect("small store"),
-        );
+    async fn eviction_rechecks_a_victim_pinned_after_selection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = PersistentByteStore::open(dir.path(), 16 * 1024).expect("small store");
         store.set_reserved_budget(1 << 30);
-        let pinned = key_in(C1, "keep");
+        // The victim is the only Survivor-class entry: eviction orders by
+        // (class, touch), so it is selected first regardless of touch ties
+        // (new entries start at touch 1; a tie would break by hash order).
+        let victim = key_in(C1, "lru");
         store
-            .put(pinned.clone(), L2Class::Invariants, payload(8 * 1024))
+            .put(victim.clone(), L2Class::Survivor, payload(6 * 1024))
             .await
-            .expect("put keep");
-        let racer = {
-            let store = store.clone();
-            std::thread::spawn(move || {
-                for _ in 0..200 {
+            .expect("put lru");
+        *store
+            .inner
+            .evict_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Box::new(|store: &PersistentByteStore, selected: &str| {
+                if selected.contains("/12/data/") && !store.is_protected(selected) {
                     store.set_protection_groups(vec![group("g1", C1, 1 << 30)]);
                 }
-            })
-        };
-        for i in 0..64 {
+            }));
+        for i in 0..4 {
             store
                 .put(
                     key_in(C2, &format!("f{i}")),
-                    L2Class::Survivor,
-                    payload(8 * 1024),
+                    L2Class::Invariants,
+                    payload(6 * 1024),
                 )
                 .await
                 .expect("pressure put");
         }
-        racer.join().expect("racer");
-        assert!(store.is_protected(&pinned), "the pin survived the pressure");
-        assert!(store.get(&pinned).await.expect("get").is_some());
+        assert!(store.is_protected(&victim), "pinned by the racing sweep");
+        assert!(
+            store.get(&victim).await.expect("get").is_some(),
+            "a victim pinned after selection must survive the pressure"
+        );
     }
 
     /// Review S2: Azure scheme aliases and doubled slashes compare equal.

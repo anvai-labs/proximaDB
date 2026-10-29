@@ -325,8 +325,7 @@ mod tests {
         }
     }
 
-    /// SC4-2: the prefixes are the flush/compaction segment roots, both
-    /// layouts, trailing `/`, with the base's own trailing `/` trimmed.
+    /// SC4-3: the status overlay reports the grant's bytes without claiming READY.
     #[test]
     fn live_residency_overlay_reports_bytes_and_stays_not_active() {
         let base = storage_class_status(&config_with_class(Some(StorageClass::Performance as i32)));
@@ -343,6 +342,8 @@ mod tests {
         assert!(status.reason.contains("1000 of 3000"), "{}", status.reason);
     }
 
+    /// SC4-2: the prefixes are the flush/compaction segment roots, both
+    /// layouts, trailing `/`, with the base's own trailing `/` trimmed.
     #[test]
     fn residency_prefixes_match_both_segment_layouts() {
         use crate::core::stable_id::CollectionIdentity;

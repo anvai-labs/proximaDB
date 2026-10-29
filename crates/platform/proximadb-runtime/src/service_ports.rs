@@ -47,6 +47,13 @@ pub trait CollectionPort: Send + Sync {
         self.get_collection(identifier, None).await
     }
 
+    /// Fill live, status-only figures into a collection returned by the
+    /// collection GET API (TD-TIER-1 SC4-3: residency reserved/resident/
+    /// covered bytes). Called ONLY from the GET operation — never from
+    /// `get_collection`, which searches and other per-request resolution
+    /// use. Default: nothing to add.
+    async fn enrich_collection_status(&self, _collection: &mut Collection) {}
+
     /// Internal (system) listing of every collection. Default: the unscoped
     /// `list_collections(None)` of ports that do not scope.
     async fn list_collections_internal(&self) -> Result<Vec<Collection>> {
