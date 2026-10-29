@@ -1266,3 +1266,57 @@ def test_query_sweep_stops_sampler_when_reads_fail() -> None:
         "sampler.stop() must run on the read-failure path"
     )
     assert sampler_calls.count({"event": "stop"}) == 1
+
+
+def _scrape_from(text: str) -> dict:
+    totals = HARNESS.parse_prometheus(text)
+    totals["_text"] = text
+    return totals
+
+
+def test_tier_split_reads_each_tier_and_sums_region_d() -> None:
+    """TD-FPRUNE-1 PR-A: per-tier deltas come from the labelled series, a
+    tier absent on both sides is zero, and Region D = OID + FiltD + Rehyd."""
+    before = _scrape_from(
+        'proximadb_pax_tier_get_ops_agg_total{tier="OID"} 10\n'
+        'proximadb_pax_tier_get_bytes_agg_total{tier="OID"} 1000\n'
+    )
+    after = _scrape_from(
+        'proximadb_pax_tier_get_ops_agg_total{tier="OID"} 14\n'
+        'proximadb_pax_tier_get_bytes_agg_total{tier="OID"} 1400\n'
+        'proximadb_pax_tier_get_ops_agg_total{tier="FiltD"} 400\n'
+        'proximadb_pax_tier_get_bytes_agg_total{tier="FiltD"} 80000\n'
+        'proximadb_pax_tier_get_ops_agg_total{tier="IdxA"} 2\n'
+        'proximadb_pax_tier_get_bytes_agg_total{tier="IdxA"} 9000\n'
+    )
+    split = HARNESS.tier_split(before, after, query_count=2)
+    assert split["tiers"]["OID"] == {"gets_per_query": 2.0, "bytes_per_query": 200.0}
+    assert split["tiers"]["FiltD"]["gets_per_query"] == 200.0
+    assert split["tiers"]["Rehyd"] == {"gets_per_query": 0.0, "bytes_per_query": 0.0}
+    assert split["region_d_bytes_per_query"] == 200.0 + 40000.0
+    assert split["attributed_bytes_per_query"] == 200.0 + 40000.0 + 4500.0
+    assert set(split["tiers"]) == set(HARNESS.PAX_TIER_LABELS)
+
+
+def test_request_cost_prices_lists_and_heads_separately() -> None:
+    """$/M queries = GET and HEAD at the GET price, LIST at the LIST price;
+    HEADs are requests that are neither GETs nor LISTs."""
+    cost = HARNESS.request_cost_per_million_queries(
+        gets=2770.0, requests=2786.0, lists=10.0, query_count=10
+    )
+    assert cost["per_query"] == {"gets": 277.0, "heads": 0.6, "lists": 1.0}
+    assert cost["usd_per_million_queries"] == pytest.approx(277.0 * 0.40 + 0.6 * 0.40 + 5.0)
+    assert cost["prices"]["as_of"] == "2026-10-29"
+
+
+def test_stage_f_summary_is_zero_on_an_unfiltered_phase() -> None:
+    empty = _scrape_from("")
+    summary = HARNESS.stage_f_summary(empty, empty, query_count=5)
+    assert set(summary.values()) == {0.0}
+    after = _scrape_from(
+        "proximadb_stage_f_calls_agg_total 10\n"
+        "proximadb_stage_f_fetch_us_agg_total 50000\n"
+    )
+    summary = HARNESS.stage_f_summary(empty, after, query_count=5)
+    assert summary["builds_per_query"] == 2.0
+    assert summary["fetch_ms_per_query"] == 10.0

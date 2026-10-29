@@ -43,6 +43,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
+from typing import Any
 from urllib.parse import urlparse
 
 PAX_MAGIC = b"PAXSEG01"
@@ -87,7 +88,38 @@ METRICS = (
     "proximadb_region_d_fetch_decode_us_agg_total",
     "proximadb_rehydrate_us_agg_total",
     "proximadb_cascade_total_us_agg_total",
+    # TD-FPRUNE-1 PR-A: filtered Stage F, per-tier GETs, LIST split.
+    "proximadb_stage_f_calls_agg_total",
+    "proximadb_stage_f_blocks_agg_total",
+    "proximadb_stage_f_blocks_pruned_footer_agg_total",
+    "proximadb_stage_f_blocks_pruned_decode_agg_total",
+    "proximadb_stage_f_rows_decoded_agg_total",
+    "proximadb_stage_f_rows_matched_agg_total",
+    "proximadb_stage_f_fetch_us_agg_total",
+    "proximadb_stage_f_decode_us_agg_total",
+    "proximadb_pax_tier_get_ops_agg_total",
+    "proximadb_pax_tier_get_bytes_agg_total",
+    "proximadb_object_store_lists_total",
 )
+
+# TD-FPRUNE-1 PR-A: one dated request-price set for the $/M-queries estimate.
+# AWS S3 Standard us-east-1 list prices, as cited across the in-repo cost docs;
+# no dated rate card lives in this repo (it is AnvaiOps'), so this is a
+# public-list-price estimate, not a billing figure. HEAD is priced as a GET;
+# same-region transfer is free, so bytes carry no request cost here.
+REQUEST_PRICES = {
+    "source": "AWS S3 Standard us-east-1 public list prices",
+    "as_of": "2026-10-29",
+    "usd_per_million_get": 0.40,
+    "usd_per_million_head": 0.40,
+    "usd_per_million_list": 5.00,
+}
+
+# The SST `CacheTier` labels (src/storage/engines/sst/metrics.rs TIER_LABELS).
+PAX_TIER_LABELS = ("IdxA", "Ctl", "Meta", "ProbeA", "Surv", "OID", "FiltD", "Rehyd")
+# Tiers that read Region D (scalar/metadata blocks): the top-k OID resolve,
+# the filtered Stage F pass and the top-k rehydration.
+REGION_D_TIERS = ("OID", "FiltD", "Rehyd")
 
 
 def directory_size_bytes(root: Path) -> int:
@@ -1555,6 +1587,77 @@ def histogram_delta_quantiles(
     return out
 
 
+def tier_split(before: dict, after: dict, query_count: int) -> dict[str, Any]:
+    """Per-query GETs and bytes for each PAX cascade tier, plus the Region-D
+    total. A tier absent from both scrapes is an observed zero (the counters
+    register lazily per label)."""
+    before_text = before.get("_text", "")
+    after_text = after.get("_text", "")
+    tiers: dict[str, dict[str, float]] = {}
+    for label in PAX_TIER_LABELS:
+        values = {}
+        for key, name in (
+            ("gets", "proximadb_pax_tier_get_ops_agg_total"),
+            ("bytes", "proximadb_pax_tier_get_bytes_agg_total"),
+        ):
+            start = labelled_metric(before_text, name, "tier", label) or 0.0
+            end = labelled_metric(after_text, name, "tier", label) or 0.0
+            values[key] = end - start
+        tiers[label] = {
+            "gets_per_query": values["gets"] / query_count,
+            "bytes_per_query": values["bytes"] / query_count,
+        }
+    region_d = sum(tiers[label]["bytes_per_query"] for label in REGION_D_TIERS)
+    return {
+        "tiers": tiers,
+        "region_d_bytes_per_query": region_d,
+        "attributed_gets_per_query": sum(t["gets_per_query"] for t in tiers.values()),
+        "attributed_bytes_per_query": sum(t["bytes_per_query"] for t in tiers.values()),
+    }
+
+
+def stage_f_summary(before: dict, after: dict, query_count: int) -> dict[str, float]:
+    """Filtered Stage-F build counters as per-query deltas (all zero on an
+    unfiltered phase)."""
+
+    def per_query(name: str) -> float:
+        return metric_delta(before, after, f"proximadb_stage_f_{name}_agg_total") / query_count
+
+    return {
+        "builds_per_query": per_query("calls"),
+        "blocks_per_query": per_query("blocks"),
+        "blocks_pruned_footer_per_query": per_query("blocks_pruned_footer"),
+        "blocks_pruned_decode_per_query": per_query("blocks_pruned_decode"),
+        "rows_decoded_per_query": per_query("rows_decoded"),
+        "rows_matched_per_query": per_query("rows_matched"),
+        "fetch_ms_per_query": per_query("fetch_us") / 1000.0,
+        "decode_ms_per_query": per_query("decode_us") / 1000.0,
+    }
+
+
+def request_cost_per_million_queries(
+    gets: float, requests: float, lists: float, query_count: int
+) -> dict[str, Any]:
+    """Object-store request cost per million queries at ``REQUEST_PRICES``.
+    HEADs are the requests that are neither GETs nor LISTs."""
+    heads = max(requests - gets - lists, 0.0)
+    per_query = {
+        "gets": gets / query_count,
+        "heads": heads / query_count,
+        "lists": lists / query_count,
+    }
+    usd = (
+        per_query["gets"] * REQUEST_PRICES["usd_per_million_get"]
+        + per_query["heads"] * REQUEST_PRICES["usd_per_million_head"]
+        + per_query["lists"] * REQUEST_PRICES["usd_per_million_list"]
+    )
+    return {
+        "per_query": per_query,
+        "usd_per_million_queries": usd,
+        "prices": dict(REQUEST_PRICES),
+    }
+
+
 def metric_delta(before: dict, after: dict, name: str) -> float:
     present_before = set(before.get("_present", []))
     present_after = set(after.get("_present", []))
@@ -1910,6 +2013,8 @@ def run_query_sweep(
     }
     survivor_total = survivor_hits + survivor_misses
     invariant_total = invariant_hits + invariant_misses
+    lists = metric_delta(before, after, "proximadb_object_store_lists_total")
+    request_cost = request_cost_per_million_queries(gets, requests, lists, query_count)
     result = {
         "phase": phase,
         "query_start": query_start,
@@ -1950,6 +2055,11 @@ def run_query_sweep(
         "waves": waves,
         "bytes_read": bytes_read,
         "bytes_per_query": bytes_read / query_count,
+        # TD-FPRUNE-1 PR-A: per-tier GET/byte split (Region D = OID + FiltD +
+        # Rehyd), the filtered Stage-F build counters and the request bill.
+        "tier_split": tier_split(before, after, query_count),
+        "stage_f": stage_f_summary(before, after, query_count),
+        "request_cost": request_cost,
         "survivor": {
             "hits": survivor_hits,
             "misses": survivor_misses,
@@ -2033,7 +2143,11 @@ def run_query_sweep(
         f"cells/q={result['ivf']['cells_probed_per_query']:.2f} "
         f"rows/q={result['ivf']['probed_rows_per_query']:.0f} "
         f"rounds/q={result['ivf']['fetch_rounds_per_query']:.2f} "
-        f"local_hits={local_hits:.0f}",
+        f"local_hits={local_hits:.0f} "
+        f"regionD/q={result['tier_split']['region_d_bytes_per_query'] / 1_000_000:.2f}MB "
+        f"stageF fetch/decode ms/q={result['stage_f']['fetch_ms_per_query']:.1f}/"
+        f"{result['stage_f']['decode_ms_per_query']:.1f} "
+        f"$/Mq={request_cost['usd_per_million_queries']:.2f}",
         flush=True,
     )
     return result

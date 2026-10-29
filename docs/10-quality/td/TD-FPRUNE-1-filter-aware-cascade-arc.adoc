@@ -45,6 +45,15 @@ residual filter as the correctness backstop.
   (`read_records_by_positions`) and a filtered SIFT ratchet leg through the real dispatch.
   Attribution: `record_pax_footer_prune` → `pax_footer_{total,pruned}_blocks` in `IoTraceSnapshot`.
 
+* *Filtered-path instrumentation (2026-10-29).* Stage F and rehydrate GETs are tier-attributed
+  (`CacheTier::FilterRowAllow` = `FiltD`, `CacheTier::Rehydrate` = `Rehyd`; io_trace tier arrays widened
+  6 → 8, older 6-entry snapshots still deserialize), so Region-D bytes per query = `OID + FiltD + Rehyd`
+  on `proximadb_pax_tier_get_bytes_agg_total`. `proximadb_stage_f_*_agg_total` exports the prune split
+  (footer / decode), rows decoded and matched, and the wall split between awaiting reads (`fetch_us`) and
+  decoding (`decode_us`). `proximadb_object_store_lists_total` separates LISTs from HEADs, the waves
+  histogram reaches 1000 (filtered p50 previously read +Inf) and the SIFT harness reports `tier_split`,
+  `stage_f` and a dated request `$/M queries` (S3 list prices; an estimate, not a billing figure).
+
 *Evidence:* filtered recall@10 = **0.996** vs filtered brute force (floor 0.90, N=10k, 8 partitions);
 C1 integrated filtered stack **4.2× byte cut** at recall parity (correlated data); C2 unfiltered recall Δ=0.000.
 

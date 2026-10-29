@@ -75,6 +75,14 @@ lazy_static! {
         "Per-tenant physical object-store read requests: GET + LIST + HEAD (TD-PAXDIR-1 D7)",
         &["tenant_id"]
     );
+    /// TD-FPRUNE-1 PR-A: per-tenant physical object-store LISTs, the subset
+    /// of [`OBJECT_STORE_REQUESTS_TOTAL`] priced per LIST rather than per GET
+    /// (HEADs = requests − GETs − LISTs). Neutral count only.
+    pub static ref OBJECT_STORE_LISTS_TOTAL: CounterVec = registered_counter_vec(
+        "proximadb_object_store_lists_total",
+        "Per-tenant physical object-store LIST requests (TD-FPRUNE-1 PR-A)",
+        &["tenant_id"]
+    );
     pub static ref IVF_CELLS_TOTAL: CounterVec = registered_counter_vec(
         "proximadb_ivf_cells_total",
         "Persisted-IVF cells considered by vector queries (TD-RDSTRAT-8)",
@@ -783,6 +791,11 @@ pub fn install_billing_observer() {
             OBJECT_STORE_REQUESTS_TOTAL
                 .with_label_values(&[t_id])
                 .inc_by(requests as f64);
+        }
+        if snap.list_ops > 0 {
+            OBJECT_STORE_LISTS_TOTAL
+                .with_label_values(&[t_id])
+                .inc_by(snap.list_ops as f64);
         }
         if !snap.vector_accesses.is_empty()
             && let Some(waves) = snap.waves
