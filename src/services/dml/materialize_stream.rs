@@ -8,8 +8,9 @@
 //! * [`generation_stem`]: the name every data file of one publication starts
 //!   with, unique per publication and ordered by time;
 //! * [`gc_older_generations`]: after version `V` commits, delete the data files
-//!   no longer referenced by `V` or `V − 1` (a reader that opened `V − 1` keeps
-//!   its files).
+//!   and the incremental MATERIALIZE's `dv-mat-*` deletion-vector Puffins no
+//!   longer referenced by `V` or `V − 1` (a reader that opened `V − 1` keeps its
+//!   files).
 
 use std::collections::HashSet;
 
@@ -92,6 +93,18 @@ fn generation_of(file_name: &str) -> Option<&str> {
     let generation = file_name.get(..21)?;
     (generation.starts_with('g') && generation[1..].bytes().all(|b| b.is_ascii_digit()))
         .then_some(generation)
+}
+
+/// The generation of a `dv-mat-{stem}.puffin` minted by the incremental
+/// MATERIALIZE, if `file_name` is one. Every other Puffin — the live delete
+/// publisher's `dv-live-{ns}` (clock-named, so unordered against an in-flight
+/// publication in another process) and any external writer's — has none, and
+/// generation GC never touches it.
+fn dv_mat_generation(file_name: &str) -> Option<&str> {
+    file_name
+        .strip_suffix(".puffin")?
+        .strip_prefix("dv-mat-")
+        .and_then(generation_of)
 }
 
 /// What a failed `publish_iceberg_files` actually left behind.
@@ -306,14 +319,15 @@ pub(super) async fn gc_older_generations(
     let mut first_err = None;
     for key in bridge.list_objects(data_prefix).await? {
         let key_str = key.as_ref();
-        if !key_str.ends_with(".parquet")
-            || keep_current.contains(key_str)
-            || keep_previous.contains(key_str)
-        {
+        if keep_current.contains(key_str) || keep_previous.contains(key_str) {
             continue;
         }
         let name = key.filename().unwrap_or_default();
-        let older = generation_of(name).is_none_or(|g| g < current_generation);
+        let older = if key_str.ends_with(".parquet") {
+            generation_of(name).is_none_or(|g| g < current_generation)
+        } else {
+            dv_mat_generation(name).is_some_and(|g| g < current_generation)
+        };
         if !older {
             continue;
         }
@@ -342,7 +356,7 @@ fn metadata_version_of(layout: &proximadb_catalog::CatalogStorageLayout) -> Opti
 
 /// Whether a deletion vector's Puffin was MINTED by one of ProximaDB's own
 /// publishers: the live delete publisher (`dv-live-…`) or the incremental
-/// MATERIALIZE (`dv-mat-…`). Every vector either mints hides only a row
+/// MATERIALIZE (`dv-mat-…`). Every vector either of them mints hides only a row
 /// version the WAL has since deleted or superseded — a WAL-durable death, or
 /// a newer version of the same oid the native state holds — which is what
 /// makes adopting an orphaned publication safe: a rewrite from native state
@@ -564,6 +578,7 @@ mod tests {
         use proximadb_iceberg_engine::IcebergObjectStoreBridge;
         let bridge = IcebergObjectStoreBridge::from_url("memory:///gc-test").unwrap();
         let store = bridge.inner_store();
+        let ancient = generation_stem(0);
         let old = generation_stem(1);
         let prev = generation_stem(2);
         let cur = generation_stem(3);
@@ -576,6 +591,16 @@ mod tests {
             format!("{cur}-00001.parquet"),
             format!("{newer}-00000.parquet"),
             "_SUCCESS".to_string(),
+            // Puffins: an unreferenced old dv-mat (collected); an old dv-mat
+            // the current snapshot still carries BY REFERENCE (kept); the
+            // previous snapshot's (kept); a newer publisher's (kept); the live
+            // publisher's clock-named and a foreign Puffin (never touched).
+            format!("dv-mat-{old}.puffin"),
+            format!("dv-mat-{ancient}.puffin"),
+            format!("dv-mat-{prev}.puffin"),
+            format!("dv-mat-{newer}.puffin"),
+            "dv-live-17.puffin".to_string(),
+            "foreign.puffin".to_string(),
         ];
         for name in &names {
             object_store::ObjectStoreExt::put(
@@ -590,14 +615,19 @@ mod tests {
         let current: HashSet<String> = [
             key(&format!("{cur}-00000.parquet")),
             key(&format!("{cur}-00001.parquet")),
+            key(&format!("dv-mat-{ancient}.puffin")),
         ]
         .into();
-        let previous: HashSet<String> = [key(&format!("{prev}-00000.parquet"))].into();
+        let previous: HashSet<String> = [
+            key(&format!("{prev}-00000.parquet")),
+            key(&format!("dv-mat-{prev}.puffin")),
+        ]
+        .into();
         let deleted =
             gc_older_generations(&bridge, &Path::from("t/data"), &current, &previous, &cur)
                 .await
                 .unwrap();
-        assert_eq!(deleted, 2);
+        assert_eq!(deleted, 3);
         let mut left: Vec<String> = bridge
             .list_objects(&Path::from("t/data"))
             .await
@@ -612,6 +642,11 @@ mod tests {
             format!("{cur}-00001.parquet"),
             format!("{newer}-00000.parquet"),
             "_SUCCESS".to_string(),
+            format!("dv-mat-{ancient}.puffin"),
+            format!("dv-mat-{prev}.puffin"),
+            format!("dv-mat-{newer}.puffin"),
+            "dv-live-17.puffin".to_string(),
+            "foreign.puffin".to_string(),
         ];
         expected.sort();
         assert_eq!(left, expected);

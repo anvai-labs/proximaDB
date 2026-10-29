@@ -322,3 +322,17 @@ This contract is the design record for the P2 writer pickup's fence requirement
 (`docs/current/TRACKER.adoc`, P2 row; `docs/current/LAKEHOUSE_PLAN.adoc` "V3 activation
 ladder" step 3). The writer's TD updates when the slice lands; this document is amended,
 not superseded, when implementation discovers sharpening.
+
+
+=== Incremental MATERIALIZE soak (2026-10-29)
+
+`soak_incremental_materialize_holds_both_views` runs 40 seeded rounds of
+inserts, updates and deletes with `PROXIMADB_MATERIALIZE_INCREMENTAL_DV` on and
+a MATERIALIZE every third round. After every round the WAL view equals the
+model, and the OLAP view's count, key sum and updated-value count equal it,
+both between publications (merged over the DV-carrying base) and after them.
+Deltas under the 20% bound publish incrementally; deltas past it compact.
+Superseded `dv-mat-*` Puffins are collected by the generation GC (bounded by
+the parts the current and previous snapshots name); the final state reads back
+through the external engines in CI. Local run: 41 updates, 20 deletes, 14
+MATERIALIZEs, at most 2 `dv-mat` Puffins on disk.

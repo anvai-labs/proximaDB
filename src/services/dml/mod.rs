@@ -2980,7 +2980,10 @@ impl DmlService {
             // referenced vectors' deaths are WAL-durable regardless — so a
             // rewrite captured now scans them dead in native state and
             // adoption cannot resurrect. An external parent carrying ONLY
-            // its own (non-dv-live) vectors keeps the refusal.
+            // its own (non-dv-live) vectors keeps the refusal. The
+            // incremental MATERIALIZE's `dv-mat-*` vectors qualify by the
+            // superseded-version argument instead (see `is_self_minted_dv`):
+            // native state holds every hidden row's newer version.
             // Round-3 review (MAJOR-1): the predicate is ALL, not ANY — a
             // MIXED parent (our dv-live vector re-referenced beside a
             // foreign engine's own positional deletes) must keep the
@@ -3527,15 +3530,28 @@ impl DmlService {
         // 7. Garbage-collect generations older than the previous version. Best
         //    effort: a leftover file is unreferenced (readers select from the
         //    manifest), so a failure here only costs storage until the next run.
-        let keep_current: std::collections::HashSet<String> =
-            snapshot_keys.iter().map(|p| p.to_string()).collect();
+        //    Puffins are kept by the same rule as data files: anything the
+        //    committed or the previous snapshot's vectors name survives. Every
+        //    vector is carried only from the parent, so a Puffin the committed
+        //    snapshot names by reference is also in `keep_previous`; keeping
+        //    the committed set too is defence in depth, not the only guard.
+        let keep_current: std::collections::HashSet<String> = snapshot_keys
+            .iter()
+            .chain(carried_deletes.iter().map(|v| &v.puffin_file))
+            .map(|p| p.to_string())
+            .collect();
         let keep_previous: std::collections::HashSet<String> = match parent {
             Some(previous) => {
                 match bridge
                     .read_iceberg_snapshot_files(&metadata_prefix, previous)
                     .await
                 {
-                    Ok(snapshot) => snapshot.data_files.iter().map(|p| p.to_string()).collect(),
+                    Ok(snapshot) => snapshot
+                        .data_files
+                        .iter()
+                        .chain(snapshot.deletion_vectors.iter().map(|v| &v.puffin_file))
+                        .map(|p| p.to_string())
+                        .collect(),
                     Err(e) => {
                         warn!(table = %table_name, "MATERIALIZE GC skipped: {e}");
                         return Ok(location);
