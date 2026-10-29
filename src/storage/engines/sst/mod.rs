@@ -303,6 +303,7 @@ pub use proximadb_storage_common::oid_resolver_cache;
 pub mod pca_manager; // PCA caching for Z-Order spatial encoding
 pub mod search;
 pub mod segment_format; // P3 Phase A: mixed-format (ProximaBlocks/PAX) read primitives
+pub mod segment_io; // TD-TIER-1 SC4-4: whole-segment residency read seam
 
 /// `CompactionParameters.hints` key a compaction producer sets to `false` when
 /// its `collection_config` is synthesized rather than the catalog meta (no tags

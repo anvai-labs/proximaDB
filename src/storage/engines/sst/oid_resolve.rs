@@ -8,6 +8,7 @@
 //! (read the footer region via `fs.read_range`, mirroring Region-A/B). Returns
 //! ALL hits (MVCC: an oid may be in >1 segment).
 
+use crate::storage::engines::sst::segment_io::ResidentRangeRead as _;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
@@ -100,7 +101,7 @@ pub async fn read_segment_resolver(
     // Read the tail [footer_len u64 | SEGMENT_MAGIC 8B] to locate the footer.
     let tail_off = file_size - SEG_TAIL_LEN as u64;
     let tail = fs
-        .read_range(&storage_url, tail_off, SEG_TAIL_LEN as u64)
+        .read_range_resident(&storage_url, tail_off, SEG_TAIL_LEN as u64)
         .await
         .map_err(|e| anyhow!("resolver load: tail read for {storage_url}: {e:?}"))?;
     if &tail[8..16] != SEGMENT_MAGIC {
@@ -117,7 +118,7 @@ pub async fn read_segment_resolver(
     // Read + parse the footer.
     let footer_off = tail_off - footer_len as u64;
     let footer_bytes = fs
-        .read_range(&storage_url, footer_off, footer_len as u64)
+        .read_range_resident(&storage_url, footer_off, footer_len as u64)
         .await
         .map_err(|e| anyhow!("resolver load: footer read for {storage_url}: {e:?}"))?;
     let footer = SegmentFooterIndex::parse(&footer_bytes)
@@ -130,7 +131,7 @@ pub async fn read_segment_resolver(
 
     // Read + deserialize the resolver region (CRC-validated by deserialize).
     let region = fs
-        .read_range(&storage_url, footer.opr_off, footer.opr_len)
+        .read_range_resident(&storage_url, footer.opr_off, footer.opr_len)
         .await
         .map_err(|e| anyhow!("resolver load: region read for {storage_url}: {e:?}"))?;
     let resolver = OidPositionResolver::deserialize(&region)

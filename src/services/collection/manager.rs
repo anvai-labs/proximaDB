@@ -157,6 +157,9 @@ pub struct CollectionService {
     >,
 }
 
+/// TD-TIER-1 SC4-4: whole-segment GETs a residency backfill keeps in flight.
+const RESIDENCY_WARM_CONCURRENCY: usize = 4;
+
 impl CollectionService {
     /// Create new collection service with multi-disk coordination
     pub async fn new(storage_config: StorageConfig) -> Result<Self> {
@@ -188,7 +191,7 @@ impl CollectionService {
             .await
             .context("TD-TIER-1 SC3: reservation pool startup failed")?;
 
-        Ok(Self {
+        let service = Self {
             filesystem_factory,
             index_config_cache: Arc::new(dashmap::DashMap::new()),
             storage_config,
@@ -201,7 +204,48 @@ impl CollectionService {
             rbac_enforcer: None,  // Will be set via with_rbac_enforcer()
             #[cfg(feature = "experimental-turboquant")]
             turboquant_registry: None, // Will be set via with_turboquant_registry()
-        })
+        };
+        // TD-TIER-1 SC4-4: after a restart, backfill what live grants cover
+        // (resident entries rebuilt from disk are skipped).
+        if let Some(registry) = &service.reservations {
+            service.spawn_residency_warm(registry.live_residency_prefixes().await);
+        }
+        Ok(service)
+    }
+
+    /// TD-TIER-1 SC4-4: backfill — make the live segments under each
+    /// residency prefix resident in the background (one whole-object GET per
+    /// segment, a few at a time). Needed whenever a grant starts covering a
+    /// collection that already has segments: a class change to PERFORMANCE,
+    /// or a restart. Detached and best-effort; outside a runtime it is
+    /// skipped (logged).
+    pub fn spawn_residency_warm(&self, prefixes: Vec<String>) {
+        if prefixes.is_empty() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            warn!("TD-TIER-1 SC4: residency warm skipped outside a runtime");
+            return;
+        };
+        let factory = self.filesystem_factory.clone();
+        runtime.spawn(async move {
+            for prefix in prefixes {
+                let data_url = prefix.trim_end_matches('/').to_string();
+                let Ok(fs) = factory.get_filesystem(&data_url) else {
+                    continue;
+                };
+                match crate::storage::engines::sst::segment_io::warm_collection(
+                    fs.as_ref(),
+                    &data_url,
+                    RESIDENCY_WARM_CONCURRENCY,
+                )
+                .await
+                {
+                    Ok(report) => debug!("TD-TIER-1 SC4: warmed {data_url}: {report:?}"),
+                    Err(error) => warn!("TD-TIER-1 SC4: warm of {data_url} failed: {error}"),
+                }
+            }
+        });
     }
 
     /// TD-TIER-1 SC4-3: report a PERFORMANCE collection's live grant on its
@@ -2474,6 +2518,10 @@ impl CollectionService {
                          {error} (policy recorded; SC4 reconciliation re-admits)"
                     );
                     reservation_pending = Some(error.to_string());
+                } else {
+                    // SC4-4: segments published before this class change
+                    // become resident in the background.
+                    self.spawn_residency_warm(protect_prefixes.clone());
                 }
             } else {
                 if let Some(owner) = owner.as_deref() {

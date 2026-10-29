@@ -34,7 +34,7 @@ use moka::notification::RemovalCause;
 mod persistent_l2;
 
 pub use persistent_l2::{
-    L2Class, PersistentByteStore, ProtectionGroup, ProtectionSweep, canonical_location,
+    L2Class, PersistentByteStore, ProtectionGroup, ProtectionSweep, canonical_location, object_key,
 };
 
 /// TD-TIER-1 SC4-1: the process-wide residency-budget bridge.

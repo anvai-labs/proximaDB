@@ -237,6 +237,23 @@ impl PersistentByteStore {
         self.release_pin(&meta)
     }
 
+    /// Logical length of an indexed value, without reading it (TD-TIER-1
+    /// SC4-4 residency probe). `None` when the key is not indexed.
+    pub fn entry_len(&self, key: &str) -> Option<u64> {
+        self.inner.entries.get(key).map(|meta| meta.value_len)
+    }
+
+    /// Whether the protection policy has a group covering `key` (SC4-4: a
+    /// grant asks for this object to be resident). Free when no group is
+    /// registered; otherwise takes the protection mutex, so call it at
+    /// publish/warm cadence, never per read.
+    pub fn policy_covers(&self, key: &str) -> bool {
+        if !self.inner.policy_active.load(Ordering::Acquire) {
+            return false;
+        }
+        self.protection_guard().matching_group(key).is_some()
+    }
+
     /// True when the entry is currently pinned (status projection helper).
     pub fn is_protected(&self, key: &str) -> bool {
         self.inner
@@ -1476,6 +1493,15 @@ impl ProtectionPolicy {
     }
 }
 
+/// TD-TIER-1 SC4-4: the persistent-L2 key holding a WHOLE immutable segment
+/// object, addressed by the same path string the segment readers use (the
+/// region keys `invariants/control/{path}` follow the same convention). The
+/// path embeds the collection's segment root, so a grant's prefix protection
+/// pins the object automatically.
+pub fn object_key(path: &str) -> String {
+    format!("pax-object/{path}")
+}
+
 /// TD-TIER-1 SC4-2: canonical form for comparing locations embedded in cache
 /// keys (review S2). Azure scheme aliases (`abfs://`, `abfss://`, `adls://`,
 /// `azure://`) become the `az://` form the Azure listing emits, `gcs://`
@@ -1531,6 +1557,7 @@ fn join_error(error: tokio::task::JoinError) -> std::io::Error {
 mod tests {
     use super::{
         CHECKSUM_CHUNK_BYTES, L2Class, PersistentByteStore, ProtectionGroup, canonical_location,
+        object_key,
     };
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::Arc;
@@ -2264,6 +2291,28 @@ mod tests {
         assert!(
             store.get(&victim).await.expect("get").is_some(),
             "a victim pinned after selection must survive the pressure"
+        );
+    }
+
+    /// SC4-4: the residency probe reports a value's length without reading
+    /// it, and a group covers exactly the object keys under its prefixes.
+    #[tokio::test]
+    async fn entry_len_and_policy_covers_follow_the_groups() {
+        let (_dir, store) = armed_store();
+        let key = object_key(&format!("{C1}L0_a.pax"));
+        assert_eq!(store.entry_len(&key), None);
+        assert!(!store.policy_covers(&key), "no group: inert");
+        store
+            .put(key.clone(), L2Class::Invariants, payload(300))
+            .await
+            .expect("put");
+        assert_eq!(store.entry_len(&key), Some(300));
+        store.set_protection_groups(vec![group("g1", C1, 1 << 20)]);
+        assert!(store.policy_covers(&key));
+        assert!(!store.policy_covers(&object_key(&format!("{C2}L0_a.pax"))));
+        assert!(
+            store.is_protected(&key),
+            "the object key is pinned by the prefix"
         );
     }
 

@@ -2275,6 +2275,27 @@ impl Compaction {
                 ),
             }
         }
+        // TD-TIER-1 SC4-4: a grant covering this collection makes the output
+        // resident in full from the retained local file (no GET),
+        // independent of the cache-on-write policy. Inert without a grant.
+        {
+            let retained_path = Path::new(staged.local_path());
+            let final_local = output_path.strip_prefix("file://").unwrap_or(&output_path);
+            let source = if retained_path.exists() {
+                retained_path
+            } else {
+                Path::new(final_local)
+            };
+            if let Err(error) =
+                crate::storage::engines::sst::segment_io::seed_object_from_local_file(
+                    &output_path,
+                    source,
+                )
+                .await
+            {
+                warn!(output = %output_path, %error, "TD-TIER-1 SC4: output residency seed failed");
+            }
+        }
         drop(staged);
 
         self.retire_task_inputs(task).await.map_err(|error| {
@@ -3065,6 +3086,18 @@ impl Compaction {
             )
             .await;
         }
+        // TD-TIER-1 SC4-4: a grant covering this collection makes the output
+        // resident in full (one GET). Inert without a grant.
+        {
+            let output = task.output_file.to_string_lossy().to_string();
+            if let Ok(fs) = self.filesystem_factory.get_filesystem(&output)
+                && let Err(error) =
+                    crate::storage::engines::sst::segment_io::warm_object(fs.as_ref(), &output)
+                        .await
+            {
+                warn!(output = %output, %error, "TD-TIER-1 SC4: output residency warm failed");
+            }
+        }
 
         // Remove input files after successful compaction using plugin filesystem
         // TD-CACHE-2 S2d: evict the warm-tier cache entries for each deleted
@@ -3503,6 +3536,9 @@ async fn purge_retired_segment_cache_entries(
     if let Some(cache) = crate::storage::engines::sst::core::get_global_oid_resolver_cache() {
         cache.invalidate(path);
     }
+    // TD-TIER-1 SC4-4: the whole-object resident copy goes with the segment
+    // (independent of the warm-tier pair, like the OID cache above).
+    crate::storage::engines::sst::segment_io::forget_object(path);
     let Some((invariants, survivor)) = warm_caches else {
         return 0;
     };

@@ -474,6 +474,20 @@ impl ReservationRegistry {
         self.sync_residency_budget().await;
     }
 
+    /// TD-TIER-1 SC4-4: the residency prefixes of every live grant (startup
+    /// backfill input).
+    pub async fn live_residency_prefixes(&self) -> Vec<String> {
+        let mut prefixes = Vec::new();
+        for (_, authority) in self.pools.values() {
+            for grant in authority.grants_snapshot().await {
+                if grant.state.charges_capacity() {
+                    prefixes.extend(grant.residency_prefixes);
+                }
+            }
+        }
+        prefixes
+    }
+
     /// TD-TIER-1 SC4-3: the live grant for a collection id in any pool
     /// (collection ids are catalog UUIDs, unique across tenants). Status
     /// reads only — never the query path.
