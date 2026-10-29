@@ -511,9 +511,10 @@ impl PersistentByteStore {
     /// after a pin was skipped AND a group pin has since been released, a
     /// bounded number of hits ([`HEAL_ATTEMPTS_PER_FREE`] per release) try
     /// it; each attempt pins only when the hit key's OWN group has freed
-    /// room, so an unrelated hit cannot consume another group's heal
-    /// (review S1). Never waits on the protection mutex; reads otherwise
-    /// take no lock and write no shared state.
+    /// room (review S1). Best-effort: hits on unrelated keys do spend the
+    /// shared attempt budget, so on a hot store a skipped key may wait for
+    /// the next release or grant change. Never waits on the protection
+    /// mutex; reads otherwise take no lock and write no shared state.
     fn heal_on_hit(&self, key: &str, meta: &EntryMeta) {
         if !self.inner.heal_pending.load(Ordering::Acquire)
             || meta.protected.load(Ordering::Acquire)
@@ -545,14 +546,10 @@ impl PersistentByteStore {
         let Some(current) = self.inner.entries.get(key).map(|entry| entry.clone()) else {
             return;
         };
-        if self
-            .pin_meta(key, &current, Some((&group.counter, group.budget)))
-            .is_err()
-        {
-            // The freed room does not fit this entry: stop paying for
-            // attempts in this group until another of its pins is released.
-            group.counter.freed.store(false, Ordering::Release);
-        }
+        // A refusal leaves `freed` set: clearing it could overwrite a newer
+        // concurrent release, or hide room that fits a smaller skipped key
+        // (verification round). `heal_attempts` alone bounds the cost.
+        let _ = self.pin_meta(key, &current, Some((&group.counter, group.budget)));
     }
 
     /// Pin a just-admitted (or re-put) key when it falls under the policy.
@@ -1440,8 +1437,9 @@ pub struct ProtectionGroup {
 #[derive(Debug, Default)]
 struct GroupCounter {
     pinned: AtomicU64,
-    /// Set when one of this group's pins is released (its budget has room
-    /// again); cleared when a heal attempt finds the room insufficient.
+    /// Set when one of this group's pins is released (its budget may have
+    /// room again). Never cleared by a heal attempt; a group change rebuilds
+    /// it.
     freed: AtomicBool,
 }
 

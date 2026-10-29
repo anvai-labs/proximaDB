@@ -1206,11 +1206,13 @@ fn grant_by_id_mut<'a>(
 async fn join_reserve(
     handle: tokio::task::JoinHandle<Result<Grant, ReservationError>>,
 ) -> Result<Grant, ReservationError> {
-    handle.await.map_err(|error| {
-        ReservationError::Io(std::io::Error::other(format!(
-            "TD-TIER-1 SC4: reservation task failed: {error}"
-        )))
-    })?
+    handle.await.map_err(reserve_task_failed)?
+}
+
+fn reserve_task_failed(error: tokio::task::JoinError) -> ReservationError {
+    ReservationError::Io(std::io::Error::other(format!(
+        "TD-TIER-1 SC4: reservation task failed: {error}"
+    )))
 }
 
 /// What a [`GrantCompensation`] still owes.
@@ -1274,15 +1276,10 @@ impl GrantCompensation {
                 "no reservation is pending on this guard".to_string(),
             ));
         };
-        let outcome = handle.await.map_err(|error| {
-            ReservationError::Io(std::io::Error::other(format!(
-                "TD-TIER-1 SC4: reservation task failed: {error}"
-            )))
-        });
-        let outcome = match outcome {
-            Ok(inner) => inner,
-            Err(error) => Err(error),
-        };
+        let outcome = handle
+            .await
+            .map_err(reserve_task_failed)
+            .and_then(|inner| inner);
         self.owed = if outcome.is_ok() {
             Compensation::Committed
         } else {
