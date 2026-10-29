@@ -993,11 +993,11 @@ pub async fn try_run_select(
             Ok(catalog_schema) => {
                 #[cfg(feature = "datafusion-integration")]
                 if let Some(location) = catalog_table_is_parquet_backed(&catalog_schema) {
-                    parquet_loc_by_key.insert(key.clone(), location);
-                    parquet_trust_by_key.insert(key.clone(), parquet_stats_trust(&catalog_schema));
-                    if let Some(params) = olap_delta_table_params(&catalog_schema) {
+                    if let Some(params) = olap_delta_table_params(&catalog_schema, &location) {
                         olap_delta_tables.insert(key.clone(), params);
                     }
+                    parquet_loc_by_key.insert(key.clone(), location);
+                    parquet_trust_by_key.insert(key.clone(), parquet_stats_trust(&catalog_schema));
                 }
                 // TD-OLAP-1 Test 2.1: Track PAX-backed tables from catalog signals
                 if catalog_table_is_pax_backed(&catalog_schema) {
@@ -2336,6 +2336,7 @@ fn olap_delta_merge_on(var: Option<&str>) -> bool {
 #[cfg(feature = "datafusion-integration")]
 fn olap_delta_table_params(
     schema: &proximadb_catalog::CatalogTableSchema,
+    location: &str,
 ) -> Option<crate::query::execution::olap_delta_merge::OlapDeltaTable> {
     use proximadb_catalog::{CatalogAuthorityMode, CatalogPhysicalFormat};
     // Single-column PK required: the merge recomputes each base row's canonical oid
@@ -2366,11 +2367,39 @@ fn olap_delta_table_params(
     if !opted_in {
         return None;
     }
-    let snapshot_lsn: u64 = layout.properties.get("snapshot_lsn")?.parse().ok()?;
+    // The (version, LSN) pair the ordered-DV merge trusts must come from ONE
+    // layout: the `parquet-snapshot` at the opened location. When that layout
+    // records its publication, BOTH come from it; otherwise the legacy LSN of
+    // the format/authority match is used and no version is trusted (a DV base
+    // then refuses, as before).
+    let (recorded_metadata_version, snapshot_lsn) = match recorded_publication_at(schema, location)
+    {
+        Some((version, lsn)) => (Some(version), lsn),
+        None => (None, layout.properties.get("snapshot_lsn")?.parse().ok()?),
+    };
     Some(crate::query::execution::olap_delta_merge::OlapDeltaTable {
         snapshot_lsn,
         pk_column,
+        recorded_metadata_version,
     })
+}
+
+/// The `(metadata version, snapshot LSN)` pair recorded by the table's
+/// `parquet-snapshot` layout, bound to the location actually being opened. The
+/// pair the merge trusts must come from the SAME layout as the base it opens:
+/// the delta-merge parameters above select a layout by format and authority,
+/// and the opened location comes from a separate scan, so a decoy layout could
+/// otherwise lend its version or LSN to another layout's files.
+#[cfg(feature = "datafusion-integration")]
+fn recorded_publication_at(
+    schema: &proximadb_catalog::CatalogTableSchema,
+    location: &str,
+) -> Option<(u64, u64)> {
+    let layout = schema
+        .storage_layouts
+        .iter()
+        .find(|l| l.name == "parquet-snapshot" && l.location.as_deref() == Some(location))?;
+    crate::services::dml::recorded_publication(std::slice::from_ref(layout))
 }
 
 /// Sync `CatalogLookup` wrapper for the process-wide engine.
@@ -5051,6 +5080,62 @@ mod tests {
             "SELECT id FROM t ORDER BY row_number() OVER (ORDER BY val)"
         ));
         assert!(!engages("SELECT id, abs(val) FROM t"));
+    }
+
+    /// The recorded (version, LSN) pair the OLAP merge trusts must come from the
+    /// layout NAMED `parquet-snapshot` AT the location being opened — never
+    /// from a decoy layout that happens to match on format and authority, and
+    /// never from a `parquet-snapshot` at another location.
+    #[cfg(feature = "datafusion-integration")]
+    #[test]
+    fn recorded_publication_binds_to_the_opened_parquet_snapshot() {
+        use proximadb_catalog::{
+            CatalogAuthorityMode, CatalogPhysicalFormat, CatalogStorageLayout, CatalogTableSchema,
+        };
+        let layout = |name: &str, location: &str, version: &str, lsn: &str| CatalogStorageLayout {
+            name: name.to_string(),
+            authority: CatalogAuthorityMode::ProjectionPublication,
+            physical_format: CatalogPhysicalFormat::Parquet,
+            location: Some(location.to_string()),
+            properties: std::collections::HashMap::from([
+                ("snapshot_lsn".to_string(), lsn.to_string()),
+                ("iceberg_metadata_version".to_string(), version.to_string()),
+            ]),
+            ..Default::default()
+        };
+        let mut s = CatalogTableSchema::new("t");
+        s.storage_layouts = vec![
+            // A decoy listed first, with a DIFFERENT version and LSN: neither
+            // half of the pair may come from it.
+            layout("open_table", "file:///w/t/data", "99", "77"),
+            layout("parquet-snapshot", "file:///w/t/data", "4", "10"),
+        ];
+        assert_eq!(
+            recorded_publication_at(&s, "file:///w/t/data"),
+            Some((4, 10)),
+            "both halves of the pair come from the parquet-snapshot layout"
+        );
+        // The merge parameters take BOTH halves from that layout too — the
+        // decoy matches on format and authority and is listed first, so the
+        // legacy LSN lookup alone would have answered 77.
+        s.primary_key = vec!["k".to_string()];
+        let params = olap_delta_table_params(&s, "file:///w/t/data").expect("eligible");
+        assert_eq!(
+            (params.recorded_metadata_version, params.snapshot_lsn),
+            (Some(4), 10),
+            "the merge must not pair one layout's version with another's LSN"
+        );
+        assert_eq!(
+            recorded_publication_at(&s, "file:///elsewhere/data"),
+            None,
+            "a parquet-snapshot at another location must not lend its version"
+        );
+        s.storage_layouts.truncate(1);
+        assert_eq!(
+            recorded_publication_at(&s, "file:///w/t/data"),
+            None,
+            "only a layout named parquet-snapshot records a publication"
+        );
     }
 
     /// ADR-058 D5 / §9.A: the stats-trust derivation is the load-bearing security

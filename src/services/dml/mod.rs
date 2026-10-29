@@ -3046,6 +3046,7 @@ impl DmlService {
                                 &table_id,
                                 previous,
                                 snapshot_lsn,
+                                &location,
                                 fence,
                             )
                             .await?;
@@ -3065,8 +3066,15 @@ impl DmlService {
                     // Nothing changed since the published snapshot: its files are
                     // exact as of now, so only its LSN moves up (which also lets
                     // WAL truncation pass the old one).
-                    self.advance_snapshot_lsn(&catalog, &table_id, previous, snapshot_lsn, fence)
-                        .await?;
+                    self.advance_snapshot_lsn(
+                        &catalog,
+                        &table_id,
+                        previous,
+                        snapshot_lsn,
+                        &location,
+                        fence,
+                    )
+                    .await?;
                     return Ok(location);
                 }
                 Ok((materialize_append::AppendPlan::Rewrite(reason), _)) => {
@@ -3459,6 +3467,7 @@ impl DmlService {
         table_id: &TableIdentifier,
         previous: u64,
         snapshot_lsn: u64,
+        location: &str,
         fence: &dyn crate::services::ddl::PublishFence,
     ) -> Result<()> {
         fence
@@ -3468,8 +3477,12 @@ impl DmlService {
         let mut layouts = catalog.get_table(table_id).await?.storage_layouts;
         // Only the publication this run planned against: if another one has
         // flipped the layout since, its LSN describes its own files.
+        // Bound to the location too: the recorded pair is trusted by the OLAP
+        // merge for the files AT this location, and a version number means
+        // nothing against another location's metadata log.
         if let Some(layout) = layouts.iter_mut().find(|l| {
             l.name == "parquet-snapshot"
+                && l.location.as_deref() == Some(location)
                 && l.properties
                     .get(materialize_stream::METADATA_VERSION_PROPERTY)
                     .and_then(|v| v.parse::<u64>().ok())
@@ -5587,6 +5600,29 @@ impl DmlService {
                     unexpected.iter().take(3).collect::<Vec<_>>()
                 );
             }
+            // The completeness check above compares KEYS — the change feed
+            // drops the op — so a DELETE followed by a re-INSERT of the same
+            // oid (both before the fence capture) passes it, and its vector
+            // would hide a row that is LIVE in the WAL. Every oid this fence
+            // publishes must be dead NOW; one that came back refuses (the
+            // next full publication reconciles). Closed in production only by
+            // the DML lock service, which the fail-open wiring can lack. It
+            // also covers an oid that was only ever WAL-side (inserted,
+            // deleted and re-inserted since the parent): published nowhere,
+            // it would otherwise be in neither the base nor the delta. COST:
+            // O(deleted oids) point lookups, under the publish and DML locks.
+            let (_, revived) = self
+                .current_records(table_name, deleted_oids, tenant_id)
+                .await
+                .map_err(|e| anyhow!("live delete: the liveness re-read: {e}"))?;
+            if !revived.is_empty() {
+                anyhow::bail!(
+                    "live delete: {} deleted oid(s) are live again (re-inserted before the \
+                     fence); publishing their vectors would hide live rows; leaving the \
+                     fence gap open until the next full publication",
+                    revived.len()
+                );
+            }
 
             // The delete-aware snapshot: its vectors are the set the
             // successor must carry forward.
@@ -5729,7 +5765,10 @@ impl DmlService {
                     .await
                     .map_err(|e| anyhow!("live delete: FENCE TEST competitor layout read: {e}"))?
                     .storage_layouts;
-                if let Some(l) = layouts.iter_mut().find(|l| l.name == "parquet-snapshot") {
+                if let Some(l) = layouts.iter_mut().find(|l| {
+                    l.name == "parquet-snapshot"
+                        && l.location.as_deref() == Some(data_location.as_str())
+                }) {
                     l.properties.insert(
                         materialize_stream::METADATA_VERSION_PROPERTY.to_string(),
                         competitor_version.to_string(),
@@ -5878,7 +5917,14 @@ impl DmlService {
                         .await
                         .map_err(|e| anyhow!("live delete: layout re-read: {e}"))?
                         .storage_layouts;
-                    match layouts.iter_mut().find(|l| l.name == "parquet-snapshot") {
+                    // Bound to the location this publication resolved: a
+                    // rename racing this delete (the publish lock is keyed by
+                    // name) must not get this log's version recorded against
+                    // another location's files.
+                    match layouts.iter_mut().find(|l| {
+                        l.name == "parquet-snapshot"
+                            && l.location.as_deref() == Some(data_location.as_str())
+                    }) {
                         Some(l) => {
                             // Forward-only (review finding 7): an external
                             // flip could have recorded a NEWER version between
@@ -9999,6 +10045,11 @@ impl crate::services::ddl::TableMaterializer for DmlTableMaterializer {
 
 mod materialize_append;
 mod materialize_stream;
+/// The (metadata version, snapshot LSN) pair a table's `parquet-snapshot`
+/// layout records — shared with the OLAP read merge, which serves a
+/// deletion-vector base only when the base IS that recorded publication.
+#[cfg(feature = "datafusion-integration")]
+pub(crate) use materialize_stream::recorded_publication;
 
 /// The distance-kernel metric that computes a catalog `DistanceMetric`.
 pub(crate) fn kernel_distance_metric(

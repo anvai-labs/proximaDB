@@ -1387,25 +1387,23 @@ async fn check_live_delete_gate5() {
     );
 }
 
-/// Gate 6 of the fence contract (reader guards stand): after a live delete
-/// closes the fence, a subsequent WAL write makes the delta nonempty against
-/// the DV-carrying base — the OLAP read REFUSES (never serves an unordered
-/// delta) until a full publication reconciles. Pins the #2256 guard in the
-/// fence's presence.
-#[test]
-fn unordered_delta_refusal_stands_across_the_fence() {
-    if std::env::var_os("PROXIMADB_LIVE_DEL5_CHILD").is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "unordered_delta_refusal_stands_across_the_fence",
-                "--nocapture",
-            ])
-            .env("PROXIMADB_LIVE_DEL5_CHILD", "1")
-            .env("PROXIMADB_LIVE_DELETE_PUBLISHER", "1")
-            .status()
-            .expect("launch isolated gate-6 child");
-        assert!(status.success(), "gate-6 child failed: {status}");
+/// Runs `body` in an isolated child process with `envs` set (the publisher's
+/// knobs are process-wide). Returns in the parent after asserting the child
+/// passed; runs the async body on a fresh runtime in the child.
+fn run_isolated<F, Fut>(test: &str, child_var: &str, envs: &[(&str, &str)], body: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if std::env::var_os(child_var).is_none() {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", test, "--nocapture"])
+            .env(child_var, "1");
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let status = cmd.status().expect("launch isolated child");
+        assert!(status.success(), "{test} child failed: {status}");
         return;
     }
     tokio::runtime::Builder::new_multi_thread()
@@ -1413,55 +1411,104 @@ fn unordered_delta_refusal_stands_across_the_fence() {
         .enable_all()
         .build()
         .unwrap()
-        .block_on(check_live_delete_gate6());
+        .block_on(body());
 }
 
-async fn check_live_delete_gate6() {
+/// Gate 6 of the fence contract, as relaxed by the ordered-DV-base rule: after
+/// a live delete closes the fence, the DV-carrying base IS the layout's
+/// recorded publication, so later WAL writes are MERGED over it (no refusal,
+/// no MATERIALIZE needed) — an insert appears and a delete of a base row
+/// disappears through the merge.
+#[test]
+fn ordered_dv_base_serves_the_merge_across_the_fence() {
+    run_isolated(
+        "ordered_dv_base_serves_the_merge_across_the_fence",
+        "PROXIMADB_LIVE_DEL5_CHILD",
+        &[("PROXIMADB_LIVE_DELETE_PUBLISHER", "1")],
+        || check_live_delete_gate6(true),
+    );
+}
+
+/// The kill switch (`PROXIMADB_OLAP_ORDERED_DV_BASE=0`) restores the original
+/// unconditional refusal of a non-empty delta against a DV base.
+#[test]
+fn ordered_dv_base_kill_switch_restores_the_refusal() {
+    run_isolated(
+        "ordered_dv_base_kill_switch_restores_the_refusal",
+        "PROXIMADB_LIVE_DEL6_CHILD",
+        &[
+            ("PROXIMADB_LIVE_DELETE_PUBLISHER", "1"),
+            ("PROXIMADB_OLAP_ORDERED_DV_BASE", "0"),
+        ],
+        || check_live_delete_gate6(false),
+    );
+}
+
+async fn check_live_delete_gate6(ordered: bool) {
     let server = TestPgServer::start().await.expect("server start");
     let client = connect_pg(&server).await;
 
-    let table = "live_del5";
+    let table = if ordered { "live_del5" } else { "live_del6" };
     create_materialized_kv(&client, table).await;
-
-    client
-        .simple_query(&format!("DELETE FROM {table} WHERE v = 'kill-me'"))
-        .await
-        .expect("delete closes the fence");
-    sleep(Duration::from_millis(300)).await;
+    delete_kill_me(&client, table).await;
     assert_live_delete_artifact(&server);
     // Empty delta against the DV base: served bare, the row hidden. The
-    // leg uses an AGGREGATE so the query routes to the DataFusion/OLAP
-    // path (the delta merge) — a plain projection can take the native/WAL
-    // scan, which never consults the DV base.
-    let n = scalar_count(&client, &table).await;
+    // AGGREGATE routes the query to the DataFusion/OLAP path (the delta
+    // merge); a plain projection can take the native/WAL scan, which never
+    // consults the DV base.
     assert_eq!(
-        n, 1,
+        scalar_count(&client, table).await,
+        1,
         "the bare DV base hides the deleted row (delta-merge path)"
     );
 
-    // A post-fence WAL write makes the delta nonempty: the guard REFUSES.
+    // A post-fence WAL write makes the delta non-empty.
     client
         .simple_query(&format!("INSERT INTO {table} (k, v) VALUES (3, 'later')"))
         .await
         .expect("insert");
-    let err = client
-        .simple_query(&format!("SELECT COUNT(*) FROM {table}"))
-        .await
-        .expect_err("a nonempty delta against a DV base must refuse");
-    assert!(
-        format!("{err:?}").contains("deletion-vector")
-            || format!("{err:?}").contains("deletion vectors"),
-        "the refusal names the unordered-delta condition: {err:?}"
-    );
+    if ordered {
+        // The base is the recorded publication: the merge serves it.
+        assert_eq!(
+            scalar_count(&client, table).await,
+            2,
+            "the insert is merged over the ordered DV base, no MATERIALIZE"
+        );
+        // A delete of a BASE row is suppressed through the merge as well.
+        client
+            .simple_query(&format!("DELETE FROM {table} WHERE k = 1"))
+            .await
+            .expect("delete a base row");
+        assert_eq!(
+            scalar_count(&client, table).await,
+            1,
+            "a base-row delete is suppressed through the merge"
+        );
+        let got = sorted_kv_rows(&client, table).await;
+        assert_eq!(got, vec![(3, "later".to_string())], "the WAL view agrees");
+    } else {
+        let err = client
+            .simple_query(&format!("SELECT COUNT(*) FROM {table}"))
+            .await
+            .expect_err("with the kill switch, a non-empty delta against a DV base refuses");
+        assert!(
+            format!("{err:?}").contains("deletion-vector"),
+            "the refusal names the unordered-delta condition: {err:?}"
+        );
+    }
 
-    // The next full publication reconciles and serves the correct state.
+    // The next full publication reconciles either way.
     client
         .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))
         .await
         .expect("materialize reconciles");
     sleep(Duration::from_millis(300)).await;
-    let n = scalar_count(&client, &table).await;
-    assert_eq!(n, 2, "reconciliation serves the full correct state");
+    let want = if ordered { 1 } else { 2 };
+    assert_eq!(
+        scalar_count(&client, table).await,
+        want,
+        "reconciliation serves the full correct state"
+    );
 }
 
 /// COUNT(*) over pgwire as an i64 — the OLAP-shaped probe gate 6 uses to
@@ -1505,9 +1552,10 @@ impl SoakRng {
 /// - Phase B, a delete chain right after a reconciling MATERIALIZE: every
 ///   delete publishes (one dv-live Puffin AND one metadata version each)
 ///   and the OLAP view tracks it with no MATERIALIZE;
-/// - Phase C, an insert on top of the DV-carrying base: the OLAP read
-///   refuses the unordered delta, and a MATERIALIZE over the DV parent
-///   (the relaxed entry guard) reconciles both views — no resurrection.
+/// - Phase C, an insert on top of the DV-carrying base: the OLAP read merges
+///   it over the base (the base IS the recorded publication), and a
+///   MATERIALIZE over the DV parent (the relaxed entry guard) reconciles
+///   both views — no resurrection.
 #[test]
 fn soak_mixed_workload_holds_the_fence() {
     if std::env::var_os("PROXIMADB_SOAK_CHILD").is_none() {
@@ -1667,9 +1715,10 @@ async fn check_soak_mixed_workload() {
     }
 
     // Phase C — an insert on top of the DV-carrying base: the delta is now
-    // nonempty against a base with vectors, so the OLAP read REFUSES; a
-    // MATERIALIZE over the DV parent (the relaxed entry guard) then
-    // reconciles both views — the vector-carrying reconciliation path.
+    // non-empty against a base with vectors, and the base IS the recorded
+    // publication, so the OLAP read merges it; a MATERIALIZE over the DV
+    // parent (the relaxed entry guard) then reconciles both views — the
+    // vector-carrying reconciliation path.
     let k = next_key;
     client
         .simple_query(&format!("INSERT INTO {table} (k, v) VALUES ({k}, 'v{k}')"))
@@ -1677,14 +1726,12 @@ async fn check_soak_mixed_workload() {
         .expect("phase C insert");
     model.insert(k, format!("v{k}"));
     assert_wal_matches(&client, table, &model, "phase C after insert").await;
-    let err = client
-        .simple_query(&format!("SELECT COUNT(*) FROM {table}"))
-        .await
-        .expect_err("phase C: a nonempty delta against the DV base must refuse");
-    assert!(
-        format!("{err:?}").contains("deletion-vector")
-            || format!("{err:?}").contains("deletion vectors"),
-        "phase C: the refusal names the unordered-delta condition: {err:?}"
+    // The base is the recorded publication (ordered DV base): the insert is
+    // merged over it, no refusal and no MATERIALIZE needed.
+    assert_eq!(
+        scalar_count(&client, &table).await as usize,
+        model.len(),
+        "phase C: the insert is merged over the ordered DV base"
     );
     client
         .simple_query(&format!("ALTER TABLE {table} MATERIALIZE"))

@@ -140,10 +140,28 @@ The fence therefore guarantees:
   a snapshot with its DVs applied. They may see the fence gap (a row the WAL already
   killed, still live in an older snapshot) — that is snapshot semantics, not corruption.
   They may NEVER see a row that the fence has crossed reappear: guaranteed by (1).
-* **The unordered-native-delta refusal stands.** The native scan's refusal to serve
-  unordered deltas against a published layout (the reader guards from #2256) is NOT
-  relaxed by this contract; it is relaxed only if the delta merge can be shown to apply
-  the same tombstone set the fence published. Until then: refuse.
+* **The unordered-delta refusal, and its one relaxation (the ordered DV base, 2026-10-29).**
+  The OLAP merge refuses a non-empty delta against a DV-carrying base (the reader guards
+  from #2256) UNLESS the base IS the publication the catalog layout recorded: opened
+  through the snapshot manifest at exactly the layout's `iceberg_metadata_version`.
+  Why that is sufficient:
+  ** Only ProximaDB's own publishers write the recorded `(iceberg_metadata_version,
+     snapshot_lsn)` pair: MATERIALIZE's flip, `advance_snapshot_lsn`, the live-delete
+     flip (and the debug-only gate-3 hook, which records its parent's LSN). DDL cannot
+     set it.
+  ** Each of them records a base complete apart from the delta at its LSN (MATERIALIZE by
+     construction; the live publisher by the completeness precondition; the advance only
+     when nothing changed), and every vector in it is backed by a WAL-durable death.
+  ** So the merge — base minus vectors, minus every changed oid, plus the current rows of
+     the changed oids — applies exactly the tombstone set the publication applied. That
+     is the condition this contract set for relaxing the refusal.
+  ** Everything else still refuses: an external DV commit or a crash-gap orphan (the
+     latest version moved past the recorded one), a listed or cached open (no proven
+     version), a layout with no recorded version, and a decoy layout (the version is
+     bound to the layout NAMED `parquet-snapshot` at the location being opened).
+     Metadata versions only grow, so a publication racing a read makes the opened
+     version newer than the recorded one: a refusal, never a wrong row.
+  ** Kill switch: `PROXIMADB_OLAP_ORDERED_DV_BASE=0` restores the unconditional refusal.
 
 == Crash and conflict
 
@@ -259,9 +277,12 @@ All six are implemented and pinned by e2e through the real pgwire facade
    the wedge refuses reads fail-closed, and the MATERIALIZE guard ADOPTS the
    orphaned publication — its `dv-live-*` Puffin proves it is ours and the
    phase ordering proves its tombstones durable — healing the table.
-6. DONE — `unordered_delta_refusal_stands_across_the_fence`: a post-fence
-   WAL write makes the delta nonempty against the DV base and the read
-   refuses until the next full publication reconciles.
+6. DONE, then RELAXED (2026-10-29, the ordered DV base) —
+   `ordered_dv_base_serves_the_merge_across_the_fence`: a post-fence WAL write
+   (an insert, then a delete of a base row) is MERGED over the DV base because
+   the base is the recorded publication; `ordered_dv_base_kill_switch_restores_the_refusal`
+   pins the original refusal under `PROXIMADB_OLAP_ORDERED_DV_BASE=0`, and the
+   external-DV and crash-gap cases (gate 5) still refuse.
 
 The activation flip of `PROXIMADB_LIVE_DELETE_PUBLISHER` remains gated on
 these six plus soak evidence; the knob stays default-OFF.

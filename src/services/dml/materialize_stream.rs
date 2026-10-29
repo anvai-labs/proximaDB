@@ -328,7 +328,12 @@ fn metadata_version_of(layout: &proximadb_catalog::CatalogStorageLayout) -> Opti
 /// precondition key on. `None` when the layout records no complete pair
 /// (an externally published snapshot, or a publication whose flip did not
 /// land): both callers refuse on `None`, fail-closed.
-pub(super) fn recorded_publication(
+/// CONTRACT for every writer of this pair (the OLAP merge trusts it — see
+/// `dv_base_is_ordered`): recording `(version, lsn)` asserts that the files of
+/// metadata `version`, minus their deletion vectors, are COMPLETE apart from
+/// the WAL delta after `lsn`, and that every vector in them is backed by a
+/// WAL-durable death. A new writer that cannot uphold that must not record.
+pub(crate) fn recorded_publication(
     layouts: &[proximadb_catalog::CatalogStorageLayout],
 ) -> Option<(u64, u64)> {
     layouts

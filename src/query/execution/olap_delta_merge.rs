@@ -152,6 +152,13 @@ pub struct OlapDeltaTable {
     /// a single-column PK are not eligible (keyless heaps fall back to the bare
     /// Parquet read — a documented first-cut limitation).
     pub pk_column: String,
+    /// The Iceberg metadata version the same `parquet-snapshot` layout records
+    /// for its publication. Only our publishers (MATERIALIZE's flip,
+    /// `advance_snapshot_lsn`, the live-delete flip) write it, so a base opened
+    /// at exactly this version IS our own publication — complete apart from
+    /// the delta at `snapshot_lsn`, its deletion vectors ordered against the
+    /// WAL. `None` when the layout records no version: never eligible.
+    pub recorded_metadata_version: Option<u64>,
 }
 
 /// Per-query wiring for the OLAP read-merge: the authoritative delta source plus
