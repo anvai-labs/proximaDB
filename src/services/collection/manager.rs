@@ -2413,6 +2413,12 @@ impl CollectionService {
                         )
                     })
                     .unwrap_or_default();
+                if protect_prefixes.is_empty() {
+                    warn!(
+                        "TD-TIER-1 SC4: collection {collection_id} has no storage assignment; \
+                         its grant charges capacity but protects no cached data"
+                    );
+                }
                 if let Err(error) = registry
                     .reserve_for_performance(&tenant, &collection_id, now, &protect_prefixes)
                     .await

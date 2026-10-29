@@ -71,6 +71,11 @@ struct EntryMeta {
     /// protection and SC4's coverage reconciliation re-derives it from the
     /// grant ledger.
     protected: AtomicBool,
+    /// TD-TIER-1 SC4-2: the grant group whose budget this pin is charged to
+    /// (`None` = a manual pin, or unpinned). Set BEFORE `protected` flips to
+    /// true and taken by whoever wins the `protected` swap back to false, so
+    /// the group refund happens exactly once (see `release_pin`).
+    pin_group: std::sync::Mutex<Option<Arc<GroupCounter>>>,
     touch: AtomicU64,
 }
 
@@ -85,15 +90,19 @@ struct StoreInner {
     /// the reservation authority arms it (SC3-2 wiring).
     reserved_budget: AtomicU64,
     protected_bytes: AtomicU64,
-    /// TD-TIER-1 SC4-2: the residency protection policy — collection
-    /// segment-root prefixes whose keys are pinned on admission and swept
-    /// when the set changes. The std mutex ALSO serializes every protect /
-    /// unprotect (review B5: concurrent same-key protects double-charged
-    /// `protected_bytes`), so protection is synchronous and callable from
-    /// inside `put` (which already holds `mutation`) and from the sync
-    /// residency bridge. Lock order: `mutation` → `protection`, never the
-    /// reverse.
-    protection: std::sync::Mutex<Vec<String>>,
+    /// TD-TIER-1 SC4-2: the residency protection policy — one group per
+    /// reservation grant, each with its own segment-root prefixes and its
+    /// own byte budget (review B2: a single shared budget let one
+    /// collection's pins consume every grant's share). The std mutex ALSO
+    /// serializes every pin and unpin (review B5: concurrent same-key
+    /// protects double-charged `protected_bytes`), so protection is
+    /// synchronous and callable from inside `put` (which holds `mutation`)
+    /// and from the sync residency bridge. Lock order: `mutation` →
+    /// `protection`, never the reverse; no guard is held across an await.
+    protection: std::sync::Mutex<ProtectionPolicy>,
+    /// Fast path: false while the policy has no groups, so an inert store
+    /// does not take the protection mutex on every `put` (review S4).
+    policy_active: AtomicBool,
     clock: AtomicU64,
     entries: DashMap<String, Arc<EntryMeta>>,
     mutation: tokio::sync::Mutex<()>,
@@ -125,7 +134,8 @@ impl PersistentByteStore {
             class_resident_bytes: [AtomicU64::new(0), AtomicU64::new(0)],
             reserved_budget: AtomicU64::new(0),
             protected_bytes: AtomicU64::new(0),
-            protection: std::sync::Mutex::new(Vec::new()),
+            protection: std::sync::Mutex::new(ProtectionPolicy::default()),
+            policy_active: AtomicBool::new(false),
             clock: AtomicU64::new(1),
             entries: DashMap::new(),
             mutation: tokio::sync::Mutex::new(()),
@@ -164,7 +174,8 @@ impl PersistentByteStore {
         self.inner.protected_bytes.load(Ordering::Acquire)
     }
 
-    /// Pin one entry against ordinary eviction pressure (SC-TE4).
+    /// Pin one entry against ordinary eviction pressure (SC-TE4) — a MANUAL
+    /// pin, charged to the store-wide budget and owned by no grant group.
     ///
     /// Fails closed when pinning would exceed the armed budget: an oversize
     /// pin is rejected at admission, never silently dropped later. Returns
@@ -173,87 +184,25 @@ impl PersistentByteStore {
     /// pin is advisory against *pressure* only — explicit invalidation via
     /// [`Self::remove`] / [`Self::remove_where`] still applies (SC-TE6).
     ///
-    /// Serialized on the mutation mutex (review B5): protect is admission-
-    /// cadence, not query-path, and lock-free check-then-act measurably
-    /// double-charged `protected_bytes` under concurrent same-key protects —
-    /// a phantom that no API could refund. The CAS loop remains as belt-and-
-    /// braces against the lock-free `remove` path, with a refund if the entry
-    /// vanishes mid-pin.
+    /// Serialized on the protection mutex (review B5: lock-free
+    /// check-then-act double-charged `protected_bytes` under concurrent
+    /// same-key protects).
     pub async fn protect(&self, key: &str) -> std::io::Result<bool> {
         let _guard = self.protection_guard();
-        self.protect_locked(key)
-    }
-
-    /// The protect body; the caller holds [`Self::protection_guard`].
-    fn protect_locked(&self, key: &str) -> std::io::Result<bool> {
         let Some(meta) = self.inner.entries.get(key).map(|entry| entry.clone()) else {
             return Ok(false);
         };
-        if meta.protected.load(Ordering::Acquire) {
-            return Ok(true);
-        }
-        // Claim file_len against the budget atomically.
-        let mut current = self.inner.protected_bytes.load(Ordering::Acquire);
-        loop {
-            let Some(next) = current.checked_add(meta.file_len) else {
-                return Err(budget_error("protected-bytes overflow"));
-            };
-            if next > self.inner.reserved_budget.load(Ordering::Acquire) {
-                return Err(budget_error(&format!(
-                    "protecting key of {} bytes exceeds the reserved budget {} \
-                     (already protected: {}); raise the reservation or unprotect first",
-                    meta.file_len,
-                    self.inner.reserved_budget.load(Ordering::Acquire),
-                    current
-                )));
-            }
-            match self.inner.protected_bytes.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
-        }
-        meta.protected.store(true, Ordering::Release);
-        // `remove` is lock-free: if it won the race between the map read and
-        // here, the SWAP arbitrates the single decrement — whoever's swap
-        // observes true refunds/removes; a false observation means the other
-        // party already did (verification round 2: refunding on map membership
-        // alone double-decremented when remove's swap followed our store).
-        if !self.inner.entries.contains_key(key) {
-            if meta.protected.swap(false, Ordering::AcqRel) {
-                self.inner
-                    .protected_bytes
-                    .fetch_sub(meta.file_len, Ordering::AcqRel);
-            }
-            return Ok(false);
-        }
-        Ok(true)
+        self.pin_meta(key, &meta, None)
     }
 
-    /// Drop one entry's pin. Returns whether the entry was protected.
-    /// Serialized on the mutation mutex for the same reason as
-    /// [`Self::protect`].
+    /// Drop one entry's pin (manual or policy). Returns whether it was
+    /// pinned. Serialized on the protection mutex.
     pub async fn unprotect(&self, key: &str) -> bool {
         let _guard = self.protection_guard();
-        self.unprotect_locked(key)
-    }
-
-    /// The unprotect body; the caller holds [`Self::protection_guard`].
-    fn unprotect_locked(&self, key: &str) -> bool {
         let Some(meta) = self.inner.entries.get(key).map(|entry| entry.clone()) else {
             return false;
         };
-        if !meta.protected.swap(false, Ordering::AcqRel) {
-            return false;
-        }
-        self.inner
-            .protected_bytes
-            .fetch_sub(meta.file_len, Ordering::AcqRel);
-        true
+        self.release_pin(&meta)
     }
 
     /// True when the entry is currently pinned (status projection helper).
@@ -264,83 +213,235 @@ impl PersistentByteStore {
             .is_some_and(|meta| meta.protected.load(Ordering::Acquire))
     }
 
-    fn protection_guard(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+    fn protection_guard(&self) -> std::sync::MutexGuard<'_, ProtectionPolicy> {
         self.inner
             .protection
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn matches_any(key: &str, prefixes: &[String]) -> bool {
-        prefixes.iter().any(|prefix| key.contains(prefix.as_str()))
+    /// Claim `len` against `counter` without exceeding `limit` (CAS loop).
+    fn claim(counter: &AtomicU64, len: u64, limit: u64) -> Result<(), u64> {
+        let mut current = counter.load(Ordering::Acquire);
+        loop {
+            let next = current.checked_add(len).ok_or(current)?;
+            if next > limit {
+                return Err(current);
+            }
+            match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Pin `meta` (the caller holds the protection mutex). A group pin is
+    /// charged to the group's own budget AND the store-wide budget; a
+    /// manual pin (`group == None`) only to the store-wide budget.
+    fn pin_meta(
+        &self,
+        key: &str,
+        meta: &Arc<EntryMeta>,
+        group: Option<(&Arc<GroupCounter>, u64)>,
+    ) -> std::io::Result<bool> {
+        if meta.protected.load(Ordering::Acquire) {
+            return Ok(true);
+        }
+        if let Some((counter, budget)) = group
+            && let Err(current) = Self::claim(&counter.pinned, meta.file_len, budget)
+        {
+            return Err(budget_error(&format!(
+                "protecting key of {} bytes exceeds its grant's budget {budget} \
+                 (grant already protects {current})",
+                meta.file_len
+            )));
+        }
+        let budget = self.inner.reserved_budget.load(Ordering::Acquire);
+        if let Err(current) = Self::claim(&self.inner.protected_bytes, meta.file_len, budget) {
+            if let Some((counter, _)) = group {
+                counter.pinned.fetch_sub(meta.file_len, Ordering::AcqRel);
+            }
+            return Err(budget_error(&format!(
+                "protecting key of {} bytes exceeds the reserved budget {budget} \
+                 (already protected: {current}); raise the reservation or unprotect first",
+                meta.file_len
+            )));
+        }
+        *meta
+            .pin_group
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            group.map(|(counter, _)| counter.clone());
+        meta.protected.store(true, Ordering::Release);
+        // `remove` is lock-free. Re-check that THIS entry (not merely the
+        // key) is still indexed: a remove + re-put between our map read and
+        // here would otherwise leave the old entry's bytes charged forever
+        // (review S1). `release_pin`'s swap arbitrates the single refund.
+        let still_indexed = self
+            .inner
+            .entries
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(&current, meta));
+        if !still_indexed {
+            self.release_pin(meta);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Release a pin exactly once: whoever wins the `protected` swap refunds
+    /// the store-wide counter and the owning group's counter.
+    fn release_pin(&self, meta: &EntryMeta) -> bool {
+        if !meta.protected.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        self.inner
+            .protected_bytes
+            .fetch_sub(meta.file_len, Ordering::AcqRel);
+        let group = meta
+            .pin_group
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(group) = group {
+            group.pinned.fetch_sub(meta.file_len, Ordering::AcqRel);
+        }
+        true
+    }
+
+    /// The group whose budget a pin on `meta` is charged to, if any.
+    fn pin_owner(meta: &EntryMeta) -> Option<Arc<GroupCounter>> {
+        meta.pin_group
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// TD-TIER-1 SC4-2: replace the protection policy and reconcile resident
-    /// entries against it. Membership is `key.contains(prefix)` — cache keys
-    /// embed the segment's published path mid-string (survivor keys are
-    /// `{namespace}/{scope}/{kind}:{path}:{off}:{len}`), and a prefix is a
-    /// full collection segment root ending in `/`, so containment cannot
-    /// match a sibling collection.
+    /// entries against it. Each group is one reservation grant: its
+    /// collection's segment-root prefixes and its own byte budget. A key
+    /// belongs to the first group (by id) one of whose prefixes it contains,
+    /// both compared in canonical form (see [`canonical_location`]); cache
+    /// keys embed the published segment path mid-string, and each prefix
+    /// ends in `/`, so containment cannot match a sibling collection.
     ///
-    /// Only keys matching an OLD or NEW prefix are touched: newly-matching
-    /// entries are pinned (best-effort — a pin that would exceed the armed
-    /// budget is skipped and counted, never forced), entries that matched a
-    /// removed prefix and no remaining one are unpinned. Pins made outside
-    /// the policy are left alone. O(entries) — admission cadence only.
-    pub fn set_protected_prefixes(&self, prefixes: Vec<String>) -> ProtectionSweep {
+    /// Reconcile: pins owned by a removed group, or whose key no longer
+    /// matches its group, are released; a group whose budget shrank below
+    /// its pinned bytes is clamped by releasing its pins; then unpinned
+    /// matching entries are pinned against their group's budget —
+    /// best-effort, skipped and counted when the budget is exhausted.
+    /// Manual pins are never touched. O(entries × prefixes): admission
+    /// cadence only.
+    pub fn set_protection_groups(&self, groups: Vec<ProtectionGroup>) -> ProtectionSweep {
         let mut policy = self.protection_guard();
-        let previous = std::mem::replace(&mut *policy, prefixes);
+        let mut previous = std::mem::take(&mut policy.groups);
+        for group in groups {
+            let counter = previous
+                .remove(&group.id)
+                .map(|old| old.counter)
+                .unwrap_or_else(|| Arc::new(GroupCounter::default()));
+            policy.groups.insert(
+                group.id,
+                PolicyGroup {
+                    prefixes: group
+                        .prefixes
+                        .iter()
+                        .map(|prefix| canonical_location(prefix))
+                        .collect(),
+                    budget: group.budget_bytes,
+                    counter,
+                },
+            );
+        }
+        self.inner
+            .policy_active
+            .store(!policy.groups.is_empty(), Ordering::Release);
+
         let mut sweep = ProtectionSweep::default();
-        let keys: Vec<String> = self
+        let entries: Vec<(String, Arc<EntryMeta>)> = self
             .inner
             .entries
             .iter()
-            .map(|entry| entry.key().clone())
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect();
-        for key in keys {
-            let now = Self::matches_any(&key, &policy);
-            if now {
-                if !self.is_protected(&key) {
-                    match self.protect_locked(&key) {
-                        Ok(true) => sweep.protected += 1,
-                        Ok(false) => {}
-                        Err(_) => sweep.skipped_over_budget += 1,
-                    }
-                }
-            } else if Self::matches_any(&key, &previous) && self.unprotect_locked(&key) {
+        // 1. Release policy pins whose group left or whose key left its group.
+        for (key, meta) in &entries {
+            let Some(owner) = Self::pin_owner(meta) else {
+                continue;
+            };
+            let canonical = canonical_location(key);
+            let keeps = policy.groups.values().any(|group| {
+                Arc::ptr_eq(&group.counter, &owner)
+                    && group
+                        .prefixes
+                        .iter()
+                        .any(|p| canonical.contains(p.as_str()))
+            });
+            if !keeps && self.release_pin(meta) {
                 sweep.unprotected += 1;
+            }
+        }
+        // 2. Clamp groups whose budget shrank below their pinned bytes.
+        for group in policy.groups.values() {
+            for (_, meta) in &entries {
+                if group.counter.pinned.load(Ordering::Acquire) <= group.budget {
+                    break;
+                }
+                if Self::pin_owner(meta).is_some_and(|owner| Arc::ptr_eq(&owner, &group.counter))
+                    && self.release_pin(meta)
+                {
+                    sweep.unprotected += 1;
+                }
+            }
+        }
+        // 3. Pin unpinned matching entries against their group's budget.
+        for (key, meta) in &entries {
+            if meta.protected.load(Ordering::Acquire) {
+                continue;
+            }
+            if let Some(group) = policy.matching_group(key) {
+                match self.pin_meta(key, meta, Some((&group.counter, group.budget))) {
+                    Ok(true) => sweep.protected += 1,
+                    Ok(false) => {}
+                    Err(_) => sweep.skipped_over_budget += 1,
+                }
             }
         }
         sweep
     }
 
-    /// The current protection policy (diagnostics/tests).
-    pub fn protected_prefixes(&self) -> Vec<String> {
-        self.protection_guard().clone()
+    /// The ids of the groups in the current policy (diagnostics/tests).
+    pub fn protection_group_ids(&self) -> Vec<String> {
+        self.protection_guard().groups.keys().cloned().collect()
     }
 
-    /// Bytes currently pinned for entries matching `prefix` — the coverage
-    /// a collection's grant has actually achieved (status/coverage input).
-    pub fn covered_bytes_matching(&self, prefix: &str) -> u64 {
-        self.inner
-            .entries
-            .iter()
-            .filter(|entry| {
-                entry.key().contains(prefix) && entry.value().protected.load(Ordering::Acquire)
-            })
-            .map(|entry| entry.value().file_len)
-            .sum()
+    /// Bytes currently pinned under one grant group — the coverage that
+    /// grant has actually achieved (status/coverage input).
+    pub fn covered_bytes(&self, group_id: &str) -> u64 {
+        self.protection_guard()
+            .groups
+            .get(group_id)
+            .map_or(0, |group| group.counter.pinned.load(Ordering::Acquire))
     }
 
-    /// Pin a just-admitted key when it falls under the policy. Called from
-    /// `put`/`put_file_range` BEFORE eviction runs, so a protected key cannot
-    /// be evicted in the window between its write and its pin. Best-effort:
-    /// an over-budget pin is skipped (coverage degrades; the write succeeds).
+    /// Pin a just-admitted (or re-put) key when it falls under the policy.
+    /// Called from `put`/`put_file_range` BEFORE eviction runs, so a
+    /// protected key cannot be evicted between its write and its pin.
+    /// Best-effort: an over-budget pin is skipped (coverage degrades; the
+    /// write succeeds). Inert stores skip the mutex entirely.
     fn protect_on_admit(&self, key: &str) {
-        let policy = self.protection_guard();
-        if Self::matches_any(key, &policy) {
-            let _ = self.protect_locked(key);
+        if !self.inner.policy_active.load(Ordering::Acquire) {
+            return;
         }
+        let policy = self.protection_guard();
+        let Some(group) = policy.matching_group(key) else {
+            return;
+        };
+        let Some(meta) = self.inner.entries.get(key).map(|entry| entry.clone()) else {
+            return;
+        };
+        let _ = self.pin_meta(key, &meta, Some((&group.counter, group.budget)));
     }
 
     /// Number of indexed entries.
@@ -366,6 +467,10 @@ impl PersistentByteStore {
         let _guard = self.inner.mutation.lock().await;
         if let Some(existing) = self.inner.entries.get(&key) {
             existing.touch.store(self.next_tick(), Ordering::Relaxed);
+            drop(existing);
+            // A re-put of a resident key retries a pin that was skipped
+            // earlier (budget exhausted then, maybe not now).
+            self.protect_on_admit(&key);
             return Ok(());
         }
         let final_path = self.entry_path(&key);
@@ -448,6 +553,10 @@ impl PersistentByteStore {
         let _guard = self.inner.mutation.lock().await;
         if let Some(existing) = self.inner.entries.get(&key) {
             existing.touch.store(self.next_tick(), Ordering::Relaxed);
+            drop(existing);
+            // A re-put of a resident key retries a pin that was skipped
+            // earlier (budget exhausted then, maybe not now).
+            self.protect_on_admit(&key);
             return Ok(());
         }
         let final_path = self.entry_path(&key);
@@ -675,11 +784,7 @@ impl PersistentByteStore {
         let Some((_, meta)) = self.inner.entries.remove(key) else {
             return false;
         };
-        if meta.protected.swap(false, Ordering::AcqRel) {
-            self.inner
-                .protected_bytes
-                .fetch_sub(meta.file_len, Ordering::AcqRel);
-        }
+        self.release_pin(&meta);
         let _ =
             self.inner
                 .resident_bytes
@@ -767,6 +872,7 @@ fn write_entry_file(
             chunk_crcs: Arc::from(chunk_crcs),
             class,
             protected: AtomicBool::new(false),
+            pin_group: std::sync::Mutex::new(None),
             touch: AtomicU64::new(1),
         }))
     })();
@@ -889,6 +995,7 @@ fn write_entry_file_range(
             chunk_crcs: Arc::from(chunk_crcs),
             class,
             protected: AtomicBool::new(false),
+            pin_group: std::sync::Mutex::new(None),
             touch: AtomicU64::new(1),
         }))
     })();
@@ -994,6 +1101,7 @@ fn read_entry_metadata(path: &Path) -> std::io::Result<(String, EntryMeta)> {
             chunk_crcs: Arc::from(chunk_crcs),
             class,
             protected: AtomicBool::new(false),
+            pin_group: std::sync::Mutex::new(None),
             touch: AtomicU64::new(1),
         },
     ))
@@ -1145,7 +1253,78 @@ fn is_rebuildable_miss(error: &std::io::Error) -> bool {
     )
 }
 
-/// Outcome of a [`PersistentByteStore::set_protected_prefixes`] reconcile.
+/// TD-TIER-1 SC4-2: one reservation grant's protection share.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectionGroup {
+    /// Stable group identity (the grant id).
+    pub id: String,
+    /// The collection's segment-root prefixes (each ending in `/`).
+    pub prefixes: Vec<String>,
+    /// Bytes this group may pin (the grant's reserved bytes).
+    pub budget_bytes: u64,
+}
+
+/// Bytes pinned under one group (shared by the policy and the entries).
+#[derive(Debug, Default)]
+struct GroupCounter {
+    pinned: AtomicU64,
+}
+
+#[derive(Debug)]
+struct PolicyGroup {
+    /// Canonical-form prefixes.
+    prefixes: Vec<String>,
+    budget: u64,
+    counter: Arc<GroupCounter>,
+}
+
+#[derive(Debug, Default)]
+struct ProtectionPolicy {
+    groups: std::collections::BTreeMap<String, PolicyGroup>,
+}
+
+impl ProtectionPolicy {
+    /// The first group (by id) whose prefix the key contains, in canonical
+    /// form.
+    fn matching_group(&self, key: &str) -> Option<&PolicyGroup> {
+        if self.groups.is_empty() {
+            return None;
+        }
+        let canonical = canonical_location(key);
+        self.groups.values().find(|group| {
+            group
+                .prefixes
+                .iter()
+                .any(|prefix| canonical.contains(prefix.as_str()))
+        })
+    }
+}
+
+/// TD-TIER-1 SC4-2: canonical form for comparing locations embedded in cache
+/// keys (review S2). Azure scheme aliases (`abfs://`, `abfss://`, `adls://`,
+/// `azure://`) become the `az://` form the Azure listing emits, and runs of
+/// `/` collapse to one except the `//` that follows a scheme's `:`, so a
+/// base written as `s3://b/x/` and keys listed as `s3://b/x/...` compare
+/// equal. Applied to both prefixes and keys.
+pub fn canonical_location(raw: &str) -> String {
+    let mut text = raw.to_string();
+    for alias in ["abfss://", "abfs://", "adls://", "azure://"] {
+        text = text.replace(alias, "az://");
+    }
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '/' && out.ends_with('/') {
+            let before_last = out[..out.len() - 1].chars().last();
+            if before_last != Some(':') {
+                continue;
+            }
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Outcome of a [`PersistentByteStore::set_protection_groups`] reconcile.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProtectionSweep {
     /// Entries newly pinned under the policy.
@@ -1170,7 +1349,9 @@ fn join_error(error: tokio::task::JoinError) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHECKSUM_CHUNK_BYTES, L2Class, PersistentByteStore};
+    use super::{
+        CHECKSUM_CHUNK_BYTES, L2Class, PersistentByteStore, ProtectionGroup, canonical_location,
+    };
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::Arc;
 
@@ -1633,24 +1814,33 @@ mod tests {
         }
     }
 
-    // ---- TD-TIER-1 SC4-2: the protection policy ----
+    // ---- TD-TIER-1 SC4-2: per-grant protection groups ----
 
     const C1: &str = "s3://bucket/tenants/acme/12/data/";
+    const C2: &str = "s3://bucket/tenants/beta/34/data/";
 
-    fn c1_key(file: &str) -> String {
-        format!("invariants/region-a/s3://bucket/tenants/acme/12/data/{file}")
+    fn key_in(prefix: &str, file: &str) -> String {
+        format!("invariants/region-a/{prefix}{file}")
     }
 
-    /// Keys under a registered prefix are pinned on admission; a sibling
+    fn group(id: &str, prefix: &str, budget: u64) -> ProtectionGroup {
+        ProtectionGroup {
+            id: id.to_string(),
+            prefixes: vec![prefix.to_string()],
+            budget_bytes: budget,
+        }
+    }
+
+    /// Keys under a group's prefix are pinned on admission; a sibling
     /// collection whose decimal id shares the prefix digits (`123` vs `12`)
-    /// is NOT — the trailing `/` makes containment exact.
+    /// is NOT; a survivor-shaped key with the path mid-string is.
     #[tokio::test]
     async fn policy_pins_on_admission_with_exact_prefix_boundaries() {
         let (_dir, store) = armed_store();
-        store.set_protected_prefixes(vec![C1.to_string()]);
+        store.set_protection_groups(vec![group("g1", C1, 1 << 20)]);
 
         store
-            .put(c1_key("L0_a.pax"), L2Class::Invariants, payload(1024))
+            .put(key_in(C1, "L0_a.pax"), L2Class::Invariants, payload(1024))
             .await
             .expect("put c1");
         let sibling = "invariants/region-a/s3://bucket/tenants/acme/123/data/L0_a.pax";
@@ -1658,75 +1848,169 @@ mod tests {
             .put(sibling, L2Class::Invariants, payload(1024))
             .await
             .expect("put sibling");
-        // Survivor-shaped key: the path sits MID-string.
-        let survivor = format!("survivor/s/2:{}L0_a.pax:0:64", C1);
+        let survivor = format!("survivor/s/2:{C1}L0_a.pax:0:64");
         store
             .put(survivor.clone(), L2Class::Survivor, payload(64))
             .await
             .expect("put survivor");
 
         assert!(
-            store.is_protected(&c1_key("L0_a.pax")),
-            "c1 key pinned on admit"
+            store.is_protected(&key_in(C1, "L0_a.pax")),
+            "pinned on admit"
         );
         assert!(store.is_protected(&survivor), "mid-string path is matched");
         assert!(
             !store.is_protected(sibling),
             "id 123 must not match prefix 12/"
         );
-        assert!(store.covered_bytes_matching(C1) > 0);
+        assert!(store.covered_bytes("g1") > 0);
     }
 
-    /// Registering a prefix pins already-resident matching entries
-    /// (retroactive sweep); removing it unpins them; a pin made OUTSIDE the
-    /// policy is left alone by both sweeps.
+    /// Review B2: each grant pins only against its OWN budget — a hot
+    /// collection cannot consume another grant's share, and releasing one
+    /// grant leaves the store within the remaining budget.
     #[tokio::test]
-    async fn sweep_pins_resident_entries_and_unpins_on_removal() {
+    async fn grants_pin_within_their_own_budget() {
+        let (_dir, store) = armed_store();
+        // Measure one entry's on-disk size (it includes the key, so the probe
+        // key has the same length as the keys below), then budget each grant
+        // for exactly one entry.
+        store
+            .put(key_in(C1, "p"), L2Class::Invariants, payload(2048))
+            .await
+            .expect("probe");
+        let one = store.resident_bytes();
+        assert!(store.remove(&key_in(C1, "p")));
+        store.set_reserved_budget(2 * one);
+        store.set_protection_groups(vec![group("a", C1, one), group("b", C2, one)]);
+
+        // A's hot data arrives first: only ONE of A's entries may pin.
+        for file in ["x", "y"] {
+            store
+                .put(key_in(C1, file), L2Class::Invariants, payload(2048))
+                .await
+                .expect("put a");
+        }
+        store
+            .put(key_in(C2, "z"), L2Class::Invariants, payload(2048))
+            .await
+            .expect("put b");
+        assert_eq!(store.covered_bytes("a"), one, "A capped at its own budget");
+        assert_eq!(store.covered_bytes("b"), one, "B keeps its share");
+
+        // Release B, shrink the budget to A's share: the store stays within it.
+        store.set_protection_groups(vec![group("a", C1, one)]);
+        store.set_reserved_budget(one);
+        assert!(store.protected_bytes() <= store.reserved_budget());
+        assert!(!store.is_protected(&key_in(C2, "z")), "B's pin released");
+    }
+
+    /// Changing the groups pins already-resident matches, releases the pins
+    /// of a removed group, and leaves MANUAL pins alone even when their key
+    /// matches the removed prefix (review NIT).
+    #[tokio::test]
+    async fn sweep_pins_resident_and_releases_only_policy_pins() {
         let (_dir, store) = armed_store();
         store
-            .put(c1_key("L1_b.pax"), L2Class::Invariants, payload(512))
+            .put(key_in(C1, "L1_b.pax"), L2Class::Invariants, payload(512))
             .await
             .expect("put");
         store
-            .put("manual/key", L2Class::Survivor, payload(256))
+            .put(key_in(C1, "manual"), L2Class::Survivor, payload(256))
             .await
             .expect("put manual");
-        assert!(store.protect("manual/key").await.expect("manual pin"));
+        assert!(
+            store
+                .protect(&key_in(C1, "manual"))
+                .await
+                .expect("manual pin")
+        );
 
-        let sweep = store.set_protected_prefixes(vec![C1.to_string()]);
-        assert_eq!(sweep.protected, 1, "resident c1 entry pinned retroactively");
-        assert!(store.is_protected(&c1_key("L1_b.pax")));
+        let sweep = store.set_protection_groups(vec![group("g1", C1, 1 << 20)]);
+        assert_eq!(sweep.protected, 1, "resident match pinned retroactively");
+        assert!(store.is_protected(&key_in(C1, "L1_b.pax")));
 
-        let sweep = store.set_protected_prefixes(Vec::new());
+        let sweep = store.set_protection_groups(Vec::new());
         assert_eq!(sweep.unprotected, 1);
         assert!(
-            !store.is_protected(&c1_key("L1_b.pax")),
-            "removed prefix unpins"
+            !store.is_protected(&key_in(C1, "L1_b.pax")),
+            "policy pin released"
         );
         assert!(
-            store.is_protected("manual/key"),
-            "a pin outside the policy is untouched"
+            store.is_protected(&key_in(C1, "manual")),
+            "a manual pin survives removal of a prefix it matches"
         );
     }
 
     /// Coverage degrades instead of forcing: matching entries beyond the
-    /// armed budget stay unpinned and are counted.
+    /// group budget stay unpinned and are counted.
     #[tokio::test]
-    async fn sweep_skips_pins_beyond_the_budget() {
-        let dir = tempfile::tempdir().expect("test tempdir");
-        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
+    async fn sweep_skips_pins_beyond_the_group_budget() {
+        let (_dir, store) = armed_store();
         for file in ["a", "b", "c"] {
             store
-                .put(c1_key(file), L2Class::Invariants, payload(4 * 1024))
+                .put(key_in(C1, file), L2Class::Invariants, payload(4 * 1024))
                 .await
                 .expect("put");
         }
-        let one_entry = store.resident_bytes() / 3;
-        store.set_reserved_budget(one_entry);
-        let sweep = store.set_protected_prefixes(vec![C1.to_string()]);
-        assert_eq!(sweep.protected, 1, "the budget covers exactly one entry");
+        let one = store.resident_bytes() / 3;
+        let sweep = store.set_protection_groups(vec![group("g1", C1, one)]);
+        assert_eq!(sweep.protected, 1, "the group budget covers one entry");
         assert_eq!(sweep.skipped_over_budget, 2);
-        assert!(store.protected_bytes() <= store.reserved_budget());
+        assert_eq!(store.covered_bytes("g1"), one);
+    }
+
+    /// A group budget that shrinks below its pinned bytes is clamped.
+    #[tokio::test]
+    async fn shrinking_a_group_budget_clamps_its_pins() {
+        let (_dir, store) = armed_store();
+        for file in ["a", "b"] {
+            store
+                .put(key_in(C1, file), L2Class::Invariants, payload(2048))
+                .await
+                .expect("put");
+        }
+        let one = store.resident_bytes() / 2;
+        store.set_protection_groups(vec![group("g1", C1, 2 * one)]);
+        assert_eq!(store.covered_bytes("g1"), 2 * one);
+        store.set_protection_groups(vec![group("g1", C1, one)]);
+        assert!(
+            store.covered_bytes("g1") <= one,
+            "clamped to the new budget"
+        );
+    }
+
+    /// Review S2: Azure scheme aliases and doubled slashes compare equal.
+    #[test]
+    fn canonical_location_unifies_aliases_and_slashes() {
+        assert_eq!(
+            canonical_location("adls://c/t/12/data/"),
+            "az://c/t/12/data/"
+        );
+        assert_eq!(canonical_location("abfs://c/x"), "az://c/x");
+        assert_eq!(
+            canonical_location("s3://b/x//tenants/t/"),
+            "s3://b/x/tenants/t/"
+        );
+        assert_eq!(
+            canonical_location("invariants/region-a/s3://b/k"),
+            "invariants/region-a/s3://b/k",
+            "the scheme's own // is preserved"
+        );
+    }
+
+    /// Review S2 end to end: a group registered with an `adls://` prefix pins
+    /// keys the Azure listing emits as `az://`.
+    #[tokio::test]
+    async fn alias_prefix_matches_listed_keys() {
+        let (_dir, store) = armed_store();
+        store.set_protection_groups(vec![group("g1", "adls://cont/tenants/t/12/data/", 1 << 20)]);
+        let listed = "invariants/control/az://cont/tenants/t/12/data/L0.pax";
+        store
+            .put(listed, L2Class::Invariants, payload(128))
+            .await
+            .expect("put");
+        assert!(store.is_protected(listed));
     }
 
     // Protection is runtime state by design: the index rebuild drops it and

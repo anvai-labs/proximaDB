@@ -33,7 +33,9 @@ use moka::notification::RemovalCause;
 
 mod persistent_l2;
 
-pub use persistent_l2::{L2Class, PersistentByteStore, ProtectionSweep};
+pub use persistent_l2::{
+    L2Class, PersistentByteStore, ProtectionGroup, ProtectionSweep, canonical_location,
+};
 
 /// TD-TIER-1 SC4-1: the process-wide residency-budget bridge.
 ///
@@ -54,21 +56,23 @@ mod residency_budget {
     use std::sync::Mutex;
     use std::sync::OnceLock;
 
-    use super::PersistentByteStore;
+    use super::{PersistentByteStore, ProtectionGroup};
 
-    /// The process residency state: the armed budget plus the refcounted set
-    /// of protected collection prefixes (two grants could register the same
-    /// prefix; only the last unregister removes it). One mutex guards both,
-    /// so no register/set interleaving can lose an update.
+    /// The process residency state: the armed budget plus one protection
+    /// group per reservation grant, keyed by grant id. Keying by id makes
+    /// registration idempotent — re-registering a grant (an in-process
+    /// registry reopen) replaces it instead of double-counting (review S5).
+    /// One mutex guards both, so no register/set interleaving can lose an
+    /// update.
     #[derive(Default)]
     struct State {
         budget: u64,
-        prefixes: BTreeMap<String, usize>,
+        groups: BTreeMap<String, ProtectionGroup>,
     }
 
     impl State {
-        fn prefix_list(&self) -> Vec<String> {
-            self.prefixes.keys().cloned().collect()
+        fn group_list(&self) -> Vec<ProtectionGroup> {
+            self.groups.values().cloned().collect()
         }
     }
 
@@ -83,7 +87,7 @@ mod residency_budget {
 
     /// Register the process's shared persistent store (first registration
     /// wins — the SST engine's singleton). The WINNER is armed with the
-    /// current budget AND the current protection prefixes (pinning entries
+    /// current budget AND the current protection groups (pinning entries
     /// rebuilt from disk that a pre-restart grant covers); a loser is left
     /// untouched (it would otherwise be a live store armed once and never
     /// managed again).
@@ -92,7 +96,7 @@ mod residency_budget {
         let applied = REGISTERED_STORE.set(store).is_ok();
         if applied && let Some(store) = REGISTERED_STORE.get() {
             store.set_reserved_budget(state.budget);
-            store.set_protected_prefixes(state.prefix_list());
+            store.set_protection_groups(state.group_list());
         }
         applied
     }
@@ -120,47 +124,37 @@ mod residency_budget {
         cell().budget
     }
 
-    /// TD-TIER-1 SC4-2: add collection segment-root prefixes to the
-    /// protection policy (refcounted) and reconcile the registered store —
-    /// already-resident matching entries are pinned, within the budget. Call
-    /// AFTER arming the budget that covers the grant.
-    pub fn register_protected_prefixes(prefixes: &[String]) {
+    /// TD-TIER-1 SC4-2: add (or replace, by id) one grant's protection group
+    /// and reconcile the registered store — its already-resident matching
+    /// entries are pinned within the group's budget. Call AFTER arming the
+    /// budget that covers the grant.
+    pub fn register_protection_group(group: ProtectionGroup) {
         let mut state = cell();
-        for prefix in prefixes {
-            *state.prefixes.entry(prefix.clone()).or_insert(0) += 1;
-        }
+        state.groups.insert(group.id.clone(), group);
         if let Some(store) = REGISTERED_STORE.get() {
-            store.set_protected_prefixes(state.prefix_list());
+            store.set_protection_groups(state.group_list());
         }
     }
 
-    /// TD-TIER-1 SC4-2: drop prefixes from the policy (refcounted; a prefix
-    /// leaves only when its last registration goes) and reconcile — entries
-    /// under a removed prefix are unpinned. Call BEFORE shrinking the budget.
-    pub fn unregister_protected_prefixes(prefixes: &[String]) {
+    /// TD-TIER-1 SC4-2: drop one grant's group and reconcile — its pins are
+    /// released. Call BEFORE shrinking the budget.
+    pub fn unregister_protection_group(group_id: &str) {
         let mut state = cell();
-        for prefix in prefixes {
-            if let Some(count) = state.prefixes.get_mut(prefix) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    state.prefixes.remove(prefix);
-                }
-            }
-        }
+        state.groups.remove(group_id);
         if let Some(store) = REGISTERED_STORE.get() {
-            store.set_protected_prefixes(state.prefix_list());
+            store.set_protection_groups(state.group_list());
         }
     }
 
-    /// The current protection prefixes (diagnostics/tests).
-    pub fn process_protected_prefixes() -> Vec<String> {
-        cell().prefix_list()
+    /// The ids of the registered protection groups (diagnostics/tests).
+    pub fn process_protection_group_ids() -> Vec<String> {
+        cell().groups.keys().cloned().collect()
     }
 }
 
 pub use residency_budget::{
-    process_protected_prefixes, process_reserved_budget, process_store, register_process_store,
-    register_protected_prefixes, set_process_reserved_budget, unregister_protected_prefixes,
+    process_protection_group_ids, process_reserved_budget, process_store, register_process_store,
+    register_protection_group, set_process_reserved_budget, unregister_protection_group,
 };
 
 /// The category of a cached artifact. Drives key-namespacing and per-kind stats;
@@ -1221,6 +1215,22 @@ mod tests {
         // A later budget update arms the registered store immediately.
         set_process_reserved_budget(8192);
         assert_eq!(store.reserved_budget(), 8192);
+    }
+
+    /// Review S5: registration is keyed by grant id — registering the same
+    /// grant twice (an in-process registry reopen) and unregistering it once
+    /// leaves nothing behind.
+    #[test]
+    fn protection_group_registration_is_idempotent_by_id() {
+        let group = ProtectionGroup {
+            id: "grant-idem-1".to_string(),
+            prefixes: vec!["s3://b/idem/9/data/".to_string()],
+            budget_bytes: 1024,
+        };
+        register_protection_group(group.clone());
+        register_protection_group(group);
+        unregister_protection_group("grant-idem-1");
+        assert!(!process_protection_group_ids().contains(&"grant-idem-1".to_string()));
     }
 
     #[tokio::test]
