@@ -57,17 +57,16 @@ byte cut (filtered cat3 bytes/q below the layout-OFF arm), n=1000, object_cold.
 
 * *Filtered cost of the flip is unmeasured at 3M.* Turning the layout off gives up C1's filtered byte
   cut for declared-schema collections; the filtered cat3 arm on the layout-OFF bed is the measurement.
-* *Layout-OFF geometry looks odd.* The layout-OFF schema bed settled at 96 + 96 cells, where the
-  smaller segment covers only 338,800 rows (~3.5k rows/cell) and reports `coarse_trained_rows`
-  2,661,200 — the larger segment's row count — while the no-schema bed settled at 8 + 50. Either a
-  harness reporting mix-up or a shared/collection model (TD-PAXDIR-1) being reused across segments;
-  check before any re-enable measurement leans on cell counts. The two segments look *swapped*: the
-  larger segment (2,661,200 rows) reports `coarse_trained_rows` 49,282, so either the reporter swaps
-  the field or the large segment's 96 cells were trained on ~49k rows — which bounds how far the
-  0.9716 baseline itself can be trusted (the no-schema bed's large segment also reports a partial
-  1,384,800 of 2,769,200).
-* *Probed-cell totals are fractional on the layout-ON arms* (`cells_total_per_query` 105.05 / 105.28
-  against a settled 10 + 100): about 5 cells per query are not counted, presumably queries where one
-  segment takes a non-probe path. Unexplained; it does not change the recall conclusion.
+* *Per-segment coarse stats are misreported (harness/reporter bug, not a recall concern).* The
+  layout-OFF schema bed's two segments carry ONE shared coarse model (identical `radii`, same
+  `coarse_seed` — the default-on write-shared model), but the result reports `coarse_trained_rows`
+  and `training_rows_per_cell` crosswise: the 338,800-row segment shows 2,661,200 trained rows and
+  the 2,661,200-row segment shows 49,282 (≈ the default 50k train sample, as on the earlier
+  layout-OFF beds that measured 0.9697–0.9739). Fix the per-segment attribution before any
+  re-enable measurement leans on per-segment cell stats.
+* *Probed-cell totals are fractional on the layout-ON arms* (`cells_total_per_query` 105.05 on
+  `p5m-sift3m-filter-build` and 105.28 on `p5m-diag-rt0-build`, both settled 10 + 100): about 5 cells
+  per query are not counted, consistent with the 10-cell segment taking a non-probe path on roughly
+  half the queries. Unexplained; it does not change the recall conclusion.
 * *Value semantics changed.* The gate used to treat anything except `0/off/false/no` as ON; it now
   accepts only `1/true/on/yes`. Only an operator who enabled it with a non-standard value is affected.
