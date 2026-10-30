@@ -698,6 +698,37 @@ fn name_mapping(fields: &[IcebergField]) -> String {
     serde_json::Value::Array(entries).to_string()
 }
 
+/// Whether a format-version 3 metadata document proves row lineage was never
+/// started — the shape v0.4.1 and earlier published (v3 without lineage): a
+/// non-empty `snapshots` list containing the current snapshot, and no snapshot
+/// carrying `first-row-id` or `added-rows`. Only then can lineage start at 0
+/// without re-issuing a row id; anything less (no list, a dangling current
+/// snapshot, any lineage field) is inconsistent metadata and stays refused.
+/// Starting at 0 is also what the spec does when it upgrades a v2 table.
+/// Caveat: only snapshot-level fields are inspected. A foreign writer that
+/// dropped next-row-id but assigned ids at the manifest-list or data-file
+/// level would be adopted; nothing foreign writes this engine's prefixes, and
+/// conformant v3 writers always write next-row-id.
+fn lineage_never_started(metadata: &serde_json::Value) -> bool {
+    let Some(snapshots) = metadata
+        .get("snapshots")
+        .and_then(|x| x.as_array())
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    let Some(current) = metadata.get("current-snapshot-id").and_then(|x| x.as_i64()) else {
+        return false;
+    };
+    let current_listed = snapshots
+        .iter()
+        .any(|s| s.get("snapshot-id").and_then(|x| x.as_i64()) == Some(current));
+    current_listed
+        && snapshots
+            .iter()
+            .all(|s| s.get("first-row-id").is_none() && s.get("added-rows").is_none())
+}
+
 /// What a new snapshot inherits from the table's previous `metadata.json`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Lineage {
@@ -746,14 +777,20 @@ impl Lineage {
         // TD-USUB-10 3c rung 2 — row lineage is fail-closed on INCONSISTENT
         // metadata, never defaulted: a v3 parent without a valid next-row-id
         // would unwrap_or(0) and RE-ISSUE row ids the parent already handed
-        // out (silent corruption). NOTE: this is ENGINE policy, not the spec's
-        // (row lineage is opt-in per Iceberg v3); it holds because this
-        // engine's own v3 publications always carry lineage, and next-row-id on
-        // a v2 table IS spec-invalid (row lineage is v3-only). Revisit at any
-        // future foreign-parent adoption seam (see lineage_fail_closed_tests).
+        // out (silent corruption). The Iceberg v3 spec requires next-row-id in
+        // v3 table metadata (row lineage is always on in v3); this engine's v3
+        // publications carry it since #2261, and next-row-id on a v2 table IS
+        // spec-invalid (row lineage is v3-only). The one adoption
+        // seam is `lineage_never_started` (v0.4.1-era publications, v3 with no
+        // lineage anywhere); revisit for any other foreign-parent adoption (see
+        // lineage_fail_closed_tests).
         let first_row_id = match v.get("next-row-id") {
             None | Some(serde_json::Value::Null) => {
-                if parent_format_version == Some(3) {
+                // v0.5.0 upgrade: v0.4.1 and earlier published format-version 3
+                // with NO row lineage at all, so an absent next-row-id is
+                // adopted as "lineage never started" (start at 0) — but only on
+                // positive evidence that no row id was ever handed out.
+                if parent_format_version == Some(3) && !lineage_never_started(&v) {
                     return Err(ser_err(
                         "parent metadata row lineage",
                         "a format-version 3 table must carry next-row-id",
@@ -1311,6 +1348,93 @@ mod lineage_fail_closed_tests {
             "next-row-id": -5,
         });
         assert!(Lineage::from_parent(Some(parent.to_string().as_str()), None).is_err());
+    }
+
+    /// The lineage-relevant fields of a v0.4.1-era publication: format-version
+    /// 3 with NO row lineage anywhere (that writer emitted none); `snapshots`
+    /// and `current-snapshot-id` as v0.4.1's `build_table_metadata` wrote them.
+    /// (The full real document is the `testdata/v041` golden fixture.)
+    fn v041_parent(snapshot_extra: serde_json::Value) -> serde_json::Value {
+        let mut snapshot = serde_json::json!({
+            "snapshot-id": 1_761_000_000_000_i64,
+            "sequence-number": 1,
+            "timestamp-ms": 1_761_000_000_000_i64,
+            "summary": {
+                "operation": "append",
+                "added-data-files": "1",
+                "added-records": "20",
+            },
+            "manifest-list": "file:///w/t/metadata/snap-1.avro",
+            "schema-id": 0,
+        });
+        if let (Some(dst), Some(src)) = (snapshot.as_object_mut(), snapshot_extra.as_object()) {
+            dst.extend(src.clone());
+        }
+        serde_json::json!({
+            "format-version": 3,
+            "last-sequence-number": 1,
+            "current-snapshot-id": 1_761_000_000_000_i64,
+            "snapshots": [snapshot],
+            "metadata-log": [],
+        })
+    }
+
+    /// v0.5.0 upgrade (release blocker): a table MATERIALIZEd by v0.4.1 is
+    /// v3 without lineage. No row id was ever handed out — no snapshot carries
+    /// `first-row-id`/`added-rows` — so lineage starts at 0 and cannot re-issue
+    /// an id. Without this every upgraded table refused its next MATERIALIZE.
+    #[test]
+    fn a_lineage_less_v041_parent_starts_lineage_at_zero() {
+        let parent = v041_parent(serde_json::json!({}));
+        let lineage = Lineage::from_parent(Some(parent.to_string().as_str()), None)
+            .expect("a v0.4.1 publication is adopted, not refused");
+        assert_eq!(lineage.first_row_id, 0);
+        assert_eq!(lineage.parent_format_version, Some(3));
+        assert_eq!(lineage.sequence_number, 2);
+    }
+
+    /// The adoption needs POSITIVE evidence lineage never started: any snapshot
+    /// carrying a lineage field means ids may have been handed out, so a
+    /// missing `next-row-id` is inconsistent metadata and still fails closed.
+    #[test]
+    fn a_v3_parent_whose_snapshots_carry_lineage_still_fails_closed() {
+        for extra in [
+            serde_json::json!({"first-row-id": 0}),
+            serde_json::json!({"added-rows": 20}),
+        ] {
+            let parent = v041_parent(extra.clone());
+            assert!(
+                Lineage::from_parent(Some(parent.to_string().as_str()), None).is_err(),
+                "lineage evidence {extra} without next-row-id must fail closed"
+            );
+        }
+    }
+
+    /// No snapshots list, or a current snapshot the list does not contain, is
+    /// not evidence of anything: refuse.
+    #[test]
+    fn a_v3_parent_without_a_matching_snapshot_list_still_fails_closed() {
+        let mut no_list = v041_parent(serde_json::json!({}));
+        no_list.as_object_mut().map(|o| o.remove("snapshots"));
+        let mut empty = v041_parent(serde_json::json!({}));
+        empty["snapshots"] = serde_json::json!([]);
+        let mut dangling = v041_parent(serde_json::json!({}));
+        dangling["current-snapshot-id"] = serde_json::json!(42);
+        let mut no_current = v041_parent(serde_json::json!({}));
+        no_current
+            .as_object_mut()
+            .map(|o| o.remove("current-snapshot-id"));
+        for (label, parent) in [
+            ("no snapshots", no_list),
+            ("empty snapshots", empty),
+            ("dangling current", dangling),
+            ("no current snapshot", no_current),
+        ] {
+            assert!(
+                Lineage::from_parent(Some(parent.to_string().as_str()), None).is_err(),
+                "{label}: must fail closed"
+            );
+        }
     }
 
     /// v2 tables carry no row lineage (the engine's own v2 writer omits it);

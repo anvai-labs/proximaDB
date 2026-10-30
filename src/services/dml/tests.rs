@@ -4294,6 +4294,89 @@ fn an_incremental_republication_hides_old_versions_with_deletion_vectors() {
     });
 }
 
+/// v0.5.0 upgrade (release blocker): v0.4.1 published Iceberg format-version
+/// 3 WITHOUT row lineage (no `next-row-id`, no snapshot `first-row-id` or
+/// `added-rows`). The lineage check from #2261 refused such a parent, so every
+/// table MATERIALIZEd before the upgrade failed its next MATERIALIZE. The
+/// latest metadata's lineage fields are stripped into that shape here (the
+/// INCREMENTAL path; a real upgraded table takes the full-rewrite path, which
+/// the engine's `a_real_v041_publication_reads_and_republishes` covers on real
+/// v0.4.1 bytes); the next UPDATE + MATERIALIZE must succeed and read back.
+#[cfg(feature = "datafusion-integration")]
+#[test]
+fn a_table_published_by_v041_without_row_lineage_republishes() {
+    let _bloom = EnvGuard::set("PROXIMADB_PARQUET_WRITE_BLOOM_MIN_ROWS", "1");
+    // v0.4.1 published v3 from the first MATERIALIZE.
+    let _v3 = EnvGuard::set("PROXIMADB_ICEBERG_V3_DEFAULT", "1");
+    crate::query::execution::test_runtime::run_with_timeout(30, async {
+        let inv = InvFixture::new("legacy-v3.wal", 20).await;
+        let location = inv.materialize().await;
+        let (_prefix, metadata_prefix) = inv.prefixes(&location);
+        let version = inv
+            .bridge
+            .latest_metadata_version(&metadata_prefix)
+            .await
+            .expect("metadata log")
+            .expect("a committed snapshot");
+        // Strip every row-lineage field, as v0.4.1's writer never emitted them.
+        let root = inv.root_url.strip_prefix("file://").expect("file root");
+        let dir = std::path::Path::new(root).join(&metadata_prefix);
+        let file = std::fs::read_dir(&dir)
+            .expect("metadata dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.ends_with(".metadata.json") && n.contains(&format!("{version:020}"))
+                })
+            })
+            .expect("the latest metadata file");
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).expect("read metadata")).expect("json");
+        assert_eq!(
+            meta["format-version"], 3,
+            "the fixture publishes v3 lineage to strip"
+        );
+        meta.as_object_mut().map(|o| o.remove("next-row-id"));
+        for snapshot in meta["snapshots"].as_array_mut().expect("snapshots") {
+            let o = snapshot.as_object_mut().expect("snapshot object");
+            o.remove("first-row-id");
+            o.remove("added-rows");
+        }
+        std::fs::write(&file, serde_json::to_vec_pretty(&meta).expect("encode")).expect("write");
+
+        inv.exec("UPDATE inv SET qty = 100 WHERE id = 'i0';").await;
+        assert_eq!(
+            inv.materialize().await,
+            location,
+            "a lineage-less v3 parent republishes instead of failing closed"
+        );
+        assert_eq!(inv_qty_sum(location.clone()).await, (20, 290));
+        let next = inv
+            .bridge
+            .latest_metadata_version(&metadata_prefix)
+            .await
+            .expect("metadata log")
+            .expect("a committed snapshot");
+        assert_eq!(next, version + 1, "the successor committed");
+        let successor: serde_json::Value = serde_json::from_slice(
+            &inv.bridge
+                .read_table_metadata(&metadata_prefix, next)
+                .await
+                .expect("successor metadata"),
+        )
+        .expect("json");
+        assert_eq!(successor["format-version"], 3);
+        assert_eq!(
+            successor["snapshots"][0]["first-row-id"], 0,
+            "lineage starts at 0 on the adopted parent"
+        );
+        assert_eq!(
+            successor["next-row-id"], successor["snapshots"][0]["added-rows"],
+            "next-row-id = 0 + the successor's rows"
+        );
+    });
+}
+
 /// Past the compaction bound (over 20% of rows deleted), the incremental
 /// plan falls back to a full rewrite: no deletion vectors, nothing carried.
 #[cfg(feature = "datafusion-integration")]

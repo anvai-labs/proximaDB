@@ -542,3 +542,7 @@ clients/python/src/proximadb_sdk/_generated/**/__pycache__/
 **/s3:/
 **/gs:/
 **/gcs:/
+
+# Real v0.4.1 Iceberg output (golden upgrade fixture: metadata JSON + Parquet
+# that the blanket *.json / *.parquet rules above would silently drop).
+!crates/storage/proximadb-iceberg-engine/testdata/v041/**
