@@ -2906,6 +2906,12 @@ type StorageClassStatusOutput struct {
 	// CoveredBytes Bytes covered by the READY coverage set (SC4). 0 until then.
 	CoveredBytes int64 `json:"covered_bytes"`
 
+	// CoveredGeneration The committed segment-set generation the coverage was proven against
+	// (TD-TIER-1 SC4-5); absent when no proof was attempted. Optional so
+	// old and new clients and servers interoperate in both directions.
+	// Computed per status read (one LIST per segment root).
+	CoveredGeneration *int64 `json:"covered_generation,omitempty"`
+
 	// PolicyGeneration Monotonic generation of the desired policy: 0 = never set (pre-SC1
 	// records), 1 = set at create; a policy-change surface will bump it.
 	PolicyGeneration int64 `json:"policy_generation"`
@@ -2920,7 +2926,8 @@ type StorageClassStatusOutput struct {
 	// ResidentBytes Bytes resident in the serving cache (SC4). 0 until then.
 	ResidentBytes int64 `json:"resident_bytes"`
 
-	// State "active" | "not_active" ("unspecified" never leaves the server).
+	// State "active" | "not_active" | "warming" | "ready" | "degraded"
+	// ("unspecified" never leaves the server).
 	State string `json:"state"`
 }
 

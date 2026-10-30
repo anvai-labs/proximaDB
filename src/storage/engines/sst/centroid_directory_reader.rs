@@ -180,13 +180,17 @@ pub(crate) async fn load_directory(
         return Some(Arc::clone(dir));
     }
     let url = &object.url;
-    let bytes = match fs.read(url).await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            tracing::debug!(%url, %error, "centroid directory unreadable; per-segment path");
-            return None;
-        }
-    };
+    // TD-TIER-1 SC4-5: a resident directory object costs no GET.
+    let bytes =
+        match crate::storage::engines::sst::segment_io::ResidentRangeRead::read_resident(fs, url)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::debug!(%url, %error, "centroid directory unreadable; per-segment path");
+                return None;
+            }
+        };
     let dir = match PaxCentroidDirectory::parse(&bytes) {
         Ok(dir) => Arc::new(dir),
         Err(error) => {

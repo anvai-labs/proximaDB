@@ -1,0 +1,75 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-FPRUNE-3: the tag-aware partition layout costs unfiltered recall at scale — default OFF until a recall-safe re-enable is measured
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Layout flipped to default OFF (opt-in `PROXIMADB_PAX_PARTITION_LAYOUT=1`) on 2026-10-29. Re-enabling it needs the gate below.
+| Priority | P1 for anyone who declares `filterable_columns`. The shipped default silently lost ~12 points of unfiltered recall@10 at 3M rows.
+| Component | `src/storage/engines/sst/block_cluster.rs` (`cluster_plan_ivf_probe_partitioned`, `partition_layout_enabled`); engaged in `src/storage/engines/sst/segment_format.rs` (compaction cluster plan, `shred_spec.first()`).
+| Relates to | link:TD-FPRUNE-1-filter-aware-cascade-arc.adoc[TD-FPRUNE-1] (M2/C2 introduced the layout; C1 is its filtered byte win), ADR-089
+|===
+
+== Finding
+
+The M2/C2 layout runs k-means separately within each value of the first declared filterable
+column, giving `k_g ∝ group share` cells per group in one shared PCA space. With an uncorrelated tag
+(`category = i % 10`), every query's true neighbours are spread over all groups, while the global
+probe budget (~21 cells/query here) covers only one or two cells per group.
+
+Measured on the settled 3M SIFT128 e1p bed (MinIO + toxiproxy, object_cold, n=1000, same binary
+`08f25648a`, same harness args):
+
+[cols="3,2,1,1,1,1", options="header"]
+|===
+| Arm | Cells | Cells probed/q | recall@10 | MB/q | Region-D MB/q
+| filterable columns declared, layout ON (the then default) | 10 + 100 | 21 of 105 | **0.855** | 149.9 | 69.7
+| same, residual tail OFF | 10 + 100 | 21 of 105 | 0.865 | 168.4 | 89.4
+| no filterable columns | 8 + 50 | 16 of 58 | 0.9706 | 171.4 | 69.5
+| filterable columns declared, layout OFF | 96 + 96 | 40 of 192 | **0.9716** | 133.2 | 44.0
+|===
+
+The arms do not share a probe budget (the reader's nprobe follows the cell count), so the ON/OFF pair
+is not an equal-probe comparison. The conclusion does not rest on it: the no-schema arm reaches 0.9706
+at a smaller budget (16 of 58, ~28%) than the ON arm (21 of 105, ~20%), and both layout-ON arms sit
+at 0.855–0.865 regardless of the residual tail.
+
+The 100-cell segment is exactly 10 groups × 10 cells. The "unfiltered recall neutral (Δ=0.000)"
+evidence the flip-ON relied on was toy-scale (a 512-row unit corpus comparing *filtered* recall,
+and a 10k ratchet that declares no filterable columns), so it never exercised this case. The bed
+only became measurable once R6 (#2284) let schema-bearing beds settle.
+
+== Re-enable gate
+
+Re-enable the layout (default or per collection) only with a change that keeps unfiltered recall:
+
+* *(a) partition-aware probe budget.* For an unfiltered query on a partitioned segment, scale nprobe
+  with the group count (or probe per group), and measure the GET/byte cost of doing so.
+* *(b) correlation-gated layout.* Partition only when the tag correlates with the vector clusters,
+  measured at compaction (e.g. cell purity of a global k-means against the tag); uncorrelated tags
+  keep the global layout.
+
+Gate: on the 3M schema bed, layout ON reaches recall@10 ≥ 0.97 unfiltered AND keeps C1's filtered
+byte cut (filtered cat3 bytes/q below the layout-OFF arm), n=1000, object_cold.
+
+== Open questions
+
+* *Filtered cost of the flip is unmeasured at 3M.* Turning the layout off gives up C1's filtered byte
+  cut for declared-schema collections; the filtered cat3 arm on the layout-OFF bed is the measurement.
+* *A shared model's `trained_on` is mis-stamped at write time (metadata bug, not a recall concern).*
+  The layout-OFF schema bed's two segments carry ONE shared coarse model (identical `radii`, same
+  `coarse_seed` — the default-on write-shared model). The 2,661,200-row segment's A0 records 49,282
+  trained rows, its real count (`default_train_sample(96)` = 50k, step ⌈2,661,200/50k⌉ = 54). The
+  338,800-row segment that reused the model records 2,661,200: `PaxCentroidDirectory::collection_model`
+  (`crates/storage/proximadb-storage-common/src/centroid_directory.rs`) builds the shared model with
+  `segment_model(template, 0, segment.rows_covered)`, stamping the template segment's *covered* rows
+  into `trained_on`, which then persists into every reusing segment's A0. The harness reads the A0
+  header faithfully. Fix the writer to carry the template's real `trained_on` before any measurement
+  leans on per-segment training stats.
+* *Probed-cell totals are fractional on the layout-ON arms* (`cells_total_per_query` 105.05 on
+  `p5m-sift3m-filter-build` and 105.28 on `p5m-diag-rt0-build`, both settled 10 + 100): about 5 cells
+  per query are not counted, consistent with the 10-cell segment taking a non-probe path on roughly
+  half the queries. Unexplained; it does not change the recall conclusion.
+* *Value semantics changed.* The gate used to treat anything except `0/off/false/no` as ON; it now
+  accepts only `1/true/on/yes`. Only an operator who enabled it with a non-standard value is affected.

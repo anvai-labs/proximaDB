@@ -6743,6 +6743,16 @@ pub mod storage_class_status {
         /// The policy is persisted but its dependency is not implemented/enabled
         /// in this build; the collection serves balanced behavior.
         NotActive = 2,
+        /// TD-TIER-1 SC4-5 (PERFORMANCE): the grant is live and its committed
+        /// segment set is being made resident; not every segment is covered yet.
+        Warming = 3,
+        /// Every segment of the committed generation `covered_generation` is
+        /// resident and protected: the declared query profile is served without
+        /// object-store payload requests.
+        Ready = 4,
+        /// Coverage cannot be reached (the segment set exceeds the grant budget,
+        /// or the persistent store is unavailable); the reason names the cause.
+        Degraded = 5,
     }
     impl State {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -6754,6 +6764,9 @@ pub mod storage_class_status {
                 Self::Unspecified => "STATE_UNSPECIFIED",
                 Self::Active => "STATE_ACTIVE",
                 Self::NotActive => "STATE_NOT_ACTIVE",
+                Self::Warming => "STATE_WARMING",
+                Self::Ready => "STATE_READY",
+                Self::Degraded => "STATE_DEGRADED",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -6762,6 +6775,9 @@ pub mod storage_class_status {
                 "STATE_UNSPECIFIED" => Some(Self::Unspecified),
                 "STATE_ACTIVE" => Some(Self::Active),
                 "STATE_NOT_ACTIVE" => Some(Self::NotActive),
+                "STATE_WARMING" => Some(Self::Warming),
+                "STATE_READY" => Some(Self::Ready),
+                "STATE_DEGRADED" => Some(Self::Degraded),
                 _ => None,
             }
         }
@@ -6793,6 +6809,11 @@ pub struct StorageClassStatus {
     /// Bytes covered by the READY coverage set (SC4). 0 until then.
     #[prost(uint64, tag = "6")]
     pub covered_bytes: u64,
+    /// TD-TIER-1 SC4-5: the committed segment-set generation the coverage was
+    /// proven against (a hash of the live segment inventory); 0 when no proof
+    /// was attempted. A new publication changes it.
+    #[prost(uint64, tag = "7")]
+    pub covered_generation: u64,
 }
 /// Canonical scalar type for a collection's embedding column. Mirrors
 /// `proximadb_records::EmbeddingScalarType`.

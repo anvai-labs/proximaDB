@@ -188,7 +188,7 @@ impl CollectionService {
             .await
             .context("TD-TIER-1 SC3: reservation pool startup failed")?;
 
-        Ok(Self {
+        let service = Self {
             filesystem_factory,
             index_config_cache: Arc::new(dashmap::DashMap::new()),
             storage_config,
@@ -201,7 +201,11 @@ impl CollectionService {
             rbac_enforcer: None,  // Will be set via with_rbac_enforcer()
             #[cfg(feature = "experimental-turboquant")]
             turboquant_registry: None, // Will be set via with_turboquant_registry()
-        })
+        };
+        // TD-TIER-1 SC4-4: the restart backfill runs when the SST engine
+        // registers the process store (`sst/core.rs`), not here — grants are
+        // restored before the store exists (review S4).
+        Ok(service)
     }
 
     /// TD-TIER-1 SC4-3: report a PERFORMANCE collection's live grant on its
@@ -234,15 +238,51 @@ impl CollectionService {
                 )
             })
             .unwrap_or((0, 0));
+        // SC4-5: prove coverage of the committed segment set (one LIST per
+        // segment root, on every status read — not the query path). A failed
+        // proof reports DEGRADED with the cause and keeps the byte figures.
+        let proof = match crate::storage::engines::sst::segment_io::prove_residency(
+            &self.filesystem_factory,
+            &grant.residency_prefixes,
+        )
+        .await
+        {
+            Ok(proof) => proof,
+            Err(error) => {
+                warn!(
+                    "TD-TIER-1 SC4: residency proof for {} failed: {error}",
+                    collection.id
+                );
+                let base = collection.storage_class_status.take().unwrap_or_else(|| {
+                    crate::services::collection::storage_class::storage_class_status(config)
+                });
+                collection.storage_class_status = Some(
+                    crate::services::collection::storage_class::with_failed_proof(
+                        base,
+                        grant.bytes,
+                        resident,
+                        covered,
+                        &error.to_string(),
+                    ),
+                );
+                return;
+            }
+        };
+        // Review S4 / S-1: the proven profile is the SST PAX scan — AXIS-routed
+        // collections (non-empty index_configs) and other engines (whose
+        // readers and object kinds the proof does not count) are outside it.
+        let in_profile = crate::services::collection::storage_class::in_ready_profile(config);
         let base = collection.storage_class_status.take().unwrap_or_else(|| {
             crate::services::collection::storage_class::storage_class_status(config)
         });
         collection.storage_class_status = Some(
-            crate::services::collection::storage_class::with_live_residency(
+            crate::services::collection::storage_class::with_residency_proof(
                 base,
                 grant.bytes,
                 resident,
                 covered,
+                in_profile,
+                &proof,
             ),
         );
     }
@@ -2295,19 +2335,14 @@ impl CollectionService {
                             // immutable, so create-time admissibility carries).
                             let mut prospective_config = existing_config.clone();
                             prospective_config.storage_class = Some(resolved as i32);
-                            let engine = previous_record
-                                .storage_assignment
-                                .as_ref()
-                                .and_then(|a| {
-                                    crate::proto::proximadb_v1::StorageEngine::try_from(a.engine)
-                                        .ok()
-                                })
-                                .or_else(|| {
-                                    existing_config.storage_engine.and_then(|e| {
-                                        crate::proto::proximadb_v1::StorageEngine::try_from(e).ok()
-                                    })
-                                })
-                                .unwrap_or(crate::proto::proximadb_v1::StorageEngine::Sst);
+                            let engine =
+                                crate::services::collection::storage_class::record_storage_engine(
+                                    previous_record
+                                        .storage_assignment
+                                        .as_ref()
+                                        .map(|a| a.engine),
+                                    existing_config.storage_engine,
+                                );
                             let base = previous_record
                                 .storage_assignment
                                 .as_ref()
@@ -2474,6 +2509,13 @@ impl CollectionService {
                          {error} (policy recorded; SC4 reconciliation re-admits)"
                     );
                     reservation_pending = Some(error.to_string());
+                } else {
+                    // SC4-4: segments published before this class change
+                    // become resident in the background.
+                    crate::storage::engines::sst::segment_io::spawn_warm_prefixes(
+                        self.filesystem_factory.clone(),
+                        protect_prefixes.clone(),
+                    );
                 }
             } else {
                 if let Some(owner) = owner.as_deref() {

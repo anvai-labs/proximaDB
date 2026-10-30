@@ -799,6 +799,18 @@ impl SstEngine {
             .await;
         }
 
+        // TD-TIER-1 SC4-4: a PERFORMANCE grant covering this collection makes
+        // the just-published segment resident in full (one GET; the staged
+        // local file is gone once the commit finalizes). Inert without a
+        // grant; detached, so it never adds to flush latency; a failure only
+        // leaves coverage partial.
+        if let Ok(final_fs) = self.filesystem().get_filesystem(&final_file_path) {
+            crate::storage::engines::sst::segment_io::spawn_warm_object(
+                final_fs,
+                final_file_path.clone(),
+            );
+        }
+
         if already_materialized {
             return Ok(FlushResult {
                 success: true,

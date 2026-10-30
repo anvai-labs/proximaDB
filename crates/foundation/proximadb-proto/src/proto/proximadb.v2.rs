@@ -887,7 +887,8 @@ pub struct V2CollectionConfig {
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct V2StorageClassStatus {
     /// "active" (balanced in effect) | "not_active" (policy persisted, dependency
-    /// not implemented — the collection serves balanced behavior).
+    /// not implemented — the collection serves balanced behavior) | "warming" |
+    /// "ready" | "degraded" (TD-TIER-1 SC4-5 PERFORMANCE residency proof).
     #[prost(string, tag = "1")]
     pub state: ::prost::alloc::string::String,
     /// Names the missing dependency when state is not_active; empty when active.
@@ -907,6 +908,10 @@ pub struct V2StorageClassStatus {
     /// Bytes covered by the READY coverage set (SC4). 0 until then.
     #[prost(uint64, tag = "6")]
     pub covered_bytes: u64,
+    /// TD-TIER-1 SC4-5: the committed segment-set generation the coverage was
+    /// proven against; 0 when no proof was attempted.
+    #[prost(uint64, tag = "7")]
+    pub covered_generation: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct V2Collection {

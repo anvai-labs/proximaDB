@@ -341,10 +341,25 @@ pub async fn publish_centroid_directory(
         match fs.write_if_absent(&url, &bytes, None).await {
             Ok(()) => {
                 for (old, entry) in &objects {
-                    if old.saturating_add(1) < generation
-                        && let Err(error) = fs.delete(&entry.url).await
-                    {
-                        tracing::debug!(url = %entry.url, %error, "centroid directory GC deferred");
+                    // TD-TIER-1 SC4-5: g-1 is kept remotely for readers but is
+                    // no longer what queries read — drop its resident copy so
+                    // it stops charging the grant (review N-b).
+                    if old.saturating_add(1) == generation {
+                        crate::storage::engines::sst::segment_io::forget_object(&entry.url);
+                    }
+                    if old.saturating_add(1) < generation {
+                        match fs.delete(&entry.url).await {
+                            // TD-TIER-1 SC4-5: a collected generation's resident
+                            // copy must not keep charging the grant.
+                            Ok(()) => {
+                                crate::storage::engines::sst::segment_io::forget_object(&entry.url)
+                            }
+                            Err(error) => tracing::debug!(
+                                url = %entry.url,
+                                %error,
+                                "centroid directory GC deferred"
+                            ),
+                        }
                     }
                 }
                 return Ok(Some(generation));

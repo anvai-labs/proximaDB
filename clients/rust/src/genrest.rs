@@ -14183,6 +14183,15 @@ pub mod types {
     ///      "format": "int64",
     ///      "minimum": 0.0
     ///    },
+    ///    "covered_generation": {
+    ///      "description": "The committed segment-set generation the coverage was proven against\n(TD-TIER-1 SC4-5); absent when no proof was attempted. Optional so\nold and new clients and servers interoperate in both directions.\nComputed per status read (one LIST per segment root).",
+    ///      "type": [
+    ///        "integer",
+    ///        "null"
+    ///      ],
+    ///      "format": "int64",
+    ///      "minimum": 0.0
+    ///    },
     ///    "policy_generation": {
     ///      "description": "Monotonic generation of the desired policy: 0 = never set (pre-SC1\nrecords), 1 = set at create; a policy-change surface will bump it.",
     ///      "type": "integer",
@@ -14206,7 +14215,7 @@ pub mod types {
     ///      "minimum": 0.0
     ///    },
     ///    "state": {
-    ///      "description": "\"active\" | \"not_active\" (\"unspecified\" never leaves the server).",
+    ///      "description": "\"active\" | \"not_active\" | \"warming\" | \"ready\" | \"degraded\"\n(\"unspecified\" never leaves the server).",
     ///      "type": "string"
     ///    }
     ///  }
@@ -14217,6 +14226,12 @@ pub mod types {
     pub struct StorageClassStatusOutput {
         ///Bytes covered by the READY coverage set (SC4). 0 until then.
         pub covered_bytes: i64,
+        /// The committed segment-set generation the coverage was proven against
+        /// (TD-TIER-1 SC4-5); absent when no proof was attempted. Optional so
+        /// old and new clients and servers interoperate in both directions.
+        /// Computed per status read (one LIST per segment root).
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub covered_generation: ::std::option::Option<i64>,
         /// Monotonic generation of the desired policy: 0 = never set (pre-SC1
         /// records), 1 = set at create; a policy-change surface will bump it.
         pub policy_generation: i64,
@@ -14227,7 +14242,8 @@ pub mod types {
         pub reserved_bytes: i64,
         ///Bytes resident in the serving cache (SC4). 0 until then.
         pub resident_bytes: i64,
-        ///"active" | "not_active" ("unspecified" never leaves the server).
+        /// "active" | "not_active" | "warming" | "ready" | "degraded"
+        /// ("unspecified" never leaves the server).
         pub state: ::std::string::String,
     }
     impl StorageClassStatusOutput {
@@ -33714,6 +33730,8 @@ pub mod types {
         #[derive(Clone, Debug)]
         pub struct StorageClassStatusOutput {
             covered_bytes: ::std::result::Result<i64, ::std::string::String>,
+            covered_generation:
+                ::std::result::Result<::std::option::Option<i64>, ::std::string::String>,
             policy_generation: ::std::result::Result<i64, ::std::string::String>,
             reason: ::std::result::Result<::std::string::String, ::std::string::String>,
             reserved_bytes: ::std::result::Result<i64, ::std::string::String>,
@@ -33724,6 +33742,7 @@ pub mod types {
             fn default() -> Self {
                 Self {
                     covered_bytes: Err("no value supplied for covered_bytes".to_string()),
+                    covered_generation: Ok(Default::default()),
                     policy_generation: Err("no value supplied for policy_generation".to_string()),
                     reason: Err("no value supplied for reason".to_string()),
                     reserved_bytes: Err("no value supplied for reserved_bytes".to_string()),
@@ -33741,6 +33760,16 @@ pub mod types {
                 self.covered_bytes = value
                     .try_into()
                     .map_err(|e| format!("error converting supplied value for covered_bytes: {e}"));
+                self
+            }
+            pub fn covered_generation<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<i64>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.covered_generation = value.try_into().map_err(|e| {
+                    format!("error converting supplied value for covered_generation: {e}")
+                });
                 self
             }
             pub fn policy_generation<T>(mut self, value: T) -> Self
@@ -33801,6 +33830,7 @@ pub mod types {
             ) -> ::std::result::Result<Self, super::error::ConversionError> {
                 Ok(Self {
                     covered_bytes: value.covered_bytes?,
+                    covered_generation: value.covered_generation?,
                     policy_generation: value.policy_generation?,
                     reason: value.reason?,
                     reserved_bytes: value.reserved_bytes?,
@@ -33813,6 +33843,7 @@ pub mod types {
             fn from(value: super::StorageClassStatusOutput) -> Self {
                 Self {
                     covered_bytes: Ok(value.covered_bytes),
+                    covered_generation: Ok(value.covered_generation),
                     policy_generation: Ok(value.policy_generation),
                     reason: Ok(value.reason),
                     reserved_bytes: Ok(value.reserved_bytes),

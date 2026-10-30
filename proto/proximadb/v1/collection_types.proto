@@ -287,6 +287,16 @@ message StorageClassStatus {
     // The policy is persisted but its dependency is not implemented/enabled
     // in this build; the collection serves balanced behavior.
     STATE_NOT_ACTIVE = 2;
+    // TD-TIER-1 SC4-5 (PERFORMANCE): the grant is live and its committed
+    // segment set is being made resident; not every segment is covered yet.
+    STATE_WARMING = 3;
+    // Every segment of the committed generation `covered_generation` is
+    // resident and protected: the declared query profile is served without
+    // object-store payload requests.
+    STATE_READY = 4;
+    // Coverage cannot be reached (the segment set exceeds the grant budget,
+    // or the persistent store is unavailable); the reason names the cause.
+    STATE_DEGRADED = 5;
   }
   State state = 1;
   // Human-readable reason when state != ACTIVE (names the missing dependency).
@@ -300,6 +310,10 @@ message StorageClassStatus {
   uint64 resident_bytes = 5;
   // Bytes covered by the READY coverage set (SC4). 0 until then.
   uint64 covered_bytes = 6;
+  // TD-TIER-1 SC4-5: the committed segment-set generation the coverage was
+  // proven against (a hash of the live segment inventory); 0 when no proof
+  // was attempted. A new publication changes it.
+  uint64 covered_generation = 7;
 }
 
 // Storage assignment information

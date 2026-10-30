@@ -447,7 +447,7 @@ fn py_metadata_to_vec(
         Some(meta_list) => {
             let mut result = Vec::with_capacity(meta_list.len());
             for item in meta_list.iter() {
-                result.push(py_dict_to_json_map(&item.cast::<PyDict>()?)?);
+                result.push(py_dict_to_json_map(item.cast::<PyDict>()?)?);
             }
             Ok(Some(result))
         }
