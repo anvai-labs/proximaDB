@@ -374,6 +374,7 @@ pub fn build_collection_config(
     let mut config = CollectionConfig {
         storage_class: None,
         policy_generation: None,
+        default_access_tier: None,
         name: name.clone(),
         embedding_config: None,
         dimension: dimension as u32,

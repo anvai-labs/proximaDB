@@ -1953,6 +1953,7 @@ impl FlightService for ProximaFlightService {
                 let config = crate::proto::proximadb_v1::CollectionConfig {
                     storage_class: None,
                     policy_generation: None,
+                    default_access_tier: None,
                     name: name.to_string(),
                     embedding_config: None,
                     dimension,

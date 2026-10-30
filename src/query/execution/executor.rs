@@ -2327,6 +2327,7 @@ mod executor_tests {
         let config = CollectionConfig {
             storage_class: None,
             policy_generation: None,
+            default_access_tier: None,
             name: "test_collection".to_string(),
             embedding_config: None,
             dimension: 3, // Match the test vector dimensions

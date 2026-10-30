@@ -17,8 +17,10 @@
 //! policy: never an input, never a claimed reservation.
 
 use crate::proto::proximadb_v1::{
-    CollectionConfig, StorageClass, StorageClassStatus, StorageEngine, storage_class_status::State,
+    AccessTier, CollectionConfig, StorageClass, StorageClassStatus, StorageEngine,
+    storage_class_status::State,
 };
+use proximadb_storage_filesystem_types::ObjectAccessTier;
 
 /// The user-facing storage-class labels (REST v2 accepts exactly these,
 /// case-insensitively, plus the proto enum names for parity with the
@@ -322,6 +324,107 @@ pub fn in_ready_profile(config: &CollectionConfig) -> bool {
         && effective_storage_engine(config.storage_engine) == Some(StorageEngine::Sst)
 }
 
+/// TD-TIER-1 SC5: the user-facing access-tier labels (REST v2 accepts exactly
+/// these, case-insensitively, plus the proto enum names). Online tiers only.
+pub const ACCESS_TIER_LABELS: [&str; 3] = ["hot", "cool", "cold"];
+
+/// Parse a user-supplied `default_access_tier` (REST v2). Empty ⇒
+/// `UNSPECIFIED` (account default). `archive` is refused with its reason —
+/// an archived segment cannot serve a query — and anything else names the
+/// valid values: a misspelt tier must never silently become the default (the
+/// lenient `FileOptions` parse stays a backend concern).
+pub fn parse_access_tier(raw: &str) -> anyhow::Result<AccessTier> {
+    let key = raw.trim().to_ascii_lowercase();
+    match key.as_str() {
+        "" | "unspecified" => Ok(AccessTier::Unspecified),
+        "hot" => Ok(AccessTier::Hot),
+        "cool" => Ok(AccessTier::Cool),
+        "cold" => Ok(AccessTier::Cold),
+        "archive" | "access_tier_archive" => Err(anyhow::anyhow!(
+            "default_access_tier 'archive' is not admissible: archived objects cannot \
+             serve queries. Valid values: {:?}",
+            ACCESS_TIER_LABELS
+        )),
+        other => other
+            .strip_prefix("access_tier_")
+            .and_then(|stripped| {
+                AccessTier::from_str_name(&format!("ACCESS_TIER_{}", stripped.to_ascii_uppercase()))
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Invalid default_access_tier '{}'. Valid values: {:?}",
+                    raw.trim(),
+                    ACCESS_TIER_LABELS
+                )
+            }),
+    }
+}
+
+/// Validate a raw proto `default_access_tier` from any facade and resolve it
+/// to the canonical storage tier: `None`/`Some(0)` ⇒ `None` (the account
+/// default); an unknown number is rejected (prost preserves it in the raw
+/// `i32`, so it reaches this check intact).
+pub fn validate_access_tier_raw(raw: Option<i32>) -> anyhow::Result<Option<ObjectAccessTier>> {
+    match raw {
+        None | Some(0) => Ok(None),
+        Some(value) => match AccessTier::try_from(value) {
+            Ok(AccessTier::Hot) => Ok(Some(ObjectAccessTier::Hot)),
+            Ok(AccessTier::Cool) => Ok(Some(ObjectAccessTier::Cool)),
+            Ok(AccessTier::Cold) => Ok(Some(ObjectAccessTier::Cold)),
+            Ok(AccessTier::Unspecified) => Ok(None),
+            Err(_) => Err(anyhow::anyhow!(
+                "Invalid default_access_tier value {value}. Valid values: hot (1), cool (2), \
+                 cold (3), or unset for the account default"
+            )),
+        },
+    }
+}
+
+/// The tier a collection's future segment PUTs carry (`None` ⇒ the account
+/// default). A stored value that would fail admission resolves to the
+/// default rather than failing a flush: admission is the gate, not the write.
+pub fn collection_access_tier(config: &CollectionConfig) -> Option<ObjectAccessTier> {
+    validate_access_tier_raw(config.default_access_tier).unwrap_or(None)
+}
+
+/// Stable lowercase label for a stored tier (`None` when unset), for the
+/// REST/gRPC-v2 read models.
+pub fn access_tier_label(raw: Option<i32>) -> Option<&'static str> {
+    match validate_access_tier_raw(raw).ok().flatten()? {
+        ObjectAccessTier::Hot => Some("hot"),
+        ObjectAccessTier::Cool => Some("cool"),
+        ObjectAccessTier::Cold => Some("cold"),
+        ObjectAccessTier::Archive => None,
+    }
+}
+
+/// TD-TIER-1 SC5 admission, on the final RESOLVED placement: an explicit tier
+/// is validated (unknown numbers refused) and requires a tiered object store
+/// (S3/Azure/GCS) — a local or unknown backend would silently drop it, and an
+/// explicit request is refused rather than ignored.
+pub fn check_access_tier_admission(
+    config: &CollectionConfig,
+    resolved_base_location: &str,
+) -> anyhow::Result<()> {
+    let Some(tier) = validate_access_tier_raw(config.default_access_tier)? else {
+        return Ok(());
+    };
+    if proximadb_storage_filesystem_types::object_store_scheme::ObjectStoreScheme::of(
+        resolved_base_location,
+    )
+    .is_none()
+    {
+        return Err(anyhow::anyhow!(
+            "default_access_tier '{}' requires an object-store placement (s3://, az://, gs://); \
+             the resolved location '{}' has no access tiers. Omit the tier or place the \
+             collection on object storage",
+            tier.as_canonical_str(),
+            resolved_base_location
+        ));
+    }
+    Ok(())
+}
+
 /// SC2 admission check for the PERFORMANCE class, evaluated on the final
 /// RESOLVED placement (not the raw client request): the engine must be the
 /// PAX path (SST) and the resolved base location — the client's explicit
@@ -534,6 +637,58 @@ mod tests {
         assert!(!in_ready_profile(&config));
         config.storage_engine = Some(9_999);
         assert!(!in_ready_profile(&config));
+    }
+
+    /// SC5: the tier vocabulary is strict — archive and typos are refused,
+    /// unknown proto numbers are refused, unset is the account default.
+    #[test]
+    fn access_tier_parse_and_validate_are_strict() {
+        assert_eq!(parse_access_tier("").unwrap(), AccessTier::Unspecified);
+        assert_eq!(parse_access_tier(" Cool ").unwrap(), AccessTier::Cool);
+        assert_eq!(
+            parse_access_tier("ACCESS_TIER_COLD").unwrap(),
+            AccessTier::Cold
+        );
+        assert!(
+            parse_access_tier("archive")
+                .unwrap_err()
+                .to_string()
+                .contains("not admissible")
+        );
+        assert!(parse_access_tier("coool").is_err());
+        assert_eq!(validate_access_tier_raw(None).unwrap(), None);
+        assert_eq!(validate_access_tier_raw(Some(0)).unwrap(), None);
+        assert_eq!(
+            validate_access_tier_raw(Some(2)).unwrap(),
+            Some(ObjectAccessTier::Cool)
+        );
+        assert!(
+            validate_access_tier_raw(Some(4)).is_err(),
+            "no archive number"
+        );
+        assert_eq!(access_tier_label(Some(3)), Some("cold"));
+        assert_eq!(access_tier_label(None), None);
+        let corrupt = CollectionConfig {
+            default_access_tier: Some(99),
+            ..Default::default()
+        };
+        assert_eq!(collection_access_tier(&corrupt), None);
+    }
+
+    /// SC5: an explicit tier needs a tiered object store; unset is admissible
+    /// anywhere.
+    #[test]
+    fn access_tier_admission_requires_an_object_store() {
+        let mut config = CollectionConfig::default();
+        check_access_tier_admission(&config, "file:///data").unwrap();
+        config.default_access_tier = Some(AccessTier::Cool as i32);
+        assert!(check_access_tier_admission(&config, "file:///data").is_err());
+        assert!(check_access_tier_admission(&config, "/var/lib/proximadb").is_err());
+        check_access_tier_admission(&config, "s3://bucket/tenants/t1").unwrap();
+        check_access_tier_admission(&config, "az://container/x").unwrap();
+        check_access_tier_admission(&config, "gs://bucket/x").unwrap();
+        config.default_access_tier = Some(42);
+        assert!(check_access_tier_admission(&config, "s3://bucket/x").is_err());
     }
 
     use super::*;

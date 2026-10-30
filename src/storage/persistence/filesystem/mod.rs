@@ -692,6 +692,17 @@ impl FilesystemFactory {
 
     /// Cross-storage atomic operations - handles full URLs for source and destination
     pub async fn copy_atomic(&self, from_url: &str, to_url: &str) -> FsResult<()> {
+        self.copy_atomic_with_options(from_url, to_url, None).await
+    }
+
+    /// [`Self::copy_atomic`] applying `options` (the access tier, TD-TIER-1
+    /// SC5) to the destination object. `None` is exactly [`Self::copy_atomic`].
+    pub async fn copy_atomic_with_options(
+        &self,
+        from_url: &str,
+        to_url: &str,
+        options: Option<FileOptions>,
+    ) -> FsResult<()> {
         trace!("📋 [] copy_atomic START");
         trace!("from_url: {}", from_url);
         trace!("to_url: {}", to_url);
@@ -741,7 +752,9 @@ impl FilesystemFactory {
             _ => false,
         };
         if same_cloud_backend || Arc::ptr_eq(&from_fs, &to_fs) {
-            from_fs.copy(&from_path, &to_path).await?;
+            from_fs
+                .copy_with_options(&from_path, &to_path, options)
+                .await?;
             trace!("Same-backend native copy complete");
             debug!("    ✅ [DEBUG] Same-backend native copy complete");
             trace!("📋 [] copy_atomic COMPLETE");
@@ -751,12 +764,23 @@ impl FilesystemFactory {
 
         if from_fs.filesystem_type() == "encrypted" || to_fs.filesystem_type() == "encrypted" {
             let data = from_fs.read(&from_path).await?;
-            to_fs.write_atomic(&to_path, &data, None).await?;
+            to_fs.write_atomic(&to_path, &data, options).await?;
             trace!("Whole-file copy complete");
             debug!("    ✅ [DEBUG] Whole-file copy complete");
             trace!("📋 [] copy_atomic COMPLETE");
             debug!("📋 [DEBUG] copy_atomic COMPLETE");
             return Ok(());
+        }
+
+        // TD-TIER-1 SC5 (review N1): the streaming path below has no way to
+        // set an object's tier. Admission refuses a tier on non-object-store
+        // placements, so a tiered request here is a routing bug — fail it
+        // rather than publish at the wrong tier silently.
+        if let Some(tier) = options.as_ref().and_then(FileOptions::access_tier) {
+            return Err(FilesystemError::InvalidOperation(format!(
+                "access tier '{}' cannot be applied by a streaming copy from {from_url} to {to_url}",
+                tier.as_canonical_str()
+            )));
         }
 
         // Open source and destination files for streaming
@@ -789,6 +813,17 @@ impl FilesystemFactory {
 
     /// Move operation with atomic cross-storage support
     pub async fn move_atomic(&self, from_url: &str, to_url: &str) -> FsResult<()> {
+        self.move_atomic_with_options(from_url, to_url, None).await
+    }
+
+    /// [`Self::move_atomic`] applying `options` (the access tier, TD-TIER-1
+    /// SC5) to the destination object. `None` is exactly [`Self::move_atomic`].
+    pub async fn move_atomic_with_options(
+        &self,
+        from_url: &str,
+        to_url: &str,
+        options: Option<FileOptions>,
+    ) -> FsResult<()> {
         trace!("🚚 [] move_atomic START");
         trace!("from_url: {}", from_url);
         trace!("to_url: {}", to_url);
@@ -799,7 +834,8 @@ impl FilesystemFactory {
         // Copy first using streaming copy
         trace!("Copying file atomically (streaming)...");
         debug!("    📋 [DEBUG] Copying file atomically (streaming)...");
-        self.copy_atomic(from_url, to_url).await?;
+        self.copy_atomic_with_options(from_url, to_url, options)
+            .await?;
         debug!("Streaming copy successful");
         debug!("    ✅ [DEBUG] Streaming copy successful");
 
@@ -2068,5 +2104,200 @@ mod object_store_contract_tests {
         if let Err(violation) = check_missing_object_contract(fs.as_ref(), &key).await {
             panic!("{violation}");
         }
+    }
+}
+
+#[cfg(test)]
+mod access_tier_publish_tests {
+    //! TD-TIER-1 SC5 (review S2): the factory's move to the final key — the
+    //! staged-segment publish every flush/compaction commit runs — carries the
+    //! tier to the destination object on a cloud backend, and an untiered
+    //! move is the native copy it always was.
+    use super::*;
+
+    /// Records the primitives a move runs (and the tier any write carried);
+    /// everything else forwards to a scratch local filesystem.
+    #[derive(Debug)]
+    struct RecordingCloudFs {
+        inner: Arc<dyn FileSystem>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingCloudFs {
+        async fn new() -> Arc<Self> {
+            let inner: Arc<dyn FileSystem> = Arc::new(
+                LocalFileSystem::new(local::LocalConfig::default())
+                    .await
+                    .expect("local fs"),
+            );
+            Arc::new(Self {
+                inner,
+                calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn record(&self, call: String) {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(call);
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .map(|calls| calls.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    proximadb_storage_filesystem_types::forward_filesystem_impl! {
+        impl FileSystem for RecordingCloudFs => inner;
+        forward [
+            as_any, filesystem_type, supports_mmap, append, exists, metadata,
+            create_dir, move_file, sync, sync_file, sync_data, open_file,
+        ];
+        {
+            async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
+                self.record(format!("read {path}"));
+                Ok(b"segment".to_vec())
+            }
+            async fn read_range(&self, _path: &str, _offset: u64, _length: u64) -> FsResult<Vec<u8>> {
+                Ok(Vec::new())
+            }
+            async fn write(&self, path: &str, _data: &[u8], options: Option<FileOptions>) -> FsResult<()> {
+                let tier = options.as_ref().and_then(FileOptions::access_tier);
+                self.record(format!("write {path} tier={tier:?}"));
+                Ok(())
+            }
+            async fn delete(&self, path: &str) -> FsResult<()> {
+                self.record(format!("delete {path}"));
+                Ok(())
+            }
+            async fn copy(&self, from: &str, to: &str) -> FsResult<()> {
+                self.record(format!("copy {from} {to}"));
+                Ok(())
+            }
+            async fn create_dir_all(&self, _path: &str) -> FsResult<()> {
+                Ok(())
+            }
+            /// A staging prefix lists one staged segment; anything else is
+            /// empty (cloud paths reach the backend as the full URL).
+            async fn list(&self, path: &str) -> FsResult<Vec<DirEntry>> {
+                if !path.contains("/__") {
+                    return Ok(Vec::new());
+                }
+                let url = format!("{}/L1.pax", path.trim_end_matches('/'));
+                Ok(vec![DirEntry {
+                    name: "L1.pax".to_string(),
+                    metadata: FsFileMetadata {
+                        path: url.clone(),
+                        size: 7,
+                        created: None,
+                        modified: None,
+                        is_directory: false,
+                        permissions: None,
+                        etag: None,
+                        storage_class: None,
+                    },
+                    url,
+                }])
+            }
+        }
+    }
+
+    fn factory_with(fs: Arc<RecordingCloudFs>) -> FilesystemFactory {
+        let mut filesystems: HashMap<String, Arc<dyn FileSystem>> = HashMap::new();
+        filesystems.insert("s3".to_string(), fs.clone());
+        // The coordinator resolves a `file://` backend at construction.
+        filesystems.insert("file".to_string(), fs);
+        FilesystemFactory {
+            config: FilesystemConfig::default(),
+            filesystems,
+            tier_mapping: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn tiered_move_writes_the_final_key_at_the_tier() {
+        let fs = RecordingCloudFs::new().await;
+        let factory = factory_with(fs.clone());
+        factory
+            .move_atomic_with_options(
+                "s3://bucket/c/__compact/L1.pax",
+                "s3://bucket/c/data/L1.pax",
+                FileOptions::for_access_tier(Some(ObjectAccessTier::Cool)),
+            )
+            .await
+            .expect("move");
+        let calls = fs.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("data/L1.pax tier=Some(Cool)")),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|call| call.starts_with("delete ")),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|call| call.starts_with("copy ")),
+            "{calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn untiered_move_is_the_native_copy() {
+        let fs = RecordingCloudFs::new().await;
+        let factory = factory_with(fs.clone());
+        factory
+            .move_atomic("s3://bucket/c/__flush/L0.pax", "s3://bucket/c/data/L0.pax")
+            .await
+            .expect("move");
+        let calls = fs.calls();
+        assert!(
+            calls.iter().any(|call| call.starts_with("copy ")),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|call| call.starts_with("write ")),
+            "{calls:?}"
+        );
+    }
+
+    /// The coordinator's finalize applies the operation's recorded tier to
+    /// the object it publishes (review round 2: replaces a source guard).
+    #[tokio::test]
+    async fn coordinator_finalize_publishes_at_the_operation_tier() {
+        use crate::storage::transaction_coordinator::{
+            StagingConfig, TransactionStageType, UnifiedTransactionCoordinator,
+        };
+        let fs = RecordingCloudFs::new().await;
+        let coordinator =
+            UnifiedTransactionCoordinator::new(Arc::new(factory_with(fs.clone())), None)
+                .await
+                .expect("coordinator");
+        let config = StagingConfig {
+            base_url: "s3://bucket/tenant".to_string(),
+            collection_id: Some("coll".to_string()),
+            operation_type: TransactionStageType::Compaction,
+            ..Default::default()
+        };
+        let operation = coordinator
+            .begin_atomic_operation(&config)
+            .await
+            .expect("begin");
+        coordinator
+            .set_operation_access_tier(&operation.operation_id, Some(ObjectAccessTier::Cold))
+            .expect("tier");
+        coordinator
+            .finalize_atomic_operation(&operation.operation_id)
+            .await
+            .expect("finalize");
+        let calls = fs.calls();
+        let published = format!("write {}/L1.pax tier=Some(Cold)", operation.final_url);
+        assert!(calls.contains(&published), "{published} not in {calls:?}");
+        assert!(
+            !calls.iter().any(|call| call.starts_with("copy ")),
+            "{calls:?}"
+        );
     }
 }
