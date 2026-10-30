@@ -1503,7 +1503,32 @@ impl PaxBlockWriter {
     ) -> Result<ColumnStripe> {
         let (raw_values, null_count) = flatten_i64_values(vals);
         let scheme = select_i64_scheme(role, nullable, vals);
-        let data = encode_i64_with_scheme(&raw_values, &scheme)?;
+        // Nulls ride as an `i64::MIN` sentinel that the scheme choice (made
+        // from the non-null values) never saw. A narrow scheme can reject it
+        // (Simple8b failed the whole segment write) or silently truncate it
+        // (bit-packing keeps only the low bits, so a null would read back as
+        // 0). So a stripe with nulls must decode back exactly, else it is
+        // written Raw. The stripe records its scheme, so readers are
+        // unaffected, and every stripe that round-tripped before is
+        // byte-identical.
+        let (scheme, data) = match encode_i64_with_scheme(&raw_values, &scheme) {
+            Ok(data)
+                if null_count == 0
+                    || crate::reader::decode_i64_with_encoding(
+                        &data,
+                        scheme.to_marker(),
+                        raw_values.len(),
+                    )
+                    .is_ok_and(|back| back == raw_values) =>
+            {
+                (scheme, data)
+            }
+            Err(e) if null_count == 0 => return Err(e),
+            _ => (
+                ProximaScheme::Raw,
+                encode_i64_with_scheme(&raw_values, &ProximaScheme::Raw)?,
+            ),
+        };
         let (data, is_lz4_compressed) =
             self.encode_lossless_scalar(data, null_count as usize, vals.len());
         let mut meta = ColumnMeta {
