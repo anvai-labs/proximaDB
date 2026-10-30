@@ -106,6 +106,40 @@ pub fn label_client_collection(mut err: anyhow::Error, requested: &str) -> anyho
     err
 }
 
+/// The addressed collection does not exist FOR THIS REQUEST: it is missing,
+/// or it is not resolvable by the request's tenant. Both cases are this one
+/// error with the same text, so a response never distinguishes them. Request
+/// boundaries answer it as HTTP 404 / gRPC `NotFound` via
+/// [`collection_not_found`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionNotFound {
+    /// The collection as the request named it.
+    pub identifier: String,
+}
+
+impl CollectionNotFound {
+    /// A not-found error for the identifier the request used.
+    pub fn new(identifier: impl Into<String>) -> Self {
+        Self {
+            identifier: identifier.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for CollectionNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Collection '{}' not found", self.identifier)
+    }
+}
+
+impl std::error::Error for CollectionNotFound {}
+
+/// The [`CollectionNotFound`] anywhere in `err`'s chain, if any.
+pub fn collection_not_found(err: &anyhow::Error) -> Option<&CollectionNotFound> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<CollectionNotFound>())
+}
+
 /// True when a search failure is the client's argument: an invalid query
 /// vector or a `top_k` above the server cap. Walks the whole `anyhow` chain so
 /// `.context(..)` wrappers don't hide it.
@@ -205,5 +239,18 @@ mod tests {
         // Non-client errors pass through untouched.
         let server = label_client_collection(anyhow::anyhow!("disk full"), "orders");
         assert_eq!(server.to_string(), "disk full");
+    }
+
+    #[test]
+    fn collection_not_found_is_found_through_context() {
+        let err = anyhow::Error::new(CollectionNotFound::new("docs")).context("search failed");
+        assert_eq!(
+            collection_not_found(&err)
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("Collection 'docs' not found")
+        );
+        assert!(!is_client_argument_error(&err));
+        assert!(collection_not_found(&anyhow::anyhow!("Collection docs not found")).is_none());
     }
 }

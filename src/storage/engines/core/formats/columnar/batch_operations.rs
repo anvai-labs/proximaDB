@@ -528,13 +528,9 @@ mod tests {
                     oid: format!("test_{i}"),
                     ..Default::default()
                 };
-                record.embeddings.push(EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    values: proximadb_records::EmbeddingValues::Fp32(values),
-                    dim,
-                    ..Default::default()
-                });
+                record
+                    .embeddings
+                    .push(EmbeddingCell::new_fp32("default", "vector", dim, values));
                 record
             })
             .collect();

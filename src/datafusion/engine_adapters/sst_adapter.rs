@@ -62,7 +62,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use futures::Stream;
 use tracing::{debug, trace};
 
-use crate::datafusion::proxima_scan_exec::{ProximaScanExec, SplitReader};
+use crate::datafusion::proxima_scan_exec::SplitReader;
 use crate::datafusion::proxima_table_provider::{
     CollectionInfo, EngineType, ProximaTableProvider, PruningStatistics,
 };
@@ -297,26 +297,22 @@ impl TableProvider for SstTableProvider {
         let files = self.discover_files().await?;
         let splits = self.generate_splits_from_files(&files, filters).await?;
 
-        // Create split reader
+        // Create split reader (engine-specific part) and build the plan
         let reader = Arc::new(SstSplitReader::new(
             self.schema.clone(),
             self.filesystem_factory.clone(),
             self.info.dimension,
         ));
 
-        // Build execution plan
-        let exec = ProximaScanExec::builder()
-            .schema(self.schema.clone())
-            .splits(splits)
-            .reader(reader)
-            .projection(projection.cloned())
-            .filters(filters.to_vec())
-            .limit(limit)
-            .collection_name(self.info.name.clone())
-            .batch_size(8192)
-            .build()?;
-
-        Ok(Arc::new(exec))
+        super::build_scan_exec(
+            self.schema.clone(),
+            self.info.name.clone(),
+            splits,
+            reader,
+            projection,
+            filters,
+            limit,
+        )
     }
 
     fn supports_filters_pushdown(

@@ -153,7 +153,13 @@ impl HybridFusionEngine {
             return Ok(Vec::new());
         }
 
-        // Find max scores for min-max normalization
+        // Find max scores for min-max normalization.
+        // NOTE: the 0.0 seed on the max folds below is safe only because
+        // every value derived from these maxes (the ranges) is consumed
+        // behind a `> 0.0` guard, so an all-negative list (seeded max =
+        // 0.0) contributes 0.0 regardless of the seed. If those guards are
+        // ever removed, reseed with f64::NEG_INFINITY like the comb_*
+        // normalization folds.
         let bm25_max = bm25_results.iter().map(|r| r.score).fold(0.0_f64, f64::max);
         let bm25_min = bm25_results
             .iter()
@@ -356,7 +362,11 @@ impl HybridFusionEngine {
         bm25_normalize: bool,
         vector_normalize: bool,
     ) -> Result<Vec<FusedSearchResult>, FusionError> {
-        // Find max scores for normalization
+        // Find max scores for normalization.
+        // NOTE: the 0.0 seed is safe only because each max is read solely
+        // as a divisor under a `> 0.0` guard below (lists with no positive
+        // score fall through to the raw score). If that guard is removed,
+        // reseed with f64::NEG_INFINITY like the comb_* normalization folds.
         let bm25_max = if bm25_normalize {
             bm25_results.iter().map(|r| r.score).fold(0.0_f64, f64::max)
         } else {
@@ -662,35 +672,43 @@ impl HybridFusionEngine {
         Ok(fused_results)
     }
 
-    /// CombSUM fusion
+    /// Shared skeleton of the score-combining fusion family
+    /// (CombSUM / CombMin / CombMax / Dempster-Shafer).
     ///
-    /// Simple summation of normalized scores.
-    /// Formula: `score = bm25_normalized + vector_normalized`
-    fn comb_sum(
-        &self,
-        bm25_results: Vec<BM25Result>,
-        vector_results: Vec<VectorResult>,
-    ) -> Result<Vec<FusedSearchResult>, FusionError> {
+    /// Normalizes each list's scores to `[0,1]` against that list's own true
+    /// min/max (range floored at `0.001` to avoid division by zero), seeds
+    /// the fused map from the BM25 list, then combines documents present in
+    /// both lists via `combine(existing_fused_score, normalized_vector_score)`.
+    ///
+    /// Documents missing from one list keep the completion tags of the list
+    /// they came from: BM25-only entries carry `vector_score: 0.0` /
+    /// `vector_rank: usize::MAX`; vector-only entries carry
+    /// `bm25_score: 0.0` / `bm25_rank: usize::MAX` and no highlights.
+    fn fuse_by_score(
+        bm25_results: &[BM25Result],
+        vector_results: &[VectorResult],
+        combine: impl Fn(f64, f64) -> f64,
+    ) -> Vec<FusedSearchResult> {
         // Normalize BM25 scores to [0,1]
         let bm25_max = bm25_results
             .iter()
             .map(|r| r.score)
-            .fold(0.0_f64, |a, b| a.max(b));
+            .fold(f64::NEG_INFINITY, |a, b| a.max(b));
         let bm25_min = bm25_results
             .iter()
             .map(|r| r.score)
-            .fold(0.0_f64, |a, b| a.min(b));
+            .fold(f64::INFINITY, |a, b| a.min(b));
         let bm25_range = (bm25_max - bm25_min).max(0.001); // Avoid division by zero
 
         // Normalize vector scores to [0,1]
         let vector_max = vector_results
             .iter()
             .map(|r| r.score)
-            .fold(0.0_f64, |a, b| a.max(b));
+            .fold(f64::NEG_INFINITY, |a, b| a.max(b));
         let vector_min = vector_results
             .iter()
             .map(|r| r.score)
-            .fold(0.0_f64, |a, b| a.min(b));
+            .fold(f64::INFINITY, |a, b| a.min(b));
         let vector_range = (vector_max - vector_min).max(0.001);
 
         let mut fused_map: HashMap<String, FusedSearchResult> = HashMap::new();
@@ -713,12 +731,12 @@ impl HybridFusionEngine {
             );
         }
 
-        // Process vector results and sum
+        // Process vector results and combine scores
         for (rank, vector) in vector_results.iter().enumerate() {
             let normalized_score = (vector.score - vector_min) / vector_range;
 
             if let Some(existing) = fused_map.get_mut(&vector.doc_id) {
-                existing.fused_score += normalized_score;
+                existing.fused_score = combine(existing.fused_score, normalized_score);
                 existing.vector_score = vector.score;
                 existing.vector_rank = rank + 1;
             } else {
@@ -745,7 +763,23 @@ impl HybridFusionEngine {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        Ok(fused_results)
+        fused_results
+    }
+
+    /// CombSUM fusion
+    ///
+    /// Simple summation of normalized scores.
+    /// Formula: `score = bm25_normalized + vector_normalized`
+    fn comb_sum(
+        &self,
+        bm25_results: Vec<BM25Result>,
+        vector_results: Vec<VectorResult>,
+    ) -> Result<Vec<FusedSearchResult>, FusionError> {
+        Ok(Self::fuse_by_score(
+            &bm25_results,
+            &vector_results,
+            |sum, v| sum + v,
+        ))
     }
 
     /// CombMIN fusion
@@ -757,81 +791,11 @@ impl HybridFusionEngine {
         bm25_results: Vec<BM25Result>,
         vector_results: Vec<VectorResult>,
     ) -> Result<Vec<FusedSearchResult>, FusionError> {
-        // Normalize BM25 scores
-        let bm25_max = bm25_results
-            .iter()
-            .map(|r| r.score)
-            .fold(0.0_f64, |a, b| a.max(b));
-        let bm25_min = bm25_results
-            .iter()
-            .map(|r| r.score)
-            .fold(0.0_f64, |a, b| a.min(b));
-        let bm25_range = (bm25_max - bm25_min).max(0.001);
-
-        // Normalize vector scores
-        let vector_max = vector_results
-            .iter()
-            .map(|r| r.score)
-            .fold(0.0_f64, |a, b| a.max(b));
-        let vector_min = vector_results
-            .iter()
-            .map(|r| r.score)
-            .fold(0.0_f64, |a, b| a.min(b));
-        let vector_range = (vector_max - vector_min).max(0.001);
-
-        let mut fused_map: HashMap<String, FusedSearchResult> = HashMap::new();
-
-        // Process BM25 results
-        for (rank, bm25) in bm25_results.iter().enumerate() {
-            let normalized_score = (bm25.score - bm25_min) / bm25_range;
-            fused_map.insert(
-                bm25.doc_id.clone(),
-                FusedSearchResult {
-                    doc_id: bm25.doc_id.clone(),
-                    bm25_score: bm25.score,
-                    vector_score: 0.0,
-                    fused_score: normalized_score,
-                    bm25_rank: rank + 1,
-                    vector_rank: usize::MAX,
-                    highlights: bm25.highlights.clone(),
-                    metadata: bm25.metadata.clone(),
-                },
-            );
-        }
-
-        // Process vector results and take minimum
-        for (rank, vector) in vector_results.iter().enumerate() {
-            let normalized_score = (vector.score - vector_min) / vector_range;
-
-            if let Some(existing) = fused_map.get_mut(&vector.doc_id) {
-                existing.fused_score = existing.fused_score.min(normalized_score);
-                existing.vector_score = vector.score;
-                existing.vector_rank = rank + 1;
-            } else {
-                fused_map.insert(
-                    vector.doc_id.clone(),
-                    FusedSearchResult {
-                        doc_id: vector.doc_id.clone(),
-                        bm25_score: 0.0,
-                        vector_score: vector.score,
-                        fused_score: normalized_score,
-                        bm25_rank: usize::MAX,
-                        vector_rank: rank + 1,
-                        highlights: None,
-                        metadata: vector.metadata.clone(),
-                    },
-                );
-            }
-        }
-
-        let mut fused_results: Vec<_> = fused_map.into_values().collect();
-        fused_results.sort_by(|a, b| {
-            b.fused_score
-                .partial_cmp(&a.fused_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        Ok(fused_results)
+        Ok(Self::fuse_by_score(
+            &bm25_results,
+            &vector_results,
+            |current, v| current.min(v),
+        ))
     }
 
     /// CombMAX fusion
@@ -843,81 +807,11 @@ impl HybridFusionEngine {
         bm25_results: Vec<BM25Result>,
         vector_results: Vec<VectorResult>,
     ) -> Result<Vec<FusedSearchResult>, FusionError> {
-        // Normalize BM25 scores
-        let bm25_max = bm25_results
-            .iter()
-            .map(|r| r.score)
-            .fold(0.0_f64, |a, b| a.max(b));
-        let bm25_min = bm25_results
-            .iter()
-            .map(|r| r.score)
-            .fold(0.0_f64, |a, b| a.min(b));
-        let bm25_range = (bm25_max - bm25_min).max(0.001);
-
-        // Normalize vector scores
-        let vector_max = vector_results
-            .iter()
-            .map(|r| r.score)
-            .fold(0.0_f64, |a, b| a.max(b));
-        let vector_min = vector_results
-            .iter()
-            .map(|r| r.score)
-            .fold(0.0_f64, |a, b| a.min(b));
-        let vector_range = (vector_max - vector_min).max(0.001);
-
-        let mut fused_map: HashMap<String, FusedSearchResult> = HashMap::new();
-
-        // Process BM25 results
-        for (rank, bm25) in bm25_results.iter().enumerate() {
-            let normalized_score = (bm25.score - bm25_min) / bm25_range;
-            fused_map.insert(
-                bm25.doc_id.clone(),
-                FusedSearchResult {
-                    doc_id: bm25.doc_id.clone(),
-                    bm25_score: bm25.score,
-                    vector_score: 0.0,
-                    fused_score: normalized_score,
-                    bm25_rank: rank + 1,
-                    vector_rank: usize::MAX,
-                    highlights: bm25.highlights.clone(),
-                    metadata: bm25.metadata.clone(),
-                },
-            );
-        }
-
-        // Process vector results and take maximum
-        for (rank, vector) in vector_results.iter().enumerate() {
-            let normalized_score = (vector.score - vector_min) / vector_range;
-
-            if let Some(existing) = fused_map.get_mut(&vector.doc_id) {
-                existing.fused_score = existing.fused_score.max(normalized_score);
-                existing.vector_score = vector.score;
-                existing.vector_rank = rank + 1;
-            } else {
-                fused_map.insert(
-                    vector.doc_id.clone(),
-                    FusedSearchResult {
-                        doc_id: vector.doc_id.clone(),
-                        bm25_score: 0.0,
-                        vector_score: vector.score,
-                        fused_score: normalized_score,
-                        bm25_rank: usize::MAX,
-                        vector_rank: rank + 1,
-                        highlights: None,
-                        metadata: vector.metadata.clone(),
-                    },
-                );
-            }
-        }
-
-        let mut fused_results: Vec<_> = fused_map.into_values().collect();
-        fused_results.sort_by(|a, b| {
-            b.fused_score
-                .partial_cmp(&a.fused_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        Ok(fused_results)
+        Ok(Self::fuse_by_score(
+            &bm25_results,
+            &vector_results,
+            |current, v| current.max(v),
+        ))
     }
 
     /// Condorcet fusion
@@ -1038,84 +932,13 @@ impl HybridFusionEngine {
         vector_results: Vec<VectorResult>,
         alpha: f64,
     ) -> Result<Vec<FusedSearchResult>, FusionError> {
-        // Normalize scores to [0,1] as belief functions
-        let bm25_max = bm25_results
-            .iter()
-            .map(|r| r.score)
-            .fold(0.0_f64, |a, b| a.max(b));
-        let bm25_min = bm25_results
-            .iter()
-            .map(|r| r.score)
-            .fold(0.0_f64, |a, b| a.min(b));
-        let bm25_range = (bm25_max - bm25_min).max(0.001);
-
-        let vector_max = vector_results
-            .iter()
-            .map(|r| r.score)
-            .fold(0.0_f64, |a, b| a.max(b));
-        let vector_min = vector_results
-            .iter()
-            .map(|r| r.score)
-            .fold(0.0_f64, |a, b| a.min(b));
-        let vector_range = (vector_max - vector_min).max(0.001);
-
-        let mut fused_map: HashMap<String, FusedSearchResult> = HashMap::new();
-
-        // Process BM25 results
-        for (rank, bm25) in bm25_results.iter().enumerate() {
-            let belief = (bm25.score - bm25_min) / bm25_range;
-            fused_map.insert(
-                bm25.doc_id.clone(),
-                FusedSearchResult {
-                    doc_id: bm25.doc_id.clone(),
-                    bm25_score: bm25.score,
-                    vector_score: 0.0,
-                    fused_score: belief,
-                    bm25_rank: rank + 1,
-                    vector_rank: usize::MAX,
-                    highlights: bm25.highlights.clone(),
-                    metadata: bm25.metadata.clone(),
-                },
-            );
-        }
-
-        // Combine using Dempster's rule (weighted combination)
-        for (rank, vector) in vector_results.iter().enumerate() {
-            let belief = (vector.score - vector_min) / vector_range;
-
-            if let Some(existing) = fused_map.get_mut(&vector.doc_id) {
-                // Dempster's combination rule with weighted alpha
-                let m1 = existing.fused_score;
-                let m2 = belief;
-                let combined = (m1 * m2) + (alpha * (m1 + m2 - 2.0 * m1 * m2));
-                existing.fused_score = combined;
-                existing.vector_score = vector.score;
-                existing.vector_rank = rank + 1;
-            } else {
-                fused_map.insert(
-                    vector.doc_id.clone(),
-                    FusedSearchResult {
-                        doc_id: vector.doc_id.clone(),
-                        bm25_score: 0.0,
-                        vector_score: vector.score,
-                        fused_score: belief,
-                        bm25_rank: usize::MAX,
-                        vector_rank: rank + 1,
-                        highlights: None,
-                        metadata: vector.metadata.clone(),
-                    },
-                );
-            }
-        }
-
-        let mut fused_results: Vec<_> = fused_map.into_values().collect();
-        fused_results.sort_by(|a, b| {
-            b.fused_score
-                .partial_cmp(&a.fused_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        Ok(fused_results)
+        // Dempster's combination rule with weighted alpha:
+        // `(m1 * m2) + alpha * (m1 + m2 - 2 * m1 * m2)`
+        Ok(Self::fuse_by_score(
+            &bm25_results,
+            &vector_results,
+            move |m1, m2| (m1 * m2) + (alpha * (m1 + m2 - 2.0 * m1 * m2)),
+        ))
     }
 
     /// Adaptive fusion
@@ -1409,6 +1232,77 @@ mod tests {
         assert_eq!(fused[0].doc_id, "doc1");
     }
 
+    fn fused_score_for(fused: &[FusedSearchResult], id: &str) -> f64 {
+        fused
+            .iter()
+            .find(|r| r.doc_id == id)
+            .unwrap_or_else(|| panic!("{id} should exist in fused results"))
+            .fused_score
+    }
+
+    /// Evenly-spaced scores, reversed across the two lists: under correct
+    /// min-max normalization every doc sits at (1,0)/(0.5,0.5)/(0,1), so
+    /// CombSUM ties all three at 1.0. Under a min fold seeded from 0.0 the
+    /// tie collapses into a strict (wrong) order 1.93/1.63/1.33.
+    #[test]
+    fn test_comb_sum_normalizes_with_true_min() {
+        let engine = HybridFusionEngine::new(FusionStrategy::CombSum);
+        let bm25 = vec![
+            make_bm25("doc_x", 3.0),
+            make_bm25("doc_y", 2.0),
+            make_bm25("doc_z", 1.0),
+        ];
+        let vector = vec![
+            make_vector("doc_x", 0.28),
+            make_vector("doc_y", 0.29),
+            make_vector("doc_z", 0.30),
+        ];
+
+        let fused = engine.fuse(bm25, vector).expect("fusion succeeds");
+
+        for id in ["doc_x", "doc_y", "doc_z"] {
+            let score = fused_score_for(&fused, id);
+            assert!(
+                (score - 1.0).abs() < 1e-9,
+                "{id} should tie at 1.0, got {score}"
+            );
+        }
+    }
+
+    /// All-negative vector scores: a max fold seeded from 0.0 computes
+    /// max = 0 and yields nonsense normalization; identity-seeded folds
+    /// (NEG_INFINITY max / INFINITY min) handle sign-uniform lists.
+    #[test]
+    fn test_comb_sum_survives_all_negative_scores() {
+        let engine = HybridFusionEngine::new(FusionStrategy::CombSum);
+        let bm25 = vec![make_bm25("doc_a", 1.0), make_bm25("doc_b", 0.5)];
+        let vector = vec![make_vector("doc_a", -0.2), make_vector("doc_b", -0.8)];
+
+        let fused = engine.fuse(bm25, vector).expect("fusion succeeds");
+
+        // Correct norms: bm25 (1.0, 0.0); vector ((-0.2+0.8)/0.6, 0.0) = (1.0, 0.0)
+        assert!((fused_score_for(&fused, "doc_a") - 2.0).abs() < 1e-9);
+        assert!(fused_score_for(&fused, "doc_b").abs() < 1e-9);
+    }
+
+    /// A constant (single-element) list now normalizes to 0.0 (min == max,
+    /// range clamps to 0.001). A min fold seeded from 0.0 normalized it to
+    /// 1.0 instead. NOTE: conditional_normalization deliberately maps
+    /// constant lists to 1.0; aligning that policy would be a separate,
+    /// intentional change.
+    #[test]
+    fn test_comb_sum_constant_list_normalizes_to_zero() {
+        let engine = HybridFusionEngine::new(FusionStrategy::CombSum);
+        let bm25 = vec![make_bm25("only", 1.0), make_bm25("other", 0.0)];
+        let vector = vec![make_vector("only", 0.5)];
+
+        let fused = engine.fuse(bm25, vector).expect("fusion succeeds");
+
+        // "only": bm25 norm 1.0 + constant-list vector norm 0.0
+        let score = fused_score_for(&fused, "only");
+        assert!((score - 1.0).abs() < 1e-9, "got {score}");
+    }
+
     #[test]
     fn test_comb_sum_normalization() {
         let engine = HybridFusionEngine::new(FusionStrategy::CombSum);
@@ -1478,8 +1372,12 @@ mod tests {
             .fuse(bm25_results, vector_results)
             .expect("Fusion should succeed");
 
-        // doc1: min(1.0, 0.8) = 0.8
-        // doc2: min(0.3, 0.9) = 0.3
+        // With true min-max normalization:
+        //   BM25 norms:   doc1 (1.0-0.3)/0.7 = 1.0, doc2 0.0
+        //   Vector norms: doc1 0.0,            doc2 (0.9-0.8)/0.1 = 1.0
+        // CombMin is pessimistic: each doc is capped by its WEAKEST list, and
+        // both docs sit at an opposite extreme, so both collapse to 0.0.
+        // (Under the old min-fold-from-0.0 bug doc1 won with min(1.0, 0.89).)
         let doc1 = fused
             .iter()
             .find(|r| r.doc_id == "doc1")
@@ -1489,7 +1387,33 @@ mod tests {
             .find(|r| r.doc_id == "doc2")
             .expect("doc2 should exist in fused results");
 
-        assert!(doc1.fused_score > doc2.fused_score);
+        assert!(doc1.fused_score.abs() < 1e-9);
+        assert!(doc2.fused_score.abs() < 1e-9);
+    }
+
+    /// Correct min-max normalization reverses the CombMin winner on the
+    /// reversed-fixture: doc_y is mediocre in both lists (0.5/0.5) and wins,
+    /// while the cross-list extremes (1,0) and (0,1) collapse to 0. A min
+    /// fold seeded from 0.0 used to crown doc_x instead.
+    #[test]
+    fn test_comb_min_uses_true_min_normalization() {
+        let engine = HybridFusionEngine::new(FusionStrategy::CombMin);
+        let bm25 = vec![
+            make_bm25("doc_x", 3.0),
+            make_bm25("doc_y", 2.0),
+            make_bm25("doc_z", 1.0),
+        ];
+        let vector = vec![
+            make_vector("doc_x", 0.28),
+            make_vector("doc_y", 0.29),
+            make_vector("doc_z", 0.30),
+        ];
+
+        let fused = engine.fuse(bm25, vector).expect("fusion succeeds");
+
+        assert!((fused_score_for(&fused, "doc_y") - 0.5).abs() < 1e-9);
+        assert!(fused_score_for(&fused, "doc_x").abs() < 1e-9);
+        assert!(fused_score_for(&fused, "doc_z").abs() < 1e-9);
     }
 
     // ==================== COMBMAX TESTS ====================
@@ -1554,6 +1478,29 @@ mod tests {
         // Both should have score 1.0 (they're tied)
         assert!((doc1.fused_score - 1.0).abs() < 0.01);
         assert!((doc2.fused_score - 1.0).abs() < 0.01);
+    }
+
+    /// CombMax discriminates on the middle doc: doc_y is 0.5 in both lists.
+    /// A min fold seeded from 0.0 scored it 0.9667 instead.
+    #[test]
+    fn test_comb_max_uses_true_min_normalization() {
+        let engine = HybridFusionEngine::new(FusionStrategy::CombMax);
+        let bm25 = vec![
+            make_bm25("doc_x", 3.0),
+            make_bm25("doc_y", 2.0),
+            make_bm25("doc_z", 1.0),
+        ];
+        let vector = vec![
+            make_vector("doc_x", 0.28),
+            make_vector("doc_y", 0.29),
+            make_vector("doc_z", 0.30),
+        ];
+
+        let fused = engine.fuse(bm25, vector).expect("fusion succeeds");
+
+        assert!((fused_score_for(&fused, "doc_x") - 1.0).abs() < 1e-9);
+        assert!((fused_score_for(&fused, "doc_y") - 0.5).abs() < 1e-9);
+        assert!((fused_score_for(&fused, "doc_z") - 1.0).abs() < 1e-9);
     }
 
     // ==================== CONDORCET TESTS ====================
@@ -1670,6 +1617,36 @@ mod tests {
         assert!(doc1.fused_score > doc2.fused_score);
         // Scores should be in [0,1] range (normalized beliefs)
         assert!(doc1.fused_score >= 0.0 && doc1.fused_score <= 1.0);
+    }
+
+    /// With identity-seeded normalization folds the symmetric fixture
+    /// combines to a three-way 0.5 tie under Dempster-Shafer (alpha 0.5):
+    /// each doc's belief pair is (1,0), (0.5,0.5) or (0,1), and
+    /// m1*m2 + 0.5*(m1+m2-2*m1*m2) = 0.5 for all three. Folds seeded from
+    /// 0.0 produced a strict 0.97/0.82/0.67 ordering instead.
+    #[test]
+    fn test_dempster_shafer_symmetric_fixture_ties() {
+        let engine = HybridFusionEngine::new(FusionStrategy::DempsterShafer { alpha: 0.5 });
+        let bm25 = vec![
+            make_bm25("doc_x", 3.0),
+            make_bm25("doc_y", 2.0),
+            make_bm25("doc_z", 1.0),
+        ];
+        let vector = vec![
+            make_vector("doc_x", 0.28),
+            make_vector("doc_y", 0.29),
+            make_vector("doc_z", 0.30),
+        ];
+
+        let fused = engine.fuse(bm25, vector).expect("fusion succeeds");
+
+        for id in ["doc_x", "doc_y", "doc_z"] {
+            let score = fused_score_for(&fused, id);
+            assert!(
+                (score - 0.5).abs() < 1e-9,
+                "{id} should tie at 0.5, got {score}"
+            );
+        }
     }
 
     #[test]

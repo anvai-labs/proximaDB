@@ -36,6 +36,13 @@ pub trait ObjectStoreBridge: Send + Sync {
     /// Returns a reference to the underlying `ObjectStore` implementation.
     fn inner_store(&self) -> Arc<dyn ObjectStore>;
 
+    /// The key in [`inner_store`](Self::inner_store) of a bridge-relative `key`
+    /// (a bridge rooted under a base prefix prepends it). For writers that go to
+    /// the store directly, e.g. multipart uploads. Default: the key itself.
+    fn object_store_path(&self, key: &Path) -> Path {
+        key.clone()
+    }
+
     /// Reads a Parquet file from object storage and yields a stream of Arrow `RecordBatch`es.
     /// This is the primary ingestion path for DataFusion logical plans.
     async fn read_parquet_batches(
@@ -304,6 +311,41 @@ pub trait ObjectStoreBridge: Send + Sync {
         ))
     }
 
+    /// Publish exactly `files` (keys of parquet objects the caller wrote) as a spec-shaped
+    /// Iceberg snapshot committed as the successor of metadata version `parent` (`None` ⇒
+    /// the first). Returns the committed version. Nothing is listed, so a data prefix
+    /// holding several generations publishes only this one. Losing the race for the
+    /// successor slot is an `Err(StorageError::AlreadyExists)`, never success.
+    /// Default: unsupported.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_iceberg_files(
+        &self,
+        files: &[Path],
+        parent: Option<u64>,
+        metadata_prefix: &str,
+        table_uuid: &str,
+        table_location: &str,
+        fields: &[IcebergSnapshotField],
+        snapshot_id: i64,
+        timestamp_ms: i64,
+        v3: bool,
+    ) -> Result<u64, StorageError> {
+        let _ = (
+            files,
+            parent,
+            metadata_prefix,
+            table_uuid,
+            table_location,
+            fields,
+            snapshot_id,
+            timestamp_ms,
+            v3,
+        );
+        Err(StorageError::Serialization(
+            "publish_iceberg_files not supported".into(),
+        ))
+    }
+
     /// Resolve the current snapshot's data-file paths from the Iceberg metadata log at
     /// `metadata_prefix` (decodes `TableMetadata` → manifest list → manifests). Default: empty.
     async fn read_iceberg_table(
@@ -314,6 +356,97 @@ pub trait ObjectStoreBridge: Send + Sync {
         let _ = (metadata_prefix, version);
         Ok(Vec::new())
     }
+
+    /// The current snapshot's data files **and the deletion vectors that apply to
+    /// them**, as one view (the snapshot's rows are its data files minus each
+    /// file's deleted positions).
+    ///
+    /// The default keeps the pre-delete behavior of bridges that never publish
+    /// vectors: the data files of [`read_iceberg_table`](Self::read_iceberg_table)
+    /// and no deletions. A bridge that CAN publish vectors must override this and
+    /// refuse a snapshot carrying them if it cannot represent them — never return
+    /// the deleted rows as live.
+    async fn read_iceberg_snapshot_files(
+        &self,
+        metadata_prefix: &str,
+        version: u64,
+    ) -> Result<IcebergSnapshotFiles, StorageError> {
+        Ok(IcebergSnapshotFiles {
+            data_files: self.read_iceberg_table(metadata_prefix, version).await?,
+            deletion_vectors: Vec::new(),
+        })
+    }
+
+    /// [`publish_iceberg_files`](Self::publish_iceberg_files) carrying `deletes`:
+    /// the committed snapshot is `files` with each vector's positions deleted.
+    /// Format v3 only; the engine validates that every vector references one of
+    /// `files` and no file has two. Default: unsupported.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_iceberg_files_deleting(
+        &self,
+        _files: &[Path],
+        _deletes: &[IcebergSnapshotDeletion],
+        _parent: Option<u64>,
+        _metadata_prefix: &str,
+        _table_uuid: &str,
+        _table_location: &str,
+        _fields: &[IcebergSnapshotField],
+        _snapshot_id: i64,
+        _timestamp_ms: i64,
+    ) -> Result<u64, StorageError> {
+        Err(StorageError::Serialization(
+            "publish_iceberg_files_deleting not supported".into(),
+        ))
+    }
+
+    /// EXACT row positions of `oids` in each of `files`, read from the hidden
+    /// `__proxima_oid` column: every occurrence, counted over every row (null
+    /// cells included, so positions stay aligned with the file). Files holding
+    /// none of the oids are omitted. A file without the oid column fails
+    /// closed. Default: unsupported.
+    async fn published_oid_positions(
+        &self,
+        _files: &[Path],
+        _oids: &[&str],
+    ) -> Result<Vec<FileOidPositions>, StorageError> {
+        Err(StorageError::Serialization(
+            "published_oid_positions not supported".into(),
+        ))
+    }
+
+    /// The deleted positions one published deletion vector holds. Default:
+    /// unsupported.
+    async fn read_deletion_vector_positions(
+        &self,
+        _vector: &IcebergSnapshotDeletion,
+    ) -> Result<Vec<u64>, StorageError> {
+        Err(StorageError::Serialization(
+            "read_deletion_vector_positions not supported".into(),
+        ))
+    }
+
+    /// Write one Puffin at `puffin_key` (create-only) holding one deletion
+    /// vector per `(data file, positions)` entry, returning their manifest
+    /// descriptors for `publish_iceberg_files_deleting`. Default: unsupported.
+    async fn write_deletion_vector_positions(
+        &self,
+        _puffin_key: &Path,
+        _vectors: &[(Path, Vec<u64>)],
+    ) -> Result<Vec<IcebergSnapshotDeletion>, StorageError> {
+        Err(StorageError::Serialization(
+            "write_deletion_vector_positions not supported".into(),
+        ))
+    }
+}
+
+/// The exact row positions some oids occupy in one published data file
+/// (see [`ObjectStoreBridge::published_oid_positions`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileOidPositions {
+    /// The data file, as the snapshot names it.
+    pub file: Path,
+    /// Sorted, de-duplicated row positions (0-based, in file order).
+    pub positions: Vec<u64>,
 }
 
 /// Storage-common-local descriptor of one Iceberg schema field (the trait can't reference
@@ -325,4 +458,239 @@ pub struct IcebergSnapshotField {
     pub name: String,
     pub type_name: String,
     pub required: bool,
+}
+
+/// One deletion vector of a published snapshot, resolved to bridge-relative keys
+/// (foundation-local mirror of the engine's descriptor — same pattern as
+/// [`IcebergSnapshotField`]: the trait cannot name the engine's types). A reader
+/// applies it by hiding `data_file`'s positions named by the vector's blob in
+/// `puffin_file`; a re-publisher passes it back to
+/// [`ObjectStoreBridge::publish_iceberg_files_deleting`] to carry the deletes forward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IcebergSnapshotDeletion {
+    /// The data file whose rows it deletes (one of the snapshot's data files).
+    pub data_file: Path,
+    /// The Puffin file holding the vector, and its blob's byte range + size there.
+    pub puffin_file: Path,
+    pub content_offset: u64,
+    pub content_size_in_bytes: u64,
+    /// The Puffin file's full size (the delete-manifest entry's `file_size_in_bytes`).
+    pub puffin_file_size_in_bytes: u64,
+    /// The number of deleted positions.
+    pub cardinality: u64,
+}
+
+/// A published snapshot's data files and the deletion vectors that apply to them
+/// (its rows are the data files minus each vector's positions).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IcebergSnapshotFiles {
+    pub data_files: Vec<Path>,
+    pub deletion_vectors: Vec<IcebergSnapshotDeletion>,
+}
+
+impl IcebergSnapshotFiles {
+    /// True when the snapshot carries deletion vectors — a reader that cannot
+    /// apply them must refuse rather than serve the deleted rows.
+    pub fn has_deletions(&self) -> bool {
+        !self.deletion_vectors.is_empty()
+    }
+}
+
+/// Map an Arrow schema to the Iceberg snapshot fields, ids 1..n in arrow order
+/// (the single mapping every publisher uses — MATERIALIZE and the DataFusion
+/// bulk-append executor must not drift apart on field ids or type names).
+pub fn iceberg_snapshot_fields(schema: &arrow_schema::Schema) -> Vec<IcebergSnapshotField> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| IcebergSnapshotField {
+            id: (i + 1) as i32,
+            name: f.name().clone(),
+            type_name: iceberg_type_for(f.data_type()),
+            required: !f.is_nullable(),
+        })
+        .collect()
+}
+
+/// The Arrow → Iceberg type-name mapping, chosen to keep external Iceberg readers'
+/// schema aligned with the Parquet physical types. Timestamps map to the v3
+/// nanosecond types (ProximaDB is nanosecond-native).
+pub fn iceberg_type_for(arrow: &arrow_schema::DataType) -> String {
+    use arrow_schema::{DataType as D, TimeUnit};
+    match arrow {
+        D::Boolean => "boolean".into(),
+        D::Int8 | D::Int16 | D::Int32 => "int".into(),
+        D::Int64 | D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64 => "long".into(),
+        D::Float16 | D::Float32 => "float".into(),
+        D::Float64 => "double".into(),
+        D::Date32 | D::Date64 => "date".into(),
+        D::Decimal128(p, s) | D::Decimal256(p, s) => format!("decimal({p},{s})"),
+        // Iceberg's v2 `timestamp` is microseconds; nanoseconds need v3's `_ns` types
+        // (see `iceberg_needs_v3`).
+        D::Timestamp(TimeUnit::Nanosecond, Some(_)) => "timestamptz_ns".into(),
+        D::Timestamp(TimeUnit::Nanosecond, None) => "timestamp_ns".into(),
+        D::Timestamp(_, Some(_)) => "timestamptz".into(),
+        D::Timestamp(_, None) => "timestamp".into(),
+        D::Utf8 | D::LargeUtf8 => "string".into(),
+        D::FixedSizeBinary(n) => format!("fixed[{n}]"),
+        D::Binary | D::LargeBinary => "binary".into(),
+        // JSON columns materialize as Utf8 today; v3 `variant` is a follow-up.
+        _ => "string".into(),
+    }
+}
+
+/// ADR-097 D3: publish Iceberg **v2** — the version external readers (PyIceberg,
+/// DuckDB, Trino) verifiably read — unless a column needs a v3-only type
+/// (nanosecond timestamps). This is the *requested*
+/// version; the engine additionally refuses to downgrade an already-v3 table.
+pub fn iceberg_needs_v3(fields: &[IcebergSnapshotField]) -> bool {
+    fields.iter().any(|f| f.type_name.ends_with("_ns"))
+}
+
+/// TD-USUB-10 3c rung 1 — the **new-table v3 policy**, the activation ladder's
+/// controllable rung. A table publishes v3 when a column needs a v3-only type
+/// (any table, any snapshot) OR the operator armed the default
+/// (`PROXIMADB_ICEBERG_V3_DEFAULT`, unset ⇒ v2) **and this is the table's
+/// first publication**.
+///
+/// The first-publication guard is what makes the knob unable to touch existing
+/// tables — the engine floor alone does not: the floor is one-way against
+/// DOWNgrades, but it honors a caller-driven v3 request onto a v2 parent (an
+/// upgrade). Without the guard, arming the knob would silently upgrade every
+/// existing v2 table at its next publication. With it, an existing table only
+/// moves to v3 through `_ns` types or the atomic delete-carry commit (pinned by
+/// `a_v2_parent_upgrades_to_v3_atomically_when_it_carries_deletes`). Deletion
+/// vectors always require v3 at the engine seam regardless. Flipping the
+/// default on is gated on the ladder's lineage/external read-back proofs.
+pub fn iceberg_publishes_v3(fields: &[IcebergSnapshotField], first_publication: bool) -> bool {
+    iceberg_needs_v3(fields)
+        || (first_publication
+            && std::env::var_os("PROXIMADB_ICEBERG_V3_DEFAULT").is_some_and(|v| {
+                matches!(
+                    v.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            }))
+}
+
+/// A stable, well-formed UUID string derived deterministically from the table's object
+/// prefix, so an Iceberg table keeps the same `table-uuid` across re-materializations
+/// (no `uuid` v5 dependency; two seeded hashes fill the 16 bytes).
+pub fn deterministic_table_uuid(prefix: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h1 = std::collections::hash_map::DefaultHasher::new();
+    prefix.hash(&mut h1);
+    let a = h1.finish();
+    let mut h2 = std::collections::hash_map::DefaultHasher::new();
+    (prefix, 0x50524f58_4944425fu64).hash(&mut h2); // "PROX_IDB_" salt
+    let b = h2.finish();
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (a >> 32) as u32,
+        (a >> 16) as u16,
+        a as u16,
+        (b >> 48) as u16,
+        b & 0x0000_ffff_ffff_ffff
+    )
+}
+
+#[cfg(test)]
+mod v3_policy_tests {
+    use super::*;
+    // edition-2024 marks env mutation unsafe. The policy reads the var per
+    // call; these tests are its only mutators. CI runs them under nextest
+    // (one process per test), but a local `cargo test --lib` shares one
+    // process across parallel tests — serialize on a mutex so the env is
+    // never observed mid-mutation locally either.
+    use std::env;
+    use std::sync::{Mutex, OnceLock};
+
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set(name: &str, value: &str) {
+        // SAFETY: test-only; no parallel reader of this var exists here.
+        unsafe { env::set_var(name, value) }
+    }
+    fn unset(name: &str) {
+        // SAFETY: test-only; no parallel reader of this var exists here.
+        unsafe { env::remove_var(name) }
+    }
+
+    fn plain() -> Vec<IcebergSnapshotField> {
+        vec![IcebergSnapshotField {
+            id: 1,
+            name: "age".into(),
+            type_name: "long".into(),
+            required: false,
+        }]
+    }
+    fn ns() -> Vec<IcebergSnapshotField> {
+        vec![IcebergSnapshotField {
+            id: 1,
+            name: "at".into(),
+            type_name: "timestamp_ns".into(),
+            required: false,
+        }]
+    }
+
+    /// TD-USUB-10 3c rung 1: the knob is default-OFF — plain fields stay v2
+    /// (today's external-reader-verified behavior) and _ns keeps forcing v3.
+    #[test]
+    fn new_table_policy_defaults_to_v2() {
+        let _guard = lock();
+        unset("PROXIMADB_ICEBERG_V3_DEFAULT");
+        assert!(!iceberg_publishes_v3(&plain(), true));
+        assert!(iceberg_publishes_v3(&ns(), true), "_ns always needs v3");
+        assert!(
+            iceberg_publishes_v3(&ns(), false),
+            "_ns needs v3 on any snapshot"
+        );
+    }
+
+    /// Armed, a NEW plain table publishes v3 (the activation rung). The knob
+    /// only affects the REQUEST: existing tables follow the engine floor.
+    #[test]
+    fn armed_default_publishes_new_tables_as_v3() {
+        let _guard = lock();
+        set("PROXIMADB_ICEBERG_V3_DEFAULT", "1");
+        assert!(iceberg_publishes_v3(&plain(), true));
+        unset("PROXIMADB_ICEBERG_V3_DEFAULT");
+        assert!(!iceberg_publishes_v3(&plain(), true), "unset restores v2");
+    }
+
+    /// Round-1 review finding: the engine floor honors a caller-driven v3
+    /// request onto a v2 parent (an upgrade), so WITHOUT the first-publication
+    /// guard, arming the knob would silently upgrade every existing v2 table
+    /// at its next publication.
+    #[test]
+    fn the_armed_default_never_touches_an_existing_table() {
+        let _guard = lock();
+        set("PROXIMADB_ICEBERG_V3_DEFAULT", "1");
+        assert!(
+            !iceberg_publishes_v3(&plain(), false),
+            "a successor publication keeps requesting v2 even with the knob armed"
+        );
+        unset("PROXIMADB_ICEBERG_V3_DEFAULT");
+    }
+
+    /// Only truthy spellings arm it: `=0` is an explicit OFF, matching the
+    /// env-gate convention (PAXRG-1's kill-switch spelling).
+    #[test]
+    fn zero_and_falsy_spellings_do_not_arm_it() {
+        let _guard = lock();
+        for value in ["0", "false", "no", "off", ""] {
+            set("PROXIMADB_ICEBERG_V3_DEFAULT", value);
+            assert!(
+                !iceberg_publishes_v3(&plain(), true),
+                "={value} must not arm v3"
+            );
+        }
+        unset("PROXIMADB_ICEBERG_V3_DEFAULT");
+    }
 }

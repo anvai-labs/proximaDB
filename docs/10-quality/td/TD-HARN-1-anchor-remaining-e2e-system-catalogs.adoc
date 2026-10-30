@@ -1,0 +1,35 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-HARN-1: ~45 remaining e2e harnesses still share the CWD-relative system catalog
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Swept 2026-10-19 while fixing PR #2072's CI flake (`rel_having_aggregate_e2e` and three siblings: 42P01 `Table 'ps' already exists` under concurrent nextest).
+| Priority | **P3** — latent flakes only. A harness fails when two concurrently running test processes perform same-named DDL; most of the 45 never do, which is why they have stayed green. But every new same-named-DDL harness is a future CI red.
+| Component | `tests/*.rs` harnesses that build `Config::default()` and anchor `data_dir`/`storage_locations`/WAL to a TempDir but leave `storage.metadata_url` at the CWD-relative `file://./metadata` default (`src/core/config.rs`), sharing one system catalog across processes. The defect family is TD-CONV-1; the tpch (PR #1898), cdc, authz and the four rel_* harnesses are already anchored.
+| Evidence | `grep -L metadata_url tests/*.rs` filtered to files with `Config::default()` + `wal_config.write_buffer_directory`: 45 files, incl. `rel_agg_arith_projection_e2e.rs`, `native_join_pgwire_e2e.rs`, `pgwire_fk_referential_actions_e2e.rs`, `ident_case_fold_e2e.rs`, `fp16_*`, `graph_*`, `flight_*`, `vector_ann_recall_e2e.rs`, `release_smoke_v2.rs` (full list reproducible with the grep above). The worktree's shared `metadata/system-catalog.wal` accretes entries from every local run.
+|===
+
+== The debt
+
+One mechanical line per harness, next to the existing WAL-directory anchor:
+
+[source,rust]
+----
+config.storage.metadata_url = format!("file://{}/metadata", tmp.path().display());
+----
+
+Caveats that make it a sweep, not a sed:
+
+* A few files are benches or non-server harnesses (`flight_v2_bench.rs` et al.) — verify each
+  actually starts a server before touching it.
+* Each anchored harness must be run at least once (its suite, or the shared lane) — an anchor
+  can surface a previously masked same-name collision.
+* Batch by domain (rel/pgwire, fp16, graph, flight, misc) so a regression bisects cleanly.
+
+== Direction
+
+Mechanical PR series (or one PR, batched commits per domain) anchoring all 45; then a guard —
+a script/checker that fails when a new `tests/*.rs` starts a server (`Config::default()` +
+WAL dir) without a `metadata_url` anchor, mirroring the tpch fix's precedent (PR #1898).

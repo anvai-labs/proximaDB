@@ -52,6 +52,30 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: "metal"
         update-types: ["version-update:semver-major"]
+      # ort ignore REMOVED with TD-ORT-1: rc.15+ builds again (one
+      # process-wide environment owned by proximadb-onnx-runtime), so bumps
+      # can flow through the group.
+      # rand_chacha 0.9 pulls a second rand_core (0.9) while all 19 ChaCha*Rng
+      # call sites import SeedableRng from rand 0.8 (rand_core 0.6) — E0599
+      # dual-trait scope error at every site. Streams are verified bit-identical
+      # 0.3.1 <-> 0.9.0 (seed_from_u64 and from_seed), so the upgrade is a
+      # mechanical trait-import migration, tracked in TD-DEPS-2's open list.
+      - dependency-name: "rand_chacha"
+        versions: [">=0.4"]
+      # arrow 60 is not admitted by datafusion 55.x (which rides arrow 59.x):
+      # dependabot #2179's lock split the family three ways (60.0.0 beside
+      # datafusion's 59.3.x and duckdb's 58.3.0) — arrow/datafusion/parquet
+      # must move as one coordinated family (TD-DEPS-2 open list).
+      - dependency-name: "arrow"
+        versions: [">=60"]
+      - dependency-name: "arrow-array"
+        versions: [">=60"]
+      - dependency-name: "arrow-buffer"
+        versions: [">=60"]
+      - dependency-name: "arrow-data"
+        versions: [">=60"]
+      - dependency-name: "arrow-schema"
+        versions: [">=60"]
     groups:
       cargo-minor-patch:
         update-types: ["minor", "patch"]

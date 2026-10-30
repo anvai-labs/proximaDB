@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Partial: first slice shipped (2026-09-21, #1917) — a native table provider registers non-Parquet relational tables with DataFusion, default-OFF behind `PROXIMADB_NATIVE_TABLE_PROVIDER`; TD-USUB-3 rides the same gate (#1919). Open: the default-ON flip (with the gate OFF — the default — a bare window function on a native table still returns a silently wrong answer, pinned KNOWN-BAD), an explicit typed decline for tables with no registered provider, and the evidence gate below.**
+| Status | **Partial: first slice shipped (2026-09-21, #1917) — a native table provider registers non-Parquet relational tables with DataFusion, default-OFF behind `PROXIMADB_NATIVE_TABLE_PROVIDER`; TD-USUB-3 rides the same gate (#1919). Open: the default-ON flip (with the gate OFF — the default — a bare window function on a native table now declines with `0A000` instead of returning a silently wrong answer), an explicit typed decline for tables with no registered provider, and the evidence gate below.**
 | Priority | **HIGH — escalated during implementation.** Not only a usability cliff: on the native path a bare window function returns a **silently wrong answer**, not an error. See "Escalation".
 | Component | `src/query/execution/native_table_provider.rs` (new), `src/network/postgres/relational_pipeline.rs`, `src/query/execution/datafusion_engine.rs`, `src/query/compute_scheduler.rs`
 | Relates to | ADR-094 (Phase 1, defect **b**), link:TD-USUB-3-abac-silently-removes-sql-capability.adoc[TD-USUB-3] (shares the gate), **TD-187** (the same defect, fixed only for materialized tables), ADR-039 (leakage ratchet — lane discipline), TD-USUB-3 (the identity-derived sibling), TD-USUB-5, TD-USUB-9 (route-stamp integrity)
@@ -17,6 +17,7 @@
 * Finding: `allow_engine_sql_fallback = true` appeared at exactly one call site (the DataFusion floor in `relational_pipeline.rs`), so the whole `classify_unsupported` set (subquery, having, join, group_by, distinct, window) plus `DISTINCT ON`, `GROUP BY ALL`, `NATURAL JOIN`/`USING`, correlated scalar subqueries, `EXISTS`/`IN (SELECT)`, UDTFs and FROM-less `SELECT` — and a second tier `logical_lowering.rs` declines (semi/anti join without `ON`, null-aware anti join, `SUM`/`AVG(DISTINCT)`, `StringAgg`, `||`) — was reachable only on `parquet_backed` tables, i.e. after `ALTER TABLE … MATERIALIZE`. The CTE decline even named the workaround.
 * **Lesson — not a storage problem.** Parquet was incidental: it was merely the only format with a registered table provider. The cliff closes by registering a provider through the existing ADR-039-legal `ProximaTableProvider` seam, with zero format change, zero publication, zero write amplification.
 * Shipped: `src/query/execution/native_table_provider.rs`, gate `PROXIMADB_NATIVE_TABLE_PROVIDER` (registered in `ENV_GATE_REGISTRY`, OFF). With it ON, window functions on native tables return real values. E2E: `tests/native_table_capability_parity_e2e.rs`.
+* Shipped (ADR-097 P3.1 PR 8): a query **mixing** Parquet-backed and native tables reaches the DataFusion floor too. It used to fit neither arm — the Parquet arm needs every table Parquet-backed, the native arm none — and fell back to Volcano, which declines a window function. With the gate ON and an ungoverned session (the Parquet side reads files and cannot apply an ABAC row filter, as on the Parquet arm), the floor registers the Parquet tables (with their ADR-025 delta merge) and the native ones side by side, each table exactly once. E2E: `tests/mixed_parquet_native_e2e.rs` (gate OFF declines; gate ON answers a join + window + aggregate over a materialized table with a post-snapshot update and a native one, by value).
 
 == Open
 
@@ -44,9 +45,14 @@ That makes this TD a **mandate #1 violation** (fail closed, never silently wrong
 why its priority is raised. Registering a provider routes these shapes to DataFusion's real
 window executor, turning a wrong answer into a correct one.
 
-The behaviour is pinned **KNOWN-BAD** in the e2e for the gate-OFF path (ADR-040 pattern), so
-that when the legacy path is repaired or the gate flips default-ON, the assertion trips and
-the pin is removed deliberately rather than by accident.
+**Fixed (fail-closed).** When lowering declines on pgwire's relational pipeline and the
+top-level projection carries a window function, `try_run_select` (`relational_pipeline.rs`)
+no longer returns `None` to the legacy single-table path; it returns SQLSTATE `0A000`
+naming the function (e.g. `window function lag() OVER (...)`) and telling the user to set
+`PROXIMADB_NATIVE_TABLE_PROVIDER=1` or `ALTER TABLE … MATERIALIZE`. With the gate ON the
+DataFusion route serves the query before this point, unchanged. The former KNOWN-BAD pin in
+`tests/native_table_capability_parity_e2e.rs` (`native_table_capability_parity`) now asserts
+the `0A000` decline; the gate-ON phase still asserts the real `LAG` deltas.
 
 === How to apply
 

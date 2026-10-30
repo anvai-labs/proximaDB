@@ -23,15 +23,9 @@ import asyncio
 
 import pytest
 
-from proximadb_sdk.chunking_strategies.base import (
-    ChunkingConfig,
-    ChunkingStrategy,
-)
+from proximadb_sdk.chunking_strategies.base import ChunkingConfig, ChunkingStrategy
 from proximadb_sdk.chunking_strategies.factory import ChunkingStrategyFactory
-from proximadb_sdk.chunking_strategies.pipeline import (
-    ChunkingPipeline,
-    PipelineConfig,
-)
+from proximadb_sdk.chunking_strategies.pipeline import ChunkingPipeline, PipelineConfig
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers

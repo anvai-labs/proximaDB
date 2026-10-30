@@ -413,21 +413,36 @@ impl RecordOpsService {
         debug!("Collection ID cache cleared");
     }
 
+    /// Resolve a client identifier to the canonical collection id for a request
+    /// acting as `request_tenant`: a collection that tenant may not resolve is
+    /// `None`, exactly like a missing one (the one ownership rule). `None`
+    /// tenant (and no tenant context) is an internal lookup.
+    /// The tenant scope for a collection lookup: the context's tenant, else
+    /// the request's, else the default — never unscoped.
+    fn collection_lookup_scope<'a>(
+        tenant_context: Option<&'a crate::storage::tenant::TenantContext>,
+        request_tenant: Option<&'a str>,
+    ) -> &'a str {
+        tenant_context
+            .map(|ctx| ctx.tenant_id.as_str())
+            .or(request_tenant)
+            .unwrap_or(proximadb_tenant::DEFAULT_TENANT)
+    }
+
     pub(crate) async fn resolve_collection_id_internal(
         &self,
         collection_identifier: &str,
         tenant_context: Option<&crate::storage::tenant::TenantContext>,
+        request_tenant: Option<&str>,
     ) -> Result<Option<String>> {
-        if let Some(tenant_ctx) = tenant_context {
-            Ok(self
-                .collection_service
-                .get_collection_with_tenant_context(collection_identifier, Some(tenant_ctx))
-                .await?
-                .map(|collection| collection.id))
-        } else {
-            self.resolve_collection_id_cached(collection_identifier)
-                .await
-        }
+        // Always resolved within a tenant: the context's, else the request's,
+        // else the default tenant — never unscoped.
+        let scope = Self::collection_lookup_scope(tenant_context, request_tenant);
+        Ok(self
+            .collection_service
+            .collection_for_tenant(collection_identifier, Some(scope))
+            .await?
+            .map(|collection| collection.id))
     }
 
     /// Resolve BOTH the canonical collection id AND its display name from a
@@ -442,26 +457,22 @@ impl RecordOpsService {
         &self,
         collection_identifier: &str,
         tenant_context: Option<&crate::storage::tenant::TenantContext>,
+        request_tenant: Option<&str>,
     ) -> Result<Option<(String, String)>> {
-        if let Some(tenant_ctx) = tenant_context {
-            Ok(self
-                .collection_service
-                .get_collection_with_tenant_context(collection_identifier, Some(tenant_ctx))
-                .await?
-                .map(|collection| {
-                    let name = collection
-                        .config
-                        .as_ref()
-                        .map(|c| c.name.clone())
-                        .unwrap_or_else(|| collection_identifier.to_string());
-                    (collection.id, name)
-                }))
-        } else {
-            Ok(self
-                .resolve_collection_id_cached(collection_identifier)
-                .await?
-                .map(|id| (id, collection_identifier.to_string())))
-        }
+        // Always resolved within a tenant (see `resolve_collection_id_internal`).
+        let scope = Self::collection_lookup_scope(tenant_context, request_tenant);
+        Ok(self
+            .collection_service
+            .collection_for_tenant(collection_identifier, Some(scope))
+            .await?
+            .map(|collection| {
+                let name = collection
+                    .config
+                    .as_ref()
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| collection_identifier.to_string());
+                (collection.id, name)
+            }))
     }
 
     /// Resolve name or object id to one canonical identity for protocol
@@ -472,8 +483,12 @@ impl RecordOpsService {
         tenant_id: Option<&str>,
     ) -> Result<Option<(String, String)>> {
         let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
-        self.resolve_collection_id_and_name(collection_identifier, tenant_context.as_ref())
-            .await
+        self.resolve_collection_id_and_name(
+            collection_identifier,
+            tenant_context.as_ref(),
+            tenant_id,
+        )
+        .await
     }
 
     // ---- precision coercion (TD-080/TD-082) ----
@@ -547,41 +562,190 @@ impl RecordOpsService {
 
     // ---- record-batch orchestration ----
 
+    /// Load the tenant context and resolve the request's collection — the
+    /// shared opening of every record-batch handler. `Ok(None)` in the second
+    /// slot means the collection was not found (each handler surfaces that
+    /// its own way).
+    async fn resolve_record_batch_collection(
+        &self,
+        request_collection_id: &str,
+        tenant_id: Option<&str>,
+    ) -> Result<(
+        Option<crate::storage::tenant::TenantContext>,
+        Option<(String, String)>,
+    )> {
+        let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
+        let resolved = self
+            .resolve_collection_id_and_name(
+                request_collection_id,
+                tenant_context.as_ref(),
+                tenant_id,
+            )
+            .await?;
+        Ok((tenant_context, resolved))
+    }
+
+    /// Schema-validate a rich record batch when a DML service is present —
+    /// shared gate of the upsert/insert-only handlers (surfaces as a failed
+    /// result with `SCHEMA_VALIDATION_FAILED`, never a hard error).
+    async fn validate_batch_schema(
+        &self,
+        tenant_id: Option<&str>,
+        collection_name: &str,
+        records: &[proximadb_records::ProximaRecord],
+    ) -> Result<Option<BatchOperationResult>> {
+        if let Some(dml_svc) = self.get_dml_service()
+            && let Err(e) = dml_svc
+                .validate_record_batch_against_schema(
+                    collection_name,
+                    Some(&proximadb_tenant::resolve_request_tenant(tenant_id)),
+                    records,
+                )
+                .await
+        {
+            return Ok(Some(BatchOperationResult::failure(
+                format!("Schema validation failed: {}", e),
+                "SCHEMA_VALIDATION_FAILED".to_string(),
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Shared write gates of the record-batch handlers: WAL lane enforcement
+    /// then the collection-lease check, both surfacing as a failed
+    /// `BatchOperationResult` with their canonical error codes.
+    async fn enforce_record_batch_gates(
+        &self,
+        tenant_id: &str,
+        collection_name: &str,
+        collection_id: &str,
+        lane_kind: WriteOperationKind,
+        batch_len: u64,
+        lane_label: &str,
+    ) -> Result<Option<BatchOperationResult>> {
+        if let Err(e) =
+            enforce_wal_lane_for_record_batch(collection_name, lane_kind, batch_len, lane_label)
+        {
+            return Ok(Some(BatchOperationResult::failure(
+                e,
+                "WAL_LANE_REJECTED".to_string(),
+            )));
+        }
+        if let Err(e) = self
+            .ensure_collection_lease(tenant_id, collection_name, collection_id)
+            .await
+        {
+            return Ok(Some(BatchOperationResult::failure(
+                e.to_string(),
+                "LEASE_NOT_HELD".to_string(),
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Schema validation + the shared write gates in one step — the full
+    /// preamble of the upsert/insert-only handlers (each failure surfaces as
+    /// a failed `BatchOperationResult`, never a hard error).
+    async fn validate_and_gate_record_batch(
+        &self,
+        tenant_id: Option<&str>,
+        collection_name: &str,
+        collection_id: &str,
+        records: &[proximadb_records::ProximaRecord],
+        lane_kind: WriteOperationKind,
+        lane_label: &str,
+    ) -> Result<Option<BatchOperationResult>> {
+        if let Some(failure) = self
+            .validate_batch_schema(tenant_id, collection_name, records)
+            .await?
+        {
+            return Ok(Some(failure));
+        }
+        self.enforce_record_batch_gates(
+            tenant_id.unwrap_or(""),
+            collection_name,
+            collection_id,
+            lane_kind,
+            records.len() as u64,
+            lane_label,
+        )
+        .await
+    }
+
+    /// Bump the collection's row-count stats by `n` (no-op without a DML
+    /// service) — shared by the record-batch handlers.
+    async fn bump_batch_row_count(&self, tenant_id: Option<&str>, collection_name: &str, n: i64) {
+        if let Some(dml_svc) = self.get_dml_service() {
+            dml_svc
+                .bump_row_count_stats(
+                    collection_name,
+                    Some(&proximadb_tenant::resolve_request_tenant(tenant_id)),
+                    n,
+                )
+                .await;
+        }
+    }
+
+    /// Map an insert outcome to the batch result — shared by the upsert and
+    /// insert-only handlers. Bumps row stats on success; on failure preserves
+    /// the `WalBackpressure` discriminant (ADR-069 S4) so the boundary
+    /// surfaces 429 / RESOURCE_EXHAUSTED (retryable) instead of a generic
+    /// RECORD_INSERT_FAILED. `label` names the failure log line.
+    async fn map_insert_batch_result(
+        &self,
+        tenant_id: Option<&str>,
+        collection_name: &str,
+        outcome: Result<BatchOperationResult>,
+        log_label: &str,
+    ) -> BatchOperationResult {
+        match outcome {
+            Ok(result) => {
+                if result.success {
+                    let n = result.vector_ids.len() as i64;
+                    self.bump_batch_row_count(tenant_id, collection_name, n)
+                        .await;
+                }
+                result
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Failed to process {}rich record batch: {:?}",
+                    log_label,
+                    error
+                );
+                let error_code = crate::storage::persistence::write_ahead_log::flush_policy::write_batch_error_code(&error, "RECORD_INSERT_FAILED");
+                BatchOperationResult::failure(
+                    format!("Record insert failed: {}", error),
+                    error_code,
+                )
+            }
+        }
+    }
+
     /// Canonical rich-record delete handler used by v2 REST/gRPC/internal callers.
     pub async fn handle_record_delete_batch_for_tenant(
         &self,
         request: RichRecordDeleteBatchRequest,
         tenant_id: Option<&str>,
     ) -> Result<BatchOperationResult> {
-        let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
-        let (collection_id, collection_name) = match self
-            .resolve_collection_id_and_name(&request.collection_id, tenant_context.as_ref())
+        let (tenant_context, resolved) = self
+            .resolve_record_batch_collection(&request.collection_id, tenant_id)
+            .await?;
+        let Some((collection_id, collection_name)) = resolved else {
+            return Err(anyhow!("Collection '{}' not found", request.collection_id));
+        };
+        if let Some(failure) = self
+            .enforce_record_batch_gates(
+                tenant_id.unwrap_or(""),
+                &collection_name,
+                &collection_id,
+                WriteOperationKind::Delete,
+                request.record_ids.len() as u64,
+                "REST/gRPC handle_record_delete_batch_for_tenant",
+            )
             .await?
         {
-            Some((id, name)) => (id, name),
-            None => {
-                return Err(anyhow!("Collection '{}' not found", request.collection_id));
-            }
-        };
-        if let Err(e) = enforce_wal_lane_for_record_batch(
-            &collection_name,
-            WriteOperationKind::Delete,
-            request.record_ids.len() as u64,
-            "REST/gRPC handle_record_delete_batch_for_tenant",
-        ) {
-            return Ok(BatchOperationResult::failure(
-                e,
-                "WAL_LANE_REJECTED".to_string(),
-            ));
-        }
-        if let Err(e) = self
-            .ensure_collection_lease(tenant_id.unwrap_or(""), &collection_name, &collection_id)
-            .await
-        {
-            return Ok(BatchOperationResult::failure(
-                e.to_string(),
-                "LEASE_NOT_HELD".to_string(),
-            ));
+            return Ok(failure);
         }
         let result = self
             .vector_operations_service
@@ -593,10 +757,9 @@ impl RecordOpsService {
             .await?;
         if result.success {
             let n = result.vector_ids.len() as i64;
-            if n > 0
-                && let Some(dml_svc) = self.get_dml_service()
-            {
-                dml_svc.bump_row_count_stats(&collection_name, -n).await;
+            if n > 0 {
+                self.bump_batch_row_count(tenant_id, &collection_name, -n)
+                    .await;
             }
         }
         Ok(result)
@@ -608,80 +771,47 @@ impl RecordOpsService {
         request: RichRecordBatchRequest,
         tenant_id: Option<&str>,
     ) -> Result<BatchOperationResult> {
-        let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
-        let (collection_id, collection_name) = match self
-            .resolve_collection_id_and_name(&request.collection_id, tenant_context.as_ref())
+        let (tenant_context, resolved) = self
+            .resolve_record_batch_collection(&request.collection_id, tenant_id)
+            .await?;
+        let Some((collection_id, collection_name)) = resolved else {
+            return Ok(BatchOperationResult::failure(
+                format!("Collection '{}' not found", request.collection_id),
+                "NOT_FOUND".to_string(),
+            ));
+        };
+        if let Some(failure) = self
+            .validate_and_gate_record_batch(
+                tenant_id,
+                &collection_name,
+                &collection_id,
+                &request.records,
+                WriteOperationKind::Insert,
+                "REST/gRPC handle_record_batch_for_tenant",
+            )
             .await?
         {
-            Some((id, name)) => (id, name),
-            None => {
-                return Ok(BatchOperationResult::failure(
-                    format!("Collection '{}' not found", request.collection_id),
-                    "NOT_FOUND".to_string(),
-                ));
-            }
-        };
-        if let Some(dml_svc) = self.get_dml_service()
-            && let Err(e) = dml_svc
-                .validate_record_batch_against_schema(&collection_name, &request.records)
-                .await
-        {
-            return Ok(BatchOperationResult::failure(
-                format!("Schema validation failed: {}", e),
-                "SCHEMA_VALIDATION_FAILED".to_string(),
-            ));
-        }
-        if let Err(e) = enforce_wal_lane_for_record_batch(
-            &collection_name,
-            WriteOperationKind::Insert,
-            request.records.len() as u64,
-            "REST/gRPC handle_record_batch_for_tenant",
-        ) {
-            return Ok(BatchOperationResult::failure(
-                e,
-                "WAL_LANE_REJECTED".to_string(),
-            ));
-        }
-        if let Err(e) = self
-            .ensure_collection_lease(tenant_id.unwrap_or(""), &collection_name, &collection_id)
-            .await
-        {
-            return Ok(BatchOperationResult::failure(
-                e.to_string(),
-                "LEASE_NOT_HELD".to_string(),
-            ));
+            return Ok(failure);
         }
 
         let mut records = request.records;
         self.coerce_records_to_canonical_precision(&mut records, &collection_name)
             .await;
 
-        match self
-            .vector_operations_service
-            .insert_records_with_tenant_context(&collection_id, records, tenant_context.as_ref())
-            .await
-        {
-            Ok(result) => {
-                if result.success {
-                    let n = result.vector_ids.len() as i64;
-                    if let Some(dml_svc) = self.get_dml_service() {
-                        dml_svc.bump_row_count_stats(&collection_name, n).await;
-                    }
-                }
-                Ok(result)
-            }
-            Err(error) => {
-                tracing::error!("Failed to process rich record batch: {:?}", error);
-                // ADR-069 S4: preserve the `WalBackpressure` discriminant so the
-                // boundary surfaces 429 / RESOURCE_EXHAUSTED (retryable) instead
-                // of a generic RECORD_INSERT_FAILED (non-retryable).
-                let error_code = crate::storage::persistence::write_ahead_log::flush_policy::write_batch_error_code(&error, "RECORD_INSERT_FAILED");
-                Ok(BatchOperationResult::failure(
-                    format!("Record insert failed: {}", error),
-                    error_code,
-                ))
-            }
-        }
+        Ok(self
+            .map_insert_batch_result(
+                tenant_id,
+                &collection_name,
+                self.vector_operations_service
+                    .insert_records_with_tenant_context(
+                        &collection_id,
+                        records,
+                        tenant_context.as_ref(),
+                    )
+                    .await,
+                "",
+            )
+            .await)
     }
 
     /// Canonical insert-only rich-record handler used when callers require existing
@@ -691,83 +821,45 @@ impl RecordOpsService {
         request: RichRecordBatchRequest,
         tenant_id: Option<&str>,
     ) -> Result<BatchOperationResult> {
-        let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
-        let (collection_id, collection_name) = match self
-            .resolve_collection_id_and_name(&request.collection_id, tenant_context.as_ref())
+        let (tenant_context, resolved) = self
+            .resolve_record_batch_collection(&request.collection_id, tenant_id)
+            .await?;
+        let Some((collection_id, collection_name)) = resolved else {
+            return Ok(BatchOperationResult::failure(
+                format!("Collection '{}' not found", request.collection_id),
+                "NOT_FOUND".to_string(),
+            ));
+        };
+        if let Some(failure) = self
+            .validate_and_gate_record_batch(
+                tenant_id,
+                &collection_name,
+                &collection_id,
+                &request.records,
+                WriteOperationKind::Insert,
+                "REST/gRPC handle_record_insert_batch_for_tenant",
+            )
             .await?
         {
-            Some((id, name)) => (id, name),
-            None => {
-                return Ok(BatchOperationResult::failure(
-                    format!("Collection '{}' not found", request.collection_id),
-                    "NOT_FOUND".to_string(),
-                ));
-            }
-        };
-        if let Some(dml_svc) = self.get_dml_service()
-            && let Err(e) = dml_svc
-                .validate_record_batch_against_schema(&collection_name, &request.records)
-                .await
-        {
-            return Ok(BatchOperationResult::failure(
-                format!("Schema validation failed: {}", e),
-                "SCHEMA_VALIDATION_FAILED".to_string(),
-            ));
-        }
-        if let Err(e) = enforce_wal_lane_for_record_batch(
-            &collection_name,
-            WriteOperationKind::Insert,
-            request.records.len() as u64,
-            "REST/gRPC handle_record_insert_batch_for_tenant",
-        ) {
-            return Ok(BatchOperationResult::failure(
-                e,
-                "WAL_LANE_REJECTED".to_string(),
-            ));
-        }
-        if let Err(e) = self
-            .ensure_collection_lease(tenant_id.unwrap_or(""), &collection_name, &collection_id)
-            .await
-        {
-            return Ok(BatchOperationResult::failure(
-                e.to_string(),
-                "LEASE_NOT_HELD".to_string(),
-            ));
+            return Ok(failure);
         }
         let mut records = request.records;
         self.coerce_records_to_canonical_precision(&mut records, &collection_name)
             .await;
-        match self
-            .vector_operations_service
-            .insert_records_only_with_tenant_context(
-                &collection_id,
-                records,
-                tenant_context.as_ref(),
+        Ok(self
+            .map_insert_batch_result(
+                tenant_id,
+                &collection_name,
+                self.vector_operations_service
+                    .insert_records_only_with_tenant_context(
+                        &collection_id,
+                        records,
+                        tenant_context.as_ref(),
+                    )
+                    .await,
+                "insert-only ",
             )
-            .await
-        {
-            Ok(result) => {
-                if result.success {
-                    let n = result.vector_ids.len() as i64;
-                    if let Some(dml_svc) = self.get_dml_service() {
-                        dml_svc.bump_row_count_stats(&collection_name, n).await;
-                    }
-                }
-                Ok(result)
-            }
-            Err(error) => {
-                tracing::error!(
-                    "Failed to process insert-only rich record batch: {:?}",
-                    error
-                );
-                // ADR-069 S4: preserve the `WalBackpressure` discriminant (→ 429).
-                let error_code = crate::storage::persistence::write_ahead_log::flush_policy::write_batch_error_code(&error, "RECORD_INSERT_FAILED");
-                Ok(BatchOperationResult::failure(
-                    format!("Record insert failed: {}", error),
-                    error_code,
-                ))
-            }
-        }
+            .await)
     }
 
     // ---- record READ path (TD-104 REST phase 2) -------------------------------
@@ -778,6 +870,30 @@ impl RecordOpsService {
     // (collection_service / vector_operations_service / dml_service), and
     // `resolve_collection_id_internal` is this service's own (single logical owner
     // of the collection-id cache).
+
+    /// Resolve a read request's collection id to its canonical form under the
+    /// port identity's tenant — the shared opening of the search/get read
+    /// handlers (hard `Err` when the collection is unknown, per those paths).
+    async fn resolve_read_collection_id(
+        &self,
+        collection_id: &str,
+        identity: &proximadb_runtime::PortIdentity<'_>,
+    ) -> Result<(Option<crate::storage::tenant::TenantContext>, String)> {
+        let tenant_context = self
+            .collection_service
+            .load_tenant_context(identity.tenant_id)?;
+        match self
+            .resolve_collection_id_internal(
+                collection_id,
+                tenant_context.as_ref(),
+                identity.tenant_id,
+            )
+            .await?
+        {
+            Some(id) => Ok((tenant_context, id)),
+            None => Err(anyhow!("Collection '{}' not found", collection_id)),
+        }
+    }
 
     /// Canonical rich-record search handler used by v2 REST/gRPC/internal callers.
     ///
@@ -795,22 +911,14 @@ impl RecordOpsService {
         // shared top_k cap (TD-SECSCAN-1 §5) also holds at the canonical
         // search authority, so a future caller cannot bypass it.
         proximadb_search_types::top_k_limit::check_top_k(u64::from(request.top_k))?;
-        let tenant_context = self
-            .collection_service
-            .load_tenant_context(identity.tenant_id)?;
         // The identifier as the caller supplied it: the only collection
         // reference a client-facing error may echo (TD-SECSCAN-1 §5).
         let requested_collection = request.collection_id.clone();
+        let (tenant_context, collection_id) = self
+            .resolve_read_collection_id(&request.collection_id, &identity)
+            .await?;
         let request = RichSearchRequest {
-            collection_id: match self
-                .resolve_collection_id_internal(&request.collection_id, tenant_context.as_ref())
-                .await?
-            {
-                Some(id) => id,
-                None => {
-                    return Err(anyhow!("Collection '{}' not found", request.collection_id));
-                }
-            },
+            collection_id,
             ..request
         };
 
@@ -837,19 +945,11 @@ impl RecordOpsService {
         request: RichRecordGetRequest,
         identity: proximadb_runtime::PortIdentity<'_>,
     ) -> Result<RichRecordGetResponse> {
-        let tenant_context = self
-            .collection_service
-            .load_tenant_context(identity.tenant_id)?;
+        let (tenant_context, collection_id) = self
+            .resolve_read_collection_id(&request.collection_id, &identity)
+            .await?;
         let request = RichRecordGetRequest {
-            collection_id: match self
-                .resolve_collection_id_internal(&request.collection_id, tenant_context.as_ref())
-                .await?
-            {
-                Some(id) => id,
-                None => {
-                    return Err(anyhow!("Collection '{}' not found", request.collection_id));
-                }
-            },
+            collection_id,
             ..request
         };
 
@@ -870,7 +970,7 @@ impl RecordOpsService {
     ) -> Result<Option<proximadb_records::ProximaRecord>> {
         let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
         let resolved = match self
-            .resolve_collection_id_internal(collection_id, tenant_context.as_ref())
+            .resolve_collection_id_internal(collection_id, tenant_context.as_ref(), tenant_id)
             .await?
         {
             Some(id) => id,
@@ -898,7 +998,7 @@ impl RecordOpsService {
     ) -> Result<(Vec<ProximaRecord>, Option<ScanCursor>)> {
         let tenant_context = self.collection_service.load_tenant_context(tenant_id)?;
         let resolved_id = match self
-            .resolve_collection_id_internal(collection_id, tenant_context.as_ref())
+            .resolve_collection_id_internal(collection_id, tenant_context.as_ref(), tenant_id)
             .await?
         {
             Some(id) => id,
@@ -924,11 +1024,17 @@ impl RecordOpsService {
             .await
     }
 
-    /// Change feed: rows changed since `since_lsn` (delegates to the DML service).
-    pub async fn table_changes(&self, table: &str, since_lsn: u64) -> Result<Vec<ChangeRow>> {
+    /// Change feed: rows of `tenant`'s table changed since `since_lsn` (delegates to
+    /// the DML service). `Ok(None)` when the table is not visible to `tenant`.
+    pub async fn table_changes_for_tenant(
+        &self,
+        table: &str,
+        tenant: &str,
+        since_lsn: u64,
+    ) -> Result<Option<Vec<ChangeRow>>> {
         match self.get_dml_service() {
-            Some(dml) => dml.changes_since(table, since_lsn).await,
-            None => Ok(Vec::new()),
+            Some(dml) => dml.changes_since_for_tenant(table, tenant, since_lsn).await,
+            None => Ok(None),
         }
     }
 }
@@ -1084,7 +1190,7 @@ impl proximadb_runtime::RecordRoutePort for RecordOpsService {
             Err(_) => return false,
         };
         matches!(
-            self.resolve_collection_id_internal(collection_id, tenant_context.as_ref())
+            self.resolve_collection_id_internal(collection_id, tenant_context.as_ref(), tenant)
                 .await,
             Ok(Some(_))
         )
@@ -1108,6 +1214,7 @@ impl proximadb_runtime::RecordRoutePort for RecordOpsService {
                 collection_id,
                 dimension,
                 tenant_context.as_ref(),
+                tenant,
                 promote_keys,
             )
             .await
@@ -1163,7 +1270,7 @@ impl proximadb_runtime::RecordRoutePort for RecordOpsService {
         let tenant_context = self.collection_service.load_tenant_context(tenant)?;
         // Unknown collection ⇒ empty (mixed-safe: the caller falls back / merges nothing).
         let Some(resolved_id) = self
-            .resolve_collection_id_internal(collection_id, tenant_context.as_ref())
+            .resolve_collection_id_internal(collection_id, tenant_context.as_ref(), tenant)
             .await?
         else {
             return Ok(Vec::new());

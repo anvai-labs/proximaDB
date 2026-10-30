@@ -10,9 +10,14 @@
 //!
 //! - **manifest** (Avro): one `manifest_entry` per data file (status + `data_file` struct).
 //! - **manifest list** (Avro): one `manifest_file` per manifest in a snapshot.
-//! - **table metadata** (JSON): format-version 2 `TableMetadata` — schema, partition spec
-//!   (unpartitioned here), snapshots (each pointing at its manifest list), `current-snapshot-id`,
-//!   and the `main` ref.
+//! - **table metadata** (JSON): format-version 2 (or 3) `TableMetadata` — schema, partition
+//!   spec (unpartitioned here), the current snapshot chained to its parent, the
+//!   `schema.name-mapping.default` property, `current-snapshot-id`, and the `main` ref.
+//!
+//! ADR-097 D3: this module is the single Iceberg writer. Paths it records are absolute
+//! URIs when the bridge knows its store URL (`IcebergObjectStoreBridge::from_url`), which
+//! is what external readers require; `tests/iceberg_interop_e2e.rs` holds the
+//! PyIceberg / DuckDB read-back gate.
 //!
 //! The Avro schemas carry Iceberg `field-id`s on every field (the spec's identity contract).
 //! Tables are written **unpartitioned** for the first cut (partition spec id 0, empty struct);
@@ -22,6 +27,9 @@
 use apache_avro::{Reader, Schema, Writer};
 use proximadb_kernel::error::StorageError;
 use serde::{Deserialize, Serialize};
+
+mod deletes;
+pub use deletes::{DeleteFileMeta, read_delete_manifest, write_delete_manifest};
 
 fn ser_err(context: &str, e: impl std::fmt::Display) -> StorageError {
     StorageError::Serialization(format!("iceberg: {context}: {e}"))
@@ -94,10 +102,143 @@ const MANIFEST_LIST_SCHEMA_JSON: &str = r#"
     {"name": "deleted_files_count", "type": "int", "field-id": 506},
     {"name": "added_rows_count", "type": "long", "field-id": 512},
     {"name": "existing_rows_count", "type": "long", "field-id": 513},
-    {"name": "deleted_rows_count", "type": "long", "field-id": 514}
+    {"name": "deleted_rows_count", "type": "long", "field-id": 514},
+    {"name": "first_row_id", "type": ["null", "long"], "default": null, "field-id": 520}
   ]
 }
 "#;
+
+// --- Avro container header: keep Iceberg field ids --------------------------
+//
+// apache-avro 0.16 re-serializes the schema into the container header's
+// `avro.schema` and drops custom field attributes — Iceberg's `field-id` — on the
+// way. Iceberg readers (PyIceberg, Java) resolve manifest fields by those ids and
+// reject a manifest without them ("missing field-id"). So after writing, the
+// header is re-encoded with the schema JSON verbatim. Data blocks follow the
+// header's sync marker and are copied byte-for-byte.
+
+const AVRO_MAGIC: &[u8; 4] = b"Obj\x01";
+
+fn read_avro_long(buf: &[u8], pos: &mut usize) -> Result<i64, StorageError> {
+    let mut n: u64 = 0;
+    let mut shift = 0;
+    loop {
+        let byte = *buf
+            .get(*pos)
+            .ok_or_else(|| ser_err("avro header", "truncated varint"))?;
+        *pos += 1;
+        n |= u64::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        if shift > 63 {
+            return Err(ser_err("avro header", "varint overflow"));
+        }
+    }
+    Ok((n >> 1) as i64 ^ -((n & 1) as i64))
+}
+
+fn write_avro_long(out: &mut Vec<u8>, v: i64) {
+    let mut n = ((v << 1) ^ (v >> 63)) as u64;
+    while n >= 0x80 {
+        out.push((n as u8) | 0x80);
+        n >>= 7;
+    }
+    out.push(n as u8);
+}
+
+fn read_avro_bytes<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a [u8], StorageError> {
+    let len = usize::try_from(read_avro_long(buf, pos)?)
+        .map_err(|_| ser_err("avro header", "negative length"))?;
+    let end = pos
+        .checked_add(len)
+        .filter(|end| *end <= buf.len())
+        .ok_or_else(|| ser_err("avro header", "truncated entry"))?;
+    let out = &buf[*pos..end];
+    *pos = end;
+    Ok(out)
+}
+
+/// Avro container header metadata: `(key, value)` byte pairs, in file order.
+type AvroHeaderEntries = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// The header metadata entries of an Avro object container file, in order, and
+/// the offset where the sync marker begins.
+fn avro_header_entries(buf: &[u8]) -> Result<(AvroHeaderEntries, usize), StorageError> {
+    if buf.len() < 4 || &buf[..4] != AVRO_MAGIC {
+        return Err(ser_err("avro header", "not an Avro object container"));
+    }
+    let mut pos = 4;
+    let mut entries = Vec::new();
+    loop {
+        let mut count = read_avro_long(buf, &mut pos)?;
+        if count == 0 {
+            break;
+        }
+        if count < 0 {
+            count = -count;
+            read_avro_long(buf, &mut pos)?; // block size in bytes — unused
+        }
+        for _ in 0..count {
+            let key = read_avro_bytes(buf, &mut pos)?.to_vec();
+            let value = read_avro_bytes(buf, &mut pos)?.to_vec();
+            entries.push((key, value));
+        }
+    }
+    Ok((entries, pos))
+}
+
+/// Re-encode `container`'s header with `avro.schema` set to `schema_json` verbatim.
+///
+/// apache-avro <= 0.16 wrote no header at all when nothing was appended (an
+/// empty manifest); since 0.21 `into_inner()` writes the header first, so this
+/// branch is defensive. An empty `container` gets a fresh header — `avro.schema`,
+/// `avro.codec` = `null`, `user_metadata` and a new sync marker — with no data
+/// blocks, which is a valid, empty Avro object container.
+fn with_verbatim_schema(
+    container: Vec<u8>,
+    schema_json: &str,
+    user_metadata: &[(String, String)],
+) -> Result<Vec<u8>, StorageError> {
+    let compact = serde_json::from_str::<serde_json::Value>(schema_json)
+        .map_err(|e| ser_err("avro header schema", e))?
+        .to_string();
+    let empty_body;
+    let (entries, body): (AvroHeaderEntries, &[u8]) = if container.is_empty() {
+        let mut entries = vec![
+            (b"avro.schema".to_vec(), Vec::new()),
+            (b"avro.codec".to_vec(), b"null".to_vec()),
+        ];
+        entries.extend(
+            user_metadata
+                .iter()
+                .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec())),
+        );
+        empty_body = uuid::Uuid::new_v4().into_bytes();
+        (entries, &empty_body[..])
+    } else {
+        let (entries, body_start) = avro_header_entries(&container)?;
+        (entries, &container[body_start..])
+    };
+    let mut out = Vec::with_capacity(container.len() + compact.len());
+    out.extend_from_slice(AVRO_MAGIC);
+    write_avro_long(&mut out, entries.len() as i64);
+    for (key, value) in &entries {
+        let value: &[u8] = if key == b"avro.schema" {
+            compact.as_bytes()
+        } else {
+            value
+        };
+        write_avro_long(&mut out, key.len() as i64);
+        out.extend_from_slice(key);
+        write_avro_long(&mut out, value.len() as i64);
+        out.extend_from_slice(value);
+    }
+    write_avro_long(&mut out, 0);
+    out.extend_from_slice(body);
+    Ok(out)
+}
 
 /// Public description of one data file in a snapshot.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -126,13 +267,47 @@ pub struct ColumnFileStats {
 }
 
 /// Public description of one manifest in a manifest list.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ManifestFileMeta {
     pub manifest_path: String,
     pub manifest_length: i64,
     pub added_files_count: i32,
     pub added_rows_count: i64,
     pub added_snapshot_id: i64,
+    /// The data sequence number of the snapshot that added this manifest. Added
+    /// entries inherit it (their own `sequence_number` is null), so it must be the
+    /// committing snapshot's sequence number — `0` would place every file before
+    /// all deletes and break v2 sequence-number semantics.
+    pub sequence_number: i64,
+    /// v3 row lineage: first row id assigned to this manifest's added rows.
+    pub first_row_id: Option<i64>,
+    /// Whether the manifest lists data files or delete files.
+    pub content: ManifestContent,
+}
+
+/// A manifest's `content` (manifest-list field 517).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ManifestContent {
+    #[default]
+    Data,
+    Deletes,
+}
+
+impl ManifestContent {
+    fn as_i32(self) -> i32 {
+        match self {
+            ManifestContent::Data => 0,
+            ManifestContent::Deletes => 1,
+        }
+    }
+
+    fn from_i32(v: i32) -> Result<Self, StorageError> {
+        match v {
+            0 => Ok(ManifestContent::Data),
+            1 => Ok(ManifestContent::Deletes),
+            other => Err(ser_err("manifest_file", format!("unknown content {other}"))),
+        }
+    }
 }
 
 // --- Avro serde mirrors (field order MUST match the schemas above) ----------
@@ -289,14 +464,49 @@ struct AvroManifestFile {
     added_rows_count: i64,
     existing_rows_count: i64,
     deleted_rows_count: i64,
+    #[serde(default)]
+    first_row_id: Option<i64>,
+}
+
+/// Avro file-level metadata Iceberg writers put in every manifest header. Java and
+/// PyIceberg readers take the manifest's schema, partition spec and format version
+/// from these keys; without them a reader must guess from the table metadata.
+pub struct ManifestHeader<'a> {
+    /// The table schema as Iceberg schema JSON (`{"type":"struct",...}`).
+    pub schema_json: &'a str,
+    pub format_version: FormatVersion,
 }
 
 /// Serialize a manifest (one `manifest_entry` per data file) as Iceberg v2 Avro.
 /// `status` is ADDED (1), `content` is DATA (0), format is PARQUET, unpartitioned.
-pub fn write_manifest(files: &[DataFileMeta], snapshot_id: i64) -> Result<Vec<u8>, StorageError> {
+pub fn write_manifest(
+    files: &[DataFileMeta],
+    snapshot_id: i64,
+    header: Option<&ManifestHeader<'_>>,
+) -> Result<Vec<u8>, StorageError> {
     let schema =
         Schema::parse_str(MANIFEST_SCHEMA_JSON).map_err(|e| ser_err("parse manifest schema", e))?;
     let mut writer = Writer::new(&schema, Vec::new());
+    let user_metadata: Vec<(String, String)> = header
+        .map(|h| {
+            vec![
+                ("schema".to_string(), h.schema_json.to_string()),
+                ("schema-id".to_string(), "0".to_string()),
+                ("partition-spec".to_string(), "[]".to_string()),
+                ("partition-spec-id".to_string(), "0".to_string()),
+                (
+                    "format-version".to_string(),
+                    h.format_version.as_i32().to_string(),
+                ),
+                ("content".to_string(), "data".to_string()),
+            ]
+        })
+        .unwrap_or_default();
+    for (k, v) in &user_metadata {
+        writer
+            .add_user_metadata(k.clone(), v)
+            .map_err(|e| ser_err("manifest header metadata", e))?;
+    }
     for f in files {
         let entry = AvroManifestEntry {
             status: 1, // ADDED
@@ -321,9 +531,10 @@ pub fn write_manifest(files: &[DataFileMeta], snapshot_id: i64) -> Result<Vec<u8
             .append_ser(&entry)
             .map_err(|e| ser_err("append manifest entry", e))?;
     }
-    writer
+    let container = writer
         .into_inner()
-        .map_err(|e| ser_err("finish manifest", e))
+        .map_err(|e| ser_err("finish manifest", e))?;
+    with_verbatim_schema(container, MANIFEST_SCHEMA_JSON, &user_metadata)
 }
 
 /// Read an Iceberg v2 manifest Avro back into the data-file list.
@@ -362,9 +573,9 @@ pub fn write_manifest_list(manifests: &[ManifestFileMeta]) -> Result<Vec<u8>, St
             manifest_path: m.manifest_path.clone(),
             manifest_length: m.manifest_length,
             partition_spec_id: 0,
-            content: 0, // DATA
-            sequence_number: 0,
-            min_sequence_number: 0,
+            content: m.content.as_i32(),
+            sequence_number: m.sequence_number,
+            min_sequence_number: m.sequence_number,
             added_snapshot_id: m.added_snapshot_id,
             added_files_count: m.added_files_count,
             existing_files_count: 0,
@@ -372,14 +583,16 @@ pub fn write_manifest_list(manifests: &[ManifestFileMeta]) -> Result<Vec<u8>, St
             added_rows_count: m.added_rows_count,
             existing_rows_count: 0,
             deleted_rows_count: 0,
+            first_row_id: m.first_row_id,
         };
         writer
             .append_ser(&mf)
             .map_err(|e| ser_err("append manifest_file", e))?;
     }
-    writer
+    let container = writer
         .into_inner()
-        .map_err(|e| ser_err("finish manifest list", e))
+        .map_err(|e| ser_err("finish manifest list", e))?;
+    with_verbatim_schema(container, MANIFEST_LIST_SCHEMA_JSON, &[])
 }
 
 /// Read an Iceberg v2 manifest list back into its entries.
@@ -399,6 +612,9 @@ pub fn read_manifest_list(bytes: &[u8]) -> Result<Vec<ManifestFileMeta>, Storage
             added_files_count: mf.added_files_count,
             added_rows_count: mf.added_rows_count,
             added_snapshot_id: mf.added_snapshot_id,
+            sequence_number: mf.sequence_number,
+            first_row_id: mf.first_row_id,
+            content: ManifestContent::from_i32(mf.content)?,
         });
     }
     Ok(out)
@@ -432,35 +648,27 @@ pub enum FormatVersion {
 }
 
 impl FormatVersion {
-    fn as_i32(self) -> i32 {
+    pub fn as_i32(self) -> i32 {
         match self {
             FormatVersion::V2 => 2,
             FormatVersion::V3 => 3,
         }
     }
+
+    /// Parse a metadata document's `format-version` (2 or 3); anything else is
+    /// not a version this writer knows, so callers keep their requested one.
+    pub fn from_i32(v: i32) -> Option<Self> {
+        match v {
+            2 => Some(FormatVersion::V2),
+            3 => Some(FormatVersion::V3),
+            _ => None,
+        }
+    }
 }
 
-/// Build a `TableMetadata` JSON document for a single snapshot at the given format version.
-///
-/// `snapshot_id` identifies the snapshot; `manifest_list_location` is the object key of the
-/// snapshot's manifest list; `timestamp_ms` is the commit time (passed in — this crate avoids
-/// wall-clock for determinism/testability). The table is unpartitioned (spec id 0). Pass
-/// [`FormatVersion::V2`] for maximum external-reader compatibility, [`FormatVersion::V3`] to
-/// opt into the lineage/DV/variant-aligned format.
-#[allow(clippy::too_many_arguments)]
-pub fn build_table_metadata(
-    format_version: FormatVersion,
-    table_uuid: &str,
-    location: &str,
-    fields: &[IcebergField],
-    snapshot_id: i64,
-    sequence_number: i64,
-    manifest_list_location: &str,
-    timestamp_ms: i64,
-    added_files: i64,
-    added_records: i64,
-) -> Result<String, StorageError> {
-    let last_column_id = fields.iter().map(|f| f.id).max().unwrap_or(0);
+/// Iceberg schema JSON (`schema-id` 0) for `fields`. Shared by the table metadata
+/// and the manifest header so both describe the same schema.
+pub fn schema_json(fields: &[IcebergField]) -> serde_json::Value {
     let schema_fields: Vec<serde_json::Value> = fields
         .iter()
         .map(|f| {
@@ -472,42 +680,251 @@ pub fn build_table_metadata(
             })
         })
         .collect();
-    let metadata = serde_json::json!({
-        "format-version": format_version.as_i32(),
-        "table-uuid": table_uuid,
-        "location": location,
-        "last-sequence-number": sequence_number,
-        "last-updated-ms": timestamp_ms,
+    serde_json::json!({
+        "type": "struct",
+        "schema-id": 0,
+        "fields": schema_fields,
+    })
+}
+
+/// `schema.name-mapping.default`: maps Iceberg field ids to Parquet column names.
+/// ProximaDB's Parquet files carry no embedded field ids, so without this mapping
+/// PyIceberg refuses to read them and other engines fall back to guessing.
+fn name_mapping(fields: &[IcebergField]) -> String {
+    let entries: Vec<serde_json::Value> = fields
+        .iter()
+        .map(|f| serde_json::json!({"field-id": f.id, "names": [f.name]}))
+        .collect();
+    serde_json::Value::Array(entries).to_string()
+}
+
+/// Whether a format-version 3 metadata document proves row lineage was never
+/// started — the shape v0.4.1 and earlier published (v3 without lineage): a
+/// non-empty `snapshots` list containing the current snapshot, and no snapshot
+/// carrying `first-row-id` or `added-rows`. Only then can lineage start at 0
+/// without re-issuing a row id; anything less (no list, a dangling current
+/// snapshot, any lineage field) is inconsistent metadata and stays refused.
+/// Starting at 0 is also what the spec does when it upgrades a v2 table.
+/// Caveat: only snapshot-level fields are inspected. A foreign writer that
+/// dropped next-row-id but assigned ids at the manifest-list or data-file
+/// level would be adopted; nothing foreign writes this engine's prefixes, and
+/// conformant v3 writers always write next-row-id.
+fn lineage_never_started(metadata: &serde_json::Value) -> bool {
+    let Some(snapshots) = metadata
+        .get("snapshots")
+        .and_then(|x| x.as_array())
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    let Some(current) = metadata.get("current-snapshot-id").and_then(|x| x.as_i64()) else {
+        return false;
+    };
+    let current_listed = snapshots
+        .iter()
+        .any(|s| s.get("snapshot-id").and_then(|x| x.as_i64()) == Some(current));
+    current_listed
+        && snapshots
+            .iter()
+            .all(|s| s.get("first-row-id").is_none() && s.get("added-rows").is_none())
+}
+
+/// What a new snapshot inherits from the table's previous `metadata.json`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Lineage {
+    /// Data sequence number for the new snapshot (previous `last-sequence-number` + 1).
+    pub sequence_number: i64,
+    /// The previous current snapshot, if any.
+    pub parent_snapshot_id: Option<i64>,
+    /// v3 row lineage: first row id for the new snapshot's added rows.
+    pub first_row_id: i64,
+    /// The parent document's `format-version` (2 or 3), when there is a parent.
+    /// Drives the never-downgrade floor in `commit_iceberg_snapshot`.
+    pub parent_format_version: Option<i32>,
+    /// The previous metadata log, extended with the previous metadata file.
+    metadata_log: Vec<serde_json::Value>,
+}
+
+impl Lineage {
+    /// Derive lineage from the previous metadata document (`None` for the first commit).
+    /// `parent_location` is the previous document's absolute location, recorded in the
+    /// new `metadata-log`.
+    pub fn from_parent(
+        parent_json: Option<&str>,
+        parent_location: Option<&str>,
+    ) -> Result<Self, StorageError> {
+        let Some(json) = parent_json else {
+            return Ok(Self {
+                sequence_number: 1,
+                ..Default::default()
+            });
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(json).map_err(|e| ser_err("parse parent metadata", e))?;
+        let last_seq = v
+            .get("last-sequence-number")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0);
+        let parent_format_version = v
+            .get("format-version")
+            .and_then(|x| x.as_i64())
+            .and_then(|x| i32::try_from(x).ok())
+            .filter(|x| FormatVersion::from_i32(*x).is_some());
+        let parent_snapshot_id = v
+            .get("current-snapshot-id")
+            .and_then(|x| x.as_i64())
+            .filter(|id| *id >= 0);
+        // TD-USUB-10 3c rung 2 — row lineage is fail-closed on INCONSISTENT
+        // metadata, never defaulted: a v3 parent without a valid next-row-id
+        // would unwrap_or(0) and RE-ISSUE row ids the parent already handed
+        // out (silent corruption). The Iceberg v3 spec requires next-row-id in
+        // v3 table metadata (row lineage is always on in v3); this engine's v3
+        // publications carry it since #2261, and next-row-id on a v2 table IS
+        // spec-invalid (row lineage is v3-only). The one adoption
+        // seam is `lineage_never_started` (v0.4.1-era publications, v3 with no
+        // lineage anywhere); revisit for any other foreign-parent adoption (see
+        // lineage_fail_closed_tests).
+        let first_row_id = match v.get("next-row-id") {
+            None | Some(serde_json::Value::Null) => {
+                // v0.5.0 upgrade: v0.4.1 and earlier published format-version 3
+                // with NO row lineage at all, so an absent next-row-id is
+                // adopted as "lineage never started" (start at 0) — but only on
+                // positive evidence that no row id was ever handed out.
+                if parent_format_version == Some(3) && !lineage_never_started(&v) {
+                    return Err(ser_err(
+                        "parent metadata row lineage",
+                        "a format-version 3 table must carry next-row-id",
+                    ));
+                }
+                0
+            }
+            Some(value) => {
+                let id = value.as_i64().ok_or_else(|| {
+                    ser_err(
+                        "parent metadata row lineage",
+                        "next-row-id is not an integer",
+                    )
+                })?;
+                if id < 0 {
+                    return Err(ser_err(
+                        "parent metadata row lineage",
+                        "next-row-id must be non-negative",
+                    ));
+                }
+                if parent_format_version != Some(3) {
+                    return Err(ser_err(
+                        "parent metadata row lineage",
+                        "next-row-id requires a format-version 3 parent (the parent's \
+                         format-version is missing or not 3)",
+                    ));
+                }
+                id
+            }
+        };
+        let mut metadata_log = v
+            .get("metadata-log")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if let Some(loc) = parent_location {
+            metadata_log.push(serde_json::json!({
+                "timestamp-ms": v.get("last-updated-ms").and_then(|x| x.as_i64()).unwrap_or(0),
+                "metadata-file": loc,
+            }));
+        }
+        Ok(Self {
+            sequence_number: last_seq + 1,
+            parent_snapshot_id,
+            first_row_id,
+            parent_format_version,
+            metadata_log,
+        })
+    }
+}
+
+/// One snapshot commit: the inputs to [`build_table_metadata`].
+#[derive(Debug, Clone)]
+pub struct SnapshotCommit<'a> {
+    pub format_version: FormatVersion,
+    pub table_uuid: &'a str,
+    /// Table root location (absolute URI when the writer knows its store URL).
+    pub location: &'a str,
+    pub fields: &'a [IcebergField],
+    pub snapshot_id: i64,
+    pub manifest_list_location: &'a str,
+    /// Commit time (passed in — this crate avoids wall-clock for determinism).
+    pub timestamp_ms: i64,
+    pub added_files: i64,
+    pub added_records: i64,
+}
+
+/// Build the `TableMetadata` JSON for `commit`, chained onto `lineage`.
+///
+/// The snapshot is the table's complete current file set, so a commit with a parent
+/// is an `overwrite` and the parent snapshot is not carried forward: a rewrite replaces
+/// the parent's files, which are then collected, and an append re-lists the files it
+/// carries (as added, so `added-files`/`added-records` count them). The parent stays referenced through `parent-snapshot-id` and the
+/// previous metadata file through `metadata-log`, exactly as after snapshot expiry.
+/// The table is unpartitioned (spec id 0). v3 adds the row-lineage fields
+/// (`next-row-id`, `first-row-id`, `added-rows`).
+pub fn build_table_metadata(
+    commit: &SnapshotCommit<'_>,
+    lineage: &Lineage,
+) -> Result<String, StorageError> {
+    let fields = commit.fields;
+    let last_column_id = fields.iter().map(|f| f.id).max().unwrap_or(0);
+    let operation = if lineage.parent_snapshot_id.is_some() {
+        "overwrite"
+    } else {
+        "append"
+    };
+    let mut snapshot = serde_json::json!({
+        "snapshot-id": commit.snapshot_id,
+        "sequence-number": lineage.sequence_number,
+        "timestamp-ms": commit.timestamp_ms,
+        "summary": {
+            "operation": operation,
+            "added-data-files": commit.added_files.to_string(),
+            "added-records": commit.added_records.to_string(),
+            "total-data-files": commit.added_files.to_string(),
+            "total-records": commit.added_records.to_string(),
+        },
+        "manifest-list": commit.manifest_list_location,
+        "schema-id": 0,
+    });
+    if let Some(parent) = lineage.parent_snapshot_id {
+        snapshot["parent-snapshot-id"] = serde_json::json!(parent);
+    }
+    let mut metadata = serde_json::json!({
+        "format-version": commit.format_version.as_i32(),
+        "table-uuid": commit.table_uuid,
+        "location": commit.location,
+        "last-sequence-number": lineage.sequence_number,
+        "last-updated-ms": commit.timestamp_ms,
         "last-column-id": last_column_id,
         "current-schema-id": 0,
-        "schemas": [{
-            "type": "struct",
-            "schema-id": 0,
-            "fields": schema_fields,
-        }],
+        "schemas": [schema_json(fields)],
         "default-spec-id": 0,
         "partition-specs": [{"spec-id": 0, "fields": []}],
         "last-partition-id": 999,
         "default-sort-order-id": 0,
         "sort-orders": [{"order-id": 0, "fields": []}],
-        "properties": {},
-        "current-snapshot-id": snapshot_id,
-        "snapshots": [{
-            "snapshot-id": snapshot_id,
-            "sequence-number": sequence_number,
-            "timestamp-ms": timestamp_ms,
-            "summary": {
-                "operation": "append",
-                "added-data-files": added_files.to_string(),
-                "added-records": added_records.to_string(),
-            },
-            "manifest-list": manifest_list_location,
-            "schema-id": 0,
-        }],
-        "snapshot-log": [{"snapshot-id": snapshot_id, "timestamp-ms": timestamp_ms}],
-        "metadata-log": [],
-        "refs": {"main": {"snapshot-id": snapshot_id, "type": "branch"}},
+        "properties": {
+            "schema.name-mapping.default": name_mapping(fields),
+            "write.format.default": "parquet",
+        },
+        "current-snapshot-id": commit.snapshot_id,
+        "snapshots": [],
+        "snapshot-log": [{"snapshot-id": commit.snapshot_id, "timestamp-ms": commit.timestamp_ms}],
+        "metadata-log": lineage.metadata_log,
+        "refs": {"main": {"snapshot-id": commit.snapshot_id, "type": "branch"}},
     });
+    if commit.format_version == FormatVersion::V3 {
+        snapshot["first-row-id"] = serde_json::json!(lineage.first_row_id);
+        snapshot["added-rows"] = serde_json::json!(commit.added_records);
+        metadata["next-row-id"] = serde_json::json!(lineage.first_row_id + commit.added_records);
+    }
+    metadata["snapshots"] = serde_json::json!([snapshot]);
     serde_json::to_string_pretty(&metadata).map_err(|e| ser_err("serialize table metadata", e))
 }
 
@@ -572,7 +989,7 @@ mod tests {
                 upper_bound: None,
             },
         ];
-        let bytes = write_manifest(&f, 42).unwrap();
+        let bytes = write_manifest(&f, 42, None).unwrap();
         let back = read_manifest(&bytes).unwrap();
         assert_eq!(
             back, f,
@@ -582,7 +999,7 @@ mod tests {
 
     #[test]
     fn manifest_round_trips() {
-        let bytes = write_manifest(&files(), 12345).unwrap();
+        let bytes = write_manifest(&files(), 12345, None).unwrap();
         let back = read_manifest(&bytes).unwrap();
         assert_eq!(back, files());
     }
@@ -595,15 +1012,17 @@ mod tests {
             added_files_count: 2,
             added_rows_count: 150,
             added_snapshot_id: 12345,
+            sequence_number: 3,
+            first_row_id: Some(10),
+            content: ManifestContent::Deletes,
         }];
         let bytes = write_manifest_list(&manifests).unwrap();
         let back = read_manifest_list(&bytes).unwrap();
         assert_eq!(back, manifests);
     }
 
-    #[test]
-    fn table_metadata_points_at_manifest_list() {
-        let fields = vec![
+    fn two_fields() -> Vec<IcebergField> {
+        vec![
             IcebergField {
                 id: 1,
                 name: "id".into(),
@@ -616,77 +1035,224 @@ mod tests {
                 type_name: "string".into(),
                 required: false,
             },
-        ];
+        ]
+    }
+
+    fn commit<'a>(
+        fields: &'a [IcebergField],
+        version: FormatVersion,
+        snapshot_id: i64,
+        list: &'a str,
+    ) -> SnapshotCommit<'a> {
+        SnapshotCommit {
+            format_version: version,
+            table_uuid: "uuid-1",
+            location: "file:///wh/t/ns/tbl",
+            fields,
+            snapshot_id,
+            manifest_list_location: list,
+            timestamp_ms: 1_700_000_000_000 + snapshot_id,
+            added_files: 2,
+            added_records: 150,
+        }
+    }
+
+    #[test]
+    fn table_metadata_points_at_manifest_list() {
+        let fields = two_fields();
+        let list = "file:///wh/t/ns/tbl/metadata/snap-777-list.avro";
         let json = build_table_metadata(
-            FormatVersion::V2,
-            "uuid-1",
-            "data/t/ns/tbl",
-            &fields,
-            777,
-            1,
-            "data/t/ns/tbl/metadata/snap-777-list.avro",
-            1_700_000_000_000,
-            2,
-            150,
+            &commit(&fields, FormatVersion::V2, 777, list),
+            &Lineage::from_parent(None, None).unwrap(),
         )
         .unwrap();
-        // Valid JSON, format v2, and resolvable current manifest list.
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["format-version"], 2);
         assert_eq!(v["last-column-id"], 2);
-        assert_eq!(
-            current_manifest_list(&json).unwrap().as_deref(),
-            Some("data/t/ns/tbl/metadata/snap-777-list.avro")
-        );
+        assert_eq!(v["last-sequence-number"], 1);
+        assert_eq!(v["snapshots"][0]["summary"]["operation"], "append");
+        assert!(v["snapshots"][0].get("parent-snapshot-id").is_none());
+        assert!(v.get("next-row-id").is_none(), "v2 has no row lineage");
+        assert_eq!(current_manifest_list(&json).unwrap().as_deref(), Some(list));
 
-        // v3 is reachable (opt-in) — same structure, format-version flips to 3.
-        let v3 = build_table_metadata(
-            FormatVersion::V3,
-            "uuid-1",
-            "data/t/ns/tbl",
-            &fields,
-            778,
-            2,
-            "data/t/ns/tbl/metadata/snap-778-list.avro",
-            1_700_000_000_001,
-            1,
-            10,
+        // External readers resolve Parquet columns through the name mapping.
+        let mapping: serde_json::Value = serde_json::from_str(
+            v["properties"]["schema.name-mapping.default"]
+                .as_str()
+                .unwrap(),
         )
         .unwrap();
-        let v3v: serde_json::Value = serde_json::from_str(&v3).unwrap();
-        assert_eq!(v3v["format-version"], 3);
-        assert!(current_manifest_list(&v3).unwrap().is_some());
+        assert_eq!(
+            mapping,
+            serde_json::json!([
+                {"field-id": 1, "names": ["id"]},
+                {"field-id": 2, "names": ["name"]}
+            ])
+        );
+    }
+
+    #[test]
+    fn successor_metadata_chains_onto_parent() {
+        let fields = two_fields();
+        let first = build_table_metadata(
+            &commit(&fields, FormatVersion::V3, 777, "l0"),
+            &Lineage::from_parent(None, None).unwrap(),
+        )
+        .unwrap();
+        let lineage =
+            Lineage::from_parent(Some(&first), Some("file:///wh/m/v0.metadata.json")).unwrap();
+        assert_eq!(lineage.sequence_number, 2);
+        assert_eq!(lineage.parent_snapshot_id, Some(777));
+        assert_eq!(lineage.first_row_id, 150, "next-row-id of the parent");
+
+        let second =
+            build_table_metadata(&commit(&fields, FormatVersion::V3, 778, "l1"), &lineage).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(v["format-version"], 3);
+        assert_eq!(v["last-sequence-number"], 2);
+        let snap = &v["snapshots"][0];
+        assert_eq!(snap["parent-snapshot-id"], 777);
+        assert_eq!(snap["sequence-number"], 2);
+        assert_eq!(snap["summary"]["operation"], "overwrite");
+        assert_eq!(snap["first-row-id"], 150);
+        assert_eq!(v["next-row-id"], 300);
+        assert_eq!(
+            v["snapshots"].as_array().unwrap().len(),
+            1,
+            "the in-place-rewritten parent snapshot is not carried forward"
+        );
+        assert_eq!(
+            v["metadata-log"][0]["metadata-file"],
+            "file:///wh/m/v0.metadata.json"
+        );
+    }
+
+    /// Iceberg readers resolve manifest fields by `field-id`; the container header
+    /// must carry them (apache-avro alone drops them), and the rewritten header
+    /// must still decode.
+    #[test]
+    fn avro_header_schema_keeps_iceberg_field_ids() {
+        for bytes in [
+            write_manifest(&files(), 9, None).unwrap(),
+            write_manifest_list(&[ManifestFileMeta::default()]).unwrap(),
+        ] {
+            let (entries, _) = avro_header_entries(&bytes).unwrap();
+            let schema = entries
+                .iter()
+                .find(|(k, _)| k == b"avro.schema")
+                .map(|(_, v)| String::from_utf8(v.clone()).unwrap())
+                .expect("avro.schema header");
+            let v: serde_json::Value = serde_json::from_str(&schema).unwrap();
+            let fields = v["fields"].as_array().unwrap();
+            assert!(
+                fields.iter().all(|f| f.get("field-id").is_some()),
+                "every top-level field carries its Iceberg field-id: {schema}"
+            );
+            assert!(
+                Reader::new(&bytes[..]).is_ok(),
+                "rewritten container decodes"
+            );
+        }
+        assert_eq!(
+            read_manifest(&write_manifest(&files(), 9, None).unwrap()).unwrap(),
+            files()
+        );
+    }
+
+    /// A snapshot with no data files still writes valid, readable (empty) Avro
+    /// containers — apache-avro alone emits zero bytes here.
+    #[test]
+    fn empty_manifest_and_list_are_valid_avro() {
+        let schema = schema_json(&two_fields()).to_string();
+        let manifest = write_manifest(
+            &[],
+            1,
+            Some(&ManifestHeader {
+                schema_json: &schema,
+                format_version: FormatVersion::V2,
+            }),
+        )
+        .unwrap();
+        assert!(read_manifest(&manifest).unwrap().is_empty());
+        let reader = Reader::new(&manifest[..]).unwrap();
+        assert_eq!(
+            reader.user_metadata().get("format-version").map(|v| &v[..]),
+            Some(&b"2"[..])
+        );
+        let list = write_manifest_list(&[]).unwrap();
+        assert!(read_manifest_list(&list).unwrap().is_empty());
+    }
+
+    #[test]
+    fn avro_long_round_trips() {
+        for v in [0i64, 1, -1, 63, -64, 64, 300, -300, i64::MAX, i64::MIN] {
+            let mut buf = Vec::new();
+            write_avro_long(&mut buf, v);
+            let mut pos = 0;
+            assert_eq!(read_avro_long(&buf, &mut pos).unwrap(), v);
+            assert_eq!(pos, buf.len());
+        }
+    }
+
+    #[test]
+    fn manifest_header_carries_schema_spec_and_format_version() {
+        let fields = two_fields();
+        let schema = schema_json(&fields).to_string();
+        let bytes = write_manifest(
+            &files(),
+            9,
+            Some(&ManifestHeader {
+                schema_json: &schema,
+                format_version: FormatVersion::V2,
+            }),
+        )
+        .unwrap();
+        let reader = Reader::new(&bytes[..]).unwrap();
+        let meta = reader.user_metadata();
+        assert_eq!(meta.get("format-version").map(|v| &v[..]), Some(&b"2"[..]));
+        assert_eq!(meta.get("content").map(|v| &v[..]), Some(&b"data"[..]));
+        assert_eq!(meta.get("partition-spec").map(|v| &v[..]), Some(&b"[]"[..]));
+        assert_eq!(
+            meta.get("schema").map(|v| v.as_slice()),
+            Some(schema.as_bytes())
+        );
+        // The header does not change the entries.
+        assert_eq!(read_manifest(&bytes).unwrap(), files());
     }
 
     /// End-to-end content round-trip: metadata → manifest-list → manifest → data files.
     #[test]
     fn snapshot_content_round_trips_end_to_end() {
         let data = files();
-        let manifest_bytes = write_manifest(&data, 777).unwrap();
+        let manifest_bytes = write_manifest(&data, 777, None).unwrap();
         let manifests = vec![ManifestFileMeta {
             manifest_path: "m0.avro".into(),
             manifest_length: manifest_bytes.len() as i64,
             added_files_count: data.len() as i32,
             added_rows_count: data.iter().map(|f| f.record_count).sum(),
             added_snapshot_id: 777,
+            ..Default::default()
         }];
         let list_bytes = write_manifest_list(&manifests).unwrap();
+        let fields = [IcebergField {
+            id: 1,
+            name: "id".into(),
+            type_name: "long".into(),
+            required: true,
+        }];
         let json = build_table_metadata(
-            FormatVersion::V2,
-            "uuid-1",
-            "loc",
-            &[IcebergField {
-                id: 1,
-                name: "id".into(),
-                type_name: "long".into(),
-                required: true,
-            }],
-            777,
-            1,
-            "snap-777-list.avro",
-            1,
-            data.len() as i64,
-            data.iter().map(|f| f.record_count).sum(),
+            &SnapshotCommit {
+                format_version: FormatVersion::V2,
+                table_uuid: "uuid-1",
+                location: "loc",
+                fields: &fields,
+                snapshot_id: 777,
+                manifest_list_location: "snap-777-list.avro",
+                timestamp_ms: 1,
+                added_files: data.len() as i64,
+                added_records: data.iter().map(|f| f.record_count).sum(),
+            },
+            &Lineage::from_parent(None, None).unwrap(),
         )
         .unwrap();
 
@@ -696,5 +1262,221 @@ mod tests {
         assert_eq!(list.len(), 1);
         let recovered = read_manifest(&manifest_bytes).unwrap();
         assert_eq!(recovered, data);
+    }
+
+    /// Mixed-read gate for the apache-avro 0.16 -> 0.21 upgrade (mandate #8):
+    /// manifests already in object storage were written by 0.16, so the
+    /// current reader must decode those exact bytes. The fixtures were produced
+    /// by `write_manifest` / `write_manifest_list` built against apache-avro
+    /// 0.16.0 and are pinned here unchanged.
+    #[test]
+    fn reads_manifests_written_by_apache_avro_0_16() {
+        let mut expected = files();
+        expected[0].column_stats = vec![ColumnFileStats {
+            field_id: 1,
+            column_size: Some(512),
+            value_count: Some(100),
+            null_value_count: Some(3),
+            lower_bound: Some(7i64.to_le_bytes().to_vec()),
+            upper_bound: Some(900i64.to_le_bytes().to_vec()),
+        }];
+        let manifest = include_bytes!("../testdata/manifest_avro016.avro");
+        assert_eq!(read_manifest(manifest).unwrap(), expected);
+
+        let list = include_bytes!("../testdata/manifest_list_avro016.avro");
+        assert_eq!(
+            read_manifest_list(list).unwrap(),
+            vec![ManifestFileMeta {
+                manifest_path: "data/t/ns/tbl/metadata/m-0.avro".into(),
+                manifest_length: 2254,
+                added_files_count: 2,
+                added_rows_count: 150,
+                added_snapshot_id: 42,
+                sequence_number: 9,
+                first_row_id: Some(1000),
+                content: ManifestContent::Data,
+            }]
+        );
+    }
+}
+
+#[cfg(test)]
+mod lineage_fail_closed_tests {
+    use super::*;
+
+    /// TD-USUB-10 3c rung 2 — fail closed on inconsistent lineage metadata.
+    /// A v3 parent whose `next-row-id` is missing (or junk) would default to 0
+    /// and RE-ISSUE row ids the parent already handed out: silent corruption,
+    /// not an error. (Engine policy — our v3 publications always carry lineage;
+    /// the Iceberg spec makes lineage opt-in, so revisit if foreign v3 parents
+    /// are ever adopted.)
+    #[test]
+    fn a_v3_parent_without_next_row_id_is_an_error() {
+        let parent = serde_json::json!({
+            "format-version": 3,
+            "last-sequence-number": 4,
+            "current-snapshot-id": 77,
+        });
+        let err = Lineage::from_parent(Some(parent.to_string().as_str()), None)
+            .expect_err("a v3 table missing next-row-id must fail closed");
+        assert!(
+            err.to_string().contains("next-row-id"),
+            "the error names the field: {err}"
+        );
+    }
+
+    #[test]
+    fn a_v3_parent_with_a_non_integer_next_row_id_is_an_error() {
+        let parent = serde_json::json!({
+            "format-version": 3,
+            "last-sequence-number": 1,
+            "current-snapshot-id": 2,
+            "next-row-id": "many",
+        });
+        assert!(
+            Lineage::from_parent(Some(parent.to_string().as_str()), None).is_err(),
+            "junk next-row-id must fail closed, not unwrap_or(0)"
+        );
+    }
+
+    #[test]
+    fn a_v3_parent_with_a_negative_next_row_id_is_an_error() {
+        let parent = serde_json::json!({
+            "format-version": 3,
+            "last-sequence-number": 1,
+            "current-snapshot-id": 2,
+            "next-row-id": -5,
+        });
+        assert!(Lineage::from_parent(Some(parent.to_string().as_str()), None).is_err());
+    }
+
+    /// The lineage-relevant fields of a v0.4.1-era publication: format-version
+    /// 3 with NO row lineage anywhere (that writer emitted none); `snapshots`
+    /// and `current-snapshot-id` as v0.4.1's `build_table_metadata` wrote them.
+    /// (The full real document is the `testdata/v041` golden fixture.)
+    fn v041_parent(snapshot_extra: serde_json::Value) -> serde_json::Value {
+        let mut snapshot = serde_json::json!({
+            "snapshot-id": 1_761_000_000_000_i64,
+            "sequence-number": 1,
+            "timestamp-ms": 1_761_000_000_000_i64,
+            "summary": {
+                "operation": "append",
+                "added-data-files": "1",
+                "added-records": "20",
+            },
+            "manifest-list": "file:///w/t/metadata/snap-1.avro",
+            "schema-id": 0,
+        });
+        if let (Some(dst), Some(src)) = (snapshot.as_object_mut(), snapshot_extra.as_object()) {
+            dst.extend(src.clone());
+        }
+        serde_json::json!({
+            "format-version": 3,
+            "last-sequence-number": 1,
+            "current-snapshot-id": 1_761_000_000_000_i64,
+            "snapshots": [snapshot],
+            "metadata-log": [],
+        })
+    }
+
+    /// v0.5.0 upgrade (release blocker): a table MATERIALIZEd by v0.4.1 is
+    /// v3 without lineage. No row id was ever handed out — no snapshot carries
+    /// `first-row-id`/`added-rows` — so lineage starts at 0 and cannot re-issue
+    /// an id. Without this every upgraded table refused its next MATERIALIZE.
+    #[test]
+    fn a_lineage_less_v041_parent_starts_lineage_at_zero() {
+        let parent = v041_parent(serde_json::json!({}));
+        let lineage = Lineage::from_parent(Some(parent.to_string().as_str()), None)
+            .expect("a v0.4.1 publication is adopted, not refused");
+        assert_eq!(lineage.first_row_id, 0);
+        assert_eq!(lineage.parent_format_version, Some(3));
+        assert_eq!(lineage.sequence_number, 2);
+    }
+
+    /// The adoption needs POSITIVE evidence lineage never started: any snapshot
+    /// carrying a lineage field means ids may have been handed out, so a
+    /// missing `next-row-id` is inconsistent metadata and still fails closed.
+    #[test]
+    fn a_v3_parent_whose_snapshots_carry_lineage_still_fails_closed() {
+        for extra in [
+            serde_json::json!({"first-row-id": 0}),
+            serde_json::json!({"added-rows": 20}),
+        ] {
+            let parent = v041_parent(extra.clone());
+            assert!(
+                Lineage::from_parent(Some(parent.to_string().as_str()), None).is_err(),
+                "lineage evidence {extra} without next-row-id must fail closed"
+            );
+        }
+    }
+
+    /// No snapshots list, or a current snapshot the list does not contain, is
+    /// not evidence of anything: refuse.
+    #[test]
+    fn a_v3_parent_without_a_matching_snapshot_list_still_fails_closed() {
+        let mut no_list = v041_parent(serde_json::json!({}));
+        no_list.as_object_mut().map(|o| o.remove("snapshots"));
+        let mut empty = v041_parent(serde_json::json!({}));
+        empty["snapshots"] = serde_json::json!([]);
+        let mut dangling = v041_parent(serde_json::json!({}));
+        dangling["current-snapshot-id"] = serde_json::json!(42);
+        let mut no_current = v041_parent(serde_json::json!({}));
+        no_current
+            .as_object_mut()
+            .map(|o| o.remove("current-snapshot-id"));
+        for (label, parent) in [
+            ("no snapshots", no_list),
+            ("empty snapshots", empty),
+            ("dangling current", dangling),
+            ("no current snapshot", no_current),
+        ] {
+            assert!(
+                Lineage::from_parent(Some(parent.to_string().as_str()), None).is_err(),
+                "{label}: must fail closed"
+            );
+        }
+    }
+
+    /// v2 tables carry no row lineage (the engine's own v2 writer omits it);
+    /// a v2 parent without `next-row-id` stays valid, and a foreign writer
+    /// grafting `next-row-id` onto v2 is unsupported metadata — refused too.
+    #[test]
+    fn v2_parents_keep_todays_semantics_and_reject_grafted_lineage() {
+        let v2_ok = serde_json::json!({
+            "format-version": 2,
+            "last-sequence-number": 9,
+            "current-snapshot-id": 12,
+        });
+        let lineage = Lineage::from_parent(Some(v2_ok.to_string().as_str()), None)
+            .expect("a v2 parent without next-row-id is valid");
+        assert_eq!(lineage.first_row_id, 0);
+
+        let v2_grafted = serde_json::json!({
+            "format-version": 2,
+            "last-sequence-number": 9,
+            "current-snapshot-id": 12,
+            "next-row-id": 50,
+        });
+        assert!(
+            Lineage::from_parent(Some(v2_grafted.to_string().as_str()), None).is_err(),
+            "next-row-id on a v2 table is unsupported metadata (the spec puts row lineage in v3 only)"
+        );
+    }
+
+    /// A well-formed v3 parent still reads exactly as before.
+    #[test]
+    fn a_v3_parent_with_next_row_id_reads_as_before() {
+        let parent = serde_json::json!({
+            "format-version": 3,
+            "last-sequence-number": 3,
+            "current-snapshot-id": 40,
+            "next-row-id": 150,
+        });
+        let lineage =
+            Lineage::from_parent(Some(parent.to_string().as_str()), None).expect("valid v3 parent");
+        assert_eq!(lineage.first_row_id, 150);
+        assert_eq!(lineage.sequence_number, 4);
+        assert_eq!(lineage.parent_snapshot_id, Some(40));
+        assert_eq!(lineage.parent_format_version, Some(3));
     }
 }

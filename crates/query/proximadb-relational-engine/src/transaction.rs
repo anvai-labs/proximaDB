@@ -33,7 +33,7 @@ use proximadb_data_model::ProximaValue;
 use proximadb_relational_algebra::TableId;
 use proximadb_relational_executor::{ExecError, ReaderFactory};
 use proximadb_relational_reader::{ReaderCapabilities, ReaderError, RelationalReader, ScanContext};
-use proximadb_relational_types::{Expr, NoFunctions, RelationalRow, RelationalSchema};
+use proximadb_relational_types::{RelationalRow, RelationalSchema};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -178,18 +178,9 @@ impl Transaction {
         Ok(n)
     }
 
-    /// Update a row by PK. Buffered.
-    pub fn update_by_pk(
-        &self,
-        table: &str,
-        key: &[ProximaValue],
-        new_row: RelationalRow,
-    ) -> Result<(), EngineError> {
-        self.ensure_active()?;
-        let schema = self
-            .engine
-            .schema_of(table)
-            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+    /// PK-shape guard shared by the buffered PK-keyed writes:
+    /// table exists, has a PK, and `key` matches its arity.
+    fn checked_pk(&self, table: &str, key: &[ProximaValue]) -> Result<(), EngineError> {
         let pk = self
             .engine
             .pk_columns(table)
@@ -203,6 +194,22 @@ impl Transaction {
                 actual: key.len(),
             });
         }
+        Ok(())
+    }
+
+    /// Update a row by PK. Buffered.
+    pub fn update_by_pk(
+        &self,
+        table: &str,
+        key: &[ProximaValue],
+        new_row: RelationalRow,
+    ) -> Result<(), EngineError> {
+        self.ensure_active()?;
+        self.checked_pk(table, key)?;
+        let schema = self
+            .engine
+            .schema_of(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
         if new_row.len() != schema.len() {
             return Err(EngineError::RowArity {
                 expected: schema.len(),
@@ -222,19 +229,7 @@ impl Transaction {
     /// Delete a row by PK. Buffered.
     pub fn delete_by_pk(&self, table: &str, key: &[ProximaValue]) -> Result<(), EngineError> {
         self.ensure_active()?;
-        let pk = self
-            .engine
-            .pk_columns(table)
-            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
-        if pk.is_empty() {
-            return Err(EngineError::NoPrimaryKey(table.to_string()));
-        }
-        if key.len() != pk.len() {
-            return Err(EngineError::PkArity {
-                expected: pk.len(),
-                actual: key.len(),
-            });
-        }
+        self.checked_pk(table, key)?;
         self.buffer
             .write()
             .tables
@@ -433,55 +428,18 @@ fn find_row_by_pkkey(rows: &[RelationalRow], pk_cols: &[usize], key: &PkKey) -> 
 }
 
 /// Read cursor backed by an already-materialised (engine ∪ tx
-/// buffer) row set. Same shape as [`crate::InMemoryReader`] but
-/// reuses the merged snapshot.
+/// buffer) row set. Scan mechanics (projection, predicate, LIMIT,
+/// PK lookup) live in the shared [`crate::VecRowScan`] core; this
+/// type only supplies the merged snapshot.
 pub struct TxReader {
-    full_schema: RelationalSchema,
-    pk_columns: Vec<usize>,
-    rows: Vec<RelationalRow>,
-    open_state: Option<OpenState>,
-}
-
-struct OpenState {
-    output_schema: RelationalSchema,
-    projection_indices: Vec<usize>,
-    predicate: Option<Expr>,
-    limit: Option<u64>,
-    cursor: usize,
-    rows_emitted: u64,
+    core: crate::VecRowScan,
 }
 
 impl TxReader {
     fn new(schema: RelationalSchema, pk_columns: Vec<usize>, rows: Vec<RelationalRow>) -> Self {
         Self {
-            full_schema: schema,
-            pk_columns,
-            rows,
-            open_state: None,
+            core: crate::VecRowScan::new(schema, pk_columns, rows),
         }
-    }
-
-    fn resolve_projection(
-        &self,
-        projection: &Option<Vec<String>>,
-    ) -> Result<(RelationalSchema, Vec<usize>), ReaderError> {
-        let Some(names) = projection else {
-            return Ok((
-                self.full_schema.clone(),
-                (0..self.full_schema.len()).collect(),
-            ));
-        };
-        let mut cols = Vec::with_capacity(names.len());
-        let mut indices = Vec::with_capacity(names.len());
-        for n in names {
-            let (idx, info) = self
-                .full_schema
-                .column_by_name(n)
-                .ok_or_else(|| ReaderError::InvalidProjection(n.clone()))?;
-            cols.push(info.clone());
-            indices.push(idx);
-        }
-        Ok((RelationalSchema::new(cols), indices))
     }
 }
 
@@ -492,89 +450,27 @@ impl RelationalReader for TxReader {
     }
 
     fn capabilities(&self) -> ReaderCapabilities {
-        ReaderCapabilities::full().with_pk_lookup(!self.pk_columns.is_empty())
+        self.core.capabilities()
     }
 
     fn schema(&self) -> &RelationalSchema {
-        match &self.open_state {
-            Some(s) => &s.output_schema,
-            None => &self.full_schema,
-        }
+        self.core.schema()
     }
 
     async fn open(&mut self, ctx: &ScanContext) -> Result<(), ReaderError> {
-        let (output_schema, projection_indices) = self.resolve_projection(&ctx.projection)?;
-        if let Some(pred) = &ctx.predicate {
-            pred.type_check(&self.full_schema)
-                .map_err(ReaderError::PredicateEval)?;
-        }
-        self.open_state = Some(OpenState {
-            output_schema,
-            projection_indices,
-            predicate: ctx.predicate.clone(),
-            limit: ctx.limit,
-            cursor: 0,
-            rows_emitted: 0,
-        });
-        Ok(())
+        self.core.open(ctx)
     }
 
     async fn next_row(&mut self) -> Result<Option<RelationalRow>, ReaderError> {
-        let state = self.open_state.as_mut().ok_or(ReaderError::NotOpen)?;
-        loop {
-            if state.cursor >= self.rows.len() {
-                return Ok(None);
-            }
-            if let Some(limit) = state.limit
-                && state.rows_emitted >= limit
-            {
-                return Ok(None);
-            }
-            let row = &self.rows[state.cursor];
-            state.cursor += 1;
-            if let Some(pred) = &state.predicate {
-                let v = pred
-                    .eval(row, &NoFunctions)
-                    .map_err(ReaderError::PredicateEval)?;
-                if !matches!(v, ProximaValue::Boolean(true)) {
-                    continue;
-                }
-            }
-            let projected: RelationalRow = state
-                .projection_indices
-                .iter()
-                .map(|&i| row[i].clone())
-                .collect();
-            state.rows_emitted += 1;
-            return Ok(Some(projected));
-        }
+        self.core.next_row()
     }
 
     async fn lookup_pk(&self, key: &[ProximaValue]) -> Result<Option<RelationalRow>, ReaderError> {
-        if self.pk_columns.is_empty() {
-            return Err(ReaderError::PkLookupUnsupported);
-        }
-        if key.len() != self.pk_columns.len() {
-            return Err(ReaderError::PkArityMismatch {
-                expected: self.pk_columns.len(),
-                actual: key.len(),
-            });
-        }
-        for row in &self.rows {
-            let matches = self
-                .pk_columns
-                .iter()
-                .zip(key.iter())
-                .all(|(&idx, expected)| &row[idx] == expected);
-            if matches {
-                return Ok(Some(row.clone()));
-            }
-        }
-        Ok(None)
+        self.core.lookup_pk(key)
     }
 
     async fn close(&mut self) -> Result<(), ReaderError> {
-        self.open_state = None;
+        self.core.close();
         Ok(())
     }
 }

@@ -58,9 +58,11 @@ impl CollectionResolver {
         // Names and aliases terminate here at the catalog lookup boundary.
         let collection = self
             .collection_port
-            .get_collection(identifier, None)
+            .get_collection_internal(identifier)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("Collection {} not found", identifier))?;
+            .ok_or_else(|| {
+                proximadb_search_types::client_argument::CollectionNotFound::new(identifier)
+            })?;
         let object_id: crate::core::stable_id::CollectionObjectId =
             collection.id.parse().map_err(|error| {
                 anyhow::anyhow!(

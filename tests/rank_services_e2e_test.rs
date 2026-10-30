@@ -54,6 +54,9 @@ struct NoopBackend;
 
 #[async_trait::async_trait]
 impl HybridSearchBackend for NoopBackend {
+    async fn scope_collection(&self, _collection: &str, _tenant: &str) -> RankResult<()> {
+        Ok(())
+    }
     async fn bm25_search(
         &self,
         _collection: &str,
@@ -119,6 +122,7 @@ async fn rest_install_then_search_emits_spec_metrics() -> Result<(), Box<dyn std
     // ── 3. Issue a rank search through the same code path REST + gRPC + Arrow
     //    Flight share at the production seam. ─────────────────────────────────
     let request = RankSearchRequest {
+        scope: proximadb::network::rest::canonical::rank::RankScope::Internal,
         collection: "docs".to_string(),
         query_vector: vec![0.1, 0.2],
         query_text: Some("body content".to_string()),

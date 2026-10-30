@@ -1,7 +1,6 @@
 //! Index storage and serialization
 
 pub mod format_strategy;
-pub mod ivf_posting_list_storage;
 pub mod recovery;
 pub mod serialization;
 pub mod universal_index_storage;
@@ -17,7 +16,5 @@ pub use format_strategy::{
 };
 
 pub use recovery::{IndexRecoveryManager, RecoveryResult, RecoveryStrategy};
-
-pub use ivf_posting_list_storage::{IvfClusterPostingListStorage, PostingEntry, PostingList};
 
 pub use universal_index_storage::{IndexStorageConfig, UniversalIndexStorage};

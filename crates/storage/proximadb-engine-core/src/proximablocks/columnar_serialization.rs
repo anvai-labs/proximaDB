@@ -580,13 +580,9 @@ impl ColumnarSerializer {
                     ..Default::default()
                 };
                 if !vector.is_empty() {
-                    record.embeddings.push(EmbeddingCell {
-                        model_id: "default".to_string(),
-                        modality: "vector".to_string(),
-                        values: proximadb_records::EmbeddingValues::Fp32(vector),
-                        dim,
-                        ..Default::default()
-                    });
+                    record
+                        .embeddings
+                        .push(EmbeddingCell::new_fp32("default", "vector", dim, vector));
                 }
                 record
             })

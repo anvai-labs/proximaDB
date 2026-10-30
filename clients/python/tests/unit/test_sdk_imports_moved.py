@@ -86,11 +86,7 @@ class TestImports:
         # opt-in design (see proximadb_sdk.__init__._chunking_concern_available).
         pytest.importorskip("tree_sitter")
 
-        from proximadb_sdk import (
-            ChunkingStrategy,
-            chunk_by_sentences,
-            create_chunker,
-        )
+        from proximadb_sdk import ChunkingStrategy, chunk_by_sentences, create_chunker
 
         # Test ChunkingStrategy enum
         assert ChunkingStrategy.SENTENCE
@@ -102,12 +98,7 @@ class TestImports:
 
     def test_filter_imports(self):
         """Test filter API imports"""
-        from proximadb_sdk import (
-            FilterOp,
-            LogicalOp,
-            and_filters,
-            eq,
-        )
+        from proximadb_sdk import FilterOp, LogicalOp, and_filters, eq
 
         # Test enums
         assert FilterOp.EQUALS

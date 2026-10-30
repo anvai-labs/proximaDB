@@ -88,13 +88,12 @@ pub async fn viper_optimization_example() -> Result<()> {
                     format!("implicit_{:06}", i) // ID-less storage uses implicit IDs
                 },
                 props,
-                embeddings: vec![EmbeddingCell {
-                    model_id: "example-model".to_string(),
-                    modality: "text".to_string(),
-                    dim: vector.len() as u32,
-                    values: proximadb_records::EmbeddingValues::Fp32(vector),
-                    ..Default::default()
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "example-model",
+                    "text",
+                    vector.len() as u32,
+                    vector,
+                )],
                 created_at_ns: i,
                 record_version: 1,
                 ..Default::default()
@@ -350,13 +349,12 @@ pub async fn nova_optimization_example() -> Result<()> {
                     format!("implicit_{:08}", i) // ID-less saves ~8 bytes per vector
                 },
                 props,
-                embeddings: vec![EmbeddingCell {
-                    model_id: "text-embedding-ada-002".to_string(),
-                    modality: "text".to_string(),
-                    dim: vector.len() as u32,
-                    values: proximadb_records::EmbeddingValues::Fp32(vector),
-                    ..Default::default()
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "text-embedding-ada-002",
+                    "text",
+                    vector.len() as u32,
+                    vector,
+                )],
                 created_at_ns: (1_700_000_000 + i),
                 record_version: 1,
                 ..Default::default()

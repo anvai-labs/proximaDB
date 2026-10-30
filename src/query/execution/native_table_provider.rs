@@ -38,8 +38,9 @@
 //! **It is memory-bounded, and declines rather than degrading.** The whole table is
 //! materialized in memory, exactly as the ADR-025 read-merge base already is. A table
 //! larger than `row_cap` returns `None`, and the caller keeps its existing behaviour
-//! (Volcano + the honest decline) rather than risking an OOM. Streaming is future work
-//! and is tracked with the same note the read-merge carries.
+//! (Volcano + the honest decline) rather than risking an OOM. This materialized path
+//! is now the fallback: a table whose store offers a Layer A snapshot is streamed by
+//! [`crate::query::execution::layer_a`] instead, with no row cap.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,6 +70,12 @@ pub fn native_table_provider_enabled() -> bool {
         "1" | "true" | "TRUE" | "on" | "ON"
     )
 }
+
+/// Marks the planning error raised when a query MIXING Parquet-backed and
+/// native tables names a native table over the row cap (no streaming Layer A
+/// provider for it). The facade must refuse rather than replace published
+/// inputs with native state whose snapshot visibility is not proven equivalent.
+pub const MIXED_QUERY_ROW_CAP_DECLINE: &str = "native table over the row cap in a mixed query";
 
 /// Row cap for a natively-registered table (see [`DEFAULT_NATIVE_TABLE_ROW_CAP`]).
 pub fn native_table_row_cap() -> usize {
@@ -100,6 +107,23 @@ pub trait NativeTableSource: Send + Sync {
         identity: PortIdentity<'_>,
         row_cap: usize,
     ) -> anyhow::Result<Option<(CatalogTableSchema, Vec<ProximaRecord>)>>;
+
+    /// A governed, flush-consistent snapshot of `table` for the streaming Layer A
+    /// provider (ADR-097 P3.1): the catalog schema, the partition's unmerged
+    /// layers, and the caller's row access — resolved by the same identity/ABAC
+    /// prelude as [`Self::full_table_records`].
+    ///
+    /// `Ok(None)` when the backing store cannot offer one; the caller keeps the
+    /// materialized path. The default is that answer.
+    async fn layer_a_snapshot(
+        &self,
+        table: &str,
+        tenant: Option<&str>,
+        identity: PortIdentity<'_>,
+    ) -> anyhow::Result<Option<crate::services::layer_a_snapshot::NativeLayerASnapshot>> {
+        let _ = (table, tenant, identity);
+        Ok(None)
+    }
 }
 
 /// Native tables eligible for registration on this query.

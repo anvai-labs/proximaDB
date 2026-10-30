@@ -252,7 +252,14 @@ fn schema_metadata_from_collection(collection: &Collection) -> CollectionSchemaM
         schema_version: record_schema.map(|schema| schema.schema_version.clone()),
         enforcement: record_schema.map(|schema| enforcement_from_i32(schema.enforcement)),
         auto_evolve: record_schema.is_none_or(|schema| schema.auto_evolve),
-        enabled: config.enable_proxima_record.unwrap_or(false) || record_schema.is_some(),
+        // TD-GRPCSCHEMA-2: `enabled` is the enforcement answer — key it on the
+        // flag alone, exactly like every write-path gate (sst/flush shred spec,
+        // props promotion). The old `|| record_schema.is_some()` disjunct was
+        // the heuristic for the era when the flag never persisted; now a
+        // pinned-OFF create can carry a record_schema block, and it made this
+        // read ON (contradicting REST's flag-derived view) for a collection the
+        // caller explicitly created OFF.
+        enabled: config.enable_proxima_record.unwrap_or(false),
         columns,
     }
 }
@@ -380,43 +387,12 @@ fn filterable_type_to_proxima_type(value: i32) -> Option<ProximaType> {
     }
 }
 
-fn proxima_type_to_filterable_type(value: &ProximaType) -> Option<i32> {
-    let data_type = match value {
-        ProximaType::Int8 | ProximaType::Int16 | ProximaType::Int32 | ProximaType::Int64 => {
-            FilterableDataType::FilterableInteger
-        }
-        ProximaType::Float32 | ProximaType::Float64 => FilterableDataType::FilterableFloat,
-        ProximaType::Decimal { .. } => FilterableDataType::FilterableDecimal,
-        ProximaType::Boolean => FilterableDataType::FilterableBoolean,
-        ProximaType::Timestamp(_) => FilterableDataType::FilterableDatetime,
-        ProximaType::TimestampTz(_) => FilterableDataType::FilterableTimestampTz,
-        ProximaType::Date => FilterableDataType::FilterableDate,
-        ProximaType::Time(_) => FilterableDataType::FilterableTime,
-        ProximaType::Uuid => FilterableDataType::FilterableUuid,
-        ProximaType::Json | ProximaType::Jsonb => FilterableDataType::FilterableJson,
-        ProximaType::Array(inner) if matches!(inner.as_ref(), ProximaType::String) => {
-            FilterableDataType::FilterableArrayString
-        }
-        ProximaType::Array(inner)
-            if matches!(
-                inner.as_ref(),
-                ProximaType::Int8 | ProximaType::Int16 | ProximaType::Int32 | ProximaType::Int64
-            ) =>
-        {
-            FilterableDataType::FilterableArrayInteger
-        }
-        ProximaType::Array(inner)
-            if matches!(inner.as_ref(), ProximaType::Float32 | ProximaType::Float64) =>
-        {
-            FilterableDataType::FilterableArrayFloat
-        }
-        ProximaType::Array(inner) if matches!(inner.as_ref(), ProximaType::Boolean) => {
-            FilterableDataType::FilterableArrayBoolean
-        }
-        _ => return None,
-    };
-    Some(data_type as i32)
-}
+/// The v1 filterable type a canonical column narrows to (`None` when it has no
+/// filterable projection). Shared so the catalog can tell whether a declared
+/// column is compatible with the filterable column already stored for it.
+/// TD-CATREPLACE-1: the ONE mapping lives in the foundation data-model crate;
+/// this re-export keeps the historical path working.
+pub use proximadb_data_model::proxima_type_to_filterable_type;
 
 fn supports_range_filter(value: &ProximaType) -> bool {
     matches!(
@@ -478,10 +454,13 @@ impl ApiHandlersPort for UnifiedHandlers {
                 resp.collection = Some(col);
             }
             CollectionOperation::CollectionGet => {
-                let col = self
+                let mut col = self
                     .collection
                     .get_collection(collection_id, tenant_id)
                     .await?;
+                if let Some(collection) = col.as_mut() {
+                    self.collection.enrich_collection_status(collection).await;
+                }
                 resp.success = col.is_some();
                 resp.collection = col;
             }
@@ -500,7 +479,12 @@ impl ApiHandlersPort for UnifiedHandlers {
                 resp.affected_count = if deleted { 1 } else { 0 };
             }
             CollectionOperation::CollectionGetIdByName => {
-                let resolved = self.collection.resolve_collection_id(collection_id).await?;
+                // Resolved within the request tenant, like CollectionGet.
+                let resolved = self
+                    .collection
+                    .get_collection(collection_id, tenant_id)
+                    .await?
+                    .map(|collection| collection.id);
                 resp.success = resolved.is_some();
                 if let Some(id) = resolved {
                     resp.metadata.insert("collection_id".to_string(), id);
@@ -546,6 +530,24 @@ impl ApiHandlersPort for UnifiedHandlers {
         update: CollectionSchemaUpdate,
         tenant_id: Option<&str>,
     ) -> Result<CollectionSchemaMetadata> {
+        // A schema UPDATE turns record mode on (the SDK semantic): delegate
+        // with the mode unpinned. TD-GRPCSCHEMA-2.
+        self.update_collection_schema_metadata_with_record_mode(
+            collection_id,
+            update,
+            tenant_id,
+            None,
+        )
+        .await
+    }
+
+    async fn update_collection_schema_metadata_with_record_mode(
+        &self,
+        collection_id: &str,
+        update: CollectionSchemaUpdate,
+        tenant_id: Option<&str>,
+        record_mode: Option<bool>,
+    ) -> Result<CollectionSchemaMetadata> {
         let collection = self
             .collection
             .get_collection(collection_id, tenant_id)
@@ -555,12 +557,22 @@ impl ApiHandlersPort for UnifiedHandlers {
         // Narrow projection (best-effort); the canonical columns are persisted
         // verbatim via the sidecar below so rich ProximaType variants survive.
         apply_schema_update(&mut config, &update)?;
+        if let Some(mode) = record_mode {
+            config.enable_proxima_record = Some(mode);
+        }
+        // TD-CATREPLACE-1: canonical FIRST. The canonical write validates the
+        // whole update (including the fold against the stored filterable
+        // columns); a rejection here leaves the narrow config untouched — the
+        // old narrow-first order persisted it before the rejection and the
+        // collection came back half-applied (new filterable columns, old
+        // canonical schema). Only when the catalog accepted the schema is the
+        // narrow config replaced.
+        self.collection
+            .set_collection_schema_columns(collection_id, &update.columns, tenant_id)
+            .await?;
         let updated = self
             .collection
             .update_collection(collection_id, config, tenant_id)
-            .await?;
-        self.collection
-            .set_collection_schema_columns(collection_id, &update.columns, tenant_id)
             .await?;
         // Return the canonical columns as the authoritative view (the narrow
         // config above cannot represent them, so re-deriving would lose them).
@@ -698,6 +710,9 @@ mod tests {
     #[derive(Default)]
     struct MockCollectionPort {
         calls: Mutex<Vec<String>>,
+        /// When set, `set_collection_schema_columns` fails (the canonical write
+        /// rejecting the update — TD-CATREPLACE-1).
+        fail_canonical: bool,
     }
 
     #[async_trait]
@@ -748,6 +763,23 @@ mod tests {
                 config: Some(config),
                 ..Collection::default()
             })
+        }
+
+        async fn set_collection_schema_columns(
+            &self,
+            id: &str,
+            _columns: &[CollectionSchemaColumn],
+            _tenant_id: Option<&str>,
+        ) -> Result<()> {
+            if self.fail_canonical {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("set_columns:{id}:FAIL"));
+                return Err(anyhow!("canonical schema rejected"));
+            }
+            self.calls.lock().unwrap().push(format!("set_columns:{id}"));
+            Ok(())
         }
 
         async fn delete_collection(&self, id: &str, tenant_id: Option<&str>) -> Result<bool> {
@@ -964,7 +996,16 @@ mod tests {
         assert!(calls.iter().any(|call| call.starts_with("get:docs")));
         assert!(calls.iter().any(|call| call.starts_with("list:")));
         assert!(calls.iter().any(|call| call.starts_with("delete:docs")));
-        assert!(calls.iter().any(|call| call == "resolve:docs"));
+        // CollectionGetIdByName resolves within the request tenant (a scoped
+        // get), not through the unscoped name resolver.
+        assert!(!calls.iter().any(|call| call == "resolve:docs"));
+        assert!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("get:docs"))
+                .count()
+                >= 2
+        );
 
         let mut missing_config = collection_request(CollectionOperation::CollectionCreate);
         missing_config.collection_config = None;
@@ -1185,5 +1226,91 @@ mod tests {
                 .and_then(|value| value.value.as_ref()),
             Some(sql_value::Value::ObjectValue(value)) if value.fields.contains_key("shape")
         ));
+    }
+    // ── TD-CATREPLACE-1: schema-update ordering ─────────────────────────
+
+    fn schema_update(columns: Vec<CollectionSchemaColumn>) -> CollectionSchemaUpdate {
+        CollectionSchemaUpdate {
+            schema_id: "s1".to_string(),
+            schema_version: "1".to_string(),
+            enforcement: CollectionSchemaEnforcement::Hybrid,
+            auto_evolve: false,
+            columns,
+        }
+    }
+
+    fn handlers_with(port: Arc<MockCollectionPort>) -> UnifiedHandlers {
+        UnifiedHandlers::new(port, Arc::new(MockVectorOpsPort::default()), None)
+    }
+
+    /// A schema update the canonical write rejects must persist NOTHING: the
+    /// narrow config write happens only after the catalog accepted the schema.
+    #[tokio::test]
+    async fn rejected_schema_update_persists_no_narrow_config() {
+        let port = Arc::new(MockCollectionPort {
+            fail_canonical: true,
+            ..Default::default()
+        });
+        let handlers = handlers_with(port.clone());
+        let err = handlers
+            .update_collection_schema_metadata(
+                "c1",
+                schema_update(vec![CollectionSchemaColumn {
+                    name: "x".to_string(),
+                    data_type: ProximaType::Boolean,
+                    nullable: true,
+                    indexed: false,
+                    filterable: true,
+                    text_storage: None,
+                    max_length: None,
+                }]),
+                None,
+            )
+            .await
+            .expect_err("the canonical write fails");
+        assert!(err.to_string().contains("rejected"));
+        assert!(
+            !port
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("update:")),
+            "the narrow config must not be written before the canonical schema is accepted: {:?}",
+            port.calls.lock().unwrap()
+        );
+    }
+
+    /// On success the canonical write happens first, then the narrow config.
+    #[tokio::test]
+    async fn schema_update_writes_canonical_before_narrow_config() {
+        let port = Arc::new(MockCollectionPort::default());
+        let handlers = handlers_with(port.clone());
+        handlers
+            .update_collection_schema_metadata(
+                "c1",
+                schema_update(vec![CollectionSchemaColumn {
+                    name: "x".to_string(),
+                    data_type: ProximaType::Int64,
+                    nullable: true,
+                    indexed: false,
+                    filterable: true,
+                    text_storage: None,
+                    max_length: None,
+                }]),
+                None,
+            )
+            .await
+            .expect("update succeeds");
+        let calls = port.calls.lock().unwrap().clone();
+        let set_at = calls
+            .iter()
+            .position(|c| c.starts_with("set_columns:"))
+            .expect("canonical write");
+        let update_at = calls
+            .iter()
+            .position(|c| c.starts_with("update:"))
+            .expect("narrow write");
+        assert!(set_at < update_at, "canonical before narrow: {calls:?}");
     }
 }

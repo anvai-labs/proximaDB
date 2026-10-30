@@ -35,9 +35,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from victor.storage.vector_stores.base import (
-    EmbeddingConfig,
-)
+from victor.storage.vector_stores.base import EmbeddingConfig
 
 from proximadb_sdk.integrations._records import insert_records, record_payload
 from proximadb_sdk.integrations.victor import ProximaDBEmbeddingProvider

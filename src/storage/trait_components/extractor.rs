@@ -59,6 +59,138 @@ pub trait VectorExtractor: Send + Sync {
     fn engine_type(&self) -> StorageEngineType;
 }
 
+/// Build the O(1) selective-extraction id filter (TD-DSEFF-1 pattern): a set
+/// built once per extraction so the per-record membership check is O(1).
+/// Previously each engine hand-rolled this — sst/nova/swift used the set,
+/// helix/viper/raptor did a linear `ids.contains` per record, and tst
+/// ignored `vector_ids` entirely (redundancy pass 3 harmonization).
+///
+/// Note: engines currently consult the filter at different points — some
+/// after fp32/metadata materialization; moving the check earlier (so
+/// excluded records skip conversion) is a follow-up.
+pub fn build_id_filter(
+    vector_ids: Option<&Vec<String>>,
+) -> Option<std::collections::HashSet<&String>> {
+    vector_ids.map(|ids| ids.iter().collect())
+}
+
+/// O(1) membership check against an optional [`build_id_filter`] set.
+///
+/// Companion to the filter builder so every engine spells the
+/// `None ⇒ include everything` rule identically (redundancy pass 4).
+pub fn id_filter_allows(
+    id_filter: &Option<std::collections::HashSet<&String>>,
+    id: &String,
+) -> bool {
+    match id_filter {
+        Some(ids) => ids.contains(id),
+        None => true,
+    }
+}
+
+/// Whether a mode asks for the FP32 representation at all.
+///
+/// `QuantizedOnly` is the only mode that skips it; engines use this instead of
+/// re-spelling the three fp32-capable arms of the mode match.
+pub fn mode_wants_fp32(mode: ExtractionMode) -> bool {
+    matches!(
+        mode,
+        ExtractionMode::Fp32Only | ExtractionMode::Both | ExtractionMode::Auto
+    )
+}
+
+/// Strip a `file://` URL prefix, returning the local path (identity otherwise).
+pub fn strip_file_url(path: &str) -> &str {
+    path.strip_prefix("file://").unwrap_or(path)
+}
+
+/// Race-tolerant exists-filter over local paths (redundancy pass 4 extraction
+/// of the shared skeleton block).
+///
+/// Keeps only files that exist on local disk, logging (debug per file, warn in
+/// aggregate) the ones dropped — extraction is often invoked just after a temp
+/// directory is cleaned up, and a hard error there would fail the whole index
+/// build. The `file://` prefix is stripped **for the existence check only**;
+/// the path as given is pushed back, because most engine readers accept full
+/// URLs. SST strips upfront instead (its reader wants local paths) and feeds
+/// this helper the already-stripped list — stripping is idempotent.
+///
+/// Not for engines whose paths may be object-store URLs: HELIX checks
+/// existence through the configured filesystem (a local `Path::exists` would
+/// classify every object-store URL as missing), and TST deliberately accepts
+/// only plain local paths. Both keep their own filters.
+pub fn filter_existing_files(engine_label: &str, file_paths: &[String]) -> Vec<String> {
+    let mut existing_files = Vec::with_capacity(file_paths.len());
+    let mut missing_count = 0;
+    for path in file_paths {
+        if std::path::Path::new(strip_file_url(path)).exists() {
+            existing_files.push(path.clone());
+        } else {
+            missing_count += 1;
+            tracing::debug!(
+                "[{} Extractor] File not found (skipping): {}",
+                engine_label,
+                path
+            );
+        }
+    }
+
+    if missing_count > 0 {
+        tracing::warn!(
+            "[{} Extractor] {} of {} files not found (temp dir cleanup race?)",
+            engine_label,
+            missing_count,
+            file_paths.len()
+        );
+    }
+
+    existing_files
+}
+
+/// Apply offset/limit pagination and assemble the final [`ExtractionResult`].
+///
+/// `vectors_extracted` reports the **pre-pagination** count (what the scan
+/// actually recovered) while `vectors` holds the paginated page — the
+/// semantics shared by every engine except TST, which reports the
+/// post-pagination count and therefore keeps its own finalize block.
+/// `files_processed` is passed by the caller because engines count
+/// differently: SST reports the original request's file count, the per-file
+/// readers report only the files they actually processed.
+pub fn finalize_extraction(
+    mut vectors: Vec<ExtractedVector>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    bytes_read: usize,
+    files_processed: usize,
+    start: std::time::Instant,
+) -> ExtractionResult {
+    let vectors_extracted = vectors.len();
+
+    // Apply limit and offset if specified
+    if let Some(offset) = offset {
+        if offset < vectors.len() {
+            vectors = vectors.into_iter().skip(offset).collect();
+        } else {
+            vectors.clear();
+        }
+    }
+    if let Some(limit) = limit {
+        vectors.truncate(limit);
+    }
+
+    ExtractionResult {
+        vectors,
+        stats: ExtractionStats {
+            vectors_extracted,
+            bytes_read,
+            files_processed,
+            duration_ms: start.elapsed().as_millis() as u64,
+            vectors_skipped: 0,
+        },
+        continuation_token: None,
+    }
+}
+
 /// Request parameters for vector extraction.
 #[derive(Debug, Clone)]
 pub struct ExtractionRequest {
@@ -464,5 +596,99 @@ mod tests {
         assert!(vector.fp32_vector.is_some());
         assert!(vector.metadata.is_some());
         assert_eq!(vector.metadata.unwrap(), metadata);
+    }
+
+    #[test]
+    fn test_strip_file_url() {
+        assert_eq!(strip_file_url("file:///tmp/a.sst"), "/tmp/a.sst");
+        assert_eq!(strip_file_url("/tmp/a.sst"), "/tmp/a.sst");
+        assert_eq!(strip_file_url("s3://bucket/a.sst"), "s3://bucket/a.sst");
+    }
+
+    #[test]
+    fn test_filter_existing_files_drops_missing_keeps_given_form() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let present = dir.path().join("present.sst");
+        std::fs::write(&present, b"x").expect("write");
+
+        let request_paths = vec![
+            present.to_string_lossy().to_string(),
+            // file:// URL of the SAME present file: the check strips the
+            // prefix, but the path as given must be pushed back.
+            format!("file://{}", present.to_string_lossy()),
+            dir.path().join("missing.sst").to_string_lossy().to_string(),
+        ];
+
+        let existing = filter_existing_files("TEST", &request_paths);
+
+        // Missing file dropped; both spellings of the present file kept
+        // verbatim (engines feed their readers the form they were given).
+        assert_eq!(existing.len(), 2);
+        assert_eq!(existing[0], request_paths[0]);
+        assert_eq!(existing[1], request_paths[1]);
+
+        assert!(filter_existing_files("TEST", &[]).is_empty());
+    }
+
+    #[test]
+    fn test_finalize_extraction_reports_pre_pagination_count() {
+        let vectors: Vec<ExtractedVector> = (0..5)
+            .map(|i| ExtractedVector::new_fp32(i.to_string(), vec![i as f32]))
+            .collect();
+
+        // Offset + limit page out of the middle.
+        let result = finalize_extraction(
+            vectors,
+            Some(1),
+            Some(2),
+            1234,
+            7,
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            result
+                .vectors
+                .iter()
+                .map(|v| v.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2"]
+        );
+        // The stat reports what the scan recovered, not the page size.
+        assert_eq!(result.stats.vectors_extracted, 5);
+        assert_eq!(result.stats.bytes_read, 1234);
+        assert_eq!(result.stats.files_processed, 7);
+        assert_eq!(result.stats.vectors_skipped, 0);
+        assert!(result.continuation_token.is_none());
+    }
+
+    #[test]
+    fn test_finalize_extraction_offset_beyond_len_clears() {
+        let vectors = vec![ExtractedVector::new_fp32("v1".to_string(), vec![1.0])];
+        let result = finalize_extraction(vectors, Some(5), None, 0, 1, std::time::Instant::now());
+        assert!(result.vectors.is_empty());
+        assert_eq!(result.stats.vectors_extracted, 1);
+    }
+
+    #[test]
+    fn test_mode_wants_fp32() {
+        assert!(mode_wants_fp32(ExtractionMode::Fp32Only));
+        assert!(mode_wants_fp32(ExtractionMode::Both));
+        assert!(mode_wants_fp32(ExtractionMode::Auto));
+        assert!(!mode_wants_fp32(ExtractionMode::QuantizedOnly));
+    }
+
+    #[test]
+    fn test_id_filter_allows() {
+        let ids = vec!["v1".to_string()];
+        let filter = build_id_filter(Some(&ids));
+        assert!(id_filter_allows(&filter, &"v1".to_string()));
+        assert!(!id_filter_allows(&filter, &"v2".to_string()));
+        // No filter (full extraction) includes everything — including the
+        // empty-filter case built from Some(vec![]).
+        let none = build_id_filter(None);
+        assert!(id_filter_allows(&none, &"anything".to_string()));
+        let empty_ids: Vec<String> = vec![];
+        let empty_filter = build_id_filter(Some(&empty_ids));
+        assert!(!id_filter_allows(&empty_filter, &"anything".to_string()));
     }
 }

@@ -39,6 +39,7 @@ mod small_batch_tests {
         engine_type: StorageEngine,
     ) -> Collection {
         Collection {
+            storage_class_status: None,
             id: collection_id.to_string(),
             config: Some(proximadb::proto::proximadb_v1::CollectionConfig {
                 name: collection_id.to_string(),

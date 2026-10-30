@@ -16,7 +16,7 @@ the support contract, that tier wins for customer and release-note claims.
 The direction is fixed by
 link:../12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096]. When
 each requirement lands is decided only by the
-link:../_internal/roadmap/STRATEGIC_ROADMAP.adoc[roadmap]; this document carries no release
+link:../current/ROADMAP.adoc[roadmap]; this document carries no release
 table. The executable MVP promise is link:MVP_TRUST_CORRIDOR.toml[MVP_TRUST_CORRIDOR.toml]:
 canonical REST v2 records, metadata scan and vector retrieval on single-tenant, single-node SST.
 pgwire joins that corridor only after its identity, ABAC, conformance and recovery gates close.
@@ -163,8 +163,8 @@ link:../06-internals/contributing.md[the contributing guide].
 
 == Related documents
 
-* link:VISION.adoc[Vision] · link:COMPETITIVE_LANDSCAPE.adoc[Competitive Landscape]
-* link:../_internal/roadmap/STRATEGIC_ROADMAP.adoc[Strategic Roadmap] — when each requirement lands.
+* link:../current/VISION.adoc[Vision] · link:COMPETITIVE_LANDSCAPE.adoc[Competitive Landscape]
+* link:../current/ROADMAP.adoc[Strategic Roadmap] — when each requirement lands.
 * link:../SUPPORTED_SURFACE.adoc[Supported Surface] — what may be claimed today.
 
 '''

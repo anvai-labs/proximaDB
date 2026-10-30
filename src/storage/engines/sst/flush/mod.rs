@@ -583,7 +583,8 @@ impl SstEngine {
                 let rerank_quant = resolve_pax_rerank_quant(rerank_tags);
                 // TD-PAXRG-1: row-group Region D — per-collection
                 // `pax_rg_layout` tag > env `PROXIMADB_PAX_WRITE_RG_LAYOUT` >
-                // default OFF. No-ops for non-RaBitQ-coalesced writes.
+                // default ON (flipped 2026-08-28, Phase-G evidence).
+                // No-ops for non-RaBitQ-coalesced writes.
                 let rg_layout = resolve_pax_rg_layout(rerank_tags);
                 // TD-FPRUNE-1 M1: shred declared filterable tags into typed
                 // user-columns at flush so footer-resident filter pruning fires
@@ -1043,9 +1044,9 @@ impl SstEngine {
     /// Whether L0→base compaction should be triggered after this flush (TD-114,
     /// per-collection override TD-WLP-2 / ADR-061 D5).
     ///
-    /// Default-OFF: absent a per-collection `compaction:on` tag the trigger only
-    /// arms when `PROXIMADB_L0_COMPACTION_ENABLED` is truthy, so the untagged
-    /// flush path is byte-for-byte unchanged. A tagged collection may arm (at
+    /// Default-ON since TD-WLP-4: the default gate with the AppendBulk
+    /// `#[default]` profile leaves an UNTAGGED collection compacting; a
+    /// per-collection `compaction:off` tag opts out. A tagged collection may arm (at
     /// its own `l0_threshold:N`) while the global gate is unset; an explicitly
     /// falsy global env is the master kill-switch nothing can override. When
     /// armed, it reuses the existing segment discovery to count L0 segments and
@@ -1078,15 +1079,28 @@ impl SstEngine {
             .discover_sstable_files(storage_url)
             .await
             .unwrap_or_default();
-        if files.len() >= threshold {
-            return Ok(Some(threshold));
-        }
+        // R6 (TD-FPRUNE-1 liveness): `files` counts EVERY level, while the
+        // executor applies `threshold` to L0 files only. Once the levelled
+        // ladder holds `threshold - 1` files, every flush armed the count arm,
+        // the executor found too few L0s and declined (`Ok(false)`), and the
+        // early return here meant the training arm was never consulted: untrained
+        // L0s stranded for good (measured on the 3M P5 bed — 4 untrained 57–61
+        // MB L0s beside L1..L4). So the count arm is only the fallback; the
+        // training arm, when it fires, wins. Higher levels are deferred, not
+        // starved: the worker's follow-up re-evaluates at threshold 1
+        // (`training_follow_up_threshold`) and falls through to L1+ merges once
+        // L0 drains, and flushes landing during the chain see the retained
+        // in-flight guard, take the count arm below and enqueue L1+ merges whose
+        // inputs do not overlap the running L0 task. Bound: L1+ waits only while
+        // the L0 backlog stays >= threshold for the whole chain (ingest
+        // outrunning L0 compaction), the same bound the count arm had.
+        let count_due = (files.len() >= threshold).then_some(threshold);
         // TD-COMPACT-5 training arm — only meaningful when the A0-emitting
         // trainer is enabled (`PROXIMADB_PAX_WRITE_A0_TRAIN`, default ON).
         // Without it compaction outputs stay layout v1, the untrained condition
         // never self-clears, and the arm would fire on every flush.
         if !crate::storage::engines::sst::block_cluster::ivf_probe_enabled() {
-            return Ok(None);
+            return Ok(count_due);
         }
         // TD-COMPACT-8: skip re-arming while a training compaction is in-flight
         // for this collection (prevents the redundant re-training loop — up to
@@ -1105,7 +1119,7 @@ impl SstEngine {
                 "TD-COMPACT-8: training compaction already in-flight for \
                  {storage_url} — skipping arm"
             );
-            return Ok(None);
+            return Ok(count_due);
         }
         // Best-effort header sniffing (72 bytes/file); any error means "not
         // yet", never fails the flush.
@@ -1114,8 +1128,13 @@ impl SstEngine {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(32)
             .saturating_mul(1024 * 1024);
+        // Only L0 files: a threshold-1 task builds an L0 morsel, so an
+        // untrained L1+ file (block clustering off, a trainer fallback, a
+        // pre-trainer legacy file) could never self-clear and would re-arm a
+        // pointless training compaction on every flush. Skipping L1+ also
+        // keeps the per-flush header sniff to the few L0s.
         for path in &files {
-            if !path.url.ends_with(".pax") {
+            if !path.url.ends_with(".pax") || !is_l0_segment_url(&path.url) {
                 continue;
             }
             if let Ok(true) = self.segment_is_untrained(&path.url, min_bytes).await {
@@ -1126,7 +1145,7 @@ impl SstEngine {
                 return Ok(Some(1));
             }
         }
-        Ok(None)
+        Ok(count_due)
     }
 
     /// TD-COMPACT-5: is this segment untrained (no A0 coarse directory) and
@@ -1150,6 +1169,19 @@ impl SstEngine {
             Err(_) => false,
         })
     }
+}
+
+/// Whether a segment URL names an L0 file the compaction executor can act
+/// on, by the executor's OWN codec: its discovery admits only tiered names
+/// (`FilenameCodec::is_tiered_filename`) and reads their level with
+/// `parse_level`. A non-tiered `.pax` (e.g. `L0_recovery_*`) is invisible to
+/// the executor, so it must never arm the training arm either — no compaction
+/// could ever clear it.
+fn is_l0_segment_url(url: &str) -> bool {
+    use crate::storage::common::compaction_orchestrator::FilenameCodec;
+    static CODEC: std::sync::LazyLock<FilenameCodec> = std::sync::LazyLock::new(FilenameCodec::new);
+    let name = url.rsplit('/').next().unwrap_or(url);
+    CODEC.is_tiered_filename(name, "pax") && CODEC.parse_level(name) == 0
 }
 
 /// L0 segment count at which compaction arms. Mirrors
@@ -1433,8 +1465,10 @@ fn pax_rg_layout_tag(tags: &[String]) -> Option<bool> {
 }
 
 /// Resolve the row-group Region D write switch. Precedence: per-collection
-/// `pax_rg_layout` tag > env `PROXIMADB_PAX_WRITE_RG_LAYOUT` > default OFF.
-/// Only effective for RaBitQ-coalesced writes (Regions A/B are the premise).
+/// `pax_rg_layout` tag > env `PROXIMADB_PAX_WRITE_RG_LAYOUT` > default ON
+/// (flipped 2026-08-28 on the TD-PAXRG-1 Phase-G evidence; the doc once said
+/// OFF — the code and its test say ON). Only effective for RaBitQ-coalesced
+/// writes (Regions A/B are the premise).
 pub(crate) fn resolve_pax_rg_layout(tags: &[String]) -> bool {
     let per_collection = pax_rg_layout_tag(tags);
     per_collection.unwrap_or_else(crate::storage::engines::sst::segment_format::rg_layout_enabled)
@@ -1496,24 +1530,58 @@ fn declares_fp32_canonical_precision(
 /// the segment's SELF-DESCRIBING footer field-map, so any consistent id works;
 /// matching the catalog assignment is just tidy. Empty spec (non-document
 /// collection, or no filterable columns) ⇒ byte-identical, mixed-read-safe.
+/// Map the proto's coarse `FilterableDataType` to the exact `ProximaType` a
+/// typed shred column can be declared with (TD-FPRUNE-1 P5 slice 2). Only
+/// types with an exact physical shred class are mapped; everything else stays
+/// `untyped` — such columns can never be authoritative, so their values keep
+/// the complete msgpack tail (fail-safe by construction).
+fn filterable_shred_column(
+    col: &crate::proto::proximadb_v1::FilterableColumnSpec,
+    idx: usize,
+) -> proximadb_block_format::ShredColumn {
+    use proximadb_block_format::ShredColumn;
+    use proximadb_data_model::ProximaType;
+    let column_id = 100 + idx as i32;
+    let data_type = crate::proto::proximadb_v1::FilterableDataType::try_from(col.data_type)
+        .unwrap_or(crate::proto::proximadb_v1::FilterableDataType::Unspecified);
+    let declared = match data_type {
+        crate::proto::proximadb_v1::FilterableDataType::FilterableInteger => {
+            Some(ProximaType::Int64)
+        }
+        crate::proto::proximadb_v1::FilterableDataType::FilterableFloat => {
+            Some(ProximaType::Float64)
+        }
+        crate::proto::proximadb_v1::FilterableDataType::FilterableString => {
+            Some(ProximaType::String)
+        }
+        // Boolean/Datetime/Array types have no exact single physical class —
+        // untyped keeps the tail complete for them (conservative).
+        _ => None,
+    };
+    match declared {
+        Some(t) => ShredColumn::typed(&col.name, column_id, t),
+        None => ShredColumn::untyped(&col.name, column_id),
+    }
+}
+
 fn resolve_flush_shred_spec(
     collection_config: Option<&crate::proto::proximadb_v1::Collection>,
-) -> Vec<(String, i32)> {
+) -> Vec<proximadb_block_format::ShredColumn> {
     let Some(config) = collection_config.and_then(|c| c.config.as_ref()) else {
         return Vec::new();
     };
     if config.enable_proxima_record != Some(true) {
         return Vec::new();
     }
-    let spec: Vec<(String, i32)> = config
+    let spec: Vec<proximadb_block_format::ShredColumn> = config
         .filterable_columns
         .iter()
         .enumerate()
         .filter(|(_, col)| !col.name.is_empty())
-        .map(|(idx, col)| (col.name.clone(), 100 + idx as i32))
+        .map(|(idx, col)| filterable_shred_column(col, idx))
         .collect();
     if !spec.is_empty() {
-        tracing::debug!("TD-FPRUNE-1 M1: flush shred spec = {:?}", spec);
+        tracing::debug!("TD-FPRUNE-1 M1/P5: flush shred spec = {:?}", spec);
     }
     spec
 }
@@ -1761,14 +1829,26 @@ mod tests {
     }
 
     // TD-FPRUNE-1 M1: the flush-side shred spec reconstructs the SAME
-    // `(name, 100+idx)` pairs the catalog schema assigns, gated on
+    // `(name, 100+idx)` columns the catalog schema assigns, gated on
     // `enable_proxima_record`. This is what makes footer filter-pruning fire for
     // vector collections (the write path previously shredded nothing).
+    // P5 slice 2: columns whose coarse proto type maps to an exact ProximaType
+    // are TYPED (residual-eligible); everything else stays untyped (complete
+    // tail, fail-safe).
     #[test]
     fn resolve_flush_shred_spec_from_filterable_columns() {
-        use crate::proto::proximadb_v1::{Collection, CollectionConfig, FilterableColumnSpec};
+        use crate::proto::proximadb_v1::{
+            Collection, CollectionConfig, FilterableColumnSpec, FilterableDataType,
+        };
+        use proximadb_block_format::ShredColumn;
+        use proximadb_data_model::ProximaType;
         let col = |name: &str| FilterableColumnSpec {
             name: name.to_string(),
+            ..Default::default()
+        };
+        let typed_col = |name: &str, t: i32| FilterableColumnSpec {
+            name: name.to_string(),
+            data_type: t,
             ..Default::default()
         };
         let mk = |enable: Option<bool>, cols: Vec<FilterableColumnSpec>| Collection {
@@ -1780,18 +1860,42 @@ mod tests {
             ..Default::default()
         };
 
-        // enable_proxima_record + two filterable columns → (name, 100+idx).
+        // enable_proxima_record + two unspecified-type columns → untyped
+        // (name, 100+idx) — same as pre-P5, never residual-eligible.
         let c = mk(Some(true), vec![col("partition"), col("lang")]);
         assert_eq!(
             resolve_flush_shred_spec(Some(&c)),
-            vec![("partition".to_string(), 100), ("lang".to_string(), 101)]
+            vec![
+                ShredColumn::untyped("partition", 100),
+                ShredColumn::untyped("lang", 101)
+            ]
+        );
+        // Exact-type columns carry their declared ProximaType (P5 slice 2).
+        let c = mk(
+            Some(true),
+            vec![
+                typed_col("category", FilterableDataType::FilterableInteger as i32),
+                typed_col("score", FilterableDataType::FilterableFloat as i32),
+                typed_col("lang", FilterableDataType::FilterableString as i32),
+                typed_col("flag", FilterableDataType::FilterableBoolean as i32),
+            ],
+        );
+        assert_eq!(
+            resolve_flush_shred_spec(Some(&c)),
+            vec![
+                ShredColumn::typed("category", 100, ProximaType::Int64),
+                ShredColumn::typed("score", 101, ProximaType::Float64),
+                ShredColumn::typed("lang", 102, ProximaType::String),
+                // Boolean has no exact physical class → untyped (tail kept).
+                ShredColumn::untyped("flag", 103),
+            ]
         );
         // Empty column names are skipped but still advance the index (mirrors
         // catalog_schema_from_collection's enumerate-then-skip).
         let c = mk(Some(true), vec![col(""), col("lang")]);
         assert_eq!(
             resolve_flush_shred_spec(Some(&c)),
-            vec![("lang".to_string(), 101)]
+            vec![ShredColumn::untyped("lang", 101)]
         );
         // Not a document collection ⇒ no shredding (byte-identical write).
         assert!(
@@ -1854,13 +1958,12 @@ mod tests {
             created_at_ns: 12_345_000_000,
             updated_at_ns: 12_345_000_000,
             record_version: 1,
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "test".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: vector.len() as u32,
-                values: proximadb_records::EmbeddingValues::Fp32(vector),
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "test",
+                "dense_vector",
+                vector.len() as u32,
+                vector,
+            )],
             ..ProximaRecord::default()
         }
     }
@@ -2273,6 +2376,130 @@ mod tests {
             "expected at least one flushed segment under {base_location}"
         );
         exts
+    }
+
+    /// R6 (TD-FPRUNE-1 liveness): an untrained L0 beside a levelled ladder
+    /// whose TOTAL file count reaches the L0 threshold must still arm the
+    /// training compaction (threshold 1). Before the fix the all-levels count
+    /// arm returned first with the L0 threshold, the executor (which counts
+    /// L0s only) found nothing due, and the untrained L0 stranded.
+    #[tokio::test]
+    async fn training_arm_fires_even_when_all_level_count_reaches_threshold() {
+        unsafe {
+            std::env::remove_var(PAX_VECTOR_SEGMENTS_DISABLE_ENV);
+            std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
+            std::env::set_var("PROXIMADB_TRAINING_COMPACTION_MIN_MB", "0");
+        }
+        let engine = create_test_engine().await;
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = temp_dir.path().to_str().unwrap();
+        let tags = vec![
+            "pax_vector_format:on".to_string(),
+            "compaction:on".to_string(),
+        ];
+        let records = (0..8)
+            .map(|i| create_test_vector(&format!("v{i}"), vec![i as f32, 1.0, 0.0, 0.0]))
+            .collect();
+        flush_segment_exts(&engine, "r6_liveness", base, tags.clone(), records).await;
+
+        let mut paxes = Vec::new();
+        collect_files_with_ext(std::path::Path::new(base), "pax", &mut paxes);
+        assert_eq!(paxes.len(), 1, "one flushed L0: {paxes:?}");
+        let flushed = paxes.remove(0);
+        let data_dir = flushed.parent().unwrap().to_path_buf();
+        let storage_url = data_dir.to_str().unwrap();
+        assert!(
+            engine
+                .segment_is_untrained(flushed.to_str().unwrap(), 0)
+                .await
+                .unwrap(),
+            "a flush-written L0 carries no A0 directory (the premise)"
+        );
+        // A levelled ladder L1..L4 (one file each): the total reaches the
+        // default L0 threshold of 5, yet only one file is at L0. The ladder
+        // files are byte copies, so they are untrained too — the block after
+        // this one proves only the L0 can arm the training arm.
+        for level in 1..=4 {
+            std::fs::copy(
+                &flushed,
+                data_dir.join(format!("L{level}_20261029T00000{level}_0000000{level}.pax")),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            engine
+                .should_trigger_compaction(storage_url, &tags)
+                .await
+                .unwrap(),
+            Some(1),
+            "the training arm must win over the all-levels count arm"
+        );
+
+        // Without the untrained L0, untrained L1+ files must NOT arm training
+        // (a threshold-1 L0 morsel cannot rewrite them, so the arm would
+        // re-fire every flush): only the count arm remains.
+        let parked = data_dir.join("parked.l0");
+        std::fs::rename(&flushed, &parked).unwrap();
+        let fifth = data_dir.join("L1_20261029T000005_00000005.pax");
+        std::fs::copy(&parked, &fifth).unwrap();
+        assert_eq!(
+            engine
+                .should_trigger_compaction(storage_url, &tags)
+                .await
+                .unwrap(),
+            Some(L0_COMPACTION_THRESHOLD),
+            "untrained L1+ files alone fall back to the count arm"
+        );
+        std::fs::remove_file(&fifth).unwrap();
+        std::fs::rename(&parked, &flushed).unwrap();
+
+        // With a training compaction in flight the arm stays suppressed
+        // (TD-COMPACT-8) and the count arm is the fallback, as before.
+        engine
+            .training_in_flight
+            .lock()
+            .unwrap()
+            .insert(storage_url.to_string());
+        assert_eq!(
+            engine
+                .should_trigger_compaction(storage_url, &tags)
+                .await
+                .unwrap(),
+            Some(L0_COMPACTION_THRESHOLD)
+        );
+        unsafe {
+            std::env::remove_var("PROXIMADB_PAX_WRITE_A0_TRAIN");
+            std::env::remove_var("PROXIMADB_TRAINING_COMPACTION_MIN_MB");
+        }
+    }
+
+    #[test]
+    fn l0_segment_url_follows_the_executor_codec() {
+        assert!(is_l0_segment_url(
+            "s3://b/c/1/data/L0_20261029T000457_66765e2a.pax"
+        ));
+        assert!(is_l0_segment_url("/tmp/x/L00_20261029T000457_66765e2a.pax"));
+        assert!(!is_l0_segment_url(
+            "s3://b/c/1/data/L1_20261029T000435_7423d2ce.pax"
+        ));
+        // Not tiered ⇒ the executor never discovers it ⇒ never arms training.
+        assert!(!is_l0_segment_url("/tmp/x/L0_recovery_col1.pax"));
+        assert!(!is_l0_segment_url("/tmp/x/legacy_segment.pax"));
+        assert!(!is_l0_segment_url("/tmp/x/L0_20261029T000457_66765e2a.sst"));
+    }
+
+    fn collect_files_with_ext(dir: &std::path::Path, ext: &str, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_files_with_ext(&path, ext, out);
+            } else if path.extension().is_some_and(|e| e == ext) {
+                out.push(path);
+            }
+        }
     }
 
     /// Staged adoption: with no PAX env set, a `pax_vector_format:on` tag opts

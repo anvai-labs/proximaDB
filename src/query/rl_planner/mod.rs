@@ -254,7 +254,7 @@ impl RLPlanner {
     }
 
     /// Load persisted policy from file
-    pub async fn load_policy(&self, path: &str) -> anyhow::Result<()> {
+    pub async fn load_policy(&self, path: &str) -> anyhow::Result<bool> {
         let mut bandit = self.bandit.write().await;
         bandit.load_from_file(path).await
     }
@@ -273,6 +273,21 @@ impl RLPlanner {
     }
 }
 
+/// Move an unreadable persisted policy out of the way and return where it went.
+///
+/// The policy is learned tuning state, not user data: a server must not refuse
+/// to start because it cannot parse it (TD-RLNAN-1 — 0.4.x could persist a NaN
+/// weight as `null`). The file is kept beside the original for diagnosis.
+pub async fn set_aside_unreadable_policy(path: &str) -> anyhow::Result<String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let aside = format!("{path}.unreadable-{stamp}");
+    tokio::fs::rename(path, &aside).await?;
+    Ok(aside)
+}
+
 impl Default for RLPlanner {
     fn default() -> Self {
         Self::new(RLPlannerConfig::default())
@@ -282,6 +297,43 @@ impl Default for RLPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TD-RLNAN-1: a 0.4.x policy with a NaN weight was written as `null`; it
+    /// must be set aside so the server can start with a fresh policy.
+    #[tokio::test]
+    async fn unreadable_policy_is_set_aside() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rl_policy.json");
+        let path = path.to_str().expect("utf-8 path").to_string();
+        tokio::fs::write(
+            &path,
+            r#"{"context_weights": {"1": {"weights": [null], "learning_rate": 0.01}}}"#,
+        )
+        .await
+        .expect("write");
+
+        let planner = RLPlanner::default();
+        // Merged contract: load_policy reports `Ok(false)` for an unreadable
+        // policy (the caller must not log a misleading "loaded" line), and the
+        // loader itself sets the bad file aside (TD-RLNAN-1).
+        let loaded = planner
+            .load_policy(&path)
+            .await
+            .expect("load_policy does not fail on an unreadable policy");
+        assert!(!loaded, "a policy with a null weight does not load");
+
+        assert!(!std::path::Path::new(&path).exists(), "original moved away");
+        let kept: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("list dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            kept.iter()
+                .any(|f| f.starts_with("rl_policy.json.unreadable-")),
+            "kept for diagnosis beside the original, found {kept:?}"
+        );
+    }
 
     #[tokio::test]
     async fn test_rl_planner_creation() {

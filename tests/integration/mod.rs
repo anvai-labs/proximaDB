@@ -59,7 +59,7 @@ pub mod grpc;
 pub mod rest;
 
 // Storage system integration tests
-pub mod storage;
+// pub mod storage; // deleted 2026-10-20: the whole directory was orphaned (never compiled; stale imports) — redundancy pass 3
 
 // Vector operations integration tests
 pub mod vector;

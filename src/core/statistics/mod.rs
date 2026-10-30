@@ -31,6 +31,18 @@ pub use proximadb_kernel::sketches;
 mod summary;
 
 pub use registry::{StatisticsRegistry, global as statistics_registry};
+
+/// The statistics-registry key of a relational table as a tenant sees it:
+/// `{tenant}/{table}` (absent/blank tenant = the default tenant). Two tenants'
+/// same-named tables never share statistics. (Vector collections are keyed by
+/// their globally unique collection id.)
+pub fn table_statistics_key(tenant: Option<&str>, table: &str) -> String {
+    format!(
+        "{}/{}",
+        proximadb_tenant::resolve_request_tenant(tenant),
+        table
+    )
+}
 pub use summary::{FieldAccumulator, StatisticsSummary};
 
 /// The semver this build of the engine emits. Consumers pin the MAJOR

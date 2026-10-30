@@ -541,73 +541,11 @@ fn statistics_from_events(events: &[AuditEvent], since: DateTime<Utc>) -> AuditS
     }
 }
 
-/// Database-based audit storage implementation (placeholder)
-pub struct DatabaseAuditStorage {
-    /// Connection string for the audit database (e.g., PostgreSQL)
-    #[allow(dead_code)]
-    connection_string: String,
-}
-
-impl DatabaseAuditStorage {
-    /// Create a new `DatabaseAuditStorage` backed by the given connection string.
-    /// This is a placeholder implementation; actual database setup is not yet performed.
-    pub async fn new(connection_string: String) -> Result<Self> {
-        // Placeholder for database initialization
-        // Real implementation would:
-        // - Connect to PostgreSQL/MySQL
-        // - Create audit tables if they don't exist
-        // - Set up indexes for efficient querying
-
-        info!(
-            "✅ Database audit storage initialized: {}",
-            connection_string
-        );
-
-        Ok(Self { connection_string })
-    }
-}
-
-#[async_trait]
-impl AuditStorage for DatabaseAuditStorage {
-    async fn store_audit_event(&self, _event: &AuditEvent) -> Result<()> {
-        // Placeholder for database storage
-        // Real implementation would:
-        // - Insert into audit_events table
-        // - Handle database connection pooling
-        // - Implement transaction safety
-        Ok(())
-    }
-
-    async fn query_events(
-        &self,
-        _event_type: Option<AuditEventType>,
-        _user_id: Option<String>,
-        _since: Option<DateTime<Utc>>,
-        _until: Option<DateTime<Utc>>,
-        _limit: Option<usize>,
-    ) -> Result<Vec<AuditEvent>> {
-        // Placeholder for database querying
-        Ok(vec![])
-    }
-
-    async fn get_audit_statistics(&self, _since: DateTime<Utc>) -> Result<AuditStatistics> {
-        // Placeholder for database statistics
-        Ok(AuditStatistics {
-            total_events: 0,
-            events_by_type: std::collections::HashMap::new(),
-            unique_users: 0,
-            unique_tenants: 0,
-            success_rate: 0.0,
-            period_start: Utc::now(),
-            period_end: Utc::now(),
-        })
-    }
-
-    async fn cleanup_old_logs(&self, _retention_days: u32) -> Result<usize> {
-        // Placeholder for database cleanup
-        Ok(0)
-    }
-}
+// NOTE: there is deliberately no DatabaseAuditStorage. The backend never
+// existed — a placeholder silently discarded every audit event — so
+// selecting `storage_backend = Database` in the config now fails closed at
+// AuditLogger construction (see logger.rs). Use File (local or object-store
+// URL) or S3.
 
 #[cfg(test)]
 mod tests {
@@ -960,80 +898,6 @@ mod tests {
             .expect("Query should succeed even with malformed data");
 
         assert!(events.is_empty());
-    }
-
-    // ==================== DatabaseAuditStorage Tests ====================
-
-    #[tokio::test]
-    async fn test_database_audit_storage_creation() {
-        let storage = DatabaseAuditStorage::new("postgres://localhost/test".to_string())
-            .await
-            .expect("Failed to create database storage");
-
-        assert_eq!(storage.connection_string, "postgres://localhost/test");
-    }
-
-    #[tokio::test]
-    async fn test_database_audit_storage_store_event_placeholder() {
-        let storage = DatabaseAuditStorage::new("postgres://localhost/test".to_string())
-            .await
-            .expect("Failed to create storage");
-
-        let event = create_test_event(AuditEventType::Authentication, Some("user-1"));
-
-        // Should succeed (placeholder implementation)
-        storage
-            .store_audit_event(&event)
-            .await
-            .expect("Store should succeed");
-    }
-
-    #[tokio::test]
-    async fn test_database_audit_storage_query_events_placeholder() {
-        let storage = DatabaseAuditStorage::new("postgres://localhost/test".to_string())
-            .await
-            .expect("Failed to create storage");
-
-        let events = storage
-            .query_events(None, None, None, None, None)
-            .await
-            .expect("Query should succeed");
-
-        // Placeholder returns empty
-        assert!(events.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_database_audit_storage_get_statistics_placeholder() {
-        let storage = DatabaseAuditStorage::new("postgres://localhost/test".to_string())
-            .await
-            .expect("Failed to create storage");
-
-        let stats = storage
-            .get_audit_statistics(Utc::now())
-            .await
-            .expect("Get stats should succeed");
-
-        // Placeholder returns zeros
-        assert_eq!(stats.total_events, 0);
-        assert_eq!(stats.unique_users, 0);
-        assert_eq!(stats.unique_tenants, 0);
-        assert_eq!(stats.success_rate, 0.0);
-    }
-
-    #[tokio::test]
-    async fn test_database_audit_storage_cleanup_placeholder() {
-        let storage = DatabaseAuditStorage::new("postgres://localhost/test".to_string())
-            .await
-            .expect("Failed to create storage");
-
-        let deleted = storage
-            .cleanup_old_logs(30)
-            .await
-            .expect("Cleanup should succeed");
-
-        // Placeholder returns 0
-        assert_eq!(deleted, 0);
     }
 
     // ==================== AuditStatistics Tests ====================

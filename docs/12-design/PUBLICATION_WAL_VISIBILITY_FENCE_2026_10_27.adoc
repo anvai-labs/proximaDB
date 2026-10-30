@@ -1,0 +1,361 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= The Shared Publication/WAL Visibility Fence (P2 delete writer, contract)
+
+Status: **Proposed (2026-10-27)** — the contract the live incremental delete writer must
+satisfy before any reader-side refusal in its name is relaxed. Written down first, per the
+P2 pickup's instruction that unordered-delta refusal stands "until a shared visibility fence
+is proven."
+
+== The two views
+
+A published table has TWO read surfaces that must agree on which rows are dead:
+
+[cols="2,3,3"]
+|===
+| | Native/WAL view | Published (Iceberg) view
+| Authority | the WAL: tombstones + memtable merge keyed by oid (`valid_to_ns == Some(0)` or TTL-expired) | the snapshot's data files minus each file's deletion vectors (positions)
+| Served by | pgwire/native scans (`read_changes_since` delta-merge over `snapshot_lsn`) | the DataFusion/duckdb readers (`object_store_parquet_reader`), external engines
+| Key | canonical **oid** | per-file **row position**
+| Dead when | a tombstone for the oid is at or before the read's LSN | the row's position is in its file's DV, in the snapshot being read
+|===
+
+The bridge between the keys is `published_positions_of` (merged #2262): oid to (file,
+position). The bridge between the views is this contract.
+
+== The invariant
+
+FENCE (single statement). For every row R of a published table T killed by a **fenced
+delete** (an explicit tombstone), and every snapshot S of T committed at or after a point
+in time F, all reads at or after F observe the same liveness for R from both views: R is
+hidden from BOTH the WAL merge and the published snapshot, or from NEITHER — or a view
+whose delta ordering against the fence is unknown REFUSES rather than guessing.
+
+Two scoping notes, stated up front so no gate author chases a counterexample:
+
+* **TTL deaths are NOT fenced.** The published snapshot carries no `valid_to_ns` — TTL on
+  the base is eventual-until-next-publication (a documented first-cut limitation of the
+  delta merge). A TTL expiry therefore disagrees between the views until the next full
+  publication, and no fence can change that; the invariant covers explicit tombstones
+  only.
+* **"Agree or refuse."** The refusal (a nonempty WAL delta that cannot be ordered
+  against a DV-carrying snapshot) is a legitimate outcome, not a violation: the reader
+  says "I cannot order this" instead of guessing. The invariant permits hidden-in-both,
+  live-in-both, or refusal — never hidden-here-live-there for a tombstoned row.
+
+A delete that has not yet crossed the fence may be visible in one view and not the other —
+that window is the *fence gap*, and the contract's job is to bound it, not to deny it.
+
+== The ordering (the fence's mechanism)
+
+A live DELETE runs in four phases. The fence is the boundary between phase 2 and phase 3;
+it is a *point in the publication ordering*, not a new lock class.
+
+[cols="1,4,3"]
+|===
+| Phase | Action | Failure mode
+| 1. Resolve | op-locks + DML locks taken (today's `execute_delete_rows` path); oids resolved; `capture_snapshot_lsn` reads the WAL's current LSN L | as today
+| 2. WAL commit | tombstones appended at LSNs > L; the WAL now hides the oids | as today (WAL-authoritative)
+| 3. **FENCE** | under the table's `publish_lock` (per tenant+table, in-process) + `PublishFence::check` (write lease): map oids to positions (`published_positions_of`; never-published oids are benign — the row is WAL-only, no DV needed — while a file written before the hidden oid column makes mapping impossible and the fence REFUSES), write each file's **complete** deletion set (the parent's DVs ∪ the new positions — a writer that publishes only its own positions resurrects every previously deleted row), publish the successor snapshot S-prime chaining onto the CURRENT published parent, recording as `snapshot_lsn` a value **at or above every tombstone LSN published** (a fresh capture after phase 2, or the max tombstone LSN) | see Crash and Conflict below
+| 4. Release | publish lock and fence released; S-prime is the new published truth | —
+|===
+
+The recorded `snapshot_lsn` is load-bearing, not bookkeeping: at or above every published
+tombstone, the OLAP delta-merge sees an EMPTY changed-set and serves the DV-carrying base
+directly (the row is hidden through the fence); below them, the changed-set is non-empty
+against a DV-carrying base and the reader REFUSES — gate 1 then tests the refusal, not
+the hide, and the unordered-delta relaxation condition (suppress-set covers every DV
+tombstone) is unstateable. The value is part of the fence, not an implementation detail.
+
+Completeness precondition (writer slice, round 2): an EMPTY changed-set at the recorded
+LSN is only correct when the successor IS a complete state at that LSN. The live publisher
+writes no data files — its base is the parent's files (the state at the parent's capture
+LSN) minus the DVs — so it must REFUSE unless (a) the parent is the publication the layout
+recorded (an externally published parent's capture LSN is unknown), and (b) the changed-set
+since the parent's recorded `snapshot_lsn` is exactly the tombstones this delete is
+publishing. Any other changed oid is in neither the parent's files nor the replayed delta:
+publishing would hide it from BOTH views. A refused fence leaves the standing gap (WAL
+dead, published stale) until the next full publication reconciles.
+
+Ordering rule: phase 3 publishes ONLY oids whose tombstones are already durable (phase 2
+completed). A reader that sees snapshot S-prime and then reads the WAL at LSN at or above
+its tombstone LSNs sees the row dead in both. A reader that reads the WAL first (row dead)
+and then S-prime (row still live in an older snapshot — one from before the fence) sees
+the row dead in the newer WAL view; that is correct WAL semantics (the WAL is the fresher
+source), and the published view converges at the next publication.
+
+== Why this is a fence, not a distributed transaction
+
+The two stores commit independently (WAL append; metadata CAS). Full atomicity across them
+would require 2PC — rejected: for WAL-routed writes the WAL is the authority and the
+published view is a *projection* whose staleness is bounded by the publication interval
+(ADR-094's seam; strictly, ADR-094's Decision 1 is "format follows modality" — the
+WAL-authority premise is the seam's, not a numbered decision).
+
+**A second publisher exists and the contract must name it.** The bulk-append lane
+(`WriteLane::BulkAppendCommit`, `src/query/table_write_executor.rs`) publishes successors
+on the same metadata log while holding NEITHER the publish lock NOR a fence, and its rows
+bypass the WAL entirely (parts + Iceberg commit). The sole-authority premise is therefore
+**scoped to WAL-routed writes**: bulk-appended rows never enter the delete's phase-1
+resolution (their oids are not in the WAL) and cannot be fenced by this contract. Chain
+safety against that racer rests on the successor CAS alone (both publishers retry from the
+new parent and re-map), which is why the CAS — not the lease — is the fork barrier; the
+lease fence additionally keeps a displaced POD from publishing. A later slice either
+forbids the bulk lane for fenced tables or extends the fence to it; the writer TD must
+pick one before activation.
+
+The fence therefore guarantees:
+
+1. **No resurrection across the fence.** Once S-prime commits, no later snapshot may name
+   the deleted rows' positions as live. Mechanism, split by successor kind:
+   * **Successors that CARRY files** (append, and the fenced writer itself): the DVs ride
+     forward — the parent's full per-file sets, unioned with any new positions.
+   * **A full REWRITE** (which re-writes rows at NEW positions, so carried DVs do not
+     apply): the existing entry guard (`dml/mod.rs` ~2876) refuses ANY publication from a
+     DV-carrying parent — appends included, not just rewrites. The ONLY safe relaxation,
+     taken by the writer slice itself, is a rewrite whose capture LSN is **at or above
+     the DV parent's recorded `snapshot_lsn`** (every DV'd oid's tombstone is visible in
+     the native read, so the rewritten parts cannot contain it). Below that LSN the
+     rewrite is a resurrection window and the guard STANDS. The unfenced MATERIALIZE path
+     never inherits; only the fenced writer may, under this condition.
+2. **No fork-before-commit.** Phase 3 runs under the per-(tenant, table) `publish_lock`
+   (in-process serialization) AND `PublishFence::check` (the write-lease authority,
+   `LeasePublishFence`): a pod that lost the lease cannot publish S-prime, so two pods
+   cannot fork the snapshot chain from the same parent — and the successor-slot CAS is
+   the cross-process barrier that also covers the lock-free bulk-append lane. Losing the
+   CAS race (`AlreadyExists` on the successor slot) is a retry from the new parent,
+   re-mapping positions (positions are FILE-relative; the file set is parent-dependent).
+3. **Convergence bound.** Between phase 2 and phase 3 the views disagree (WAL dead,
+   published live). This is the fence gap. It is bounded by the publication latency, and
+   it closes monotonically: no interleaving can re-widen it once phase 3 commits, because
+   (1) holds.
+
+== What each reader may assume (and may not)
+
+* **WAL readers** (pgwire native, delta-merge): unchanged. The WAL is authoritative; a
+  tombstone hides the row regardless of any snapshot. The delta-merge already suppresses
+  published rows whose oids are tombstoned — that mechanism IS the WAL-side half of the
+  fence and needs no new code.
+* **Published readers** (DataFusion table provider, duckdb view, external engines): read
+  a snapshot with its DVs applied. They may see the fence gap (a row the WAL already
+  killed, still live in an older snapshot) — that is snapshot semantics, not corruption.
+  They may NEVER see a row that the fence has crossed reappear: guaranteed by (1).
+* **The unordered-delta refusal, and its one relaxation (the ordered DV base, 2026-10-29).**
+  The OLAP merge refuses a non-empty delta against a DV-carrying base (the reader guards
+  from #2256) UNLESS the base IS the publication the catalog layout recorded: opened
+  through the snapshot manifest at exactly the layout's `iceberg_metadata_version`.
+  Why that is sufficient:
+  ** Only ProximaDB's own publishers write the recorded `(iceberg_metadata_version,
+     snapshot_lsn)` pair: MATERIALIZE's flip, `advance_snapshot_lsn`, the live-delete
+     flip (and the debug-only gate-3 hook, which records its parent's LSN). DDL cannot
+     set it.
+  ** Each of them records a base complete apart from the delta at its LSN (MATERIALIZE by
+     construction; the live publisher by the completeness precondition; the advance only
+     when nothing changed), and every vector in it is backed by a WAL-durable death.
+  ** So the merge — base minus vectors, minus every changed oid, plus the current rows of
+     the changed oids — applies exactly the tombstone set the publication applied. That
+     is the condition this contract set for relaxing the refusal.
+  ** Everything else still refuses: an external DV commit or a crash-gap orphan (the
+     latest version moved past the recorded one), a listed or cached open (no proven
+     version), a layout with no recorded version, and a decoy layout (the version is
+     bound to the layout NAMED `parquet-snapshot` at the location being opened).
+     Metadata versions only grow, so a publication racing a read makes the opened
+     version newer than the recorded one: a refusal, never a wrong row.
+  ** Kill switch: `PROXIMADB_OLAP_ORDERED_DV_BASE=0` restores the unconditional refusal.
+     With incremental MATERIALIZE ON (the default), turning ONLY this off is an
+     outage: every table that took an incremental publication carries `dv-mat`
+     vectors, so every OLAP read with a nonempty delta refuses (`db error`) until
+     the next MATERIALIZE — and that MATERIALIZE stays incremental, so the
+     refusal returns with the next write. Disarm both together: set
+     `PROXIMADB_MATERIALIZE_INCREMENTAL_DV=0`, then re-MATERIALIZE each affected
+     table (the entry guard admits its own `dv-mat` parent and the rewrite drops
+     the vectors).
+
+== Crash and conflict
+
+* **Crash after phase 2, before phase 3:** the WAL is dead-authoritative; the published
+  view is stale within the fence gap. Recovery = the next publication (MATERIALIZE or a
+  later delete) re-crosses the fence. No data loss; bounded staleness.
+* **Crash mid-phase 3 (DV written, CAS lost or pod died):** the Puffin file is an
+  orphan (`put_if_absent`, never referenced by any manifest). Harmless; a GC follow-up.
+  The successor slot CAS is the atomic commit — if it did not land, nothing is published.
+* **Crash AFTER the CAS but before the catalog layout flip:** S-prime IS published (the
+  metadata log names it) while the layout still names the older version. Recovery is the
+  LAYOUT FLIP (the next publication or the next plan_append observation), not a
+  re-publication; until it flips, appends classify the layout as stale and fall to
+  rewrite, which the entry guard then gates on the DV condition above.
+* **The bulk-append lane (`WriteLane::BulkAppendCommit`):** FORBIDDEN above a
+  DV-carrying parent (the writer slice's forbid-or-fence decision). That lane
+  commits a successor without the `publish_lock` and never records the catalog
+  layout flip, so running it above a DV parent strands every later
+  publication's (metadata version, snapshot LSN) pairing — both the guard's
+  relaxation and the publisher's completeness precondition would refuse
+  forever, and after any later WAL delete every read of a nonempty delta
+  against the DV base refuses. The DML routing reads the parent's DV state
+  BEFORE the lane is chosen (a commit-time refusal would strand the written
+  parts) and demotes the statement to the WAL lane. Since incremental
+  MATERIALIZE (which publishes vectors and does NOT take the DML lock) is ON by
+  default, that read is repeated under the table's `publish_lock` once the bulk
+  lane is chosen, and the lock is held through the bulk commit: in one process
+  no publisher can commit vectors between the eligibility read and the bulk
+  commit (publishers in another process remain gate 3's CAS/lease fence). The
+  lock is keyed on the RESOLVED table identity, not the SQL spelling. Cost: a
+  bulk append waits for an in-flight MATERIALIZE (O(table)) and vice versa; the
+  DML lease (10 s, not renewed) can lapse during that wait, which is safe
+  because correctness rests on the publish lock, and a long wait raises the
+  chance a MATERIALIZE's lease fence refuses at commit (retry). A statement
+  demoted to the WAL lane releases the lock. The bulk
+  lane's snapshot
+  ids join MATERIALIZE's millisecond scale, bumped past the parent's, so the
+  lane can no longer starve later publications of valid ids.
+* **Concurrent publisher (MATERIALIZE racing a DELETE):** both hold the `publish_lock`;
+  the loser retries against the new parent. If MATERIALIZE wins, the delete re-maps
+  positions against the NEW file set (its rows may now live in rewritten files) and
+  re-crosses the fence. If the delete wins, MATERIALIZE's plan_append sees a
+  DV-carrying parent and falls to its existing rewrite path, whose entry guard refuses —
+  the writer must instead make the rewrite path *inherit* the DVs (carry-through), which
+  is the same inheritance as (1).
+* **The lease fence:** `PublishFence::check` immediately precedes the CAS, as
+  `materialize_table_to_parquet_fenced` already does for full publications. A displaced
+  pod fails the check and publishes nothing.
+
+== What this contract deliberately does not decide
+
+* Whether the delete's phase 3 publishes synchronously in the DELETE round-trip or
+  asynchronously after the WAL commit (the fence permits both, with the lock lifetimes
+  above; the choice is latency vs round-trip budget, decided at implementation).
+* **UPDATE publication** (the ladder's step 3 covers "incremental update/delete"): an
+  UPDATE is delete+insert of a NEW oid, so its phase 3 must publish the DV *and* the
+  appended rows — the four phases model the delete half only. Scoped as the writer
+  slice's follow-on, not a hidden assumption.
+* The Iceberg REST catalog's and external engines' own snapshot caches (beyond the
+  in-repo DataFusion table cache already deferred): out of scope here.
+* Multi-pod cache coherence of the published view (the DataFusion table cache): out of
+  scope here; the snapshot cache bypasses from #2256 remain.
+* The footer/sidecar oid-to-position index that removes the O(published bytes) mapping
+  cost (the #2262 cost statement names it the follow-up).
+
+== Proving it (the acceptance gates)
+
+The writer slice is DONE only when all of these hold, tested through the real pgwire
+facade (not test-side DV construction):
+
+1. **Delete, both views agree:** DELETE over pgwire against a materialized table; the
+   row is hidden from a pgwire SELECT (this leg is phase-2 evidence — the WAL hides the
+   row regardless of the fence) and from an external reader (the fence-specific leg: the
+   DV-carrying S-prime served bare), after the fence crosses, in one test.
+2. **No resurrection across snapshots:** publish S-prime (the delete), then append and
+   publish S-double-prime; the deleted row is still hidden in S-double-prime (DV
+   inheritance).
+3. **Fence conflict:** a concurrent MATERIALIZE racing the delete; the loser re-maps and
+   both views still agree. Forcing mechanism (without it GREEN is vacuous): a test hook
+   that holds the publish lock across a barrier — the delete blocks in phase 3, the test
+   runs the MATERIALIZE, the lock releases, and the delete's CAS retry re-maps against
+   the new parent.
+4. **Lease fence:** the publish fails closed when the lease check fails — tested at the
+   `PublishFence` seam with a fence whose `check` errs (real lease displacement cannot
+   be forced single-pod; the seam is the contract's surface, embedded deployments run
+   `NoPublishFence` by design).
+5. **Crash gap:** kill after the WAL commit before publication (a fault-injection point
+   between phases 2 and 3, on the pattern of the existing
+   `PROXIMADB_TEST_TXN_COMMIT_FAULT` hook); the WAL view is dead, the published view is
+   stale-but-consistent, and the next publication converges.
+
+Lock lifetimes (the sync/async choice must state these): synchronously, the DML and
+op-locks are held through phase 4 — correct, at the cost of serializing table DML for
+the publication latency; asynchronously, they are released after phase 2 and the
+publication carries only the publish lock and fence — but then a concurrent DML's own
+publication must chain via the same CAS-retry, never assume it is the only publisher.
+The writer slice picks one and states it; both are conforming.
+6. **The reader guards stand:** the unordered-delta refusal and snapshot cache bypasses
+   remain in force and tested.
+
+=== Gate status (2026-10-28, the gates slice)
+
+All six are implemented and pinned by e2e through the real pgwire facade
+(`tests/iceberg_interop_e2e.rs`, publisher armed in isolated children):
+
+1. DONE — `live_delete_publishes_and_both_views_hide_the_row` (artifact
+   assertions prove the publication fired; the external leg is CI-required).
+2. DONE — `live_delete_survives_a_successor_publication` (both the WAL and
+   the published view).
+3. DONE — `live_delete_loses_a_cas_race_and_the_retry_closes_the_fence`. The
+   forcing mechanism is a DETERMINISTIC competitor injection
+   (`PROXIMADB_TEST_FENCE_INJECT_COMPETITOR`), not a lock barrier: the hook
+   commits a legitimate no-change successor from the same parent and flips
+   the layout, so the real CAS loses and the bounded retry re-reads, re-maps,
+   and re-unions against the new parent — the same interleaving the barrier
+   forces, without sleeps or true concurrency.
+4. DONE — the publisher consults the shared `WriteLeaseAuthority` (the same
+   value DDL consults) twice per attempt: before any publication I/O (so a
+   displaced pod orphans nothing) and immediately before the CAS (the check is
+   point-in-time, so this bounds the displaced-pod window); unit tests pin
+   allow/inert/misrouted at the authority (real displacement cannot be forced
+   single-pod; the seam is the contract's surface).
+5. DONE — `crash_gap_is_fail_closed_and_materialize_adopts`
+   (`PROXIMADB_TEST_FENCE_CRASH_BEFORE_FLIP` skips the flip after the CAS):
+   the wedge refuses reads fail-closed, and the MATERIALIZE guard ADOPTS the
+   orphaned publication — its `dv-live-*` Puffin proves it is ours and the
+   phase ordering proves its tombstones durable — healing the table.
+6. DONE, then RELAXED (2026-10-29, the ordered DV base) —
+   `ordered_dv_base_serves_the_merge_across_the_fence`: a post-fence WAL write
+   (an insert, then a delete of a base row) is MERGED over the DV base because
+   the base is the recorded publication; `ordered_dv_base_kill_switch_restores_the_refusal`
+   pins the original refusal under `PROXIMADB_OLAP_ORDERED_DV_BASE=0`, and the
+   external-DV and crash-gap cases (gate 5) still refuse.
+
+The activation flip of `PROXIMADB_LIVE_DELETE_PUBLISHER` remains gated on
+these six plus soak evidence; the knob stays default-OFF.
+
+=== MATERIALIZE as a fenced carry-through writer (2026-10-29)
+
+With `PROXIMADB_MATERIALIZE_INCREMENTAL_DV` (default ON since 2026-10-29), MATERIALIZE itself publishes updates
+and deletes incrementally, and it becomes the second writer of DV-bearing recorded
+versions. It upholds the writer contract (`recorded_publication`): its successor is
+complete by construction at the captured LSN. Every oid changed since the parent's
+LSN is either re-appended as its live after-image or has its old positions hidden;
+an oid unchanged since then is exact in the parent's files; one changed again after
+the capture is in the reader's delta. Every vector it mints (`dv-mat-*`) hides only
+a superseded or WAL-deleted row version. Guarantee 1 holds per file: a touched
+file's single vector is the parent's union the new positions, and untouched parent
+vectors are carried by reference. The crash-gap adoption recognizes `dv-mat-*` as
+self-minted, by file name, ungated.
+
+=== Soak evidence (2026-10-28)
+
+`soak_mixed_workload_holds_the_fence` runs a seeded mixed workload with the
+publisher armed. **Correctness holds:** the WAL view matches the model after
+every round, and the OLAP view reconciles to the model at every MATERIALIZE.
+**Reach is narrow:** under interleaved inserts the completeness precondition
+refuses every DV-only publication (45 deletes, 0 publications). A pending
+insert is in neither the parent's files nor a vector, so publishing would hide
+it from both views. In the eligible shape (deletes as the only writes since the
+last publication) every delete publishes (one Puffin and one metadata version
+each) and the OLAP view tracks it with no MATERIALIZE. An insert on top of the
+DV-carrying base then makes the OLAP read refuse the unordered delta, and a
+MATERIALIZE over the DV parent reconciles both views. The reach question is filed as TD-LIVEDEL-1 and is part of the
+activation decision.
+
+== Filing
+
+This contract is the design record for the P2 writer pickup's fence requirement
+(`docs/current/TRACKER.adoc`, P2 row; `docs/current/LAKEHOUSE_PLAN.adoc` "V3 activation
+ladder" step 3). The writer's TD updates when the slice lands; this document is amended,
+not superseded, when implementation discovers sharpening.
+
+
+=== Incremental MATERIALIZE soak (2026-10-29)
+
+`soak_incremental_materialize_holds_both_views` runs 40 seeded rounds of
+inserts, updates and deletes with `PROXIMADB_MATERIALIZE_INCREMENTAL_DV` on and
+a MATERIALIZE every third round. After every round the WAL view equals the
+model, and the OLAP view's count, key sum and updated-value count equal it,
+both between publications (merged over the DV-carrying base) and after them.
+Deltas under the 20% bound publish incrementally; deltas past it compact.
+Superseded `dv-mat-*` Puffins are collected by the generation GC (bounded by
+the parts the current and previous snapshots name); the final state reads back
+through the external engines in CI (#2286). Run with CI's pinned readers
+required: 41 updates, 20 deletes, 15 MATERIALIZEs, at most 2 `dv-mat` Puffins on
+disk, pyiceberg (REST and static) and DuckDB exact. On that evidence the gate is
+ON by default from 2026-10-29; `PROXIMADB_MATERIALIZE_INCREMENTAL_DV=0` is the
+kill switch back to full rewrites.

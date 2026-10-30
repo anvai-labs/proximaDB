@@ -150,6 +150,7 @@ async fn compute_entanglement(
 /// Compute EI for a collection by loading its records.
 async fn get_collection_entanglement(
     State(state): State<AnalyticsApiState>,
+    tenant: Option<axum::Extension<crate::network::middleware::tenant::TenantContext>>,
     Path(collection_id): Path<String>,
     Query(params): Query<CollectionEiParams>,
 ) -> ApiResult<Json<EntanglementResponse>> {
@@ -162,14 +163,21 @@ async fn get_collection_entanglement(
     proximadb_search_types::top_k_limit::check_top_k(limit as u64)
         .map_err(|e| ApiError::InvalidArgument(format!("limit: {e}")))?;
 
-    // Load records from collection.
+    // Load records from the collection, resolved within the request tenant
+    // (absent ⇒ the default tenant).
+    let request_tenant = tenant
+        .map(|axum::Extension(t)| t.tenant_id)
+        .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
+    let tenant_context =
+        crate::storage::tenant::context::TenantContext::for_tenant_id(&request_tenant);
     let records = vector_ops
-        .unified_search_native(
+        .unified_search_native_with_tenant_context(
             &collection_id,
             vec![],
             limit,
             None,
             None,
+            Some(&tenant_context),
             #[cfg(feature = "abac-policy")]
             &proximadb_abac::ReadContext::system(
                 proximadb_abac::SystemReadReason::Statistics,
@@ -177,7 +185,12 @@ async fn get_collection_entanglement(
             ),
         )
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        .map_err(
+            |e| match crate::services::operations::vectors::collection_not_found(&e) {
+                Some(_) => ApiError::CollectionNotFound(collection_id.clone()),
+                None => ApiError::Internal(e.to_string()),
+            },
+        )?;
 
     let chunks: Vec<ChunkEmbedding> = records
         .into_iter()

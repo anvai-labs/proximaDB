@@ -458,6 +458,7 @@ impl AtomicMetadataStore {
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0) as i32;
                 let collection = crate::proto::proximadb_v1::Collection {
+                    storage_class_status: None,
                     id: versioned_metadata.id.clone(),
                     config: Some(crate::proto::proximadb_v1::CollectionConfig {
                         name: versioned_metadata.name.clone(),
@@ -707,6 +708,7 @@ impl MetadataStoreInterface for AtomicMetadataStore {
             let quantization = super::catalog_config::read_quantization(&versioned.config);
             let index_policy = super::catalog_config::read_index_policy(&versioned.config);
             let collection = crate::proto::proximadb_v1::Collection {
+                storage_class_status: None,
                 id: versioned.id,
                 config: Some(crate::proto::proximadb_v1::CollectionConfig {
                     name: versioned.name,
@@ -810,6 +812,7 @@ impl MetadataStoreInterface for AtomicMetadataStore {
             .into_iter()
             .map(|versioned| {
                 crate::proto::proximadb_v1::Collection {
+                    storage_class_status: None,
                     id: versioned.id,
                     config: Some(crate::proto::proximadb_v1::CollectionConfig {
                         name: versioned.name,

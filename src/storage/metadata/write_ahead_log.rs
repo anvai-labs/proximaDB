@@ -649,13 +649,12 @@ impl MetadataWriteAheadLog {
         let timestamp_secs = metadata.timestamp; // Already in seconds
         Ok(proximadb_records::ProximaRecord {
             oid: format!("metadata_{}", metadata.id),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "metadata".to_string(),
-                modality: "collection_metadata".to_string(),
-                dim: vector.len() as u32,
-                values: proximadb_records::EmbeddingValues::Fp32(vector),
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "metadata",
+                "collection_metadata",
+                vector.len() as u32,
+                vector,
+            )],
             created_at_ns: timestamp_secs as i64 * 1_000_000_000,
             updated_at_ns: timestamp_secs as i64 * 1_000_000_000,
             record_version: 1,

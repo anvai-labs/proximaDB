@@ -89,7 +89,11 @@ def test_is_connection_error_by_class():
 
 def test_is_connection_error_by_marker():
     assert _is_connection_error(Exception("Connection refused now")) is True
-    assert _is_connection_error(Exception("unavailable upstream")) is True
+    # TD-SDKERR-1: "unavailable" alone is a server ANSWER (503), not an
+    # unreachable server.
+    assert _is_connection_error(Exception("unavailable upstream")) is False
+    assert _is_connection_error(Exception("service unavailable")) is False
+    assert _is_connection_error(TimeoutError("Request timeout")) is True
 
 
 def test_is_connection_error_server_rejection_propagates():
@@ -287,7 +291,7 @@ def test_list_collections_prefer_local():
 
 def test_list_collections_adapter_error_falls_back():
     adapter = MagicMock()
-    adapter.list_collections.side_effect = Exception("boom")
+    adapter.list_collections.side_effect = ConnectionError("connection refused")
     c = make_client(adapter)
     c._store_local_collection(a_collection("safecoll"))
     assert len(c.list_collections()) == 1
@@ -319,7 +323,7 @@ def test_delete_collection_prefer_local():
 
 def test_delete_collection_adapter_error_falls_back():
     adapter = MagicMock()
-    adapter.delete_collection.side_effect = Exception("err")
+    adapter.delete_collection.side_effect = ConnectionError("connection refused")
     c = make_client(adapter)
     c._store_local_collection(a_collection("ecollxxx"))
     assert c.delete_collection("ecollxxx") is True
@@ -451,8 +455,9 @@ def test_search_invalid_top_k():
 
 
 def test_search_adapter_error_falls_back_local():
+    # TD-SDKERR-1: only an UNREACHABLE server activates the local fallback.
     adapter = MagicMock()
-    adapter.search.side_effect = Exception("boom")
+    adapter.search.side_effect = ConnectionError("connection refused")
     c = make_client(adapter)
     c._store_local_collection(a_collection("colxxxxx"))
     c._store_local_vector_records(
@@ -461,6 +466,17 @@ def test_search_adapter_error_falls_back_local():
     res = c.search("colxxxxx", [1.0, 2.0, 3.0], top_k=3)
     assert res[0].id == "x"
     assert c._prefer_local_fallback is True
+
+
+def test_search_server_rejected_error_raises():
+    # TD-SDKERR-1: a server-rejected search raises and does NOT flip the
+    # client into the (empty) local-only mode.
+    adapter = MagicMock()
+    adapter.search.side_effect = Exception("INVALID_ARGUMENT: bad filter")
+    c = make_client(adapter)
+    with pytest.raises(Exception, match="INVALID_ARGUMENT"):
+        c.search("colxxxxx", [1.0, 2.0, 3.0], top_k=3)
+    assert c._prefer_local_fallback is False
 
 
 def test_search_prefer_local():
@@ -543,7 +559,7 @@ def test_get_vector_via_client():
 
 def test_get_vector_client_error_falls_back():
     c = make_client()
-    c._client.get_vector.side_effect = Exception("boom")
+    c._client.get_vector.side_effect = ConnectionError("connection refused")
     c._store_local_collection(a_collection("colxxxxx"))
     c._store_local_vector_records(
         "colxxxxx", [VectorRecord(id="v1", vector=[1.0, 2.0, 3.0])]
@@ -575,7 +591,7 @@ def test_delete_vectors_prefer_local():
 
 def test_delete_vectors_adapter_error_falls_back():
     adapter = MagicMock()
-    adapter.delete_vectors.side_effect = Exception("boom")
+    adapter.delete_vectors.side_effect = ConnectionError("connection refused")
     c = make_client(adapter)
     c._store_local_collection(a_collection("colxxxxx"))
     c._store_local_vector_records("colxxxxx", [VectorRecord(id="a", vector=[1.0])])
@@ -1360,26 +1376,16 @@ def test_invoke_graph_method_no_graph_id():
 # ---------------------------------------------------------------------------
 
 
-def test_hybrid_search_rest_adapter_error_then_local(monkeypatch):
+def test_hybrid_search_adapter_error_raises(monkeypatch):
+    # TD-SDKERR-1: a failed hybrid search raises instead of falling through
+    # to the local engine (which returned {'results': []} and hid the error).
     adapter = MagicMock()
     adapter.hybrid_search.side_effect = Exception("boom")
     c = make_client(adapter)
-
-    class FakeHybrid:
-        def __init__(self, client):
-            pass
-
-        def search(self, **kwargs):
-            return []
-
-    import proximadb_sdk.hybrid as hybrid_mod
-
-    monkeypatch.setattr(hybrid_mod, "ProximaDBHybrid", FakeHybrid)
-    out = c.hybrid_search(
-        "colxxxxx", "text", [1.0, 2.0], fusion_strategy="weighted_linear"
-    )
-    assert out["results"] == []
-    assert "metrics" in out
+    with pytest.raises(Exception, match="boom"):
+        c.hybrid_search(
+            "colxxxxx", "text", [1.0, 2.0], fusion_strategy="weighted_linear"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1487,7 +1493,7 @@ def test_list_collections_raw_rest():
 
 def test_create_collection_raw_rest_error_falls_back_local():
     c = raw_rest_client()
-    c._client.create_collection.side_effect = Exception("any error")
+    c._client.create_collection.side_effect = ConnectionError("connection refused")
     out = c.create_collection(
         "rawcrecl", CollectionConfig(name="rawcrecl", dimension=3)
     )

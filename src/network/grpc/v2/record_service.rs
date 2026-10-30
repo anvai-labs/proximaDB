@@ -2046,7 +2046,12 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
             .update_collection_schema_metadata(&req.collection_id, update, Some(tenant_id.as_str()))
             .await
             .map_err(|e| {
-                if e.to_string().contains("not found") {
+                if let Some(rejected) =
+                    crate::storage::metadata::collection_mapping::schema_declaration_rejection(&e)
+                {
+                    // TD-RESTGET-1: the caller's schema, not the server.
+                    Status::invalid_argument(rejected.to_string())
+                } else if e.to_string().contains("not found") {
                     Status::not_found(format!("Collection not found: {}", req.collection_id))
                 } else {
                     Status::internal(format!("Failed to create schema: {}", e))
@@ -2084,19 +2089,19 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
                 Status::not_found(format!("Collection not found: {}", req.collection_id))
             })?;
 
-        if !metadata.enabled {
-            return Err(Status::not_found(format!(
-                "No schema defined for collection '{}'. Enable ProximaRecord to use schemas.",
-                req.collection_id
-            )));
-        }
-
+        // TD-GRPCSCHEMA-1: the persisted schema is the authority (ADR-047) —
+        // serve it regardless of the ProximaRecord flag, which gates record
+        // ENFORCEMENT on writes, not the existence of a schema. The flag is
+        // settable at create and surfaced below since TD-GRPCSCHEMA-2.
         let schema = Some(runtime_metadata_to_grpc_schema(&metadata));
 
         Ok(Response::new(GetSchemaResponse {
             success: true,
             schema,
             error_message: None,
+            // TD-GRPCSCHEMA-2: surface the mode — the schema is served either
+            // way; this says whether write enforcement is ON.
+            record_enabled: Some(metadata.enabled),
         }))
     }
 
@@ -2121,8 +2126,9 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
                 }
             })?;
 
+        // TD-GRPCSCHEMA-1: same rule as GetSchema — the persisted schema is
+        // served regardless of the ProximaRecord flag.
         let schemas = metadata
-            .filter(|metadata| metadata.enabled)
             .map(|metadata| vec![runtime_metadata_to_grpc_schema(&metadata)])
             .unwrap_or_default();
         let total_count = schemas.len() as i64;
@@ -2181,7 +2187,12 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
             .update_collection_schema_metadata(&req.collection_id, update, Some(tenant_id.as_str()))
             .await
             .map_err(|e| {
-                if e.to_string().contains("not found") {
+                if let Some(rejected) =
+                    crate::storage::metadata::collection_mapping::schema_declaration_rejection(&e)
+                {
+                    // TD-RESTGET-1: the caller's schema, not the server.
+                    Status::invalid_argument(rejected.to_string())
+                } else if e.to_string().contains("not found") {
                     Status::not_found(format!("Collection not found: {}", req.collection_id))
                 } else {
                     Status::internal(format!("Failed to evolve schema: {}", e))
@@ -2267,6 +2278,14 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
             }),
             ..Default::default()
         };
+        // TD-GRPCSCHEMA-2: record mode at create (REST parity).
+        let mut v1_config = v1_config;
+        v1_config.enable_proxima_record = cfg.enable_proxima_record;
+        // TD-TIER-1 SC1 (review round 1): the v2 create MUST NOT silently drop
+        // the desired storage class — an unknown label is an actionable
+        // InvalidArgument here, and a known label flows into the v1 config so
+        // manager admission applies identically to REST, gRPC and Flight.
+        v1_config.storage_class = v2_storage_class_field(&cfg)?;
 
         let req = CollectionRequest {
             operation: CollectionOperation::CollectionCreate as i32,
@@ -2304,10 +2323,16 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         };
         if let Err(e) = self
             .api_handlers
-            .update_collection_schema_metadata(
+            .update_collection_schema_metadata_with_record_mode(
                 &cfg.name,
                 canonical_update,
                 Some(tenant_id.as_str()),
+                // The caller's create-time choice owns the mode; the canonical
+                // persist step is persistence, not a schema update that turns
+                // record mode on (TD-GRPCSCHEMA-2). UNSET means OFF — REST
+                // create's default, and the behavior every pre-field gRPC
+                // client had (round 1 review: None would have meant ON).
+                Some(cfg.enable_proxima_record.unwrap_or(false)),
             )
             .await
         {
@@ -2535,6 +2560,52 @@ fn quantization_strategy_to_str(v: Option<i32>) -> String {
         .unwrap_or_default()
 }
 
+/// TD-TIER-1 SC1: map the v1 observed status onto the v2 read model. The
+/// state label mirrors the REST surface ("active" | "not_active"; anything
+/// unrecognized reads as "unspecified", never a false "active").
+fn v2_storage_class_status_from(
+    _cfg: &crate::proto::proximadb_v1::CollectionConfig,
+    status: crate::proto::proximadb_v1::StorageClassStatus,
+) -> proximadb_v2::V2StorageClassStatus {
+    use crate::proto::proximadb_v1::storage_class_status::State;
+    let state = State::try_from(status.state)
+        .map(|s| match s {
+            State::Active => "active",
+            State::NotActive => "not_active",
+            State::Unspecified => "unspecified",
+        })
+        .unwrap_or("unspecified");
+    proximadb_v2::V2StorageClassStatus {
+        state: state.to_string(),
+        reason: status.reason,
+        policy_generation: status.policy_generation,
+        reserved_bytes: status.reserved_bytes,
+        resident_bytes: status.resident_bytes,
+        covered_bytes: status.covered_bytes,
+    }
+}
+
+/// TD-TIER-1 SC1: parse the v2 create request's `storage_class` label onto
+/// the v1 config discriminant. `None` (absent/empty/unspecified) ⇒ the manager
+/// resolves and persists BALANCED; a known label maps to its enum value so
+/// admission applies; anything else is an `InvalidArgument` naming the valid
+/// labels — never the silent default the strict REST surface already rejects
+/// (TD-RESTGET-1 class).
+fn v2_storage_class_field(cfg: &proximadb_v2::V2CollectionConfig) -> Result<Option<i32>, Status> {
+    match cfg.storage_class.as_deref() {
+        None | Some("") | Some("unspecified") => Ok(None),
+        Some(raw) => {
+            let class = crate::services::collection::storage_class::parse_storage_class(raw)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            if class == crate::proto::proximadb_v1::StorageClass::Unspecified {
+                Ok(None)
+            } else {
+                Ok(Some(class as i32))
+            }
+        }
+    }
+}
+
 fn collection_to_v2(c: crate::proto::proximadb_v1::Collection) -> V2Collection {
     let cfg = c.config.unwrap_or_default();
     let distance_metric = cfg
@@ -2547,14 +2618,34 @@ fn collection_to_v2(c: crate::proto::proximadb_v1::Collection) -> V2Collection {
         .and_then(|e| crate::proto::proximadb_v1::StorageEngine::try_from(e).ok())
         .map(|e| e.as_str_name().to_ascii_lowercase())
         .unwrap_or_default();
+    // TD-TIER-1 SC1: echo the resolved desired storage class ("economy" |
+    // "balanced" | "performance"; absent ⇒ balanced) AND the observed status —
+    // desired and observed are distinct surfaces.
+    let storage_class = crate::services::collection::storage_class::storage_class_label(
+        crate::services::collection::storage_class::storage_class_or_balanced(&cfg),
+    )
+    .to_string();
+    let storage_class_status = c
+        .storage_class_status
+        .map(|status| v2_storage_class_status_from(&cfg, status))
+        .unwrap_or_else(|| {
+            v2_storage_class_status_from(
+                &cfg,
+                crate::services::collection::storage_class::storage_class_status(&cfg),
+            )
+        });
     V2Collection {
+        storage_class_status: Some(storage_class_status),
         id: c.id,
         config: Some(V2CollectionConfig {
+            // TD-GRPCSCHEMA-2: round-trip the mode on reads too.
+            enable_proxima_record: cfg.enable_proxima_record,
             name: cfg.name,
             dimension: cfg.dimension,
             distance_metric,
             storage_engine,
             filterable_columns: cfg.filterable_columns.into_iter().map(|f| f.name).collect(),
+            storage_class: Some(storage_class),
             description: cfg.description.unwrap_or_default(),
             index_specs: cfg
                 .index_configs
@@ -2596,9 +2687,59 @@ fn check_search_top_k(top_k: u32) -> Result<(), Status> {
 mod tests {
     use super::*;
 
+    /// TD-TIER-1 SC1 (review round 1): the v2 create MUST read
+    /// `V2CollectionConfig.storage_class` — before, a client setting
+    /// "performance" silently got balanced (the TD-RESTGET-1 silent-default
+    /// class). Absent/empty/unspecified ⇒ `None` (the manager resolves and
+    /// persists BALANCED); known labels map onto the v1 discriminants so
+    /// manager admission applies identically to REST, gRPC and Flight;
+    /// anything else is an actionable InvalidArgument naming the vocabulary.
+    #[test]
+    fn v2_create_storage_class_is_mapped_not_dropped() {
+        let cfg = |class: Option<&str>| proximadb_v2::V2CollectionConfig {
+            storage_class: class.map(ToString::to_string),
+            ..Default::default()
+        };
+
+        for absent in [None, Some(""), Some("unspecified")] {
+            assert_eq!(
+                v2_storage_class_field(&cfg(absent)).unwrap(),
+                None,
+                "absent/unspecified must resolve to None"
+            );
+        }
+
+        assert_eq!(
+            v2_storage_class_field(&cfg(Some("performance"))).unwrap(),
+            Some(crate::proto::proximadb_v1::StorageClass::Performance as i32)
+        );
+        assert_eq!(
+            v2_storage_class_field(&cfg(Some("ECONOMY"))).unwrap(),
+            Some(crate::proto::proximadb_v1::StorageClass::Economy as i32)
+        );
+        // The proto enum-name form parses too (parity with the REST surface).
+        assert_eq!(
+            v2_storage_class_field(&cfg(Some("storage_class_balanced"))).unwrap(),
+            Some(crate::proto::proximadb_v1::StorageClass::Balanced as i32)
+        );
+
+        let error = v2_storage_class_field(&cfg(Some("perfromance")))
+            .expect_err("an unknown label must be rejected, not defaulted");
+        assert_eq!(
+            error.code(),
+            tonic::Code::InvalidArgument,
+            "{}",
+            error.message()
+        );
+        let message = error.message();
+        assert!(message.contains("perfromance"), "{message}");
+        assert!(message.contains("balanced"), "{message}");
+    }
+
     #[test]
     fn v2_config_to_canonical_columns_emits_embedding_plus_filterable_scalars() {
         let cfg = proximadb_v2::V2CollectionConfig {
+            storage_class: None,
             name: "c".to_string(),
             dimension: 128,
             distance_metric: "cosine".to_string(),
@@ -2607,6 +2748,7 @@ mod tests {
             description: String::new(),
             index_specs: Vec::new(),
             quantization: None,
+            enable_proxima_record: None,
         };
         let cols = v2_config_to_canonical_columns(&cfg);
         // Primary vector column mirrors config.dimension; empty filterable names skipped.

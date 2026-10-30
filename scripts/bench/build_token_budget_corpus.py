@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import tempfile
 import tomllib  # stdlib from 3.11, this project's floor
 from collections import defaultdict
@@ -37,13 +38,16 @@ from proximadb_sdk.embedding_providers.providers.local.open_weights import (
     create_open_model_provider,
 )
 
+# corpus_io is a sibling module in scripts/bench/. Inject that directory so the
+# import works both when run as a script and when loaded via importlib in tests.
+_BENCH_DIR = str(Path(__file__).resolve().parent)
+if _BENCH_DIR not in sys.path:
+    sys.path.insert(0, _BENCH_DIR)
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+from corpus_io import (  # noqa: E402  — path-injected sibling bench module
+    histogram as _histogram,
+    sha256_file as _sha256,
+)
 
 
 def _python_tree_sha256(root: Path) -> str:
@@ -259,24 +263,6 @@ def _load_contracts(path: Path) -> CompositeInputContract:
             continue
         contracts.append(_declared_contract(model, index))
     return CompositeInputContract(tuple(contracts))
-
-
-def _percentile(sorted_values: list[int], fraction: float) -> int | None:
-    if not sorted_values:
-        return None
-    index = round((len(sorted_values) - 1) * fraction)
-    return sorted_values[index]
-
-
-def _histogram(values: list[int]) -> dict[str, int | None]:
-    ordered = sorted(values)
-    return {
-        "min": ordered[0] if ordered else None,
-        "p50": _percentile(ordered, 0.50),
-        "p90": _percentile(ordered, 0.90),
-        "p99": _percentile(ordered, 0.99),
-        "max": ordered[-1] if ordered else None,
-    }
 
 
 def _atomic_paths(

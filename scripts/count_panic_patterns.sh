@@ -12,6 +12,17 @@
 #   ./scripts/count_panic_patterns.sh --mode module-guard \
 #     --critical-modules network_rest,api_handlers,graph
 #   ./scripts/count_panic_patterns.sh --format json --write /tmp/panic_metrics.json
+#   ./scripts/count_panic_patterns.sh --scope workspace --mode no-regression
+#
+# Scopes:
+#   legacy    -> the seven root-crate modules under src/ (the original WS-2
+#                guard; semantics unchanged, same default baseline)
+#   workspace -> every crates/<layer>/<crate> and apps/<app> as its own module
+#                group. The guard predates the workspace decomposition, so
+#                production code that moved into crates/ was invisible to it
+#                (found via PR #2238's review: four new sites merged green).
+#                Baseline starts at the measured counts of 2026-10-26 and
+#                ratchets from there.
 
 set -euo pipefail
 
@@ -19,12 +30,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SRC_ROOT="$REPO_ROOT/src"
 DEFAULT_BASELINE="$REPO_ROOT/docs/_internal/roadmap/PANIC_POLICY_BASELINE.json"
+DEFAULT_WORKSPACE_BASELINE="$REPO_ROOT/docs/_internal/roadmap/PANIC_POLICY_WORKSPACE_BASELINE.json"
 
 MODE="report"
 OUTPUT_FORMAT="text"
 BASELINE_PATH=""
 WRITE_PATH=""
 CRITICAL_MODULES="network_rest,api_handlers"
+SCOPE="legacy"
 
 usage() {
   cat <<'EOF'
@@ -32,6 +45,8 @@ Usage: scripts/count_panic_patterns.sh [options]
 
 Options:
   --mode <report|no-regression|module-guard>  Policy mode (default: report)
+  --scope <legacy|workspace>                  Which module groups to scan
+                                              (default: legacy)
   --baseline <path>                           Baseline metrics JSON path
   --format <text|json>                        Output format (default: text)
   --write <path>                              Write metrics JSON to file
@@ -62,6 +77,10 @@ while [[ $# -gt 0 ]]; do
       CRITICAL_MODULES="${2:-}"
       shift 2
       ;;
+    --scope)
+      SCOPE="${2:-}"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -89,8 +108,18 @@ if [[ ! -d "$SRC_ROOT" ]]; then
   exit 2
 fi
 
-if [[ -z "$BASELINE_PATH" && "$MODE" != "report" && -f "$DEFAULT_BASELINE" ]]; then
-  BASELINE_PATH="$DEFAULT_BASELINE"
+if [[ "$SCOPE" != "legacy" && "$SCOPE" != "workspace" ]]; then
+  echo "Invalid --scope: $SCOPE" >&2
+  exit 2
+fi
+
+if [[ -z "$BASELINE_PATH" && "$MODE" != "report" ]]; then
+  if [[ "$SCOPE" == "legacy" && -f "$DEFAULT_BASELINE" ]]; then
+    BASELINE_PATH="$DEFAULT_BASELINE"
+  fi
+  if [[ "$SCOPE" == "workspace" && -f "$DEFAULT_WORKSPACE_BASELINE" ]]; then
+    BASELINE_PATH="$DEFAULT_WORKSPACE_BASELINE"
+  fi
 fi
 
 if [[ -n "$BASELINE_PATH" && ! -f "$BASELINE_PATH" ]]; then
@@ -98,7 +127,7 @@ if [[ -n "$BASELINE_PATH" && ! -f "$BASELINE_PATH" ]]; then
   exit 2
 fi
 
-python3 - "$REPO_ROOT" "$SRC_ROOT" "$MODE" "$OUTPUT_FORMAT" "$BASELINE_PATH" "$WRITE_PATH" "$CRITICAL_MODULES" <<'PY'
+python3 - "$REPO_ROOT" "$SRC_ROOT" "$MODE" "$OUTPUT_FORMAT" "$BASELINE_PATH" "$WRITE_PATH" "$CRITICAL_MODULES" "$SCOPE" <<'PY'
 import datetime as dt
 import fnmatch
 import json
@@ -113,21 +142,49 @@ output_format = sys.argv[4]
 baseline_path_raw = sys.argv[5]
 write_path_raw = sys.argv[6]
 critical_modules_raw = sys.argv[7]
+scope = sys.argv[8] if len(sys.argv) > 8 else "legacy"
 
 unwrap_re = re.compile(r"\.unwrap\(\)")
 expect_re = re.compile(r"\.expect\(")
 parser_expect_re = re.compile(r"\bself\s*\.\s*expect\(")
 cfg_test_attr_re = re.compile(r"^\s*#\s*\[\s*cfg\s*\([^]]*test[^]]*\)\s*\]\s*$")
 
-modules = [
-    ("storage", Path("src/storage")),
-    ("graph", Path("src/graph")),
-    ("query", Path("src/query")),
-    ("services", Path("src/services")),
-    ("network_rest", Path("src/network/rest")),
-    ("api_handlers", Path("src/api_handlers")),
-    ("core", Path("src/core")),
-]
+if scope == "legacy":
+    modules = [
+        ("storage", Path("src/storage")),
+        ("graph", Path("src/graph")),
+        ("query", Path("src/query")),
+        ("services", Path("src/services")),
+        ("network_rest", Path("src/network/rest")),
+        ("api_handlers", Path("src/api_handlers")),
+        ("core", Path("src/core")),
+    ]
+    scan_root = src_root
+    scan_scope_description = (
+        "src/**/*.rs excluding tests/legacy/test-benchmark-example files and "
+        "#[cfg(test)] blocks; ignores parser-internal self.expect(...) calls"
+    )
+else:
+    # Every workspace crate (crates/<layer>/<name>) and app (apps/<name>) is
+    # its own module group, discovered from the directory tree so a new crate
+    # is guarded from the day it lands (its baseline entry defaults to 0,
+    # i.e. any panic site in it is a regression).
+    module_dirs = [p.parent for p in sorted((repo_root / "crates").glob("*/*/Cargo.toml"))]
+    module_dirs += [p.parent for p in sorted((repo_root / "apps").glob("*/Cargo.toml"))]
+    names = [d.name for d in module_dirs]
+    modules = []
+    for module_dir, name in zip(module_dirs, names):
+        # Crate names are unique today; if one ever collides, disambiguate by
+        # layer so baseline keys stay stable.
+        if names.count(name) > 1:
+            name = f"{name}@{module_dir.parent.name}"
+        modules.append((name, module_dir.relative_to(repo_root)))
+    scan_root = repo_root
+    scan_scope_description = (
+        "crates/*/*/ and apps/*/ (per-crate module groups) excluding "
+        "tests/legacy/test-benchmark-example files and #[cfg(test)] blocks; "
+        "ignores parser-internal self.expect(...) calls"
+    )
 
 def include_file(rel_path: Path) -> bool:
     if rel_path.suffix != ".rs":
@@ -215,9 +272,17 @@ def count_patterns() -> dict:
         for name, path in modules
     }
 
-    for file_path in sorted(src_root.rglob("*.rs")):
+    for file_path in sorted(scan_root.rglob("*.rs")):
         rel = file_path.relative_to(repo_root)
         if not include_file(rel):
+            continue
+        # Legacy totals were always src-wide (files outside the seven module
+        # dirs counted toward totals, not toward any module); only the
+        # workspace scope restricts counting to its discovered modules —
+        # applying it to legacy would silently unguard e.g. src/database.rs.
+        if scope == "workspace" and not any(
+            rel.is_relative_to(module_path) for _, module_path in modules
+        ):
             continue
 
         try:
@@ -254,11 +319,9 @@ metrics = count_patterns()
 payload = {
     "generated_at_utc": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     "repo": repo_root.name,
-    "source_root": "src",
-    "scan_scope": (
-        "src/**/*.rs excluding tests/legacy/test-benchmark-example files and "
-        "#[cfg(test)] blocks; ignores parser-internal self.expect(...) calls"
-    ),
+    "source_root": "src" if scope == "legacy" else "workspace",
+    "scope": scope,
+    "scan_scope": scan_scope_description,
     "totals": metrics["totals"],
     "modules": metrics["modules"],
 }
@@ -291,6 +354,18 @@ if baseline is not None:
                 f"total panic-prone calls increased by {deltas['total']} "
                 f"({baseline_totals.get('total', 0)} -> {payload['totals']['total']})"
             )
+        # A module that is not in the baseline starts from an implicit 0, so
+        # any site in it is a regression even when reductions elsewhere
+        # compensate the sum (a new crate's first unwrap must never slip in
+        # under a cleanup happening in the same PR).
+        if scope == "workspace":
+            baseline_modules = baseline.get("modules", {})
+            for module_name, stats in payload["modules"].items():
+                if stats["total"] > 0 and module_name not in baseline_modules:
+                    violations.append(
+                        f"module '{module_name}' is absent from the baseline but has "
+                        f"{stats['total']} panic-prone call(s); every module starts at 0"
+                    )
 
     if mode == "module-guard":
         baseline_modules = baseline.get("modules", {})

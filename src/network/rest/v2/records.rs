@@ -1203,13 +1203,12 @@ pub async fn insert_records(
             updated_at_ns: now_ns,
             origin: Some("v2_api".to_string()),
             props,
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "dense_vector".to_string(),
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "dense_vector",
                 dim,
-                values: proximadb_records::EmbeddingValues::Fp32(vector),
-                ..Default::default()
-            }],
+                vector,
+            )],
             ..ProximaRecord::default()
         };
 
@@ -2560,13 +2559,17 @@ pub struct ChangesQuery {
 pub async fn get_changes(
     Path(collection_id): Path<String>,
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Query(q): Query<ChangesQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // The table is resolved within the request tenant, and the feed carries only
+    // that tenant's writes; a table outside the tenant reads as missing.
     let changes = state
         .record_ops
-        .table_changes(&collection_id, q.since_lsn)
+        .table_changes_for_tenant(&collection_id, &tenant.tenant_id, q.since_lsn)
         .await
-        .map_err(|e| ApiError::Internal(format!("change-feed read failed: {e}")))?;
+        .map_err(change_feed_error)?
+        .ok_or_else(|| ApiError::CollectionNotFound(collection_id.clone()))?;
     let next_lsn = changes.iter().map(|c| c.lsn).max();
     Ok(Json(serde_json::json!({
         "collection": collection_id,
@@ -2577,9 +2580,47 @@ pub async fn get_changes(
     })))
 }
 
+/// Map a change-feed read failure to its HTTP shape. A cursor older than the
+/// retained WAL history is `410 Gone` (TD-SEAM-12): the client must re-sync
+/// from a snapshot rather than resume, and must never receive the retained
+/// suffix as if it were the complete history. Anything else is a 500.
+fn change_feed_error(error: anyhow::Error) -> ApiError {
+    if let Some(truncated) = error.chain().find_map(|cause| {
+        cause.downcast_ref::<crate::services::canonical_wal::WalHistoryTruncated>()
+    }) {
+        return ApiError::Gone(format!(
+            "change history after since_lsn={} is no longer retained (oldest retained lsn is \
+             {}); re-sync from a snapshot, then resume with since_lsn >= {}",
+            truncated.since,
+            truncated.retained_from,
+            truncated.retained_from.saturating_sub(1)
+        ));
+    }
+    ApiError::Internal(format!("change-feed read failed: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_truncated_change_feed_cursor_is_410_gone() {
+        let truncated = anyhow::Error::new(crate::services::canonical_wal::WalHistoryTruncated {
+            since: 0,
+            retained_from: 42,
+        })
+        .context("reading the change feed");
+        match change_feed_error(truncated) {
+            ApiError::Gone(message) => {
+                assert!(message.contains("since_lsn >= 41"), "{message}");
+            }
+            other => panic!("expected 410 Gone, got {other:?}"),
+        }
+        assert!(matches!(
+            change_feed_error(anyhow::anyhow!("disk on fire")),
+            ApiError::Internal(_)
+        ));
+    }
 
     fn rv(value: serde_json::Value) -> RestProximaValue {
         RestProximaValue::Inferred(value)

@@ -6,11 +6,11 @@
 |===
 | Field | Value
 | Status | **Partial (reconciled 2026-10-15).** Catalog slices 1–4 shipped (#892, #894, #900, #927) and metrics slice 1 shipped (#907). Open: the storage-coupled metrics set behind a `MetricsStoragePort` (`src/metrics/{store,updater,query_service,metering_writer,consumption_metrics,collection_pin_metrics,tier_migration_metrics}.rs`, collectors `engine`/`graph`/`filesystem`), and the coupled catalog modules still in root (`index_location_resolver`, `tenant_tier`, `tier_recommendation`, `budget_guard`, `tier_transition`).
-| Relates to | link:ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan] (umbrella), link:ROOT_CRATE_DECOMPOSITION_ENGINES_EXTRACTION_2026_07_12.adoc[engines track] (parallel)
+| Relates to | link:../history/planning/ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan] (umbrella), link:ROOT_CRATE_DECOMPOSITION_ENGINES_EXTRACTION_2026_07_12.adoc[engines track] (parallel)
 |===
 
 [abstract]
-Companion to `ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc` and the CI-build
+Companion to `docs/history/planning/ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc` and the CI-build
 optimization plan (#876). Scopes extraction of the two remaining non-storage
 root subsystems flagged by the observability handoff — `src/catalog` and
 `src/metrics` — behind the existing `proximadb-catalog` crate (catalog) and a

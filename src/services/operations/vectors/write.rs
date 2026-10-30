@@ -161,7 +161,8 @@ impl VectorWriteCoordinator {
         apply_pseudo_query_metadata(&mut vectors, &*self.pseudo_query_generator);
 
         self.validate_records_for_insert(collection_id, &vectors)
-            .await?;
+            .await
+            .map_err(crate::services::record_store::rejected_before_append)?;
 
         let decision = self.bulk_write_router.route_records(&vectors);
 

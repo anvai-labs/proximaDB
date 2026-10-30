@@ -688,66 +688,59 @@ impl Catalog for GlueCatalog {
     }
 
     async fn get_table(&self, identifier: &TableIdentifier) -> Result<CatalogTableSchema> {
-        // Check cache first
-        if let Some(schema) = self.cache.get_table(&self.name, identifier) {
-            return Ok(schema);
-        }
+        crate::cached_table(&self.cache, &self.name, identifier, async {
+            let db_name = self.database_name(&identifier.namespace);
 
-        let db_name = self.database_name(&identifier.namespace);
+            #[cfg(feature = "aws")]
+            if let Some(client) = &self.client {
+                let resp = client
+                    .get_table()
+                    .database_name(&db_name)
+                    .name(&identifier.name)
+                    .catalog_id(&self.config.catalog_id)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("Failed to get Glue table '{}': {}", identifier, e))?;
 
-        #[cfg(feature = "aws")]
-        if let Some(client) = &self.client {
-            let resp = client
-                .get_table()
-                .database_name(&db_name)
-                .name(&identifier.name)
-                .catalog_id(&self.config.catalog_id)
-                .send()
-                .await
-                .map_err(|e| anyhow!("Failed to get Glue table '{}': {}", identifier, e))?;
+                let table = resp.table().ok_or_else(|| anyhow!("Table not found"))?;
+                let sd = table
+                    .storage_descriptor()
+                    .ok_or_else(|| anyhow!("No storage descriptor"))?;
 
-            let table = resp.table().ok_or_else(|| anyhow!("Table not found"))?;
-            let sd = table
-                .storage_descriptor()
-                .ok_or_else(|| anyhow!("No storage descriptor"))?;
+                // Convert Glue columns to CatalogColumn
+                let columns: Vec<CatalogColumn> = sd
+                    .columns()
+                    .iter()
+                    .map(Self::glue_column_to_column)
+                    .collect();
 
-            // Convert Glue columns to CatalogColumn
-            let columns: Vec<CatalogColumn> = sd
-                .columns()
-                .iter()
-                .map(Self::glue_column_to_column)
-                .collect();
+                let schema_version = table
+                    .parameters()
+                    .and_then(|p| p.get("proximadb.schema_version"))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1);
 
-            let schema_version = table
-                .parameters()
-                .and_then(|p| p.get("proximadb.schema_version"))
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
 
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
+                return Ok(CatalogTableSchema {
+                    name: identifier.name.clone(),
+                    columns,
+                    primary_key: vec![],
+                    indexes: vec![],
+                    schema_version,
+                    properties: table.parameters().cloned().unwrap_or_default(),
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                    ..Default::default()
+                });
+            }
 
-            let schema = CatalogTableSchema {
-                name: identifier.name.clone(),
-                columns,
-                primary_key: vec![],
-                indexes: vec![],
-                schema_version,
-                properties: table.parameters().cloned().unwrap_or_default(),
-                created_at_ms: now,
-                updated_at_ms: now,
-                ..Default::default()
-            };
-
-            // Update cache
-            self.cache.put_table(&self.name, identifier, schema.clone());
-
-            return Ok(schema);
-        }
-
-        Err(anyhow!("Table '{}' not found", identifier))
+            Err(anyhow!("Table '{}' not found", identifier))
+        })
+        .await
     }
 
     async fn rename_table(&self, from: &TableIdentifier, to: &TableIdentifier) -> Result<()> {

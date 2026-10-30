@@ -29,10 +29,12 @@
 
 use proximadb_data_model::ProximaValue;
 use proximadb_proto::proto::proximadb_v1::{
-    LogEntry, MetricSample, SpanStatusCode, SqlValue, TraceData, sql_value,
+    LogEntry, MetricSample, SpanStatusCode, SqlValue, TraceData,
 };
 use proximadb_query_filter::{FilterOperator, FilterValue};
-use proximadb_records::{ProximaRecord, ProximaTree, ProximaTreeNode};
+use proximadb_records::{
+    ProximaRecord, ProximaTree, ProximaTreeNode, conversions::sql_value_to_proxima,
+};
 
 /// Stable labels used by observability records.
 pub const OBSERVABILITY_LABEL: &str = "observability";
@@ -237,30 +239,6 @@ fn string_map_to_tree(fields: &std::collections::HashMap<String, String>) -> Pro
         .collect()
 }
 
-fn sql_value_to_proxima(sql: &SqlValue) -> ProximaValue {
-    match sql.value.as_ref() {
-        Some(sql_value::Value::StringValue(value)) => ProximaValue::String(value.clone()),
-        Some(sql_value::Value::NumberValue(value)) => ProximaValue::Float64(*value),
-        Some(sql_value::Value::BoolValue(value)) => ProximaValue::Boolean(*value),
-        Some(sql_value::Value::Int64Value(value)) => ProximaValue::Int64(*value),
-        Some(sql_value::Value::BytesValue(value)) => ProximaValue::Binary(value.clone()),
-        // Canonical MessagePack JSONB decode (the shared helper) so a tag-9
-        // value compares equal across read paths.
-        Some(sql_value::Value::JsonbValue(value)) => ProximaValue::from_jsonb_or_binary(value),
-        Some(sql_value::Value::NullValue(_)) | None => ProximaValue::Null,
-        Some(sql_value::Value::ArrayValue(array)) => {
-            ProximaValue::Array(array.values.iter().map(sql_value_to_proxima).collect())
-        }
-        Some(sql_value::Value::ObjectValue(object)) => ProximaValue::Map(
-            object
-                .fields
-                .iter()
-                .map(|(key, value)| (key.clone(), sql_value_to_proxima(value)))
-                .collect(),
-        ),
-    }
-}
-
 fn string_value(value: impl Into<String>) -> ProximaTreeNode {
     ProximaTreeNode::Value(ProximaValue::String(value.into()))
 }
@@ -443,6 +421,46 @@ mod tests {
 
         assert_eq!(left_record.oid, right_record.oid);
         assert!(left_record.labels.contains(METRIC_LABEL));
+    }
+
+    #[test]
+    fn legacy_magic_jsonb_bytes_field_decodes_to_jsonb() {
+        // The canonical records decoder (conversions::sql_value_to_proxima)
+        // strips JSONB_LEGACY_MAGIC and decodes the trailing JSON payload; the
+        // observability mapping must agree, not fall back to Binary.
+        let original = serde_json::json!({"event": "login", "count": 3});
+        let mut bytes = proximadb_data_model::JSONB_LEGACY_MAGIC.to_vec();
+        bytes.extend_from_slice(original.to_string().as_bytes());
+
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "payload".to_string(),
+            SqlValue {
+                value: Some(sql_value::Value::BytesValue(bytes)),
+            },
+        );
+
+        let record = log_entry_to_proxima_record(
+            "tenant-a",
+            &LogEntry {
+                timestamp_ns: 7,
+                severity: Severity::Info as i32,
+                message: "ok".to_string(),
+                fields,
+                source: None,
+                service: None,
+            },
+            0,
+        );
+
+        let fields_tree = match record.props.get("fields") {
+            Some(ProximaTreeNode::Object(tree)) => tree,
+            other => panic!("expected fields object prop, got {:?}", other),
+        };
+        match fields_tree.get("payload") {
+            Some(ProximaTreeNode::Value(ProximaValue::Jsonb(v))) => assert_eq!(*v, original),
+            other => panic!("expected Jsonb field, got {:?}", other),
+        }
     }
 
     #[test]

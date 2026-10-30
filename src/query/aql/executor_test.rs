@@ -95,7 +95,7 @@ mod tests {
         };
 
         // 3. Execute
-        let (result, trail) = executor.execute(query).await.unwrap();
+        let (result, trail) = executor.execute_as_internal(query).await.unwrap();
 
         // 4. Verify
         assert_eq!(result.rows.len(), 1);
@@ -199,7 +199,10 @@ mod tests {
                 predicate: Some(predicate),
             },
         };
-        executor.execute(query).await.map(|(result, _)| result.rows)
+        executor
+            .execute_as_internal(query)
+            .await
+            .map(|(result, _)| result.rows)
     }
 
     fn kinds(rows: &[HashMap<String, AqlValue>]) -> Vec<String> {
@@ -371,5 +374,18 @@ mod tests {
             .await
             .expect("accepted predicate");
         assert_eq!(source.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_unset_or_empty_scope_resolves_nothing() {
+        use crate::query::aql::{AqlScope, AuditContext};
+        let mut ctx = AuditContext::new();
+        assert!(ctx.resolution_tenant("c").is_err(), "unset scope denies");
+        ctx.scope = AqlScope::Tenant(String::new());
+        assert!(ctx.resolution_tenant("c").is_err(), "empty tenant denies");
+        ctx.scope = AqlScope::Tenant("acme".to_string());
+        assert_eq!(ctx.resolution_tenant("c").unwrap(), Some("acme"));
+        ctx.scope = AqlScope::Internal;
+        assert_eq!(ctx.resolution_tenant("c").unwrap(), None);
     }
 }

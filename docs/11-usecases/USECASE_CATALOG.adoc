@@ -229,15 +229,11 @@ ibkrtrading -- 16 Rust crates, IBKR TWS/Gateway integration. Currently uses Post
 
 ==== Cross-Model Query Example
 
-[source,sql]
-----
-SELECT r.timestamp, r.regime_label, r.similarity_score, ts.close_return_5d
-FROM VECTOR_SEARCH('regimes', current_regime_vector, 20) r
-JOIN time_series('bars_1d', r.timestamp, r.timestamp + interval '5 days') ts
-  ON ts.symbol = r.symbol
-WHERE r.similarity_score > 0.85
-ORDER BY r.similarity_score DESC;
-----
+The flagship pattern is regime similarity joined to forward returns — `VECTOR_SEARCH` over the
+`regimes` collection joined to a `bars_1d` time-series window, filtered on `similarity_score`.
+That query, plus three more cross-model patterns (correlated-asset graphs, order audit trails
+with event correlation, drawdown risk analysis), live in the dogfood plan:
+link:IBKRTRADING_DOGFOOD.adoc[IBKRTRADING_DOGFOOD] § _Cross-Model Query Examples_.
 
 ==== Required Features
 
@@ -763,7 +759,7 @@ The following matrix maps ProximaDB features to the use cases that require them.
 == Related Documents
 
 * link:IBKRTRADING_DOGFOOD.adoc[ibkrtrading Dogfood Blueprint]
-* link:../00-product/VISION.adoc[Vision Document]
+* link:../current/VISION.adoc[Vision Document]
 * link:../00-product/PRD.adoc[Product Requirements Document]
 * link:../05-concepts/architecture.adoc[Architecture Overview]
 

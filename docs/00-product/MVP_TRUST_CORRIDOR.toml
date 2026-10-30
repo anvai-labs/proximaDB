@@ -4,8 +4,8 @@ product_name = "ProximaDB"
 positioning = "Object-storage-native context serving for SQL, JSON, and vectors"
 deployment = "single-node"
 canonical_api = "REST /api/v2"
-# The corridor's engine. Its smokes set "engine": "sst" explicitly: a REST/gRPC create that omits
-# the engine is auto-routed to HELIX until TD-ENGSEL-1 makes SST the automatic default (v0.5).
+# The corridor's engine. SST is also the automatic default for a REST/gRPC create that omits the
+# engine (TD-ENGSEL-1; pinned by tests/release_smoke_v2.rs rest_v2_create_without_engine_defaults_to_sst).
 default_engine = "sst"
 
 [promise]
@@ -102,7 +102,7 @@ tracking = ["docs/SUPPORTED_SURFACE.adoc"]
 id = "full_sql"
 tier = "experimental"
 reason = "PostgreSQL transaction, constraint, procedural, and broad SQL parity are out of scope."
-tracking = ["docs/12-design/adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc", "docs/10-quality/td/TD-PGOLTP-1-atomic-commit-record-group-commit.adoc", "roadmap/techdebt/TD_110_OLTP_OLAP_HTAP_STORAGE_AND_CONSTRAINTS_PLAN_2026_06_04.adoc"]
+tracking = ["docs/12-design/adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc", "docs/10-quality/td/TD-PGOLTP-1-atomic-commit-record-group-commit.adoc", "docs/history/planning/TD_110_OLTP_OLAP_HTAP_STORAGE_AND_CONSTRAINTS_PLAN_2026_06_04.adoc"]
 
 [release]
 binary_targets = [
@@ -117,7 +117,7 @@ required_commands = [
 required_docs = [
   "README.adoc",
   "docs/SUPPORTED_SURFACE.adoc",
-  "docs/00-product/VISION.adoc",
+  "docs/current/VISION.adoc",
   "docs/00-product/COMPETITIVE_LANDSCAPE.adoc",
   "docs/00-product/MVP_EXECUTION_SCORECARD.adoc",
   "docs/01-quick-start/CONTEXT_SERVING_MVP.adoc",

@@ -1,0 +1,39 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-GRPCSCHEMA-1: GetSchema answers NotFound for a collection created over gRPC
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved (2026-10-23).** The persisted schema is the authority (ADR-047) and is served regardless of the ProximaRecord flag, which gates record ENFORCEMENT on writes, not the existence of a schema: gRPC `GetSchema`/`ListSchemas` and the REST v2 schema GET no longer answer NotFound for a flag-off collection, while the responses do not expose the ProximaRecord flag — REST `GET /collections/{id}` carries `proxima_record_enabled`; gRPC has no flag surface (TD-GRPCSCHEMA-2). Pinned by `grpc_created_collection_serves_its_schema_e2e` (red on develop).
+| Priority | **LOW** — the collection works; only schema introspection over gRPC is missing.
+| Component | gRPC v2 `CreateCollection` / `GetSchema` (`src/network/grpc/v2/record_service.rs`)
+| Relates to | TD-GRPCCREATE-1, TD-122 (create-time schema parity)
+|===
+
+== Problem
+
+`V2CollectionConfig` has no way to enable ProximaRecord, so a collection created over gRPC has it
+off, and `GetSchema` answers `NotFound: No schema defined for collection '<name>'. Enable
+ProximaRecord to use schemas.` The handler still persists a canonical schema (`embedding` plus the
+filterable columns) and its comment says this is "so v2 GetSchema returns the catalog-authoritative
+view", which cannot happen.
+
+== Fix
+
+Either add `enable_proxima_record` to `V2CollectionConfig` (REST parity) or let `GetSchema` serve
+the persisted canonical schema regardless of the flag; then assert gRPC GetSchema after a gRPC
+create returns `embedding` and the filterable columns.
+
+== Resolution (2026-10-23)
+
+Chose the second option (serve the persisted canonical schema regardless of the flag) over adding
+`enable_proxima_record` to `V2CollectionConfig`: the create path already persists a canonical
+schema (embedding + filterable columns) whose stated purpose is exactly this read, and the flag
+semantics — enforcement on writes — have nothing to do with introspection. The same gate existed
+on the REST v2 schema GET; both surfaces now behave identically (the REST/gRPC divergence the TD
+worried about is fixed in the unifying direction). The REST schema PUT's evolution baseline is the
+SAME authoritative schema GET serves (previously `enabled`-gated, so a PUT could silently drop
+advertised columns — including `embedding` — on a flag-off collection while the identical PUT on a
+flag-on collection was rejected). Pinned by `grpc_created_collection_serves_its_schema_e2e` (GetSchema + REST GET); its
+sibling `schema_read_and_evolution_baseline_agree_e2e` pins list-schemas and the PUT baseline.

@@ -426,13 +426,12 @@ mod tests {
                     oid: "test_1".to_string(),
                     ..Default::default()
                 };
-                r.embeddings.push(EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![1.0; 128]),
-                    dim: 128,
-                    ..Default::default()
-                });
+                r.embeddings.push(EmbeddingCell::new_fp32(
+                    "default",
+                    "vector",
+                    128,
+                    vec![1.0; 128],
+                ));
                 r
             },
             {
@@ -440,13 +439,12 @@ mod tests {
                     oid: "test_2".to_string(),
                     ..Default::default()
                 };
-                r.embeddings.push(EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![2.0; 128]),
-                    dim: 128,
-                    ..Default::default()
-                });
+                r.embeddings.push(EmbeddingCell::new_fp32(
+                    "default",
+                    "vector",
+                    128,
+                    vec![2.0; 128],
+                ));
                 r
             },
         ];
@@ -478,13 +476,12 @@ mod tests {
             oid: "test_1".to_string(),
             ..Default::default()
         };
-        r.embeddings.push(EmbeddingCell {
-            model_id: "default".to_string(),
-            modality: "vector".to_string(),
-            values: proximadb_records::EmbeddingValues::Fp32(vec![1.0; 64]),
-            dim: 64,
-            ..Default::default()
-        });
+        r.embeddings.push(EmbeddingCell::new_fp32(
+            "default",
+            "vector",
+            64,
+            vec![1.0; 64],
+        ));
         r.props.insert(
             "category".to_string(),
             proximadb_records::ProximaTreeNode::Value(proximadb_data_model::ProximaValue::String(

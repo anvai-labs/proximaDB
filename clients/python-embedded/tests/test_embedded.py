@@ -257,6 +257,27 @@ class TestVectorOperations:
             count = db.insert("vectors_meta", ids=ids, vectors=vectors, metadata=metadata)
             assert count == 10
 
+    def test_insert_upsert_reject_ids_vectors_count_mismatch(self):
+        """Length mismatches must raise ValueError on every surface.
+
+        Parity fix (redundancy pass 3): insert_numpy already validated;
+        insert/upsert/upsert_numpy used to fail late (or, for insert,
+        silently zip-truncate in the record builder).
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = ProximaDB(data_dirs=tmpdir)
+            db.create_collection("mismatch_guard", dimension=4)
+
+            vectors = np.zeros((1, 4), dtype=np.float32)
+            ids2 = ["a", "b"]
+
+            for method in ("insert", "insert_numpy", "upsert", "upsert_numpy"):
+                with pytest.raises(
+                    ValueError,
+                    match=r"Number of IDs \(2\) doesn't match number of vectors \(1\)",
+                ):
+                    getattr(db, method)("mismatch_guard", ids=ids2, vectors=vectors)
+
     def test_search_basic(self):
         """Test basic vector search"""
         with tempfile.TemporaryDirectory() as tmpdir:

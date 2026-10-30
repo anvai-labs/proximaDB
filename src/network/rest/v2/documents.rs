@@ -229,13 +229,12 @@ async fn ingest_documents_inner(
         }
 
         let embeddings = match doc.vector {
-            Some(values) if !values.is_empty() => vec![EmbeddingCell {
-                model_id: "sdk-provided".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: values.len() as u32,
-                values: proximadb_records::EmbeddingValues::Fp32(values),
-                ..Default::default()
-            }],
+            Some(values) if !values.is_empty() => vec![EmbeddingCell::new_fp32(
+                "sdk-provided",
+                "dense_vector",
+                values.len() as u32,
+                values,
+            )],
             _ => vec![],
         };
 
@@ -267,9 +266,11 @@ async fn ingest_documents_inner(
     // accepted against a collection that cannot hold it (missing, dimension
     // 0, or a mismatched dimension) and then silently dropped by the batch
     // processor after the response has gone out.
+    // Resolved within the request tenant: another tenant's collection is
+    // treated exactly like a missing one.
     let tenant_ctx = state
         .collection_service
-        .load_tenant_context(Some(&tenant_id))
+        .request_tenant_context(Some(&tenant_id))
         .map_err(|e| ApiError::InvalidArgument(format!("tenant resolution failed: {e}")))?;
     let existing_dimension: Option<u32> = state
         .collection_service

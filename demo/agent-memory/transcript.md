@@ -1,6 +1,6 @@
 # Verified full-stack run — 2026-10-18
 
-Engine: proximadb-server built from this repo with `--features onnx` + BGE-small (build-full-fidelity.sh).
+Engine: proximadb-server built from this repo with `cargo build --release -p proximadb-server --features onnx` + BGE-small model files (see demo/agent-memory/fetch-models.sh).
 API: AnvaiOps API (governed multi-tenant surface) over the same engine.
 Agent surface: anvaiops-mcp driven exactly like an MCP host (stdio JSON-RPC).
 Reproduce: anvaiops-mcp repo, demo/ directory — e2e.js asserts every step.

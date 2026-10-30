@@ -231,9 +231,56 @@ jobs:
         run: |
           python3 scripts/mvp_smoke.py --base-url "http://127.0.0.1:${SERVER_PORT}" \
             --output evidence/docker-mvp-smoke.json
+      # TD-PKG-3: the image declared a volume nobody wrote to — every root in
+      # the shipped config was under /tmp/proximadb, so `docker rm` (and every
+      # documented upgrade) lost all data. PROXIMADB_DATA_DIR is now honoured
+      # by the loader, which rebases every default root under it. Prove it:
+      # write, remove the container, start a fresh one on the same volume,
+      # read back.
+      - name: Data persists across docker rm (TD-PKG-3)
+        run: |
+          set -euo pipefail
+          IMAGE="${IMAGE_REPO}:${VERSION}"
+          VOL=proximadb-persist-smoke
+          PERSIST_PORT=$((SERVER_PORT + 1))
+          if docker volume inspect "$VOL" >/dev/null 2>&1; then docker volume rm "$VOL" >/dev/null; fi
+          # The containers and volume are left behind on FAILURE (the
+          # failure-log step dumps them); the success path at the end of this
+          # step removes both.
+
+          docker run -d --name proximadb-persist-a -p "127.0.0.1:${PERSIST_PORT}:5678" -v "${VOL}:/data/proximadb" "$IMAGE" >/dev/null
+          bash scripts/release_smoke/wait_healthy.sh "http://127.0.0.1:${PERSIST_PORT}" "$VERSION" 180
+
+          code="$(curl -sS -o /tmp/persist-create.json -w '%{http_code}' \
+            -X POST "http://127.0.0.1:${PERSIST_PORT}/api/v2/collections" \
+            -H 'content-type: application/json' \
+            -d '{"name":"persist_smoke","dimension":4}')"
+          [ "$code" = "200" ] || { cat /tmp/persist-create.json; echo "::error::create on the first container: HTTP ${code}"; exit 1; }
+          # The data must be ON THE VOLUME, not in the container layer.
+          docker exec proximadb-persist-a sh -c 'ls /data/proximadb' | tee /tmp/persist-ls.txt
+          grep -q metadata /tmp/persist-ls.txt \
+            || { echo "::error::no /data/proximadb/metadata after create — the volume still receives no data"; exit 1; }
+
+          docker rm -f proximadb-persist-a >/dev/null
+          docker run -d --name proximadb-persist-b -p "127.0.0.1:${PERSIST_PORT}:5678" -v "${VOL}:/data/proximadb" "$IMAGE" >/dev/null
+          bash scripts/release_smoke/wait_healthy.sh "http://127.0.0.1:${PERSIST_PORT}" "$VERSION" 180
+
+          code="$(curl -sS -o /tmp/persist-get.json -w '%{http_code}' \
+            "http://127.0.0.1:${PERSIST_PORT}/api/v2/collections/persist_smoke")"
+          [ "$code" = "200" ] \
+            || { cat /tmp/persist-get.json; echo "::error::collection lost across docker rm: HTTP ${code} (TD-PKG-3 regression)"; exit 1; }
+          echo "TD-PKG-3: collection survived docker rm on the named volume"
+          jq -n --arg v "$VERSION" '{check: "docker-persistence", version: $v, passed: true}' > evidence/docker-persistence.json
+          # Success path only (a failure aborts the step above, leaving the
+          # containers for the failure-log step): clean up behind us.
+          docker rm -f proximadb-persist-a proximadb-persist-b >/dev/null
+          if docker volume inspect "$VOL" >/dev/null 2>&1; then docker volume rm "$VOL" >/dev/null; fi
       - name: Server logs (on failure)
         if: failure()
-        run: docker logs --tail 300 proximadb-release-smoke
+        run: |
+          docker logs --tail 300 proximadb-release-smoke
+          echo '--- persist-a ---'; docker logs --tail 300 proximadb-persist-a 2>/dev/null
+          echo '--- persist-b ---'; docker logs --tail 300 proximadb-persist-b 2>/dev/null
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v7

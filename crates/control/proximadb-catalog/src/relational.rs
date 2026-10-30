@@ -26,9 +26,46 @@ pub enum RelationalConstraintKind {
     ForeignKey,
     /// CHECK constraint evaluated to FALSE — SQLSTATE `23514`.
     Check,
-    /// One `INSERT … ON CONFLICT DO UPDATE` statement proposes the same
-    /// conflict key twice — SQLSTATE `21000` (cardinality_violation).
+    /// One `INSERT … ON CONFLICT DO UPDATE` statement would update a row it
+    /// already inserted or updated — SQLSTATE `21000` (cardinality_violation).
     UpsertAffectsRowTwice,
+    /// An `ON CONFLICT (col, …)` target matches no PRIMARY KEY / UNIQUE
+    /// constraint — SQLSTATE `42P10` (invalid_column_reference), TD-DML-3.
+    NoMatchingConflictTarget,
+    /// `ON CONFLICT ON CONSTRAINT name` names no constraint of the table —
+    /// SQLSTATE `42704` (undefined_object), TD-DML-3.
+    UndefinedConstraint,
+    /// A statement names a column the table does not have — SQLSTATE `42703`
+    /// (undefined_column), TD-DML-3.
+    UndefinedColumn,
+    /// One `SET` list assigns the same column twice — SQLSTATE `42701`
+    /// (duplicate_column), TD-DML-3.
+    DuplicateColumn,
+    /// A valid statement shape this engine does not support (e.g. assigning a
+    /// PRIMARY KEY column in `ON CONFLICT DO UPDATE`) — SQLSTATE `0A000`
+    /// (feature_not_supported), TD-DML-3.
+    FeatureNotSupported,
+    /// Text that does not parse as the target column's type — SQLSTATE
+    /// `22P02` (invalid_text_representation), TD-DML-3.
+    InvalidTextRepresentation,
+    /// Division by zero while evaluating a write expression — SQLSTATE
+    /// `22012` (division_by_zero), TD-DML-3.
+    DivisionByZero,
+    /// Arithmetic overflow while evaluating a write expression — SQLSTATE
+    /// `22003` (numeric_value_out_of_range), TD-DML-3.
+    NumericValueOutOfRange,
+    /// An expression's type cannot be assigned or operated on — SQLSTATE
+    /// `42804` (datatype_mismatch), TD-DML-3.
+    DatatypeMismatch,
+    /// No operator matches the operand types — SQLSTATE `42883`
+    /// (undefined_function), TD-DML-3.
+    UndefinedFunction,
+    /// No cast exists between the two types — SQLSTATE `42846`
+    /// (cannot_coerce), TD-DML-3.
+    CannotCoerce,
+    /// The caller's row-level policy does not admit the row — SQLSTATE
+    /// `42501` (insufficient_privilege), TD-DML-3.
+    InsufficientPrivilege,
 }
 
 impl RelationalConstraintKind {
@@ -39,6 +76,18 @@ impl RelationalConstraintKind {
             Self::ForeignKey => "23503",
             Self::Check => "23514",
             Self::UpsertAffectsRowTwice => "21000",
+            Self::NoMatchingConflictTarget => "42P10",
+            Self::UndefinedConstraint => "42704",
+            Self::UndefinedColumn => "42703",
+            Self::DuplicateColumn => "42701",
+            Self::FeatureNotSupported => "0A000",
+            Self::InvalidTextRepresentation => "22P02",
+            Self::DivisionByZero => "22012",
+            Self::NumericValueOutOfRange => "22003",
+            Self::DatatypeMismatch => "42804",
+            Self::UndefinedFunction => "42883",
+            Self::CannotCoerce => "42846",
+            Self::InsufficientPrivilege => "42501",
         }
     }
 }
@@ -180,6 +229,10 @@ pub struct RelationalRecordOptions {
     pub record_version: Option<u64>,
     /// Also project vector columns into `EmbeddingCell`s.
     pub include_vector_embeddings: bool,
+    /// Record id to use when the table declares no primary key: an UPDATE or
+    /// DELETE of a keyless row must keep the row's existing `oid` instead of
+    /// minting a new one (TD-RELIDEQ-1). Ignored when the table has a key.
+    pub record_id: Option<String>,
 }
 
 impl Default for RelationalRecordOptions {
@@ -195,6 +248,7 @@ impl Default for RelationalRecordOptions {
             valid_to_ns: None,
             record_version: None,
             include_vector_embeddings: true,
+            record_id: None,
         }
     }
 }
@@ -358,6 +412,7 @@ impl CatalogRow {
     ) -> Result<ProximaRecord> {
         let record_id = self
             .primary_key_string(schema)?
+            .or_else(|| options.record_id.clone())
             .unwrap_or_else(|| new_local_record_id(schema));
 
         let props = self
@@ -490,7 +545,11 @@ impl CatalogRow {
     }
 }
 
-fn effective_primary_key(schema: &CatalogTableSchema) -> Vec<&str> {
+/// The DECLARED primary key — the columns whose encoded values become a row's
+/// `oid` in [`CatalogRow::to_proxima_record`]. Empty for a keyless table: its
+/// rows get a generated `oid`, and a column named `id`/`record_id` is an
+/// ordinary column (TD-RELIDEQ-1/2). Prefers `relational_capabilities`.
+pub fn effective_primary_key(schema: &CatalogTableSchema) -> Vec<&str> {
     if !schema.relational_capabilities.primary_key.is_empty() {
         schema
             .relational_capabilities
@@ -1007,6 +1066,72 @@ fn proxima_value_type_name(value: &ProximaValue) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TD-RELIDEQ-1: a keyless table's UPDATE/DELETE mutation must keep the
+    /// addressed row's oid (the `record_id` override), while a declared key
+    /// ignores the override (the key value is the oid).
+    #[test]
+    fn record_id_override_only_applies_to_keyless_tables() {
+        let keyless = CatalogTableSchema::new("keyless")
+            .with_column(CatalogColumn::new(1, "id", ProximaType::Int64))
+            .with_column(CatalogColumn::new(2, "name", ProximaType::String));
+        let mut values = std::collections::HashMap::new();
+        values.insert("id".to_string(), ProximaValue::Int64(7));
+        values.insert("name".to_string(), ProximaValue::String("a".to_string()));
+        let row = CatalogRow {
+            table: "keyless".to_string(),
+            values,
+        };
+
+        // Keyless: the override becomes the record id (a generated id otherwise).
+        let mutated = row
+            .to_mutation_record(
+                &keyless,
+                RelationalMutationKind::Update,
+                RelationalRecordOptions {
+                    record_id: Some("keyless:row:123".to_string()),
+                    ..RelationalRecordOptions::default()
+                },
+            )
+            .expect("keyless mutation");
+        assert_eq!(mutated.oid, "keyless:row:123");
+
+        let defaulted = row
+            .to_mutation_record(
+                &keyless,
+                RelationalMutationKind::Update,
+                RelationalRecordOptions::default(),
+            )
+            .expect("keyless mutation, default options");
+        assert_ne!(
+            defaulted.oid, "7",
+            "a keyless row never keys on its id value"
+        );
+        assert!(defaulted.oid.starts_with("keyless:row:"));
+
+        // Declared key: the encoded key is the record id; the override is ignored.
+        let keyed = CatalogTableSchema::new("keyed")
+            .with_column(CatalogColumn::new(1, "id", ProximaType::Int64).nullable(false))
+            .with_primary_key(vec!["id".to_string()]);
+        let mut values = std::collections::HashMap::new();
+        values.insert("id".to_string(), ProximaValue::Int64(7));
+        let row = CatalogRow {
+            table: "keyed".to_string(),
+            values,
+        };
+        let mutated = row
+            .to_mutation_record(
+                &keyed,
+                RelationalMutationKind::Update,
+                RelationalRecordOptions {
+                    record_id: Some("ignored".to_string()),
+                    ..RelationalRecordOptions::default()
+                },
+            )
+            .expect("keyed mutation");
+        assert_eq!(mutated.oid, "7", "the declared key value is the record id");
+    }
+
     use crate::{
         CatalogColumn, CatalogIndex, CatalogIndexType, ColumnConstraint, RelationalCapabilities,
     };

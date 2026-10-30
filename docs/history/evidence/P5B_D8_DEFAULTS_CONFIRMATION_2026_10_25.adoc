@@ -1,0 +1,53 @@
+= TD-PAXDIR-1 D8: P5b defaults-ON confirmation over MinIO + Toxiproxy
+
+**Date:** 2026-10-25 · **Branch:** `feat/paxdir-d8-defaults` @ `78e99d2c1` (binary built in-worktree at that commit) · **TD:** link:../../10-quality/td/TD-PAXDIR-1-collection-global-centroid-directory.adoc[TD-PAXDIR-1] D8.
+
+== Bed realignment (owner decision, 2026-10-25)
+
+No cross-region deployments are planned, so the **canonical gate profile is intra-region**: Toxiproxy 5 + 5 ms (measured 11.4 ms RTT through the proxy), matching intra-region S3 GET p50 (~5–15 ms) with headroom. The prior 50 ms profile (D7's gate run, and this run's stress arms) is retained as a **robustness column**, not the gate. Waves and requests are latency-independent; p50 re-prices accordingly.
+
+Same bed otherwise: MinIO single drive behind the proxy, SIFT1M (1,000,000 × 128, L2), full-corpus ground truth, top-10, 1,000 queries/phase (disjoint ranges), concurrency 1, `--read-ranges-inflight 16`, `--training-compaction-min-mb 1 --max-segments 3`, planner pinned to 4 MiB coalesce range, `systemd-run -p MemoryMax=64G`, arms serialized on an idle box.
+
+== Result
+
+**Canonical (10 ms RTT), `object_cold`:**
+
+[cols="3,2,2,2",options="header"]
+|===
+| | Defaults ON (gates unset, gates armed) | Kill-switch OFF | Gate
+| recall@10 | 0.9822 | 0.9816 | ≥ 0.98 ✅
+| waves p50 (p95) | **3** (—) | 8 | ≤ 3 ✅
+| requests/q | **19.55** | 20.62 | ≤ 20 ✅
+| p50 / p95 | **107 / 143 ms** | 194 / 287 ms | —
+| MB/q | 54.7 | 50.2 | —
+| qps (c=1) | 9.28 | 5.14 | —
+|===
+
+Harness exit 0 (G1, G2-cold ≤ 3, G3 ≤ 20, warm ≤ 2 = LIST + 1 as restated). The defaults arm leaves every PAXDIR gate **unset** — the run proves the D8 defaults end-to-end, including `PROXIMADB_PAX_WRITE_SHARED_MODEL` (unset ⇒ ON; D7's evidence did not cover it). At this profile the non-wave residual (~74 ms) is the dominant p50 term: rank + SQ8 decode + rehydration compute, the deployment-relevant tuning surface.
+
+**Stress column (50 ms RTT), `object_cold`:**
+
+[cols="3,2,2",options="header"]
+|===
+| | Defaults ON | Kill-switch OFF
+| recall@10 | 0.9818 | 0.9822
+| waves p50 | **3** | 8
+| requests/q | **18.82** | 21.41
+| p50 / p95 | 223 / 287 ms | 500 / 747 ms
+| MB/q | 49.5 | 51.5
+|===
+
+The off baseline also improved against D7's (22.66 → 21.41 req/q at 50 ms; 60.2 → 51.5 MB/q): the `k_G` cell rule helps the per-segment path too. G4 (no regression with the directory off) holds at both profiles.
+
+Default cell geometry (k_G): the settled beds carry ~34 cells per 1M-row segment (old rule: ~15); each query probes 11–12 cells (~34–41% of rows).
+
+== Known costs and follow-ups (from the D8 review)
+
+* `k_G` sizes against the default RaBitQ + SQ8 geometry; a collection with a non-default rerank quant sizes against that assumption (follow-up: plumb the actual per-tier bytes).
+* Pre-D8-trained collections retrain their coarse model once on the next compaction (old k ≈ 15 vs needed ≈ 34 > 2× growth trigger) — a one-time cost, mixed-read-safe.
+* The D5 warm-planning interaction documented in D7's artifact (one merged B range re-fetched per repeat) remains and is inside the warm budget.
+
+== Provenance
+
+* Results (local, not checked in): `~/bench-beds/p5b-runs/{d8-10ms-on,d8-10ms-off,d8-default-on,d8-all-off}/result.json`; build log `d8-build.log`; chain logs `d8-chain10.log`, `d8-chain.log`, `d8-retry.log`.
+* Single-machine emulator evidence, not an SLA or a cloud-latency claim.

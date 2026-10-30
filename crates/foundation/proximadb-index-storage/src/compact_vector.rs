@@ -59,8 +59,8 @@
 //! ## Implementation Notes
 //!
 //! The CompactVector below implements Version 3 (external dimension).
-//! For Version 4 (ultra-compact), see ultra_compact_vector.rs which removes
-//! ALL metadata overhead by leveraging collection-level configuration.
+//! Version 4 (ultra-compact, all metadata overhead moved to collection-level
+//! configuration) was prototyped but never compiled, and was removed under TD-ORPHAN-1.
 
 use anyhow::{Result, anyhow};
 use bytemuck;

@@ -52,5 +52,9 @@ pub mod metal;
 #[cfg(feature = "gpu")]
 pub mod opencl;
 
+// Shared scalar CPU fallback cores the deferred scheme kernels delegate to
+// (compiles un-gated so its round-trip tests run in default builds).
+pub mod cpu_fallback;
+
 // Common GPU utilities
 pub mod utils;

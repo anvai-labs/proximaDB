@@ -363,13 +363,9 @@ async fn handle_insert_socket(socket: WebSocket, collection: String, state: WebS
                                 }
                                 proximadb_records::ProximaRecord {
                                     oid: v.id,
-                                    embeddings: vec![proximadb_records::EmbeddingCell {
-                                        model_id: "default".to_string(),
-                                        modality: "vector".to_string(),
-                                        dim,
-                                        values: proximadb_records::EmbeddingValues::Fp32(v.vector),
-                                        ..Default::default()
-                                    }],
+                                    embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                                        "default", "vector", dim, v.vector,
+                                    )],
                                     props,
                                     record_version: 1,
                                     created_at_ns: chrono::Utc::now()

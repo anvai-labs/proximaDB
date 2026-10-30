@@ -252,9 +252,14 @@ if [ "$SCOPE" = "restart" ]; then
   # — the boundary that repeatedly regressed with zero coverage (container-strip
   # / malformed prefix). Reuses the exported PROXIMADB_OBJECT_STORE_URL.
   echo "==> TD-CACHE-7: warm-manifest round-trip over Azurite (adls://)"
-  CARGO_BUILD_JOBS=1 cargo test -p proximadb --features azure --lib \
+  # Same build: a missing object must read as `NotFound`, not `Network`
+  # (the record spill's discovery depends on it).
+  CARGO_BUILD_JOBS=1 cargo test -p proximadb --features azure --lib -- \
     warm_manifest_round_trips_on_object_store \
-    -- --ignored --nocapture --test-threads=1
+    a_missing_object_is_not_found_on_object_store \
+    spill_segments_round_trip_on_object_store \
+    placement_is_claimed_and_fenced_on_object_store \
+    --ignored --nocapture --test-threads=1
   # TD-OBJSTORE-5 S2 (backend contract tests) moved to --qa — see below.
   # Keeping it here forced a 3rd cold feature-set compile (aws,azure,gcp)
   # that, combined with the two azure builds above, exceeded the job's timeout

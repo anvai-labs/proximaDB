@@ -57,10 +57,14 @@ Older releases differ: **v0.4.1 and earlier** were built on Ubuntu 22.04 and
 need glibc 2.35 and `libssl.so.3` -- their `.el8.rpm` does **not** run on
 RHEL/Rocky 8 or 9, and their `.deb` needs Ubuntu 22.04+ / Debian 12+.
 
-> **Known issue (TD-PKG-1, fix scheduled for v0.5):** as shipped, the RPM/DEB service does not start
-> (the unit waits for a readiness signal the server never sends, the state directories are
-> root-owned, and the server's `./log` directory resolves to `/`), and the packaged config keeps all
-> data under `/tmp`, which the unit wipes on restart. Until it is fixed, apply this after installing:
+> **Fixed in v0.5 (TD-PKG-1):** the unit is `Type=simple` with a writable working directory, the
+> state directories are chowned to the service user at install, and the service sets
+> `PROXIMADB_DATA_DIR=/var/lib/proximadb`, which moves every config root still at its shipped
+> `/tmp/proximadb` default under `/var/lib/proximadb` — data survives restarts. The release smoke
+> asserts the unit, the ownership and (for the container) persistence across `docker rm`.
+>
+> **v0.4.1 and earlier** shipped the broken unit and config; after installing those versions, apply
+> this workaround:
 >
 > ```bash
 > sudo sed -i 's#/tmp/proximadb#/var/lib/proximadb#g' /etc/proximadb/config.toml
@@ -165,11 +169,14 @@ curl http://localhost:5678/health
 
 ### Docker Hub
 
-> **Known issue (TD-PKG-3, fix scheduled for v0.5):** the image's built-in config keeps every
-> storage root under `/tmp/proximadb` inside the container, so data does not survive `docker rm`
-> even with a volume mounted. Until it is fixed, run it with a config that points the roots at the
-> image's volume (verified: a record written before `docker rm` is readable from a new container on
-> the same volume):
+> **Fixed in v0.5 (TD-PKG-3):** the image's `PROXIMADB_DATA_DIR=/data/proximadb` now reaches the
+> config loader, which moves every root still at its shipped `/tmp/proximadb` default onto the
+> volume. `docker run -v some-volume:/data/proximadb` persists across `docker rm` (the release
+> smoke asserts write → `docker rm` → rerun on the same volume → read back).
+>
+> **v0.4.1 and earlier** images keep their data under `/tmp/proximadb`; to rescue it, run with a
+> config that points the roots at the volume (verified: a record written before `docker rm` is
+> readable from a new container on the same volume):
 
 ```bash
 # One-time: copy the image's config with every root moved to the volume
@@ -325,21 +332,16 @@ curl http://localhost:5678/health
 
 ### Test Collection
 
-```bash
-# Create a canonical record collection
-curl -X POST http://localhost:5678/api/v2/collections \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "test",
-    "dimension": 128,
-    "distance_metric": "cosine",
-    "engine": "sst",
-    "enable_proxima_record": true
-  }'
+A healthy `/health` response is the install's own verification. As a last check you can list
+the (empty) collection set:
 
-# List collections
+```bash
 curl http://localhost:5678/api/v2/collections
 ```
+
+Creating a collection and running your first insert and search is the
+[First Query tutorial](./first-query.md)'s job — it is the canonical walkthrough (REST, Python
+SDK and SQL variants), kept in one place so the steps cannot drift apart between guides.
 
 ---
 

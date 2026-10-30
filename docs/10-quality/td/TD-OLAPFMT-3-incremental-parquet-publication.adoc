@@ -8,6 +8,7 @@
 | Status | Open — reference implementation exists off-tree (`handoff/reference/p2-publisher.patch`); needs rework before merge
 | Priority | P2
 | Relates to | ADR-094 D1 ("a second representation is optional, catalog-expressed and cost-justified") and D2 (multi-layout catalog, additive MATERIALIZE); TD-USUB-1/4
+| Tracked under | TD-SEAM-4 (streaming MATERIALIZE / incremental publisher, phase P2 of link:../../current/LAKEHOUSE_PLAN.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10]; ADR-097)
 |===
 
 == Why
@@ -15,7 +16,10 @@
 ADR-094 lands relational tables in Parquet Layer A (one copy). Tables that land in PAX
 (vector / multimodal) can still carry an *optional* Parquet OLAP representation (ADR-094 D1/D2),
 today produced only by `ALTER TABLE … MATERIALIZE` — a full, in-memory O(table) rewrite. Measured:
-the TPC-DS ledger at SF 0.05 is OOM-killed (13.7 GB RSS) inside MATERIALIZE on a 15 GB host.
+the TPC-DS ledger at SF 0.05 is OOM-killed (13.7 GB RSS) inside MATERIALIZE on a 15 GB host
+(`docs/_internal/status/TPC_DS_SPEC_PRUNING_EVIDENCE_2026_10_18.adoc`, "SF 0.05 could not run").
+That is the cgroup kill point on that host, not the job's full requirement; re-measure peak RSS
+once publication streams.
 
 == Design (reference implementation, 2026-10-18)
 
@@ -27,8 +31,52 @@ next append; opt-in background driver.
 
 == Rework required before merge
 
-The reference classifies insert-vs-update from the **full WAL history**. On develop the WAL is
-truncated behind manifest durability (TD-USUB-1), so that history is incomplete and an update of a
-flushed row would be misread as an insert (duplicate row). Replace the history check with a probe
-of the published representation (key min/max + SBBF from TD-OLAPFMT-2, or a published key set),
-and register the publication as an *additional* catalog layout per ADR-094 D2.
+The reference classifies insert-vs-update from the **full WAL history**. That history will not
+stay complete: once canonical-WAL truncation lands (TD-USUB-1 slice 2b, TD-SEAM-2), entries behind
+manifest durability are discarded, and an update of a flushed row would be misread as an insert
+(duplicate row). Replace the history check with a probe of the published representation (key
+min/max + SBBF from TD-OLAPFMT-2, or a published key set), and register the publication as an
+*additional* catalog layout per ADR-094 D2.
+
+*Corrected 2026-10-18 (was: "On develop the WAL is truncated behind manifest durability
+(TD-USUB-1)").* It is not, on `develop` @ `1db3a05`. Slice 2b is not built; the table record WAL
+(`canonical-records.wal`) is only ever appended to, plus torn-tail repair on open
+(`src/services/canonical_wal.rs:203`). `SpillRecordStorage::min_unflushed_lsn`
+(`src/services/record_spill.rs:1055`) has no production caller (only its own unit tests), and the
+only rewrite of a canonical-format WAL is the system catalog compacting its *own* WAL after a
+snapshot checkpoint (`src/services/system_catalog.rs:610`). Verified with
+`grep -rn min_unflushed_lsn src crates` and `grep -rn rewrite_canonical_wal src crates`. The
+rework is still required, because truncation is planned (P2), not because it ships today.
+
+== P2.4 slice 3: multi-part Parquet writer (2026-10-22)
+
+`proximadb_storage_common::parquet_multipart::MultipartParquetWriter` streams Arrow batches
+into size-capped data files (`{dir}/{stem}-{nnnnn}.parquet`). Each file is an
+`AsyncArrowWriter` over an `object_store` multipart `BufWriter`, written with the warehouse
+`ParquetWritePolicy` and Iceberg field ids. Two new policy knobs size the parts:
+
+* `target_file_rows` (`PROXIMADB_MATERIALIZE_TARGET_FILE_ROWS`, default 16 Mi rows) is exact,
+  because a batch that crosses the cap is split;
+* `target_file_bytes` (`PROXIMADB_MATERIALIZE_TARGET_FILE_BYTES`, default 256 MiB) is checked
+  between batches.
+
+Up to one row group is buffered before a part opens, so the part's Bloom filters are sized
+from a full row group rather than from the first small batch. `finish` returns the parts for
+the caller to commit as one snapshot; `abort` aborts the open upload and deletes the finished
+parts. `ObjectStoreBridge::object_store_path` lets the writer address a base-prefixed bridge's
+store directly.
+
+Evidence: the `parquet_multipart::tests` suite: exact row roll-over with every row kept, byte
+roll-over, an empty publication writing one empty part, abort removing every part, a mismatched
+batch rejected, and Bloom filters sized from a full row group.
+
+== P2.4 gate run (2026-10-23)
+
+Release build, TPC-DS load-only (`docs/history/evidence/P24_SF1_GATE_EVIDENCE_2026_10_23.adoc`).
+SF1 was not run: with spill on, bulk INSERT is quadratic once a table spills
+(link:TD-USUB-21-insert-existence-probe-decodes-every-spill-segment.adoc[TD-USUB-21]; 257×
+slower at SF 0.01 with a 16,384 threshold), and with spill off the memtable needs ≈ 39 GiB at SF1.
+With spill off, MATERIALIZE peaked +210 / +329 / +405 MiB above the load phase's peak at
+SF 0.01 / 0.1 / 0.2 and published 22/22 tables each time; over a spilled segment it was measured
+once (+265 MiB, one 16,384-row segment). The SF 0.05 OOM recorded in "Why" was measured on the
+whole-table in-memory rewrite that P2.4 replaced; it was not re-run.

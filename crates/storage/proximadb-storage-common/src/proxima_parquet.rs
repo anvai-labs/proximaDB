@@ -205,10 +205,8 @@ mod tests {
                 ("score", ProximaValue::Float64(9.5)),
             ],
         );
-        r0.embeddings.push(EmbeddingCell {
-            values: EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-            ..Default::default()
-        });
+        r0.embeddings
+            .push(EmbeddingCell::new_fp32("", "", 0, vec![1.0, 2.0, 3.0]));
         // r1: `age` absent (→ null), no embedding (→ null vector).
         let r1 = record(
             "r1",

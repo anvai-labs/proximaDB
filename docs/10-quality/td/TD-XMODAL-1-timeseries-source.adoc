@@ -1,0 +1,14 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-XMODAL-1: timeseries multi-modal query source
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Landed** — the `timeseries_range` table function (PR #665), per ADR-053's reconciliation; this entry filed 2026-10-26 so the number resolves (it was cited as "landed" without a register entry).
+| Relates to | ADR-053, TD-XMODAL-2 (landed, #673), TD-XMODAL-4 (filed)
+|===
+
+== Scope
+
+The `timeseries_range` multi-modal query source. Design and landing evidence live in ADR-053.

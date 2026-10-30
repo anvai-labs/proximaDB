@@ -17,7 +17,6 @@
 
 use anyhow::{Result, anyhow};
 use dashmap::DashMap;
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -284,8 +283,6 @@ impl CentroidStore {
     }
 
     fn train(&mut self, training_vectors: &[Vec<f32>]) -> Result<()> {
-        use rand::seq::SliceRandom;
-
         info!(
             "Training IVF centroids with {} vectors",
             training_vectors.len()
@@ -298,81 +295,29 @@ impl CentroidStore {
         let n_clusters = self.centroids.capacity();
         let dimension = training_vectors[0].len();
 
-        // K-means++ initialization
-        let mut rng = rand::thread_rng();
-        let mut centroids = Vec::with_capacity(n_clusters);
-
-        // Choose first centroid randomly
-        let first_centroid = training_vectors
-            .choose(&mut rng)
-            .ok_or_else(|| anyhow!("Cannot select initial centroid from empty training set"))?
-            .clone();
-        centroids.push(first_centroid);
-
-        // Choose remaining centroids with K-means++ probability
-        for _ in 1..n_clusters {
-            let mut distances = Vec::with_capacity(training_vectors.len());
-
-            for vector in training_vectors {
-                let min_dist = centroids
-                    .iter()
-                    .map(|c| euclidean_distance(vector, c))
-                    .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .unwrap_or(f32::MAX);
-                distances.push(min_dist * min_dist); // Square for probability
-            }
-
-            // Choose next centroid with probability proportional to squared distance
-            let total: f32 = distances.iter().sum();
-            let mut threshold = rng.gen_range(0.0..1.0) * total;
-
-            for (idx, &dist) in distances.iter().enumerate() {
-                threshold -= dist;
-                if threshold <= 0.0 {
-                    centroids.push(training_vectors[idx].clone());
-                    break;
-                }
-            }
-        }
+        // K-means++ initialization (shared with `UnifiedIvfIndex`'s seeding)
+        let mut centroids = kmeans_plusplus_seeded(training_vectors, n_clusters)?;
 
         // Run K-means iterations
         let max_iter = 20;
         let tolerance = 1e-4;
 
         for iter in 0..max_iter {
-            // Assign vectors to clusters
+            // Assign vectors to clusters (Lloyd step 1)
             let mut clusters: Vec<Vec<&Vec<f32>>> = vec![Vec::new(); n_clusters];
-
-            for vector in training_vectors {
-                let mut min_dist = f32::MAX;
-                let mut best_cluster = 0;
-
-                for (idx, centroid) in centroids.iter().enumerate() {
-                    let dist = euclidean_distance(vector, centroid);
-                    if dist < min_dist {
-                        min_dist = dist;
-                        best_cluster = idx;
-                    }
-                }
-
-                clusters[best_cluster].push(vector);
+            for (vector, best) in training_vectors
+                .iter()
+                .zip(assign_nearest_centroids(training_vectors, &centroids))
+            {
+                clusters[best].push(vector);
             }
 
-            // Update centroids
+            // Update centroids (Lloyd step 2)
             let mut converged = true;
             for (idx, cluster) in clusters.iter().enumerate() {
                 if !cluster.is_empty() {
-                    let mut new_centroid = vec![0.0; dimension];
-
-                    for vector in cluster {
-                        for (i, &val) in vector.iter().enumerate() {
-                            new_centroid[i] += val;
-                        }
-                    }
-
-                    for val in &mut new_centroid {
-                        *val /= cluster.len() as f32;
-                    }
+                    let members: Vec<&[f32]> = cluster.iter().map(|v| v.as_slice()).collect();
+                    let new_centroid = cluster_mean(&members, dimension);
 
                     // Check convergence
                     let movement = euclidean_distance(&centroids[idx], &new_centroid);
@@ -620,47 +565,148 @@ impl ProductQuantizer {
 
         // Run iterations (simplified)
         for _ in 0..10 {
-            // Assign points to clusters
+            // Assign points to clusters (Lloyd step 1)
             let mut clusters: Vec<Vec<Vec<f32>>> = vec![Vec::new(); k];
-
-            for vector in vectors {
-                let mut min_dist = f32::MAX;
-                let mut best_cluster = 0;
-
-                for (idx, centroid) in centroids.iter().enumerate() {
-                    let dist = euclidean_distance(vector, centroid);
-                    if dist < min_dist {
-                        min_dist = dist;
-                        best_cluster = idx;
-                    }
-                }
-
-                clusters[best_cluster].push(vector.clone());
+            for (vector, best) in vectors
+                .iter()
+                .zip(assign_nearest_centroids(vectors, &centroids))
+            {
+                clusters[best].push(vector.clone());
             }
 
-            // Update centroids
+            // Update centroids (Lloyd step 2)
             for (idx, cluster) in clusters.iter().enumerate() {
                 if !cluster.is_empty() {
                     let dim = cluster[0].len();
-                    let mut new_centroid = vec![0.0; dim];
-
-                    for vector in cluster {
-                        for (i, &val) in vector.iter().enumerate() {
-                            new_centroid[i] += val;
-                        }
-                    }
-
-                    for val in &mut new_centroid {
-                        *val /= cluster.len() as f32;
-                    }
-
-                    centroids[idx] = new_centroid;
+                    let members: Vec<&[f32]> = cluster.iter().map(|v| v.as_slice()).collect();
+                    centroids[idx] = cluster_mean(&members, dim);
                 }
             }
         }
 
         Ok(centroids)
     }
+}
+
+/// K-means++ seeding: first centroid uniform at random, the rest with
+/// probability proportional to squared distance to the nearest chosen
+/// centroid. Shared by `CentroidStore::train` and
+/// `UnifiedIvfIndex::kmeans_plusplus_init`.
+fn kmeans_plusplus_seeded(vectors: &[Vec<f32>], k: usize) -> Result<Vec<Vec<f32>>> {
+    use rand::Rng;
+    use rand::seq::SliceRandom;
+
+    let mut rng = rand::thread_rng();
+    let mut centroids = Vec::with_capacity(k);
+
+    // Choose first centroid randomly
+    let first_centroid = vectors
+        .choose(&mut rng)
+        .ok_or_else(|| anyhow!("Cannot select initial centroid from empty vector set"))?
+        .clone();
+    centroids.push(first_centroid);
+
+    // Choose remaining centroids
+    for _ in 1..k {
+        let mut distances = Vec::with_capacity(vectors.len());
+
+        for vector in vectors {
+            let min_dist = centroids
+                .iter()
+                .map(|c| euclidean_distance(vector, c))
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(f32::MAX);
+            distances.push(min_dist * min_dist); // Square for probability
+        }
+
+        // Choose next centroid with probability proportional to squared distance
+        let total: f32 = distances.iter().sum();
+        let mut threshold = rng.gen_range(0.0..1.0) * total;
+
+        for (idx, &dist) in distances.iter().enumerate() {
+            threshold -= dist;
+            if threshold <= 0.0 {
+                centroids.push(vectors[idx].clone());
+                break;
+            }
+        }
+    }
+
+    Ok(centroids)
+}
+
+/// Assign every vector to the index of its nearest centroid (Lloyd step 1).
+fn assign_nearest_centroids(vectors: &[Vec<f32>], centroids: &[Vec<f32>]) -> Vec<usize> {
+    vectors
+        .iter()
+        .map(|vector| {
+            let mut min_dist = f32::MAX;
+            let mut best = 0;
+            for (idx, centroid) in centroids.iter().enumerate() {
+                let dist = euclidean_distance(vector, centroid);
+                if dist < min_dist {
+                    min_dist = dist;
+                    best = idx;
+                }
+            }
+            best
+        })
+        .collect()
+}
+
+/// Mean of a non-empty cluster (Lloyd step 2). `dim` fixes the output
+/// length so an all-zero member still yields a correctly-sized centroid.
+fn cluster_mean(cluster: &[&[f32]], dim: usize) -> Vec<f32> {
+    let mut mean = vec![0.0f32; dim];
+    for vector in cluster {
+        for (i, &val) in vector.iter().enumerate() {
+            mean[i] += val;
+        }
+    }
+    for val in &mut mean {
+        *val /= cluster.len() as f32;
+    }
+    mean
+}
+
+/// Walk dimension-prefixed records — `[u32 dim LE][elem × dim]` with
+/// `elem_size` bytes per element — decoding each element with `decode_elem`.
+/// Shared by the FP32 and INT8 raw-bytes backends.
+fn parse_dim_prefixed_records(
+    data: &[u8],
+    expected_dim: usize,
+    elem_size: usize,
+    mut decode_elem: impl FnMut(&[u8], usize) -> f32,
+) -> Result<Vec<Vec<f32>>> {
+    let mut vectors = Vec::new();
+    let mut offset = 0;
+    let record_size = 4 + expected_dim * elem_size; // u32 dim + elements
+
+    while offset + record_size <= data.len() {
+        let dim = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize;
+        offset += 4;
+
+        if dim != expected_dim {
+            return Err(anyhow::anyhow!(
+                "Dimension mismatch: expected {}, got {}",
+                expected_dim,
+                dim
+            ));
+        }
+
+        let mut vec = Vec::with_capacity(dim);
+        for i in 0..dim {
+            vec.push(decode_elem(data, offset + i * elem_size));
+        }
+        offset += dim * elem_size;
+        vectors.push(vec);
+    }
+    Ok(vectors)
 }
 
 fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
@@ -1093,62 +1139,15 @@ impl UnifiedIvfIndex {
 
     /// K-means++ initialization
     fn kmeans_plusplus_init(&self, vectors: &[Vec<f32>], k: usize) -> Result<Vec<Vec<f32>>> {
-        use rand::Rng;
-        use rand::seq::SliceRandom;
-
-        let mut rng = rand::thread_rng();
-        let mut centroids = Vec::with_capacity(k);
-
-        // Choose first centroid randomly
-        let first_centroid = vectors
-            .choose(&mut rng)
-            .ok_or_else(|| anyhow!("Cannot select initial centroid from empty vector set"))?
-            .clone();
-        centroids.push(first_centroid);
-
-        // Choose remaining centroids
-        for _ in 1..k {
-            let mut distances = Vec::with_capacity(vectors.len());
-
-            for vector in vectors {
-                let min_dist = centroids
-                    .iter()
-                    .map(|c| euclidean_distance(vector, c))
-                    .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .unwrap_or(f32::MAX);
-                distances.push(min_dist * min_dist);
-            }
-
-            // Choose next centroid with probability proportional to squared distance
-            let total: f32 = distances.iter().sum();
-            let mut threshold = rng.gen_range(0.0..1.0) * total;
-
-            for (idx, &dist) in distances.iter().enumerate() {
-                threshold -= dist;
-                if threshold <= 0.0 {
-                    centroids.push(vectors[idx].clone());
-                    break;
-                }
-            }
-        }
-
-        Ok(centroids)
+        // Shared with `CentroidStore::train`'s seeding — one implementation,
+        // two k-means call sites.
+        kmeans_plusplus_seeded(vectors, k)
     }
 
     /// Helper functions for clustering
     fn find_nearest_centroid_idx(&self, vector: &[f32], centroids: &[Vec<f32>]) -> usize {
-        let mut min_dist = f32::MAX;
-        let mut nearest = 0;
-
-        for (idx, centroid) in centroids.iter().enumerate() {
-            let dist = euclidean_distance(vector, centroid);
-            if dist < min_dist {
-                min_dist = dist;
-                nearest = idx;
-            }
-        }
-
-        nearest
+        self.find_nearest_centroid_with_distance(vector, centroids)
+            .0
     }
 
     fn find_nearest_centroid_with_distance(
@@ -1631,6 +1630,35 @@ impl UnifiedIvfIndex {
         Ok(())
     }
 
+    /// Collect a cluster's posting-list internal ids under the store guard
+    /// (no clone of the inline `Vec<Vec<f32>>` — up to 1000×dim floats per
+    /// probe with the old `get`). `None` when the cluster has no posting
+    /// list. Awaits only on the async-store fallback, BEFORE the guard is
+    /// taken (the guard is a std RwLock read guard and must never be held
+    /// across an await — the future would become !Send).
+    async fn posting_internal_ids(&self, cluster_id: usize) -> Option<Vec<usize>> {
+        let key = PartitionedKey::new(self.collection_id.clone(), cluster_id);
+        let mut internal_ids: Vec<usize> = Vec::new();
+        let mut collect_ids = |list: &TieredPostingList| {
+            internal_ids.extend_from_slice(&list.vector_ids);
+        };
+        let visited = match self
+            .posting_lists
+            .try_with_value_sync(&key, &mut collect_ids)
+        {
+            Some(present) => present,
+            // Async-backed store (Moka): fall back to the cloning get.
+            None => match self.posting_lists.get(&key).await {
+                Some(list) => {
+                    collect_ids(&list);
+                    true
+                }
+                None => false,
+            },
+        };
+        visited.then_some(internal_ids)
+    }
+
     /// Search for nearest neighbors
     pub async fn search(
         &self,
@@ -1702,33 +1730,10 @@ impl UnifiedIvfIndex {
         }
 
         // Phase A — collect the probed clusters' internal ids. Visits happen
-        // under the store guard (no clone of the inline `Vec<Vec<f32>>`, up
-        // to 1000×dim floats per probe with the old `get`); awaits are only
-        // possible on the async-store fallback, BEFORE any collection guard
-        // is taken (the guard is a std RwLock read guard and must never be
-        // held across an await — the future would become !Send).
+        // under the store guard (see `posting_internal_ids`).
         let mut per_cluster_ids: Vec<Vec<usize>> = Vec::with_capacity(nearest_clusters.len());
         for (cluster_id, _centroid_dist) in nearest_clusters {
-            let key = PartitionedKey::new(self.collection_id.clone(), cluster_id);
-            let mut internal_ids: Vec<usize> = Vec::new();
-            let mut collect_ids = |list: &TieredPostingList| {
-                internal_ids.extend_from_slice(&list.vector_ids);
-            };
-            let visited = match self
-                .posting_lists
-                .try_with_value_sync(&key, &mut collect_ids)
-            {
-                Some(present) => present,
-                // Async-backed store (Moka): fall back to the cloning get.
-                None => match self.posting_lists.get(&key).await {
-                    Some(list) => {
-                        collect_ids(&list);
-                        true
-                    }
-                    None => false,
-                },
-            };
-            if visited {
+            if let Some(internal_ids) = self.posting_internal_ids(cluster_id).await {
                 per_cluster_ids.push(internal_ids);
             }
         }
@@ -2045,43 +2050,13 @@ impl UnifiedIvfIndex {
 
     /// Parse FP32 vectors from raw bytes (dimension-prefixed records)
     ///
+    /// Parse FP32 vectors from raw bytes (dimension-prefixed records)
+    ///
     /// Format per record: [u32 dimension LE][f32 × dimension LE]
     fn parse_vectors_from_bytes(data: &[u8], expected_dim: usize) -> Result<Vec<Vec<f32>>> {
-        let mut vectors = Vec::new();
-        let mut offset = 0;
-        let record_size = 4 + expected_dim * 4; // u32 dim + f32 * dim
-
-        while offset + record_size <= data.len() {
-            let dim = u32::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ]) as usize;
-            offset += 4;
-
-            if dim != expected_dim {
-                return Err(anyhow::anyhow!(
-                    "Dimension mismatch: expected {}, got {}",
-                    expected_dim,
-                    dim
-                ));
-            }
-
-            let mut vec = Vec::with_capacity(dim);
-            for _ in 0..dim {
-                let val = f32::from_le_bytes([
-                    data[offset],
-                    data[offset + 1],
-                    data[offset + 2],
-                    data[offset + 3],
-                ]);
-                vec.push(val);
-                offset += 4;
-            }
-            vectors.push(vec);
-        }
-        Ok(vectors)
+        parse_dim_prefixed_records(data, expected_dim, 4, |rec, off| {
+            f32::from_le_bytes([rec[off], rec[off + 1], rec[off + 2], rec[off + 3]])
+        })
     }
 
     /// Dequantize INT8 vectors back to FP32
@@ -2089,36 +2064,9 @@ impl UnifiedIvfIndex {
     /// INT8 format per record: [u32 dimension LE][i8 × dimension]
     /// Dequantization: f32 = i8 / 127.0
     fn dequantize_int8_vectors(data: &[u8], expected_dim: usize) -> Result<Vec<Vec<f32>>> {
-        let mut vectors = Vec::new();
-        let mut offset = 0;
-        let record_size = 4 + expected_dim;
-
-        while offset + record_size <= data.len() {
-            let dim = u32::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ]) as usize;
-            offset += 4;
-
-            if dim != expected_dim {
-                return Err(anyhow::anyhow!(
-                    "Dimension mismatch: expected {}, got {}",
-                    expected_dim,
-                    dim
-                ));
-            }
-
-            let mut vec = Vec::with_capacity(dim);
-            for _ in 0..dim {
-                let val = data[offset] as i8;
-                vec.push(val as f32 / 127.0);
-                offset += 1;
-            }
-            vectors.push(vec);
-        }
-        Ok(vectors)
+        parse_dim_prefixed_records(data, expected_dim, 1, |rec, off| {
+            rec[off] as i8 as f32 / 127.0
+        })
     }
 
     /// NEW: Get preferred vector representation for queue consumption
@@ -2169,32 +2117,12 @@ impl UnifiedIvfIndex {
             // Hamming is meaningful within the cluster.
             let centroid = &self.centroids.centroids[*cluster_id];
             let bq = BinaryCode::from_rotated_residual(query, centroid, &self.rotation_signs);
-            let key = PartitionedKey::new(self.collection_id.clone(), *cluster_id);
-            // Visit the posting list under the store guard — no clone of the
-            // inline `Vec<Vec<f32>>` (up to 1000×dim floats per probe with
-            // the old `get`). The external-id resolution below is required
-            // here (`binary_codes` is keyed by external id).
-            let mut internal_ids: Vec<usize> = Vec::new();
-            let mut collect_ids = |list: &TieredPostingList| {
-                internal_ids.extend_from_slice(&list.vector_ids);
-            };
-            let visited = match self
-                .posting_lists
-                .try_with_value_sync(&key, &mut collect_ids)
-            {
-                Some(present) => present,
-                // Async-backed store (Moka): fall back to the cloning get.
-                None => match self.posting_lists.get(&key).await {
-                    Some(list) => {
-                        collect_ids(&list);
-                        true
-                    }
-                    None => false,
-                },
-            };
-            if !visited {
+            // Visit the posting list under the store guard (see
+            // `posting_internal_ids`). The external-id resolution below is
+            // required here (`binary_codes` is keyed by external id).
+            let Some(internal_ids) = self.posting_internal_ids(*cluster_id).await else {
                 continue;
-            }
+            };
             for internal_id in internal_ids {
                 // TD-147: resolve compact internal id → external String
                 let vector_id = match self.id_mapping.external(internal_id) {
@@ -2728,20 +2656,11 @@ impl UnifiedIvfIndex {
         // (id, packed sign bits, cluster_id) alongside — ADR-023 T-A.
         let mut ids: Vec<String> = Vec::new();
         let mut binary_tier: Vec<(String, Vec<u8>, u32)> = Vec::new();
-        for key in self.posting_lists.keys().await {
-            if let Some(posting_list) = self.posting_lists.get(&key).await {
-                let cluster_id = posting_list.cluster_id as u32;
-                for internal_id in &posting_list.vector_ids {
-                    let vid = match self.id_mapping.external(*internal_id) {
-                        Some(id) => id,
-                        None => continue,
-                    };
-                    if let Some(code) = self.binary_codes.get(&vid) {
-                        binary_tier.push((vid.clone(), code.bits.clone(), cluster_id));
-                    }
-                    ids.push(vid.clone());
-                }
+        for (vid, cluster_id) in self.external_ids_by_cluster().await {
+            if let Some(code) = self.binary_codes.get(&vid) {
+                binary_tier.push((vid.clone(), code.bits.clone(), cluster_id));
             }
+            ids.push(vid.clone());
         }
 
         // Read each fp32 vector from the store (same access path as Stage-2 rerank).
@@ -2801,23 +2720,33 @@ impl UnifiedIvfIndex {
         Ok(())
     }
 
+    /// Walk every posting list and yield `(external id, cluster_id)` pairs
+    /// in store order (every indexed vector lives in exactly one cluster's
+    /// posting list; unresolvable internal ids are skipped). Shared by
+    /// `export_state` and `export_cold_tier` (ADR-023 T-A/T-B).
+    async fn external_ids_by_cluster(&self) -> Vec<(String, u32)> {
+        let mut out = Vec::new();
+        for key in self.posting_lists.keys().await {
+            if let Some(posting_list) = self.posting_lists.get(&key).await {
+                let cluster_id = posting_list.cluster_id as u32;
+                for internal_id in &posting_list.vector_ids {
+                    if let Some(id) = self.id_mapping.external(*internal_id) {
+                        out.push((id, cluster_id));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Export only the COLD tier (ADR-023 T-B): centroids + 1-bit codes with
     /// cluster membership — the ~1/32 blob a cold start loads first.
     pub async fn export_cold_tier(&self) -> Result<SerializableIvfColdTier> {
         let centroids: Vec<Vec<f32>> = self.centroids.centroids.as_ref().clone();
         let mut binary_tier: Vec<(String, Vec<u8>, u32)> = Vec::new();
-        for key in self.posting_lists.keys().await {
-            if let Some(posting_list) = self.posting_lists.get(&key).await {
-                let cluster_id = posting_list.cluster_id as u32;
-                for internal_id in &posting_list.vector_ids {
-                    let vid = match self.id_mapping.external(*internal_id) {
-                        Some(id) => id,
-                        None => continue,
-                    };
-                    if let Some(code) = self.binary_codes.get(&vid) {
-                        binary_tier.push((vid.clone(), code.bits.clone(), cluster_id));
-                    }
-                }
+        for (vid, cluster_id) in self.external_ids_by_cluster().await {
+            if let Some(code) = self.binary_codes.get(&vid) {
+                binary_tier.push((vid.clone(), code.bits.clone(), cluster_id));
             }
         }
         Ok(SerializableIvfColdTier {
@@ -3167,13 +3096,7 @@ mod tests {
         cfg.recall_target = 0.5; // aggressive early termination
         let mut index = UnifiedIvfIndex::new("c_et".to_string(), cfg).unwrap();
         let data = mixed_sign_vectors();
-        index
-            .train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            index.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
+        train_and_add(&mut index, &data).await;
         // Exact-match query → its rotated residual matches the stored code
         // (Hamming 0) and is well separated, so early termination returns it first.
         let query = data[0].1.clone(); // "v0"
@@ -3229,6 +3152,49 @@ mod tests {
         .collect()
     }
 
+    /// The stamped train+add sequence of the binary-tier tests.
+    async fn train_and_add(index: &mut UnifiedIvfIndex, data: &[(String, Vec<f32>)]) {
+        index
+            .train(data.iter().map(|(_, v)| v.clone()).collect())
+            .await
+            .unwrap();
+        for (id, v) in data {
+            index.add_vector(id.clone(), v.clone(), None).await.unwrap();
+        }
+    }
+
+    /// The stamped binary-tier prologue: a fresh 4-dim/2-cluster binary index
+    /// named `cid`, trained on and populated with the mixed-sign fixture.
+    /// Returns the index and the fixture (queries index into it).
+    async fn mixed_sign_trained_index(cid: &str) -> (UnifiedIvfIndex, Vec<(String, Vec<f32>)>) {
+        let mut index = UnifiedIvfIndex::new(cid.to_string(), binary_ivf_config(4, 2)).unwrap();
+        let data = mixed_sign_vectors();
+        train_and_add(&mut index, &data).await;
+        (index, data)
+    }
+
+    /// The stamped cold-replica prologue: train a FullTwoStage reference on
+    /// `data`, export its COLD tier, and restore that tier into a fresh
+    /// ColdBinaryOnly index (same name). Both halves are returned (the
+    /// reference provides the exact-search ground truth).
+    async fn full_and_cold_replica(
+        cid: &str,
+        dim: usize,
+        n_clusters: usize,
+        data: &[(String, Vec<f32>)],
+    ) -> (UnifiedIvfIndex, UnifiedIvfIndex) {
+        let mut full =
+            UnifiedIvfIndex::new(cid.to_string(), binary_ivf_config(dim, n_clusters)).unwrap();
+        train_and_add(&mut full, data).await;
+
+        // Cold-start replica: COLD tier only → ColdBinaryOnly (Hamming, no fp32).
+        let cold_tier = full.export_cold_tier().await.unwrap();
+        let mut cold = UnifiedIvfIndex::new(cid.to_string(), cold_tier.config.to_config()).unwrap();
+        cold.restore_cold_only(cold_tier).await.unwrap();
+        assert_eq!(cold.serving_state(), IvfServingState::ColdBinaryOnly);
+        (full, cold)
+    }
+
     #[tokio::test]
     async fn binary_storage_populates_on_add_and_gates_has_quantized() {
         let _ = proximadb_hardware::hardware_capabilities();
@@ -3238,13 +3204,7 @@ mod tests {
             "empty index has no binary tier"
         );
         let data = mixed_sign_vectors();
-        index
-            .train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            index.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
+        train_and_add(&mut index, &data).await;
         assert!(
             index.has_quantized_storage(),
             "binary tier should be populated after add with use_binary"
@@ -3254,16 +3214,7 @@ mod tests {
     #[tokio::test]
     async fn binary_two_stage_matches_exact_topk() {
         let _ = proximadb_hardware::hardware_capabilities();
-        let mut index =
-            UnifiedIvfIndex::new("c_bin2".to_string(), binary_ivf_config(4, 2)).unwrap();
-        let data = mixed_sign_vectors();
-        index
-            .train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            index.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
+        let (index, _data) = mixed_sign_trained_index("c_bin2").await;
 
         // Query near v0; candidate_k = k*4 >= dataset, so the binary route reranks
         // the full set → identical top-k to exact search (recall = 1.0).
@@ -3377,23 +3328,9 @@ mod tests {
         let data = synth_clustered_corpus(dim, n_clusters, per_cluster);
 
         // FullTwoStage reference. recall_target 1.0 (from binary_ivf_config) +
-        // n_probe = n_clusters → exact brute-force top-k (the ground truth).
-        let mut full =
-            UnifiedIvfIndex::new("cold_floor".to_string(), binary_ivf_config(dim, n_clusters))
-                .unwrap();
-        full.train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            full.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
-
-        // Cold-start replica: COLD tier only → ColdBinaryOnly (Hamming, no fp32).
-        let cold_tier = full.export_cold_tier().await.unwrap();
-        let mut cold =
-            UnifiedIvfIndex::new("cold_floor".to_string(), cold_tier.config.to_config()).unwrap();
-        cold.restore_cold_only(cold_tier).await.unwrap();
-        assert_eq!(cold.serving_state(), IvfServingState::ColdBinaryOnly);
+        // n_probe = n_clusters → exact brute-force top-k (the ground truth);
+        // the replica restores only the COLD tier → ColdBinaryOnly.
+        let (full, cold) = full_and_cold_replica("cold_floor", dim, n_clusters, &data).await;
 
         // Queries: deterministically jitter existing vectors so each has a real
         // nearest neighbour in the corpus.
@@ -3498,20 +3435,7 @@ mod tests {
         // them. (synth_clustered_corpus's separated regime cannot show this.)
         let data = synth_corpus_amp(dim, n_clusters, per_cluster, 0.4, 3.0);
 
-        let mut full =
-            UnifiedIvfIndex::new("cold_lift".to_string(), binary_ivf_config(dim, n_clusters))
-                .unwrap();
-        full.train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            full.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
-        let cold_tier = full.export_cold_tier().await.unwrap();
-        let mut cold =
-            UnifiedIvfIndex::new("cold_lift".to_string(), cold_tier.config.to_config()).unwrap();
-        cold.restore_cold_only(cold_tier).await.unwrap();
-        assert_eq!(cold.serving_state(), IvfServingState::ColdBinaryOnly);
+        let (full, cold) = full_and_cold_replica("cold_lift", dim, n_clusters, &data).await;
 
         let k = 10;
         let n_queries = 60;
@@ -3714,20 +3638,7 @@ mod tests {
             data.len()
         );
 
-        let mut full =
-            UnifiedIvfIndex::new("real_cold".to_string(), binary_ivf_config(dim, n_clusters))
-                .unwrap();
-        full.train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            full.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
-        let cold_tier = full.export_cold_tier().await.unwrap();
-        let mut cold =
-            UnifiedIvfIndex::new("real_cold".to_string(), cold_tier.config.to_config()).unwrap();
-        cold.restore_cold_only(cold_tier).await.unwrap();
-        assert_eq!(cold.serving_state(), IvfServingState::ColdBinaryOnly);
+        let (full, cold) = full_and_cold_replica("real_cold", dim, n_clusters, &data).await;
 
         // Queries: jitter corpus vectors slightly so the exact top-k are genuine
         // neighbours (not a trivial self-match), as in the synthetic tests.
@@ -3795,16 +3706,7 @@ mod tests {
         // ADR-023 T-A: export carries the COLD tier (id, packed bits, cluster_id)
         // separately from the WARM fp32 tier, one entry per indexed vector.
         let _ = proximadb_hardware::hardware_capabilities();
-        let mut index =
-            UnifiedIvfIndex::new("c_cold".to_string(), binary_ivf_config(4, 2)).unwrap();
-        let data = mixed_sign_vectors();
-        index
-            .train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            index.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
+        let (index, data) = mixed_sign_trained_index("c_cold").await;
 
         let state = index.export_state().await.unwrap();
         assert_eq!(
@@ -3829,16 +3731,7 @@ mod tests {
         // (authoritative) and the binary two-stage route is unchanged.
         use crate::index::axis::storage::serialization::IndexSerializer;
         let _ = proximadb_hardware::hardware_capabilities();
-        let mut index =
-            UnifiedIvfIndex::new("c_cold_rt".to_string(), binary_ivf_config(4, 2)).unwrap();
-        let data = mixed_sign_vectors();
-        index
-            .train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            index.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
+        let (index, _data) = mixed_sign_trained_index("c_cold_rt").await;
         let query = vec![0.9, -0.8, 1.1, -0.7];
         let before = index
             .search_with_binary_acceleration(&query, 3, None)
@@ -3868,14 +3761,7 @@ mod tests {
         // Stage-1 Hamming results. Proves the ~1/32 blob is independently
         // sufficient for cold-start serving.
         let _ = proximadb_hardware::hardware_capabilities();
-        let mut full = UnifiedIvfIndex::new("c_full".to_string(), binary_ivf_config(4, 2)).unwrap();
-        let data = mixed_sign_vectors();
-        full.train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            full.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
+        let (full, data) = mixed_sign_trained_index("c_full").await;
         assert_eq!(full.serving_state(), IvfServingState::FullTwoStage);
 
         let cold = full.export_cold_tier().await.unwrap();
@@ -3912,15 +3798,7 @@ mod tests {
         use crate::index::axis::ColdPathLoadPolicy;
         use crate::index::axis::storage::serialization::IndexSerializer;
         let _ = proximadb_hardware::hardware_capabilities();
-        let mut index = UnifiedIvfIndex::new("c_cf".to_string(), binary_ivf_config(4, 2)).unwrap();
-        let data = mixed_sign_vectors();
-        index
-            .train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            index.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
+        let (mut index, data) = mixed_sign_trained_index("c_cf").await;
         let bytes = IndexSerializer::serialize_ivf(&index, "c_cf")
             .await
             .unwrap();
@@ -3980,14 +3858,7 @@ mod tests {
         use crate::index::axis::ColdPathLoadPolicy;
         use crate::index::axis::storage::serialization::IndexSerializer;
         let _ = proximadb_hardware::hardware_capabilities();
-        let mut full = UnifiedIvfIndex::new("c_r3".to_string(), binary_ivf_config(4, 2)).unwrap();
-        let data = mixed_sign_vectors();
-        full.train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            full.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
+        let (full, data) = mixed_sign_trained_index("c_r3").await;
         let bytes = IndexSerializer::serialize_ivf(&full, "c_r3").await.unwrap();
         let mut loaded = IndexSerializer::load_ivf_with_policy(
             &bytes,
@@ -4041,15 +3912,7 @@ mod tests {
         use crate::index::axis::ColdPathLoadPolicy;
         use crate::index::axis::storage::serialization::IndexSerializer;
         let _ = proximadb_hardware::hardware_capabilities();
-        let mut index = UnifiedIvfIndex::new("c_dir".to_string(), binary_ivf_config(4, 2)).unwrap();
-        let data = mixed_sign_vectors();
-        index
-            .train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            index.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
+        let (index, data) = mixed_sign_trained_index("c_dir").await;
         let bytes = IndexSerializer::serialize_ivf(&index, "c_dir")
             .await
             .unwrap();
@@ -4117,16 +3980,7 @@ mod tests {
         use std::sync::Arc;
         let _ = proximadb_hardware::hardware_capabilities();
 
-        let mut index =
-            UnifiedIvfIndex::new("c_ranged".to_string(), binary_ivf_config(4, 2)).unwrap();
-        let data = mixed_sign_vectors();
-        index
-            .train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            index.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
+        let (mut index, data) = mixed_sign_trained_index("c_ranged").await;
         let bytes = IndexSerializer::serialize_ivf(&index, "c_ranged")
             .await
             .unwrap();
@@ -4196,140 +4050,19 @@ mod tests {
         let _ = tokio::fs::remove_file(&path).await;
     }
 
-    /// Test-only `FileSystem` decorator that counts bytes returned by `read` /
-    /// `read_range`. The ADR-023 cold-path win is a BANDWIDTH win; a wall-clock
-    /// bench over a local FS / emulator would mislead (I/O latency tracks bytes
-    /// only over a real network), so bytes-transferred is the faithful,
-    /// deterministic, backend-independent metric.
-    #[derive(Debug)]
-    struct CountingFileSystem {
-        inner: std::sync::Arc<dyn crate::storage::persistence::filesystem::FileSystem>,
-        bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::storage::persistence::filesystem::FileSystem for CountingFileSystem {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-        async fn read(
-            &self,
-            path: &str,
-        ) -> crate::storage::persistence::filesystem::FsResult<Vec<u8>> {
-            let b = self.inner.read(path).await?;
-            self.bytes_read
-                .fetch_add(b.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            Ok(b)
-        }
-        async fn read_range(
-            &self,
-            path: &str,
-            offset: u64,
-            length: u64,
-        ) -> crate::storage::persistence::filesystem::FsResult<Vec<u8>> {
-            let b = self.inner.read_range(path, offset, length).await?;
-            self.bytes_read
-                .fetch_add(b.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            Ok(b)
-        }
-        async fn write(
-            &self,
-            path: &str,
-            data: &[u8],
-            options: Option<crate::storage::persistence::filesystem::FileOptions>,
-        ) -> crate::storage::persistence::filesystem::FsResult<()> {
-            self.inner.write(path, data, options).await
-        }
-        async fn append(
-            &self,
-            path: &str,
-            data: &[u8],
-        ) -> crate::storage::persistence::filesystem::FsResult<()> {
-            self.inner.append(path, data).await
-        }
-        async fn delete(
-            &self,
-            path: &str,
-        ) -> crate::storage::persistence::filesystem::FsResult<()> {
-            self.inner.delete(path).await
-        }
-        async fn exists(
-            &self,
-            path: &str,
-        ) -> crate::storage::persistence::filesystem::FsResult<bool> {
-            self.inner.exists(path).await
-        }
-        async fn metadata(
-            &self,
-            path: &str,
-        ) -> crate::storage::persistence::filesystem::FsResult<
-            crate::storage::persistence::filesystem::FsFileMetadata,
-        > {
-            self.inner.metadata(path).await
-        }
-        async fn list(
-            &self,
-            path: &str,
-        ) -> crate::storage::persistence::filesystem::FsResult<
-            Vec<crate::storage::persistence::filesystem::DirEntry>,
-        > {
-            self.inner.list(path).await
-        }
-        async fn create_dir(
-            &self,
-            path: &str,
-        ) -> crate::storage::persistence::filesystem::FsResult<()> {
-            self.inner.create_dir(path).await
-        }
-        async fn create_dir_all(
-            &self,
-            path: &str,
-        ) -> crate::storage::persistence::filesystem::FsResult<()> {
-            self.inner.create_dir_all(path).await
-        }
-        async fn copy(
-            &self,
-            from: &str,
-            to: &str,
-        ) -> crate::storage::persistence::filesystem::FsResult<()> {
-            self.inner.copy(from, to).await
-        }
-        async fn move_file(
-            &self,
-            from: &str,
-            to: &str,
-        ) -> crate::storage::persistence::filesystem::FsResult<()> {
-            self.inner.move_file(from, to).await
-        }
-        fn filesystem_type(&self) -> &'static str {
-            "counting"
-        }
-        async fn sync(&self) -> crate::storage::persistence::filesystem::FsResult<()> {
-            self.inner.sync().await
-        }
-        async fn open_file(
-            &self,
-            path: &str,
-            create: bool,
-        ) -> crate::storage::persistence::filesystem::FsResult<
-            Box<dyn crate::storage::persistence::filesystem::FilesystemFile>,
-        > {
-            self.inner.open_file(path, create).await
-        }
-    }
-
     /// ADR-023 faithful BANDWIDTH bench: the cold path must transfer only
     /// `[header] + [COLD] + probed-cluster fp32`, never the whole file. Asserts
-    /// bytes-read (the deterministic metric) through the `CountingFileSystem`
-    /// decorator over the SAME `cold_load_ranged` / `fetch_warm_cluster_ranged`
+    /// bytes-read (the deterministic metric) through the canonical
+    /// `CountingFileSystem` decorator over the SAME `cold_load_ranged` / `fetch_warm_cluster_ranged`
     /// code that runs against S3/Azure/GCS.
     #[tokio::test]
     async fn cold_load_reads_far_fewer_bytes_than_whole_file() {
         use crate::index::axis::storage::serialization::IndexSerializer;
         use crate::storage::persistence::filesystem::LocalFileSystem;
         use crate::storage::persistence::filesystem::local::LocalConfig;
+        use proximadb_storage_filesystem_types::counting::{CountingFileSystem, GetCounters};
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::atomic::Ordering;
         let _ = proximadb_hardware::hardware_capabilities();
 
         // A corpus large enough that the WARM (fp32) tier dominates the file, so
@@ -4369,18 +4102,17 @@ mod tests {
             .await
             .unwrap(),
         );
-        let counter = Arc::new(AtomicU64::new(0));
+        // Bandwidth is the metric: the cold path issues only `read_range`, whose
+        // returned bytes the canonical decorator tallies in `bytes_read`.
+        let counters = Arc::new(GetCounters::default());
         let fs: Arc<dyn crate::storage::persistence::filesystem::FileSystem> =
-            Arc::new(CountingFileSystem {
-                inner: local,
-                bytes_read: counter.clone(),
-            });
+            Arc::new(CountingFileSystem::new(local, counters.clone()));
 
         // Cold-first load: reads only [len-prefix] + [header] + [COLD].
         let loaded = IndexSerializer::cold_load_ranged(&fs, &path_str)
             .await
             .unwrap();
-        let cold_bytes = counter.load(Ordering::Relaxed);
+        let cold_bytes = counters.bytes_read.load(Ordering::Relaxed);
         assert!(
             cold_bytes < file_size,
             "cold load must read less than the whole file ({cold_bytes} < {file_size})"
@@ -4398,7 +4130,7 @@ mod tests {
         let _ = IndexSerializer::fetch_warm_cluster_ranged(&fs, &path_str, loaded.warm_base, &ext)
             .await
             .unwrap();
-        let after_one_cluster = counter.load(Ordering::Relaxed);
+        let after_one_cluster = counters.bytes_read.load(Ordering::Relaxed);
 
         // The faithful bandwidth assertion: cold-serve + one probed cluster
         // transfers materially less than the whole file (>50% saved on this
@@ -4444,15 +4176,7 @@ mod tests {
             std::env::var("PROXIMADB_S3_TEST_SECRET").unwrap_or_else(|_| "minioadmin".into());
         let _ = proximadb_hardware::hardware_capabilities();
 
-        let mut index = UnifiedIvfIndex::new("c_s3".to_string(), binary_ivf_config(4, 2)).unwrap();
-        let data = mixed_sign_vectors();
-        index
-            .train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            index.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
+        let (mut index, data) = mixed_sign_trained_index("c_s3").await;
         let bytes = IndexSerializer::serialize_ivf(&index, "c_s3")
             .await
             .unwrap();
@@ -4543,15 +4267,7 @@ mod tests {
             return;
         }
         let _ = proximadb_hardware::hardware_capabilities();
-        let mut index = UnifiedIvfIndex::new("c_az".to_string(), binary_ivf_config(4, 2)).unwrap();
-        let data = mixed_sign_vectors();
-        index
-            .train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            index.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
+        let (mut index, data) = mixed_sign_trained_index("c_az").await;
         let bytes = IndexSerializer::serialize_ivf(&index, "c_az")
             .await
             .unwrap();
@@ -4611,15 +4327,7 @@ mod tests {
         let bucket =
             std::env::var("PROXIMADB_GCS_TEST_BUCKET").unwrap_or_else(|_| "proximadb-test".into());
         let _ = proximadb_hardware::hardware_capabilities();
-        let mut index = UnifiedIvfIndex::new("c_gcs".to_string(), binary_ivf_config(4, 2)).unwrap();
-        let data = mixed_sign_vectors();
-        index
-            .train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            index.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
+        let (mut index, data) = mixed_sign_trained_index("c_gcs").await;
         let bytes = IndexSerializer::serialize_ivf(&index, "c_gcs")
             .await
             .unwrap();
@@ -4862,16 +4570,7 @@ mod tests {
         // profile (has_binary_tier + per-tier byte sizes).
         use crate::index::axis::storage::serialization::IndexSerializer;
         let _ = proximadb_hardware::hardware_capabilities();
-        let mut index =
-            UnifiedIvfIndex::new("c_prof".to_string(), binary_ivf_config(4, 2)).unwrap();
-        let data = mixed_sign_vectors();
-        index
-            .train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            index.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
+        let (index, _data) = mixed_sign_trained_index("c_prof").await;
 
         let bytes = IndexSerializer::serialize_ivf(&index, "c_prof")
             .await
@@ -4888,15 +4587,7 @@ mod tests {
     async fn serialize_roundtrip_preserves_search_topk() {
         use crate::index::axis::storage::serialization::IndexSerializer;
         let _ = proximadb_hardware::hardware_capabilities();
-        let mut index = UnifiedIvfIndex::new("c_ser".to_string(), binary_ivf_config(4, 2)).unwrap();
-        let data = mixed_sign_vectors();
-        index
-            .train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            index.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
+        let (index, _data) = mixed_sign_trained_index("c_ser").await;
 
         let query = vec![0.9, -0.8, 1.1, -0.7];
         let exact_before = index.search(&query, 3, None).await.unwrap();
@@ -4941,16 +4632,7 @@ mod tests {
     async fn deserialize_rejects_corrupted_or_truncated_bytes() {
         use crate::index::axis::storage::serialization::IndexSerializer;
         let _ = proximadb_hardware::hardware_capabilities();
-        let mut index =
-            UnifiedIvfIndex::new("c_corrupt".to_string(), binary_ivf_config(4, 2)).unwrap();
-        let data = mixed_sign_vectors();
-        index
-            .train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            index.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
+        let (index, _data) = mixed_sign_trained_index("c_corrupt").await;
         let mut bytes = IndexSerializer::serialize_ivf(&index, "c_corrupt")
             .await
             .unwrap();
@@ -4964,16 +4646,7 @@ mod tests {
     async fn persist_and_load_ivf_index_roundtrips_on_disk() {
         use crate::index::axis::storage::serialization::IndexSerializer;
         let _ = proximadb_hardware::hardware_capabilities();
-        let mut index =
-            UnifiedIvfIndex::new("c_disk".to_string(), binary_ivf_config(4, 2)).unwrap();
-        let data = mixed_sign_vectors();
-        index
-            .train(data.iter().map(|(_, v)| v.clone()).collect())
-            .await
-            .unwrap();
-        for (id, v) in &data {
-            index.add_vector(id.clone(), v.clone(), None).await.unwrap();
-        }
+        let (index, _data) = mixed_sign_trained_index("c_disk").await;
         let path = std::env::temp_dir().join(format!(
             "proximadb_ivf_persist_{}/ivf.bin",
             uuid::Uuid::new_v4().simple()

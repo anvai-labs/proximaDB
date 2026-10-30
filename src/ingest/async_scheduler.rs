@@ -3,7 +3,6 @@
 #![allow(missing_docs)]
 
 use std::collections::VecDeque;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Mutex, Notify};
 
@@ -72,7 +71,9 @@ impl IngestTask {
             collection: collection.into(),
             kind,
             priority,
-            created_at_ms: now_ms(),
+            // created_at_ms is u64 while the shared kernel clock is i64; the value is
+            // epoch millis (never negative), so the widening cast is lossless.
+            created_at_ms: proximadb_kernel::time::now_unix_ms() as u64,
             payload_bytes: 0,
         }
     }
@@ -238,13 +239,6 @@ fn choose_next(state: &mut QueueState, fairness_window: usize) -> Option<IngestT
 
 fn queued_len(state: &QueueState) -> usize {
     state.lanes.iter().map(VecDeque::len).sum()
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

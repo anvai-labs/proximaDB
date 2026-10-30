@@ -1,0 +1,25 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PGPORTAL-1: the legacy pgwire reader ignores Execute's row limit
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-22, found by the TD-PGEXT-1 review).
+| Priority | **LOW** — clients that page with `Execute(max_rows)` get every row at once, and a second Execute re-runs the query.
+| Component | `src/network/postgres/protocol.rs` (`execute_portal_query` → legacy single-table reader)
+| Relates to | TD-PGEXT-1
+|===
+
+== Problem
+
+On the extended protocol, a SELECT served by the legacy single-table reader returns all rows
+plus CommandComplete even when Execute asks for `max_rows > 0`, instead of returning that many
+rows and PortalSuspended; a second Execute on the portal runs the query again. The
+relational-pipeline route suspends correctly, but after PortalSuspended an `Execute(portal, max_rows = 0)` takes the non-paging branch of `execute_portal_query` and re-runs the query, so the client receives duplicate rows instead of the remainder.
+
+== Fix
+
+Materialize the legacy reader's result into the portal's execution state, as the pipeline route
+does, and serve it in `max_rows` pages with PortalSuspended. Test with an Execute(max_rows=1)
+sequence over a raw-wire or JDBC fetch-size client.

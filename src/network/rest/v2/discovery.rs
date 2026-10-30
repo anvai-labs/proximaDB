@@ -51,6 +51,25 @@ pub struct DiscoveryJobListResponse {
     pub jobs: Vec<DiscoveryJob>,
 }
 
+/// Resolve the job's collection within the request tenant: another tenant's
+/// collection is answered exactly like a missing one, so no job is created,
+/// listed or read for it.
+async fn require_collection(
+    state: &AppState,
+    tenant: &crate::network::middleware::tenant::TenantContext,
+    collection_id: &str,
+) -> ApiResult<()> {
+    match state
+        .collection_service
+        .collection_for_tenant(collection_id, Some(&tenant.tenant_id))
+        .await
+    {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(ApiError::CollectionNotFound(collection_id.to_string())),
+        Err(e) => Err(ApiError::Internal(format!("collection lookup failed: {e}"))),
+    }
+}
+
 fn service(state: &AppState) -> ApiResult<&std::sync::Arc<DiscoveryService>> {
     state.discovery_service.as_ref().ok_or_else(|| {
         ApiError::NotImplemented("Continuous Discovery service is not enabled".to_string())
@@ -61,6 +80,7 @@ fn service(state: &AppState) -> ApiResult<&std::sync::Arc<DiscoveryService>> {
 pub async fn create_discovery_job_v2(
     Path(collection_id): Path<String>,
     State(state): State<AppState>,
+    axum::Extension(tenant): axum::Extension<crate::network::middleware::tenant::TenantContext>,
     Json(req): Json<CreateDiscoveryJobRequest>,
 ) -> ApiResult<Json<DiscoveryJobResponse>> {
     if collection_id.is_empty() {
@@ -68,6 +88,7 @@ pub async fn create_discovery_job_v2(
             "Collection ID is required".to_string(),
         ));
     }
+    require_collection(&state, &tenant, &collection_id).await?;
     let job = service(&state)?.create_job(collection_id.clone(), req.kind);
     info!(
         "V2 API: scheduled discovery job {} ({:?}) for collection '{}'",
@@ -80,7 +101,9 @@ pub async fn create_discovery_job_v2(
 pub async fn list_discovery_jobs_v2(
     Path(collection_id): Path<String>,
     State(state): State<AppState>,
+    axum::Extension(tenant): axum::Extension<crate::network::middleware::tenant::TenantContext>,
 ) -> ApiResult<Json<DiscoveryJobListResponse>> {
+    require_collection(&state, &tenant, &collection_id).await?;
     let jobs = service(&state)?.list_jobs(&collection_id);
     Ok(Json(DiscoveryJobListResponse {
         collection_id,
@@ -92,7 +115,9 @@ pub async fn list_discovery_jobs_v2(
 pub async fn get_discovery_job_v2(
     Path((collection_id, job_id)): Path<(String, String)>,
     State(state): State<AppState>,
+    axum::Extension(tenant): axum::Extension<crate::network::middleware::tenant::TenantContext>,
 ) -> ApiResult<Json<DiscoveryJobResponse>> {
+    require_collection(&state, &tenant, &collection_id).await?;
     let job = service(&state)?
         .get_job(&job_id)
         .filter(|j| j.collection_id == collection_id)

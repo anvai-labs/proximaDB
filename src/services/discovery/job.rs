@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use proximadb_kernel::time::now_unix_ms;
+
 use serde::{Deserialize, Serialize};
 
 /// Kind of offline refinement a discovery job performs over a pinned snapshot.
@@ -86,7 +88,7 @@ impl DiscoveryJob {
             collection_id: collection_id.into(),
             kind,
             status: DiscoveryJobStatus::Scheduled,
-            created_at_ms: now_ms(),
+            created_at_ms: now_unix_ms(),
             started_at_ms: None,
             completed_at_ms: None,
             snapshot_from_lsn: 0,
@@ -121,9 +123,4 @@ pub struct DiscoveryJobResult {
     pub removed_count: u64,
     /// Pass-specific quality metrics.
     pub quality_metrics: HashMap<String, f64>,
-}
-
-/// Current epoch milliseconds.
-pub(crate) fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
 }

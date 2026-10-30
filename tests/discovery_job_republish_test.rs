@@ -14,111 +14,20 @@
 //! Exercises S0 (snapshot coordinator) + S1 (registry) + S2/S2b (service +
 //! executor wired into SharedServices) + S3/recluster (passes) + S4 (REST surface).
 
-use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
-use proximadb::core::Config;
-use proximadb::database::ProximaDB;
 use serde_json::json;
-use tempfile::TempDir;
 use tokio::time::sleep;
 
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
-}
+#[path = "common/pg_server.rs"]
+mod pg_server;
 
-fn nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
-}
-
-struct DiscoveryServer {
-    rest_port: u16,
-    db: Option<ProximaDB>,
-    _tmp_data: TempDir,
-}
-
-impl DiscoveryServer {
-    async fn start() -> anyhow::Result<Self> {
-        let rest_port = free_port();
-        let grpc_port = free_port();
-        let flight_port = free_port();
-        let pg_port = free_port();
-        let tmp_data = TempDir::new()?;
-
-        let mut config = Config::default();
-        config.server.bind_address = "127.0.0.1".to_string();
-        config.server.port = rest_port;
-        config.server.data_dir = tmp_data.path().to_path_buf();
-        config.api.rest_port = rest_port;
-        config.api.grpc_port = grpc_port;
-        config.api.arrow_flight_port = flight_port;
-        config.api.pg_port = Some(pg_port);
-        config.api.unified_mode = false;
-        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
-            url: format!("file://{}", tmp_data.path().display()),
-            ..Default::default()
-        }];
-        config.storage.wal_config.write_buffer_directory =
-            format!("file://{}/wal", tmp_data.path().display());
-
-        let mut db = ProximaDB::new(config).await?;
-        db.start().await?;
-
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .no_proxy()
-            .build()?;
-        let health_url = format!("http://127.0.0.1:{}/health", rest_port);
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            match http_client.get(&health_url).send().await {
-                Ok(resp) if resp.status().is_success() => break,
-                _ => {
-                    if Instant::now() > deadline {
-                        anyhow::bail!("REST didn't become ready in 15s");
-                    }
-                    sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-
-        Ok(Self {
-            rest_port,
-            db: Some(db),
-            _tmp_data: tmp_data,
-        })
-    }
-
-    fn base_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.rest_port)
-    }
-}
-
-impl Drop for DiscoveryServer {
-    fn drop(&mut self) {
-        if let Some(mut db) = self.db.take() {
-            tokio::spawn(async move {
-                let _ = db.shutdown().await;
-            });
-        }
-    }
-}
+use pg_server::TestPgServer;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovery_dedup_and_recluster_e2e() {
-    let server = DiscoveryServer::start().await.expect("server start");
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .no_proxy()
-        .build()
-        .unwrap();
-    let base = server.base_url();
+    let server = TestPgServer::start().await.expect("server start");
+    let (http, base) = server.rest_client().expect("rest client");
 
     // Dedup must work on every production engine whose read_all_records override
     // exposes flushed records to the storage-inclusive scan. VIPER is no
@@ -134,7 +43,7 @@ async fn discovery_dedup_and_recluster_e2e() {
     // PR's storage-side diff is SWIFT cfg-gating only). Re-add "helix" to
     // this loop when the helix scan defect is fixed.
     for engine in ["sst", "nova"] {
-        let name = format!("disc_dedup_{engine}_{}", nanos());
+        let name = server.unique_name(&format!("disc_dedup_{engine}"));
         let dim: usize = 8;
 
         // CREATE (fp32 default, canonical searchable path).
@@ -192,9 +101,7 @@ async fn discovery_dedup_and_recluster_e2e() {
         // exercise the storage-inclusive read leg (read_all_records) for this
         // engine, not just the WAL leg.
         server
-            .db
-            .as_ref()
-            .expect("db handle")
+            .db()
             .force_flush_collection(&name)
             .await
             .unwrap_or_else(|e| panic!("[{engine}] force flush: {e}"));
@@ -290,7 +197,7 @@ async fn discovery_dedup_and_recluster_e2e() {
         );
         return;
     }
-    let name = format!("disc_recluster_{}", nanos());
+    let name = server.unique_name("disc_recluster");
     let dim: usize = 8;
 
     // CREATE (fp32 default, canonical searchable path).
@@ -427,18 +334,13 @@ async fn discovery_dedup_and_recluster_e2e() {
 /// first flush/read.
 #[tokio::test]
 async fn viper_create_is_rejected_with_deprecation_hint() {
-    let server = DiscoveryServer::start().await.unwrap();
-    let base = server.base_url();
-    let http = reqwest::Client::new();
+    let server = TestPgServer::start().await.unwrap();
+    let (http, base) = server.rest_client().unwrap();
 
     let resp = http
         .post(format!("{base}/api/v2/collections"))
         .json(&json!({
-            "name": format!("disc_viper_reject_{}",
-                           std::time::SystemTime::now()
-                               .duration_since(std::time::UNIX_EPOCH)
-                               .unwrap()
-                               .as_nanos()),
+            "name": server.unique_name("disc_viper_reject"),
             "dimension": 8,
             "engine": "viper",
             "distance_metric": "cosine",
@@ -463,14 +365,9 @@ async fn viper_create_is_rejected_with_deprecation_hint() {
 /// complete, remove nothing, and report their headline metric over the snapshot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovery_quality_and_trajectory_e2e() {
-    let server = DiscoveryServer::start().await.expect("server start");
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .no_proxy()
-        .build()
-        .unwrap();
-    let base = server.base_url();
-    let name = format!("disc_qt_{}", nanos());
+    let server = TestPgServer::start().await.expect("server start");
+    let (http, base) = server.rest_client().expect("rest client");
+    let name = server.unique_name("disc_qt");
     let dim: usize = 8;
 
     let create = http

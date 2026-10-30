@@ -16,9 +16,9 @@ pub use state::{RestAppState, TenantContext};
 
 // Re-export canonical REST handler + state types
 pub use canonical::{
-    AnalyticsHandler, AqlHandler, CatalogHandler, CollectionHandler, DocumentHandler,
-    DocumentQueryHandler, EntityHandler, GraphHandler, GraphTraversalHandler, HybridSearchHandler,
-    LogsHandler, MetricsHandler, ProgressiveSearchHandler, UnifiedQueryRestState, VectorHandler,
+    AnalyticsHandler, AqlHandler, DocumentHandler, DocumentQueryHandler, EntityHandler,
+    GraphHandler, GraphTraversalHandler, HybridSearchHandler, LogsHandler, MetricsHandler,
+    ProgressiveSearchHandler, UnifiedQueryRestState, VectorHandler,
 };
 pub use canonical::{
     AnalyticsRestState, DocumentRestState, GraphRestState, HybridRestState, ObservabilityRestState,

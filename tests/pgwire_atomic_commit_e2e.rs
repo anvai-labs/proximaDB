@@ -762,3 +762,61 @@ fn vector_table_update_returns_only_the_current_version_e2e() {
         );
     });
 }
+
+/// TD-RELIDEQ-2: inside an atomic transaction, an UPDATE of a UNIQUE column
+/// that children reference must hold those children (`TxnLockScope`) — else
+/// the commit refuses to write unlocked — and must still apply ON UPDATE NO
+/// ACTION: an unreferenced value commits, a referenced one fails the COMMIT.
+#[test]
+fn atomic_update_of_a_referenced_unique_value_e2e() {
+    run(async {
+        let server = Server::start().await.expect("server");
+        let client = server.connect().await;
+        let parent = unique("upar");
+        let child = unique("uchi");
+        exec(
+            &client,
+            &format!("CREATE TABLE {parent} (id INT, name VARCHAR, UNIQUE (id))"),
+        )
+        .await;
+        exec(
+            &client,
+            &format!(
+                "CREATE TABLE {child} (cid INT PRIMARY KEY, pid INT, \
+                 FOREIGN KEY (pid) REFERENCES {parent}(id))"
+            ),
+        )
+        .await;
+        exec(
+            &client,
+            &format!("INSERT INTO {parent} VALUES (1, 'a'), (2, 'b')"),
+        )
+        .await;
+        exec(&client, &format!("INSERT INTO {child} VALUES (10, 1)")).await;
+
+        assert_eq!(
+            batch_sqlstate(
+                &client,
+                &format!("BEGIN; UPDATE {parent} SET id = 6 WHERE id = 2; COMMIT"),
+            )
+            .await,
+            None,
+            "an unreferenced UNIQUE value updates inside a transaction"
+        );
+        assert_eq!(
+            batch_sqlstate(
+                &client,
+                &format!("BEGIN; UPDATE {parent} SET id = 5 WHERE id = 1; COMMIT"),
+            )
+            .await
+            .as_deref(),
+            Some("23503"),
+            "a referenced UNIQUE value must not change"
+        );
+        exec(&client, "ROLLBACK").await;
+        assert_eq!(
+            column(&client, &format!("SELECT id FROM {parent}")).await,
+            vec!["1", "6"]
+        );
+    });
+}

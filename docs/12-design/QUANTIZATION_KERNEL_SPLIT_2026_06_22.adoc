@@ -7,7 +7,7 @@
 | Field | Value
 | Status | **Done (2026-06-22).** The quantization glue moved to `src/storage/compute_bridge/` and the pure kernel was extracted to `proximadb-quantization-kernel` (#217, #229). A later redirect (#812) and the `QuantizationEnginePort` (#822, #845) finished the storage side.
 | Component | `crates/modalities/proximadb-quantization-kernel`, `src/storage/compute_bridge/`, `crates/foundation/proximadb-quantization-types`
-| Relates to | link:STORAGE_INDEX_COMPUTE_DECOUPLING_CONTRACTS_2026_06_21.adoc[decoupling contracts] (Part B), link:ROOT_CRATE_DECOMPOSITION_SLICE_D_PORT_INVERSION_2026_06_26.adoc[Slice D] (D-quant), link:ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan]
+| Relates to | link:STORAGE_INDEX_COMPUTE_DECOUPLING_CONTRACTS_2026_06_21.adoc[decoupling contracts] (Part B), link:ROOT_CRATE_DECOMPOSITION_SLICE_D_PORT_INVERSION_2026_06_26.adoc[Slice D] (D-quant), link:../history/planning/ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan]
 |===
 
 == History

@@ -1,0 +1,468 @@
+= Lakehouse and multimodal implementation plan
+:toc:
+:toclevels: 2
+
+This is the remaining implementation contract, governed by
+link:../12-design/adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097].
+Status, branch ownership and ordering at pickup: link:TRACKER.adoc[tracker].
+The original investigation and completed slice designs are in
+link:../history/planning/LAKEHOUSE_MULTIMODAL_SEAMS_2026_10.adoc[design history] and
+link:../history/planning/LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc[execution history].
+Historical code-gap descriptions must be rechecked before implementation.
+
+== Architecture and invariants
+
+----
+ pgwire / REST / gRPC / Flight / Iceberg REST / OTLP / graph facades
+                               |
+ S6 PLAN   DataFusion LogicalPlan; native ExecutionPlan adapters
+                               |
+ S5 SCAN   streaming providers + authorization + snapshot/WAL-tail view
+                               |
+ S7 INDEX  rebuildable, snapshot/LSN-stamped projections
+                               |
+ S4 PUBLISH  one Iceberg v3 writer and fenced catalog publication
+                               |
+ S3 LAND   catalog-schema Parquet; vector PAX; time-partitioned append data
+                               |
+ S2 DURABLE  canonical segmented WAL; all-consumer retirement floor
+                               |
+ S1 IDENTITY  stable record oid; explicit tenant, version and subject semantics
+
+ S8 COST: measured critical-path depth / fan-out / bytes / CPU
+ S9 GOVERN: row/column policy at every provider and modality operator
+----
+
+[cols="1,4",options="header"]
+|===
+| Seam | Required contract and residual design boundary
+| S1 | Preserve real oid through files and operator output. Record identity and subject/entity identity differ (TD-SEAM-15); a graph edge has its own oid and references endpoint oids. Define tenant, valid_to and version/LSN encoding consistently. Do not assume every proposed system column exists; add encoder/decoder together when needed.
+| S2 | WAL append precedes engine apply. RecordUpsert/Delete/PartitionDrop must replay idempotently. Retirement is the minimum of every consumer floor, including readers, branches and publication; unknown/non-spill refusal cannot authorize truncation.
+| S3 | Layer A uses catalog schema and ParquetWritePolicy, with residuals for schema drift. PAX remains vector authority. Local spill is not automatically durable after node loss; resolve owner/reattach semantics before remote placement defaults (TD-SEAM-14).
+| S4 | One engine owns immutable manifests and metadata; REST exposes the same committed snapshot. Fence publication before catalog advance; fail closed on broken metadata. No parallel REST metadata tree or prefix listing as silent recovery from manifest failure.
+| S5 | Stream bounded batches with visibility/version merge, projection/filter/limit pushdown and ABAC. Pin a coherent snapshot plus WAL-tail boundary; deduplicate updates/deletes. A streaming UNION without reconciliation is incorrect.
+| S6 | Lower modality operations to DataFusion LogicalPlan; native physical operators live behind src/datafusion/ adapters, respecting ADR-039. Existing UQL/federated/other IRs lower or retire; no parallel semantic authority.
+| S7 | Cataloged index projections carry source snapshot/LSN/schema stamps and rebuild from authoritative records. No AXIS disk IVF authority. A stale HNSW/CSR/directory is repairable and cannot hide a visible write/delete.
+| S8 | Extend the ADR-033 cost spine. Distinguish sequential waves from total GETs, bytes from useful bytes and cache hits from discovery. Calibrate exact/ANN/prefilter and tier selection on measured workload facts.
+| S9 | Tenant admission and ABAC precede candidate selection where required, including UDTFs and direct facade paths. No query-shape guard may bypass policy; column policy survives join/projection.
+|===
+
+A coherent read token is a required contract, not a claim that all modalities already share
+one transactional snapshot. Specify publication generation, WAL high-water/visibility boundary,
+projection stamp and authorization context. Pin required history while a query runs; reject or
+repair inconsistent projections. Test concurrent publish/compact/update, not only static joins.
+
+== Thought experiments become acceptance tests
+
+These are intended gates; a test name below is not evidence that a runnable test exists.
+
+[cols="1,2,4",options="header"]
+|===
+| ID | Workload | Proof / decision
+| TE-1 | Similar tickets + churned customers + session error logs, grouped by plan | One pgwire query with EXPLAIN showing pushed filters and lazy ANN; canonical oid joins, ABAC negatives, read-token correctness while publication races it. This is M1, not just a vector benchmark.
+| TE-2 | External engines read published tables | Real facade create/insert/MATERIALIZE; REST catalog and pinned external readers agree with pgwire values across two snapshots, updates and deletes. Document feature/version matrix and honest unsupported cases.
+| TE-3 | 50k OTLP rows/s, <=2s freshness, 30-day retention | Release build, bounded memory/WAL, time partitions and partition drops; retention visibility and snapshot expiry separately observed. No synthetic throughput claim from an isolated storage primitive.
+| TE-4 | Forget a subject across modalities | Shared subject lookup, record-specific deletes, graph incident edges and document/log references; test current-query invisibility, historical-snapshot accessibility, expiry and physical erasure as four separate guarantees. A new snapshot cannot revoke old copies already exported.
+| TE-5 | Cold start at 100M x 768d | PAX authority with lazy centroid access; optional stamped HNSW load/rebuild. Measure restart memory, request waves, recall and availability during repair; do not extrapolate 100K HNSW calibration to this scale.
+| TE-6 | Two-hop citation aggregate + vector predicate | Graph nodes/edges return canonical identity, traversal composes with SQL and authorization; compare recursive join vs GraphExpandExec costs, verify pgwire reachability (TD-XMODAL-10).
+| TE-7 | Drifting nested JSON + facets | Typed shredded columns plus JSON residual preserve values; ranged reads avoid whole-segment fetch. Activate v3 variant only with reader evidence, independently of v3 table format.
+| TE-8 | Write at t, SQL at t+1s on 50M rows | Streaming snapshot+WAL-tail reconciliation stays bounded and fresh under flush/compaction; update/delete/limit/window results match the canonical read.
+| TE-9 | Scale analytical publication and queries | Reuse bounded multipart publisher; release SF1/SF10 peak RSS plus value-compared query results, not row-count-only equality. Separate compiler OOM from process publication OOM.
+|===
+
+== P1 and P2: close publication and delete correctness
+
+=== P1 production authority and external gate
+
+Reuse `proximadb-iceberg-engine`; audit its current callers instead of implementing another
+writer. Resolve the tenant-scoped REST metadata-key mismatch and production reachability of
+the bulk TableWriteExecutor route. Preserve catalog field IDs/nested types; a string fallback
+must not claim external schema fidelity. REST returns the writer's committed metadata and
+valid absolute object URIs; manifests, sequence numbers and parent chains must be spec-valid.
+
+Exercise pgwire→MATERIALIZE→REST load_table→external read through production wiring. Compare
+values and schema against pgwire after a second publication, plus tenant-negative cases.
+Pinned pyiceberg/DuckDB versions must support each exercised v3 feature; unsupported features
+stay gated and visible in the support matrix. Spark/Trino certification is a later expansion,
+not a reason to silently emit v2 from a new v3-first table.
+
+=== V3 activation ladder (TD-USUB-10 slice 3)
+
+Published DV readers, v3 new-table policy/upgrade, lineage proof, oid-position mapping and the
+live-delete publisher have landed (#2256/#2260–#2262/#2266). See
+link:../history/evidence/INTEGRATION_RECONCILIATION_2026_10_28.adoc[completed scope and limits].
+Both `PROXIMADB_ICEBERG_V3_DEFAULT` and `PROXIMADB_LIVE_DELETE_PUBLISHER` remain default OFF.
+Remaining activation work:
+
+. Complete the visibility contract's race, lease, crash-gap recovery and reader-standing gates
+  through the real facade. The active fence-gates branch is not merged acceptance evidence.
+. Preserve DV inheritance, schema checks, external-parent refusal and shared publication/WAL
+  ordering. Prove replay/recovery across successor CAS and catalog layout update before relaxing
+  refusals; do not assume successful WAL acknowledgement implies published-view freshness.
+. Finish incremental update/upsert semantics and the P1 facade/schema/tenant gates. The landed
+  tombstone publisher is not a general incremental update publisher.
+. Roll out only after internal/external gates; record a compatibility/rollback boundary
+  (a format upgrade may require forward recovery, not an older binary opening new data).
+
+Variant and other v3 features each require their own compatibility gate; v3-first does not
+mean enabling every optional feature at once. No new v2 position-delete implementation.
+
+=== Recovery and materialization residuals
+
+TD-SEAM-14 must specify durable owner, lease/epoch, replacement recovery, spill/object
+visibility and WAL retention until safe ownership transfer. A local Layer A checkpoint is
+not remote machine-loss durability. Keep all-consumer floors fail closed, including branch
+merge bases and pinned snapshots; resolve branch residuals without broad truncation shortcuts.
+
+Reuse bounded multipart and manifest-driven publication. Classify incremental insert versus
+update against published key bounds/SBBF, not retained WAL history. Preserve real oid; do not
+reuse Layer A segments as published files unless versions, tombstones, field IDs and placement
+are normalized. No whole-table MemTable or directory-list fallback reintroduced by a new lane.
+
+== P3: governed format-independent SQL
+
+=== Provider default-on gate
+
+Complete LayerATableProvider soak, stats and EXPLAIN reason parity, default-on ABAC negatives,
+window correctness (including lag), mixed layouts and bounded delta memory. Preserve newest
+version semantics during row-group pruning; residual/type/null-key cases may need conservative
+fallback. Runtime join filters must not prune the newest visible version through an older key.
+
+Register PaxTableProvider only when it shares the same WAL tail, liveness and policy contract;
+its existence is insufficient admission. UDTF-only queries need DataFusion routing without a
+tenant-policy bypass. Probe SBBF for runtime filters in the real split reader.
+
+=== FilteredAnnExec
+
+Create the ExecutionPlan adapter with projection, filter, limit and DynamicFilterPhysicalExpr
+support. Reuse lower_vector_filter and ProximaScanExec patterns. Emit oid, metric and score;
+resolve ties/deduplication and metric ordering consistently. ABAC cannot be deferred until
+filtered candidate selection has leaked unauthorized membership or produced wrong top-k.
+
+Wire vector_ops/graph_ops from the facade. Lower federated VECTOR_SEARCH/LOGS/METRICS to the
+same providers. A Sort(distance)+Limit optimizer substitution must preserve metric, predicate,
+null, limit and exactness semantics; expose approximate/fallback decisions in EXPLAIN.
+Gate native_table_capability_parity_e2e, filtered recall >=0.95 in every selectivity band and
+the complete TE-1 pgwire query; do not infer these from isolated ANN tests.
+
+== P4: one vertical, then the remaining modalities
+
+First deliver observability end to end: canonical appender, time-partitioned Layer A, Iceberg
+publication, ObsTimeTable/TimeBucketExec, service/time sorting and partition-drop retention.
+SBBF for trace_id and inverted/BM25 log-body projections are rebuildable; metric rollups are
+materialized views (TD-OLAP-8). Prove TE-3 and M1 with the read-token contract.
+
+Graph writes RecordUpsert before ORION apply; sort edge rows by (src,label,dst), with CSR
+rebuild at checkpoint_lsn. Recursive joins are the initial candidate for shallow traversal
+(<=3 hops); deeper GraphExpandExec uses CSR. Choose by measured fan-out as well as depth,
+and gate pgwire reachability, cycles, deletes, duplicates and authorization.
+
+Documents retire the independent document_wal only after canonical recovery parity. Use typed
+shredding plus JSON residual, ranged reads and JSON-path/inverted projections; preserve drifting
+values. Publish residual as JSON string until variant compatibility is proven.
+
+Subject deletion follows TD-SEAM-15's identity contract. Define subject association and graph
+incident-edge policy explicitly; coordinate table/PAX deletion visibility with historical
+snapshot expiry and physical retirement. Pinned cache bytes never override deletion visibility.
+
+== P5: vector residuals, without rebuilding delivered infrastructure
+
+PAX is authority; collection-global centroid projections and shared-model directory work are
+reuse points. Close TD-PAXDIR-2 coherent warm segment-set discovery; a TTL does not guarantee
+freshness after a remote writer. Report discovery separately from payload waves, and cold/warm
+separately from result-cache hits. Confirm configured local L2 behavior at real call sites.
+
+Physical cluster-contiguous A+B co-location (D4) remains conditional: implement only if measured
+critical-path or byte cost justifies it after current directory/cache improvements. Keep exact
+WAL-tail merge and DV visibility. Extend gates to BIGANN 10M, filtered/fragmented data, 768d,
+concurrent ingest and resource bounds before a broad scale or pricing claim.
+
+HNSW remains AXIS but becomes a persisted hot projection after TD-PAXPREC-1: source/schema/
+precision stamp, load on match, apply delta when safe, otherwise background repair from PAX.
+The query remains correct during rebuild. Do not resurrect independent disk IVF posting storage.
+Optional external Parquet vectors preserve values under the agreed precision contract; codes
+remain PAX-only and extra copies require a measured cost justification.
+
+== P6: proof and release boundaries
+
+Use release builds for SF1/SF10, value comparison across engines, bounded memory and peak RSS.
+Raise ratchets only for passing query cases; loaded table counts are not query counts. Benchmark
+TE-1/TE-6/TE-3 against declared equivalent workflows, distinguishing measured competitor runs
+from cited reference figures. SIFT cold requests and p95 waves are independent gates.
+Store commands, commit, parameters, raw results, limitations and negative results in history;
+register claimable numbers in the evidence ledger. No pricing promise before integrated cost
+and correctness gates in link:STORAGE_PLAN.adoc[storage plan].
+
+[[native-execution-research]]
+== Native execution: differentiation before expansion
+
+Owner request 2026-10-26: native execution must solve a demonstrated workload problem, not
+reimplement another engine because it uses Arrow or Rust. The dated
+link:../history/evidence/NATIVE_EXECUTION_RESEARCH_2026_10_26.adoc[research catalog]
+records existing remedies in Spark/Photon, Trino, Redshift, Snowflake, DataFusion, DuckDB,
+ClickHouse, Velox, StarRocks, turbopuffer, S3 Vectors, LanceDB/Vespa and relevant papers.
+The experiments below are *proposed, unrun admission gates*, not benchmark claims or a
+replacement for ADR-054/097. The accepted logical IR remains DataFusion; native physical
+operators and fused regions remain ours. No generic HashJoin/HashAgg/Sort rewrite is implied.
+
+=== Candidate advantage
+
+Reduce the work required to produce *fresh, authorized multimodal context*: propagate compact
+versioned record references through relational eligibility, ANN and graph expansion; hydrate
+payloads late; reconcile the WAL tail and index projections under one read contract; schedule
+query and maintenance work within a common resource budget. Compare this combination against
+existing late materialization, filtered search and adaptive execution, all of which are prior art.
+
+----
+ SQL / context request
+          |
+ semantic plan + exact/approximate contract (DataFusion LogicalPlan)
+          |
+ pinned visibility + authorization + resource context
+          |
+ +-------- native physical region -------------------------+
+ | relational eligibility <-> resumable ANN / graph search |
+ |     compact versioned IDs + scores + multiplicity       |
+ |     bounded scheduling, dynamic filters, tail merge     |
+ |     snapshot-bound payload fetch only when required     |
+ +--------------------------------------------------------+
+          |
+ Arrow batches -> existing relational operators / output
+          |
+ cost + quality + freshness + p99 evidence
+----
+
+The physical region is a candidate design, not a new mandatory executor. If existing
+ExecutionPlan adapters achieve the same result, retain them. A separate native scheduler or
+whole-query backend requires evidence that adapter/materialization boundaries are the limiting
+cost and that simpler improvements cannot remove it. DuckDB stays a comparison baseline and
+existing optional route; no investment in its general-purpose internals is part of this lane.
+
+=== Contracts to decide through experiments
+
+* *Visibility:* a token identifies table snapshot(s), a consistent committed WAL boundary,
+  projection generations and authorization context. Multiple table snapshots do not become
+  atomic merely by placing their IDs in a struct; define acquisition/validation and pinning.
+  Sharded logs may need a boundary vector rather than one scalar LSN. Reject or reconcile
+  incompatible sources. Explicit revocation policy decides abort/restart of in-flight reads.
+* *Candidates:* use tenant + record oid + version and a snapshot-bound locator; optional score,
+  metric, tie-break and multiplicity. Oids are not file positions. Compaction may invalidate
+  locators, never logical identity. Intermediate Arrow batches may carry these fields; reuse
+  existing contracts before introducing another batch representation.
+* *Continuation:* request bounded additional candidates with observable work and cancellation.
+  Never assume arbitrary ANN iteration is monotone or a score bound proves exactness.
+  Exact SQL requires a sound termination proof or exact fallback. Approximate results require
+  explicit query semantics and eligible-set recall measurement; no silent mode switch.
+* *Relational semantics:* top-k before a join is not generally top-k after it. Define distinct
+  entities versus joined-row multiplicities; preserve NULLs, ties, outer/anti-join behavior and
+  graph path/cycle semantics. Dynamic allow-sets may prune only where logically sound.
+* *Resources:* one accountable budget for candidate state, joins, decode buffers, tail merge,
+  pinned cache, in-flight reads and spill. Share reservations rather than counting shared bytes
+  repeatedly. Backpressure/cancellation must reach object fetch and search loops. Refusal is
+  explicit; never truncate exact results to satisfy a time budget.
+* *Fallback:* choose exact scan, native fused execution or existing relational operators by
+  measured cost and valid capability. Adaptive switching after emitting rows needs a defined
+  reconciliation protocol; otherwise choose before emission. Keep snapshot and ABAC unchanged.
+
+=== Search and columnar execution must compose (Quickwit / ClickHouse)
+
+Both access patterns belong inside S5/S6/S7; do not create an independent logs engine with
+its own visibility or billing authority. Quickwit-style indexed retrieval and ClickHouse-style
+columnar aggregation are compatible capabilities, and modern ClickHouse also has inverted
+text indexes. Supporting them structurally does not establish performance parity.
+
+[cols="2,4",options="header"]
+|===
+| Contract | Required behavior
+| Access-path capabilities | Describe supported predicates and exactness, ordering, projection, candidate continuation, row-reference lookup, statistics and snapshot/LSN coverage. The planner chooses postings, range/index lookup, dense scan or a valid combination. An unsupported predicate remains an exact residual or a declared rejection.
+| Identity / selection | Map split-local doc IDs or row offsets to versioned oids under the pinned projection generation. Compact selection buffers can cross native operators without eager payload conversion. Dictionary IDs are local to an encoding unless their domain equivalence is proved; never join unrelated dictionaries by integer code.
+| Text semantics | Version analyzers/tokenizers, normalization, phrase positions and scoring statistics. Token matching is not automatically equivalent to SQL substring/regex. Exact aggregation consumes all qualified rows, not only ranked top-k. Global BM25 semantics need compatible corpus statistics; local scores cannot be merged blindly.
+| Columnar fast path | Keep useful encodings/dictionaries and typed batches through filters/aggregation where supported; bound decode buffers by bytes as well as rows. Dense selections use sequential column scans; sparse ones use selective reads only when cheaper. Arrow output compatibility must not force every internal value to become a row object.
+| Aggregate / exchange | Reuse mergeable partial aggregate states with explicit type/version and memory limits. DISTINCT, order-sensitive and holistic aggregates cannot assume the same bounded merge contract as count/sum. Cross-node exchange is a later seam; it does not require durable shuffle after every local operator.
+| Cache / scheduler | Cache immutable data by object identity and index generation; derived results also include snapshot and policy context. Account index headers, postings, fast fields, payload blocks and query state under common reservations. Preserve backpressure, cancellation and fair admission through all access paths.
+| Projection maintenance | Build immutable inverted/columnar projections from the canonical records and publish coverage atomically. Compaction preserves identity and visibility; stale/missing projections fall back or fail explicitly. Price indexing, merge amplification and duplicate storage; no blanket copy of every column into every index.
+|===
+
+Add *NE-7* to the experiment harness: the same immutable log corpus with rare terms, frequent
+terms, phrase/token predicates, time+tenant restrictions, latest-k hydration, broad time
+histograms and high-cardinality grouped counts. Then join matching logs to relational/vector
+context. Compare index off/on and sparse/dense native paths against Quickwit and current
+ClickHouse text-index/columnar paths on equivalent predicates and aggregate guarantees.
+Bounded distributed top-bucket results require disclosed error/completeness semantics; do not
+compare them to exact SQL GROUP BY as equivalent answers. Report cold metadata/data,
+metadata-warm, fully warm and restart cases separately; include ingest freshness, index size,
+merge cost and concurrent queries. An indexed top-ten hit does not measure a full scan.
+
+NE-7 starts with TextMatchExec feeding selected typed columns into existing aggregate operators,
+with S5 visibility/ABAC and S7 coverage stamps. Only specialize native aggregation after a
+profile proves that kernel is the remaining bottleneck. Read the dated research catalog for
+vendor claim conditions and older benchmark caveats. "Seamless" means composable contracts
+without a second authority, not zero integration work or guaranteed matching performance.
+
+=== Source-driven constraints for the native prototype
+
+The pinned Quickwit/ClickHouse source inspection is recorded in
+link:../history/evidence/NATIVE_EXECUTION_RESEARCH_2026_10_26.adoc[research evidence].
+It is development-head code inspection, not measured parity or a release-support claim.
+Keep the existing NE-0..7 sequence; refine its contracts before implementing:
+
+* Separate exact index replacement from a pruning hint with an exact residual. Selectivity
+  estimates choose work, never result completeness. Extend NE-7 with common phrases, absent
+  tokens under OR, partial projection coverage and analyzer changes.
+* Separate async I/O readiness from CPU execution within current stream adapters. Reserve
+  bytes *before* warmup/decode growth, bound in-flight reads and release on cancellation.
+  NE-4 must deliberately underestimate warmup size; post-hoc accounting alone fails the gate.
+* Make late hydration optional by cost and semantics. Carry compact, versioned references,
+  group physical reads and restore logical order. Bound or spill survivor state; test wide
+  payloads, large LIMIT, WITH TIES, duplicate/outer joins and guarded invalid casts (NE-2/3).
+  An eager native-to-Arrow conversion at every boundary defeats this prototype; Arrow at
+  the adapter boundary remains compatible with native encoded selections internally.
+* Stage predicates by shared physical columns and index readers where equivalence permits;
+  volatile/throwing expressions, null padding and version/delete resolution constrain reorder.
+  Do not transplant another engine's heuristic as a semantic proof.
+* Predict latency and allocated cost separately in S8. Count dependent waves, total requests,
+  useful/overread bytes, CPU and queueing; avoid double-counting overlapped work. NE-6 must
+  price index build/maintenance/storage, compaction and idle resources over a fixed horizon.
+  Compare tiny/large tenants and ingest/query ratios before choosing compaction or read caps.
+
+Native `ExecutionOperator` already supports async batch streams and source splitting;
+S5/DataFusion adapters remain the integration boundary. First add the missing capability,
+visibility and resource descriptors around one TextMatchExec or FilteredAnnExec region.
+Only propose a scheduler replacement after a profile demonstrates that these contracts cannot
+be implemented efficiently within the existing boundary. Keep broad scan/aggregate paths as
+negative controls and select them when indexing or scattered hydration costs more.
+
+=== Experiments before promotion
+
+[cols="1,3,4",options="header"]
+|===
+| ID / links | Experiment | Acceptance and falsifier
+| NE-1 / TE-1, TD-SEAM-6 | Correlated eligibility: 1M and then 10M tickets; customer predicates at 100%, 10%, 1%, 0.1%, 0.01%; aligned, independent and anti-correlated embeddings. Compare exact eligible-set scan, stock plan, pushed-filter adapter and native fused region. | Same explicit semantics, exact value oracle, and approximate recall >=0.95 in every required band (retain stricter P5 gates where applicable). Record candidate count, intermediate bytes and p99. Fixed oversampling that misses qualified winners fails even if fast. Test duplicate join matches and fewer than k eligible entities.
+| NE-2 / TE-6, S5/S7 | Sweep payload width and graph frontier fanout independently, with clustered and scattered winners. | Measure bytes fetched/decoded versus useful result bytes, object waves and frontier state. Compare late fetch to scan and existing lazy-materialization baselines. Native must fall back when random hydration or frontier growth loses; hop count alone cannot choose the path.
+| NE-3 / TE-4/8, TD-SEAM-4/15 | Pause between candidate generation and hydration; race update/delete, policy change, compaction and index publication. Grow the unindexed tail. | Exact visible rows/versions and declared authorization boundary; no resurrected rows, stale payload/score pairing or omitted writes. Include crash/retry and stale-cache tests. A shared token without a valid acquisition protocol fails.
+| NE-4 / SC0–4, P5 | Concurrent small tenants plus a broad scan and compaction; cold/warm cache, bursty arrivals and node/cache loss. | Measure admission, p50/p95/p99, useful/overread bytes, dependent waves, peak memory, spill and resource release after cancellation. Fix arrival distribution and cache preparation. Local MinIO tests show mechanisms; real-cloud calibration is required for cloud-price claims.
+| NE-5 / P6, TD-OLAP-10/11/12 | Broad scans, high-cardinality aggregates, skewed joins and windows remove the selective-index advantage. | Keep existing value/coverage ratchets. Compare best supported native and mature fallback paths under equal resources. Reject general default promotion if weighted throughput/cost regresses materially; retain per-shape routing rather than hiding losing queries.
+| NE-6 / S8, SC6 | Price the complete workload at fixed correctness, recall, freshness and p99, including ingestion and maintenance. | Include reserved idle capacity, object operations, transfers, cache media, write amplification and recovery. Report marginal and allocated cost separately. Different vendor billing units remain distinct. No pricing claim based on a warm ANN microbenchmark or local-disk extrapolation alone.
+|===
+
+Start with an exact fixture small enough to enumerate every eligible answer, then scale fixed
+inputs. Publish dataset/model/query hashes, build and feature settings, seeds, cache state,
+concurrency/arrival process, hardware and all exclusions. Compare current optimized baselines:
+Spark AQE/layout-aware joins; Trino dynamic filtering; suitable warehouse access paths; and
+LanceDB/Vespa/turbopuffer for supported retrieval subqueries. For a multi-service composition,
+include assembly and synchronization costs on both sides and disclose unsupported semantics.
+Vendor published numbers are context, never same-hardware experimental results.
+
+=== Baseline strength and crossover suites (all planned)
+
+Test the workloads each engine is designed to handle well, as well as the crossover where
+that feature becomes expensive. These strengths are not exclusive inventions. Case IDs below
+are parameters of NE-0..7, not another roadmap or a claim of runnable/green tests. Reuse the
+TPC/ClickBench ledger harness and add focused fixtures; do not replace their coverage ratchets.
+
+[cols="1,3,4,3",options="header"]
+|===
+| Baseline / cases | Positive control and required baseline feature | Crossover / failure experiment | Native decision / evidence
+| DataFusion DF-1/2 (NE-0/2/5)
+| Wide Parquet latest-k with dynamic TopK filters; selective dimension join with runtime filters and provider pruning. Compare direct DataFusion, current ProximaDB adapter and native region on identical files.
+| Sorted/reversed/shuffled row groups; selective/broad predicates; late-arriving runtime filters; missing stats and deletes. Separate startup/registration/planning from execution.
+| Attribute rows/pages pruned, bytes decoded and filter-arrival time. Fix provider gaps first; a native replacement needs a remaining measured ceiling. Exact results with ties/nulls and deletes.
+| DuckDB DU-1/2 (NE-2/5)
+| Embedded multiway joins, grouped aggregates, ORDER BY/windows with configured memory and temporary disk. Test both Parquet access and its native table layout as separate arms, charging native load/storage cost.
+| Data and intermediate state above RAM; skew, high-cardinality grouping, wide strings and concurrent queries. Include repeated-session and fresh-process runs.
+| Measure RSS beyond the configured buffer limit, spill bytes/time and end-to-end latency. Keep a mature relational path if native kernels lose. No claim that the memory_limit alone bounds total process RSS.
+| Spark SP-1/2 (NE-4/5)
+| Large skewed batch join/aggregate with AQE, adaptive broadcast/skew handling; compatible storage-partition join arm. Repeated transform DAG with cache enabled and its population cost counted.
+| Mismatched partition layouts, changed join keys, many small files; evict cached partitions and kill one executor during a long job. Compare task/recompute work and skewed tail latency, not just average scan speed.
+| Measure shuffle bytes, spills, task-size distribution, startup and recovery. A local ProximaDB query does not prove distributed batch parity. Exchange/recovery additions remain gated on a demonstrated distributed product need.
+| Trino TR-1/2 (NE-4/5)
+| Interactive star join on Iceberg with dynamic filters and connector pushdown; federation over frozen source versions. Verify EXPLAIN/runtime counters show the intended pushdown rather than assuming it.
+| Slow build-side filter arrival, selective-to-broad sweep, source latency/skew. Test interactive retry policy separately from task-retry/spooled-exchange mode; kill a worker in the latter.
+| Measure coordinator planning, splits avoided, remote bytes, exchange and recovered work. Snapshot consistency across independent connectors is a separate requirement; unsupported distributed snapshots are not silently treated as equivalent.
+| PostgreSQL PG-1 (NE-2/5)
+| PK lookup, small ordered range and selective secondary-index lookup, including covering-index and bitmap-scan opportunities. Maintain statistics; record visibility-map state and VACUUM work.
+| Warm/cold index and heap; payload width; sustained updates reducing index-only opportunities; scan selectivity crossover. Compare native point lookup to a correctly indexed database, not to a full table scan.
+| p99/throughput, heap fetches, buffer reads, WAL and maintenance. Require tenant isolation and identical visible versions. Decide when PK/index projection beats PAX/Parquet scan; avoid bringing broad OLAP machinery onto every point read.
+| PostgreSQL PG-2 (NE-3/4)
+| Conditional update, transfer between two accounts, unique-key conflict and concurrent reader under explicitly selected isolation/durability settings.
+| Contended hot keys; lost-update/write-skew schedules; abort/retry; crash after acknowledged commit. Preserve sum-of-balances, nonnegative balances where required, uniqueness and the declared isolation guarantees.
+| Validate operation histories and crash recovery, not only final row counts. Count successful logical transactions including retry cost. If ProximaDB lacks matching semantics, record UNSUPPORTED; faster weaker transactions are not a win or automatic scope expansion.
+| Redshift RS-1/2 (NE-5/6)
+| Star join/aggregate with suitable sort/distribution keys; AUTO/ATO as a separate trained arm with optimization actions recorded. Test selective time scans and colocated joins.
+| Hot-key skew and an alternate join key that breaks collocation; ingestion and layout adaptation during repeated queries. Separate provisioned/serverless and native/Spectrum arms where used.
+| Measure redistribution, scanned bytes, spill, queue time, maintenance and allocated cost. Wait for or report ATO convergence; compare ProximaDB secondary projections including their build/maintenance costs. No local Redshift emulator substitutes for managed measurements.
+| Snowflake SF-1/2 (NE-3/4/6)
+| Pruned scan/selective lookup with eligible search optimization; concurrent dashboard burst using appropriate warehouse/multi-cluster policy. Incremental derived-table refresh as a separately priced arm.
+| Resume/cold cache, broad joins and spill, burst/idle cycle, high update fraction and actual refresh lag. Separate result-cache hits from fresh execution; disclose edition/features and cluster min/max.
+| Measure p99/queue time, credits, idle/resume time, storage and maintenance. Multi-cluster improves concurrency, not necessarily one query. Target lag is a target, not a guaranteed freshness bound; compare observed staleness at equal requirements.
+| ClickHouse CH-1/2 (NE-2/5/7)
+| Sorted/compressed column scans, PREWHERE, lazy top-N and text-index exact reads. Include an in-order aggregate and an eligible preaggregate/projection arm with build cost.
+| Common phrases, high-cardinality aggregate, disorder/small parts, large LIMIT and sustained writes; force the sparse/dense crossover and measure compaction.
+| Use the pinned-source constraints above; compare raw-query and maintained-projection arms separately. Preserve update/delete semantics explicitly; engine/layout-specific merge behavior is not assumed equivalent to OLTP isolation.
+| Quickwit QW-1/2 (NE-4/6/7)
+| Rare term plus time/tenant restriction, latest-k document fetch and fast-field histogram with metadata-warm and cold cases separated.
+| Common/absent/phrase terms, broad/high-cardinality aggregation, wide warmup fields, tiny-tenant splits and concurrent cold queries.
+| Measure warmup versus CPU/fetch time, permit estimates versus actual bytes, split fanout and merge amplification. Match exactness/completeness; ranked top-k and approximate bucket selection cannot stand in for an exact SQL aggregate.
+|===
+
+Adjacent systems already in the research catalog receive the same discipline when they are
+part of a product claim: Photon uses SP-1/2 with acceleration and fallback operators disclosed;
+Velox uses repeated-build/cache and spill tests inside a named host engine (not a fictitious
+standalone database); StarRocks uses star joins, supported materialized-view rewrites and
+shared-data cache-loss/compaction tests. Vector baselines (LanceDB, Vespa, turbopuffer and S3
+Vectors) keep NE-1/3/6 selectivity/correlation/recall/freshness and full context-assembly cost.
+Unsupported operators require a disclosed composition or UNSUPPORTED, never an invented score.
+
+==== Fixture, oracle and run contract
+
+. Start with enumerable customers/events/typed payloads and accounts/transfer histories.
+  Hash logical input values separately from physical files. Scale dimensions independently:
+  selectivity, key skew, payload width, update rate, retained history, tenant count and concurrency.
+  Reuse immutable Parquet files for comparable scan arms; native-layout arms may optimize their
+  own storage but must report preprocessing, indexes, extra storage and ongoing maintenance.
+. Exact relational cases compare values and multiplicity, with deterministic tie breakers,
+  NULL/decimal/time-zone rules and declared floating-point tolerances. Use a simple independent
+  oracle for small fixtures and cross-engine checks at scale. Hashes/counts alone are insufficient
+  for the small oracle. Approximate retrieval has separate recall/error/completeness gates.
+. Transaction cases record invocation/response histories, committed/aborted operations and
+  retry identity. Check the requested isolation model and durability at acknowledged commit.
+  Schema-level invariant checks supplement that history; they do not prove serializability.
+. Every run records engine/build/extensions, SQL/config, physical plan and actual route,
+  dataset/query/model hashes, isolation, storage, hardware/region, cache preparation, memory,
+  concurrency/arrival process, failure schedule, maintenance and all excluded work. Distinguish
+  cold metadata, cold data, warm bytes and result-cache hits. Randomize repeated arm order.
+. Report latency distributions, completed throughput, queue time, peak RSS/reservations, CPU,
+  bytes read/decoded/spilled/shuffled, GET waves/count, maintenance, freshness and total cost.
+  Load and index build are separate phases and also enter amortized cost. Managed services
+  require real runs at recorded region/date/prices; local MinIO tests only establish mechanisms.
+. Status per case is PLANNED, RUNNABLE, PASSED, FAILED, UNSUPPORTED or BLOCKED with evidence.
+  Start local CI with small semantic/route probes (DF/DU/PG and native). Run scale, distributed
+  fault tests and managed-service cost experiments in dedicated environments, not every PR.
+  No performance promotion until a chosen case and its losing/crossover controls both run.
+
+=== Small implementation sequence and stop rules
+
+. *NE-0: evidence harness and route audit.* Reuse P6 ledgers, io_trace and native execution
+  contracts. Record the operator actually executed; attribute planning, scan, search, join,
+  decode, tail merge and queueing separately. Fix integration defects before alleging an
+  upstream ceiling. This can start with controlled fixtures while P2/P3 correctness closes.
+. *NE-1 prototype:* one native relational-eligibility + resumable-vector + late-fetch region
+  behind a flag, using existing PAX search and ADR-097 adapters. First close candidate, tie,
+  multiplicity and exactness semantics. Do not simultaneously build a new planner, shuffle
+  service, storage format or generic function library.
+. *NE-2/3 admission:* prove payload/frontier crossovers and concurrent visibility. Production
+  routing must preserve the landed P2 deletion guards and prove S5 visibility/ABAC guarantees. Reject candidates
+  from incompatible projections rather than treating index freshness as optional.
+. *NE-4/6 resource/cost admission:* integrate bounded work with SC reservations and P5 I/O
+  measurements. A low isolated latency does not establish tenant isolation or profitable p99.
+. *Promotion:* propose thresholds before running the benchmark. Suggested starting criterion
+  is >=2x lower p95 *or* >=30% lower fully allocated cost at the same p99/quality/freshness,
+  on a declared representative workload, without weakening NE-5 or correctness gates.
+  These thresholds are proposed, not yet ratified. Publish losing cases and variance.
+. *Stop or narrow:* if a tuned existing adapter matches the fused path, keep the adapter.
+  If advantages vanish after maintenance/idle cost or under realistic selectivity, stop broad
+  native expansion and retain only winning shapes. Existing sunk code is not an admission gate.
+
+A standalone native engine or changed logical IR would need a separately reviewed ADR with
+measured evidence. This research does not silently reverse ADR-097 or retire existing native
+operators that already have a demonstrated, correctly routed use case.

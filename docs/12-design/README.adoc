@@ -2,10 +2,11 @@
 :toc:
 :toclevels: 2
 
-This directory holds current architectural decisions and active implementation blueprints.
+This directory holds stable architectural decisions and specialist reference blueprints.
+Start active work at link:../current/README.adoc[current index] and link:../current/TRACKER.adoc[tracker].
 The product direction these serve is link:adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096]: a SQL-first context engine on object storage.
-Historical phase reports, superseded visions and one-off audits do not belong here: delete them and
-repoint their links to the successor. Git history keeps the old text.
+Historical phase reports, superseded plans and one-off audits belong in link:../history/README.adoc[history].
+Keep pending implementation contracts in current; do not create another status authority here.
 
 [IMPORTANT]
 ====
@@ -18,9 +19,8 @@ Gate in link:CONVERGENCE_AUDIT_2026_05_30.adoc[CONVERGENCE_AUDIT_2026_05_30].
 
 [TIP]
 ====
-**For current status across the whole corpus** — completed / in progress / pending work by area, the canonical document for every overlapping topic, and the governance decisions pending — see
-link:WORK_LEDGER_2026_10_15.adoc[WORK_LEDGER_2026_10_15] (reconciled against git and code on 2026-10-15).
-It supersedes the 2026-05-26 bookkeeping snapshot (removed; in git history).
+For work pickup, read only the current index, tracker and relevant plan. The references below
+are a lookup catalog, not a mandatory whole-corpus reading list or independent release plan.
 ====
 
 == Canonical Architecture Path
@@ -30,11 +30,11 @@ It supersedes the 2026-05-26 bookkeeping snapshot (removed; in git history).
 **Direction:** link:adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096] — a
 SQL-first context engine on object storage; pgwire is the front door; every data model is a
 projection of one canonical record; one release-based
-link:../_internal/roadmap/STRATEGIC_ROADMAP.adoc[roadmap]. Where an older design document frames the
+link:../current/ROADMAP.adoc[roadmap]. Where an older design document frames the
 product differently (for example as a direct warehouse competitor), ADR-096 wins.
 ====
 
-Read these in order for future-shaping architecture work:
+Consult the relevant decision for future-shaping architecture work:
 
 1. link:adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096] +
    Product direction and the governance that keeps documents from drifting.
@@ -46,6 +46,10 @@ Read these in order for future-shaping architecture work:
 4. link:adr/ADR-052-analytics-execution-competitiveness-codesign.adoc[ADR-052] and ADR-054 +
    OLAP execution: DataFusion is the executor behind the `ComputeBackend` seam; native operators
    exist only as ADR-054's default-off, ledger-gated plane.
+   link:adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097] amends both: DataFusion
+   `LogicalPlan` is the single logical IR and native operators plug in as `ExecutionPlan` adapters;
+   the seams S1–S9 are the contracts every modality plugs into (design:
+   link:../current/LAKEHOUSE_PLAN.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10]).
 5. link:adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc[ADR-095] +
    Postgres-compatible OLTP: reattachable WAL volume, writer-epoch fencing, transactions.
 
@@ -60,7 +64,7 @@ Background — read for context and engineering mandates, not for direction:
   `COMPETITIVE_OLTP_OLAP_MPP_TRAJECTORY_2026_05_20.adoc` — the May 2026 platform framing and
   MPP trajectory, superseded as direction by ADR-096.
 
-Active blueprints, continuing the reading order:
+Specialist references (sequence and live status belong to current/):
 
 6. `VECTOR_OBJECT_ECONOMY_ROUTE_HLD_LLD_2026_05_27.adoc` +
    Active HLD/LLD for object-storage vector economics, SST/HELIX centroid block pruning, cache
@@ -79,16 +83,16 @@ Active blueprints, continuing the reading order:
    Relational/PAX/MVCC/open-format storage shape. (Updated 2026-06-04 for tiered HTAP:
    OLTP row/delta authority, PAX as an internal HTAP candidate, and Parquet/Iceberg for analytics).
 10. `PAX_CODEC_LAYOUT_COMPRESSION_LLD_2026_05_20.adoc` +
-   Active HLD/LLD tracker for Iceberg statistics, Parquet shredding, and PAX block-layout work.
+   Specialist HLD/LLD reference for Iceberg statistics, Parquet shredding, and PAX block-layout work.
    Subordinate to the storage-format HTAP decision above.
 11. `RELATIONAL_PGWIRE_DML_COMPUTE_BLUEPRINT_2026_05_20.adoc` +
-   Active HLD/LLD tracker for pgwire DML, legacy VectorOps routing, table-record execution, and compute-engine routing (DataFusion integration).
-12. `roadmap/techdebt/TD_110_OLTP_OLAP_HTAP_STORAGE_AND_CONSTRAINTS_PLAN_2026_06_04.adoc` +
-   Active roadmap tracker for PostgreSQL-style OLTP constraints, native row/delta commit,
+   Specialist HLD/LLD reference for pgwire DML, legacy VectorOps routing, table-record execution, and compute-engine routing (DataFusion integration).
+12. `docs/history/planning/TD_110_OLTP_OLAP_HTAP_STORAGE_AND_CONSTRAINTS_PLAN_2026_06_04.adoc` +
+   Historical design input for PostgreSQL-style OLTP constraints, native row/delta commit,
    Volcano strong-freshness execution, DataFusion snapshot-plus-delta reads, and distributed
    consistency gates.
 13. `PROXIMA_NOTEBOOK_PSEUDO_DISTRIBUTED_BLUEPRINT_2026_06_04.adoc` +
-   Active HLD/LLD tracker for Python notebook/procedural APIs, PySpark-style lazy planning,
+   Specialist HLD/LLD reference for Python notebook/procedural APIs, PySpark-style lazy planning,
    Rust-backed embedded execution, DataFusion routes, and single-node pseudo-distributed proof mode.
 14. `OPEN_FORMAT_CATALOG_2026_05_17.adoc` +
    Iceberg REST catalog, OLTP catalog backends, open-format compatibility, and xCatalog ownership
@@ -177,6 +181,15 @@ Active blueprints, continuing the reading order:
    per-surface fusion is *incorrect by construction* (cosine≈Gaussian vs graph≈power-law need PIT
    calibration only the shared `Fuser` provides). Resolves where `EntityService.SearchEntities` (PR
    #278) fits: entity-typed view over the seam, no standalone vector-ANN. Adds TD-146.
+
+25. link:../current/LAKEHOUSE_PLAN.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10] +
+   Accepted direction (owner decision 2026-10-18; implementation Open): thought experiments
+   TE-1..TE-9, the foundational seams S1–S9 (identity, durable WAL, Layer A landing, one Iceberg
+   writer, streaming scan providers, one logical IR, index projections, cost, governance), the
+   vector-tier comparison against turbopuffer / memory HNSW / AXIS IVF with the round-trip-depth
+   plan, and phases P0–P6 with gates. Decisions in ADR-097; tracked by TD-SEAM-1..13.
+   Execution status, in-flight work and the resume protocol:
+   link:../current/TRACKER.adoc[LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER].
 
 == Stable Reference Docs
 

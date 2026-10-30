@@ -384,3 +384,52 @@ async fn rest_v2_search_top_k_above_cap_returns_400() {
         resp.text().await.unwrap_or_default()
     );
 }
+
+/// TD-ENGSEL-1: a REST v2 create that omits `engine` (no index, quantization,
+/// recall target or policy) lands on SST, the supported default — not HELIX
+/// (Beta), which the auto-router used to pick for this exact shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_v2_create_without_engine_defaults_to_sst() {
+    let server = ReleaseSmokeServer::start().await.expect("server start");
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .no_proxy()
+        .build()
+        .unwrap();
+
+    let coll = format!(
+        "release_default_engine_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let create_resp = http
+        .post(format!("{}/api/v2/collections", server.base_url()))
+        .json(&json!({
+            "name": coll,
+            "dimension": 4,
+            "distance_metric": "cosine",
+        }))
+        .send()
+        .await
+        .expect("v2 create");
+    assert!(
+        create_resp.status().is_success(),
+        "v2 create: {}",
+        create_resp.text().await.unwrap_or_default()
+    );
+
+    let got: Value = http
+        .get(format!("{}/api/v2/collections/{}", server.base_url(), coll))
+        .send()
+        .await
+        .expect("v2 get")
+        .json()
+        .await
+        .expect("v2 get json");
+    assert_eq!(
+        got["engine"], "sst",
+        "a create without `engine` must default to SST: {got}"
+    );
+}

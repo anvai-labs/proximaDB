@@ -695,6 +695,10 @@ pub struct GetSchemaResponse {
     pub schema: ::core::option::Option<RecordSchema>,
     #[prost(string, optional, tag = "3")]
     pub error_message: ::core::option::Option<::prost::alloc::string::String>,
+    /// TD-GRPCSCHEMA-2: whether record mode (write enforcement) is ON for the
+    /// collection — the schema above is served either way.
+    #[prost(bool, optional, tag = "4")]
+    pub record_enabled: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListSchemasRequest {
@@ -868,6 +872,41 @@ pub struct V2CollectionConfig {
     pub index_specs: ::prost::alloc::vec::Vec<V2IndexSpec>,
     #[prost(message, optional, tag = "8")]
     pub quantization: ::core::option::Option<V2QuantizationConfig>,
+    /// TD-GRPCSCHEMA-2: record mode at create (REST parity; before, a gRPC-created
+    /// collection could never enable it).
+    #[prost(bool, optional, tag = "9")]
+    pub enable_proxima_record: ::core::option::Option<bool>,
+    /// TD-TIER-1 SC1: desired storage class, "economy" | "balanced" (default) |
+    /// "performance". Echoes the resolved policy; observed status is NOT carried
+    /// here (v1 classes other than balanced are accepted-but-inactive).
+    #[prost(string, optional, tag = "10")]
+    pub storage_class: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// TD-TIER-1 SC1: observed storage-class status (read-side projection of the
+/// desired policy; never an input). Mirrors the v1 `StorageClassStatus`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct V2StorageClassStatus {
+    /// "active" (balanced in effect) | "not_active" (policy persisted, dependency
+    /// not implemented — the collection serves balanced behavior).
+    #[prost(string, tag = "1")]
+    pub state: ::prost::alloc::string::String,
+    /// Names the missing dependency when state is not_active; empty when active.
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+    /// Monotonic generation of the desired policy: 0 = never set (pre-SC1
+    /// records), 1 = set at create. The class is immutable after create in v1,
+    /// so generation does not advance yet.
+    #[prost(uint64, tag = "3")]
+    pub policy_generation: u64,
+    /// Reserved bytes under residency admission (SC3). 0 until then.
+    #[prost(uint64, tag = "4")]
+    pub reserved_bytes: u64,
+    /// Bytes resident in the serving cache (SC4). 0 until then.
+    #[prost(uint64, tag = "5")]
+    pub resident_bytes: u64,
+    /// Bytes covered by the READY coverage set (SC4). 0 until then.
+    #[prost(uint64, tag = "6")]
+    pub covered_bytes: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct V2Collection {
@@ -879,6 +918,10 @@ pub struct V2Collection {
     pub created_at: i64,
     #[prost(int64, tag = "4")]
     pub updated_at: i64,
+    /// TD-TIER-1 SC1: observed status alongside the echoed desired class in
+    /// `V2CollectionConfig.storage_class` — desired and observed are distinct.
+    #[prost(message, optional, tag = "5")]
+    pub storage_class_status: ::core::option::Option<V2StorageClassStatus>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct V2GetCollectionRequest {

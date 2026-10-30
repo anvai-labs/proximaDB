@@ -33,11 +33,7 @@ _tests_root = Path(__file__).parent.parent
 if str(_tests_root) not in sys.path:
     sys.path.insert(0, str(_tests_root))
 
-from utils.test_helpers import (
-    CollectionInfo,
-    InsertResult,
-    SearchResult,
-)
+from utils.test_helpers import CollectionInfo, InsertResult, SearchResult
 
 # Lazy SDK imports - only load when actually needed by tests
 _SDK_LOADED = False
@@ -81,11 +77,7 @@ StorageEngine = None
 ProximaDBError = None
 
 try:
-    from proximadb_sdk import (
-        CollectionConfig,
-        ProximaDBError,
-        StorageEngine,
-    )
+    from proximadb_sdk import CollectionConfig, ProximaDBError, StorageEngine
 except Exception:
     pass
 

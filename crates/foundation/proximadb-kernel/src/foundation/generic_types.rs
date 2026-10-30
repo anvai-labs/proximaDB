@@ -2,10 +2,35 @@
 
 use super::base_traits::*;
 use chrono::{DateTime, Utc};
+use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
+use std::fmt;
 use std::fmt::Debug;
 use std::marker::PhantomData;
+
+/// Serialize a fixed list of named fields as a struct — shared body of the
+/// manual `Serialize` impls below (struct name, field order, and count are
+/// preserved verbatim by each caller).
+macro_rules! serialize_fields {
+    ($serializer:expr, $name:expr, $( $field:expr => $value:expr ),+ $(,)?) => {{
+        use serde::ser::SerializeStruct;
+        let mut state = $serializer.serialize_struct($name, [$( $field ),+].len())?;
+        $( state.serialize_field($field, &$value)?; )+
+        state.end()
+    }};
+}
+
+/// Read the next map value into `slot`, rejecting a repeated field — the
+/// shared shape of every field arm in the manual `Deserialize` visitors below.
+macro_rules! take_field {
+    ($map:expr, $slot:expr, $name:expr) => {{
+        if $slot.is_some() {
+            return Err(de::Error::duplicate_field($name));
+        }
+        $slot = Some($map.next_value()?);
+    }};
+}
 
 /// Generic configuration wrapper that implements BaseConfig
 #[derive(Debug, Clone)]
@@ -263,11 +288,10 @@ where
     where
         S: Serializer,
     {
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("GenericConfig", 2)?;
-        state.serialize_field("data", &self.data)?;
-        state.serialize_field("validation_rules", &self.validation_rules)?;
-        state.end()
+        serialize_fields!(serializer, "GenericConfig",
+            "data" => self.data,
+            "validation_rules" => self.validation_rules,
+        )
     }
 }
 
@@ -279,9 +303,6 @@ where
     where
         D: Deserializer<'de>,
     {
-        use serde::de::{self, MapAccess, Visitor};
-        use std::fmt;
-
         struct GenericConfigVisitor<T>(PhantomData<T>);
 
         impl<'de, T> Visitor<'de> for GenericConfigVisitor<T>
@@ -303,17 +324,9 @@ where
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
-                        "data" => {
-                            if data.is_some() {
-                                return Err(de::Error::duplicate_field("data"));
-                            }
-                            data = Some(map.next_value()?);
-                        }
+                        "data" => take_field!(map, data, "data"),
                         "validation_rules" => {
-                            if validation_rules.is_some() {
-                                return Err(de::Error::duplicate_field("validation_rules"));
-                            }
-                            validation_rules = Some(map.next_value()?);
+                            take_field!(map, validation_rules, "validation_rules")
                         }
                         _ => {
                             let _ = map.next_value::<serde_json::Value>()?;
@@ -344,16 +357,15 @@ where
     where
         S: Serializer,
     {
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("GenericMetadata", 7)?;
-        state.serialize_field("id", &self.id)?;
-        state.serialize_field("data", &self.data)?;
-        state.serialize_field("version", &self.version)?;
-        state.serialize_field("timestamp", &self.timestamp)?;
-        state.serialize_field("updated_at", &self.updated_at)?;
-        state.serialize_field("tags", &self.tags)?;
-        state.serialize_field("properties", &self.properties)?;
-        state.end()
+        serialize_fields!(serializer, "GenericMetadata",
+            "id" => self.id,
+            "data" => self.data,
+            "version" => self.version,
+            "timestamp" => self.timestamp,
+            "updated_at" => self.updated_at,
+            "tags" => self.tags,
+            "properties" => self.properties,
+        )
     }
 }
 
@@ -365,9 +377,6 @@ where
     where
         D: Deserializer<'de>,
     {
-        use serde::de::{self, MapAccess, Visitor};
-        use std::fmt;
-
         #[derive(Deserialize)]
         #[serde(field_identifier, rename_all = "snake_case")]
         enum Field {
@@ -406,48 +415,13 @@ where
 
                 while let Some(key) = map.next_key()? {
                     match key {
-                        Field::Id => {
-                            if id.is_some() {
-                                return Err(de::Error::duplicate_field("id"));
-                            }
-                            id = Some(map.next_value()?);
-                        }
-                        Field::Data => {
-                            if data.is_some() {
-                                return Err(de::Error::duplicate_field("data"));
-                            }
-                            data = Some(map.next_value()?);
-                        }
-                        Field::Version => {
-                            if version.is_some() {
-                                return Err(de::Error::duplicate_field("version"));
-                            }
-                            version = Some(map.next_value()?);
-                        }
-                        Field::Timestamp => {
-                            if timestamp.is_some() {
-                                return Err(de::Error::duplicate_field("timestamp"));
-                            }
-                            timestamp = Some(map.next_value()?);
-                        }
-                        Field::UpdatedAt => {
-                            if updated_at.is_some() {
-                                return Err(de::Error::duplicate_field("updated_at"));
-                            }
-                            updated_at = Some(map.next_value()?);
-                        }
-                        Field::Tags => {
-                            if tags.is_some() {
-                                return Err(de::Error::duplicate_field("tags"));
-                            }
-                            tags = Some(map.next_value()?);
-                        }
-                        Field::Properties => {
-                            if properties.is_some() {
-                                return Err(de::Error::duplicate_field("properties"));
-                            }
-                            properties = Some(map.next_value()?);
-                        }
+                        Field::Id => take_field!(map, id, "id"),
+                        Field::Data => take_field!(map, data, "data"),
+                        Field::Version => take_field!(map, version, "version"),
+                        Field::Timestamp => take_field!(map, timestamp, "timestamp"),
+                        Field::UpdatedAt => take_field!(map, updated_at, "updated_at"),
+                        Field::Tags => take_field!(map, tags, "tags"),
+                        Field::Properties => take_field!(map, properties, "properties"),
                     }
                 }
 
@@ -483,13 +457,12 @@ where
     where
         S: Serializer,
     {
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("GenericStats", 4)?;
-        state.serialize_field("data", &self.data)?;
-        state.serialize_field("timestamp", &self.timestamp)?;
-        state.serialize_field("collection_count", &self.collection_count)?;
-        state.serialize_field("reset_count", &self.reset_count)?;
-        state.end()
+        serialize_fields!(serializer, "GenericStats",
+            "data" => self.data,
+            "timestamp" => self.timestamp,
+            "collection_count" => self.collection_count,
+            "reset_count" => self.reset_count,
+        )
     }
 }
 
@@ -501,9 +474,6 @@ where
     where
         D: Deserializer<'de>,
     {
-        use serde::de::{self, MapAccess, Visitor};
-        use std::fmt;
-
         #[derive(Deserialize)]
         #[serde(field_identifier, rename_all = "snake_case")]
         enum Field {
@@ -536,30 +506,12 @@ where
 
                 while let Some(key) = map.next_key()? {
                     match key {
-                        Field::Data => {
-                            if data.is_some() {
-                                return Err(de::Error::duplicate_field("data"));
-                            }
-                            data = Some(map.next_value()?);
-                        }
-                        Field::Timestamp => {
-                            if timestamp.is_some() {
-                                return Err(de::Error::duplicate_field("timestamp"));
-                            }
-                            timestamp = Some(map.next_value()?);
-                        }
+                        Field::Data => take_field!(map, data, "data"),
+                        Field::Timestamp => take_field!(map, timestamp, "timestamp"),
                         Field::CollectionCount => {
-                            if collection_count.is_some() {
-                                return Err(de::Error::duplicate_field("collection_count"));
-                            }
-                            collection_count = Some(map.next_value()?);
+                            take_field!(map, collection_count, "collection_count")
                         }
-                        Field::ResetCount => {
-                            if reset_count.is_some() {
-                                return Err(de::Error::duplicate_field("reset_count"));
-                            }
-                            reset_count = Some(map.next_value()?);
-                        }
+                        Field::ResetCount => take_field!(map, reset_count, "reset_count"),
                     }
                 }
 
@@ -589,14 +541,13 @@ where
     where
         S: Serializer,
     {
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("GenericResult", 5)?;
-        state.serialize_field("success", &self.success)?;
-        state.serialize_field("data", &self.data)?;
-        state.serialize_field("error_code", &self.error_code)?;
-        state.serialize_field("processing_time_us", &self.processing_time_us)?;
-        state.serialize_field("metadata", &self.metadata)?;
-        state.end()
+        serialize_fields!(serializer, "GenericResult",
+            "success" => self.success,
+            "data" => self.data,
+            "error_code" => self.error_code,
+            "processing_time_us" => self.processing_time_us,
+            "metadata" => self.metadata,
+        )
     }
 }
 
@@ -608,9 +559,6 @@ where
     where
         D: Deserializer<'de>,
     {
-        use serde::de::{self, MapAccess, Visitor};
-        use std::fmt;
-
         #[derive(Deserialize)]
         #[serde(field_identifier, rename_all = "snake_case")]
         enum Field {
@@ -645,36 +593,13 @@ where
 
                 while let Some(key) = map.next_key()? {
                     match key {
-                        Field::Success => {
-                            if success.is_some() {
-                                return Err(de::Error::duplicate_field("success"));
-                            }
-                            success = Some(map.next_value()?);
-                        }
-                        Field::Data => {
-                            if data.is_some() {
-                                return Err(de::Error::duplicate_field("data"));
-                            }
-                            data = Some(map.next_value()?);
-                        }
-                        Field::ErrorCode => {
-                            if error_code.is_some() {
-                                return Err(de::Error::duplicate_field("error_code"));
-                            }
-                            error_code = Some(map.next_value()?);
-                        }
+                        Field::Success => take_field!(map, success, "success"),
+                        Field::Data => take_field!(map, data, "data"),
+                        Field::ErrorCode => take_field!(map, error_code, "error_code"),
                         Field::ProcessingTimeUs => {
-                            if processing_time_us.is_some() {
-                                return Err(de::Error::duplicate_field("processing_time_us"));
-                            }
-                            processing_time_us = Some(map.next_value()?);
+                            take_field!(map, processing_time_us, "processing_time_us")
                         }
-                        Field::Metadata => {
-                            if metadata.is_some() {
-                                return Err(de::Error::duplicate_field("metadata"));
-                            }
-                            metadata = Some(map.next_value()?);
-                        }
+                        Field::Metadata => take_field!(map, metadata, "metadata"),
                     }
                 }
 

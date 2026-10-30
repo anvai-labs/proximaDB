@@ -77,6 +77,24 @@ export interface CollectionHttpClient extends SearchHttpClient {
 // COLLECTION BUILDER
 // ============================================================================
 
+const INDEX_TYPES: readonly string[] = Object.values(IndexType);
+
+/**
+ * Normalize an index type the way the server reads algorithm names (trimmed,
+ * case-insensitive), failing fast on anything that is not an `IndexType`: a
+ * plain-JS caller's `"HNSW"` used to be sent as a declared index instead of
+ * the default route, and a typo only failed as a server 400.
+ */
+export function normalizeIndexType(idx: IndexType | string): IndexType {
+  const value = String(idx).trim().toLowerCase();
+  if (!INDEX_TYPES.includes(value)) {
+    throw new TypeError(
+      `unknown index type "${String(idx)}"; expected one of ${INDEX_TYPES.join(", ")}`,
+    );
+  }
+  return value as IndexType;
+}
+
 /**
  * Builder for creating collections
  */
@@ -120,10 +138,14 @@ export class CollectionBuilder {
   }
 
   /**
-   * Set the index type
+   * Set the index type.
+   *
+   * Case-insensitive and whitespace-tolerant, like the server's algorithm
+   * names (`"HNSW"` is `IndexType.Hnsw`). An unknown value throws a
+   * `TypeError` here, at the call that is wrong, before any request is sent.
    */
   index(idx: IndexType): CollectionBuilder {
-    this.indexValue = idx;
+    this.indexValue = normalizeIndexType(idx);
     return this;
   }
 
@@ -159,11 +181,24 @@ export class CollectionBuilder {
       throw new Error("Dimension is required for collection creation");
     }
 
+    // TD-RESTGET-1: the server ignores `index_type` "hnsw" (index selection
+    // is cost-derived) and rejects any other value, which it never honoured.
+    // Send what each choice means: Hnsw keeps the default payload; Flat forces
+    // brute force through the routing policy; the others declare that index.
+    // `index()` already normalized the value, so these comparisons are exact.
+    const index = this.indexValue;
+    const indexFields =
+      index === IndexType.Hnsw
+        ? { index_type: index }
+        : index === IndexType.Flat
+          ? { index_policy: { mode: "exact" } }
+          : { index_configs: [{ algorithm: index, is_primary: true }] };
+
     const request = {
       name: this.collectionName,
       dimension: this.dimensionValue,
       engine: this.engineValue,
-      index_type: this.indexValue,
+      ...indexFields,
       distance_metric: this.metricValue,
       description: this.descriptionValue ?? undefined,
       tags: this.tagsValue.length > 0 ? this.tagsValue : undefined,

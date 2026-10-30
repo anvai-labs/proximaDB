@@ -1,0 +1,189 @@
+= ProximaDB Vision: The Context Database
+:toc: left
+:toclevels: 2
+:icons: font
+:sectnums:
+
+
+[IMPORTANT]
+====
+Historical planning snapshot archived 2026-10-26; statements of "current", "open" or
+"done" below describe the source document at its recorded date, not current delivery.
+Current work: link:../../current/VISION.adoc[the consolidated plan/tracker].
+Preserved as design rationale and evidence; do not resume its old task list verbatim.
+====
+
+[.lead]
+ProximaDB is a **SQL-first context engine on object storage**: a Postgres-compatible database in
+which vectors, JSON documents and relationships are first-class, so applications and AI agents
+can retrieve, transact, analyse and relate over the same governed data.
+
+The market-facing wedge is **Object-storage-native context serving for SQL, JSON, and vectors**:
+one governed record, standard interfaces outside, and co-designed storage/query/cache economics
+inside. This wedge is deliberately smaller than the durable vision.
+
+[IMPORTANT]
+====
+This document states the *broad, durable vision*. The direction it describes was decided in
+link:../../12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096]; changing
+it takes a new ADR. What may be *claimed* today is decided by
+link:../../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE.adoc], and the exact adoption promise is
+machine-checked in link:../../00-product/MVP_TRUST_CORRIDOR.toml[MVP_TRUST_CORRIDOR.toml]: a capability outside
+that corridor is not an MVP or GA claim merely because code for it exists. Sequencing lives in
+the link:STRATEGIC_ROADMAP.adoc[roadmap].
+====
+
+== The problem
+
+An AI application, or the agent inside it, assembles *context*: passages found by semantic
+similarity, the structured record they belong to, the user's transactional state, the
+relationships between entities, and the history of what happened. Today that context lives in a
+vector database, an operational database, a document store and a warehouse, joined by
+application code and kept in sync by pipelines. Each copy has its own security model, its own
+freshness and its own bill.
+
+== The approach
+
+[source,mermaid]
+----
+%%{init: {"theme": "neutral"}}%%
+flowchart LR
+  subgraph Out["Standard outside"]
+    SQL["SQL over Postgres wire<br/>(front door)"]
+    API["REST v2 · gRPC v2<br/>Arrow Flight"]
+  end
+  subgraph In["Co-designed inside"]
+    REC["One canonical record<br/>id · typed properties · embeddings"]
+    PROJ["Projections<br/>relational · vector index<br/>document · graph"]
+    ROUTE["The engine routes<br/>(DataFusion, vector engines, graph)"]
+  end
+  OBJ[("Object storage<br/>tenant-isolated, metered")]
+  SQL --> ROUTE
+  API --> ROUTE
+  ROUTE --> PROJ --> REC --> OBJ
+----
+
+* **SQL is the front door.** Applications, ORMs, BI tools and agents speak PostgreSQL. Vectors,
+  JSON and graph are expressed inside SQL — table functions, the pgvector `<->` operator, JSON
+  operators — and transactional writes are part of that contract
+  (link:../../12-design/adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc[ADR-095]).
+  The native REST v2 record API serves SDKs and services directly.
+* **One canonical record; every model is a projection of it.** A record has an identifier,
+  typed properties and embeddings. The relational row, the vector index, the document view and
+  the graph are projections of that record
+  (link:../../12-design/adr/ADR-094-unified-storage-substrate-and-compute-seam.adoc[ADR-094]), not
+  copies kept in sync by pipelines.
+* **The engine routes; the client does not choose.** One statement goes to the engine that fits
+  it: DataFusion over Parquet for analytical scans
+  (link:../../12-design/adr/ADR-052-analytics-execution-competitiveness-codesign.adoc[ADR-052]), the
+  vector engines for similarity, the graph runtime for traversal. The planner discloses what it
+  chose.
+* **Co-designed against the cloud's real cost.** Storage format, cache, engine and network are
+  optimised together against object-store round trips and egress, measured per query, not
+  against CPU microbenchmarks
+  (link:../../12-design/CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc[co-design architecture]).
+* **Tenancy and governance are structural.** Every byte lives under a tenant and namespace
+  path, every I/O boundary carries the tenant for isolation and metering, and policy is enforced
+  inside the query plan.
+
+== Design principles
+
+=== Standard interfaces outside, freedom inside
+Clients use PostgreSQL wire, REST, gRPC and Arrow Flight (Flight's canonical `vector_search` is
+Supported; Flight as a general customer transport is experimental). Internals — record layout, codecs,
+caches, engines — may change freely behind those seams, and storage changes are mixed-read-safe
+and version-marked.
+
+=== Format follows modality
+Relational data lands in a Parquet-encoded layer so open tools can read it; vector and
+multimodal data use the PAX block format built for similarity search. One physical copy of
+each, with additional representations only when their cost is justified (ADR-094).
+
+=== Correctness before breadth
+A delete is never resurrected, a committed transaction is all-or-nothing, a read after a write
+sees the write. These invariants are enforced by tests at every read boundary before a new
+surface or model is added.
+
+=== Measure, don't assert
+Every performance number in a customer-facing document maps to a runnable benchmark in the
+evidence ledger (`docs/_internal/roadmap/BENCHMARK_EVIDENCE.toml`). A number that is not in the
+ledger is not a claim.
+
+=== Continuous serving and continuous discovery
+Serving answers queries at low latency; discovery improves the data offline — deduplication,
+reclustering, re-embedding, quality and drift scans — and publishes the result into serving
+atomically through a new catalog snapshot. Each turn of the loop improves the next.
+
+=== Deployment neutrality
+The same engine runs as a server over object storage, on local disk, or embedded in a process.
+The server over object storage is the primary deployment; embedded mode serves edge and
+single-process use cases.
+
+== Non-goals
+
+* **Not a general-purpose cloud data warehouse.** ProximaDB runs analytical SQL well enough to
+  pass TPC-H and TPC-DS over pgwire, and that conformance is a quality bar. It does not compete
+  feature-for-feature with Snowflake or Databricks on petabyte batch analytics.
+* **Not a full PostgreSQL replacement in the current release.** Postgres-compatible OLTP is
+  being built in compatibility levels behind default-off gates
+  (link:../../12-design/adr/ADR-095-postgres-compatible-oltp-on-object-storage.adoc[ADR-095]);
+  stored procedures, triggers and multi-writer sharding are not on that path.
+* **Not a pure vector database.** Vector retrieval is a first-class capability of the engine,
+  not the whole product. Strong vector products also store payloads and filters; ProximaDB must
+  win on governed composition with SQL and on measured object-storage economics.
+* **Not a model training platform.** It serves features and stores embeddings; it does not
+  train models.
+* **Not a message queue or a distributed ledger.** It consumes events through CDC and keeps
+  immutable logs for audit, not for pub/sub fan-out or consensus.
+
+== Durable outcomes
+
+The roadmap sequences these by release; this list does not carry dates.
+
+. **A developer points a Postgres client at ProximaDB** and gets correct SQL, transactions and
+  vector search over object storage, with a single `docker run`.
+. **One record serves every view.** Relational, vector, document and graph access read the same
+  canonical record, with no pipeline between them.
+. **Recovery is boring.** Losing a machine loses no acknowledged write; a replacement recovers
+  the durable volume and object storage and resumes.
+. **Costs are visible per query.** Bytes read, requests and egress are traced and metered per
+  tenant, and the planner chooses routes from measured costs.
+. **The data improves itself.** Discovery passes publish better embeddings, indexes and
+  metadata into serving without downtime.
+. **It scales out when a workload needs it** — distributed execution and elastic compute over the
+  same storage — once single-node correctness and evidence are established.
+
+== Use cases
+
+The use-case catalog (link:../../11-usecases/USECASE_CATALOG.adoc[USECASE_CATALOG]) holds worked
+designs. Retrieval-augmented generation over governed documents and agent memory are the
+reference workloads. The ibkrtrading trading-system migration
+(link:../../11-usecases/IBKRTRADING_DOGFOOD.adoc[blueprint], TD-030) is one design-partner use case
+that exercises embedded mode, time-series and audit; it is not the product's anchor (ADR-096 D2).
+
+== Adoption strategy
+
+Go-to-market sequence; the engineering sequence is the roadmap.
+
+. **Win builders.** A developer goes from `docker run` to a working SQL-plus-vector query in under
+  ten minutes, with the MVP corridor's smoke as the proof.
+. **Expand to teams.** Shared catalogs, schema evolution and query patterns make ProximaDB the
+  team's default data layer for AI workloads.
+. **Institutionalise.** Multi-tenancy, policy, audit, recovery objectives and a published cost
+  comparison give organisations what they need to standardise on it.
+
+== Related documents
+
+* link:../../12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096] — the
+  direction decision this vision states.
+* link:../../00-product/PRD.adoc[Product Requirements Document] — positioning, personas and prioritised
+  requirements.
+* link:../../00-product/COMPETITIVE_LANDSCAPE.adoc[Competitive Landscape].
+* link:STRATEGIC_ROADMAP.adoc[Strategic Roadmap] — release-by-release plan.
+* link:../../12-design/SYSTEM_MAP_2026_05_30.adoc[System Map] — how the system is built today.
+
+'''
+_Last Updated_: 2026-10-17 — rewritten for ADR-096. Removed: the engine table with unledgered
+latency numbers (VIPER is deprecated, ADR-093), the ibkrtrading anchor section, and the Year 1–3
+milestone lists and Gantt chart (dates now live only in the roadmap). Earlier text is in git
+history.

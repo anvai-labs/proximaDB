@@ -893,6 +893,7 @@ impl Default for StorageConfig {
             compaction_config: CompactionConfig::default(),
             filesystem_config: FilesystemOptimizationConfig::default(),
             optimization: OptimizationConfig::default(),
+            reservation_pools: Vec::new(),
         }
     }
 }
@@ -941,6 +942,18 @@ pub struct CoreStorageConfig {
     /// Performance optimization settings
     #[serde(default)]
     pub optimization: OptimizationConfig,
+
+    /// TD-TIER-1 SC3: operator-declared local reservation pools. Empty (the
+    /// default) leaves the reservation feature entirely inert — no authority
+    /// is constructed, admission is unchanged. The whole list is validated at
+    /// config load (`validate_pool_configs`: per-pool shape, duplicate
+    /// id/path rejection) and each pool again when an authority opens it, so
+    /// a bad declaration fails at startup rather than degrading silently.
+    /// Each pool is EXCLUSIVELY OWNED per process (and per host via the
+    /// owner.lock): a second in-process `CollectionService` construction or a
+    /// second process on the same pool directory fails startup by design.
+    #[serde(default)]
+    pub reservation_pools: Vec<crate::services::collection::reservation::ReservationPoolConfig>,
 }
 
 pub use proximadb_config::{

@@ -628,7 +628,22 @@ impl SstEngine {
                     let root = std::path::PathBuf::from(path).join("pax-warm-tier-v1");
                     let max_bytes = max_gb.saturating_mul(1024 * 1024 * 1024);
                     match proximadb_cache::PersistentByteStore::open(root, max_bytes) {
-                        Ok(store) => Some(Arc::new(store)),
+                        Ok(store) => {
+                            // TD-TIER-1 SC4-1: register this singleton as the
+                            // process residency store — the reservation
+                            // registry's budget bridge then arms its protection
+                            // budget (a late registration picks up the current
+                            // cell, so construction order does not matter).
+                            // First registration wins: a second engine
+                            // construction in-process keeps the original.
+                            if !proximadb_cache::register_process_store(Arc::new(store.clone())) {
+                                tracing::debug!(
+                                    "TD-TIER-1 SC4-1: a persistent store was already \
+                                     registered for this process; keeping the original"
+                                );
+                            }
+                            Some(Arc::new(store))
+                        }
                         Err(error) => {
                             tracing::warn!(
                                 "persistent PAX cache disabled: unable to open local-disk tier: {error}"

@@ -15,7 +15,6 @@ use dashmap::DashMap;
 use proximadb_rank_core::{RankError, RankResult};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Observer hook for cache events. The root-crate Prometheus glue
 /// implements this to emit spec §4.10 model-cache metrics
@@ -114,7 +113,8 @@ struct CacheEntry {
 
 impl CacheEntry {
     fn touch(&self) {
-        self.last_used_at_ms.store(now_ms(), Ordering::Relaxed);
+        self.last_used_at_ms
+            .store(proximadb_kernel::time::now_unix_ms(), Ordering::Relaxed);
     }
     fn last_used(&self) -> i64 {
         self.last_used_at_ms.load(Ordering::Relaxed)
@@ -154,7 +154,7 @@ impl OnnxModelCache {
         let model_id = key.model_id.clone();
         let entry = Arc::new(CacheEntry {
             session: session.clone(),
-            last_used_at_ms: AtomicI64::new(now_ms()),
+            last_used_at_ms: AtomicI64::new(proximadb_kernel::time::now_unix_ms()),
         });
         self.entries.insert(key, entry);
         let token = ScorerToken { session };
@@ -305,13 +305,6 @@ impl OnnxModelCache {
         }
         freed
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

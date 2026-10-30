@@ -707,10 +707,29 @@ fn sql_params_to_proxima_values(
 /// `tests/graph_branch_merge_rest_integration_test.rs`.
 pub async fn merge_graph_branch(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Path((collection, branch)): Path<(String, String)>,
     Json(request): Json<GraphBranchMergeRequest>,
 ) -> ApiResult<JsonResponse<serde_json::Value>> {
-    merge_graph_branch_inner(&state.data_dir, &collection, &branch, request).await
+    // The collection is resolved within the request tenant (another tenant's
+    // reads as missing); the tenant is never taken from the request body.
+    let visible = state
+        .collection_service
+        .collection_for_tenant(&collection, Some(&tenant.tenant_id))
+        .await
+        .map_err(|e| ApiError::Internal(format!("collection lookup failed: {e}")))?
+        .is_some();
+    if !visible {
+        return Err(ApiError::CollectionNotFound(collection));
+    }
+    merge_graph_branch_inner(
+        &state.data_dir,
+        &tenant.tenant_id,
+        &collection,
+        &branch,
+        request,
+    )
+    .await
 }
 
 /// Pure-logic core of the branch-merge handler. Decoupled from `AppState`
@@ -718,11 +737,14 @@ pub async fn merge_graph_branch(
 /// endpoint that needs the same logic) without service-stub scaffolding.
 ///
 /// Reads the canonical WAL under `data_dir/pgwire/canonical-records.wal`,
-/// filters by `collection`, runs `merge_branches`, and (if `!dry_run`)
+/// filters by `collection`, runs `merge_branches` — or, once the WAL was
+/// truncated, `merge_branches_with_base` over the collection's merge-base
+/// image (410 when its base is gone) — and (if `!dry_run`)
 /// writes the resolutions back through `write_back_merge` with
 /// `origin = "branch_merge:<branch>:<request.target_branch>"`.
 pub async fn merge_graph_branch_inner(
     data_dir: &std::path::Path,
+    tenant: &str,
     collection: &str,
     branch: &str,
     request: GraphBranchMergeRequest,
@@ -744,37 +766,106 @@ pub async fn merge_graph_branch_inner(
     }
 
     let wal_path = graph_branch_merge_wal_path(data_dir);
-    if !tokio::fs::try_exists(&wal_path).await.map_err(|err| {
-        ApiError::Internal(format!(
-            "checking canonical WAL {} failed: {}",
-            wal_path.display(),
-            err
-        ))
-    })? {
+    if !crate::services::FramedTableWalAppender::exists_at(&wal_path)
+        .await
+        .map_err(|err| {
+            ApiError::Internal(format!(
+                "checking canonical WAL {} failed: {err:#}",
+                wal_path.display()
+            ))
+        })?
+    {
         return Err(ApiError::NotFound(format!(
             "canonical WAL not found at {}",
             wal_path.display()
         )));
     }
 
-    let entries = crate::services::FramedTableWalAppender::read_entries_from_path(&wal_path)
+    // TD-SEAM-12 hazard 2: the merge base is the main-line history up to the
+    // branch point. Pin everything the WAL still holds for the whole merge
+    // (write-back included), so no truncation runs under it. The base then
+    // comes from the retained history when that is complete for this
+    // collection, or from its merge-base image plus the history above it;
+    // when neither can give it (the collection lost history before it was
+    // branched), refuse with 410 rather than merge against a partial base.
+    let wal = crate::services::FramedTableWalAppender::open_shared(&wal_path)
         .await
         .map_err(|err| {
             ApiError::Internal(format!(
-                "reading canonical WAL {} failed: {}",
-                wal_path.display(),
-                err
+                "opening canonical WAL {} failed: {err:#}",
+                wal_path.display()
             ))
         })?;
-    let collection_entries = filter_canonical_wal_for_collection(entries, collection);
-    let report =
-        crate::graph::merge::merge_branches(&collection_entries, branch, &request.target_branch)
-            .ok_or_else(|| {
-                ApiError::NotFound(format!(
-                    "no mergeable branch entries found for collection '{}' source '{}' target '{}'",
-                    collection, branch, request.target_branch
-                ))
-            })?;
+    let (_, _history_pin) = wal
+        .pin_history(&|_| wal.retained_from().saturating_sub(1))
+        .await
+        .map_err(|err| ApiError::Internal(format!("pinning canonical WAL history: {err:#}")))?;
+    let retained_from = wal.retained_from();
+    let entries = wal.read_entries().await.map_err(|err| {
+        ApiError::Internal(format!(
+            "reading canonical WAL {} failed: {err:#}",
+            wal_path.display()
+        ))
+    })?;
+    let bases = if retained_from > 0 {
+        Some(
+            crate::services::branch_base_store::BranchBases::replay(&entries).map_err(|err| {
+                ApiError::Internal(format!("replaying the branch merge bases: {err:#}"))
+            })?,
+        )
+    } else {
+        None
+    };
+    // Only this tenant's entries (entries without a tenant are the default
+    // tenant's).
+    let collection_entries: Vec<_> = filter_canonical_wal_for_collection(entries, collection)
+        .into_iter()
+        .filter(|entry| {
+            proximadb_tenant::resolve_request_tenant(entry.tenant_id.as_deref()) == tenant
+        })
+        .collect();
+    let not_mergeable = || {
+        ApiError::NotFound(format!(
+            "no mergeable branch entries found for collection '{}' source '{}' target '{}'",
+            collection, branch, request.target_branch
+        ))
+    };
+    // Nothing to merge is a 404 whatever the history: checked before the base,
+    // so an unbranched collection with truncated history is not a 410.
+    if proximadb_storage_common::find_merge_base_lsn(
+        &collection_entries,
+        branch,
+        &request.target_branch,
+    )
+    .is_none()
+    {
+        return Err(not_mergeable());
+    }
+    let gone = |err: &dyn std::fmt::Display| ApiError::Gone(format!("{err} (TD-SEAM-12 hazard 2)"));
+    let base = match &bases {
+        None => crate::services::branch_base_store::MergeBase::Retained,
+        Some(bases) => bases
+            .base_for(
+                &crate::services::canonical_wal::TenantCollection::new(Some(tenant), collection),
+                retained_from,
+            )
+            .map_err(|err| gone(&err))?,
+    };
+    let report = match base {
+        crate::services::branch_base_store::MergeBase::Retained => {
+            crate::graph::merge::merge_branches(&collection_entries, branch, &request.target_branch)
+        }
+        crate::services::branch_base_store::MergeBase::Image(image) => {
+            crate::graph::merge::merge_branches_with_base(
+                &collection_entries,
+                image,
+                branch,
+                &request.target_branch,
+            )
+            .map_err(|err| gone(&err))?
+        }
+    }
+    .ok_or_else(not_mergeable)?;
 
     // If not dry-run, write the merged records to WAL
     let write_back_result = if !request.dry_run {
@@ -785,7 +876,7 @@ pub async fn merge_graph_branch_inner(
             collection,
             branch,
             &request.target_branch,
-            request.tenant_id.clone(),
+            Some(tenant.to_string()),
         )
         .await
         {
@@ -898,7 +989,8 @@ pub struct GraphBranchMergeRequest {
     /// Dry-run returns the ADR-012 merge report without writing a merge commit.
     #[serde(default = "default_graph_branch_merge_dry_run")]
     pub dry_run: bool,
-    /// Optional tenant ID for multi-tenant deployments.
+    /// Ignored: the merge acts as the request tenant. Kept so existing request
+    /// bodies still parse.
     pub tenant_id: Option<String>,
 }
 
@@ -920,9 +1012,59 @@ fn default_graph_branch_merge_dry_run() -> bool {
 /// ORDER BY score ASC
 /// LIMIT 10
 /// ```
+/// Ensure every request carries a tenant: the one the tenant middleware
+/// resolved, or the default tenant when none was. Never overwrites a resolved
+/// tenant. Mirrors it into the API crate's tenant extension.
+async fn default_tenant_if_unresolved(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let tenant = match request.extensions().get::<TenantContext>() {
+        Some(tenant) => tenant.clone(),
+        None => {
+            let tenant = TenantContext::new(
+                proximadb_tenant::DEFAULT_TENANT,
+                crate::network::middleware::tenant::TenantIdSource::Default,
+            );
+            request.extensions_mut().insert(tenant.clone());
+            tenant
+        }
+    };
+    if request
+        .extensions()
+        .get::<proximadb_api::rest::TenantContext>()
+        .is_none()
+    {
+        request
+            .extensions_mut()
+            .insert(proximadb_api::rest::TenantContext {
+                tenant_id: tenant.tenant_id.clone(),
+            });
+    }
+    next.run(request).await
+}
+
 pub async fn execute_sql(
     State(state): State<AppState>,
+    tenant: Option<Extension<crate::network::middleware::tenant::TenantContext>>,
     Json(request): Json<SqlQueryRequest>,
+) -> ApiResult<JsonResponse<serde_json::Value>> {
+    // Collections are resolved within the request tenant (absent ⇒ the
+    // default tenant) for the whole statement, through every query layer.
+    let request_tenant = tenant
+        .map(|Extension(t)| t.tenant_id)
+        .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
+    crate::query::request_scope::with_request_tenant(
+        request_tenant.clone(),
+        execute_sql_in_scope(state, request, request_tenant),
+    )
+    .await
+}
+
+async fn execute_sql_in_scope(
+    state: AppState,
+    request: SqlQueryRequest,
+    scoped_tenant: String,
 ) -> ApiResult<JsonResponse<serde_json::Value>> {
     let start_time = std::time::Instant::now();
     let request_id = Uuid::new_v4().to_string();
@@ -986,7 +1128,7 @@ pub async fn execute_sql(
             }
             Err(e) => {
                 error!("SQL query {} (port) failed: {}", request_id, e);
-                Err(ApiError::Internal(e.to_string()))
+                Err(sql_error_to_api(e))
             }
         };
     }
@@ -1017,7 +1159,7 @@ pub async fn execute_sql(
             }
             Err(e) => {
                 error!("SQL query {} (adapter) failed: {}", request_id, e);
-                Err(ApiError::Internal(e.to_string()))
+                Err(sql_error_to_api(e))
             }
         };
     }
@@ -1045,7 +1187,7 @@ pub async fn execute_sql(
             query_with_hint,
             sql_params_to_proxima_values(request.parameters.clone()),
             request.collection,
-            proximadb_runtime::PortIdentity::anonymous(),
+            proximadb_runtime::PortIdentity::for_tenant(&scoped_tenant),
         )
         .await
     {
@@ -1093,14 +1235,25 @@ pub async fn execute_sql(
                     None => resource,
                 }));
             }
-            Err(ApiError::Internal(e.to_string()))
+            Err(sql_error_to_api(e))
         }
+    }
+}
+
+/// A statement addressing a collection that does not resolve for the request
+/// (missing, or not resolvable by its tenant) is 404 — one response for both;
+/// anything else stays a server error.
+fn sql_error_to_api(error: anyhow::Error) -> ApiError {
+    match crate::services::operations::vectors::collection_not_found(&error) {
+        Some(missing) => ApiError::CollectionNotFound(missing.identifier.clone()),
+        None => ApiError::Internal(error.to_string()),
     }
 }
 
 /// Return table-level xCatalog routing metadata for REST clients.
 pub async fn get_catalog_table_routing(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Query(query): Query<CatalogRoutingQuery>,
 ) -> ApiResult<Json<crate::services::CatalogIntrospectionResult>> {
     let sql = match query.table_name.as_deref().map(str::trim) {
@@ -1112,6 +1265,7 @@ pub async fn get_catalog_table_routing(
     };
 
     let result = crate::services::CatalogIntrospectionService::new(state.catalog_manager.clone())
+        .for_tenant(tenant.tenant_id)
         .execute_select(&sql)
         .await
         .map_err(|error| ApiError::Internal(error.to_string()))?
@@ -1123,6 +1277,7 @@ pub async fn get_catalog_table_routing(
 /// Explain table-write route selection without executing the write.
 pub async fn explain_table_write_route(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Json(request): Json<TableWriteExplainRequest>,
 ) -> ApiResult<Json<crate::query::table_write_plan::TableWriteRouteExplanation>> {
     use crate::query::table_write_plan::{
@@ -1134,7 +1289,7 @@ pub async fn explain_table_write_route(
     let target_table_name = target.qualified_name();
     let (catalog, table_id) = state
         .catalog_manager
-        .resolve_table(&target_table_name)
+        .resolve_table_scoped(&target_table_name, Some(&tenant.tenant_id))
         .await
         .map_err(|error| ApiError::NotFound(error.to_string()))?;
     if !catalog
@@ -1153,7 +1308,7 @@ pub async fn explain_table_write_route(
         .map_err(|error| ApiError::Internal(error.to_string()))?;
     let target_stats = catalog.get_statistics(&table_id).await.unwrap_or_default();
     let (source, source_schema, source_stats) =
-        resolve_table_write_explain_source(&state, &request).await?;
+        resolve_table_write_explain_source(&state, &tenant.tenant_id, &request).await?;
     let write_mode = parse_table_write_mode(request.write_mode.as_deref())?;
     let distribution = parse_distribution_mode(request.distribution.as_deref())?;
     let conflict_policy = if matches!(write_mode, WriteMode::Upsert | WriteMode::Merge) {
@@ -1181,6 +1336,10 @@ pub async fn explain_table_write_route(
     let routed = DmlWritePlanner::default()
         .plan(DmlWritePlanRequest {
             target_schema: &target_schema,
+            // The explain path does not resolve the fence eligibility (the
+            // executed route is authoritative); the explained lane may show
+            // bulk where execution would demote to WAL above a DV parent.
+            published_parent_has_deletes: false,
             target_stats: Some(&target_stats),
             source_schema: source_schema.as_ref(),
             source_stats: source_stats.as_ref(),
@@ -1195,6 +1354,7 @@ pub async fn explain_table_write_route(
 
 async fn resolve_table_write_explain_source(
     state: &AppState,
+    tenant: &str,
     request: &TableWriteExplainRequest,
 ) -> ApiResult<(
     crate::query::table_write_plan::ReadSource,
@@ -1225,7 +1385,7 @@ async fn resolve_table_write_explain_source(
             let table = logical_table_ref_from_name(table_name)?;
             let (catalog, table_id) = state
                 .catalog_manager
-                .resolve_table(&table.qualified_name())
+                .resolve_table_scoped(&table.qualified_name(), Some(tenant))
                 .await
                 .map_err(|error| ApiError::NotFound(error.to_string()))?;
             if !catalog
@@ -1545,12 +1705,20 @@ fn operator_and_control_v2_routes() -> axum::Router<AppState> {
             "/api/v2/rank/search",
             post(
                 |State(state): State<AppState>,
+                 axum::Extension(tenant): axum::Extension<
+                    crate::network::middleware::tenant::TenantContext,
+                >,
                  payload: Result<
                     Json<crate::network::rest::canonical::rank::RankSearchRequest>,
                     axum::extract::rejection::JsonRejection,
                 >| async move {
                     match payload {
-                        Ok(Json(req)) => {
+                        Ok(Json(mut req)) => {
+                            // Candidates resolve the collection within the
+                            // request tenant set by the tenant middleware.
+                            req.scope = crate::network::rest::canonical::rank::RankScope::Tenant(
+                                tenant.tenant_id,
+                            );
                             match crate::network::rest::canonical::rank::rank_search_dispatch(
                                 state, req,
                             )
@@ -1693,7 +1861,12 @@ pub fn create_router(state: AppState) -> axum::Router {
         let store = legacy_arc.clone();
         // Register store globally for hybrid executor access (embedding catalog)
         crate::storage::entity_store::ProximaEntityStore::register_global(store.clone());
-        let entity_state = EntityApiState { store };
+        let entity_state = EntityApiState {
+            store,
+            collections: Some(
+                state.collection_service.clone() as Arc<dyn proximadb_runtime::CollectionPort>
+            ),
+        };
         entities::configure_routes().with_state(entity_state)
     };
 
@@ -1792,10 +1965,15 @@ pub fn create_router(state: AppState) -> axum::Router {
             .unwrap_or_else(|| Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())));
         let vector_ops: Arc<dyn proximadb_runtime::VectorOpsPort> =
             state.vector_operations_service.clone();
-        let hybrid_port: Arc<dyn proximadb_runtime::HybridPort> =
-            Arc::new(RestHybridPortImpl::new(vector_ops, indexes.clone()));
+        let hybrid_port: Arc<dyn proximadb_runtime::HybridPort> = Arc::new(
+            RestHybridPortImpl::new(vector_ops, indexes.clone()).with_collection_port(
+                state.collection_service.clone() as Arc<dyn proximadb_runtime::CollectionPort>,
+            ),
+        );
         let bm25_port: Arc<dyn proximadb_runtime::BM25IndexPort> =
-            Arc::new(Bm25IndexPortImpl::new(indexes));
+            Arc::new(Bm25IndexPortImpl::new(indexes).with_collection_port(
+                state.collection_service.clone() as Arc<dyn proximadb_runtime::CollectionPort>,
+            ));
         let hybrid_state = HybridRestState {
             hybrid_port,
             bm25_port: Some(bm25_port),
@@ -1995,18 +2173,13 @@ pub fn create_router(state: AppState) -> axum::Router {
         warn!("⚠️ LLM engine not available; Natural Language (AV-SQL) endpoints disabled");
     }
 
-    // Convert to Router<()> by providing state, with default tenant context for all routes
-    let default_tenant = TenantContext::new(
-        "default",
-        crate::network::middleware::tenant::TenantIdSource::Default,
-    );
-    let default_api_tenant = proximadb_api::rest::TenantContext {
-        tenant_id: "default".to_string(),
-    };
+    // Convert to Router<()> by providing state. Routes get the per-request
+    // tenant resolved by the tenant middleware; the default tenant only when
+    // none was resolved (an unconditional Extension layer here would
+    // overwrite the request's tenant on every route below).
     let router = router
         .with_state(state)
-        .layer(Extension(default_tenant))
-        .layer(axum::Extension(default_api_tenant))
+        .layer(axum::middleware::from_fn(default_tenant_if_unresolved))
         .layer(axum::middleware::from_fn(add_rest_v1_deprecation_headers))
         // Merged AFTER the layers above so the per-request tenant from the
         // tenant middleware is not clobbered by the default-tenant Extension

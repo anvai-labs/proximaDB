@@ -14,92 +14,13 @@
 //!
 //! The feature is default-OFF (mandate #8), so the test enables
 //! `PROXIMADB_NATIVE_TABLE_PROVIDER` for the enabled half and asserts the
-//! default-off half still declines — proving the gate actually gates.
+//! default-off half still declines — proving the gate actually gates — and that a
+//! window function declines with SQLSTATE 0A000 rather than a silently wrong answer.
 
-use std::net::TcpListener;
-use std::time::Duration;
+#[path = "common/pg_server.rs"]
+mod pg_server;
 
-use proximadb::core::Config;
-use proximadb::database::ProximaDB;
-use tempfile::TempDir;
-use tokio::time::sleep;
-
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let p = l.local_addr().expect("addr").port();
-    drop(l);
-    p
-}
-
-struct PgServer {
-    pg_port: u16,
-    db: Option<ProximaDB>,
-    _tmp: TempDir,
-}
-
-impl PgServer {
-    async fn start() -> anyhow::Result<Self> {
-        let pg_port = free_port();
-        let rest_port = free_port();
-        let grpc_port = free_port();
-        let tmp = TempDir::new()?;
-        let mut config = Config::default();
-        config.server.bind_address = "127.0.0.1".to_string();
-        config.server.port = rest_port;
-        config.server.data_dir = tmp.path().to_path_buf();
-        config.api.rest_port = rest_port;
-        config.api.grpc_port = grpc_port;
-        config.api.unified_mode = false;
-        config.api.pg_port = Some(pg_port);
-        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
-            url: format!("file://{}", tmp.path().display()),
-            ..Default::default()
-        }];
-        config.storage.wal_config.write_buffer_directory =
-            format!("file://{}/wal", tmp.path().display());
-        // TD-CONV-1: anchor the system catalog in this server's temp dir, not the
-        // shared CWD-relative `file://./metadata` default (cross-run DDL replay).
-        config.storage.metadata_url = format!("file://{}", tmp.path().join("metadata").display());
-        let mut db = ProximaDB::new(config).await?;
-        db.start().await?;
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .no_proxy()
-            .build()?;
-        let health = format!("http://127.0.0.1:{rest_port}/health");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match http.get(&health).send().await {
-                Ok(r) if r.status().is_success() => break,
-                _ if std::time::Instant::now() > deadline => anyhow::bail!("REST not ready"),
-                _ => sleep(Duration::from_millis(100)).await,
-            }
-        }
-        sleep(Duration::from_millis(200)).await;
-        Ok(Self {
-            pg_port,
-            db: Some(db),
-            _tmp: tmp,
-        })
-    }
-    fn conn_str(&self) -> String {
-        format!(
-            "host=127.0.0.1 port={} user=postgres dbname=proximadb sslmode=disable",
-            self.pg_port
-        )
-    }
-}
-
-impl Drop for PgServer {
-    fn drop(&mut self) {
-        if let Some(mut db) = self.db.take() {
-            tokio::spawn(async move {
-                let _ = db.shutdown().await;
-            });
-        }
-    }
-}
-
+use pg_server::TestPgServer;
 /// The shapes that were Parquet-only before TD-USUB-2. Each is declined by the
 /// shared relational frontend and therefore reachable only through `ctx.sql`.
 const CAPABILITY_SHAPES: &[(&str, &str)] = &[
@@ -120,12 +41,6 @@ const CAPABILITY_SHAPES: &[(&str, &str)] = &[
         "select id, val from usub2_t where val > (select avg(val) from usub2_t) order by id",
     ),
 ];
-
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    e.as_db_error()
-        .map(|d| format!("[{}] {}", d.code().code(), d.message()))
-        .unwrap_or_else(|| e.to_string())
-}
 
 #[test]
 fn native_table_capability_parity() {
@@ -151,7 +66,7 @@ async fn body() {
     // exactly how an operator would enable the feature.
     unsafe { std::env::remove_var("PROXIMADB_NATIVE_TABLE_PROVIDER") };
 
-    let server = PgServer::start().await.expect("server");
+    let server = TestPgServer::start().await.expect("server");
     let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
         .await
         .expect("connect");
@@ -195,42 +110,49 @@ async fn body() {
          otherwise this test proves nothing about the gate"
     );
 
-    // KNOWN-BAD, pinned deliberately (ADR-040 pattern).
+    // Fail closed, never silently wrong (mandate #1).
     //
-    // A bare window function over a NATIVE table does not merely decline with the gate
-    // off — it returns a **silently wrong answer**: `val - lag(val) OVER (...)` comes
-    // back as `val` for every row, because `lag(...)` contributes nothing.
-    //
-    // This is the TD-187 defect, which was fixed only for *materialized* tables. The
-    // TD-187 engagement fix makes the query engage the relational pipeline, but with no
-    // DataFusion route available for a native table `try_run_select` returns `None` and
-    // the query falls through to the legacy single-table path, whose projection
-    // extractor has no expression parser and re-reads the bare `val` column.
-    //
-    // So TD-USUB-2 closes a **correctness** bug on this path, not just a capability gap
-    // (mandate #1: fail closed, never silently wrong). When the legacy path is fixed or
-    // the gate becomes default-ON, this assertion trips and should be deleted.
-    let known_bad = client
+    // A bare window function over a NATIVE table with the gate off has no DataFusion
+    // route, and the relational frontend declines `OVER (...)` (TD-187). It used to fall
+    // through to the legacy single-table path, whose projection extractor has no
+    // expression parser and re-read the bare `val` column — so `val - lag(val) OVER
+    // (...)` came back as `val` for every row (the former KNOWN-BAD pin). The pipeline
+    // now declines it with SQLSTATE 0A000 naming the function and the gate to enable.
+    let err = client
         .simple_query(
             "select id, val - lag(val) over (order by id) as delta from usub2_t order by id",
         )
         .await
-        .expect("legacy path currently serves this (wrongly) rather than declining");
-    let bad_deltas: Vec<String> = known_bad
-        .iter()
-        .filter_map(|m| match m {
-            tokio_postgres::SimpleQueryMessage::Row(r) => {
-                Some(r.get(1).unwrap_or("NULL").trim().to_string())
-            }
-            _ => None,
-        })
-        .collect();
+        .expect_err("a window function on a native table must decline with the gate OFF");
+    let db = err
+        .as_db_error()
+        .unwrap_or_else(|| panic!("expected a server error, got {err}"));
     assert_eq!(
-        bad_deltas,
-        vec!["5", "20", "12", "40"],
-        "KNOWN-BAD (TD-187 residual on the native path): with the gate OFF, delta must \
-         still equal val — if this changed, the legacy path was fixed and this pin \
-         should be removed"
+        db.code().code(),
+        "0A000",
+        "window decline must be feature_not_supported: {}",
+        pg_server::db_err(&err)
+    );
+    assert!(
+        db.message().contains("lag") && db.message().contains("PROXIMADB_NATIVE_TABLE_PROVIDER"),
+        "decline must name the window function and the gate: {}",
+        db.message()
+    );
+
+    // A window nested in another expression declines the same way (it used to
+    // escape detection and reach the legacy path).
+    let nested = client
+        .simple_query("select id, coalesce(lag(val) over (order by id), 0) as p from usub2_t")
+        .await
+        .expect_err("a nested window function must decline with the gate OFF");
+    let nested_db = nested
+        .as_db_error()
+        .unwrap_or_else(|| panic!("expected a server error, got {nested}"));
+    assert_eq!(nested_db.code().code(), "0A000");
+    assert!(
+        nested_db.message().contains("lag") && nested_db.message().contains("TD-USUB-2"),
+        "the nested window must be declined by the window decline: {}",
+        nested_db.message()
     );
 
     drop(client);
@@ -240,7 +162,7 @@ async fn body() {
     // SAFETY: see phase 1.
     unsafe { std::env::set_var("PROXIMADB_NATIVE_TABLE_PROVIDER", "1") };
 
-    let server = PgServer::start().await.expect("server 2");
+    let server = TestPgServer::start().await.expect("server 2");
     let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
         .await
         .expect("connect 2");
@@ -262,7 +184,7 @@ async fn body() {
         let rows = client.simple_query(sql).await.unwrap_or_else(|e| {
             panic!(
                 "`{label}` must serve on a NATIVE table: {}",
-                explain_err(&e)
+                pg_server::db_err(&e)
             )
         });
         let n = rows

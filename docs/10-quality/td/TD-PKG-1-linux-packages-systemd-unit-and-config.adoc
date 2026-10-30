@@ -5,7 +5,15 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open** (filed 2026-10-17). Found by reading the unit file, the packaged config and the code; not reproduced on an installed package.
+| Status | **Resolved (2026-10-25).**
+
+* **Service readiness:** the unit is `Type=simple` (the server never calls `sd_notify`, so `Type=notify` could never report ready) with `WorkingDirectory=/var/lib/proximadb`, so the `./log` rolling appender no longer resolves to `/` under `ProtectSystem=strict`.
+* **Data survives restarts:** the unit sets `PROXIMADB_DATA_DIR=/var/lib/proximadb`. The loader (TD-PKG-3 fix) rebases every config root still at the shipped `/tmp/proximadb` default under it, so the `PrivateTmp` wipe is harmless.
+* **Ownership:** `postinstall.sh` chowns `/var/lib/proximadb` and `/var/log/proximadb` to the service user unconditionally (the payload creates them root-owned before postinst).
+* **Release smoke** (`scripts/release_smoke/package_smoke.sh`) now asserts the unit is installed with `Type=simple` and that both state directories are `proximadb:proximadb` after install, on every distro it covers.
+* The `/tmp` entry left `ReadWritePaths` (the roots no longer live there).
+
+Not done here (minor, from the filed list): the archive clutter (`/usr/bin/config/`, `/usr/bin/README.adoc`, the `/tmp/postinstall.sh` payload paths) is unchanged. The Linux archive and the Homebrew formula keep shipping the development config; the documented `PROXIMADB_DATA_DIR` knob makes those roots safe, but the shipped file itself is unchanged.
 | Priority | **HIGH** — the documented RPM/DEB install path does not work as written.
 | Component | `deploy/packaging/systemd/proximadb.service`; `.github/workflows/release.yml` (RPM/DEB steps copy `config/config.toml` to `/etc/proximadb/`)
 | Relates to | ADR-096 durable outcome 1 ("`docker run` / install to a working query"); roadmap v0.5

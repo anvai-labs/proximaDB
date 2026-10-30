@@ -288,13 +288,12 @@ mod tests {
     fn record_with_vector(id: &str, values: Vec<f32>) -> ProximaRecord {
         ProximaRecord {
             oid: id.to_string(),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                dim: values.len() as u32,
-                values: proximadb_records::EmbeddingValues::Fp32(values),
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                values.len() as u32,
+                values,
+            )],
             ..Default::default()
         }
     }

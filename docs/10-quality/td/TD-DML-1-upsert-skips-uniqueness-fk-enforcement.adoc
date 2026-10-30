@@ -138,13 +138,17 @@ and, under `oltp-integrity`, `upsert_claims_and_releases_pk_in_fenced_store`.
 
 === Out of scope (tracked in other TDs)
 
-* `ON CONFLICT` target and action are not honoured (pre-existing scope of
-  this TD, tracked for a follow-up): the conflict is
-  always resolved on the primary key, `DO UPDATE SET …` assignments are not
-  evaluated (the whole proposed row replaces the existing one), and `DO NOTHING`
-  replaces instead of skipping. With this fix a conflict on a non-PK target
-  (`ON CONFLICT (email)`) fails closed with `23505` instead of silently
-  duplicating.
+* `ON CONFLICT` target and action: *resolved by*
+  link:TD-DML-3-on-conflict-target-and-action-semantics.adoc[TD-DML-3]
+  (2026-10-17). The target (columns / `ON CONSTRAINT` / none) now arbitrates,
+  `DO NOTHING` skips, and `DO UPDATE SET … [WHERE …]` is evaluated against the
+  existing row with `EXCLUDED`. The enforcement sequence above still runs on
+  every written row. The Upsert mode described above is replaced by
+  `RowWriteConstraintMode::OnConflict`. The 21000 check moved into
+  arbitration, so a statement that would update a row it already inserted or
+  updated raises 21000. A PK repeated within the statement that is not
+  arbitrated raises 23505. Remaining gaps (RETURNING, `AS alias`, PK
+  assignment) are listed in TD-DML-3.
 * A constraint violation raised while replaying a buffered transaction at
   COMMIT surfaces as `25P02`.
 * REST/gRPC record upserts and pgwire COPY (insert-only since #2036) do not

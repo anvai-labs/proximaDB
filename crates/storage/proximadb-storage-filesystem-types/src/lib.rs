@@ -14,9 +14,64 @@ use std::io::Error as IoError;
 /// TD-096 S2 / S1.5: GET-count instrumentation on the filesystem seam.
 pub mod counting;
 pub mod faults;
+mod forwarding;
+#[doc(hidden)]
+pub mod testing;
+
+// `forward_filesystem_impl!` expands in the caller's crate; these let it name
+// the attribute and the mmap type without the caller depending on either.
+#[doc(hidden)]
+pub use async_trait as __async_trait;
+#[doc(hidden)]
+pub use memmap2 as __memmap2;
+/// The object-store URL schemes (TD-IOBUDGET-1 single home).
+pub mod object_store_scheme;
 
 /// Turning logical byte needs into physical requests (ADR-034 P7).
 pub mod read_ranges_plan;
+
+/// Default `read_ranges_prefetch` width on object-store paths when
+/// `PROXIMADB_READ_RANGES_INFLIGHT` is unset (TD-PAXDIR-1 D6): a wave's ranges
+/// are independent GETs, so on a store that pays a round trip per request they
+/// run in parallel — one round instead of one per range. The same requests
+/// are issued; only their overlap changes. Matches the gate-run width
+/// (`--read-ranges-inflight 16`, P5b design §4.2).
+pub const OBJECT_STORE_READ_RANGES_INFLIGHT: usize = 16;
+
+/// The `read_ranges_prefetch` concurrency for `path`.
+///
+/// `PROXIMADB_READ_RANGES_INFLIGHT` (TD-RDSTRAT-12), parsed once:
+/// - `N > 0`: that cap, everywhere;
+/// - `0` (or unparseable): defer to `PROXIMADB_FS_READ_RANGES_PARALLEL` —
+///   the explicit way to restore sequential waves on an object store;
+/// - unset: [`OBJECT_STORE_READ_RANGES_INFLIGHT`] on object-store paths
+///   ([`object_store_scheme::ObjectStoreScheme`]), else defer to `PARALLEL`
+///   (local disk is unchanged).
+pub fn read_ranges_prefetch_inflight(path: &str) -> usize {
+    static INFLIGHT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    static PARALLEL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let configured = *INFLIGHT.get_or_init(|| {
+        std::env::var("PROXIMADB_READ_RANGES_INFLIGHT")
+            .ok()
+            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+    });
+    let parallel = || {
+        *PARALLEL.get_or_init(|| {
+            std::env::var("PROXIMADB_FS_READ_RANGES_PARALLEL")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0)
+        })
+    };
+    match configured {
+        Some(n) if n > 0 => n,
+        Some(_) => parallel(),
+        None if object_store_scheme::ObjectStoreScheme::of(path).is_some() => {
+            OBJECT_STORE_READ_RANGES_INFLIGHT
+        }
+        None => parallel(),
+    }
+}
 
 /// Filesystem operation result type
 pub type FsResult<T> = Result<T, FilesystemError>;
@@ -783,34 +838,7 @@ pub trait FileSystem: Send + Sync + std::fmt::Debug {
         path: &str,
         ranges: Vec<std::ops::Range<u64>>,
     ) -> FsResult<Vec<Vec<u8>>> {
-        // `PROXIMADB_READ_RANGES_INFLIGHT`: pure prefetch cap (TD-RDSTRAT-12).
-        // Parsed once + cached (fn-local `static` = persists across calls, read
-        // on the hot path without re-parsing env each call).
-        //
-        // Semantics (per ENV_GATE_REGISTRY):
-        // - unset = defer to PROXIMADB_FS_READ_RANGES_PARALLEL
-        // - 0 = same as PARALLEL
-        // - N > 0 = separate cap (independent of PARALLEL)
-        static INFLIGHT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let inflight = *INFLIGHT.get_or_init(|| {
-            std::env::var("PROXIMADB_READ_RANGES_INFLIGHT")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0) // Default: 0 = defer to PARALLEL (opt-in until measured)
-        });
-
-        // If INFLIGHT is 0 (default or explicitly set), defer to PARALLEL.
-        let inflight = if inflight == 0 {
-            static PARALLEL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-            *PARALLEL.get_or_init(|| {
-                std::env::var("PROXIMADB_FS_READ_RANGES_PARALLEL")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(0)
-            })
-        } else {
-            inflight
-        };
+        let inflight = read_ranges_prefetch_inflight(path);
 
         // Plan first: which physical reads serve which logical ranges.
         let plan = self.plan_read_ranges(&ranges)?;
@@ -981,11 +1009,18 @@ pub trait FileSystem: Send + Sync + std::fmt::Debug {
     /// Create directory and all parent directories
     async fn create_dir_all(&self, path: &str) -> FsResult<()>;
 
-    /// Copy file
-    async fn copy(&self, from: &str, to: &str) -> FsResult<()>;
+    /// Copy file. Default: read it whole, write it whole (what an object
+    /// store without a native copy does).
+    async fn copy(&self, from: &str, to: &str) -> FsResult<()> {
+        let data = self.read(from).await?;
+        self.write(to, &data, None).await
+    }
 
-    /// Move/rename file
-    async fn move_file(&self, from: &str, to: &str) -> FsResult<()>;
+    /// Move/rename file. Default: copy, then delete the source (not atomic).
+    async fn move_file(&self, from: &str, to: &str) -> FsResult<()> {
+        self.copy(from, to).await?;
+        self.delete(from).await
+    }
 
     /// Get filesystem type identifier
     fn filesystem_type(&self) -> &'static str;
@@ -1955,5 +1990,51 @@ pub(crate) mod read_ranges_coalescing_tests {
         // And the object-store error semantics survive untouched when OFF.
         let store = CountingFake::new(100, EofMode::Error, None);
         read(&store, vec![0..32, 200..232]).expect_err("past-EOF still errors when OFF");
+    }
+}
+
+#[cfg(test)]
+mod read_ranges_prefetch_inflight_tests {
+    use super::{OBJECT_STORE_READ_RANGES_INFLIGHT, read_ranges_prefetch_inflight};
+
+    /// TD-PAXDIR-1 D6: unset, object-store waves run in parallel and local
+    /// disk keeps deferring to `PROXIMADB_FS_READ_RANGES_PARALLEL`.
+    #[test]
+    fn unset_inflight_is_parallel_on_object_stores_only() {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe {
+            std::env::remove_var("PROXIMADB_READ_RANGES_INFLIGHT");
+            std::env::remove_var("PROXIMADB_FS_READ_RANGES_PARALLEL");
+        }
+        for remote in ["s3://b/seg.pax", "azure://c/seg.pax", "gs://b/seg.pax"] {
+            assert_eq!(
+                read_ranges_prefetch_inflight(remote),
+                OBJECT_STORE_READ_RANGES_INFLIGHT,
+                "{remote}"
+            );
+        }
+        for local in ["/data/seg.pax", "file:///data/seg.pax", "minio://b/seg.pax"] {
+            assert_eq!(read_ranges_prefetch_inflight(local), 0, "{local}");
+        }
+    }
+
+    /// An explicit `0` restores the deferral (sequential by default) on
+    /// object stores too.
+    #[test]
+    fn explicit_zero_restores_the_deferral_on_object_stores() {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe {
+            std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "0");
+            std::env::remove_var("PROXIMADB_FS_READ_RANGES_PARALLEL");
+        }
+        assert_eq!(read_ranges_prefetch_inflight("s3://b/seg.pax"), 0);
+    }
+
+    #[test]
+    fn an_explicit_cap_applies_everywhere() {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "4") };
+        assert_eq!(read_ranges_prefetch_inflight("s3://b/seg.pax"), 4);
+        assert_eq!(read_ranges_prefetch_inflight("/data/seg.pax"), 4);
     }
 }

@@ -1592,13 +1592,9 @@ impl HybridQueryEngine {
                                     created_at_ns: rec.timestamp.unwrap_or(now_ms) * 1_000_000,
                                     updated_at_ns: rec.updated_at.unwrap_or(now_ms) * 1_000_000,
                                     props,
-                                    embeddings: vec![EmbeddingCell {
-                                        model_id: "default".to_string(),
-                                        modality: "vector".to_string(),
-                                        values: proximadb_records::EmbeddingValues::Fp32(vector),
-                                        dim,
-                                        ..Default::default()
-                                    }],
+                                    embeddings: vec![EmbeddingCell::new_fp32(
+                                        "default", "vector", dim, vector,
+                                    )],
                                     ..Default::default()
                                 },
                             });
@@ -1665,15 +1661,12 @@ impl HybridQueryEngine {
                             created_at_ns: node.created_at_ms * 1_000_000,
                             updated_at_ns: node.updated_at_ms * 1_000_000,
                             props,
-                            embeddings: vec![EmbeddingCell {
-                                model_id: "default".to_string(),
-                                modality: "vector".to_string(),
-                                values: proximadb_records::EmbeddingValues::Fp32(
-                                    embedding.vector.clone(),
-                                ),
+                            embeddings: vec![EmbeddingCell::new_fp32(
+                                "default",
+                                "vector",
                                 dim,
-                                ..Default::default()
-                            }],
+                                embedding.vector.clone(),
+                            )],
                             ..Default::default()
                         },
                     });

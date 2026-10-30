@@ -164,9 +164,17 @@ impl ReferenceBackend for EngineBackend {
             .query
             .as_ref()
             .ok_or_else(|| BackendError::internal("query facade not available".to_string()))?;
-        port.explain_unified_query(q, Some(id))
-            .await
-            .map_err(|e| BackendError::internal(format!("explain failed: {e}")))
+        // The MCP session acts as its configured tenant (default when none).
+        let tenant = self
+            .tenant
+            .clone()
+            .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
+        crate::query::request_scope::with_request_tenant(
+            tenant,
+            port.explain_unified_query(q, Some(id)),
+        )
+        .await
+        .map_err(|e| BackendError::internal(format!("explain failed: {e}")))
     }
 
     async fn search(&self, args: &Value) -> Result<Value, BackendError> {
@@ -177,9 +185,16 @@ impl ReferenceBackend for EngineBackend {
             .query
             .as_ref()
             .ok_or_else(|| BackendError::internal("query facade not available".to_string()))?;
-        port.execute_unified_query(q, None, Some(id), limit)
-            .await
-            .map_err(|e| BackendError::internal(format!("search failed: {e}")))
+        let tenant = self
+            .tenant
+            .clone()
+            .unwrap_or_else(|| proximadb_tenant::DEFAULT_TENANT.to_string());
+        crate::query::request_scope::with_request_tenant(
+            tenant,
+            port.execute_unified_query(q, None, Some(id), limit),
+        )
+        .await
+        .map_err(|e| BackendError::internal(format!("search failed: {e}")))
     }
 
     async fn memory(&self, args: &Value) -> Result<Value, BackendError> {

@@ -23,7 +23,7 @@
 use anyhow::{Result, anyhow};
 use tracing::{debug, trace, warn};
 
-use crate::utils::{GpuBatchConfig, GpuBuffer};
+use super::utils::GpuBatchConfig;
 use proximadb_hardware_caps::HardwareBackend;
 
 // Import CUDA FFI bindings when available
@@ -176,7 +176,7 @@ pub fn cuda_delta_encode_f32(values: &[f32], base: f32) -> Result<Vec<i64>> {
 
     #[cfg(not(all(feature = "gpu", target_os = "linux", target_arch = "x86_64")))]
     {
-        let deltas: Vec<i64> = values.iter().map(|&v| (v - base) as i64).collect();
+        let deltas = super::cpu_fallback::delta_encode_f32(values, base);
         debug!(
             "✅ [CUDA] Delta encoded {} values → {} deltas (CPU fallback)",
             values.len(),
@@ -231,7 +231,7 @@ pub fn cuda_delta_decode_f32(deltas: &[i64], base: f32) -> Result<Vec<f32>> {
 
     #[cfg(not(all(feature = "gpu", target_os = "linux", target_arch = "x86_64")))]
     {
-        let values: Vec<f32> = deltas.iter().map(|&d| d as f32 + base).collect();
+        let values = super::cpu_fallback::delta_decode_f32(deltas, base);
         debug!(
             "✅ [CUDA] Delta decoded {} deltas → {} values (CPU fallback)",
             deltas.len(),
@@ -300,31 +300,8 @@ pub fn cuda_bitpack_encode_f32(values: &[f32], bits: u8) -> Result<Vec<u8>> {
 
     #[cfg(not(all(feature = "gpu", target_os = "linux", target_arch = "x86_64")))]
     {
-        // CPU fallback
-        let total_bits = values.len() * bits as usize;
-        let byte_count = (total_bits + 7) / 8;
-        let mut result = vec![0u8; byte_count];
-
-        let mask = if bits == 32 {
-            u32::MAX
-        } else {
-            (1u32 << bits) - 1
-        };
-
-        for (i, &value) in values.iter().enumerate() {
-            let bit_offset = i * bits as usize;
-            let byte_offset = bit_offset / 8;
-            let bit_in_byte = bit_offset % 8;
-
-            let masked_value = (value.to_bits()) & mask;
-            result[byte_offset] |= ((masked_value << bit_in_byte) & 0xFF) as u8;
-
-            if bit_in_byte + bits as usize > 8 {
-                if byte_offset + 1 < result.len() {
-                    result[byte_offset + 1] |= (masked_value >> (8 - bit_in_byte)) as u8;
-                }
-            }
-        }
+        // CPU fallback (shared scalar core; see kernels/cpu_fallback.rs)
+        let result = super::cpu_fallback::bitpack_encode_f32(values, bits)?;
 
         debug!(
             "✅ [CUDA] BitPacked encoded {} values → {} bytes (CPU fallback)",
@@ -385,28 +362,8 @@ pub fn cuda_bitpack_decode_f32(packed: &[u8], bits: u8, count: usize) -> Result<
 
     #[cfg(not(all(feature = "gpu", target_os = "linux", target_arch = "x86_64")))]
     {
-        // CPU fallback
-        let mut output = vec![0f32; count];
-        let mask = if bits == 32 {
-            u32::MAX
-        } else {
-            (1u32 << bits) - 1
-        };
-
-        for i in 0..count {
-            let bit_offset = i * bits as usize;
-            let byte_offset = bit_offset / 8;
-            let bit_in_byte = bit_offset % 8;
-
-            let mut value = ((packed[byte_offset] as u32) >> bit_in_byte) & mask;
-            if bit_in_byte + bits as usize > 8 && byte_offset + 1 < packed.len() {
-                let next_byte = packed[byte_offset + 1] as u32;
-                value |= (next_byte & ((1 << (bit_in_byte + bits as usize - 8)) - 1))
-                    << (8 - bit_in_byte);
-            }
-
-            output[i] = f32::from_bits(value);
-        }
+        // CPU fallback (shared scalar core; see kernels/cpu_fallback.rs)
+        let output = super::cpu_fallback::bitpack_decode_f32(packed, bits, count)?;
 
         debug!(
             "✅ [CUDA] BitPacked decoded {} bytes → {} values (CPU fallback)",
@@ -479,32 +436,8 @@ pub fn cuda_frame_of_reference_encode_f32(
 
     #[cfg(not(all(feature = "gpu", target_os = "linux", target_arch = "x86_64")))]
     {
-        // CPU fallback
-        let reference_f32 = reference as f32;
-        let offsets: Vec<i64> = values.iter().map(|&v| (v - reference_f32) as i64).collect();
-
-        let total_bits = offsets.len() * bits as usize;
-        let byte_count = (total_bits + 7) / 8;
-        let mut result = vec![0u8; byte_count];
-
-        let mask = if bits == 32 {
-            u32::MAX
-        } else {
-            (1u32 << bits) - 1
-        };
-
-        for (i, &offset) in offsets.iter().enumerate() {
-            let bit_offset = i * bits as usize;
-            let byte_offset = bit_offset / 8;
-            let bit_in_byte = bit_offset % 8;
-
-            let masked_value = (offset as u32) & mask;
-            result[byte_offset] |= ((masked_value << bit_in_byte) & 0xFF) as u8;
-
-            if bit_in_byte + bits as usize > 8 && byte_offset + 1 < result.len() {
-                result[byte_offset + 1] |= (masked_value >> (8 - bit_in_byte)) as u8;
-            }
-        }
+        // CPU fallback (shared scalar core; see kernels/cpu_fallback.rs)
+        let result = super::cpu_fallback::frame_of_reference_encode_f32(values, reference, bits)?;
 
         debug!(
             "✅ [CUDA] FrameOfReference encoded {} values → {} bytes (CPU fallback)",
@@ -569,33 +502,9 @@ pub fn cuda_frame_of_reference_decode_f32(
 
     #[cfg(not(all(feature = "gpu", target_os = "linux", target_arch = "x86_64")))]
     {
-        // CPU fallback
-        let mask = if bits == 32 {
-            u32::MAX
-        } else {
-            (1u32 << bits) - 1
-        };
-        let mut offsets = Vec::with_capacity(count);
-
-        for i in 0..count {
-            let bit_offset = i * bits as usize;
-            let byte_offset = bit_offset / 8;
-            let bit_in_byte = bit_offset % 8;
-
-            let mut value = ((packed[byte_offset] as u32) >> bit_in_byte) & mask;
-            if bit_in_byte + bits as usize > 8 && byte_offset + 1 < packed.len() {
-                let next_byte = packed[byte_offset + 1] as u32;
-                value |= (next_byte & ((1 << (bit_in_byte + bits as usize - 8)) - 1))
-                    << (8 - bit_in_byte);
-            }
-            offsets.push(value as i64);
-        }
-
-        let reference_f32 = reference as f32;
-        let decoded: Vec<f32> = offsets
-            .into_iter()
-            .map(|o| (o as f32) + reference_f32)
-            .collect();
+        // CPU fallback (shared scalar core; see kernels/cpu_fallback.rs)
+        let decoded =
+            super::cpu_fallback::frame_of_reference_decode_f32(packed, reference, bits, count)?;
 
         debug!(
             "✅ [CUDA] FrameOfReference decoded {} bytes → {} values (CPU fallback)",

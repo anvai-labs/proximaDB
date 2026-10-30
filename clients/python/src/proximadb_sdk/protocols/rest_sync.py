@@ -45,10 +45,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from ..batching_unified import (
-    BatchConfig,
-    ThreadedBatchProcessor,
-)
+from ..batching_unified import BatchConfig, ThreadedBatchProcessor
 from ..cache import ResponseCache
 from ..config import ClientConfig, load_config
 from ..exceptions import (
@@ -75,6 +72,7 @@ from ..models import (
     ServerCapabilities,
     UpdateSchemaResponse,
     VectorArray,
+    normalize_collection_config_kwargs,
 )
 from ..models_v2 import ProximaRecord
 from ..proto_conversion import ProtoConverter
@@ -600,9 +598,20 @@ class ProximaDBClient:
             ... )
             >>> collection = client.create_collection("products", config)
         """
+        # TD-SDKENG-1 (round-2 review): the raw client normalizes too —
+        # engine= used to be silently dropped here exactly as in the
+        # unified clients. Aliases apply, unknowns raise, pass-through
+        # stays out of the config (schema/initial_capacity are already
+        # explicit keyword parameters of this method).
+        config_kwargs, _extra = normalize_collection_config_kwargs(
+            {k: v for k, v in kwargs.items() if k not in ("schema", "initial_capacity")}
+        )
         if config is None:
-            # Include name in kwargs for config creation
-            config = CollectionConfig(name=name, **kwargs)
+            config = CollectionConfig(name=name, **config_kwargs)
+        elif config_kwargs:
+            merged = config.model_dump(exclude={"name"})
+            merged.update(config_kwargs)
+            config = CollectionConfig(name=name, **merged)
 
         # Validate filterable metadata fields limit in client
         if (
@@ -901,6 +910,39 @@ class ProximaDBClient:
                 v2_request_data["schema"] = schema
         if initial_capacity is not None:
             v2_request_data["initial_capacity"] = initial_capacity
+        # TD-SDKENG-1 (round-3 review): the sync v2 body carried NO index or
+        # quantization settings — the request-schema spellings (the async
+        # client's twin of this block) must be here too.
+        if getattr(config, "index_configs", None):
+            v2_request_data["index_configs"] = [
+                {
+                    "index_name": index.index_name,
+                    "algorithm": getattr(index.algorithm, "value", index.algorithm),
+                    **(
+                        {
+                            "hnsw_config": {
+                                "m": index.hnsw_config.m,
+                                "ef_construction": index.hnsw_config.ef_construction,
+                                "ef_search": index.hnsw_config.ef_search,
+                            }
+                        }
+                        if index.hnsw_config
+                        else {}
+                    ),
+                    "is_primary": bool(index.is_primary),
+                }
+                for index in config.index_configs
+            ]
+        quant = getattr(config, "quantization_config", None)
+        if quant and quant.enabled:
+            v2_quant: dict[str, Any] = {"enabled": True}
+            # The server's QuantizationConfigInput.strategy is
+            # SMART_DEFAULTS|CUSTOM_LEVELS|MINIMAL|AGGRESSIVE — the SDK's
+            # type (scalar/pq/...) is a METHOD, not a strategy. A concrete
+            # method means custom levels; the default needs no key.
+            if getattr(quant.type, "value", quant.type) not in (None, "none"):
+                v2_quant["strategy"] = "custom_levels"
+            v2_request_data["quantization"] = v2_quant
         # Spec-driven request shape/path via the generated REST transport
         # (TD-126 Phase 4); the HTTP call still goes through _make_request.
         call = _gen.create_collection(v2_request_data)
@@ -1659,6 +1701,21 @@ class ProximaDBClient:
             batch_size=batch_size,
         )
 
+    @staticmethod
+    def _unwrap_props_cells(props: Any) -> dict[str, Any]:
+        """TD-SDKERR-1: REST returns properties as `{"type": ..., "value": ...}`
+        cells (proto-aligned); gRPC returns plain values. Unwrap the cells so
+        both transports expose plain `metadata[key]` values."""
+        if not isinstance(props, dict):
+            return props or {}
+        unwrapped: dict[str, Any] = {}
+        for key, cell in props.items():
+            if isinstance(cell, dict) and set(cell.keys()) == {"type", "value"}:
+                unwrapped[key] = cell["value"]
+            else:
+                unwrapped[key] = cell
+        return unwrapped
+
     def search(
         self,
         collection_id: str,
@@ -1797,7 +1854,9 @@ class ProximaDBClient:
                     rank=result.get("rank", 0),
                     vector=(result.get("vector", []) if include_vectors else None),
                     metadata=(
-                        result.get("props", result.get("metadata", {}))
+                        self._unwrap_props_cells(
+                            result.get("props", result.get("metadata", {}))
+                        )
                         if include_metadata
                         else None
                     ),

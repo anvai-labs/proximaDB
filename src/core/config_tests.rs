@@ -40,6 +40,7 @@ mod tests {
             compaction_config: Default::default(),
             prune_mode: None,
             optimization: OptimizationConfig::default(),
+            reservation_pools: Vec::new(),
         };
 
         let storage_urls = config.storage_urls();

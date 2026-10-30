@@ -2,6 +2,138 @@
 
 All notable changes to ProximaDB will be documented in this file.
 
+## [0.5.0] - 2026-10-29
+
+Lakehouse-publication release: **211** merged PRs (203 merge commits plus 8
+squash or custom-titled merges on the first-parent line; 645 commits) since
+`v0.4.1`, counted from origin's `v0.4.1` tag (commit `c4043fb3f`) to `develop`
+at `62213e4ca`.
+
+### Upgrade notes (read before deploying)
+- **Back up first: rollback to v0.4.x is unsupported.** Back up the
+  `data_dir` AND every object-store prefix the deployment writes (the Iceberg
+  warehouse, PAX segments, spill): deletion vectors and new PAX footers can live
+  outside `data_dir`. Data format 2 is the
+  default: canonical-WAL segment rotation, WAL truncation and Layer A spill are
+  on (ADR-097 P2). Once the truncator runs, spill segments are the only copy of
+  some rows, and v0.4.x binaries do not read sealed WAL segments. The
+  `{data_dir}/pgwire/DATA_FORMAT` marker (format 2) makes this and later
+  binaries refuse a newer-format directory, but v0.4.x predates the marker and
+  cannot check it. To go back, restore the pre-upgrade backup.
+- **Incremental MATERIALIZE is ON by default** (`PROXIMADB_MATERIALIZE_INCREMENTAL_DV`).
+  After an UPDATE or DELETE, `ALTER TABLE … MATERIALIZE` carries the published
+  files, appends the changed rows and hides old row versions with Iceberg v3
+  deletion vectors (`dv-mat-*.puffin`) instead of rewriting the table. It falls
+  back to a compacting rewrite past 20% of rows or 500k positions deleted, at
+  64 or more parts, or above 1M changed rows. Insert-only republication
+  likewise appends new multi-part, generation-named files. Both incremental
+  paths share `PROXIMADB_MATERIALIZE_APPEND_MAX_ROWS` (default 1M; `0`
+  disables both); `PROXIMADB_MATERIALIZE_INCREMENTAL_DV=0` restores full
+  rewrites after updates and deletes only.
+- **Iceberg format versions.** v0.4.1 published every table as format-version 3
+  without row lineage. 0.5.0 adopts those tables: their first 0.5.0
+  MATERIALIZE starts row lineage at 0, which is safe because they never handed
+  out a row id. New 0.5.0 tables publish **v2** by default
+  (`PROXIMADB_ICEBERG_V3_DEFAULT` is OFF) **unless they have a TIMESTAMP or
+  TIMESTAMPTZ column**: nanosecond timestamps need v3, so those tables are v3
+  from their first MATERIALIZE. Other tables become v3 at their first
+  republication that writes deletion vectors. External read-back is verified
+  for pyiceberg 0.12 (REST and static) and DuckDB 1.5, not Trino; v2-only
+  consumers cannot read a table once it is v3.
+- **External readers of deletion-vector tables.** A v0.4.x binary, or any reader
+  that ignores Iceberg deletes, silently resurrects deleted rows and shows
+  updated rows twice. To publish without vectors, set
+  `PROXIMADB_MATERIALIZE_INCREMENTAL_DV=0` and re-MATERIALIZE.
+- **Do not disable `PROXIMADB_OLAP_ORDERED_DV_BASE` on its own** while incremental
+  MATERIALIZE is on: OLAP reads of tables with deletion vectors would refuse
+  after every write. Disarm both and re-MATERIALIZE (see `ENV_GATE_REGISTRY`).
+- **PAX residual tail is ON** (`PROXIMADB_PAX_RESIDUAL_TAIL`). New vector/PAX
+  segments with typed filterable columns carry a v2 field-map section that
+  v0.4.x readers reject at the footer parse. During a rolling or mixed-version
+  upgrade, set `PROXIMADB_PAX_RESIDUAL_TAIL=0` until every node runs 0.5.0.
+- **Spill cannot be switched off after use.** Setting
+  `PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT=0` over a spill root that already
+  holds segments refuses boot, because those rows may be in no retained WAL
+  entry.
+- **SST is the default engine** for vector collections created with no index,
+  quantization, recall target or policy (previously the Beta HELIX engine).
+
+### Added
+- **Iceberg deletes and incremental publication (TD-USUB-10):** v3 deletion
+  vectors, Puffin files and delete manifests; delete-aware readers on every
+  path (DataFusion, DuckDB, external read-back); an ordered-DV-base OLAP merge so
+  later writes merge over a deletion-vector base; insert-only republication
+  appends; Puffin GC; a seeded incremental soak with external read-back in CI.
+  An opt-in (default OFF) per-DELETE live publisher behind the visibility fence
+  contract.
+- **Bounded-memory MATERIALIZE (P2.4):** multi-part, generation-named Parquet,
+  spill-merged chunked scans, a hidden `__proxima_oid` row key, fenced snapshot
+  advance; the TPC-DS SF1 harness loads in bounded memory.
+- **Layer A streaming SQL (ADR-097 P3.1, P3.2a), opt-in:** behind
+  `PROXIMADB_NATIVE_TABLE_PROVIDER=1` (default OFF), ungoverned sessions only —
+  a streaming table provider for native SQL with no row cap, oid-range partitions, row-group pruning with a key
+  spine, residual-aware pruning, DataFusion dynamic filters; queries mixing
+  Parquet and native tables (P3.1), or over table functions alone (P3.2a), run
+  on DataFusion.
+- **Canonical WAL:** segmented WAL with a per-segment LSN index, a scheduled
+  truncator, durable branch merge-base images (TD-SEAM-12), per-partition
+  truncation floors, lagging-partition flush so small tables stop pinning
+  truncation.
+- **PAX vector search:** a collection-global centroid directory (TD-PAXDIR-1,
+  defaults ON), parallel object-store waves, residual-tail store-once and an
+  instrumented filtered path (TD-FPRUNE-1).
+- **Storage classes (TD-TIER-1):** storage-class policy, reservation grants that
+  protect cached segment data, pin-safe eviction and live residency status.
+- **OLTP (ADR-095):** atomic pgwire COMMIT and writer-epoch fencing on a
+  reattachable WAL volume (default OFF).
+- A one-command agent-memory demo; release evidence (provenance plus registry
+  install smoke) for every artifact.
+
+### Fixed
+- Upgrade (found by a v0.4.1 → 0.5.0 drill on real data): tables MATERIALIZEd
+  by v0.4.1 read correctly before their first 0.5.0 MATERIALIZE (v0.4.1
+  recorded paths relative to the warehouse root), and republish instead of
+  failing closed (Iceberg v3 without row lineage is adopted at row id 0). A
+  golden fixture of real v0.4.1 output guards both.
+- Read-after-write: deleted rows no longer resurrected and flushed updates no
+  longer lost on vector collections; filtered-path search is WAL-authoritative
+  with TTL on PAX hits.
+- DML: `INSERT … ON CONFLICT` honours its target and action (TD-DML-3); UNIQUE
+  and FOREIGN KEY use the declared key (TD-RELIDEQ-2).
+- pgwire: extended-protocol Describe reports the columns Execute streams
+  (TD-PGEXT-1); window functions without a DataFusion route decline (0A000)
+  instead of answering wrong.
+- Catalog: atomic table replace and ordered schema updates (TD-CATREPLACE-1).
+- Tenancy: every collection surface resolves within the request tenant; an
+  absent scope denies.
+- REST v2 rejects unknown and invalid create settings (TD-RESTGET-1); gRPC/REST
+  serve the persisted collection schema (TD-GRPCSCHEMA-1/2).
+- SDKs: the Python SDK surfaces failures and honours `engine=`; the TypeScript
+  SDK validates `index()`.
+- Packaging: shipped RPM/DEB artifacts persist data and the service starts
+  (TD-PKG-1/2/3). Object stores report a missing object as NotFound on S3,
+  Azure and GCS. The server installs SIGINT/SIGTERM handlers before boot.
+
+### Security
+- RUSTSEC-2026-0367/0368/0369 (zip via duckdb), 0381/0382/0383 (webpki trust
+  anchors), 0385 (ctutils), 0414 (pulldown-cmark, build-time via prost-build)
+  and 0418 (libz-sys) cleared; the panic policy now
+  covers the whole workspace (TD-PANICSCOPE-1).
+- **Known, not fixed:** 13 zstd advisories published 2026-10-26
+  (RUSTSEC-2026-0391 for zstd 0.13.3; 0395–0406 for zstd-safe 7.2.4) ship
+  ignored in `.cargo/audit.toml`. Three are vulnerability-class (0391, 0398,
+  0403); the rest are unsound warnings on streaming, seekable and buffer APIs.
+  No lock-level fix exists: the patched releases need zstd >= 0.14.3 and
+  zstd-safe >= 8.2.0, while arrow-ipc and parquet 59 pin zstd ^0.13 and
+  compression-codecs (async-compression, via tower-http) co-pins zstd-safe
+  7.x. Retiring them needs both an arrow major and a tower-http /
+  async-compression move (TD-AUDITGATE-1).
+
+### Internal
+- Duplication ratchet (may only go down); more than 18k lines of verified-dead
+  code and 52 orphaned source files removed; a shared pgwire e2e harness; dependency upgrades (avro, tantivy,
+  OpenTelemetry, sha2, toml, metrics, ONNX Runtime with one shared environment).
+
 ## [0.4.1] - 2026-10-16
 
 ### Fixed

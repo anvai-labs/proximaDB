@@ -1135,14 +1135,12 @@ mod tests {
             oid: oid.to_string(),
             local_id: Some(oid.to_string()),
             updated_at_ns,
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "test-model".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: 4,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.1, 0.2, 0.3, 0.4]),
-                precision: proximadb_records::EmbeddingScalarType::Fp32,
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "test-model",
+                "dense_vector",
+                4,
+                vec![0.1, 0.2, 0.3, 0.4],
+            )],
             ..proximadb_records::ProximaRecord::default()
         }
     }
@@ -1615,5 +1613,43 @@ mod tests {
             }
         }
         out
+    }
+
+    // ========================================================================
+    // ids/vectors count validation (redundancy pass 3)
+    // ========================================================================
+
+    #[test]
+    fn test_insert_rejects_ids_vectors_count_mismatch() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config = EmbeddedConfig::for_low_memory(temp_dir.path().to_string_lossy().as_ref());
+        let db = EmbeddedProximaDB::new(config).expect("create embedded db");
+
+        db.execute_sql(
+            "CREATE TABLE IF NOT EXISTS \"insert_mismatch_t\" (
+                \"record_id\" TEXT NOT NULL,
+                \"embedding\" VECTOR(4),
+                PRIMARY KEY (\"record_id\")
+            ) WITH (storage_engine = 'SST');",
+            None,
+            None,
+        )
+        .expect("create table");
+
+        // 2 ids, 1 vector: must be rejected, not silently zip-truncated to 1
+        let result = db.insert(
+            "insert_mismatch_t",
+            vec!["a".to_string(), "b".to_string()],
+            vec![vec![0.0, 0.1, 0.2, 0.3]],
+            None,
+        );
+
+        let err = result.expect_err("mismatched ids/vectors must fail, not truncate");
+        assert!(
+            err.to_string()
+                .contains("IDs count (2) must match vectors count (1)"),
+            "unexpected error: {err}"
+        );
+        db.close();
     }
 }

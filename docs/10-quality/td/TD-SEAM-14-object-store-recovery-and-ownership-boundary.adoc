@@ -1,0 +1,49 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SEAM-14: object-store spill recovery and ownership boundary (S2/S3)
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-25 from the M1 rebase review (contract refinement: object-store recovery and ownership guarantees).
+| Priority | HIGH. Gates object-store spill placement leaving opt-in, and any second-writer / restored-bucket deployment.
+| Component | `src/services/spill_placement.rs` (#2231), `src/services/record_spill.rs`, `src/services/wal_truncator.rs`, the canonical WAL appender; recorded as the two open follow-ups on the TD-SEAM-3 row.
+| Relates to | TD-SEAM-3 (object-store placement landed #2231), TD-SEAM-2 (truncation floors), ADR-020 (canonical WAL authority), ADR-094 (one substrate)
+|===
+
+== Problem
+
+An acknowledged write today is a local canonical-WAL append (fsync) plus, after a flush,
+remote spill segments under `PROXIMADB_RELATIONAL_SPILL_URL`. Two boundaries are undefined:
+
+. **Durability boundary.** The WAL is local; the segments are remote. What an acknowledged
+  write survives — process crash, node loss, total loss of the writer's local disk — is not
+  written down, and neither is the recovery procedure (replay order, what a node that lost
+  its WAL may serve, when it must refuse).
+. **Ownership boundary.** Placement is fenced only at boot: a local placement marker plus a
+  prefix owner marker whose epoch advances every boot (#2231). (a) A copy of a data
+  directory booted while the original runs presents a fresh epoch and can purge segments the
+  original still serves. (b) A bucket restored to a point *inside* the current run passes the
+  boot check, so in-run rollback is undetected.
+
+== Plan
+
+. Write the acknowledged-write durability boundary down (which fsync/PUT acknowledgments
+  imply survival of which failure classes), and the recovery procedure for a writer that
+  lost its local disk; drill it as a test, not prose.
+. Runtime owner fence: re-read the owner epoch/nonce before every destructive operation
+  (purge, truncation-driven delete, flush overwrite), and treat a mismatch as a hard refusal
+  to delete — the running owner wins, the late boot refuses.
+. In-run rollback high-water: epoch-stamped segment names (or an equivalent forward-only
+  marker) so a restored bucket reads as "older than this run" and is refused.
+. Placement stays opt-in (`PROXIMADB_RELATIONAL_SPILL_URL`, default off) until the fence and
+  the high-water land; multi-writer object storage stays unsupported until then.
+
+== Acceptance
+
+* Boot a second writer on a copied data directory while the first serves: it must not delete
+  or purge anything the first is serving (test, not review).
+* Restore the bucket to a mid-run point: the writer detects rollback and refuses rather than
+  serving mixed generations.
+* The documented durability boundary matches tested behavior (a recovery drill that loses the
+  local WAL and replays from remote segments + whatever the boundary promises).

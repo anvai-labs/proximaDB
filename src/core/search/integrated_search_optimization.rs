@@ -373,6 +373,7 @@ impl AdvancedSearchOptimizer {
     ) -> Result<Vec<OptimizedSearchRecord>> {
         // Create a StorageQueryContext from the parameters
         let collection = Arc::new(crate::proto::proximadb_v1::Collection {
+            storage_class_status: None,
             id: collection_id.to_string(),
             config: None,
             stats: None,
@@ -586,14 +587,14 @@ impl AdvancedSearchOptimizer {
         Ok(results)
     }
 
-    /// Check result cache for cached query results
-    async fn check_result_cache(
-        &self,
+    /// Cache key for a (collection, query, params) triple — the v1 and the
+    /// legacy cache paths must derive the SAME key.
+    fn result_cache_key(
         collection_id: &str,
         query_vector: &[f32],
         params: &SearchParams,
-    ) -> Result<Option<Vec<OptimizedSearchRecord>>> {
-        let key = QueryKey::new(
+    ) -> QueryKey {
+        QueryKey::new(
             collection_id.to_string(),
             query_vector,
             params.top_k.unwrap_or(10) as u32,
@@ -602,7 +603,17 @@ impl AdvancedSearchOptimizer {
                 .as_ref()
                 .map(|f| format!("{:?}", f))
                 .as_deref(),
-        );
+        )
+    }
+
+    /// Check result cache for cached query results
+    async fn check_result_cache(
+        &self,
+        collection_id: &str,
+        query_vector: &[f32],
+        params: &SearchParams,
+    ) -> Result<Option<Vec<OptimizedSearchRecord>>> {
+        let key = Self::result_cache_key(collection_id, query_vector, params);
         // Prefer v1 cached results if present
         if let Some(cached_v1) = self
             .query_cache
@@ -669,16 +680,7 @@ impl AdvancedSearchOptimizer {
         params: &SearchParams,
         results: &[OptimizedSearchRecord],
     ) -> Result<()> {
-        let key = QueryKey::new(
-            collection_id.to_string(),
-            query_vector,
-            params.top_k.unwrap_or(10) as u32,
-            params
-                .filters
-                .as_ref()
-                .map(|f| format!("{:?}", f))
-                .as_deref(),
-        );
+        let key = Self::result_cache_key(collection_id, query_vector, params);
 
         // Convert to proto SearchVectorRecord for caching
         let proto_results = crate::proto::proximadb_v1::SearchResult {

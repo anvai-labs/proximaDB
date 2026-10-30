@@ -128,8 +128,8 @@ surface table in link:../SUPPORTED_SURFACE.adoc[SUPPORTED_SURFACE.adoc].
   in depth.
 * link:storage-engines.adoc[Storage engines] — which vector engine to use and why.
 * link:../architecture-diagrams/README.md[Architecture diagrams] — per-subsystem drill-downs.
-* link:../00-product/VISION.adoc[Vision] and
-  link:../_internal/roadmap/STRATEGIC_ROADMAP.adoc[Roadmap] — where it is going and in what order.
+* link:../current/VISION.adoc[Vision] and
+  link:../current/ROADMAP.adoc[Roadmap] — where it is going and in what order.
 
 '''
 _Last Updated_: 2026-10-17 — rewritten for ADR-096. Removed: the "8-model" target, the phase and

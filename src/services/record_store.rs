@@ -31,6 +31,7 @@ use proximadb_catalog::{
     CatalogPhysicalFormat, CatalogStorageLayout, CatalogStorageSpecialization, CatalogTableSchema,
     CatalogWorkloadProfile,
 };
+use proximadb_records::chunked::{RecordChunkStream, merge_newest_wins, once_then_chunks};
 use proximadb_records::{
     ProximaRecord, ProximaTreeNode, RecordKey, RecordScanOptions, RecordScanPredicate,
     RecordStorage,
@@ -179,6 +180,32 @@ pub trait TableWalAppender: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Whether [`Self::read_all_entries`] returns the log (`false` for the
+    /// default, which returns nothing). Only then is an empty change feed proof
+    /// that nothing changed.
+    fn has_readable_log(&self) -> bool {
+        false
+    }
+
+    /// Entries with `sequence_number > since` that may belong to
+    /// `collection_id`, oldest first (callers still filter by collection). The
+    /// default reads everything; a segmented WAL (P2.1) reads only the segments
+    /// whose LSN summary can contain a match, so a change-feed read stops
+    /// costing the whole log.
+    async fn read_entries_since(
+        &self,
+        collection_id: &str,
+        since: u64,
+    ) -> Result<Vec<CanonicalWalEntry>> {
+        let _ = collection_id;
+        Ok(self
+            .read_all_entries()
+            .await?
+            .into_iter()
+            .filter(|e| e.sequence_number > since)
+            .collect())
+    }
+
     /// Highest sequence_number assigned to an entry for `collection_id`, when the
     /// appender tracks per-collection watermarks. `None` (default) = unknown ⇒ the
     /// caller must scan. Used by the TD-OLAP-17 fast-path in `read_changes_since`:
@@ -202,6 +229,78 @@ pub trait TableWalAppender: Send + Sync {
     /// time at TPC-DS SF 0.02).
     fn tracks_collection_high_water(&self) -> bool {
         false
+    }
+
+    /// Highest sequence number assigned so far, when the appender knows it.
+    /// `None` (default) ⇒ unknown, and an in-flight write reservation then
+    /// blocks WAL truncation entirely (TD-SEAM-12).
+    fn last_sequence(&self) -> Option<u64> {
+        None
+    }
+
+    /// First sequence still readable after WAL truncation; `0` (default) when
+    /// nothing was ever truncated. A change-feed read asking for history below
+    /// it fails with [`WalHistoryTruncated`] instead of returning a gap.
+    ///
+    /// [`WalHistoryTruncated`]: crate::services::canonical_wal::WalHistoryTruncated
+    fn retained_from(&self) -> u64 {
+        0
+    }
+
+    /// Pin the history after a snapshot LSN chosen from the head (see
+    /// [`FramedTableWalAppender::pin_history`]). `None` (default): the
+    /// appender never truncates, so there is nothing to pin.
+    ///
+    /// [`FramedTableWalAppender::pin_history`]: crate::services::FramedTableWalAppender::pin_history
+    async fn pin_history(
+        &self,
+        snapshot_lsn: &(dyn Fn(u64) -> u64 + Send + Sync),
+    ) -> Result<Option<(u64, crate::services::canonical_wal::WalHistoryPin)>> {
+        let _ = snapshot_lsn;
+        Ok(None)
+    }
+}
+
+/// Writes whose WAL entries are durable but not yet applied to their partition
+/// (TD-SEAM-12). Each holds a reservation at the lowest sequence it can carry
+/// — the appender's `last_sequence() + 1` read BEFORE its append — so a
+/// truncation floor taken while it is in flight can never pass it, even though
+/// no partition shows its rows yet.
+#[derive(Debug, Default)]
+struct InflightWrites {
+    reservations: parking_lot::Mutex<std::collections::BTreeMap<u64, usize>>,
+}
+
+/// Releases its reservation on drop, so every exit path — success, error,
+/// cancellation — clears it.
+struct InflightReservation<'a> {
+    writes: &'a InflightWrites,
+    floor: u64,
+}
+
+impl InflightWrites {
+    fn reserve(&self, floor: u64) -> InflightReservation<'_> {
+        *self.reservations.lock().entry(floor).or_insert(0) += 1;
+        InflightReservation {
+            writes: self,
+            floor,
+        }
+    }
+
+    fn floor(&self) -> Option<u64> {
+        self.reservations.lock().keys().next().copied()
+    }
+}
+
+impl Drop for InflightReservation<'_> {
+    fn drop(&mut self) {
+        let mut reservations = self.writes.reservations.lock();
+        if let Some(count) = reservations.get_mut(&self.floor) {
+            *count -= 1;
+            if *count == 0 {
+                reservations.remove(&self.floor);
+            }
+        }
     }
 }
 
@@ -258,6 +357,14 @@ pub struct TableRecordWriteResult {
     pub errors: Vec<String>,
     /// Optional stable error code.
     pub error_code: Option<String>,
+    /// The maximum durable WAL LSN of this batch's entries, when the appender
+    /// bound them (a count mismatch disables the association — see
+    /// `write_mutations`). The live delete publisher uses it to clamp its
+    /// recorded fence LSN at or above the tombstones it publishes
+    /// (round-4 review, MAJOR-1: a fresh capture alone can sit BELOW them,
+    /// because `capture_snapshot_lsn` subtracts the STORE-GLOBAL inflight
+    /// floor, which a concurrent write on any other table lowers).
+    pub max_lsn: Option<u64>,
 }
 
 impl TableRecordWriteResult {
@@ -268,6 +375,7 @@ impl TableRecordWriteResult {
             metrics: OperationMetrics::default(),
             errors: Vec::new(),
             error_code: None,
+            max_lsn: None,
         }
     }
 
@@ -275,6 +383,7 @@ impl TableRecordWriteResult {
         Self {
             success: false,
             record_ids: Vec::new(),
+            max_lsn: None,
             metrics: OperationMetrics::default(),
             errors: vec![error.into()],
             error_code: Some(error_code.into()),
@@ -290,6 +399,7 @@ impl TableRecordWriteResult {
             metrics: result.metrics,
             errors: result.errors,
             error_code: result.error_code,
+            max_lsn: None,
         }
     }
 }
@@ -319,6 +429,28 @@ fn normalize_object_path_prefix(location: &str) -> String {
         .map(|(_, rest)| rest)
         .unwrap_or(location);
     without_scheme.trim_matches('/').to_string()
+}
+
+/// Encode a partition identity component (tenant id or collection key) as one
+/// path segment, INJECTIVELY: `[A-Za-z0-9.-]` pass through and every other
+/// byte (including `_` itself) becomes `_XX` hex. Two distinct tables must
+/// never share a spill prefix — `sanitize_object_path_segment` maps `a/b` and
+/// `a_b` to the same string, which here would merge their rows.
+fn spill_path_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("_{byte:02X}"));
+        }
+    }
+    // `.` and `..` alone would be path navigation, and an empty segment would
+    // collapse a level; all three get an explicit marker instead.
+    match out.as_str() {
+        "" | "." | ".." => format!("_{out}_"),
+        _ => out,
+    }
 }
 
 fn sanitize_object_path_segment(value: &str) -> String {
@@ -391,20 +523,27 @@ fn mutation_kind_label(kind: TableRecordMutationKind) -> &'static str {
     }
 }
 
+/// The shared name stem for an object-store mutation object:
+/// `{table}-{kind}-{nanos}` — the per-format path builders below add their
+/// directory prefix and extension.
+fn mutation_object_stem(schema: &CatalogTableSchema, kind: TableRecordMutationKind) -> String {
+    let table = sanitize_object_path_segment(&schema.name);
+    let sequence = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{table}-{}-{sequence}", mutation_kind_label(kind))
+}
+
 fn object_store_parquet_mutation_path(
     schema: &CatalogTableSchema,
     kind: TableRecordMutationKind,
     tenant_context: Option<&TenantContext>,
 ) -> ObjectPath {
     let base = object_store_write_base_path(schema, tenant_context);
-    let table = sanitize_object_path_segment(&schema.name);
-    let sequence = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
     ObjectPath::from(format!(
-        "{base}data/{table}-{}-{sequence}.parquet",
-        mutation_kind_label(kind)
+        "{base}data/{}.parquet",
+        mutation_object_stem(schema, kind)
     ))
 }
 
@@ -414,14 +553,9 @@ fn object_store_pax_segment_path(
     tenant_context: Option<&TenantContext>,
 ) -> ObjectPath {
     let base = object_store_write_base_path(schema, tenant_context);
-    let table = sanitize_object_path_segment(&schema.name);
-    let sequence = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
     ObjectPath::from(format!(
-        "{base}segments/{table}-{}-{sequence}{PAX_SEGMENT_EXT}",
-        mutation_kind_label(kind)
+        "{base}segments/{stem}{PAX_SEGMENT_EXT}",
+        stem = mutation_object_stem(schema, kind)
     ))
 }
 
@@ -526,6 +660,31 @@ pub struct ChangeRow {
     pub collection: String,
     pub key: String,
     pub props: Option<serde_json::Value>,
+}
+
+/// A table snapshot's position in the canonical WAL (ADR-025): every change
+/// at or below `lsn` is visible to a scan started after the capture, and the
+/// OLAP read-merge replays every change above it. While `pin` is held the WAL
+/// keeps every entry above `lsn` (TD-SEAM-12); drop it once `lsn` is recorded
+/// in the catalog, whose published snapshots then hold the truncation floor.
+#[derive(Debug)]
+pub struct SnapshotLsn {
+    pub lsn: u64,
+    pub pin: Option<crate::services::canonical_wal::WalHistoryPin>,
+}
+
+/// The pre-truncation snapshot LSN: the table's newest change, or `0`. Sound
+/// only for a store whose WAL never truncates.
+async fn snapshot_lsn_from_change_feed<S: TableRecordStore + ?Sized>(
+    store: &S,
+    collection_id: &str,
+) -> SnapshotLsn {
+    let lsn = store
+        .read_changes_since(collection_id, 0)
+        .await
+        .map(|changes| changes.iter().map(|c| c.lsn).max().unwrap_or(0))
+        .unwrap_or(0);
+    SnapshotLsn { lsn, pin: None }
 }
 
 /// Build a [`ChangeRow`] for `collection_id` from a canonical WAL entry, or `None`
@@ -677,6 +836,61 @@ pub trait TableRecordStore: Send + Sync {
         ))
     }
 
+    /// A flush-consistent snapshot of the table's partition for the streaming
+    /// Layer A provider (ADR-097 P3.1), or `Ok(None)` when this store cannot
+    /// offer one — the caller then keeps its materialized scan. Taking it
+    /// reads no segment.
+    ///
+    /// Rows are NOT filtered: the reader applies table membership, liveness
+    /// and the caller's row access after resolving newest-wins.
+    async fn layer_a_snapshot(
+        &self,
+        table_schema: &CatalogTableSchema,
+        tenant_context: Option<&TenantContext>,
+        #[cfg(feature = "abac-policy")] read_context: &ReadContext,
+    ) -> Result<Option<crate::services::layer_a_snapshot::LayerASnapshot>> {
+        #[cfg(feature = "abac-policy")]
+        let _ = read_context;
+        let _ = (table_schema, tenant_context);
+        Ok(None)
+    }
+
+    /// Every visible record of the table as an ordered chunk stream
+    /// ([`RecordChunkStream`]: strictly ascending `oid`, each once, chunks of at
+    /// most `chunk_rows`). `request.limit` is ignored. The stream owns its inputs
+    /// (`'static`), so a bounded-memory consumer such as MATERIALIZE can drive it
+    /// while it writes. Authorization (ABAC) stays with the caller, which applies
+    /// its row filter per chunk.
+    ///
+    /// Default: correct but not bounded — `scan_records`, then sorted chunks.
+    fn scan_records_chunked(
+        self: Arc<Self>,
+        table_schema: CatalogTableSchema,
+        request: TableRecordScanRequest,
+        chunk_rows: usize,
+        tenant_context: Option<TenantContext>,
+    ) -> RecordChunkStream<'static>
+    where
+        Self: 'static,
+    {
+        once_then_chunks(
+            async move {
+                self.scan_records(
+                    &table_schema,
+                    TableRecordScanRequest {
+                        limit: None,
+                        ..request
+                    },
+                    tenant_context.as_ref(),
+                    #[cfg(feature = "abac-policy")]
+                    &ReadContext::system(SystemReadReason::Statistics, "scan_records_chunked"),
+                )
+                .await
+            },
+            chunk_rows,
+        )
+    }
+
     /// Scan with a row `predicate` pushed into the store (relational `WHERE`
     /// push-down). Returns up to `request.limit` records matching `predicate`;
     /// the store applies it, so callers must NOT re-filter afterward. This lets
@@ -776,9 +990,44 @@ pub trait TableRecordStore: Send + Sync {
                 return Ok(Some(UniqueConflict {
                     columns: set.columns.clone(),
                     tuple,
+                    oid: existing.oid.clone(),
                 }));
             }
         }
+        Ok(None)
+    }
+
+    /// TD-DML-3: the FULL canonical record envelope for `key` (not the lossy
+    /// `RichSearchResult` projection `get_by_key` returns), classified as
+    /// live / dead (tombstoned or TTL-expired — `ProximaRecord::is_dead`) /
+    /// absent. DML uses it to (a) treat a dead row as no conflict and (b)
+    /// rewrite a row from its whole envelope (TTL, every vector column).
+    ///
+    /// The default is [`RecordEnvelopeLookup::Unsupported`]; callers then fall
+    /// back to `get_by_key`.
+    async fn get_record_envelope(
+        &self,
+        table_schema: &CatalogTableSchema,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<RecordEnvelopeLookup> {
+        let _ = (table_schema, key, tenant_context);
+        Ok(RecordEnvelopeLookup::Unsupported)
+    }
+
+    /// TD-DML-3: whether this store's DURABLE log holds a live write of `key`
+    /// for the table — `Some(true)` the last durable operation on `key` is an
+    /// upsert, `Some(false)` provably none (never written, deleted, or the
+    /// partition was dropped since), `None` the store cannot tell. Used to
+    /// reconcile a fenced PK claim whose row is absent after an ambiguous write
+    /// failure: only a provable `Some(false)` lets the claim be released.
+    async fn durable_row_write(
+        &self,
+        table_schema: &CatalogTableSchema,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<Option<bool>> {
+        let _ = (table_schema, key, tenant_context);
         Ok(None)
     }
 
@@ -819,17 +1068,119 @@ pub trait TableRecordStore: Send + Sync {
     /// with `None`/empty treated as the unscoped/default tenant). Required for the
     /// OLAP read-merge because the WAL `collection_id` is the bare table name (not
     /// tenant-unique), so two tenants sharing a table name would otherwise share
-    /// the feed. The default delegates to the tenant-agnostic [`read_changes_since`];
-    /// the WAL-backed store overrides it to enforce isolation.
+    /// the feed. The default returns nothing: a store that cannot filter its change
+    /// log by tenant must not serve one (never the tenant-agnostic feed). The
+    /// WAL-backed store and every store that routes to it override this.
     async fn read_changes_since_scoped(
         &self,
         collection_id: &str,
         tenant: Option<&str>,
         since_lsn: u64,
     ) -> Result<Vec<ChangeRow>> {
-        let _ = tenant;
-        self.read_changes_since(collection_id, since_lsn).await
+        let _ = (collection_id, tenant, since_lsn);
+        Ok(Vec::new())
     }
+
+    /// Whether every write to `table_schema` reaches the change feed
+    /// [`Self::read_changes_since_scoped`] serves. Only then does an empty feed
+    /// prove the table unchanged (P2.4 incremental MATERIALIZE). The default is
+    /// `false`; the WAL-backed store and the stores that route to it override it.
+    fn has_change_feed(&self, table_schema: &CatalogTableSchema) -> bool {
+        let _ = table_schema;
+        false
+    }
+
+    /// Capture the snapshot LSN for MATERIALIZE before it scans the table
+    /// (ADR-025). The default reads the table's newest change, which is sound
+    /// only when the WAL never truncates; the WAL-backed store pins history
+    /// instead, and every store that routes to it forwards this.
+    async fn capture_snapshot_lsn(&self, collection_id: &str) -> Result<SnapshotLsn> {
+        Ok(snapshot_lsn_from_change_feed(self, collection_id).await)
+    }
+}
+
+/// TD-DML-3: marker carried by a `write_mutations` error raised BEFORE the
+/// store made anything durable (validation, health, existence-read failures),
+/// so the caller may release state it reserved for the write — e.g. fenced PK
+/// claims. Any `Err` WITHOUT this marker may follow a durable append and must
+/// be treated as durability-unknown. Attached with [`rejected_before_append`];
+/// `Display` is the original message, so user-visible text is unchanged.
+#[derive(Debug, Clone)]
+pub struct RejectedBeforeAppend(String);
+
+impl std::fmt::Display for RejectedBeforeAppend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Mark `error` as raised before anything was made durable (see
+/// [`RejectedBeforeAppend`]). The original error stays in the chain, so typed
+/// violations (SQLSTATEs) are still found.
+pub fn rejected_before_append(error: anyhow::Error) -> anyhow::Error {
+    let message = error.to_string();
+    error.context(RejectedBeforeAppend(message))
+}
+
+/// Whether `error` carries the [`RejectedBeforeAppend`] marker.
+pub fn is_rejected_before_append(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RejectedBeforeAppend>().is_some()
+}
+
+/// TD-DML-3: result of [`TableRecordStore::get_record_envelope`].
+#[derive(Debug, Clone)]
+pub enum RecordEnvelopeLookup {
+    /// A live row and its full envelope.
+    Live(Box<ProximaRecord>),
+    /// The store holds the key but the row is dead (tombstoned / TTL-expired).
+    Dead,
+    /// The store does not hold the key.
+    Absent,
+    /// The store cannot serve full envelopes; use `get_by_key`.
+    Unsupported,
+}
+
+impl RecordEnvelopeLookup {
+    /// Classify a raw point-lookup result (which may include a dead copy).
+    pub fn classify(record: Option<ProximaRecord>) -> Self {
+        match record {
+            None => Self::Absent,
+            Some(record) if record.is_dead(unix_now_ns()) => Self::Dead,
+            Some(record) => Self::Live(Box::new(record)),
+        }
+    }
+}
+
+/// Wall-clock nanoseconds since the Unix epoch (the `is_dead` clock).
+pub(crate) fn unix_now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Mandate #16a: whether `key` holds a LIVE row in `partition` (or the
+/// legacy cutover partition). A dead copy (TTL-expired) does not occupy the
+/// key, so an INSERT over it is not a conflict and an UPDATE of it finds
+/// nothing (TD-DML-3).
+async fn live_row_present(
+    partition: &Arc<dyn RecordStorage>,
+    legacy: Option<&Arc<dyn RecordStorage>>,
+    key: &RecordKey,
+) -> Result<bool> {
+    let now_ns = unix_now_ns();
+    // The primary partition wins when it holds the key at all (a dead primary
+    // copy shadows an older legacy one), exactly as the reads resolve it.
+    if let Some(record) = partition.get_record(key).await? {
+        return Ok(!record.is_dead(now_ns));
+    }
+    Ok(match legacy {
+        Some(legacy) => legacy
+            .get_record(key)
+            .await?
+            .is_some_and(|record| !record.is_dead(now_ns)),
+        None => false,
+    })
 }
 
 /// One unique column set plus the candidate tuples a write intends to insert
@@ -843,13 +1194,17 @@ pub struct UniqueCandidateSet {
     pub candidates: std::collections::HashSet<Vec<String>>,
 }
 
-/// A detected uniqueness violation: which column set, and the existing tuple.
+/// A detected uniqueness violation: which column set, the existing tuple, and
+/// the row holding it.
 #[derive(Debug, Clone)]
 pub struct UniqueConflict {
     /// The violated unique constraint/index columns.
     pub columns: Vec<String>,
     /// The committed tuple that the candidate collided with.
     pub tuple: Vec<String>,
+    /// Oid of the row holding `tuple` — the row an `ON CONFLICT` on this
+    /// constraint arbitrates against (TD-DML-3).
+    pub oid: String,
 }
 
 /// Canonical comparable-text rendering of a scalar `ProximaValue` for UNIQUE/PK
@@ -1004,6 +1359,31 @@ pub(crate) fn schema_unique_column_sets(table_schema: &CatalogTableSchema) -> Ve
     sets
 }
 
+/// TD-RELIDEQ-2: the column whose value IS the whole record `oid` — a
+/// declared single-column primary key. `None` for a keyless table (generated
+/// `oid`; `id`/`record_id` live in `props`) and for a composite key (the `oid`
+/// encodes the whole tuple, not one column). UNIQUE tuples, the unique index
+/// and FOREIGN KEY resolution read a column from the `oid` only when it is
+/// this one; every other column comes from `props`, which holds every column
+/// (`CatalogRow::to_proxima_record`).
+pub(crate) fn schema_oid_key_column(table_schema: &CatalogTableSchema) -> Option<String> {
+    match proximadb_catalog::relational::effective_primary_key(table_schema).as_slice() {
+        [column] => Some((*column).to_string()),
+        _ => None,
+    }
+}
+
+/// TD-RELIDEQ-2: the declared primary-key columns (composite-aware, empty for a
+/// keyless table) — the columns a row's `oid` encodes.
+pub(crate) fn schema_declared_primary_key_columns(
+    table_schema: &CatalogTableSchema,
+) -> Vec<String> {
+    proximadb_catalog::relational::effective_primary_key(table_schema)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
 /// The single-column primary key for a table (explicit, else conventional
 /// `id`/`record_id`). The PK value lives in `oid`, not `props` — see
 /// [`record_unique_tuple`].
@@ -1122,12 +1502,17 @@ pub(crate) fn build_unique_candidate_sets(
                 continue; // NULL/absent in the tuple → exempt
             };
             if !candidates.insert(tuple.clone()) {
-                return Err(anyhow!(
-                    "duplicate key value violates unique constraint on ({}) for table '{}': ({}) appears more than once in this statement",
-                    columns.join(", "),
-                    table_schema.name,
-                    tuple.join(", ")
-                ));
+                // Typed (23505) like every other UNIQUE rejection (TD-DML-3).
+                return Err(proximadb_catalog::relational::RelationalConstraintViolation::new(
+                    proximadb_catalog::relational::RelationalConstraintKind::Unique,
+                    format!(
+                        "duplicate key value violates unique constraint on ({}) for table '{}': ({}) appears more than once in this statement",
+                        columns.join(", "),
+                        table_schema.name,
+                        tuple.join(", ")
+                    ),
+                )
+                .into());
             }
         }
         if !candidates.is_empty() {
@@ -1184,6 +1569,28 @@ impl CatalogRoutingTableRecordStore {
 
 #[async_trait]
 impl TableRecordStore for CatalogRoutingTableRecordStore {
+    async fn durable_row_write(
+        &self,
+        table_schema: &CatalogTableSchema,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<Option<bool>> {
+        self.store_for_schema(table_schema)
+            .durable_row_write(table_schema, key, tenant_context)
+            .await
+    }
+
+    async fn get_record_envelope(
+        &self,
+        table_schema: &CatalogTableSchema,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<RecordEnvelopeLookup> {
+        self.store_for_schema(table_schema)
+            .get_record_envelope(table_schema, key, tenant_context)
+            .await
+    }
+
     async fn drop_table_records(
         &self,
         table_schema: &CatalogTableSchema,
@@ -1268,6 +1675,34 @@ impl TableRecordStore for CatalogRoutingTableRecordStore {
             .await
     }
 
+    async fn layer_a_snapshot(
+        &self,
+        table_schema: &CatalogTableSchema,
+        tenant_context: Option<&TenantContext>,
+        #[cfg(feature = "abac-policy")] read_context: &ReadContext,
+    ) -> Result<Option<crate::services::layer_a_snapshot::LayerASnapshot>> {
+        self.store_for_schema(table_schema)
+            .layer_a_snapshot(
+                table_schema,
+                tenant_context,
+                #[cfg(feature = "abac-policy")]
+                read_context,
+            )
+            .await
+    }
+
+    fn scan_records_chunked(
+        self: Arc<Self>,
+        table_schema: CatalogTableSchema,
+        request: TableRecordScanRequest,
+        chunk_rows: usize,
+        tenant_context: Option<TenantContext>,
+    ) -> RecordChunkStream<'static> {
+        self.store_for_schema(&table_schema)
+            .clone()
+            .scan_records_chunked(table_schema, request, chunk_rows, tenant_context)
+    }
+
     async fn scan_records_filtered(
         &self,
         table_schema: &CatalogTableSchema,
@@ -1330,6 +1765,19 @@ impl TableRecordStore for CatalogRoutingTableRecordStore {
             .read_changes_since_scoped(collection_id, tenant, since_lsn)
             .await
     }
+
+    async fn capture_snapshot_lsn(&self, collection_id: &str) -> Result<SnapshotLsn> {
+        self.iceberg_store.capture_snapshot_lsn(collection_id).await
+    }
+
+    /// Only a relational route writes to `iceberg_store`, whose feed this
+    /// router serves.
+    fn has_change_feed(&self, table_schema: &CatalogTableSchema) -> bool {
+        matches!(
+            TableRecordStoreRoute::for_schema(table_schema),
+            TableRecordStoreRoute::RelationalStorage
+        ) && self.iceberg_store.has_change_feed(table_schema)
+    }
 }
 
 /// Compatibility implementation backed by `VectorOps`.
@@ -1350,6 +1798,22 @@ impl VectorOpsTableRecordStore {
 
 #[async_trait]
 impl TableRecordStore for VectorOpsTableRecordStore {
+    /// TD-DML-3: the full envelope from the vector store (dead copies
+    /// included), so UPDATE / DO UPDATE on a vector table keep every vector
+    /// column and the TTL, and a dead holder is told apart from a live one.
+    async fn get_record_envelope(
+        &self,
+        table_schema: &CatalogTableSchema,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<RecordEnvelopeLookup> {
+        Ok(RecordEnvelopeLookup::classify(
+            self.vector_ops
+                .get_record_envelope_with_tenant_context(&table_schema.name, key, tenant_context)
+                .await?,
+        ))
+    }
+
     async fn write_mutations(
         &self,
         table_schema: &CatalogTableSchema,
@@ -1419,10 +1883,89 @@ pub struct RecordStorageTableRecordStore {
     storage: Arc<dyn RecordStorage>,
 }
 
+/// The scan options for a table scan request: the request's limit pushed
+/// down, and the tenant's partition selected when a tenant context is
+/// present — shared prologue of `RecordStorageTableRecordStore`'s scan
+/// methods.
+fn table_scan_options(
+    request: &TableRecordScanRequest,
+    tenant_context: Option<&TenantContext>,
+) -> RecordScanOptions {
+    let mut options = request
+        .limit
+        .map(RecordScanOptions::limit)
+        .unwrap_or_else(RecordScanOptions::unbounded);
+    if let Some(tenant_context) = tenant_context {
+        options = options.with_tenant_id(tenant_context.tenant_id.clone());
+    }
+    options
+}
+
+/// Apply a scan request's limit and include flags to already-materialized
+/// records — shared tail of the object-store `scan_records` impls (truncate
+/// to the limit, then strip vectors and/or props as requested).
+fn truncate_and_project_scan(records: &mut Vec<ProximaRecord>, request: &TableRecordScanRequest) {
+    if let Some(limit) = request.limit {
+        records.truncate(limit);
+    }
+    if !request.include_vector {
+        for record in records.iter_mut() {
+            record.embeddings.clear();
+        }
+    }
+    if !request.include_props {
+        for record in records.iter_mut() {
+            record.props.clear();
+        }
+    }
+}
+
 impl RecordStorageTableRecordStore {
     /// Wrap a canonical record storage implementation.
     pub fn new(storage: Arc<dyn RecordStorage>) -> Self {
         Self { storage }
+    }
+
+    /// The ordered chunk scan of one record partition, with the same table
+    /// membership (`variation_id`) and vector/prop stripping as `scan_records`.
+    fn partition_chunks(
+        storage: Arc<dyn RecordStorage>,
+        table_name: String,
+        request: &TableRecordScanRequest,
+        chunk_rows: usize,
+        tenant_id: Option<String>,
+    ) -> RecordChunkStream<'static> {
+        let mut options = RecordScanOptions::unbounded();
+        if let Some(tenant_id) = tenant_id {
+            options = options.with_tenant_id(tenant_id);
+        }
+        let (include_vector, include_props) = (request.include_vector, request.include_props);
+        storage
+            .scan_record_chunks(options, chunk_rows)
+            .filter_map(move |chunk| {
+                let chunk = chunk.map(|mut records| {
+                    records.retain(|record| {
+                        record
+                            .variation_id
+                            .as_deref()
+                            .is_none_or(|variation| variation == table_name)
+                    });
+                    for record in &mut records {
+                        if !include_vector {
+                            record.embeddings.clear();
+                        }
+                        if !include_props {
+                            record.props.clear();
+                        }
+                    }
+                    records
+                });
+                futures::future::ready(match chunk {
+                    Ok(records) if records.is_empty() => None,
+                    other => Some(other),
+                })
+            })
+            .boxed()
     }
 }
 
@@ -1443,7 +1986,7 @@ impl TableRecordStore for RecordStorageTableRecordStore {
 
             match kind {
                 TableRecordMutationKind::Insert => {
-                    if self.storage.get_record(&key).await?.is_some() {
+                    if live_row_present(&self.storage, None, &key).await? {
                         return Ok(TableRecordWriteResult::failure(
                             format!(
                                 "Record '{}' already exists in table '{}'",
@@ -1478,6 +2021,19 @@ impl TableRecordStore for RecordStorageTableRecordStore {
         Ok(TableRecordWriteResult::success(record_ids))
     }
 
+    async fn get_record_envelope(
+        &self,
+        _table_schema: &CatalogTableSchema,
+        key: &str,
+        _tenant_context: Option<&TenantContext>,
+    ) -> Result<RecordEnvelopeLookup> {
+        Ok(RecordEnvelopeLookup::classify(
+            self.storage
+                .get_record_including_dead(&RecordKey::new(key.to_string()))
+                .await?,
+        ))
+    }
+
     async fn get_by_key(
         &self,
         table_schema: &CatalogTableSchema,
@@ -1506,14 +2062,7 @@ impl TableRecordStore for RecordStorageTableRecordStore {
         tenant_context: Option<&TenantContext>,
         #[cfg(feature = "abac-policy")] _read_context: &ReadContext,
     ) -> Result<TableRecordScanResponse> {
-        let mut options = request
-            .limit
-            .map(RecordScanOptions::limit)
-            .unwrap_or_else(RecordScanOptions::unbounded);
-        if let Some(tenant_context) = tenant_context {
-            options = options.with_tenant_id(tenant_context.tenant_id.clone());
-        }
-
+        let options = table_scan_options(&request, tenant_context);
         let mut records = self.storage.scan_records_with_options(options).await?;
         records.retain(|record| {
             record
@@ -1522,17 +2071,24 @@ impl TableRecordStore for RecordStorageTableRecordStore {
                 .map(|variation| variation == table_schema.name)
                 .unwrap_or(true)
         });
-        if !request.include_vector {
-            for record in &mut records {
-                record.embeddings.clear();
-            }
-        }
-        if !request.include_props {
-            for record in &mut records {
-                record.props.clear();
-            }
-        }
+        truncate_and_project_scan(&mut records, &request);
         Ok(records)
+    }
+
+    fn scan_records_chunked(
+        self: Arc<Self>,
+        table_schema: CatalogTableSchema,
+        request: TableRecordScanRequest,
+        chunk_rows: usize,
+        tenant_context: Option<TenantContext>,
+    ) -> RecordChunkStream<'static> {
+        Self::partition_chunks(
+            self.storage.clone(),
+            table_schema.name,
+            &request,
+            chunk_rows,
+            tenant_context.map(|t| t.tenant_id),
+        )
     }
 
     async fn scan_records_filtered(
@@ -1543,13 +2099,7 @@ impl TableRecordStore for RecordStorageTableRecordStore {
         tenant_context: Option<&TenantContext>,
         #[cfg(feature = "abac-policy")] _read_context: &ReadContext,
     ) -> Result<TableRecordScanResponse> {
-        let mut options = request
-            .limit
-            .map(RecordScanOptions::limit)
-            .unwrap_or_else(RecordScanOptions::unbounded);
-        if let Some(tenant_context) = tenant_context {
-            options = options.with_tenant_id(tenant_context.tenant_id.clone());
-        }
+        let options = table_scan_options(&request, tenant_context);
 
         // Fold the table-membership (variation_id) check INTO the pushed-down
         // predicate so the store's early-stop counts only fully-matching rows —
@@ -1568,16 +2118,7 @@ impl TableRecordStore for RecordStorageTableRecordStore {
             .scan_records_filtered(options, Some(&combined))
             .await?;
 
-        if !request.include_vector {
-            for record in &mut records {
-                record.embeddings.clear();
-            }
-        }
-        if !request.include_props {
-            for record in &mut records {
-                record.props.clear();
-            }
-        }
+        truncate_and_project_scan(&mut records, &request);
         Ok(records)
     }
 }
@@ -1667,8 +2208,9 @@ impl TableUniqueIndex {
         }
     }
 
-    /// First candidate tuple in `candidates` that already exists for the set
-    /// matching `columns`, owned by some oid NOT in `exclude_oids`, if any.
+    /// Every `(candidate tuple, owner oid)` in `candidates` that already exists
+    /// for the set matching `columns`, owned by an oid NOT in `exclude_oids`.
+    /// The caller filters out owners that are dead (TTL-expired).
     /// `exclude_oids` lets an UPDATE ignore the rows it is itself rewriting (so a
     /// row keeping or vacating its own unique value is not a self-conflict).
     fn conflict(
@@ -1676,16 +2218,20 @@ impl TableUniqueIndex {
         columns: &[String],
         candidates: &std::collections::HashSet<Vec<String>>,
         exclude_oids: &std::collections::HashSet<String>,
-    ) -> Option<Vec<String>> {
-        let set = self.sets.iter().find(|set| set.columns == columns)?;
+    ) -> Vec<(Vec<String>, String)> {
+        let Some(set) = self.sets.iter().find(|set| set.columns == columns) else {
+            return Vec::new();
+        };
         candidates
             .iter()
-            .find(|candidate| {
-                set.tuple_to_oids
-                    .get(*candidate)
-                    .is_some_and(|owners| owners.iter().any(|oid| !exclude_oids.contains(oid)))
+            .filter_map(|candidate| Some((candidate, set.tuple_to_oids.get(candidate)?)))
+            .flat_map(|(candidate, owners)| {
+                owners
+                    .iter()
+                    .filter(|oid| !exclude_oids.contains(*oid))
+                    .map(move |oid| (candidate.clone(), oid.clone()))
             })
-            .cloned()
+            .collect()
     }
 }
 
@@ -1786,6 +2332,85 @@ impl TableSecondaryIndex {
     }
 }
 
+/// Catalog schemas the spill partitions encode with, keyed like the partitions
+/// (`(tenant, collection key)`). Filled by `partitions_for` on every write —
+/// the one place the schema is in hand — and read by a partition at each flush
+/// through its [`SpillSchemaSource`](crate::services::record_spill::SpillSchemaSource).
+///
+/// Boot seeding fills a second, per-collection map from the catalog before WAL
+/// replay, so a partition replay creates encodes with its schema before any
+/// write arrives. The catalog does not record which tenant wrote a table, and
+/// two tenants may share a table name, so a collection key that maps to
+/// different schemas is recorded as ambiguous and gets no fallback.
+#[derive(Default)]
+struct SchemaHints {
+    by_partition:
+        parking_lot::RwLock<std::collections::HashMap<(String, String), Arc<CatalogTableSchema>>>,
+    /// Seeded at boot; `None` = ambiguous (several distinct schemas).
+    by_collection:
+        parking_lot::RwLock<std::collections::HashMap<String, Option<Arc<CatalogTableSchema>>>>,
+}
+
+fn same_columns(a: &CatalogTableSchema, b: &CatalogTableSchema) -> bool {
+    a.columns.len() == b.columns.len()
+        && a.columns.iter().zip(&b.columns).all(|(x, y)| {
+            x.name == y.name && x.data_type == y.data_type && x.is_deleted == y.is_deleted
+        })
+}
+
+impl SchemaHints {
+    /// Record `schema` for the partition, replacing a stale one (an `ALTER
+    /// TABLE`); an unchanged schema costs a read-lock and a column compare.
+    fn note(&self, tenant_id: &str, collection: &str, schema: &CatalogTableSchema) {
+        let key = (tenant_id.to_string(), collection.to_string());
+        if self
+            .by_partition
+            .read()
+            .get(&key)
+            .is_some_and(|held| same_columns(held, schema))
+        {
+            return;
+        }
+        self.by_partition
+            .write()
+            .insert(key, Arc::new(schema.clone()));
+    }
+
+    /// Boot seeding: record `schema` as the fallback for `collection`, or mark
+    /// the key ambiguous if a different schema already claims it.
+    fn seed(&self, collection: &str, schema: &CatalogTableSchema) {
+        let mut by_collection = self.by_collection.write();
+        match by_collection.get_mut(collection) {
+            None => {
+                by_collection.insert(collection.to_string(), Some(Arc::new(schema.clone())));
+            }
+            Some(slot) => {
+                if slot
+                    .as_ref()
+                    .is_some_and(|held| !same_columns(held, schema))
+                {
+                    *slot = None;
+                }
+            }
+        }
+    }
+
+    fn get(&self, tenant_id: &str, collection: &str) -> Option<CatalogTableSchema> {
+        if let Some(schema) = self
+            .by_partition
+            .read()
+            .get(&(tenant_id.to_string(), collection.to_string()))
+        {
+            return Some((**schema).clone());
+        }
+        self.by_collection
+            .read()
+            .get(collection)
+            .and_then(|slot| slot.as_ref())
+            .map(|schema| (**schema).clone())
+    }
+}
+
 pub struct DirectWalTableRecordStore {
     /// Per-(tenant_id, collection) record partitions, created on demand via
     /// `storage_factory`. TD-064: tenant + collection isolation is STRUCTURAL —
@@ -1813,6 +2438,16 @@ pub struct DirectWalTableRecordStore {
     /// speculatively to throw the result away is no longer merely wasteful.
     shared_storage: bool,
     wal_appender: Arc<dyn TableWalAppender>,
+    /// Appended-but-not-yet-applied writes (TD-SEAM-12); see [`InflightWrites`].
+    inflight: InflightWrites,
+    /// Per partition, the WAL head at its last successful lag flush
+    /// (TD-USUB-22). A partition is lag-flushed at most once per lag window,
+    /// whatever that flush achieved: one whose oldest rows a flush cannot move
+    /// (held resident by a codec hold or an ambiguous oid, or a purge's hold)
+    /// costs at most one small segment per window, and is retried each window
+    /// in case it can move now. A failed flush is not recorded, so the next
+    /// run retries it.
+    lag_flushed: std::sync::Mutex<std::collections::HashMap<(String, String), u64>>,
     /// TD-110 Slice C: UNIQUE/PK index keyed by `(tenant_id, collection)` so a
     /// table's UNIQUE/PK enforcement is per-tenant. Presence of a key == "index
     /// built". Lazily built on first `check_unique_conflict`, then maintained on
@@ -1830,6 +2465,24 @@ pub struct DirectWalTableRecordStore {
     /// transaction, so every read and write is refused until a restart replays
     /// the WAL — never serve a half-applied commit.
     poisoned: std::sync::atomic::AtomicBool,
+    /// Set by [`Self::new_spilling`]: the catalog schemas its spill partitions
+    /// encode with. `None` for stores whose partitions never encode a segment.
+    schema_hints: Option<Arc<SchemaHints>>,
+    /// Set by [`Self::new_spilling`]: the filesystem its spill partitions write
+    /// segments with, which a [`Self::layer_a_snapshot`] reader must read them
+    /// through. `None` for stores whose partitions never write a segment.
+    segment_filesystem: Option<Arc<dyn crate::storage::persistence::filesystem::FileSystem>>,
+}
+
+/// Synthetic collections whose rows a service store appends straight to the
+/// canonical WAL and replays itself: never table data.
+fn is_store_owned_collection(collection_id: &str) -> bool {
+    [
+        crate::services::branch_base_store::BRANCH_BASES_COLLECTION_ID,
+        crate::services::FUNCTIONS_COLLECTION_ID,
+        crate::services::RANK_PROFILES_COLLECTION_ID,
+    ]
+    .contains(&collection_id)
 }
 
 impl DirectWalTableRecordStore {
@@ -1870,8 +2523,8 @@ impl DirectWalTableRecordStore {
     /// to durable Parquet segments once resident rows exceed the configured bound
     /// (TD-USUB-1 slice 2a).
     ///
-    /// **Default-OFF by construction, and off means the legacy TYPE.** With
-    /// `PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT` unset this builds
+    /// **Off means the legacy TYPE.** With
+    /// `PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT` off (`0`) this builds
     /// [`MemtableRecordStorage`] — the same store [`Self::new_partitioned`] builds —
     /// rather than a spill store configured never to flush. Mandate #8: with the
     /// marker absent, the shipped path is byte-identical to the legacy one, not
@@ -1890,45 +2543,259 @@ impl DirectWalTableRecordStore {
     /// prefix. That is why slice 2b (WAL truncation) requires catalog-registered
     /// segments first: truncation may only reference a segment whose location is
     /// recorded somewhere recovery can read it. See TD-USUB-1.
+    /// The production constructor (TD-SEAM-3 / TD-USUB-1 item iii): with the
+    /// spill gate (`PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT`) off (`0`) this is
+    /// exactly [`Self::new_partitioned`]; on (the default), partitions spill to
+    /// local Parquet segments under `spill_root`, beside the canonical WAL they
+    /// recover with — `{spill_root}/{tenant}/{collection}`, each component
+    /// encoded injectively ([`spill_path_segment`]).
+    ///
+    /// Local by default: segments next to the local WAL are durable exactly as
+    /// long as it is, and recovery needs no catalog lookup to find them. See
+    /// [`Self::open_for_server_at`] for the object-store placement.
+    pub async fn open_for_server(
+        wal_appender: Arc<dyn TableWalAppender>,
+        spill_root: std::path::PathBuf,
+    ) -> Result<Self> {
+        Self::open_for_server_at(
+            wal_appender,
+            crate::services::spill_placement::SpillTarget::Local(spill_root),
+        )
+        .await
+    }
+
+    /// [`Self::open_for_server`] with segments at `target`: a local root, or
+    /// an object-store prefix (`PROXIMADB_RELATIONAL_SPILL_URL`, resolved and
+    /// guarded by [`crate::services::spill_placement::resolve_spill_target`]),
+    /// at `{url}/{tenant}/{collection}` — derived from exactly what WAL replay
+    /// carries, so recovery needs no catalog lookup.
+    pub async fn open_for_server_at(
+        wal_appender: Arc<dyn TableWalAppender>,
+        target: crate::services::spill_placement::SpillTarget,
+    ) -> Result<Self> {
+        use crate::services::spill_placement::SpillTarget;
+        let location = target.location();
+        if crate::services::record_spill::configured_flush_threshold().is_none() {
+            // Spill turned off over a root an earlier run spilled into, AFTER
+            // the WAL was truncated: rows flushed there may be in no retained
+            // WAL entry, so a memtable store would serve a silent subset.
+            // Refuse. With the history intact, replay rebuilds every row in
+            // memory and turning the spill off is safe.
+            if wal_appender.retained_from() > 1
+                && target.has_state().await.with_context(|| {
+                    format!(
+                        "record spill is off and the WAL was truncated, but {location} could not \
+                         be checked for spill segments whose rows only it holds"
+                    )
+                })?
+            {
+                anyhow::bail!(
+                    "record spill is off ({}=0) but {location} holds spill segments from an \
+                     earlier run and the WAL below them was truncated, so their rows are in no \
+                     retained WAL entry; turn the spill back on",
+                    crate::services::record_spill::SPILL_MAX_RESIDENT_ENV,
+                );
+            }
+            return Ok(Self::new_partitioned(wal_appender));
+        }
+        // An empty root would put segments at `/{tenant}/{collection}`.
+        if location.trim_end_matches('/').is_empty() {
+            anyhow::bail!("record spill: the spill gate is set but no spill root was configured");
+        }
+        let (filesystem, root): (
+            Arc<dyn crate::storage::persistence::filesystem::FileSystem>,
+            String,
+        ) = match target {
+            SpillTarget::Local(spill_root) => (
+                Arc::new(
+                    crate::storage::persistence::filesystem::local::LocalFileSystem::new(
+                        crate::storage::persistence::filesystem::local::LocalConfig::default(),
+                    )
+                    .await
+                    .map_err(|e| anyhow!("record spill: local filesystem init failed: {e}"))?,
+                ),
+                spill_root
+                    .to_string_lossy()
+                    .trim_end_matches('/')
+                    .to_string(),
+            ),
+            SpillTarget::Object { url, filesystem } => {
+                (filesystem, url.trim_end_matches('/').to_string())
+            }
+        };
+        tracing::info!(
+            spill_root = %root,
+            "relational record spill enabled: partitions flush to Parquet segments"
+        );
+        Ok(Self::new_spilling(
+            wal_appender,
+            filesystem,
+            Arc::new(move |tenant_id: &str, collection: &str| {
+                format!(
+                    "{root}/{}/{}",
+                    spill_path_segment(tenant_id),
+                    spill_path_segment(collection)
+                )
+            }),
+        ))
+    }
+
+    /// Every live partition with its key, snapshotted so the read lock is not
+    /// held across the per-partition awaits that follow.
+    fn partition_snapshot(&self) -> Vec<((String, String), Arc<dyn RecordStorage>)> {
+        self.partitions
+            .read()
+            .iter()
+            .map(|(key, partition)| (key.clone(), partition.clone()))
+            .collect()
+    }
+
+    /// Flush every partition whose oldest unflushed row is more than
+    /// `max_lag` WAL entries behind `head` (TD-USUB-22), returning how many
+    /// flushed.
+    ///
+    /// A partition flushes on its own only at the resident-row threshold, so a
+    /// table that never reaches it — a small dimension table loaded once —
+    /// keeps its first row's LSN as the tier's floor and pins every WAL entry
+    /// after it. Flushing it makes those rows durable in a segment, so the
+    /// floor moves up to the next partition's.
+    ///
+    /// Best effort: a partition that refuses to report a floor (a memtable) is
+    /// skipped, and a failed flush is logged and leaves its rows resident, so
+    /// the floor computed afterwards still retains them. A failed or cancelled
+    /// segment write also makes that partition refuse (`min_unflushed_lsn`)
+    /// until a purge or restart, which stops truncation for the whole tier:
+    /// fail-closed, but worth the warning it logs. A partition lag-flushed
+    /// within the last `max_lag` entries is not flushed again (see
+    /// `lag_flushed`). Writes may race it: `flush` serializes on its
+    /// `flush_guard` and evicts only the generation it wrote, and after a
+    /// DROP's purge `flush` writes nothing until the partition's next write.
+    pub async fn flush_lagging_partitions(&self, head: u64, max_lag: u64) -> usize {
+        if self.shared_storage {
+            return 0;
+        }
+        let partitions = self.partition_snapshot();
+        let mut flushed = 0;
+        for ((tenant_id, collection), partition) in partitions {
+            // A partition that refuses (a memtable, an unresolved segment
+            // write, an untracked row) is skipped: the floor recomputed after
+            // this refuses on its account anyway, so nothing is hidden.
+            let Ok(Some(oldest)) = partition.min_unflushed_lsn().await else {
+                continue;
+            };
+            if head.saturating_sub(oldest) <= max_lag {
+                continue;
+            }
+            let key = (tenant_id.clone(), collection.clone());
+            if self
+                .lag_flushed_at(&key)
+                .is_some_and(|at| head.saturating_sub(at) <= max_lag)
+            {
+                continue;
+            }
+            match partition.flush().await {
+                Ok(()) => {
+                    flushed += 1;
+                    self.set_lag_flushed_at(key, Some(head));
+                }
+                Err(error) => tracing::warn!(
+                    tenant_id = %tenant_id,
+                    collection = %collection,
+                    oldest,
+                    head,
+                    "flushing a partition that pins WAL truncation failed; its rows stay \
+                     resident and retained: {error:#}"
+                ),
+            }
+        }
+        flushed
+    }
+
+    fn lag_flushed_at(&self, key: &(String, String)) -> Option<u64> {
+        self.lag_flushed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .copied()
+    }
+
+    fn set_lag_flushed_at(&self, key: (String, String), head: Option<u64>) {
+        let mut seen = self
+            .lag_flushed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match head {
+            Some(lsn) => seen.insert(key, lsn),
+            None => seen.remove(&key),
+        };
+    }
+
+    /// Flush every live partition's write buffer to durable segments
+    /// ([`RecordStore::flush`]; a no-op for a memtable partition). Called on
+    /// graceful shutdown AFTER the servers stop, so no write races it.
+    ///
+    /// Every partition is attempted even if one fails; the error names each
+    /// failure. A failed flush loses nothing — the rows stay resident and the
+    /// WAL, which is never truncated past an unflushed row, replays them.
+    pub async fn flush_partitions(&self) -> Result<usize> {
+        let partitions = self.partition_snapshot();
+        let mut failures = Vec::new();
+        for ((tenant_id, collection), partition) in &partitions {
+            if let Err(error) = partition.flush().await {
+                failures.push(format!(
+                    "(tenant '{tenant_id}', collection '{collection}'): {error:#}"
+                ));
+            }
+        }
+        if failures.is_empty() {
+            Ok(partitions.len())
+        } else {
+            Err(anyhow!(
+                "flushing {} of {} record partition(s) failed: {}",
+                failures.len(),
+                partitions.len(),
+                failures.join("; ")
+            ))
+        }
+    }
+
     pub fn new_spilling(
         wal_appender: Arc<dyn TableWalAppender>,
         filesystem: Arc<dyn crate::storage::persistence::filesystem::FileSystem>,
         segment_base: Arc<dyn Fn(&str, &str) -> String + Send + Sync>,
     ) -> Self {
-        Self::with_storage_factory(
+        let hints = Arc::new(SchemaHints::default());
+        let factory_hints = hints.clone();
+        let segment_filesystem = filesystem.clone();
+        let mut store = Self::with_storage_factory(
             wal_appender,
             Arc::new(move |tenant_id, collection| {
+                // Each spill partition encodes with its table's catalog schema,
+                // looked up at flush time so a later `ALTER TABLE` applies.
+                let schema_source = {
+                    let hints = factory_hints.clone();
+                    let (tenant_id, collection) = (tenant_id.to_string(), collection.to_string());
+                    crate::services::record_spill::SpillSchemaSource::new(move || {
+                        hints.get(&tenant_id, &collection)
+                    })
+                };
                 match crate::services::record_spill::configured_flush_threshold() {
-                    // An EMPTY tenant is not a spillable partition. `tenant_key`
-                    // and the replay path are both `unwrap_or_default()`, so `""`
-                    // is a real input here — and a spill store that cannot stamp a
-                    // tenant cannot persist a tombstone, so its `tombstones` set
-                    // would grow monotonically (nothing but a purge clears it) and
-                    // `min_unflushed_lsn` would refuse FOREVER. That is a worse
-                    // failure than having no heap bound: unbounded state *plus*
-                    // permanently unachievable truncation.
-                    //
-                    // So the unusable shape is made unconstructible instead of
-                    // tolerated. The untenanted partition keeps today's behaviour
-                    // (an unbounded memtable — the defect TD-USUB-1 exists to fix,
-                    // unchanged for this case and recorded there as an open item).
-                    Some(_) if tenant_id.is_empty() => {
-                        // Say so. The in-store arm at least `warn!`s; a silent
-                        // fallback here would mean an operator who set the spill
-                        // gate to bound the heap gets no spill partitions and no
-                        // signal — and `""` is the NORMAL key for a single-tenant
-                        // server today, not an edge case (pgwire auth is still an
-                        // open item, and the relational pipeline maps an empty
-                        // tenant to `None`).
-                        tracing::warn!(
-                            collection = %collection,
-                            "spill gate is set but this partition has no tenant, so it \
-                             falls back to an unbounded memtable: a spill store cannot \
-                             stamp a tombstone without a tenant. See TD-USUB-1."
-                        );
-                        Arc::new(crate::services::MemtableRecordStorage::new())
-                            as Arc<dyn RecordStorage>
-                    }
+                    // The untenanted partition (`tenant_key(None)`, the normal
+                    // key on a single-tenant server) spills too: it persists its
+                    // deletes stamped `""`, like its own rows, so its heap is
+                    // bounded and its tombstones leave memory. See
+                    // `SpillRecordStorage::untenanted` for why that is safe for
+                    // exactly this partition.
+                    Some(threshold) if tenant_id.is_empty() => Arc::new(
+                        crate::services::SpillRecordStorage::with_flush_threshold(
+                            filesystem.clone(),
+                            segment_base(tenant_id, collection),
+                            Some(threshold),
+                        )
+                        .untenanted()
+                        .with_schema_source(schema_source),
+                    )
+                        as Arc<dyn RecordStorage>,
                     Some(threshold) => {
                         Arc::new(
                             crate::services::SpillRecordStorage::with_flush_threshold(
@@ -1939,14 +2806,18 @@ impl DirectWalTableRecordStore {
                             // Required for a tombstone-only flush to stamp its
                             // synthesised record; the store refuses to persist a
                             // tombstone without it.
-                            .with_tenant(tenant_id),
+                            .with_tenant(tenant_id)
+                            .with_schema_source(schema_source),
                         ) as Arc<dyn RecordStorage>
                     }
                     None => Arc::new(crate::services::MemtableRecordStorage::new())
                         as Arc<dyn RecordStorage>,
                 }
             }),
-        )
+        );
+        store.schema_hints = Some(hints);
+        store.segment_filesystem = Some(segment_filesystem);
+        store
     }
 
     /// Create a direct writer with a custom per-partition storage factory. The
@@ -1985,10 +2856,69 @@ impl DirectWalTableRecordStore {
             storage_factory,
             shared_storage,
             wal_appender,
+            inflight: InflightWrites::default(),
+            lag_flushed: std::sync::Mutex::new(std::collections::HashMap::new()),
             unique_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
             secondary_index: parking_lot::RwLock::new(std::collections::HashMap::new()),
             poisoned: std::sync::atomic::AtomicBool::new(false),
+            schema_hints: None,
+            segment_filesystem: None,
         }
+    }
+
+    /// Reserve the lowest sequence the next append can be assigned, for the
+    /// whole append-then-apply span (TD-SEAM-12). An appender that cannot say
+    /// its last sequence reserves `0`, which blocks truncation outright.
+    fn reserve_inflight(&self) -> InflightReservation<'_> {
+        let floor = self
+            .wal_appender
+            .last_sequence()
+            .map_or(0, |last| last.saturating_add(1));
+        self.inflight.reserve(floor)
+    }
+
+    /// The lowest sequence any in-flight write (appended, not yet applied) may
+    /// hold; `None` when no write is in flight. One input to the WAL
+    /// truncation floor, alongside [`Self::min_unflushed_lsn`] (TD-SEAM-12).
+    pub fn inflight_floor(&self) -> Option<u64> {
+        self.inflight.floor()
+    }
+
+    /// Seed the spill partitions' catalog schemas before WAL replay (see
+    /// `SchemaHints`), so a partition replay creates encodes typed columns
+    /// instead of holding those rows resident until the first write. Returns
+    /// how many collection keys were seeded; a no-op for stores whose
+    /// partitions never encode a segment.
+    pub fn seed_schema_hints<'a>(
+        &self,
+        schemas: impl IntoIterator<Item = &'a CatalogTableSchema>,
+    ) -> usize {
+        let Some(hints) = &self.schema_hints else {
+            return 0;
+        };
+        let mut seeded = 0;
+        for schema in schemas {
+            let (primary, legacy) = memtable_partition_keys(schema);
+            for key in std::iter::once(primary).chain(legacy) {
+                hints.seed(&key, schema);
+                seeded += 1;
+            }
+        }
+        seeded
+    }
+
+    /// Fail loudly when the change feed is asked for history the WAL no longer
+    /// holds, instead of returning the retained suffix as if it were complete.
+    fn ensure_history_retained(&self, since_lsn: u64) -> Result<()> {
+        let retained_from = self.wal_appender.retained_from();
+        if retained_from > since_lsn.saturating_add(1) {
+            return Err(crate::services::canonical_wal::WalHistoryTruncated {
+                since: since_lsn,
+                retained_from,
+            }
+            .into());
+        }
+        Ok(())
     }
 
     /// Refuse when a durable commit could not be applied (see `poisoned`).
@@ -2022,6 +2952,54 @@ impl DirectWalTableRecordStore {
             .clone()
     }
 
+    /// The lowest canonical-WAL LSN the relational record tier still needs: the
+    /// minimum of every live partition's [`RecordStore::min_unflushed_lsn`].
+    /// One input to WAL truncation (TD-SEAM-2 / TD-USUB-1 slice 2b); the other
+    /// WAL consumers (change-feed readers, graph checkpoints) bound it too.
+    ///
+    /// * `Ok(None)`: no partition holds an unflushed row.
+    /// * `Ok(Some(lsn))`: entries below `lsn` are durable elsewhere on this
+    ///   tier's account.
+    /// * `Err`: do not truncate. Any partition refusing makes the whole tier
+    ///   refuse; there is no partial answer. A plain memtable partition refuses
+    ///   (the trait default), so with the spill gate off — every partition a
+    ///   memtable — this always refuses unless no partition exists.
+    ///
+    /// Shared-storage mode ([`Self::new`]) refuses unconditionally: its one
+    /// backing store is not a per-partition durable store.
+    ///
+    /// **What this does NOT cover: writes in flight.** The write path appends
+    /// to the WAL first and applies to the partition after, so an entry that is
+    /// durable in the WAL but not yet resident in any partition is invisible
+    /// here. A truncation must therefore also be bounded by the lowest LSN any
+    /// in-flight write can hold (a reservation taken before its append) and by
+    /// a WAL position read BEFORE this call. That reservation is P2.2's to add,
+    /// alongside the truncation that needs it; this answer alone is not a safe
+    /// truncation point.
+    ///
+    /// The partition list is snapshotted first, so the read lock is not held
+    /// across the per-partition awaits.
+    pub async fn min_unflushed_lsn(&self) -> Result<Option<u64>> {
+        if self.shared_storage {
+            anyhow::bail!(
+                "shared-storage record store: one backing store for every partition is not \
+                 durable per partition, so the WAL cannot be truncated on its account"
+            );
+        }
+        let partitions = self.partition_snapshot();
+        let mut floor: Option<u64> = None;
+        for ((tenant_id, collection), partition) in partitions {
+            let partition_floor = partition.min_unflushed_lsn().await.with_context(|| {
+                format!("record partition (tenant '{tenant_id}', collection '{collection}') refuses WAL truncation")
+            })?;
+            floor = match (floor, partition_floor) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        Ok(floor)
+    }
+
     /// Remove ALL in-RAM state for one `(tenant, collection)` partition: the
     /// partition itself (recreated empty on demand) and any lazily built
     /// UNIQUE/secondary index for it. The WAL marker that keeps this
@@ -2033,6 +3011,7 @@ impl DirectWalTableRecordStore {
         let index_key = (tenant_id.to_string(), collection_id.to_string());
         self.unique_index.write().remove(&index_key);
         self.secondary_index.write().remove(&index_key);
+        self.set_lag_flushed_at(index_key, None);
     }
 
     /// Apply already-durable mutations to the memtable partitions and the
@@ -2052,7 +3031,7 @@ impl DirectWalTableRecordStore {
         // once it has been built (first `check_unique_conflict`). Until then the
         // lazy build captures these writes from current state, so skipping is
         // safe; checking once avoids per-write work for tables never probed.
-        let index_primary_key = schema_primary_key_column(table_schema);
+        let index_primary_key = schema_oid_key_column(table_schema);
         let maintain_index = !schema_unique_column_sets(table_schema).is_empty()
             && self.unique_index.read().contains_key(index_key);
         // TD-127: maintain the secondary index on the same once-built basis as the
@@ -2107,8 +3086,21 @@ impl DirectWalTableRecordStore {
                     }
                 }
                 TableRecordMutationKind::Delete => {
-                    partition.delete_record(&key).await?;
-                    // Delete from BOTH partitions during the cutover window.
+                    match lsn {
+                        Some(lsn) => partition.delete_record_at_lsn(&key, lsn).await?,
+                        None => partition.delete_record(&key).await?,
+                    };
+                    // Delete from BOTH partitions during the cutover window. The
+                    // legacy copy's delete is not this WAL entry's (replay routes
+                    // it to the primary), so it stays untracked: a tracked one
+                    // would let truncation drop the only evidence of it.
+                    //
+                    // Known cost, cutover only (`PROXIMADB_WAL_OBJECT_ID_KEY`,
+                    // default off): once the legacy partition has segments,
+                    // these untracked tombstones make the record tier refuse
+                    // truncation until that partition flushes them. The WAL
+                    // grows; nothing is lost. Finish the cutover (or flush the
+                    // legacy partitions) to let truncation resume.
                     if let Some(legacy) = &legacy_partition {
                         legacy.delete_record(&key).await?;
                     }
@@ -2147,6 +3139,12 @@ impl DirectWalTableRecordStore {
         table_schema: &CatalogTableSchema,
     ) -> (Arc<dyn RecordStorage>, Option<Arc<dyn RecordStorage>>) {
         let (primary, legacy) = memtable_partition_keys(table_schema);
+        if let Some(hints) = &self.schema_hints {
+            hints.note(tenant_id, &primary, table_schema);
+            if let Some(legacy) = &legacy {
+                hints.note(tenant_id, legacy, table_schema);
+            }
+        }
         let primary_partition = self.partition(tenant_id, &primary);
         let legacy_partition = legacy
             .map(|key| self.partition(tenant_id, &key))
@@ -2169,6 +3167,16 @@ impl DirectWalTableRecordStore {
     {
         let mut summary = proximadb_records::RecordRecoverySummary::default();
         for entry in entries {
+            // TD-SEAM-12: rows a service store keeps in the WAL itself belong
+            // to that store, not to a table; replayed here they would sit
+            // unflushed in a partition of their own and cap the truncation
+            // floor (the live path never puts them in a partition either).
+            if let CanonicalOperation::RecordUpsert { collection_id, .. }
+            | CanonicalOperation::RecordDelete { collection_id, .. } = &entry.operation
+                && is_store_owned_collection(collection_id)
+            {
+                continue;
+            }
             let tenant_id = entry.tenant_id.clone().unwrap_or_default();
             // The replayed entry carries its own LSN, and it is the SAME LSN the
             // live write path recorded. Passing it keeps a spill-backed partition
@@ -2192,14 +3200,41 @@ impl DirectWalTableRecordStore {
                     collection_id, oid, ..
                 } => {
                     self.partition(&tenant_id, &collection_id)
-                        .delete_record(&RecordKey::new(oid))
+                        .delete_record_at_lsn(&RecordKey::new(oid), lsn)
                         .await?;
                     summary.deletes_replayed += 1;
                 }
                 CanonicalOperation::RecordPartitionDrop { collection_id } => {
-                    // DROP TABLE: void the partition (+ its lazily built index
-                    // state). Upserts replayed after this entry re-seed the
-                    // partition — a table recreated post-drop starts empty.
+                    // DROP TABLE: purge the partition's durable objects, then void
+                    // it (+ its lazily built index state). Upserts replayed after
+                    // this entry re-seed the partition — a table recreated
+                    // post-drop starts empty.
+                    //
+                    // The purge mirrors the live `drop_table_records` (TD-USUB-20).
+                    // Without it, a spill partition that crossed its flush
+                    // threshold earlier in THIS replay has written the dropped
+                    // rows into segments; voiding the map entry leaves them on
+                    // disk, and the next access's discovery adopts them into the
+                    // re-created table. Safe under WAL truncation: truncation only
+                    // discards entries below `min_unflushed_lsn`, so a drop that
+                    // replay still sees is at or above it, and every post-drop row
+                    // a purge here deletes is still in the WAL after it and
+                    // replays back. A failure propagates: serving the dropped rows
+                    // would be silently wrong (mandate #1).
+                    //
+                    // Shared-storage mode cannot purge one partition (every key is
+                    // one backing store); the live path declines there too.
+                    if !self.shared_storage {
+                        self.partition(&tenant_id, &collection_id)
+                            .purge_durable_objects()
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "replaying RecordPartitionDrop for '{collection_id}': \
+                                     purging durable objects"
+                                )
+                            })?;
+                    }
                     self.drop_partition_state(&tenant_id, &collection_id);
                 }
                 // Checkpoints, CDC barriers, and system-catalog mutations carry
@@ -2214,6 +3249,52 @@ impl DirectWalTableRecordStore {
 
     /// Build the UNIQUE/PK index for `(tenant_id, table_schema)` if not already
     /// built, by scanning the tenant's current visible state (WAL recovery has
+    /// Scan the table's visible records across BOTH the current partition
+    /// and (TD-127 O3) any pre-flip legacy name-keyed partition, the current
+    /// partition winning on conflict — shared by the unique/secondary index
+    /// builders below.
+    async fn scan_visible_records_for_index(
+        &self,
+        table_schema: &CatalogTableSchema,
+        tenant_id: &str,
+        collection_id: &str,
+        legacy_key: &Option<String>,
+    ) -> Result<Vec<ProximaRecord>> {
+        let scan_request = TableRecordScanRequest {
+            filter: None,
+            table_id: collection_id.to_string(),
+            limit: None,
+            include_vector: false,
+            include_props: true,
+        };
+        let mut existing =
+            RecordStorageTableRecordStore::new(self.partition(tenant_id, collection_id))
+                .scan_records(
+                    table_schema,
+                    scan_request.clone(),
+                    None,
+                    #[cfg(feature = "abac-policy")]
+                    &ReadContext::system(
+                        SystemReadReason::IndexBuild,
+                        "record_store::build_unique_index",
+                    ),
+                )
+                .await?;
+        if let Some(legacy) = legacy_key {
+            let legacy_recs = RecordStorageTableRecordStore::new(self.partition(tenant_id, legacy))
+                .scan_records(
+                    table_schema,
+                    scan_request,
+                    None,
+                    #[cfg(feature = "abac-policy")]
+                    &ReadContext::system(SystemReadReason::IndexBuild, "record_store::build_index"),
+                )
+                .await?;
+            existing = merge_scan_primary_wins(existing, legacy_recs, None);
+        }
+        Ok(existing)
+    }
+
     /// rebuilt it). A no-op when the table has no UNIQUE/PK sets.
     async fn ensure_unique_index_built(
         &self,
@@ -2229,41 +3310,10 @@ impl DirectWalTableRecordStore {
         if set_columns.is_empty() {
             return Ok(());
         }
-        let primary_key = schema_primary_key_column(table_schema);
-        let scan_request = TableRecordScanRequest {
-            filter: None,
-            table_id: collection_id.clone(),
-            limit: None,
-            include_vector: false,
-            include_props: true,
-        };
-        let mut existing =
-            RecordStorageTableRecordStore::new(self.partition(tenant_id, &collection_id))
-                .scan_records(
-                    table_schema,
-                    scan_request.clone(),
-                    None,
-                    #[cfg(feature = "abac-policy")]
-                    &ReadContext::system(
-                        SystemReadReason::IndexBuild,
-                        "record_store::build_unique_index",
-                    ),
-                )
-                .await?;
-        // O3: include any pre-flip records still in the legacy name-keyed partition
-        // so the index reflects current visible state across the cutover window.
-        if let Some(legacy) = &legacy_key {
-            let legacy_recs = RecordStorageTableRecordStore::new(self.partition(tenant_id, legacy))
-                .scan_records(
-                    table_schema,
-                    scan_request,
-                    None,
-                    #[cfg(feature = "abac-policy")]
-                    &ReadContext::system(SystemReadReason::IndexBuild, "record_store::build_index"),
-                )
-                .await?;
-            existing = merge_scan_primary_wins(existing, legacy_recs, None);
-        }
+        let primary_key = schema_oid_key_column(table_schema);
+        let existing = self
+            .scan_visible_records_for_index(table_schema, tenant_id, &collection_id, &legacy_key)
+            .await?;
         let mut index = TableUniqueIndex::with_sets(&set_columns);
         for record in &existing {
             index.upsert(record, primary_key.as_deref());
@@ -2294,39 +3344,9 @@ impl DirectWalTableRecordStore {
         if columns.is_empty() {
             return Ok(());
         }
-        let scan_request = TableRecordScanRequest {
-            filter: None,
-            table_id: collection_id.clone(),
-            limit: None,
-            include_vector: false,
-            include_props: true,
-        };
-        let mut existing =
-            RecordStorageTableRecordStore::new(self.partition(tenant_id, &collection_id))
-                .scan_records(
-                    table_schema,
-                    scan_request.clone(),
-                    None,
-                    #[cfg(feature = "abac-policy")]
-                    &ReadContext::system(
-                        SystemReadReason::IndexBuild,
-                        "record_store::build_unique_index",
-                    ),
-                )
-                .await?;
-        // O3: include any pre-flip records still in the legacy name-keyed partition.
-        if let Some(legacy) = &legacy_key {
-            let legacy_recs = RecordStorageTableRecordStore::new(self.partition(tenant_id, legacy))
-                .scan_records(
-                    table_schema,
-                    scan_request,
-                    None,
-                    #[cfg(feature = "abac-policy")]
-                    &ReadContext::system(SystemReadReason::IndexBuild, "record_store::build_index"),
-                )
-                .await?;
-            existing = merge_scan_primary_wins(existing, legacy_recs, None);
-        }
+        let existing = self
+            .scan_visible_records_for_index(table_schema, tenant_id, &collection_id, &legacy_key)
+            .await?;
         let mut index = TableSecondaryIndex::with_columns(&columns);
         for record in &existing {
             index.upsert(record);
@@ -2383,6 +3403,8 @@ impl TableRecordStore for DirectWalTableRecordStore {
                 collection_id: legacy.clone(),
             });
         }
+        // Held until the purge and state drop below have run (TD-SEAM-12).
+        let _inflight = self.reserve_inflight();
         self.wal_appender
             .append_operations(operations, tenant_id)
             .await?;
@@ -2438,6 +3460,33 @@ impl TableRecordStore for DirectWalTableRecordStore {
         Ok(())
     }
 
+    /// Every write goes through the canonical WAL this store reads its feed
+    /// from, so the feed is complete whenever that log can be read back.
+    fn has_change_feed(&self, _table_schema: &CatalogTableSchema) -> bool {
+        self.wal_appender.has_readable_log()
+    }
+
+    /// The snapshot LSN is the WAL head, lowered below any write that is
+    /// appended but not yet applied (a scan could miss it, so the read-merge
+    /// must replay it). Chosen under the WAL's append lock and pinned there,
+    /// so no truncation can slip between the capture and the pin. Falls back
+    /// to the table's newest change for an appender that never truncates.
+    async fn capture_snapshot_lsn(&self, collection_id: &str) -> Result<SnapshotLsn> {
+        let inflight = &self.inflight;
+        let below_inflight = |head: u64| {
+            inflight
+                .floor()
+                .map_or(head, |floor| head.min(floor.saturating_sub(1)))
+        };
+        match self.wal_appender.pin_history(&below_inflight).await? {
+            Some((lsn, pin)) => Ok(SnapshotLsn {
+                lsn,
+                pin: Some(pin),
+            }),
+            None => Ok(snapshot_lsn_from_change_feed(self, collection_id).await),
+        }
+    }
+
     /// CDC change-feed over the canonical WAL: surface every RecordUpsert/RecordDelete for
     /// `collection_id` (the table name) with sequence number > `since_lsn`, oldest first.
     /// Tenant-agnostic (all tenants) — see [`read_changes_since_scoped`] for the
@@ -2450,10 +3499,14 @@ impl TableRecordStore for DirectWalTableRecordStore {
         // TD-OLAP-17 fast-path: skip the O(WAL) scan when the collection's
         // high-water hasn't advanced past `since_lsn` (no entry can satisfy
         // `sequence_number > since_lsn`). `None` ⇒ appender doesn't track ⇒ scan.
+        self.ensure_history_retained(since_lsn)?;
         if self.change_feed_is_empty(collection_id, since_lsn) {
             return Ok(Vec::new());
         }
-        let entries = self.wal_appender.read_all_entries().await?;
+        let entries = self
+            .wal_appender
+            .read_entries_since(collection_id, since_lsn)
+            .await?;
         let mut out: Vec<ChangeRow> = entries
             .iter()
             .filter(|e| e.sequence_number > since_lsn)
@@ -2476,10 +3529,14 @@ impl TableRecordStore for DirectWalTableRecordStore {
         // TD-OLAP-17 fast-path (tenant-agnostic): the collection high-water is a
         // sufficient condition for emptiness across ALL tenants — if no entry for
         // this collection exceeds `since_lsn`, the tenant filter cannot add any.
+        self.ensure_history_retained(since_lsn)?;
         if self.change_feed_is_empty(collection_id, since_lsn) {
             return Ok(Vec::new());
         }
-        let entries = self.wal_appender.read_all_entries().await?;
+        let entries = self
+            .wal_appender
+            .read_entries_since(collection_id, since_lsn)
+            .await?;
         let want = tenant.filter(|t| !t.is_empty());
         let mut out: Vec<ChangeRow> = entries
             .iter()
@@ -2497,7 +3554,11 @@ impl TableRecordStore for DirectWalTableRecordStore {
         mutations: Vec<TableRecordMutation>,
         tenant_context: Option<&TenantContext>,
     ) -> Result<TableRecordWriteResult> {
-        self.ensure_healthy()?;
+        // TD-DML-3: every failure before `append_operations` below is marked
+        // "rejected before append" — nothing is durable yet, so a caller may
+        // release what it reserved for this write (fenced PK claims). Failures
+        // from the append onward stay unmarked (durability unknown).
+        self.ensure_healthy().map_err(rejected_before_append)?;
         let mut operations = Vec::with_capacity(mutations.len());
         let mut storage_actions = Vec::with_capacity(mutations.len());
         let projections = projection_directives_for_schema(table_schema);
@@ -2526,11 +3587,9 @@ impl TableRecordStore for DirectWalTableRecordStore {
 
             match kind {
                 TableRecordMutationKind::Insert => {
-                    let exists = partition.get_record(&key).await?.is_some()
-                        || match &legacy_partition {
-                            Some(legacy) => legacy.get_record(&key).await?.is_some(),
-                            None => false,
-                        };
+                    let exists = live_row_present(&partition, legacy_partition.as_ref(), &key)
+                        .await
+                        .map_err(rejected_before_append)?;
                     if exists {
                         return Ok(TableRecordWriteResult::failure(
                             format!(
@@ -2548,11 +3607,9 @@ impl TableRecordStore for DirectWalTableRecordStore {
                     storage_actions.push((kind, record));
                 }
                 TableRecordMutationKind::Update => {
-                    let exists = partition.get_record(&key).await?.is_some()
-                        || match &legacy_partition {
-                            Some(legacy) => legacy.get_record(&key).await?.is_some(),
-                            None => false,
-                        };
+                    let exists = live_row_present(&partition, legacy_partition.as_ref(), &key)
+                        .await
+                        .map_err(rejected_before_append)?;
                     if !exists {
                         return Ok(TableRecordWriteResult::failure(
                             format!(
@@ -2598,12 +3655,20 @@ impl TableRecordStore for DirectWalTableRecordStore {
         }
 
         let tenant_id = tenant_context.map(|tenant| tenant.tenant_id.clone());
+        // Backpressure while nothing is durable yet: a refusal here is truthful.
+        // The legacy partition takes this write's migrate-on-write deletes.
+        partition.admit_writes().await?;
+        if let Some(legacy) = &legacy_partition {
+            legacy.admit_writes().await?;
+        }
         // Bind the result: each entry's `sequence_number` is the durable WAL LSN
         // of the corresponding operation, and until TD-USUB-1's 2b work it was
         // discarded here. `operations` and `storage_actions` are pushed in
         // lockstep below, and `append_operations` returns its entries in input
         // order (built by `map`/`collect` over the input, after `sync_data`), so
         // index i of this vec is the LSN for `storage_actions[i]`.
+        // Held until the entries are applied to their partitions (TD-SEAM-12).
+        let _inflight = self.reserve_inflight();
         let wal_entries = self
             .wal_appender
             .append_operations(operations, tenant_id)
@@ -2633,9 +3698,22 @@ impl TableRecordStore for DirectWalTableRecordStore {
                 storage_actions,
                 lsns.as_deref(),
             )
-            .await?;
+            .await
+            .map_err(|err| {
+                // Durable but only partly applied (indexes and the rest of the
+                // batch skipped): refuse to serve it, as `commit_atomic` does.
+                self.poisoned
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                tracing::error!(
+                    error = %format!("{err:#}"),
+                    "applying durable writes failed; record store poisoned until restart"
+                );
+                crate::services::txn_staging::CommitOutcomeUnknown(format!("{err:#}"))
+            })?;
 
-        Ok(TableRecordWriteResult::success(record_ids))
+        let mut result = TableRecordWriteResult::success(record_ids);
+        result.max_lsn = lsns.as_ref().and_then(|v| v.iter().max().copied());
+        Ok(result)
     }
 
     /// ADR-095 D3 / TD-PGOLTP-1: make a whole transaction durable as ONE WAL
@@ -2689,11 +3767,7 @@ impl TableRecordStore for DirectWalTableRecordStore {
                     Some(present) => *present,
                     None => {
                         let key = RecordKey::from(&record);
-                        partition.get_record(&key).await?.is_some()
-                            || match &legacy_partition {
-                                Some(legacy) => legacy.get_record(&key).await?.is_some(),
-                                None => false,
-                            }
+                        live_row_present(&partition, legacy_partition.as_ref(), &key).await?
                     }
                 };
                 match mutation.kind {
@@ -2757,7 +3831,16 @@ impl TableRecordStore for DirectWalTableRecordStore {
             });
         }
 
+        // Backpressure while nothing is durable yet: a refusal here is truthful.
+        for batch in &planned {
+            batch.partition.admit_writes().await?;
+            if let Some(legacy) = &batch.legacy_partition {
+                legacy.admit_writes().await?;
+            }
+        }
         let expected = operations.len();
+        // Held until the batch is applied (TD-SEAM-12).
+        let _inflight = self.reserve_inflight();
         let entries = match self.wal_appender.append_operations_atomic(operations).await {
             Ok(entries) => entries,
             Err(err)
@@ -2905,6 +3988,95 @@ impl TableRecordStore for DirectWalTableRecordStore {
         Ok(merge_scan_primary_wins(primary_recs, legacy_recs, limit))
     }
 
+    /// The primary partition's [`RecordScanView`] and the filesystem its
+    /// segments were written with.
+    ///
+    /// Declines (`Ok(None)`) while the pre-flip legacy partition still holds a
+    /// segment or a live resident row: the materialized scan merges it
+    /// primary-wins over LIVE rows, which is not a layer order a snapshot can
+    /// express. Declines for a shared-storage store (every tenant in one
+    /// store; the snapshot carries no tenant filter). Also declines when
+    /// there are segments but no filesystem to read them through (a custom
+    /// storage factory) — never a snapshot that silently omits them.
+    async fn layer_a_snapshot(
+        &self,
+        table_schema: &CatalogTableSchema,
+        tenant_context: Option<&TenantContext>,
+        #[cfg(feature = "abac-policy")] _read_context: &ReadContext,
+    ) -> Result<Option<crate::services::layer_a_snapshot::LayerASnapshot>> {
+        self.ensure_healthy()?;
+        // One store shared by every partition key (`Self::new`) holds every
+        // tenant's rows together; the snapshot has no tenant filter, because
+        // tenancy is otherwise structural (one partition per tenant).
+        if self.shared_storage {
+            return Ok(None);
+        }
+        let tenant = Self::tenant_key(tenant_context);
+        let (primary, legacy) = self.partitions_for(&tenant, table_schema);
+        if let Some(legacy) = legacy {
+            // Decided from the legacy partition's own view, so taking the
+            // snapshot still reads no segment: any segment, or any live
+            // resident row, declines.
+            let legacy = legacy.scan_view().await?;
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            if !legacy.segments.is_empty() || legacy.resident.iter().any(|r| !r.is_dead(now_ns)) {
+                return Ok(None);
+            }
+        }
+        let view = primary.scan_view().await?;
+        if !view.segments.is_empty() && self.segment_filesystem.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(crate::services::layer_a_snapshot::LayerASnapshot {
+            view,
+            filesystem: self.segment_filesystem.clone(),
+            table_name: table_schema.name.clone(),
+        }))
+    }
+
+    /// Primary-over-legacy, like `scan_records`: during an oid-keying cutover the
+    /// legacy (name-keyed) partition is merged under the primary, and the primary
+    /// copy of an oid wins. Both partitions stream in oid order, so the merge holds
+    /// one chunk of each.
+    fn scan_records_chunked(
+        self: Arc<Self>,
+        table_schema: CatalogTableSchema,
+        request: TableRecordScanRequest,
+        chunk_rows: usize,
+        tenant_context: Option<TenantContext>,
+    ) -> RecordChunkStream<'static> {
+        if let Err(e) = self.ensure_healthy() {
+            return futures::stream::once(async move { Err(e) }).boxed();
+        }
+        let tenant = Self::tenant_key(tenant_context.as_ref());
+        let (primary, legacy) = self.partitions_for(&tenant, &table_schema);
+        let name = table_schema.name;
+        // The partition is already the tenant's: no per-record tenant filter, as in
+        // `scan_records` (which passes `None`).
+        let primary = RecordStorageTableRecordStore::partition_chunks(
+            primary,
+            name.clone(),
+            &request,
+            chunk_rows,
+            None,
+        );
+        match legacy {
+            None => primary,
+            Some(legacy) => merge_newest_wins(
+                vec![
+                    RecordStorageTableRecordStore::partition_chunks(
+                        legacy, name, &request, chunk_rows, None,
+                    ),
+                    primary,
+                ],
+                chunk_rows,
+            ),
+        }
+    }
+
     async fn scan_records_filtered(
         &self,
         table_schema: &CatalogTableSchema,
@@ -2952,6 +4124,76 @@ impl TableRecordStore for DirectWalTableRecordStore {
         Ok(merge_scan_primary_wins(primary_recs, legacy_recs, limit))
     }
 
+    /// TD-DML-3: the canonical WAL is this store's durable log — scan it for
+    /// the last durable operation on `key` in this table's partition(s) and
+    /// tenant. A live upsert ⇒ `Some(true)`; a delete, a dead upsert, a later
+    /// partition drop, or no entry at all ⇒ `Some(false)` (the row would NOT
+    /// come back on replay). WAL-truncated rows live in segments and are never
+    /// asked about (they are present, not absent).
+    async fn durable_row_write(
+        &self,
+        table_schema: &CatalogTableSchema,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<Option<bool>> {
+        self.ensure_healthy()?;
+        let tenant = Self::tenant_key(tenant_context);
+        let want = (!tenant.is_empty()).then_some(tenant.as_str());
+        let (collection_id, legacy_key) = memtable_partition_keys(table_schema);
+        let ours = |c: &str| c == collection_id || legacy_key.as_deref() == Some(c);
+        let now_ns = unix_now_ns();
+        let mut last: Option<(u64, bool)> = None;
+        for entry in self.wal_appender.read_all_entries().await? {
+            if entry.tenant_id.as_deref().filter(|t| !t.is_empty()) != want {
+                continue;
+            }
+            let state = match &entry.operation {
+                CanonicalOperation::RecordUpsert {
+                    collection_id: c,
+                    record,
+                    ..
+                } if ours(c) && record.oid == key => Some(!record.is_dead(now_ns)),
+                CanonicalOperation::RecordDelete {
+                    collection_id: c,
+                    oid,
+                    ..
+                } if ours(c) && oid == key => Some(false),
+                CanonicalOperation::RecordPartitionDrop { collection_id: c } if ours(c) => {
+                    Some(false)
+                }
+                _ => None,
+            };
+            if let Some(state) = state
+                && last.is_none_or(|(lsn, _)| entry.sequence_number >= lsn)
+            {
+                last = Some((entry.sequence_number, state));
+            }
+        }
+        Ok(Some(last.is_some_and(|(_, live)| live)))
+    }
+
+    /// TD-DML-3: the full envelope from the tenant's partition (primary, then
+    /// the legacy cutover partition), dead copies included so the caller can
+    /// tell dead from absent.
+    async fn get_record_envelope(
+        &self,
+        table_schema: &CatalogTableSchema,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<RecordEnvelopeLookup> {
+        self.ensure_healthy()?;
+        let tenant = Self::tenant_key(tenant_context);
+        let (primary, legacy) = self.partitions_for(&tenant, table_schema);
+        let key = RecordKey::new(key.to_string());
+        let mut record = primary.get_record_including_dead(&key).await?;
+        if record.is_none()
+            && let Some(legacy) = &legacy
+        {
+            record = legacy.get_record_including_dead(&key).await?;
+        }
+        Ok(RecordEnvelopeLookup::classify(record))
+    }
+
     /// TD-110 Slice C: O(1) index-backed override of the default scan. Builds the
     /// per-table index on first use (from WAL-recovered current state), then
     /// probes candidate tuples directly.
@@ -2968,18 +4210,51 @@ impl TableRecordStore for DirectWalTableRecordStore {
         let tenant_scope = Self::tenant_key(tenant_context);
         self.ensure_unique_index_built(table_schema, &tenant_scope)
             .await?;
-        let index_key = (tenant_scope, memtable_partition_keys(table_schema).0);
-        let index = self.unique_index.read();
-        let Some(table_index) = index.get(&index_key) else {
-            return Ok(None); // table has no UNIQUE/PK sets
+        let index_key = (
+            tenant_scope.clone(),
+            memtable_partition_keys(table_schema).0,
+        );
+        // Collect the indexed owners first: the index guard must not be held
+        // across the liveness reads below.
+        let owners: Vec<(Vec<String>, Vec<String>, String)> = {
+            let index = self.unique_index.read();
+            let Some(table_index) = index.get(&index_key) else {
+                return Ok(None); // table has no UNIQUE/PK sets
+            };
+            sets.iter()
+                .flat_map(|set| {
+                    table_index
+                        .conflict(&set.columns, &set.candidates, exclude_oids)
+                        .into_iter()
+                        .map(|(tuple, oid)| (set.columns.clone(), tuple, oid))
+                })
+                .collect()
         };
-        for set in sets {
-            if let Some(tuple) = table_index.conflict(&set.columns, &set.candidates, exclude_oids) {
-                return Ok(Some(UniqueConflict {
-                    columns: set.columns.clone(),
-                    tuple,
-                }));
+        // Mandate #16a / TD-DML-3: the index keeps a TTL-expired row's tuple
+        // until it is purged, so an indexed owner that is DEAD holds nothing.
+        // An owner the partitions no longer return is kept as a conflict
+        // (fail closed — the index is the authority for "held").
+        let now_ns = unix_now_ns();
+        let (primary, legacy) = self.partitions_for(&tenant_scope, table_schema);
+        for (columns, tuple, oid) in owners {
+            let key = RecordKey::new(oid.clone());
+            // `get_record_including_dead`: a store that hides dead copies from
+            // `get_record` (the spill store) would otherwise make an expired
+            // owner read as ABSENT and fail closed as a conflict.
+            let mut record = primary.get_record_including_dead(&key).await?;
+            if record.is_none()
+                && let Some(legacy) = &legacy
+            {
+                record = legacy.get_record_including_dead(&key).await?;
             }
+            if record.is_some_and(|record| record.is_dead(now_ns)) {
+                continue;
+            }
+            return Ok(Some(UniqueConflict {
+                columns,
+                tuple,
+                oid,
+            }));
         }
         Ok(None)
     }
@@ -3152,6 +4427,74 @@ pub(crate) fn proxima_record_to_get_response(
 
 #[cfg(test)]
 mod tests {
+
+    /// Forgotten tempdir root for a spill test: `(root, base)` — the dir is
+    /// deliberately leaked (test-hygiene: unique per test, never shared), and
+    /// `base` is its string form for path closures.
+    /// A WAL upsert of a propless row `r{lsn}` into `collection` for `tenant`.
+    fn upsert_entry(lsn: u64, tenant: &str, collection: &str) -> CanonicalWalEntry {
+        CanonicalWalEntry::new(
+            lsn,
+            CanonicalOperation::RecordUpsert {
+                collection_id: collection.to_string(),
+                record: Box::new(ProximaRecord {
+                    oid: format!("r{lsn}"),
+                    ..Default::default()
+                }),
+                projections: vec![],
+            },
+            Some(tenant.to_string()),
+        )
+    }
+
+    fn spill_root() -> (std::path::PathBuf, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let base = root.to_string_lossy().to_string();
+        std::mem::forget(dir);
+        (root, base)
+    }
+
+    /// A default local filesystem handle for the spill harness.
+    async fn local_fs() -> Arc<crate::storage::persistence::filesystem::local::LocalFileSystem> {
+        Arc::new(
+            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
+                crate::storage::persistence::filesystem::local::LocalConfig::default(),
+            )
+            .await
+            .expect("local filesystem"),
+        )
+    }
+
+    /// `n` upsert WAL entries (`r{i}` oids, LSN 1..=n) for `collection`,
+    /// stamped `tenant` on the entry (the record stays unstamped — the
+    /// tenant-ingestion path derives it from the entry).
+    fn upsert_entries(n: u64, collection: &str, tenant: &str) -> Vec<CanonicalWalEntry> {
+        (0..n)
+            .map(|i| {
+                CanonicalWalEntry::new(
+                    i + 1,
+                    CanonicalOperation::RecordUpsert {
+                        collection_id: collection.to_string(),
+                        record: Box::new(ProximaRecord {
+                            oid: format!("r{i}"),
+                            variation_id: Some(collection.to_string()),
+                            ..Default::default()
+                        }),
+                        projections: vec![],
+                    },
+                    Some(tenant.to_string()),
+                )
+            })
+            .collect()
+    }
+
+    /// The standard spill-path resolver: `{base}/{tenant}/{collection}`.
+    fn tenant_path_resolver(base: String) -> Arc<dyn Fn(&str, &str) -> String + Send + Sync> {
+        Arc::new(move |tenant_id: &str, collection: &str| {
+            format!("{base}/{tenant_id}/{collection}")
+        })
+    }
     use super::*;
     use arrow_array::RecordBatch;
     use arrow_schema::Schema as ArrowSchema;
@@ -3792,6 +5135,27 @@ mod tests {
         );
     }
 
+    /// A store shared by every partition key holds every tenant's rows in one
+    /// place; a Layer A snapshot of it would carry no tenant filter, so it
+    /// declines and the caller keeps the materialized path's behaviour.
+    #[tokio::test]
+    async fn a_shared_storage_store_offers_no_layer_a_snapshot() {
+        let store = DirectWalTableRecordStore::new(
+            Arc::new(MemoryRecordStorage::default()),
+            Arc::new(RecordingWalAppender::default()),
+        );
+        let snapshot = store
+            .layer_a_snapshot(
+                &CatalogTableSchema::new("orders"),
+                Some(&TenantContext::for_tenant_id("tenant-a")),
+                #[cfg(feature = "abac-policy")]
+                &ReadContext::system(SystemReadReason::Statistics, "record_store::tests"),
+            )
+            .await
+            .expect("snapshot call");
+        assert!(snapshot.is_none());
+    }
+
     #[tokio::test]
     async fn direct_wal_table_store_appends_canonical_wal_before_storage_state() {
         let storage = Arc::new(MemoryRecordStorage::default());
@@ -4421,13 +5785,12 @@ mod tests {
         let record = ProximaRecord {
             oid: "p1".to_string(),
             variation_id: Some("products".to_string()),
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: 4,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.1, 0.2, 0.3, 0.4]),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "dense_vector",
+                4,
+                vec![0.1, 0.2, 0.3, 0.4],
+            )],
             ..Default::default()
         };
 
@@ -4669,11 +6032,8 @@ mod tests {
                 ("amount", ProximaValue::Int64(30)),
             ],
         );
-        r0.embeddings.push(EmbeddingCell {
-            values: EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-            dim: 3,
-            ..Default::default()
-        });
+        r0.embeddings
+            .push(EmbeddingCell::new_fp32("", "", 3, vec![1.0, 2.0, 3.0]));
         let r1 = props_record(
             "o2",
             "orders",
@@ -4774,12 +6134,12 @@ mod tests {
             variation_id: Some("vectors".to_string()),
             created_at_ns: 1_700_000_000_000_000_000,
             props,
-            embeddings: vec![EmbeddingCell {
-                modality: "dense".into(),
-                dim: 4,
-                values: EmbeddingValues::Fp32(vec![0.1, 0.2, 0.3, 0.4]),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "",
+                "dense",
+                4,
+                vec![0.1, 0.2, 0.3, 0.4],
+            )],
             ..Default::default()
         };
 
@@ -4924,12 +6284,12 @@ mod tests {
                 variation_id: Some("docs".to_string()),
                 created_at_ns: 1_700_000_000_000_000_000 + i as i64,
                 props,
-                embeddings: vec![EmbeddingCell {
-                    modality: "dense".into(),
-                    dim: 8,
-                    values: EmbeddingValues::Fp32((0..8).map(|d| ((i + d) as f32).sin()).collect()),
-                    ..Default::default()
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "",
+                    "dense",
+                    8,
+                    (0..8).map(|d| ((i + d) as f32).sin()).collect(),
+                )],
                 ..Default::default()
             };
             muts.push(TableRecordMutation::new(
@@ -5080,7 +6440,7 @@ mod tests {
         );
     }
 
-    /// Mandate #8: with the gate unset the shipped path must be the LEGACY one.
+    /// Mandate #8: with the gate off the path must be the LEGACY one.
     ///
     /// The observable form of that claim is that nothing is written to object
     /// storage at all — not that a spill store was constructed with flushing
@@ -5088,47 +6448,16 @@ mod tests {
     /// absent precisely so the default path runs the same code it always did,
     /// rather than different code that currently behaves the same.
     #[tokio::test]
-    async fn spilling_store_writes_no_segments_when_the_gate_is_unset() {
-        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+    async fn spilling_store_writes_no_segments_when_the_gate_is_off() {
+        unsafe { std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "0") };
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().to_path_buf();
-        let base = root.to_string_lossy().to_string();
-        std::mem::forget(dir);
-        let fs = Arc::new(
-            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
-                crate::storage::persistence::filesystem::local::LocalConfig::default(),
-            )
-            .await
-            .expect("local filesystem"),
-        );
+        let (root, base) = spill_root();
+        let fs = local_fs().await;
 
         let wal = Arc::new(RecordingWalAppender::default());
-        let store = DirectWalTableRecordStore::new_spilling(
-            wal,
-            fs,
-            Arc::new(move |tenant_id: &str, collection: &str| {
-                format!("{base}/{tenant_id}/{collection}")
-            }),
-        );
+        let store = DirectWalTableRecordStore::new_spilling(wal, fs, tenant_path_resolver(base));
 
-        let entries: Vec<CanonicalWalEntry> = (0..32)
-            .map(|i| {
-                CanonicalWalEntry::new(
-                    i + 1,
-                    CanonicalOperation::RecordUpsert {
-                        collection_id: "orders".to_string(),
-                        record: Box::new(ProximaRecord {
-                            oid: format!("r{i}"),
-                            variation_id: Some("orders".to_string()),
-                            ..Default::default()
-                        }),
-                        projections: vec![],
-                    },
-                    Some("tenant-a".to_string()),
-                )
-            })
-            .collect();
+        let entries = upsert_entries(32, "orders", "tenant-a");
         store.replay_wal_entries(entries).await.expect("replay");
 
         // `expect`, not `unwrap_or(false)`: an unreadable root must fail the test,
@@ -5139,84 +6468,496 @@ mod tests {
             .is_some();
         assert!(
             !wrote_anything,
-            "gate unset must write no segments; found entries under {}",
+            "gate off must write no segments; found entries under {}",
             root.display()
         );
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
     }
 
-    /// An EMPTY tenant must NOT get a spill partition, even with the gate on.
-    ///
-    /// `tenant_key` and the replay path are both `unwrap_or_default()`, so `""`
-    /// reaches the factory. A spill store with no tenant cannot persist a
-    /// tombstone, and nothing but a purge clears one — so its `tombstones` set
-    /// would grow monotonically while `min_unflushed_lsn` refused forever.
-    /// Unbounded state plus permanently unachievable truncation is strictly worse
-    /// than the unbounded memtable this slice is trying to replace, so the shape
-    /// is made unconstructible.
-    ///
-    /// Asserted by OBSERVABLE effect: with the gate on and well past the
-    /// threshold, an untenanted partition writes no segment anywhere under the
-    /// root — and still serves its rows.
+    /// A spill flush failing while a durable write is applied must not abort
+    /// the apply. It used to: the error skipped the UNIQUE index update (so a
+    /// later duplicate passed the check), skipped the rest of the batch in
+    /// memory, and reported a write that replay would bring back as failed.
     ///
     /// Process-isolated under nextest, so the env gate does not leak.
     #[tokio::test]
-    async fn an_empty_tenant_gets_no_spill_partition() {
+    async fn a_failing_spill_flush_neither_fails_the_write_nor_skips_the_unique_index() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "2");
+        }
+        // Directories occupy the first segment names, so flushes fail
+        // (`write_if_absent` finds the name taken) while discovery, which
+        // lists files only, still sees an empty partition.
+        let (root, base) = spill_root();
+        for seq in 0..8u64 {
+            std::fs::create_dir_all(root.join("users").join(format!("spill-{seq:016x}.parquet")))
+                .expect("blocker directory");
+        }
+        let store = DirectWalTableRecordStore::new_spilling(
+            Arc::new(RecordingWalAppender::default()),
+            local_fs().await,
+            tenant_path_resolver(base),
+        );
+        let mut schema = CatalogTableSchema::new("users").with_column(CatalogColumn::new(
+            1,
+            "email",
+            ProximaType::String,
+        ));
+        schema.relational_capabilities.constraints.push(
+            proximadb_catalog::ColumnConstraint::Unique {
+                columns: vec!["email".to_string()],
+            },
+        );
+        let row = |oid: &str, email: &str| {
+            props_record(
+                oid,
+                "users",
+                vec![("email", ProximaValue::String(email.to_string()))],
+            )
+        };
+        let no_exclusions = std::collections::HashSet::new();
+        // The first probe builds the index; the writes below maintain it.
+        let probe = |email: &str| {
+            build_unique_candidate_sets(&schema, &[row("probe", email)], None).expect("candidates")
+        };
+        assert!(
+            store
+                .check_unique_conflict(&schema, "users", None, &probe("a@x"), &no_exclusions, None)
+                .await
+                .expect("probe")
+                .is_none()
+        );
+
+        let written = store
+            .write_mutations(
+                &schema,
+                vec![
+                    TableRecordMutation::new(TableRecordMutationKind::Insert, row("u1", "a@x")),
+                    TableRecordMutation::new(TableRecordMutationKind::Insert, row("u2", "b@x")),
+                    TableRecordMutation::new(TableRecordMutationKind::Insert, row("u3", "c@x")),
+                ],
+                None,
+            )
+            .await
+            .expect("a failing flush must not fail a durable write");
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+        assert!(written.success);
+
+        for email in ["a@x", "b@x", "c@x"] {
+            assert!(
+                store
+                    .check_unique_conflict(
+                        &schema,
+                        "users",
+                        None,
+                        &probe(email),
+                        &no_exclusions,
+                        None
+                    )
+                    .await
+                    .expect("probe")
+                    .is_some(),
+                "every row of the batch is applied and indexed: a duplicate of {email} is caught"
+            );
+        }
+    }
+
+    /// ADR-097 P3.1: a spilling store's Layer A snapshot names the segments its
+    /// partition flushed and the filesystem that wrote them, with the unflushed
+    /// rows resident — and together they hold every row, none read twice.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn layer_a_snapshot_lists_flushed_segments_and_resident_rows() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
+        }
+        let (_, base) = spill_root();
+        let fs = local_fs().await;
+        let store = DirectWalTableRecordStore::new_spilling(
+            Arc::new(RecordingWalAppender::default()),
+            fs,
+            tenant_path_resolver(base),
+        );
+        let entries: Vec<CanonicalWalEntry> = (0..6)
+            .map(|i| {
+                CanonicalWalEntry::new(
+                    i + 1,
+                    CanonicalOperation::RecordUpsert {
+                        collection_id: "orders".to_string(),
+                        record: Box::new(ProximaRecord {
+                            oid: format!("r{i}"),
+                            tenant_id: "tenant-a".to_string(),
+                            variation_id: Some("orders".to_string()),
+                            ..Default::default()
+                        }),
+                        projections: vec![],
+                    },
+                    Some("tenant-a".to_string()),
+                )
+            })
+            .collect();
+        store.replay_wal_entries(entries).await.expect("replay");
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+
+        let snapshot = store
+            .layer_a_snapshot(
+                &CatalogTableSchema::new("orders"),
+                Some(&TenantContext::for_tenant_id("tenant-a")),
+                #[cfg(feature = "abac-policy")]
+                &ReadContext::system(SystemReadReason::Statistics, "record_store::tests"),
+            )
+            .await
+            .expect("snapshot")
+            .expect("a spilling store offers a snapshot");
+        assert_eq!(snapshot.table_name, "orders");
+        assert!(
+            !snapshot.view.segments.is_empty(),
+            "rows past the threshold flushed"
+        );
+        let filesystem = snapshot
+            .filesystem
+            .clone()
+            .expect("segments come with their filesystem");
+
+        let mut oids: Vec<String> = snapshot
+            .view
+            .resident
+            .iter()
+            .map(|r| r.oid.clone())
+            .collect();
+        for path in &snapshot.view.segments {
+            let bytes = filesystem.read(path).await.expect("segment");
+            let rows = crate::storage::engines::sst::segment_format::read_segment_records(
+                &bytes,
+                &[],
+                &[],
+                None,
+            )
+            .expect("decode");
+            oids.extend(rows.into_iter().map(|r| r.oid));
+        }
+        oids.sort();
+        assert_eq!(oids, ["r0", "r1", "r2", "r3", "r4", "r5"]);
+    }
+
+    /// TD-SEAM-3 object-store placement: segments land at
+    /// `{url}/{tenant}/{collection}`, and a store opened later over the same
+    /// target finds them by listing that prefix — no catalog lookup.
+    async fn spill_segments_round_trip_at(url: String) {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
+        }
+        let factory = crate::storage::persistence::filesystem::FilesystemFactory::create_default()
+            .await
+            .expect("factory");
+        let target = || crate::services::spill_placement::SpillTarget::Object {
+            url: url.clone(),
+            filesystem: factory
+                .get_filesystem(&url)
+                .expect("filesystem for the url"),
+        };
+        let schema = CatalogTableSchema::new("orders");
+        let tenant = TenantContext::for_tenant_id("tenant-a");
+        let segments_of = |store: DirectWalTableRecordStore| {
+            let (schema, tenant) = (schema.clone(), tenant.clone());
+            async move {
+                let snapshot = store
+                    .layer_a_snapshot(
+                        &schema,
+                        Some(&tenant),
+                        #[cfg(feature = "abac-policy")]
+                        &ReadContext::system(SystemReadReason::Statistics, "record_store::tests"),
+                    )
+                    .await
+                    .expect("snapshot")
+                    .expect("a spilling store offers a snapshot");
+                (snapshot.view.segments.clone(), snapshot.view.resident.len())
+            }
+        };
+
+        let first = DirectWalTableRecordStore::open_for_server_at(
+            Arc::new(RecordingWalAppender::default()),
+            target(),
+        )
+        .await
+        .expect("open");
+        first
+            .replay_wal_entries(upsert_entries(6, "orders", "tenant-a"))
+            .await
+            .expect("replay");
+        let (written, _) = segments_of(first).await;
+        assert!(!written.is_empty(), "rows past the threshold flushed");
+        let prefix = format!("{url}/tenant-a/orders/");
+        assert!(
+            written.iter().all(|path| path.starts_with(&prefix)),
+            "segments under {prefix}: {written:?}"
+        );
+
+        let later = DirectWalTableRecordStore::open_for_server_at(
+            Arc::new(RecordingWalAppender::default()),
+            target(),
+        )
+        .await
+        .expect("reopen");
+        let (found, resident) = segments_of(later).await;
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+        assert_eq!(found, written, "discovery lists the derived prefix");
+        assert_eq!(resident, 0);
+    }
+
+    /// `file://` exercises the object-store arm (URL-addressed paths, prefix
+    /// listing) without an emulator.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn spill_segments_round_trip_at_a_url_prefix() {
+        let (root, _) = spill_root();
+        spill_segments_round_trip_at(format!("file://{}/bucket/spill", root.display())).await;
+    }
+
+    /// The same against a real object store (run by the `--restart` scope of
+    /// `scripts/run_cloud_emulator_tests.sh`, Azurite).
+    #[tokio::test]
+    #[ignore = "requires an object-store emulator (PROXIMADB_OBJECT_STORE_URL)"]
+    async fn spill_segments_round_trip_on_object_store() {
+        let base = std::env::var("PROXIMADB_OBJECT_STORE_URL")
+            .expect("set PROXIMADB_OBJECT_STORE_URL to an emulator prefix");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        spill_segments_round_trip_at(format!("{base}/spill-round-trip/{run}")).await;
+    }
+
+    /// The UNTENANTED partition spills too, and persists its deletes.
+    ///
+    /// `tenant_key` and the replay path are both `unwrap_or_default()`, so `""`
+    /// reaches the factory — and it is the normal key on a single-tenant
+    /// server. It used to get an unbounded memtable, because a spill store
+    /// without a tenant could not persist a tombstone. The factory now builds it
+    /// `untenanted()`: its rows and its tombstones both carry `""`, so the heap
+    /// is bounded and a delete leaves memory like any other.
+    ///
+    /// Asserted by OBSERVABLE effect: past the threshold a segment exists under
+    /// the root, every row is still served, a delete is suppressed, and after a
+    /// flush nothing constrains WAL truncation.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    /// Boot seeding reaches a partition WAL replay creates, before any write,
+    /// so its DECIMAL column is typed from the catalog. A collection key two
+    /// different schemas claim gets no fallback (the catalog cannot say which
+    /// tenant owns which) — its rows are never encoded under a guessed schema;
+    /// they flush through inference plus the residual, still exact.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn boot_seeded_schemas_reach_replayed_partitions_unless_ambiguous() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "100");
+        }
+        let (_, base) = spill_root();
+        let fs = local_fs().await;
+        let store = DirectWalTableRecordStore::new_spilling(
+            Arc::new(RecordingWalAppender::default()),
+            fs,
+            tenant_path_resolver(base),
+        );
+        let decimal = |table: &str| {
+            CatalogTableSchema::new(table).with_column(proximadb_catalog::CatalogColumn::new(
+                1,
+                "price",
+                ProximaType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+            ))
+        };
+        let other_shape = CatalogTableSchema::new("shared").with_column(
+            proximadb_catalog::CatalogColumn::new(1, "price", ProximaType::String),
+        );
+        let schemas = [decimal("orders"), decimal("shared"), other_shape];
+        assert!(store.seed_schema_hints(&schemas) >= 3);
+
+        let priced = |lsn: u64, table: &str| {
+            let mut record = ProximaRecord {
+                oid: format!("{table}-{lsn}"),
+                tenant_id: "tenant-a".to_string(),
+                ..Default::default()
+            };
+            record.props.insert(
+                "price".to_string(),
+                proximadb_records::ProximaTreeNode::Value(ProximaValue::Decimal("1.50".into())),
+            );
+            CanonicalWalEntry::new(
+                lsn,
+                CanonicalOperation::RecordUpsert {
+                    collection_id: table.to_string(),
+                    record: Box::new(record),
+                    projections: vec![],
+                },
+                Some("tenant-a".to_string()),
+            )
+        };
+        store
+            .replay_wal_entries(vec![priced(1, "orders"), priced(2, "shared")])
+            .await
+            .expect("replay");
+        store.flush_partitions().await.expect("flush");
+
+        let orders = store.partition("tenant-a", "orders");
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(orders.as_ref()).await.ok(),
+            Some(None),
+            "the seeded schema typed the replayed DECIMAL rows, so they flushed"
+        );
+        let hints = store.schema_hints.as_ref().expect("spilling store");
+        assert!(
+            hints.get("tenant-a", "orders").is_some(),
+            "the unambiguous key has a fallback"
+        );
+        assert!(
+            hints.get("tenant-a", "shared").is_none(),
+            "an ambiguous key gets no fallback, so no schema is guessed"
+        );
+        let shared = store.partition("tenant-a", "shared");
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(shared.as_ref()).await.ok(),
+            Some(None),
+            "it still flushes, through inference plus the residual"
+        );
+        let back = shared
+            .get_record(&RecordKey::new("shared-2".to_string()))
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            back.props.get("price"),
+            Some(&proximadb_records::ProximaTreeNode::Value(
+                ProximaValue::Decimal("1.50".into())
+            )),
+            "exact"
+        );
+
+        unsafe {
+            std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV);
+        }
+    }
+
+    /// The production factory encodes with the table's catalog schema: the
+    /// schema `partitions_for` sees on a write reaches the spill partition, so a
+    /// DECIMAL column — which inference cannot type — is flushed rather than
+    /// held resident.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn the_spilling_factory_encodes_with_the_catalog_schema() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "2");
+        }
+        let (_, base) = spill_root();
+        let fs = local_fs().await;
+        let store = DirectWalTableRecordStore::new_spilling(
+            Arc::new(RecordingWalAppender::default()),
+            fs,
+            tenant_path_resolver(base),
+        );
+        let schema =
+            CatalogTableSchema::new("orders").with_column(proximadb_catalog::CatalogColumn::new(
+                1,
+                "price",
+                ProximaType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+            ));
+
+        let (partition, _) = store.partitions_for("tenant-a", &schema);
+        for i in 0..3u64 {
+            let mut row = ProximaRecord {
+                oid: format!("o{i}"),
+                tenant_id: "tenant-a".to_string(),
+                ..Default::default()
+            };
+            row.props.insert(
+                "price".to_string(),
+                proximadb_records::ProximaTreeNode::Value(ProximaValue::Decimal(format!("{i}.50"))),
+            );
+            partition
+                .upsert_record_at_lsn(row, i + 1)
+                .await
+                .expect("upsert");
+        }
+        RecordStore::flush(partition.as_ref()).await.expect("flush");
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(partition.as_ref())
+                .await
+                .ok(),
+            Some(None),
+            "every DECIMAL row was written — none held for want of a schema"
+        );
+
+        unsafe {
+            std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_tenant_partition_spills_and_persists_deletes() {
         unsafe {
             std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "2");
         }
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().to_path_buf();
-        let base = root.to_string_lossy().to_string();
-        std::mem::forget(dir);
-        let fs = Arc::new(
-            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
-                crate::storage::persistence::filesystem::local::LocalConfig::default(),
-            )
-            .await
-            .expect("local filesystem"),
-        );
+        let (root, base) = spill_root();
+        let fs = local_fs().await;
         let wal = Arc::new(RecordingWalAppender::default());
         let store = DirectWalTableRecordStore::new_spilling(
             wal,
             fs,
             Arc::new(move |tenant_id: &str, collection: &str| {
-                format!("{base}/{tenant_id}/{collection}")
+                format!("{base}/untenanted{tenant_id}/{collection}")
             }),
         );
 
         // No tenant context at all — this is what `tenant_key(None)` produces.
         let partition = store.partition("", "orders");
-        for i in 0..8 {
+        for i in 0..8u64 {
             partition
-                .upsert_record(ProximaRecord {
-                    oid: format!("o{i}"),
-                    tenant_id: String::new(),
-                    ..Default::default()
-                })
+                .upsert_record_at_lsn(
+                    ProximaRecord {
+                        oid: format!("o{i}"),
+                        tenant_id: String::new(),
+                        ..Default::default()
+                    },
+                    i + 1,
+                )
                 .await
                 .expect("upsert must succeed for an untenanted partition");
         }
-
-        // Same shape as the gate-unset test above, including `expect` rather
-        // than `unwrap_or(false)`: an unreadable root must FAIL the test, not read
-        // as "wrote nothing" and pass it.
-        let wrote_anything = std::fs::read_dir(&root)
-            .expect("read spill root")
-            .next()
-            .is_some();
         assert!(
-            !wrote_anything,
-            "an untenanted partition must not spill; found entries under {}",
-            root.display()
+            std::fs::read_dir(root.join("untenanted").join("orders"))
+                .expect("the untenanted partition spilled")
+                .next()
+                .is_some(),
+            "past the threshold the untenanted partition must write a segment"
         );
+
+        partition
+            .delete_record(&RecordKey::new("o0".to_string()))
+            .await
+            .expect("delete");
+        RecordStore::flush(partition.as_ref()).await.expect("flush");
         assert_eq!(
             RecordScan::scan_records(partition.as_ref(), 100)
                 .await
                 .expect("scan")
                 .len(),
-            8,
-            "and it must still serve every row"
+            7,
+            "every row but the deleted one is served"
+        );
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(partition.as_ref())
+                .await
+                .ok(),
+            Some(None),
+            "the delete is durable: nothing constrains truncation"
         );
 
         unsafe {
@@ -5245,26 +6986,11 @@ mod tests {
             std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
         }
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().to_path_buf();
-        let base = root.to_string_lossy().to_string();
-        std::mem::forget(dir);
-        let fs = Arc::new(
-            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
-                crate::storage::persistence::filesystem::local::LocalConfig::default(),
-            )
-            .await
-            .expect("local filesystem"),
-        );
+        let (root, base) = spill_root();
+        let fs = local_fs().await;
 
         let wal = Arc::new(RecordingWalAppender::default());
-        let store = DirectWalTableRecordStore::new_spilling(
-            wal,
-            fs,
-            Arc::new(move |tenant_id: &str, collection: &str| {
-                format!("{base}/{tenant_id}/{collection}")
-            }),
-        );
+        let store = DirectWalTableRecordStore::new_spilling(wal, fs, tenant_path_resolver(base));
 
         let upsert = |i: u64| {
             CanonicalWalEntry::new(
@@ -5314,16 +7040,18 @@ mod tests {
         // silently invalidated the evidence, which went unnoticed for two rounds.)
         //
         // What does distinguish them is DURABILITY: with the tenant, the tombstone
-        // reaches the segment and is cleared post-commit, so this is `Ok(None)` —
-        // no constraint, nothing unflushed. Without it the tombstone is still in
-        // memory and this is `Err`. Asserted by VALUE rather than `is_ok()` so a
-        // different refusal arm cannot silently stand in for the right answer.
-        assert_eq!(
-            RecordStore::min_unflushed_lsn(store.partition("tenant-a", "orders").as_ref())
-                .await
-                .ok(),
-            Some(None),
-            "the tombstone must be DURABLE — i.e. the production factory supplied a tenant"
+        // reaches a segment and is cleared post-commit, so the floor lies above
+        // the delete's LSN (9) — only later upserts may still be resident.
+        // Without it the tombstone stays in memory at LSN 9 and pins the floor
+        // there. Asserted by VALUE rather than `is_ok()` so a refusal arm cannot
+        // silently stand in for the right answer.
+        let floor = RecordStore::min_unflushed_lsn(store.partition("tenant-a", "orders").as_ref())
+            .await
+            .expect("every replayed write carries its LSN");
+        assert!(
+            floor.is_none_or(|lsn| lsn > 9),
+            "the tombstone must be DURABLE — i.e. the production factory supplied a tenant; \
+             floor {floor:?}"
         );
 
         // And the deleted row stays gone through the read-merge.
@@ -5352,6 +7080,570 @@ mod tests {
         unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
     }
 
+    /// TD-USUB-20: replaying `insert × N → RecordPartitionDrop → insert` into a
+    /// spilling store must leave the re-created table holding ONLY the post-drop
+    /// row, with no pre-drop segment left under its prefix.
+    ///
+    /// The N inserts cross the flush threshold during replay, so the dropped
+    /// rows reach segments. Before the fix the replay drop arm only voided the
+    /// map entry; the next access rebuilt the partition over the same prefix,
+    /// discovery adopted those segments, and the dropped rows came back.
+    /// Mutation check: removing the purge from the replay drop arm fails both
+    /// assertions. A second replay over the same prefix (the next boot) must
+    /// agree.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn replayed_drop_purges_segments_written_earlier_in_the_replay() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
+        }
+
+        let (root, base) = spill_root();
+        let fs = local_fs().await;
+        let build = |fs: Arc<crate::storage::persistence::filesystem::local::LocalFileSystem>| {
+            let base = base.clone();
+            DirectWalTableRecordStore::new_spilling(
+                Arc::new(RecordingWalAppender::default()),
+                fs,
+                Arc::new(move |tenant_id: &str, collection: &str| {
+                    format!("{base}/{tenant_id}/{collection}")
+                }),
+            )
+        };
+        let tenant = Some("tenant-a".to_string());
+        let upsert = |lsn: u64, oid: &str| {
+            CanonicalWalEntry::new(
+                lsn,
+                CanonicalOperation::RecordUpsert {
+                    collection_id: "orders".to_string(),
+                    record: Box::new(ProximaRecord {
+                        oid: oid.to_string(),
+                        variation_id: Some("orders".to_string()),
+                        ..Default::default()
+                    }),
+                    projections: vec![],
+                },
+                tenant.clone(),
+            )
+        };
+        let mut entries: Vec<CanonicalWalEntry> = (0..8u64)
+            .map(|i| upsert(i + 1, &format!("old{i}")))
+            .collect();
+        entries.push(CanonicalWalEntry::new(
+            9,
+            CanonicalOperation::RecordPartitionDrop {
+                collection_id: "orders".to_string(),
+            },
+            tenant.clone(),
+        ));
+        entries.push(upsert(10, "new0"));
+
+        let segment_files = || -> Vec<String> {
+            std::fs::read_dir(root.join("tenant-a").join("orders"))
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .filter(|n| n.starts_with("spill-"))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        async fn scan_oids(store: &DirectWalTableRecordStore) -> Vec<String> {
+            let mut oids: Vec<String> = store
+                .scan_records(
+                    &CatalogTableSchema::new("orders"),
+                    TableRecordScanRequest {
+                        filter: None,
+                        table_id: "orders".to_string(),
+                        limit: None,
+                        include_vector: false,
+                        include_props: true,
+                    },
+                    Some(&TenantContext::for_tenant_id("tenant-a")),
+                    #[cfg(feature = "abac-policy")]
+                    &ReadContext::system(SystemReadReason::Statistics, "record_store::tests"),
+                )
+                .await
+                .expect("scan")
+                .into_iter()
+                .map(|r| r.oid)
+                .collect();
+            oids.sort();
+            oids
+        }
+
+        for boot in 0..2 {
+            let store = build(fs.clone());
+            store
+                .replay_wal_entries(entries.clone())
+                .await
+                .expect("replay must succeed");
+            assert_eq!(
+                scan_oids(&store).await,
+                ["new0"],
+                "boot {boot}: the re-created table must hold only the post-drop row"
+            );
+            assert!(
+                segment_files().is_empty(),
+                "boot {boot}: no pre-drop segment may survive the replayed drop: {:?}",
+                segment_files()
+            );
+        }
+
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+    }
+
+    /// The record tier's truncation floor refuses for every non-durable shape:
+    /// a memtable partition (the trait default) and shared-storage mode. An
+    /// empty partitioned store has no constraint.
+    #[tokio::test]
+    async fn record_tier_floor_refuses_for_memtable_and_shared_storage() {
+        let partitioned =
+            DirectWalTableRecordStore::new_partitioned(Arc::new(RecordingWalAppender::default()));
+        assert_eq!(
+            partitioned.min_unflushed_lsn().await.ok(),
+            Some(None),
+            "no partition, no constraint"
+        );
+        partitioned
+            .replay_wal_entries(vec![CanonicalWalEntry::new(
+                1,
+                CanonicalOperation::RecordUpsert {
+                    collection_id: "orders".to_string(),
+                    record: Box::new(ProximaRecord {
+                        oid: "r1".to_string(),
+                        ..Default::default()
+                    }),
+                    projections: vec![],
+                },
+                Some("tenant-a".to_string()),
+            )])
+            .await
+            .expect("replay");
+        let err = partitioned
+            .min_unflushed_lsn()
+            .await
+            .expect_err("a memtable partition holds its rows only in memory");
+        assert!(
+            format!("{err:#}").contains("collection 'orders'"),
+            "{err:#}"
+        );
+
+        let shared = DirectWalTableRecordStore::new(
+            Arc::new(crate::services::MemtableRecordStorage::new()),
+            Arc::new(RecordingWalAppender::default()),
+        );
+        assert!(
+            shared.min_unflushed_lsn().await.is_err(),
+            "shared storage refuses unconditionally"
+        );
+    }
+
+    /// TD-USUB-22: a partition below the flush threshold — a small table
+    /// loaded once — pins the tier's floor at its first row until something
+    /// flushes it. `flush_lagging_partitions` flushes exactly the partitions
+    /// lagging the head by more than the allowed lag, the floor moves up, and
+    /// the flushed rows still read back.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn a_lagging_partition_is_flushed_so_it_stops_pinning_the_floor() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
+        }
+        let (_, base) = spill_root();
+        let store = DirectWalTableRecordStore::new_spilling(
+            Arc::new(RecordingWalAppender::default()),
+            local_fs().await,
+            tenant_path_resolver(base),
+        );
+        let upsert = |lsn: u64, collection: &str| upsert_entry(lsn, "tenant-a", collection);
+        // `dims`: LSNs 1 and 2, below the threshold, so they stay resident.
+        // `facts`: LSNs 3..=9 — 3..=6 flush at the threshold, 7..=9 resident.
+        let mut entries: Vec<CanonicalWalEntry> = (1..=2).map(|lsn| upsert(lsn, "dims")).collect();
+        entries.extend((3..=9).map(|lsn| upsert(lsn, "facts")));
+        store.replay_wal_entries(entries).await.expect("replay");
+        assert_eq!(store.min_unflushed_lsn().await.ok(), Some(Some(1)));
+
+        // Within the allowed lag nothing flushes.
+        assert_eq!(store.flush_lagging_partitions(9, 8).await, 0);
+        assert_eq!(store.min_unflushed_lsn().await.ok(), Some(Some(1)));
+
+        // `dims` lags the head by 8 > 5; `facts` (oldest resident 7) by 2.
+        assert_eq!(store.flush_lagging_partitions(9, 5).await, 1);
+        assert_eq!(
+            store.min_unflushed_lsn().await.ok(),
+            Some(Some(7)),
+            "the floor moves up to the next partition's oldest resident row"
+        );
+        let dims = store.partition("tenant-a", "dims");
+        assert!(
+            dims.get_record(&RecordKey::new("r1".to_string()))
+                .await
+                .expect("read")
+                .is_some(),
+            "the flushed row is served from its segment"
+        );
+        // `facts` now lags by 4 > 3 and flushes; afterwards it holds nothing
+        // unflushed, so a second run has nothing to flush.
+        assert_eq!(store.flush_lagging_partitions(11, 3).await, 1);
+        assert_eq!(store.flush_lagging_partitions(11, 3).await, 0);
+        assert_eq!(store.min_unflushed_lsn().await.ok(), Some(None));
+    }
+
+    /// A partition double for the lag flush: its oldest unflushed LSN stays put
+    /// until a flush succeeds and frees it (unless `stuck`); the first
+    /// `failures` flushes fail.
+    struct LagProbePartition {
+        oldest: std::sync::Mutex<Option<u64>>,
+        failures: std::sync::atomic::AtomicUsize,
+        stuck: bool,
+        flushes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl LagProbePartition {
+        fn new(oldest: u64, failures: usize, stuck: bool) -> Self {
+            Self {
+                oldest: std::sync::Mutex::new(Some(oldest)),
+                failures: std::sync::atomic::AtomicUsize::new(failures),
+                stuck,
+                flushes: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn flushes(&self) -> usize {
+            self.flushes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl RecordStore for LagProbePartition {
+        async fn upsert_record(&self, record: ProximaRecord) -> Result<ProximaRecord> {
+            Ok(record)
+        }
+        async fn get_record(&self, _key: &RecordKey) -> Result<Option<ProximaRecord>> {
+            Ok(None)
+        }
+        async fn delete_record(&self, _key: &RecordKey) -> Result<bool> {
+            Ok(false)
+        }
+        async fn min_unflushed_lsn(&self) -> Result<Option<u64>> {
+            Ok(*self.oldest.lock().expect("lock"))
+        }
+        async fn flush(&self) -> Result<()> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.flushes.fetch_add(1, SeqCst);
+            if self
+                .failures
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                anyhow::bail!("transient segment write failure");
+            }
+            if !self.stuck {
+                *self.oldest.lock().expect("lock") = None;
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl RecordScan for LagProbePartition {
+        async fn scan_records(&self, _limit: usize) -> Result<Vec<ProximaRecord>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn lag_probe_store(partition: Arc<LagProbePartition>) -> DirectWalTableRecordStore {
+        DirectWalTableRecordStore::with_storage_factory(
+            Arc::new(RecordingWalAppender::default()),
+            Arc::new(move |_: &str, _: &str| partition.clone() as Arc<dyn RecordStorage>),
+        )
+    }
+
+    /// TD-USUB-22 review: a failed lag flush is retried on the next run — it
+    /// must not mark the partition as "flushed, did not move", or one transient
+    /// error would leave a small idle table pinning the WAL for good.
+    #[tokio::test]
+    async fn a_failed_lag_flush_is_retried_on_the_next_run() {
+        let partition = Arc::new(LagProbePartition::new(1, 1, false));
+        let store = lag_probe_store(partition.clone());
+        let _ = store.partition("t", "dims");
+        assert_eq!(
+            store.flush_lagging_partitions(100, 10).await,
+            0,
+            "flush failed"
+        );
+        assert_eq!(
+            store.flush_lagging_partitions(100, 10).await,
+            1,
+            "and is retried"
+        );
+        assert_eq!(partition.flushes(), 2);
+        assert_eq!(store.min_unflushed_lsn().await.ok(), Some(None));
+    }
+
+    /// TD-USUB-22 review: a partition a lag flush did not move (its oldest rows
+    /// are held resident) is flushed at most once per lag window, and retried
+    /// in the next window in case it can move then.
+    #[tokio::test]
+    async fn a_lag_flush_that_frees_nothing_waits_a_lag_window() {
+        let partition = Arc::new(LagProbePartition::new(1, 0, true));
+        let store = lag_probe_store(partition.clone());
+        let _ = store.partition("t", "dims");
+        assert_eq!(store.flush_lagging_partitions(100, 10).await, 1);
+        assert_eq!(
+            store.flush_lagging_partitions(110, 10).await,
+            0,
+            "same window"
+        );
+        assert_eq!(
+            store.flush_lagging_partitions(111, 10).await,
+            1,
+            "next window"
+        );
+        assert_eq!(partition.flushes(), 2);
+    }
+
+    /// With the spill gate on, the tier floor is the minimum over spill
+    /// partitions' resident LSNs — the untenanted (`""`) partition included,
+    /// since it spills too — and ONE refusing partition (a memtable) makes the
+    /// whole tier refuse.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn record_tier_floor_is_the_minimum_over_spill_partitions() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
+        }
+        let (_, base) = spill_root();
+        let fs = local_fs().await;
+        let store_fs = fs.clone();
+        let refusing_base = format!("{base}/mixed");
+        let store = DirectWalTableRecordStore::new_spilling(
+            Arc::new(RecordingWalAppender::default()),
+            fs,
+            tenant_path_resolver(base),
+        );
+        let upsert = upsert_entry;
+
+        // `orders`: LSNs 1..=6 at threshold 4 — 1..=4 flush, 5 and 6 stay
+        // resident. `items`: LSNs 7 and 8, both resident.
+        let mut entries: Vec<CanonicalWalEntry> = (1..=6)
+            .map(|lsn| upsert(lsn, "tenant-a", "orders"))
+            .collect();
+        entries.extend((7..=8).map(|lsn| upsert(lsn, "tenant-a", "items")));
+        store.replay_wal_entries(entries).await.expect("replay");
+        assert_eq!(
+            store.min_unflushed_lsn().await.ok(),
+            Some(Some(5)),
+            "the minimum resident LSN across spill partitions"
+        );
+
+        // The untenanted partition spills like any other, so it reports its
+        // resident LSN instead of refusing; the minimum is unchanged.
+        store
+            .replay_wal_entries(vec![upsert(9, "", "orders")])
+            .await
+            .expect("replay");
+        assert_eq!(
+            store.min_unflushed_lsn().await.ok(),
+            Some(Some(5)),
+            "an untenanted spill partition answers, it does not refuse"
+        );
+
+        // A memtable partition has no durable copy of its rows, so it refuses —
+        // and one refusal makes the whole tier refuse.
+        let spill_fs = store_fs.clone();
+        let spill_base = refusing_base.clone();
+        let mixed = DirectWalTableRecordStore::with_storage_factory(
+            Arc::new(RecordingWalAppender::default()),
+            Arc::new(move |tenant_id: &str, collection: &str| {
+                if collection == "legacy" {
+                    Arc::new(crate::services::MemtableRecordStorage::new())
+                        as Arc<dyn RecordStorage>
+                } else {
+                    Arc::new(
+                        crate::services::SpillRecordStorage::with_flush_threshold(
+                            spill_fs.clone(),
+                            format!("{spill_base}/{tenant_id}/{collection}"),
+                            Some(4),
+                        )
+                        .with_tenant(tenant_id),
+                    ) as Arc<dyn RecordStorage>
+                }
+            }),
+        );
+        mixed
+            .replay_wal_entries(vec![
+                upsert(1, "tenant-a", "orders"),
+                upsert(2, "tenant-a", "legacy"),
+            ])
+            .await
+            .expect("replay");
+        assert!(
+            mixed.min_unflushed_lsn().await.is_err(),
+            "one refusing partition makes the whole tier refuse"
+        );
+
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+    }
+
+    #[test]
+    fn spill_path_segment_is_injective_and_never_navigates() {
+        let samples = [
+            "a/b", "a_b", "a_2Fb", "A.b-c", "", ".", "..", "tenant a", "é",
+        ];
+        let encoded: Vec<String> = samples.iter().map(|s| spill_path_segment(s)).collect();
+        let unique: std::collections::HashSet<&String> = encoded.iter().collect();
+        assert_eq!(unique.len(), samples.len(), "{encoded:?}");
+        for e in &encoded {
+            assert!(
+                !e.contains('/') && !e.is_empty() && e != "." && e != "..",
+                "{e}"
+            );
+        }
+        assert_eq!(spill_path_segment("orders-2026.v1"), "orders-2026.v1");
+    }
+
+    /// With the gate off (`0`) the production constructor is the legacy
+    /// memtable store and writes nothing under the spill root.
+    #[tokio::test]
+    async fn open_for_server_with_the_gate_off_is_the_partitioned_memtable() {
+        unsafe { std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "0") };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("record-spill");
+        let store = DirectWalTableRecordStore::open_for_server(
+            Arc::new(RecordingWalAppender::default()),
+            root.clone(),
+        )
+        .await
+        .expect("open");
+        store
+            .replay_wal_entries((1..=20u64).map(|lsn| upsert_entry(lsn, "tenant-a", "orders")))
+            .await
+            .expect("replay");
+        assert_eq!(store.flush_partitions().await.expect("flush"), 1);
+        assert!(
+            !root.exists(),
+            "no spill object may be written with the gate off"
+        );
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+    }
+
+    /// Turning the spill off over a root an earlier run spilled into refuses:
+    /// those rows may be in no retained WAL entry, so a memtable store would
+    /// serve a silent subset.
+    #[tokio::test]
+    async fn open_for_server_refuses_to_turn_the_spill_off_over_spilled_state() {
+        unsafe { std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "0") };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("record-spill");
+        let partition = root.join("tenant-a").join("orders");
+        std::fs::create_dir_all(&partition).expect("spill dir");
+        std::fs::write(partition.join("spill-0000000000000001.parquet"), b"x").expect("segment");
+        let wal = Arc::new(
+            crate::services::FramedTableWalAppender::open(dir.path().join("canonical-records.wal"))
+                .await
+                .expect("wal"),
+        );
+        wal.enable_segment_rotation(1);
+        for i in 0..3 {
+            wal.append_operations(
+                vec![CanonicalOperation::RecordUpsert {
+                    collection_id: "orders".to_string(),
+                    record: Box::new(ProximaRecord {
+                        oid: format!("r{i}"),
+                        ..Default::default()
+                    }),
+                    projections: vec![],
+                }],
+                None,
+            )
+            .await
+            .expect("append");
+        }
+
+        // History intact: replay rebuilds every row in memory, so off is safe.
+        DirectWalTableRecordStore::open_for_server(wal.clone(), root.clone())
+            .await
+            .expect("an untruncated WAL may turn the spill off");
+
+        // History truncated: the segments may hold the only copy. Refuse.
+        wal.truncate_below(u64::MAX).await.expect("truncate");
+        let err = DirectWalTableRecordStore::open_for_server(wal, root)
+            .await
+            .err()
+            .expect("spilled state over a truncated WAL with the gate off must refuse");
+        assert!(
+            format!("{err:#}").contains("turn the spill back on"),
+            "{err:#}"
+        );
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+    }
+
+    /// With the gate set, the production constructor spills under
+    /// `{root}/{tenant}/{collection}` and `flush_partitions` makes the resident
+    /// tail durable, so the tier floor then has no constraint.
+    ///
+    /// Process-isolated under nextest, so the env gate does not leak.
+    #[tokio::test]
+    async fn open_for_server_with_the_gate_spills_under_the_root_and_flushes_on_shutdown() {
+        unsafe {
+            std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("record-spill");
+        let store = DirectWalTableRecordStore::open_for_server(
+            Arc::new(RecordingWalAppender::default()),
+            root.clone(),
+        )
+        .await
+        .expect("open");
+        // 6 rows at threshold 4: 4 flush on the way, 2 stay resident.
+        store
+            .replay_wal_entries((1..=6u64).map(|lsn| {
+                CanonicalWalEntry::new(
+                    lsn,
+                    CanonicalOperation::RecordUpsert {
+                        collection_id: "orders/eu".to_string(),
+                        record: Box::new(ProximaRecord {
+                            oid: format!("r{lsn}"),
+                            ..Default::default()
+                        }),
+                        projections: vec![],
+                    },
+                    Some("tenant-a".to_string()),
+                )
+            }))
+            .await
+            .expect("replay");
+        let partition_dir = root.join("tenant-a").join("orders_2Feu");
+        let segments = |dir: &std::path::Path| -> usize {
+            std::fs::read_dir(dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| e.file_name().to_string_lossy().starts_with("spill-"))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            segments(&partition_dir),
+            1,
+            "one threshold flush during replay"
+        );
+
+        store.flush_partitions().await.expect("shutdown flush");
+        assert_eq!(
+            segments(&partition_dir),
+            2,
+            "the resident tail is now durable"
+        );
+
+        unsafe { std::env::remove_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV) };
+    }
+
     /// The wiring proof: with the gate ON, a partition really is spill-backed —
     /// it flushes to a durable segment AND still serves every row through the
     /// ordinary `TableRecordStore` read path.
@@ -5368,45 +7660,14 @@ mod tests {
             std::env::set_var(crate::services::record_spill::SPILL_MAX_RESIDENT_ENV, "4");
         }
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().to_path_buf();
-        let base = root.to_string_lossy().to_string();
-        std::mem::forget(dir);
-        let fs = Arc::new(
-            crate::storage::persistence::filesystem::local::LocalFileSystem::new(
-                crate::storage::persistence::filesystem::local::LocalConfig::default(),
-            )
-            .await
-            .expect("local filesystem"),
-        );
+        let (root, base) = spill_root();
+        let fs = local_fs().await;
 
         let wal = Arc::new(RecordingWalAppender::default());
-        let store = DirectWalTableRecordStore::new_spilling(
-            wal,
-            fs,
-            Arc::new(move |tenant_id: &str, collection: &str| {
-                format!("{base}/{tenant_id}/{collection}")
-            }),
-        );
+        let store = DirectWalTableRecordStore::new_spilling(wal, fs, tenant_path_resolver(base));
 
         const ROWS: u64 = 20;
-        let entries: Vec<CanonicalWalEntry> = (0..ROWS)
-            .map(|i| {
-                CanonicalWalEntry::new(
-                    i + 1,
-                    CanonicalOperation::RecordUpsert {
-                        collection_id: "orders".to_string(),
-                        record: Box::new(ProximaRecord {
-                            oid: format!("r{i}"),
-                            variation_id: Some("orders".to_string()),
-                            ..Default::default()
-                        }),
-                        projections: vec![],
-                    },
-                    Some("tenant-a".to_string()),
-                )
-            })
-            .collect();
+        let entries = upsert_entries(ROWS, "orders", "tenant-a");
         store.replay_wal_entries(entries).await.expect("replay");
 
         // Half 1: rows above the threshold actually left memory for a segment.
@@ -5522,6 +7783,40 @@ pub struct ObjectStoreIcebergRecordStore {
     bridge: Arc<dyn ObjectStoreBridge>,
 }
 
+/// Unpack a mutation batch into (records, ids, kind), short-circuiting an
+/// empty batch to a successful no-op result — the shared opening of the
+/// object-store `write_mutations` impls.
+enum UnpackedMutations {
+    Empty(TableRecordWriteResult),
+    Batch {
+        records: Vec<ProximaRecord>,
+        record_ids: Vec<String>,
+        kind: TableRecordMutationKind,
+    },
+}
+
+fn unpack_mutations(mutations: &[TableRecordMutation]) -> UnpackedMutations {
+    let records = mutations
+        .iter()
+        .map(|mutation| mutation.record.clone())
+        .collect::<Vec<_>>();
+    let record_ids = records.iter().map(record_id).collect::<Vec<_>>();
+
+    if records.is_empty() {
+        return UnpackedMutations::Empty(TableRecordWriteResult::success(record_ids));
+    }
+
+    let kind = mutations
+        .first()
+        .map(|mutation| mutation.kind)
+        .unwrap_or(TableRecordMutationKind::Insert);
+    UnpackedMutations::Batch {
+        records,
+        record_ids,
+        kind,
+    }
+}
+
 impl ObjectStoreIcebergRecordStore {
     pub fn new(bridge: Arc<dyn ObjectStoreBridge>) -> Self {
         Self { bridge }
@@ -5589,20 +7884,14 @@ impl TableRecordStore for ObjectStoreIcebergRecordStore {
         mutations: Vec<TableRecordMutation>,
         _tenant_context: Option<&TenantContext>,
     ) -> Result<TableRecordWriteResult> {
-        let records = mutations
-            .iter()
-            .map(|mutation| mutation.record.clone())
-            .collect::<Vec<_>>();
-        let record_ids = records.iter().map(record_id).collect::<Vec<_>>();
-
-        if records.is_empty() {
-            return Ok(TableRecordWriteResult::success(record_ids));
-        }
-
-        let kind = mutations
-            .first()
-            .map(|mutation| mutation.kind)
-            .unwrap_or(TableRecordMutationKind::Insert);
+        let (records, record_ids, kind) = match unpack_mutations(&mutations) {
+            UnpackedMutations::Empty(result) => return Ok(result),
+            UnpackedMutations::Batch {
+                records,
+                record_ids,
+                kind,
+            } => (records, record_ids, kind),
+        };
         let path = object_store_parquet_mutation_path(schema, kind, _tenant_context);
         let tenant_id = _tenant_context.map(|tc| tc.tenant_id.as_str());
         record_object_store_op(tenant_id, "write_parquet");
@@ -5618,6 +7907,7 @@ impl TableRecordStore for ObjectStoreIcebergRecordStore {
             })?;
 
         Ok(TableRecordWriteResult {
+            max_lsn: None,
             success: true,
             record_ids,
             metrics: OperationMetrics::default(),
@@ -5653,19 +7943,7 @@ impl TableRecordStore for ObjectStoreIcebergRecordStore {
         #[cfg(feature = "abac-policy")] _read_context: &ReadContext,
     ) -> Result<TableRecordScanResponse> {
         let mut records = self.read_all_records(table_schema, _tenant_context).await?;
-        if let Some(limit) = request.limit {
-            records.truncate(limit);
-        }
-        if !request.include_vector {
-            for record in &mut records {
-                record.embeddings.clear();
-            }
-        }
-        if !request.include_props {
-            for record in &mut records {
-                record.props.clear();
-            }
-        }
+        truncate_and_project_scan(&mut records, &request);
         Ok(records)
     }
 }
@@ -6008,20 +8286,14 @@ impl TableRecordStore for ObjectStoreVectorRecordStore {
         mutations: Vec<TableRecordMutation>,
         _tenant_context: Option<&TenantContext>,
     ) -> Result<TableRecordWriteResult> {
-        let records = mutations
-            .iter()
-            .map(|mutation| mutation.record.clone())
-            .collect::<Vec<_>>();
-        let record_ids = records.iter().map(record_id).collect::<Vec<_>>();
-
-        if records.is_empty() {
-            return Ok(TableRecordWriteResult::success(record_ids));
-        }
-
-        let kind = mutations
-            .first()
-            .map(|mutation| mutation.kind)
-            .unwrap_or(TableRecordMutationKind::Insert);
+        let (records, record_ids, kind) = match unpack_mutations(&mutations) {
+            UnpackedMutations::Empty(result) => return Ok(result),
+            UnpackedMutations::Batch {
+                records,
+                record_ids,
+                kind,
+            } => (records, record_ids, kind),
+        };
         let object_path = object_store_pax_segment_path(schema, kind, _tenant_context);
         let local_path = temp_pax_segment_path(schema, kind);
         // P-Shred (ADR-055): resolve the shred-list from the catalog's props-auto-promotion
@@ -6109,6 +8381,7 @@ impl TableRecordStore for ObjectStoreVectorRecordStore {
         }
 
         Ok(TableRecordWriteResult {
+            max_lsn: None,
             success: true,
             record_ids,
             metrics: OperationMetrics::default(),
@@ -6144,19 +8417,7 @@ impl TableRecordStore for ObjectStoreVectorRecordStore {
         #[cfg(feature = "abac-policy")] _read_context: &ReadContext,
     ) -> Result<TableRecordScanResponse> {
         let mut records = self.read_all_records(table_schema, _tenant_context).await?;
-        if let Some(limit) = request.limit {
-            records.truncate(limit);
-        }
-        if !request.include_vector {
-            for record in &mut records {
-                record.embeddings.clear();
-            }
-        }
-        if !request.include_props {
-            for record in &mut records {
-                record.props.clear();
-            }
-        }
+        truncate_and_project_scan(&mut records, &request);
         Ok(records)
     }
     /// Override: when a structured `request.filter` is present, read segments via

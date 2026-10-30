@@ -721,6 +721,10 @@ impl RestServer {
             }
         };
 
+        // Query request scope from the resolved tenant (inside the tenant layer).
+        router = router.layer(middleware::from_fn(
+            crate::network::middleware::request_scope::rest_request_scope,
+        ));
         // Apply tenant layer (runs after auth to access JWT claims)
         router = router.layer(tenant_layer);
         tracing::info!(
@@ -1050,7 +1054,11 @@ impl RestServer {
         // Axum applies layers in reverse order, so auth runs first on
         // the request path, then tenant, then handler.
         use tower_http::trace::TraceLayer;
-        let mut router = base_router.layer(tenant_layer);
+        let mut router = base_router
+            .layer(middleware::from_fn(
+                crate::network::middleware::request_scope::rest_request_scope,
+            ))
+            .layer(tenant_layer);
         if let Some(auth) = auth_layer {
             router = router.layer(auth);
             tracing::info!("🔒 Unified-port REST auth: ENABLED (auth_middleware_unified attached)");
@@ -1394,11 +1402,9 @@ mod tests {
 
     use crate::network::auth::middleware::auth_middleware_unified;
     use crate::security::auth_service::{
-        ApiKeyInfo, AuthenticationConfig, AuthenticationMethod, JwtConfig, MtlsConfig, SSOConfig,
+        ApiKeyInfo, AuthenticationConfig, AuthenticationMethod, JwtConfig, SSOConfig,
     };
-    use crate::security::rbac_service::RBACConfig;
-    use crate::security::security_coordinator::{ComplianceConfig, TlsConfig};
-    use crate::security::{AuditConfig, SecurityConfig, SecurityCoordinator, SecurityMode};
+    use crate::security::{SecurityConfig, SecurityCoordinator};
 
     fn build_api_key_security_config() -> SecurityConfig {
         let mut api_keys = std::collections::HashMap::new();
@@ -1418,51 +1424,28 @@ mod tests {
 
         SecurityConfig {
             enabled: true,
-            mode: SecurityMode::Development,
             authentication: AuthenticationConfig {
                 enabled: true,
                 methods: vec![AuthenticationMethod::ApiKey],
                 require_authentication: true,
                 default_session_timeout_minutes: 60,
                 api_keys,
-                scram_users: std::collections::HashMap::new(),
                 jwt: JwtConfig {
-                    enabled: false,
                     secret: "dev-secret".to_string(),
                     access_token_expiration_minutes: 15,
                     refresh_token_expiration_days: 7,
                     issuer: "test".to_string(),
                     audience: "test".to_string(),
                     algorithm: "HS256".to_string(),
+                    ..Default::default()
                 },
                 sso: SSOConfig {
-                    enabled: false,
-                    providers: vec![],
                     token_cache_ttl_minutes: 5,
+                    ..Default::default()
                 },
-                mtls: MtlsConfig::default(),
-                oidc: None,
-                audit_fail_closed: false,
+                ..Default::default()
             },
-            rbac: RBACConfig::default(),
-            audit: AuditConfig::default(),
-            tls: TlsConfig {
-                enabled: false,
-                require_client_certificates: false,
-                cert_file: None,
-                key_file: None,
-                ca_file: None,
-            },
-            compliance: ComplianceConfig {
-                frameworks: vec![],
-                data_residency: None,
-                encryption_at_rest: false,
-                encryption_in_transit: false,
-            },
-            encryption: crate::security::EncryptionConfig::default(),
-            key_store: crate::security::KeyStoreConfig::default(),
-            tenant: Default::default(),
-            pgwire: crate::security::security_coordinator::PgwireSecurityConfig::default(),
+            ..Default::default()
         }
     }
 

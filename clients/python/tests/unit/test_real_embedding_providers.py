@@ -31,19 +31,13 @@ except ImportError:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
 
 from proximadb_sdk.embedding_providers.core import ProviderConfig
-from proximadb_sdk.embedding_providers.providers.local.bge import (
-    BGEProvider,
-)
+from proximadb_sdk.embedding_providers.providers.local.bge import BGEProvider
 from proximadb_sdk.embedding_providers.providers.local.e5 import E5Provider
-from proximadb_sdk.embedding_providers.providers.local.gte_qwen import (
-    GTEQwenProvider,
-)
+from proximadb_sdk.embedding_providers.providers.local.gte_qwen import GTEQwenProvider
 from proximadb_sdk.embedding_providers.providers.local.sentence_transformer import (
     SentenceTransformerProvider,
 )
-from proximadb_sdk.embedding_providers.providers.local.sfr import (
-    SFRProvider,
-)
+from proximadb_sdk.embedding_providers.providers.local.sfr import SFRProvider
 
 # Mark all tests in this module as requiring models
 pytestmark = pytest.mark.requires_models

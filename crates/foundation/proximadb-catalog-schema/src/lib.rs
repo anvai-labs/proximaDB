@@ -793,14 +793,6 @@ impl CatalogTableSchema {
     // of *column names* (the canonical form). `from_columns` accepts ids and
     // resolves them to names; `primary_key_ids` is the inverse by-id helper.
 
-    /// Millis since epoch (no `chrono` dependency in this crate).
-    fn now_ms() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0)
-    }
-
     /// Construct a storage-plane schema from explicit columns and a primary key
     /// given by *column id* (the storage-side `ProximaSchema::new` signature).
     /// The ids are resolved to the canonical by-name `primary_key`.
@@ -820,7 +812,7 @@ impl CatalogTableSchema {
             columns,
             primary_key,
             fingerprint,
-            created_at_ms_schema: Self::now_ms(),
+            created_at_ms_schema: proximadb_kernel::time::now_unix_ms(),
             is_legacy_vector_record: false,
             ..Default::default()
         }

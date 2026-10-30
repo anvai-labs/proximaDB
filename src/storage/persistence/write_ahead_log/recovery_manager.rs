@@ -649,7 +649,7 @@ impl RecoveryManager {
             .filter(|r| r.valid_to_ns == Some(0) && r.origin.as_deref() == Some("delete"))
             .filter_map(|r| oid_to_lsn.get(&r.oid).map(|&lsn| (r.oid.clone(), lsn)))
             .collect();
-        let digest = format!("{:x}", digest.finalize());
+        let digest = hex::encode(digest.finalize());
         let range = match (
             replay.first().and_then(|object| object.token.as_ref()),
             replay.last().and_then(|object| object.token.as_ref()),
@@ -1364,13 +1364,12 @@ mod tests {
     fn create_test_vector(id: &str) -> ProximaRecord {
         ProximaRecord {
             oid: id.to_string(),
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.1, 0.2, 0.3, 0.4]),
-                dim: 4,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                4,
+                vec![0.1, 0.2, 0.3, 0.4],
+            )],
             record_version: 1,
             ..Default::default()
         }

@@ -3,14 +3,14 @@
 = ADR-096: Product direction — a SQL-first context engine on object storage, one planning frame
 :toc: left
 :toclevels: 2
-:last-updated: 2026-10-17
+:last-updated: 2026-10-18
 
 [cols="1,3"]
 |===
 | Status | **Accepted (2026-10-17).** Decisions D1–D4 were taken by the product owner; D5 is the governance that keeps them from drifting.
 | Date | 2026-10-17
 | Deciders | Vijaykumar Singh
-| Supersedes (in part) | The *framing* sections of `DATA_WAREHOUSE_AND_ENGINEERING_COURSE_CORRECTION_2026_06_04` ("compete directly with Snowflake/Databricks/Trino"); the milestone lists in `00-product/VISION.adoc` and `00-product/PRD.adoc`; the numbered-phase frame of `STRATEGIC_ROADMAP.adoc`. Engineering mandates (pgwire, object storage, `ComputeScheduler` routing, ADR-094/095) are unchanged. OLAP execution: DataFusion is the executor (ADR-052); native operators exist only as ADR-054's default-off, ledger-gated plane.
+| Supersedes (in part) | The *framing* sections of `DATA_WAREHOUSE_AND_ENGINEERING_COURSE_CORRECTION_2026_06_04` ("compete directly with Snowflake/Databricks/Trino"); the milestone lists in the former vision and `00-product/PRD.adoc`; the former numbered-phase roadmap frame. Engineering mandates (pgwire, object storage, `ComputeScheduler` routing, ADR-094/095) are unchanged. OLAP execution: DataFusion is the executor (ADR-052); native operators exist only as ADR-054's default-off, ledger-gated plane.
 | Relates to | ADR-052 (OLAP executor), ADR-094 (one substrate, format follows modality), ADR-095 (Postgres-compatible OLTP), `SUPPORTED_SURFACE.adoc` (support contract), `MVP_TRUST_CORRIDOR.toml`
 |===
 
@@ -90,7 +90,7 @@ No document may claim a model as a supported engine unless the support contract 
 
 === D4 — One planning frame: a release-based roadmap
 
-`STRATEGIC_ROADMAP.adoc` is the only plan. It is organised by release (v0.5, v0.6, v0.7,
+`docs/current/ROADMAP.adoc` is the only release plan. It is organised by release (v0.5, v0.6, v0.7,
 v1.0, then "later"), each with a theme, exit criteria and the TDs that carry the work.
 
 * `VISION.adoc` keeps the durable outcomes and non-goals, and no dated milestone lists.
@@ -106,8 +106,12 @@ v1.0, then "later"), each with a theme, exit criteria and the TDs that carry the
   system map, ADR index, work ledger, evidence ledger. Other documents link to them instead of
   restating them.
 . **A document that disagrees with its authority is a bug**, fixed in the PR that finds it.
-. **Superseded documents are deleted and their links repointed** (git keeps history); there is
-  no archive tree.
+. **Current/history split (owner amendment, 2026-10-26):** consolidate active direction,
+  sequencing, coordination and implementation contracts in `docs/current/`. Preserve unique
+  rationale, superseded plans and completed evidence in `docs/history/`; remove duplicate
+  active paths and repoint their links. Current keeps short completed-work pointers and
+  detailed pending work. Stable ADR/TD/spec IDs remain reference contracts. This replaces
+  the earlier delete-only/no-archive rule, without creating another planning authority.
 . **Every engineering slice ships with tests first and an end-to-end smoke where the slice
   touches durability or a wire protocol** (see `docs/06-internals/contributing.md`), so the
   roadmap's exit criteria are executable, not prose.
@@ -116,7 +120,7 @@ v1.0, then "later"), each with a theme, exit criteria and the TDs that carry the
 
 == 3. Consequences
 
-* `VISION.adoc`, `PRD.adoc`, `STRATEGIC_ROADMAP.adoc`, `SUPPORTED_SURFACE.adoc` (authority
+* `VISION.adoc`, `PRD.adoc`, `docs/current/ROADMAP.adoc`, `SUPPORTED_SURFACE.adoc` (authority
   table and positioning), the course-correction document (banner), `README.adoc`,
   `docs/index.md`, the work ledger and the diagrams are rewritten or re-bannered to match, in the
   same change set as this ADR.
@@ -133,3 +137,19 @@ v1.0, then "later"), each with a theme, exit criteria and the TDs that carry the
 
 * Which cloud object store is the first GA backend (S3, Azure Blob or GCS).
 * Pricing and packaging, and the open-core boundary beyond `OPEN_CORE.md`.
+
+== Amendment 2026-10-18 (ADR-097)
+
+link:ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097] D4 adds a positioning line that
+sharpens D1 without changing it:
+
+[quote]
+ProximaDB is the **lakehouse system of record for AI context — analytics is the proof, not the
+product.**
+
+Every modality lands as an open table on object storage under one catalog, one record identity
+and one snapshot. TPC-H/TPC-DS conformance and the multimodal benchmark are how that claim is
+proven, consistent with D1's "analytics is a capability of the engine, not the positioning".
+The positioning amendment leaves the product decisions intact; D5 now also records the
+2026-10-26 owner-directed current/history maintenance rule. The seams that make the line true, and the phased work, are
+in link:../../current/LAKEHOUSE_PLAN.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10].

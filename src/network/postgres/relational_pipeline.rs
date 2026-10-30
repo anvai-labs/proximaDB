@@ -549,7 +549,7 @@ async fn execute_pgvector_plan(
             matches!(column, PgVectorOutputColumn::Metadata { source, .. } if source.eq_ignore_ascii_case("metadata"))
         }))
         .then_some(requested_metadata.as_slice());
-        match dml
+        let exact = match dml
             .search_table_vectors_exact(
                 &plan.search.collection,
                 vector_column,
@@ -563,8 +563,16 @@ async fn execute_pgvector_plan(
                 &controls,
             )
             .await
-            .map_err(|error| format!("catalog-table vector search failed: {error}"))?
         {
+            // A catalog entry this tenant may not see is no catalog table for
+            // it: fall through to the collection path, which answers exactly
+            // as for a name that does not exist.
+            Err(error) if proximadb_catalog::TableNotVisible::is(&error) => None,
+            other => {
+                other.map_err(|error| format!("catalog-table vector search failed: {error}"))?
+            }
+        };
+        match exact {
             Some(results) => results,
             None => vector_ops
                 .unified_search_native(&plan.search, identity)
@@ -619,20 +627,7 @@ fn pgvector_distance(
     record: &proximadb_search_types::results::OptimizedSearchRecord,
     metric: proximadb_distance_types::DistanceMetric,
 ) -> Result<f64, String> {
-    let expected = match metric {
-        proximadb_distance_types::DistanceMetric::L2 => {
-            proximadb_distance_kernel::DistanceMetric::Euclidean
-        }
-        proximadb_distance_types::DistanceMetric::Cosine => {
-            proximadb_distance_kernel::DistanceMetric::Cosine
-        }
-        proximadb_distance_types::DistanceMetric::InnerProduct => {
-            proximadb_distance_kernel::DistanceMetric::DotProduct
-        }
-        proximadb_distance_types::DistanceMetric::L1 => {
-            proximadb_distance_kernel::DistanceMetric::Manhattan
-        }
-    };
+    let expected = crate::services::dml::kernel_distance_metric(metric);
     let semantic = record.semantic_similarity.as_ref().ok_or_else(|| {
         format!(
             "vector search result '{}' omitted the requested {metric} distance",
@@ -918,34 +913,6 @@ pub async fn try_run_select(
         return None;
     }
 
-    // OLAP result cache lookup (ADR-051 D2 / mandate #16c). Strong freshness:
-    // a hit is served ONLY when the entry was computed at the current canonical
-    // WAL LSN, so any write since → guaranteed miss → read-after-write correct.
-    // `cache_ctx` carries the (key, lsn) pair so the real-data success paths
-    // below can stamp the result without recomputing it.
-    let cache_ctx: Option<(StructuralKey, u64)> = if relational_abac_required {
-        None
-    } else if let Some(cache) = result_cache {
-        let current_lsn = current_canonical_lsn().await;
-        let skey = StructuralKey::new(
-            tenant.unwrap_or(""),
-            namespace.unwrap_or(""),
-            QueryKey::from_sql(sql),
-        );
-        if let Some(cached) = cache.get_fresh(&skey, &VectorFreshnessMode::Strong, current_lsn) {
-            tracing::debug!(
-                target: "proximadb::pgwire::result_cache",
-                tenant = tenant.unwrap_or(""),
-                lsn = current_lsn,
-                "OLAP result cache hit — short-circuiting route + execution"
-            );
-            return Some(Ok(cached.result.clone()));
-        }
-        Some((skey, current_lsn))
-    } else {
-        None
-    };
-
     // TD-OLAP-4 result-path probe: time ALL of `try_run_select` before execution
     // — including the path-1 engine-catalog `lower_sql` attempt below, which a
     // DataFusion-routed query pays and fails before reaching the path-2 setup.
@@ -1026,11 +993,11 @@ pub async fn try_run_select(
             Ok(catalog_schema) => {
                 #[cfg(feature = "datafusion-integration")]
                 if let Some(location) = catalog_table_is_parquet_backed(&catalog_schema) {
-                    parquet_loc_by_key.insert(key.clone(), location);
-                    parquet_trust_by_key.insert(key.clone(), parquet_stats_trust(&catalog_schema));
-                    if let Some(params) = olap_delta_table_params(&catalog_schema) {
+                    if let Some(params) = olap_delta_table_params(&catalog_schema, &location) {
                         olap_delta_tables.insert(key.clone(), params);
                     }
+                    parquet_loc_by_key.insert(key.clone(), location);
+                    parquet_trust_by_key.insert(key.clone(), parquet_stats_trust(&catalog_schema));
                 }
                 // TD-OLAP-1 Test 2.1: Track PAX-backed tables from catalog signals
                 if catalog_table_is_pax_backed(&catalog_schema) {
@@ -1043,16 +1010,59 @@ pub async fn try_run_select(
                     target: "proximadb::pgwire::new_pipeline",
                     "relational schema resolve for `{raw}` failed: {e}; falling through to legacy"
                 );
+                // TD-USUB-2: the legacy path would drop a window function — but
+                // say why this table has no relational route (a typo, a vector
+                // collection) rather than suggest enabling one. System catalogs
+                // keep their legacy stubs.
+                if require_engagement && !is_system_catalog_relation(raw) {
+                    return unresolved_window_decline(query, raw, &e).map(Err);
+                }
                 return None;
             }
         }
     }
 
+    #[cfg(feature = "datafusion-integration")]
+    let publication_backed = !parquet_loc_by_key.is_empty();
+    #[cfg(not(feature = "datafusion-integration"))]
+    let publication_backed = false;
+
+    // OLAP result cache lookup (ADR-051 D2 / mandate #16c). Strong freshness:
+    // WAL freshness alone cannot detect an independently published snapshot.
+    // Resolve dependencies first and bypass this cache for published inputs
+    // until its key includes their pinned snapshot identities.
+    // `cache_ctx` carries the (key, lsn) pair so the real-data success paths
+    // below can stamp the result without recomputing it.
+    let cache_ctx: Option<(StructuralKey, u64)> = if relational_abac_required || publication_backed
+    {
+        None
+    } else if let Some(cache) = result_cache {
+        let current_lsn = current_canonical_lsn().await;
+        let skey = StructuralKey::new(
+            tenant.unwrap_or(""),
+            namespace.unwrap_or(""),
+            QueryKey::from_sql(sql),
+        );
+        if let Some(cached) = cache.get_fresh(&skey, &VectorFreshnessMode::Strong, current_lsn) {
+            tracing::debug!(
+                target: "proximadb::pgwire::result_cache",
+                tenant = tenant.unwrap_or(""),
+                lsn = current_lsn,
+                "OLAP result cache hit — short-circuiting route + execution"
+            );
+            return Some(Ok(cached.result.clone()));
+        }
+        Some((skey, current_lsn))
+    } else {
+        None
+    };
+
     // Course-correction §5: compute the per-query Parquet-backed signal — only ever
     // true under `datafusion-integration`, where the DataFusion destination is
     // compiled — and feed it into the canonical `ComputeScheduler` so the ROUTE
     // DECISION and the physical DISPATCH come from ONE place. Mixed Parquet+native
-    // queries report `false` (cross-engine join is a later phase) → Volcano.
+    // queries report `false` here; they reach the DataFusion floor through
+    // `native_registerable` (ADR-097 P3.1 PR 8).
     #[cfg(feature = "datafusion-integration")]
     let parquet_backed = !relational_abac_required
         && !tables.is_empty()
@@ -1065,11 +1075,14 @@ pub async fn try_run_select(
     // is what makes CTEs / window functions / joins reachable without a manual
     // `ALTER TABLE … MATERIALIZE` — the capability cliff ADR-094 records as defect (b).
     //
-    // Mixed Parquet+native queries stay `false` (the Parquet arm already serves those,
-    // and cross-representation joins are a later phase).
+    // ADR-097 P3.1 PR 8: a query MIXING Parquet-backed and native tables is admitted
+    // too — the floor registers the Parquet tables (with their ADR-025 delta merge)
+    // and the native ones side by side, so a cross-representation join no longer
+    // falls back to Volcano. Ungoverned sessions only: the Parquet side reads files
+    // directly and cannot apply a row filter, exactly as the Parquet arm.
     //
-    // TD-USUB-3: a governed (ABAC-scoped) session IS admitted here, unlike the Parquet
-    // arm. That asymmetry is the whole point — every row this path registers comes from
+    // TD-USUB-3: a governed (ABAC-scoped) session IS admitted for an all-native
+    // query (not a mixed one), unlike the Parquet arm. That asymmetry is the whole point — every row this path registers comes from
     // `scan_table_relational`, which resolves the ABAC row filter itself, so the rows
     // handed to DataFusion are already governed. The Parquet arm reads files directly
     // and cannot apply a row filter, which is why it stays excluded under ABAC.
@@ -1078,12 +1091,33 @@ pub async fn try_run_select(
     // resolves through `vector_ops`/`graph_ops`, which do not apply the relational row
     // filter. `query_has_table_function` is the fail-closed guard that keeps a governed
     // query from mixing governed rows with an ungoverned source.
+    //
+    // ADR-097 P3.2: a query over table functions ALONE (no catalog table — e.g. an
+    // aggregate or join over `vector_search(...)`) is admitted too: the frontend
+    // cannot lower a table function, so it used to fall through to the legacy
+    // single-table path. Ungoverned sessions only, by the same guard.
     #[cfg(feature = "datafusion-integration")]
-    let native_registerable =
-        crate::query::execution::native_table_provider::native_table_provider_enabled()
-            && !tables.is_empty()
-            && tables.keys().all(|k| !parquet_loc_by_key.contains_key(k))
-            && (!relational_abac_required || !query_has_table_function(query));
+    let (native_registerable, mixed_registerable, has_udtf) = {
+        let gate = crate::query::execution::native_table_provider::native_table_provider_enabled();
+        let parquet = |k: &String| parquet_loc_by_key.contains_key(k);
+        let has_udtf = query_has_table_function(query);
+        let all_native = !tables.is_empty()
+            && tables.keys().all(|k| !parquet(k))
+            && (!relational_abac_required || !has_udtf);
+        let mixed = gate
+            && !relational_abac_required
+            && tables.keys().any(parquet)
+            && tables.keys().any(|k| !parquet(k));
+        // pgwire only (`require_engagement`): it hands the floor the vector and
+        // graph ports, so every function the query names is registered; other
+        // callers keep their own fallback for these queries.
+        let udtf_only = gate
+            && require_engagement
+            && !relational_abac_required
+            && tables.is_empty()
+            && query_reads_only_table_functions(query);
+        ((gate && all_native) || mixed || udtf_only, mixed, has_udtf)
+    };
     #[cfg(not(feature = "datafusion-integration"))]
     let native_registerable = false;
 
@@ -1176,7 +1210,8 @@ pub async fn try_run_select(
     // block does NOT re-decide — it is a thin `match decision.backend` over the
     // parquet-OLAP engines, each PRIMARY owning its own fall-through to the shared
     // DataFusion floor. The DataFusion arm exists only under the feature (and
-    // `parquet_backed`), so a default build never enters it and stays Volcano.
+    // `parquet_backed` or `native_registerable`), so a build without it never
+    // enters and stays Volcano.
     //
     // The outer guard restricts entry to the three parquet-OLAP backends; any
     // other `decision.backend` (never produced for a parquet-OLAP shape) falls
@@ -1368,17 +1403,20 @@ pub async fn try_run_select(
             graph_ops,
             identity: identity.clone(),
             // ADR-025: reconcile opted-in parquet-backed tables with their
-            // post-snapshot WAL delta at scan time. `None` (no opted-in table)
-            // keeps the legacy bare-Parquet read (default-OFF).
-            // TD-USUB-2: native relational tables registered as MemTables, so the
-            // DataFusion floor (and its `ctx.sql` fallback) can serve them. `None`
-            // whenever the gate is off or any table is Parquet-backed.
+            // post-snapshot WAL delta at scan time (default-ON for eligible
+            // tables). `None` keeps the bare-Parquet read.
+            // TD-USUB-2: native relational tables registered with the DataFusion
+            // floor (and its `ctx.sql` fallback). `None` whenever the gate is off or
+            // no table is native. A mixed query registers only its non-Parquet
+            // tables here — the Parquet ones arrive through `parquet_tables` — so no
+            // table is registered twice (ADR-097 P3.1 PR 8).
             native_tables: if native_registerable {
                 Some(
                     crate::query::execution::native_table_provider::NativeTableConfig {
                         source: dml.clone(),
                         tables: tables
                             .iter()
+                            .filter(|(k, _)| !parquet_loc_by_key.contains_key(*k))
                             .map(|(k, t)| (k.clone(), t.table_name.clone()))
                             .collect(),
                         row_cap:
@@ -1452,15 +1490,31 @@ pub async fn try_run_select(
             )
             .await;
         }
-        return Some(match engine_result {
+        match engine_result {
             Ok(result) => {
-                if let Some((skey, lsn)) = &cache_ctx {
+                // A table function's rows are not catalog-table dependencies, so
+                // the cache could not invalidate them: never cached.
+                if let Some((skey, lsn)) = cache_ctx.as_ref().filter(|_| !has_udtf) {
                     populate_olap_result_cache(result_cache, skey, *lsn, result.clone(), &tables);
                 }
-                Ok(result)
+                return Some(Ok(result));
             }
-            Err(e) => Err(e.to_string()),
-        });
+            // Switching a published input to the native record store changes
+            // its visibility authority. A row-cap decline cannot authorize that
+            // fallback, even if opening the latest metadata found no DVs: a
+            // concurrent publication could change that before the native scan.
+            Err(e)
+                if mixed_registerable
+                    && e.to_string().contains(
+                        crate::query::execution::native_table_provider::MIXED_QUERY_ROW_CAP_DECLINE,
+                    ) =>
+            {
+                return Some(Err(format!(
+                    "{e}; cannot fall back to native storage for published inputs without a shared snapshot"
+                )));
+            }
+            Err(e) => return Some(Err(e.to_string())),
+        }
     }
 
     let snapshot = SnapshotCatalog {
@@ -1472,9 +1526,17 @@ pub async fn try_run_select(
     // Lower + plan via the shared planning path (so EXPLAIN discloses exactly this
     // plan). `None` → lowering declined → fall through to legacy. From the planned
     // physical onward, errors are real and surface to the client.
-    let physical = match plan_over_snapshot(sql, &snapshot)? {
-        Ok(p) => p,
-        Err(e) => return Some(Err(e)),
+    //
+    // TD-USUB-2 fail-closed: the frontend always declines `OVER (…)` (TD-187), and a
+    // windowed query that reaches here had no DataFusion route (e.g. a native table
+    // with `PROXIMADB_NATIVE_TABLE_PROVIDER` off). pgwire's legacy single-table path
+    // (`require_engagement`) would drop the window and serve a silently wrong answer,
+    // so decline it explicitly instead. Off-pgwire callers keep their own fallback.
+    let physical = match plan_over_snapshot(sql, &snapshot) {
+        Some(Ok(p)) => p,
+        Some(Err(e)) => return Some(Err(e)),
+        None if !require_engagement => return None,
+        None => return window_decline(query, relational_abac_required).map(Err),
     };
     crate::observability::io_trace::record_setup_ms(setup_start.elapsed().as_millis() as u64);
     match execute_physical(physical, &snapshot, controls).await {
@@ -2039,7 +2101,9 @@ async fn try_native_over_parquet(
             return None;
         }
     };
-    let (store, files, file_schema) = table.native_scan_inputs();
+    // The native file-only scanner/metadata shortcut cannot apply DVs yet.
+    // Decline to the delete-aware provider before any raw footer elision.
+    let (store, files, file_schema) = table.native_scan_inputs()?;
     // Metadata elision (TD-OLAP-4): unfiltered MIN/MAX/COUNT answered from the
     // parquet FOOTER — zero column I/O, flat cost. The single biggest native win at
     // scale (q07 MIN/MAX: a full-column vectorized scan → a footer read). Emits the
@@ -2272,6 +2336,7 @@ fn olap_delta_merge_on(var: Option<&str>) -> bool {
 #[cfg(feature = "datafusion-integration")]
 fn olap_delta_table_params(
     schema: &proximadb_catalog::CatalogTableSchema,
+    location: &str,
 ) -> Option<crate::query::execution::olap_delta_merge::OlapDeltaTable> {
     use proximadb_catalog::{CatalogAuthorityMode, CatalogPhysicalFormat};
     // Single-column PK required: the merge recomputes each base row's canonical oid
@@ -2302,11 +2367,39 @@ fn olap_delta_table_params(
     if !opted_in {
         return None;
     }
-    let snapshot_lsn: u64 = layout.properties.get("snapshot_lsn")?.parse().ok()?;
+    // The (version, LSN) pair the ordered-DV merge trusts must come from ONE
+    // layout: the `parquet-snapshot` at the opened location. When that layout
+    // records its publication, BOTH come from it; otherwise the legacy LSN of
+    // the format/authority match is used and no version is trusted (a DV base
+    // then refuses, as before).
+    let (recorded_metadata_version, snapshot_lsn) = match recorded_publication_at(schema, location)
+    {
+        Some((version, lsn)) => (Some(version), lsn),
+        None => (None, layout.properties.get("snapshot_lsn")?.parse().ok()?),
+    };
     Some(crate::query::execution::olap_delta_merge::OlapDeltaTable {
         snapshot_lsn,
         pk_column,
+        recorded_metadata_version,
     })
+}
+
+/// The `(metadata version, snapshot LSN)` pair recorded by the table's
+/// `parquet-snapshot` layout, bound to the location actually being opened. The
+/// pair the merge trusts must come from the SAME layout as the base it opens:
+/// the delta-merge parameters above select a layout by format and authority,
+/// and the opened location comes from a separate scan, so a decoy layout could
+/// otherwise lend its version or LSN to another layout's files.
+#[cfg(feature = "datafusion-integration")]
+fn recorded_publication_at(
+    schema: &proximadb_catalog::CatalogTableSchema,
+    location: &str,
+) -> Option<(u64, u64)> {
+    let layout = schema
+        .storage_layouts
+        .iter()
+        .find(|l| l.name == "parquet-snapshot" && l.location.as_deref() == Some(location))?;
+    crate::services::dml::recorded_publication(std::slice::from_ref(layout))
 }
 
 /// Sync `CatalogLookup` wrapper for the process-wide engine.
@@ -2715,6 +2808,74 @@ pub fn pg_type_for(t: &ProximaType) -> PgType {
         ProximaType::Jsonb => PgType::Jsonb,
         ProximaType::Uuid | ProximaType::ULID => PgType::Uuid,
         _ => PgType::Text,
+    }
+}
+
+/// Nanoseconds in one `unit`.
+fn unit_nanos(unit: proximadb_data_model::TimeUnit) -> i64 {
+    use proximadb_data_model::TimeUnit as U;
+    match unit {
+        U::Second => 1_000_000_000,
+        U::Millisecond => 1_000_000,
+        U::Microsecond => 1_000,
+        U::Nanosecond => 1,
+    }
+}
+
+/// `HH:MM:SS[.ffffff]`, Postgres style: up to microseconds, trailing zeros trimmed.
+fn pg_time_of_day(t: chrono::NaiveTime) -> String {
+    use chrono::Timelike;
+    let base = t.format("%H:%M:%S").to_string();
+    let micros = t.nanosecond() / 1_000;
+    if micros == 0 {
+        base
+    } else {
+        let frac = format!("{micros:06}");
+        format!("{base}.{}", frac.trim_end_matches('0'))
+    }
+}
+
+/// pgwire **result-cell** text: the Postgres text output a client parses for
+/// the advertised type (`pg_type_for`). DATE is `YYYY-MM-DD`, TIMESTAMP is
+/// `YYYY-MM-DD HH:MM:SS[.ffffff]`, TIMESTAMPTZ appends `+00`, TIME is
+/// `HH:MM:SS[.ffffff]`; every other value renders as [`text_encode`].
+///
+/// [`text_encode`] stays the canonical *key* form (PK / secondary-index probes
+/// match the stored oid text, e.g. a DATE key's day count), so the two must not
+/// be merged: this one is only for DataRow cells.
+pub fn wire_text(v: &ProximaValue) -> Option<String> {
+    use ProximaValue as V;
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?.and_hms_opt(0, 0, 0)?;
+    let datetime = |ticks: i64, unit| {
+        let nanos = (ticks as i128) * (unit_nanos(unit) as i128);
+        let secs = nanos.div_euclid(1_000_000_000) as i64;
+        let sub = nanos.rem_euclid(1_000_000_000) as u32;
+        chrono::DateTime::from_timestamp(secs, sub).map(|d| d.naive_utc())
+    };
+    match v {
+        V::Date(days) => Some(
+            epoch
+                .date()
+                .checked_add_signed(chrono::Duration::days(*days as i64))
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| days.to_string()),
+        ),
+        V::Timestamp(t, unit) => Some(
+            datetime(*t, *unit)
+                .map(|d| format!("{} {}", d.format("%Y-%m-%d"), pg_time_of_day(d.time())))
+                .unwrap_or_else(|| t.to_string()),
+        ),
+        V::TimestampTz(t, unit) => Some(
+            datetime(*t, *unit)
+                .map(|d| format!("{} {}+00", d.format("%Y-%m-%d"), pg_time_of_day(d.time())))
+                .unwrap_or_else(|| t.to_string()),
+        ),
+        V::Time(t, unit) => Some(
+            datetime(*t, *unit)
+                .map(|d| pg_time_of_day(d.time()))
+                .unwrap_or_else(|| t.to_string()),
+        ),
+        other => text_encode(other),
     }
 }
 
@@ -3614,6 +3775,27 @@ mod route_explain_tests {
 // Engagement gate + table-name collection (over the parsed AST)
 // =========================================================================
 
+/// TD-PGEXT-1: whether `sql` is a SELECT the relational pipeline routes
+/// (joins, aggregates, GROUP BY, set operations, CTEs) rather than pgwire's
+/// legacy single-table reader. Mirrors `try_run_select`'s gate — same dialect,
+/// same opt-out — so `Describe` can follow the route `Execute` takes.
+pub(super) fn select_engages_relational_engine(sql: &str) -> bool {
+    if std::env::var("PROXIMADB_PGWIRE_RELATIONAL_PIPELINE")
+        .ok()
+        .as_deref()
+        == Some("0")
+    {
+        return false;
+    }
+    match Parser::parse_sql(&GenericDialect {}, sql) {
+        Ok(statements) => matches!(
+            statements.as_slice(),
+            [Statement::Query(query)] if query_engages_relational_engine(query)
+        ),
+        Err(_) => false,
+    }
+}
+
 /// True iff the query uses a feature the legacy single-table path can't serve
 /// (join / GROUP BY / HAVING / aggregate projection / set-op / WITH), so it
 /// should be routed to the algebra engine over real data. Simple single-table
@@ -3624,7 +3806,11 @@ fn query_engages_relational_engine(query: &SqlQuery) -> bool {
     // walk can only misparse it. Engage the relational/OLAP route; the
     // frontend's CTE decline then falls the query through to the DataFusion
     // floor (which plans CTEs, recursive included, natively).
-    query.with.is_some() || set_expr_engages(&query.body)
+    query.with.is_some()
+        || set_expr_engages(&query.body)
+        // TD-USUB-2: a window function anywhere (ORDER BY, a nested
+        // expression) is beyond the legacy path just as a projected one is.
+        || query_window_function_name(query).is_some()
 }
 
 /// TD-OLAP-4 operation dimension: classify the SELECT's OLAP operation from the AST
@@ -3730,6 +3916,62 @@ fn query_has_table_function(query: &SqlQuery) -> bool {
         return true;
     }
     set_expr_has_tvf(&query.body)
+}
+
+/// ADR-097 P3.2: does `query` read table functions the DataFusion floor
+/// registers — and nothing else a table-less query could name? Unlike the
+/// fail-closed [`query_has_table_function`] guard, this answers `true` only
+/// for what it recognizes: every FROM item is one of the registered functions,
+/// a CTE reference (the query names no catalog table), or a subquery / join of
+/// those, and at least one function is read.
+fn query_reads_only_table_functions(query: &SqlQuery) -> bool {
+    const REGISTERED: [&str; 4] = [
+        "vector_search",
+        "graph_traverse",
+        "timeseries_range",
+        "documents",
+    ];
+    fn factor(f: &TableFactor, found: &mut bool) -> bool {
+        match f {
+            TableFactor::Table {
+                name,
+                args: Some(_),
+                ..
+            } => {
+                let registered = name.0.len() == 1
+                    && REGISTERED
+                        .iter()
+                        .any(|r| name.to_string().eq_ignore_ascii_case(r));
+                *found |= registered;
+                registered
+            }
+            TableFactor::Table { args: None, .. } => true,
+            TableFactor::Derived { subquery, .. } => query_reads(subquery, found),
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => twj(table_with_joins, found),
+            _ => false,
+        }
+    }
+    fn twj(t: &TableWithJoins, found: &mut bool) -> bool {
+        factor(&t.relation, found) && t.joins.iter().all(|j| factor(&j.relation, found))
+    }
+    fn body(b: &SetExpr, found: &mut bool) -> bool {
+        match b {
+            SetExpr::Select(select) => select.from.iter().all(|t| twj(t, found)),
+            SetExpr::Query(q) => query_reads(q, found),
+            SetExpr::SetOperation { left, right, .. } => body(left, found) && body(right, found),
+            _ => false,
+        }
+    }
+    fn query_reads(q: &SqlQuery, found: &mut bool) -> bool {
+        q.with
+            .as_ref()
+            .is_none_or(|w| w.cte_tables.iter().all(|c| query_reads(&c.query, found)))
+            && body(&q.body, found)
+    }
+    let mut found = false;
+    query_reads(query, &mut found) && found
 }
 
 fn query_join_bearing(query: &SqlQuery) -> bool {
@@ -4070,24 +4312,71 @@ fn geometry_subqueries_of_expr<'a>(expr: &'a SqlExpr, out: &mut Vec<&'a SqlQuery
     }
 }
 
-/// True if a projection item applies a window function (`… OVER (…)`).
+/// True if a projection item applies a window function (`… OVER (…)`) at any
+/// depth — `coalesce(lag(x) OVER (…), 0)` and `CASE WHEN rank() OVER (…) …`
+/// count as much as a bare `lag(x) OVER (…)`.
 fn select_item_has_window(item: &SelectItem) -> bool {
-    let expr = match item {
-        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
-        _ => return false,
-    };
-    expr_has_window(expr)
+    first_window_function(item).is_some()
 }
 
-fn expr_has_window(expr: &SqlExpr) -> bool {
-    match expr {
-        SqlExpr::Function(f) => f.over.is_some(),
-        SqlExpr::BinaryOp { left, right, .. } => expr_has_window(left) || expr_has_window(right),
-        SqlExpr::UnaryOp { expr, .. } | SqlExpr::Nested(expr) | SqlExpr::Cast { expr, .. } => {
-            expr_has_window(expr)
-        }
-        _ => false,
+/// Name of the first window function (`… OVER (…)`) anywhere in `node`.
+fn first_window_function<V: sqlparser::ast::Visit>(node: &V) -> Option<String> {
+    use std::ops::ControlFlow;
+    match sqlparser::ast::visit_expressions(node, |expr| match expr {
+        SqlExpr::Function(f) if f.over.is_some() => ControlFlow::Break(f.name.to_string()),
+        _ => ControlFlow::Continue(()),
+    }) {
+        ControlFlow::Break(name) => Some(name),
+        ControlFlow::Continue(()) => None,
     }
+}
+
+/// TD-USUB-2: name of the first window function anywhere in the query — the
+/// projection at any depth, ORDER BY, derived tables, CTEs and set operations.
+/// The relational frontend declines every `OVER (…)` (TD-187), so such a query
+/// is served correctly only by a DataFusion route; the legacy single-table path
+/// would drop the window and return a silently wrong answer.
+fn query_window_function_name(query: &SqlQuery) -> Option<String> {
+    first_window_function(query)
+}
+
+/// TD-USUB-2: the pgwire decline for a windowed query no DataFusion route
+/// serves. `MATERIALIZE` is offered only where it would help: the Parquet route
+/// is closed to ABAC-governed sessions.
+fn window_decline(query: &SqlQuery, abac_governed: bool) -> Option<String> {
+    let name = query_window_function_name(query)?;
+    let materialize = if abac_governed {
+        ""
+    } else {
+        " or ALTER TABLE ... MATERIALIZE"
+    };
+    Some(format!(
+        "0A000: window function {name} OVER (...) is not supported on this table without \
+         a DataFusion route; enable the native table provider \
+         (PROXIMADB_NATIVE_TABLE_PROVIDER=1){materialize} so DataFusion serves it (TD-USUB-2)"
+    ))
+}
+
+/// TD-USUB-2: the decline for a windowed query naming a relation that does not
+/// resolve as a relational table — carrying the resolution error, since the
+/// remedy is the name or the object, not a gate.
+fn unresolved_window_decline(
+    query: &SqlQuery,
+    relation: &str,
+    error: &anyhow::Error,
+) -> Option<String> {
+    let name = query_window_function_name(query)?;
+    Some(format!(
+        "0A000: window function {name} OVER (...) needs a relational table, and `{relation}` \
+         did not resolve as one: {error} (TD-USUB-2)"
+    ))
+}
+
+/// `pg_catalog.*` / `information_schema.*` — served by pgwire's introspection
+/// stubs, never by the relational pipeline.
+fn is_system_catalog_relation(relation: &str) -> bool {
+    let lower = relation.trim().to_ascii_lowercase();
+    lower.starts_with("pg_catalog.") || lower.starts_with("information_schema.")
 }
 
 fn set_expr_engages(body: &SetExpr) -> bool {
@@ -4682,6 +4971,173 @@ mod tests {
         assert!(!gate("SELECT hostname, usage_user FROM cpu"));
     }
 
+    /// TD-USUB-2: the legacy-path decline must find (and name) the window function
+    /// inside a computed projection, and must not fire on a window-free query.
+    #[test]
+    fn window_function_name_is_found_for_the_legacy_decline() {
+        let window_name = |sql: &str| match Parser::parse_sql(&GenericDialect {}, sql)
+            .expect("parse")
+            .pop()
+        {
+            Some(Statement::Query(query)) => query_window_function_name(&query),
+            _ => panic!("expected a SELECT"),
+        };
+        assert_eq!(
+            window_name("SELECT id, val - lag(val) OVER (ORDER BY id) AS delta FROM t").as_deref(),
+            Some("lag")
+        );
+        assert_eq!(
+            window_name("SELECT id, rank() OVER (ORDER BY val DESC) AS r FROM t").as_deref(),
+            Some("rank")
+        );
+        assert_eq!(window_name("SELECT id, abs(val) FROM t"), None);
+        assert_eq!(window_name("SELECT count(*) FROM t"), None);
+        // Any depth and any position — every shape the legacy path would serve
+        // wrongly must be found (review of #2128).
+        for (sql, name) in [
+            (
+                "SELECT coalesce(lag(val) OVER (ORDER BY id), 0) FROM t",
+                "lag",
+            ),
+            (
+                "SELECT abs(val - lag(val) OVER (ORDER BY id)) FROM t",
+                "lag",
+            ),
+            (
+                "SELECT CASE WHEN lead(val) OVER (ORDER BY id) IS NULL THEN 1 END FROM t",
+                "lead",
+            ),
+            (
+                "SELECT id FROM t ORDER BY row_number() OVER (ORDER BY val)",
+                "row_number",
+            ),
+            (
+                "SELECT id FROM (SELECT id, rank() OVER (ORDER BY val) AS r FROM t) s",
+                "rank",
+            ),
+            (
+                "WITH w AS (SELECT ntile(2) OVER (ORDER BY id) AS b FROM t) SELECT b FROM w",
+                "ntile",
+            ),
+            ("(SELECT id, lag(val) OVER (ORDER BY id) FROM t)", "lag"),
+            (
+                "SELECT id FROM t UNION SELECT dense_rank() OVER (ORDER BY id) FROM t",
+                "dense_rank",
+            ),
+        ] {
+            assert_eq!(window_name(sql).as_deref(), Some(name), "{sql}");
+        }
+        // Engagement follows the same rule, so none of these reaches the legacy path.
+        let engages = |sql: &str| match Parser::parse_sql(&GenericDialect {}, sql)
+            .expect("parse")
+            .pop()
+        {
+            Some(Statement::Query(query)) => query_engages_relational_engine(&query),
+            _ => panic!("expected a SELECT"),
+        };
+        for (sql, name) in [
+            (
+                "SELECT rank() OVER w FROM t WINDOW w AS (ORDER BY val)",
+                "rank",
+            ),
+            (
+                "SELECT id FROM t QUALIFY row_number() OVER (ORDER BY id) = 1",
+                "row_number",
+            ),
+        ] {
+            assert_eq!(window_name(sql).as_deref(), Some(name), "{sql}");
+        }
+        // The hint offers MATERIALIZE only where the Parquet route could serve.
+        let query = match Parser::parse_sql(&GenericDialect {}, "SELECT lag(v) OVER () FROM t")
+            .expect("parse")
+            .pop()
+        {
+            Some(Statement::Query(query)) => query,
+            _ => panic!("expected a SELECT"),
+        };
+        let open = window_decline(&query, false).expect("windowed");
+        let governed = window_decline(&query, true).expect("windowed");
+        assert!(
+            open.starts_with("0A000: ") && open.contains("MATERIALIZE"),
+            "{open}"
+        );
+        assert!(!governed.contains("MATERIALIZE"), "{governed}");
+        // An unresolved relation says why, and system catalogs keep their stubs.
+        let unresolved = unresolved_window_decline(
+            &query,
+            "nosuch",
+            &anyhow::anyhow!("Table 'nosuch' does not exist"),
+        )
+        .expect("windowed");
+        assert!(unresolved.contains("nosuch") && unresolved.contains("does not exist"));
+        assert!(is_system_catalog_relation("PG_CATALOG.pg_proc"));
+        assert!(is_system_catalog_relation("information_schema.columns"));
+        assert!(!is_system_catalog_relation("public.t"));
+        assert!(engages(
+            "SELECT coalesce(lag(val) OVER (ORDER BY id), 0) FROM t"
+        ));
+        assert!(engages(
+            "SELECT id FROM t ORDER BY row_number() OVER (ORDER BY val)"
+        ));
+        assert!(!engages("SELECT id, abs(val) FROM t"));
+    }
+
+    /// The recorded (version, LSN) pair the OLAP merge trusts must come from the
+    /// layout NAMED `parquet-snapshot` AT the location being opened — never
+    /// from a decoy layout that happens to match on format and authority, and
+    /// never from a `parquet-snapshot` at another location.
+    #[cfg(feature = "datafusion-integration")]
+    #[test]
+    fn recorded_publication_binds_to_the_opened_parquet_snapshot() {
+        use proximadb_catalog::{
+            CatalogAuthorityMode, CatalogPhysicalFormat, CatalogStorageLayout, CatalogTableSchema,
+        };
+        let layout = |name: &str, location: &str, version: &str, lsn: &str| CatalogStorageLayout {
+            name: name.to_string(),
+            authority: CatalogAuthorityMode::ProjectionPublication,
+            physical_format: CatalogPhysicalFormat::Parquet,
+            location: Some(location.to_string()),
+            properties: std::collections::HashMap::from([
+                ("snapshot_lsn".to_string(), lsn.to_string()),
+                ("iceberg_metadata_version".to_string(), version.to_string()),
+            ]),
+            ..Default::default()
+        };
+        let mut s = CatalogTableSchema::new("t");
+        s.storage_layouts = vec![
+            // A decoy listed first, with a DIFFERENT version and LSN: neither
+            // half of the pair may come from it.
+            layout("open_table", "file:///w/t/data", "99", "77"),
+            layout("parquet-snapshot", "file:///w/t/data", "4", "10"),
+        ];
+        assert_eq!(
+            recorded_publication_at(&s, "file:///w/t/data"),
+            Some((4, 10)),
+            "both halves of the pair come from the parquet-snapshot layout"
+        );
+        // The merge parameters take BOTH halves from that layout too — the
+        // decoy matches on format and authority and is listed first, so the
+        // legacy LSN lookup alone would have answered 77.
+        s.primary_key = vec!["k".to_string()];
+        let params = olap_delta_table_params(&s, "file:///w/t/data").expect("eligible");
+        assert_eq!(
+            (params.recorded_metadata_version, params.snapshot_lsn),
+            (Some(4), 10),
+            "the merge must not pair one layout's version with another's LSN"
+        );
+        assert_eq!(
+            recorded_publication_at(&s, "file:///elsewhere/data"),
+            None,
+            "a parquet-snapshot at another location must not lend its version"
+        );
+        s.storage_layouts.truncate(1);
+        assert_eq!(
+            recorded_publication_at(&s, "file:///w/t/data"),
+            None,
+            "only a layout named parquet-snapshot records a publication"
+        );
+    }
+
     /// ADR-058 D5 / §9.A: the stats-trust derivation is the load-bearing security
     /// mapping behind the native route's footer-elision gate — an authority that
     /// wrongly classifies external parquet as `Trusted` would re-open the
@@ -5086,6 +5542,26 @@ mod tests {
     /// the guard must see a table function at every nesting level, and must fail
     /// closed on shapes it does not decompose.
     #[test]
+    fn only_registered_table_functions_admit_a_table_less_query() {
+        let reads = |sql: &str| query_reads_only_table_functions(&parse_query(sql));
+        assert!(reads("SELECT count(*) FROM timeseries_range('m', 0, 9) t"));
+        assert!(reads(
+            "WITH v AS (SELECT * FROM vector_search('c', '[1]', 3)) \
+             SELECT count(*) FROM v JOIN graph_traverse('g', 'a', 2) g ON v.id = g.node_id"
+        ));
+        assert!(reads(
+            "SELECT * FROM (SELECT * FROM DOCUMENTS('d')) x \
+             UNION ALL SELECT * FROM documents('e')"
+        ));
+        // No table function, an unknown one, or a FROM item it does not know.
+        assert!(!reads("SELECT 1 UNION SELECT 2"));
+        assert!(!reads("SELECT count(*) FROM (VALUES (1), (2)) v(x)"));
+        assert!(!reads("SELECT * FROM generate_series(1, 3)"));
+        assert!(!reads("SELECT * FROM s.vector_search('c', '[1]', 3)"));
+        assert!(!reads("SELECT * FROM UNNEST(ARRAY[1, 2])"));
+    }
+
+    #[test]
     fn table_function_guard_sees_udtfs_at_every_nesting_level() {
         // Plain catalog tables: no UDTF, so a governed session may use the native route.
         assert!(!query_has_table_function(&parse_query(
@@ -5327,6 +5803,49 @@ mod tests {
             resolver
                 .secondary_index_columns(&TableId::new("edges"))
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn wire_text_renders_postgres_temporal_text() {
+        use proximadb_data_model::TimeUnit;
+        // 2024-01-02 = day 19724 since the Unix epoch.
+        assert_eq!(
+            wire_text(&ProximaValue::Date(19724)),
+            Some("2024-01-02".into())
+        );
+        assert_eq!(
+            wire_text(&ProximaValue::Date(-1)),
+            Some("1969-12-31".into())
+        );
+        assert_eq!(
+            wire_text(&ProximaValue::Timestamp(
+                1_704_164_645_000,
+                TimeUnit::Millisecond
+            )),
+            Some("2024-01-02 03:04:05".into())
+        );
+        assert_eq!(
+            wire_text(&ProximaValue::Timestamp(
+                1_704_164_645_123_456_789,
+                TimeUnit::Nanosecond
+            )),
+            Some("2024-01-02 03:04:05.123456".into())
+        );
+        assert_eq!(
+            wire_text(&ProximaValue::TimestampTz(1_704_164_645, TimeUnit::Second)),
+            Some("2024-01-02 03:04:05+00".into())
+        );
+        assert_eq!(
+            wire_text(&ProximaValue::Time(3_723_500_000, TimeUnit::Microsecond)),
+            Some("01:02:03.5".into())
+        );
+        // Non-temporal values are unchanged, and the KEY form stays the raw count.
+        assert_eq!(wire_text(&ProximaValue::Int64(7)), Some("7".into()));
+        assert_eq!(wire_text(&ProximaValue::Null), None);
+        assert_eq!(
+            text_encode(&ProximaValue::Date(19724)),
+            Some("19724".into())
         );
     }
 

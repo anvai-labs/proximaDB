@@ -280,8 +280,9 @@ impl AqlSource for MemoryAqlSource {
         let start = Instant::now();
         let search_results = self
             .vector_ops
-            .unified_search_v1(
+            .unified_search_v1_for_tenant(
                 &scope.collection,
+                ctx.resolution_tenant(&scope.collection)?,
                 scope.query_vector.clone(),
                 recall_k,
                 scope_filter,
@@ -306,7 +307,7 @@ impl AqlSource for MemoryAqlSource {
                 row.insert("score".to_string(), AqlValue::Float(res.score));
                 for (k, v) in &res.metadata {
                     if let Some(val) = &v.value {
-                        row.insert(k.clone(), VectorAqlSource::sql_data_to_aql(val));
+                        row.insert(k.clone(), super::sql_value_to_aql(val));
                     }
                 }
                 semantic_records.push(UnifiedRecord {

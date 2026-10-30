@@ -259,11 +259,7 @@ class ParentLinkagePass:
         return groups
 
     def apply(self, document: str, chunks: list[Any]) -> PassResult:
-        from .base import (
-            OFFSET_BASIS_CHAR,
-            OFFSET_CONTRACT_EXACT,
-            TextChunk,
-        )
+        from .base import OFFSET_BASIS_CHAR, OFFSET_CONTRACT_EXACT, TextChunk
 
         parents: list[Any] = []
         edges: list[ChunkEdge] = []

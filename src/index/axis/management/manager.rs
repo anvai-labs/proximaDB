@@ -5466,13 +5466,12 @@ mod recluster_apply_tests {
             // lets `supports_predicate_search` distinguish add_with_metadata
             // (used now) from a plain add (the gap this closes).
             tenant_id: "t1".to_string(),
-            embeddings: vec![EmbeddingCell {
-                model_id: "t".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: v.len() as u32,
-                values: EmbeddingValues::Fp32(v),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "t",
+                "dense_vector",
+                v.len() as u32,
+                v,
+            )],
             ..ProximaRecord::default()
         }
     }
@@ -6530,13 +6529,12 @@ mod hot_swap_ef_tests {
             v[i % dim] = 1.0;
             let r = ProximaRecord {
                 oid: format!("v{i}"),
-                embeddings: vec![EmbeddingCell {
-                    model_id: "test".into(),
-                    modality: "dense_vector".into(),
-                    dim: dim as u32,
-                    values: EmbeddingValues::Fp32(v),
-                    ..Default::default()
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "test",
+                    "dense_vector",
+                    dim as u32,
+                    v,
+                )],
                 ..Default::default()
             };
             records.push(r);
@@ -6790,13 +6788,12 @@ mod clear_collection_vectors_tests {
             props: ProximaTree::new(),
             refs: Vec::new(),
             edge: None,
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "dense_vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-                dim: 3,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "dense_vector",
+                3,
+                vec![1.0, 2.0, 3.0],
+            )],
             sequence: None,
             labels: LabelSet::new(),
             ..Default::default()
@@ -6893,13 +6890,12 @@ mod hmgi_lifecycle_tests {
         let invalid_vector = vec![0.0; 100_001];
         let record = ProximaRecord {
             oid: "oversized_embedding".to_string(),
-            embeddings: vec![EmbeddingCell {
-                model_id: "test".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: invalid_vector.len() as u32,
-                values: EmbeddingValues::Fp32(invalid_vector),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "test",
+                "dense_vector",
+                invalid_vector.len() as u32,
+                invalid_vector,
+            )],
             ..Default::default()
         };
         manager

@@ -9,6 +9,13 @@ pub mod test_assignments;
 // Integration test utilities for all ProximaDB components
 pub mod integration_test_helpers;
 
+// Shared in-process pgwire e2e server harness (TestPgServer + rows helpers).
+pub mod pg_server;
+
+// Shared TPC accuracy-phase machinery (ADR-040): norm_cell/canon_rows,
+// phase-boundary re-seed, and the KNOWN-BAD anchored-accuracy runner.
+pub mod tpc_anchor;
+
 // Centralized test data generation
 pub mod test_data;
 
@@ -24,20 +31,16 @@ pub mod sks_fixtures;
 // Global test counter to ensure unique collection IDs
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 static INIT: Once = Once::new();
-static HARDWARE_INIT: Once = Once::new();
+
+// `setup_hardware_capabilities` lives once, in `integration_test_helpers`
+// (it used to be duplicated here with its own `HARDWARE_INIT`); re-exported so
+// `common::setup_hardware_capabilities` keeps resolving for users of this module.
+pub use integration_test_helpers::setup_hardware_capabilities;
 
 /// Generate a unique collection ID for tests
 pub fn unique_collection_id(prefix: &str) -> String {
     let counter = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     format!("{}_{}", prefix, counter)
-}
-
-/// Setup hardware capabilities for tests
-/// This function is idempotent and safe to call multiple times
-pub fn setup_hardware_capabilities() {
-    HARDWARE_INIT.call_once(|| {
-        let _ = proximadb::core::hardware_capabilities::initialize_hardware_capabilities_default();
-    });
 }
 
 /// Ensure required test directories exist

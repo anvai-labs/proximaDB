@@ -1,0 +1,917 @@
+{
+  "generated_at_utc": "2026-10-26T12:48:10Z",
+  "modules": {
+    "proximadb-abac": {
+      "expect": 1,
+      "path": "crates/control/proximadb-abac",
+      "total": 1,
+      "unwrap": 0
+    },
+    "proximadb-admin-ui": {
+      "expect": 0,
+      "path": "crates/platform/proximadb-admin-ui",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-ann-bench": {
+      "expect": 7,
+      "path": "apps/proximadb-ann-bench",
+      "total": 7,
+      "unwrap": 0
+    },
+    "proximadb-api": {
+      "expect": 0,
+      "path": "crates/platform/proximadb-api",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-arrow-block-index": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-arrow-block-index",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-audit": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-audit",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-automl": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-automl",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-axis-tunnel": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-axis-tunnel",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-batch-group-cache": {
+      "expect": 0,
+      "path": "crates/query/proximadb-batch-group-cache",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-bench": {
+      "expect": 0,
+      "path": "apps/proximadb-bench",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-block-format": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-block-format",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-bloom": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-bloom",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-cache": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-cache",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-catalog": {
+      "expect": 5,
+      "path": "crates/control/proximadb-catalog",
+      "total": 156,
+      "unwrap": 151
+    },
+    "proximadb-catalog-introspection": {
+      "expect": 0,
+      "path": "crates/binding/proximadb-catalog-introspection",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-catalog-schema": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-catalog-schema",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-catapult": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-catapult",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-cdc": {
+      "expect": 0,
+      "path": "crates/integrations/proximadb-cdc",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-cks-local": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-cks-local",
+      "total": 11,
+      "unwrap": 11
+    },
+    "proximadb-cks-objectstore": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-cks-objectstore",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-clustering-kernel": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-clustering-kernel",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-codec": {
+      "expect": 1,
+      "path": "crates/horizontal/proximadb-codec",
+      "total": 1,
+      "unwrap": 0
+    },
+    "proximadb-compression": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-compression",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-compression-types": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-compression-types",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-concurrent": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-concurrent",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-config": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-config",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-connectors-types": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-connectors-types",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-cross-modal-fusion": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-cross-modal-fusion",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-data-model": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-data-model",
+      "total": 12,
+      "unwrap": 12
+    },
+    "proximadb-distance-kernel": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-distance-kernel",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-distance-types": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-distance-types",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-document": {
+      "expect": 2,
+      "path": "crates/modalities/proximadb-document",
+      "total": 2,
+      "unwrap": 0
+    },
+    "proximadb-document-compression": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-document-compression",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-document-geo-index": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-document-geo-index",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-document-query": {
+      "expect": 0,
+      "path": "crates/query/proximadb-document-query",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-embedded": {
+      "expect": 0,
+      "path": "crates/binding/proximadb-embedded",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-embedded-common": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-embedded-common",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-embedding": {
+      "expect": 7,
+      "path": "crates/modalities/proximadb-embedding",
+      "total": 7,
+      "unwrap": 0
+    },
+    "proximadb-encoding-types": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-encoding-types",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-engine-core": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-engine-core",
+      "total": 2,
+      "unwrap": 2
+    },
+    "proximadb-execution-contracts": {
+      "expect": 0,
+      "path": "crates/query/proximadb-execution-contracts",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-filter-expression": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-filter-expression",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-filterable-metadata": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-filterable-metadata",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-functions": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-functions",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-geo-queries": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-geo-queries",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-geo-spatial-index": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-geo-spatial-index",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-geo-types": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-geo-types",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-geohash": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-geohash",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-graph": {
+      "expect": 3,
+      "path": "crates/modalities/proximadb-graph",
+      "total": 3,
+      "unwrap": 0
+    },
+    "proximadb-graph-arrow": {
+      "expect": 0,
+      "path": "crates/query/proximadb-graph-arrow",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-graph-engine-traits": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-graph-engine-traits",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-graph-model": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-graph-model",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-graph-query": {
+      "expect": 1,
+      "path": "crates/query/proximadb-graph-query",
+      "total": 1,
+      "unwrap": 0
+    },
+    "proximadb-graph-subset": {
+      "expect": 0,
+      "path": "crates/query/proximadb-graph-subset",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-hardware": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-hardware",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-hardware-caps": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-hardware-caps",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-iceberg-engine": {
+      "expect": 4,
+      "path": "crates/storage/proximadb-iceberg-engine",
+      "total": 4,
+      "unwrap": 0
+    },
+    "proximadb-implicit-id-generator": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-implicit-id-generator",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-index-storage": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-index-storage",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-index-traits": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-index-traits",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-index-types": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-index-types",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-interner": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-interner",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-kafka-config": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-kafka-config",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-kafka-deserializer": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-kafka-deserializer",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-kernel": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-kernel",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-ledger": {
+      "expect": 0,
+      "path": "crates/modalities/proximadb-ledger",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-llm-config": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-llm-config",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-mcp": {
+      "expect": 0,
+      "path": "crates/platform/proximadb-mcp",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-memory-pool": {
+      "expect": 5,
+      "path": "crates/foundation/proximadb-memory-pool",
+      "total": 5,
+      "unwrap": 0
+    },
+    "proximadb-metrics": {
+      "expect": 0,
+      "path": "crates/control/proximadb-metrics",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-migrate": {
+      "expect": 0,
+      "path": "apps/proximadb-migrate",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-mongodb-parser": {
+      "expect": 0,
+      "path": "crates/binding/proximadb-mongodb-parser",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-montecarlo": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-montecarlo",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-multimodel-codec": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-multimodel-codec",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-multimodel-plan": {
+      "expect": 0,
+      "path": "crates/query/proximadb-multimodel-plan",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-multimodel-query": {
+      "expect": 0,
+      "path": "crates/query/proximadb-multimodel-query",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-mvcc-resolution": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-mvcc-resolution",
+      "total": 1,
+      "unwrap": 1
+    },
+    "proximadb-network-middleware": {
+      "expect": 0,
+      "path": "crates/platform/proximadb-network-middleware",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-object-store": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-object-store",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-observability": {
+      "expect": 0,
+      "path": "crates/modalities/proximadb-observability",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-observability-engine": {
+      "expect": 2,
+      "path": "crates/modalities/proximadb-observability-engine",
+      "total": 2,
+      "unwrap": 0
+    },
+    "proximadb-observability-query": {
+      "expect": 0,
+      "path": "crates/query/proximadb-observability-query",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-onnx-runtime": {
+      "expect": 1,
+      "path": "crates/horizontal/proximadb-onnx-runtime",
+      "total": 1,
+      "unwrap": 0
+    },
+    "proximadb-orion-engine": {
+      "expect": 0,
+      "path": "crates/modalities/proximadb-orion-engine",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-pgwire-translator": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-pgwire-translator",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-pipeline-operator": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-pipeline-operator",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-proto": {
+      "expect": 10,
+      "path": "crates/foundation/proximadb-proto",
+      "total": 10,
+      "unwrap": 0
+    },
+    "proximadb-pushdown": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-pushdown",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-quantization-kernel": {
+      "expect": 0,
+      "path": "crates/modalities/proximadb-quantization-kernel",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-quantization-model": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-quantization-model",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-quantization-types": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-quantization-types",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-query": {
+      "expect": 0,
+      "path": "crates/query/proximadb-query",
+      "total": 5,
+      "unwrap": 5
+    },
+    "proximadb-query-cache": {
+      "expect": 0,
+      "path": "crates/query/proximadb-query-cache",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-query-capability": {
+      "expect": 4,
+      "path": "crates/query/proximadb-query-capability",
+      "total": 4,
+      "unwrap": 0
+    },
+    "proximadb-query-clauses": {
+      "expect": 0,
+      "path": "crates/query/proximadb-query-clauses",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-query-filter": {
+      "expect": 0,
+      "path": "crates/query/proximadb-query-filter",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-query-fusion": {
+      "expect": 0,
+      "path": "crates/query/proximadb-query-fusion",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-queue": {
+      "expect": 5,
+      "path": "crates/horizontal/proximadb-queue",
+      "total": 5,
+      "unwrap": 0
+    },
+    "proximadb-rank-core": {
+      "expect": 0,
+      "path": "crates/modalities/proximadb-rank-core",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-rank-expr": {
+      "expect": 10,
+      "path": "crates/modalities/proximadb-rank-expr",
+      "total": 13,
+      "unwrap": 3
+    },
+    "proximadb-rank-features": {
+      "expect": 0,
+      "path": "crates/modalities/proximadb-rank-features",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-rank-onnx": {
+      "expect": 0,
+      "path": "crates/modalities/proximadb-rank-onnx",
+      "total": 1,
+      "unwrap": 1
+    },
+    "proximadb-rank-profile": {
+      "expect": 0,
+      "path": "crates/modalities/proximadb-rank-profile",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-raptor-common": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-raptor-common",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-raptor-engine": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-raptor-engine",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-recall-bench": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-recall-bench",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-record-buffer-pool": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-record-buffer-pool",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-records": {
+      "expect": 2,
+      "path": "crates/foundation/proximadb-records",
+      "total": 2,
+      "unwrap": 0
+    },
+    "proximadb-relational-algebra": {
+      "expect": 0,
+      "path": "crates/query/proximadb-relational-algebra",
+      "total": 1,
+      "unwrap": 1
+    },
+    "proximadb-relational-engine": {
+      "expect": 0,
+      "path": "crates/query/proximadb-relational-engine",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-relational-executor": {
+      "expect": 5,
+      "path": "crates/query/proximadb-relational-executor",
+      "total": 7,
+      "unwrap": 2
+    },
+    "proximadb-relational-frontend": {
+      "expect": 5,
+      "path": "crates/query/proximadb-relational-frontend",
+      "total": 5,
+      "unwrap": 0
+    },
+    "proximadb-relational-planner": {
+      "expect": 0,
+      "path": "crates/query/proximadb-relational-planner",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-relational-reader": {
+      "expect": 0,
+      "path": "crates/query/proximadb-relational-reader",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-relational-types": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-relational-types",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-resilience": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-resilience",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-rl-reward": {
+      "expect": 0,
+      "path": "crates/query/proximadb-rl-reward",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-runtime": {
+      "expect": 0,
+      "path": "crates/platform/proximadb-runtime",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-runtime-common": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-runtime-common",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-scan-cursor": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-scan-cursor",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-search-types": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-search-types",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-security": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-security",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-serialization": {
+      "expect": 1,
+      "path": "crates/horizontal/proximadb-serialization",
+      "total": 2,
+      "unwrap": 1
+    },
+    "proximadb-server": {
+      "expect": 0,
+      "path": "apps/proximadb-server",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-spark-jni": {
+      "expect": 0,
+      "path": "crates/binding/proximadb-spark-jni",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-sst-engine": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-sst-engine",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-storage-common": {
+      "expect": 3,
+      "path": "crates/storage/proximadb-storage-common",
+      "total": 12,
+      "unwrap": 9
+    },
+    "proximadb-storage-encryption": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-storage-encryption",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-storage-filesystem-types": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-storage-filesystem-types",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-storage-kv": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-storage-kv",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-storage-operations": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-storage-operations",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-storage-optimization": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-storage-optimization",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-storage-ports": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-storage-ports",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-storage-strategy": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-storage-strategy",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-storage-tenant": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-storage-tenant",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-storage-traits": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-storage-traits",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-storage-transaction": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-storage-transaction",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-subscription": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-subscription",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-tcp-multiplexer": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-tcp-multiplexer",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-telemetry": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-telemetry",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-tenant": {
+      "expect": 0,
+      "path": "crates/foundation/proximadb-tenant",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-tls": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-tls",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-type-validators": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-type-validators",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-uql": {
+      "expect": 0,
+      "path": "crates/query/proximadb-uql",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-usage-event": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-usage-event",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-utility-scorer": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-utility-scorer",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-vector": {
+      "expect": 16,
+      "path": "crates/modalities/proximadb-vector",
+      "total": 24,
+      "unwrap": 8
+    },
+    "proximadb-vector-query": {
+      "expect": 0,
+      "path": "crates/query/proximadb-vector-query",
+      "total": 0,
+      "unwrap": 0
+    },
+    "proximadb-wal-segment-header": {
+      "expect": 0,
+      "path": "crates/storage/proximadb-wal-segment-header",
+      "total": 5,
+      "unwrap": 5
+    },
+    "proximadb-write-intent": {
+      "expect": 0,
+      "path": "crates/horizontal/proximadb-write-intent",
+      "total": 0,
+      "unwrap": 0
+    },
+    "quantization": {
+      "expect": 0,
+      "path": "crates/contracts/quantization",
+      "total": 0,
+      "unwrap": 0
+    }
+  },
+  "scope": "workspace",
+  "totals": {
+    "expect": 100,
+    "total": 312,
+    "unwrap": 212
+  }
+}

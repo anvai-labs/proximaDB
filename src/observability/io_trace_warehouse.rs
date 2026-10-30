@@ -45,6 +45,7 @@ use proximadb_iceberg_engine::IcebergObjectStoreBridge;
 use proximadb_iceberg_engine::iceberg::{FormatVersion, IcebergField};
 use proximadb_iceberg_engine::manifest::CommitOutcome;
 use proximadb_kernel::error::StorageError;
+use proximadb_kernel::time::now_unix_ms;
 use proximadb_object_store::ProximaObjectStore;
 use proximadb_storage_common::proxima_parquet::record_batches_to_parquet_bytes;
 use sha2::{Digest, Sha256};
@@ -344,13 +345,6 @@ impl IoTraceWarehouse {
 
 /// Wall-clock milliseconds since the Unix epoch — the per-run Iceberg snapshot id.
 /// Wall-clock is fine in production; only workflow scripts forbid it.
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 struct TriggerHandle {
     shutdown: tokio::sync::watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
@@ -442,7 +436,7 @@ async fn run_compaction_loop(
 
 /// One compaction pass; best-effort — a failure is logged, never fatal.
 async fn run_compaction_pass(warehouse: &IoTraceWarehouse) {
-    match warehouse.compact(now_ms()).await {
+    match warehouse.compact(now_unix_ms()).await {
         Ok(summary) if summary.segments_processed > 0 => tracing::info!(
             "io_trace warehouse: compacted {} segment(s), {} header row(s)",
             summary.segments_processed,

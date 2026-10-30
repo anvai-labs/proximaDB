@@ -15,22 +15,9 @@
 //! Labels are kept low-cardinality (collection_id, ann_filtering_mode) so
 //! these are safe to scrape from Prometheus at default cadence.
 
+use crate::register_counter_vec_safe;
 use lazy_static::lazy_static;
-use prometheus::{CounterVec, Opts, register_counter_vec};
-use tracing::error;
-
-fn register_counter_vec_safe(name: &str, help: &str, labels: &[&str]) -> CounterVec {
-    match register_counter_vec!(name, help, labels) {
-        Ok(metric) => metric,
-        Err(reg_err) => {
-            error!("Failed to register {}: {}", name, reg_err);
-            CounterVec::new(Opts::new(name, help), labels).unwrap_or_else(|_| {
-                CounterVec::new(Opts::new(format!("{}_fallback", name), help), labels)
-                    .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
-            })
-        }
-    }
-}
+use prometheus::CounterVec;
 
 lazy_static! {
     /// Number of TD-064 predicate-aware searches that returned fewer matches

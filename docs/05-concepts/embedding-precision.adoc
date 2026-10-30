@@ -51,11 +51,15 @@ curl -X POST http://localhost:5678/api/v1/collections \
 a|
 [source,python]
 ----
-client.create_collection(CollectionConfig(
-    name="docs_fp16",
+from proximadb_sdk import EmbeddingPrecision, Protocol, ProximaDBClient
+
+client = ProximaDBClient(url="http://localhost:5678", protocol=Protocol.REST)
+
+client.create_collection(
+    "docs_fp16",
     dimension=768,
     canonical_embedding_precision=EmbeddingPrecision.FP16,
-))
+)
 ----
 
 | pgwire SQL `CREATE TABLE ... WITH (...)`
@@ -148,5 +152,5 @@ the recall floor.
 
 * xref:../12-design/EMBEDDING_PRECISION_LLD_2026_05_22.adoc[LLD — Embedding Precision Rollout]
 * xref:../12-design/EMBEDDING_PRECISION_END_TO_END_2026_05_22.adoc[End-to-End Architecture]
-* xref:../12-design/EMBEDDING_PRECISION_INTEGRATION_PLAN_2026_05_23.adoc[Integration Plan]
+* xref:../history/planning/EMBEDDING_PRECISION_INTEGRATION_PLAN_2026_05_23.adoc[Integration Plan]
 * xref:../03-api-reference/rest.adoc[REST API Reference]

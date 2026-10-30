@@ -4,7 +4,7 @@
 
 [cols="1,3"]
 |===
-|Status|Proposed (reconciled 2026-10-15). **No TD-SC-1…5 entries exist** in the register or `docs/10-quality/td/` — the tracking TDs were never filed. Keying on ADR-031's `u64 object_id` (TD-SC-3) conflicts with ADR-0083, which retires the u64 as identity in favour of the composite; re-key on the composite before implementing.
+|Status|Proposed (reconciled 2026-10-15). The tracking TDs were never filed at reconciliation time; **filed 2026-10-26** as TD-SC-1…5 in `docs/10-quality/td/` (Open, gated on this ADR's acceptance; TD-SC-3 carries the composite-key conflict below). Keying on ADR-031's `u64 object_id` (TD-SC-3) conflicts with ADR-0083, which retires the u64 as identity in favour of the composite; re-key on the composite before implementing.
 |Date|2026-06-27
 |Deciders|Vijaykumar Singh
 |Relates to|ADR-032 (Durable, tenant-prefixed object-store catalog — the storage substrate this caches; D3 system-only writes), ADR-031 (Stable `u64` object_id physical key — the per-type globally-unique id the metadata group is keyed by), ADR-027 (Unified storage + metering substrate — the OPERATIONAL group: coalesced `_metering`/`_trace` writers, TD-161 landed), ADR-030 (hot-path trace+meter seam — the query-scoped I/O trace this is measured against), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` (dominant cost term = I/O round-trips, isolation structural, treat the boundary as the contract)

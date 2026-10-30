@@ -27,14 +27,7 @@ Tracked by TD-CHUNK-1; the defects it measures are ADR-091's evidence base.
 
 from ..measures import CHAR_MEASURE, CharMeasure, Measure, TokenMeasure
 from .corpus import CorpusEntry, by_name, scale_corpus, standard_corpus
-from .evals import (
-    STANDARD_CASES,
-    CaseScore,
-    EvalCase,
-    EvalReport,
-    run_eval,
-    score_case,
-)
+from .evals import STANDARD_CASES, CaseScore, EvalCase, EvalReport, run_eval, score_case
 from .golden import (
     DIGEST_RECIPE_VERSION,
     case_digest,
@@ -57,13 +50,7 @@ from .invariants import (
     check_stream_equivalence,
     check_totality,
 )
-from .runner import (
-    ChunkerAdapter,
-    Evaluation,
-    evaluate,
-    evaluate_all,
-    format_baseline,
-)
+from .runner import ChunkerAdapter, Evaluation, evaluate, evaluate_all, format_baseline
 from .trace import BASIS_BYTE, BASIS_CHAR, ChunkTrace, Gap, compute_trace
 
 __all__ = [

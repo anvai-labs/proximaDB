@@ -4,6 +4,7 @@
 use crate::core::search::DataFreshnessTier;
 use crate::storage::engines::core::ops::{
     UniversalOptimizationStrategy, UniversalPerformanceOptimizer, UniversallyOptimized,
+    insert_universal_optimizer_metrics,
 };
 use crate::storage::persistence::filesystem::FileStorageTier;
 use anyhow::{Result, anyhow};
@@ -27,10 +28,8 @@ use crate::storage::traits::{
     FlushResult, StorageFormatStrategy, UnifiedStorageFormat,
 };
 use proximadb_distance_kernel::DistanceMetric;
-use proximadb_filter_expression::{ComparisonOperator, FilterExpression};
-use proximadb_index_traits::{
-    IndexFilterOperator, IndexHybridQuery, IndexMetadataFilter, IndexVectorQuery,
-};
+use proximadb_filter_expression::FilterExpression;
+use proximadb_index_traits::{IndexHybridQuery, IndexMetadataFilter, IndexVectorQuery};
 use proximadb_records::ProximaRecord;
 // Removed unused import: IndexingAlgorithm
 use crate::metrics::collectors::{EngineMetricsCollector, OperationTimer};
@@ -834,58 +833,10 @@ impl SwiftEngine {
     fn convert_filter_to_index(
         filter_expression: Option<&FilterExpression>,
     ) -> Vec<IndexMetadataFilter> {
-        let Some(filter) = filter_expression else {
-            return Vec::new();
-        };
-
-        // Convert filter expressions to index metadata filters
-        let mut index_filters = Vec::new();
-
-        match filter {
-            FilterExpression::Comparison {
-                field,
-                operator,
-                value,
-            } => {
-                // Convert ComparisonOperator to IndexFilterOperator
-                let index_operator = match operator {
-                    ComparisonOperator::Equals => IndexFilterOperator::Equals,
-                    ComparisonOperator::NotEquals => IndexFilterOperator::NotEquals,
-                    ComparisonOperator::GreaterThan => IndexFilterOperator::GreaterThan,
-                    ComparisonOperator::GreaterThanOrEqual => {
-                        IndexFilterOperator::GreaterThanOrEqual
-                    }
-                    ComparisonOperator::LessThan => IndexFilterOperator::LessThan,
-                    ComparisonOperator::LessThanOrEqual => IndexFilterOperator::LessThanOrEqual,
-                    ComparisonOperator::In => IndexFilterOperator::In,
-                    ComparisonOperator::NotIn => IndexFilterOperator::NotIn,
-                    _ => {
-                        debug!(
-                            "Operator {:?} not directly supported by index, will use post-filtering",
-                            operator
-                        );
-                        return index_filters;
-                    }
-                };
-
-                index_filters.push(IndexMetadataFilter {
-                    field: field.clone(),
-                    operator: index_operator,
-                    value: value.clone(),
-                });
-            }
-            FilterExpression::And(filters) => {
-                for f in filters {
-                    index_filters.extend(Self::convert_filter_to_index(Some(f)));
-                }
-            }
-            FilterExpression::Or(_) | FilterExpression::Not(_) => {
-                // OR and NOT are not directly supported by index, will use post-filtering
-                debug!("OR/NOT filters not supported by index, will use post-filtering");
-            }
-        }
-
-        index_filters
+        // Canonical converter (redundancy pass 3): the six per-engine copies
+        // had drifted — only SST mapped Contains/StartsWith/EndsWith/Like/
+        // Between. See proximadb_filter_expression::to_index_metadata_filters.
+        proximadb_filter_expression::to_index_metadata_filters(filter_expression)
     }
 
     // =========================================================================
@@ -1947,25 +1898,7 @@ impl UniversallyOptimized for SwiftEngine {
         );
 
         // Universal optimizer metrics
-        let strategy = self.universal_optimizer.get_strategy();
-        metrics.insert(
-            "universal_optimization_strategy".to_string(),
-            serde_json::Value::String(format!("{:?}", strategy)),
-        );
-
-        let config = self.universal_optimizer.get_config();
-        metrics.insert(
-            "universal_cache_size_mb".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(config.cache_size_mb)),
-        );
-        metrics.insert(
-            "universal_parallel_operations".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(config.parallel_operations)),
-        );
-        metrics.insert(
-            "universal_prefetching_enabled".to_string(),
-            serde_json::Value::Bool(config.enable_prefetching),
-        );
+        insert_universal_optimizer_metrics(&mut metrics, &self.universal_optimizer);
 
         Ok(metrics)
     }

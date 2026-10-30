@@ -69,8 +69,11 @@ impl RankServiceImpl {
         &self,
         request: tonic::Request<proto_ranking::RankSearchRequest>,
     ) -> Result<tonic::Response<proto_ranking::RankSearchResponse>, tonic::Status> {
+        // The collection is resolved within the request tenant.
+        let request_tenant = crate::network::grpc::auth::resolved_tenant_id(&request)?;
         let proto_req = request.into_inner();
-        let rest_req = proto_to_rest_request(proto_req);
+        let mut rest_req = proto_to_rest_request(proto_req);
+        rest_req.scope = crate::network::rest::canonical::rank::RankScope::Tenant(request_tenant);
         let second_phase_scorer = rest_req
             .rank_profile
             .as_deref()
@@ -106,6 +109,7 @@ fn proto_to_rest_request(p: proto_ranking::RankSearchRequest) -> RankSearchReque
         k: p.k as usize,
         rank_profile: p.rank_profile,
         rank_overrides: p.rank_overrides.map(proto_to_rest_overrides),
+        scope: crate::network::rest::canonical::rank::RankScope::Unset,
     }
 }
 
@@ -177,6 +181,10 @@ fn rank_error_to_status(e: RankError) -> tonic::Status {
             tonic::Status::not_found(format!("rank profile not found: {name}"))
         }
         RankError::InvalidProfile(msg) => tonic::Status::invalid_argument(msg),
+        RankError::InvalidArgument(msg) => tonic::Status::invalid_argument(msg),
+        RankError::CollectionNotFound(collection) => {
+            tonic::Status::not_found(format!("Collection not found: {collection}"))
+        }
         other => tonic::Status::internal(format!("rank pipeline failed: {other}")),
     }
 }

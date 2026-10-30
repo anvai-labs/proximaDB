@@ -5,8 +5,8 @@
 
 //! Arrow <-> Proto codec for Flight protocol
 //!
-//! Reuses existing Arrow infrastructure from arrow_ipc_scanner.rs and columnar_io.rs
-//! for maximum code reuse and consistency.
+//! Reuses existing Arrow infrastructure from columnar_io.rs for maximum code reuse
+//! and consistency.
 
 use anyhow::{Context, Result};
 use arrow_array::{
@@ -113,7 +113,7 @@ pub struct FlightRequestMetadata {
 
 /// Arrow-Proto bidirectional codec
 ///
-/// Reuses existing conversion functions from arrow_ipc_scanner.rs
+/// Reuses existing Arrow conversion functions
 pub struct ArrowProtoCodec;
 
 /// Canonical v2 vector-search ticket for Arrow Flight `DoGet` (TD-FLIGHT-1).
@@ -398,13 +398,12 @@ impl ArrowProtoCodec {
             if let Some(values) = vectors.as_mut() {
                 let row_values = std::mem::take(&mut values[row]);
                 let dim = row_values.len() as u32;
-                record.embeddings.push(EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "dense_vector".to_string(),
+                record.embeddings.push(EmbeddingCell::new_fp32(
+                    "default",
+                    "dense_vector",
                     dim,
-                    values: proximadb_records::EmbeddingValues::Fp32(row_values),
-                    ..Default::default()
-                });
+                    row_values,
+                ));
             }
 
             if let (Some(source_id), Some(target_id), Some(edge_type)) = (
@@ -2168,25 +2167,23 @@ mod tests {
         let records = vec![
             ProximaRecord {
                 oid: "vec_a".to_string(),
-                embeddings: vec![EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "dense_vector".to_string(),
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-                    dim: 3,
-                    ..Default::default()
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "default",
+                    "dense_vector",
+                    3,
+                    vec![1.0, 2.0, 3.0],
+                )],
                 created_at_ns: 100_000_000,
                 ..Default::default()
             },
             ProximaRecord {
                 oid: "vec_b".to_string(),
-                embeddings: vec![EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "dense_vector".to_string(),
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![4.0, 5.0, 6.0]),
-                    dim: 3,
-                    ..Default::default()
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "default",
+                    "dense_vector",
+                    3,
+                    vec![4.0, 5.0, 6.0],
+                )],
                 created_at_ns: 200_000_000,
                 ..Default::default()
             },
@@ -2214,24 +2211,22 @@ mod tests {
         let original_records = vec![
             ProximaRecord {
                 oid: "rt_1".to_string(),
-                embeddings: vec![EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "dense_vector".to_string(),
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![0.5, 1.5, 2.5, 3.5]),
-                    dim: 4,
-                    ..Default::default()
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "default",
+                    "dense_vector",
+                    4,
+                    vec![0.5, 1.5, 2.5, 3.5],
+                )],
                 ..Default::default()
             },
             ProximaRecord {
                 oid: "rt_2".to_string(),
-                embeddings: vec![EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "dense_vector".to_string(),
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![4.5, 5.5, 6.5, 7.5]),
-                    dim: 4,
-                    ..Default::default()
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "default",
+                    "dense_vector",
+                    4,
+                    vec![4.5, 5.5, 6.5, 7.5],
+                )],
                 ..Default::default()
             },
         ];

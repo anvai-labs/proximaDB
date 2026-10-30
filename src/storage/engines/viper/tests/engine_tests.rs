@@ -111,8 +111,11 @@ mod tests {
         use crate::proto::proximadb_v1::{Collection, CollectionConfig, StorageAssignment};
 
         Collection {
+            storage_class_status: None,
             id: collection_id.to_string(),
             config: Some(CollectionConfig {
+                storage_class: None,
+                policy_generation: None,
                 name: collection_id.to_string(),
                 embedding_config: None,
                 dimension: 128,           // Match actual test vector dimension
@@ -171,13 +174,12 @@ mod tests {
         );
         ProximaRecord {
             oid: id.to_string(),
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                dim: dimension as u32,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![value; dimension]),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                dimension as u32,
+                vec![value; dimension],
+            )],
             props,
             record_version: 1,
             created_at_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
@@ -883,13 +885,12 @@ mod tests {
             );
             let vector = ProximaRecord {
                 oid: id.to_string(),
-                embeddings: vec![EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "default",
+                    "vector",
                     dim,
-                    values: proximadb_records::EmbeddingValues::Fp32(vector_data),
-                    ..Default::default()
-                }],
+                    vector_data,
+                )],
                 props,
                 record_version: 1,
                 created_at_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),

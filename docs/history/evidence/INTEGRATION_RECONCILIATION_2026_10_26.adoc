@@ -1,0 +1,108 @@
+= Integration reconciliation — 2026-10-26
+
+Point-in-time evidence, not a live task queue. Current ownership and remaining gates are in
+link:../../current/TRACKER.adoc[the tracker]. Source: fetched develop c4ffc0af9, GitHub PR
+metadata, registered worktrees and selected read-only WIP diffs. No foreign worktree was edited.
+
+== Newly completed lanes
+
+[cols="1,2,3",options="header"]
+|===
+| PR | Integration evidence | Completed scope and limits
+| https://github.com/anvai-labs/proximaDB/pull/2248[#2248]
+| Merged 2026-10-26 19:04:32 UTC; merge c4ffc0af9, implementation ab89d158a
+| TD-PANICSCOPE-1: workspace panic-policy discovery/ratchet, 312-site starting baseline, eight fixture tests; legacy src-wide semantics preserved. This closes guard coverage, not the existing panic sites or compiler lint adoption.
+| https://github.com/anvai-labs/proximaDB/pull/2251[#2251]
+| Merged 2026-10-26 18:37:52 UTC; merge 36a0d7193, implementation 6aa512a58
+| TD-AUDITGATE-1 follow-up: 13 zstd/zstd-safe advisory exceptions with rationale/exposure analysis and removal triggers. This is a reviewed exception disposition, not a dependency patch or absence of vulnerabilities. Arrow and tower-http/async-compression constraints remain relevant to retirement.
+|===
+
+Both former worktrees (`fix/panic-scope-workspace`, `fix/audit-zstd-advisories`) were already
+absent from the registered inventory. This audit did not remove them and cannot attest to
+another session's cache/ignored-file cleanup. Their completed rows were removed from current;
+remaining dependency and panic-reduction work stays in the current platform contract.
+
+== Ownership observations
+
+* `feat/p24-delete-readers` remained at d929d7993 with 12 dirty files. The owner contributed
+  tracker commit 6bc7b0b7e reporting a usage-limit pause and 114/114 engine tests, with reader,
+  executor, DuckDB, DML and external interop checks still outstanding. Those test results are
+  owner-reported, not independently rerun by this audit. Preserve that session's WIP.
+* `feat/sc1-storage-policy` remained dirty at d929d7993. Read-only diff review confirms resolved
+  base-location admission and immutable-after-create class changes. A tenant-path substring
+  check still does not establish configured-target authorization; generated OpenAPI/SDK claims
+  remain unverified. These are pending pickup corrections, not completed SC1/SC2 delivery.
+* New `bench/tier1-e1-fixed`, clean at eb1dd04e2: commits 3b643fdd4/f5aef1b0b/eb1dd04e2 add
+  fixed-object reuse and p99/RSS/CPU instrumentation, then fix fresh-catalog collection creation
+  with a collection-id assertion. No PR or completed controlled-repeat evidence was found.
+* New `fix/gov-ledger-filings`, initially clean at c4ffc0af9: active governance pickup. Zero
+  unique commits do not prove it is disposable. Preserve it and coordinate through the tracker.
+* `docs/release-notes-v040`, b448e4acc, still has 11 commits not in develop and ignored `site/`.
+  No branch PR found. Partial overlap with #1960 remains insufficient proof of supersession.
+* Shared develop stayed clean at d929d7993. All unmerged implementation/benchmark/docs worktrees
+  were retained. No additional checkout qualified for verified supersession cleanup.
+
+== Consolidation integration checks
+
+PR #2250's remote owner-status commit was preserved before rebasing onto c4ffc0af9. Previous
+CI passed the Rust/unit/storage/platform lanes but failed two documentation checks: the docs
+index lacked the experimental general-Flight caveat; mkdocs treated current/history as site
+content. The repair restores the support caveat and explicitly excludes engineering planning/
+history from the customer site, matching the existing ADR/TD/internal scope. Coverage and
+strict-link validation remain enabled; no baseline inflation or weakened check is needed.
+
+Merge/CI state is determined by GitHub, not this historical record. The consolidation is
+complete only when #2250 merges; current implementation work remains with its owning lanes.
+
+== Resumed-session audit (later on 2026-10-26)
+
+This appendix preserves the later observation; earlier entries above remain point-in-time facts.
+#2250 merged the current/history consolidation. #2252 (5f1274b51) and #2254 (f62cf6522) merged
+the native-engine literature/source review and per-engine strength/crossover test contracts,
+after green CI and clean adversarial review. These are completed design investigations;
+NE implementation and comparative benchmarks remain planned in the current lakehouse plan.
+
+#2253 merged concurrently during the later audit at 23:34:08 UTC as 17a6f1e28. It filed missing
+TD references and corrected citation/comment drift. A subsequent status review found existing
+hot/warm cache and provisioning implementations mislabeled not started. The central follow-up
+corrects those three TDs to partial implementation and preserves their actual remaining gates;
+it does not declare full per-tenant/signup correctness or restart the lanes from zero.
+
+PR #2255 at f27a21548 received a blocked adversarial verdict: result/optimum claims, CLI
+forwarding, telemetry failure handling and evidence placement require owner corrections.
+Detailed actionable work stays in the current tracker, not a second historical queue.
+
+The original P2 source remains 51cefaaf2 with the same two dirty changes incorporated into the
+Codex reader continuation (#2256). Its incremental Git bundle was verified against prerequisite
+d929d7993; dirty-patch SHA-256 is
+`194ce951df770038620632be28cb30ed5893b5a4fc3b7367f63a2a33fb47fa5e`.
+Archive: `/tmp/proximadb-p24-complete/archive-glm-source/`. The only ignored source-worktree
+content at audit was `target/`; no source worktree was removed before merge. Other active GLM
+worktrees were read only. User direction now assigns implementation/refinement to resumed GLM
+sessions and central guidance/review/merge coordination to Codex.
+
+The next inventory refresh found the governance checkout already absent; this session did not
+remove it. SC1 advanced to 671706827 with an outermost-tenant-segment parsing fix; configured
+target authorization remains an independent gate. The original P2 source was rebased/committed
+by its resumed session as PR #2258 at 2a01cac26, overlapping #2256. The earlier archive above
+preserves its pre-resumption state, not a claim that the live checkout is still at 51cefaaf2.
+
+Independent exact-head comparison of #2258 (2a01cac26) against #2256 (9cd63699f) found
+no unique valid source/test behavior to port. Its first commit reproduces the original reader
+source; its second commits the two previously archived dirty fixes. #2256 strengthens both:
+statistics subtract deletions within surviving row-group ranges, not a whole file's deletion
+cardinality whenever any one group survives. Duplicate closure waits for the replacement merge;
+the active GLM worktree is retained for its owner's cleanup.
+
+== Reader integration and duplicate disposition
+
+#2256 merged on 2026-10-27 at 00:12:06 UTC (2026-10-26 Chicago), as e45cc3943.
+Exact implementation head 9cd63699ff243e36f59f83d13a204483ebcf33e5 had clean independent
+adversarial review and all applicable CI green, including root unit tests, integration groups
+and enterprise-catalog runtime tests/Clippy. Local engine 116/116 and interop/mixed 4/4 validation
+is recorded in link:P24_DELETION_READER_REVIEW_2026_10_26.adoc[the reader evidence].
+The authorized adversarial-review proxy was used to merge; the live writer was not activated.
+
+#2258 was then closed as superseded at reviewed head 2a01cac26. Its branch/worktree remains
+with the GLM owner. No foreign active checkout or generated evidence was deleted. The completed
+reader lane leaves only the writer/visibility/v3-activation residual in current planning.

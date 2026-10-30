@@ -150,7 +150,7 @@ heuristics"* (co-design mandate):
   *latency-driven, not trace/geometry-aware*: quant is in its search space but is not
   refined from the measured I/O trace, and geometry is not tunable at all today.
   (Corrected 2026-06-25 — the earlier "do not tune quant" was inaccurate; see
-  `docs/_internal/review/PAX_SUBSTRATE_DESIGN_PLAN_2026_06_25.adoc`.)
+  `docs/history/planning/PAX_SUBSTRATE_DESIGN_PLAN_2026_06_25.adoc`.)
 
 *Sequencing (measure before you tune — co-design mandate):*
 . **TD-158** — wire block-level `range_gets`/bytes into the live AXIS/SST read

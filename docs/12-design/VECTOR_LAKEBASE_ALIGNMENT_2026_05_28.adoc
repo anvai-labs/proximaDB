@@ -20,7 +20,7 @@ not yet cover.
 
 It is read alongside, and defers to, the governing documents:
 
-* `docs/00-product/VISION.adoc` -- "The Context Database" positioning.
+* `docs/current/VISION.adoc` -- "The Context Database" positioning.
 * `docs/12-design/DATA_AI_PLATFORM_ARCHITECTURE_ANCHOR_2026_05_12.adoc` -- storage/compute
   separation, branchable state, multi-engine routing.
 * `docs/12-design/COMPETITIVE_OLTP_OLAP_MPP_TRAJECTORY_2026_05_20.adoc` -- workload-aware route
@@ -475,4 +475,4 @@ with task checklists and success criteria, in
 '''
 
 _Author_: architecture review, 2026-05-28. _Status_: trajectory input, not an accepted ADR.
-_Supersedes_: nothing. _Feeds_: VISION.adoc, STRATEGIC_ROADMAP.adoc, TECHNICAL_DEBT.adoc (TD-086..091).
+_Supersedes_: nothing. _Feeds_: VISION.adoc, docs/current/ROADMAP.adoc, TECHNICAL_DEBT.adoc (TD-086..091).

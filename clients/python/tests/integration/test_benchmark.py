@@ -20,11 +20,7 @@ import numpy as np
 import pytest
 
 from proximadb_sdk import ProximaDBClient
-from proximadb_sdk.chunking import (
-    ChunkingConfig,
-    ChunkingStrategy,
-    TextChunker,
-)
+from proximadb_sdk.chunking import ChunkingConfig, ChunkingStrategy, TextChunker
 from proximadb_sdk.embedding_providers import get_provider
 from proximadb_sdk.embedding_providers.core import (
     BaseEmbeddingProvider as EmbeddingProvider,

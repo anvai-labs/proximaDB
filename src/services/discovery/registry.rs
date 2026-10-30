@@ -11,7 +11,8 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
-use super::job::{DiscoveryJob, DiscoveryJobStatus, now_ms};
+use super::job::{DiscoveryJob, DiscoveryJobStatus};
+use proximadb_kernel::time::now_unix_ms;
 
 const REGISTRY_SCHEMA_VERSION: u32 = 1;
 
@@ -220,7 +221,7 @@ impl DiscoveryRegistry {
 
         let mut job = candidate?;
         job.status = DiscoveryJobStatus::Running;
-        job.started_at_ms = Some(now_ms());
+        job.started_at_ms = Some(now_unix_ms());
         self.jobs.insert(job.job_id.clone(), job.clone());
         self.persist_if_configured();
         Some(job)

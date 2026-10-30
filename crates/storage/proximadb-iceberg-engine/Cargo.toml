@@ -30,11 +30,13 @@ arrow-schema.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 # Spec-compliant Iceberg manifest / manifest-list (Avro) + TableMetadata (JSON).
-apache-avro = "0.16"
+apache-avro = "0.21"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 bincode.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
+# CRC-32 of each Iceberg v3 deletion-vector blob (`deletion_vector`).
+crc32fast.workspace = true
 uuid = { version = "1.0", features = ["v4"] }
 # `prune_retention` compares `ObjectMeta.last_modified` (a `DateTime<Utc>`) against a
 # retention age; `tracing` logs best-effort delete failures without aborting the pass.

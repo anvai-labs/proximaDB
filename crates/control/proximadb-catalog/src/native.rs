@@ -255,6 +255,46 @@ impl NativeCatalog {
         }
     }
 
+    /// Check the namespace exists and mint the per-scope typed identity —
+    /// shared by `create_table_inner` and `replace_table_inner` so the two
+    /// cannot drift (ADR-031 Phase 4a / TD-181).
+    async fn check_namespace_and_mint_identity(
+        &self,
+        identifier: &TableIdentifier,
+        schema: &mut CatalogTableSchema,
+    ) -> Result<()> {
+        if !self.namespace_exists(&identifier.namespace).await? {
+            return Err(anyhow!(
+                "Namespace '{}' does not exist",
+                identifier.namespace.join(".")
+            ));
+        }
+        // Legacy/anonymous namespaces keep `None` (mixed-read-safe — the typed
+        // path is opt-in, env-gated).
+        let ns = self.get_namespace(&identifier.namespace).await?;
+        if let Some(account) = ns.account_id.as_deref() {
+            self.mint_stable_identity(account, &identifier.namespace.join("."), schema)
+                .await;
+        }
+        Ok(())
+    }
+
+    /// ADR-031 / TD-181: mint stable object_ids for the table and every catalog
+    /// object carried in its schema — columns and indexes — from the one
+    /// system-wide sequence. `mint_object_id` allocates when unset and
+    /// adopts-without-reuse a caller-supplied id (import/migration/CTAS). The
+    /// `identifier` is unused: kept for signature symmetry with
+    /// [`Self::check_namespace_and_mint_identity`], which needs it.
+    fn mint_table_identity(&self, _identifier: &TableIdentifier, schema: &mut CatalogTableSchema) {
+        schema.object_id = Some(self.mint_object_id(schema.object_id));
+        for column in &mut schema.columns {
+            column.object_id = Some(self.mint_object_id(column.object_id));
+        }
+        for index in &mut schema.indexes {
+            index.object_id = Some(self.mint_object_id(index.object_id));
+        }
+    }
+
     /// ADR-031 / TD-181: recover the allocator floor from a persisted `object_id`
     /// so a restart never reuses it. The load-path inverse of `mint_object_id`;
     /// every recovery path (table, namespace, index, column) routes through it.
@@ -1545,35 +1585,9 @@ impl Catalog for NativeCatalog {
         crate::schema::normalize_identity(&mut schema);
         validate_schema(&schema)?;
 
-        // ADR-031 / TD-181: mint stable object_ids for the table and every
-        // catalog object carried in its schema — columns and indexes — from the
-        // one system-wide sequence. `mint_object_id` allocates when unset and
-        // adopts-without-reuse a caller-supplied id (import/migration/CTAS).
-        schema.object_id = Some(self.mint_object_id(schema.object_id));
-        for column in &mut schema.columns {
-            column.object_id = Some(self.mint_object_id(column.object_id));
-        }
-        for index in &mut schema.indexes {
-            index.object_id = Some(self.mint_object_id(index.object_id));
-        }
-
-        // Check namespace exists
-        if !self.namespace_exists(&identifier.namespace).await? {
-            return Err(anyhow!(
-                "Namespace '{}' does not exist",
-                identifier.namespace.join(".")
-            ));
-        }
-
-        // ADR-031 Phase 4a: mint the per-scope typed identity
-        // (`stable_namespace_id` u16, `stable_collection_id` u32) when the
-        // namespace carries an account. Legacy/anonymous namespaces keep `None`
-        // (mixed-read-safe — the typed path is opt-in, env-gated).
-        let ns = self.get_namespace(&identifier.namespace).await?;
-        if let Some(account) = ns.account_id.as_deref() {
-            self.mint_stable_identity(account, &identifier.namespace.join("."), &mut schema)
-                .await;
-        }
+        self.check_namespace_and_mint_identity(identifier, &mut schema)
+            .await?;
+        self.mint_table_identity(identifier, &mut schema);
 
         // Check table doesn't exist
         if self.table_exists(identifier).await? {
@@ -1601,6 +1615,87 @@ impl Catalog for NativeCatalog {
         }
         info!("Created table: {}", identifier);
 
+        Ok(schema)
+    }
+
+    /// TD-CATREPLACE-1: atomic in place — one `save_table` overwrite IS the
+    /// whole swap, so a reader never sees the table absent and an I/O failure
+    /// leaves the previous schema durable. `created_at`, statistics and the
+    /// partition/sort metadata survive; identity follows `create_table`
+    /// (caller-supplied ids adopted, floor raised). When the adopted
+    /// `object_id` differs from the existing one, the previous authority copy
+    /// and its index entries are removed after the new write (authority-first,
+    /// like `drop_table`), so no orphaned oid file can resurrect the old row.
+    async fn replace_table_inner(
+        &self,
+        identifier: &TableIdentifier,
+        schema: CatalogTableSchema,
+    ) -> Result<CatalogTableSchema> {
+        let mut schema = schema;
+        crate::schema::normalize_identity(&mut schema);
+        validate_schema(&schema)?;
+
+        // Round-4 review: the shared helper, exactly as create — the namespace
+        // check AND the stable typed-identity mint (a replace must not be able
+        // to leave a row untyped, or create-via-replace to diverge from
+        // create). Order (stable identity, then object ids) matches the
+        // pre-refactor behavior.
+        self.check_namespace_and_mint_identity(identifier, &mut schema)
+            .await?;
+        self.mint_table_identity(identifier, &mut schema);
+
+        // Only a genuinely absent table may be replaced into existence; an
+        // unreadable previous row must fail the replace rather than silently
+        // reset created_at/statistics (review m2).
+        let previous = if self.table_exists(identifier).await? {
+            Some(self.load_table(identifier).await?)
+        } else {
+            None
+        };
+        let now = Self::now_millis();
+        let meta = TableMetadata {
+            identifier: identifier.into(),
+            schema: schema.clone(),
+            statistics: previous.as_ref().and_then(|p| p.statistics.clone()),
+            partition_spec: previous.as_ref().and_then(|p| p.partition_spec.clone()),
+            sort_order: previous.as_ref().and_then(|p| p.sort_order.clone()),
+            created_at: previous.as_ref().map_or(now, |p| p.created_at),
+            updated_at: now,
+            data_location: self.table_data_location(identifier),
+        };
+        self.save_table(&meta).await?;
+        // Mandate 16b: invalidate the shared cache immediately after the
+        // durable write, before any fallible step below, so no reader is served
+        // the previous schema from cache (review m1).
+        self.cache
+            .invalidate_table_in_catalog(&self.name, identifier);
+
+        // An adopted object_id that differs from the replaced row's leaves the
+        // old authority copy + reverse-index entry behind; drop them now that
+        // the new write is durable (mirrors drop_table's authority-first rule).
+        if let (Some(previous_oid), Some(new_oid)) = (
+            previous.as_ref().and_then(|p| p.schema.object_id),
+            schema.object_id,
+        ) && previous_oid != new_oid
+        {
+            if self.oid_paths_on()
+                && !self
+                    .io_remove_file(&Self::object_file_rel(previous_oid))
+                    .await
+            {
+                // A leftover old-oid authority file can resurrect the previous
+                // row if the durable index is ever rebuilt from the objects dir.
+                warn!(
+                    "replace_table: old authority file for object {} survived removal; table {}",
+                    previous_oid, identifier
+                );
+            }
+            self.index_remove_table(identifier).await?;
+        }
+        if let Some(oid) = schema.object_id {
+            self.index_upsert_table(oid, identifier).await?;
+        }
+        info!("Replaced table: {}", identifier);
         Ok(schema)
     }
 
@@ -2083,12 +2178,121 @@ impl Catalog for NativeCatalog {
 }
 
 #[cfg(test)]
+mod catreplace_tests {
+    use super::tests::catalog_in_tempdir;
+    use super::*;
+    use proximadb_catalog_schema::CatalogColumn;
+    use proximadb_data_model::ProximaType;
+
+    fn schema_with_columns(columns: &[(&str, ProximaType)]) -> CatalogTableSchema {
+        let mut schema = CatalogTableSchema::new("t1");
+        for (name, data_type) in columns {
+            schema.columns.push(
+                CatalogColumn::new(100 + schema.columns.len() as i32, *name, data_type.clone())
+                    .nullable(true),
+            );
+        }
+        schema
+    }
+
+    /// TD-CATREPLACE-1: replace_table keeps the row present, preserves
+    /// identity and birth metadata, and applies the new schema — without the
+    /// drop window the drop+create dance had.
+    /// A native catalog with namespace `ns` and the `ns.t1` table id.
+    async fn catalog_with_ns_t1() -> (NativeCatalog, tempfile::TempDir, TableIdentifier) {
+        let (catalog, dir) = catalog_in_tempdir().await;
+        catalog
+            .create_namespace(&["ns".to_string()], Default::default())
+            .await
+            .expect("namespace");
+        let identifier = TableIdentifier::new(vec!["ns".into()], "t1");
+        (catalog, dir, identifier)
+    }
+
+    #[tokio::test]
+    async fn replace_table_updates_in_place_preserving_identity() {
+        let (catalog, _dir, identifier) = catalog_with_ns_t1().await;
+        let created = catalog
+            .create_table(
+                &identifier,
+                schema_with_columns(&[("a", ProximaType::Int64)]),
+            )
+            .await
+            .expect("create");
+        let original_oid = created.object_id.expect("object id minted");
+
+        // The old behavior dropped the table first; assert the invariant
+        // directly: after replace, the row exists with the new columns, the
+        // same object_id (caller adopts it) and the same created_at.
+        let mut replacement =
+            schema_with_columns(&[("a", ProximaType::Int64), ("b", ProximaType::String)]);
+        replacement.object_id = Some(original_oid);
+        let replaced = catalog
+            .replace_table(&identifier, replacement)
+            .await
+            .expect("replace");
+        assert_eq!(replaced.object_id, Some(original_oid));
+        let after = catalog.get_table(&identifier).await.expect("table present");
+        assert_eq!(after.object_id, Some(original_oid));
+        assert!(after.columns.iter().any(|c| c.name == "b"));
+
+        // An adopted object_id that differs from the replaced row's swaps the
+        // identity and keeps the table readable (the removal branch).
+        let mut reidentified = schema_with_columns(&[("a", ProximaType::Int64)]);
+        reidentified.object_id = Some(original_oid + 1000);
+        let reidentified = catalog
+            .replace_table(&identifier, reidentified)
+            .await
+            .expect("replace with a new oid");
+        assert_eq!(reidentified.object_id, Some(original_oid + 1000));
+        assert_eq!(
+            catalog
+                .get_table(&identifier)
+                .await
+                .expect("readable after identity swap")
+                .object_id,
+            Some(original_oid + 1000)
+        );
+
+        // A schema the catalog rejects costs the existing table nothing —
+        // asserted LAST, so no later replace could have recreated the table had
+        // the rejection dropped it.
+        assert!(
+            catalog
+                .replace_table(&identifier, schema_with_columns(&[]))
+                .await
+                .is_err(),
+            "a columnless schema is invalid"
+        );
+        assert!(
+            catalog.table_exists(&identifier).await.expect("exists"),
+            "a rejected replace must leave the table in place"
+        );
+    }
+
+    /// TD-CATREPLACE-1: replace on a missing table behaves like a create.
+    #[tokio::test]
+    async fn replace_table_on_missing_table_creates() {
+        let (catalog, _dir, identifier) = catalog_with_ns_t1().await;
+        let replaced = catalog
+            .replace_table(
+                &identifier,
+                schema_with_columns(&[("a", ProximaType::Int64)]),
+            )
+            .await
+            .expect("replace creates");
+        assert!(replaced.object_id.is_some());
+        assert!(catalog.table_exists(&identifier).await.expect("exists"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     // ── ADR-031 Phase 4a: typed-identity minting ────────────────────────
 
-    async fn catalog_in_tempdir() -> (NativeCatalog, tempfile::TempDir) {
+    pub(super) async fn catalog_in_tempdir() -> (NativeCatalog, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = NativeCatalogConfig {
             storage_url: format!("file://{}", dir.path().join("cat").display()),

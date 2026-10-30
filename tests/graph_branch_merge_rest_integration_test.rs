@@ -61,7 +61,7 @@ async fn test_merge_handler(
     AxumPath((collection, branch)): AxumPath<(String, String)>,
     Json(request): Json<GraphBranchMergeRequest>,
 ) -> ApiResult<JsonResponse<serde_json::Value>> {
-    merge_graph_branch_inner(&data_dir, &collection, &branch, request).await
+    merge_graph_branch_inner(&data_dir, "default", &collection, &branch, request).await
 }
 
 /// Returns (TempDir guard, data_dir path). The TempDir must be held for the
@@ -333,5 +333,45 @@ async fn merge_endpoint_returns_404_when_no_branch_entries_for_collection() -> R
         body
     );
 
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TD-SEAM-12 hazard 2: truncated history refuses the merge (410), never a
+// silently wrong merge base. A floor marker with no merge-base generation in
+// the WAL is history truncated before merge bases were tracked: whether the
+// collection's base survived cannot be told, so the merge refuses.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn merge_endpoint_refuses_when_wal_history_was_truncated() -> Result<()> {
+    let (_tmp, data_dir) = fresh_data_dir()?;
+    let wal_path = wal_path_for(&data_dir);
+    seed_two_branch_conflict(&wal_path).await?;
+    let uri = format!("/api/v1/collections/{COLLECTION}/branches/{BRANCH_A}/merge");
+    let body = serde_json::json!({ "target_branch": BRANCH_B, "dry_run": true });
+
+    // Complete history: the merge runs.
+    let (status, _) = post_json(router_for_test(data_dir.clone()), &uri, body.clone()).await?;
+    assert_eq!(status, StatusCode::OK);
+
+    // The durable floor marker says the main-line base write (seq 1) is gone,
+    // and no merge-base generation recorded what it held.
+    let mut floor = wal_path.as_os_str().to_owned();
+    floor.push(".floor");
+    std::fs::write(&floor, "1")?;
+
+    let (status, response) = post_json(router_for_test(data_dir), &uri, body).await?;
+    assert_eq!(
+        status,
+        StatusCode::GONE,
+        "a merge base computed from truncated history must be refused: {response}"
+    );
+    assert!(
+        response
+            .to_string()
+            .contains("before merge bases were tracked"),
+        "refused because nothing tracked the truncated history: {response}"
+    );
     Ok(())
 }

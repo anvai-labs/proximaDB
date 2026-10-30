@@ -12,97 +12,12 @@
 //!
 //!   RUST_LOG=proximadb=debug cargo test --test graph_ldbc_pgwire_e2e -- --nocapture
 
-use std::net::TcpListener;
-use std::time::Duration;
-
-use proximadb::core::Config;
-use proximadb::database::ProximaDB;
-use tempfile::TempDir;
-use tokio::time::sleep;
-
 const GRAPH_RATCHET: usize = 10;
 
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let p = l.local_addr().expect("addr").port();
-    drop(l);
-    p
-}
+#[path = "common/pg_server.rs"]
+mod pg_server;
 
-struct PgServer {
-    pg_port: u16,
-    db: Option<ProximaDB>,
-    _tmp: TempDir,
-}
-
-impl PgServer {
-    async fn start() -> anyhow::Result<Self> {
-        let pg_port = free_port();
-        let rest_port = free_port();
-        let grpc_port = free_port();
-        let tmp = TempDir::new()?;
-        let mut config = Config::default();
-        config.server.bind_address = "127.0.0.1".to_string();
-        config.server.port = rest_port;
-        config.server.data_dir = tmp.path().to_path_buf();
-        config.api.rest_port = rest_port;
-        config.api.grpc_port = grpc_port;
-        config.api.unified_mode = false;
-        config.api.pg_port = Some(pg_port);
-        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
-            url: format!("file://{}", tmp.path().display()),
-            ..Default::default()
-        }];
-        config.storage.wal_config.write_buffer_directory =
-            format!("file://{}/wal", tmp.path().display());
-        let mut db = ProximaDB::new(config).await?;
-        db.start().await?;
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .no_proxy()
-            .build()?;
-        let health = format!("http://127.0.0.1:{rest_port}/health");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match http.get(&health).send().await {
-                Ok(r) if r.status().is_success() => break,
-                _ if std::time::Instant::now() > deadline => anyhow::bail!("REST not ready"),
-                _ => sleep(Duration::from_millis(100)).await,
-            }
-        }
-        sleep(Duration::from_millis(200)).await;
-        Ok(Self {
-            pg_port,
-            db: Some(db),
-            _tmp: tmp,
-        })
-    }
-    fn conn_str(&self) -> String {
-        format!(
-            "host=127.0.0.1 port={} user=postgres dbname=proximadb sslmode=disable",
-            self.pg_port
-        )
-    }
-}
-
-impl Drop for PgServer {
-    fn drop(&mut self) {
-        if let Some(mut db) = self.db.take() {
-            tokio::spawn(async move {
-                let _ = db.shutdown().await;
-            });
-        }
-    }
-}
-
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    if let Some(db) = e.as_db_error() {
-        format!("[{}] {}", db.code().code(), db.message())
-    } else {
-        e.to_string()
-    }
-}
-
+use pg_server::TestPgServer;
 /// Run a single-column query and parse each row's first cell as `i64`, returned
 /// **sorted** for order-independent set comparison (ADR-040 `canon()`-style — row
 /// order across engines/routes is a separate concern from result correctness; see
@@ -111,7 +26,7 @@ async fn col_ints(client: &tokio_postgres::Client, sql: &str) -> Vec<i64> {
     let mut v: Vec<i64> = client
         .simple_query(sql)
         .await
-        .unwrap_or_else(|e| panic!("query `{sql}`: {}", explain_err(&e)))
+        .unwrap_or_else(|e| panic!("query `{sql}`: {}", pg_server::db_err(&e)))
         .into_iter()
         .filter_map(|m| match m {
             tokio_postgres::SimpleQueryMessage::Row(r) => {
@@ -130,7 +45,7 @@ async fn col_int_pairs(client: &tokio_postgres::Client, sql: &str) -> Vec<(i64, 
     let mut v: Vec<(i64, i64)> = client
         .simple_query(sql)
         .await
-        .unwrap_or_else(|e| panic!("query `{sql}`: {}", explain_err(&e)))
+        .unwrap_or_else(|e| panic!("query `{sql}`: {}", pg_server::db_err(&e)))
         .into_iter()
         .filter_map(|m| match m {
             tokio_postgres::SimpleQueryMessage::Row(r) => Some((
@@ -217,7 +132,7 @@ fn graph_ldbc_pgwire_conformance() {
 }
 
 async fn graph_ldbc_pgwire_conformance_inner() {
-    let server = PgServer::start().await.expect("server start");
+    let server = TestPgServer::start().await.expect("server start");
     let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
         .await
         .expect("connect");
@@ -232,7 +147,7 @@ async fn graph_ldbc_pgwire_conformance_inner() {
         client
             .simple_query(ddl)
             .await
-            .unwrap_or_else(|e| panic!("CREATE {name}: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("CREATE {name}: {}", pg_server::db_err(&e)));
     }
     eprintln!("✓ schema: {} tables created", SCHEMA.len());
 
@@ -240,7 +155,7 @@ async fn graph_ldbc_pgwire_conformance_inner() {
         client
             .simple_query(&sql)
             .await
-            .unwrap_or_else(|e| panic!("INSERT failed: {}\n  sql: {sql}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("INSERT failed: {}\n  sql: {sql}", pg_server::db_err(&e)));
     }
     eprintln!("✓ data: graph loaded");
 
@@ -251,7 +166,7 @@ async fn graph_ldbc_pgwire_conformance_inner() {
             .await
         {
             Ok(_) => materialized += 1,
-            Err(e) => eprintln!("  · MATERIALIZE {name}: {}", explain_err(&e)),
+            Err(e) => eprintln!("  · MATERIALIZE {name}: {}", pg_server::db_err(&e)),
         }
     }
     eprintln!("✓ materialize: {materialized}/{} tables", SCHEMA.len());
@@ -266,8 +181,8 @@ async fn graph_ldbc_pgwire_conformance_inner() {
                 passed.push(*id);
             }
             Err(e) => {
-                eprintln!("  ✗ {id}: {}", explain_err(&e));
-                failed.push((*id, explain_err(&e)));
+                eprintln!("  ✗ {id}: {}", pg_server::db_err(&e));
+                failed.push((*id, pg_server::db_err(&e)));
             }
         }
     }
@@ -375,7 +290,7 @@ fn graph_deletion_vector_reflects_edge_mutations() {
 }
 
 async fn graph_deletion_vector_reflects_edge_mutations_inner() {
-    let server = PgServer::start().await.expect("server start");
+    let server = TestPgServer::start().await.expect("server start");
     let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
         .await
         .expect("connect");
@@ -393,11 +308,11 @@ async fn graph_deletion_vector_reflects_edge_mutations_inner() {
     client
         .simple_query("CREATE TABLE gperson (p_id INT PRIMARY KEY, name VARCHAR)")
         .await
-        .unwrap_or_else(|e| panic!("create gperson: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("create gperson: {}", pg_server::db_err(&e)));
     client
         .simple_query("CREATE TABLE edge (e_id INT PRIMARY KEY, src INT, dst INT)")
         .await
-        .unwrap_or_else(|e| panic!("create edge: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("create edge: {}", pg_server::db_err(&e)));
     for sql in [
         "INSERT INTO gperson (p_id, name) VALUES (1, 'A')",
         "INSERT INTO gperson (p_id, name) VALUES (2, 'B')",
@@ -410,24 +325,24 @@ async fn graph_deletion_vector_reflects_edge_mutations_inner() {
         client
             .simple_query(sql)
             .await
-            .unwrap_or_else(|e| panic!("seed `{sql}`: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("seed `{sql}`: {}", pg_server::db_err(&e)));
     }
     for t in ["gperson", "edge"] {
         client
             .simple_query(&format!("ALTER TABLE {t} MATERIALIZE"))
             .await
-            .unwrap_or_else(|e| panic!("materialize {t}: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("materialize {t}: {}", pg_server::db_err(&e)));
     }
 
     // Post-snapshot edge mutations: delete edge 1 (drops 1→2), insert edge 4 (2→3).
     client
         .simple_query("DELETE FROM edge WHERE e_id = 1")
         .await
-        .unwrap_or_else(|e| panic!("delete edge: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("delete edge: {}", pg_server::db_err(&e)));
     client
         .simple_query("INSERT INTO edge (e_id, src, dst) VALUES (4, 2, 3)")
         .await
-        .unwrap_or_else(|e| panic!("insert edge: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("insert edge: {}", pg_server::db_err(&e)));
 
     // Out-degree per source = JOIN(edge, gperson) + GROUP BY → DataFusion OLAP route
     // (where the read-merge lives). col_int_pairs sorts → order-independent.

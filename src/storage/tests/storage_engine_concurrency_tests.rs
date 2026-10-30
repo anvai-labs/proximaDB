@@ -93,13 +93,12 @@ mod tests {
         ProximaRecord {
             oid: id.to_string(),
             record_version: 1,
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.1_f32; 128]),
-                dim: 128,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                128,
+                vec![0.1_f32; 128],
+            )],
             ..ProximaRecord::default()
         }
     }

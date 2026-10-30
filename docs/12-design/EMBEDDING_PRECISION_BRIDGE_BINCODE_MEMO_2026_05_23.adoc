@@ -7,7 +7,7 @@
 | Field | Value
 | Status | **Done (2026-06-05).** Option A shipped: `EmbeddingCell.values` is `EmbeddingValues` in memory while v1 WAL bytes stay byte-identical (INT-2.5a/b/c; positional-layout regression fixed 2026-06-05).
 | Component | `crates/foundation/proximadb-records` (`EmbeddingCell` custom serde)
-| Relates to | link:EMBEDDING_PRECISION_LLD_2026_05_22.adoc[EMBEDDING_PRECISION_LLD] (layout contract), link:EMBEDDING_PRECISION_INTEGRATION_PLAN_2026_05_23.adoc[INTEGRATION_PLAN] (INT-2.5)
+| Relates to | link:EMBEDDING_PRECISION_LLD_2026_05_22.adoc[EMBEDDING_PRECISION_LLD] (layout contract), link:../history/planning/EMBEDDING_PRECISION_INTEGRATION_PLAN_2026_05_23.adoc[INTEGRATION_PLAN] (INT-2.5)
 |===
 
 == History

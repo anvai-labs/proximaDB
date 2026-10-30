@@ -336,16 +336,14 @@ impl JwtService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::auth::JwtAlgorithm;
 
     fn test_jwt_config() -> JwtConfig {
         JwtConfig {
             secret: Some("test-secret-key-for-jwt-tokens".to_string()),
-            expiration_secs: 3600,
             refresh_expiration_secs: 86400,
             issuer: "test-proximadb".to_string(),
             audience: "test-api".to_string(),
-            algorithm: JwtAlgorithm::HS256,
+            ..Default::default()
         }
     }
 

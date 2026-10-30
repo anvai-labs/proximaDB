@@ -236,7 +236,10 @@ impl BackgroundFlushContext {
             data_size_bytes: 0,  // Unknown from context
         };
 
+        let storage_class_status =
+            crate::services::collection::storage_class::storage_class_status(&config);
         Collection {
+            storage_class_status: Some(storage_class_status),
             id: self.collection_id.clone(),
             config: Some(config),
             stats: Some(stats),

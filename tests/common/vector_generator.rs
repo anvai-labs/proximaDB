@@ -53,13 +53,12 @@ fn make_record(id: &str, vector: Vec<f32>, props: ProximaTree) -> ProximaRecord 
         refs: Vec::new(),
         edge: None,
         embeddings: if !vector.is_empty() {
-            vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "dense_vector".to_string(),
+            vec![EmbeddingCell::new_fp32(
+                "default",
+                "dense_vector",
                 dim,
-                values: EmbeddingValues::Fp32(vector),
-                ..Default::default()
-            }]
+                vector,
+            )]
         } else {
             vec![]
         },

@@ -74,13 +74,12 @@ fn create_compressible_test_vectors(
             );
             proximadb_records::ProximaRecord {
                 oid: format!("{}_{}", prefix, i),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    dim: dimension as u32,
-                    values: proximadb_records::EmbeddingValues::Fp32(values),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default",
+                    "vector",
+                    dimension as u32,
+                    values,
+                )],
                 props,
                 record_version: 1,
                 created_at_ns: (1000 + i) as i64 * 1_000_000_000,
@@ -358,13 +357,9 @@ async fn test_sst_search_compressed_blocks() -> anyhow::Result<()> {
         );
         all_vectors.push(proximadb_records::ProximaRecord {
             oid: format!("sparse_{}", i),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                dim: 512,
-                values: proximadb_records::EmbeddingValues::Fp32(values),
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "default", "vector", 512, values,
+            )],
             props,
             record_version: 1,
             created_at_ns: (1000 + i) as i64 * 1_000_000_000,
@@ -385,13 +380,9 @@ async fn test_sst_search_compressed_blocks() -> anyhow::Result<()> {
         );
         all_vectors.push(proximadb_records::ProximaRecord {
             oid: format!("dense_{}", i),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                dim: 512,
-                values: proximadb_records::EmbeddingValues::Fp32(values),
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "default", "vector", 512, values,
+            )],
             props,
             record_version: 1,
             created_at_ns: (2000 + i) as i64 * 1_000_000_000,

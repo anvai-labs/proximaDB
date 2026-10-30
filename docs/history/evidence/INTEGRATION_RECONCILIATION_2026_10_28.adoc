@@ -1,0 +1,84 @@
+= Integration reconciliation — 2026-10-28
+
+Point-in-time reconciliation against fetched develop `74f7f0a83`, GitHub merge records,
+CI logs and read-only worktree inspection. Current assignments and blockers belong to
+link:../../current/TRACKER.adoc[the tracker]. No foreign active checkout was edited or removed.
+Prior audit: link:INTEGRATION_RECONCILIATION_2026_10_26.adoc[October 26].
+
+== Completed publication slices and remaining boundary
+
+[cols="1,2,4",options="header"]
+|===
+| PR | Merge | Scope and limits
+| #2260 | 9c2a91460 | New-table v3 policy and atomic v2-to-v3 carry proof. PROXIMADB_ICEBERG_V3_DEFAULT remains default OFF; never-downgrade does not itself activate new-table v3.
+| #2261 | 2b2c56f27 | Lineage/sequence/parent-chain proof and fail-closed engine lineage policy. The policy rejects legacy inconsistent/missing lineage; do not misdescribe it as an unconditional Iceberg-spec requirement at a foreign-parent boundary.
+| #2262 | 57a4db1d5 | published_positions_of maps canonical oids to physical row positions, with missing-oid/pre-system-column refusal. It scans the oid column of published files; this is a correctness primitive, not a zero-I/O lookup index.
+| #2264 | 103cf6e4f | Shared publication/WAL visibility contract. A merged contract does not certify every implementation gate.
+| #2266 | a8cd7bf08 | Default-OFF live-delete publisher: parent DV union, completeness/schema checks, successor publication and forward-only layout update. Bulk append over a DV parent is demoted to WAL; the safe MATERIALIZE relaxation requires recorded publication/LSN agreement. This is tombstone publication, not general incremental update/upsert delivery.
+|===
+
+#2266 explicitly defers forced race, lease-fence, crash-gap recovery and standing reader-guard
+gates. Its successor-CAS-to-layout gap can refuse publication/read paths until reconciled.
+The active `p24/fence-gates` checkout at 82364e23d claims these gates with 9/9 interop checks,
+but had additional dirty DML/pgwire changes and no PR at this audit. Those are owner-reported
+WIP results, not merged or independently rerun acceptance. Preserve the external-DV guard.
+The two publication gates remain default OFF; broader facade/schema/tenant and rollout proof
+remain separate. Contract: link:../../12-design/PUBLICATION_WAL_VISIBILITY_FENCE_2026_10_27.adoc[visibility fence].
+
+== Completed storage-policy foundation
+
+* #2259 merged as b3bf8a28b: additive SC1 policy/status and initial SC2 resolved-placement
+  checks/facade serialization. Configured-target authorization and actual placement lifecycle
+  proof remain open; an explicit tenant-path check is not general target authorization.
+* #2267 merged as 3e81e4d2d: reservation authority, durable usage and protected-store primitives,
+  inert by default. No query-residency promise follows from these primitives.
+* #2269 merged as ef0c48819: registry/create admission, compensation on ordinary create failure,
+  delete release and coalesced usage cadence. Pools and default grants must be explicitly armed;
+  PERFORMANCE remains NOT_ACTIVE pending SC4 coverage/store-budget integration. Reserve-to-catalog
+  crash reconciliation and real MinIO facade lifecycle proof remain residuals.
+
+At committed head 9baae280e, #2270's policy-mutation follow-up is not merge-ready. Hosted CI
+fails Python generated-file lint and the root unit test
+`economy_persists_intent_and_performance_requires_object_backed_sst` (stale dependency-reason
+assertion). Independent source review also found quota-before-persist, facade pending-signal,
+grant recovery, delete-race and generation-ownership issues. Actionable corrections stay in
+the central tracker. The owner was modifying generated Python and manager code during review;
+no conclusion here applies to those uncommitted refinements or a future head.
+
+== Completed E1 evidence, not a production optimum
+
+#2255 merged as 98faebd8a after corrections and scale extensions. The old f27a21548 blocked
+verdict in the October 26 audit is historical, not its current merge state. Evidence:
+
+* link:TIER1_E1_FIXED_OBJECT_CAP_SWEEP_2026_10_26.adoc[Fixed-object cap sweep]: approximately
+  28.67% fewer requests from 4 to 16 MiB, with approximately 4.50% more bytes. Two repeats do
+  not establish a universal optimum or attribute CPU variation causally to fetched tails.
+* link:TIER1_E1_SCALE_CAP_SWEEP_2026_10_27.adoc[Scale sweep]: 3M single-segment cap effect
+  strengthened; 10M tiered effect weakened. Sparse repeats and recall/probe calibration limit
+  product claims; the attempted single-segment 10M fixture was not producible under the bed.
+* #2265, ef3f74b79: link:TIER1_E1_FRAGMENT_LADDER_2026_10_27.adoc[Fragment ladder]. The cap
+  lever falls sharply after initial fragmentation. Segment count alone does not explain the
+  10M result; corpus size/probe density and asymmetric warm phases remain limits.
+* #2268, 74f7f0a83: link:TIER1_E1_FILTERED_QUERIES_2026_10_28.adoc[Filtered queries]. At the
+  measured 3M shape the filter retained the 16-cell plan but Stage-F whole-D reads dominated
+  bytes; exact fallback did not fire. This motivates TD-FPRUNE-1 P5–P7, not a measured speedup
+  from changes that are still unimplemented/unmerged.
+
+The evidence remains workload-specific. No pricing, cap default, residency or competitor win
+is accepted by this reconciliation. Raw artifacts, hashes, failed fixtures and caveats remain
+in those reports and the stable benchmark evidence ledger.
+
+== Worktree disposition
+
+Observed active GLM heads: `p24/fence-gates` 82364e23d (dirty DML/pgwire),
+`feat/pax-residual-tail` 8d6b7e284 (dirty layout/compaction), and
+`feat/sc3-policy-mutation` 9baae280e (dirty generated clients/manager).
+The PAX branch has committed default-gate and typed-shred slices; neither is merged proof.
+`docs/release-notes-v040` remains b448e4acc with unique history, so it is not proven disposable.
+Shared develop was clean at 2b2c56f27 and was left untouched.
+
+Earlier reader/SC1/E1/governance and Codex scratch worktrees are absent from the registered
+inventory. This audit did not remove them or attest to their owners' ignored-file cleanup.
+GLM retains implementation/refinement ownership; Codex owns review/merge coordination and the
+seven current documents. Completed detail now lives here or in existing evidence, not in a
+second live status report.

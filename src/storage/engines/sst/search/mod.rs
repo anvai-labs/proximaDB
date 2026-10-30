@@ -55,6 +55,20 @@ impl Drop for UmbrellaTimer {
     }
 }
 
+tokio::task_local! {
+    /// TD-PAXDIR-1 D7: one query's segment listing, by storage URL. Bound by
+    /// [`scope_discovery_memo`] around a search, so the Adaptive-mode vector
+    /// count and the scan share one LIST (the P5b gate run measured them as
+    /// two sequential round trips on every query). Within one query both see
+    /// the same segment set.
+    static DISCOVERY_MEMO: std::sync::Mutex<std::collections::HashMap<String, Vec<DiscoveredSstFile>>>;
+}
+
+/// Run one search with a per-query discovery memo (see [`DISCOVERY_MEMO`]).
+async fn scope_discovery_memo<F: std::future::Future>(search: F) -> F::Output {
+    DISCOVERY_MEMO.scope(Default::default(), search).await
+}
+
 /// TD-RDSTRAT-13 C3: a discovered segment plus the size the listing already
 /// reported. `size_bytes` lets the read path skip the per-segment HEAD (one
 /// billed metadata op per segment per query); `None` means the backend did
@@ -63,6 +77,9 @@ impl Drop for UmbrellaTimer {
 pub(crate) struct DiscoveredSstFile {
     pub url: String,
     pub size_bytes: Option<u64>,
+    /// The listing's ETag, when the backend reports one (TD-PAXDIR-1 D6
+    /// binds a directory decode key to it).
+    pub etag: Option<String>,
 }
 
 /// TD-SEARCH-2 S2: process-wide in-flight cold-scan counter — the input to
@@ -195,9 +212,9 @@ use crate::storage::engines::core::formats::arrow_block::ArrowBlockReader;
 use crate::storage::engines::sst::{SstEngine, SstError};
 use crate::storage::traits::{StorageQueryContext, UnifiedStorageFormat};
 use proximadb_distance_kernel::DistanceMetric;
-use proximadb_filter_expression::{ComparisonOperator, FilterExpression};
+use proximadb_filter_expression::FilterExpression;
 use proximadb_index_traits::{
-    IndexFilterOperator, IndexHybridQuery, IndexMetadataFilter, IndexSearchEffort, IndexVectorQuery,
+    IndexHybridQuery, IndexMetadataFilter, IndexSearchEffort, IndexVectorQuery,
 };
 
 pub use coordinator::SearchCoordinator;
@@ -283,6 +300,34 @@ impl Drop for ComputeMsGuard {
 // TODO(serverless follow-up): source this from config per storage class.
 const EXACT_SCAN_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// A segment's contribution to the Adaptive exact gate's row count.
+enum SegmentCountFact {
+    /// Countable and exact-scannable: this many rows.
+    Rows(usize),
+    /// A PAX segment without exact f32 authority: the collection cannot be
+    /// exact-scanned at all.
+    Lossy,
+    /// Not countable (legacy PAX, unknown format, read error): contributes 0.
+    Unknown,
+}
+
+/// What the Adaptive exact gate needs from a PAX segment footer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaxFooterFacts {
+    row_count: usize,
+    /// The segment carries authoritative f32 values (`has_f32_tier`), so an
+    /// exact scan over it is permitted.
+    exact_authority: bool,
+}
+
+/// Footer facts of immutable PAX segment objects, keyed by object URL
+/// (see `SstEngine::pax_footer_facts`).
+static PAX_FOOTER_FACTS: once_cell::sync::Lazy<dashmap::DashMap<String, PaxFooterFacts>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+const PAX_FOOTER_FACTS_CACHE_MAX: usize = 100_000;
+/// Bound on concurrent footer/header reads in `segment_vector_count`.
+const FOOTER_FACTS_CONCURRENCY: usize = 32;
+
 /// ADR-028: resolve the collection's `index_policy` into the exact-scan decision
 /// inputs for the SST adaptive route. Returns `(byte_budget, pin_exact)`:
 ///
@@ -320,13 +365,73 @@ impl SstEngine {
             Ok(files) => files,
             Err(_) => return 0,
         };
+        // Concurrent waves: footer facts / legacy headers for every segment are
+        // independent reads, so a cold first query pays ~one round trip of
+        // latency per `FOOTER_FACTS_CONCURRENCY` segments, not one per segment
+        // (PAX spec study TE-P2, change #6; TD-PAXMETA-1 removes the reads).
         let mut total = 0usize;
-        for file_path in &files {
-            if let Ok(Some(entry_count)) = self.legacy_sst_entry_count(&file_path.url).await {
-                total = total.saturating_add(entry_count);
+        for chunk in files.chunks(FOOTER_FACTS_CONCURRENCY) {
+            let counts = join_all(chunk.iter().map(|f| self.segment_count_fact(&f.url))).await;
+            for count in counts {
+                match count {
+                    // An exact scan needs authoritative f32 values in EVERY
+                    // segment: one lossy (RaBitQ/SQ8-only) segment would make
+                    // `search_pax_file_exact` refuse the scan. So the whole
+                    // collection reads as "uncounted" (0) and Adaptive stays on
+                    // the cascade — the pre-existing behaviour for such data.
+                    SegmentCountFact::Lossy => return 0,
+                    SegmentCountFact::Rows(rows) => total = total.saturating_add(rows),
+                    SegmentCountFact::Unknown => {}
+                }
             }
         }
         total
+    }
+
+    /// One segment's contribution to `segment_vector_count`.
+    async fn segment_count_fact(&self, url: &str) -> SegmentCountFact {
+        if url.ends_with(".pax") {
+            match self.pax_footer_facts(url).await {
+                Some(facts) if !facts.exact_authority => SegmentCountFact::Lossy,
+                Some(facts) => SegmentCountFact::Rows(facts.row_count),
+                None => SegmentCountFact::Unknown,
+            }
+        } else {
+            match self.legacy_sst_entry_count(url).await {
+                Ok(Some(rows)) => SegmentCountFact::Rows(rows),
+                _ => SegmentCountFact::Unknown,
+            }
+        }
+    }
+
+    /// Footer facts of a coalesced PAX segment — `row_count` and whether it
+    /// carries the exact f32 tier — read once per object and then served from
+    /// [`PAX_FOOTER_FACTS`]. Segment objects are immutable (compaction writes new
+    /// ones), so a URL's facts never change: the two ranged reads are paid once
+    /// per segment, not per query. `None` for a legacy (non-coalesced) PAX
+    /// segment or any read error — the gate then treats that segment as
+    /// uncounted, as before (TD-SEAM-11).
+    async fn pax_footer_facts(&self, url: &str) -> Option<PaxFooterFacts> {
+        if let Some(facts) = PAX_FOOTER_FACTS.get(url) {
+            return Some(*facts);
+        }
+        let port = self.filesystem_port();
+        let footer =
+            crate::storage::engines::sst::segment_format::read_coalesced_segment_footer(&port, url)
+                .await
+                .ok()
+                .flatten()?;
+        let facts = PaxFooterFacts {
+            row_count: usize::try_from(footer.row_count).ok()?,
+            exact_authority: footer.has_f32_tier,
+        };
+        if PAX_FOOTER_FACTS.len() >= PAX_FOOTER_FACTS_CACHE_MAX {
+            // Bounded: entries for compacted-away segments are never read again,
+            // so a full reset only costs a re-read of live segments.
+            PAX_FOOTER_FACTS.clear();
+        }
+        PAX_FOOTER_FACTS.insert(url.to_string(), facts);
+        Some(facts)
     }
 
     /// Read the count carried by a legacy `SST1` header.
@@ -456,12 +561,13 @@ impl SstEngine {
         // the in-block RaBitQ cascade below (mixed-read). Any I/O error / `None`
         // also falls through (safe degradation, never an incorrect result).
         //
-        // Filtered queries: with the ADR-089 P1 gate ON, a Stage-F metadata
-        // pre-scan builds a row allow-set and the cascade ranks ONLY matching
-        // rows (row-accurate — same `evaluate_filter_proxima` semantics as the
-        // exact path). Gate OFF (default), a non-coalesced segment, or any
+        // Filtered queries: with the ADR-089 P1 gate ON (the default), a
+        // Stage-F metadata pre-scan builds a row allow-set and the cascade
+        // ranks ONLY matching rows (row-accurate — same `evaluate_filter_proxima`
+        // semantics as the exact path). Gate OFF (kill-switch
+        // `PROXIMADB_PAX_FILTERED_CASCADE=0`), a non-coalesced segment, or any
         // stage-F failure routes the filtered query past the cascade to the
-        // exact materialize-and-rank path below, exactly as before.
+        // exact materialize-and-rank path below.
         {
             use crate::storage::engines::sst::segment_format::{
                 pax_filtered_cascade_enabled, pax_filtered_row_allow,
@@ -470,7 +576,8 @@ impl SstEngine {
             // ADR-089 / TD-FPRUNE-1 P1: a filtered query builds a predicate
             // row allow-set from the Region-D metadata (Stage F) and runs the
             // cascade restricted to matching rows — instead of declining into
-            // the whole-object exact scan. Default-OFF env gate; any stage-F
+            // the whole-object exact scan. Default-ON env gate (flipped
+            // 2026-08-31, see `pax_filtered_cascade_enabled`); any stage-F
             // failure or a non-coalesced segment falls back to the exact path
             // (fail-safe, never an incorrect result).
             let row_allow = match filter_expression {
@@ -586,6 +693,13 @@ impl SstEngine {
                                         &full.props,
                                     );
                                 r.vector_id = Some(full.oid.clone());
+                                // Mandate 16a + MVCC: carry the version and
+                                // validity of the PERSISTED copy so the
+                                // service merge can (a) drop a TTL-expired
+                                // row via `is_dead` and (b) order this copy
+                                // against unflushed WAL versions by freshness
+                                // instead of by source priority.
+                                stamp_persisted_version(&mut r, &full);
                             }
                             r
                         })
@@ -614,6 +728,13 @@ impl SstEngine {
     /// This is the primary search entry point that implements intelligent
     /// search routing and the three-stage filtering pipeline.
     pub async fn search_vectors_unified(
+        &self,
+        ctx: &StorageQueryContext,
+    ) -> Result<Vec<OptimizedSearchRecord>> {
+        scope_discovery_memo(self.search_vectors_unified_inner(ctx)).await
+    }
+
+    async fn search_vectors_unified_inner(
         &self,
         ctx: &StorageQueryContext,
     ) -> Result<Vec<OptimizedSearchRecord>> {
@@ -1171,63 +1292,10 @@ impl SstEngine {
     fn convert_filter_to_index(
         filter_expression: Option<&FilterExpression>,
     ) -> Vec<IndexMetadataFilter> {
-        let Some(filter) = filter_expression else {
-            return Vec::new();
-        };
-
-        // Convert filter expressions to index metadata filters
-        let mut index_filters = Vec::new();
-
-        match filter {
-            FilterExpression::Comparison {
-                field,
-                operator,
-                value,
-            } => {
-                // Convert ComparisonOperator to IndexFilterOperator
-                let index_operator = match operator {
-                    ComparisonOperator::Equals => IndexFilterOperator::Equals,
-                    ComparisonOperator::NotEquals => IndexFilterOperator::NotEquals,
-                    ComparisonOperator::GreaterThan => IndexFilterOperator::GreaterThan,
-                    ComparisonOperator::GreaterThanOrEqual => {
-                        IndexFilterOperator::GreaterThanOrEqual
-                    }
-                    ComparisonOperator::LessThan => IndexFilterOperator::LessThan,
-                    ComparisonOperator::LessThanOrEqual => IndexFilterOperator::LessThanOrEqual,
-                    ComparisonOperator::In => IndexFilterOperator::In,
-                    ComparisonOperator::NotIn => IndexFilterOperator::NotIn,
-                    ComparisonOperator::Contains => IndexFilterOperator::Contains,
-                    ComparisonOperator::StartsWith => IndexFilterOperator::StartsWith,
-                    ComparisonOperator::EndsWith => IndexFilterOperator::EndsWith,
-                    ComparisonOperator::Like => IndexFilterOperator::Like,
-                    ComparisonOperator::Between => IndexFilterOperator::Between,
-                    _ => {
-                        debug!(
-                            "Operator {:?} not directly supported by index, will use post-filtering",
-                            operator
-                        );
-                        return index_filters;
-                    }
-                };
-
-                index_filters.push(IndexMetadataFilter {
-                    field: field.clone(),
-                    operator: index_operator,
-                    value: value.clone(),
-                });
-            }
-            FilterExpression::And(filters) => {
-                for f in filters {
-                    index_filters.extend(Self::convert_filter_to_index(Some(f)));
-                }
-            }
-            FilterExpression::Or(_) | FilterExpression::Not(_) => {
-                // OR and NOT are not directly supported by the index, will use post-filtering
-                debug!("OR/NOT filters not supported by index, will use post-filtering");
-            }
-        }
-
-        index_filters
+        // Canonical converter (redundancy pass 3): the six per-engine copies
+        // had drifted — only SST mapped Contains/StartsWith/EndsWith/Like/
+        // Between. See proximadb_filter_expression::to_index_metadata_filters.
+        proximadb_filter_expression::to_index_metadata_filters(filter_expression)
     }
 
     /// Execute direct search without orchestration
@@ -1352,6 +1420,29 @@ impl SstEngine {
                 prune_config,
             )
             .await?;
+        // TD-PAXDIR-1 D7: the server's StorageEngine search reaches this
+        // fan-out, not the Arc one, so the collection centroid directory is
+        // planned here too (the P5b gate run found every "directory on" query
+        // on this path with the directory dark). Same preconditions and the
+        // same per-segment scope as `fallback_to_direct_search_arc`.
+        let directory_cells = self
+            .centroid_directory_cells(
+                storage_url,
+                &sstable_files,
+                query_vector,
+                k,
+                distance_metric,
+                filter_expression.is_some() || prune_config.force_exact,
+            )
+            .await;
+        let sstable_files: Vec<DiscoveredSstFile> = sstable_files
+            .into_iter()
+            .filter(|f| {
+                directory_cells
+                    .get(&f.url)
+                    .is_none_or(|c| !c.cells.is_empty())
+            })
+            .collect();
         let discovery_us = discovery_start.elapsed().as_micros() as u64;
         tracing::info!(
             target: "sst_warm_phase",
@@ -1408,7 +1499,10 @@ impl SstEngine {
                 let sstable_path = discovered.url.as_str();
                 let known_size = discovered.size_bytes;
                 let filter_owned = filter_expression.cloned();
-                async move {
+                let directory_choice = directory_cells.get(sstable_path).cloned();
+                // TD-PAXDIR-1 D7: concurrent scans polled in one task each
+                // get their own wave unit (`io_trace::scope_concurrent_unit`).
+                crate::observability::io_trace::scope_concurrent_unit(async move {
                     let result: Result<Vec<OptimizedSearchRecord>, String> = async {
                         // PAX cascade
                         let pax_cascade: Option<Vec<OptimizedSearchRecord>> =
@@ -1417,8 +1511,9 @@ impl SstEngine {
                                 distance_metric,
                                 prune_config,
                             ) {
-                                match self
-                                    .try_pax_cascade(
+                                match crate::storage::engines::sst::segment_format::scope_directory_cells(
+directory_choice,
+self.try_pax_cascade(
                                         sstable_path,
                                         query_vector,
                                         filter_expression,
@@ -1428,8 +1523,9 @@ impl SstEngine {
                                         storage_url,
                                         snapshot_lsn,
                                         known_size,
-                                    )
-                                    .await
+),
+)
+.await
                                 {
                                     Ok(Some(records)) => Some(records),
                                     Ok(None) => None,
@@ -1486,7 +1582,7 @@ impl SstEngine {
                     }
                     .await;
                     (sstable_path, result)
-                }
+                })
             });
 
             let results = join_all(file_futures).await;
@@ -1525,8 +1621,9 @@ impl SstEngine {
                 // (not-PAX / no RaBitQ / error) — so this is additive and mixed-read-safe.
                 let pax_cascade: Option<Vec<OptimizedSearchRecord>> =
                     if Self::should_try_pax_cascade(sstable_path, distance_metric, prune_config) {
-                        match self
-                            .try_pax_cascade(
+                        match crate::storage::engines::sst::segment_format::scope_directory_cells(
+                            directory_cells.get(sstable_path).cloned(),
+                            self.try_pax_cascade(
                                 sstable_path,
                                 query_vector,
                                 filter_expression,
@@ -1536,8 +1633,9 @@ impl SstEngine {
                                 storage_url,
                                 snapshot_lsn,
                                 known_size,
-                            )
-                            .await
+                            ),
+                        )
+                        .await
                         {
                             Ok(Some(records)) => {
                                 debug!(
@@ -1968,10 +2066,15 @@ impl SstEngine {
     ) -> bool {
         !prune_config.force_exact
             && sstable_path.ends_with(".pax")
-            && matches!(
-                distance_metric,
-                DistanceMetric::Euclidean | DistanceMetric::Cosine | DistanceMetric::DotProduct
-            )
+            && Self::is_pax_cascade_metric(distance_metric)
+    }
+
+    /// Metrics the PAX RaBitQ cascade ranks; every other metric scans exactly.
+    fn is_pax_cascade_metric(distance_metric: DistanceMetric) -> bool {
+        matches!(
+            distance_metric,
+            DistanceMetric::Euclidean | DistanceMetric::Cosine | DistanceMetric::DotProduct
+        )
     }
 
     /// Preserve the caller's completeness contract at the per-file boundary.
@@ -1994,6 +2097,54 @@ impl SstEngine {
         Ok(())
     }
 
+    /// TD-PAXDIR-1 D2: the collection centroid directory's per-segment A0
+    /// cell choice for this query, keyed by segment URL (empty map = unused).
+    ///
+    /// Skipping a segment is only sound when every planned segment really
+    /// runs the A0 coarse probe, so the directory is unused unless: the read
+    /// gate is on; the query is unfiltered and not exact; its metric takes the
+    /// PAX cascade (others scan exactly, and a skipped segment would lose
+    /// rows); the coarse probe is enabled (its kill-switch means "scan every
+    /// cell"); and no explicit `PROXIMADB_PAX_READ_COARSE_NPROBE` is set (an
+    /// operator's per-segment probe count, including exhaustive mode).
+    pub(crate) async fn centroid_directory_cells(
+        &self,
+        storage_url: &str,
+        files: &[DiscoveredSstFile],
+        query: &[f32],
+        k: usize,
+        distance_metric: DistanceMetric,
+        filtered_or_exact: bool,
+    ) -> std::collections::HashMap<
+        String,
+        std::sync::Arc<crate::storage::engines::sst::centroid_directory_reader::DirectoryChoice>,
+    > {
+        use crate::storage::engines::sst::centroid_directory_reader as reader;
+        if filtered_or_exact
+            || !Self::is_pax_cascade_metric(distance_metric)
+            || !reader::centroid_directory_read_enabled()
+            || !crate::storage::engines::sst::segment_format::coarse_probe_enabled()
+            || std::env::var_os("PROXIMADB_PAX_READ_COARSE_NPROBE").is_some()
+        {
+            return Default::default();
+        }
+        let Ok(fs) = self.filesystem().get_filesystem(storage_url) else {
+            return Default::default();
+        };
+        let Some(dir) = reader::load_directory(fs.as_ref(), storage_url).await else {
+            return Default::default();
+        };
+        reader::plan_segments(
+            &dir,
+            files
+                .iter()
+                .map(|f| (f.url.as_str(), f.size_bytes, f.etag.as_deref())),
+            query,
+            k,
+        )
+        .unwrap_or_default()
+    }
+
     /// TD-SEARCH-2 S2: multi-core direct search. Same semantics as
     /// `fallback_to_direct_search` but each per-file scan runs on its own tokio
     /// worker via `tokio::spawn`, gated by a per-query `Semaphore(degree)`, so a
@@ -2014,6 +2165,7 @@ impl SstEngine {
         include_vectors: bool,
         include_metadata: bool,
     ) -> Result<Vec<OptimizedSearchRecord>> {
+        use crate::storage::engines::sst::segment_format::scope_directory_cells;
         // --- discover (mirrors fallback_to_direct_search) ---
         let search_mode = &ctx.search_params.search_mode;
         let prune_config_owned;
@@ -2029,7 +2181,7 @@ impl SstEngine {
             } else {
                 &ctx.search_params.block_prune
             };
-        let sstable_files = self
+        let mut sstable_files = self
             .discover_sstable_files_with_centroid_pruning(
                 storage_url,
                 query_vector,
@@ -2038,6 +2190,23 @@ impl SstEngine {
                 prune_config,
             )
             .await?;
+        // TD-PAXDIR-1 D2: segments the collection centroid directory plans
+        // carry their selected A0 cells; those that own none are skipped.
+        let directory_cells = self
+            .centroid_directory_cells(
+                storage_url,
+                &sstable_files,
+                query_vector,
+                k,
+                distance_metric,
+                filter_expression.is_some() || prune_config.force_exact,
+            )
+            .await;
+        sstable_files.retain(|f| {
+            directory_cells
+                .get(&f.url)
+                .is_none_or(|c| !c.cells.is_empty())
+        });
 
         let file_count = u16::try_from(sstable_files.len()).unwrap_or(u16::MAX);
         let degree = resolve_search_parallelism(self.config().search_parallel_files)
@@ -2079,6 +2248,7 @@ impl SstEngine {
                 let DiscoveredSstFile {
                     url: path,
                     size_bytes: known_size,
+                    ..
                 } = discovered;
                 // Gate concurrency: await a permit before spawning (bound at degree).
                 let permit = std::sync::Arc::clone(&sem).acquire_owned().await?;
@@ -2091,6 +2261,7 @@ impl SstEngine {
                 let prune = prune_config.clone();
                 let trace = trace_handle.clone();
                 let scan_path = path.clone();
+                let cells = directory_cells.get(&path).cloned();
                 handles.push((
                     path,
                     tokio::spawn(async move {
@@ -2111,6 +2282,7 @@ impl SstEngine {
                             use_vectorized,
                             known_size,
                         );
+                        let scan = scope_directory_cells(cells, scan);
                         if let Some(trace) = trace {
                             crate::observability::io_trace::scope_with_handle(trace, scan).await
                         } else {
@@ -2139,24 +2311,23 @@ impl SstEngine {
         } else {
             // degree == 1 / single file: sequential, no spawn overhead.
             for discovered in &sstable_files {
-                match self
-                    .scan_single_file(
-                        &discovered.url,
-                        &collection,
-                        &query_arc[..],
-                        filter_owned.as_ref(),
-                        k,
-                        distance_metric,
-                        collection_id,
-                        storage_url,
-                        prune_config,
-                        use_pipeline,
-                        use_parallel_morsels,
-                        use_vectorized,
-                        discovered.size_bytes,
-                    )
-                    .await
-                {
+                let scan = self.scan_single_file(
+                    &discovered.url,
+                    &collection,
+                    &query_arc[..],
+                    filter_owned.as_ref(),
+                    k,
+                    distance_metric,
+                    collection_id,
+                    storage_url,
+                    prune_config,
+                    use_pipeline,
+                    use_parallel_morsels,
+                    use_vectorized,
+                    discovered.size_bytes,
+                );
+                let cells = directory_cells.get(&discovered.url).cloned();
+                match scope_directory_cells(cells, scan).await {
                     Ok(recs) => all_candidates.extend(recs),
                     Err(e) => Self::handle_per_file_scan_failure(
                         &discovered.url,
@@ -2184,6 +2355,13 @@ impl SstEngine {
     /// branches delegate to the existing `&self` methods (no spawn needed:
     /// exact is a single segment; orchestrated is in-memory AXIS).
     pub async fn search_vectors_unified_arc(
+        self: std::sync::Arc<Self>,
+        ctx: &StorageQueryContext,
+    ) -> Result<Vec<OptimizedSearchRecord>> {
+        scope_discovery_memo(self.search_vectors_unified_arc_inner(ctx)).await
+    }
+
+    async fn search_vectors_unified_arc_inner(
         self: std::sync::Arc<Self>,
         ctx: &StorageQueryContext,
     ) -> Result<Vec<OptimizedSearchRecord>> {
@@ -2533,6 +2711,34 @@ impl SstEngine {
         &self,
         storage_url: &str,
     ) -> Result<Vec<DiscoveredSstFile>> {
+        // TD-PAXDIR-1 D7: within one search, reuse its first listing — minus
+        // anything retired since (the TD-COMPACT-13 pending set is re-read,
+        // as a fresh listing would filter it).
+        if let Ok(Some(mut files)) = DISCOVERY_MEMO.try_with(|memo| {
+            memo.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(storage_url)
+                .cloned()
+        }) {
+            let pending = crate::storage::engines::sst::retirement_ledger::pending_paths();
+            files.retain(|f| !pending.contains(&f.url));
+            return Ok(files);
+        }
+        let files = self.discover_sstable_files_listed(storage_url).await?;
+        let _ = DISCOVERY_MEMO.try_with(|memo| {
+            memo.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(storage_url.to_owned(), files.clone())
+        });
+        Ok(files)
+    }
+
+    /// One LIST of the collection data directory (see
+    /// [`Self::discover_sstable_files`]).
+    async fn discover_sstable_files_listed(
+        &self,
+        storage_url: &str,
+    ) -> Result<Vec<DiscoveredSstFile>> {
         tracing::debug!(
             "[SST] discover_sstable_files called with storage_url: {}",
             storage_url
@@ -2576,6 +2782,13 @@ impl SstEngine {
             &std::path::PathBuf::from(data_url),
         );
         let pending = crate::storage::engines::sst::retirement_ledger::pending_paths();
+        // TD-PAXDIR-1 D2: the same LIST locates the newest centroid directory.
+        if crate::storage::engines::sst::centroid_directory_reader::centroid_directory_read_enabled(
+        ) {
+            crate::storage::engines::sst::centroid_directory_reader::note_listing(
+                data_url, &entries,
+            );
+        }
         for entry in entries {
             tracing::trace!(
                 "[SST] Examining entry: name={}, url={}, is_dir={}",
@@ -2601,6 +2814,7 @@ impl SstEngine {
                 // reader fall back to a real stat; never guess.
                 files.push(DiscoveredSstFile {
                     size_bytes: (entry.metadata.size > 0).then_some(entry.metadata.size),
+                    etag: entry.metadata.etag.clone(),
                     url: entry.url,
                 });
                 tracing::debug!("[SST] Found data file: {}", entry.name);
@@ -2875,7 +3089,7 @@ impl SstEngine {
             let similarity_result = SimilarityResult::new(raw_distance, distance_metric);
             let metadata = proximadb_records::conversions::proxima_tree_to_value_map(&record.props);
 
-            candidates.push(OptimizedSearchRecord {
+            let mut hit = OptimizedSearchRecord {
                 id: record.oid.clone(),
                 vector_id: Some(record.oid.clone()),
                 score: similarity_result.normalized_score,
@@ -2883,7 +3097,9 @@ impl SstEngine {
                 vector: Some(Arc::new(embedding.values.to_fp32_owned())),
                 metadata,
                 ..Default::default()
-            });
+            };
+            stamp_persisted_version(&mut hit, record);
+            candidates.push(hit);
         }
 
         // Sort by score descending (higher normalized_score = more similar = better).
@@ -2897,6 +3113,24 @@ impl SstEngine {
         debug!("📦 Exact PAX scan found {} candidates", candidates.len());
         Ok(candidates)
     }
+}
+
+/// Copy the MVCC/validity facts of a persisted record onto a storage search
+/// hit (mandate 16a + freshness merge). Without them a storage hit looked LIVE
+/// and infinitely old: a TTL-expired flushed row could never be dropped by the
+/// service's `is_dead` filter, and the WAL↔storage merge had to fall back to
+/// source priority (which lets a stale retained tombstone hide a newer flushed
+/// re-insert). Units mirror the WAL hit builder: ms for `timestamp` /
+/// `updated_at`, secs for display-only `expires_at`, ns for `valid_to_ns`.
+fn stamp_persisted_version(
+    hit: &mut OptimizedSearchRecord,
+    record: &proximadb_records::ProximaRecord,
+) {
+    hit.version = Some(record.record_version as u32);
+    hit.timestamp = Some(record.created_at_ns / 1_000_000);
+    hit.updated_at = Some(record.updated_at_ns / 1_000_000);
+    hit.valid_to_ns = record.valid_to_ns;
+    hit.expires_at = record.valid_to_ns.map(|ns| ns / 1_000_000_000);
 }
 
 #[cfg(test)]
@@ -2919,39 +3153,32 @@ mod tests {
         assert_eq!(adaptive_degree(4, 0), 4, "0 in-flight: treated as 1");
     }
 
-    /// TD-SEARCH-2 S2: multi-core (`tokio::spawn`) inter-file search is
-    /// recall-neutral vs sequential. Flushes 3 batches → 3 files (no compaction),
-    /// then runs the SAME query through `search_vectors_unified_arc` at degree=1
-    /// (sequential) and degree=4 (multi-core spawn) and asserts the returned
-    /// id-sets agree. Process-per-test isolation (nextest) makes the env-set safe.
-    #[tokio::test]
-    async fn s2_multicore_arc_matches_sequential() {
-        use crate::core::search::SearchParams;
+    /// A file-backed SST engine (unique leaked tempdir, compaction effectively
+    /// off so every flush stays its own file) and a matching collection.
+    async fn file_backed_test_engine(
+        cid: &str,
+        dim: usize,
+        block_format: Option<&str>,
+    ) -> (SstEngine, crate::proto::proximadb_v1::Collection) {
         use crate::proto::proximadb_v1::{
             Collection, CollectionConfig, StorageAssignment, StorageConfig,
         };
         use crate::storage::persistence::filesystem::FilesystemConfig;
-        use crate::storage::traits::{FlushParameters, StorageQueryContext, StorageQueryMetadata};
-        use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
         let base = temp_dir.path().to_str().unwrap().to_string();
         std::mem::forget(temp_dir); // keep dir for the engine's lifetime
         let mut fs_config = FilesystemConfig::default();
         fs_config.default_fs = Some(format!("file://{}", base));
         let filesystem = Arc::new(FilesystemFactory::create(fs_config).await.unwrap());
-
         let mut sst_config = SstConfig::default();
-        sst_config.block_format = "ArrowBlock".to_string();
-        sst_config.compaction_threshold = 100; // keep 3 files (no compaction) → degree > 1
+        if let Some(f) = block_format {
+            sst_config.block_format = f.to_string();
+        }
+        sst_config.compaction_threshold = 100;
         let distance_compute = Arc::new(UnifiedDistanceCompute::default());
         let engine = SstEngine::new_with_config(sst_config, filesystem, distance_compute)
             .await
             .unwrap();
-
-        let dim = 64usize;
-        let cid = "s2_multicore_test";
         let collection = Collection {
             id: cid.to_string(),
             config: Some(CollectionConfig {
@@ -2962,11 +3189,29 @@ mod tests {
             }),
             storage_assignment: Some(StorageAssignment {
                 primary_path: base.clone(),
-                base_location: base.clone(),
+                base_location: base,
                 ..Default::default()
             }),
             ..Default::default()
         };
+        (engine, collection)
+    }
+
+    /// TD-SEARCH-2 S2: multi-core (`tokio::spawn`) inter-file search is
+    /// recall-neutral vs sequential. Flushes 3 batches → 3 files (no compaction),
+    /// then runs the SAME query through `search_vectors_unified_arc` at degree=1
+    /// (sequential) and degree=4 (multi-core spawn) and asserts the returned
+    /// id-sets agree. Process-per-test isolation (nextest) makes the env-set safe.
+    #[tokio::test]
+    async fn s2_multicore_arc_matches_sequential() {
+        use crate::core::search::SearchParams;
+        use crate::storage::traits::{FlushParameters, StorageQueryContext, StorageQueryMetadata};
+        use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+
+        let dim = 64usize;
+        let cid = "s2_multicore_test";
+        // keep 3 files (no compaction) → degree > 1
+        let (engine, collection) = file_backed_test_engine(cid, dim, Some("ArrowBlock")).await;
 
         let mk_rec = |idx: usize| {
             let id = format!("b_{}", idx);
@@ -2977,17 +3222,14 @@ mod tests {
                 created_at_ns: ts_ns,
                 updated_at_ns: ts_ns,
                 record_version: 1,
-                embeddings: vec![EmbeddingCell {
-                    model_id: "test".to_string(),
-                    modality: "dense_vector".to_string(),
-                    dim: dim as u32,
-                    values: EmbeddingValues::Fp32(
-                        (0..dim)
-                            .map(|j| ((idx as f32) * 0.1 + (j as f32) * 0.01).sin())
-                            .collect(),
-                    ),
-                    ..Default::default()
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "test",
+                    "dense_vector",
+                    dim as u32,
+                    (0..dim)
+                        .map(|j| ((idx as f32) * 0.1 + (j as f32) * 0.01).sin())
+                        .collect(),
+                )],
                 ..ProximaRecord::default()
             }
         };
@@ -3060,6 +3302,117 @@ mod tests {
         );
     }
 
+    /// Mandate 16a (R3): a TTL-expired row that was flushed into a PAX segment
+    /// must never come back from storage looking LIVE. Before the fix the exact
+    /// path materialized it with `valid_to_ns: None` (so the service merge's
+    /// `is_dead` could never drop it) and the cascade hit build never copied
+    /// `valid_to_ns` from the rehydrated record. Covers both the default
+    /// (Adaptive → exact on a small bed) and the Approximate (cascade) modes.
+    #[tokio::test]
+    async fn ttl_expired_pax_rows_never_return_live() {
+        use crate::core::search::SearchParams;
+        use crate::storage::traits::{FlushParameters, StorageQueryContext, StorageQueryMetadata};
+        use proximadb_records::{EmbeddingCell, ProximaRecord};
+
+        let dim = 16usize;
+        let cid = "ttl_expired_pax";
+        let (engine, collection) = file_backed_test_engine(cid, dim, None).await;
+        let now_ns = proximadb_kernel::time::now_unix_ns();
+        // The expired row is the EXACT query vector, so it is the top hit
+        // whenever it is (wrongly) treated as live.
+        let query: Vec<f32> = (0..dim).map(|j| (j as f32) * 0.05).collect();
+        let mut recs: Vec<ProximaRecord> = (0..40usize)
+            .map(|idx| {
+                let id = format!("live_{idx}");
+                ProximaRecord {
+                    oid: id.clone(),
+                    local_id: Some(id),
+                    created_at_ns: 1_000,
+                    updated_at_ns: 1_000,
+                    record_version: 1,
+                    embeddings: vec![EmbeddingCell::new_fp32(
+                        "test",
+                        "dense_vector",
+                        dim as u32,
+                        (0..dim)
+                            .map(|j| 5.0 + (idx * dim + j) as f32 * 0.01)
+                            .collect(),
+                    )],
+                    ..ProximaRecord::default()
+                }
+            })
+            .collect();
+        recs.push(ProximaRecord {
+            oid: "expired".to_string(),
+            local_id: Some("expired".to_string()),
+            created_at_ns: 1_000,
+            updated_at_ns: 1_000,
+            record_version: 1,
+            // TTL elapsed one hour ago (not a tombstone: valid_to_ns != 0).
+            valid_to_ns: Some(now_ns - 3_600_000_000_000),
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "test",
+                "dense_vector",
+                dim as u32,
+                query.clone(),
+            )],
+            ..ProximaRecord::default()
+        });
+        let params = FlushParameters {
+            collection_id: Some(cid.to_string()),
+            vector_records: recs,
+            force: true,
+            synchronous: true,
+            collection_config: Some(collection.clone()),
+            ..Default::default()
+        };
+        assert!(
+            engine.do_flush(&params).await.unwrap().success,
+            "flush failed"
+        );
+
+        let engine = Arc::new(engine);
+        for mode in [
+            None,
+            Some(proximadb_search_types::search_params::SearchMode::Approximate { nprobe: None }),
+        ] {
+            let mut sp = SearchParams {
+                vector: Some(query.clone()),
+                top_k: Some(5),
+                ..Default::default()
+            };
+            if let Some(m) = mode.clone() {
+                sp.search_mode = m;
+            }
+            let ctx = StorageQueryContext {
+                search_params: Arc::new(sp),
+                collection: Arc::new(collection.clone()),
+                metadata: StorageQueryMetadata {
+                    collection_id: cid.to_string(),
+                    ..Default::default()
+                },
+                user_context: None,
+                tenant_context: None,
+            };
+            let results = engine
+                .clone()
+                .search_vectors_unified_arc(&ctx)
+                .await
+                .unwrap();
+            assert!(!results.is_empty(), "{mode:?}: live rows must be found");
+            for r in &results {
+                if r.id == "expired" {
+                    assert!(
+                        r.is_dead(now_ns),
+                        "{mode:?}: an expired PAX row came back LIVE (valid_to_ns={:?}) — \
+                         the service merge cannot drop it",
+                        r.valid_to_ns
+                    );
+                }
+            }
+        }
+    }
+
     /// ADR-030 / TD-158: the SST `ComputeMsGuard` records elapsed compute to the
     /// active per-query I/O trace on drop, under the engine label — so the
     /// billing observer can attribute KRU to "sst". No-op outside a scope.
@@ -3123,6 +3476,57 @@ mod tests {
                 .is_err(),
             "unknown/legacy paths must retain the mixed-format magic sniff"
         );
+    }
+
+    /// TD-SEAM-11: the Adaptive exact gate reads a PAX segment's row count and
+    /// exact-f32 authority from its footer (cached per immutable object), so a
+    /// small collection WITH the f32 tier can take the exact scan, while a
+    /// lossy (RaBitQ/SQ8-only) segment keeps the whole collection on the cascade.
+    #[tokio::test]
+    async fn pax_footer_facts_report_rows_and_exact_authority() {
+        use crate::storage::engines::sst::segment_format::write_pax_segment_with_f32_tier;
+        use proximadb_records::{EmbeddingCell, EmbeddingValues, ProximaRecord};
+        // Coalesced RaBitQ layout (the default write), env-pinned like the
+        // segment_format tests.
+        unsafe { std::env::set_var("PROXIMADB_PAX_COALESCED_RABITQ", "1") };
+        let rec = |oid: &str, v: Vec<f32>| {
+            let mut r = ProximaRecord {
+                oid: oid.into(),
+                tenant_id: "t".into(),
+                ..Default::default()
+            };
+            r.embeddings
+                .push(EmbeddingCell::new_fp32("", "dense", v.len() as u32, v));
+            r
+        };
+        let records: Vec<_> = (0..5)
+            .map(|i| rec(&format!("r{i}"), vec![i as f32, 1.0, -1.0, 0.5]))
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = create_test_engine().await;
+        for (name, f32_tier) in [("exact.pax", true), ("lossy.pax", false)] {
+            let path = dir.path().join(name);
+            write_pax_segment_with_f32_tier(
+                &path,
+                &records,
+                "col",
+                1,
+                proximadb_block_format::VectorQuant::RaBitQ,
+                f32_tier,
+                None,
+                None,
+            )
+            .unwrap();
+            let url = format!("file://{}", path.display());
+            let facts = engine
+                .pax_footer_facts(&url)
+                .await
+                .expect("coalesced footer facts");
+            assert_eq!(facts.row_count, 5, "{name}");
+            assert_eq!(facts.exact_authority, f32_tier, "{name}");
+            // Served from the cache once read (the object is immutable).
+            assert_eq!(PAX_FOOTER_FACTS.get(&url).map(|f| *f), Some(facts));
+        }
     }
 
     #[tokio::test]

@@ -43,12 +43,9 @@ from .models import (
     StorageEngine,
     VectorOperationResponse,
     VectorRecord,
+    normalize_collection_config_kwargs,
 )
-from .operation_router import (
-    OperationRouter,
-    RoutingConfig,
-    RoutingStrategy,
-)
+from .operation_router import OperationRouter, RoutingConfig, RoutingStrategy
 from .proto_conversion import ProtoConverter
 from .protocol_selector import (
     ProtocolSelector,
@@ -79,7 +76,8 @@ logger = logging.getLogger(__name__)
 # propagate to the caller.
 _CONNECTION_ERROR_MARKERS = (
     "connection failed",
-    "unavailable",
+    # No bare "unavailable": a server 503 ("service unavailable") is a
+    # server ANSWER, not an unreachable server (TD-SDKERR-1 review).
     "connect failed",
     "connection refused",
     "failed to connect",
@@ -91,6 +89,12 @@ _CONNECTION_ERROR_CLASSES = (
     "ConnectTimeout",
     "ConnectionRefusedError",
     "MaxRetryError",
+    # The SDK's own transport exceptions (TD-SDKERR-1 review): matched by
+    # class, not message, so a timeout or DNS failure still enters offline
+    # mode instead of raising.
+    "NetworkError",
+    "TransportError",
+    "TimeoutError",
 )
 
 
@@ -339,10 +343,16 @@ class ProximaDBClient:
         # Perform initial authentication if method requires it
         try:
             auth_result = self._auth.authenticate()
-            if auth_result.success:
+            # TD-SDKERR-1: AuthResult carries no `success` attribute — the old
+            # check raised AttributeError, was swallowed below, and every
+            # api_key= client construction logged a bogus setup-failure warning.
+            if auth_result and auth_result.user_id:
                 logger.info(f"✅ Authentication successful using {method.value}")
             else:
-                logger.warning(f"⚠️ Authentication failed: {auth_result.error}")
+                logger.warning(
+                    "⚠️ Authentication failed: %s",
+                    getattr(auth_result, "error", None) or "no user id returned",
+                )
         except Exception as e:
             logger.warning(f"⚠️ Authentication setup failed: {e}")
 
@@ -602,9 +612,13 @@ class ProximaDBClient:
                 metadata_list,
             )
         except Exception as e:
+            # TD-SDKERR-1: gate like every other fallback site — a rejected
+            # write must surface, not flip the client into local-only mode.
+            if not _is_connection_error(e):
+                raise
             self._activate_local_fallback(e)
             logger.debug(
-                "Embedded NumPy %s failed for %s, falling back: %s",
+                "Embedded NumPy %s unreachable for %s, falling back: %s",
                 method_name,
                 collection_id,
                 e,
@@ -959,8 +973,13 @@ class ProximaDBClient:
         enable_prefetch: bool | None = None,
         prefetch_budget: int | None = None,
         timeout: float | None = None,
+        graph_id: str = "default",
     ):
-        """Unified shortest path across gRPC/REST with prefetch overrides."""
+        """Unified shortest path across gRPC/REST with prefetch overrides.
+
+        ``graph_id`` names the graph; both transports take it, and before
+        TD-SDKDOC-1 this wrapper dropped it, so every call ran on ``default``.
+        """
         if self._active_protocol == Protocol.GRPC and hasattr(
             self._client, "shortest_path"
         ):
@@ -973,6 +992,7 @@ class ProximaDBClient:
                 k,
                 enable_prefetch,
                 prefetch_budget,
+                graph_id=graph_id,
             )
         # Fallback to REST
         if hasattr(self._client, "graph_shortest_path"):
@@ -986,6 +1006,7 @@ class ProximaDBClient:
                 enable_prefetch,
                 prefetch_budget,
                 timeout=timeout,
+                graph_id=graph_id,
             )
         raise ProximaDBError("Active client does not support graph_shortest_path")
 
@@ -1585,13 +1606,30 @@ class ProximaDBClient:
             )
             client.create_collection(config=config)
         """
+        # TD-SDKENG-1: never silently drop an unknown keyword — aliases apply,
+        # unknowns raise, and the transport-consumed keywords (schema=,
+        # initial_capacity=, indexing_algorithm=) travel past the config.
+        config_kwargs, passthrough = normalize_collection_config_kwargs(kwargs)
+        if "name" in config_kwargs and config_kwargs["name"] != name:
+            # Round-3 review: a friendly error instead of Python's raw
+            # "got multiple values for argument 'name'".
+            raise TypeError(
+                f"create_collection() got both the positional name ({name!r}) "
+                f"and name={config_kwargs['name']!r}; pass the name once"
+            )
+        config_kwargs.pop("name", None)
         if config is None:
-            config = CollectionConfig(name=name, **kwargs)
-        elif getattr(config, "name", None) != name:
-            if hasattr(config, "model_copy"):
-                config = config.model_copy(update={"name": name})
-            else:
-                config = CollectionConfig(name=name, **config.model_dump())
+            config = CollectionConfig(name=name, **config_kwargs)
+        else:
+            # Round-2 review: model_copy does NOT validate nor translate
+            # pydantic field aliases (quantization= would write a bogus
+            # attribute the read-only property shadows), and the name
+            # mismatch must still apply when overrides are present — so the
+            # config-given branch re-validates through the constructor.
+            merged = config.model_dump(exclude={"name"})
+            merged.update(config_kwargs)
+            config = CollectionConfig(name=name, **merged)
+        kwargs = passthrough
 
         if self._get_local_collection(name) is not None:
             raise ProximaDBError(f"Collection '{name}' already exists")
@@ -1704,9 +1742,11 @@ class ProximaDBClient:
             try:
                 return self._client.create_collection(name, config, **kwargs)
             except Exception as e:
+                if not _is_connection_error(e):
+                    raise
                 self._activate_local_fallback(e)
                 logger.debug(
-                    "REST create_collection failed, using local fallback for %s: %s",
+                    "REST create_collection unreachable, local fallback for %s: %s",
                     name,
                     e,
                 )
@@ -1728,9 +1768,11 @@ class ProximaDBClient:
             try:
                 result = self._adapter.get_collection(collection_id)
             except Exception as e:
+                if not _is_connection_error(e):
+                    raise
                 self._activate_local_fallback(e)
                 logger.debug(
-                    "Get collection failed, checking local fallback for %s: %s",
+                    "Get collection unreachable, checking local fallback for %s: %s",
                     collection_id,
                     e,
                 )
@@ -1762,8 +1804,10 @@ class ProximaDBClient:
             try:
                 result = self._adapter.list_collections()
             except Exception as e:
+                if not _is_connection_error(e):
+                    raise
                 self._activate_local_fallback(e)
-                logger.debug("List collections failed, using local fallback: %s", e)
+                logger.debug("List collections unreachable, local fallback: %s", e)
                 result = []
             if result:
                 return result
@@ -1833,9 +1877,11 @@ class ProximaDBClient:
             try:
                 deleted = self._adapter.delete_collection(collection_id)
             except Exception as e:
+                if not _is_connection_error(e):
+                    raise
                 self._activate_local_fallback(e)
                 logger.debug(
-                    "Delete collection failed, applying local fallback for %s: %s",
+                    "Delete collection unreachable, local fallback for %s: %s",
                     collection_id,
                     e,
                 )
@@ -2282,8 +2328,12 @@ class ProximaDBClient:
                     top_k=top_k,
                     **kwargs,
                 )
-            except Exception as e:
-                logger.debug("REST hybrid search failed, using local fallback: %s", e)
+            except Exception:
+                # TD-SDKERR-1: a failed hybrid search must raise. Falling
+                # through to the local engine returned {'results': []} with
+                # only log noise, hiding the real error (it also cascaded into
+                # hundreds of per-record error lines from the local path).
+                raise
 
         from .hybrid import (
             CascadeFusion,
@@ -2512,9 +2562,11 @@ class ProximaDBClient:
                         self._store_local_vector_records(collection_id, list(records))
                     return result
                 except Exception as e:
+                    if not _is_connection_error(e):
+                        raise
                     self._activate_local_fallback(e)
                     logger.debug(
-                        "Insert vectors failed, using local fallback for %s: %s",
+                        "Insert vectors unreachable, local fallback for %s: %s",
                         collection_id,
                         e,
                     )
@@ -2892,9 +2944,11 @@ class ProximaDBClient:
                         self._store_local_vector_records(collection_id, list(records))
                     return result
                 except Exception as e:
+                    if not _is_connection_error(e):
+                        raise
                     self._activate_local_fallback(e)
                     logger.debug(
-                        "Upsert vectors failed, using local fallback for %s: %s",
+                        "Upsert vectors unreachable, local fallback for %s: %s",
                         collection_id,
                         e,
                     )
@@ -3032,6 +3086,10 @@ class ProximaDBClient:
     ) -> list[SearchResult]:
         """Search for similar vectors with storage-aware optimizations
 
+        TD-SDKERR-1: `filter=` is accepted as an alias of `metadata_filter=`
+        (the old collision raised TypeError inside the adapter, which the old
+        blanket fallback then turned into silent empty results).
+
         Args:
             collection_id: Target collection ID
             vector: Query vector
@@ -3046,6 +3104,13 @@ class ProximaDBClient:
         Returns:
             List of search results ordered by similarity
         """
+        # `filter=` aliases `metadata_filter=`; when both are given the
+        # explicitly named parameter wins and the alias is ignored (never
+        # forwarded — it would collide in the adapter call below).
+        filter_alias = kwargs.pop("filter", None)
+        if metadata_filter is None:
+            metadata_filter = filter_alias
+
         if self._prefer_local_fallback:
             return self._search_local_vectors(
                 collection_id=collection_id,
@@ -3074,9 +3139,17 @@ class ProximaDBClient:
                         },
                     )
                 except Exception as e:
+                    # TD-SDKERR-1: only an unreachable server may fall back to
+                    # the local store — a server-rejected search (bad filter,
+                    # unknown kwarg, INTERNAL) must propagate. The old blanket
+                    # catch made the fallback sticky: one failed call and every
+                    # later search hit the EMPTY local store, returning [] with
+                    # no error.
+                    if not _is_connection_error(e):
+                        raise
                     self._activate_local_fallback(e)
                     logger.debug(
-                        "Search failed, using local fallback for %s: %s",
+                        "Search unreachable, using local fallback for %s: %s",
                         collection_id,
                         e,
                     )
@@ -3409,9 +3482,11 @@ class ProximaDBClient:
                         self._delete_local_vector_records(collection_id, vector_ids)
                     return result
                 except Exception as e:
+                    if not _is_connection_error(e):
+                        raise
                     self._activate_local_fallback(e)
                     logger.debug(
-                        "Delete vectors failed, using local fallback for %s: %s",
+                        "Delete vectors unreachable, local fallback for %s: %s",
                         collection_id,
                         e,
                     )
@@ -3507,9 +3582,11 @@ class ProximaDBClient:
                     )
                     return result
                 except Exception as e:
+                    if not _is_connection_error(e):
+                        raise
                     self._activate_local_fallback(e)
                     logger.debug(
-                        "Get vector failed, using local fallback for %s/%s: %s",
+                        "Get vector unreachable, local fallback for %s/%s: %s",
                         collection_id,
                         vector_id,
                         e,
@@ -3521,9 +3598,11 @@ class ProximaDBClient:
                     )
                     return result
                 except Exception as e:
+                    if not _is_connection_error(e):
+                        raise
                     self._activate_local_fallback(e)
                     logger.debug(
-                        "Get vector failed, using local fallback for %s/%s: %s",
+                        "Get vector unreachable, local fallback for %s/%s: %s",
                         collection_id,
                         vector_id,
                         e,

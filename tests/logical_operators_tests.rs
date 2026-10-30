@@ -35,13 +35,12 @@ mod tests {
         }
         ProximaRecord {
             oid: id.to_string(),
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                dim: 4,
-                values: EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0, 4.0]),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                4,
+                vec![1.0, 2.0, 3.0, 4.0],
+            )],
             props,
             record_version: 1,
             created_at_ns: Utc::now().timestamp_nanos_opt().unwrap_or(0),

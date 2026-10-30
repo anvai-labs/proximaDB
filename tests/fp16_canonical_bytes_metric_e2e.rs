@@ -58,14 +58,12 @@ fn make_fp32_record(oid: &str, dim: usize) -> ProximaRecord {
     ProximaRecord {
         oid: oid.to_string(),
         local_id: Some(oid.to_string()),
-        embeddings: vec![EmbeddingCell {
-            model_id: "test".to_string(),
-            modality: "dense_vector".to_string(),
-            dim: dim as u32,
-            values: EmbeddingValues::Fp32(vs),
-            precision: EmbeddingScalarType::Fp32,
-            ..Default::default()
-        }],
+        embeddings: vec![EmbeddingCell::new_fp32(
+            "test",
+            "dense_vector",
+            dim as u32,
+            vs,
+        )],
         ..ProximaRecord::default()
     }
 }

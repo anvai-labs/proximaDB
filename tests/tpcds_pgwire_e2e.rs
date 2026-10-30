@@ -12,14 +12,6 @@
 //!
 //!   RUST_LOG=proximadb=debug cargo test --test tpcds_pgwire_e2e -- --nocapture
 
-use std::net::TcpListener;
-use std::time::Duration;
-
-use proximadb::core::Config;
-use proximadb::database::ProximaDB;
-use tempfile::TempDir;
-use tokio::time::sleep;
-
 /// TPC-DS subset queries expected to execute cleanly over pgwire (the ratchet).
 const TPCDS_RATCHET: usize = 18;
 /// ADR-040 accuracy ratchet (TD-182 P1): TPC-DS queries with full-row anchors
@@ -27,129 +19,15 @@ const TPCDS_RATCHET: usize = 18;
 /// ROLLUP/CUBE/rank/RANGE-GROUPS/INTERSECT section). Only goes up.
 const TPCDS_ACCURATE_RATCHET: usize = 10;
 
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let p = l.local_addr().expect("addr").port();
-    drop(l);
-    p
-}
+#[path = "common/pg_server.rs"]
+mod pg_server;
+#[path = "common/tpc_anchor.rs"]
+mod tpc_anchor;
 
-struct PgServer {
-    pg_port: u16,
-    db: Option<ProximaDB>,
-    _tmp: TempDir,
-}
-
-impl PgServer {
-    async fn start() -> anyhow::Result<Self> {
-        let pg_port = free_port();
-        let rest_port = free_port();
-        let grpc_port = free_port();
-        let tmp = TempDir::new()?;
-        let mut config = Config::default();
-        config.server.bind_address = "127.0.0.1".to_string();
-        config.server.port = rest_port;
-        config.server.data_dir = tmp.path().to_path_buf();
-        config.api.rest_port = rest_port;
-        config.api.grpc_port = grpc_port;
-        config.api.unified_mode = false;
-        config.api.pg_port = Some(pg_port);
-        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
-            url: format!("file://{}", tmp.path().display()),
-            ..Default::default()
-        }];
-        config.storage.wal_config.write_buffer_directory =
-            format!("file://{}/wal", tmp.path().display());
-        // TD-CONV-1: anchor the system catalog in this server's temp dir, not the
-        // shared CWD-relative `file://./metadata` default (cross-run DDL replay).
-        config.storage.metadata_url = format!("file://{}", tmp.path().join("metadata").display());
-        let mut db = ProximaDB::new(config).await?;
-        db.start().await?;
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .no_proxy()
-            .build()?;
-        let health = format!("http://127.0.0.1:{rest_port}/health");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match http.get(&health).send().await {
-                Ok(r) if r.status().is_success() => break,
-                _ if std::time::Instant::now() > deadline => anyhow::bail!("REST not ready"),
-                _ => sleep(Duration::from_millis(100)).await,
-            }
-        }
-        sleep(Duration::from_millis(200)).await;
-        Ok(Self {
-            pg_port,
-            db: Some(db),
-            _tmp: tmp,
-        })
-    }
-    fn conn_str(&self) -> String {
-        format!(
-            "host=127.0.0.1 port={} user=postgres dbname=proximadb sslmode=disable",
-            self.pg_port
-        )
-    }
-}
-
-impl Drop for PgServer {
-    fn drop(&mut self) {
-        if let Some(mut db) = self.db.take() {
-            tokio::spawn(async move {
-                let _ = db.shutdown().await;
-            });
-        }
-    }
-}
-
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    if let Some(db) = e.as_db_error() {
-        format!("[{}] {}", db.code().code(), db.message())
-    } else {
-        e.to_string()
-    }
-}
-
-/// Normalize a result cell for value comparison: numeric cells are rounded to 2
-/// decimals (collapsing f64 decimal-accumulation error on `DOUBLE PRECISION` price
-/// sums, e.g. 69.4799… → "69.48") and rendered minimally (whole numbers without a
-/// decimal); SQL NULL → "NULL"; other text passes through.
-fn norm_cell(s: &str) -> String {
-    match s.parse::<f64>() {
-        Ok(f) => {
-            let r = (f * 100.0).round() / 100.0;
-            if r.fract() == 0.0 {
-                format!("{}", r as i64)
-            } else {
-                format!("{r}")
-            }
-        }
-        Err(_) => s.to_string(),
-    }
-}
-
-/// Run a query and return its rows as normalized text cells, **sorted** for
-/// order-independent set comparison (ADR-040 `canon()` style; row order across
-/// routes is a separate concern — see TD-185).
-async fn canon_rows(client: &tokio_postgres::Client, sql: &str) -> Vec<Vec<String>> {
-    let mut rows: Vec<Vec<String>> = client
-        .simple_query(sql)
-        .await
-        .unwrap_or_else(|e| panic!("query `{sql}`: {}", explain_err(&e)))
-        .into_iter()
-        .filter_map(|m| match m {
-            tokio_postgres::SimpleQueryMessage::Row(r) => Some(
-                (0..r.len())
-                    .map(|i| norm_cell(r.get(i).unwrap_or("NULL")))
-                    .collect(),
-            ),
-            _ => None,
-        })
-        .collect();
-    rows.sort();
-    rows
-}
+use pg_server::TestPgServer;
+use tpc_anchor::{
+    AnchorSpec, canon_rows, explain_err, reseed_for_accuracy_phase, run_anchored_phase,
+};
 
 /// Core TPC-DS star-schema subset (standard column names, subset of columns).
 const SCHEMA: &[(&str, &str)] = &[
@@ -245,7 +123,7 @@ fn tpcds_pgwire_conformance() {
 }
 
 async fn tpcds_pgwire_conformance_inner() {
-    let server = PgServer::start().await.expect("server start");
+    let server = TestPgServer::start().await.expect("server start");
     let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
         .await
         .expect("connect");
@@ -506,16 +384,17 @@ fn tpcds_expected() -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
             ],
         ),
         // win_running: per-day revenue + running total in date order. d_date
-        // renders as a day-number (1999-11-05 = 10900 …) on this route — DATE
-        // column-fidelity is a known rendering follow-up; the daily/running
-        // VALUE columns are the assertion.
+        // used to render as a day-number (1999-11-05 = 10900 …) on this
+        // route; fixed by the Postgres-text DATE rendering (#2075) — the
+        // anchor tripped and is re-pinned value-correct with the DATE
+        // strings (day numbers were 10900/11262/11276/11301).
         (
             "win_running",
             vec![
-                vec!["10900", "19.99", "19.99"],
-                vec!["11262", "69.48", "89.47"],
-                vec!["11276", "49.95", "139.42"],
-                vec!["11301", "42", "181.42"],
+                vec!["1999-11-05", "19.99", "19.99"],
+                vec!["2000-11-01", "69.48", "89.47"],
+                vec!["2000-11-15", "49.95", "139.42"],
+                vec!["2000-12-10", "42", "181.42"],
             ],
         ),
         // cte (TD-185a closed by #1860): WITH now executes; anchored to the
@@ -552,15 +431,10 @@ fn tpcds_expected() -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
 /// process-wide set-once; a second boot in the same process silently
 /// reuses the first's manifest pointed at a deleted tempdir).
 async fn tpcds_accuracy_anchored_phase(client: &tokio_postgres::Client) {
-    for (name, ddl) in SCHEMA {
-        let _ = client
-            .simple_query(&format!("DROP TABLE IF EXISTS {name}"))
-            .await;
-        client
-            .simple_query(ddl)
-            .await
-            .unwrap_or_else(|e| panic!("CREATE {name}: {}", explain_err(&e)));
-    }
+    // Phase boundary (ported from tpch_pgwire_e2e, #2080): drop + recreate
+    // every table in place on the SAME boot (the stale-state DROP/CREATE race
+    // this absorbs is documented on `reseed_for_accuracy_phase`).
+    reseed_for_accuracy_phase(client, SCHEMA).await;
     for sql in DATA {
         client
             .simple_query(sql)
@@ -576,56 +450,28 @@ async fn tpcds_accuracy_anchored_phase(client: &tokio_postgres::Client) {
 
     let expected = tpcds_expected();
     let by_id: std::collections::HashMap<&str, String> = tpcds_queries().into_iter().collect();
-    let mut accurate = 0;
-    let mut failures = Vec::new();
-    for (id, want) in &expected {
-        let is_known_bad = id.ends_with("-KNOWN-BAD");
-        let lookup_id = id.strip_suffix("-KNOWN-BAD").unwrap_or(id);
-        let sql = by_id
-            .get(lookup_id)
-            .unwrap_or_else(|| panic!("{lookup_id} missing from tpcds_queries()"));
-        let got = canon_rows(client, sql).await;
-        let want: Vec<Vec<String>> = want
-            .iter()
-            .map(|row| row.iter().map(|c| c.to_string()).collect())
-            .collect();
-        if is_known_bad {
-            if got == *want {
-                // Still returns the pinned wrong answer — known-bad holds.
-                eprintln!("  ✓ {id} still KNOWN-BAD (pinned wrong answer)");
-                continue;
+    let specs: Vec<_> = expected
+        .into_iter()
+        .map(|(id, rows)| {
+            let lookup_id = id.strip_suffix("-KNOWN-BAD").unwrap_or(id);
+            let sql = by_id
+                .get(lookup_id)
+                .unwrap_or_else(|| panic!("{lookup_id} missing from tpcds_queries()"))
+                .as_str();
+            AnchorSpec {
+                id,
+                sql,
+                expected: rows,
             }
-            panic!(
-                "{id}: KNOWN-BAD anchor tripped — the engine's answer CHANGED (got \\
-                 {got:?}, pinned {want:?}). If the result is now the CORRECT \\
-                 {{Books 91.95, Electronics 89.47}} set, update the anchor, move \\
-                 {lookup_id} into the anchored set, and close TD-185a on this branch."
-            );
-        }
-        if got == want {
-            accurate += 1;
-            eprintln!("  ✓ {id} accurate ({} rows)", got.len());
-        } else {
-            failures.push(format!("{id}: want {want:?}, got {got:?}"));
-        }
-    }
-
-    eprintln!(
-        "\n=== TPC-DS accuracy: {}/{} anchored queries accurate (ratchet {}) ===",
-        accurate,
-        expected.len(),
-        TPCDS_ACCURATE_RATCHET
-    );
-    for f in &failures {
-        eprintln!("  ✗ {f}");
-    }
-    assert!(
-        failures.is_empty(),
-        "TPC-DS anchored accuracy failures: {}",
-        failures.join("; ")
-    );
-    assert!(
-        accurate >= TPCDS_ACCURATE_RATCHET,
-        "TPC-DS accuracy regressed: {accurate} < ratchet {TPCDS_ACCURATE_RATCHET}"
-    );
+        })
+        .collect();
+    let _ = run_anchored_phase(
+        client,
+        &specs,
+        "TPC-DS",
+        "{Books 91.95, Electronics 89.47} set, update the anchor",
+        "TD-185a on this branch.",
+        TPCDS_ACCURATE_RATCHET,
+    )
+    .await;
 }

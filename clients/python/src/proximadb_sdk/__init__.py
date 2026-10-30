@@ -8,7 +8,7 @@ Licensed under the Apache License, Version 2.0
 """
 
 # Version information
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 __author__ = "ProximaDB Contributors"
 
 # Protocol adapters (TD-126 Phase 3): loaded LAZILY via the package-level
@@ -19,20 +19,10 @@ __author__ = "ProximaDB Contributors"
 # only the import timing moves to first access.
 
 # Authentication
-from .auth import (
-    AuthConfig,
-    AuthMethod,
-    AuthResult,
-    Permission,
-    ProximaDBAuth,
-)
+from .auth import AuthConfig, AuthMethod, AuthResult, Permission, ProximaDBAuth
 
 # Builders
-from .builders import (
-    CollectionBuilder,
-    InsertBuilder,
-    SearchBuilder,
-)
+from .builders import CollectionBuilder, InsertBuilder, SearchBuilder
 from .client_v1 import ProximaDBClientV1
 from .config import (
     ClientConfig,
@@ -530,11 +520,7 @@ except ImportError:
 _streaming_available = False
 
 try:
-    from .cache import (
-        CacheMetrics,
-        CacheStrategy,
-        SmartCache,
-    )
+    from .cache import CacheMetrics, CacheStrategy, SmartCache
 
     _cache_available = True
 except ImportError:

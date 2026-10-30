@@ -38,6 +38,9 @@ pub struct ProductionHybridBackend {
     vector_ops: Arc<dyn proximadb_runtime::VectorOpsPort>,
     fulltext_indexes: HybridFullTextIndexMap,
     recall_pool: usize,
+    /// Resolves the target collection within the request tenant
+    /// (`scope_collection`). `None` (tests) skips the check.
+    collection_port: Option<Arc<dyn proximadb_runtime::CollectionPort>>,
 }
 
 impl ProductionHybridBackend {
@@ -51,7 +54,18 @@ impl ProductionHybridBackend {
             vector_ops,
             fulltext_indexes,
             recall_pool: DEFAULT_RECALL_POOL,
+            collection_port: None,
         }
+    }
+
+    /// Resolve the target collection within the request tenant before either
+    /// leg runs (`HybridSearchBackend::scope_collection`).
+    pub fn with_collection_port(
+        mut self,
+        collection_port: Arc<dyn proximadb_runtime::CollectionPort>,
+    ) -> Self {
+        self.collection_port = Some(collection_port);
+        self
     }
 
     /// Override the recall pool size used per side. Useful for tests that
@@ -64,6 +78,24 @@ impl ProductionHybridBackend {
 
 #[async_trait]
 impl HybridSearchBackend for ProductionHybridBackend {
+    async fn scope_collection(&self, collection: &str, tenant: &str) -> RankResult<()> {
+        // Without a collection port nothing can be resolved within a tenant.
+        let Some(collection_port) = &self.collection_port else {
+            return Err(RankError::CollectionNotFound(collection.to_string()));
+        };
+        match collection_port
+            .get_collection(collection, Some(tenant))
+            .await
+        {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(RankError::CollectionNotFound(collection.to_string())),
+            Err(err) => Err(RankError::ModelInference {
+                model_id: "production_hybrid_backend.collection".to_string(),
+                reason: format!("collection lookup failed for '{collection}': {err}"),
+            }),
+        }
+    }
+
     async fn bm25_search(&self, collection: &str, query: &str) -> RankResult<Vec<BM25Result>> {
         let trimmed = query.trim();
         if trimmed.is_empty() {

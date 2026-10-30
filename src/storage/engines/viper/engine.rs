@@ -40,8 +40,11 @@ use crate::storage::engines::core::formats::columnar::{
 // Universal performance optimization imports
 use crate::storage::engines::core::ops::performance_optimization::{
     UniversalOptimizationStrategy, UniversalPerformanceOptimizer, UniversallyOptimized,
+    insert_universal_optimizer_metrics,
 };
 // VectorMemoryPool now managed by universal optimizer
+use super::compaction::ViperCompactionService;
+use super::flush::Flush;
 use super::types::*;
 use crate::core::String;
 use crate::core::search::SearchMode;
@@ -52,9 +55,6 @@ use crate::storage::persistence::filesystem::FileStorageTier;
 use crate::storage::persistence::filesystem::FilesystemFactory;
 use crate::storage::traits::{FlushResult, UnifiedStorageFormat};
 use proximadb_records::conversions::proxima_record_to_vector;
-// Schema now uses shared ColumnarSchema from columnar module
-use super::compaction::ViperCompactionService;
-use super::flush::Flush;
 // use super::ml_clustering::MLClusteringEngine; // Moved to AXIS
 use super::utilities::ViperUtilities;
 // Unified search engine removed - using IntegratedSearchOptimizer
@@ -174,17 +174,6 @@ pub struct ViperEngine {
     ///
     /// Used by components that need direct filesystem access
     filesystem_factory: Arc<FilesystemFactory>,
-
-    /// **Columnar Schema** (Shared with NOVA)
-    ///
-    /// Defines Parquet table structure:
-    /// - Column definitions (id, vector, metadata, timestamps)
-    /// - Data types and encoding (dictionary, RLE, delta)
-    /// - Compression per column (ZSTD for vectors, Snappy for strings)
-    /// - Nested schema for complex metadata
-    ///
-    /// Shared between VIPER and NOVA for format compatibility
-    _schema: crate::storage::engines::core::formats::columnar::columnar_schema::ColumnarSchema,
 
     /// **Compaction Service**
     ///
@@ -584,7 +573,6 @@ impl ViperEngine {
             collection_service: collection_service.clone(),
             filesystem: filesystem.clone(),
             filesystem_factory,
-            _schema: crate::storage::engines::core::formats::columnar::columnar_schema::ColumnarSchema::new(),
             compaction,
             flush_manager,
             // ml_clustering_engine, // Moved to AXIS
@@ -631,61 +619,10 @@ impl ViperEngine {
     fn convert_filter_to_index(
         filter_expression: Option<&proximadb_filter_expression::FilterExpression>,
     ) -> Vec<proximadb_index_traits::IndexMetadataFilter> {
-        use proximadb_filter_expression::{ComparisonOperator, FilterExpression};
-        use proximadb_index_traits::{IndexFilterOperator, IndexMetadataFilter};
-
-        let Some(filter) = filter_expression else {
-            return Vec::new();
-        };
-
-        // Convert filter expressions to index metadata filters
-        let mut index_filters = Vec::new();
-
-        match filter {
-            FilterExpression::Comparison {
-                field,
-                operator,
-                value,
-            } => {
-                // Convert ComparisonOperator to IndexFilterOperator
-                let index_operator = match operator {
-                    ComparisonOperator::Equals => IndexFilterOperator::Equals,
-                    ComparisonOperator::NotEquals => IndexFilterOperator::NotEquals,
-                    ComparisonOperator::GreaterThan => IndexFilterOperator::GreaterThan,
-                    ComparisonOperator::GreaterThanOrEqual => {
-                        IndexFilterOperator::GreaterThanOrEqual
-                    }
-                    ComparisonOperator::LessThan => IndexFilterOperator::LessThan,
-                    ComparisonOperator::LessThanOrEqual => IndexFilterOperator::LessThanOrEqual,
-                    ComparisonOperator::In => IndexFilterOperator::In,
-                    ComparisonOperator::NotIn => IndexFilterOperator::NotIn,
-                    _ => {
-                        tracing::debug!(
-                            "Operator {:?} not directly supported by index, will use post-filtering",
-                            operator
-                        );
-                        return index_filters;
-                    }
-                };
-
-                index_filters.push(IndexMetadataFilter {
-                    field: field.clone(),
-                    operator: index_operator,
-                    value: value.clone(),
-                });
-            }
-            FilterExpression::And(filters) => {
-                for f in filters {
-                    index_filters.extend(Self::convert_filter_to_index(Some(f)));
-                }
-            }
-            FilterExpression::Or(_) | FilterExpression::Not(_) => {
-                // OR and NOT are not directly supported by index, will use post-filtering
-                tracing::debug!("OR/NOT filters not supported by index, will use post-filtering");
-            }
-        }
-
-        index_filters
+        // Canonical converter (redundancy pass 3): the six per-engine copies
+        // had drifted — only SST mapped Contains/StartsWith/EndsWith/Like/
+        // Between. See proximadb_filter_expression::to_index_metadata_filters.
+        proximadb_filter_expression::to_index_metadata_filters(filter_expression)
     }
 
     // ============================================================================
@@ -888,54 +825,6 @@ impl ViperEngine {
         self.universal_optimizer
             .prefetch_data(&row_group_urls)
             .await
-    }
-
-    /// Optimized row group reading for prefetching (delegates to universal optimizer)
-    async fn read_row_group_optimized(
-        file_path: &str,
-        row_group_idx: usize,
-        _optimizer: &UniversalPerformanceOptimizer,
-        filesystem_factory: Arc<FilesystemFactory>,
-        cached_filesystem: Arc<
-            crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingFilesystem,
-        >,
-        collection_id: &str,
-    ) -> Result<Vec<u8>> {
-        // For row group reading, we don't need dimension - Parquet has schema info
-        // Use 0 to indicate dimension is not needed for this operation
-        let reader = super::readers::UnifiedParquetReader::new(
-            vec![file_path.to_string()],
-            0,
-            filesystem_factory,
-            cached_filesystem,
-            collection_id.to_string(),
-            "viper".to_string(),
-        )?;
-
-        // Read vectors from the specific row group
-        // Note: UnifiedParquetReader currently reads all data, but in production
-        // this would be optimized to read only the specific row group using Arrow's
-        // row group API for selective reading
-        let record_batches = reader
-            .read_row_groups_projected(file_path, &[row_group_idx], None)
-            .await?;
-
-        // Calculate approximate row group boundaries
-        // Parquet typically has row groups of ~50-100MB or ~50k-100k rows
-        let rows_per_group = 50000;
-        let _start_idx = row_group_idx * rows_per_group;
-        let _end_idx = ((row_group_idx + 1) * rows_per_group).min(10000); // Placeholder, since all_vectors no longer exists
-
-        // Extract data from the record batches
-        // Vector extraction from Parquet: vectors stored as FixedSizeList<f32>
-        // This needs to read actual vector data from the batch columns
-        if !record_batches.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Row group data extraction not yet implemented"
-            ));
-        }
-
-        Ok(Vec::new())
     }
 
     /// Memory pool optimization for columnar operations (delegates to universal optimizer)
@@ -2052,70 +1941,23 @@ impl UnifiedStorageFormat for ViperEngine {
         base_path: &str,
         records: Vec<proximadb_records::ProximaRecord>,
     ) -> Result<crate::storage::traits::SegmentIngestResult> {
-        use crate::proto::proximadb_v1::{Collection, StorageAssignment};
+        use crate::storage::engines::core::ops::bulk_ingest::{
+            build_bulk_flush_parameters, empty_segment_result, segment_result_from_flush,
+        };
 
         let count = records.len();
         if count == 0 {
-            return Ok(crate::storage::traits::SegmentIngestResult {
-                collection_id: collection_id.to_string(),
-                record_count: 0,
-                synthetic_segment_id: "empty".to_string(),
-                used_engine_specific_path: true,
-            });
+            return Ok(empty_segment_result(collection_id));
         }
 
-        let collection_config = Some(Collection {
-            id: collection_id.to_string(),
-            config: None,
-            stats: None,
-            created_at: 0,
-            updated_at: 0,
-            storage_assignment: Some(StorageAssignment {
-                primary_path: base_path.to_string(),
-                backup_paths: vec![],
-                engine: 0,
-                engine_config: std::collections::HashMap::new(),
-                base_location: base_path.to_string(),
-                assigned_at: 0,
-                ..Default::default()
-            }),
-        });
-
-        let params = crate::storage::traits::FlushParameters {
-            collection_id: Some(
-                collection_id
-                    .parse::<u64>()
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "VIPER bulk ingest requires a numeric catalog object id, got {collection_id:?}: {error}"
-                        )
-                    })?
-                    .to_string(),
-            ),
-            force: true,
-            synchronous: true,
-            hints: std::collections::HashMap::new(),
-            timeout_ms: None,
-            vector_records: records,
-            trigger_compaction: false,
-            batch_ids: vec![],
-            collection_config,
-            estimated_size: 0,
-        };
-
+        let params = build_bulk_flush_parameters(collection_id, base_path, records, "VIPER")?;
         let flush_result = self.do_flush(&params).await?;
-        let synthetic_segment_id = flush_result
-            .file_paths
-            .first()
-            .cloned()
-            .unwrap_or_else(|| format!("viper-bulkload-{collection_id}-{count}"));
-
-        Ok(crate::storage::traits::SegmentIngestResult {
-            collection_id: collection_id.to_string(),
-            record_count: count,
-            synthetic_segment_id,
-            used_engine_specific_path: true,
-        })
+        Ok(segment_result_from_flush(
+            collection_id,
+            count,
+            &flush_result,
+            "viper",
+        ))
     }
 
     async fn do_compact(
@@ -3096,26 +2938,7 @@ impl UnifiedStorageFormat for ViperEngine {
         &self,
         ctx: &crate::storage::traits::StorageQueryContext,
     ) -> Option<crate::storage::traits::RlsRecordPredicate> {
-        let tenant_id = ctx
-            .tenant_context
-            .as_ref()
-            .map(|tc| tc.tenant_id.as_str())
-            .or_else(|| {
-                ctx.user_context
-                    .as_ref()
-                    .and_then(|uc| uc.tenant_id.as_deref())
-            });
-
-        let principal = ctx.user_context.as_ref().map(|uc| uc.user_id.as_str());
-
-        if tenant_id.is_none() && principal.is_none() {
-            return None;
-        }
-
-        Some(crate::storage::traits::RlsRecordPredicate {
-            required_tenant_id: tenant_id.map(str::to_string),
-            required_principal: principal.map(str::to_string),
-        })
+        crate::storage::traits::rls_predicate_from_ctx(ctx)
     }
 } // End of impl UnifiedStorageFormat for ViperEngine
 
@@ -3192,25 +3015,7 @@ impl UniversallyOptimized for ViperEngine {
         );
 
         // Universal optimizer metrics
-        let strategy = self.universal_optimizer.get_strategy();
-        metrics.insert(
-            "universal_optimization_strategy".to_string(),
-            serde_json::Value::String(format!("{:?}", strategy)),
-        );
-
-        let config = self.universal_optimizer.get_config();
-        metrics.insert(
-            "universal_cache_size_mb".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(config.cache_size_mb)),
-        );
-        metrics.insert(
-            "universal_parallel_operations".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(config.parallel_operations)),
-        );
-        metrics.insert(
-            "universal_prefetching_enabled".to_string(),
-            serde_json::Value::Bool(config.enable_prefetching),
-        );
+        insert_universal_optimizer_metrics(&mut metrics, &self.universal_optimizer);
 
         Ok(metrics)
     }
@@ -3283,8 +3088,11 @@ mod minimal_compaction_tests {
 
         // Create collection config with dimension and storage assignment for flush
         let collection_config = Some(crate::proto::proximadb_v1::Collection {
+            storage_class_status: None,
             id: collection_id.to_string(),
             config: Some(crate::proto::proximadb_v1::CollectionConfig {
+                storage_class: None,
+                policy_generation: None,
                 name: collection_id.to_string(),
                 embedding_config: None,
                 dimension: 128,

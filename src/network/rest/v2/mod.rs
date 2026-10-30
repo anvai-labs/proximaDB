@@ -62,8 +62,27 @@ pub use records::*;
 pub use schema::*;
 
 use axum::Router;
+use axum::extract::rejection::JsonRejection;
+use axum::response::{IntoResponse, Response};
 
 use super::canonical::handlers::AppState;
+
+/// A JSON request body, or the response that rejects it (TD-RESTGET-1).
+///
+/// A body the request type cannot accept — an unknown field (the strict request
+/// types deny them), a wrong type, a missing field, malformed JSON — is the
+/// documented 400 in the API's error envelope naming the problem, instead of
+/// axum's plain-text 422. Any other rejection (no JSON content type, a body
+/// too large) keeps axum's own status (415, 413, ...).
+pub(crate) fn json_body<T>(payload: Result<axum::Json<T>, JsonRejection>) -> Result<T, Response> {
+    match payload {
+        Ok(axum::Json(body)) => Ok(body),
+        Err(rejection @ (JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_))) => {
+            Err(crate::errors::ApiError::InvalidArgument(rejection.body_text()).into_response())
+        }
+        Err(other) => Err(other.into_response()),
+    }
+}
 
 /// Create the v2 API router with all endpoints
 ///

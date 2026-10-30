@@ -543,7 +543,7 @@ impl Worker {
 }
 
 fn digest_hex(data: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(data))
+    hex::encode(Sha256::digest(data))
 }
 
 /// Commit immutable bytes with create-only semantics. A fully synced hidden temp

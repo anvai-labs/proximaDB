@@ -1,0 +1,59 @@
+= TD-TIER-1 E1 scale arms: SIFT3M and SIFT10M fixed-object cap sweeps
+
+**Date:** 2026-10-27 · **Branch:** `bench/tier1-e1-fixed` — runs executed at worktree HEAD `248f214f2` with the **binary sha256 `11b6a8a1…` (built from the `f5aef1b0b` tree 2026-10-26 13:20, never rebuilt)**; result.json `binary.source_revision` records the run-time HEAD, not the build commit — see Provenance for the tree-range and rebase caveats · **TD:** link:../../10-quality/td/TD-TIER-1-collection-storage-policy-and-residency.adoc[TD-TIER-1] SC0/E1 · **Companion to** link:TIER1_E1_FIXED_OBJECT_CAP_SWEEP_2026_10_26.adoc[the 1M E1 run].
+
+== Protocol
+
+Same fixed-object protocol as the 1M run, per scale: one bed built once, ETag-fingerprinted, then cap arms (4/16/40 MiB) via `--skip-ingest` reuse — identical objects, model and query IDs; only the cap varies. Corpus: the first 3M/10M vectors of the ANN_SIFT1B **learn split** (the official base split is FTP-only and this host's FTP data channel is blocked; the learn split is the same 128-d u8 SIFT descriptor distribution — disclosed, not hidden). Ground truth: exact top-100 computed per-prefix against the same corpus (4096 queries covering all three phase windows), satisfying the harness's subset-GT contract (`--groundtruth-scope-rows`). **n=1 per arm at scale** (exploratory; the 1M run established repeat behavior) — labeled accordingly.
+
+== Results (`object_cold`, n=1 per cap per scale)
+
+**SIFT3M — single-segment fixture (1 × 3M rows, 56 cells, 15 probed):**
+
+[cols="1,1,1,1",options="header"]
+|===
+| | 4 MiB | 16 MiB | 40 MiB
+| requests/q | 36.342 | **23.634** | 23.073
+| waves p50 (p95) | 5 (5) | **4 (4)** | 4 (4)
+| recall@10 | 0.9740 | 0.9740 | 0.9740
+| p50 / p99 ms | 179 / 271 | 179 / 282 | 179 / 309
+| CPU s / RSS GiB | 202.9 / 5.0 | 213.1 / 5.0 | 214.5 / 5.1
+|===
+
+**SIFT10M — the shape compaction actually produces (3 segments: 912k/126c + 2.69M/97c + 6.4M/231c; 43 cells probed):**
+
+[cols="1,1,1,1",options="header"]
+|===
+| | 4 MiB | 16 MiB | 40 MiB
+| requests/q | 81.419 | 76.907 | 76.889
+| waves p50 (p95) | 5 (6) | 5 (6) | 5 (6)
+| recall@10 | 0.9715 | 0.9715 | 0.9715
+| p50 / p99 ms | 266 / 365 | 261 / 349 | 264 / 354
+| CPU s / RSS GiB | 356.8 / 5.2 | 349.6 / 5.4 | 354.2 / 5.4
+|===
+
+All values [M] from the result.json files (`~/bench-beds/p5b-runs/e1/e1s-sift{3m,10m}*/`). Within each scale, recall and the probe plan (cells probed, probed rows) are **identical across all arms** — the fixed-object protocol's identical-probe-plan property, now confirmed at 3M and 10M. Bed shapes differ across scales (1 seg / 1 seg / 3 segs); cross-scale request counts are not directly comparable and are not presented as a curve.
+
+*Gate status (disclosed):* these arms carried the harness's default `--min-recall 0.98` and **failed that gate in every phase at both scales** (e.g. 3M: `object_cold: recall 0.9740 < 0.9800`; 10M: `0.9715 < 0.9800`) — recorded in each result.json `gate_failures`. This is the expected consequence of running default nprobe (finding 4), not a cap artifact: recall is identical across caps within each scale, so the cap comparisons are unaffected. The numbers are exploratory measurements, not green-gated runs.
+
+*Build-run reuse check:* at 3M the build run and the cap4 arm reproduce **exactly** (36.342 = 36.342 req/q; GET counts equal) — plan-determinism holds. At 10M the cap4 arm issued **+59 GETs over 1000 queries (+0.07%)** vs the build run (80,418 vs 80,359; 81.419 vs 81.360 req/q) — small non-plan noise at scale (both are cap4; the cap16/40 comparisons are arm-vs-arm and unaffected).
+
+== Findings
+
+. **Single-segment scale: the cap effect strengthens.** At 3M (one segment), 4 → 16 MiB cuts requests **−35%** (36.342 → 23.634) — larger than 1M's −28.67% — and removes a wave (5 → 4). 16 → 40 saves only 0.56 req/q at the same p50 with p99 +27 ms. Same shape as 1M, stronger effect. [M]
+. **Multi-segment scale: the cap saturates.** At 10M over 3 segments, 4 → 16 MiB cuts only **−5.5%** (81.419 → 76.907) with no wave change; 40 MiB adds nothing. Under segment fan-out each segment issues its own probe ranges — a per-segment request floor the coalescing cap cannot merge across. **Segment count, not the cap, becomes the dominant request term** at multi-segment scale. [M]
+. **The 3-segment bed is not a protocol accident — it is what compaction produces.** A follow-up run requiring exactly one segment (`--max-segments 1`, 3600 s settle) timed out with the bed stable at 3 segments and zero unready segments — the harness error verbatim: `materialization/compaction did not quiesce: rows=not-snapshotted/10000000, segments=3 (max 1), last_parse_error=None, unready_segments=[]` — the tier-merge policy does not emit a single 2.5 GB segment for a 10M corpus under current triggers. The 10M row above is therefore the *shipped shape's* measured behavior, not a confounded approximation. A single-segment 10M fixture would require compaction-trigger work (its own slice); recorded as the blocker. [M]
+. **Geometric nprobe under-covers at scale (product-gate item, not an experiment defect):** cells probed 15/56 (27% of cells, 26% of rows) at 3M → recall 0.9740; 43/454 (9.5% of cells, 9.3% of rows) at 10M → recall 0.9715 — both below the 0.98 SIFT1M product gate. Recall is **constant across caps within each scale** (identical probe plans), so the cap conclusions are unaffected. nprobe calibration for product gates at scale is the design's anticipated follow-up (the D7-sweep-calibration item); the arms here deliberately used default nprobe to hold the protocol comparable to the 1M run. [M]
+. **First scale measurements of the full p99/RSS/CPU telemetry** — landed with these runs, no server code change needed. [M]
+
+== What this does NOT establish
+
+n=1 per cap per scale (no repeats) — directions, not distributions. The corpus is the learn split, not the base split. Cross-scale comparison is confounded by bed shape (the 10M single-segment counterfactual was not producible). Fragmented segments, filtered queries and 768d remain unmeasured. **No default change and no pricing claim rides on this run** (production S3 already targets 8 MiB ranges; the design's stop rule still requires the fragmented/filter finalists before any global flip). The 10M finding sharpens the deferred-D4 question — segment fan-out is now a measured, not assumed, request term — but D4 stays deferred until its measured-need gate is met.
+
+== Provenance
+
+* Result files (local, not checked in): `~/bench-beds/p5b-runs/e1/e1s-sift{3m,10m}{,-cap{4,16,40}}*/result.json`; the failed 1-segment attempt's log `e1s-sift10m1-build.log` documents the settle timeout; fixture fingerprints as for 1M. Datasets: `~/sift10m/{sift3m,sift10m}_{base.u8bin,query.fvecs,gt.ivecs}` (learn-split prefixes; query set = the canonical 10k ANN_SIFT1B queries, first 4096; GT exact per-prefix).
+* An earlier scale-chain launch was discarded wholesale (beds and roots deleted): its 10M build refused a dirty worktree — code edits landed in the worktree mid-chain — and the 3M arms ran inside that edit window with ambiguous provenance. All results in this artifact come from the clean relaunch at `248f214f2`. The first single-segment launch failed on a script path bug (`_base.u8bin`) — the harness refused before any measurement.
+* **Run serialization verified from filesystem and object-store timestamps** (recorded after a review question): within the clean relaunch all eight measured runs are strictly sequential — run-root directory births chain each start to the previous run's end (3M build 22:44:22 CDT → 3M arms → 10M build 23:51:04 → 10M arms → last ends 01:33:29 CDT, Oct 26–27); the single-segment attempt started only after that (process 01:33:44; run-root birth 03:41:57; ingest 508.9 s; 3,600 s settle timeout → error; ends 04:50:33). Two traps to not re-trip: (i) segment names embed **UTC** timestamps — `L3_20261027T034629` is 22:46:29 CDT, mid-3M-build (MinIO LastModified 22:47:03 CDT confirms) — never compare them against local-time windows; (ii) `e1s-sift10m-build.log`'s birth time (18:57:55) predates its run: the file was truncated-and-reused from the aborted first launch (`scale-chain.log`, born the same second); the run itself started 23:51:04 per its root-dir birth. Root-dir births are the serialization authority, not log-file births.
+* **Binary and rebase provenance (disclosed after review):** the measured binary was built once, from the `f5aef1b0b` tree (2026-10-26 13:20, sha256 `11b6a8a1…`), and never rebuilt — the identical sha256 is recorded in every result.json from the 1M runs through these arms. `binary.source_revision`/`git_revision` record the run-time worktree HEAD (`248f214f2`), **not** the build commit. The `f5aef1b0b..248f214f2` tree range additionally contains develop-side server-code changes (iceberg-engine, query/execution, services/dml, datafusion adapters, storage engines, several crates/) that entered via the branch's mid-chain rebase and are **not** in the measured binary — arm-vs-arm comparisons are unaffected (one binary throughout), but the binary does not correspond to the `248f214f2` tree; anchor audits to the sha256. The branch was rebased onto develop `9c2a91460` on 2026-10-27 with a patch-identical chain (force-push follows): pre-rebase hashes cited here (`f5aef1b0b`, `248f214f2`) are worktree provenance and will not be reachable from the merged PR.
+* Single-machine emulator evidence, not an SLA or a cloud-latency claim.

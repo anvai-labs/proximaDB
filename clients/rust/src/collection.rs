@@ -289,11 +289,14 @@ impl<'a> CollectionBuilder<'a> {
             other => Some(other.as_str().to_string()),
         };
 
+        let (index_type, index_configs, index_policy) = index_request_fields(self.index);
         let request = CreateCollectionRequest {
             name: self.name,
             dimension,
             engine: Some(self.engine.as_str().to_string()),
-            index_type: Some(self.index.as_str().to_string()),
+            index_type,
+            index_configs,
+            index_policy,
             canonical_embedding_precision: precision_payload,
         };
 
@@ -819,12 +822,103 @@ struct CreateCollectionRequest {
     engine: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     index_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index_configs: Option<Vec<IndexConfigRequest>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index_policy: Option<IndexPolicyRequest>,
     /// `None` for the legacy fp32 default — omitted from the wire
     /// payload to keep requests byte-identical with pre-precision-
     /// rollout SDKs. `Some("fp16")` etc. when the caller asks for a
     /// non-fp32 collection.
     #[serde(skip_serializing_if = "Option::is_none")]
     canonical_embedding_precision: Option<String>,
+}
+
+/// TD-RESTGET-1: the server ignores `index_type` "hnsw" (index selection is
+/// cost-derived) and rejects any other value, which it never honoured. Send
+/// what each choice means: Hnsw keeps the byte-identical default payload; Flat
+/// forces brute force through the routing policy; the others declare that
+/// primary index.
+fn index_request_fields(
+    index: IndexType,
+) -> (
+    Option<String>,
+    Option<Vec<IndexConfigRequest>>,
+    Option<IndexPolicyRequest>,
+) {
+    match index {
+        IndexType::Hnsw => (Some("hnsw".to_string()), None, None),
+        IndexType::Flat => (
+            None,
+            None,
+            Some(IndexPolicyRequest {
+                mode: "exact".to_string(),
+            }),
+        ),
+        other => (
+            None,
+            Some(vec![IndexConfigRequest {
+                algorithm: other.as_str().to_string(),
+                is_primary: true,
+            }]),
+            None,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod index_request_tests {
+    use super::*;
+
+    fn body(index: IndexType) -> serde_json::Value {
+        let (index_type, index_configs, index_policy) = index_request_fields(index);
+        serde_json::to_value(CreateCollectionRequest {
+            name: "c".to_string(),
+            dimension: 4,
+            engine: None,
+            index_type,
+            index_configs,
+            index_policy,
+            canonical_embedding_precision: None,
+        })
+        .unwrap_or_default()
+    }
+
+    #[test]
+    fn default_hnsw_payload_is_unchanged() {
+        assert_eq!(
+            body(IndexType::Hnsw),
+            serde_json::json!({"name": "c", "dimension": 4, "index_type": "hnsw"})
+        );
+    }
+
+    #[test]
+    fn flat_is_the_exact_routing_policy() {
+        let b = body(IndexType::Flat);
+        assert_eq!(b["index_policy"], serde_json::json!({"mode": "exact"}));
+        assert!(b.get("index_type").is_none());
+    }
+
+    #[test]
+    fn other_indexes_are_declared_not_sent_as_index_type() {
+        let b = body(IndexType::Ivf);
+        assert_eq!(
+            b["index_configs"],
+            serde_json::json!([{"algorithm": "ivf", "is_primary": true}])
+        );
+        assert!(b.get("index_type").is_none());
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct IndexConfigRequest {
+    algorithm: String,
+    is_primary: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct IndexPolicyRequest {
+    mode: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1232,6 +1326,8 @@ mod tests {
             dimension: 384,
             engine: Some("sst".to_string()),
             index_type: Some("hnsw".to_string()),
+            index_configs: None,
+            index_policy: None,
             canonical_embedding_precision: None,
         };
         assert_eq!(
@@ -1395,6 +1491,8 @@ mod tests {
             dimension: 384,
             engine: None,
             index_type: None,
+            index_configs: None,
+            index_policy: None,
             canonical_embedding_precision: Some("fp16".to_string()),
         };
         let body = serde_json::to_value(&req).unwrap();
@@ -1408,6 +1506,8 @@ mod tests {
             dimension: 384,
             engine: None,
             index_type: None,
+            index_configs: None,
+            index_policy: None,
             canonical_embedding_precision: None,
         };
         let body = serde_json::to_value(&req).unwrap();

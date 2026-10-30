@@ -545,6 +545,7 @@ impl ProximaFlightService {
     async fn catalog_arrow_schema_for_descriptor(
         catalog_manager: Option<&Arc<CatalogManager>>,
         descriptor: &FlightDescriptor,
+        tenant: &str,
     ) -> Result<Option<Arc<Schema>>> {
         let Some(catalog_manager) = catalog_manager else {
             return Ok(None);
@@ -553,7 +554,10 @@ impl ProximaFlightService {
             return Ok(None);
         };
 
-        let (catalog, table_id) = catalog_manager.resolve_table(&table_fqn).await?;
+        // Resolved within the caller's tenant, like every other table lookup.
+        let (catalog, table_id) = catalog_manager
+            .resolve_table_scoped(&table_fqn, Some(tenant))
+            .await?;
         let table_schema = catalog.get_table(&table_id).await?;
         Ok(Some(relational_schema_from_catalog(&table_schema)))
     }
@@ -1137,13 +1141,12 @@ impl ProximaFlightService {
 
         let dim = result.route.dimension() as u32;
         for (slot, vector) in to_embed.iter().zip(result.vectors) {
-            records[*slot].embeddings.push(EmbeddingCell {
-                model_id: "native".to_string(),
-                modality: "dense_vector".to_string(),
+            records[*slot].embeddings.push(EmbeddingCell::new_fp32(
+                "native",
+                "dense_vector",
                 dim,
-                values: proximadb_records::EmbeddingValues::Fp32(vector),
-                ..Default::default()
-            });
+                vector,
+            ));
         }
         Ok(())
     }
@@ -1162,15 +1165,18 @@ impl ProximaFlightService {
     async fn records_for_write_batches(
         catalog_manager: Option<&Arc<CatalogManager>>,
         table_fqn: Option<&str>,
+        tenant_id: Option<&str>,
         operation: FlightWriteOperation,
         write_mode: WriteMode,
         batches: &[arrow_array::RecordBatch],
     ) -> Result<(Vec<ProximaRecord>, Option<CatalogBulkWriteResult>)> {
         if let (Some(catalog_manager), Some(table_fqn)) = (catalog_manager, table_fqn) {
             let service = CatalogBulkWriteService::with_defaults(catalog_manager.clone());
+            let tenant = proximadb_tenant::resolve_request_tenant(tenant_id);
             let (records, result) = service
                 .prepare_bulk_write(
                     table_fqn,
+                    &tenant,
                     batches,
                     Self::catalog_bulk_write_mode(operation, write_mode),
                 )
@@ -1208,6 +1214,7 @@ impl ProximaFlightService {
         let (mut records, catalog_result) = Self::records_for_write_batches(
             self.catalog_manager.as_ref(),
             table_fqn,
+            tenant_id,
             operation,
             write_mode,
             &batches,
@@ -1534,12 +1541,13 @@ impl FlightService for ProximaFlightService {
             crate::storage::tenant::TenantContext::for_tenant_id(&auth_context.tenant_id);
         let descriptor = request.into_inner();
 
-        if let Some(schema) =
-            Self::catalog_arrow_schema_for_descriptor(self.catalog_manager.as_ref(), &descriptor)
-                .await
-                .map_err(|e| {
-                    TonicStatus::internal(format!("Failed to resolve catalog schema: {}", e))
-                })?
+        if let Some(schema) = Self::catalog_arrow_schema_for_descriptor(
+            self.catalog_manager.as_ref(),
+            &descriptor,
+            &auth_context.tenant_id,
+        )
+        .await
+        .map_err(|e| TonicStatus::internal(format!("Failed to resolve catalog schema: {}", e)))?
         {
             let result = Self::schema_result_from_arrow_schema(&schema)
                 .map_err(|e| TonicStatus::internal(e.to_string()))?;
@@ -1679,6 +1687,14 @@ impl FlightService for ProximaFlightService {
                 .map_err(|e| {
                     // Wrong-dimension / empty / non-finite query vector or
                     // over-cap top_k: the client's argument (TD-SECSCAN-1 §5).
+                    if let Some(missing) =
+                        crate::services::operations::vectors::collection_not_found(&e)
+                    {
+                        return TonicStatus::not_found(format!(
+                            "Collection not found: {}",
+                            missing.identifier
+                        ));
+                    }
                     match crate::services::operations::vectors::client_argument_message(&e) {
                         Some(message) => TonicStatus::invalid_argument(message),
                         None => TonicStatus::internal(format!("Search failed: {}", e)),
@@ -1935,6 +1951,8 @@ impl FlightService for ProximaFlightService {
                 };
 
                 let config = crate::proto::proximadb_v1::CollectionConfig {
+                    storage_class: None,
+                    policy_generation: None,
                     name: name.to_string(),
                     embedding_config: None,
                     dimension,
@@ -2208,13 +2226,9 @@ impl FlightService for ProximaFlightService {
 
                     records.push(ProximaRecord {
                         oid,
-                        embeddings: vec![proximadb_records::EmbeddingCell {
-                            model_id: "default".to_string(),
-                            modality: "vector".to_string(),
-                            dim,
-                            values: proximadb_records::EmbeddingValues::Fp32(values),
-                            ..Default::default()
-                        }],
+                        embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                            "default", "vector", dim, values,
+                        )],
                         props,
                         created_at_ns: now_ns,
                         updated_at_ns: now_ns,
@@ -2283,6 +2297,20 @@ impl FlightService for ProximaFlightService {
                     vector_count = vector_ids.len(),
                     "Arrow Flight: delete_vectors"
                 );
+                // Resolved within the request tenant: another tenant's
+                // collection is answered exactly like a missing one.
+                if self
+                    .collection_service
+                    .get_collection_with_tenant_context(collection_id, Some(&tenant_context))
+                    .await
+                    .map_err(|e| TonicStatus::internal(format!("Failed to get collection: {}", e)))?
+                    .is_none()
+                {
+                    return Err(TonicStatus::not_found(format!(
+                        "Collection not found: {}",
+                        collection_id
+                    )));
+                }
 
                 // Vector deletion is handled via soft-delete (tombstone markers)
                 // For now, this returns the count of requested deletions
@@ -2416,6 +2444,20 @@ impl FlightService for ProximaFlightService {
                     })?;
 
                 info!(collection_id = %collection_id, "Arrow Flight: flush_collection");
+                // Resolved within the request tenant: another tenant's
+                // collection is answered exactly like a missing one.
+                if self
+                    .collection_service
+                    .get_collection_with_tenant_context(collection_id, Some(&tenant_context))
+                    .await
+                    .map_err(|e| TonicStatus::internal(format!("Failed to get collection: {}", e)))?
+                    .is_none()
+                {
+                    return Err(TonicStatus::not_found(format!(
+                        "Collection not found: {}",
+                        collection_id
+                    )));
+                }
 
                 // Flush collection via vector operations service
                 self.vector_operations_service
@@ -2456,6 +2498,20 @@ impl FlightService for ProximaFlightService {
                     })?;
 
                 info!(collection_id = %collection_id, "Arrow Flight: compact_collection");
+                // Resolved within the request tenant: another tenant's
+                // collection is answered exactly like a missing one.
+                if self
+                    .collection_service
+                    .get_collection_with_tenant_context(collection_id, Some(&tenant_context))
+                    .await
+                    .map_err(|e| TonicStatus::internal(format!("Failed to get collection: {}", e)))?
+                    .is_none()
+                {
+                    return Err(TonicStatus::not_found(format!(
+                        "Collection not found: {}",
+                        collection_id
+                    )));
+                }
 
                 self.trigger_collection_compaction(collection_id)
                     .await
@@ -2494,6 +2550,20 @@ impl FlightService for ProximaFlightService {
                     })?;
 
                 info!(collection_id = %collection_id, "Arrow Flight: flush_and_compact");
+                // Resolved within the request tenant: another tenant's
+                // collection is answered exactly like a missing one.
+                if self
+                    .collection_service
+                    .get_collection_with_tenant_context(collection_id, Some(&tenant_context))
+                    .await
+                    .map_err(|e| TonicStatus::internal(format!("Failed to get collection: {}", e)))?
+                    .is_none()
+                {
+                    return Err(TonicStatus::not_found(format!(
+                        "Collection not found: {}",
+                        collection_id
+                    )));
+                }
 
                 // Flush first, then compact
                 self.vector_operations_service
@@ -2599,6 +2669,7 @@ impl FlightService for ProximaFlightService {
                 let ipc_bytes = super::rank_features_export::export_rank_features_to_arrow_ipc(
                     &services,
                     &action.body,
+                    &auth_context.tenant_id,
                 )
                 .await
                 .map_err(|e| {
@@ -2607,8 +2678,11 @@ impl FlightService for ProximaFlightService {
                         RankError::ProfileNotFound(name) => TonicStatus::not_found(format!(
                             "rank_features_export: rank profile not found: {name}"
                         )),
-                        RankError::InvalidProfile(msg) => {
+                        RankError::InvalidProfile(msg) | RankError::InvalidArgument(msg) => {
                             TonicStatus::invalid_argument(format!("rank_features_export: {msg}"))
+                        }
+                        RankError::CollectionNotFound(collection) => {
+                            TonicStatus::not_found(format!("Collection not found: {collection}"))
                         }
                         other => TonicStatus::internal(format!("rank_features_export: {other}")),
                     }

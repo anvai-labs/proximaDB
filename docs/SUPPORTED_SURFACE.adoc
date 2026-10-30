@@ -2,7 +2,7 @@
 :toc: left
 :toclevels: 2
 :icons: font
-:last-updated: 2026-10-17
+:last-updated: 2026-10-29
 // status-as-of: 2026-09-11
 // The status-as-of tag above is checked by scripts/check_status_as_of.py (wired into
 // `make work-commit-check`): re-verify the support tiers against HEAD, then bump it.
@@ -15,7 +15,7 @@ Canonical product support contract for the ProximaDB working tree. This document
 This matrix is the product support contract.
 
 * Use link:./10-quality/TECHNICAL_DEBT.adoc[Technical Debt Register] for the active backlog.
-* Use link:./_internal/roadmap/STRATEGIC_ROADMAP.adoc[Strategic Roadmap] for sequencing; product direction is ADR-096.
+* Use link:current/ROADMAP.adoc[Strategic Roadmap] for sequencing; product direction is ADR-096.
 * Use link:./12-design/SUPPORTED_SURFACES.adoc[Supported Surfaces: API vs. Physical Projection Status] for the technical API/projection companion matrix.
 * Do not infer support level from code presence alone.
 ====
@@ -37,10 +37,10 @@ marking themselves historical, aspirational, or implementation-only:
 | link:./12-design/SYSTEM_MAP_2026_05_30.adoc[SYSTEM_MAP_2026_05_30.adoc].
 
 | Product direction (identity, front door, model breadth, planning frame)
-| link:./12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096], stated in link:./00-product/VISION.adoc[VISION.adoc]. The engineering mandates of the 2026-06-04 course correction (pgwire, object storage, engine routing) still apply; its "compete with warehouses" framing is superseded.
+| link:./12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc[ADR-096], stated in link:current/VISION.adoc[VISION.adoc]. The engineering mandates of the 2026-06-04 course correction (pgwire, object storage, engine routing) still apply; its "compete with warehouses" framing is superseded.
 
 | Sequencing and release exit criteria
-| link:./_internal/roadmap/STRATEGIC_ROADMAP.adoc[STRATEGIC_ROADMAP.adoc]; live implementation status per TD, indexed by link:./12-design/WORK_LEDGER_2026_10_15.adoc[the Work Ledger].
+| link:current/ROADMAP.adoc[docs/current/ROADMAP.adoc]; live coordination in link:current/TRACKER.adoc[the central tracker], with detailed issue contracts in the TD registry.
 
 | Performance / benchmark claims (what is *measured*)
 | link:./_internal/roadmap/BENCHMARK_EVIDENCE.toml[BENCHMARK_EVIDENCE.toml] — every external perf number maps to a runnable bench; only `status = "measured"` entries carry a dated artifact. Do not quote a perf figure as validated unless its ledger entry is `measured`.
@@ -533,7 +533,12 @@ must not list them under "supported", "production", or "ready":
   spec-shaped Iceberg v3 table (`v*.metadata.json` referencing an Avro manifest list + manifest)
   to the warehouse so external Iceberg engines can read it (verified by `tests/iceberg_interop_e2e.rs`).
   One-way publish only; this is distinct from the hot-authority item above (still experimental), and
-  external read-back plus multi-writer coordination are unverified.
+  external read-back plus multi-writer coordination are unverified. Republication after UPDATE/DELETE is
+  incremental by default (carried files + one new part + `dv-mat-*` deletion vectors; a compacting rewrite
+  past 20% of rows or 500k positions deleted, or 64 parts), which upgrades the published table to Iceberg v3
+  at its first such republication; `PROXIMADB_MATERIALIZE_INCREMENTAL_DV=0` restores full rewrites. Rolling
+  back to an older release after that is unsafe (older binaries ignore the vectors): disarm and
+  re-MATERIALIZE first.
 * Columnar vector quantization (RaBitQ / SQ8) in PAX vector segments — _flag-gated, default OFF_.
   Enabled with `PROXIMADB_PAX_VECTOR_SEGMENTS=1` plus `PROXIMADB_PAX_VECTOR_QUANT=rabitq|sq8|auto`
   (deployment-level env selector; per-collection proto config is the productionization follow-up).

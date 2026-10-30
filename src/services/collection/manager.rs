@@ -64,6 +64,11 @@
 //! - **Smart Defaults**: Automatic selection of optimal configurations
 
 use anyhow::{Context, Result};
+
+/// Serializes collection-config read-modify-write (`update_collection`, the
+/// owner backfill) so a stamped owner can never be overwritten by a write that
+/// read the record before the stamp.
+static COLLECTION_CONFIG_RMW: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -102,6 +107,8 @@ pub struct CollectionService {
     index_config_cache: Arc<dashmap::DashMap<String, crate::index::config::RuntimeIndexConfig>>,
     /// Global storage configuration for engine and WAL settings
     storage_config: StorageConfig,
+    /// TD-TIER-1 SC3-2: reservation pools opened at startup (None ⇒ inert).
+    reservations: Option<Arc<crate::services::collection::ReservationRegistry>>,
     /// xCatalog manager — the sole authoritative store for collection lifecycle
     /// metadata. When wired, collection reads/writes resolve through xCatalog.
     catalog_manager: Option<Arc<CatalogManager>>,
@@ -169,10 +176,23 @@ impl CollectionService {
                 .context("Failed to initialize filesystem factory")?,
         );
 
+        // TD-TIER-1 SC3-2: open the reservation pools declared in
+        // `[storage.reservation_pools]` (validated at config load). Empty
+        // list ⇒ None ⇒ every reservation seam is inert. A pool another
+        // process exclusively owns fails construction — an operator wants
+        // that at startup, not at first PERFORMANCE admission.
+        let reservations =
+            crate::services::collection::reservation::ReservationRegistry::open_from_config(
+                &storage_config.reservation_pools,
+            )
+            .await
+            .context("TD-TIER-1 SC3: reservation pool startup failed")?;
+
         Ok(Self {
             filesystem_factory,
             index_config_cache: Arc::new(dashmap::DashMap::new()),
             storage_config,
+            reservations,
             catalog_manager: None,
             syscat_cache: None,    // Built in `with_catalog_manager`.
             syscat_warm_dir: None, // Set via `with_syscat_warm_dir` / env.
@@ -182,6 +202,57 @@ impl CollectionService {
             #[cfg(feature = "experimental-turboquant")]
             turboquant_registry: None, // Will be set via with_turboquant_registry()
         })
+    }
+
+    /// TD-TIER-1 SC4-3: report a PERFORMANCE collection's live grant on its
+    /// status — reserved bytes from the ledger, resident and covered bytes
+    /// from the registered process store. Only the collection GET operation
+    /// (REST v2 and gRPC v2) calls this, through
+    /// `CollectionPort::enrich_collection_status` — never `get_collection`,
+    /// which every search resolves through (review B1). Non-PERFORMANCE
+    /// collections and an inert registry return immediately.
+    pub async fn overlay_live_residency(&self, collection: &mut Collection) {
+        let Some(registry) = &self.reservations else {
+            return;
+        };
+        let Some(config) = collection.config.as_ref() else {
+            return;
+        };
+        if crate::services::collection::storage_class::storage_class_or_balanced(config)
+            != crate::proto::proximadb_v1::StorageClass::Performance
+        {
+            return;
+        }
+        let Some(grant) = registry.live_grant_for_collection(&collection.id).await else {
+            return;
+        };
+        let (resident, covered) = proximadb_cache::process_store()
+            .map(|store| {
+                (
+                    store.group_resident_bytes(&grant.id),
+                    store.covered_bytes(&grant.id),
+                )
+            })
+            .unwrap_or((0, 0));
+        let base = collection.storage_class_status.take().unwrap_or_else(|| {
+            crate::services::collection::storage_class::storage_class_status(config)
+        });
+        collection.storage_class_status = Some(
+            crate::services::collection::storage_class::with_live_residency(
+                base,
+                grant.bytes,
+                resident,
+                covered,
+            ),
+        );
+    }
+
+    /// TD-TIER-1 SC3-2: the shared reservation registry, when pools are
+    /// declared. The metering cadence ticks it (release tails + accrual).
+    pub fn reservations(
+        &self,
+    ) -> Option<&Arc<crate::services::collection::reservation::ReservationRegistry>> {
+        self.reservations.as_ref()
     }
 
     /// Attach a TurboQuant store registry (Phase P — Quantization Trait
@@ -400,6 +471,20 @@ impl CollectionService {
             .unwrap_or(Self::DEFAULT_VERSION_TENANT)
     }
 
+    /// Bump the corpus version of `name` for `tenant` and, when that is not the
+    /// default bucket, also for the default bucket: the name-keyed collection
+    /// cache ([`Self::collection`]) reads the default bucket, so a named
+    /// tenant's create or delete must invalidate it too. Returns `tenant`'s
+    /// new version.
+    async fn bump_corpus_versions(tenant: &str, name: &str) -> u64 {
+        let registry = crate::catalog::CorpusVersionRegistry::global();
+        let version = registry.bump(tenant, name).await;
+        if tenant != Self::DEFAULT_VERSION_TENANT {
+            let _ = registry.bump(Self::DEFAULT_VERSION_TENANT, name).await;
+        }
+        version
+    }
+
     async fn count_tenant_collections(&self, tenant_id: &str) -> Result<usize> {
         Ok(self
             .list_collections()
@@ -432,18 +517,11 @@ impl CollectionService {
             return Ok(None);
         };
 
-        let Some(collection_tenant) = Self::collection_tenant_id(&collection) else {
-            warn!(
-                "🚨 Collection '{}' is missing tenant metadata; denying tenant-scoped access",
-                collection_identifier
-            );
-            return Ok(None);
-        };
-
-        if collection_tenant != tenant_ctx.tenant_id {
-            warn!(
-                "🚨 Cross-tenant access attempt blocked: user tenant {} tried to access collection owned by tenant {}",
-                tenant_ctx.tenant_id, collection_tenant
+        if !proximadb_tenant::collection_visible_to(&collection, Some(&tenant_ctx.tenant_id)) {
+            debug!(
+                tenant = %tenant_ctx.tenant_id,
+                collection = %collection_identifier,
+                "collection is not resolvable for this tenant"
             );
             return Ok(None);
         }
@@ -469,29 +547,214 @@ impl CollectionService {
             .await
     }
 
+    /// Resolve a collection for a request acting as `request_tenant`.
+    ///
+    /// `Some(tenant)` (a request; blank = the default tenant) returns the
+    /// collection only when that tenant may resolve it under the one ownership
+    /// rule (`proximadb_tenant::collection_visible_to`); otherwise `None`,
+    /// exactly as for a collection that does not exist. `None` (no tenant)
+    /// denies; internal lookups use [`Self::collection_internal`].
+    pub async fn collection_for_tenant(
+        &self,
+        identifier: &str,
+        request_tenant: Option<&str>,
+    ) -> Result<Option<Collection>> {
+        // No request tenant ⇒ deny. Internal lookups use `collection_internal`.
+        let Some(tenant) = request_tenant else {
+            return Ok(None);
+        };
+        let ctx = self.request_tenant_context(Some(tenant))?;
+        self.get_collection_with_tenant_context(identifier, ctx.as_ref())
+            .await
+    }
+
+    /// The tenant context a request acting as `request_tenant` resolves
+    /// collections in: the managed context when a TenantManager is wired,
+    /// else a context for the tenant itself. `None` tenant ⇒ `None` (deny).
+    pub fn request_tenant_context(
+        &self,
+        request_tenant: Option<&str>,
+    ) -> Result<Option<crate::storage::tenant::TenantContext>> {
+        let Some(tenant) = request_tenant else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.load_tenant_context(Some(tenant))?.unwrap_or_else(|| {
+                crate::storage::tenant::TenantContext::for_tenant_id(
+                    proximadb_tenant::resolve_request_tenant(Some(tenant)),
+                )
+            }),
+        ))
+    }
+
+    /// Record `tenant` as the owner of a collection that has no recorded owner,
+    /// through the same catalog write as `update_collection`. Never re-assigns
+    /// a collection that already records an owner (or conflicting owners).
+    /// Returns whether an owner was written.
+    pub async fn assign_owner_if_unattributed(
+        &self,
+        identifier: &str,
+        tenant: &str,
+    ) -> Result<bool> {
+        // Serialized with `update_collection` so the read and the write see
+        // the same record (no lost owner, no lost update).
+        let _rmw = COLLECTION_CONFIG_RMW.lock().await;
+        // Under tenant-prefixed catalog namespaces (TD-CAT-2b gate) an owner
+        // change would move the catalog asset to another namespace; leave such
+        // collections to the default tenant (fail closed) rather than rewrite
+        // the asset key here.
+        if self.tenant_namespaces_on() {
+            return Ok(false);
+        }
+        let Some(mut record) = self.collection(identifier).await? else {
+            return Ok(false);
+        };
+        if proximadb_tenant::collection_owner(&record)
+            != proximadb_tenant::CollectionOwner::Unattributed
+        {
+            return Ok(false);
+        }
+        let Some(config) = record.config.as_mut() else {
+            return Ok(false);
+        };
+        proximadb_tenant::stamp_collection_owner(config, tenant);
+        let name = config.name.clone();
+        if !self
+            .write_owner_metadata_in_place(&record)
+            .await
+            .context("Failed to record collection owner")?
+        {
+            return Ok(false);
+        }
+        let _ = crate::catalog::CorpusVersionRegistry::global()
+            .bump(Self::DEFAULT_VERSION_TENANT, &name)
+            .await;
+        Ok(true)
+    }
+
+    /// Write `record`'s owner metadata (the `owner` and `tags` properties) onto
+    /// its existing catalog entry and change nothing else: columns, layouts,
+    /// identity and every other property stay as they are. Only an entry that
+    /// records exactly this collection is touched. Returns whether it wrote.
+    async fn write_owner_metadata_in_place(&self, record: &Collection) -> Result<bool> {
+        let (Some(catalog_manager), Some(config)) = (&self.catalog_manager, record.config.as_ref())
+        else {
+            return Ok(false);
+        };
+        let catalog = catalog_manager.default_catalog().await?;
+        let identifier = Self::tenant_scoped_identifier(
+            self.tenant_namespaces_on(),
+            Self::collection_tenant_id(record).as_deref(),
+            crate::storage::metadata::collection_mapping::collection_table_identifier(config),
+        );
+        if !catalog.table_exists(&identifier).await? {
+            return Ok(false);
+        }
+        let mut schema = catalog.get_table(&identifier).await?;
+        if schema.properties.get("collection.id") != Some(&record.id) {
+            return Ok(false);
+        }
+        match &config.owner {
+            Some(owner) => {
+                schema.properties.insert("owner".to_string(), owner.clone());
+            }
+            None => {
+                schema.properties.remove("owner");
+            }
+        }
+        if config.tags.is_empty() {
+            schema.properties.remove("tags");
+        } else {
+            schema
+                .properties
+                .insert("tags".to_string(), config.tags.join(","));
+        }
+        // The full config is also recorded as JSON (the reader restores it from
+        // there); carry the same two fields into it and nothing else.
+        if let Some(json) = schema.properties.get("collection.config_json")
+            && let Ok(mut full) =
+                serde_json::from_str::<crate::proto::proximadb_v1::CollectionConfig>(json)
+        {
+            full.owner = config.owner.clone();
+            full.tags = config.tags.clone();
+            schema.properties.insert(
+                "collection.config_json".to_string(),
+                serde_json::to_string(&full).context("serializing collection config")?,
+            );
+        }
+        // TD-CATREPLACE-1: replace in place — no drop window (this path used
+        // the drop+create pattern this TD retires).
+        catalog.replace_table(&identifier, schema).await?;
+        Ok(true)
+    }
+
+    /// Record that the owner backfill could not attribute a collection (it stays
+    /// owned by the default tenant): adds `marker` to its tags unless it
+    /// meanwhile gained an owner. Same catalog write and lock as
+    /// [`Self::assign_owner_if_unattributed`].
+    pub async fn mark_owner_unattributable(&self, identifier: &str, marker: &str) -> Result<()> {
+        let _rmw = COLLECTION_CONFIG_RMW.lock().await;
+        let Some(mut record) = self.collection(identifier).await? else {
+            return Ok(());
+        };
+        if proximadb_tenant::collection_owner(&record)
+            != proximadb_tenant::CollectionOwner::Unattributed
+        {
+            return Ok(());
+        }
+        let Some(config) = record.config.as_mut() else {
+            return Ok(());
+        };
+        if config.tags.iter().any(|tag| tag == marker) {
+            return Ok(());
+        }
+        config.tags.push(marker.to_string());
+        let name = config.name.clone();
+        self.write_owner_metadata_in_place(&record)
+            .await
+            .context("Failed to record collection owner backfill outcome")?;
+        let _ = crate::catalog::CorpusVersionRegistry::global()
+            .bump(Self::DEFAULT_VERSION_TENANT, &name)
+            .await;
+        Ok(())
+    }
+
     /// Get collection with tenant validation
     pub async fn get_collection_with_tenant_context(
         &self,
         collection_name: &str,
         tenant_context: Option<&crate::storage::tenant::TenantContext>,
     ) -> Result<Option<crate::proto::proximadb_v1::Collection>> {
-        if let Some(tenant_ctx) = tenant_context.filter(|_| self.tenant_manager.is_some()) {
-            let collection = self
-                .validate_tenant_collection_access(collection_name, tenant_ctx)
-                .await?;
-
-            if collection.is_some() {
-                debug!(
-                    "✅ Tenant ownership validation passed for collection access: tenant={}, collection={}",
-                    tenant_ctx.tenant_id, collection_name
-                );
-            }
-
-            return Ok(collection);
+        // No tenant context ⇒ deny. Internal (system) lookups use
+        // `collection_internal`.
+        let Some(tenant_ctx) = tenant_context else {
+            return Ok(None);
+        };
+        if self.tenant_manager.is_none() {
+            return Ok(self
+                .collection(collection_name)
+                .await?
+                .filter(|collection| {
+                    proximadb_tenant::collection_visible_to(collection, Some(&tenant_ctx.tenant_id))
+                }));
         }
+        let collection = self
+            .validate_tenant_collection_access(collection_name, tenant_ctx)
+            .await?;
+        if collection.is_some() {
+            debug!(
+                "✅ Tenant ownership validation passed for collection access: tenant={}, collection={}",
+                tenant_ctx.tenant_id, collection_name
+            );
+        }
+        Ok(collection)
+    }
 
-        // Proceed with normal collection retrieval
-        self.collection(collection_name).await
+    /// Internal (system) lookup by name or id, not scoped to any tenant: for
+    /// background flush, compaction, recovery and the owner backfill. Request
+    /// paths resolve through `collection_for_tenant`.
+    pub async fn collection_internal(&self, identifier: &str) -> Result<Option<Collection>> {
+        self.collection(identifier).await
     }
 
     /// List all collections, filtered to the given tenant context if multi-tenant mode is active.
@@ -501,7 +764,19 @@ impl CollectionService {
     ) -> Result<Vec<Collection>> {
         let collections = self.list_collections().await?;
 
-        if let Some(tenant_ctx) = tenant_context.filter(|_| self.tenant_manager.is_some()) {
+        // No tenant context ⇒ deny (an empty listing).
+        let Some(tenant_ctx) = tenant_context else {
+            return Ok(Vec::new());
+        };
+        if self.tenant_manager.is_none() {
+            return Ok(collections
+                .into_iter()
+                .filter(|collection| {
+                    proximadb_tenant::collection_visible_to(collection, Some(&tenant_ctx.tenant_id))
+                })
+                .collect());
+        }
+        {
             if let Some(ref tenant_manager) = self.tenant_manager
                 && !tenant_manager.is_tenant_active(&tenant_ctx.tenant_id)
             {
@@ -512,16 +787,13 @@ impl CollectionService {
                 return Ok(Vec::new());
             }
 
-            let filtered = collections
+            Ok(collections
                 .into_iter()
                 .filter(|collection| {
-                    Self::collection_tenant_id(collection).as_deref() == Some(&tenant_ctx.tenant_id)
+                    proximadb_tenant::collection_visible_to(collection, Some(&tenant_ctx.tenant_id))
                 })
-                .collect();
-            return Ok(filtered);
+                .collect())
         }
-
-        Ok(collections)
     }
 
     /// Delete collection with tenant validation
@@ -532,28 +804,51 @@ impl CollectionService {
     ) -> Result<CollectionServiceResponse> {
         debug!("🗑️ Deleting collection: {}", collection_name);
 
-        if let Some(tenant_ctx) = tenant_context.filter(|_| self.tenant_manager.is_some()) {
-            let collection = self
-                .validate_tenant_collection_access(collection_name, tenant_ctx)
-                .await?;
-
-            if collection.is_none() {
-                return Ok(CollectionServiceResponse::error(
-                    format!(
-                        "TENANT_ACCESS_DENIED: collection {} is not accessible to tenant {}",
-                        collection_name, tenant_ctx.tenant_id
-                    ),
-                    0,
-                ));
-            }
-
-            debug!(
-                "✅ Tenant ownership validation passed for collection deletion: tenant={}, collection={}",
-                tenant_ctx.tenant_id, collection_name
-            );
-        }
+        // Resolve within the request tenant (no context ⇒ deny). A collection
+        // this tenant may not resolve is answered exactly like a missing one,
+        // and nothing is touched.
+        let Some(target) = self
+            .get_collection_with_tenant_context(collection_name, tenant_context)
+            .await?
+        else {
+            return Ok(CollectionServiceResponse {
+                success: false,
+                collection: None,
+                storage_path: None,
+                error_code: Some("COLLECTION_NOT_FOUND".to_string()),
+                processing_time_us: 0,
+            });
+        };
 
         let response = self.delete_collection(collection_name).await?;
+        // TD-TIER-1 SC3-2: the inner delete is the authoritative release
+        // (keyed by the record it removed). This belt-and-braces release keys
+        // the REQUEST tenant against the outer-resolved target — idempotent
+        // where the inner path already released, and it covers an owner field
+        // that disagrees with the request tenant.
+        if response.success
+            && let Some(registry) = &self.reservations
+        {
+            registry
+                .release_for_collection(
+                    Self::version_tenant(tenant_context),
+                    &target.id,
+                    chrono::Utc::now().timestamp(),
+                )
+                .await;
+        }
+        // The name-keyed cache is also keyed by id and by the name the caller
+        // used; invalidate every key the deleted collection can be read by.
+        if response.success {
+            let tenant = Self::version_tenant(tenant_context);
+            let mut keys = vec![target.id.clone()];
+            if let Some(config) = &target.config {
+                keys.push(config.name.clone());
+            }
+            for key in keys.iter().filter(|key| key.as_str() != collection_name) {
+                let _ = Self::bump_corpus_versions(tenant, key).await;
+            }
+        }
 
         // Bump the corpus_version for (tenant, collection) so corpus-version-keyed
         // caches (PlanCache, the per-tenant system-catalog cache) invalidate on
@@ -563,9 +858,7 @@ impl CollectionService {
         // too, keyed by the default bucket reads use.
         if response.success {
             let tenant = Self::version_tenant(tenant_context);
-            let version = crate::catalog::CorpusVersionRegistry::global()
-                .bump(tenant, collection_name)
-                .await;
+            let version = Self::bump_corpus_versions(tenant, collection_name).await;
             debug!(
                 "🔄 corpus_version bumped after delete: tenant={} collection={} version={}",
                 tenant, collection_name, version
@@ -585,6 +878,7 @@ impl CollectionService {
         name: &str,
         dimension: u32,
         tenant_context: Option<&crate::storage::tenant::TenantContext>,
+        request_tenant: Option<&str>,
         promote_keys: &[String],
     ) -> Result<()> {
         // P-Shred follow-up (ADR-055): declared hot keys become filterable columns (typed, id >= 100
@@ -601,7 +895,7 @@ impl CollectionService {
                 ..Default::default()
             })
             .collect();
-        let config = CollectionConfig {
+        let mut config = CollectionConfig {
             name: name.to_string(),
             dimension,
             storage_engine: Some(StorageEngine::Sst as i32),
@@ -609,6 +903,10 @@ impl CollectionService {
             filterable_columns,
             ..Default::default()
         };
+        // Record the requesting tenant as owner.
+        if let Some(tenant) = request_tenant {
+            proximadb_tenant::stamp_collection_owner(&mut config, tenant);
+        }
         let resp = self
             .create_collection_with_tenant_context(&config, tenant_context)
             .await?;
@@ -682,6 +980,16 @@ impl CollectionService {
 
         let mut enriched_config = config.clone();
 
+        // TD-TIER-1 SC1: validate the desired storage class at admission on
+        // every facade path (REST strings are pre-parsed by the facade; gRPC /
+        // Flight / SQL reach here with the raw enum number, which prost
+        // preserves intact). Unknown ⇒ error; absent/UNSPECIFIED ⇒ balanced,
+        // persisted explicitly below so reads echo one vocabulary.
+        let resolved_storage_class =
+            crate::services::collection::storage_class::validate_storage_class_raw(
+                enriched_config.storage_class,
+            )?;
+
         // Persist an explicit default metric so every downstream subsystem
         // sees the same collection semantics instead of applying its own fallback.
         let resolved_distance_metric = enriched_config
@@ -726,6 +1034,10 @@ impl CollectionService {
         })?;
         let previous_engine_field = enriched_config.storage_engine;
         enriched_config.storage_engine = Some(selected_engine as i32);
+        // Persist the RESOLVED class (absent/UNSPECIFIED ⇒ BALANCED) so every
+        // read path and the catalog round-trip see one vocabulary; pre-SC1
+        // records keep their absent field and resolve balanced on read.
+        enriched_config.storage_class = Some(resolved_storage_class as i32);
         tracing::info!(
             target: "collection.engine_selector",
             collection = %enriched_config.name,
@@ -786,26 +1098,15 @@ impl CollectionService {
 
         // Resolve compression and storage configuration
 
-        // NEW: Add tenant metadata to collection if tenant context is provided
+        // Record the owning tenant on the collection (the one ownership rule,
+        // `proximadb_tenant::ownership`). The port-level create stamps the
+        // request tenant even without a tenant context; this covers callers
+        // that pass a context.
         if let Some(tenant_ctx) = tenant_context {
-            enriched_config
-                .tags
-                .retain(|tag| !tag.starts_with("tenant:") && tag != "tenant_isolated:true");
-
-            // Add tenant ID to collection tags for tenant isolation (metadata field doesn't exist)
-            enriched_config
-                .tags
-                .push(format!("tenant:{}", tenant_ctx.tenant_id));
-            enriched_config
-                .tags
-                .push("tenant_isolated:true".to_string());
+            proximadb_tenant::stamp_collection_owner(&mut enriched_config, &tenant_ctx.tenant_id);
             enriched_config
                 .tags
                 .push(format!("created_at:{}", chrono::Utc::now().to_rfc3339()));
-
-            // Set owner field if available
-            enriched_config.owner = Some(tenant_ctx.tenant_id.clone());
-
             debug!(
                 "✅ Added tenant metadata to collection: tenant_id={}",
                 tenant_ctx.tenant_id
@@ -1107,6 +1408,21 @@ impl CollectionService {
                 .clone()
         };
 
+        // TD-TIER-1 SC2: admission runs on the final RESOLVED placement — the
+        // client's explicit storage_path, or the operator-CONFIGURED location
+        // chosen above — plus the resolved engine and the requesting tenant,
+        // and BEFORE any side effects (identity minting, directory creation).
+        // A configured remote default is admissible; another tenant's explicit
+        // prefix is not; anything not object-store-backed on the PAX path is
+        // rejected with an actionable message, never silently degraded.
+        let admission_tenant_id = tenant_context.map(|ctx| ctx.tenant_id.as_str());
+        crate::services::collection::storage_class::check_performance_admission(
+            &enriched_config,
+            selected_engine,
+            &base_location,
+            admission_tenant_id,
+        )?;
+
         // ADR-031 Phase 4c: pre-mint the typed collection identity
         // `(account, namespace, collection)` BEFORE storage-dir creation, so the
         // DATA/WAL/index dirs are created at the typed account-rooted path
@@ -1128,9 +1444,64 @@ impl CollectionService {
             .mint_typed_identity_for_collection(tenant_context, &enriched_config.name, &uuid)
             .await;
 
+        // TD-TIER-1 SC3-2: a PERFORMANCE create acquires its reservation from
+        // the default pool before any collection-KEYED durable side effect
+        // (directories, catalog upsert): a refused admission leaves the
+        // request rejected with the old policy unchanged — the pool ledger is
+        // the durable record of what was granted, keyed (tenant, collection
+        // uuid). The key tenant is the same default-folding `version_tenant`
+        // uses (never the empty string — an empty tenant id is rejected by the
+        // metering path resolver, so it must never reach a grant). Kill-switch
+        // and pool misconfiguration surface as actionable errors here, never a
+        // silent zero-byte grant. Non-PERFORMANCE classes and an empty pool
+        // list skip this seam entirely. If a later create step fails, the
+        // compensation below releases the grant: a leaked grant would charge
+        // capacity and accrue billing for a collection that never existed.
+        let mut reserved_grant =
+            crate::services::collection::reservation::GrantCompensation::none();
+        if crate::services::collection::storage_class::storage_class_or_balanced(&enriched_config)
+            == crate::proto::proximadb_v1::StorageClass::Performance
+            && let Some(registry) = &self.reservations
+        {
+            let reservation_tenant = Self::version_tenant(tenant_context).to_string();
+            // SC4-2: the grant protects the collection's segment roots — built
+            // from the same tenant-scoped base the storage assignment records
+            // below, so the prefixes match what flush/compaction publish.
+            let protect_base = match tenant_context.map(|ctx| ctx.tenant_id.as_str()) {
+                Some(tid) => StoragePath::tenant_root_path(&base_location, tid),
+                None => base_location.clone(),
+            };
+            let protect_prefixes = crate::services::collection::storage_class::residency_prefixes(
+                &protect_base,
+                &uuid,
+                typed_identity,
+            );
+            reserved_grant = crate::services::collection::reservation::GrantCompensation::reserve(
+                registry,
+                reservation_tenant,
+                uuid.clone(),
+                chrono::Utc::now().timestamp(),
+                &protect_prefixes,
+            );
+            reserved_grant
+                .committed()
+                .await
+                .context("TD-TIER-1 SC3: PERFORMANCE admission refused")?;
+        }
+        // Compensating release for every early exit after a successful
+        // reserve (review B1: the grant must not outlive a failed create). A
+        // DROPPED create future (client disconnect) releases too: the guard's
+        // Drop spawns the release (SC4-3 review S3); it is disarmed once the
+        // catalog record — the collection's existence — is durable.
+        macro_rules! compensate_reservation {
+            () => {
+                reserved_grant.release_now().await;
+            };
+        }
+
         // Create storage directories (tenant-isolated if multi-tenant mode)
         let tenant_id = tenant_context.map(|ctx| ctx.tenant_id.as_str());
-        let _storage_created = self
+        let _storage_created = match self
             .create_storage_directories(
                 &base_location,
                 &enriched_config.name,
@@ -1141,7 +1512,13 @@ impl CollectionService {
                 ),
             )
             .await
-            .context("Failed to create storage directories")?;
+        {
+            Ok(created) => created,
+            Err(e) => {
+                compensate_reservation!();
+                return Err(e.context("Failed to create storage directories"));
+            }
+        };
 
         // Build tenant-prefixed base location for storage assignment
         let tenant_base_location = match tenant_id {
@@ -1166,6 +1543,9 @@ impl CollectionService {
 
         // Create proto collection with stats and storage assignment
         let proto_collection = Collection {
+            storage_class_status: Some(
+                crate::services::collection::storage_class::storage_class_status(&enriched_config),
+            ),
             id: uuid.clone(),
             config: Some(enriched_config.clone()), // Use enriched config with compression
             stats: Some(crate::proto::proximadb_v1::CollectionStats {
@@ -1194,11 +1574,13 @@ impl CollectionService {
             .upsert_collection_catalog_asset(&proto_collection, typed_identity)
             .await
         {
+            compensate_reservation!();
             return Ok(CollectionServiceResponse::error(
                 format!("CATALOG_CREATE_FAILED: {}", e),
                 start_time.elapsed().as_micros() as i64,
             ));
         }
+        reserved_grant.disarm();
 
         // The catalog asset write above is the sole authoritative store for the
         // collection; the legacy metadata backend is no longer dual-written.
@@ -1225,9 +1607,7 @@ impl CollectionService {
         // this bump — gets superseded immediately.
         {
             let tenant = Self::version_tenant(tenant_context);
-            let version = crate::catalog::CorpusVersionRegistry::global()
-                .bump(tenant, &config.name)
-                .await;
+            let version = Self::bump_corpus_versions(tenant, &config.name).await;
             debug!(
                 "🔄 corpus_version bumped after create: tenant={} collection={} version={}",
                 tenant, config.name, version
@@ -1624,6 +2004,30 @@ impl CollectionService {
                 ));
             }
 
+            // TD-TIER-1 SC3-2 (review SF3): release the reservation HERE —
+            // keyed by the record THIS delete actually removed, so every
+            // caller (the tenant-aware wrapper, the embedded bindings) is
+            // covered and a delete-vs-recreate race cannot key the wrong
+            // incarnation. Both the record's owner and the default tenant are
+            // released (idempotent): create folds its key the same way, and
+            // the tail billing interval parks for the metering tick.
+            if let Some(registry) = &self.reservations {
+                let now = chrono::Utc::now().timestamp();
+                let owner = record
+                    .config
+                    .as_ref()
+                    .and_then(|cfg| cfg.owner.clone())
+                    .filter(|owner| !owner.is_empty());
+                if let Some(owner) = owner.as_deref() {
+                    registry
+                        .release_for_collection(owner, &collection_uuid, now)
+                        .await;
+                }
+                registry
+                    .release_for_collection(Self::DEFAULT_VERSION_TENANT, &collection_uuid, now)
+                    .await;
+            }
+
             let deleted = true;
 
             if deleted {
@@ -1669,6 +2073,11 @@ impl CollectionService {
         vector_delta: i64,
         size_delta: i64,
     ) -> Result<()> {
+        // SF2 (SC3-2b review): this is a full-record read-modify-write of the
+        // catalog asset — without the RMW lock it interleaves with
+        // update_collection's policy mutation and silently reverts a
+        // persisted class change while its grant stays live.
+        let _rmw = COLLECTION_CONFIG_RMW.lock().await;
         debug!(
             "📊 Updating stats for {}: vectors={:+}, size={:+}",
             collection_name, vector_delta, size_delta
@@ -1763,6 +2172,9 @@ impl CollectionService {
     ) -> Result<CollectionServiceResponse> {
         info!("📝 Updating collection: {}", identifier);
         let start_time = std::time::Instant::now();
+        // One read-modify-write at a time (shared with the owner backfill), so
+        // the recorded owner carried over below is the current one.
+        let _rmw = COLLECTION_CONFIG_RMW.lock().await;
 
         // Get current record (supports both names and UUIDs) through xCatalog first.
         let mut record = match self.collection(identifier).await? {
@@ -1778,6 +2190,14 @@ impl CollectionService {
             }
         };
         let previous_record = record.clone();
+
+        // TD-TIER-1 SC3-2b: pending grant side effect of a class change —
+        // `Some(true)` = reserve after persist, `Some(false)` = release.
+        // Applied only after the durable upsert succeeds.
+        let mut policy_side_effect: Option<bool> = None;
+        // SF1: a post-persist reserve failure surfaces here (policy durable,
+        // grant missing) instead of a quiet success.
+        let mut reservation_pending: Option<String> = None;
 
         // Apply updates using native proto types
         if let Some(new_config) = config_update {
@@ -1824,18 +2244,162 @@ impl CollectionService {
                 if new_config.description.is_some() {
                     existing_config.description = new_config.description;
                 }
+                // TD-TIER-1 SC2: durable placement is resolved at create; a
+                // later storage-path change is a migration, not a config
+                // patch. It used to be silently dropped by this merge — now
+                // it is an actionable rejection.
+                if let Some(new_storage) = new_config.storage_config.as_ref()
+                    && let Some(new_path) = new_storage.storage_path.as_deref()
+                    && new_path
+                        != existing_config
+                            .storage_config
+                            .as_ref()
+                            .and_then(|s| s.storage_path.as_deref())
+                            .unwrap_or_default()
+                {
+                    return Err(anyhow::anyhow!(
+                        "storage_config.storage_path cannot be changed after create \
+                         ('{new_path}'): durable placement is immutable in v1; recreate \
+                         the collection at the new location to migrate it"
+                    ));
+                }
+                // TD-TIER-1 SC3-2b: the policy-mutation surface. A different
+                // class is RE-ADMITTED, not rejected: entry to PERFORMANCE
+                // re-runs the SC2 placement floor on the EXISTING resolved
+                // placement and PEEKS the reservation registry (default pool
+                // resolvable + armed + kill switch off) BEFORE the config
+                // persists — a refused update keeps the old policy unchanged.
+                // The grant side effects (reserve/release) apply only AFTER
+                // the catalog upsert succeeds, so a failed update can never
+                // orphan a grant (the create-path lesson, applied here). A
+                // same-value re-apply is an idempotent no-op (no generation
+                // bump); an unknown enum number is rejected on every facade;
+                // an omitted field (or UNSPECIFIED) preserves the recorded
+                // class.
+                if let Some(raw_class) = new_config.storage_class
+                    && raw_class != 0
+                {
+                    let resolved =
+                        crate::services::collection::storage_class::validate_storage_class_raw(
+                            Some(raw_class),
+                        )?;
+                    let recorded =
+                        crate::services::collection::storage_class::storage_class_or_balanced(
+                            existing_config,
+                        );
+                    if resolved != recorded {
+                        if resolved == crate::proto::proximadb_v1::StorageClass::Performance {
+                            // SC2 floor on the existing placement: the same
+                            // checks create runs, against the placement this
+                            // collection already has (durable placement is
+                            // immutable, so create-time admissibility carries).
+                            let mut prospective_config = existing_config.clone();
+                            prospective_config.storage_class = Some(resolved as i32);
+                            let engine = previous_record
+                                .storage_assignment
+                                .as_ref()
+                                .and_then(|a| {
+                                    crate::proto::proximadb_v1::StorageEngine::try_from(a.engine)
+                                        .ok()
+                                })
+                                .or_else(|| {
+                                    existing_config.storage_engine.and_then(|e| {
+                                        crate::proto::proximadb_v1::StorageEngine::try_from(e).ok()
+                                    })
+                                })
+                                .unwrap_or(crate::proto::proximadb_v1::StorageEngine::Sst);
+                            let base = previous_record
+                                .storage_assignment
+                                .as_ref()
+                                .map(|a| a.base_location.clone())
+                                .unwrap_or_default();
+                            let owner = previous_record
+                                .config
+                                .as_ref()
+                                .and_then(|cfg| cfg.owner.clone())
+                                .filter(|owner| !owner.is_empty());
+                            let admission_tenant = owner.as_deref().map(str::to_string);
+                            crate::services::collection::storage_class::check_performance_admission(
+                                &prospective_config,
+                                engine,
+                                &base,
+                                admission_tenant.as_deref(),
+                            )?;
+                            // Registry peek (no side effects): an unarmed or
+                            // kill-switched pool refuses BEFORE the config
+                            // persists. `self.reservations = None` (no pools
+                            // declared) also refuses — PERFORMANCE without a
+                            // reservation admission would be a silent lie.
+                            match &self.reservations {
+                                Some(registry) => registry.peek_performance_admission().await?,
+                                None => {
+                                    return Err(anyhow::anyhow!(
+                                        "storage_class 'performance' requires a \
+                                         configured reservation pool: none is declared \
+                                         ([storage.reservation_pools]); the update is \
+                                         refused and the recorded policy is unchanged"
+                                    ));
+                                }
+                            }
+                        }
+                        // Commit the class change + monotonic generation bump
+                        // in-memory; the grant side effect applies after the
+                        // durable upsert below.
+                        let generation =
+                            crate::services::collection::storage_class::policy_generation_or_legacy(
+                                existing_config,
+                            );
+                        existing_config.policy_generation =
+                            Some(u32::try_from(generation.saturating_add(1)).unwrap_or(u32::MAX));
+                        existing_config.storage_class = Some(resolved as i32);
+                        policy_side_effect =
+                            Some(resolved == crate::proto::proximadb_v1::StorageClass::Performance);
+                    }
+                }
                 if !new_config.tags.is_empty() {
                     existing_config.tags = new_config.tags;
                 }
                 if new_config.owner.is_some() {
                     existing_config.owner = new_config.owner;
                 }
-                if !new_config.filterable_columns.is_empty() {
-                    existing_config.filterable_columns = new_config.filterable_columns;
+                // Ownership is not client-updatable: keep the recorded owner
+                // signals exactly as they were.
+                if let Some(previous) = previous_record.config.as_ref() {
+                    proximadb_tenant::ownership::carry_over_owner(previous, existing_config);
+                }
+                // TD-CATREPLACE-1: a schema update (marked by the record-schema
+                // block `apply_schema_update` always sets) carries the
+                // authoritative FULL list — replace it even when empty, so a
+                // removed filterable column stops being served. A raw config
+                // patch without that intent — including one that only flips
+                // `enable_proxima_record` — keeps the legacy non-empty merge.
+                let schema_update_intent = new_config.record_schema.is_some();
+                if schema_update_intent || !new_config.filterable_columns.is_empty() {
+                    existing_config.filterable_columns = new_config.filterable_columns.clone();
+                }
+                // TD-GRPCSCHEMA-2: a schema update carries the authoritative
+                // record-mode block too — before, the merge DROPPED
+                // `enable_proxima_record`/`record_schema` (and the text-column
+                // projection), so record mode could never be enabled after
+                // create, no matter how many schema updates ran.
+                if schema_update_intent {
+                    existing_config.enable_proxima_record = new_config.enable_proxima_record;
+                    existing_config.record_schema = new_config.record_schema.clone();
+                    existing_config.text_columns = new_config.text_columns.clone();
+                    existing_config.text_storage_configs = new_config.text_storage_configs.clone();
                 }
                 // Add other fields as needed
             } else {
-                // No existing config, use the new one
+                // No existing config: use the new one, but a storage class
+                // cannot ride this defensive branch — it would bypass the
+                // entire policy surface (SC2 floor, registry peek,
+                // generation, grant effects). Refuse it explicitly.
+                if new_config.storage_class.is_some_and(|class| class != 0) {
+                    return Err(anyhow::anyhow!(
+                        "storage_class cannot be set on a record without a \
+                         recorded config; recreate the collection instead"
+                    ));
+                }
                 record.config = Some(new_config);
             }
         }
@@ -1857,6 +2421,71 @@ impl CollectionService {
         self.upsert_collection_catalog_asset(&record, None)
             .await
             .context("Failed to update collection catalog metadata")?;
+
+        // TD-TIER-1 SC3-2b: the policy is durable — now apply the grant side
+        // effect. Entry's reserve failure here is a recorded SC4
+        // reconciliation residual (policy persisted as performance without a
+        // grant; status stays NOT_ACTIVE and re-admission heals it) — the
+        // inverse ordering (grant before persist) could ORPHAN a grant,
+        // which is strictly worse.
+        if let Some(to_performance) = policy_side_effect
+            && let Some(registry) = &self.reservations
+        {
+            let collection_id = previous_record.id.clone();
+            let owner = previous_record
+                .config
+                .as_ref()
+                .and_then(|cfg| cfg.owner.clone())
+                .filter(|owner| !owner.is_empty());
+            let now = chrono::Utc::now().timestamp();
+            if to_performance {
+                let tenant = owner.unwrap_or_else(|| Self::DEFAULT_VERSION_TENANT.to_string());
+                // SC4-2: protection prefixes from the record's own storage
+                // assignment (the exact base + typed triple flush uses).
+                let protect_prefixes = previous_record
+                    .storage_assignment
+                    .as_ref()
+                    .map(|sa| {
+                        crate::services::collection::storage_class::residency_prefixes(
+                            &sa.base_location,
+                            &collection_id,
+                            crate::storage::trait_components::path_resolver::typed_identity_from_storage_assignment(
+                                Some(sa),
+                            ),
+                        )
+                    })
+                    .unwrap_or_default();
+                if protect_prefixes.is_empty() {
+                    warn!(
+                        "TD-TIER-1 SC4: collection {collection_id} has no storage assignment; \
+                         its grant charges capacity but protects no cached data"
+                    );
+                }
+                if let Err(error) = registry
+                    .reserve_for_performance(&tenant, &collection_id, now, &protect_prefixes)
+                    .await
+                {
+                    // The policy is durable but unreserved (peek→reserve
+                    // window): the caller must SEE it, not just the log —
+                    // success stays true (the update persisted) with an
+                    // explicit error_code.
+                    warn!(
+                        "TD-TIER-1 SC3: post-persist reserve failed for {collection_id}: \
+                         {error} (policy recorded; SC4 reconciliation re-admits)"
+                    );
+                    reservation_pending = Some(error.to_string());
+                }
+            } else {
+                if let Some(owner) = owner.as_deref() {
+                    registry
+                        .release_for_collection(owner, &collection_id, now)
+                        .await;
+                }
+                registry
+                    .release_for_collection(Self::DEFAULT_VERSION_TENANT, &collection_id, now)
+                    .await;
+            }
+        }
 
         info!(
             "✅ Collection updated: {} in {}μs",
@@ -1884,6 +2513,13 @@ impl CollectionService {
                 .await;
         }
 
+        // NIT6: recompute the status projection so the response carries the
+        // NEW class's status, not the read-time snapshot.
+        if let Some(config) = record.config.as_ref() {
+            record.storage_class_status =
+                Some(crate::services::collection::storage_class::storage_class_status(config));
+        }
+
         // Record is already a proto Collection, no conversion needed
         let collection = record;
 
@@ -1892,7 +2528,8 @@ impl CollectionService {
             collection: Some(collection),
             storage_path: None,
             // error_message removed -  None,
-            error_code: None,
+            error_code: reservation_pending
+                .map(|message| format!("RESERVATION_ADMISSION_PENDING: {message}")),
             processing_time_us: start_time.elapsed().as_micros() as i64,
         })
     }
@@ -1951,6 +2588,10 @@ impl CollectionService {
         compression: &crate::proto::proximadb_v1::CompressionConfig,
     ) -> Result<CollectionServiceResponse> {
         let start_time = std::time::Instant::now();
+        // SF2 (SC3-2b review): same full-record RMW discipline as
+        // update_stats/update_collection — the policy mutation's ordering
+        // contract rests on one writer at a time.
+        let _rmw = COLLECTION_CONFIG_RMW.lock().await;
 
         // Get existing collection
         let collection = match self.collection(identifier).await? {
@@ -2336,11 +2977,19 @@ impl CollectionService {
             // (`PROXIMADB_INDEX_CATALOG_PATHS`), and catalog asset paths are still
             // flat/name-keyed — so this records identity now for the
             // tenant-prefixed-paths slice (TD-CAT-2b) without shifting any path.
+            // Without tenant-prefixed namespaces (TD-CAT-2b gate off) a
+            // namespace is shared by every tenant's collections, so it records
+            // no single owner even though the collection itself does.
+            let namespace_tenant = if self.tenant_namespaces_on() {
+                Self::collection_tenant_id(collection)
+            } else {
+                None
+            };
             catalog
                 .create_namespace_for_tenant(
                     &identifier.namespace,
                     std::collections::HashMap::new(),
-                    Self::collection_tenant_id(collection).as_deref(),
+                    namespace_tenant.as_deref(),
                 )
                 .await?;
         }
@@ -2388,14 +3037,12 @@ impl CollectionService {
                 .properties
                 .get(crate::storage::metadata::collection_mapping::CANONICAL_SCHEMA_PROPERTY)
                 .cloned();
-            preserved_canonical_columns = existing
-                .columns
-                .iter()
-                .filter(|c| {
-                    c.id >= crate::storage::metadata::collection_mapping::CANONICAL_COLUMN_ID_BASE
-                })
-                .cloned()
-                .collect();
+            // TD-GRPCCREATE-1: include declarations folded into reserved columns,
+            // which the rebuild below would otherwise lose.
+            preserved_canonical_columns =
+                crate::storage::metadata::collection_mapping::declared_canonical_columns(
+                    &existing.columns,
+                );
             if existing
                 .properties
                 .get("asset.kind")
@@ -2404,6 +3051,10 @@ impl CollectionService {
                 existing
                     .properties
                     .insert("asset.kind".to_string(), "collection".to_string());
+                existing.properties.insert(
+                    proximadb_catalog::table_properties::COLLECTION_PROVENANCE_PROPERTY.to_string(),
+                    proximadb_catalog::table_properties::COLLECTION_PROVENANCE_VALUE.to_string(),
+                );
                 existing
                     .properties
                     .insert("asset.capability.vector".to_string(), "true".to_string());
@@ -2424,12 +3075,22 @@ impl CollectionService {
                     existing.location = schema.location.clone();
                 }
 
-                let _ = catalog.drop_table(&identifier, false).await?;
-                catalog.create_table(&identifier, existing).await?;
+                // TD-GRPCCREATE-1 validates first; TD-CATREPLACE-1 replaces in
+                // place — no drop window in which the collection has no table.
+                catalog.replace_table(&identifier, existing).await?;
                 return Ok(());
             }
-
-            let _ = catalog.drop_table(&identifier, false).await?;
+        }
+        // TD-GRPCCREATE-1: the rebuilt reserved band can now hold a name the
+        // declared schema also has (a column turned filterable). Merge with the
+        // same rule as `set_collection_schema_columns`, and validate BEFORE
+        // dropping the existing table: a rejected schema must never cost the
+        // collection its table.
+        if !preserved_canonical_columns.is_empty() {
+            crate::storage::metadata::collection_mapping::merge_canonical_band(
+                &mut schema,
+                preserved_canonical_columns,
+            )?;
         }
         if let Some(canonical) = preserved_canonical_schema {
             schema.properties.insert(
@@ -2437,10 +3098,9 @@ impl CollectionService {
                 canonical,
             );
         }
-        if !preserved_canonical_columns.is_empty() {
-            schema.columns.extend(preserved_canonical_columns);
-        }
-        catalog.create_table(&identifier, schema).await?;
+        // TD-GRPCCREATE-1 validates first (inside replace_table);
+        // TD-CATREPLACE-1 replaces in place — no drop window.
+        catalog.replace_table(&identifier, schema).await?;
         Ok(())
     }
 
@@ -2622,12 +3282,14 @@ async fn read_collection_asset(
         && catalog.table_exists(&table_id).await.unwrap_or(false)
     {
         let schema = catalog.get_table(&table_id).await?;
-        if let Some(collection) =
-            crate::storage::metadata::collection_mapping::collection_from_catalog_schema(
-                &table_id, &schema,
-            )?
-        {
-            return Ok(Some(collection));
+        match crate::storage::metadata::collection_mapping::collection_from_catalog_schema(
+            &table_id, &schema,
+        ) {
+            Ok(Some(collection)) => return Ok(Some(collection)),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(table = ?table_id, %error, "unreadable collection catalog entry; skipped");
+            }
         }
     }
 
@@ -2667,8 +3329,7 @@ async fn read_collections_from_catalog(
         namespaces.push(vec!["default".to_string()]);
     }
 
-    let mut collections = Vec::new();
-    let mut seen_ids = HashSet::new();
+    let mut collections: Vec<Collection> = Vec::new();
     for namespace in namespaces {
         let table_ids = match catalog.list_tables(&namespace).await {
             Ok(table_ids) => table_ids,
@@ -2680,18 +3341,43 @@ async fn read_collections_from_catalog(
                 Ok(schema) => schema,
                 Err(_) => continue,
             };
-            let Some(collection) =
-                crate::storage::metadata::collection_mapping::collection_from_catalog_schema(
+            // One unreadable entry never takes down the listing (or startup).
+            let collection =
+                match crate::storage::metadata::collection_mapping::collection_from_catalog_schema(
                     &table_id, &schema,
-                )?
-            else {
-                continue;
-            };
-            if seen_ids.insert(collection.id.clone()) {
-                collections.push(collection);
-            }
+                ) {
+                    Ok(Some(collection)) => collection,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::error!(table = ?table_id, %error, "unreadable collection catalog entry; skipped");
+                        continue;
+                    }
+                };
+            collections.push(collection);
         }
     }
+
+    // Entries that claim the same collection id must agree on its owner; if
+    // they do not, none is trusted. Otherwise the first is used.
+    let mut owners: std::collections::HashMap<String, HashSet<Option<String>>> =
+        std::collections::HashMap::new();
+    for collection in &collections {
+        owners
+            .entry(collection.id.clone())
+            .or_default()
+            .insert(proximadb_tenant::effective_owner(collection));
+    }
+    let mut seen_ids = HashSet::new();
+    collections.retain(|collection| {
+        if owners.get(&collection.id).is_some_and(|set| set.len() > 1) {
+            tracing::error!(
+                collection = %collection.id,
+                "catalog entries record this collection id with different owners; none is used"
+            );
+            return false;
+        }
+        seen_ids.insert(collection.id.clone())
+    });
 
     Ok(collections)
 }
@@ -2856,19 +3542,21 @@ impl proximadb_storage_ports::CollectionMetadataPort for CollectionService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default tenant's request context (tenant-less callers act as it).
+    fn default_tenant_ctx() -> crate::storage::tenant::TenantContext {
+        crate::storage::tenant::TenantContext::for_tenant_id(proximadb_tenant::DEFAULT_TENANT)
+    }
     use crate::catalog::TableIdentifier;
     use crate::proto::proximadb_v1::CollectionConfig;
     use crate::proto::proximadb_v1::{FilterableDataType, IndexingAlgorithm};
 
-    #[tokio::test]
-    async fn test_collection_validation() -> Result<()> {
-        let service = CollectionService::new(StorageConfig::default())
-            .await
-            .context("Failed to create collection service for test")?;
-
-        // Valid config
-        let valid_config = CollectionConfig {
-            name: "valid_collection".to_string(),
+    /// The standard valid-collection preamble (dimension 128, metric 1,
+    /// engine SST, primary index "default") — the exact values the
+    /// exhaustive literals used; tests override what they exercise.
+    fn collection_config(name: &str) -> CollectionConfig {
+        CollectionConfig {
+            name: name.to_string(),
             embedding_config: None,
             dimension: 128,
             distance_metric: Some(1),
@@ -2892,7 +3580,204 @@ mod tests {
             permitted_principals: vec![],
             index_policy: None,
             pax_vector_quant: None,
+            storage_class: None,
+            policy_generation: None,
+        }
+    }
+
+    /// TD-GRPCSCHEMA-2: a schema update persists the record-mode block.
+    /// Before, `update_collection`'s field merge dropped `enable_proxima_record`
+    /// and `record_schema`, so record mode could never be enabled after create.
+    #[tokio::test]
+    async fn schema_update_persists_record_mode() -> Result<()> {
+        let (svc, mgr, _temp_dir) = service_in_tempdir().await?;
+
+        let name = "grpcschema2_record";
+        assert!(
+            svc.create_collection(&collection_config(name))
+                .await?
+                .success
+        );
+        let before = svc.collection(name).await?.expect("present");
+        assert_ne!(
+            before.config.as_ref().unwrap().enable_proxima_record,
+            Some(true),
+            "precondition: record mode is off after create"
+        );
+
+        let mut update = collection_config(name);
+        update.enable_proxima_record = Some(true);
+        update.record_schema = Some(crate::proto::proximadb_v1::RecordSchemaConfig {
+            schema_id: "s1".to_string(),
+            schema_version: "1".to_string(),
+            enforcement: 0,
+            auto_evolve: false,
+            columns: vec![],
+        });
+        assert!(svc.update_collection(name, Some(update)).await?.success);
+
+        let after = svc.collection(name).await?.expect("present");
+        let config = after.config.as_ref().unwrap();
+        assert_eq!(
+            config.enable_proxima_record,
+            Some(true),
+            "the record-mode switch must persist through the merge"
+        );
+        assert!(
+            config.record_schema.is_some(),
+            "the record-schema block must persist through the merge"
+        );
+        Ok(())
+    }
+
+    /// A collection service over a fresh native catalog in a tempdir.
+    async fn service_in_tempdir()
+    -> Result<(CollectionService, Arc<CatalogManager>, tempfile::TempDir)> {
+        let temp_dir = tempfile::tempdir()?;
+        let temp_path = format!("file://{}", temp_dir.path().display());
+        let mgr = Arc::new(CatalogManager::new());
+        mgr.create_native_catalog("default", &temp_path).await?;
+        let svc = CollectionService::new(StorageConfig::default())
+            .await?
+            .with_catalog_manager(mgr.clone());
+        Ok((svc, mgr, temp_dir))
+    }
+
+    /// TD-CATREPLACE-1: a schema update (the record-schema switch
+    /// `apply_schema_update` always sets) carries the authoritative FULL
+    /// filterable list — an empty list REMOVES the columns. Before, an empty
+    /// list was ignored, so a removed filterable column kept being served and
+    /// could not be retyped or removed afterwards.
+    #[tokio::test]
+    async fn schema_update_clears_filterable_columns_it_empties() -> Result<()> {
+        use crate::proto::proximadb_v1::{FilterableColumnSpec, FilterableDataType};
+
+        let (svc, mgr, _temp_dir) = service_in_tempdir().await?;
+
+        // The schema-update intent marker `apply_schema_update` always writes.
+        let record_schema = || crate::proto::proximadb_v1::RecordSchemaConfig {
+            schema_id: "s1".to_string(),
+            schema_version: "1".to_string(),
+            enforcement: 0,
+            auto_evolve: false,
+            columns: vec![],
         };
+        let int_x = || FilterableColumnSpec {
+            name: "x".to_string(),
+            data_type: FilterableDataType::FilterableInteger as i32,
+            indexed: true,
+            supports_range: true,
+            estimated_cardinality: None,
+        };
+        let mut config = collection_config("catreplace_removal");
+        config.filterable_columns = vec![int_x()];
+        assert!(svc.create_collection(&config).await?.success);
+
+        // A schema update that no longer declares `x` filterable — marked by
+        // the record-schema block `apply_schema_update` always sets (NOT by
+        // `enable_proxima_record`: a raw flag flip must not clear columns).
+        let mut update = collection_config("catreplace_removal");
+        update.filterable_columns = vec![];
+        update.enable_proxima_record = Some(true);
+        update.record_schema = Some(record_schema());
+        assert!(
+            svc.update_collection("catreplace_removal", Some(update))
+                .await?
+                .success
+        );
+
+        let after = svc
+            .collection("catreplace_removal")
+            .await?
+            .expect("collection present");
+        assert!(
+            after
+                .config
+                .as_ref()
+                .expect("config")
+                .filterable_columns
+                .is_empty(),
+            "an emptied filterable list must remove the columns, got {:?}",
+            after.config.as_ref().unwrap().filterable_columns
+        );
+
+        // A RAW flag flip (enable_proxima_record set, no record-schema block)
+        // must NOT clear the columns — only a schema update carries the
+        // authoritative list (review M3).
+        let mut restore = collection_config("catreplace_removal");
+        restore.filterable_columns = vec![int_x()];
+        restore.enable_proxima_record = Some(true);
+        assert!(
+            svc.update_collection("catreplace_removal", Some(restore))
+                .await?
+                .success
+        );
+        let mut flag_flip = collection_config("catreplace_removal");
+        flag_flip.filterable_columns = vec![];
+        flag_flip.enable_proxima_record = Some(true);
+        assert!(
+            svc.update_collection("catreplace_removal", Some(flag_flip))
+                .await?
+                .success
+        );
+        let after_flip = svc
+            .collection("catreplace_removal")
+            .await?
+            .expect("collection present");
+        assert_eq!(
+            after_flip.config.as_ref().unwrap().filterable_columns.len(),
+            1,
+            "a raw enable_proxima_record flip must keep the filterable columns"
+        );
+
+        // Clear it again via a schema update for the catalog-band assertions.
+        let mut clear = collection_config("catreplace_removal");
+        clear.filterable_columns = vec![];
+        clear.enable_proxima_record = Some(true);
+        clear.record_schema = Some(record_schema());
+        assert!(
+            svc.update_collection("catreplace_removal", Some(clear))
+                .await?
+                .success
+        );
+
+        // The catalog table's reserved filterable band follows.
+        // `get_catalog` (not the counted `default_catalog`): the anonymous-
+        // identity guard ratchets direct default-catalog uses in this file, and
+        // a test-side lookup must not spend one.
+        let catalog = mgr.get_catalog("default").await?;
+        let identifier = crate::storage::metadata::collection_mapping::collection_table_identifier(
+            after.config.as_ref().unwrap(),
+        );
+        let table = catalog.get_table(&identifier).await?;
+        // The reserved filterable band is ids [100, 200): assert by RANGE, not by a
+        // bound the column ids can never satisfy (round-2 review: the old `< 100`
+        // was vacuous — filterable columns start at 100).
+        let gone = !table.columns.iter().any(|c| {
+            c.name == "x"
+                && (100..crate::storage::metadata::collection_mapping::CANONICAL_COLUMN_ID_BASE)
+                    .contains(&c.id)
+        });
+        assert!(
+            gone,
+            "the reserved filterable column must be gone, got {:?}",
+            table
+                .columns
+                .iter()
+                .map(|c| (c.id, c.name.clone()))
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_collection_validation() -> Result<()> {
+        let service = CollectionService::new(StorageConfig::default())
+            .await
+            .context("Failed to create collection service for test")?;
+
+        // Valid config
+        let valid_config = collection_config("valid_collection");
 
         // Test create with valid config
         let result = service
@@ -2992,32 +3877,7 @@ mod tests {
         ];
 
         for (name, should_succeed, expected_error_code) in test_cases {
-            let config = CollectionConfig {
-                name: name.to_string(),
-                embedding_config: None,
-                dimension: 128,
-                distance_metric: Some(1),
-                storage_engine: Some(2), // SST — VIPER is no longer selectable for new collections (ADR-093 S2)
-                filterable_columns: vec![],
-                index_configs: vec![],
-                quantization: None,
-                primary_index: Some("default".to_string()),
-                auto_index_selection: Some(false),
-                description: Some("Test collection".to_string()),
-                tags: vec![],
-                owner: Some("test".to_string()),
-                embedding_models: vec![],
-                storage_config: None,
-                record_schema: None,
-                enable_proxima_record: None,
-                text_columns: vec![],
-                text_storage_configs: vec![],
-                enable_dual_use_embeddings: None,
-                canonical_embedding_precision: None,
-                permitted_principals: vec![],
-                index_policy: None,
-                pax_vector_quant: None,
-            };
+            let config = collection_config(name);
 
             let result = service
                 .create_collection(&config)
@@ -3120,7 +3980,7 @@ mod tests {
 
         // delete (tenant-less)
         service
-            .delete_collection_with_tenant_context(name, None)
+            .delete_collection_with_tenant_context(name, Some(&default_tenant_ctx()))
             .await
             .context("delete")?;
         let v_delete = CorpusVersionRegistry::global().current(tenant, name).await;
@@ -3263,7 +4123,7 @@ mod tests {
         // no longer matches → the next read must reflect the delete (None), not a
         // stale hit.
         service
-            .delete_collection_with_tenant_context(name, None)
+            .delete_collection_with_tenant_context(name, Some(&default_tenant_ctx()))
             .await
             .context("delete")?;
         assert!(
@@ -3329,8 +4189,9 @@ mod tests {
         Ok(())
     }
 
-    /// TD-CAT-2a (audit gap G6): creating a `tenant:`-tagged collection records
-    /// the owning tenant on the freshly-created namespace. The upsert routes
+    /// TD-CAT-2a (audit gap G6): with tenant-prefixed namespaces (TD-CAT-2b
+    /// gate on), creating a `tenant:`-tagged collection records the owning
+    /// tenant on the freshly-created namespace. The upsert routes
     /// through `create_namespace_for_tenant`, so the persisted
     /// `CatalogNamespace.tenant_id` carries the tenant derived by
     /// `collection_tenant_id` (the `tenant:` tag) — instead of the `None` the
@@ -3350,6 +4211,9 @@ mod tests {
             .await
             .context("service")?
             .with_catalog_manager(catalog_manager.clone());
+        // Owner recording applies to tenant-prefixed namespaces (TD-CAT-2b);
+        // a namespace shared by every tenant records no single owner.
+        service.set_tenant_namespaces_for_test(true);
 
         // A namespaced name → the upsert creates a brand-new namespace
         // `tdc2a_ns` (the tenant is recorded only on namespace creation, so the
@@ -3375,7 +4239,7 @@ mod tests {
             .await
             .context("default catalog")?;
         let ns = catalog
-            .get_namespace(&["tdc2a_ns".to_string()])
+            .get_namespace(&["acme".to_string(), "tdc2a_ns".to_string()])
             .await
             .context("get_namespace")?;
         assert_eq!(
@@ -3384,6 +4248,184 @@ mod tests {
             "the freshly-created namespace must record the owning tenant (TD-CAT-2a)"
         );
 
+        Ok(())
+    }
+
+    async fn service_with_catalog() -> Result<(CollectionService, tempfile::TempDir)> {
+        let temp_dir = tempfile::TempDir::new().context("temp dir")?;
+        let temp_path = format!("file://{}", temp_dir.path().display());
+        let catalog_manager = Arc::new(CatalogManager::new());
+        catalog_manager
+            .create_native_catalog("default", &temp_path)
+            .await
+            .context("xcatalog")?;
+        let service = CollectionService::new(StorageConfig::default())
+            .await
+            .context("service")?
+            .with_catalog_manager(catalog_manager);
+        Ok((service, temp_dir))
+    }
+
+    fn scope_config(name: &str) -> CollectionConfig {
+        CollectionConfig {
+            name: name.to_string(),
+            dimension: 4,
+            primary_index: Some("default".to_string()),
+            auto_index_selection: Some(false),
+            ..Default::default()
+        }
+    }
+
+    /// Collection resolution is scoped to the request tenant: a collection
+    /// created through the port records its creator as owner, resolves for that
+    /// tenant (by name and object id), and is absent for every other tenant —
+    /// in get, list, update and delete alike.
+    #[tokio::test]
+    async fn port_resolution_is_scoped_to_the_request_tenant() -> Result<()> {
+        use proximadb_runtime::CollectionPort;
+        let (service, _dir) = service_with_catalog().await?;
+        let created =
+            CollectionPort::create_collection(&service, scope_config("scope_acme"), Some("acme"))
+                .await
+                .context("create as acme")?;
+        assert_eq!(
+            proximadb_tenant::collection_owner(&created),
+            proximadb_tenant::CollectionOwner::Tenant("acme".into()),
+            "create records its owner"
+        );
+        for reference in ["scope_acme", created.id.as_str()] {
+            assert!(
+                CollectionPort::get_collection(&service, reference, Some("acme"))
+                    .await?
+                    .is_some()
+            );
+            assert!(
+                CollectionPort::get_collection(&service, reference, Some("globex"))
+                    .await?
+                    .is_none()
+            );
+            assert!(
+                CollectionPort::get_collection(&service, reference, None)
+                    .await?
+                    .is_none(),
+                "no tenant is denied"
+            );
+            assert!(
+                CollectionPort::get_collection_internal(&service, reference)
+                    .await?
+                    .is_some(),
+                "internal lookup"
+            );
+            assert!(
+                CollectionPort::get_collection(&service, reference, Some(""))
+                    .await?
+                    .is_none()
+            );
+        }
+        let names = |list: Vec<Collection>| {
+            list.into_iter()
+                .filter_map(|c| c.config.map(|cfg| cfg.name))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            names(CollectionPort::list_collections(&service, Some("acme")).await?)
+                .contains(&"scope_acme".to_string())
+        );
+        assert!(
+            !names(CollectionPort::list_collections(&service, Some("globex")).await?)
+                .contains(&"scope_acme".to_string())
+        );
+
+        // Update by another tenant behaves like a missing collection; an update
+        // by the owner cannot change the recorded owner.
+        let foreign_update = CollectionPort::update_collection(
+            &service,
+            "scope_acme",
+            CollectionConfig {
+                description: Some("x".into()),
+                ..Default::default()
+            },
+            Some("globex"),
+        )
+        .await;
+        assert!(foreign_update.is_err());
+        let updated = CollectionPort::update_collection(
+            &service,
+            "scope_acme",
+            CollectionConfig {
+                tags: vec!["tenant:globex".into()],
+                owner: Some("globex".into()),
+                ..Default::default()
+            },
+            Some("acme"),
+        )
+        .await?;
+        assert_eq!(
+            proximadb_tenant::collection_owner(&updated),
+            proximadb_tenant::CollectionOwner::Tenant("acme".into())
+        );
+        assert!(!CollectionPort::delete_collection(&service, "scope_acme", Some("globex")).await?);
+        assert!(
+            CollectionPort::get_collection(&service, "scope_acme", Some("acme"))
+                .await?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    /// A collection created before ownership was recorded belongs to the
+    /// default tenant only, until the owner backfill records its owner — and
+    /// the backfill never re-assigns an owned collection.
+    #[tokio::test]
+    async fn unattributed_collection_is_default_only_until_assigned() -> Result<()> {
+        use proximadb_runtime::CollectionPort;
+        let (service, _dir) = service_with_catalog().await?;
+        let legacy = service
+            .create_collection_with_tenant_context(&scope_config("scope_legacy"), None)
+            .await?
+            .collection
+            .context("created")?;
+        assert_eq!(
+            proximadb_tenant::collection_owner(&legacy),
+            proximadb_tenant::CollectionOwner::Unattributed
+        );
+        assert!(
+            CollectionPort::get_collection(&service, "scope_legacy", Some("default"))
+                .await?
+                .is_some()
+        );
+        assert!(
+            CollectionPort::get_collection(&service, "scope_legacy", Some("acme"))
+                .await?
+                .is_none()
+        );
+
+        assert!(
+            service
+                .assign_owner_if_unattributed("scope_legacy", "acme")
+                .await?
+        );
+        assert!(
+            CollectionPort::get_collection(&service, "scope_legacy", Some("acme"))
+                .await?
+                .is_some()
+        );
+        assert!(
+            CollectionPort::get_collection(&service, "scope_legacy", Some("default"))
+                .await?
+                .is_none()
+        );
+        assert!(
+            !service
+                .assign_owner_if_unattributed("scope_legacy", "globex")
+                .await?,
+            "never re-assigns"
+        );
+        assert!(
+            CollectionPort::get_collection(&service, "scope_legacy", Some("acme"))
+                .await?
+                .is_some()
+        );
         Ok(())
     }
 
@@ -3594,30 +4636,10 @@ mod tests {
         // the old 8-char floor.
         let name = "part";
         let config = CollectionConfig {
-            name: name.to_string(),
-            embedding_config: None,
             dimension: 16,
-            distance_metric: Some(1),
-            storage_engine: Some(2), // SST — VIPER is no longer selectable for new collections (ADR-093 S2)
-            filterable_columns: vec![],
-            index_configs: vec![],
-            quantization: None,
-            primary_index: Some("default".to_string()),
-            auto_index_selection: Some(false),
             description: None,
-            tags: vec![],
             owner: None,
-            embedding_models: vec![],
-            storage_config: None,
-            record_schema: None,
-            enable_proxima_record: None,
-            text_columns: vec![],
-            text_storage_configs: vec![],
-            enable_dual_use_embeddings: None,
-            canonical_embedding_precision: None,
-            permitted_principals: vec![],
-            index_policy: None,
-            pax_vector_quant: None,
+            ..collection_config(name)
         };
         let created = service.create_collection(&config).await.context("create")?;
         assert!(
@@ -3663,30 +4685,10 @@ mod tests {
             .with_catalog_manager(catalog_manager.clone());
 
         let config = CollectionConfig {
-            name: "metric_default_test".to_string(),
-            embedding_config: None,
-            dimension: 128,
             distance_metric: None,
             storage_engine: Some(StorageEngine::Sst as i32), // VIPER is no longer selectable for new collections (ADR-093 S2)
-            filterable_columns: vec![],
-            index_configs: vec![],
-            quantization: None,
             primary_index: None,
-            auto_index_selection: Some(false),
-            storage_config: None,
-            description: Some("Test collection".to_string()),
-            tags: vec![],
-            owner: Some("test".to_string()),
-            embedding_models: vec![],
-            record_schema: None,
-            enable_proxima_record: None,
-            text_columns: vec![],
-            text_storage_configs: vec![],
-            enable_dual_use_embeddings: None,
-            canonical_embedding_precision: None,
-            permitted_principals: vec![],
-            index_policy: None,
-            pax_vector_quant: None,
+            ..collection_config("metric_default_test")
         };
 
         let result = service.create_collection(&config).await?;
@@ -4056,7 +5058,7 @@ mod tests {
                 .success
         );
         svc_a
-            .set_collection_schema_columns(name, &columns, None)
+            .set_collection_schema_columns(name, &columns, Some("default"))
             .await
             .context("set canonical columns")?;
         drop(svc_a);
@@ -4074,7 +5076,7 @@ mod tests {
             .with_catalog_manager(mgr_b);
 
         let restored = svc_b
-            .get_collection_schema_columns(name, None)
+            .get_collection_schema_columns(name, Some("default"))
             .await
             .context("read canonical columns after restart")?
             .expect("canonical columns persisted across catalog restart");
@@ -4101,7 +5103,7 @@ mod tests {
         );
         assert_eq!(
             svc_b
-                .get_collection_schema_columns("canon_legacy", None)
+                .get_collection_schema_columns("canon_legacy", Some("default"))
                 .await?,
             None,
             "collection without a canonical sidecar returns None"
@@ -4142,7 +5144,7 @@ mod tests {
             canonical_col("u", ProximaType::UInt64),
             canonical_col("s", ProximaType::String),
         ];
-        svc.set_collection_schema_columns(name, &columns, None)
+        svc.set_collection_schema_columns(name, &columns, Some("default"))
             .await
             .context("set canonical columns")?;
 
@@ -4178,7 +5180,7 @@ mod tests {
 
         // And the trait read returns them.
         let restored = svc
-            .get_collection_schema_columns(name, None)
+            .get_collection_schema_columns(name, Some("default"))
             .await?
             .expect("typed columns read back");
         assert_eq!(restored, columns);
@@ -4231,17 +5233,17 @@ mod tests {
 
         // Transitional read returns the legacy sidecar.
         let restored = svc
-            .get_collection_schema_columns(name, None)
+            .get_collection_schema_columns(name, Some("default"))
             .await?
             .expect("transitional read of the legacy sidecar");
         assert_eq!(restored, columns);
 
         // A subsequent set migrates it to typed columns (property removed).
         let columns2 = vec![canonical_col("n", ProximaType::Int64)];
-        svc.set_collection_schema_columns(name, &columns2, None)
+        svc.set_collection_schema_columns(name, &columns2, Some("default"))
             .await?;
         let restored2 = svc
-            .get_collection_schema_columns(name, None)
+            .get_collection_schema_columns(name, Some("default"))
             .await?
             .expect("post-migration read");
         assert_eq!(restored2, columns2);
@@ -4297,7 +5299,7 @@ mod tests {
                 fields: vec![("a".to_string(), ProximaType::Int64)],
             },
         )];
-        svc.set_collection_schema_columns(name, &columns, None)
+        svc.set_collection_schema_columns(name, &columns, Some("default"))
             .await
             .context("set canonical columns")?;
 
@@ -4315,11 +5317,473 @@ mod tests {
         );
 
         let restored = svc
-            .get_collection_schema_columns(name, None)
+            .get_collection_schema_columns(name, Some("default"))
             .await
             .context("read canonical after update")?
             .expect("canonical sidecar survived unrelated update_collection");
         assert_eq!(restored, columns);
+
+        Ok(())
+    }
+
+    /// TD-TIER-1 SC1: absent storage class resolves BALANCED, persists
+    /// explicitly, and round-trips through the catalog with an ACTIVE status;
+    /// a pre-SC1 record (config_json without the field) decodes with the
+    /// field absent and reports generation 0.
+    #[tokio::test]
+    async fn storage_class_absent_resolves_balanced_and_round_trips() -> Result<()> {
+        use crate::proto::proximadb_v1::StorageClass;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().context("temp dir")?;
+        let temp_path = format!("file://{}", temp_dir.path().display());
+        let mgr = Arc::new(CatalogManager::new());
+        mgr.create_native_catalog("default", &temp_path)
+            .await
+            .context("create test catalog")?;
+        let svc = CollectionService::new(StorageConfig::default())
+            .await
+            .context("collection service")?
+            .with_catalog_manager(mgr);
+
+        let config = CollectionConfig {
+            name: "sc_balanced_default".to_string(),
+            dimension: 8,
+            primary_index: Some("default".to_string()),
+            auto_index_selection: Some(false),
+            ..Default::default()
+        };
+        assert!(
+            svc.create_collection(&config)
+                .await
+                .context("create collection")?
+                .success
+        );
+
+        let read_back = svc
+            .collection("sc_balanced_default")
+            .await?
+            .context("collection after create")?;
+        let read_config = read_back.config.context("config on read")?;
+        assert_eq!(
+            crate::services::collection::storage_class::storage_class_or_balanced(&read_config),
+            StorageClass::Balanced
+        );
+        assert_eq!(
+            read_config.storage_class,
+            Some(StorageClass::Balanced as i32)
+        );
+        let status = read_back
+            .storage_class_status
+            .context("status projection on read")?;
+        assert_eq!(
+            status.state,
+            crate::proto::proximadb_v1::storage_class_status::State::Active as i32
+        );
+        assert_eq!(status.policy_generation, 1);
+
+        // Restart: a NEW service instance over the SAME catalog URL replays
+        // the recorded class and status (durable round-trip).
+        let reopened_mgr = Arc::new(CatalogManager::new());
+        reopened_mgr
+            .create_native_catalog("default", &temp_path)
+            .await
+            .context("reopen test catalog")?;
+        let restarted = CollectionService::new(StorageConfig::default())
+            .await
+            .context("restarted collection service")?
+            .with_catalog_manager(reopened_mgr);
+        let after_restart = restarted
+            .collection("sc_balanced_default")
+            .await?
+            .context("collection after restart")?;
+        assert_eq!(
+            after_restart.config.context("config")?.storage_class,
+            Some(StorageClass::Balanced as i32)
+        );
+        assert_eq!(
+            after_restart
+                .storage_class_status
+                .context("status after restart")?
+                .state,
+            crate::proto::proximadb_v1::storage_class_status::State::Active as i32
+        );
+
+        // Pre-SC1 record: a config_json WITHOUT the field decodes with the
+        // field absent (serde default) and reports generation 0 — old assets
+        // serve unchanged.
+        let pre_sc1_json = r#"{"name":"legacy","dimension":8}"#;
+        let legacy: CollectionConfig =
+            serde_json::from_str(pre_sc1_json).context("decode pre-SC1 config")?;
+        assert_eq!(legacy.storage_class, None);
+        let legacy_status =
+            crate::services::collection::storage_class::storage_class_status(&legacy);
+        assert_eq!(legacy_status.policy_generation, 0);
+        assert_eq!(
+            legacy_status.state,
+            crate::proto::proximadb_v1::storage_class_status::State::Active as i32
+        );
+
+        Ok(())
+    }
+
+    /// TD-TIER-1 SC1: an unknown storage-class enum number is rejected at
+    /// create (fail-closed on every facade — gRPC/Flight reach here with the
+    /// raw number), never coerced to a default.
+    #[tokio::test]
+    async fn storage_class_unknown_number_rejected_on_create() -> Result<()> {
+        use crate::proto::proximadb_v1::StorageClass;
+        let service = CollectionService::new(StorageConfig::default())
+            .await
+            .context("collection service")?;
+        let config = CollectionConfig {
+            name: "sc_bad_number".to_string(),
+            dimension: 8,
+            storage_class: Some(99), // an unknown discriminant
+            ..Default::default()
+        };
+        let error = service
+            .create_collection(&config)
+            .await
+            .expect_err("unknown storage class number must be rejected");
+        assert!(error.to_string().contains("99"), "{error}");
+        Ok(())
+    }
+
+    /// TD-TIER-1 SC1/SC2: economy persists intent and reports NOT_ACTIVE with
+    /// a reason naming the missing dependency; performance is admitted only
+    /// with an object-store-backed SST placement (rejected with an actionable
+    /// message otherwise — never accepted and silently degraded).
+    #[tokio::test]
+    async fn economy_persists_intent_and_performance_requires_object_backed_sst() -> Result<()> {
+        use crate::proto::proximadb_v1::StorageClass;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().context("temp dir")?;
+        let temp_path = format!("file://{}", temp_dir.path().display());
+        let mgr = Arc::new(CatalogManager::new());
+        mgr.create_native_catalog("default", &temp_path)
+            .await
+            .context("create test catalog")?;
+        let svc = CollectionService::new(StorageConfig::default())
+            .await
+            .context("collection service")?
+            .with_catalog_manager(mgr);
+
+        // Economy: accepted, persisted, NOT_ACTIVE with a dependency-naming reason.
+        let economy = CollectionConfig {
+            name: "sc_economy".to_string(),
+            dimension: 8,
+            storage_class: Some(StorageClass::Economy as i32),
+            ..Default::default()
+        };
+        assert!(
+            svc.create_collection(&economy)
+                .await
+                .context("create economy collection")?
+                .success
+        );
+        let read_back = svc
+            .collection("sc_economy")
+            .await?
+            .context("economy read")?;
+        assert_eq!(
+            read_back.config.context("config")?.storage_class,
+            Some(StorageClass::Economy as i32)
+        );
+        let status = read_back.storage_class_status.context("status")?;
+        assert_eq!(
+            status.state,
+            crate::proto::proximadb_v1::storage_class_status::State::NotActive as i32
+        );
+        assert!(
+            status.reason.contains("SC4"),
+            "reason names the missing dependency: {}",
+            status.reason
+        );
+
+        // Performance without a storage path: rejected, naming the requirement.
+        let perf_no_path = CollectionConfig {
+            name: "sc_perf_no_path".to_string(),
+            dimension: 8,
+            storage_engine: Some(StorageEngine::Sst as i32),
+            storage_class: Some(StorageClass::Performance as i32),
+            ..Default::default()
+        };
+        let error = svc
+            .create_collection(&perf_no_path)
+            .await
+            .expect_err("performance over the local default location is rejected");
+        let message = error.to_string();
+        assert!(message.contains("object-store-backed"), "{message}");
+        assert!(message.contains("file://./data"), "{message}");
+
+        // Performance on a non-SST engine: rejected, naming the engine.
+        let perf_helix = CollectionConfig {
+            name: "sc_perf_helix".to_string(),
+            dimension: 8,
+            storage_engine: Some(StorageEngine::Helix as i32),
+            storage_class: Some(StorageClass::Performance as i32),
+            ..Default::default()
+        };
+        let error = svc
+            .create_collection(&perf_helix)
+            .await
+            .expect_err("performance on a non-PAX engine is rejected");
+        assert!(error.to_string().contains("SST"), "{error}");
+
+        // Performance with SST + an object-store path: ADMITTED. The
+        // in-process create then fails at storage-directory creation (no S3
+        // backend in the test process) — the assertion is that this failure
+        // is the environmental one, never a storage_class rejection: an
+        // admission failure would name the class/placement and fire BEFORE
+        // any side effect.
+        let perf_ok = CollectionConfig {
+            name: "sc_perf_ok".to_string(),
+            dimension: 8,
+            storage_engine: Some(StorageEngine::Sst as i32),
+            storage_class: Some(StorageClass::Performance as i32),
+            storage_config: Some(crate::proto::proximadb_v1::StorageConfig {
+                storage_path: Some("s3://bench/collections/sc_perf_ok".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = svc
+            .create_collection(&perf_ok)
+            .await
+            .expect_err("no S3 backend in-process: directories cannot be created")
+            .to_string();
+        assert!(
+            !error.contains("storage_class") && !error.contains("object-store-backed"),
+            "admission must have passed; got: {error}"
+        );
+        // The environmental signature: storage-directory creation over the
+        // object-store location (no S3 backend in-process).
+        assert!(error.contains("storage directories"), "{error}");
+
+        // Configured remote DEFAULT (no client path): admissible — the operator's
+        // configured location is the resolved placement and is authorized by
+        // construction (a bare default StorageConfig resolves to the local
+        // "file://./data" and is NOT admissible, per the arm above).
+        let remote_default_svc = CollectionService::new(StorageConfig {
+            storage_locations: vec![crate::core::config::StorageLocation {
+                url: "s3://bench/datasets".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await
+        .context("service with a configured remote location")?;
+        let perf_default = CollectionConfig {
+            name: "sc_perf_configured_default".to_string(),
+            dimension: 8,
+            storage_class: Some(StorageClass::Performance as i32),
+            ..Default::default()
+        };
+        // Admitted: the create fails only at storage-directory creation over
+        // the configured s3:// location (environmental), never at admission.
+        let error = remote_default_svc
+            .create_collection(&perf_default)
+            .await
+            .expect_err("no S3 backend in-process: directories cannot be created")
+            .to_string();
+        assert!(
+            !error.contains("storage_class") && !error.contains("object-store-backed"),
+            "admission must have passed; got: {error}"
+        );
+
+        // An explicit path under ANOTHER tenant's prefix is rejected for that
+        // tenant, at admission, on the resolved output.
+        let other_tenant_path = CollectionConfig {
+            name: "sc_perf_other_tenant".to_string(),
+            dimension: 8,
+            storage_engine: Some(StorageEngine::Sst as i32),
+            storage_class: Some(StorageClass::Performance as i32),
+            storage_config: Some(crate::proto::proximadb_v1::StorageConfig {
+                storage_path: Some("s3://bench/tenants/other-tenant/coll".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let ctx = crate::storage::tenant::TenantContext::for_tenant_id("acme");
+        let error = svc
+            .create_collection_with_tenant_context(&other_tenant_path, Some(&ctx))
+            .await
+            .expect_err("another tenant's prefix is rejected at admission");
+        let message = error.to_string();
+        assert!(message.contains("other-tenant"), "{message}");
+        assert!(message.contains("acme"), "{message}");
+
+        Ok(())
+    }
+
+    /// TD-TIER-1 SC1/SC2 update semantics: an unrelated update preserves the
+    /// recorded class (no silent reset); an unknown number is rejected; a
+    /// class change re-runs admission; and a storage-path mutation is
+    /// rejected as an immutable-placement change (it used to be silently
+    /// dropped by the merge).
+    #[tokio::test]
+    async fn update_collection_storage_class_semantics() -> Result<()> {
+        use crate::proto::proximadb_v1::StorageClass;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().context("temp dir")?;
+        let temp_path = format!("file://{}", temp_dir.path().display());
+        let mgr = Arc::new(CatalogManager::new());
+        mgr.create_native_catalog("default", &temp_path)
+            .await
+            .context("create test catalog")?;
+        let svc = CollectionService::new(StorageConfig::default())
+            .await
+            .context("collection service")?
+            .with_catalog_manager(mgr);
+
+        let config = CollectionConfig {
+            name: "sc_update".to_string(),
+            dimension: 8,
+            storage_class: Some(StorageClass::Economy as i32),
+            ..Default::default()
+        };
+        assert!(
+            svc.create_collection(&config)
+                .await
+                .context("create")?
+                .success
+        );
+
+        // Unrelated update (description only): class preserved.
+        let unrelated = CollectionConfig {
+            description: Some("tweaked".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            svc.update_collection("sc_update", Some(unrelated))
+                .await?
+                .success
+        );
+        let read_back = svc.collection("sc_update").await?.context("read")?;
+        assert_eq!(
+            read_back.config.context("config")?.storage_class,
+            Some(StorageClass::Economy as i32),
+            "an unrelated update must not reset the storage class"
+        );
+
+        // Unknown number on update: rejected.
+        let bad = CollectionConfig {
+            storage_class: Some(-7),
+            ..Default::default()
+        };
+        let error = svc
+            .update_collection("sc_update", Some(bad))
+            .await
+            .expect_err("unknown storage class number on update is rejected");
+        assert!(error.to_string().contains("-7"), "{error}");
+
+        // Same-value re-apply: an accepted idempotent no-op.
+        let same = CollectionConfig {
+            storage_class: Some(StorageClass::Economy as i32),
+            ..Default::default()
+        };
+        assert!(
+            svc.update_collection("sc_update", Some(same))
+                .await?
+                .success
+        );
+        let read_back = svc.collection("sc_update").await?.context("read")?;
+        assert_eq!(
+            read_back.config.context("config")?.storage_class,
+            Some(StorageClass::Economy as i32)
+        );
+
+        // SC3-2b: a DIFFERENT class is re-admitted, not rejected. Entry to
+        // PERFORMANCE re-runs the SC2 floor first: this collection's local
+        // placement (file://) is inadmissible, so the update is refused
+        // BEFORE the config persists — the recorded economy class survives.
+        // (A pool-less deployment refuses one step later, at the registry
+        // peek — covered by the registry's own gates.)
+        let perf = CollectionConfig {
+            storage_class: Some(StorageClass::Performance as i32),
+            ..Default::default()
+        };
+        let error = svc
+            .update_collection("sc_update", Some(perf))
+            .await
+            .expect_err("PERFORMANCE entry onto an inadmissible placement is refused");
+        let message = error.to_string();
+        assert!(message.contains("object-store-backed"), "{message}");
+        let read_back = svc.collection("sc_update").await?.context("read")?;
+        assert_eq!(
+            read_back.config.context("config")?.storage_class,
+            Some(StorageClass::Economy as i32),
+            "a refused class change must not alter the recorded class"
+        );
+
+        // economy → balanced: a real mutation through the surface — the
+        // class changes and the generation bumps monotonically (legacy
+        // heuristic is 1 for a class persisted at create ⇒ now 2).
+        let balanced = CollectionConfig {
+            storage_class: Some(StorageClass::Balanced as i32),
+            ..Default::default()
+        };
+        assert!(
+            svc.update_collection("sc_update", Some(balanced))
+                .await?
+                .success
+        );
+        let read_back = svc.collection("sc_update").await?.context("read")?;
+        let config = read_back.config.context("config")?;
+        assert_eq!(config.storage_class, Some(StorageClass::Balanced as i32));
+        assert_eq!(
+            config.policy_generation,
+            Some(2),
+            "an actual class change bumps the monotonic generation"
+        );
+
+        // balanced → economy: bumps again; same-value re-apply does not.
+        let economy = CollectionConfig {
+            storage_class: Some(StorageClass::Economy as i32),
+            ..Default::default()
+        };
+        assert!(
+            svc.update_collection("sc_update", Some(economy))
+                .await?
+                .success
+        );
+        let read_back = svc.collection("sc_update").await?.context("read")?;
+        assert_eq!(
+            read_back.config.context("config")?.policy_generation,
+            Some(3)
+        );
+        let same_again = CollectionConfig {
+            storage_class: Some(StorageClass::Economy as i32),
+            ..Default::default()
+        };
+        assert!(
+            svc.update_collection("sc_update", Some(same_again))
+                .await?
+                .success
+        );
+        let read_back = svc.collection("sc_update").await?.context("read")?;
+        assert_eq!(
+            read_back.config.context("config")?.policy_generation,
+            Some(3),
+            "a same-value re-apply does not bump the generation"
+        );
+
+        // Storage-path mutation: rejected as an immutable-placement change.
+        let move_config = CollectionConfig {
+            storage_config: Some(crate::proto::proximadb_v1::StorageConfig {
+                storage_path: Some("s3://other/place".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = svc
+            .update_collection("sc_update", Some(move_config))
+            .await
+            .expect_err("storage path mutation is rejected");
+        assert!(error.to_string().contains("cannot be changed"), "{error}");
 
         Ok(())
     }
@@ -4416,17 +5880,30 @@ impl proximadb_runtime::CollectionPort for CollectionService {
         identifier: &str,
         tenant_id: Option<&str>,
     ) -> anyhow::Result<Option<crate::proto::proximadb_v1::Collection>> {
-        let ctx = self.load_tenant_context(tenant_id)?;
-        self.get_collection_with_tenant_context(identifier, ctx.as_ref())
-            .await
+        self.collection_for_tenant(identifier, tenant_id).await
+    }
+
+    async fn enrich_collection_status(
+        &self,
+        collection: &mut crate::proto::proximadb_v1::Collection,
+    ) {
+        self.overlay_live_residency(collection).await;
     }
 
     async fn create_collection(
         &self,
-        config: crate::proto::proximadb_v1::CollectionConfig,
+        mut config: crate::proto::proximadb_v1::CollectionConfig,
         tenant_id: Option<&str>,
     ) -> anyhow::Result<crate::proto::proximadb_v1::Collection> {
         let ctx = self.load_tenant_context(tenant_id)?;
+        // Stamp the creating tenant as owner (the tenant-context path below
+        // does the same when a context exists). Without a creating tenant the
+        // owner is never taken from the config: client-supplied owner signals
+        // are dropped.
+        match tenant_id {
+            Some(tenant) => proximadb_tenant::stamp_collection_owner(&mut config, tenant),
+            None => proximadb_tenant::clear_collection_owner(&mut config),
+        }
         let resp = self
             .create_collection_with_tenant_context(&config, ctx.as_ref())
             .await?;
@@ -4442,8 +5919,14 @@ impl proximadb_runtime::CollectionPort for CollectionService {
         &self,
         id: &str,
         config: crate::proto::proximadb_v1::CollectionConfig,
-        _tenant_id: Option<&str>,
+        tenant_id: Option<&str>,
     ) -> anyhow::Result<crate::proto::proximadb_v1::Collection> {
+        // Scoped to the request tenant (no tenant ⇒ deny).
+        if self.collection_for_tenant(id, tenant_id).await?.is_none() {
+            return Err(
+                proximadb_search_types::client_argument::CollectionNotFound::new(id).into(),
+            );
+        }
         let resp = CollectionService::update_collection(self, id, Some(config)).await?;
         resp.collection.ok_or_else(|| {
             anyhow::anyhow!(
@@ -4454,7 +5937,8 @@ impl proximadb_runtime::CollectionPort for CollectionService {
     }
 
     async fn delete_collection(&self, id: &str, tenant_id: Option<&str>) -> anyhow::Result<bool> {
-        let ctx = self.load_tenant_context(tenant_id)?;
+        // Scoped to the request tenant (no tenant ⇒ deny).
+        let ctx = self.request_tenant_context(tenant_id)?;
         let resp = self
             .delete_collection_with_tenant_context(id, ctx.as_ref())
             .await?;
@@ -4465,13 +5949,27 @@ impl proximadb_runtime::CollectionPort for CollectionService {
         &self,
         tenant_id: Option<&str>,
     ) -> anyhow::Result<Vec<crate::proto::proximadb_v1::Collection>> {
-        let ctx = self.load_tenant_context(tenant_id)?;
+        // Scoped to the request tenant (no tenant ⇒ an empty listing).
+        let ctx = self.request_tenant_context(tenant_id)?;
         self.list_collections_with_tenant_context(ctx.as_ref())
             .await
     }
 
     async fn resolve_collection_id(&self, identifier: &str) -> anyhow::Result<Option<String>> {
         CollectionService::resolve_collection_id(self, identifier).await
+    }
+
+    async fn get_collection_internal(
+        &self,
+        identifier: &str,
+    ) -> anyhow::Result<Option<crate::proto::proximadb_v1::Collection>> {
+        self.collection_internal(identifier).await
+    }
+
+    async fn list_collections_internal(
+        &self,
+    ) -> anyhow::Result<Vec<crate::proto::proximadb_v1::Collection>> {
+        self.list_collections().await
     }
 
     async fn set_collection_schema_columns(
@@ -4500,8 +5998,16 @@ impl proximadb_runtime::CollectionPort for CollectionService {
             Self::collection_tenant_id(&collection).as_deref(),
             crate::storage::metadata::collection_mapping::collection_table_identifier(config),
         );
-        if !catalog.table_exists(&identifier).await.unwrap_or(false) {
-            return Ok(());
+        // TD-CATREPLACE-1 (review m4): fail closed. The canonical columns are
+        // the schema authority; silently dropping them while reporting success
+        // (which the old best-effort no-op did once the caller reordered to
+        // canonical-first) leaves the collection wearing a schema it does not
+        // have. A collection without its catalog asset is already inconsistent.
+        if !catalog.table_exists(&identifier).await? {
+            anyhow::bail!(
+                "collection '{}' has no catalog asset to hold its schema columns",
+                id
+            );
         }
         let mut schema = catalog.get_table(&identifier).await?;
         // ADR-048 P1: the canonical schema IS the typed catalog columns (200+
@@ -4516,15 +6022,21 @@ impl proximadb_runtime::CollectionPort for CollectionService {
         schema
             .properties
             .remove(crate::storage::metadata::collection_mapping::CANONICAL_SCHEMA_PROPERTY);
-        if !columns.is_empty() {
-            schema.columns.extend(
-                crate::storage::metadata::collection_mapping::collection_schema_columns_to_catalog_columns(
-                    columns,
-                ),
-            );
-        }
-        let _ = catalog.drop_table(&identifier, false).await?;
-        catalog.create_table(&identifier, schema).await?;
+        // TD-GRPCCREATE-1: a column that repeats a reserved column's name folds
+        // into it when compatible (recorded on the reserved column, so the typed
+        // columns stay the one authority) and is rejected otherwise. Runs even
+        // for an empty list, to clear earlier fold markers.
+        crate::storage::metadata::collection_mapping::merge_canonical_band(
+            &mut schema,
+            crate::storage::metadata::collection_mapping::collection_schema_columns_to_catalog_columns(
+                columns,
+            ),
+        )?;
+        // TD-GRPCCREATE-1: validate before touching the table (replace_table
+        // does). TD-CATREPLACE-1: replace in place — no drop window.
+        proximadb_catalog::schema::normalize_identity(&mut schema);
+        proximadb_catalog::schema::validate_schema(&schema)?;
+        catalog.replace_table(&identifier, schema).await?;
         Ok(())
     }
 

@@ -58,13 +58,12 @@ use proximadb_records::{ProximaTree, ProximaTreeNode, tree_get};
 /// AND the record's `collection_id` must be composed from this — they key the same canonical OID
 /// (`document/{collection_id}/{doc_id}`), so a scoped write and its recovery/read agree
 /// (TD-DOC-TENANT-1); scoping only one side mis-keys the live read immediately.
+///
+/// The collection name is validated too (no `/`), so a client-supplied name can never
+/// address another tenant's `{tenant}/{collection}` key.
 pub fn scoped_document_collection(tenant: &str, collection: &str) -> anyhow::Result<String> {
-    proximadb_tenant::validate_request_tenant(tenant)
-        .map_err(|e| anyhow::anyhow!("invalid tenant '{tenant}': {e}"))?;
-    if tenant == proximadb_tenant::DEFAULT_TENANT {
-        return Ok(collection.to_string());
-    }
-    Ok(format!("{tenant}/{collection}"))
+    proximadb_tenant::scoped_resource_key(tenant, collection)
+        .map_err(|e| anyhow::anyhow!("invalid document collection key: {e}"))
 }
 
 /// Inverse of [`scoped_document_collection`]: recover `(tenant, clean_collection)` from a
@@ -172,22 +171,36 @@ pub fn doc_canonical_vector_enabled(collection: &str) -> bool {
 }
 
 impl DocumentService {
-    /// Create a new document service (legacy mode, uses in-memory HashMap)
-    pub fn new(storage_engine: Arc<dyn UnifiedStorageFormat>) -> Self {
+    /// Shared constructor core: every field except the ones each public
+    /// constructor actually varies (`document_engine`,
+    /// `canonical_record_store`, WAL wiring, metrics) — see the constructors
+    /// below.
+    fn from_parts(
+        storage_engine: Arc<dyn UnifiedStorageFormat>,
+        document_engine: Option<Arc<dyn DocumentStorageEngine>>,
+        wal_writer: Option<UnifiedWALWriter>,
+        wal_path: String,
+        metrics_collector: Option<Arc<DocumentMetricsCollector>>,
+    ) -> Self {
         Self {
             storage_engine,
-            document_engine: None,
+            document_engine,
             index_manager: Arc::new(IndexManager::new()),
             query_executor: Arc::new(QueryExecutor::new()),
             collections: Arc::new(RwLock::new(HashMap::new())),
             documents: Arc::new(DashMap::new()),
             #[cfg(feature = "canonical-document-store")]
             canonical_record_store: None,
-            wal_writer: Arc::new(Mutex::new(None)),
-            wal_path: String::new(),
-            metrics_collector: None,
+            wal_writer: Arc::new(Mutex::new(wal_writer)),
+            wal_path,
+            metrics_collector,
             record_route: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Create a new document service (legacy mode, uses in-memory HashMap)
+    pub fn new(storage_engine: Arc<dyn UnifiedStorageFormat>) -> Self {
+        Self::from_parts(storage_engine, None, None, String::new(), None)
     }
 
     /// Create a document service backed by a DocumentStorageEngine (CEDAR).
@@ -198,20 +211,13 @@ impl DocumentService {
         storage_engine: Arc<dyn UnifiedStorageFormat>,
         document_engine: Arc<dyn DocumentStorageEngine>,
     ) -> Self {
-        Self {
+        Self::from_parts(
             storage_engine,
-            document_engine: Some(document_engine),
-            index_manager: Arc::new(IndexManager::new()),
-            query_executor: Arc::new(QueryExecutor::new()),
-            collections: Arc::new(RwLock::new(HashMap::new())),
-            documents: Arc::new(DashMap::new()),
-            #[cfg(feature = "canonical-document-store")]
-            canonical_record_store: None,
-            wal_writer: Arc::new(Mutex::new(None)),
-            wal_path: String::new(),
-            metrics_collector: None,
-            record_route: std::sync::OnceLock::new(),
-        }
+            Some(document_engine),
+            None,
+            String::new(),
+            None,
+        )
     }
 
     /// Create a new document service with metrics collection
@@ -219,20 +225,13 @@ impl DocumentService {
         storage_engine: Arc<dyn UnifiedStorageFormat>,
         metrics_collector: Arc<DocumentMetricsCollector>,
     ) -> Self {
-        Self {
+        Self::from_parts(
             storage_engine,
-            document_engine: None,
-            index_manager: Arc::new(IndexManager::new()),
-            query_executor: Arc::new(QueryExecutor::new()),
-            collections: Arc::new(RwLock::new(HashMap::new())),
-            documents: Arc::new(DashMap::new()),
-            #[cfg(feature = "canonical-document-store")]
-            canonical_record_store: None,
-            wal_writer: Arc::new(Mutex::new(None)),
-            wal_path: String::new(),
-            metrics_collector: Some(metrics_collector),
-            record_route: std::sync::OnceLock::new(),
-        }
+            None,
+            None,
+            String::new(),
+            Some(metrics_collector),
+        )
     }
 
     /// Create a document service backed by canonical `ProximaRecord` storage.
@@ -246,19 +245,9 @@ impl DocumentService {
         storage_engine: Arc<dyn UnifiedStorageFormat>,
         record_store: Arc<dyn RecordStorage>,
     ) -> Self {
-        Self {
-            storage_engine,
-            document_engine: None,
-            index_manager: Arc::new(IndexManager::new()),
-            query_executor: Arc::new(QueryExecutor::new()),
-            collections: Arc::new(RwLock::new(HashMap::new())),
-            documents: Arc::new(DashMap::new()),
-            canonical_record_store: Some(record_store),
-            wal_writer: Arc::new(Mutex::new(None)),
-            wal_path: String::new(),
-            metrics_collector: None,
-            record_route: std::sync::OnceLock::new(),
-        }
+        let mut service = Self::from_parts(storage_engine, None, None, String::new(), None);
+        service.canonical_record_store = Some(record_store);
+        service
     }
 
     /// Create a canonical-record-backed document service with WAL recovery.
@@ -277,19 +266,8 @@ impl DocumentService {
             .await
             .context("Failed to create document WAL writer")?;
 
-        let mut service = Self {
-            storage_engine,
-            document_engine: None,
-            index_manager: Arc::new(IndexManager::new()),
-            query_executor: Arc::new(QueryExecutor::new()),
-            collections: Arc::new(RwLock::new(HashMap::new())),
-            documents: Arc::new(DashMap::new()),
-            canonical_record_store: Some(record_store),
-            wal_writer: Arc::new(Mutex::new(Some(wal_writer))),
-            wal_path,
-            metrics_collector: None,
-            record_route: std::sync::OnceLock::new(),
-        };
+        let mut service = Self::from_parts(storage_engine, None, Some(wal_writer), wal_path, None);
+        service.canonical_record_store = Some(record_store);
 
         service.recover_from_wal().await?;
 
@@ -331,20 +309,13 @@ impl DocumentService {
             .await
             .context("Failed to create document WAL writer")?;
 
-        let mut service = Self {
+        let mut service = Self::from_parts(
             storage_engine,
-            document_engine: None,
-            index_manager: Arc::new(IndexManager::new()),
-            query_executor: Arc::new(QueryExecutor::new()),
-            collections: Arc::new(RwLock::new(HashMap::new())),
-            documents: Arc::new(DashMap::new()),
-            #[cfg(feature = "canonical-document-store")]
-            canonical_record_store: None,
-            wal_writer: Arc::new(Mutex::new(Some(wal_writer))),
+            None,
+            Some(wal_writer),
             wal_path,
             metrics_collector,
-            record_route: std::sync::OnceLock::new(),
-        };
+        );
 
         // Recover from WAL on startup
         service.recover_from_wal().await?;
@@ -1592,7 +1563,19 @@ impl DocumentService {
     }
 
     /// Remove a field at a dotted path.
-    fn unset_path(&self, doc: &mut ProximaTree, path: &str) -> Result<()> {
+    /// Descend a dotted path's parent objects and apply `f` to the leaf
+    /// container + key — the shared skeleton of the tree mutators below.
+    /// `require_parents` selects the absent-parent behavior: a hard error
+    /// (mutators that must land at a known parent) or an idempotent no-op.
+    fn mutate_path_leaf<F>(
+        doc: &mut ProximaTree,
+        path: &str,
+        require_parents: bool,
+        f: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut ProximaTree, &str) -> Result<()>,
+    {
         let parts = Self::path_segments(path)?;
         let (last, parents) = parts
             .split_last()
@@ -1603,68 +1586,57 @@ impl DocumentService {
             match current.get_mut(*part) {
                 Some(ProximaTreeNode::Object(sub)) => current = sub,
                 Some(_) => return Err(anyhow!("Path {} is not an object", part)),
-                None => return Ok(()), // path doesn't exist, nothing to unset
+                None => {
+                    if require_parents {
+                        return Err(anyhow!("Path {} does not exist", part));
+                    }
+                    return Ok(()); // path doesn't exist, nothing to do
+                }
             }
         }
-        current.remove(*last);
-        Ok(())
+        f(current, last)
+    }
+
+    fn unset_path(&self, doc: &mut ProximaTree, path: &str) -> Result<()> {
+        Self::mutate_path_leaf(doc, path, false, |leaf, key| {
+            leaf.remove(key);
+            Ok(())
+        })
     }
 
     /// Increment a numeric leaf at a dotted path (creating it if absent).
     fn increment_path(&self, doc: &mut ProximaTree, path: &str, inc: f64) -> Result<()> {
-        let parts = Self::path_segments(path)?;
-        let (last, parents) = parts
-            .split_last()
-            .ok_or_else(|| anyhow!("path must have at least one segment"))?;
-
-        let mut current = doc;
-        for part in parents {
-            match current.get_mut(*part) {
-                Some(ProximaTreeNode::Object(sub)) => current = sub,
-                Some(_) => return Err(anyhow!("Path {} is not an object", part)),
-                None => return Err(anyhow!("Path {} does not exist", part)),
+        Self::mutate_path_leaf(doc, path, true, |leaf, key| {
+            match leaf.get_mut(key) {
+                Some(ProximaTreeNode::Value(ProximaValue::Int64(v))) => *v += inc as i64,
+                Some(ProximaTreeNode::Value(ProximaValue::Float64(v))) => *v += inc,
+                Some(_) => return Err(anyhow!("Field at path {} is not numeric", path)),
+                None => {
+                    leaf.insert(
+                        key.to_string(),
+                        ProximaTreeNode::Value(ProximaValue::Float64(inc)),
+                    );
+                }
             }
-        }
-        match current.get_mut(*last) {
-            Some(ProximaTreeNode::Value(ProximaValue::Int64(v))) => *v += inc as i64,
-            Some(ProximaTreeNode::Value(ProximaValue::Float64(v))) => *v += inc,
-            Some(_) => return Err(anyhow!("Field at path {} is not numeric", path)),
-            None => {
-                current.insert(
-                    last.to_string(),
-                    ProximaTreeNode::Value(ProximaValue::Float64(inc)),
-                );
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Push a value onto an array leaf at a dotted path (creating it if absent).
     fn push_to_array(&self, doc: &mut ProximaTree, path: &str, value: ProximaValue) -> Result<()> {
-        let parts = Self::path_segments(path)?;
-        let (last, parents) = parts
-            .split_last()
-            .ok_or_else(|| anyhow!("path must have at least one segment"))?;
-
-        let mut current = doc;
-        for part in parents {
-            match current.get_mut(*part) {
-                Some(ProximaTreeNode::Object(sub)) => current = sub,
-                Some(_) => return Err(anyhow!("Path {} is not an object", part)),
-                None => return Err(anyhow!("Path {} does not exist", part)),
+        Self::mutate_path_leaf(doc, path, true, |leaf, key| {
+            match leaf.get_mut(key) {
+                Some(ProximaTreeNode::Value(ProximaValue::Array(arr))) => arr.push(value),
+                Some(_) => return Err(anyhow!("Field at path {} is not an array", path)),
+                None => {
+                    leaf.insert(
+                        key.to_string(),
+                        ProximaTreeNode::Value(ProximaValue::Array(vec![value])),
+                    );
+                }
             }
-        }
-        match current.get_mut(*last) {
-            Some(ProximaTreeNode::Value(ProximaValue::Array(arr))) => arr.push(value),
-            Some(_) => return Err(anyhow!("Field at path {} is not an array", path)),
-            None => {
-                current.insert(
-                    last.to_string(),
-                    ProximaTreeNode::Value(ProximaValue::Array(vec![value])),
-                );
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Pull (remove) matching values from an array leaf at a dotted path.
@@ -1674,78 +1646,47 @@ impl DocumentService {
         path: &str,
         value: &ProximaValue,
     ) -> Result<()> {
-        let parts = Self::path_segments(path)?;
-        let (last, parents) = parts
-            .split_last()
-            .ok_or_else(|| anyhow!("path must have at least one segment"))?;
-
-        let mut current = doc;
-        for part in parents {
-            match current.get_mut(*part) {
-                Some(ProximaTreeNode::Object(sub)) => current = sub,
-                Some(_) => return Err(anyhow!("Path {} is not an object", part)),
-                None => return Ok(()), // path doesn't exist
+        Self::mutate_path_leaf(doc, path, false, |leaf, key| {
+            match leaf.get_mut(key) {
+                Some(ProximaTreeNode::Value(ProximaValue::Array(arr))) => {
+                    arr.retain(|v| v != value)
+                }
+                Some(_) => return Err(anyhow!("Field at path {} is not an array", path)),
+                None => {} // field doesn't exist
             }
-        }
-        match current.get_mut(*last) {
-            Some(ProximaTreeNode::Value(ProximaValue::Array(arr))) => arr.retain(|v| v != value),
-            Some(_) => return Err(anyhow!("Field at path {} is not an array", path)),
-            None => {} // field doesn't exist
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Add a value to a set (array with unique values) at a dotted path.
     fn add_to_set(&self, doc: &mut ProximaTree, path: &str, value: ProximaValue) -> Result<()> {
-        let parts = Self::path_segments(path)?;
-        let (last, parents) = parts
-            .split_last()
-            .ok_or_else(|| anyhow!("path must have at least one segment"))?;
-
-        let mut current = doc;
-        for part in parents {
-            match current.get_mut(*part) {
-                Some(ProximaTreeNode::Object(sub)) => current = sub,
-                Some(_) => return Err(anyhow!("Path {} is not an object", part)),
-                None => return Err(anyhow!("Path {} does not exist", part)),
-            }
-        }
-        match current.get_mut(*last) {
-            Some(ProximaTreeNode::Value(ProximaValue::Array(arr))) => {
-                if !arr.contains(&value) {
-                    arr.push(value);
+        Self::mutate_path_leaf(doc, path, true, |leaf, key| {
+            match leaf.get_mut(key) {
+                Some(ProximaTreeNode::Value(ProximaValue::Array(arr))) => {
+                    if !arr.contains(&value) {
+                        arr.push(value);
+                    }
+                }
+                Some(_) => return Err(anyhow!("Field at path {} is not an array", path)),
+                None => {
+                    leaf.insert(
+                        key.to_string(),
+                        ProximaTreeNode::Value(ProximaValue::Array(vec![value])),
+                    );
                 }
             }
-            Some(_) => return Err(anyhow!("Field at path {} is not an array", path)),
-            None => {
-                current.insert(
-                    last.to_string(),
-                    ProximaTreeNode::Value(ProximaValue::Array(vec![value])),
-                );
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Rename a field at a dotted path. `new_name` is the new (leaf) field name.
     fn rename_path(&self, doc: &mut ProximaTree, old_path: &str, new_name: &str) -> Result<()> {
-        let parts = Self::path_segments(old_path)?;
-        let (last, parents) = parts
-            .split_last()
-            .ok_or_else(|| anyhow!("path must have at least one segment"))?;
-
-        let mut current = doc;
-        for part in parents {
-            match current.get_mut(*part) {
-                Some(ProximaTreeNode::Object(sub)) => current = sub,
-                Some(_) => return Err(anyhow!("Path {} is not an object", part)),
-                None => return Ok(()), // path doesn't exist
+        Self::mutate_path_leaf(doc, old_path, false, |leaf, key| {
+            if let Some(node) = leaf.remove(key) {
+                leaf.insert(new_name.to_string(), node);
             }
-        }
-        if let Some(node) = current.remove(*last) {
-            current.insert(new_name.to_string(), node);
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Delete a document by ID
@@ -1868,6 +1809,52 @@ impl DocumentService {
         Ok(true)
     }
 
+    /// Run the in-memory query executor and assemble the result, recording
+    /// query metrics for the error and success cases — the shared tail of the
+    /// canonical and legacy routes of `query_documents`.
+    async fn finish_query(
+        &self,
+        collection: &str,
+        start: std::time::Instant,
+        documents: Vec<DocumentRecord>,
+        params: &DocumentQueryParams,
+    ) -> Result<DocumentQueryResult> {
+        let (documents, total_count) = match self
+            .query_executor
+            .execute(collection, &documents, params, &self.index_manager)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                self.record_query_metrics(start, true).await;
+                return Err(e);
+            }
+        };
+
+        let query_time_ms = start.elapsed().as_millis() as u64;
+        self.record_query_metrics(start, false).await;
+
+        Ok(DocumentQueryResult {
+            documents,
+            total_count: if params.include_count {
+                Some(total_count)
+            } else {
+                None
+            },
+            query_time_ms,
+        })
+    }
+
+    /// Snapshot the legacy in-memory documents of a collection (empty when
+    /// the collection is absent) — the shared legacy-path document source.
+    fn legacy_collection_documents(&self, collection: &str) -> Vec<DocumentRecord> {
+        let docs = &*self.documents;
+        match docs.get(collection) {
+            Some(collection_docs) => collection_docs.values().cloned().collect(),
+            None => Vec::new(),
+        }
+    }
+
     /// Query documents with filter, sort, and pagination
     pub async fn query_documents(
         &self,
@@ -1897,28 +1884,9 @@ impl DocumentService {
                 .iter()
                 .filter_map(proxima_record_to_legacy_document)
                 .collect();
-            let (documents, total_count) = match self
-                .query_executor
-                .execute(collection, &documents, &params, &self.index_manager)
-                .await
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    self.record_query_metrics(start, true).await;
-                    return Err(e);
-                }
-            };
-            let query_time_ms = start.elapsed().as_millis() as u64;
-            self.record_query_metrics(start, false).await;
-            return Ok(DocumentQueryResult {
-                documents,
-                total_count: if params.include_count {
-                    Some(total_count)
-                } else {
-                    None
-                },
-                query_time_ms,
-            });
+            return self
+                .finish_query(collection, start, documents, &params)
+                .await;
         }
 
         // Verify collection exists
@@ -1953,46 +1921,14 @@ impl DocumentService {
                     .filter_map(proxima_record_to_legacy_document)
                     .collect()
             } else {
-                let docs = &*self.documents;
-                match docs.get(collection) {
-                    Some(collection_docs) => collection_docs.values().cloned().collect(),
-                    None => Vec::new(),
-                }
+                self.legacy_collection_documents(collection)
             };
 
         #[cfg(not(feature = "canonical-document-store"))]
-        let documents: Vec<DocumentRecord> = {
-            let docs = &*self.documents;
-            match docs.get(collection) {
-                Some(collection_docs) => collection_docs.values().cloned().collect(),
-                None => Vec::new(),
-            }
-        };
+        let documents: Vec<DocumentRecord> = self.legacy_collection_documents(collection);
 
-        let (documents, total_count) = match self
-            .query_executor
-            .execute(collection, &documents, &params, &self.index_manager)
+        self.finish_query(collection, start, documents, &params)
             .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                self.record_query_metrics(start, true).await;
-                return Err(e);
-            }
-        };
-
-        let query_time_ms = start.elapsed().as_millis() as u64;
-        self.record_query_metrics(start, false).await;
-
-        Ok(DocumentQueryResult {
-            documents,
-            total_count: if params.include_count {
-                Some(total_count)
-            } else {
-                None
-            },
-            query_time_ms,
-        })
     }
 
     /// Aggregate documents with a pipeline
@@ -2104,13 +2040,7 @@ impl DocumentService {
             .ok_or_else(|| anyhow!("Collection '{}' not found", collection))?;
 
         // Get all documents from the source collection
-        let documents: Vec<DocumentRecord> = {
-            let docs = &*self.documents;
-            match docs.get(collection) {
-                Some(collection_docs) => collection_docs.values().cloned().collect(),
-                None => Vec::new(),
-            }
-        };
+        let documents: Vec<DocumentRecord> = self.legacy_collection_documents(collection);
 
         // Check if pipeline contains lookup stages
         let has_lookup = pipeline.iter().any(|stage| {
@@ -2176,13 +2106,7 @@ impl DocumentService {
             .ok_or_else(|| anyhow!("Collection '{}' not found", collection))?;
 
         // Get all documents from the source collection
-        let documents: Vec<DocumentRecord> = {
-            let docs = &*this.documents;
-            match docs.get(collection) {
-                Some(collection_docs) => collection_docs.values().cloned().collect(),
-                None => Vec::new(),
-            }
-        };
+        let documents: Vec<DocumentRecord> = this.legacy_collection_documents(collection);
 
         // Create a lookup fetcher that can query foreign collections
         let fetcher = DocumentServiceLookupFetcher {

@@ -85,13 +85,12 @@ fn versioned_record(
         props: ProximaTree::new(),
         refs: Vec::new(),
         edge: None,
-        embeddings: vec![EmbeddingCell {
-            model_id: "default".to_string(),
-            modality: "dense_vector".to_string(),
-            dim: dim as u32,
-            values: EmbeddingValues::Fp32(vector),
-            ..Default::default()
-        }],
+        embeddings: vec![EmbeddingCell::new_fp32(
+            "default",
+            "dense_vector",
+            dim as u32,
+            vector,
+        )],
         sequence: None,
         labels: LabelSet::new(),
         branch_id: None,

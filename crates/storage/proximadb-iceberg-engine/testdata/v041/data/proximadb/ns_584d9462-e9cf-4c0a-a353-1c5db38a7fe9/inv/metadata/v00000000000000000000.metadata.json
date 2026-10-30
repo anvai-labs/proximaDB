@@ -1,0 +1,73 @@
+{
+  "format-version": 3,
+  "table-uuid": "d64048f4-5dff-a213-340c-55c8bc8d5d3e",
+  "location": "file:///WAREHOUSE/data/proximadb/ns_584d9462-e9cf-4c0a-a353-1c5db38a7fe9/inv/data",
+  "last-sequence-number": 1,
+  "last-updated-ms": 1793315162573,
+  "last-column-id": 2,
+  "current-schema-id": 0,
+  "schemas": [
+    {
+      "type": "struct",
+      "schema-id": 0,
+      "fields": [
+        {
+          "id": 1,
+          "name": "id",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "id": 2,
+          "name": "qty",
+          "required": false,
+          "type": "int"
+        }
+      ]
+    }
+  ],
+  "default-spec-id": 0,
+  "partition-specs": [
+    {
+      "spec-id": 0,
+      "fields": []
+    }
+  ],
+  "last-partition-id": 999,
+  "default-sort-order-id": 0,
+  "sort-orders": [
+    {
+      "order-id": 0,
+      "fields": []
+    }
+  ],
+  "properties": {},
+  "current-snapshot-id": 1793315162573,
+  "snapshots": [
+    {
+      "snapshot-id": 1793315162573,
+      "sequence-number": 1,
+      "timestamp-ms": 1793315162573,
+      "summary": {
+        "operation": "append",
+        "added-data-files": "1",
+        "added-records": "20"
+      },
+      "manifest-list": "data/proximadb/ns_584d9462-e9cf-4c0a-a353-1c5db38a7fe9/inv/metadata/snap-1793315162573-list.avro",
+      "schema-id": 0
+    }
+  ],
+  "snapshot-log": [
+    {
+      "snapshot-id": 1793315162573,
+      "timestamp-ms": 1793315162573
+    }
+  ],
+  "metadata-log": [],
+  "refs": {
+    "main": {
+      "snapshot-id": 1793315162573,
+      "type": "branch"
+    }
+  }
+}

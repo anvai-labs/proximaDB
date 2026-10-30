@@ -17,6 +17,31 @@ use proximadb_storage_filesystem_types::FileSystem;
 use crate::cache::CatalogCache;
 use crate::{Catalog, TableIdentifier};
 
+/// A table name that resolves, for the requesting tenant, to an entry it may
+/// not see. Displays exactly like a missing table so the two are
+/// indistinguishable; callers that treat "missing" specially (`DROP ... IF
+/// EXISTS`, `CREATE`) downcast to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableNotVisible {
+    /// The name as the caller supplied it.
+    pub table: String,
+}
+
+impl std::fmt::Display for TableNotVisible {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Table '{}' does not exist", self.table)
+    }
+}
+
+impl std::error::Error for TableNotVisible {}
+
+impl TableNotVisible {
+    /// Whether `error` (or anything it wraps) is a [`TableNotVisible`].
+    pub fn is(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| cause.is::<TableNotVisible>())
+    }
+}
+
 /// Resolves a [`FileSystem`] backend for an object-store catalog URL
 /// (`s3://`, `gs://`, `az://`). Implemented by the root composition root (which
 /// wraps `FilesystemFactory`); injected via
@@ -645,6 +670,49 @@ impl CatalogManager {
         Ok(())
     }
 
+    /// Every table schema in the registered catalogs that `include` selects,
+    /// found by walking each catalog's namespace tree. Fails on the first
+    /// catalog, namespace or table that cannot be read: a caller that needs the
+    /// complete set (the WAL truncation floor) must refuse on that, and a
+    /// best-effort caller logs it and carries on.
+    pub async fn table_schemas(
+        &self,
+        include: impl Fn(&dyn Catalog) -> bool,
+    ) -> Result<Vec<crate::CatalogTableSchema>> {
+        let catalogs: Vec<Arc<dyn Catalog>> =
+            self.catalogs.read().await.values().cloned().collect();
+        let mut schemas = Vec::new();
+        for catalog in catalogs.iter().filter(|c| include(c.as_ref())) {
+            let mut pending: Vec<Option<Vec<String>>> = vec![None];
+            let mut seen = std::collections::HashSet::new();
+            while let Some(parent) = pending.pop() {
+                let namespaces = catalog
+                    .list_namespaces(parent.as_deref())
+                    .await
+                    .map_err(|e| {
+                        anyhow!("listing namespaces of catalog '{}': {e:#}", catalog.name())
+                    })?;
+                for namespace in namespaces {
+                    if !seen.insert(namespace.levels.clone()) {
+                        continue;
+                    }
+                    let tables = catalog.list_tables(&namespace.levels).await.map_err(|e| {
+                        anyhow!(
+                            "listing tables of '{}.{:?}': {e:#}",
+                            catalog.name(),
+                            namespace.levels
+                        )
+                    })?;
+                    for table in tables {
+                        schemas.push(catalog.get_table(&table).await?);
+                    }
+                    pending.push(Some(namespace.levels));
+                }
+            }
+        }
+        Ok(schemas)
+    }
+
     /// List all registered catalogs
     pub async fn list_catalogs(&self) -> Vec<String> {
         let catalogs = self.catalogs.read().await;
@@ -745,6 +813,7 @@ impl CatalogManager {
             );
         }
         let (catalog, id) = self.resolve_table(fqn).await?;
+        let base_id = id.clone();
         let id = match tenant {
             Some(tenant) if !tenant.is_empty() => {
                 if id
@@ -771,13 +840,94 @@ impl CatalogManager {
                 .await
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|t| t.name.eq_ignore_ascii_case(&id.name))
+                // Only a table in exactly this namespace: a listing must never
+                // hand back another tenant's table.
+                .filter(|t| t.namespace == id.namespace && t.name.eq_ignore_ascii_case(&id.name))
                 .collect();
             if let [declared] = candidates.as_slice() {
-                return Ok((catalog, declared.clone()));
+                let declared = declared.clone();
+                Self::ensure_visible_to(catalog.as_ref(), &declared, fqn, tenant).await?;
+                return Ok((catalog, declared));
             }
         }
+        // A collection's catalog entry is recorded under the unprefixed
+        // identifier; a tenant whose own namespace has no entry of that name
+        // resolves to it when — and only when — it records a collection visible
+        // to the tenant (its owner).
+        if id != base_id
+            && !catalog.table_exists(&id).await.unwrap_or(false)
+            && Self::records_collection_visible_to(catalog.as_ref(), &base_id, tenant).await
+        {
+            return Ok((catalog, base_id));
+        }
+        Self::ensure_visible_to(catalog.as_ref(), &id, fqn, tenant).await?;
         Ok((catalog, id))
+    }
+
+    /// Whether `id` exists and records a collection visible to `tenant`.
+    async fn records_collection_visible_to(
+        catalog: &dyn Catalog,
+        id: &TableIdentifier,
+        tenant: Option<&str>,
+    ) -> bool {
+        let Some(tenant) = tenant.filter(|tenant| !tenant.is_empty()) else {
+            return false;
+        };
+        if !catalog.table_exists(id).await.unwrap_or(false) {
+            return false;
+        }
+        let Ok(schema) = catalog.get_table(id).await else {
+            return false;
+        };
+        schema.properties.contains_key("collection.id")
+            && proximadb_tenant::collection_entry_visible_to(
+                schema.properties.get("owner").map(String::as_str),
+                schema.properties.get("tags").map(String::as_str),
+                Some(tenant),
+            )
+    }
+
+    /// A request acting as `tenant` resolves a catalog entry that records a
+    /// collection only when that collection is visible to it (the
+    /// `proximadb_tenant` ownership rule — the same rule every collection
+    /// surface applies). Other entries surface as [`TableNotVisible`], which
+    /// reads exactly like a missing table. Internal resolution (`tenant` =
+    /// `None`) is not filtered.
+    async fn ensure_visible_to(
+        catalog: &dyn Catalog,
+        id: &TableIdentifier,
+        fqn: &str,
+        tenant: Option<&str>,
+    ) -> Result<()> {
+        let Some(tenant) = tenant.filter(|tenant| !tenant.is_empty()) else {
+            return Ok(());
+        };
+        if !catalog.table_exists(id).await.unwrap_or(false) {
+            return Ok(());
+        }
+        let schema = catalog.get_table(id).await?;
+        let records_collection = schema.properties.contains_key("collection.id")
+            && (schema
+                .properties
+                .get("asset.kind")
+                .is_some_and(|kind| kind == "collection")
+                || schema
+                    .properties
+                    .get("asset.capability.vector")
+                    .is_some_and(|flag| flag == "true"));
+        if records_collection
+            && !proximadb_tenant::collection_entry_visible_to(
+                schema.properties.get("owner").map(String::as_str),
+                schema.properties.get("tags").map(String::as_str),
+                Some(tenant),
+            )
+        {
+            return Err(TableNotVisible {
+                table: fqn.to_string(),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     /// Get cache reference for direct access
@@ -812,3 +962,54 @@ fn ident_case_fold_env_enabled() -> bool {
 // here shadowed the canonical type and caused the in-flight catalog
 // trait migration to keep "two TableIdentifier" type-identity errors.
 // Removed as part of Option B consolidation.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CatalogColumn, CatalogTableSchema};
+    use proximadb_data_model::ProximaType;
+
+    /// `table_schemas` finds tables in nested namespaces exactly once, and
+    /// `include` filters whole catalogs.
+    #[tokio::test]
+    async fn table_schemas_walks_nested_namespaces_of_selected_catalogs() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let manager = CatalogManager::new();
+        let catalog = manager
+            .create_native_catalog("local", &format!("file://{}", dir.path().display()))
+            .await?;
+        let outer = vec!["a".to_string()];
+        let inner = vec!["a".to_string(), "b".to_string()];
+        catalog.create_namespace(&outer, HashMap::new()).await?;
+        catalog.create_namespace(&inner, HashMap::new()).await?;
+        for (namespace, name) in [(&outer, "t1"), (&inner, "t2")] {
+            catalog
+                .create_table(
+                    &TableIdentifier::new(namespace.clone(), name),
+                    CatalogTableSchema::new(name).with_column(CatalogColumn::new(
+                        1,
+                        "id",
+                        ProximaType::Int64,
+                    )),
+                )
+                .await?;
+        }
+
+        let mut names: Vec<String> = manager
+            .table_schemas(|_| true)
+            .await?
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["t1", "t2"], "each table once, nested included");
+        assert!(
+            manager
+                .table_schemas(|c| c.catalog_type() != "native")
+                .await?
+                .is_empty(),
+            "a deselected catalog is not walked"
+        );
+        Ok(())
+    }
+}

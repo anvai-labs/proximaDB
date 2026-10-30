@@ -6,95 +6,10 @@
 //! of returning a silent wrong answer — proven here for both a real,
 //! successfully-created graph collection and a name that was never created.
 
-use std::net::TcpListener;
-use std::time::Duration;
+#[path = "common/pg_server.rs"]
+mod pg_server;
 
-use proximadb::core::Config;
-use proximadb::database::ProximaDB;
-use tempfile::TempDir;
-use tokio::time::sleep;
-
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let p = l.local_addr().expect("addr").port();
-    drop(l);
-    p
-}
-
-struct PgServer {
-    pg_port: u16,
-    db: Option<ProximaDB>,
-    _tmp: TempDir,
-}
-
-impl PgServer {
-    async fn start() -> anyhow::Result<Self> {
-        let pg_port = free_port();
-        let rest_port = free_port();
-        let grpc_port = free_port();
-        let tmp = TempDir::new()?;
-        let mut config = Config::default();
-        config.server.bind_address = "127.0.0.1".to_string();
-        config.server.port = rest_port;
-        config.server.data_dir = tmp.path().to_path_buf();
-        config.api.rest_port = rest_port;
-        config.api.grpc_port = grpc_port;
-        config.api.unified_mode = false;
-        config.api.pg_port = Some(pg_port);
-        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
-            url: format!("file://{}", tmp.path().display()),
-            ..Default::default()
-        }];
-        config.storage.wal_config.write_buffer_directory =
-            format!("file://{}/wal", tmp.path().display());
-        // TD-CONV-1: anchor the system catalog in this server's temp dir, not the
-        // shared CWD-relative `file://./metadata` default (cross-run DDL replay).
-        config.storage.metadata_url = format!("file://{}", tmp.path().join("metadata").display());
-        let mut db = ProximaDB::new(config).await?;
-        db.start().await?;
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .no_proxy()
-            .build()?;
-        let health = format!("http://127.0.0.1:{rest_port}/health");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match http.get(&health).send().await {
-                Ok(r) if r.status().is_success() => break,
-                _ if std::time::Instant::now() > deadline => anyhow::bail!("REST not ready"),
-                _ => sleep(Duration::from_millis(100)).await,
-            }
-        }
-        sleep(Duration::from_millis(200)).await;
-        Ok(Self {
-            pg_port,
-            db: Some(db),
-            _tmp: tmp,
-        })
-    }
-    fn conn_str(&self) -> String {
-        format!(
-            "host=127.0.0.1 port={} user=postgres dbname=proximadb sslmode=disable",
-            self.pg_port
-        )
-    }
-}
-impl Drop for PgServer {
-    fn drop(&mut self) {
-        if let Some(mut db) = self.db.take() {
-            tokio::spawn(async move {
-                let _ = db.shutdown().await;
-            });
-        }
-    }
-}
-
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    e.as_db_error()
-        .map(|d| format!("[{}] {}", d.code().code(), d.message()))
-        .unwrap_or_else(|| e.to_string())
-}
-
+use pg_server::TestPgServer;
 #[test]
 fn graph_select_over_pgwire_declines_honestly() {
     std::thread::Builder::new()
@@ -113,7 +28,7 @@ fn graph_select_over_pgwire_declines_honestly() {
 }
 
 async fn body() {
-    let server = PgServer::start().await.expect("server");
+    let server = TestPgServer::start().await.expect("server");
     let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
         .await
         .expect("connect");
@@ -133,7 +48,7 @@ async fn body() {
         .simple_query("SELECT * FROM graph_social")
         .await
         .expect_err("SELECT over a graph collection must be declined, not served");
-    let msg = explain_err(&err);
+    let msg = pg_server::db_err(&err);
     assert!(msg.starts_with("[0A000]"), "unexpected error: {msg}");
     assert!(
         msg.contains("not supported over pgwire"),
@@ -152,7 +67,7 @@ async fn body() {
         .simple_query("SELECT * FROM graph_never_created_xyz")
         .await
         .expect_err("SELECT over a nonexistent graph-shaped table must also decline");
-    let msg2 = explain_err(&err2);
+    let msg2 = pg_server::db_err(&err2);
     assert!(msg2.starts_with("[0A000]"), "unexpected error: {msg2}");
 
     // Confirm no phantom collection was silently provisioned as a side
@@ -162,7 +77,7 @@ async fn body() {
         .simple_query("DROP TABLE graph_never_created_xyz")
         .await
         .expect_err("a declined SELECT must not have created a phantom collection");
-    let drop_msg = explain_err(&drop_err);
+    let drop_msg = pg_server::db_err(&drop_err);
     assert!(
         drop_msg.contains("does not exist") || drop_msg.contains("42P01"),
         "unexpected DROP outcome (phantom collection?): {drop_msg}"

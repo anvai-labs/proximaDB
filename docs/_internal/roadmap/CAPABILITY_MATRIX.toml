@@ -115,7 +115,7 @@ notes = "OLTP/OLAP HTAP storage + PostgreSQL constraint semantics (TD-110). ON D
 controlling_td = ["TD-110"]
 evidence = [
   "src/services/dml/mod.rs:1",
-  "roadmap/techdebt/TD_110_OLTP_OLAP_HTAP_STORAGE_AND_CONSTRAINTS_PLAN_2026_06_04.adoc:1",
+  "docs/history/planning/TD_110_OLTP_OLAP_HTAP_STORAGE_AND_CONSTRAINTS_PLAN_2026_06_04.adoc:1",
 ]
 
 [[capabilities]]

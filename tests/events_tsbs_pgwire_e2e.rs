@@ -10,97 +10,12 @@
 //!
 //!   RUST_LOG=proximadb=debug cargo test --test events_tsbs_pgwire_e2e -- --nocapture
 
-use std::net::TcpListener;
-use std::time::Duration;
-
-use proximadb::core::Config;
-use proximadb::database::ProximaDB;
-use tempfile::TempDir;
-use tokio::time::sleep;
-
 const TSBS_RATCHET: usize = 10;
 
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let p = l.local_addr().expect("addr").port();
-    drop(l);
-    p
-}
+#[path = "common/pg_server.rs"]
+mod pg_server;
 
-struct PgServer {
-    pg_port: u16,
-    db: Option<ProximaDB>,
-    _tmp: TempDir,
-}
-
-impl PgServer {
-    async fn start() -> anyhow::Result<Self> {
-        let pg_port = free_port();
-        let rest_port = free_port();
-        let grpc_port = free_port();
-        let tmp = TempDir::new()?;
-        let mut config = Config::default();
-        config.server.bind_address = "127.0.0.1".to_string();
-        config.server.port = rest_port;
-        config.server.data_dir = tmp.path().to_path_buf();
-        config.api.rest_port = rest_port;
-        config.api.grpc_port = grpc_port;
-        config.api.unified_mode = false;
-        config.api.pg_port = Some(pg_port);
-        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
-            url: format!("file://{}", tmp.path().display()),
-            ..Default::default()
-        }];
-        config.storage.wal_config.write_buffer_directory =
-            format!("file://{}/wal", tmp.path().display());
-        let mut db = ProximaDB::new(config).await?;
-        db.start().await?;
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .no_proxy()
-            .build()?;
-        let health = format!("http://127.0.0.1:{rest_port}/health");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match http.get(&health).send().await {
-                Ok(r) if r.status().is_success() => break,
-                _ if std::time::Instant::now() > deadline => anyhow::bail!("REST not ready"),
-                _ => sleep(Duration::from_millis(100)).await,
-            }
-        }
-        sleep(Duration::from_millis(200)).await;
-        Ok(Self {
-            pg_port,
-            db: Some(db),
-            _tmp: tmp,
-        })
-    }
-    fn conn_str(&self) -> String {
-        format!(
-            "host=127.0.0.1 port={} user=postgres dbname=proximadb sslmode=disable",
-            self.pg_port
-        )
-    }
-}
-
-impl Drop for PgServer {
-    fn drop(&mut self) {
-        if let Some(mut db) = self.db.take() {
-            tokio::spawn(async move {
-                let _ = db.shutdown().await;
-            });
-        }
-    }
-}
-
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    if let Some(db) = e.as_db_error() {
-        format!("[{}] {}", db.code().code(), db.message())
-    } else {
-        e.to_string()
-    }
-}
-
+use pg_server::TestPgServer;
 /// Normalize a result cell for value comparison: numeric cells are reparsed to a
 /// canonical form (whole numbers without a decimal, fractions minimal) so engine
 /// rendering (`95` vs `95.0` vs `95.000`) doesn't matter; other text passes through.
@@ -119,7 +34,7 @@ async fn canon_rows(client: &tokio_postgres::Client, sql: &str) -> Vec<Vec<Strin
     let mut rows: Vec<Vec<String>> = client
         .simple_query(sql)
         .await
-        .unwrap_or_else(|e| panic!("query `{sql}`: {}", explain_err(&e)))
+        .unwrap_or_else(|e| panic!("query `{sql}`: {}", pg_server::db_err(&e)))
         .into_iter()
         .filter_map(|m| match m {
             tokio_postgres::SimpleQueryMessage::Row(r) => Some(
@@ -255,7 +170,7 @@ fn tsbs_queries() -> Vec<(&'static str, String)> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn events_tsbs_pgwire_conformance() {
-    let server = PgServer::start().await.expect("server start");
+    let server = TestPgServer::start().await.expect("server start");
     let (client, conn) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
         .await
         .expect("connect");
@@ -270,7 +185,7 @@ async fn events_tsbs_pgwire_conformance() {
         client
             .simple_query(ddl)
             .await
-            .unwrap_or_else(|e| panic!("CREATE {name}: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("CREATE {name}: {}", pg_server::db_err(&e)));
     }
     eprintln!("✓ schema: {} tables created", SCHEMA.len());
 
@@ -278,7 +193,7 @@ async fn events_tsbs_pgwire_conformance() {
         client
             .simple_query(&sql)
             .await
-            .unwrap_or_else(|e| panic!("INSERT failed: {}\n  sql: {sql}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("INSERT failed: {}\n  sql: {sql}", pg_server::db_err(&e)));
     }
     eprintln!("✓ data: metrics loaded");
 
@@ -289,7 +204,7 @@ async fn events_tsbs_pgwire_conformance() {
             .await
         {
             Ok(_) => materialized += 1,
-            Err(e) => eprintln!("  · MATERIALIZE {name}: {}", explain_err(&e)),
+            Err(e) => eprintln!("  · MATERIALIZE {name}: {}", pg_server::db_err(&e)),
         }
     }
     eprintln!("✓ materialize: {materialized}/{} tables", SCHEMA.len());
@@ -304,8 +219,8 @@ async fn events_tsbs_pgwire_conformance() {
                 passed.push(*id);
             }
             Err(e) => {
-                eprintln!("  ✗ {id}: {}", explain_err(&e));
-                failed.push((*id, explain_err(&e)));
+                eprintln!("  ✗ {id}: {}", pg_server::db_err(&e));
+                failed.push((*id, pg_server::db_err(&e)));
             }
         }
     }

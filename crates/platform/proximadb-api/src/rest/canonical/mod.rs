@@ -16,10 +16,10 @@
 //! re-exported below.
 
 pub mod analytics;
-pub mod catalog;
 pub mod document;
 pub mod entities;
 pub mod graph;
+pub mod graph_tenant_scope;
 pub mod hybrid;
 pub mod multimodal_query;
 pub mod observability;
@@ -35,7 +35,6 @@ pub use crate::rest::deprecation::{
 
 // Re-exports — handler types
 pub use analytics::{AnalyticsHandler, AqlHandler};
-pub use catalog::{CatalogHandler, CollectionHandler};
 pub use document::{DocumentHandler, DocumentQueryHandler};
 pub use entities::{EntityHandler, VectorHandler};
 pub use graph::{GraphHandler, GraphTraversalHandler};
@@ -59,5 +58,4 @@ pub use multimodal_query::create_multimodal_router;
 pub use observability::create_observability_router;
 
 // Re-exports — handler functions (for direct registration in existing root-crate routers)
-pub use catalog::{collection_operation, delete_collection, get_collection, list_collections};
 pub use hybrid::{liveness_check, readiness_check};

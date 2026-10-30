@@ -96,10 +96,7 @@ from .document_parsers import (  # Enums; Data structures; Tool detection; Parse
     get_available_tools,
 )
 from .factory import ChunkingStrategyFactory, get_chunking_strategy
-from .native_boundaries import (
-    NativeSentenceBoundarySource,
-    native_sentences_available,
-)
+from .native_boundaries import NativeSentenceBoundarySource, native_sentences_available
 from .paragraph import ParagraphStrategy
 
 # Parser utilities (enhanced design patterns)
@@ -149,20 +146,9 @@ from .recursive import RecursiveStrategy
 from .semantic import SemanticStrategy
 from .semantic_embedding import SemanticEmbeddingStrategy
 from .sentence import SentenceStrategy
-from .sizing import (
-    Absolute,
-    Fraction,
-    Of,
-    ResolvedSizing,
-    SizingPolicy,
-)
+from .sizing import Absolute, Fraction, Of, ResolvedSizing, SizingPolicy
 from .sliding_window import SlidingWindowStrategy
-from .structure import (
-    Heading,
-    HeadingOutline,
-    find_headings,
-    protected_spans,
-)
+from .structure import Heading, HeadingOutline, find_headings, protected_spans
 from .token_budget import TokenBudgetStrategy
 from .tokenizers import HuggingFaceTokenCounter
 

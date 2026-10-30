@@ -229,12 +229,25 @@ impl QueryStrategy for VectorSearchStrategy {
             .as_deref()
             .ok_or_else(|| anyhow!("VectorSearchStrategy requires a target collection"))?;
 
-        // Verify collection exists
-        let _collection = self
-            .collection_port
-            .get_collection(collection_id, None)
-            .await?
-            .ok_or_else(|| anyhow!("Collection '{}' not found", collection_id))?;
+        // Resolve the collection within the request tenant (None outside a
+        // request scope = internal); a collection the tenant may not resolve
+        // is answered exactly like a missing one.
+        let request_tenant = crate::query::request_scope::resolution_tenant(collection_id)?;
+        let _collection = match request_tenant.as_deref() {
+            Some(tenant) => {
+                self.collection_port
+                    .get_collection(collection_id, Some(tenant))
+                    .await?
+            }
+            None => {
+                self.collection_port
+                    .get_collection_internal(collection_id)
+                    .await?
+            }
+        }
+        .ok_or_else(|| {
+            crate::services::operations::vectors::CollectionNotFound::new(collection_id)
+        })?;
 
         // Convert to proto request
         let proto_request = self.to_proto_request(&request)?;
@@ -248,7 +261,13 @@ impl QueryStrategy for VectorSearchStrategy {
         // Execute search through VectorOps
         let response = self
             .vector_ops
-            .search_v1(proto_request, proximadb_runtime::PortIdentity::anonymous())
+            .search_v1(
+                proto_request,
+                match request_tenant.as_deref() {
+                    Some(tenant) => proximadb_runtime::PortIdentity::for_tenant(tenant),
+                    None => proximadb_runtime::PortIdentity::anonymous(),
+                },
+            )
             .await?;
 
         let execution_time_ms = start.elapsed().as_millis() as u64;

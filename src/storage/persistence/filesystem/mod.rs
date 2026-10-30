@@ -119,7 +119,6 @@
 //! - **`s3.rs`**: Amazon S3 backend
 //! - **`azure.rs`**: Azure Data Lake Storage
 //! - **`gcs.rs`**: Google Cloud Storage
-//! - **`hdfs.rs`**: Hadoop HDFS support
 //! - **`zero_copy_filesystem.rs`**: High-performance I/O layer
 //! - **`atomic_strategy.rs`**: Atomic write implementations
 //! - **`manager.rs`**: Filesystem factory and routing
@@ -173,6 +172,7 @@ use url::Url;
 pub mod atomic_strategy;
 // intelligent_filesystem removed - using UnifiedCachingFilesystem instead
 pub mod local;
+pub mod parquet_async_reader;
 // Cloud object-store backends, built on the official SDKs (which handle signing,
 // custom endpoints, and path-style — incl. MinIO/Azurite/fake-gcs emulators) and
 // gated behind their features. These replace the deleted legacy s3.rs/azure.rs/
@@ -183,6 +183,10 @@ pub mod aws_s3;
 pub mod azure_blob;
 #[cfg(feature = "gcp")]
 pub mod gcs_store;
+/// TD-PAXDIR-1 test support: request latency injected inside the timed
+/// physical request (`PROXIMADB_TEST_FS_LATENCY_MS`).
+#[cfg(test)]
+pub(crate) mod latency;
 pub mod scheme_validation;
 pub mod write_strategy;
 // zero_copy_filesystem removed - functionality integrated into UnifiedCachingFilesystem
@@ -276,17 +280,52 @@ impl std::fmt::Debug for FilesystemFactory {
 /// Record a successful whole-object read at the physical filesystem boundary.
 /// This is always-on query evidence; `PROXIMADB_COUNT_FS_IO` controls only the
 /// separate process-global benchmark counters.
-pub(super) fn record_physical_full_read(bytes: u64) {
+/// `started` is when the read was issued (TD-PAXDIR-1 D7 wave count).
+pub(super) fn record_physical_full_read(bytes: u64, started: std::time::Instant) {
     crate::observability::io_trace::record_op(crate::observability::io_trace::IoOp::Get);
     crate::observability::io_trace::record_bytes_read(bytes);
+    crate::observability::io_trace::record_request(started);
 }
 
 /// Record a successful ranged read at the physical filesystem boundary.
 /// `get_ops` is the total physical GET count; `range_gets` is its ranged subset.
-pub(super) fn record_physical_range_read(bytes: u64) {
+pub(super) fn record_physical_range_read(bytes: u64, started: std::time::Instant) {
     crate::observability::io_trace::record_op(crate::observability::io_trace::IoOp::Get);
     crate::observability::io_trace::record_range_gets(1);
     crate::observability::io_trace::record_bytes_read(bytes);
+    crate::observability::io_trace::record_request(started);
+}
+
+/// A non-GET read request kind at the physical filesystem boundary.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum TracedOp {
+    /// A LIST (one page, for paginated backends).
+    List,
+    /// A HEAD / existence check.
+    Head,
+}
+
+/// TD-PAXDIR-1 D7: run one LIST or HEAD request and record it into the
+/// per-query trace — counted and timed whether it succeeds or not (a failed
+/// or not-found request still costs its round trip). With the GET recorders
+/// above this is the request count the P5b gate is defined on (GET + LIST +
+/// HEAD) and the input of the query's wave count.
+pub(super) async fn traced_request<T>(
+    op: TracedOp,
+    request: impl std::future::Future<Output = FsResult<T>>,
+) -> FsResult<T> {
+    let started = std::time::Instant::now();
+    #[cfg(test)]
+    latency::inject().await;
+    let out = request.await;
+    match op {
+        TracedOp::List => {
+            crate::observability::io_trace::record_op(crate::observability::io_trace::IoOp::List)
+        }
+        TracedOp::Head => crate::observability::io_trace::record_head(),
+    }
+    crate::observability::io_trace::record_request(started);
+    out
 }
 
 /// Records `ProximaObjectStore` reads into the per-query `IoTrace`.
@@ -1911,5 +1950,123 @@ mod range_coalesce_gate_tests {
             zero.max_merged_bytes, 1,
             "a zero ceiling would merge nothing at all"
         );
+    }
+}
+
+/// `scheme://bucket/key` → `(bucket, key)` for the object-store backends.
+/// `schemes` are the accepted prefixes; `(article, name)` names the backend
+/// in errors and `part` what follows the bucket.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+pub(crate) fn split_object_url(
+    path: &str,
+    schemes: &[&str],
+    (article, name): (&str, &str),
+    part: &str,
+) -> FsResult<(String, String)> {
+    let rest = schemes
+        .iter()
+        .find_map(|scheme| path.strip_prefix(scheme))
+        .ok_or_else(|| {
+            FilesystemError::InvalidPath(format!("not {article} {name} path: {path}"))
+        })?;
+    let (bucket, key) = rest.split_once('/').ok_or_else(|| {
+        FilesystemError::InvalidPath(format!("missing {part} in {name} path: {path}"))
+    })?;
+    if bucket.is_empty() || key.is_empty() {
+        return Err(FilesystemError::InvalidPath(format!(
+            "bad {name} path: {path}"
+        )));
+    }
+    Ok((bucket.to_string(), key.to_string()))
+}
+
+/// Error mapping shared by the `object_store`-backed backends (S3, Azure).
+#[cfg(any(feature = "aws", feature = "azure"))]
+pub(crate) mod object_store_errors {
+    use super::{FilesystemError, FsResult};
+
+    /// A missing object is `NotFound` (carrying the caller's `path`), as on the
+    /// local backend: callers tell "absent" from "unreachable" by the variant.
+    pub(crate) fn object_error(ctx: &str, path: &str, e: object_store::Error) -> FilesystemError {
+        match e {
+            object_store::Error::NotFound { .. } => FilesystemError::NotFound(path.to_string()),
+            other => denied(ctx, other),
+        }
+    }
+
+    /// A refused credential is not a transient fault: callers that retry
+    /// `Network` must not retry these. Only errors object_store classifies
+    /// reach here as such: it reports a refused LIST (S3, Azure) as `Generic`,
+    /// so that stays `Network`.
+    pub(crate) fn denied(ctx: &str, e: object_store::Error) -> FilesystemError {
+        match e {
+            object_store::Error::PermissionDenied { .. } => {
+                FilesystemError::PermissionDenied(format!("{ctx}: {e}"))
+            }
+            object_store::Error::Unauthenticated { .. } => {
+                FilesystemError::Auth(format!("{ctx}: {e}"))
+            }
+            other => FilesystemError::Network(format!("{ctx}: {other}")),
+        }
+    }
+
+    /// A HEAD answer as `exists`: only a missing object is `false`; any other
+    /// failure (auth, network) propagates rather than reading as "absent".
+    pub(crate) fn exists_from_head<T>(ctx: &str, head: object_store::Result<T>) -> FsResult<bool> {
+        match head {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(denied(ctx, e)),
+        }
+    }
+}
+
+/// The missing-object contract every backend keeps: reads of a missing object
+/// are `NotFound` — the variant callers use to tell "absent" from
+/// "unreachable" — a delete of one is a no-op or `NotFound` (never `Network`),
+/// and `exists` answers `false`. Reported as `Network`, a missing object made
+/// the record spill refuse every fresh partition on object storage: its first
+/// discovery reads a purge-obligation marker that does not exist yet.
+///
+/// Shared by the backend contract tests and the emulator lib test.
+#[doc(hidden)]
+pub async fn check_missing_object_contract(fs: &dyn FileSystem, key: &str) -> Result<(), String> {
+    match fs.read(key).await {
+        Err(FilesystemError::NotFound(_)) => {}
+        other => return Err(format!("read: expected NotFound, got {other:?}")),
+    }
+    match fs.read_range(key, 0, 4).await {
+        Err(FilesystemError::NotFound(_)) => {}
+        other => return Err(format!("ranged read: expected NotFound, got {other:?}")),
+    }
+    match fs.delete(key).await {
+        Ok(()) | Err(FilesystemError::NotFound(_)) => {}
+        other => return Err(format!("delete: expected Ok or NotFound, got {other:?}")),
+    }
+    match fs.exists(key).await {
+        Ok(false) => Ok(()),
+        other => Err(format!("exists: expected Ok(false), got {other:?}")),
+    }
+}
+
+/// Object-store backends against an emulator (run by the `--restart` scope of
+/// `scripts/run_cloud_emulator_tests.sh`, which exports
+/// `PROXIMADB_OBJECT_STORE_URL`).
+#[cfg(test)]
+mod object_store_contract_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires an object-store emulator (PROXIMADB_OBJECT_STORE_URL)"]
+    async fn a_missing_object_is_not_found_on_object_store() {
+        let base = std::env::var("PROXIMADB_OBJECT_STORE_URL")
+            .expect("set PROXIMADB_OBJECT_STORE_URL to an emulator prefix");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let key = format!("{base}/missing-object/{run}/never-written.json");
+        let factory = FilesystemFactory::create_default().await.expect("factory");
+        let fs = factory.get_filesystem(&key).expect("backend for the key");
+        if let Err(violation) = check_missing_object_contract(fs.as_ref(), &key).await {
+            panic!("{violation}");
+        }
     }
 }

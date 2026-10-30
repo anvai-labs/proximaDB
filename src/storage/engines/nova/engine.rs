@@ -12,6 +12,7 @@ use crate::storage::engines::core::formats::columnar::{
 };
 use crate::storage::engines::core::ops::{
     UniversalOptimizationStrategy, UniversalPerformanceOptimizer, UniversallyOptimized,
+    insert_universal_optimizer_metrics,
 };
 use crate::storage::engines::nova::NovaFile;
 use crate::storage::traits::{
@@ -1445,75 +1446,23 @@ impl UnifiedStorageFormat for NovaEngine {
         base_path: &str,
         records: Vec<proximadb_records::ProximaRecord>,
     ) -> Result<crate::storage::traits::SegmentIngestResult> {
-        use crate::proto::proximadb_v1::{Collection, StorageAssignment};
+        use crate::storage::engines::core::ops::bulk_ingest::{
+            build_bulk_flush_parameters, empty_segment_result, segment_result_from_flush,
+        };
 
         let count = records.len();
         if count == 0 {
-            return Ok(crate::storage::traits::SegmentIngestResult {
-                collection_id: collection_id.to_string(),
-                record_count: 0,
-                synthetic_segment_id: "empty".to_string(),
-                used_engine_specific_path: true,
-            });
+            return Ok(empty_segment_result(collection_id));
         }
 
-        // Build a minimal Collection so flush_ops knows where to write.
-        // `config = None` lets dimension fall back to inspecting
-        // records[0].embeddings[0].dim inside the flush path (per the
-        // existing fallback chain). `storage_assignment.base_location`
-        // is the only field flush_ops::flush actually reads.
-        let collection_config = Some(Collection {
-            id: collection_id.to_string(),
-            config: None,
-            stats: None,
-            created_at: 0,
-            updated_at: 0,
-            storage_assignment: Some(StorageAssignment {
-                primary_path: base_path.to_string(),
-                backup_paths: vec![],
-                engine: 0, // engine enum slot — flush_ops doesn't read this
-                engine_config: std::collections::HashMap::new(),
-                base_location: base_path.to_string(),
-                assigned_at: 0,
-                ..Default::default()
-            }),
-        });
-
-        let params = FlushParameters {
-            collection_id: Some(
-                collection_id
-                    .parse::<u64>()
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "NOVA bulk ingest requires a numeric catalog object id, got {collection_id:?}: {error}"
-                        )
-                    })?
-                    .to_string(),
-            ),
-            force: true,
-            synchronous: true,
-            hints: std::collections::HashMap::new(),
-            timeout_ms: None,
-            vector_records: records,
-            trigger_compaction: false,
-            batch_ids: vec![],
-            collection_config,
-            estimated_size: 0,
-        };
-
+        let params = build_bulk_flush_parameters(collection_id, base_path, records, "NOVA")?;
         let flush_result = self.flush_ops.flush(&params).await?;
-        let synthetic_segment_id = flush_result
-            .file_paths
-            .first()
-            .cloned()
-            .unwrap_or_else(|| format!("nova-bulkload-{collection_id}-{count}"));
-
-        Ok(crate::storage::traits::SegmentIngestResult {
-            collection_id: collection_id.to_string(),
-            record_count: count,
-            synthetic_segment_id,
-            used_engine_specific_path: true,
-        })
+        Ok(segment_result_from_flush(
+            collection_id,
+            count,
+            &flush_result,
+            "nova",
+        ))
     }
 
     async fn do_compact(&self, params: &CompactionParameters) -> Result<CompactionResult> {
@@ -2039,33 +1988,14 @@ impl UnifiedStorageFormat for NovaEngine {
 
     /// Engine-level RLS predicate (Tier 1 multi-tenant safety hardening).
     ///
-    /// Mirrors the SST implementation at `src/storage/engines/sst/trait_impl.rs:303`.
+    /// Mirrors the SST implementation at `src/storage/engines/sst/trait_impl.rs`.
     /// Extracts tenant_id from the query context so NOVA's scan iterator can
     /// apply row-level isolation without referencing application-layer middleware.
     fn rls_record_filter(
         &self,
         ctx: &crate::storage::traits::StorageQueryContext,
     ) -> Option<crate::storage::traits::RlsRecordPredicate> {
-        let tenant_id = ctx
-            .tenant_context
-            .as_ref()
-            .map(|tc| tc.tenant_id.as_str())
-            .or_else(|| {
-                ctx.user_context
-                    .as_ref()
-                    .and_then(|uc| uc.tenant_id.as_deref())
-            });
-
-        let principal = ctx.user_context.as_ref().map(|uc| uc.user_id.as_str());
-
-        if tenant_id.is_none() && principal.is_none() {
-            return None;
-        }
-
-        Some(crate::storage::traits::RlsRecordPredicate {
-            required_tenant_id: tenant_id.map(str::to_string),
-            required_principal: principal.map(str::to_string),
-        })
+        crate::storage::traits::rls_predicate_from_ctx(ctx)
     }
 }
 
@@ -2160,25 +2090,7 @@ impl UniversallyOptimized for NovaEngine {
         );
 
         // Universal optimizer metrics
-        let strategy = self.universal_optimizer.get_strategy();
-        metrics.insert(
-            "universal_optimization_strategy".to_string(),
-            serde_json::Value::String(format!("{:?}", strategy)),
-        );
-
-        let config = self.universal_optimizer.get_config();
-        metrics.insert(
-            "universal_cache_size_mb".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(config.cache_size_mb)),
-        );
-        metrics.insert(
-            "universal_parallel_operations".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(config.parallel_operations)),
-        );
-        metrics.insert(
-            "universal_prefetching_enabled".to_string(),
-            serde_json::Value::Bool(config.enable_prefetching),
-        );
+        insert_universal_optimizer_metrics(&mut metrics, &self.universal_optimizer);
 
         Ok(metrics)
     }
@@ -2202,61 +2114,10 @@ impl NovaEngine {
     fn convert_filter_to_index(
         filter_expression: Option<&proximadb_filter_expression::FilterExpression>,
     ) -> Vec<proximadb_index_traits::IndexMetadataFilter> {
-        use proximadb_filter_expression::{ComparisonOperator, FilterExpression};
-        use proximadb_index_traits::{IndexFilterOperator, IndexMetadataFilter};
-
-        let Some(filter) = filter_expression else {
-            return Vec::new();
-        };
-
-        // Convert filter expressions to index metadata filters
-        let mut index_filters = Vec::new();
-
-        match filter {
-            FilterExpression::Comparison {
-                field,
-                operator,
-                value,
-            } => {
-                // Convert ComparisonOperator to IndexFilterOperator
-                let index_operator = match operator {
-                    ComparisonOperator::Equals => IndexFilterOperator::Equals,
-                    ComparisonOperator::NotEquals => IndexFilterOperator::NotEquals,
-                    ComparisonOperator::GreaterThan => IndexFilterOperator::GreaterThan,
-                    ComparisonOperator::GreaterThanOrEqual => {
-                        IndexFilterOperator::GreaterThanOrEqual
-                    }
-                    ComparisonOperator::LessThan => IndexFilterOperator::LessThan,
-                    ComparisonOperator::LessThanOrEqual => IndexFilterOperator::LessThanOrEqual,
-                    ComparisonOperator::In => IndexFilterOperator::In,
-                    ComparisonOperator::NotIn => IndexFilterOperator::NotIn,
-                    _ => {
-                        tracing::debug!(
-                            "Operator {:?} not directly supported by index, will use post-filtering",
-                            operator
-                        );
-                        return index_filters;
-                    }
-                };
-
-                index_filters.push(IndexMetadataFilter {
-                    field: field.clone(),
-                    operator: index_operator,
-                    value: value.clone(),
-                });
-            }
-            FilterExpression::And(filters) => {
-                for f in filters {
-                    index_filters.extend(Self::convert_filter_to_index(Some(f)));
-                }
-            }
-            FilterExpression::Or(_) | FilterExpression::Not(_) => {
-                // OR and NOT are not directly supported by index, will use post-filtering
-                tracing::debug!("OR/NOT filters not supported by index, will use post-filtering");
-            }
-        }
-
-        index_filters
+        // Canonical converter (redundancy pass 3): the six per-engine copies
+        // had drifted — only SST mapped Contains/StartsWith/EndsWith/Like/
+        // Between. See proximadb_filter_expression::to_index_metadata_filters.
+        proximadb_filter_expression::to_index_metadata_filters(filter_expression)
     }
 
     // Removed unnecessary helper methods - engines receive all params directly

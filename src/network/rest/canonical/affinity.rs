@@ -29,14 +29,18 @@
 //!   operators can see which collections went cold.
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, State},
     http::StatusCode,
 };
 use serde::Serialize;
 
 use crate::cluster::cache_affinity::AffinityEntry;
+use crate::network::middleware::tenant::TenantContext;
 use crate::network::rest::canonical::handlers::AppState;
+use crate::network::rest::canonical::pinning::{
+    collection_visible_to_request, visible_collection_keys,
+};
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -108,8 +112,10 @@ fn entry_to_item(
 /// `GET /api/v2/collections/:collection_id/affinity`
 pub async fn get_affinity(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(collection_id): Path<String>,
 ) -> Result<Json<AffinityResponse>, (StatusCode, String)> {
+    collection_visible_to_request(&state, &tenant, &collection_id).await?;
     let registry = &state.affinity_registry;
 
     match registry.entry(&collection_id) {
@@ -135,8 +141,10 @@ pub async fn get_affinity(
 /// `DELETE /api/v2/collections/:collection_id/affinity`
 pub async fn delete_affinity(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
     Path(collection_id): Path<String>,
 ) -> Result<Json<AffinityDeleteResponse>, (StatusCode, String)> {
+    collection_visible_to_request(&state, &tenant, &collection_id).await?;
     let registry = &state.affinity_registry;
     let dropped = registry.invalidate(&collection_id);
     Ok(Json(AffinityDeleteResponse::Dropped {
@@ -145,13 +153,20 @@ pub async fn delete_affinity(
     }))
 }
 
-/// `GET /api/v2/collections/affinity` — operator dashboard list.
+/// `GET /api/v2/collections/affinity` — the entries for collections visible to
+/// the request tenant.
 pub async fn list_affinity(
     State(state): State<AppState>,
+    Extension(tenant): Extension<TenantContext>,
 ) -> Result<Json<AffinityListResponse>, (StatusCode, String)> {
     let registry = &state.affinity_registry;
+    let visible = visible_collection_keys(&state, &tenant).await;
 
-    let listed = registry.list();
+    let listed: Vec<_> = registry
+        .list()
+        .into_iter()
+        .filter(|(collection_id, _)| visible.contains(collection_id))
+        .collect();
     // Determine staleness per-entry using the registry's own TTL
     // semantics (preferred_node returns None for stale entries).
     let items: Vec<AffinityListItem> = listed

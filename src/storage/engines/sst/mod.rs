@@ -250,6 +250,8 @@ pub mod writer;
 pub mod block_cluster; // TD-RDSTRAT-5 S1: sort-by-code block clustering at PAX write
 pub mod block_format;
 pub mod blocks;
+pub mod centroid_directory_publisher; // TD-PAXDIR-1 D1: collection-global centroid directory
+pub mod centroid_directory_reader; // TD-PAXDIR-1 D2: query-side global cell selection
 pub mod codebook_integration;
 pub mod collections;
 pub mod core;
@@ -286,6 +288,12 @@ mod cold_recovery_reconcile_test;
 #[cfg(all(test, feature = "cold-deletion-vectors"))]
 #[path = "tests/cold_compaction_dv_test.rs"]
 mod cold_compaction_dv_test;
+// TD-PAXDIR-1 D2: the collection centroid directory on a multi-segment
+// collection (recall vs brute force, reads vs the per-segment path). In-crate
+// (#[path]) to drive the pub(crate) fan-out and the directory publisher.
+#[cfg(test)]
+#[path = "tests/centroid_directory_search_test.rs"]
+mod centroid_directory_search_test;
 pub mod flush;
 pub mod manifest;
 #[cfg(feature = "cold-deletion-vectors")]
@@ -293,7 +301,6 @@ pub mod oid_resolve; // TD-DELVEC-1 WI-3c-1c: resolve_oid_positions + read_resol
 #[cfg(feature = "cold-deletion-vectors")]
 pub use proximadb_storage_common::oid_resolver_cache;
 pub mod pca_manager; // PCA caching for Z-Order spatial encoding
-pub mod progressive_stages; // ISP-compliant progressive search stages
 pub mod search;
 pub mod segment_format; // P3 Phase A: mixed-format (ProximaBlocks/PAX) read primitives
 

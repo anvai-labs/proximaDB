@@ -12,10 +12,7 @@ import time
 import numpy as np
 import pytest
 
-from proximadb_sdk import (
-    CollectionConfig,
-    StorageEngine,
-)
+from proximadb_sdk import CollectionConfig, StorageEngine
 
 logger = logging.getLogger(__name__)
 

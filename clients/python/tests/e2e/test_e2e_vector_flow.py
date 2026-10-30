@@ -15,12 +15,7 @@ import time
 
 from sentence_transformers import SentenceTransformer
 
-from proximadb_sdk import (
-    CollectionConfig,
-    Protocol,
-    ProximaDBClient,
-    StorageEngine,
-)
+from proximadb_sdk import CollectionConfig, Protocol, ProximaDBClient, StorageEngine
 
 
 def generate_bert_embeddings(texts, model_name="all-MiniLM-L6-v2"):

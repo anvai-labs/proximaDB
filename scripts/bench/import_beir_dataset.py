@@ -9,9 +9,20 @@ import hashlib
 import json
 import math
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+# corpus_io is a sibling module in scripts/bench/. Inject that directory so the
+# import works both when run as a script and when loaded via importlib in tests.
+_BENCH_DIR = str(Path(__file__).resolve().parent)
+if _BENCH_DIR not in sys.path:
+    sys.path.insert(0, _BENCH_DIR)
+
+from corpus_io import (  # noqa: E402  — path-injected sibling bench module
+    atomic_json_write as _atomic_json,
+)
 
 
 def _digest(path: Path, algorithm: str = "sha256") -> str:
@@ -57,22 +68,6 @@ def _atomic_jsonl(records: list[dict[str, Any]], path: Path) -> None:
                 output.write(
                     json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
                 )
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _atomic_json(value: Any, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f"{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    os.close(descriptor)
-    temporary = Path(temporary_name)
-    try:
-        with temporary.open("w", encoding="utf-8") as output:
-            json.dump(value, output, indent=2, sort_keys=True)
-            output.write("\n")
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)

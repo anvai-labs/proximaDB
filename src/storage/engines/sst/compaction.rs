@@ -1673,6 +1673,58 @@ impl Compaction {
         Ok(failed)
     }
 
+    /// TD-PAXDIR-1 D3: the collection's shared cell space for an output in
+    /// `output`'s directory — the space covering the most rows in the newest
+    /// valid centroid directory — when `PROXIMADB_PAX_WRITE_SHARED_MODEL` is
+    /// on. It needs a published directory, so it also requires the directory
+    /// write gate (no LIST or GET otherwise). `None` trains as before; the
+    /// writer still retrains on drift, growth or a dimension mismatch.
+    async fn shared_collection_model(
+        &self,
+        output: &Path,
+    ) -> Option<Arc<proximadb_storage_common::centroid_directory::SharedCellSpace>> {
+        use super::centroid_directory_publisher::{
+            centroid_directory_write_enabled, load_newest_directory,
+        };
+        if !super::block_cluster::shared_model_enabled() || !centroid_directory_write_enabled() {
+            return None;
+        }
+        let dir_url = output.parent()?.to_string_lossy().into_owned();
+        let fs = self.filesystem_factory.get_filesystem(&dir_url).ok()?;
+        load_newest_directory(fs.as_ref(), &dir_url)
+            .await?
+            .collection_model()
+            .map(Arc::new)
+    }
+
+    /// TD-PAXDIR-1 D1: bring the collection centroid directory up to date with
+    /// the live set once the output is published and the inputs retired. The
+    /// directory is a projection, so a failure is logged and never fails the
+    /// compaction.
+    async fn refresh_centroid_directory(&self, output: &Path) {
+        use super::centroid_directory_publisher::{
+            centroid_directory_write_enabled, publish_centroid_directory,
+        };
+        if !centroid_directory_write_enabled() {
+            return;
+        }
+        let Some(dir) = output.parent() else {
+            return;
+        };
+        let dir_url = dir.to_string_lossy();
+        let result = match self.filesystem_factory.get_filesystem(&dir_url) {
+            Ok(fs) => publish_centroid_directory(fs.as_ref(), &dir_url).await,
+            Err(error) => Err(error.into()),
+        };
+        match result {
+            Ok(Some(generation)) => {
+                debug!(dir = %dir_url, generation, "published PAX centroid directory")
+            }
+            Ok(None) => {}
+            Err(error) => warn!(dir = %dir_url, %error, "PAX centroid directory not published"),
+        }
+    }
+
     /// TD-COMPACT-13 reconciler sweep (debounced 30s): drain recorded
     /// obligations for every known collection dir.
     async fn sweep_pending_retirements_if_due(&self) {
@@ -1688,7 +1740,12 @@ impl Compaction {
     async fn drain_pending_for_dir(&self, collection_data_dir: &Path) -> Result<()> {
         // Hold the ledger lock across this whole load-modify-save sequence.
         let _ledger_guard = retirement_ledger::ledger_lock().await;
-        let mut ledger = retirement_ledger::load_ledger(collection_data_dir);
+        let mut ledger = retirement_ledger::load_ledger(collection_data_dir).map_err(|error| {
+            crate::core::StorageError::SstEngine(format!(
+                "load retire-pending ledger for {}: {error:#}",
+                collection_data_dir.display()
+            ))
+        })?;
         if ledger.pending.is_empty() {
             return Ok(());
         }
@@ -1721,6 +1778,7 @@ impl Compaction {
         let failed = self
             .retire_inputs_with_retry(&task.output_file, &task.input_files)
             .await?;
+        self.refresh_centroid_directory(&task.output_file).await;
         if !failed.is_empty() {
             warn!(
                 output = %task.output_file.display(),
@@ -1959,21 +2017,26 @@ impl Compaction {
                         "update local-spill IVF manifest: {error}"
                     ))
                 })?;
-            SpillOrdering::Ivf(
-                cluster_external_mvcc(
-                    winners,
-                    &scratch_root,
-                    run_buffer_bytes,
-                    merge_fan_in,
-                    plan.memory_bytes,
-                    task.output_file.to_str(),
-                )
-                .map_err(|error| {
-                    crate::core::StorageError::SstEngine(format!(
-                        "local-spill IVF ordering failed: {error}"
-                    ))
-                })?,
-            )
+            // TD-PAXDIR-1 D3: classify with the collection's shared model.
+            let collection_model = self.shared_collection_model(&task.output_file).await;
+            let model_scope =
+                crate::storage::engines::sst::block_cluster::CollectionModelScope::enter(
+                    collection_model,
+                );
+            let clustered = cluster_external_mvcc(
+                winners,
+                &scratch_root,
+                run_buffer_bytes,
+                merge_fan_in,
+                plan.memory_bytes,
+                task.output_file.to_str(),
+            );
+            drop(model_scope);
+            SpillOrdering::Ivf(clustered.map_err(|error| {
+                crate::core::StorageError::SstEngine(format!(
+                    "local-spill IVF ordering failed: {error}"
+                ))
+            })?)
         } else {
             SpillOrdering::Mvcc(winners)
         };
@@ -2692,6 +2755,13 @@ impl Compaction {
                         &task.input_files,
                     )
                     .await;
+                    // TD-PAXDIR-1 D3: classify with the collection's shared
+                    // model (scoped to the synchronous write below).
+                    let collection_model = self.shared_collection_model(&task.output_file).await;
+                    let model_scope =
+                        crate::storage::engines::sst::block_cluster::CollectionModelScope::enter(
+                            collection_model,
+                        );
                     if cache_on_write.includes_invariants() {
                         let write = crate::storage::engines::sst::segment_format::
                             write_pax_segment_compacted_with_cache_seed_shredded(
@@ -2732,6 +2802,7 @@ impl Compaction {
                             ))
                         })?;
                     }
+                    drop(model_scope);
                     info!(
                         "✅ COMPACTION: Wrote {} records to PAX segment",
                         records.len()
@@ -2866,6 +2937,13 @@ impl Compaction {
                         &task.input_files,
                     )
                     .await;
+                    // TD-PAXDIR-1 D3: classify with the collection's shared
+                    // model (scoped to the synchronous write below).
+                    let collection_model = self.shared_collection_model(&task.output_file).await;
+                    let model_scope =
+                        crate::storage::engines::sst::block_cluster::CollectionModelScope::enter(
+                            collection_model,
+                        );
                     if cache_on_write.includes_invariants() {
                         let write = crate::storage::engines::sst::segment_format::
                             write_pax_segment_compacted_with_cache_seed_shredded(
@@ -2906,6 +2984,7 @@ impl Compaction {
                             ))
                         })?;
                     }
+                    drop(model_scope);
                     info!(
                         "✅ COMPACTION (non-atomic): Wrote {} records to PAX segment",
                         records.len()
@@ -3000,6 +3079,7 @@ impl Compaction {
         let retirement_pending = self
             .retire_inputs_with_retry(&task.output_file, &task.input_files)
             .await?;
+        self.refresh_centroid_directory(&task.output_file).await;
         if !retirement_pending.is_empty() {
             warn!(
                 output = %task.output_file.display(),
@@ -3199,7 +3279,7 @@ impl Compaction {
     async fn extract_shred_spec_from_inputs(
         factory: &Arc<dyn proximadb_storage_ports::FilesystemPort>,
         input_files: &[PathBuf],
-    ) -> Vec<(String, i32)> {
+    ) -> Vec<proximadb_block_format::ShredColumn> {
         use proximadb_storage_common::segment_layout::SegmentFooterIndex;
         for input in input_files {
             let url = input.to_string_lossy();
@@ -3211,6 +3291,11 @@ impl Compaction {
             if let Ok(Some(footer)) = SegmentFooterIndex::locate_in_segment(&bytes)
                 && !footer.shred_field_map.is_empty()
             {
+                // TD-FPRUNE-1 P5 slice 3: the v2 field-map carries the
+                // declared types, so compaction preserves residual outputs
+                // (typed re-shred) instead of regressing to the complete
+                // tail on rewrite. A v1 map (untyped, all-legacy) parses as
+                // untyped columns — the conservative complete-tail rewrite.
                 return footer.shred_field_map;
             }
         }

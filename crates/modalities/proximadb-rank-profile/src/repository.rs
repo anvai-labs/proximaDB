@@ -8,7 +8,6 @@ use crate::spec::RankProfileSpec;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use proximadb_rank_core::{RankError, RankResult};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
 /// Notifications emitted by the repository so registries (and CDC
@@ -60,13 +59,6 @@ impl Default for InMemoryRankProfileRepository {
     }
 }
 
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 #[async_trait]
 impl RankProfileRepository for InMemoryRankProfileRepository {
     async fn create(&self, mut spec: RankProfileSpec) -> RankResult<u32> {
@@ -77,7 +69,7 @@ impl RankProfileRepository for InMemoryRankProfileRepository {
             )));
         }
         spec.version = 1;
-        spec.created_at_ms = now_ms();
+        spec.created_at_ms = proximadb_kernel::time::now_unix_ms();
         let v = spec.version;
         let name = spec.name.clone();
         self.inner.insert(name.clone(), spec);
@@ -97,7 +89,7 @@ impl RankProfileRepository for InMemoryRankProfileRepository {
                 ))
             })?;
         spec.version = prior + 1;
-        spec.created_at_ms = now_ms();
+        spec.created_at_ms = proximadb_kernel::time::now_unix_ms();
         let v = spec.version;
         let name = spec.name.clone();
         self.inner.insert(name.clone(), spec);

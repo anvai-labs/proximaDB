@@ -11,6 +11,7 @@
 use proximadb_data_model::ProximaType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::OnceLock;
 
 // Proto re-export so modules extracted from the root `src/catalog` keep their
@@ -43,7 +44,10 @@ pub mod tenant_posture;
 // through the injected `CatalogFilesystemResolver` port (no catalog->storage
 // up-edge).
 pub mod manager;
-pub use manager::{CatalogFilesystemResolver, CatalogManager, TableOpLockRegistry};
+pub mod table_properties;
+pub use manager::{
+    CatalogFilesystemResolver, CatalogManager, TableNotVisible, TableOpLockRegistry,
+};
 /// Typed MLOps/model-registry facet for the unified xCatalog object model.
 pub mod mlops;
 /// Tenant-scoped model-registry lifecycle application service shared by API adapters.
@@ -2435,9 +2439,44 @@ pub trait Catalog: Send + Sync {
         schema: CatalogTableSchema,
     ) -> anyhow::Result<CatalogTableSchema> {
         let created = self.create_table_inner(identifier, schema).await?;
-        if self.identity_authority().is_some() && created.object_id.is_none() {
+        Self::require_object_id(self, "created", identifier, &created)?;
+        Ok(created)
+    }
+
+    /// TD-CATREPLACE-1: replace a table's schema in place. The table is never
+    /// absent to a concurrent reader, and an I/O failure mid-replace leaves the
+    /// previous schema intact — the drop+create dance could lose the table
+    /// entirely (drop succeeded, create failed).
+    ///
+    /// The schema is validated BEFORE anything is touched, so a rejected
+    /// schema costs nothing. Identity follows [`Catalog::create_table`]: a
+    /// caller-supplied `object_id` is adopted; backends mint otherwise.
+    ///
+    /// **Do not override** — this is the sealed TD-CAT-7 post-condition over
+    /// [`Catalog::replace_table_inner`], exactly as `create_table` seals
+    /// `create_table_inner` (minting must be unforgettable, not merely
+    /// implemented). Backends override `replace_table_inner`.
+    async fn replace_table(
+        &self,
+        identifier: &TableIdentifier,
+        schema: CatalogTableSchema,
+    ) -> anyhow::Result<CatalogTableSchema> {
+        let replaced = self.replace_table_inner(identifier, schema).await?;
+        Self::require_object_id(self, "replaced", identifier, &replaced)?;
+        Ok(replaced)
+    }
+
+    /// The TD-CAT-7 post-condition shared by the sealed `create_table` and
+    /// `replace_table` wrappers.
+    fn require_object_id(
+        &self,
+        verb: &str,
+        identifier: &TableIdentifier,
+        written: &CatalogTableSchema,
+    ) -> anyhow::Result<()> {
+        if self.identity_authority().is_some() && written.object_id.is_none() {
             anyhow::bail!(
-                "TD-CAT-7: catalog '{}' ({}) is an identity authority but created table {:?} \
+                "TD-CAT-7: catalog '{}' ({}) is an identity authority but {verb} table {:?} \
                  with no object_id; authorization keys on it, so the row must not be committed \
                  without one",
                 self.name(),
@@ -2445,7 +2484,26 @@ pub trait Catalog: Send + Sync {
                 identifier,
             );
         }
-        Ok(created)
+        Ok(())
+    }
+
+    /// The backend half of [`Catalog::replace_table`]. The default keeps the
+    /// historical drop+create semantics for catalogs without an atomic
+    /// overwrite (routing through the sealed `create_table`, so identity
+    /// minting stays inside the one chokepoint); backends whose authority is
+    /// a single object (the native catalog) override with one write.
+    async fn replace_table_inner(
+        &self,
+        identifier: &TableIdentifier,
+        schema: CatalogTableSchema,
+    ) -> anyhow::Result<CatalogTableSchema> {
+        let mut schema = schema;
+        crate::schema::normalize_identity(&mut schema);
+        crate::schema::validate_schema(&schema)?;
+        if self.table_exists(identifier).await? {
+            self.drop_table(identifier, false).await?;
+        }
+        self.create_table(identifier, schema).await
     }
 
     async fn drop_table(&self, identifier: &TableIdentifier, purge: bool) -> anyhow::Result<bool>;
@@ -2727,6 +2785,53 @@ pub trait Catalog: Send + Sync {
     async fn close(&self) -> anyhow::Result<()> {
         Ok(())
     }
+}
+
+// =============================================================================
+// Shared cache-first table lookup used by the format-backend catalogs
+// (Iceberg / Delta / Glue / Polaris / Unity). Each backend's `get_table` is
+// the same cache-check / cache-fill sandwich around a backend-specific fetch
+// (local metadata map or remote API) that converts the loaded table into a
+// `CatalogTableSchema`.
+// =============================================================================
+
+/// Cache-first `get_table` skeleton shared by the format-backend catalogs.
+///
+/// Returns the cached schema when present; otherwise awaits `fetch`, fills
+/// the cache with its result, and returns it. `fetch` errors propagate
+/// untouched — each backend's not-found wording is its own contract.
+pub(crate) async fn cached_table(
+    cache: &cache::CatalogCache,
+    catalog_name: &str,
+    identifier: &TableIdentifier,
+    fetch: impl Future<Output = anyhow::Result<CatalogTableSchema>>,
+) -> anyhow::Result<CatalogTableSchema> {
+    if let Some(schema) = cache.get_table(catalog_name, identifier) {
+        return Ok(schema);
+    }
+    let schema = fetch.await?;
+    cache.put_table(catalog_name, identifier, schema.clone());
+    Ok(schema)
+}
+
+/// List identifiers from an in-memory `{key: metadata}` table map (the
+/// Iceberg/Delta `list_tables` twins). `id_of` reads the embedded
+/// identifier's `(namespace, name)` off the backend's own metadata type
+/// (each backend keeps its own serde identifier struct).
+pub(crate) async fn list_tables_from_map<M>(
+    tables: &tokio::sync::RwLock<HashMap<String, M>>,
+    namespace_key: &str,
+    id_of: impl Fn(&M) -> (&[String], &str),
+) -> anyhow::Result<Vec<TableIdentifier>> {
+    let tables = tables.read().await;
+    Ok(tables
+        .values()
+        .filter(|t| id_of(t).0.join(".") == namespace_key)
+        .map(|t| {
+            let (namespace, name) = id_of(t);
+            TableIdentifier::new(namespace.to_vec(), name.to_string())
+        })
+        .collect())
 }
 
 // =============================================================================

@@ -8,7 +8,7 @@
 | Status | **Done (2026-08-29).** `/api/v1/*` went 410-by-default (#814), the deprecation-header utility was relocated to `proximadb_api::rest::deprecation`, gRPC v1 was already hard-deleted, and the `v1_sunset` middleware and its env gates were removed (#1773). Removed v1 paths now answer 404 naming the exact `/api/v2` replacement.
 | Severity | Medium — outward-facing break; recovery was a one-line revert
 | Component | `src/network/` REST/gRPC v1 surfaces; `crates/platform/proximadb-api/src/rest/`
-| Tracked-by | link:../../12-design/V1_RETIREMENT_ROADMAP_2026_07_08.adoc[V1_RETIREMENT_ROADMAP] (Tier 1); link:../../12-design/adr/ADR-049-v1-to-v2-migration-to-native-model.adoc[ADR-049] (M0-c); the v1-proto ratchet (`scripts/check_v1_proto_usage.py`)
+| Tracked-by | link:../../history/planning/V1_RETIREMENT_ROADMAP_2026_07_08.adoc[V1_RETIREMENT_ROADMAP] (Tier 1); link:../../12-design/adr/ADR-049-v1-to-v2-migration-to-native-model.adoc[ADR-049] (M0-c); the v1-proto ratchet (`scripts/check_v1_proto_usage.py`)
 | Relates to | link:TD-V1SUNSET-2-vectorrecord-to-proximatecord-first-slice.adoc[TD-V1SUNSET-2], link:TD-V1SUNSET-3-sqlvalue-to-proximavalue.adoc[TD-V1SUNSET-3] (the type-level v1 sunset)
 |===
 

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::services::canonical_wal::{WalAppendIndeterminate, WalAppenderPoisoned};
-use crate::services::dml::{DmlResult, DmlService, DmlStatement};
+use crate::services::dml::{DmlResult, DmlService, DmlStatement, TxnLockScope};
 use crate::services::txn_staging::{
     AtomicCommitUnsupported, CommitOutcomeUnknown, StagingTableRecordStore,
     TxnSerializationConflict,
@@ -87,6 +87,12 @@ impl AtomicTxnError {
         let statement_fallback = fallback;
         match self {
             Self::Unsupported(_) => "0A000",
+            // Refused before anything was durable, and retryable.
+            Self::Commit(error)
+                if caused_by::<crate::services::record_spill::SpillBacklogFull>(error) =>
+            {
+                "53000"
+            }
             Self::Setup(_) | Self::Commit(_) => fallback,
             Self::Statement { error, .. } => {
                 proximadb_catalog::relational::find_relational_constraint_violation(error)
@@ -158,19 +164,28 @@ pub struct AtomicOutcome {
 }
 
 /// The op-lock set `statements` need: each target, plus the ON DELETE cascade
-/// closure for DELETEs only.
+/// closure for DELETEs and the referencing children for an UPDATE / UPSERT
+/// that writes a UNIQUE column (TD-RELIDEQ-2).
 pub async fn lock_set_for(
     dml: &DmlService,
     statements: &[AtomicStatement],
 ) -> anyhow::Result<std::collections::HashSet<crate::catalog::TableIdentifier>> {
-    let tables: Vec<(String, Option<TenantContext>, bool)> = statements
+    let tables: Vec<(String, Option<TenantContext>, TxnLockScope)> = statements
         .iter()
         .map(|s| {
-            (
-                s.table.clone(),
-                s.tenant.clone(),
-                matches!(s.statement, DmlStatement::Delete { .. }),
-            )
+            let scope = match &s.statement {
+                DmlStatement::Delete { .. } => TxnLockScope::DeleteCascade,
+                DmlStatement::Update { assignments, .. } => TxnLockScope::UpdateColumns(
+                    assignments
+                        .iter()
+                        .map(|(column, _)| column.clone())
+                        .collect(),
+                ),
+                // An UPSERT replaces the whole row: every column is written.
+                DmlStatement::Upsert { .. } => TxnLockScope::UpdateColumns(Vec::new()),
+                _ => TxnLockScope::Target,
+            };
+            (s.table.clone(), s.tenant.clone(), scope)
         })
         .collect();
     dml.transaction_op_lock_set(&tables).await
@@ -306,6 +321,14 @@ mod tests {
         // autocommit statement has no transaction block to report 25P02 for).
         assert_eq!(poisoned.sqlstate("XX000"), "XX000");
         assert_eq!(poisoned.sqlstate("25P02"), "25P02");
+        // A spill backlog refusal comes before the append: nothing committed,
+        // and retryable — 53000 whatever the caller's fallback.
+        let refused = classify_commit_error(
+            crate::services::record_spill::SpillBacklogFull("cap".into()).into(),
+            &[],
+        );
+        assert!(!refused.maybe_durable());
+        assert_eq!(refused.sqlstate("25P02"), "53000");
         let unknown = classify_commit_error(
             CommitOutcomeUnknown("y".into()).into(),
             &["parent".to_string(), "child".to_string()],

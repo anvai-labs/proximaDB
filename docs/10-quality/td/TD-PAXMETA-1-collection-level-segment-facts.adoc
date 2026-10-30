@@ -1,0 +1,60 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-PAXMETA-1: per-segment facts live only in each PAX footer, so collection-level decisions cost O(segments) GETs
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-19).
+| Priority | **MEDIUM**. Correctness is unaffected; the cost lands on cold queries and on the GET-depth budget the PAX cascade is measured against (ADR-033: DEPTH ≫ WIDTH ≫ BYTES ≫ CPU).
+| Component | PAX segment footer (`crates/storage/proximadb-storage-common/src/segment_layout.rs`, `SegmentFooterIndex`), SST search routing (`src/storage/engines/sst/search/mod.rs`: `segment_vector_count`, `pax_footer_facts`, `all_segments_coarse_rabitq_pax_without_f32_tier`, `durable_vector_count_for_rebuild`), catalog / Iceberg manifests
+| Relates to | TD-SEAM-10 (collection-global centroid directory), TD-SEAM-11 (P5a: `.pax` row count), TD-CACHE-9 (persistent PAX warm tier), TD-PAXRG-1 (row-group Region D), ADR-062 (self-describing tail footer), ADR-097 S7 (indexes as catalog projections), `docs/current/LAKEHOUSE_PLAN.adoc` Part C
+|===
+
+== Problem
+
+Facts that routing and planning need for a whole collection are stored only inside each segment's
+footer:
+
+* row count (`row_count`);
+* exact-f32 authority (`has_f32_tier`);
+* quantization tier and rerank encoding;
+* block/row-group stats (Stage F);
+* the IVF cell directory (Region A0).
+
+Every collection-level question therefore reads every segment's footer: two ranged GETs each
+(header prefix, then footer body). Current consumers:
+
+* The Adaptive exact-vs-ANN gate (`segment_vector_count`). TD-SEAM-11 now reads the PAX footer
+  facts and caches them per immutable object URL, but the first query after a restart, or after
+  compaction, still pays 2 × segments GETs before it can route.
+* The AXIS rebuild coverage check (`durable_vector_count_for_rebuild`) does a full read of every
+  `.pax` file to count rows.
+* The coarse-RaBitQ rebuild guard (`all_segments_coarse_rabitq_pax_without_f32_tier`) also does a
+  full read per segment.
+* Coarse IVF probing reads each segment's A0 directory, which is why one query touches many
+  segments (20–80 GET/q cold at 1M vectors versus turbopuffer's 3–4 round trips; seams doc Part C).
+
+Parquet and Iceberg solve the same problem with a *manifest*: per-file record counts and column
+statistics live one level up, so a planner prunes and routes without opening data files. PAX has
+no equivalent level.
+
+== Fix direction (to be validated by the PAX spec thought experiments)
+
+* Publish a **collection-level segment manifest** with each segment set (flush or compaction
+  commit). It holds, per segment: URL, size, row count, LSN range, quantization tier,
+  `has_f32_tier`, A0 centroid summary and zone-map stats. It is written atomically with the
+  segment set, through the same create-only CAS committer the Iceberg publisher uses.
+* Routing, rebuild checks and coarse probing read the manifest: one object, cacheable, with no
+  per-segment GETs.
+* The manifest is the natural carrier for TD-SEAM-10's collection-global centroid directory, and
+  for exporting PAX facts into Iceberg manifests (ADR-097 S4/S7).
+* The per-object footer-facts cache from TD-SEAM-11 stays as the fallback for segments written
+  before the manifest exists (mixed-read-safe).
+
+== Acceptance
+
+* Cold Adaptive routing on an N-segment collection: at most 1 metadata GET, not 2N.
+* The AXIS rebuild coverage and coarse-RaBitQ checks read no segment bodies.
+* The SIFT1M MinIO RTT-ladder bench (`RDSTRAT13`) shows the manifest removes the per-segment
+  footer wave from the cold critical path.

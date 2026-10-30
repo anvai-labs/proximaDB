@@ -74,7 +74,7 @@ One plan, by release: v0.5 makes the SQL front door correct and durable, v0.6
 brings vectors and context fully inside SQL, v0.7 measures cost and performance
 on real object stores, and v1.0 makes pgwire SQL and transactions part of the
 supported promise. See the
-[roadmap](https://github.com/anvai-labs/proximaDB/blob/main/docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc)
+[roadmap](https://github.com/anvai-labs/proximaDB/blob/main/docs/current/ROADMAP.adoc)
 and the
 [direction decision](https://github.com/anvai-labs/proximaDB/blob/main/docs/12-design/adr/ADR-096-product-direction-sql-first-context-engine.adoc).
 

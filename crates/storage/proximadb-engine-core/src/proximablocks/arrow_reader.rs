@@ -594,15 +594,12 @@ mod tests {
                 ProximaRecord {
                     oid: format!("vec_{i}"),
                     props,
-                    embeddings: vec![EmbeddingCell {
-                        model_id: "test-model".to_string(),
-                        modality: "text".to_string(),
-                        values: proximadb_records::EmbeddingValues::Fp32(
-                            (0..dimension).map(|d| (i + d) as f32 * 0.01).collect(),
-                        ),
-                        dim: dimension as u32,
-                        ..Default::default()
-                    }],
+                    embeddings: vec![EmbeddingCell::new_fp32(
+                        "test-model",
+                        "text",
+                        dimension as u32,
+                        (0..dimension).map(|d| (i + d) as f32 * 0.01).collect(),
+                    )],
                     created_at_ns: 1_700_000_000_000_000_000 + i as i64,
                     record_version: 1,
                     ..Default::default()

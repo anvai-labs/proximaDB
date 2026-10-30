@@ -146,6 +146,27 @@ pub struct InMemoryRelationalEngine {
 }
 
 impl InMemoryRelationalEngine {
+    /// PK-shape guard shared by the PK-keyed writes: lock the table map,
+    /// resolve `table`, and check that it HAS a PK matching `key`'s arity.
+    fn pk_checked_state<'a>(
+        tables: &'a mut HashMap<String, TableState>,
+        table: &str,
+        key: &[ProximaValue],
+    ) -> Result<&'a mut TableState, EngineError> {
+        let state = tables
+            .get_mut(table)
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        if state.pk_columns.is_empty() {
+            return Err(EngineError::NoPrimaryKey(table.to_string()));
+        }
+        if key.len() != state.pk_columns.len() {
+            return Err(EngineError::PkArity {
+                expected: state.pk_columns.len(),
+                actual: key.len(),
+            });
+        }
+        Ok(state)
+    }
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
@@ -245,18 +266,7 @@ impl RelationalWriter for InMemoryRelationalEngine {
         new_row: RelationalRow,
     ) -> Result<bool, EngineError> {
         let mut tables = self.tables.write();
-        let state = tables
-            .get_mut(table)
-            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
-        if state.pk_columns.is_empty() {
-            return Err(EngineError::NoPrimaryKey(table.to_string()));
-        }
-        if key.len() != state.pk_columns.len() {
-            return Err(EngineError::PkArity {
-                expected: state.pk_columns.len(),
-                actual: key.len(),
-            });
-        }
+        let state = Self::pk_checked_state(&mut tables, table, key)?;
         if new_row.len() != state.schema.len() {
             return Err(EngineError::RowArity {
                 expected: state.schema.len(),
@@ -274,18 +284,7 @@ impl RelationalWriter for InMemoryRelationalEngine {
 
     fn delete_by_pk(&self, table: &str, key: &[ProximaValue]) -> Result<bool, EngineError> {
         let mut tables = self.tables.write();
-        let state = tables
-            .get_mut(table)
-            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
-        if state.pk_columns.is_empty() {
-            return Err(EngineError::NoPrimaryKey(table.to_string()));
-        }
-        if key.len() != state.pk_columns.len() {
-            return Err(EngineError::PkArity {
-                expected: state.pk_columns.len(),
-                actual: key.len(),
-            });
-        }
+        let state = Self::pk_checked_state(&mut tables, table, key)?;
         Ok(match Self::find_pk_index(state, key) {
             Some(idx) => {
                 state.rows.remove(idx);
@@ -338,23 +337,8 @@ impl ReaderFactory for EngineReaderFactory {
 // InMemoryReader — the cursor over a snapshot
 // =========================================================================
 
-/// Read cursor. Identical contract to the test `VecReader` in
-/// the reader crate, but lives in the engine crate so we can
-/// evolve it independently (e.g. add bloom/zone-map metadata
-/// in Phase 3).
-pub struct InMemoryReader {
-    /// Table name for diagnostics. Read by future EXPLAIN integration;
-    /// currently constructed for observability and kept against
-    /// dead-code lint by `#[allow]`.
-    #[allow(dead_code)]
-    table_name: String,
-    full_schema: RelationalSchema,
-    pk_columns: Vec<usize>,
-    rows: Vec<RelationalRow>,
-    open_state: Option<OpenState>,
-}
-
-struct OpenState {
+/// Scan-state of one open [`VecRowScan`].
+pub(crate) struct OpenState {
     output_schema: RelationalSchema,
     projection_indices: Vec<usize>,
     predicate: Option<Expr>,
@@ -363,16 +347,26 @@ struct OpenState {
     rows_emitted: u64,
 }
 
-impl InMemoryReader {
-    fn new(
-        table_name: String,
-        schema: RelationalSchema,
+/// Scan core over a materialized `Vec<RelationalRow>`: projection
+/// resolution, predicate type-check + row filter, LIMIT, and O(N) PK
+/// point-lookup. Shared by [`InMemoryReader`] (engine snapshot) and
+/// [`transaction::TxReader`] (engine ∪ transaction buffer) — they differ
+/// only in how `rows` is populated.
+pub(crate) struct VecRowScan {
+    full_schema: RelationalSchema,
+    pk_columns: Vec<usize>,
+    rows: Vec<RelationalRow>,
+    open_state: Option<OpenState>,
+}
+
+impl VecRowScan {
+    pub(crate) fn new(
+        full_schema: RelationalSchema,
         pk_columns: Vec<usize>,
         rows: Vec<RelationalRow>,
     ) -> Self {
         Self {
-            table_name,
-            full_schema: schema,
+            full_schema,
             pk_columns,
             rows,
             open_state: None,
@@ -401,30 +395,20 @@ impl InMemoryReader {
         }
         Ok((RelationalSchema::new(cols), indices))
     }
-}
 
-#[async_trait]
-impl RelationalReader for InMemoryReader {
-    fn name(&self) -> &'static str {
-        // Cannot return the table-specific name — the trait
-        // wants a 'static str. Use the engine-level identifier;
-        // callers consult `.schema()` for table-specific info.
-        "in_memory"
-    }
-
-    fn capabilities(&self) -> ReaderCapabilities {
+    pub(crate) fn capabilities(&self) -> ReaderCapabilities {
         // Same shape as the test VecReader: every flag honoured.
         ReaderCapabilities::full().with_pk_lookup(!self.pk_columns.is_empty())
     }
 
-    fn schema(&self) -> &RelationalSchema {
+    pub(crate) fn schema(&self) -> &RelationalSchema {
         match &self.open_state {
             Some(s) => &s.output_schema,
             None => &self.full_schema,
         }
     }
 
-    async fn open(&mut self, ctx: &ScanContext) -> Result<(), ReaderError> {
+    pub(crate) fn open(&mut self, ctx: &ScanContext) -> Result<(), ReaderError> {
         let (output_schema, projection_indices) = self.resolve_projection(&ctx.projection)?;
         if let Some(pred) = &ctx.predicate {
             pred.type_check(&self.full_schema)
@@ -441,7 +425,7 @@ impl RelationalReader for InMemoryReader {
         Ok(())
     }
 
-    async fn next_row(&mut self) -> Result<Option<RelationalRow>, ReaderError> {
+    pub(crate) fn next_row(&mut self) -> Result<Option<RelationalRow>, ReaderError> {
         let state = self.open_state.as_mut().ok_or(ReaderError::NotOpen)?;
         loop {
             if state.cursor >= self.rows.len() {
@@ -472,7 +456,10 @@ impl RelationalReader for InMemoryReader {
         }
     }
 
-    async fn lookup_pk(&self, key: &[ProximaValue]) -> Result<Option<RelationalRow>, ReaderError> {
+    pub(crate) fn lookup_pk(
+        &self,
+        key: &[ProximaValue],
+    ) -> Result<Option<RelationalRow>, ReaderError> {
         if self.pk_columns.is_empty() {
             return Err(ReaderError::PkLookupUnsupported);
         }
@@ -495,8 +482,69 @@ impl RelationalReader for InMemoryReader {
         Ok(None)
     }
 
-    async fn close(&mut self) -> Result<(), ReaderError> {
+    pub(crate) fn close(&mut self) {
         self.open_state = None;
+    }
+}
+
+/// Read cursor. Identical contract to the test `VecReader` in
+/// the reader crate, but lives in the engine crate so we can
+/// evolve it independently (e.g. add bloom/zone-map metadata
+/// in Phase 3). Scan mechanics live in the shared [`VecRowScan`].
+pub struct InMemoryReader {
+    /// Table name for diagnostics. Read by future EXPLAIN integration;
+    /// currently constructed for observability and kept against
+    /// dead-code lint by `#[allow]`.
+    #[allow(dead_code)]
+    table_name: String,
+    core: VecRowScan,
+}
+
+impl InMemoryReader {
+    fn new(
+        table_name: String,
+        schema: RelationalSchema,
+        pk_columns: Vec<usize>,
+        rows: Vec<RelationalRow>,
+    ) -> Self {
+        Self {
+            table_name,
+            core: VecRowScan::new(schema, pk_columns, rows),
+        }
+    }
+}
+
+#[async_trait]
+impl RelationalReader for InMemoryReader {
+    fn name(&self) -> &'static str {
+        // Cannot return the table-specific name — the trait
+        // wants a 'static str. Use the engine-level identifier;
+        // callers consult `.schema()` for table-specific info.
+        "in_memory"
+    }
+
+    fn capabilities(&self) -> ReaderCapabilities {
+        self.core.capabilities()
+    }
+
+    fn schema(&self) -> &RelationalSchema {
+        self.core.schema()
+    }
+
+    async fn open(&mut self, ctx: &ScanContext) -> Result<(), ReaderError> {
+        self.core.open(ctx)
+    }
+
+    async fn next_row(&mut self) -> Result<Option<RelationalRow>, ReaderError> {
+        self.core.next_row()
+    }
+
+    async fn lookup_pk(&self, key: &[ProximaValue]) -> Result<Option<RelationalRow>, ReaderError> {
+        self.core.lookup_pk(key)
+    }
+
+    async fn close(&mut self) -> Result<(), ReaderError> {
+        self.core.close();
         Ok(())
     }
 }
@@ -514,6 +562,42 @@ mod tests {
     use proximadb_relational_planner::{Planner, StaticCapabilities};
     use proximadb_relational_reader::ReaderCapabilities as RC;
     use proximadb_relational_types::ColumnInfo;
+
+    /// Stamped prologue: a `users` table (PK on `id`) populated with `rows`.
+    fn users_engine(rows: Vec<RelationalRow>) -> Arc<InMemoryRelationalEngine> {
+        let engine = InMemoryRelationalEngine::new();
+        engine
+            .create_table("users", users_schema(), vec![0])
+            .unwrap();
+        engine.insert_rows("users", rows).unwrap();
+        engine
+    }
+
+    /// Frontend catalog over the engine (SQL e2e tests).
+    struct EngineCatalog(Arc<InMemoryRelationalEngine>);
+    impl proximadb_relational_frontend::CatalogLookup for EngineCatalog {
+        fn lookup_table(&self, name: &str) -> Option<std::sync::Arc<RelationalSchema>> {
+            self.0.schema_of(name).map(std::sync::Arc::new)
+        }
+    }
+
+    /// Lower `sql` → plan → execute against `engine`, returning the rows.
+    /// Plans with a capability resolver that knows the users PK (`id`).
+    async fn run_sql(engine: &Arc<InMemoryRelationalEngine>, sql: &str) -> Vec<RelationalRow> {
+        let catalog = EngineCatalog(engine.clone());
+        let logical = proximadb_relational_frontend::lower_sql(sql, &catalog).unwrap();
+        let planner = Planner::new(StaticCapabilities {
+            caps: RC::full(),
+            pk_columns: vec![0],
+            secondary_columns: Vec::new(),
+        });
+        let physical = planner.plan(logical).unwrap();
+        let factory = EngineReaderFactory::new(engine.clone());
+        let ctx = ExecutionContext::default();
+        let mut exec = build_executor(physical, &factory, &ctx).unwrap();
+        exec.open().await.unwrap();
+        collect(&mut *exec).await.unwrap()
+    }
 
     fn users_schema() -> RelationalSchema {
         RelationalSchema::new(vec![
@@ -615,13 +699,7 @@ mod tests {
 
     #[test]
     fn update_by_pk_replaces_row() {
-        let engine = InMemoryRelationalEngine::new();
-        engine
-            .create_table("users", users_schema(), vec![0])
-            .unwrap();
-        engine
-            .insert_rows("users", vec![user_row(1, "alice", 30)])
-            .unwrap();
+        let engine = users_engine(vec![user_row(1, "alice", 30)]);
         let updated = engine
             .update_by_pk(
                 "users",
@@ -636,10 +714,7 @@ mod tests {
 
     #[test]
     fn update_missing_pk_returns_false() {
-        let engine = InMemoryRelationalEngine::new();
-        engine
-            .create_table("users", users_schema(), vec![0])
-            .unwrap();
+        let engine = users_engine(Vec::new());
         let updated = engine
             .update_by_pk(
                 "users",
@@ -652,16 +727,7 @@ mod tests {
 
     #[test]
     fn delete_by_pk_removes_row() {
-        let engine = InMemoryRelationalEngine::new();
-        engine
-            .create_table("users", users_schema(), vec![0])
-            .unwrap();
-        engine
-            .insert_rows(
-                "users",
-                vec![user_row(1, "alice", 30), user_row(2, "bob", 25)],
-            )
-            .unwrap();
+        let engine = users_engine(vec![user_row(1, "alice", 30), user_row(2, "bob", 25)]);
         let deleted = engine
             .delete_by_pk("users", &[ProximaValue::Int64(1)])
             .unwrap();
@@ -700,20 +766,11 @@ mod tests {
 
     #[tokio::test]
     async fn scan_via_factory_emits_all_rows() {
-        let engine = InMemoryRelationalEngine::new();
-        engine
-            .create_table("users", users_schema(), vec![0])
-            .unwrap();
-        engine
-            .insert_rows(
-                "users",
-                vec![
-                    user_row(1, "alice", 30),
-                    user_row(2, "bob", 25),
-                    user_row(3, "carol", 40),
-                ],
-            )
-            .unwrap();
+        let engine = users_engine(vec![
+            user_row(1, "alice", 30),
+            user_row(2, "bob", 25),
+            user_row(3, "carol", 40),
+        ]);
         let factory = EngineReaderFactory::new(engine.clone());
         let plan = proximadb_relational_planner::PhysicalPlan::Scan {
             table: TableId::new("users"),
@@ -734,46 +791,13 @@ mod tests {
     async fn end_to_end_select_via_frontend() {
         // Round-trip: create+insert via writer, lower SQL via
         // frontend, plan, execute, verify result.
-        let engine = InMemoryRelationalEngine::new();
-        engine
-            .create_table("users", users_schema(), vec![0])
-            .unwrap();
-        engine
-            .insert_rows(
-                "users",
-                vec![
-                    user_row(1, "alice", 30),
-                    user_row(2, "bob", 25),
-                    user_row(3, "carol", 40),
-                ],
-            )
-            .unwrap();
-        // Build a CatalogLookup that consults the engine.
-        struct EngineCatalog(Arc<InMemoryRelationalEngine>);
-        impl proximadb_relational_frontend::CatalogLookup for EngineCatalog {
-            fn lookup_table(&self, name: &str) -> Option<std::sync::Arc<RelationalSchema>> {
-                self.0.schema_of(name).map(std::sync::Arc::new)
-            }
-        }
-        let catalog = EngineCatalog(engine.clone());
+        let engine = users_engine(vec![
+            user_row(1, "alice", 30),
+            user_row(2, "bob", 25),
+            user_row(3, "carol", 40),
+        ]);
         // SELECT name FROM users WHERE age > 25
-        let logical = proximadb_relational_frontend::lower_sql(
-            "SELECT name FROM users WHERE age > 25",
-            &catalog,
-        )
-        .unwrap();
-        // Plan with a capability resolver that knows the PK.
-        let planner = Planner::new(StaticCapabilities {
-            caps: RC::full(),
-            pk_columns: vec![0],
-            secondary_columns: Vec::new(),
-        });
-        let physical = planner.plan(logical).unwrap();
-        let factory = EngineReaderFactory::new(engine.clone());
-        let ctx = ExecutionContext::default();
-        let mut exec = build_executor(physical, &factory, &ctx).unwrap();
-        exec.open().await.unwrap();
-        let rows = collect(&mut *exec).await.unwrap();
+        let rows = run_sql(&engine, "SELECT name FROM users WHERE age > 25").await;
         // alice (30) + carol (40); bob (25) excluded.
         assert_eq!(rows.len(), 2);
         let names: Vec<String> = rows
@@ -795,42 +819,12 @@ mod tests {
         // projection through the PkLookup, executor narrows the row
         // returned by `lookup_pk`. Final result must be a single-row,
         // single-column ("bob") output.
-        let engine = InMemoryRelationalEngine::new();
-        engine
-            .create_table("users", users_schema(), vec![0])
-            .unwrap();
-        engine
-            .insert_rows(
-                "users",
-                vec![
-                    user_row(1, "alice", 30),
-                    user_row(2, "bob", 25),
-                    user_row(3, "carol", 40),
-                ],
-            )
-            .unwrap();
-        struct EngineCatalog(Arc<InMemoryRelationalEngine>);
-        impl proximadb_relational_frontend::CatalogLookup for EngineCatalog {
-            fn lookup_table(&self, name: &str) -> Option<std::sync::Arc<RelationalSchema>> {
-                self.0.schema_of(name).map(std::sync::Arc::new)
-            }
-        }
-        let catalog = EngineCatalog(engine.clone());
-        let logical = proximadb_relational_frontend::lower_sql(
-            "SELECT name FROM users WHERE id = 2",
-            &catalog,
-        )
-        .unwrap();
-        let planner = Planner::new(StaticCapabilities {
-            caps: RC::full(),
-            pk_columns: vec![0],
-            secondary_columns: Vec::new(),
-        });
-        let physical = planner.plan(logical).unwrap();
-        let factory = EngineReaderFactory::new(engine.clone());
-        let mut exec = build_executor(physical, &factory, &ExecutionContext::default()).unwrap();
-        exec.open().await.unwrap();
-        let rows = collect(&mut *exec).await.unwrap();
+        let engine = users_engine(vec![
+            user_row(1, "alice", 30),
+            user_row(2, "bob", 25),
+            user_row(3, "carol", 40),
+        ]);
+        let rows = run_sql(&engine, "SELECT name FROM users WHERE id = 2").await;
         assert_eq!(rows.len(), 1, "PK lookup must return exactly one row");
         assert_eq!(rows[0].len(), 1, "row must be narrowed to one column");
         assert_eq!(rows[0][0], ProximaValue::String("bob".into()));
@@ -838,40 +832,12 @@ mod tests {
 
     #[tokio::test]
     async fn end_to_end_count_star() {
-        let engine = InMemoryRelationalEngine::new();
-        engine
-            .create_table("users", users_schema(), vec![0])
-            .unwrap();
-        engine
-            .insert_rows(
-                "users",
-                vec![
-                    user_row(1, "alice", 30),
-                    user_row(2, "bob", 25),
-                    user_row(3, "carol", 40),
-                ],
-            )
-            .unwrap();
-        struct EngineCatalog(Arc<InMemoryRelationalEngine>);
-        impl proximadb_relational_frontend::CatalogLookup for EngineCatalog {
-            fn lookup_table(&self, name: &str) -> Option<std::sync::Arc<RelationalSchema>> {
-                self.0.schema_of(name).map(std::sync::Arc::new)
-            }
-        }
-        let catalog = EngineCatalog(engine.clone());
-        let logical =
-            proximadb_relational_frontend::lower_sql("SELECT COUNT(*) FROM users", &catalog)
-                .unwrap();
-        let planner = Planner::new(StaticCapabilities {
-            caps: RC::full(),
-            pk_columns: vec![0],
-            secondary_columns: Vec::new(),
-        });
-        let physical = planner.plan(logical).unwrap();
-        let factory = EngineReaderFactory::new(engine.clone());
-        let mut exec = build_executor(physical, &factory, &ExecutionContext::default()).unwrap();
-        exec.open().await.unwrap();
-        let rows = collect(&mut *exec).await.unwrap();
+        let engine = users_engine(vec![
+            user_row(1, "alice", 30),
+            user_row(2, "bob", 25),
+            user_row(3, "carol", 40),
+        ]);
+        let rows = run_sql(&engine, "SELECT COUNT(*) FROM users").await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], ProximaValue::Int64(3));
     }

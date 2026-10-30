@@ -560,11 +560,13 @@ impl DeltaCatalog {
     }
 
     /// Get current timestamp in milliseconds
+    ///
+    /// Thin wrapper over the shared kernel clock (`proximadb_kernel::time`).
+    /// Deliberate behavior change: the old body propagated a pre-epoch clock
+    /// as an error, while the kernel helper clamps to 0 — the same trade-off
+    /// every other clock call site in the workspace already makes.
     fn now_ms() -> Result<i64> {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| anyhow!("System time error: {}", e))
-            .map(|d| d.as_millis() as i64)
+        Ok(proximadb_kernel::time::now_unix_ms())
     }
 
     /// Build schema string for Delta log
@@ -932,18 +934,10 @@ impl Catalog for DeltaCatalog {
     }
 
     async fn list_tables(&self, namespace: &[String]) -> Result<Vec<TableIdentifier>> {
-        let ns_key = Self::namespace_key(namespace);
-        let tables = self.tables.read().await;
-
-        let identifiers: Vec<TableIdentifier> = tables
-            .values()
-            .filter(|t| t.identifier.namespace.join(".") == ns_key)
-            .map(|t| {
-                TableIdentifier::new(t.identifier.namespace.clone(), t.identifier.name.clone())
-            })
-            .collect();
-
-        Ok(identifiers)
+        crate::list_tables_from_map(&self.tables, &Self::namespace_key(namespace), |t| {
+            (&t.identifier.namespace, &t.identifier.name)
+        })
+        .await
     }
 
     async fn table_exists(&self, identifier: &TableIdentifier) -> Result<bool> {
@@ -952,60 +946,55 @@ impl Catalog for DeltaCatalog {
     }
 
     async fn get_table(&self, identifier: &TableIdentifier) -> Result<CatalogTableSchema> {
-        // Check cache first
-        if let Some(schema) = self.cache.get_table(&self.name, identifier) {
-            return Ok(schema);
-        }
+        crate::cached_table(&self.cache, &self.name, identifier, async {
+            let key = Self::table_key(identifier);
+            let tables = self.tables.read().await;
+            let table = tables
+                .get(&key)
+                .ok_or_else(|| anyhow!("Table '{}' not found", identifier))?;
 
-        let key = Self::table_key(identifier);
-        let tables = self.tables.read().await;
-        let table = tables
-            .get(&key)
-            .ok_or_else(|| anyhow!("Table '{}' not found", identifier))?;
+            // Convert Delta schema to CatalogTableSchema
+            let columns: Vec<CatalogColumn> = table
+                .schema
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let mut properties = HashMap::new();
+                    // Extract vector dimension from metadata
+                    if let Some(dim) = f.metadata.get("delta.proximadb.dimension") {
+                        properties.insert("dimension".to_string(), dim.clone());
+                    }
 
-        // Convert Delta schema to CatalogTableSchema
-        let columns: Vec<CatalogColumn> = table
-            .schema
-            .fields
-            .iter()
-            .enumerate()
-            .map(|(i, f)| {
-                let mut properties = HashMap::new();
-                // Extract vector dimension from metadata
-                if let Some(dim) = f.metadata.get("delta.proximadb.dimension") {
-                    properties.insert("dimension".to_string(), dim.clone());
-                }
+                    CatalogColumn {
+                        id: i as i32,
+                        object_id: None,
+                        name: f.name.clone(),
+                        data_type: Self::spark_type_to_data_type(&f.data_type),
+                        nullable: f.nullable,
+                        default_value: None,
+                        comment: f.metadata.get("comment").cloned(),
+                        properties,
+                        is_deleted: false,
+                        original_id: None,
+                    }
+                })
+                .collect();
 
-                CatalogColumn {
-                    id: i as i32,
-                    object_id: None,
-                    name: f.name.clone(),
-                    data_type: Self::spark_type_to_data_type(&f.data_type),
-                    nullable: f.nullable,
-                    default_value: None,
-                    comment: f.metadata.get("comment").cloned(),
-                    properties,
-                    is_deleted: false,
-                    original_id: None,
-                }
+            Ok(CatalogTableSchema {
+                name: identifier.name.clone(),
+                columns,
+                primary_key: vec![],
+                indexes: vec![],
+                schema_version: table.schema.version,
+                properties: table.properties.clone(),
+                location: Some(table.location.clone()),
+                created_at_ms: table.created_at_ms,
+                updated_at_ms: table.last_modified_ms,
+                ..Default::default()
             })
-            .collect();
-
-        let schema = CatalogTableSchema {
-            name: identifier.name.clone(),
-            columns,
-            primary_key: vec![],
-            indexes: vec![],
-            schema_version: table.schema.version,
-            properties: table.properties.clone(),
-            location: Some(table.location.clone()),
-            created_at_ms: table.created_at_ms,
-            updated_at_ms: table.last_modified_ms,
-            ..Default::default()
-        };
-
-        self.cache.put_table(&self.name, identifier, schema.clone());
-        Ok(schema)
+        })
+        .await
     }
 
     async fn rename_table(&self, from: &TableIdentifier, to: &TableIdentifier) -> Result<()> {

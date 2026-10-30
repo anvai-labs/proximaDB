@@ -320,7 +320,7 @@ does not acquire a support tier merely by appearing in the repository.
 
 === Supported Default
 
-* **SST** - ✅ Supported storage engine for the canonical single-node vector path (set it explicitly over REST/gRPC until it becomes the automatic default in v0.5, TD-ENGSEL-1).
+* **SST** - ✅ Supported storage engine for the canonical single-node vector path (the automatic default for REST/gRPC creates that omit the engine, TD-ENGSEL-1).
 * **Canonical REST `/api/v2` vector CRUD/search** - ✅ Supported. Other
   query languages and modality projections retain their own tiers below.
 
@@ -421,7 +421,7 @@ Criteria evolve based on:
 * link:../SUPPORTED_SURFACE.adoc[Supported Surface Matrix] - Feature status matrix
 * link:../10-quality/feature_toggles.md[Feature Toggles] - Feature flag documentation
 * link:../10-quality/TECHNICAL_DEBT.adoc[Technical Debt Register] - Known gaps and limitations
-* link:../_internal/roadmap/STRATEGIC_ROADMAP.adoc[Strategic Roadmap] - Feature roadmap
+* link:../current/ROADMAP.adoc[Strategic Roadmap] - Feature roadmap
 
 == Governance
 

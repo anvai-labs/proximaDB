@@ -1,0 +1,20 @@
+# Docker build context hygiene — the builder stage only needs sources + config.
+# (The root Dockerfile's comment claiming this file exists is finally true.)
+.git
+.github
+target
+node_modules
+dist
+__pycache__
+*.pyc
+**/__pycache__
+# Demo runtime state — fetched/generated at runtime, never baked into layers
+demo/agent-memory/models
+demo/agent-memory/data
+demo/agent-memory/data2
+demo/**/data
+demo/**/models
+# Scratch + logs
+*.log
+*.tar.gz
+.DS_Store

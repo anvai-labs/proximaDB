@@ -546,13 +546,32 @@ impl FederatedExecutor {
             ));
         }
 
+        // Resolve within the request tenant (None outside a request scope =
+        // internal). A collection the tenant may not resolve is answered
+        // exactly like a missing one — never by an unscoped fallback.
+        let request_tenant = crate::query::request_scope::resolution_tenant(collection)?;
         if let Some(vector_ops) = &self.vector_operations_service {
             let collection_id = if let Some(collection_port) = &self.collection_port {
-                collection_port
-                    .get_collection(collection, None)
-                    .await?
-                    .map(|resolved| resolved.id)
-                    .unwrap_or_else(|| collection.to_string())
+                let found = match request_tenant.as_deref() {
+                    Some(tenant) => {
+                        collection_port
+                            .get_collection(collection, Some(tenant))
+                            .await?
+                    }
+                    None => collection_port.get_collection_internal(collection).await?,
+                };
+                match found {
+                    Some(resolved) => resolved.id,
+                    None if request_tenant.is_some() => {
+                        return Err(
+                            crate::services::operations::vectors::CollectionNotFound::new(
+                                collection,
+                            )
+                            .into(),
+                        );
+                    }
+                    None => collection.to_string(),
+                }
             } else {
                 collection.to_string()
             };
@@ -575,7 +594,13 @@ impl FederatedExecutor {
             };
 
             let response = vector_ops
-                .search_v1(request, proximadb_runtime::PortIdentity::anonymous())
+                .search_v1(
+                    request,
+                    match request_tenant.as_deref() {
+                        Some(tenant) => proximadb_runtime::PortIdentity::for_tenant(tenant),
+                        None => proximadb_runtime::PortIdentity::anonymous(),
+                    },
+                )
                 .await?;
             let records = response
                 .results
@@ -613,7 +638,15 @@ impl FederatedExecutor {
 
         use crate::proto::proximadb_v1::CollectionConfig;
         let collection_config = if let Some(collection_port) = &self.collection_port {
-            match collection_port.get_collection(collection, None).await? {
+            let found = match request_tenant.as_deref() {
+                Some(tenant) => {
+                    collection_port
+                        .get_collection(collection, Some(tenant))
+                        .await?
+                }
+                None => collection_port.get_collection_internal(collection).await?,
+            };
+            match found {
                 Some(mut resolved) => {
                     let mut config = resolved.config.take().unwrap_or_else(|| CollectionConfig {
                         name: collection.to_string(),
@@ -630,6 +663,12 @@ impl FederatedExecutor {
 
                     resolved.config = Some(config);
                     Arc::new(resolved)
+                }
+                None if request_tenant.is_some() => {
+                    return Err(
+                        crate::services::operations::vectors::CollectionNotFound::new(collection)
+                            .into(),
+                    );
                 }
                 None => Arc::new(Collection {
                     id: collection.to_string(),
@@ -817,6 +856,9 @@ impl FederatedExecutor {
             k,
             rank_profile: Some(profile_name.to_string()),
             rank_overrides: None,
+            scope: crate::network::rest::canonical::rank::RankScope::from_resolution_tenant(
+                crate::query::request_scope::resolution_tenant(collection)?,
+            ),
         };
 
         // Resolve the per-profile second-phase scorer (may be absent —

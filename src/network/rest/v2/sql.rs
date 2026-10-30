@@ -109,6 +109,11 @@ fn map_execution_error(error: anyhow::Error) -> ApiError {
             None => format!("resource {resource} is locked"),
         };
         ApiError::LockConflict(message)
+    } else if let Some(missing) = crate::services::operations::vectors::collection_not_found(&error)
+    {
+        // A collection that does not resolve for the request (missing, or not
+        // resolvable by its tenant) is 404 — one response for both.
+        ApiError::CollectionNotFound(missing.identifier.clone())
     } else {
         ApiError::Internal(format!("SQL execution failed: {error}"))
     }

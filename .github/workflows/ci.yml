@@ -159,6 +159,7 @@ jobs:
       # filter definition below and the rust-compile job comment.
       compile: ${{ steps.filter.outputs.compile }}
       python: ${{ steps.filter.outputs.python }}
+      sdk_docs: ${{ steps.filter.outputs.sdk_docs }}
       ui: ${{ steps.filter.outputs.ui }}
       docker: ${{ steps.filter.outputs.docker }}
       docs: ${{ steps.filter.outputs.docs }}
@@ -319,6 +320,13 @@ jobs:
               - 'pyproject.toml'
               - 'clients/python-queue-embedded/**'
               - '.github/workflows/ci.yml'
+            # TD-SDKDOC-1: the doc families whose Python blocks the doc smoke
+            # executes. A docs-only edit must still run them, or an example
+            # broken by that edit passes review exactly as before.
+            sdk_docs:
+              - 'docs/02-guides/sdk-python-guide.adoc'
+              - 'docs/01-quick-start/**'
+              - 'docs/05-concepts/**'
             ui:
               - 'ui/**'
               - '.github/workflows/ci.yml'
@@ -370,6 +378,14 @@ jobs:
               - 'src/**'
               - 'scripts/count_panic_patterns.sh'
               - 'docs/_internal/roadmap/PANIC_POLICY_BASELINE.json'
+              - docs/_internal/roadmap/PANIC_POLICY_WORKSPACE_BASELINE.json
+            dup_ratchet:
+              - 'scripts/dup_ratchet.py'
+              - 'docs/10-quality/DUP_RATCHET_BASELINE.json'
+              - 'Makefile'
+              - 'docs/**'
+              - '*.md'
+              - '*.adoc'
             v1_proto_usage:
               - 'src/**'
               - 'crates/**'
@@ -418,6 +434,12 @@ jobs:
               # TD-RECALL-2/#1406: track what can break the outcome, not who
               # owns the file.
               - 'tests/sift_pax_recall_ratchet_test.rs'
+              # ADR-097 D3 / TD-SEAM-1: the external Iceberg read-back gate runs in
+              # this lane; the writer, the REST catalog and the gate itself feed it.
+              - 'crates/storage/proximadb-iceberg-engine/**'
+              - 'crates/control/proximadb-catalog/src/iceberg_rest_service.rs'
+              - 'tests/iceberg_interop_e2e.rs'
+              - 'scripts/iceberg_readback.py'
             # Cloud object-store Cool-tier validation (TD-168). The tier-mapping code
             # lives in the object-store crate + the cold-payload store; the orchestration
             # is scripts/run_cloud_emulator_tests.sh. Re-run the (cheap) emulator tier
@@ -465,6 +487,11 @@ jobs:
             # UNCONDITIONALLY at develop->qa.
             object_store_restart_changes:
               - 'src/storage/persistence/**'
+              # The relational spill on object storage (TD-SEAM-3).
+              - 'src/services/spill_placement.rs'
+              - 'src/services/record_spill.rs'
+              - 'src/services/record_store.rs'
+              - 'src/services/storage_format.rs'
               - 'src/storage/memtable/**'
               # Review of #2043: the durable-write + flush + lease path the
               # server crosses between INSERT and the SIGKILL/recover cycles,
@@ -754,7 +781,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15  # max 1 min over 14 runs, 2026-10-09..11
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dup_ratchet == 'true'
     steps:
       - uses: actions/checkout@v7
       - name: Check for tracked artifact files
@@ -773,6 +800,12 @@ jobs:
       # docs-validation job would not see them.
       - name: Check env gates are registered
         run: python3 scripts/check_env_gates.py
+      # Duplication ratchet (redundancy pass 3): the jscpd census percentage
+      # may not rise above the committed baseline + tolerance. Refresh the
+      # baseline via `make dup-ratchet-baseline` only with justification.
+      # ~40s: npx fetch + 4s scan.
+      - name: Duplication ratchet
+        run: make dup-ratchet-check
 
   deterministic-commit-contract:
     name: Deterministic Commit Contract
@@ -789,8 +822,12 @@ jobs:
         run: python3 -m unittest discover -s tests/scripts -p 'test_cloud_emulator_harness.py'
       - name: Test trusted branch-route workflow contract
         run: python3 -m unittest discover -s tests/scripts -p 'test_branch_promotion_policy.py'
+      - name: Test duplication ratchet contract
+        run: python3 -m unittest discover -s tests/scripts -p 'test_dup_ratchet.py'
       - name: Test promotion tree-reuse gate (TD-CITIER-2)
         run: python3 -m unittest discover -s tests/scripts -p 'test_ci_tree_reuse.py'
+      - name: Test panic-policy scanner scopes (legacy vs workspace)
+        run: python3 -m unittest discover -s tests/scripts -p 'test_count_panic_patterns.py'
       - name: Test Flake Rerun infra-kill matcher (fixture job logs)
         run: python3 -m unittest discover -s tests/scripts -p 'test_flake_rerun.py'
       - name: Test Pre-Release CI await gate (run_id hand-off to release.yml)
@@ -1163,7 +1200,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 70  # max 36 min over 14 runs, 2026-10-09..11 (run 37880949062)
     needs: changes
-    if: (needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true') && !contains(needs.changes.outputs.reused, ',python-sdk-round-trip,')
+    if: (needs.changes.outputs.sweep == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.openapi_spec == 'true' || needs.changes.outputs.sdk_docs == 'true') && !contains(needs.changes.outputs.reused, ',python-sdk-round-trip,')
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
@@ -1200,6 +1237,17 @@ jobs:
         run: pytest clients/python/tests/test_round_trip.py -v
         env:
           PROXIMADB_REST_URL: http://127.0.0.1:5678
+      # TD-SDKDOC-1: execute the SDK guide / quick-start / concept examples
+      # against this server, in document order, so an example that fails as
+      # written fails the build. Blocks marked `# doc-smoke: skip` are skipped
+      # explicitly; the compile and symbol tiers also run in the unit lane.
+      - name: Doc smoke (TD-SDKDOC-1)
+        # ~30 s when healthy; each block also has a 120 s limit and the run
+        # stops at the first block that finds the server dead.
+        timeout-minutes: 15
+        run: pytest clients/python/tests/unit/test_doc_examples.py -v
+        env:
+          PROXIMADB_DOC_SMOKE_URL: http://127.0.0.1:5678
       - name: Stop server
         if: always()
         run: kill $(cat /tmp/server.pid) 2>/dev/null || true
@@ -1242,6 +1290,14 @@ jobs:
             --mode no-regression \
             --baseline docs/_internal/roadmap/PANIC_POLICY_BASELINE.json \
             --write artifacts/panic_policy/panic_policy_no_regression.json \
+            --format text
+      - name: Enforce no-regression baseline (workspace scope)
+        run: |
+          mkdir -p artifacts/panic_policy
+          bash scripts/count_panic_patterns.sh \
+            --scope workspace --mode no-regression \
+            --baseline docs/_internal/roadmap/PANIC_POLICY_WORKSPACE_BASELINE.json \
+            --write artifacts/panic_policy/panic_policy_workspace_no_regression.json \
             --format text
 
   panic-policy-module-guard:
@@ -1365,7 +1421,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 110
     # max 53 min over 14 runs, 2026-10-09..11. 15 legs since 2026-10-14
-    # (bert-tokenizer added; ~1min leg). An earlier comment said 15: GitHub
+    # (bert-tokenizer added; ~1min leg); back to 14 when enterprise-catalogs
+    # moved to its own job (TD-CITIER-1); 15 with experimental-turboquant, 16
+    # with onnx-cdc-duckdb, both 2026-10-23 (TD-TQFEAT-1). An earlier comment said 15: GitHub
     # reports a SKIPPED matrix job under its raw un-expanded name, which the
     # sample counted as a leg.
     needs: changes
@@ -1411,6 +1469,19 @@ jobs:
           # F3v (TD-DELVEC-1): cold-tier deletion vectors — feature-gated PAX flush-path
           # resolver capture. Check it compiles so cfg drift in that path is caught.
           - { label: "cold-deletion-vectors", pkg: proximadb,      args: "--features cold-deletion-vectors" }
+          # TD-TQFEAT-1: TurboQuant (ADR-021) is non-default, so no leg compiled it and
+          # tests/turboquant_e2e_propagation_test.rs rotted unnoticed against three
+          # TraceBuilderInputs changes (egress_bytes, then #863 flattening `plan`, then
+          # #1091's object-store meters). The root crate is checked with its tests, and
+          # so is each sub-crate that declares the feature: `-p proximadb --tests` builds
+          # dependencies as libs only, so their gated #[cfg(test)] code needs its own -p.
+          - { label: "experimental-turboquant", pkg: "proximadb proximadb-quantization-types proximadb-quantization-model proximadb-distance-kernel proximadb-vector proximadb-quantization-kernel", args: "--features experimental-turboquant" }
+          # TD-TQFEAT-1 class: three more non-default root features whose gated code
+          # (incl. the onnx-gated service_tests module and cdc-kafka's three
+          # required-features [[test]] targets) no leg compiled. The server's own
+          # `onnx` feature forwards only to proximadb-embedding, so root onnx code
+          # needs this -p proximadb leg.
+          - { label: "onnx-cdc-duckdb",     pkg: proximadb,        args: "--features onnx,cdc-kafka,duckdb" }
           # Embedded crate (default, no language bindings) — validates the extracted
           # crate compiles against root at every tier. Python-feature + wheel build
           # is a qa→main (FULL) concern (heavy pyo3/numpy deps).
@@ -1458,6 +1529,19 @@ jobs:
             cargo nextest run -p proximadb-rank-onnx --features bert-tokenizer
           else
             cargo test -p proximadb-rank-onnx --features bert-tokenizer
+          fi
+      # TD-ORT-1's regression gate: two ONNX sessions through the one shared
+      # process environment (a per-crate environment fails the second build for
+      # the life of the process). Runs on the leg whose feature set pulls ort.
+      - name: serve onnx-runtime shared-environment test (TD-ORT-1)
+        if: matrix.label == 'onnx-cdc-duckdb'
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+        run: |
+          if cargo nextest --version >/dev/null 2>&1; then
+            cargo nextest run -p proximadb-onnx-runtime
+          else
+            cargo test -p proximadb-onnx-runtime
           fi
 
   # Feature Matrix (enterprise-catalogs) — split out of the `feature-matrix`
@@ -1974,6 +2058,14 @@ jobs:
       # ADR-031 files, or a new per-file TD reusing a legacy id). Fires on rebase
       # so a number that collides with freshly-merged develop is caught before
       # merge. Convention: docs/12-design/HOW_TO_FILE_TD_AND_ADR.adoc.
+      # Advisory tier-2 semantic report: near-duplicate docs sections
+      # (paraphrased restatements token-CPD cannot see). Deterministic
+      # TF-IDF; prints the top pairs for the reviewer, never fails.
+      - name: Docs semantic near-duplicate report (advisory)
+        continue-on-error: true  # advisory: a pip/PyPI flake must not redden a gating job
+        run: |
+          pip install --quiet scikit-learn
+          python3 scripts/docs_semantic_report.py --top 10
       - name: Check TD/ADR id uniqueness
         run: python3 scripts/check_td_adr_unique.py
       - name: Check ADR/TD status coverage and index agreement
@@ -2643,10 +2735,30 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config protobuf-compiler
+      # ADR-097 D3 / TD-SEAM-1: external Iceberg read-back gate. Pinned readers
+      # that are NOT ProximaDB read a pgwire-materialized table back value-for-
+      # value (tests/iceberg_interop_e2e.rs -> scripts/iceberg_readback.py).
+      - name: Set up Python (Iceberg read-back readers)
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install pinned Iceberg readers
+        run: |
+          python -m pip install "pyiceberg[pyarrow]==0.12.0" "duckdb==1.5.6"
+          python -c "import duckdb; c = duckdb.connect(); c.sql('INSTALL iceberg'); c.sql('LOAD iceberg')"
       - name: Run Storage Integration Tests
+        env:
+          # Every reader must run; a missing one fails instead of skipping.
+          PROXIMADB_ICEBERG_READBACK_REQUIRE: "pyiceberg-rest,pyiceberg-static,duckdb"
+          PROXIMADB_PYTHON: python
+          # iceberg_interop_e2e drives a full server in a dev-profile build; its
+          # pgwire DDL/MATERIALIZE chain overflows tokio's default ~2 MiB worker
+          # stack (reproduced locally). Same remedy as the query lane; on the
+          # step, not the job, so the rust-cache key is unchanged.
+          RUST_MIN_STACK: "8388608"
         run: |
           # Run only explicitly named storage test files (avoids compiling all tests)
-          for test_file in tests/*sst*.rs tests/*storage*.rs tests/*wal*.rs tests/embedded_tenant_context.rs tests/td112_postflush_recall_e2e.rs tests/mlflow_run_store_test.rs; do
+          for test_file in tests/*sst*.rs tests/*storage*.rs tests/*wal*.rs tests/embedded_tenant_context.rs tests/td112_postflush_recall_e2e.rs tests/mlflow_run_store_test.rs tests/iceberg_interop_e2e.rs; do
             if [ -f "$test_file" ]; then
               test_name=$(basename "$test_file" .rs)
               echo "Running $test_name..."
@@ -2953,7 +3065,11 @@ jobs:
             rel_lower_3_orderby_e2e \
             rel_lower_native_join_e2e \
             rel_two_key_correlated_scalar_e2e \
-            native_tpch_q18_q20_e2e; do
+            native_tpch_q18_q20_e2e \
+            native_table_capability_parity_e2e \
+            layer_a_spill_sql_e2e \
+            mixed_parquet_native_e2e \
+            udtf_only_datafusion_e2e; do
             echo "Running $test_name..."
             # pgwire_fk_referential_actions_e2e also contains the TD-110 S1 recursive-cascade
             # + concurrency/cycle test (pgwire_cascade_recurses_and_rejects_cycles_depth_and_concurrency),

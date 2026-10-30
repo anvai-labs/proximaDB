@@ -73,6 +73,78 @@ where
     }
 }
 
+/// Run every gRPC call in the query request scope of its resolved tenant
+/// (`crate::query::request_scope`), so the query facade and federated executor
+/// resolve collections within it. The tenant is resolved exactly as the
+/// handlers resolve it (`resolved_tenant_id`): the auth layer's verdict, else
+/// the `x-tenant-id` metadata, under the deployment's tenant mode. A call whose
+/// tenant does not resolve gets no scope (the query layers deny). Must sit
+/// inside the tenant-mode and auth layers.
+#[derive(Debug, Clone, Default)]
+pub struct GrpcRequestScopeLayer;
+
+#[derive(Clone)]
+pub struct GrpcRequestScopeService<S> {
+    inner: S,
+}
+
+impl<S> Layer<S> for GrpcRequestScopeLayer {
+    type Service = GrpcRequestScopeService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        GrpcRequestScopeService { inner }
+    }
+}
+
+fn request_scope_tenant<B>(request: &HttpRequest<B>) -> Option<String> {
+    let asserted = match request.extensions().get::<GrpcAuthContext>() {
+        Some(context) => context
+            .resolved_tenant
+            .clone()
+            .or_else(|| context.user_context.tenant_id.clone()),
+        None => proximadb_tenant::tenant_claim(|name| {
+            request
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+        })
+        .map(|hit| hit.value.to_owned()),
+    };
+    let fallback_mode = proximadb_tenant::TenantDeploymentMode::single_tenant_default();
+    let mode = request
+        .extensions()
+        .get::<proximadb_tenant::TenantDeploymentMode>()
+        .unwrap_or(&fallback_mode);
+    proximadb_tenant::resolve_request_tenant_for_mode(asserted.as_deref(), mode).ok()
+}
+
+impl<S, B> Service<HttpRequest<B>> for GrpcRequestScopeService<S>
+where
+    S: Service<HttpRequest<B>> + Send,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<S::Response, S::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
+        let tenant = request_scope_tenant(&request);
+        let future = self.inner.call(request);
+        Box::pin(async move {
+            match tenant {
+                Some(tenant) => {
+                    crate::query::request_scope::with_request_tenant(tenant, future).await
+                }
+                None => future.await,
+            }
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GrpcAuthContext {
     pub user_context: UnifiedUserContext,
@@ -682,12 +754,10 @@ mod tests {
     use crate::network::auth::JwtService;
     use crate::network::auth::config::JwtAlgorithm;
     use crate::network::auth::jwt::{Claims, TokenType};
+    use crate::security::SecurityConfig;
     use crate::security::auth_service::{
-        AuthenticationConfig, AuthenticationMethod, JwtConfig, MtlsConfig, SSOConfig,
+        AuthenticationConfig, AuthenticationMethod, JwtConfig, SSOConfig,
     };
-    use crate::security::rbac_service::RBACConfig;
-    use crate::security::security_coordinator::{ComplianceConfig, TlsConfig};
-    use crate::security::{AuditConfig, SecurityConfig, SecurityMode};
 
     #[test]
     fn resolved_tenant_id_defaults_in_single_tenant_mode() {
@@ -732,14 +802,11 @@ mod tests {
     fn security_config() -> SecurityConfig {
         SecurityConfig {
             enabled: true,
-            mode: SecurityMode::Development,
             authentication: AuthenticationConfig {
                 enabled: true,
                 methods: vec![AuthenticationMethod::JWT],
                 require_authentication: true,
                 default_session_timeout_minutes: 60,
-                api_keys: HashMap::new(),
-                scram_users: HashMap::new(),
                 jwt: JwtConfig {
                     enabled: true,
                     secret: "dev-jwt-secret".to_string(),
@@ -750,33 +817,12 @@ mod tests {
                     algorithm: "HS256".to_string(),
                 },
                 sso: SSOConfig {
-                    enabled: false,
-                    providers: vec![],
                     token_cache_ttl_minutes: 5,
+                    ..Default::default()
                 },
-                mtls: MtlsConfig::default(),
-                oidc: None,
-                audit_fail_closed: false,
+                ..Default::default()
             },
-            rbac: RBACConfig::default(),
-            audit: AuditConfig::default(),
-            tls: TlsConfig {
-                enabled: false,
-                require_client_certificates: false,
-                cert_file: None,
-                key_file: None,
-                ca_file: None,
-            },
-            compliance: ComplianceConfig {
-                frameworks: vec![],
-                data_residency: None,
-                encryption_at_rest: false,
-                encryption_in_transit: false,
-            },
-            encryption: crate::security::EncryptionConfig::default(),
-            key_store: crate::security::KeyStoreConfig::default(),
-            tenant: Default::default(),
-            pgwire: crate::security::security_coordinator::PgwireSecurityConfig::default(),
+            ..Default::default()
         }
     }
 

@@ -13,6 +13,22 @@
 | Relates to | TD-OLAP-7 (selective GPU OLAP + the fused-operator wedge — same target, different substrate), TD-OLAP-10/11/12 (the relational operator plane + scheduler this extends), TD-OLAP-11 §"Gate" (the multimodal-join >99%-recall gate is shared), ADR-011 (bloom/ANN pre-filter — the routing policy + thresholds), ADR-052 invariant 4 (measured), `RELATIONAL_DOCUMENT_GRAPH_CONVERGENCE_2026_05_14.adoc` (the operator sketches).
 |===
 
+[IMPORTANT]
+.Amended by ADR-097 (2026-10-18) — premise superseded, operators kept
+====
+link:../../12-design/adr/ADR-097-foundational-seams-single-logical-ir.adoc[ADR-097] D1 makes
+DataFusion `LogicalPlan` the single logical IR. This TD's premise that a fused
+ANN+filter+aggregate "cannot be expressed inside DataFusion" / that "DataFusion structurally
+cannot host this" is **superseded**: DataFusion's `TableProvider::supports_filters_pushdown`,
+`limit` and dynamic-filter pushdown into a custom `ExecutionPlan` carry the predicate *into* the
+search (the pattern already exists in `ProximaScanExec`, `src/datafusion/proxima_scan_exec.rs`).
+The operators below are kept, re-homed as native `ExecutionPlan` adapters under
+`src/datafusion/` (ADR-039 no-leakage unchanged), not as a separate per-query native plane. The
+vector operator is tracked as TD-SEAM-6 (`FilteredAnnExec`); see
+link:../../current/LAKEHOUSE_PLAN.adoc[LAKEHOUSE_MULTIMODAL_SEAMS_2026_10]
+§4 (S6). The status and text below are otherwise unchanged history.
+====
+
 == The central design fact (row-oriented engines behind an Arrow contract)
 
 The `ExecutionOperator` contract is **Arrow `RecordBatch`** (`BatchStream`); every domain

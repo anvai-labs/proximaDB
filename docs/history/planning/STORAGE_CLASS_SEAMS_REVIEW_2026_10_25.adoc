@@ -1,0 +1,695 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= Storage classes: seam review, experiments, economics, and implementation roadmap
+:toc: left
+:toclevels: 2
+// status-as-of: 2026-10-25
+
+
+[IMPORTANT]
+====
+Historical planning snapshot archived 2026-10-26; statements of "current", "open" or
+"done" below describe the source document at its recorded date, not current delivery.
+Current work: link:../../current/STORAGE_PLAN.adoc[the consolidated plan/tracker].
+Preserved as design rationale and evidence; do not resume its old task list verbatim.
+====
+
+== Status and scope
+
+*Proposed implementation contract; design review, not a release or an accepted ADR.*
+Reviewed initially at `56bd798b1`, then reconciled to `origin/develop` at `c18bb630e`
+after D8 merged as #2241 during this review. Original inputs:
+`/home/vsingh/code/handoff-storage-class-seams-codex-prompt.md` and
+`/home/vsingh/code/handoff-storage-class-seams-codex.md`.
+This review supersedes their proposed implementation order and the specific premises
+corrected below. Preserve their product intent: object-backed collections with selectable
+cost/residency policies, metered capacity, and rate cards outside the storage engine.
+
+Tracking: link:../../10-quality/td/TD-TIER-1-collection-storage-policy-and-residency.adoc[TD-TIER-1].
+Plan-mode entry point: link:STORAGE_CLASS_IMPLEMENTER_PLAN_PROMPT.adoc[implementation planning prompt].
+The SC labels below are storage-class work packages, not ADR-097's foundational S1–S9.
+
+User additions incorporated: compare S3 Vectors and turbopuffer; evaluate gp3/gp2/st1/sc1;
+test 8 MiB versus 40 MiB+ reads; use local MinIO (or ds3); inspect physical hardware
+through WSL interop and label extrapolations separately from measurements.
+
+== Current pickup overlay — 2026-10-26
+
+This review's 2026-10-25 audit below is retained as history. Current baseline is
+`69ddbd91b`; link:LAKEHOUSE_MULTIMODAL_EXECUTION_TRACKER.adoc[the central tracker]
+and link:ROADMAP_WORKTREE_RECONCILIATION_2026_10_26.adoc[worktree audit]
+control live status/ownership. Do not reimplement from stale findings in §0.
+
+* #2243 merged the M1 reconciliation and TD-SEAM-14/15.
+* #2244 merged this review and the cap/gap CLI/reporting seam; that harness work is done.
+* #2245 migrated bulk append to the engine and added a never-downgrade floor. The route's
+  tenant REST-key and facade reachability still gate production wiring; P1 is not universally closed.
+* #2249 supplies a measured 4/16/40 MiB pilot. Cell geometry differs (21/25/26), one trial
+  per cap; full E1 telemetry and same-object repeats remain open. Do not infer a proven
+  causal halving, latency neutrality or a global default from those measurements.
+* `feat/sc1-storage-policy` owns local SC1/partial SC2 WIP. Scheme validation alone does not
+  prove authorized resolved placement; policy updates need a real generation. SC3–SC6 remain open.
+* `feat/p24-delete-readers` owns local internal DV reader/read-back WIP. Owner reaffirmed
+  v3-first on 2026-10-26; ADR-097 is aligned. Live v3-default/upgrade/DV publisher activation
+  remains gated, with no new v2 delete implementation.
+
+== 0. Reconciliation of the October 18 plan with code at the 2026-10-25 review
+
+Do not restart P0/P1 or implement the old gap list literally. Some gaps are closed, some
+are narrower, and several completion claims in the tracker were premature. This is a
+point-in-time reconciliation, not a claim that this review reran the Rust/CI suites.
+
+----
+ P0     ADR-097 / lakehouse direction               LANDED
+ P1     MATERIALIZE + external read-back            LANDED for that route
+        legacy bulk-append _manifests writer        OPEN
+ P2     segmented WAL / spill / truncation          LANDED, default ON
+        bounded publisher + SF1 memory gate        LANDED / measured
+        real oid + incremental insert append       LANDED
+        deletion-vector codec / manifests          LANDED; readers/writer OPEN
+        object spill                              OPT-IN; ownership gaps OPEN
+ P3     streaming Layer A / mixed tables / merge   LANDED behind existing gates
+        UDTF-only pgwire routing                   LANDED, ungoverned scope
+        safe PAX scan / FilteredAnnExec / S9        OPEN
+ P4     observability / graph / subject erasure    OPEN
+ P5     centroid D1-D3,D5-D8 / defaults             LANDED; D4 DEFERRED
+        zero-remote warm / broad scale proof       OPEN
+        persisted HNSW from exact PAX tier         OPEN
+ P6     SF1 load+publish memory                    MEASURED PASS
+        SF1/SF10 query parity / multimodal proof   OPEN
+                       |
+                       +--> SC0-SC6 residency/economics (this review)
+----
+
+Evidence and boundaries:
+
+* P1: `tests/iceberg_interop_e2e.rs` and CI's required pinned external readers exist.
+  The originally proposed filename `iceberg_external_readback_e2e.rs` does not exist.
+  `table_write_executor.rs` still calls `publish_snapshot` under `_manifests` for bulk
+  append. Thus the MATERIALIZE route is proven; the single-writer migration is incomplete.
+* P2: defaults, durable branch merge-base and WAL compatibility fixtures are already present.
+  SF1 evidence records 1,655 s load, 225 s MATERIALIZE, 22/22 tables and 10,773 MiB peak RSS.
+  That proves bounded load/publication, not query correctness or SF10. Insert-only append
+  landed in #2234; v3 deletion-vector infrastructure in #2238 does not imply live delete publication.
+* Iceberg format is selected by `iceberg_needs_v3`: v2 unless a field needs a v3-only
+  nanosecond type. The TD-USUB-10 sentence saying all published tables are v3 was inaccurate.
+  Owner direction on 2026-10-25 is now v3-first: one v3 write target, legacy v2 reads
+  and an explicit atomic upgrade, no new v2 delete path or downgrade fallback. Persist
+  format policy, validate row-lineage allocation, and land readers before the DV writer. Extend
+  external value read-back to deleted/updated rows, not merely codec round trips.
+* P3: mixed Parquet/native routing (#2212), streamed read merge (#2217), and UDTF-only
+  pgwire routing (#2229) landed. UDTF routing does not supply missing ABAC enforcement.
+  Registering `PaxTableProvider` without WAL-tail, visibility/deletion and ABAC contracts
+  would expose wrong answers. Complete those contracts before enabling that route.
+* P5: #2241 is now merged. The six directory/shared-model/same-wave/decode-key gates are
+  default ON with kill switches; the unused AXIS IVF disk placeholder was removed.
+  Physical A+B co-location and D4 compaction are deferred, not prerequisites to rebuild.
+  D8's 10 ms profile has 18.553 GET/q, 19.553 requests/q, cold p50 107.4 ms, recall 0.9822;
+  waves p50=3, p95=4. Warm disk still has 4.939 GET/q, p50 105.5 ms and two waves.
+  Do not convert a median-wave gate into a worst-case promise. See the hashed result extract.
+* An independent reconciliation PR #2243 is open. Reuse its ownership/recovery and
+  record-vs-subject contract work when it lands; do not duplicate TD-SEAM-14/15 or
+  overwrite its changes. Its D8-open and mixed-tables-open statements require updating
+  against #2241 and #2212. This review's baseline and source checks take precedence.
+
+Foundational refinements for the next multimodal milestone:
+
+. Keep record identity (`oid`) separate from subject/entity identity. Edges, logs and
+  documents referring to one person remain distinct records; a subject index relates them.
+. Define a query read token: per-table snapshot, WAL cutoff and projection generation,
+  with a captured authoritative visibility boundary. One catalog does not by itself
+  provide an atomic cross-table snapshot. Reject or label unsupported consistency modes.
+  PAX authority also does not make vectors directly readable as an Iceberg open table:
+  optional Parquet publication needs explicit freshness and duplicated-storage accounting.
+. Split subject deletion into current-query invisibility, historical snapshot access,
+  expiry, and confirmed physical erasure (including cache/retained copies). A delete in
+  the next snapshot alone does not satisfy the original historical-snapshot experiment.
+. Preserve ADR-097's single logical IR/native ExecutionPlan adapters; verify the actual
+  extension point before writing optimizer rules. ADR-054 contains older consolidation
+  prose and a newer ADR-097 amendment; neither establishes that rule wiring already exists.
+. Make the next product proof a governed TE-1 query while writes/publication proceed.
+  Close writer/format and visibility contracts, then ANN + observability as one vertical
+  slice. Do not equate the storage-class API or an ANN microbenchmark with multimodal delivery.
+
+Measured hardware/emulator evidence:
+link:../evidence/STORAGE_CLASS_MEDIA_EVIDENCE_2026_10_25.adoc[local NVMe, MinIO and EBS bounds].
+
+=== V3-first implementation decision (owner amendment, 2026-10-25)
+
+The target is decided: v3, not another v2 feature cycle. The earlier v2 proposal served
+external-reader compatibility; it does not justify implementing v2 position deletes now.
+Reuse the landed Puffin/DV engine. Sequence:
+
+----
+ current v2 tables --legacy reads--> unchanged visibility
+          |
+          +-- atomic, persisted v3 upgrade (reuse compatible data files)
+                         |
+ new tables ---------- v3 publication / one authoritative writer
+                         |
+              delete-aware internal readers
+                         |
+        pinned external readers: values + deletes + snapshot chain
+                         |
+              enable incremental DV publication
+----
+
+The arrows express readiness dependencies, not permission to emit deletes before readers.
+Replace type-based format selection with a stored monotonic version; validate required
+row lineage, parent/sequence inheritance, upgrade races and crash recovery. Unsupported
+legacy delete encodings fail closed. No new dual-format feature implementation; no forced
+whole-data rewrite merely to change the metadata version. Optional variant support is
+separate from establishing the v3 publication contract. Update ADR-097 D3 and its callers
+in the implementation slice; this review updates the decision but changes no Rust behavior.
+
+The https://iceberg.apache.org/spec/[Iceberg specification] defines v3 DVs and row lineage,
+allows existing v2 position deletes after upgrade, and forbids adding new position-delete
+files to v3 tables. New DVs must incorporate applicable earlier position deletes.
+
+== 1. Decision summary
+
+. Separate collection policy, durable placement, local residency, provider access tier,
+  and physical disk profile. They are independent dimensions with explicit compatibility checks.
+. A cache pin is a capacity reservation plus protected coverage of a committed object set.
+  Changing an eviction priority does not create a reservation or a guarantee.
+. Preserve old behavior when policy is absent. New non-default behavior is opt-in and
+  unsupported configurations fail at policy admission, not later inside a data write.
+. For v1, admit performance residency only for explicitly supported object-backed SST/PAX
+  collections on one serving owner. Do not claim all modalities or fleet-wide warmth.
+. Initial quota failure rejects the policy change. Later disk failure or dataset growth
+  preserves durable writes and reports degraded coverage. Never report READY after falling back.
+. Reuse the persistent byte store, typed path resolution, publication hooks, and metering sink.
+  Do not introduce another durable table, manifest authority, cache implementation, or pricing engine.
+. Keep TD-PAXDIR-2 separately owned, but make it an explicit dependency of a zero-total-request
+  promise. Until then, measure zero payload GETs and remaining control requests separately.
+. Choose range size from measured useful-byte density, latency, and tier costs. No global
+  40 MiB default and no fixed depth-first ordering independent of the deployment profile.
+
+----
+                    CollectionPolicy (desired, versioned)
+                    /            |                 \
+             durable location  residency intent   access-tier intent
+                    |            |                 |
+             typed path +     quota + pool       object-kind +
+             authorization    reservation        backend capability
+                    |            |                 |
+                    +------ publication ------ object PUT
+                                 |
+                       committed object inventory
+                                 |
+                    cache coverage reconciliation
+                      /                       \
+             READY(generation)          WARMING / DEGRADED
+                      \                       /
+                  normal query correctness + remote fallback
+                                 |
+                physical usage + reservation-time records
+                                 |
+                  AnvaiOps: prices, commitments, invoices
+
+ Disk-pool profile: gp3 | gp2 | st1 | sc1 | local NVMe
+   constrains capacity / IOPS / throughput / queueing, not durable authority.
+----
+
+== 2. Premise audit: corrections that prevent wasted implementation
+
+[cols="2,3,3",options="header"]
+|===
+| Original premise | Verified evidence | Consequence
+| Named locations already exist
+| `StorageLocation` in `proximadb-config/src/lib.rs` has URL, weight, tags and optional io_budget, but no name/id. `StorageConfig::register_io_budgets` is called by `src/database.rs`; the registry already does boundary-aware longest-prefix matching.
+| Reuse this registry. Decide whether the smallest API needs an operator-defined location id; do not assume a name field or build a second registry. Admission must authorize selection, not merely recognize a URL scheme.
+| Set `StorageAssignment.base_location` from the request
+| `CollectionManager` resolves `CollectionConfig.storage_config.storage_path`, otherwise chooses a configured location, then stores the assignment. Query context derives typed paths from the assignment. REST v2 has its own strict request schema.
+| Treat assignment as resolved output. Trace REST/gRPC/catalog create and restart paths. Preserve typed and legacy path compatibility instead of hard-coding `data/{tenant}/...`.
+| Extend `CacheTier::evict_priority` to pin disk capacity
+| SST `segment_format::CacheTier` governs content priority in DRAM. `PersistentByteStore` has a separate `L2Class`, disk byte budget, and `evict_blocking` that can evict every entry.
+| Reservation/protection belongs in the persistent residency budget. Content type and protection are separate attributes. A priority-last entry is still evictable and can exceed capacity after admission.
+| `cache_on_write=all` makes every warm query local
+| `install_pax_cache_seed_from_local_file` seeds control/Region A and optional SQ8 Region B. It does not seed every result block, optional exact tier, directory or deletion sidecar.
+| Inventory required bytes and trace residual misses before extending admission. A whole-object residency prototype is the simplest correctness baseline; selective residency is a later optimization.
+| Existing whole-file cache solves efficient local ranges
+| `UnifiedCachingFilesystem::read_range` calls `DiskCacheManager::get_data` and slices the returned full object. The persistent PAX store already supports checksum-verified `get_range` and streamed `put_file_range`.
+| Do not implement pinned 8–40 MiB reads by repeatedly loading a whole large segment. Reuse the verified ranged primitive with one ownership/budget model.
+| Tier-aware storage billing can come from a query snapshot
+| `install_billing_observer` records query work/reads. `record_storage_snapshot` sums collection `stats.data_size_bytes`; `metering_writer.rs` persists hourly storage levels. Neither is a reservation integral or an authoritative per-object access-tier inventory.
+| Meter idle reservations and object lifecycle independently of queries. Extend the existing durable sink; do not derive physical occupancy from a query trace or logical row statistics.
+| Access tiers are almost-free plumbing and GCS support is absent
+| Current GCS writes set storage class, and `ProximaObjectStore::put_with_tier` exists; ADR-036's residual notes are stale. Coverage of every atomic/multipart/compaction caller still needs verification.
+| Reuse existing mappings; fix ADR-036's premise. Test real production write paths, not just the enum conversion. MinIO is not an access-tier enforcement oracle.
+| Footer can stay Hot while its segment is Cool
+| PAX header/footer/A/B/D are ranges inside one object. Object-store access tier applies to the object.
+| Embedded control bytes inherit the segment's tier. Only separate control objects can be forced Hot. Do not split PAX merely to satisfy that sentence.
+| Performance can guarantee warmth while quota admission degrades silently
+| These are incompatible promises; no reservation lifecycle is specified.
+| Separate desired/admitted/observed state; reject initial over-quota policy admission, preserve writes on later cache failure, and expose degradation.
+| Zero object requests while LIST cache is out of scope
+| D7 measures one discovery LIST even on warm queries. TD-PAXDIR-2 owns its removal.
+| Keep ownership separate, dependency explicit. Do not weaken consistency or hide LIST/HEAD to pass the test.
+| Current store is always remotely authoritative
+| Local storage locations and a local canonical WAL remain supported; object-store spill is opt-in.
+| Scope this promise to the durable segment target of opted-in collections. Residency work must not claim remote durability of every acknowledged WAL-tail write or alter the existing acknowledgement boundary.
+|===
+
+Relevant existing specs read: ADR-033, ADR-036, ADR-085, ADR-094, ADR-097;
+TD-CACHE-9, TD-IOTRACE-4, TD-PAXDIR-1/2; the filing convention and local repo rules.
+Older design prose is not stronger evidence than current production call sites.
+
+== 3. Thought experiments that decide the contracts
+
+[cols="1,3,3,2",options="header"]
+|===
+| ID | Experiment | Required decision/invariant | Gate
+| SC-TE1 | Old catalog record, old client, absent/new unknown enum | Absent/UNSPECIFIED resolves balanced. Unknown explicit REST strings and proto numbers are rejected; absent PATCH preserves existing state. No duplicate mutable policy fields. | Old-record decode, create/get/update/restart and unknown-value tests across facades.
+| SC-TE2 | Tenant selects another tenant's prefix, or a local URL for performance | Location selection is operator-authorized; path construction uses stable tenant/namespace/collection identity. New performance admission requires object-backed placement and a supported pool. | Cross-prefix rejection; no write outside selected location; alias/typed-path tests.
+| SC-TE3 | Two concurrent reservations each see 60 GiB free and each request 40 GiB | Atomic reserve/resize/release under one owner; sum reservations plus protected overhead/headroom never exceeds allocatable capacity. | Concurrent admission; retry idempotency; restart reconciliation.
+| SC-TE4 | All entries are pinned and a new write arrives | Pins cannot be evicted by ordinary pressure. Do not admit an oversize pin. A successful durable write remains successful; READY becomes WARMING/DEGRADED when coverage cannot catch up. | Full disk, quota exhaustion, oversize entry and concurrent growth.
+| SC-TE5 | Compaction temporarily holds old+new segments and an old reader | Reserve coexistence/staging headroom; publish before cache exposure; retain source correctness until safe retirement. Residency release cannot authorize object deletion. | Faults before/after publish, seeding and retirement; concurrent query.
+| SC-TE6 | Delete/TTL/subject erasure while bytes remain pinned | Pin immutable bytes, not visibility. Normal WAL merge/MVCC/DV authorization still applies. Retirement/deletion revokes residency independently of eviction protection. | Updated/deleted/expired rows never reappear; drop/recreate gets a fresh identity.
+| SC-TE7 | Restart, corrupted entry, lost NVMe or failover to a new node | Cache is reconstructible. Reconcile saved policy and reservation ownership; validate cached objects. Disk failure falls back remotely and clears READY. | Reopen, corrupt range, lost disk, cold owner; no warm claim after loss.
+| SC-TE8 | Queries route to two nodes but only one has a pin | v1 guarantee is serving-owner scoped. Reject fleet-wide admission without routing and replica reservations. | Query reaches admitted owner, or clearly reports fallback; no cross-node pin claim.
+| SC-TE9 | No query for 24 hours while capacity remains reserved | Reservation time accrues without query traffic. Reserved, resident, ready and object bytes are distinct quantities. | Clock-driven idle accounting, crash/replay/dedup; release stops accrual.
+| SC-TE10 | Cool segments are read heavily and compacted after a day | Model retrieval and minimum-duration charges; a PUT default is not a lifecycle manager. Archive is inadmissible for online serving v1. | Per-object tier provenance; expected-cost sensitivity; unsupported capability rejection.
+| SC-TE11 | First diverse query asks for metadata/full vectors outside A/B | READY requires an explicitly covered query profile and complete required object set. Repeated cached results do not prove byte residency. | Diverse queries, fresh DRAM, result cache bypass, include-vectors/metadata/filter paths.
+| SC-TE12 | Snapshot shared by two readers or collection renamed | Keys use stable identity and immutable object revision, never display name alone. Physical bytes counted once per physical object; reservations remain distinct from dedup savings. | Rename/drop/recreate; reference release; no tenant collision.
+| SC-TE13 | Change cap from 8 to 40 MiB, many scattered cells | Cap is a maximum, not a minimum fetch. Coalesce only worthwhile gaps; preserve recall and per-query in-flight byte limits. | Fixed geometry, offsets trace, useful/fetched bytes, p95 and QPS.
+| SC-TE14 | Small st1/sc1 volume bursts well then credits drain | Size for sustained throughput and instance limit, not burst headline. HDD random access is a separate workload from sequential throughput. | Credit-depleted run on real EBS; emulator predicts only sensitivity.
+| SC-TE15 | Publish v3 deletes or new Parquet layout for another modality | Storage class does not choose format/engine/precision or create another snapshot authority. Providers opt into residency coverage explicitly. | Unsupported modality fails policy admission; balanced behavior unchanged.
+| SC-TE16 | Remote writer publishes during a listing-cache TTL | TTL bounds staleness, not strong freshness. A local generation is sufficient only for a proven single owner; otherwise validate an authoritative version. | No new zero-LIST strong-consistency claim for multiwriter serving.
+|===
+
+== 4. Refined interfaces and v1 behavior
+
+=== 4.1 Collection policy and placement
+
+Keep one versioned desired policy in the canonical collection config, projected into the
+catalog as required by existing conventions. `Collection` reports it through that config;
+do not independently mutate both a top-level class and a config class. Proto enum zero is
+UNSPECIFIED, resolving to balanced for compatibility. Validate unrecognized numeric values.
+
+Proposed policy concepts (names are interface sketches, not a mandate to add all fields):
+
+* `storage_class`: economy / balanced / performance.
+* resolved durable location: existing assignment, chosen through an authorized configured target.
+* optional `default_access_tier`: online tiers only in the first supported provider path.
+* performance request: reservation bytes and a supported local pool selector; quota is
+  operator/tenant policy, not a client-supplied entitlement.
+* observed status: state, reason, policy generation, serving owner/pool, committed generation
+  covered, reserved bytes, resident bytes, covered bytes, and last transition.
+
+Proposed precise class semantics:
+
+[cols="1,3,3",options="header"]
+|===
+| Class | Data residency | Promise
+| balanced | Preserve current shared caches and their existing defaults | Best effort; no reservation and no new latency guarantee.
+| economy | No persistent payload admission or proactive payload warming; bounded common control metadata may still cache | Lower local footprint; object requests remain metered. It does not force a colder object access tier or a different index.
+| performance | Explicitly admitted protected disk bytes; demand and post-publication reconciliation of covered objects | Admitted bytes survive ordinary cache pressure while the owner/pool is healthy; readiness reports actual coverage. No reserved CPU or p99 guarantee in v1.
+|===
+
+If economy's difference from balanced is not wanted, do not ship two identical promises:
+defer economy activation until the product choice is settled. Config-only SC1 can persist
+intent behind a gate but must report NOT_ACTIVE, never imply a working reservation.
+
+Changing durable location remains a separate migration. Policy changes are versioned and
+idempotent; access-tier changes affect future objects only unless a separate migration is
+requested. Old explicit local configurations continue to work with balanced behavior.
+
+=== 4.2 Reservation and coverage lifecycle
+
+----
+ request --validate capabilities/quota--> REJECTED (old policy unchanged)
+              |
+              v
+          RESERVED --> WARMING(g) --> READY(g, profile)
+              |             |             |
+              +-------------+-------------+--> DEGRADED(reason)
+                            |                       |
+                       reconcile <------------------+
+                            |
+                  downgrade/drop --> RELEASING --> RELEASED
+----
+
+Use one reservation authority for a physical pool. For v1, a process owns the pool exclusively;
+acquire an exclusive pool lock and reject a second owner. Persist/reconcile grants through the
+existing durable catalog/control path; do not invent a distributed quota service. Tenant quota
+scope must be explicit: this v1 is a deployment/owner scope, not independently enforced global
+limits on multiple nodes. Fleet rollout requires control-plane grants whose sum obeys the global cap.
+
+Charge physical capacity once per actual reservation replica/pool. Reserve bytes for entry
+headers/checksums, temporary warming, and old/new generation overlap. Capacity reservation is
+not free disk space observed once. Do not hold a global reservation lock while doing network I/O.
+A kill switch releases/bypasses residency safely; it cannot erase policy or remove the remote copy.
+
+Use `PersistentByteStore::put_file_range` / `get_range` for a small whole-immutable-object
+prototype. Extend ownership/protection independently of `L2Class`. Verify every read path
+consults the same resident object through a thin adapter; retain existing derived DRAM caches.
+Avoid storing duplicate A/B parent ranges and a full object without counting both bytes.
+Do not build an alternative object cache if the existing store can be adapted.
+
+An object key includes stable tenant/collection incarnation and canonical immutable object
+identity/revision. Bind coverage to the published segment set and directory/sidecar revisions.
+Use checksums for local integrity; an ETag is an opaque validator, not assumed content hashing.
+Derive a residency inventory from the existing committed read set; it is a cache descriptor,
+not a second publication manifest or latest-snapshot authority.
+
+READY is conditional on owner health, admitted capacity, generation and query profile.
+New publication does not wait for warming and cannot lose acknowledged writes because of it.
+Queries keep the normal freshness/ABAC/deletion logic and read remote bytes on a miss.
+Expose reduced coverage immediately; preserve already-admitted pins until released or retired.
+Strict uninterrupted readiness during arbitrary growth is out of scope unless the product
+accepts write backpressure and reserves the necessary transition capacity.
+
+=== 4.3 Usage versus billing
+
+Add a neutral usage schema, not dollar arithmetic in OSS:
+
+* object bytes by physical location, provider class (observed/unknown), object kind and owner;
+* reserved bytes, actual disk-resident bytes, and ready-covered bytes as separate levels;
+* reservation byte-seconds with interval boundaries and producer/lease epoch + sequence;
+* remote operations separated as GET, HEAD, LIST page, PUT, DELETE, retry/error where measurable;
+* remote retrieved bytes, local bytes read/written, query CPU time, warming and compaction work.
+
+Keep operation/object-class/media/product-class labels distinct. Avoid per-object metric labels;
+collection detail can live in bounded durable records/status while Prometheus aggregates by tenant/pool.
+Count background work outside query traces. Never sample or compile out billing-required events.
+Record a metric as partial where the SDK hides retry/page detail; do not claim invoice equivalence.
+
+Extend `MeteringWriter` with additive/versioned events and periodic reconciliation, reusing its
+typed tenant paths. Durable sequence/interval keys support downstream deduplication. A gauge
+alone cannot recover idle accrual across process loss. Report uncertainty after an unobserved
+interval instead of fabricating exact usage. Count retained snapshots/orphans until confirmed
+physical retirement; do not infer physical release from row deletion. Rate-card treatment of
+reserved-but-degraded capacity is an AnvaiOps product decision; record both reservation and
+readiness so it can apply credits without guessing.
+
+=== 4.4 Provider access tier
+
+Implement only after the selected backend and production write paths prove support. The
+canonical enum maps to provider classes, but service semantics are not identical. Strictly
+validate new public policy; leave legacy lenient FileOptions parsing unchanged unless separately
+migrated. Reject unsupported explicit requests rather than silently ignoring the user's intent.
+
+Set the final object's tier on atomic and multipart publication and compaction output. A helper
+that overwrites with `put_with_tier` must not replace create-only or conditional commit semantics.
+Separate manifests/directories/control objects stay explicitly Hot where supported; embedded
+headers/footers inherit their data object's tier. Account lifecycle rules can subsequently
+change it: distinguish desired, last-written and observed tier, with unknown allowed.
+No Archive, automatic lifecycle controller, backend migration, or split-file layout in this work.
+
+== 5. 8 MiB versus 40 MiB, and local disks versus EBS
+
+Eight MiB is a size, not a locality classification. Reads at offsets 0, 8, 16 MiB are sequential;
+8 MiB reads at unrelated offsets or in different objects are random between contiguous extents.
+An HTTP GET is not an EBS I/O: the filesystem/block layer may split it into many requests.
+
+Keep three knobs separate: remote coalescing cap/gap, local prefetch/read size, and integrity
+chunk size. ADR-085's 64 KiB checksum unit addressed local read amplification; increasing the
+cloud cap must not enlarge that unit. With 16 concurrent 40 MiB buffers, nominal payload alone
+is 640 MiB per active wave, before decode and overlapping requests. Add an in-flight byte budget.
+
+Measure fixed geometry first. Changing the IOPS target may also change `k_G` at compaction;
+that would confound a range-cap experiment. Pin the object set/ETags, trained cells, nprobe,
+coalescing gap, concurrency, query sequence, return payload, binary and cache policy. Inspect
+actual geometry: the local D8 10 ms result JSON contains 27 coarse cells, while the narrative
+summarizes about 34. Record the JSON geometry, not the summary as an invariant.
+
+Sweep 4/8/16/32/40/64 MiB in stages: first 4/16/40, then refine around the Pareto frontier.
+For each arm record useful and fetched bytes, overread gap bytes, actual request-size distribution,
+GET/HEAD/LIST, waves, p50/p95/p99, CPU, peak RSS, in-flight bytes, throughput and recall.
+A larger cap may make no difference if selected extents remain disjoint; never pad reads to it.
+Keep SIFT1M recall >= 0.98 and compare the same query identities. Extend finalists to fragmented
+segments, filters, 10M rows and 768d before any global default change. Unknowns stay unknown.
+
+Proposed disk profiles:
+
+[cols="1,2,3",options="header"]
+|===
+| Medium | Use in this design | Qualification
+| gp3 | Default EBS candidate for shared/reserved query residency | Baseline 3,000 IOPS and 125 MiB/s; provision throughput/IOPS independently and include the EC2 instance cap. Capacity alone does not guarantee query throughput.
+| gp2 | Existing deployments; migration comparison | Size-coupled baseline and burst behavior. Do not assume small-volume burst throughput is sustained or that converting to default gp3 preserves the old throughput.
+| st1 | Sequential scan/compaction staging candidate | At 1 TiB: 40 MiB/s sustained baseline, 250 MiB/s burst; large/random ANN scatter needs a real trace test. Not the default performance pool.
+| sc1 | Rare sequential staging candidate | At 1 TiB: 12 MiB/s baseline, 80 MiB/s burst. Low capacity price can be erased by sizing for throughput. Not a latency promise.
+| Local NVMe | Fast serving residency, rebuildable on node loss | Compare incremental instance cost and replacement/warm-up work. Do not call bundled capacity free.
+|===
+
+Sources checked 2026-10-25:
+https://docs.aws.amazon.com/ebs/latest/userguide/general-purpose.html[SSD profiles],
+https://docs.aws.amazon.com/ebs/latest/userguide/hdd-vols.html[HDD profiles],
+https://docs.aws.amazon.com/ebs/latest/userguide/ebs-io-characteristics.html[I/O and credit behavior].
+
+Preflight on this host: WSL kernel `6.18.33.2-microsoft-standard-WSL2`, 16 exposed logical CPUs
+on a Ryzen 9 7950X, about 126 GiB guest RAM; Windows reports one Samsung SSD 990 PRO 2TB,
+NVMe, disk 0, C:. Ubuntu's VHD is on C:; `/tmp` is ext4 on guest `/dev/sde`.
+The guest's `ROTA=1` on "Virtual Disk" is not evidence of an HDD. MinIO listens on 12000,
+Toxiproxy on 12002. Read-only interop inventory identified these; performance is not inferred
+from the SSD model. See the accompanying experiment artifact for any measurements actually run.
+
+Use a task-owned test file, direct I/O where available, sequential and randomized offsets,
+and bounded queue depths. WSL/VHD/Windows caching remains a caveat even with guest O_DIRECT;
+do not call that a raw-NVMe or EBS measurement. Never drop host caches or alter another workload.
+
+For extrapolation use constraints, not a blanket NVMe-to-EBS multiplier:
+
+----
+effective_bandwidth <= min(volume bandwidth, instance EBS bandwidth,
+                           network limit, measured application consumption)
+QPS <= min(effective_bandwidth / local_bytes_per_query,
+           effective_IOPS / block_IOs_per_query,
+           available_CPU_seconds / CPU_seconds_per_query)
+EBS latency model = backend/queue term + critical-path bytes/bandwidth
+                   + unchanged decode/merge/compute work
+----
+
+For HDDs include the seek/locality term and exhausted-credit baseline. For gp3 account for
+additional throughput/IOPS prices. Rewarm time is bounded by bytes / bottleneck bandwidth plus
+request/decode overhead; regional placement does not make a large failover cheap or immediate.
+Measure local-L2 bytes/query: remote 54.7 MB/query is not automatically the local read demand.
+
+== 6. Economics corrections and competitive strategy
+
+=== 6.1 Correct the original T1–T10 ledger
+
+Use [M] for dated reproducible measurements, [D] for equations with all inputs, [A] for assumptions,
+and [U] for unknowns. Provider prices are dated rate-card inputs, not measurements.
+
+[cols="1,4",options="header"]
+|===
+| Item | Correction / next decision
+| T1 | Under the handoff's assumed $0.40/M GET and $5/M LIST, 18.55 GET/query + one LIST costs $12.42/M queries before compute; adding its assumed $1.50 gives $13.92, not $12.4. The inspected D8 JSON records 18.553 GETs and 19.553 total requests/query; the model assumes the remaining request is the observed discovery LIST. Counter limitations and separate HEAD/LIST accounting still matter for invoice-grade rating. Larger-cap request counts are unknown, not linearly derivable from the cap.
+| T2 | Removing discovery saves only the requests actually removed. Strong consistency still applies; cache hits do not justify stale discovery. Keep background validation costs in the account total.
+| T3 | Cell geometry and read cap interact; isolate them before co-tuning. Record actual segment distribution, not only nominal k_G.
+| T4 | Transfer fees and retrieval fees differ. Same-region S3-to-AWS transfer exemptions are not restricted to Standard; IA adds retrieval fees. At the assumed $0.01/GB retrieval and 54.7 decimal MB/query, retrieval alone is $547/M queries. Include minimum-duration and object-size charges where applicable.
+| T5 | Object storage remains, so added EBS is not EBS minus S3. With an assumed $0.08 per billed-GB-month and $12.42/M fully avoidable request cost, a one-unit copy breaks even at about 6,441 queries/month, not 4,600. This illustration excludes utilization, replicas, headroom, residual requests, warming, CPU and unit conversion; it is not a product threshold.
+| T6 | 107 ms minus three RTTs is a wall-time residual, not measured CPU. It includes transfer, decoding, local I/O, scheduling and overlap. CPU-cost and instance-per-query estimates require process CPU and utilization measurements.
+| T7 | Wave count is useful, but wave duration includes bytes and queuing. Retain the 10 ms emulator profile plus a 50 ms stress arm; do not assert that every wave equals one RTT.
+| T8 | PUT class is not lifecycle management. Compaction churn can negate at-rest savings; control bytes inside a data object cannot be tiered separately.
+| T9 | Vendor logical-byte pricing is not physical scanned bytes or its internal COGS. Four-byte 128d vectors occupy 512 bytes each: 14 decimal GB is 27.34M vectors before attributes, not 3M. No universal crossover without measured request scaling. Current turbopuffer docs also describe f16 logical accounting; do not assume every vector is billed as f32.
+| T10 | There is no verified vendor 0.5 GB physical-read rule. Do not imitate it. Model actual segment geometry and useful-byte density at each scale.
+|===
+
+S3 transfer/retrieval and billing caveats:
+https://aws.amazon.com/s3/pricing/[AWS pricing] and
+https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html[storage-class semantics].
+Azure online/offline tier and minimum-retention distinctions:
+https://learn.microsoft.com/en-us/azure/storage/blobs/access-tiers-overview[Azure tiers].
+
+=== 6.2 Three ledgers, not one misleading comparison
+
+. *Physical usage:* bytes, operations, CPU seconds, capacity-time, rewrites, rewarming.
+. *Our COGS:* rated physical usage plus allocated idle capacity, replicas, support/operations,
+  control-plane/network services, durability overhead and amortized warming/compaction.
+. *Customer invoice:* stable logical units or explicit reserved capacity with published limits,
+  mapped by AnvaiOps. Never expose implementation GET count as the only user planning unit.
+
+----
+monthly_COGS = object_storage + retained_versions + requests + retrieval
+             + disk_capacity + provisioned_IOPS_throughput + compute
+             + network/services + warming/compaction + operational allocation
+
+cost_per_query = monthly_COGS / successful_queries
+minimum_price_for_margin_m = COGS / (1 - m)
+
+Q_break_even = (additional_reserved_capacity_cost + rewarming + fixed_overhead)
+               / (shared_variable_cost_per_query - reserved_variable_cost_per_query)
+----
+
+Require a positive denominator; otherwise no cost breakeven exists. Do not count avoided
+compute unless measured, subtract retained S3 storage, or divide by peak QPS when billing an
+idle month. Model capacity at provisioned bytes / utilization, and each serving replica separately.
+
+=== 6.3 Competitor-normalized worksheet
+
+Use same region, corpus precision, keys/attributes, filter selectivity, top-k/result bytes,
+recall target, freshness, QPS/concurrency, availability, write churn and namespace distribution.
+One namespace of 100M vectors and 100 namespaces of 1M have different pricing and cache economics.
+Account for all fan-out queries; do not recommend arbitrary sharding solely to exploit a floor.
+
+Published reference inputs, checked 2026-10-25 (recheck before quoting):
+
+* S3 Vectors US-East example: storage $0.06/GB-month, PUT $0.20/GB, queries $2.50/M
+  plus tiered processed-byte charges ($0.004/TB for first 100K vectors, $0.002/TB to
+  10M, $0.0004/TB above), and result-byte charges subject to the published allowance.
+  Index size/keys/filterable attributes, not a measured physical scan trace, determine that model.
+* turbopuffer public rates: storage up to $0.33/logical GB-month, writes up to $2/GB,
+  queries up to $1/PB of billed queried data with a 1.28 GB floor and marginal size discounts.
+  Returned data is separate; account minimums and precision/attribute rules matter.
+* Its pinned offer reserves compute and NVMe, unlike this proposed residency-only v1.
+  Pinning is sized by namespace bytes, replicas and time, with a 128 GB/10-minute floor;
+  normal queried-byte charges are replaced while pinned, but other charges remain.
+
+Sources: https://aws.amazon.com/s3/pricing/[S3 Vectors pricing],
+https://turbopuffer.com/pricing[turbopuffer pricing],
+https://turbopuffer.com/docs/pinning[pinning].
+
+Illustrative query-only worksheet: 1M queries, one namespace/index, fp32 vectors only, no
+attributes/keys/results/write/storage/commitments. Decimal GB/TB/PB throughout for transparent
+arithmetic; this is a sensitivity baseline, not either provider's exact invoice (verify its
+byte convention, per-result minima and rounding in the rating fixture).
+
+[cols="2,1,1,2",options="header"]
+|===
+| Corpus | S3 Vectors model $/M | turbopuffer model $/M | ProximaDB
+| 1M x 128d | 3.6264 | 1.2800 | Original assumed request-only COGS about 12.42; no full managed-service price yet.
+| 1M x 768d | 9.2584 | 3.0720 | Unmeasured; do not reuse 128d request/CPU counts.
+| 10M x 768d | 64.5544 | 30.7200 | Unmeasured at this workload and serving shape.
+| 100M x 768d | 175.1464 | 58.3680 | Unmeasured; scale/fragmentation and cache footprint determine cost.
+|===
+
+Reproduction equations with N vectors and b bytes/vector:
+
+----
+S3_vectors_query_1M = 2.5 + (b / 1e6) * (
+  .004 * min(N,100000)
+  + .002 * min(max(N-100000,0),9900000)
+  + .0004 * max(N-10000000,0))
+
+G = max(N*b/1e9, 1.28)
+tp_query_1M = min(G,32) + .2*min(max(G-32,0),96) + .04*max(G-128,0)
+----
+
+This comparison rejects a blanket cheapest-query claim at SIFT1M scale. The economic thesis
+must be demonstrated in selected workloads; competitive vendor price can be below our current
+request-only infrastructure cost. A margin target makes the required engineering improvement
+larger, not smaller. Logical storage pricing versus our compressed physical S3 bill does not
+prove a 28x managed-service price advantage.
+
+=== 6.4 Recommended commercial experiments
+
+* *Shared balanced:* simple logical storage plus query-work allowance/overage and a small
+  transparent account minimum. Pool capacity across tenants; measure hit-rate distribution and
+  idle utilization. Publish an estimate before expensive query shapes; enforce compute/concurrency
+  budgets without silently reducing recall or freshness.
+* *Reserved performance:* sell explicit capacity-time and, only when implemented, separately
+  admitted compute/concurrency. Include a stated query-work allowance, not unlimited QPS.
+  Avoid charging full usage-based query work and the same reserved resource twice. Rewarming,
+  upgrades, grace periods and degraded-service credits need explicit rules in AnvaiOps.
+* *Economy:* target large, rarely queried context with optional online colder tiers. Price
+  retrieval risk and minimum retention; use a forecast/advisor before tiering. Low $/GB alone
+  does not establish low total cost.
+* *Commitments:* discount predictable baseline consumption only when pooled utilization and
+  reservation savings support it. Use interruptible compute for rebuildable background work
+  after measuring restart cost, not as an unqualified serving-SLO assumption.
+* *BYOC option:* show customer cloud charges plus software/control-plane fees separately;
+  this can avoid double storage margin and strengthen open-table positioning. Do not build a
+  new deployment mode in TD-TIER-1.
+* *Multimodal value:* compare complete workflow cost (copies, ETL, joins, operational services)
+  only for capabilities proven end to end. Never use unimplemented lakehouse/graph guarantees
+  to justify a current price premium.
+
+For each candidate rate card, calculate contribution margin at low/base/high utilization,
+one/two serving replicas, cold-start frequency, update/compaction amplification, tail concurrency
+and all four storage media. Price off a conservative cost envelope, not a single mean trace.
+Use actual workload commitments to amortize warming; do not introduce punitive time minima
+solely because a competitor has them. Customer spending caps and reservation previews are
+product controls; internal physical meters remain available for audit and optimization.
+
+EBS capacity assumptions for the worksheet only: gp3 $0.08, gp2 $0.10, st1 $0.045,
+sc1 $0.015 per provisioned billed-GB-month, plus gp3 extra IOPS/throughput where needed.
+Recheck region, unit basis, size minima and current rates at
+https://aws.amazon.com/ebs/pricing/[EBS pricing]. Example of throughput sizing, not a recommendation:
+100 MiB/s sustained requires about 2.5 TiB st1 or 8.33 TiB sc1 using baseline rates; 1 TiB
+of cheap capacity cannot be compared with gp3 solely on its capacity bill. Include the
+instance cap and cache utilization before choosing a pool.
+
+== 7. Experiments, emulator constraints and stop rules
+
+E0: inventory available source/binary, dataset, hardware, active services, credentials by
+reference, cache paths and real read call sites. Record hashes and commit; never log secrets.
+Use task-owned data/config/prefixes/ports. No modification of another session's benchmark bed.
+
+E1 remaining gate (#2249 is only a geometry-confounded pilot): fixed-object query cap sweep on local S3-compatible MinIO plus owned Toxiproxy latency
+profile; ds3 is an alternative only after its endpoint/access is known. Baseline 4 MiB, then
+16/40; refine 8/32/64 when informative. First restart with L2 absent, then L2 warm with new
+queries and result-cache bypass. Keep actual server path, not an adapter-only microbenchmark.
+The cap/gap CLI and effective reporting already landed in #2244. Use those flags and
+verify actual sizes; inherited env variables are scrubbed. Preserve identical objects/model
+and run repeats; add the telemetry missing from #2249 before claiming E1 complete.
+
+E2: direct local range tests (sequential/random, 4–64 MiB, queue depths 1 and 8), then
+application traces. Guest direct I/O does not prove Windows host cache coldness. These tests
+can identify local decode/I/O limits but cannot emulate HDD seek or EBS credits.
+
+E3: one whole-object protected-residency prototype versus existing A/B L2 on the same PAX
+objects. Inventory the residual GETs; do not implement a broad pinning subsystem before
+proving the production read path can serve verified ranges locally. Track duplicate cache bytes.
+
+E4: access-tier option round-trip through the existing LocalStack scope; MinIO does not validate
+the same tier semantics. Real AWS smoke is required for lifecycle/retrieval economics; emulators
+cannot measure provider prices, minimum-duration charges, or availability.
+
+E5: finalists on actual gp3, then st1/sc1 only if sequential locality and forecast justify them.
+Run beyond burst-credit exhaustion, record volume AND instance limits. Until authorized hardware
+is available, supply optimistic/base/pessimistic bounds labeled [D]/[A], never [M].
+
+Stop/replan when: the production reader bypasses the intended adapter; a class lacks a distinct
+contract; remote write durability is being silently changed; pin coverage cannot be enumerated;
+range gains disappear at fixed geometry; larger ranges violate memory/recall/p95 constraints;
+or vendor price is below credible COGS without a measured differentiation. Preserve negative
+results. Do not build deferred D4 co-location, a new cache, or a new manifest merely because
+earlier effort has already been spent.
+
+== 8. PR-sized roadmap and gates
+
+----
+ SC0 premise/evidence + E0/E1/E2
+          |
+          v
+ SC1 policy/status + SC2 placement/capabilities
+          |                     |
+          +----------+----------+
+                     v
+          SC3 reservation + usage lifecycle
+                     |
+                     v
+          SC4 coverage/read-path prototype --> admission/pressure/restart gate
+                     |
+       TD-PAXDIR-2 --+--> SC6 integrated cost/consistency proof --> opt-in rollout
+                     ^
+ SC2 -------------> SC5 future-PUT access tier (optional, separately gated)
+
+ Finance: physical worksheet from SC0; reservation pricing inputs from SC3;
+          candidate rate cards only after SC6, in AnvaiOps.
+----
+
+[cols="1,3,3",options="header"]
+|===
+| Slice | Changes / principal files | Exit gate and explicit boundary
+| SC0 | This TD/design; premise corrections for ADR-036/085 if needed; evidence/harness changes in `scripts/bench/sift1m_get_reduction.py` plus focused harness tests. Reconcile D8 branch evidence and actual geometry. | Reproducible controlled baseline; every unknown labeled; no tuning default changed. Run only feasible experiments, record blockers honestly.
+| SC1 | Additive policy/config and observed status. `proto/proximadb/v1/collection_types.proto`, canonical config/catalog mapping, REST v2 and gRPC validation, generated OpenAPI/SDKs. Define enum/version/patch semantics. | Old records preserve behavior; new unsupported intent is rejected or explicitly inactive; no claimed pin. Test round-trip through create/get/update/restart. One canonical policy owner.
+| SC2 | Authorize and persist durable target; reuse location budget/factory/path chain. Capability checks for backend, engine, owner scope and local pool. Reject location mutation after create. | Create/insert/flush/compact/restart/query/drop uses chosen prefix and budget; cross-tenant negatives; balanced spill/AXIS defaults unchanged. No cloud provisioning code.
+| SC3 | Reservation state machine in a layering-safe control service; persistent store budget/protection support; tenant limit and exclusive pool owner; additive durable reservation usage. Extend existing metering sink. | Concurrent admission cannot overcommit; crash/retry/release correct; idle byte-seconds and producer-epoch dedup; no quota check on query hot path. No fleet allocator or pricing math.
+| SC4 | Small residency provider/adapter over `PersistentByteStore`; whole immutable PAX coverage first, selective later only if justified. Connect post-publication, warm, retirement/drop and status. | Diverse fresh-DRAM queries have zero payload GETs for READY generation/profile; pressure, corruption, growth, update/delete, restart and compaction coexistence tests. Count control requests honestly. No unsupported modality promise.
+| SC5 | Per-collection future-PUT tier through verified atomic/multipart/compaction paths; explicitly Hot separate control objects. Reuse provider mappings. | LocalStack option persistence and leaf/adapter tests; backend unsupported cases reject; preserve CAS/create-only semantics. No lifecycle rewrite/Archive or embedded-footer split.
+| SC6 | Integrated MinIO release runs; phase-specific costs, metadata inventory, declared pool limits; independent comparison/financial worksheet; update SUPPORTED_SURFACE only for proven scope. | Same correctness/recall across classes; bounded resource use; all requested metrics; zero total requests only with coherent discovery and all read dependencies covered. No default-on flip without soak.
+|===
+
+SC1 and SC2 can share a coherent PR if an otherwise inert API would be misleading. SC3 is
+larger than an eviction tweak: split durable admission from cache integration if review size
+requires it, keeping the public feature inactive until the full contract is green.
+
+Per code PR: current `origin/develop`, isolated worktree, premise recheck, formatter/clippy,
+targeted nextest + server build, env/doc/dup/contract guards, required CI. Reuse current toolchain
+and scripts instead of stale local rule version strings. No speculative test names in TDs:
+label new acceptance cases as planned until their tests exist. No release-default changes in
+this design-only review, no production code written, and no claims that an unknown experiment ran.

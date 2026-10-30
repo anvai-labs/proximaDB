@@ -92,6 +92,20 @@ lazy_static! {
         "proximadb_queries_failed_total",
         "Search queries that returned an error from the query facade",
     );
+    /// TD-PAXDIR-1 D7 (P5b design §4.1): sequential object-store request
+    /// waves along each vector query's critical path. Integer buckets, so a
+    /// p50 read from the histogram is exact up to 10 waves (the P5b gate is
+    /// ≤ 3 cold, ≤ 1 warm). The tail reaches 1000 because filtered queries
+    /// run a serial Stage F (~200 waves measured, TD-FPRUNE-1) — a top bucket
+    /// of 50 reported their p50 as +Inf.
+    pub static ref PAX_QUERY_WAVES: Histogram = histogram(
+        "proximadb_pax_query_waves",
+        "Sequential object-store request waves per vector query (critical path)",
+        vec![
+            0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 12.0, 16.0, 20.0, 30.0, 50.0,
+            75.0, 100.0, 150.0, 200.0, 300.0, 500.0, 1000.0,
+        ],
+    );
     /// Buckets span DRAM-hot (sub-ms) through cold object-store scans (10s).
     pub static ref SEARCH_LATENCY_SECONDS: Histogram = histogram(
         "proximadb_search_latency_seconds",

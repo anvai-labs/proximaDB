@@ -488,6 +488,8 @@ impl MetadataStoreInterface for MetadataStore {
             // Direct WAL read - convert VersionedCollectionMetadata to proto Collection
             if let Some(versioned) = self.write_buffer_manager.collection(collection_id).await? {
                 let config = CollectionConfig {
+                    storage_class: None,
+                    policy_generation: None,
                     name: versioned.name.clone(),
                     embedding_config: None,
                     dimension: versioned.dimension as u32,
@@ -523,7 +525,10 @@ impl MetadataStoreInterface for MetadataStore {
                     data_size_bytes: versioned.total_size_bytes as i64,
                 };
 
+                let storage_class_status =
+                    crate::services::collection::storage_class::storage_class_status(&config);
                 let collection = Collection {
+                    storage_class_status: Some(storage_class_status),
                     id: versioned.id.clone(),
                     config: Some(config),
                     stats: Some(stats),
@@ -606,6 +611,8 @@ impl MetadataStoreInterface for MetadataStore {
                 .into_iter()
                 .map(|versioned| {
                     let config = CollectionConfig {
+                        storage_class: None,
+                        policy_generation: None,
                         name: versioned.name.clone(),
                         embedding_config: None,
                         dimension: versioned.dimension as u32,
@@ -645,7 +652,10 @@ impl MetadataStoreInterface for MetadataStore {
                         data_size_bytes: versioned.total_size_bytes as i64,
                     };
 
+                    let storage_class_status =
+                        crate::services::collection::storage_class::storage_class_status(&config);
                     Collection {
+                        storage_class_status: Some(storage_class_status),
                         id: versioned.id.clone(),
                         config: Some(config),
                         stats: Some(stats),

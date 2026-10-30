@@ -728,18 +728,10 @@ impl Catalog for IcebergCatalog {
     }
 
     async fn list_tables(&self, namespace: &[String]) -> Result<Vec<TableIdentifier>> {
-        let ns_key = Self::namespace_key(namespace);
-        let tables = self.tables.read().await;
-
-        let identifiers: Vec<TableIdentifier> = tables
-            .values()
-            .filter(|t| t.identifier.namespace.join(".") == ns_key)
-            .map(|t| {
-                TableIdentifier::new(t.identifier.namespace.clone(), t.identifier.name.clone())
-            })
-            .collect();
-
-        Ok(identifiers)
+        crate::list_tables_from_map(&self.tables, &Self::namespace_key(namespace), |t| {
+            (&t.identifier.namespace, &t.identifier.name)
+        })
+        .await
     }
 
     async fn table_exists(&self, identifier: &TableIdentifier) -> Result<bool> {
@@ -748,51 +740,46 @@ impl Catalog for IcebergCatalog {
     }
 
     async fn get_table(&self, identifier: &TableIdentifier) -> Result<CatalogTableSchema> {
-        // Check cache
-        if let Some(schema) = self.cache.get_table(&self.name, identifier) {
-            return Ok(schema);
-        }
+        crate::cached_table(&self.cache, &self.name, identifier, async {
+            let key = Self::table_key(identifier);
+            let tables = self.tables.read().await;
+            let table = tables
+                .get(&key)
+                .ok_or_else(|| anyhow!("Table '{}' not found", identifier))?;
 
-        let key = Self::table_key(identifier);
-        let tables = self.tables.read().await;
-        let table = tables
-            .get(&key)
-            .ok_or_else(|| anyhow!("Table '{}' not found", identifier))?;
+            // Convert Iceberg schema to CatalogTableSchema
+            let columns: Vec<CatalogColumn> = table
+                .current_schema
+                .fields
+                .iter()
+                .map(|f| CatalogColumn {
+                    id: f.id,
+                    object_id: None,
+                    name: f.name.clone(),
+                    data_type: Self::iceberg_type_to_data_type(&f.field_type),
+                    nullable: !f.required,
+                    default_value: None,
+                    comment: f.doc.clone(),
+                    properties: HashMap::new(),
+                    is_deleted: false,
+                    original_id: None,
+                })
+                .collect();
 
-        // Convert Iceberg schema to CatalogTableSchema
-        let columns: Vec<CatalogColumn> = table
-            .current_schema
-            .fields
-            .iter()
-            .map(|f| CatalogColumn {
-                id: f.id,
-                object_id: None,
-                name: f.name.clone(),
-                data_type: Self::iceberg_type_to_data_type(&f.field_type),
-                nullable: !f.required,
-                default_value: None,
-                comment: f.doc.clone(),
-                properties: HashMap::new(),
-                is_deleted: false,
-                original_id: None,
+            Ok(CatalogTableSchema {
+                name: identifier.name.clone(),
+                columns,
+                primary_key: vec![],
+                indexes: vec![],
+                schema_version: table.current_schema_id,
+                properties: table.properties.clone(),
+                location: Some(table.location.clone()),
+                created_at_ms: table.last_updated_ms,
+                updated_at_ms: table.last_updated_ms,
+                ..Default::default()
             })
-            .collect();
-
-        let schema = CatalogTableSchema {
-            name: identifier.name.clone(),
-            columns,
-            primary_key: vec![],
-            indexes: vec![],
-            schema_version: table.current_schema_id,
-            properties: table.properties.clone(),
-            location: Some(table.location.clone()),
-            created_at_ms: table.last_updated_ms,
-            updated_at_ms: table.last_updated_ms,
-            ..Default::default()
-        };
-
-        self.cache.put_table(&self.name, identifier, schema.clone());
-        Ok(schema)
+        })
+        .await
     }
 
     async fn rename_table(&self, from: &TableIdentifier, to: &TableIdentifier) -> Result<()> {

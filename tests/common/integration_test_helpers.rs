@@ -324,6 +324,7 @@ impl UnifiedTestEnvironment {
         };
 
         Collection {
+            storage_class_status: None,
             id: self.collection_id.clone(),
             config: Some(config),
             stats: Some(stats),
@@ -532,15 +533,12 @@ impl UnifiedTestEnvironment {
 
                 ProximaRecord {
                     oid: format!("{}_{}", self.collection_id, i),
-                    embeddings: vec![proximadb_records::EmbeddingCell {
-                        model_id: "default".to_string(),
-                        modality: "vector".to_string(),
-                        dim: dimension as u32,
-                        values: proximadb_records::EmbeddingValues::Fp32(
-                            (0..dimension).map(|j| (i + j) as f32).collect(),
-                        ),
-                        ..Default::default()
-                    }],
+                    embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                        "default",
+                        "vector",
+                        dimension as u32,
+                        (0..dimension).map(|j| (i + j) as f32).collect(),
+                    )],
                     props,
                     record_version: 1,
                     created_at_ns: (1000 + i) as i64 * 1_000_000_000,
@@ -675,6 +673,7 @@ impl UnifiedTestEnvironment {
         };
 
         Collection {
+            storage_class_status: None,
             id: name.to_string(),
             config: Some(config),
             stats: Some(stats),
@@ -1139,6 +1138,7 @@ pub fn create_test_collection_with_storage(name: &str, base_location: String) ->
     };
 
     Collection {
+        storage_class_status: None,
         id: name.to_string(),
         config: Some(config),
         stats: Some(stats),
