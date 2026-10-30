@@ -1246,13 +1246,7 @@ pub(crate) async fn pax_filtered_row_allow(
     let (_header, footer_bytes) = if let Some(layout) = cached_layout {
         layout
     } else {
-        let size = match known_size {
-            Some(size) => size,
-            None => fs
-                .object_size_resident(path)
-                .await
-                .map_err(|e| anyhow::anyhow!("filtered stage-F stat {path}: {e}"))?,
-        };
+        let size = segment_size_or_stat(fs, path, known_size, "filtered stage-F").await?;
         if size < (SEG_HEADER_PREFIX_LEN as u64 + SEGMENT_MAGIC.len() as u64) {
             return Ok(None);
         }
@@ -1386,22 +1380,7 @@ pub(crate) async fn pax_filtered_row_allow(
     for wave in stage_f_waves(&fetches, STAGE_F_WAVE_MAX_BYTES) {
         let fetch_started = std::time::Instant::now();
         let ranges: Vec<std::ops::Range<u64>> = wave.iter().map(|f| f.start..f.end).collect();
-        let bufs = match fs.read_ranges_prefetch_resident(path, ranges.clone()).await {
-            Ok(bufs) => bufs,
-            Err(error) => {
-                // Defensive fallback to the sequential shape.
-                tracing::debug!(path, %error, "stage-F wave failed; reading serially");
-                let mut seq = Vec::with_capacity(ranges.len());
-                for range in &ranges {
-                    seq.push(
-                        fs.read_range_resident(path, range.start, range.end - range.start)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("filtered stage-F blocks {path}: {e}"))?,
-                    );
-                }
-                seq
-            }
-        };
+        let bufs = read_ranges_wave_or_serial(fs, path, &ranges, "filtered stage-F blocks").await?;
         if bufs.len() != wave.len() {
             anyhow::bail!(
                 "filtered stage-F {path}: wave returned {} buffers for {} ranges",
@@ -1493,6 +1472,55 @@ pub(crate) async fn pax_filtered_row_allow(
         },
     );
     Ok(Some((allow, stats)))
+}
+
+/// TD-RDSTRAT-13 C3: the listed object size when the caller has one (no
+/// billed HEAD), else the resident copy's length or one metered stat.
+/// Callers bounds-check footer extents against it, so a stale size fails
+/// closed.
+async fn segment_size_or_stat(
+    fs: &dyn proximadb_storage_filesystem_types::FileSystem,
+    path: &str,
+    known_size: Option<u64>,
+    what: &str,
+) -> Result<u64> {
+    match known_size {
+        Some(size) => Ok(size),
+        None => fs
+            .object_size_resident(path)
+            .await
+            .map_err(|e| anyhow::anyhow!("{what} stat {path}: {e}")),
+    }
+}
+
+/// PR-D: one bounded-concurrency wave over `ranges` (`read_ranges_prefetch`,
+/// one buffer per range, in order), falling back to serial reads if the wave
+/// fails, so a transient wave error costs latency, never a cascade-to-exact
+/// fallback. Callers record tier GETs.
+async fn read_ranges_wave_or_serial(
+    fs: &dyn proximadb_storage_filesystem_types::FileSystem,
+    path: &str,
+    ranges: &[std::ops::Range<u64>],
+    what: &str,
+) -> Result<Vec<Vec<u8>>> {
+    match fs
+        .read_ranges_prefetch_resident(path, ranges.to_vec())
+        .await
+    {
+        Ok(bufs) => Ok(bufs),
+        Err(error) => {
+            tracing::debug!(path, %error, what, "range wave failed; reading serially");
+            let mut seq = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                seq.push(
+                    fs.read_range_resident(path, range.start, range.end - range.start)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{what} {path}: {e}"))?,
+                );
+            }
+            Ok(seq)
+        }
+    }
 }
 
 /// PR-D L1a: per-wave byte bound for the Stage-F D fetch. One wave holds
@@ -1667,25 +1695,7 @@ pub(crate) async fn read_records_by_positions(
     let mut cold_bufs = if cold_ranges.is_empty() {
         Vec::new()
     } else {
-        let bufs = match fs
-            .read_ranges_prefetch_resident(path, cold_ranges.clone())
-            .await
-        {
-            Ok(bufs) => bufs,
-            Err(error) => {
-                // Defensive fallback to the sequential shape.
-                tracing::debug!(path, %error, "rehydrate wave failed; reading serially");
-                let mut seq = Vec::with_capacity(cold_ranges.len());
-                for range in &cold_ranges {
-                    seq.push(
-                        fs.read_range_resident(path, range.start, range.end - range.start)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("rehydrate blocks {path}: {e}"))?,
-                    );
-                }
-                seq
-            }
-        };
+        let bufs = read_ranges_wave_or_serial(fs, path, &cold_ranges, "rehydrate blocks").await?;
         // Metrics parity: one tier record per physical GET, at batch time.
         for range in &cold_ranges {
             record_get_physical(CacheTier::Rehydrate, range.end - range.start, trace_on);
@@ -4580,13 +4590,7 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         // still magic-validated by `SegmentHeaderPrefix::parse`, and the
         // footer extents are bounds-checked against this size below (a
         // stale/foreign size fails closed to the generic scan path).
-        let size = match known_size {
-            Some(s) => s,
-            None => fs
-                .object_size_resident(path)
-                .await
-                .map_err(|e| anyhow::anyhow!("coalesced scan stat {path}: {e}"))?,
-        };
+        let size = segment_size_or_stat(fs, path, known_size, "coalesced scan").await?;
         if size < (SEG_HEADER_PREFIX_LEN as u64 + SEGMENT_MAGIC.len() as u64) {
             return Ok(None);
         }
@@ -5307,23 +5311,8 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         // PR-D L4: this arm now runs on every cascade query, so a transient
         // wave error retries serially (like the chunk and legacy arms) rather
         // than failing the cascade over to a whole-object exact scan.
-        let bufs = match fs.read_ranges_prefetch_resident(path, ranges.clone()).await {
-            Ok(bufs) => bufs,
-            Err(error) => {
-                tracing::debug!(path, %error, "top-k block wave failed; reading serially");
-                let mut seq = Vec::with_capacity(ranges.len());
-                for range in &ranges {
-                    seq.push(
-                        fs.read_range_resident(path, range.start, range.end - range.start)
-                            .await
-                            .map_err(|e| {
-                                anyhow::anyhow!("coalesced scan top-k blocks {path}: {e}")
-                            })?,
-                    );
-                }
-                seq
-            }
-        };
+        let bufs =
+            read_ranges_wave_or_serial(fs, path, &ranges, "coalesced scan top-k blocks").await?;
         crate::observability::io_trace::drain_and_forward_read_ranges_metrics();
         for (fetch, buf) in fetches.iter().zip(bufs) {
             record_get_physical(CacheTier::ResultPayload, fetch.end - fetch.start, trace_on);
