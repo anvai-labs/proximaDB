@@ -90,15 +90,10 @@ pub async fn read_segment_resolver(
 
     // File size (to read the tail). A resident segment answers from its
     // copy (TD-TIER-1 SC4-4: no HEAD on a READY collection).
-    let file_size = match crate::storage::engines::sst::segment_io::resident_len(&storage_url) {
-        Some(len) => len,
-        None => {
-            fs.metadata(&storage_url)
-                .await
-                .map_err(|e| anyhow!("resolver load: metadata for {storage_url}: {e:?}"))?
-                .size as u64
-        }
-    };
+    let file_size = fs
+        .object_size_resident(&storage_url)
+        .await
+        .map_err(|e| anyhow!("resolver load: metadata for {storage_url}: {e:?}"))?;
     if file_size < SEG_TAIL_LEN as u64 {
         return Ok(None); // too small
     }

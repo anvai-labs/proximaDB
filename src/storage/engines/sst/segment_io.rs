@@ -36,6 +36,16 @@ use proximadb_storage_filesystem_types::{FileSystem, FilesystemError, FsResult};
 const WARM_CHUNK_BYTES: u64 = 64 << 20;
 /// Recently retired object keys remembered for the backfill race.
 const RETIRED_MEMORY: usize = 4096;
+/// Whole-object fetches in flight across EVERY warm path in the process
+/// (post-flush, post-compaction, backfills): bounds RAM (one chunk each),
+/// staging disk, and how far concurrent warms can overshoot the advisory
+/// budget check.
+const WARMS_IN_FLIGHT: usize = 4;
+
+fn warm_permits() -> &'static tokio::sync::Semaphore {
+    static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| tokio::sync::Semaphore::new(WARMS_IN_FLIGHT))
+}
 
 /// Segment reads that prefer a resident whole-segment copy.
 #[async_trait::async_trait]
@@ -224,6 +234,12 @@ pub async fn warm_object(
                 .size
         }
     };
+    // Process-wide limit, then re-judge the budget: a warm that waited may
+    // find the room taken by the ones ahead of it.
+    let _permit = warm_permits()
+        .acquire()
+        .await
+        .map_err(|error| anyhow::anyhow!("warm permit for {path}: {error}"))?;
     let Some((store, key)) = warm_target(path, len) else {
         return Ok(false);
     };
@@ -429,25 +445,9 @@ mod tests {
         }
     }
 
-    /// One store directory for the whole test process: the process store is
-    /// first-registration-wins and outlives every test, so its root must too
-    /// (verification round: a per-test tempdir was deleted under later tests
-    /// in a shared-process runner).
-    fn process_store_dir() -> &'static Path {
-        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-        DIR.get_or_init(|| {
-            let dir = tempfile::tempdir().expect("store dir");
-            let path = dir.path().to_path_buf();
-            std::mem::forget(dir);
-            path
-        })
-    }
-
-    fn arm(_store_dir: &Path, covered_dir: &Path, group_id: &str, budget: u64) -> Armed {
+    fn arm(covered_dir: &Path, group_id: &str, budget: u64) -> Armed {
         let gate = crate::services::collection::reservation::residency_test_gate();
-        let candidate =
-            Arc::new(PersistentByteStore::open(process_store_dir(), 64 << 20).expect("store"));
-        let _ = proximadb_cache::register_process_store(candidate);
+        let store = crate::services::collection::reservation::residency_test_store();
         proximadb_cache::set_process_reserved_budget(32 << 20);
         proximadb_cache::register_protection_group(proximadb_cache::ProtectionGroup {
             id: group_id.to_string(),
@@ -459,7 +459,7 @@ mod tests {
         });
         Armed {
             _gate: gate,
-            store: proximadb_cache::process_store().expect("a store is registered"),
+            store,
             group_id: group_id.to_string(),
         }
     }
@@ -500,9 +500,8 @@ mod tests {
     #[tokio::test]
     async fn covered_segment_reads_with_zero_gets_uncovered_unchanged() {
         let root = tempfile::tempdir().expect("root");
-        let store_dir = tempfile::tempdir().expect("store");
         let (covered, other) = dirs(root.path());
-        let _armed = arm(store_dir.path(), &covered, "zero-gets", 32 << 20);
+        let _armed = arm(&covered, "zero-gets", 32 << 20);
         let (fs, counters) = counting_local(root.path()).await;
         let (hot, hot_bytes) = segment(&covered, "L0_a.pax", 200_000);
         let (cold, cold_bytes) = segment(&other, "L0_b.pax", 1_000);
@@ -547,9 +546,8 @@ mod tests {
     #[tokio::test]
     async fn local_seed_then_forget_under_another_spelling() {
         let root = tempfile::tempdir().expect("root");
-        let store_dir = tempfile::tempdir().expect("store");
         let (covered, _) = dirs(root.path());
-        let armed = arm(store_dir.path(), &covered, "local-seed", 32 << 20);
+        let armed = arm(&covered, "local-seed", 32 << 20);
         let (fs, counters) = counting_local(root.path()).await;
         let (path, bytes) = segment(&covered, "L1_c.pax", 4_096);
 
@@ -594,9 +592,8 @@ mod tests {
     #[tokio::test]
     async fn warm_that_races_retirement_leaves_no_copy() {
         let root = tempfile::tempdir().expect("root");
-        let store_dir = tempfile::tempdir().expect("store");
         let (covered, _) = dirs(root.path());
-        let armed = arm(store_dir.path(), &covered, "race", 32 << 20);
+        let armed = arm(&covered, "race", 32 << 20);
         let (fs, _) = counting_local(root.path()).await;
         let (path, _) = segment(&covered, "L0_r.pax", 2_048);
         forget_object(&path); // retirement wins the race
@@ -610,9 +607,8 @@ mod tests {
     #[tokio::test]
     async fn object_beyond_the_budget_costs_no_get() {
         let root = tempfile::tempdir().expect("root");
-        let store_dir = tempfile::tempdir().expect("store");
         let (covered, _) = dirs(root.path());
-        let _armed = arm(store_dir.path(), &covered, "tight", 1_024);
+        let _armed = arm(&covered, "tight", 1_024);
         let (fs, counters) = counting_local(root.path()).await;
         let (path, _) = segment(&covered, "L0_big.pax", 8_192);
         assert!(
@@ -629,9 +625,8 @@ mod tests {
     #[tokio::test]
     async fn backfill_warms_live_segments_idempotently() {
         let root = tempfile::tempdir().expect("root");
-        let store_dir = tempfile::tempdir().expect("store");
         let (covered, _) = dirs(root.path());
-        let armed = arm(store_dir.path(), &covered, "backfill", 32 << 20);
+        let armed = arm(&covered, "backfill", 32 << 20);
         let (fs, _) = counting_local(root.path()).await;
         segment(&covered, "L0_a.pax", 2_048);
         segment(&covered, "L0_b.pax", 2_048);
@@ -662,11 +657,16 @@ mod tests {
             ("oid_resolve.rs", include_str!("oid_resolve.rs")),
             ("search/mod.rs", include_str!("search/mod.rs")),
         ] {
+            let heads =
+                source.matches(".metadata(").count() - source.matches(".metadata()").count();
+            assert_eq!(
+                heads, 0,
+                "{name}: {heads} direct `.metadata(` — use `object_size_resident`"
+            );
             for direct in [
                 ".read_range(",
                 ".read_ranges_prefetch(",
                 ".read_ranges(",
-                ".metadata(path)",
                 "fs.read(",
             ] {
                 let count = source.matches(direct).count();

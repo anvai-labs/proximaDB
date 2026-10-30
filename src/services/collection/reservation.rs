@@ -1236,6 +1236,26 @@ pub(crate) fn residency_test_gate() -> std::sync::MutexGuard<'static, ()> {
     GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Test-only: the process persistent store, registered on ONE directory that
+/// lives as long as the test process. Registration is first-wins and the
+/// store outlives every test, so every test that registers it must use this
+/// (a per-test tempdir is deleted under the tests that run after it in a
+/// shared-process runner).
+#[cfg(test)]
+pub(crate) fn residency_test_store() -> Arc<proximadb_cache::PersistentByteStore> {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("test store dir: {error}"));
+        let path = dir.path().to_path_buf();
+        std::mem::forget(dir);
+        path
+    });
+    if let Ok(store) = proximadb_cache::PersistentByteStore::open(dir, 64 << 20) {
+        let _ = proximadb_cache::register_process_store(Arc::new(store));
+    }
+    proximadb_cache::process_store().unwrap_or_else(|| panic!("a process store is registered"))
+}
+
 /// TD-TIER-1 SC4-3: compensating release for a create that reserves a grant
 /// (review S3). It owns the reserve from the moment it starts: the create
 /// path releases explicitly on every error exit, and if the create future is
@@ -2214,12 +2234,7 @@ mod tests {
         // Registration is first-wins per process: in a shared-process run a
         // sibling test (or an SST engine test) may already own it. Assert
         // against WHICHEVER store is registered, never on winning.
-        let store_dir = tempfile::tempdir().unwrap();
-        let candidate = std::sync::Arc::new(
-            proximadb_cache::PersistentByteStore::open(store_dir.path(), 1 << 20).unwrap(),
-        );
-        let _ = proximadb_cache::register_process_store(candidate);
-        let store = proximadb_cache::process_store().expect("a store is registered");
+        let store = super::residency_test_store();
 
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = pool_config(&dir, "p1", 0);
@@ -2415,12 +2430,7 @@ mod tests {
         let prefix = "s3://b/tenants/t1/77/data/".to_string();
         let key = proximadb_cache::object_key(&format!("{prefix}L0_x.pax"));
 
-        let store_dir = tempfile::tempdir().unwrap();
-        let candidate = std::sync::Arc::new(
-            proximadb_cache::PersistentByteStore::open(store_dir.path(), 1 << 20).unwrap(),
-        );
-        let _ = proximadb_cache::register_process_store(candidate);
-        let store = proximadb_cache::process_store().expect("a store is registered");
+        let store = super::residency_test_store();
         store
             .put(
                 key.clone(),

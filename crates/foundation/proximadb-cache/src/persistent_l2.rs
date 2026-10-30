@@ -150,6 +150,12 @@ impl PersistentByteStore {
     pub fn open(base: impl AsRef<Path>, max_bytes: u64) -> std::io::Result<Self> {
         let base = base.as_ref().to_path_buf();
         std::fs::create_dir_all(&base)?;
+        // SC4-4: staging files a crash left behind are garbage (an entry is
+        // only ever indexed from a completed write under a shard).
+        let staging = base.join("staging");
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
+        }
         for shard in 0..SHARDS {
             std::fs::create_dir_all(base.join(format!("shard_{shard:02}")))?;
         }
@@ -560,7 +566,12 @@ impl PersistentByteStore {
         self.inner
             .entries
             .iter()
+            // Whole-object keys only, like the pins (`covered_bytes`): a
+            // segment's region keys duplicate bytes its whole object holds.
             .filter(|entry| {
+                if !entry.key().starts_with(OBJECT_KEY_PREFIX) {
+                    return false;
+                }
                 let canonical = canonical_location(entry.key());
                 prefixes
                     .iter()
@@ -2318,6 +2329,17 @@ mod tests {
         let each = store.resident_bytes() / 3;
         store.set_protection_groups(vec![group("g1", C1, each)]);
         assert_eq!(store.group_resident_bytes("g1"), 2 * each);
+        // A region key of a covered segment is not counted (it duplicates
+        // bytes the whole object holds; only whole objects can be covered).
+        store
+            .put(
+                format!("invariants/control/{C1}a"),
+                L2Class::Invariants,
+                payload(64),
+            )
+            .await
+            .expect("put region");
+        assert_eq!(store.group_resident_bytes("g1"), 2 * each);
         assert_eq!(store.covered_bytes("g1"), each, "covered <= resident");
         assert_eq!(store.group_resident_bytes("absent"), 0);
     }
@@ -2386,6 +2408,19 @@ mod tests {
             store.is_protected(&key),
             "the object key is pinned by the prefix"
         );
+    }
+
+    /// SC4-4: staging files a crash left behind are removed when the store
+    /// reopens (they are never indexed, so nothing else would reclaim them).
+    #[test]
+    fn reopen_clears_crash_left_staging() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
+        let staged = store.staging_dir().expect("staging").join("orphan.tmp");
+        std::fs::write(&staged, vec![0u8; 4096]).expect("write orphan");
+        drop(store);
+        let _reopened = PersistentByteStore::open(dir.path(), 1 << 20).expect("reopen");
+        assert!(!staged.exists(), "the orphaned staging file is reclaimed");
     }
 
     /// SC4-4 verification: headroom is judged on the STORED size (what a pin
