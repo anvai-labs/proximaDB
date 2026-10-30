@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, BinaryIO, Generator, TextIO, TypeVar
+from typing import TYPE_CHECKING, Any, BinaryIO, Generator, TextIO, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -31,8 +31,10 @@ class StorageClassStatusOutput:
             reserved_bytes (int): Reserved bytes under the collection's residency admission (SC3). 0 until then.
             resident_bytes (int): Bytes resident in the serving cache (SC4). 0 until then.
             covered_bytes (int): Bytes covered by the READY coverage set (SC4). 0 until then.
-            covered_generation (int): The committed segment-set generation the coverage was proven against
-                (TD-TIER-1 SC4-5); 0 when no proof was attempted.
+            covered_generation (int | None | Unset): The committed segment-set generation the coverage was proven against
+                (TD-TIER-1 SC4-5); absent when no proof was attempted. Optional so
+                old and new clients and servers interoperate in both directions.
+                Computed per status read (one LIST per segment root).
     """
 
     state: str
@@ -41,7 +43,7 @@ class StorageClassStatusOutput:
     reserved_bytes: int
     resident_bytes: int
     covered_bytes: int
-    covered_generation: int
+    covered_generation: int | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -57,7 +59,11 @@ class StorageClassStatusOutput:
 
         covered_bytes = self.covered_bytes
 
-        covered_generation = self.covered_generation
+        covered_generation: int | None | Unset
+        if isinstance(self.covered_generation, Unset):
+            covered_generation = UNSET
+        else:
+            covered_generation = self.covered_generation
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -69,9 +75,10 @@ class StorageClassStatusOutput:
                 "reserved_bytes": reserved_bytes,
                 "resident_bytes": resident_bytes,
                 "covered_bytes": covered_bytes,
-                "covered_generation": covered_generation,
             }
         )
+        if covered_generation is not UNSET:
+            field_dict["covered_generation"] = covered_generation
 
         return field_dict
 
@@ -90,7 +97,16 @@ class StorageClassStatusOutput:
 
         covered_bytes = d.pop("covered_bytes")
 
-        covered_generation = d.pop("covered_generation")
+        def _parse_covered_generation(data: object) -> int | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(int | None | Unset, data)
+
+        covered_generation = _parse_covered_generation(
+            d.pop("covered_generation", UNSET)
+        )
 
         storage_class_status_output = cls(
             state=state,

@@ -1079,8 +1079,11 @@ pub struct StorageClassStatusOutput {
     /// Bytes covered by the READY coverage set (SC4). 0 until then.
     pub covered_bytes: u64,
     /// The committed segment-set generation the coverage was proven against
-    /// (TD-TIER-1 SC4-5); 0 when no proof was attempted.
-    pub covered_generation: u64,
+    /// (TD-TIER-1 SC4-5); absent when no proof was attempted. Optional so
+    /// old and new clients and servers interoperate in both directions.
+    /// Computed per status read (one LIST per segment root).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covered_generation: Option<u64>,
 }
 
 impl StorageClassStatusOutput {
@@ -1093,7 +1096,8 @@ impl StorageClassStatusOutput {
             reserved_bytes: status.reserved_bytes,
             resident_bytes: status.resident_bytes,
             covered_bytes: status.covered_bytes,
-            covered_generation: status.covered_generation,
+            covered_generation: (status.covered_generation != 0)
+                .then_some(status.covered_generation),
         }
     }
 }

@@ -239,7 +239,8 @@ impl CollectionService {
             })
             .unwrap_or((0, 0));
         // SC4-5: prove coverage of the committed segment set (one LIST per
-        // segment root). A failed listing leaves the SC4-3 progress figures.
+        // segment root, on every status read — not the query path). A failed
+        // proof reports DEGRADED with the cause and keeps the byte figures.
         let proof = match crate::storage::engines::sst::segment_io::prove_residency(
             &self.filesystem_factory,
             &grant.residency_prefixes,
@@ -252,9 +253,24 @@ impl CollectionService {
                     "TD-TIER-1 SC4: residency proof for {} failed: {error}",
                     collection.id
                 );
+                let base = collection.storage_class_status.take().unwrap_or_else(|| {
+                    crate::services::collection::storage_class::storage_class_status(config)
+                });
+                collection.storage_class_status = Some(
+                    crate::services::collection::storage_class::with_failed_proof(
+                        base,
+                        grant.bytes,
+                        resident,
+                        covered,
+                        &error.to_string(),
+                    ),
+                );
                 return;
             }
         };
+        // Review S4: AXIS-routed collections (non-empty index_configs) are
+        // outside the proven profile.
+        let in_profile = config.index_configs.is_empty();
         let base = collection.storage_class_status.take().unwrap_or_else(|| {
             crate::services::collection::storage_class::storage_class_status(config)
         });
@@ -264,6 +280,7 @@ impl CollectionService {
                 grant.bytes,
                 resident,
                 covered,
+                in_profile,
                 &proof,
             ),
         );

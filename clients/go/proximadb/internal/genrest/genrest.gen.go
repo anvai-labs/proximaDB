@@ -2907,8 +2907,10 @@ type StorageClassStatusOutput struct {
 	CoveredBytes int64 `json:"covered_bytes"`
 
 	// CoveredGeneration The committed segment-set generation the coverage was proven against
-	// (TD-TIER-1 SC4-5); 0 when no proof was attempted.
-	CoveredGeneration int64 `json:"covered_generation"`
+	// (TD-TIER-1 SC4-5); absent when no proof was attempted. Optional so
+	// old and new clients and servers interoperate in both directions.
+	// Computed per status read (one LIST per segment root).
+	CoveredGeneration *int64 `json:"covered_generation,omitempty"`
 
 	// PolicyGeneration Monotonic generation of the desired policy: 0 = never set (pre-SC1
 	// records), 1 = set at create; a policy-change surface will bump it.

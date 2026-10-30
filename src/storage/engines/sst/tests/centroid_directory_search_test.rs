@@ -330,11 +330,42 @@ mod tests {
         let (hot_recall, hot_reads) = measure(&hot, &rows, false).await;
         // The default configuration reads the centroid directory on every
         // cold query; it is resident too, so the directory path is also free.
-        let (_, hot_directory_reads) = measure(&hot, &rows, true).await;
+        // Its own FRESH arm (review N1): no DRAM entry from the pass above.
+        let hot_dir = arm("res-hot-dir", &rows).await;
+        proximadb_cache::register_protection_group(proximadb_cache::ProtectionGroup {
+            id: "res-hot-dir-grant".to_string(),
+            prefixes: vec![format!("{}/", hot_dir.storage_url.trim_end_matches('/'))],
+            budget_bytes: 1 << 30,
+        });
+        let dir_fs = hot_dir
+            .engine
+            .filesystem()
+            .get_filesystem(&hot_dir.storage_url)
+            .unwrap();
+        let dir_warm = crate::storage::engines::sst::segment_io::warm_collection(
+            dir_fs.as_ref(),
+            &hot_dir.storage_url,
+            4,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dir_warm.warmed,
+            SEGMENTS + 1,
+            "segments + the newest directory"
+        );
+        let (dir_recall, hot_directory_reads) = measure(&hot_dir, &rows, true).await;
+        let (cold_dir_recall, cold_directory_reads) = measure(&cold, &rows, true).await;
+        proximadb_cache::unregister_protection_group("res-hot-dir-grant");
+        assert!(
+            cold_directory_reads > 0,
+            "the ungranted arm still reads remotely"
+        );
         assert_eq!(
             hot_directory_reads, 0,
             "the directory path reads nothing remotely"
         );
+        assert!((dir_recall - cold_dir_recall).abs() < 1e-9);
 
         // SC4-5: the proof sees every segment covered for generation g ...
         let prefixes = vec![format!("{}/", hot.storage_url.trim_end_matches('/'))];

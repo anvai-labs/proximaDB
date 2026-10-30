@@ -3523,9 +3523,11 @@ export interface components {
             /**
              * Format: int64
              * @description The committed segment-set generation the coverage was proven against
-             *     (TD-TIER-1 SC4-5); 0 when no proof was attempted.
+             *     (TD-TIER-1 SC4-5); absent when no proof was attempted. Optional so
+             *     old and new clients and servers interoperate in both directions.
+             *     Computed per status read (one LIST per segment root).
              */
-            covered_generation: number;
+            covered_generation?: number | null;
         };
         /**
          * @description Input format for TEXT fields

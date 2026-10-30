@@ -366,11 +366,22 @@ pub struct ResidencyProof {
     pub segments: usize,
     /// Of those, resident in full at their listed size AND protected.
     pub covered_segments: usize,
-    /// Sum of the live segments' sizes (the bytes READY needs resident).
+    /// Segment roots examined (0 = the grant names none: nothing can be
+    /// proven).
+    pub roots: usize,
+    /// Sum of the residency objects' listed sizes (segments + the newest
+    /// directory; an object with an unknown size adds 0 and is never
+    /// covered).
     pub inventory_bytes: u64,
-    /// Generation `g` of the committed set: a stable hash (FNV-1a 64) of the
-    /// sorted canonical (url, size) pairs, so any publication or retirement
-    /// changes it.
+    /// The same set's STORED size — what pins are charged against the grant
+    /// and the store (header + key + CRC table + value per object).
+    pub inventory_stored_bytes: u64,
+    /// The persistent store's capacity (0 without a store).
+    pub store_capacity: u64,
+    /// Generation `g` of the committed set: a stable hash (FNV-1a 64, masked
+    /// to 53 bits so it is exact in every client — int64 schema, JS numbers)
+    /// of the sorted canonical (url, size) pairs, so any publication or
+    /// retirement changes it.
     pub generation: u64,
 }
 
@@ -410,12 +421,21 @@ pub async fn prove_residency(
     }
     let mut proof = ResidencyProof {
         store_present: store.is_some(),
+        roots: prefixes.len(),
         segments: keyed.len(),
-        generation,
+        generation: generation & ((1u64 << 53) - 1),
+        store_capacity: store.as_ref().map_or(0, |store| store.capacity()),
         ..ResidencyProof::default()
     };
     for (url, size) in &keyed {
         proof.inventory_bytes = proof.inventory_bytes.saturating_add(size.unwrap_or(0));
+        proof.inventory_stored_bytes =
+            proof
+                .inventory_stored_bytes
+                .saturating_add(PersistentByteStore::stored_size(
+                    &object_key(url),
+                    size.unwrap_or(0),
+                ));
         let (Some(store), Some(size)) = (&store, size) else {
             continue;
         };
@@ -449,8 +469,8 @@ pub(crate) async fn live_segments(
 }
 
 /// Everything a query on the vector profile reads under one data directory:
-/// the live segments plus the collection's centroid directory objects
-/// (`*.pxcd`, read on every cold query when the directory is enabled).
+/// the live segments plus the collection's NEWEST centroid directory object
+/// (read on every cold query when the directory is enabled).
 /// Backfill makes these resident and the READY proof requires them all —
 /// search discovery itself stays segments-only ([`live_segments`]).
 pub(crate) async fn residency_objects(
@@ -465,15 +485,23 @@ pub(crate) async fn residency_objects(
         }
         Err(error) => anyhow::bail!("list {data_url}: {error}"),
     };
+    // Only the NEWEST directory generation is read by queries; older ones
+    // linger until GC and must not be required (or warmed) for READY.
     let directories: Vec<(String, Option<u64>)> = entries
         .iter()
-        .filter(|entry| !entry.metadata.is_directory && entry.name.ends_with(".pxcd"))
-        .map(|entry| {
+        .filter(|entry| !entry.metadata.is_directory)
+        .filter_map(|entry| {
+            proximadb_storage_common::centroid_directory::parse_object_name(&entry.name)
+                .map(|generation| (generation, entry))
+        })
+        .max_by_key(|(generation, _)| *generation)
+        .map(|(_, entry)| {
             (
                 entry.url.clone(),
                 (entry.metadata.size > 0).then_some(entry.metadata.size),
             )
         })
+        .into_iter()
         .collect();
     let pending = crate::storage::engines::sst::retirement_ledger::pending_paths();
     let mut objects: Vec<(String, Option<u64>)> =

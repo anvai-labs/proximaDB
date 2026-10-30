@@ -164,12 +164,16 @@ pub fn storage_class_status(config: &CollectionConfig) -> StorageClassStatus {
 pub const READY_PROFILE: &str = "pax-ann-v1";
 
 /// TD-TIER-1 SC4-5: the PERFORMANCE status from a grant and a residency proof
-/// of its committed segment set:
-/// - READY when every live segment is resident in full and protected, for
-///   generation `g` and [`READY_PROFILE`];
-/// - DEGRADED when there is no persistent store, or the segment set does not
-///   fit the grant's budget (coverage can never complete);
-/// - WARMING otherwise (coverage in progress).
+/// of its committed segment set. READY needs POSITIVE evidence (review B1):
+/// - DEGRADED: the grant names no segment roots; the collection is not served
+///   by [`READY_PROFILE`] (AXIS-routed `index_configs`); no persistent store;
+///   or the set's STORED size exceeds the grant or the store's capacity
+///   (coverage can never complete);
+/// - WARMING: no published segment found under the roots yet (an empty
+///   listing is never proof — the roots may not be where the segments are),
+///   or coverage in progress;
+/// - READY: every residency object is resident in full and protected, for
+///   generation `g` and [`READY_PROFILE`].
 ///
 /// Recomputed on every status read, so a lost entry (eviction, corruption,
 /// retirement race) or a new publication drops READY immediately.
@@ -178,42 +182,67 @@ pub fn with_residency_proof(
     reserved_bytes: u64,
     resident_bytes: u64,
     covered_bytes: u64,
+    in_profile: bool,
     proof: &crate::storage::engines::sst::segment_io::ResidencyProof,
 ) -> StorageClassStatus {
     status.reserved_bytes = reserved_bytes;
     status.resident_bytes = resident_bytes;
     status.covered_bytes = covered_bytes;
     status.covered_generation = proof.generation;
-    let (state, reason) = if !proof.store_present {
+    let capacity = reserved_bytes.min(proof.store_capacity);
+    let (state, reason) = if proof.roots == 0 {
+        (
+            State::Degraded,
+            "the grant names no segment roots (the collection has no storage assignment), \
+             so no coverage can be proven"
+                .to_string(),
+        )
+    } else if !in_profile {
+        (
+            State::Degraded,
+            format!(
+                "the collection is not served by profile {READY_PROFILE} (its index_configs \
+                 route search through AXIS), so residency cannot be proven for it"
+            ),
+        )
+    } else if !proof.store_present {
         (
             State::Degraded,
             "no persistent local store is configured, so no segment can be resident \
              (set the cache local-disk path)"
                 .to_string(),
         )
+    } else if proof.segments == 0 {
+        (
+            State::Warming,
+            "no published segment found under the grant's segment roots yet; READY needs a \
+             proven, non-empty segment set"
+                .to_string(),
+        )
     } else if proof.covered_segments == proof.segments {
         (
             State::Ready,
             format!(
-                "all {} segments of generation {:#x} are resident and protected \
+                "all {} objects of generation {:#x} are resident and protected \
                  (profile {READY_PROFILE})",
                 proof.segments, proof.generation
             ),
         )
-    } else if proof.inventory_bytes > reserved_bytes {
+    } else if proof.inventory_stored_bytes > capacity {
         (
             State::Degraded,
             format!(
-                "the committed segment set ({} bytes) exceeds the grant ({reserved_bytes} \
-                 bytes); {} of {} segments resident — raise the reservation",
-                proof.inventory_bytes, proof.covered_segments, proof.segments
+                "the committed segment set ({} bytes stored) exceeds what can be held \
+                 ({capacity} bytes: the grant or the store's capacity, whichever is \
+                 smaller); {} of {} objects resident — raise the reservation",
+                proof.inventory_stored_bytes, proof.covered_segments, proof.segments
             ),
         )
     } else {
         (
             State::Warming,
             format!(
-                "{} of {} segments of generation {:#x} resident; warming (profile \
+                "{} of {} objects of generation {:#x} resident; warming (profile \
                  {READY_PROFILE})",
                 proof.covered_segments, proof.segments, proof.generation
             ),
@@ -221,6 +250,24 @@ pub fn with_residency_proof(
     };
     status.state = state as i32;
     status.reason = reason;
+    status
+}
+
+/// TD-TIER-1 SC4-5: the PERFORMANCE status when the proof itself failed (e.g.
+/// the listing errored): the progress figures stay, the state is DEGRADED
+/// with the cause (review S5).
+pub fn with_failed_proof(
+    mut status: StorageClassStatus,
+    reserved_bytes: u64,
+    resident_bytes: u64,
+    covered_bytes: u64,
+    error: &str,
+) -> StorageClassStatus {
+    status.reserved_bytes = reserved_bytes;
+    status.resident_bytes = resident_bytes;
+    status.covered_bytes = covered_bytes;
+    status.state = State::Degraded as i32;
+    status.reason = format!("the residency proof could not run: {error}");
     status
 }
 
@@ -397,44 +444,70 @@ mod tests {
     ) -> crate::storage::engines::sst::segment_io::ResidencyProof {
         crate::storage::engines::sst::segment_io::ResidencyProof {
             store_present,
+            roots: 1,
             segments,
             covered_segments,
             inventory_bytes,
+            inventory_stored_bytes: inventory_bytes + 100 * segments as u64,
+            store_capacity: 1 << 30,
             generation: 0xabc,
         }
     }
 
-    /// SC4-5: READY only when every segment is covered; WARMING while the
-    /// set fits but is partial; DEGRADED when it can never fit or there is
-    /// no store. Bytes and generation are reported in every state.
+    /// SC4-5: READY only with positive evidence; WARMING while the set fits
+    /// but is partial or nothing is published yet; DEGRADED when it can
+    /// never fit (STORED size), has no roots or store, or the collection is
+    /// outside the profile. Bytes and generation are reported in every state.
     #[test]
     fn residency_proof_drives_the_state() {
         let base =
             || storage_class_status(&config_with_class(Some(StorageClass::Performance as i32)));
-        let ready = with_residency_proof(base(), 4096, 3000, 3000, &proof(true, 3, 3, 3000));
+        let ready = with_residency_proof(base(), 4096, 3000, 3000, true, &proof(true, 3, 3, 3000));
         assert_eq!(ready.state, State::Ready as i32, "{}", ready.reason);
         assert_eq!(ready.covered_generation, 0xabc);
         assert!(ready.reason.contains(READY_PROFILE));
 
-        let warming = with_residency_proof(base(), 4096, 3000, 1000, &proof(true, 3, 1, 3000));
+        let warming =
+            with_residency_proof(base(), 4096, 3000, 1000, true, &proof(true, 3, 1, 3000));
         assert_eq!(warming.state, State::Warming as i32, "{}", warming.reason);
         assert!(warming.reason.contains("1 of 3"));
 
-        let over = with_residency_proof(base(), 2048, 3000, 1000, &proof(true, 3, 1, 3000));
+        // Fits by value bytes (3000 <= 3100) but not by STORED bytes (3300).
+        let over = with_residency_proof(base(), 3100, 3000, 1000, true, &proof(true, 3, 1, 3000));
         assert_eq!(over.state, State::Degraded as i32, "{}", over.reason);
-        assert!(over.reason.contains("exceeds the grant"));
+        assert!(over.reason.contains("exceeds"));
 
-        let no_store = with_residency_proof(base(), 4096, 0, 0, &proof(false, 3, 0, 3000));
+        let no_store = with_residency_proof(base(), 4096, 0, 0, true, &proof(false, 3, 0, 3000));
         assert_eq!(no_store.state, State::Degraded as i32);
         assert_eq!(state_label(no_store.state), "degraded");
         assert_eq!(state_label(ready.state), "ready");
         assert_eq!(state_label(warming.state), "warming");
 
-        let empty = with_residency_proof(base(), 4096, 0, 0, &proof(true, 0, 0, 0));
+        // Review B1: an empty set is never proof.
+        let empty = with_residency_proof(base(), 4096, 0, 0, true, &proof(true, 0, 0, 0));
+        assert_eq!(empty.state, State::Warming as i32, "{}", empty.reason);
+        let mut no_roots = proof(true, 0, 0, 0);
+        no_roots.roots = 0;
+        let rootless = with_residency_proof(base(), 4096, 0, 0, true, &no_roots);
         assert_eq!(
-            empty.state,
-            State::Ready as i32,
-            "no published segments: nothing to fetch"
+            rootless.state,
+            State::Degraded as i32,
+            "{}",
+            rootless.reason
+        );
+        // Review S4: outside the profile, never READY even when covered.
+        let axis = with_residency_proof(base(), 4096, 3000, 3000, false, &proof(true, 3, 3, 3000));
+        assert_eq!(axis.state, State::Degraded as i32, "{}", axis.reason);
+
+        let failed = with_failed_proof(base(), 4096, 10, 5, "list failed");
+        assert_eq!(failed.state, State::Degraded as i32);
+        assert_eq!(
+            (
+                failed.reserved_bytes,
+                failed.resident_bytes,
+                failed.covered_bytes
+            ),
+            (4096, 10, 5)
         );
     }
 
