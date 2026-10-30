@@ -184,7 +184,12 @@ jobs:
           # 0.17.x aarch64 CAPS_STATIC const-assertion (documented on the macos-14
           # runner in ci.yml's GPU job); fail-fast:false keeps the Linux wheels
           # flowing if it bites, and it surfaces as its own portability follow-up.
-          - os: macos-14
+          # macos-15, not macos-14: GitHub retires the macos-14 image on
+          # 2026-11-02 and its scheduled brownouts cancelled this leg before it
+          # started (v0.5.0 dry run). A cancelled leg fails the matrix, and
+          # publish-embedded-pypi needs every leg, so it blocked the whole
+          # proximadb_embedded upload. Both images are arm64.
+          - os: macos-15
             target: aarch64
           # Windows x86_64 (MSVC). Enabled after the windows-compile-ratchet
           # (TD-EMBED-1) proved the whole engine + `python` feature + C-deps
@@ -266,7 +271,8 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64
-          - os: macos-14
+          # macos-15: the macos-14 image retires 2026-11-02 (see the build leg).
+          - os: macos-15
             target: aarch64
     runs-on: ${{ matrix.os }}
     # max 0.1 min green step span over 16 runs since 2026-07-06 (1 green per
