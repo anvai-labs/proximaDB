@@ -1616,7 +1616,10 @@ const OBJECT_KEY_PREFIX: &str = "pax-object/";
 /// differ only in a run of slashes (`s3://b/x//y/` vs `s3://b/x/y/`), which
 /// object stores treat as distinct keys, compare equal here.
 pub fn canonical_location(raw: &str) -> String {
-    let mut text = raw.to_string();
+    // A local location has two spellings — the writer's plain path and the
+    // listing's `file://` URL — that must name ONE resident copy (SC4
+    // hardening review: two keys for one object charge the grant twice).
+    let mut text = raw.strip_prefix("file://").unwrap_or(raw).to_string();
     for alias in ["abfss://", "abfs://", "adls://", "azure://"] {
         text = text.replace(alias, "az://");
     }
