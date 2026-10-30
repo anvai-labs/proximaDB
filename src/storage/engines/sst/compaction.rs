@@ -3087,18 +3087,12 @@ impl Compaction {
             .await;
         }
         // TD-TIER-1 SC4-4: a grant covering this collection makes the output
-        // resident in full (one GET). Inert without a grant.
+        // resident in full (one GET, detached — never adds to compaction
+        // latency). Inert without a grant.
         {
             let output = task.output_file.to_string_lossy().to_string();
-            if let Ok(fs) = self.filesystem_factory.get_filesystem(&output)
-                && let Err(error) = crate::storage::engines::sst::segment_io::warm_object(
-                    fs.as_ref(),
-                    &output,
-                    None,
-                )
-                .await
-            {
-                warn!(output = %output, %error, "TD-TIER-1 SC4: output residency warm failed");
+            if let Ok(fs) = self.filesystem_factory.get_filesystem(&output) {
+                crate::storage::engines::sst::segment_io::spawn_warm_object(fs, output);
             }
         }
 

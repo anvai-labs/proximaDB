@@ -2413,7 +2413,7 @@ mod tests {
     async fn grant_protects_its_entries_and_release_unprotects() {
         let _guard = budget_cell_gate();
         let prefix = "s3://b/tenants/t1/77/data/".to_string();
-        let key = format!("invariants/region-a/{prefix}L0_x.pax");
+        let key = proximadb_cache::object_key(&format!("{prefix}L0_x.pax"));
 
         let store_dir = tempfile::tempdir().unwrap();
         let candidate = std::sync::Arc::new(

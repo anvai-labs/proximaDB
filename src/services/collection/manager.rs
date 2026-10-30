@@ -157,9 +157,6 @@ pub struct CollectionService {
     >,
 }
 
-/// TD-TIER-1 SC4-4: whole-segment GETs a residency backfill keeps in flight.
-const RESIDENCY_WARM_CONCURRENCY: usize = 4;
-
 impl CollectionService {
     /// Create new collection service with multi-disk coordination
     pub async fn new(storage_config: StorageConfig) -> Result<Self> {
@@ -209,41 +206,6 @@ impl CollectionService {
         // registers the process store (`sst/core.rs`), not here — grants are
         // restored before the store exists (review S4).
         Ok(service)
-    }
-
-    /// TD-TIER-1 SC4-4: backfill — make the live segments under each
-    /// residency prefix resident in the background (one whole-object GET per
-    /// segment, a few at a time). Needed whenever a grant starts covering a
-    /// collection that already has segments: a class change to PERFORMANCE,
-    /// or a restart. Detached and best-effort; outside a runtime it is
-    /// skipped (logged).
-    pub fn spawn_residency_warm(&self, prefixes: Vec<String>) {
-        if prefixes.is_empty() {
-            return;
-        }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            warn!("TD-TIER-1 SC4: residency warm skipped outside a runtime");
-            return;
-        };
-        let factory = self.filesystem_factory.clone();
-        runtime.spawn(async move {
-            for prefix in prefixes {
-                let data_url = prefix.trim_end_matches('/').to_string();
-                let Ok(fs) = factory.get_filesystem(&data_url) else {
-                    continue;
-                };
-                match crate::storage::engines::sst::segment_io::warm_collection(
-                    fs.as_ref(),
-                    &data_url,
-                    RESIDENCY_WARM_CONCURRENCY,
-                )
-                .await
-                {
-                    Ok(report) => debug!("TD-TIER-1 SC4: warmed {data_url}: {report:?}"),
-                    Err(error) => warn!("TD-TIER-1 SC4: warm of {data_url} failed: {error}"),
-                }
-            }
-        });
     }
 
     /// TD-TIER-1 SC4-3: report a PERFORMANCE collection's live grant on its
@@ -2519,7 +2481,10 @@ impl CollectionService {
                 } else {
                     // SC4-4: segments published before this class change
                     // become resident in the background.
-                    self.spawn_residency_warm(protect_prefixes.clone());
+                    crate::storage::engines::sst::segment_io::spawn_warm_prefixes(
+                        self.filesystem_factory.clone(),
+                        protect_prefixes.clone(),
+                    );
                 }
             } else {
                 if let Some(owner) = owner.as_deref() {

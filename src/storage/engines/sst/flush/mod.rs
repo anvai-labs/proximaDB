@@ -802,16 +802,13 @@ impl SstEngine {
         // TD-TIER-1 SC4-4: a PERFORMANCE grant covering this collection makes
         // the just-published segment resident in full (one GET; the staged
         // local file is gone once the commit finalizes). Inert without a
-        // grant; a failure only leaves coverage partial.
-        if let Ok(final_fs) = self.filesystem().get_filesystem(&final_file_path)
-            && let Err(error) = crate::storage::engines::sst::segment_io::warm_object(
-                final_fs.as_ref(),
-                &final_file_path,
-                None,
-            )
-            .await
-        {
-            tracing::warn!("TD-TIER-1 SC4: post-flush residency for {final_file_path}: {error}");
+        // grant; detached, so it never adds to flush latency; a failure only
+        // leaves coverage partial.
+        if let Ok(final_fs) = self.filesystem().get_filesystem(&final_file_path) {
+            crate::storage::engines::sst::segment_io::spawn_warm_object(
+                final_fs,
+                final_file_path.clone(),
+            );
         }
 
         if already_materialized {

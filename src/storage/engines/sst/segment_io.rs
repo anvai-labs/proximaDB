@@ -54,6 +54,10 @@ pub trait ResidentRangeRead {
 
     /// [`FileSystem::read`], served from the resident copy when present.
     async fn read_resident(&self, path: &str) -> FsResult<Vec<u8>>;
+
+    /// The object's size: from the resident copy when present (no HEAD),
+    /// otherwise one recorded metadata op.
+    async fn object_size_resident(&self, path: &str) -> FsResult<u64>;
 }
 
 #[async_trait::async_trait]
@@ -96,6 +100,15 @@ impl<T: FileSystem + ?Sized> ResidentRangeRead for T {
             return Ok(bytes);
         }
         self.read(path).await
+    }
+
+    async fn object_size_resident(&self, path: &str) -> FsResult<u64> {
+        if let Some(resident) = Resident::lookup(path) {
+            return Ok(resident.len);
+        }
+        crate::observability::io_trace::record_metadata_op();
+        crate::storage::engines::sst::metrics::record_metadata_op();
+        Ok(self.metadata(path).await?.size)
     }
 }
 
@@ -214,11 +227,19 @@ pub async fn warm_object(
     let Some((store, key)) = warm_target(path, len) else {
         return Ok(false);
     };
-    let staged = tempfile::NamedTempFile::new()
+    // Stage on the store's own filesystem (never a possibly RAM-backed
+    // system temp dir), with async writes; removed on every exit (Drop).
+    let staging_dir = store
+        .staging_dir()
+        .map_err(|error| anyhow::anyhow!("warm staging dir for {path}: {error}"))?;
+    let staged = tempfile::NamedTempFile::new_in(staging_dir)
         .map_err(|error| anyhow::anyhow!("warm temp file for {path}: {error}"))?;
     {
-        use std::io::Write;
-        let mut out = std::io::BufWriter::new(staged.as_file());
+        use tokio::io::AsyncWriteExt;
+        let file = staged
+            .reopen()
+            .map_err(|error| anyhow::anyhow!("warm stage {path}: {error}"))?;
+        let mut out = tokio::fs::File::from_std(file);
         let mut offset = 0u64;
         while offset < len {
             let chunk = WARM_CHUNK_BYTES.min(len - offset);
@@ -230,10 +251,12 @@ pub async fn warm_object(
                 anyhow::bail!("warm read {path}@{offset}: short read");
             }
             out.write_all(&bytes)
+                .await
                 .map_err(|error| anyhow::anyhow!("warm stage {path}: {error}"))?;
             offset += chunk;
         }
         out.flush()
+            .await
             .map_err(|error| anyhow::anyhow!("warm stage {path}: {error}"))?;
     }
     store
@@ -273,6 +296,48 @@ pub fn forget_object(path: &str) {
     if let Some(store) = proximadb_cache::process_store() {
         store.remove(&key);
     }
+}
+
+/// Detached [`warm_object`] for a just-published segment, so a whole-object
+/// fetch never adds to flush/compaction latency (verification round).
+pub fn spawn_warm_object(fs: Arc<dyn FileSystem>, path: String) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    runtime.spawn(async move {
+        if let Err(error) = warm_object(fs.as_ref(), &path, None).await {
+            warn_rate_limited(&format!("post-publication residency for {path}: {error}"));
+        }
+    });
+}
+
+/// Detached backfill of every residency prefix (one [`warm_collection`] per
+/// segment root, a few fetches at a time). Shared by the class-change path
+/// and the store-registration path at startup.
+pub fn spawn_warm_prefixes(
+    factory: Arc<crate::storage::persistence::filesystem::FilesystemFactory>,
+    prefixes: Vec<String>,
+) {
+    const CONCURRENCY: usize = 4;
+    if prefixes.is_empty() {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!("TD-TIER-1 SC4: residency warm skipped outside a runtime");
+        return;
+    };
+    runtime.spawn(async move {
+        for prefix in prefixes {
+            let data_url = prefix.trim_end_matches('/').to_string();
+            let Ok(fs) = factory.get_filesystem(&data_url) else {
+                continue;
+            };
+            match warm_collection(fs.as_ref(), &data_url, CONCURRENCY).await {
+                Ok(report) => tracing::debug!("TD-TIER-1 SC4: warmed {data_url}: {report:?}"),
+                Err(error) => warn_rate_limited(&format!("warm of {data_url}: {error}")),
+            }
+        }
+    });
 }
 
 /// The live segment data files of one collection data directory (one LIST,
@@ -364,9 +429,24 @@ mod tests {
         }
     }
 
-    fn arm(store_dir: &Path, covered_dir: &Path, group_id: &str, budget: u64) -> Armed {
+    /// One store directory for the whole test process: the process store is
+    /// first-registration-wins and outlives every test, so its root must too
+    /// (verification round: a per-test tempdir was deleted under later tests
+    /// in a shared-process runner).
+    fn process_store_dir() -> &'static Path {
+        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("store dir");
+            let path = dir.path().to_path_buf();
+            std::mem::forget(dir);
+            path
+        })
+    }
+
+    fn arm(_store_dir: &Path, covered_dir: &Path, group_id: &str, budget: u64) -> Armed {
         let gate = crate::services::collection::reservation::residency_test_gate();
-        let candidate = Arc::new(PersistentByteStore::open(store_dir, 64 << 20).expect("store"));
+        let candidate =
+            Arc::new(PersistentByteStore::open(process_store_dir(), 64 << 20).expect("store"));
         let _ = proximadb_cache::register_process_store(candidate);
         proximadb_cache::set_process_reserved_budget(32 << 20);
         proximadb_cache::register_protection_group(proximadb_cache::ProtectionGroup {
@@ -447,6 +527,7 @@ mod tests {
         assert_eq!(waves[2], hot_bytes[199_000..200_000]);
         assert_eq!(fs.read_resident(&hot).await.expect("whole"), hot_bytes);
         assert_eq!(resident_len(&hot), Some(200_000), "a HEAD can be skipped");
+        assert_eq!(fs.object_size_resident(&hot).await.expect("size"), 200_000);
         assert_eq!(counters.total_gets(), 0, "a resident segment costs no GET");
 
         assert_eq!(
@@ -585,6 +666,7 @@ mod tests {
                 ".read_range(",
                 ".read_ranges_prefetch(",
                 ".read_ranges(",
+                ".metadata(path)",
                 "fs.read(",
             ] {
                 let count = source.matches(direct).count();

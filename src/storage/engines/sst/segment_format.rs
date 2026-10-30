@@ -1230,13 +1230,10 @@ pub(crate) async fn pax_filtered_row_allow(
     let fetch_started = std::time::Instant::now();
 
     // 1. Header prefix → coalesced? (mirrors the cascade's detection).
-    crate::observability::io_trace::record_metadata_op();
-    crate::storage::engines::sst::metrics::record_metadata_op();
     let size = fs
-        .metadata(path)
+        .object_size_resident(path)
         .await
-        .map_err(|e| anyhow::anyhow!("filtered stage-F stat {path}: {e}"))?
-        .size;
+        .map_err(|e| anyhow::anyhow!("filtered stage-F stat {path}: {e}"))?;
     if size < (SEG_HEADER_PREFIX_LEN as u64 + SEGMENT_MAGIC.len() as u64) {
         return Ok(None);
     }
@@ -1492,13 +1489,10 @@ pub(crate) async fn read_records_by_positions(
                 }
             }
         } else {
-            crate::observability::io_trace::record_metadata_op();
-            crate::storage::engines::sst::metrics::record_metadata_op();
             let size = fs
-                .metadata(path)
+                .object_size_resident(path)
                 .await
-                .map_err(|e| anyhow::anyhow!("rehydrate stat {path}: {e}"))?
-                .size;
+                .map_err(|e| anyhow::anyhow!("rehydrate stat {path}: {e}"))?;
             if size < (SEG_HEADER_PREFIX_LEN as u64 + SEGMENT_MAGIC.len() as u64) {
                 anyhow::bail!("rehydrate {path}: not a coalesced segment");
             }
@@ -2927,10 +2921,9 @@ pub async fn prefetch_segment_invariants(
         return Ok(false); // already warm
     }
     let size = fs
-        .metadata(path)
+        .object_size_resident(path)
         .await
-        .map_err(|e| anyhow::anyhow!("prefetch stat {path}: {e}"))?
-        .size;
+        .map_err(|e| anyhow::anyhow!("prefetch stat {path}: {e}"))?;
     if size < (SEG_HEADER_PREFIX_LEN as u64 + SEGMENT_MAGIC.len() as u64) {
         return Ok(false);
     }
@@ -4397,14 +4390,10 @@ pub async fn rabitq_search_segment_coalesced_allowed(
         // stale/foreign size fails closed to the generic scan path).
         let size = match known_size {
             Some(s) => s,
-            None => {
-                crate::observability::io_trace::record_metadata_op();
-                crate::storage::engines::sst::metrics::record_metadata_op();
-                fs.metadata(path)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("coalesced scan stat {path}: {e}"))?
-                    .size
-            }
+            None => fs
+                .object_size_resident(path)
+                .await
+                .map_err(|e| anyhow::anyhow!("coalesced scan stat {path}: {e}"))?,
         };
         if size < (SEG_HEADER_PREFIX_LEN as u64 + SEGMENT_MAGIC.len() as u64) {
             return Ok(None);
