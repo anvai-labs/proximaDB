@@ -636,7 +636,15 @@ impl SstEngine {
                             // cell, so construction order does not matter).
                             // First registration wins: a second engine
                             // construction in-process keeps the original.
-                            if !proximadb_cache::register_process_store(Arc::new(store.clone())) {
+                            if proximadb_cache::register_process_store(Arc::new(store.clone())) {
+                                // TD-TIER-1 SC4-4: grants restored at startup
+                                // registered their groups before this store
+                                // existed — backfill what they cover now.
+                                crate::storage::engines::sst::segment_io::spawn_warm_prefixes(
+                                    filesystem.clone(),
+                                    proximadb_cache::process_protection_prefixes(),
+                                );
+                            } else {
                                 tracing::debug!(
                                     "TD-TIER-1 SC4-1: a persistent store was already \
                                      registered for this process; keeping the original"

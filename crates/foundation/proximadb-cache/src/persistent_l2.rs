@@ -150,6 +150,15 @@ impl PersistentByteStore {
     pub fn open(base: impl AsRef<Path>, max_bytes: u64) -> std::io::Result<Self> {
         let base = base.as_ref().to_path_buf();
         std::fs::create_dir_all(&base)?;
+        // SC4-4: staging files a crash left behind are garbage (an entry is
+        // only ever indexed from a completed write under a shard).
+        // Best-effort: a cleanup failure must never disable the whole tier
+        // (leftover staging files cost disk, not correctness — they are never
+        // indexed). The next successful open reclaims them.
+        let staging = base.join("staging");
+        if staging.exists() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
         for shard in 0..SHARDS {
             std::fs::create_dir_all(base.join(format!("shard_{shard:02}")))?;
         }
@@ -235,6 +244,69 @@ impl PersistentByteStore {
             return false;
         };
         self.release_pin(&meta)
+    }
+
+    /// A directory on the store's own filesystem for staging values before
+    /// [`Self::put_file_range`] (SC4-4: never the system temp dir, which may
+    /// be RAM-backed).
+    pub fn staging_dir(&self) -> std::io::Result<PathBuf> {
+        let dir = self.inner.base.join("staging");
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    /// Logical length of an indexed value, without reading it (TD-TIER-1
+    /// SC4-4 residency probe). `None` when the key is not indexed.
+    pub fn entry_len(&self, key: &str) -> Option<u64> {
+        self.inner.entries.get(key).map(|meta| meta.value_len)
+    }
+
+    /// Whether any protection group is registered (lock-free). With none,
+    /// no grant asks for residency (SC4-4 read fast path).
+    pub fn policy_active(&self) -> bool {
+        self.inner.policy_active.load(Ordering::Acquire)
+    }
+
+    /// Whether pinning `len` more bytes under `key`'s group would fit — the
+    /// group's own budget, the store-wide reserved budget, and the store's
+    /// capacity (SC4-4 review: check BEFORE paying a whole-object GET, so an
+    /// over-budget object is neither fetched nor left unpinned to churn the
+    /// cache). Advisory: the pin itself re-checks under the mutex.
+    pub fn policy_headroom(&self, key: &str, value_len: u64) -> bool {
+        // Pins are charged the STORED size (header + key + CRC table +
+        // value), not the value length (verification round).
+        let len = stored_len(key, value_len);
+        if !self.policy_active() || len > self.inner.max_bytes {
+            return false;
+        }
+        let policy = self.protection_guard();
+        let Some(group) = policy.matching_group(key) else {
+            return false;
+        };
+        let group_fits = group
+            .counter
+            .pinned
+            .load(Ordering::Acquire)
+            .checked_add(len)
+            .is_some_and(|next| next <= group.budget);
+        let store_fits = self
+            .inner
+            .protected_bytes
+            .load(Ordering::Acquire)
+            .checked_add(len)
+            .is_some_and(|next| next <= self.inner.reserved_budget.load(Ordering::Acquire));
+        group_fits && store_fits
+    }
+
+    /// Whether the protection policy has a group covering `key` (SC4-4: a
+    /// grant asks for this object to be resident). Free when no group is
+    /// registered; otherwise takes the protection mutex, so call it at
+    /// publish/warm cadence, never per read.
+    pub fn policy_covers(&self, key: &str) -> bool {
+        if !self.inner.policy_active.load(Ordering::Acquire) {
+            return false;
+        }
+        self.protection_guard().matching_group(key).is_some()
     }
 
     /// True when the entry is currently pinned (status projection helper).
@@ -497,7 +569,12 @@ impl PersistentByteStore {
         self.inner
             .entries
             .iter()
+            // Whole-object keys only, like the pins (`covered_bytes`): a
+            // segment's region keys duplicate bytes its whole object holds.
             .filter(|entry| {
+                if !entry.key().starts_with(OBJECT_KEY_PREFIX) {
+                    return false;
+                }
                 let canonical = canonical_location(entry.key());
                 prefixes
                     .iter()
@@ -1463,7 +1540,12 @@ impl ProtectionPolicy {
     /// The first group (by id) whose prefix the key contains, in canonical
     /// form.
     fn matching_group(&self, key: &str) -> Option<&PolicyGroup> {
-        if self.groups.is_empty() {
+        // SC4-4: grants protect WHOLE segment objects only. A segment's
+        // region keys (control, Region A, survivor ranges) are redundant once
+        // the object is resident — a region miss is served from the resident
+        // object with no GET — and charging both made whole-object coverage
+        // unfittable in a grant sized to the collection.
+        if self.groups.is_empty() || !key.starts_with(OBJECT_KEY_PREFIX) {
             return None;
         }
         let canonical = canonical_location(key);
@@ -1475,6 +1557,31 @@ impl ProtectionPolicy {
         })
     }
 }
+
+/// TD-TIER-1 SC4-4: the persistent-L2 key holding a WHOLE immutable segment
+/// object, addressed by the same path string the segment readers use (the
+/// region keys `invariants/control/{path}` follow the same convention). The
+/// path embeds the collection's segment root, so a grant's prefix protection
+/// pins the object automatically.
+///
+/// Canonicalized (review B2): flush seeds under its publish URL while readers
+/// and compaction use the LIST URL, which can spell the same object
+/// differently (`adls://` vs `az://`, slash runs); one canonical key keeps
+/// seed, read and forget on the same entry.
+pub fn object_key(path: &str) -> String {
+    format!("{OBJECT_KEY_PREFIX}{}", canonical_location(path))
+}
+
+/// The on-disk size of an entry: what pins and the budget are charged.
+fn stored_len(key: &str, value_len: u64) -> u64 {
+    HEADER_LEN
+        .saturating_add(key.len() as u64)
+        .saturating_add(value_len.div_ceil(CHECKSUM_CHUNK_BYTES).saturating_mul(4))
+        .saturating_add(value_len)
+}
+
+/// Prefix of every whole-object key ([`object_key`]).
+const OBJECT_KEY_PREFIX: &str = "pax-object/";
 
 /// TD-TIER-1 SC4-2: canonical form for comparing locations embedded in cache
 /// keys (review S2). Azure scheme aliases (`abfs://`, `abfss://`, `adls://`,
@@ -1531,6 +1638,7 @@ fn join_error(error: tokio::task::JoinError) -> std::io::Error {
 mod tests {
     use super::{
         CHECKSUM_CHUNK_BYTES, L2Class, PersistentByteStore, ProtectionGroup, canonical_location,
+        object_key, stored_len,
     };
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::Arc;
@@ -2000,7 +2108,7 @@ mod tests {
     const C2: &str = "s3://bucket/tenants/beta/34/data/";
 
     fn key_in(prefix: &str, file: &str) -> String {
-        format!("invariants/region-a/{prefix}{file}")
+        object_key(&format!("{prefix}{file}"))
     }
 
     fn group(id: &str, prefix: &str, budget: u64) -> ProtectionGroup {
@@ -2011,9 +2119,10 @@ mod tests {
         }
     }
 
-    /// Keys under a group's prefix are pinned on admission; a sibling
-    /// collection whose decimal id shares the prefix digits (`123` vs `12`)
-    /// is NOT; a survivor-shaped key with the path mid-string is.
+    /// Whole-object keys under a group's prefix are pinned on admission; a
+    /// sibling collection whose decimal id shares the prefix digits (`123` vs
+    /// `12`) is NOT; a region/survivor key of the SAME segment is not either
+    /// (SC4-4: grants protect whole objects; region keys are redundant).
     #[tokio::test]
     async fn policy_pins_on_admission_with_exact_prefix_boundaries() {
         let (_dir, store) = armed_store();
@@ -2023,7 +2132,8 @@ mod tests {
             .put(key_in(C1, "L0_a.pax"), L2Class::Invariants, payload(1024))
             .await
             .expect("put c1");
-        let sibling = "invariants/region-a/s3://bucket/tenants/acme/123/data/L0_a.pax";
+        let sibling = object_key("s3://bucket/tenants/acme/123/data/L0_a.pax");
+        let sibling = sibling.as_str();
         store
             .put(sibling, L2Class::Invariants, payload(1024))
             .await
@@ -2038,7 +2148,10 @@ mod tests {
             store.is_protected(&key_in(C1, "L0_a.pax")),
             "pinned on admit"
         );
-        assert!(store.is_protected(&survivor), "mid-string path is matched");
+        assert!(
+            !store.is_protected(&survivor),
+            "a region/survivor key is ordinary cache under a grant"
+        );
         assert!(
             !store.is_protected(sibling),
             "id 123 must not match prefix 12/"
@@ -2219,6 +2332,17 @@ mod tests {
         let each = store.resident_bytes() / 3;
         store.set_protection_groups(vec![group("g1", C1, each)]);
         assert_eq!(store.group_resident_bytes("g1"), 2 * each);
+        // A region key of a covered segment is not counted (it duplicates
+        // bytes the whole object holds; only whole objects can be covered).
+        store
+            .put(
+                format!("invariants/control/{C1}a"),
+                L2Class::Invariants,
+                payload(64),
+            )
+            .await
+            .expect("put region");
+        assert_eq!(store.group_resident_bytes("g1"), 2 * each);
         assert_eq!(store.covered_bytes("g1"), each, "covered <= resident");
         assert_eq!(store.group_resident_bytes("absent"), 0);
     }
@@ -2267,6 +2391,82 @@ mod tests {
         );
     }
 
+    /// SC4-4: the residency probe reports a value's length without reading
+    /// it, and a group covers exactly the object keys under its prefixes.
+    #[tokio::test]
+    async fn entry_len_and_policy_covers_follow_the_groups() {
+        let (_dir, store) = armed_store();
+        let key = object_key(&format!("{C1}L0_a.pax"));
+        assert_eq!(store.entry_len(&key), None);
+        assert!(!store.policy_covers(&key), "no group: inert");
+        store
+            .put(key.clone(), L2Class::Invariants, payload(300))
+            .await
+            .expect("put");
+        assert_eq!(store.entry_len(&key), Some(300));
+        store.set_protection_groups(vec![group("g1", C1, 1 << 20)]);
+        assert!(store.policy_covers(&key));
+        assert!(!store.policy_covers(&object_key(&format!("{C2}L0_a.pax"))));
+        assert!(
+            store.is_protected(&key),
+            "the object key is pinned by the prefix"
+        );
+    }
+
+    /// SC4-4: staging files a crash left behind are removed when the store
+    /// reopens (they are never indexed, so nothing else would reclaim them).
+    #[test]
+    fn reopen_clears_crash_left_staging() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = PersistentByteStore::open(dir.path(), 1 << 20).expect("open");
+        let staged = store.staging_dir().expect("staging").join("orphan.tmp");
+        std::fs::write(&staged, vec![0u8; 4096]).expect("write orphan");
+        drop(store);
+        let _reopened = PersistentByteStore::open(dir.path(), 1 << 20).expect("reopen");
+        assert!(!staged.exists(), "the orphaned staging file is reclaimed");
+    }
+
+    /// SC4-4 verification: headroom is judged on the STORED size (what a pin
+    /// is charged), so an object whose value just fits but whose entry does
+    /// not is refused before any fetch.
+    #[tokio::test]
+    async fn headroom_charges_the_stored_size() {
+        let (_dir, store) = armed_store();
+        let key = key_in(C1, "edge.pax");
+        let value_len = 64 * 1024;
+        let stored = stored_len(&key, value_len);
+        assert!(stored > value_len);
+        store.set_protection_groups(vec![group("g1", C1, value_len)]);
+        assert!(
+            !store.policy_headroom(&key, value_len),
+            "value fits, entry does not"
+        );
+        store.set_protection_groups(vec![group("g1", C1, stored)]);
+        assert!(store.policy_headroom(&key, value_len));
+        assert!(
+            !store.policy_headroom(&format!("invariants/control/{C1}edge.pax"), 1),
+            "region keys are not covered"
+        );
+    }
+
+    /// SC4-4 review B2: the publish URL and the LIST URL of one object map to
+    /// one whole-object key.
+    #[test]
+    fn object_key_is_canonical_across_spellings() {
+        assert_eq!(
+            object_key("adls://cont/tenants/t/12/data/L0.pax"),
+            object_key("az://cont/tenants/t/12/data/L0.pax")
+        );
+        assert_eq!(
+            object_key("s3://b/x//12/data/L0.pax"),
+            object_key("s3://b/x/12/data/L0.pax")
+        );
+        assert_ne!(
+            object_key("s3://b/12/data/L0.pax"),
+            object_key("s3://b/123/data/L0.pax")
+        );
+    }
+
     /// Review S2: Azure scheme aliases and doubled slashes compare equal.
     #[test]
     fn canonical_location_unifies_aliases_and_slashes() {
@@ -2292,12 +2492,14 @@ mod tests {
     async fn alias_prefix_matches_listed_keys() {
         let (_dir, store) = armed_store();
         store.set_protection_groups(vec![group("g1", "adls://cont/tenants/t/12/data/", 1 << 20)]);
-        let listed = "invariants/control/az://cont/tenants/t/12/data/L0.pax";
+        // The listing's `az://` spelling of a whole object under the
+        // `adls://` grant prefix (SC4-4: grants pin whole-object keys).
+        let listed = object_key("az://cont/tenants/t/12/data/L0.pax");
         store
-            .put(listed, L2Class::Invariants, payload(128))
+            .put(listed.clone(), L2Class::Invariants, payload(128))
             .await
             .expect("put");
-        assert!(store.is_protected(listed));
+        assert!(store.is_protected(&listed));
     }
 
     // Protection is runtime state by design: the index rebuild drops it and

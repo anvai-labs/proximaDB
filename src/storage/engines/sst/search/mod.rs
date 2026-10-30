@@ -32,6 +32,7 @@ pub mod coordinator;
 pub mod operations;
 pub mod optimizer;
 
+use crate::storage::engines::sst::segment_io::ResidentRangeRead as _;
 use anyhow::Result;
 use futures::future::join_all;
 
@@ -67,6 +68,45 @@ tokio::task_local! {
 /// Run one search with a per-query discovery memo (see [`DISCOVERY_MEMO`]).
 async fn scope_discovery_memo<F: std::future::Future>(search: F) -> F::Output {
     DISCOVERY_MEMO.scope(Default::default(), search).await
+}
+
+/// The live segment data files in one LIST of a collection data directory:
+/// `.sst` / `.arrow` / `.pax` files, minus any input whose retirement is
+/// pending (TD-COMPACT-13 — superseded segments stop serving the moment the
+/// obligation is recorded). Shared by search discovery and the TD-TIER-1
+/// residency inventory so both agree on what "live" means.
+pub(crate) fn live_segment_files(
+    entries: Vec<proximadb_storage_filesystem_types::DirEntry>,
+    pending: &std::collections::HashSet<String>,
+) -> Vec<DiscoveredSstFile> {
+    let mut files = Vec::new();
+    for entry in entries {
+        if entry.metadata.is_directory {
+            continue;
+        }
+        if pending.contains(&entry.url) {
+            tracing::debug!(
+                url = %entry.url,
+                "TD-COMPACT-13: filtering pending-retirement segment from discovery"
+            );
+            continue;
+        }
+        if entry.name.ends_with(".sst")
+            || entry.name.ends_with(".arrow")
+            || entry.name.ends_with(".pax")
+        {
+            // TD-RDSTRAT-13 C3: carry the list-time object size so the
+            // search path can skip the per-segment HEAD. `0` means the
+            // backend did not report a size — record `None` and let the
+            // reader fall back to a real stat; never guess.
+            files.push(DiscoveredSstFile {
+                size_bytes: (entry.metadata.size > 0).then_some(entry.metadata.size),
+                etag: entry.metadata.etag.clone(),
+                url: entry.url,
+            });
+        }
+    }
+    files
 }
 
 /// TD-RDSTRAT-13 C3: a discovered segment plus the size the listing already
@@ -447,12 +487,12 @@ impl SstEngine {
             return Ok(None);
         }
         let fs = self.filesystem().get_filesystem(file_path)?;
-        let prefix = fs.read_range(file_path, 0, 8).await?;
+        let prefix = fs.read_range_resident(file_path, 0, 8).await?;
         if prefix.len() < 8 || &prefix[0..4] != b"SST1" {
             return Ok(None);
         }
         let header_len = u32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]) as u64;
-        let header_data = fs.read_range(file_path, 8, header_len).await?;
+        let header_data = fs.read_range_resident(file_path, 8, header_len).await?;
         let header: SstableHeader = bincode::deserialize(&header_data)?;
         Ok(Some(header.entry_count as usize))
     }
@@ -1040,7 +1080,7 @@ impl SstEngine {
                 // Segments are the flush unit and small relative to query cost;
                 // a full read + index parse is the same cost class as the
                 // coarse-RaBitQ probe below.
-                let bytes = fs.read(file_path).await.ok()?;
+                let bytes = fs.read_resident(file_path).await.ok()?;
                 use proximadb_storage_common::pax_block::{PaxSegmentScanner, ScanPredicate};
                 let mut scanner =
                     PaxSegmentScanner::from_bytes(bytes, ScanPredicate::default()).ok()?;
@@ -1048,13 +1088,16 @@ impl SstEngine {
                     total += block.row_count() as u64;
                 }
             } else {
-                let prefix = fs.read_range(file_path, 0, 8).await.ok()?;
+                let prefix = fs.read_range_resident(file_path, 0, 8).await.ok()?;
                 if prefix.len() < 8 || &prefix[0..4] != b"SST1" {
                     return None; // unknown format (e.g. .arrow) → rebuild
                 }
                 let header_len =
                     u32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]) as u64;
-                let header_data = fs.read_range(file_path, 8, header_len).await.ok()?;
+                let header_data = fs
+                    .read_range_resident(file_path, 8, header_len)
+                    .await
+                    .ok()?;
                 let header = bincode::deserialize::<SstableHeader>(&header_data).ok()?;
                 total += header.entry_count;
             }
@@ -1071,7 +1114,7 @@ impl SstEngine {
             let Ok(fs) = self.filesystem().get_filesystem(file) else {
                 return false; // can't open → don't skip; let the rebuild try
             };
-            let Ok(bytes) = fs.read(file).await else {
+            let Ok(bytes) = fs.read_resident(file).await else {
                 return false;
             };
             if !pax_segment_is_coarse_rabitq_without_f32_tier(&bytes) {
@@ -2624,7 +2667,7 @@ self.try_pax_cascade(
 
         // Read just the first part of the file to get header
         // Format: SST1 (4 bytes) + header_len (4 bytes) + header data
-        let header_prefix = fs.read_range(file_path, 0, 8).await?;
+        let header_prefix = fs.read_range_resident(file_path, 0, 8).await?;
 
         // Verify magic — a coalesced segment (PXH1, ADR-065) has no legacy SST1
         // centroid; return None cleanly (no error) so partition-aware search skips it.
@@ -2640,7 +2683,9 @@ self.try_pax_cascade(
         ]) as usize;
 
         // Read header data
-        let header_data = fs.read_range(file_path, 8, header_len as u64).await?;
+        let header_data = fs
+            .read_range_resident(file_path, 8, header_len as u64)
+            .await?;
 
         // Deserialize header
         let header: SstableHeader = bincode::deserialize(&header_data)
@@ -2789,37 +2834,7 @@ self.try_pax_cascade(
                 data_url, &entries,
             );
         }
-        for entry in entries {
-            tracing::trace!(
-                "[SST] Examining entry: name={}, url={}, is_dir={}",
-                entry.name,
-                entry.url,
-                entry.metadata.is_directory
-            );
-            if !entry.metadata.is_directory && pending.contains(&entry.url) {
-                tracing::debug!(
-                    url = %entry.url,
-                    "TD-COMPACT-13: filtering pending-retirement segment from discovery"
-                );
-                continue;
-            }
-            if !entry.metadata.is_directory
-                && (entry.name.ends_with(".sst")
-                    || entry.name.ends_with(".arrow")
-                    || entry.name.ends_with(".pax"))
-            {
-                // TD-RDSTRAT-13 C3: carry the list-time object size so the
-                // search path can skip the per-segment HEAD. `0` means the
-                // backend did not report a size — record `None` and let the
-                // reader fall back to a real stat; never guess.
-                files.push(DiscoveredSstFile {
-                    size_bytes: (entry.metadata.size > 0).then_some(entry.metadata.size),
-                    etag: entry.metadata.etag.clone(),
-                    url: entry.url,
-                });
-                tracing::debug!("[SST] Found data file: {}", entry.name);
-            }
-        }
+        files.extend(live_segment_files(entries, &pending));
 
         tracing::debug!(
             "[SST] Discovered {} .sst files in {}",

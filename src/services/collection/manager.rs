@@ -188,7 +188,7 @@ impl CollectionService {
             .await
             .context("TD-TIER-1 SC3: reservation pool startup failed")?;
 
-        Ok(Self {
+        let service = Self {
             filesystem_factory,
             index_config_cache: Arc::new(dashmap::DashMap::new()),
             storage_config,
@@ -201,7 +201,11 @@ impl CollectionService {
             rbac_enforcer: None,  // Will be set via with_rbac_enforcer()
             #[cfg(feature = "experimental-turboquant")]
             turboquant_registry: None, // Will be set via with_turboquant_registry()
-        })
+        };
+        // TD-TIER-1 SC4-4: the restart backfill runs when the SST engine
+        // registers the process store (`sst/core.rs`), not here — grants are
+        // restored before the store exists (review S4).
+        Ok(service)
     }
 
     /// TD-TIER-1 SC4-3: report a PERFORMANCE collection's live grant on its
@@ -2474,6 +2478,13 @@ impl CollectionService {
                          {error} (policy recorded; SC4 reconciliation re-admits)"
                     );
                     reservation_pending = Some(error.to_string());
+                } else {
+                    // SC4-4: segments published before this class change
+                    // become resident in the background.
+                    crate::storage::engines::sst::segment_io::spawn_warm_prefixes(
+                        self.filesystem_factory.clone(),
+                        protect_prefixes.clone(),
+                    );
                 }
             } else {
                 if let Some(owner) = owner.as_deref() {
