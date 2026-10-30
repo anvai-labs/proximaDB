@@ -286,6 +286,115 @@ mod tests {
         (hits as f64 / (QUERIES * TOP_K) as f64, reads)
     }
 
+    /// TD-TIER-1 SC4 gate (profile: default PAX ANN search): a collection
+    /// whose live segments are resident under a grant answers fresh queries
+    /// with ZERO object-store GETs at the same recall as a cold, ungranted
+    /// arm. Each arm has its own segment paths, so no DRAM cache entry is
+    /// shared between them.
+    #[tokio::test]
+    async fn a_resident_collection_answers_queries_with_zero_gets() {
+        enable_env();
+        let rows = corpus();
+        let cold = arm("res-cold", &rows).await;
+        let (cold_recall, cold_reads) = measure(&cold, &rows, false).await;
+        assert!(cold_reads > 0, "the ungranted arm reads the object store");
+
+        let _gate = crate::services::collection::reservation::residency_test_gate();
+        let _store = crate::services::collection::reservation::residency_test_store();
+        let hot = arm("res-hot", &rows).await;
+        proximadb_cache::set_process_reserved_budget(1 << 30);
+        proximadb_cache::register_protection_group(proximadb_cache::ProtectionGroup {
+            id: "res-hot-grant".to_string(),
+            prefixes: vec![format!("{}/", hot.storage_url.trim_end_matches('/'))],
+            budget_bytes: 1 << 30,
+        });
+        let fs = hot
+            .engine
+            .filesystem()
+            .get_filesystem(&hot.storage_url)
+            .unwrap();
+        let warmed = crate::storage::engines::sst::segment_io::warm_collection(
+            fs.as_ref(),
+            &hot.storage_url,
+            4,
+        )
+        .await
+        .unwrap();
+        // The segments plus the published centroid directory object.
+        assert_eq!(
+            (warmed.warmed, warmed.failed),
+            (SEGMENTS + 1, 0),
+            "{warmed:?}"
+        );
+
+        let (hot_recall, hot_reads) = measure(&hot, &rows, false).await;
+        // The default configuration reads the centroid directory on every
+        // cold query; it is resident too, so the directory path is also free.
+        let (_, hot_directory_reads) = measure(&hot, &rows, true).await;
+        assert_eq!(
+            hot_directory_reads, 0,
+            "the directory path reads nothing remotely"
+        );
+
+        // SC4-5: the proof sees every segment covered for generation g ...
+        let prefixes = vec![format!("{}/", hot.storage_url.trim_end_matches('/'))];
+        let factory = hot.engine.filesystem().clone();
+        let proof = crate::storage::engines::sst::segment_io::prove_residency(&factory, &prefixes)
+            .await
+            .unwrap();
+        assert!(proof.store_present);
+        assert_eq!(
+            (proof.segments, proof.covered_segments),
+            (SEGMENTS + 1, SEGMENTS + 1),
+            "{proof:?}"
+        );
+        // ... a new publication changes g and is not covered yet (READY drops)
+        let extra: Vec<ProximaRecord> = (0..8).map(|i| record(10_000 + i, &rows[i])).collect();
+        write_pax_segment_compacted(
+            Path::new(&format!("{}/seg-new.pax", hot.storage_url)),
+            &extra,
+            "res-hot",
+            1,
+            VectorQuant::RaBitQ,
+            VectorQuant::Sq8,
+            false,
+            Some(16 * 1024),
+            None,
+        )
+        .unwrap();
+        let after = crate::storage::engines::sst::segment_io::prove_residency(&factory, &prefixes)
+            .await
+            .unwrap();
+        assert_ne!(
+            after.generation, proof.generation,
+            "a publication changes g"
+        );
+        assert_eq!(
+            (after.segments, after.covered_segments),
+            (SEGMENTS + 2, SEGMENTS + 1)
+        );
+        // ... and warming it restores full coverage under the new g.
+        crate::storage::engines::sst::segment_io::warm_collection(fs.as_ref(), &hot.storage_url, 4)
+            .await
+            .unwrap();
+        let healed = crate::storage::engines::sst::segment_io::prove_residency(&factory, &prefixes)
+            .await
+            .unwrap();
+        assert_eq!(healed.generation, after.generation);
+        assert_eq!(healed.covered_segments, SEGMENTS + 2, "{healed:?}");
+
+        proximadb_cache::unregister_protection_group("res-hot-grant");
+        proximadb_cache::set_process_reserved_budget(0);
+        assert_eq!(
+            hot_reads, 0,
+            "a resident collection costs no GET (cold arm: {cold_reads})"
+        );
+        assert!(
+            (hot_recall - cold_recall).abs() < 1e-9,
+            "residency never changes results: {hot_recall} vs {cold_recall}"
+        );
+    }
+
     #[tokio::test]
     async fn global_selection_keeps_recall_and_reads_less() {
         enable_env();

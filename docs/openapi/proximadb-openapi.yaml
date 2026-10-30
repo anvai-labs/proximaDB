@@ -6862,10 +6862,13 @@ components:
       - reserved_bytes
       - resident_bytes
       - covered_bytes
+      - covered_generation
       properties:
         state:
           type: string
-          description: '"active" | "not_active" ("unspecified" never leaves the server).'
+          description: |-
+            "active" | "not_active" | "warming" | "ready" | "degraded"
+            ("unspecified" never leaves the server).
         reason:
           type: string
           description: |-
@@ -6892,6 +6895,13 @@ components:
           type: integer
           format: int64
           description: Bytes covered by the READY coverage set (SC4). 0 until then.
+          minimum: 0
+        covered_generation:
+          type: integer
+          format: int64
+          description: |-
+            The committed segment-set generation the coverage was proven against
+            (TD-TIER-1 SC4-5); 0 when no proof was attempted.
           minimum: 0
     TextFieldInput:
       type: object

@@ -22,7 +22,8 @@ class StorageClassStatusOutput:
     proto `StorageClassStatus` — a read-side projection, never an input).
 
         Attributes:
-            state (str): "active" | "not_active" ("unspecified" never leaves the server).
+            state (str): "active" | "not_active" | "warming" | "ready" | "degraded"
+                ("unspecified" never leaves the server).
             reason (str): Human-readable reason when `state` is not active (names the missing
                 dependency); empty when active.
             policy_generation (int): Monotonic generation of the desired policy: 0 = never set (pre-SC1
@@ -30,6 +31,8 @@ class StorageClassStatusOutput:
             reserved_bytes (int): Reserved bytes under the collection's residency admission (SC3). 0 until then.
             resident_bytes (int): Bytes resident in the serving cache (SC4). 0 until then.
             covered_bytes (int): Bytes covered by the READY coverage set (SC4). 0 until then.
+            covered_generation (int): The committed segment-set generation the coverage was proven against
+                (TD-TIER-1 SC4-5); 0 when no proof was attempted.
     """
 
     state: str
@@ -38,6 +41,7 @@ class StorageClassStatusOutput:
     reserved_bytes: int
     resident_bytes: int
     covered_bytes: int
+    covered_generation: int
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -53,6 +57,8 @@ class StorageClassStatusOutput:
 
         covered_bytes = self.covered_bytes
 
+        covered_generation = self.covered_generation
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -63,6 +69,7 @@ class StorageClassStatusOutput:
                 "reserved_bytes": reserved_bytes,
                 "resident_bytes": resident_bytes,
                 "covered_bytes": covered_bytes,
+                "covered_generation": covered_generation,
             }
         )
 
@@ -83,6 +90,8 @@ class StorageClassStatusOutput:
 
         covered_bytes = d.pop("covered_bytes")
 
+        covered_generation = d.pop("covered_generation")
+
         storage_class_status_output = cls(
             state=state,
             reason=reason,
@@ -90,6 +99,7 @@ class StorageClassStatusOutput:
             reserved_bytes=reserved_bytes,
             resident_bytes=resident_bytes,
             covered_bytes=covered_bytes,
+            covered_generation=covered_generation,
         )
 
         storage_class_status_output.additional_properties = d

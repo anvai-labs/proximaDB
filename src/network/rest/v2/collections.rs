@@ -1063,7 +1063,8 @@ pub struct CollectionV2Response {
 /// proto `StorageClassStatus` — a read-side projection, never an input).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct StorageClassStatusOutput {
-    /// "active" | "not_active" ("unspecified" never leaves the server).
+    /// "active" | "not_active" | "warming" | "ready" | "degraded"
+    /// ("unspecified" never leaves the server).
     pub state: String,
     /// Human-readable reason when `state` is not active (names the missing
     /// dependency); empty when active.
@@ -1077,18 +1078,14 @@ pub struct StorageClassStatusOutput {
     pub resident_bytes: u64,
     /// Bytes covered by the READY coverage set (SC4). 0 until then.
     pub covered_bytes: u64,
+    /// The committed segment-set generation the coverage was proven against
+    /// (TD-TIER-1 SC4-5); 0 when no proof was attempted.
+    pub covered_generation: u64,
 }
 
 impl StorageClassStatusOutput {
     fn from_proto(status: crate::proto::proximadb_v1::StorageClassStatus) -> Self {
-        use crate::proto::proximadb_v1::storage_class_status::State;
-        let state = State::try_from(status.state)
-            .map(|s| match s {
-                State::Active => "active",
-                State::NotActive => "not_active",
-                State::Unspecified => "unspecified",
-            })
-            .unwrap_or("unspecified");
+        let state = crate::services::collection::storage_class::state_label(status.state);
         Self {
             state: state.to_string(),
             reason: status.reason,
@@ -1096,6 +1093,7 @@ impl StorageClassStatusOutput {
             reserved_bytes: status.reserved_bytes,
             resident_bytes: status.resident_bytes,
             covered_bytes: status.covered_bytes,
+            covered_generation: status.covered_generation,
         }
     }
 }

@@ -238,15 +238,33 @@ impl CollectionService {
                 )
             })
             .unwrap_or((0, 0));
+        // SC4-5: prove coverage of the committed segment set (one LIST per
+        // segment root). A failed listing leaves the SC4-3 progress figures.
+        let proof = match crate::storage::engines::sst::segment_io::prove_residency(
+            &self.filesystem_factory,
+            &grant.residency_prefixes,
+        )
+        .await
+        {
+            Ok(proof) => proof,
+            Err(error) => {
+                warn!(
+                    "TD-TIER-1 SC4: residency proof for {} failed: {error}",
+                    collection.id
+                );
+                return;
+            }
+        };
         let base = collection.storage_class_status.take().unwrap_or_else(|| {
             crate::services::collection::storage_class::storage_class_status(config)
         });
         collection.storage_class_status = Some(
-            crate::services::collection::storage_class::with_live_residency(
+            crate::services::collection::storage_class::with_residency_proof(
                 base,
                 grant.bytes,
                 resident,
                 covered,
+                &proof,
             ),
         );
     }

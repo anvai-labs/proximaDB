@@ -3489,7 +3489,10 @@ export interface components {
          *     proto `StorageClassStatus` — a read-side projection, never an input).
          */
         StorageClassStatusOutput: {
-            /** @description "active" | "not_active" ("unspecified" never leaves the server). */
+            /**
+             * @description "active" | "not_active" | "warming" | "ready" | "degraded"
+             *     ("unspecified" never leaves the server).
+             */
             state: string;
             /**
              * @description Human-readable reason when `state` is not active (names the missing
@@ -3517,6 +3520,12 @@ export interface components {
              * @description Bytes covered by the READY coverage set (SC4). 0 until then.
              */
             covered_bytes: number;
+            /**
+             * Format: int64
+             * @description The committed segment-set generation the coverage was proven against
+             *     (TD-TIER-1 SC4-5); 0 when no proof was attempted.
+             */
+            covered_generation: number;
         };
         /**
          * @description Input format for TEXT fields
