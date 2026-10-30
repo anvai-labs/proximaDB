@@ -1216,7 +1216,6 @@ impl UnifiedTransactionCoordinator {
         }
     }
 
-    /// Update operation status
     /// TD-TIER-1 SC5: apply `tier` to every object this operation publishes
     /// at finalize (a staged segment's final key must carry the collection's
     /// tier: the move is a copy, and a copy without options would land on the
@@ -1234,6 +1233,7 @@ impl UnifiedTransactionCoordinator {
         Ok(())
     }
 
+    /// Update operation status
     async fn update_operation_status(
         &self,
         operation_id: &OperationId,

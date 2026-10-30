@@ -107,8 +107,10 @@ message CollectionConfig {
   // re-applies do NOT bump. Read-side projection: `Collection.storage_class_status`.
   optional uint32 policy_generation = 31;
 
-  // TD-TIER-1 SC5: provider access tier for the collection's FUTURE segment
-  // PUTs (flush and compaction output; existing objects are not rewritten).
+  // TD-TIER-1 SC5: provider access tier for the collection's FUTURE compacted
+  // segment PUTs (fresh L0 flush output keeps the account default: it is
+  // compacted away before a cold tier's minimum duration; existing objects are
+  // not rewritten).
   // UNSPECIFIED/absent ⇒ the account/bucket default (today's PUT). Online
   // tiers only — Archive is not admissible for a serving collection. An
   // explicit tier requires a tiered object-store placement (S3/Azure/GCS);

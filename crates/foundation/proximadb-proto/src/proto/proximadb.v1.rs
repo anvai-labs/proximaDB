@@ -6690,9 +6690,9 @@ pub struct CollectionConfig {
     #[prost(uint32, optional, tag = "31")]
     #[serde(default)]
     pub policy_generation: ::core::option::Option<u32>,
-    /// TD-TIER-1 SC5: provider access tier for the collection's FUTURE segment
-    /// PUTs (flush and compaction output; existing objects are not
-    /// rewritten). UNSPECIFIED/absent ⇒ the account/bucket default. Online
+    /// TD-TIER-1 SC5: provider access tier for the collection's FUTURE
+    /// compacted segment PUTs (fresh L0 flush output keeps the account
+    /// default; existing objects are not rewritten). UNSPECIFIED/absent ⇒ the account/bucket default. Online
     /// tiers only; an explicit tier requires a tiered object-store placement.
     /// `serde(default)` keeps old persisted records readable.
     #[prost(enumeration = "AccessTier", optional, tag = "32")]

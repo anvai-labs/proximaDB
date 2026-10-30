@@ -94,6 +94,11 @@ pub struct CollectionFlushPlan {
     /// TD-READFID-1 residual: the per-collection base vector quant
     /// (`rabitq`/`sq8`/`raw_f32`); previously dropped by the DTO like `tags`.
     pub pax_vector_quant: Option<String>,
+    /// TD-TIER-1 SC5: the collection's future-PUT access tier (raw proto
+    /// number). The DTO used to drop every field this plan did not carry, so
+    /// without it the flush — and the compaction it enqueues — never saw the
+    /// tier (review B1).
+    pub default_access_tier: Option<i32>,
 }
 
 /// Build a [`CollectionFlushPlan`] from a collection's catalog metadata. The single
@@ -161,6 +166,7 @@ pub fn flush_plan_from_collection_meta(
         canonical_embedding_precision: config.and_then(|c| c.canonical_embedding_precision),
         tags: config.map(|c| c.tags.clone()).unwrap_or_default(),
         pax_vector_quant: config.and_then(|c| c.pax_vector_quant.clone()),
+        default_access_tier: config.and_then(|c| c.default_access_tier),
     })
 }
 
@@ -619,6 +625,7 @@ async fn materialize_collection_with_coordinator_mode(
             // mixed-format reader already handles (see the per-knob tests).
             tags: plan.tags.clone(),
             pax_vector_quant: plan.pax_vector_quant.clone(),
+            default_access_tier: plan.default_access_tier,
             ..Default::default()
         }),
         ..Default::default()
@@ -963,6 +970,7 @@ mod tests {
             canonical_embedding_precision: None,
             tags: Vec::new(),
             pax_vector_quant: None,
+            default_access_tier: None,
         }
     }
 
@@ -1326,6 +1334,7 @@ mod tests {
                 storage_engine: Some(ProtoStorageEngine::Sst as i32),
                 tags: tags.clone(),
                 pax_vector_quant: Some("sq8".to_string()),
+                default_access_tier: Some(crate::proto::proximadb_v1::AccessTier::Cool as i32),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1367,6 +1376,13 @@ mod tests {
             config.pax_vector_quant.as_deref(),
             Some("sq8"),
             "the engine flush DTO must carry the per-collection pax_vector_quant"
+        );
+        // TD-TIER-1 SC5 review B1: the tier reaches the engine (and from
+        // there the compaction the flush enqueues).
+        assert_eq!(
+            config.default_access_tier,
+            Some(crate::proto::proximadb_v1::AccessTier::Cool as i32),
+            "the engine flush DTO must carry the collection's access tier"
         );
     }
 

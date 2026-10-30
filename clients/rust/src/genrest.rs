@@ -4178,7 +4178,7 @@ pub mod types {
     ///      ]
     ///    },
     ///    "default_access_tier": {
-    ///      "description": "Provider access tier for the collection's FUTURE segment writes\n(TD-TIER-1 SC5): \"hot\" | \"cool\" | \"cold\". Omitted ⇒ the account/bucket\ndefault. Requires an object-store placement (s3/az/gs); \"archive\" is\nrefused (archived objects cannot serve queries). Existing objects are\nnot rewritten; control objects keep the account default.",
+    ///      "description": "Provider access tier for the collection's FUTURE compacted segments\n(TD-TIER-1 SC5): \"hot\" | \"cool\" | \"cold\". Omitted ⇒ the account/bucket\ndefault. Requires an object-store placement (s3/az/gs); \"archive\" is\nrefused (archived objects cannot serve queries). Fresh flush (L0)\nsegments keep the account default — they are compacted away long\nbefore a cool/cold tier's minimum storage duration. Existing objects\nare not rewritten; control objects keep the account default. Once\nset, a tier can be changed but not cleared back to the default.",
     ///      "type": [
     ///        "string",
     ///        "null"
@@ -4293,11 +4293,14 @@ pub mod types {
         /// converge on the same enum discriminant.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub canonical_embedding_precision: ::std::option::Option<::std::string::String>,
-        /// Provider access tier for the collection's FUTURE segment writes
+        /// Provider access tier for the collection's FUTURE compacted segments
         /// (TD-TIER-1 SC5): "hot" | "cool" | "cold". Omitted ⇒ the account/bucket
         /// default. Requires an object-store placement (s3/az/gs); "archive" is
-        /// refused (archived objects cannot serve queries). Existing objects are
-        /// not rewritten; control objects keep the account default.
+        /// refused (archived objects cannot serve queries). Fresh flush (L0)
+        /// segments keep the account default — they are compacted away long
+        /// before a cool/cold tier's minimum storage duration. Existing objects
+        /// are not rewritten; control objects keep the account default. Once
+        /// set, a tier can be changed but not cleared back to the default.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub default_access_tier: ::std::option::Option<::std::string::String>,
         ///Free-text description, persisted on the collection config.

@@ -2724,11 +2724,14 @@ export interface components {
              */
             storage_class?: string | null;
             /**
-             * @description Provider access tier for the collection's FUTURE segment writes
+             * @description Provider access tier for the collection's FUTURE compacted segments
              *     (TD-TIER-1 SC5): "hot" | "cool" | "cold". Omitted ⇒ the account/bucket
              *     default. Requires an object-store placement (s3/az/gs); "archive" is
-             *     refused (archived objects cannot serve queries). Existing objects are
-             *     not rewritten; control objects keep the account default.
+             *     refused (archived objects cannot serve queries). Fresh flush (L0)
+             *     segments keep the account default — they are compacted away long
+             *     before a cool/cold tier's minimum storage duration. Existing objects
+             *     are not rewritten; control objects keep the account default. Once
+             *     set, a tier can be changed but not cleared back to the default.
              */
             default_access_tier?: string | null;
         };
