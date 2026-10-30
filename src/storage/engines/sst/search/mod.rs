@@ -557,8 +557,37 @@ impl SstEngine {
     /// L2-validated (recall 0.932 @ N=100k). Other metrics stay on the generic scan
     /// until the cascade is metric-generalized + re-validated (follow-up).
     #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(not(feature = "cold-deletion-vectors"), allow(unused_variables))]
     async fn try_pax_cascade(
+        &self,
+        sstable_path: &str,
+        query_vector: &[f32],
+        filter_expression: Option<&FilterExpression>,
+        k: usize,
+        distance_metric: DistanceMetric,
+        collection_id: &str,
+        collection_root: &str,
+        snapshot_lsn: u64,
+        known_size: Option<u64>,
+    ) -> anyhow::Result<Option<Vec<OptimizedSearchRecord>>> {
+        // PR-D L4: one top-k block stash per segment cascade, shared by its
+        // Region-D OID resolve and its rehydration (one block wave, not two).
+        crate::storage::engines::sst::segment_format::scope_topk_stash(self.try_pax_cascade_scoped(
+            sstable_path,
+            query_vector,
+            filter_expression,
+            k,
+            distance_metric,
+            collection_id,
+            collection_root,
+            snapshot_lsn,
+            known_size,
+        ))
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(feature = "cold-deletion-vectors"), allow(unused_variables))]
+    async fn try_pax_cascade_scoped(
         &self,
         sstable_path: &str,
         query_vector: &[f32],
@@ -622,7 +651,15 @@ impl SstEngine {
             // (fail-safe, never an incorrect result).
             let row_allow = match filter_expression {
                 Some(filter) if pax_filtered_cascade_enabled() => {
-                    match pax_filtered_row_allow(fs.as_ref(), sstable_path, filter).await {
+                    match pax_filtered_row_allow(
+                        fs.as_ref(),
+                        sstable_path,
+                        filter,
+                        self.segment_invariants_cache.as_deref(),
+                        known_size,
+                    )
+                    .await
+                    {
                         Ok(Some((allow, _stats))) if allow.is_empty() => {
                             // Provably zero matching rows in THIS segment —
                             // an empty per-file result (other segments/WAL
@@ -3425,6 +3462,128 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// PR-D L4: an Approximate (cascade) query outside any directory scope
+    /// reads its top-k Region-D blocks ONCE — the OID resolve fetches them
+    /// whole and stashes them, and the rehydration takes them (zero `Rehyd`
+    /// GETs) — instead of an OID wave plus a second rehydrate wave of the same
+    /// blocks. Covers a filtered query too (the hand-off used to be disabled
+    /// under a filter).
+    #[tokio::test]
+    async fn cascade_rehydrate_reuses_the_top_k_block_fetch() {
+        use crate::core::search::SearchParams;
+        use crate::storage::engines::sst::segment_format::CacheTier;
+        use crate::storage::traits::{FlushParameters, StorageQueryContext, StorageQueryMetadata};
+        use proximadb_records::{EmbeddingCell, ProximaRecord};
+
+        let dim = 16usize;
+        let cid = "topk_stash";
+        let (engine, collection) = file_backed_test_engine(cid, dim, None).await;
+        let recs: Vec<ProximaRecord> = (0..60usize)
+            .map(|idx| {
+                let id = format!("r{idx}");
+                let mut rec = ProximaRecord {
+                    oid: id.clone(),
+                    local_id: Some(id),
+                    created_at_ns: 1_000,
+                    updated_at_ns: 1_000,
+                    record_version: 1,
+                    embeddings: vec![EmbeddingCell::new_fp32(
+                        "test",
+                        "dense_vector",
+                        dim as u32,
+                        (0..dim).map(|j| (idx * dim + j) as f32 * 0.01).collect(),
+                    )],
+                    ..ProximaRecord::default()
+                };
+                rec.props.insert(
+                    "half".to_string(),
+                    proximadb_records::ProximaTreeNode::Value(
+                        proximadb_records::ProximaValue::Int64((idx % 2) as i64),
+                    ),
+                );
+                rec
+            })
+            .collect();
+        let params = FlushParameters {
+            collection_id: Some(cid.to_string()),
+            vector_records: recs,
+            force: true,
+            synchronous: true,
+            collection_config: Some(collection.clone()),
+            ..Default::default()
+        };
+        assert!(engine.do_flush(&params).await.unwrap().success);
+
+        let engine = Arc::new(engine);
+        let query: Vec<f32> = (0..dim).map(|j| (7 * dim + j) as f32 * 0.01).collect();
+        for filter in [
+            None,
+            Some(proximadb_filter_expression::FilterExpression::Comparison {
+                field: "half".to_string(),
+                operator: proximadb_filter_expression::ComparisonOperator::Equals,
+                value: serde_json::json!(1),
+            }),
+        ] {
+            let sp = SearchParams {
+                vector: Some(query.clone()),
+                top_k: Some(5),
+                filter_expression: filter.clone(),
+                search_mode: proximadb_search_types::search_params::SearchMode::Approximate {
+                    nprobe: None,
+                },
+                ..Default::default()
+            };
+            let ctx = StorageQueryContext {
+                search_params: Arc::new(sp),
+                collection: Arc::new(collection.clone()),
+                metadata: StorageQueryMetadata {
+                    collection_id: cid.to_string(),
+                    ..Default::default()
+                },
+                user_context: None,
+                tenant_context: None,
+            };
+            let (results, snap) = crate::observability::io_trace::scope(async {
+                let results = engine
+                    .clone()
+                    .search_vectors_unified_arc(&ctx)
+                    .await
+                    .unwrap();
+                (results, crate::observability::io_trace::snapshot())
+            })
+            .await;
+            let snap = snap.expect("io_trace scope");
+            assert!(!results.is_empty(), "filter={filter:?}: hits");
+            // The stashed blocks really rehydrated the rows: every hit carries
+            // its metadata (a swallowed rehydrate error would leave none), and
+            // filtered hits satisfy the predicate.
+            for r in &results {
+                let half = r.metadata.get("half").unwrap_or_else(|| {
+                    panic!("filter={filter:?}: hit {} was not rehydrated: {r:?}", r.id)
+                });
+                if filter.is_some() {
+                    assert_eq!(
+                        half,
+                        &proximadb_records::ProximaValue::Int64(1),
+                        "hit {} violates the filter",
+                        r.id
+                    );
+                }
+            }
+            assert!(
+                snap.rehydrate_us > 0 && snap.tier_get_ops[CacheTier::ResultPayload as usize] > 0,
+                "filter={filter:?}: the cascade resolved OIDs and rehydrated: {:?}",
+                snap.tier_get_ops
+            );
+            assert_eq!(
+                snap.tier_get_ops[CacheTier::Rehydrate as usize],
+                0,
+                "filter={filter:?}: rehydration must reuse the top-k block fetch: {:?}",
+                snap.tier_get_ops
+            );
         }
     }
 
