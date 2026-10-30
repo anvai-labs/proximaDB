@@ -1178,3 +1178,57 @@ async fn filtered_search_returns_a_record_reinserted_after_delete_and_flush() {
     )
     .await;
 }
+
+/// TD-FPRUNE-1 PR-E smoke: with Region E writes on, a real flush writes the
+/// filter columns into the PAX segment, and a filtered REST search after the
+/// flush is answered from them — same results as the full-row path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filtered_search_after_flush_is_answered_from_region_e() {
+    // SAFETY: nextest runs each test in its own process, before any server
+    // thread reads the gate.
+    unsafe {
+        std::env::set_var("PROXIMADB_PAX_WRITE_FILTER_REGION", "1");
+    }
+    let (server, http, base, name) = filterable_fixture("flt_region_e").await;
+    let mut want = Vec::new();
+    for i in 0..40i64 {
+        let id = format!("r{i}");
+        put(&http, &base, &name, &id, i as f32 * 0.01, i % 5).await;
+        if i % 5 == 3 {
+            want.push(id);
+        }
+    }
+    sleep(Duration::from_millis(500)).await;
+    server.force_flush(&name).await.expect("force flush");
+    let files = server.persisted_pax_files();
+    let with_region_e = files
+        .iter()
+        .filter_map(|f| std::fs::read(f).ok())
+        .filter_map(|bytes| {
+            proximadb_storage_common::segment_layout::SegmentFooterIndex::locate_in_segment(&bytes)
+                .ok()
+                .flatten()
+        })
+        .filter(|footer| footer.filter_region.is_some())
+        .count();
+    assert!(
+        with_region_e > 0,
+        "flush must write Region E; files: {files:?}"
+    );
+
+    let before = proximadb::storage::engines::sst::metrics::STAGE_F_REGION_E.get();
+    let want: Vec<&str> = want.iter().map(String::as_str).collect();
+    assert_filtered(
+        &http,
+        &base,
+        &name,
+        3,
+        &want,
+        "a filtered search over a Region-E segment returns exactly the matches",
+    )
+    .await;
+    assert!(
+        proximadb::storage::engines::sst::metrics::STAGE_F_REGION_E.get() > before,
+        "the filtered search must be answered from Region E"
+    );
+}

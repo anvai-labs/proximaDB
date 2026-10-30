@@ -921,6 +921,11 @@ pub struct PaxSegmentWriter {
     /// P-Shred (ADR-055): `(prop_key, user_col_id)` to shred into typed user-columns —
     /// re-applied to every block writer so all blocks in the segment shred uniformly.
     shred_spec: Vec<proximadb_block_format::ShredColumn>,
+    /// TD-FPRUNE-1 PR-E: write Region E (filter columns) for the shred-spec
+    /// columns (coalesced layout only). Default OFF.
+    filter_region_on: bool,
+    /// Region-E rows accumulated in `add_record` order (= on-disk ordinals).
+    filter_region: Option<crate::filter_region::FilterRegionBuilder>,
 
     current_writer: PaxBlockWriter,
     index: SegmentIndex,
@@ -1047,6 +1052,8 @@ impl PaxSegmentWriter {
             lossless_scalar: false,
             record_version_stripe,
             shred_spec: Vec::new(),
+            filter_region_on: false,
+            filter_region: None,
             current_writer: writer,
             index: SegmentIndex { blocks: Vec::new() },
             block_stats: Vec::new(),
@@ -1186,6 +1193,15 @@ impl PaxSegmentWriter {
     pub fn with_shred_columns(mut self, spec: Vec<proximadb_block_format::ShredColumn>) -> Self {
         self.shred_spec = spec;
         self.current_writer = self.fresh_block_writer();
+        self
+    }
+
+    /// TD-FPRUNE-1 PR-E: also write Region E (filter columns) — one chunk per
+    /// shred-spec column holding each row's resolved filter literal — in the
+    /// coalesced layout. A no-op without shred columns or outside the
+    /// coalesced layout.
+    pub fn with_filter_region(mut self, enabled: bool) -> Self {
+        self.filter_region_on = enabled;
         self
     }
 
@@ -1365,6 +1381,15 @@ impl PaxSegmentWriter {
         let t = trace_on.then(Instant::now);
         self.current_writer.add_record(record)?;
         self.row_count += 1;
+        if self.filter_region_on && self.coalesced_rabitq && !self.shred_spec.is_empty() {
+            let spec = &self.shred_spec;
+            self.filter_region
+                .get_or_insert_with(|| {
+                    let names: Vec<String> = spec.iter().map(|c| c.key.clone()).collect();
+                    crate::filter_region::FilterRegionBuilder::new(&names)
+                })
+                .push_row(&record.props);
+        }
         if let Some(t) = t {
             d_raw = t.elapsed();
         }
@@ -1938,6 +1963,8 @@ impl PaxSegmentWriter {
         } else {
             Vec::new()
         };
+        let e_off = data_offset + spill.blocks_len;
+        let (filter_region_bytes, filter_region) = self.take_filter_region(e_off);
         let footer = SegmentFooterIndex {
             row_count: self.row_count,
             rabitq_off,
@@ -1992,9 +2019,10 @@ impl PaxSegmentWriter {
                     .map(|c| proximadb_block_format::ShredColumn::untyped(&c.key, c.column_id))
                     .collect()
             },
+            filter_region,
         };
         let footer_body = footer.to_bytes()?;
-        let footer_off = data_offset + spill.blocks_len;
+        let footer_off = e_off + filter_region_bytes.len() as u64;
         let footer_len = footer_body.len() as u64;
         let header = SegmentHeaderPrefix {
             layout_version,
@@ -2032,6 +2060,7 @@ impl PaxSegmentWriter {
             total = copy_counted(&mut output, path, total)?;
         }
         total = copy_counted(&mut output, &spill.blocks_path, total)?;
+        total = write_counted(&mut output, &filter_region_bytes, total)?;
         total = write_counted(&mut output, &footer_body, total)?;
         total = write_counted(&mut output, &tail, total)?;
         output.flush()?;
@@ -2479,6 +2508,8 @@ impl PaxSegmentWriter {
         } else {
             Vec::new()
         };
+        let e_off = data_offset + self.file_buf.len() as u64;
+        let (filter_region_bytes, filter_region) = self.take_filter_region(e_off);
         let footer = SegmentFooterIndex {
             row_count: self.row_count,
             rabitq_off,
@@ -2535,9 +2566,10 @@ impl PaxSegmentWriter {
                     .map(|c| proximadb_block_format::ShredColumn::untyped(&c.key, c.column_id))
                     .collect()
             },
+            filter_region,
         };
         let footer_body = footer.to_bytes()?;
-        let footer_off = data_offset + self.file_buf.len() as u64;
+        let footer_off = e_off + filter_region_bytes.len() as u64;
         let footer_len = footer_body.len() as u64;
 
         let header = SegmentHeaderPrefix {
@@ -2569,6 +2601,7 @@ impl PaxSegmentWriter {
             &sq8_region_bytes,
             exact_region_bytes.as_deref(),
             opr_bytes.as_deref(),
+            &filter_region_bytes,
             &footer_body,
             &trailer,
         )?;
@@ -2604,6 +2637,27 @@ impl PaxSegmentWriter {
         Ok(PaxSegmentWrite { meta, cache_seed })
     }
 
+    /// TD-FPRUNE-1 PR-E: encode Region E at `e_off` (just after Region D).
+    /// No builder, or no column kept ⇒ no bytes and no footer section.
+    fn take_filter_region(
+        &mut self,
+        e_off: u64,
+    ) -> (Vec<u8>, Option<crate::filter_region::FilterRegionDirectory>) {
+        let Some(builder) = self.filter_region.take() else {
+            return (Vec::new(), None);
+        };
+        let built = builder.finish(e_off);
+        if built.columns.is_empty() {
+            return (Vec::new(), None);
+        }
+        let directory = crate::filter_region::FilterRegionDirectory {
+            e_off,
+            e_len: built.bytes.len() as u64,
+            columns: built.columns,
+        };
+        (built.bytes, Some(directory))
+    }
+
     /// Create the parent dir + write `buf` to `self.path`; returns bytes written.
     fn write_file(&self, buf: &[u8]) -> Result<u64> {
         if let Some(parent) = self.path.parent() {
@@ -2623,6 +2677,7 @@ impl PaxSegmentWriter {
         sq8: &[u8],
         exact_region: Option<&[u8]>,
         oid_resolver: Option<&[u8]>,
+        filter_region: &[u8],
         footer: &[u8],
         tail: &[u8],
     ) -> Result<u64> {
@@ -2639,6 +2694,7 @@ impl PaxSegmentWriter {
             exact_region,
             oid_resolver,
             Some(&self.file_buf),
+            Some(filter_region),
             Some(footer),
             Some(tail),
         ]
@@ -3098,6 +3154,213 @@ mod tests {
             updated_at_ns: ts,
             ..Default::default()
         }
+    }
+
+    /// A nullable integer shred stripe stores nulls as an `i64::MIN`
+    /// sentinel, but its codec is chosen from the non-null values only. A
+    /// block of small non-negative ints with a null picked Simple8b, which
+    /// cannot encode the sentinel, and the whole segment write failed (found
+    /// by the TD-FPRUNE-1 PR-E Region-E fixture; row 1825 cuts that block).
+    #[test]
+    fn nullable_int_shred_stripes_never_fail_the_segment_write() -> Result<()> {
+        use proximadb_block_format::ShredColumn;
+        use proximadb_data_model::{ProximaType, ProximaValue as V};
+        use proximadb_records::{EmbeddingCell, ProximaTreeNode};
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("nullable-int.pax");
+        let typed = [("cat", ProximaType::Int64), ("score", ProximaType::Float64)];
+        let mut spec: Vec<ShredColumn> = typed
+            .iter()
+            .zip(100..)
+            .map(|((name, ty), id)| ShredColumn::typed(*name, id, ty.clone()))
+            .collect();
+        spec.push(ShredColumn::typed("tag", 102, ProximaType::String));
+        spec.extend(
+            ["flag", "doc"]
+                .iter()
+                .zip(103..)
+                .map(|(n, id)| ShredColumn::untyped(*n, id)),
+        );
+        let mut writer = PaxSegmentWriter::new(
+            &path,
+            BlockMode::Pax,
+            BlockCompression::Lz4,
+            "c",
+            0,
+            1,
+            Some(16 * 1024),
+        )
+        .with_quant(VectorQuant::RaBitQ)
+        .with_rerank_quant(VectorQuant::Sq8)
+        .with_coalesced_rabitq(true)
+        .with_shred_columns(spec);
+        // Mixed cat values: absent, null, wrong-typed, else small ints.
+        let cat_special: [Option<V>; 5] = [
+            None,
+            Some(V::Null),
+            Some(V::Int32(3)),
+            Some(V::String("3".into())),
+            Some(V::Float64(3.0)),
+        ];
+        for i in 0..2000usize {
+            let mut r = make_record(&format!("r{i}"), "t", 1000 + i as i64);
+            let cat = cat_special
+                .get(i % 23)
+                .cloned()
+                .unwrap_or(Some(V::Int64((i % 10) as i64)));
+            let score = [Some(V::Float64(f64::NAN)), Some(V::Float32(0.5)), None]
+                .get(i % 17)
+                .cloned()
+                .unwrap_or(Some(V::Float64((i % 100) as f64 / 10.0)));
+            let tag = [Some(V::Symbol("abc".into())), Some(V::Int64(7))]
+                .get(i % 13)
+                .cloned()
+                .unwrap_or_else(|| Some(V::String(format!("t{}", i % 6))));
+            let flag = (i % 5 != 0).then(|| V::Boolean(i % 2 == 0));
+            let doc = Some(V::Json(serde_json::json!({ "x": i % 3 })));
+            for (key, value) in [
+                ("cat", cat),
+                ("score", score),
+                ("tag", tag),
+                ("flag", flag),
+                ("doc", doc),
+            ] {
+                if let Some(value) = value {
+                    r.props.insert(key.into(), ProximaTreeNode::Value(value));
+                }
+            }
+            r.embeddings.push(EmbeddingCell::new_fp32(
+                "",
+                "dense",
+                32,
+                (0..32)
+                    .map(|d| ((i * 131 + d * 17) % 251) as f32 * 0.01)
+                    .collect(),
+            ));
+            writer.add_record(&r)?;
+        }
+        writer.finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn filter_region_is_written_between_d_and_footer_by_both_twins() -> Result<()> {
+        // TD-FPRUNE-1 PR-E: Region E sits after Region D, its column chunks
+        // hold each ordinal's resolved filter literal, and the spill twin
+        // writes the byte-identical file.
+        use proximadb_data_model::ProximaValue;
+        use proximadb_records::{EmbeddingCell, ProximaTreeNode};
+
+        const DIM: usize = 8;
+        const ROWS: usize = 40;
+        let output = tempfile::tempdir()?;
+        let scratch = tempfile::tempdir()?;
+        let spec = vec![
+            proximadb_block_format::ShredColumn::typed(
+                "cat",
+                100,
+                proximadb_data_model::ProximaType::Int64,
+            ),
+            proximadb_block_format::ShredColumn::untyped("flag", 101),
+        ];
+        let writer = |path: &Path, region: bool| {
+            PaxSegmentWriter::new(
+                path,
+                BlockMode::Pax,
+                BlockCompression::Lz4,
+                "collection",
+                0,
+                1,
+                Some(512),
+            )
+            .with_quant(VectorQuant::RaBitQ)
+            .with_coalesced_rabitq(true)
+            .with_shred_columns(spec.clone())
+            .with_filter_region(region)
+        };
+        let record = |row: usize| {
+            let mut record = make_record(&format!("oid-{row:03}"), "tenant", row as i64);
+            record.props.insert(
+                "cat".into(),
+                ProximaTreeNode::Value(ProximaValue::Int64((row % 4) as i64)),
+            );
+            if row % 3 != 0 {
+                record.props.insert(
+                    "flag".into(),
+                    ProximaTreeNode::Value(ProximaValue::Boolean(row % 2 == 0)),
+                );
+            }
+            record.embeddings.push(EmbeddingCell::new_fp32(
+                "model_0",
+                "dense",
+                DIM as u32,
+                (0..DIM).map(|d| (row * 7 + d) as f32 * 0.01).collect(),
+            ));
+            record
+        };
+        let memory_path = output.path().join("memory.pax");
+        let spill_path = output.path().join("spill.pax");
+        let plain_path = output.path().join("plain.pax");
+        let mut memory = writer(&memory_path, true);
+        let mut spilled = writer(&spill_path, true).with_local_spill(scratch.path())?;
+        let mut plain = writer(&plain_path, false);
+        let records: Vec<ProximaRecord> = (0..ROWS).map(record).collect();
+        for r in &records {
+            memory.add_record(r)?;
+            spilled.add_record(r)?;
+            plain.add_record(r)?;
+        }
+        memory.finish()?;
+        spilled.finish()?;
+        plain.finish()?;
+
+        let segment = std::fs::read(&memory_path)?;
+        assert_eq!(
+            std::fs::read(&spill_path)?,
+            segment,
+            "spill twin is identical"
+        );
+        let plain_footer = SegmentFooterIndex::locate_in_segment(&std::fs::read(&plain_path)?)?
+            .ok_or_else(|| anyhow::anyhow!("plain footer"))?;
+        assert!(
+            plain_footer.filter_region.is_none(),
+            "gate off writes no Region E"
+        );
+
+        let footer = SegmentFooterIndex::locate_in_segment(&segment)?
+            .ok_or_else(|| anyhow::anyhow!("footer"))?;
+        let header = SegmentHeaderPrefix::parse(&segment)?;
+        let region = footer
+            .filter_region
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Region E missing"))?;
+        let d_end = footer
+            .blocks
+            .iter()
+            .map(|b| b.offset + u64::from(b.size))
+            .max()
+            .unwrap_or(0);
+        assert_eq!(region.e_off, d_end, "Region E starts where Region D ends");
+        assert_eq!(
+            region.e_off + region.e_len,
+            header.footer_off,
+            "and ends at the footer"
+        );
+        let names: Vec<&str> = region.columns.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["cat", "flag"]);
+        for (name, off, len) in &region.columns {
+            let col = crate::filter_region::FilterColumn::parse(
+                &segment[*off as usize..(*off + *len) as usize],
+            )?;
+            assert_eq!(col.rows(), ROWS);
+            for (i, r) in records.iter().enumerate() {
+                let expected = proximadb_search_types::sql_value_filter::resolve_filter_literal(
+                    &r.props, name,
+                );
+                assert_eq!(col.literal(i)?, expected.as_ref(), "{name} row {i}");
+            }
+        }
+        Ok(())
     }
 
     #[test]

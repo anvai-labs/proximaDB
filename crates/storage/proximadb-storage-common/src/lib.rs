@@ -18,6 +18,7 @@ pub mod delta_simd;
 pub mod engine_constants;
 pub mod engine_profile;
 pub mod engine_type;
+pub mod filter_region;
 pub mod flush_integration;
 pub mod format_conversion;
 pub mod format_splits;
