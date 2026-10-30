@@ -32,6 +32,7 @@ pub mod coordinator;
 pub mod operations;
 pub mod optimizer;
 
+use crate::storage::engines::sst::segment_io::ResidentRangeRead as _;
 use anyhow::Result;
 use futures::future::join_all;
 
@@ -67,6 +68,45 @@ tokio::task_local! {
 /// Run one search with a per-query discovery memo (see [`DISCOVERY_MEMO`]).
 async fn scope_discovery_memo<F: std::future::Future>(search: F) -> F::Output {
     DISCOVERY_MEMO.scope(Default::default(), search).await
+}
+
+/// The live segment data files in one LIST of a collection data directory:
+/// `.sst` / `.arrow` / `.pax` files, minus any input whose retirement is
+/// pending (TD-COMPACT-13 — superseded segments stop serving the moment the
+/// obligation is recorded). Shared by search discovery and the TD-TIER-1
+/// residency inventory so both agree on what "live" means.
+pub(crate) fn live_segment_files(
+    entries: Vec<proximadb_storage_filesystem_types::DirEntry>,
+    pending: &std::collections::HashSet<String>,
+) -> Vec<DiscoveredSstFile> {
+    let mut files = Vec::new();
+    for entry in entries {
+        if entry.metadata.is_directory {
+            continue;
+        }
+        if pending.contains(&entry.url) {
+            tracing::debug!(
+                url = %entry.url,
+                "TD-COMPACT-13: filtering pending-retirement segment from discovery"
+            );
+            continue;
+        }
+        if entry.name.ends_with(".sst")
+            || entry.name.ends_with(".arrow")
+            || entry.name.ends_with(".pax")
+        {
+            // TD-RDSTRAT-13 C3: carry the list-time object size so the
+            // search path can skip the per-segment HEAD. `0` means the
+            // backend did not report a size — record `None` and let the
+            // reader fall back to a real stat; never guess.
+            files.push(DiscoveredSstFile {
+                size_bytes: (entry.metadata.size > 0).then_some(entry.metadata.size),
+                etag: entry.metadata.etag.clone(),
+                url: entry.url,
+            });
+        }
+    }
+    files
 }
 
 /// TD-RDSTRAT-13 C3: a discovered segment plus the size the listing already
@@ -447,12 +487,12 @@ impl SstEngine {
             return Ok(None);
         }
         let fs = self.filesystem().get_filesystem(file_path)?;
-        let prefix = fs.read_range(file_path, 0, 8).await?;
+        let prefix = fs.read_range_resident(file_path, 0, 8).await?;
         if prefix.len() < 8 || &prefix[0..4] != b"SST1" {
             return Ok(None);
         }
         let header_len = u32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]) as u64;
-        let header_data = fs.read_range(file_path, 8, header_len).await?;
+        let header_data = fs.read_range_resident(file_path, 8, header_len).await?;
         let header: SstableHeader = bincode::deserialize(&header_data)?;
         Ok(Some(header.entry_count as usize))
     }
@@ -517,8 +557,37 @@ impl SstEngine {
     /// L2-validated (recall 0.932 @ N=100k). Other metrics stay on the generic scan
     /// until the cascade is metric-generalized + re-validated (follow-up).
     #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(not(feature = "cold-deletion-vectors"), allow(unused_variables))]
     async fn try_pax_cascade(
+        &self,
+        sstable_path: &str,
+        query_vector: &[f32],
+        filter_expression: Option<&FilterExpression>,
+        k: usize,
+        distance_metric: DistanceMetric,
+        collection_id: &str,
+        collection_root: &str,
+        snapshot_lsn: u64,
+        known_size: Option<u64>,
+    ) -> anyhow::Result<Option<Vec<OptimizedSearchRecord>>> {
+        // PR-D L4: one top-k block stash per segment cascade, shared by its
+        // Region-D OID resolve and its rehydration (one block wave, not two).
+        crate::storage::engines::sst::segment_format::scope_topk_stash(self.try_pax_cascade_scoped(
+            sstable_path,
+            query_vector,
+            filter_expression,
+            k,
+            distance_metric,
+            collection_id,
+            collection_root,
+            snapshot_lsn,
+            known_size,
+        ))
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(feature = "cold-deletion-vectors"), allow(unused_variables))]
+    async fn try_pax_cascade_scoped(
         &self,
         sstable_path: &str,
         query_vector: &[f32],
@@ -582,7 +651,15 @@ impl SstEngine {
             // (fail-safe, never an incorrect result).
             let row_allow = match filter_expression {
                 Some(filter) if pax_filtered_cascade_enabled() => {
-                    match pax_filtered_row_allow(fs.as_ref(), sstable_path, filter).await {
+                    match pax_filtered_row_allow(
+                        fs.as_ref(),
+                        sstable_path,
+                        filter,
+                        self.segment_invariants_cache.as_deref(),
+                        known_size,
+                    )
+                    .await
+                    {
                         Ok(Some((allow, _stats))) if allow.is_empty() => {
                             // Provably zero matching rows in THIS segment —
                             // an empty per-file result (other segments/WAL
@@ -1040,7 +1117,7 @@ impl SstEngine {
                 // Segments are the flush unit and small relative to query cost;
                 // a full read + index parse is the same cost class as the
                 // coarse-RaBitQ probe below.
-                let bytes = fs.read(file_path).await.ok()?;
+                let bytes = fs.read_resident(file_path).await.ok()?;
                 use proximadb_storage_common::pax_block::{PaxSegmentScanner, ScanPredicate};
                 let mut scanner =
                     PaxSegmentScanner::from_bytes(bytes, ScanPredicate::default()).ok()?;
@@ -1048,13 +1125,16 @@ impl SstEngine {
                     total += block.row_count() as u64;
                 }
             } else {
-                let prefix = fs.read_range(file_path, 0, 8).await.ok()?;
+                let prefix = fs.read_range_resident(file_path, 0, 8).await.ok()?;
                 if prefix.len() < 8 || &prefix[0..4] != b"SST1" {
                     return None; // unknown format (e.g. .arrow) → rebuild
                 }
                 let header_len =
                     u32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]) as u64;
-                let header_data = fs.read_range(file_path, 8, header_len).await.ok()?;
+                let header_data = fs
+                    .read_range_resident(file_path, 8, header_len)
+                    .await
+                    .ok()?;
                 let header = bincode::deserialize::<SstableHeader>(&header_data).ok()?;
                 total += header.entry_count;
             }
@@ -1071,7 +1151,7 @@ impl SstEngine {
             let Ok(fs) = self.filesystem().get_filesystem(file) else {
                 return false; // can't open → don't skip; let the rebuild try
             };
-            let Ok(bytes) = fs.read(file).await else {
+            let Ok(bytes) = fs.read_resident(file).await else {
                 return false;
             };
             if !pax_segment_is_coarse_rabitq_without_f32_tier(&bytes) {
@@ -2624,7 +2704,7 @@ self.try_pax_cascade(
 
         // Read just the first part of the file to get header
         // Format: SST1 (4 bytes) + header_len (4 bytes) + header data
-        let header_prefix = fs.read_range(file_path, 0, 8).await?;
+        let header_prefix = fs.read_range_resident(file_path, 0, 8).await?;
 
         // Verify magic — a coalesced segment (PXH1, ADR-065) has no legacy SST1
         // centroid; return None cleanly (no error) so partition-aware search skips it.
@@ -2640,7 +2720,9 @@ self.try_pax_cascade(
         ]) as usize;
 
         // Read header data
-        let header_data = fs.read_range(file_path, 8, header_len as u64).await?;
+        let header_data = fs
+            .read_range_resident(file_path, 8, header_len as u64)
+            .await?;
 
         // Deserialize header
         let header: SstableHeader = bincode::deserialize(&header_data)
@@ -2789,37 +2871,7 @@ self.try_pax_cascade(
                 data_url, &entries,
             );
         }
-        for entry in entries {
-            tracing::trace!(
-                "[SST] Examining entry: name={}, url={}, is_dir={}",
-                entry.name,
-                entry.url,
-                entry.metadata.is_directory
-            );
-            if !entry.metadata.is_directory && pending.contains(&entry.url) {
-                tracing::debug!(
-                    url = %entry.url,
-                    "TD-COMPACT-13: filtering pending-retirement segment from discovery"
-                );
-                continue;
-            }
-            if !entry.metadata.is_directory
-                && (entry.name.ends_with(".sst")
-                    || entry.name.ends_with(".arrow")
-                    || entry.name.ends_with(".pax"))
-            {
-                // TD-RDSTRAT-13 C3: carry the list-time object size so the
-                // search path can skip the per-segment HEAD. `0` means the
-                // backend did not report a size — record `None` and let the
-                // reader fall back to a real stat; never guess.
-                files.push(DiscoveredSstFile {
-                    size_bytes: (entry.metadata.size > 0).then_some(entry.metadata.size),
-                    etag: entry.metadata.etag.clone(),
-                    url: entry.url,
-                });
-                tracing::debug!("[SST] Found data file: {}", entry.name);
-            }
-        }
+        files.extend(live_segment_files(entries, &pending));
 
         tracing::debug!(
             "[SST] Discovered {} .sst files in {}",
@@ -3410,6 +3462,128 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// PR-D L4: an Approximate (cascade) query outside any directory scope
+    /// reads its top-k Region-D blocks ONCE — the OID resolve fetches them
+    /// whole and stashes them, and the rehydration takes them (zero `Rehyd`
+    /// GETs) — instead of an OID wave plus a second rehydrate wave of the same
+    /// blocks. Covers a filtered query too (the hand-off used to be disabled
+    /// under a filter).
+    #[tokio::test]
+    async fn cascade_rehydrate_reuses_the_top_k_block_fetch() {
+        use crate::core::search::SearchParams;
+        use crate::storage::engines::sst::segment_format::CacheTier;
+        use crate::storage::traits::{FlushParameters, StorageQueryContext, StorageQueryMetadata};
+        use proximadb_records::{EmbeddingCell, ProximaRecord};
+
+        let dim = 16usize;
+        let cid = "topk_stash";
+        let (engine, collection) = file_backed_test_engine(cid, dim, None).await;
+        let recs: Vec<ProximaRecord> = (0..60usize)
+            .map(|idx| {
+                let id = format!("r{idx}");
+                let mut rec = ProximaRecord {
+                    oid: id.clone(),
+                    local_id: Some(id),
+                    created_at_ns: 1_000,
+                    updated_at_ns: 1_000,
+                    record_version: 1,
+                    embeddings: vec![EmbeddingCell::new_fp32(
+                        "test",
+                        "dense_vector",
+                        dim as u32,
+                        (0..dim).map(|j| (idx * dim + j) as f32 * 0.01).collect(),
+                    )],
+                    ..ProximaRecord::default()
+                };
+                rec.props.insert(
+                    "half".to_string(),
+                    proximadb_records::ProximaTreeNode::Value(
+                        proximadb_records::ProximaValue::Int64((idx % 2) as i64),
+                    ),
+                );
+                rec
+            })
+            .collect();
+        let params = FlushParameters {
+            collection_id: Some(cid.to_string()),
+            vector_records: recs,
+            force: true,
+            synchronous: true,
+            collection_config: Some(collection.clone()),
+            ..Default::default()
+        };
+        assert!(engine.do_flush(&params).await.unwrap().success);
+
+        let engine = Arc::new(engine);
+        let query: Vec<f32> = (0..dim).map(|j| (7 * dim + j) as f32 * 0.01).collect();
+        for filter in [
+            None,
+            Some(proximadb_filter_expression::FilterExpression::Comparison {
+                field: "half".to_string(),
+                operator: proximadb_filter_expression::ComparisonOperator::Equals,
+                value: serde_json::json!(1),
+            }),
+        ] {
+            let sp = SearchParams {
+                vector: Some(query.clone()),
+                top_k: Some(5),
+                filter_expression: filter.clone(),
+                search_mode: proximadb_search_types::search_params::SearchMode::Approximate {
+                    nprobe: None,
+                },
+                ..Default::default()
+            };
+            let ctx = StorageQueryContext {
+                search_params: Arc::new(sp),
+                collection: Arc::new(collection.clone()),
+                metadata: StorageQueryMetadata {
+                    collection_id: cid.to_string(),
+                    ..Default::default()
+                },
+                user_context: None,
+                tenant_context: None,
+            };
+            let (results, snap) = crate::observability::io_trace::scope(async {
+                let results = engine
+                    .clone()
+                    .search_vectors_unified_arc(&ctx)
+                    .await
+                    .unwrap();
+                (results, crate::observability::io_trace::snapshot())
+            })
+            .await;
+            let snap = snap.expect("io_trace scope");
+            assert!(!results.is_empty(), "filter={filter:?}: hits");
+            // The stashed blocks really rehydrated the rows: every hit carries
+            // its metadata (a swallowed rehydrate error would leave none), and
+            // filtered hits satisfy the predicate.
+            for r in &results {
+                let half = r.metadata.get("half").unwrap_or_else(|| {
+                    panic!("filter={filter:?}: hit {} was not rehydrated: {r:?}", r.id)
+                });
+                if filter.is_some() {
+                    assert_eq!(
+                        half,
+                        &proximadb_records::ProximaValue::Int64(1),
+                        "hit {} violates the filter",
+                        r.id
+                    );
+                }
+            }
+            assert!(
+                snap.rehydrate_us > 0 && snap.tier_get_ops[CacheTier::ResultPayload as usize] > 0,
+                "filter={filter:?}: the cascade resolved OIDs and rehydrated: {:?}",
+                snap.tier_get_ops
+            );
+            assert_eq!(
+                snap.tier_get_ops[CacheTier::Rehydrate as usize],
+                0,
+                "filter={filter:?}: rehydration must reuse the top-k block fetch: {:?}",
+                snap.tier_get_ops
+            );
         }
     }
 

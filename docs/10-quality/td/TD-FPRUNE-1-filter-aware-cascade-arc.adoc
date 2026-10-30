@@ -39,7 +39,8 @@ residual filter as the correctness backstop.
   *Lesson:* the SST vector-flush path passed an EMPTY shred spec, so user-tag pruning was dark end-to-end until
   `CollectionFlushPlan` carried `filterable_columns` (M1/Gap-B); compaction preserves shredded columns (A1).
 * *M3* re-armed the geometric A0 probe under a filter; *M2/C2* tag-aware two-level compaction layout
-  (per-partition k-means over shared PCA; default-ON, kill-switch `PROXIMADB_PAX_PARTITION_LAYOUT=0`).
+  (per-partition k-means over shared PCA; flipped back to default-OFF 2026-10-29, opt-in
+  `PROXIMADB_PAX_PARTITION_LAYOUT=1` — see link:TD-FPRUNE-3-partition-layout-recall-safe-reenable.adoc[TD-FPRUNE-3]).
 * *Flip (2026-08-31).* An adversarial review found the original promotion criterion vacuously dischargeable
   (the SIFT ratchet is unfiltered) and that the cascade dropped metadata; the flip added top-k rehydration
   (`read_records_by_positions`) and a filtered SIFT ratchet leg through the real dispatch.
@@ -54,8 +55,16 @@ residual filter as the correctness backstop.
   histogram reaches 1000 (filtered p50 previously read +Inf) and the SIFT harness reports `tier_split`,
   `stage_f` and a dated request `$/M queries` (S3 list prices; an estimate, not a billing figure).
 
+* *First settled schema bed (2026-10-29).* R6 (#2284) let the 3M schema-bearing e1p bed settle
+  for the first time. With filterable columns declared, the M2/C2 partition layout cost unfiltered
+  recall@10 (0.855 vs 0.9716 layout OFF), so it is default-OFF again (TD-FPRUNE-3). The same arms
+  gave the first P5 measurement: with the layout off, the residual tail cuts unfiltered Region-D
+  bytes 69.5 → 44.0 MB/q (−37%, predicted −35 to −39%), total 133.2 MB/q at recall 0.9716. The new
+  tier counters also show unfiltered queries reading Region D twice (OID resolve ~41 MB/q, then a
+  serial rehydrate ~27 MB/q of the same top-k blocks) — the PR-D L4 target.
+
 *Evidence:* filtered recall@10 = **0.996** vs filtered brute force (floor 0.90, N=10k, 8 partitions);
-C1 integrated filtered stack **4.2× byte cut** at recall parity (correlated data); C2 unfiltered recall Δ=0.000.
+C1 integrated filtered stack **4.2× byte cut** at recall parity (correlated data); C2 unfiltered recall Δ=0.000 (toy scale; superseded at 3M by TD-FPRUNE-3, where the layout cost 0.855 vs 0.9716).
 
 == Open
 

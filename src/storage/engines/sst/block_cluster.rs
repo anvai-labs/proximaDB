@@ -1069,29 +1069,36 @@ pub fn ivf_probe_enabled() -> bool {
 }
 
 /// TD-FPRUNE-1 M2 / C2: gate for the tag-aware two-level compaction layout
-/// (partition-by-tag, cluster-within). **Default ON** — engaged STRUCTURALLY at
+/// (partition-by-tag, cluster-within). **Default OFF, opt-in** with
+/// `PROXIMADB_PAX_PARTITION_LAYOUT=1|true|on|yes`; when on it engages at
 /// compaction whenever the segment carries a shredded filterable tag (the
-/// per-collection signal: the owner declared `filterable_columns`; the caller
-/// ANDs this with `shred_spec.first()`). Evidence-gated flip: C1 measured a 4.2×
-/// filtered byte cut for an UNCORRELATED tag (whose non-partitioned filtered
-/// query reads *more* than a full scan), and C2 measured UNFILTERED recall
-/// neutral vs the global layout (Δ=0.000). Mixed-read-safe: emits the SAME A0
-/// `CoarseModel` format (no layout_version change), only a different row
-/// placement. `PROXIMADB_PAX_PARTITION_LAYOUT=0|off|false|no` is the kill-switch
-/// back to the global (single-directory) plan.
+/// caller ANDs this with `shred_spec.first()`).
+///
+/// Flipped OFF 2026-10-29 on measured evidence (TD-FPRUNE-3): on the settled
+/// 3M SIFT128 bed with declared filterable columns, the layout split cells by
+/// the uncorrelated `category` tag (10 groups × 10 cells) and UNFILTERED
+/// recall@10 fell to 0.855 vs 0.9716 with the layout off — the global nprobe
+/// covers only one or two cells per partition. Its earlier "recall neutral"
+/// evidence (C2) was toy-scale only; C1's filtered byte cut is real but cannot
+/// be bought with unfiltered recall. Mixed-read-safe either way: the SAME A0
+/// `CoarseModel` format, only a different row placement.
 pub fn partition_layout_enabled() -> bool {
-    !matches!(
-        std::env::var("PROXIMADB_PAX_PARTITION_LAYOUT")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("0" | "off" | "false" | "no")
-    )
+    env_gate_on("PROXIMADB_PAX_PARTITION_LAYOUT")
 }
 
-/// Boolean gate read: truthy = `1|true|on|yes`.
+/// Pure parse of an opt-in gate value (shared by [`env_gate_on`]): only
+/// `1|true|on|yes` (trimmed, case-insensitive) is ON; unset or anything else
+/// is OFF.
+fn gate_value_on(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
+/// Kill-switch read: ON unless set to `0|off|false|no` (unset is ON).
 pub(crate) fn env_kill_switch_off(name: &str) -> bool {
     std::env::var(name)
         .map(|v| {
@@ -1104,15 +1111,7 @@ pub(crate) fn env_kill_switch_off(name: &str) -> bool {
 }
 
 pub(crate) fn env_gate_on(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
-            )
-        })
-        .unwrap_or(false)
+    gate_value_on(std::env::var(name).ok().as_deref())
 }
 
 /// The persisted IVF probe directory compaction plan (rev 3): the physical row
@@ -1635,6 +1634,37 @@ fn sign_gray_key(v: &[f32], mean: &[f64]) -> Vec<u8> {
 mod tests {
     use super::*;
     use proximadb_records::EmbeddingCell;
+
+    /// TD-FPRUNE-3: the partition layout is opt-in — unset (or any
+    /// non-truthy value) is the global layout; only an explicit truthy value
+    /// engages it.
+    #[test]
+    fn partition_layout_is_opt_in() {
+        assert!(!gate_value_on(None), "unset must be OFF");
+        for (value, on) in [
+            ("1", true),
+            ("on", true),
+            ("TRUE", true),
+            ("yes", true),
+            ("0", false),
+            ("off", false),
+            ("", false),
+            ("bogus", false),
+            ("enabled", false),
+            (" On ", true),
+        ] {
+            assert_eq!(gate_value_on(Some(value)), on, "{value:?}");
+        }
+    }
+
+    /// TD-FPRUNE-3: pins the shipped default of the gate itself (not just
+    /// the parser) — unset is OFF. Env-touching; relies on nextest's
+    /// process-per-test isolation like the other gate tests here.
+    #[test]
+    fn partition_layout_gate_defaults_off() {
+        unsafe { std::env::remove_var("PROXIMADB_PAX_PARTITION_LAYOUT") };
+        assert!(!partition_layout_enabled());
+    }
 
     #[test]
     fn default_train_sample_scales_with_k_and_caps() {

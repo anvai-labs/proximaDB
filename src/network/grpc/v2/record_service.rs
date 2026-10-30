@@ -2567,21 +2567,14 @@ fn v2_storage_class_status_from(
     _cfg: &crate::proto::proximadb_v1::CollectionConfig,
     status: crate::proto::proximadb_v1::StorageClassStatus,
 ) -> proximadb_v2::V2StorageClassStatus {
-    use crate::proto::proximadb_v1::storage_class_status::State;
-    let state = State::try_from(status.state)
-        .map(|s| match s {
-            State::Active => "active",
-            State::NotActive => "not_active",
-            State::Unspecified => "unspecified",
-        })
-        .unwrap_or("unspecified");
     proximadb_v2::V2StorageClassStatus {
-        state: state.to_string(),
+        state: crate::services::collection::storage_class::state_label(status.state).to_string(),
         reason: status.reason,
         policy_generation: status.policy_generation,
         reserved_bytes: status.reserved_bytes,
         resident_bytes: status.resident_bytes,
         covered_bytes: status.covered_bytes,
+        covered_generation: status.covered_generation,
     }
 }
 
