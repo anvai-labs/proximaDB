@@ -907,6 +907,17 @@ impl PersistentByteStore {
         self.remove_indexed(key, true)
     }
 
+    /// The indexed keys matching `predicate` — a lock-free snapshot (entries
+    /// put or removed concurrently may or may not appear).
+    pub fn keys_where(&self, predicate: impl Fn(&str) -> bool) -> Vec<String> {
+        self.inner
+            .entries
+            .iter()
+            .filter(|entry| predicate(entry.key()))
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
     /// Remove every indexed entry whose logical key matches `predicate`.
     ///
     /// The mutation lock serializes the sweep with atomic publication so a
@@ -1605,7 +1616,10 @@ const OBJECT_KEY_PREFIX: &str = "pax-object/";
 /// differ only in a run of slashes (`s3://b/x//y/` vs `s3://b/x/y/`), which
 /// object stores treat as distinct keys, compare equal here.
 pub fn canonical_location(raw: &str) -> String {
-    let mut text = raw.to_string();
+    // A local location has two spellings — the writer's plain path and the
+    // listing's `file://` URL — that must name ONE resident copy (SC4
+    // hardening review: two keys for one object charge the grant twice).
+    let mut text = raw.strip_prefix("file://").unwrap_or(raw).to_string();
     for alias in ["abfss://", "abfs://", "adls://", "azure://"] {
         text = text.replace(alias, "az://");
     }

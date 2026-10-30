@@ -287,6 +287,41 @@ pub fn state_label(state: i32) -> &'static str {
         .unwrap_or("unspecified")
 }
 
+/// The engine a record actually runs on, as the engine factory resolves it:
+/// absent and `UNSPECIFIED` (legacy records persist `Some(0)`) run on SST; an
+/// unknown number resolves to `None`, which no SST-only check accepts.
+pub fn effective_storage_engine(raw: Option<i32>) -> Option<StorageEngine> {
+    match raw.map(StorageEngine::try_from) {
+        None | Some(Ok(StorageEngine::Unspecified)) => Some(StorageEngine::Sst),
+        Some(Ok(engine)) => Some(engine),
+        Some(Err(_)) => None,
+    }
+}
+
+/// The engine a stored record runs on, for re-admission: the storage
+/// assignment's engine, unless it is UNSPECIFIED (0), which defers to the
+/// config; both resolve as [`effective_storage_engine`]. An unknown number
+/// stays unresolved (`Unspecified`), so the SST-only admission refuses it.
+pub fn record_storage_engine(
+    assignment_engine: Option<i32>,
+    config_engine: Option<i32>,
+) -> StorageEngine {
+    effective_storage_engine(
+        assignment_engine
+            .filter(|engine| *engine != StorageEngine::Unspecified as i32)
+            .or(config_engine),
+    )
+    .unwrap_or(StorageEngine::Unspecified)
+}
+
+/// Whether a collection is inside the READY profile `pax-ann-v1`: the SST
+/// PAX scan. AXIS-routed collections (non-empty `index_configs`) and other
+/// engines, whose readers and object kinds the proof does not count, are not.
+pub fn in_ready_profile(config: &CollectionConfig) -> bool {
+    config.index_configs.is_empty()
+        && effective_storage_engine(config.storage_engine) == Some(StorageEngine::Sst)
+}
+
 /// SC2 admission check for the PERFORMANCE class, evaluated on the final
 /// RESOLVED placement (not the raw client request): the engine must be the
 /// PAX path (SST) and the resolved base location — the client's explicit
@@ -425,6 +460,82 @@ fn tenant_segment_of(path: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Review NIT on SC4-5: a legacy record persisting UNSPECIFIED runs on SST
+    /// (the engine factory's fallback), so it is in the SST-only profile and
+    /// admissible; an unknown number resolves to nothing.
+    #[test]
+    fn effective_storage_engine_follows_the_factory() {
+        assert_eq!(effective_storage_engine(None), Some(StorageEngine::Sst));
+        assert_eq!(
+            effective_storage_engine(Some(StorageEngine::Unspecified as i32)),
+            Some(StorageEngine::Sst)
+        );
+        assert_eq!(
+            effective_storage_engine(Some(StorageEngine::Helix as i32)),
+            Some(StorageEngine::Helix)
+        );
+        assert_eq!(effective_storage_engine(Some(9_999)), None);
+    }
+
+    /// Review SF2: re-admission resolves a legacy record's engine like the
+    /// factory — an assignment's 0 defers to the config, an unknown number
+    /// is refused rather than assumed SST.
+    #[test]
+    fn record_storage_engine_defers_unspecified_and_refuses_unknown() {
+        let sst = Some(StorageEngine::Sst as i32);
+        let zero = Some(StorageEngine::Unspecified as i32);
+        assert_eq!(record_storage_engine(zero, None), StorageEngine::Sst);
+        assert_eq!(record_storage_engine(zero, zero), StorageEngine::Sst);
+        assert_eq!(
+            record_storage_engine(zero, Some(StorageEngine::Helix as i32)),
+            StorageEngine::Helix
+        );
+        assert_eq!(record_storage_engine(None, sst), StorageEngine::Sst);
+        assert_eq!(
+            record_storage_engine(Some(9_999), sst),
+            StorageEngine::Unspecified,
+            "unknown is not assumed SST"
+        );
+        let mut config = CollectionConfig {
+            storage_class: Some(StorageClass::Performance as i32),
+            ..Default::default()
+        };
+        assert!(
+            check_performance_admission(
+                &config,
+                record_storage_engine(Some(9_999), sst),
+                "s3://bucket/data",
+                None
+            )
+            .is_err()
+        );
+        config.storage_engine = zero;
+        assert!(
+            check_performance_admission(
+                &config,
+                record_storage_engine(zero, config.storage_engine),
+                "s3://bucket/data",
+                None
+            )
+            .is_ok()
+        );
+    }
+
+    /// Review SF2: a legacy record persisting UNSPECIFIED is in the READY
+    /// profile (it runs SST); other engines and AXIS-routed ones are not.
+    #[test]
+    fn ready_profile_includes_unspecified_engine_records() {
+        let mut config = CollectionConfig::default();
+        assert!(in_ready_profile(&config), "absent engine runs SST");
+        config.storage_engine = Some(StorageEngine::Unspecified as i32);
+        assert!(in_ready_profile(&config));
+        config.storage_engine = Some(StorageEngine::Helix as i32);
+        assert!(!in_ready_profile(&config));
+        config.storage_engine = Some(9_999);
+        assert!(!in_ready_profile(&config));
+    }
+
     use super::*;
     use crate::proto::proximadb_v1::StorageConfig;
 
