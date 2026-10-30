@@ -212,10 +212,10 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || '' }}
-          args: --release --out dist --features python
-          # `openssl/vendored` (enabled by the python feature — openssl-sys is
-          # transitive via sqlx/reqwest) builds OpenSSL from source inside the
-          # manylinux container. openssl-src's Configure needs Perl's IPC::Cmd,
+          args: --release --out dist --features python,vendored-openssl
+          # `vendored-openssl` (separate feature, mirrors the server crate)
+          # compiles OpenSSL from source inside the manylinux container for
+          # portable PyPI wheels. openssl-src's Configure needs Perl's IPC::Cmd,
           # which the stock manylinux2014 image lacks. Install it (yum or dnf,
           # whichever the image ships) before the build. Linux-only hook; macOS/
           # Windows system Perl already carries these modules.
