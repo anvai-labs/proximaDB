@@ -1339,7 +1339,6 @@ pub(crate) async fn pax_filtered_row_allow(
         Ok(Some(region)) => {
             stats.rows_matched = region.rows_matched;
             stats.region_e = true;
-            crate::observability::io_trace::record_pax_footer_prune(stats.blocks_total as u64, 0);
             record_stage_f_outcome(&stats, 0, fetch_us + region.fetch_us, region.decode_us);
             return Ok(Some((region.allow, stats)));
         }
