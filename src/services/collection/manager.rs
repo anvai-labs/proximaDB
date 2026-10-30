@@ -84,6 +84,44 @@ use crate::storage::trait_components::path_resolver::{
 };
 use proximadb_storage_common::storage_path::StoragePath;
 
+/// The `(wal, data, indexes)` directories of a collection under its
+/// tenant-scoped base: the typed `{base}/accounts/{a}/{n}/{c}/…` layout for a
+/// typed identity, else the legacy `{base}/{uuid}/…` — the same helpers flush
+/// and compaction resolve their paths with.
+fn collection_storage_dirs(
+    tenant_base: &str,
+    collection_uuid: &str,
+    identity: Option<CollectionIdentity>,
+) -> (String, String, String) {
+    (
+        collection_wal_path_typed(tenant_base, collection_uuid, identity),
+        collection_data_path_typed(tenant_base, collection_uuid, identity),
+        collection_index_path_typed(tenant_base, collection_uuid, identity),
+    )
+}
+
+/// Every root directory a collection's storage may live under: the legacy
+/// `{base}/{uuid}` always and, when a typed identity is recorded, the typed
+/// `{base}/accounts/{a}/{n}/{c}` — both regardless of the current
+/// `PROXIMADB_TYPED_PATHS`, because a restart can flip which layout flushes
+/// write (the residency prefixes register both for the same reason).
+fn collection_storage_roots(
+    base: &str,
+    collection_uuid: &str,
+    identity: Option<CollectionIdentity>,
+) -> Vec<String> {
+    let base = base.trim_end_matches('/');
+    let mut roots = vec![format!("{base}/{collection_uuid}")];
+    if identity.is_some()
+        && let Some(root) = collection_data_path_typed(base, collection_uuid, identity)
+            .strip_suffix("/data")
+            .map(str::to_string)
+    {
+        roots.push(root);
+    }
+    roots
+}
+
 // Proto-first architecture - use crate::proto::proximadb_v1::Collection directly
 
 // Local types to replace assignment service
@@ -1503,6 +1541,15 @@ impl CollectionService {
         // list skip this seam entirely. If a later create step fails, the
         // compensation below releases the grant: a leaked grant would charge
         // capacity and accrue billing for a collection that never existed.
+        // The tenant-scoped base every storage consumer reads: the storage
+        // assignment records it, flush/compaction publish under it, the grant
+        // protects it — and the create-time directories are built from it.
+        let tenant_id = tenant_context.map(|ctx| ctx.tenant_id.as_str());
+        let tenant_base_location = match tenant_id {
+            Some(tid) => StoragePath::tenant_root_path(&base_location, tid),
+            None => base_location.clone(),
+        };
+
         let mut reserved_grant =
             crate::services::collection::reservation::GrantCompensation::none();
         if crate::services::collection::storage_class::storage_class_or_balanced(&enriched_config)
@@ -1513,12 +1560,8 @@ impl CollectionService {
             // SC4-2: the grant protects the collection's segment roots — built
             // from the same tenant-scoped base the storage assignment records
             // below, so the prefixes match what flush/compaction publish.
-            let protect_base = match tenant_context.map(|ctx| ctx.tenant_id.as_str()) {
-                Some(tid) => StoragePath::tenant_root_path(&base_location, tid),
-                None => base_location.clone(),
-            };
             let protect_prefixes = crate::services::collection::storage_class::residency_prefixes(
-                &protect_base,
+                &tenant_base_location,
                 &uuid,
                 typed_identity,
             );
@@ -1545,11 +1588,11 @@ impl CollectionService {
             };
         }
 
-        // Create storage directories (tenant-isolated if multi-tenant mode)
-        let tenant_id = tenant_context.map(|ctx| ctx.tenant_id.as_str());
+        // Create storage directories under the tenant-scoped base (typed or
+        // legacy layout) — exactly where flush and compaction will publish.
         let _storage_created = match self
             .create_storage_directories(
-                &base_location,
+                &tenant_base_location,
                 &enriched_config.name,
                 &uuid,
                 tenant_id,
@@ -1564,12 +1607,6 @@ impl CollectionService {
                 compensate_reservation!();
                 return Err(e.context("Failed to create storage directories"));
             }
-        };
-
-        // Build tenant-prefixed base location for storage assignment
-        let tenant_base_location = match tenant_id {
-            Some(tid) => StoragePath::tenant_root_path(&base_location, tid),
-            None => base_location.clone(),
         };
 
         // ADR-031 Phase 4d: when a typed identity was minted (env ON + account
@@ -2819,14 +2856,18 @@ impl CollectionService {
     /// (`{base}/accounts/{base62}/…/{sub}`) instead of the tenant/legacy path.
     /// `None` keeps the legacy `StoragePath::collection_*_path_with_tenant`
     /// (byte-identical, mixed-read-safe).
+    /// `tenant_base_location` is the TENANT-SCOPED base the storage
+    /// assignment records (`{base}/tenants/{id}` for a tenant) — the base
+    /// every reader and writer of the collection resolves paths from.
     async fn create_storage_directories(
         &self,
-        base_location: &str,
+        tenant_base_location: &str,
         collection_name: &str,
         collection_uuid: &str,
         tenant_id: Option<&str>,
         typed_identity: Option<CollectionIdentity>,
     ) -> Result<Vec<StorageComponentType>> {
+        let base_location = tenant_base_location;
         let tenant_info = tenant_id.unwrap_or("(default)");
         info!(
             "🏗️ Creating storage directories for collection {} (UUID: {}, tenant: {}) at base: {}",
@@ -2835,37 +2876,13 @@ impl CollectionService {
 
         let mut created_components = Vec::new();
 
-        // ADR-031 Phase 4c: typed path short-circuits the tenant/legacy layout.
-        // The typed helper's `None` branch is byte-identical to the legacy
-        // `StoragePath::collection_*_path` (non-tenant) — but the create path
-        // here historically used the `_with_tenant` variant. To preserve that
-        // exactly when no typed identity is set, fall through to the tenant-aware
-        // StoragePath calls below for `None`. For `Some`, use the typed helpers
-        // (the typed path has NO tenant slot — Phase 4 hierarchy collapse).
-        let (write_buffer_dir, data_dir, indexes_dir) = match typed_identity {
-            Some(id) => (
-                collection_wal_path_typed(base_location, collection_uuid, Some(id)),
-                collection_data_path_typed(base_location, collection_uuid, Some(id)),
-                collection_index_path_typed(base_location, collection_uuid, Some(id)),
-            ),
-            None => (
-                StoragePath::collection_wal_path_with_tenant(
-                    base_location,
-                    tenant_id,
-                    collection_uuid,
-                ),
-                StoragePath::collection_data_path_with_tenant(
-                    base_location,
-                    tenant_id,
-                    collection_uuid,
-                ),
-                StoragePath::collection_index_path_with_tenant(
-                    base_location,
-                    tenant_id,
-                    collection_uuid,
-                ),
-            ),
-        };
+        // Typed layout `{base}/accounts/{a}/{n}/{c}/…` or legacy
+        // `{base}/{uuid}/…`, both under the tenant-scoped base. The typed
+        // branch used to take the RAW base while flush wrote under the
+        // tenant-scoped one, so a tenant's typed directories were created
+        // where no segment ever landed.
+        let (write_buffer_dir, data_dir, indexes_dir) =
+            collection_storage_dirs(base_location, collection_uuid, typed_identity);
 
         // Create directories
         if let Ok(filesystem) = self.filesystem_factory.get_filesystem(base_location) {
@@ -2935,27 +2952,26 @@ impl CollectionService {
 
         if let Some(ref assignment) = collection.storage_assignment {
             let base_location = &assignment.base_location;
-
-            // Delete the entire collection directory (includes write_buffer/, data/, indexes/)
-            let collection_dir = format!(
-                "{}/{}",
-                base_location.trim_end_matches('/'),
-                collection_uuid
+            // Every root the collection's storage may live under: the legacy
+            // `{base}/{uuid}` and, when the assignment records a typed
+            // identity, `{base}/accounts/{a}/{n}/{c}`. Dropping only the
+            // legacy root left a typed collection's segments in place.
+            let roots = collection_storage_roots(
+                base_location,
+                collection_uuid,
+                crate::storage::trait_components::path_resolver::typed_identity_from_storage_assignment(
+                    Some(assignment),
+                ),
             );
 
             match self.filesystem_factory.get_filesystem(base_location) {
                 Ok(filesystem) => {
-                    // Check if directory exists before attempting to delete
-                    match filesystem.exists(&collection_dir).await {
-                        Ok(true) => {
-                            // Recursively delete the entire collection directory
-                            match filesystem.remove_dir_all(&collection_dir).await {
+                    let mut all_clean = true;
+                    for collection_dir in &roots {
+                        match filesystem.exists(collection_dir).await {
+                            Ok(true) => match filesystem.remove_dir_all(collection_dir).await {
                                 Ok(_) => {
-                                    info!(
-                                        "✅ Deleted entire collection directory: {}",
-                                        collection_dir
-                                    );
-                                    cleaned_components = 3; // All components deleted
+                                    info!("✅ Deleted collection directory: {}", collection_dir)
                                 }
                                 Err(e) => {
                                     error!(
@@ -2967,33 +2983,35 @@ impl CollectionService {
                                         e
                                     ));
                                 }
-                            }
-                        }
-                        Ok(false) => {
-                            debug!(
+                            },
+                            Ok(false) => debug!(
                                 "📂 Collection directory {} does not exist (already cleaned up)",
                                 collection_dir
-                            );
-                            cleaned_components = 3; // Count as all cleaned
-                        }
-                        Err(e) => {
-                            warn!(
-                                "⚠️ Failed to check existence of collection directory {}: {}",
-                                collection_dir, e
-                            );
+                            ),
+                            Err(e) => {
+                                all_clean = false;
+                                warn!(
+                                    "⚠️ Failed to check existence of collection directory {}: {}",
+                                    collection_dir, e
+                                );
+                            }
                         }
                     }
-                    if cleaned_components == 3 {
-                        let purged = crate::storage::engines::sst::core::purge_warm_tier_prefix(
-                            &collection_dir,
-                        )
-                        .await;
-                        if purged > 0 {
-                            debug!(
-                                collection_dir,
-                                purged,
-                                "Reclaimed retired collection entries from the PAX warm tier"
-                            );
+                    if all_clean {
+                        cleaned_components = 3; // All components deleted
+                        for collection_dir in &roots {
+                            let purged =
+                                crate::storage::engines::sst::core::purge_warm_tier_prefix(
+                                    collection_dir,
+                                )
+                                .await;
+                            if purged > 0 {
+                                debug!(
+                                    collection_dir,
+                                    purged,
+                                    "Reclaimed retired collection entries from the PAX warm tier"
+                                );
+                            }
                         }
                     }
                 }
@@ -5696,6 +5714,146 @@ mod tests {
         assert!(message.contains("other-tenant"), "{message}");
         assert!(message.contains("acme"), "{message}");
 
+        Ok(())
+    }
+
+    /// The typed + tenant create directories sit under the TENANT-scoped
+    /// base the storage assignment records — the base flush, compaction and
+    /// the residency grant resolve paths from — not the raw base (the
+    /// directory a tenant's typed segments never landed in).
+    #[test]
+    fn create_directories_follow_the_tenant_scoped_base() {
+        let identity = CollectionIdentity {
+            account_id: 7,
+            namespace_id: 5,
+            collection_id: 9,
+        };
+        let tenant_base = StoragePath::tenant_root_path("s3://bucket/data", "acme");
+        let (wal, data, indexes) = collection_storage_dirs(&tenant_base, "42", Some(identity));
+        assert_eq!(
+            data,
+            "s3://bucket/data/tenants/acme/accounts/000007/005/000009/data"
+        );
+        assert!(
+            wal.starts_with("s3://bucket/data/tenants/acme/accounts/"),
+            "{wal}"
+        );
+        assert!(
+            indexes.starts_with("s3://bucket/data/tenants/acme/accounts/"),
+            "{indexes}"
+        );
+        assert_eq!(
+            format!("{data}/"),
+            crate::services::collection::storage_class::residency_prefixes(
+                &tenant_base,
+                "42",
+                Some(identity)
+            )[1],
+            "the grant protects exactly the directory created"
+        );
+        // Legacy layout: byte-identical to the historical tenant-aware paths.
+        let (wal, data, indexes) = collection_storage_dirs(&tenant_base, "42", None);
+        assert_eq!(
+            (wal, data, indexes),
+            (
+                StoragePath::collection_wal_path_with_tenant(
+                    "s3://bucket/data",
+                    Some("acme"),
+                    "42"
+                ),
+                StoragePath::collection_data_path_with_tenant(
+                    "s3://bucket/data",
+                    Some("acme"),
+                    "42"
+                ),
+                StoragePath::collection_index_path_with_tenant(
+                    "s3://bucket/data",
+                    Some("acme"),
+                    "42"
+                ),
+            )
+        );
+    }
+
+    #[test]
+    fn storage_roots_cover_both_layouts() {
+        let identity = CollectionIdentity {
+            account_id: 7,
+            namespace_id: 5,
+            collection_id: 9,
+        };
+        assert_eq!(collection_storage_roots("/b/", "42", None), vec!["/b/42"]);
+        assert_eq!(
+            collection_storage_roots("/b", "42", Some(identity)),
+            vec![
+                "/b/42".to_string(),
+                "/b/accounts/000007/005/000009".to_string()
+            ]
+        );
+    }
+
+    /// Dropping a typed collection deletes its account-rooted directory too
+    /// (cleanup used to delete only the legacy `{base}/{uuid}` root, leaving
+    /// every typed segment in storage).
+    #[tokio::test]
+    async fn drop_cleanup_deletes_the_typed_root() -> Result<()> {
+        let temp_dir = tempfile::TempDir::new().context("temp dir")?;
+        let catalog_url = format!("file://{}/catalog", temp_dir.path().display());
+        let data_url = format!("file://{}/data", temp_dir.path().display());
+        let mgr = Arc::new(CatalogManager::new());
+        mgr.create_native_catalog("default", &catalog_url)
+            .await
+            .context("create test catalog")?;
+        let svc = CollectionService::new(StorageConfig {
+            storage_locations: vec![crate::core::config::StorageLocation {
+                url: data_url.clone(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await
+        .context("collection service")?
+        .with_catalog_manager(mgr);
+        let config = CollectionConfig {
+            name: "typed_drop".to_string(),
+            dimension: 8,
+            ..Default::default()
+        };
+        assert!(
+            svc.create_collection(&config)
+                .await
+                .context("create")?
+                .success
+        );
+        let mut record = svc.collection("typed_drop").await?.context("record")?;
+        let identity = CollectionIdentity {
+            account_id: 7,
+            namespace_id: 5,
+            collection_id: 9,
+        };
+        let assignment = record.storage_assignment.as_mut().context("assignment")?;
+        assignment.typed_account_id = Some(identity.account_id);
+        assignment.typed_namespace_id = Some(u32::from(identity.namespace_id));
+        assignment.typed_collection_id = Some(identity.collection_id);
+        let base = assignment.base_location.clone();
+        svc.upsert_collection_catalog_asset(&record, Some(identity))
+            .await
+            .context("record typed identity")?;
+        let roots = collection_storage_roots(&base, &record.id, Some(identity));
+        let typed_root = std::path::PathBuf::from(roots[1].trim_start_matches("file://"));
+        std::fs::create_dir_all(typed_root.join("data")).context("typed dirs")?;
+        std::fs::write(typed_root.join("data/L0_x.pax"), b"segment").context("segment")?;
+
+        svc.cleanup_storage_directories("typed_drop", &record.id)
+            .await
+            .context("cleanup")?;
+        assert!(
+            !typed_root.exists(),
+            "typed root must be deleted: {}",
+            typed_root.display()
+        );
+        let legacy_root = std::path::PathBuf::from(roots[0].trim_start_matches("file://"));
+        assert!(!legacy_root.exists(), "legacy root must be deleted");
         Ok(())
     }
 
