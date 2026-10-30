@@ -61,7 +61,7 @@ byte cut (filtered cat3 bytes/q below the layout-OFF arm), n=1000, object_cold.
   The layout-OFF schema bed's two segments carry ONE shared coarse model (identical `radii`, same
   `coarse_seed` — the default-on write-shared model). The 2,661,200-row segment's A0 records 49,282
   trained rows, its real count (`default_train_sample(96)` = 50k, step ⌈2,661,200/50k⌉ = 54). The
-  338,800-row segment that reused the model records 2,661,200: `CentroidDirectory::collection_model`
+  338,800-row segment that reused the model records 2,661,200: `PaxCentroidDirectory::collection_model`
   (`crates/storage/proximadb-storage-common/src/centroid_directory.rs`) builds the shared model with
   `segment_model(template, 0, segment.rows_covered)`, stamping the template segment's *covered* rows
   into `trained_on`, which then persists into every reusing segment's A0. The harness reads the A0
