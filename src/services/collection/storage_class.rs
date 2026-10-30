@@ -287,6 +287,17 @@ pub fn state_label(state: i32) -> &'static str {
         .unwrap_or("unspecified")
 }
 
+/// The engine a record actually runs on, as the engine factory resolves it:
+/// absent and `UNSPECIFIED` (legacy records persist `Some(0)`) run on SST; an
+/// unknown number resolves to `None`, which no SST-only check accepts.
+pub fn effective_storage_engine(raw: Option<i32>) -> Option<StorageEngine> {
+    match raw.map(StorageEngine::try_from) {
+        None | Some(Ok(StorageEngine::Unspecified)) => Some(StorageEngine::Sst),
+        Some(Ok(engine)) => Some(engine),
+        Some(Err(_)) => None,
+    }
+}
+
 /// SC2 admission check for the PERFORMANCE class, evaluated on the final
 /// RESOLVED placement (not the raw client request): the engine must be the
 /// PAX path (SST) and the resolved base location — the client's explicit
@@ -425,6 +436,24 @@ fn tenant_segment_of(path: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Review NIT on SC4-5: a legacy record persisting UNSPECIFIED runs on SST
+    /// (the engine factory's fallback), so it is in the SST-only profile and
+    /// admissible; an unknown number resolves to nothing.
+    #[test]
+    fn effective_storage_engine_follows_the_factory() {
+        assert_eq!(effective_storage_engine(None), Some(StorageEngine::Sst));
+        assert_eq!(
+            effective_storage_engine(Some(StorageEngine::Unspecified as i32)),
+            Some(StorageEngine::Sst)
+        );
+        assert_eq!(
+            effective_storage_engine(Some(StorageEngine::Helix as i32)),
+            Some(StorageEngine::Helix)
+        );
+        assert_eq!(effective_storage_engine(Some(9_999)), None);
+    }
+
     use super::*;
     use crate::proto::proximadb_v1::StorageConfig;
 
