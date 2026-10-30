@@ -1483,9 +1483,16 @@ jobs:
           # needs this -p proximadb leg.
           - { label: "onnx-cdc-duckdb",     pkg: proximadb,        args: "--features onnx,cdc-kafka,duckdb" }
           # Embedded crate (default, no language bindings) — validates the extracted
-          # crate compiles against root at every tier. Python-feature + wheel build
-          # is a qa→main (FULL) concern (heavy pyo3/numpy deps).
+          # crate compiles against root at every tier. The full wheel build stays in
+          # release-python.yml (heavy pyo3/numpy deps).
           - { label: "embedded",             pkg: proximadb-embedded, args: "" }
+          # The python binding was compiled by NO PR or promotion gate, only
+          # by release-python.yml at tag time — so a refactor (706eae88a) broke it and it
+          # reached main undetected until the v0.5.0 release dry-run. Compile the binding
+          # with the default features exactly as release-python.yml builds it (the
+          # python dataframe surface needs datafusion-integration), so the break
+          # surfaces on its own PR.
+          - { label: "embedded-python",      pkg: proximadb-embedded, args: "--features python" }
           # Node.js is optional and invisible to the default embedded build. Keep the
           # runtime and derive-macro API families aligned by compiling that surface alone.
           - { label: "embedded-nodejs",      pkg: proximadb-embedded, args: "--no-default-features --features nodejs" }

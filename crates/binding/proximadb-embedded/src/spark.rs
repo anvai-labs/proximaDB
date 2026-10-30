@@ -963,7 +963,7 @@ fn record_batch_to_proxima_records(
     batch: &RecordBatch,
 ) -> Result<Vec<proximadb_records::ProximaRecord>, SparkError> {
     use arrow::array::{Float32Array, ListArray, StringArray};
-    use proximadb_records::{EmbeddingCell, EmbeddingScalarType, EmbeddingValues, ProximaRecord};
+    use proximadb_records::{EmbeddingCell, ProximaRecord};
 
     let id_col = batch
         .column_by_name("id")
@@ -1287,7 +1287,7 @@ mod tests {
     // ========================================================================
 
     use crate::{EmbeddedConfig, EmbeddedProximaDB};
-    use proximadb_records::{EmbeddingCell, EmbeddingScalarType, EmbeddingValues, ProximaRecord};
+    use proximadb_records::{EmbeddingCell, ProximaRecord};
 
     fn build_spark_test_db() -> (EmbeddedProximaDB, tempfile::TempDir) {
         let temp_dir = tempfile::tempdir().expect("tempdir");
