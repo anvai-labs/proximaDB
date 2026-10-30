@@ -1462,6 +1462,12 @@ impl CollectionService {
             &base_location,
             admission_tenant_id,
         )?;
+        // TD-TIER-1 SC5: an explicit access tier is validated and needs a
+        // tiered object store on the same resolved placement.
+        crate::services::collection::storage_class::check_access_tier_admission(
+            &enriched_config,
+            &base_location,
+        )?;
 
         // ADR-031 Phase 4c: pre-mint the typed collection identity
         // `(account, namespace, collection)` BEFORE storage-dir creation, so the
@@ -2391,6 +2397,29 @@ impl CollectionService {
                             Some(resolved == crate::proto::proximadb_v1::StorageClass::Performance);
                     }
                 }
+                // TD-TIER-1 SC5: the tier governs FUTURE segment PUTs only
+                // (nothing is rewritten), so a change needs no reservation
+                // effects — just re-admission on the EXISTING placement,
+                // refused before the config persists. Omitted/UNSPECIFIED
+                // preserves the recorded tier; an unknown number is refused.
+                if let Some(raw_tier) = new_config.default_access_tier
+                    && raw_tier != 0
+                {
+                    let base = previous_record
+                        .storage_assignment
+                        .as_ref()
+                        .map(|a| a.base_location.clone())
+                        .unwrap_or_default();
+                    let prospective = crate::proto::proximadb_v1::CollectionConfig {
+                        default_access_tier: Some(raw_tier),
+                        ..Default::default()
+                    };
+                    crate::services::collection::storage_class::check_access_tier_admission(
+                        &prospective,
+                        &base,
+                    )?;
+                    existing_config.default_access_tier = Some(raw_tier);
+                }
                 if !new_config.tags.is_empty() {
                     existing_config.tags = new_config.tags;
                 }
@@ -2429,10 +2458,13 @@ impl CollectionService {
                 // cannot ride this defensive branch — it would bypass the
                 // entire policy surface (SC2 floor, registry peek,
                 // generation, grant effects). Refuse it explicitly.
-                if new_config.storage_class.is_some_and(|class| class != 0) {
+                if new_config.storage_class.is_some_and(|class| class != 0)
+                    || new_config.default_access_tier.is_some_and(|tier| tier != 0)
+                {
                     return Err(anyhow::anyhow!(
-                        "storage_class cannot be set on a record without a \
-                         recorded config; recreate the collection instead"
+                        "storage_class / default_access_tier cannot be set on a \
+                         record without a recorded config; recreate the collection \
+                         instead"
                     ));
                 }
                 record.config = Some(new_config);
@@ -3624,6 +3656,7 @@ mod tests {
             pax_vector_quant: None,
             storage_class: None,
             policy_generation: None,
+            default_access_tier: None,
         }
     }
 

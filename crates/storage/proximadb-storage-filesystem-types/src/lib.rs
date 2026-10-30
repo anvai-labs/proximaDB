@@ -275,6 +275,19 @@ pub struct FileOptions {
 }
 
 impl FileOptions {
+    /// Options that only set the destination's access tier, with every other
+    /// field matching what `None` options mean to the backends (notably
+    /// `overwrite: true` — a local backend reads `Some` options with
+    /// `overwrite: false` as create-only). `None` tier ⇒ `None` options, so
+    /// an untiered write is byte-for-byte today's call (TD-TIER-1 SC5).
+    pub fn for_access_tier(tier: Option<ObjectAccessTier>) -> Option<Self> {
+        tier.map(|tier| Self {
+            overwrite: true,
+            storage_class: Some(tier.as_canonical_str().to_string()),
+            ..Self::default()
+        })
+    }
+
     /// Resolve [`FileOptions::storage_class`] to a canonical [`ObjectAccessTier`].
     /// Returns `None` when unset or unrecognized — the caller then uses the
     /// backend/account default tier rather than failing the write.
@@ -1014,6 +1027,29 @@ pub trait FileSystem: Send + Sync + std::fmt::Debug {
     async fn copy(&self, from: &str, to: &str) -> FsResult<()> {
         let data = self.read(from).await?;
         self.write(to, &data, None).await
+    }
+
+    /// Copy, applying `options` to the DESTINATION object — today its access
+    /// tier (TD-TIER-1 SC5): a staged segment's final key must carry the
+    /// collection's tier, and a native copy keeps the SOURCE's. Default:
+    /// without a tier, exactly [`Self::copy`]; with one, read whole and write
+    /// whole with the options (what [`Self::copy`] does on object stores
+    /// anyway, so the request cost is unchanged).
+    async fn copy_with_options(
+        &self,
+        from: &str,
+        to: &str,
+        options: Option<FileOptions>,
+    ) -> FsResult<()> {
+        if options
+            .as_ref()
+            .and_then(FileOptions::access_tier)
+            .is_none()
+        {
+            return self.copy(from, to).await;
+        }
+        let data = self.read(from).await?;
+        self.write(to, &data, options).await
     }
 
     /// Move/rename file. Default: copy, then delete the source (not atomic).
@@ -2036,5 +2072,150 @@ mod read_ranges_prefetch_inflight_tests {
         unsafe { std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "4") };
         assert_eq!(read_ranges_prefetch_inflight("s3://b/seg.pax"), 4);
         assert_eq!(read_ranges_prefetch_inflight("/data/seg.pax"), 4);
+    }
+}
+
+#[cfg(test)]
+mod access_tier_copy_tests {
+    //! TD-TIER-1 SC5: the tier survives a copy to the final key, and an
+    //! untiered copy is exactly today's call.
+    use super::{
+        DirEntry, FileOptions, FileSystem, FilesystemError, FsFileMetadata, FsResult,
+        ObjectAccessTier,
+    };
+    use std::sync::Mutex;
+
+    /// Records which primitive ran and the tier any write carried.
+    #[derive(Debug, Default)]
+    struct RecordingFs {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl RecordingFs {
+        fn calls(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .map(|calls| calls.clone())
+                .unwrap_or_default()
+        }
+        fn record(&self, call: String) {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(call);
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FileSystem for RecordingFs {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
+            self.record(format!("read {path}"));
+            Ok(b"segment".to_vec())
+        }
+        async fn read_range(&self, _path: &str, _offset: u64, _length: u64) -> FsResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        async fn write(
+            &self,
+            path: &str,
+            data: &[u8],
+            options: Option<FileOptions>,
+        ) -> FsResult<()> {
+            let options = options.unwrap_or_default();
+            self.record(format!(
+                "write {path} {} tier={:?} overwrite={}",
+                data.len(),
+                options.access_tier(),
+                options.overwrite
+            ));
+            Ok(())
+        }
+        async fn append(&self, _path: &str, _data: &[u8]) -> FsResult<()> {
+            Ok(())
+        }
+        async fn delete(&self, _path: &str) -> FsResult<()> {
+            Ok(())
+        }
+        async fn exists(&self, _path: &str) -> FsResult<bool> {
+            Ok(false)
+        }
+        async fn metadata(&self, path: &str) -> FsResult<FsFileMetadata> {
+            Err(FilesystemError::NotFound(path.to_string()))
+        }
+        async fn list(&self, _path: &str) -> FsResult<Vec<DirEntry>> {
+            Ok(Vec::new())
+        }
+        async fn create_dir(&self, _path: &str) -> FsResult<()> {
+            Ok(())
+        }
+        async fn create_dir_all(&self, _path: &str) -> FsResult<()> {
+            Ok(())
+        }
+        async fn copy(&self, from: &str, to: &str) -> FsResult<()> {
+            self.record(format!("copy {from} {to}"));
+            Ok(())
+        }
+        async fn move_file(&self, _from: &str, _to: &str) -> FsResult<()> {
+            Ok(())
+        }
+        fn filesystem_type(&self) -> &'static str {
+            "recording"
+        }
+        async fn sync(&self) -> FsResult<()> {
+            Ok(())
+        }
+        async fn open_file(
+            &self,
+            _path: &str,
+            _create: bool,
+        ) -> FsResult<Box<dyn super::FilesystemFile>> {
+            Err(FilesystemError::InvalidOperation("recording".into()))
+        }
+    }
+
+    #[test]
+    fn untiered_copy_is_the_native_copy() {
+        let fs = RecordingFs::default();
+        futures::executor::block_on(fs.copy_with_options("a", "b", None)).unwrap();
+        futures::executor::block_on(fs.copy_with_options(
+            "a",
+            "b",
+            FileOptions::for_access_tier(None),
+        ))
+        .unwrap();
+        assert_eq!(fs.calls(), vec!["copy a b", "copy a b"]);
+    }
+
+    /// The destination carries the tier — a native copy would keep the
+    /// source's (the staging object's account default).
+    #[test]
+    fn tiered_copy_writes_the_destination_at_the_tier() {
+        let fs = RecordingFs::default();
+        futures::executor::block_on(fs.copy_with_options(
+            "staging/L0.pax",
+            "data/L0.pax",
+            FileOptions::for_access_tier(Some(ObjectAccessTier::Cool)),
+        ))
+        .unwrap();
+        assert_eq!(
+            fs.calls(),
+            vec![
+                "read staging/L0.pax",
+                "write data/L0.pax 7 tier=Some(Cool) overwrite=true"
+            ]
+        );
+    }
+
+    /// Tier-only options keep `None`'s overwrite semantics (a local backend
+    /// reads `Some(default)` as create-only).
+    #[test]
+    fn tier_options_keep_untiered_write_semantics() {
+        assert!(FileOptions::for_access_tier(None).is_none());
+        let options = FileOptions::for_access_tier(Some(ObjectAccessTier::Cold)).unwrap();
+        assert!(options.overwrite);
+        assert!(!options.create_dirs);
+        assert_eq!(options.access_tier(), Some(ObjectAccessTier::Cold));
     }
 }

@@ -45,6 +45,7 @@ async fn test_compaction_task_scheduling() {
         precision_hint: None,
         rg_layout: None,
         vector_quant: None,
+        access_tier: None,
     };
 
     assert!(manager.schedule_compaction(task).await.is_ok());
@@ -72,6 +73,7 @@ async fn td_compact6_schedule_dedups_same_output_at_enqueue() {
         precision_hint: None,
         rg_layout: None,
         vector_quant: None,
+        access_tier: None,
     };
     assert!(manager.schedule_compaction(mk_task()).await.unwrap());
     // Second schedule for the same output file is deduped at enqueue (the
@@ -114,6 +116,7 @@ async fn compaction_morsel_admission_rejects_overlapping_inputs() {
         precision_hint: None,
         rg_layout: None,
         vector_quant: None,
+        access_tier: None,
     };
 
     assert!(manager.schedule_compaction(task(1)).await.unwrap());
@@ -167,6 +170,7 @@ async fn td_compact6_worker_clears_training_in_flight_after_completion() {
         precision_hint: None,
         rg_layout: None,
         vector_quant: None,
+        access_tier: None,
     };
     manager.schedule_compaction(task).await.unwrap();
 
@@ -309,6 +313,7 @@ async fn test_sst_compaction_expired_deletion_unit() -> anyhow::Result<()> {
         precision_hint: None,
         rg_layout: None,
         vector_quant: None,
+        access_tier: None,
     };
 
     // Create config and perform compaction
@@ -685,6 +690,7 @@ async fn canonical_compaction_round_trips_real_pax_inputs() -> anyhow::Result<()
         precision_hint: None,
         rg_layout: None,
         vector_quant: None,
+        access_tier: None,
     };
     let stats = compaction
         .perform_compaction_enhanced(&task, &config, None, None)
@@ -847,6 +853,7 @@ async fn forced_local_spill_compacts_real_pax_with_mvcc_and_reclaims_scratch() -
         precision_hint: None,
         rg_layout: None,
         vector_quant: None,
+        access_tier: None,
     };
     let assert_no_task_scratch = |root: &std::path::Path| -> anyhow::Result<()> {
         for owner in std::fs::read_dir(root)? {
@@ -1269,6 +1276,7 @@ async fn spill_quant_fixture(
         precision_hint: None,
         rg_layout: None,
         vector_quant: Some(collection_quant),
+        access_tier: None,
     };
     Ok(SpillQuantFixture {
         _root: root,
@@ -1445,6 +1453,7 @@ async fn tier_probe_read_error_aborts_and_keeps_exact_inputs() -> anyhow::Result
         precision_hint: None,
         rg_layout: None,
         vector_quant: None,
+        access_tier: None,
     };
     let result = compaction
         .perform_compaction_enhanced(&task, &config, None, None)
@@ -1557,6 +1566,7 @@ async fn shared_model_gate_classifies_compaction_output_with_the_collection_mode
         precision_hint: None,
         rg_layout: None,
         vector_quant: None,
+        access_tier: None,
     };
     compaction
         .perform_compaction_enhanced(&task, &config, None, None)

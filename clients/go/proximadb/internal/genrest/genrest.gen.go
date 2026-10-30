@@ -1191,6 +1191,11 @@ type CollectionV2Response struct {
 	// CreatedAt Creation timestamp
 	CreatedAt string `json:"created_at"`
 
+	// DefaultAccessTier Desired access tier for future segment writes (TD-TIER-1 SC5):
+	// "hot" | "cool" | "cold"; omitted when unset (the account default).
+	// Desired, not observed: an account lifecycle rule may move objects.
+	DefaultAccessTier *string `json:"default_access_tier,omitempty"`
+
 	// Dimension Vector dimension
 	Dimension int32 `json:"dimension"`
 
@@ -1288,6 +1293,13 @@ type CreateCollectionV2Request struct {
 	// service applies the same normalisation, so SDKs and pgwire
 	// converge on the same enum discriminant.
 	CanonicalEmbeddingPrecision *string `json:"canonical_embedding_precision,omitempty"`
+
+	// DefaultAccessTier Provider access tier for the collection's FUTURE segment writes
+	// (TD-TIER-1 SC5): "hot" | "cool" | "cold". Omitted ⇒ the account/bucket
+	// default. Requires an object-store placement (s3/az/gs); "archive" is
+	// refused (archived objects cannot serve queries). Existing objects are
+	// not rewritten; control objects keep the account default.
+	DefaultAccessTier *string `json:"default_access_tier,omitempty"`
 
 	// Description Free-text description, persisted on the collection config.
 	Description *string `json:"description,omitempty"`

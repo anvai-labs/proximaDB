@@ -27,6 +27,9 @@ pub struct StagedSegmentWrite {
     local_path: String,
     /// Final local path published by a same-directory atomic rename.
     local_final_path: Option<String>,
+    /// TD-TIER-1 SC5: access tier for the uploaded segment and its sidecar
+    /// (`None` ⇒ the account default — the upload is today's call).
+    access_tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
 }
 
 impl StagedSegmentWrite {
@@ -68,6 +71,7 @@ impl StagedSegmentWrite {
                 remote_url: Some(target_url.to_string()),
                 local_path: local.to_string_lossy().into_owned(),
                 local_final_path: None,
+                access_tier: None,
             })
         } else {
             let final_path = target_url
@@ -97,8 +101,25 @@ impl StagedSegmentWrite {
                 remote_url: None,
                 local_path: local.to_string_lossy().into_owned(),
                 local_final_path: Some(final_path),
+                access_tier: None,
             })
         }
+    }
+
+    /// TD-TIER-1 SC5: publish the segment (and its Arrow sidecar, which is
+    /// read with it and shares its lifetime) at `tier`. A local target has no
+    /// tier and ignores it.
+    #[must_use]
+    pub fn with_access_tier(
+        mut self,
+        tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
+    ) -> Self {
+        self.access_tier = tier;
+        self
+    }
+
+    fn upload_options(&self) -> Option<proximadb_storage_filesystem_types::FileOptions> {
+        proximadb_storage_filesystem_types::FileOptions::for_access_tier(self.access_tier)
     }
 
     /// The local path the segment writer must write to.
@@ -143,7 +164,11 @@ impl StagedSegmentWrite {
                 );
             }
             let bytes = fs
-                .write_local_file(remote, std::path::Path::new(&self.local_path), None)
+                .write_local_file(
+                    remote,
+                    std::path::Path::new(&self.local_path),
+                    self.upload_options(),
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("upload staged segment to {remote}: {e}"))?;
             let sidecar = format!("{}.idx", self.local_path);
@@ -154,7 +179,7 @@ impl StagedSegmentWrite {
                 fs.write_local_file(
                     &format!("{remote}.idx"),
                     std::path::Path::new(&sidecar),
-                    None,
+                    self.upload_options(),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("upload Arrow sidecar to {remote}.idx: {e}"))?;
@@ -212,7 +237,11 @@ impl StagedSegmentWrite {
                 );
             }
             let bytes = fs
-                .write_local_file(&remote, std::path::Path::new(&self.local_path), None)
+                .write_local_file(
+                    &remote,
+                    std::path::Path::new(&self.local_path),
+                    self.upload_options(),
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("upload staged segment to {remote}: {e}"))?;
             let _ = tokio::fs::remove_file(&self.local_path).await;
@@ -222,7 +251,7 @@ impl StagedSegmentWrite {
                 fs.write_local_file(
                     &format!("{remote}.idx"),
                     std::path::Path::new(&sidecar),
-                    None,
+                    self.upload_options(),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("upload Arrow sidecar to {remote}.idx: {e}"))?;
@@ -367,6 +396,28 @@ mod tests {
             !tmp.path().join("coll/data/L0_failed.pax").exists(),
             "failed write must never publish its target"
         );
+    }
+
+    /// TD-TIER-1 SC5: a tier set on the staged write rides every upload
+    /// (segment and sidecar); unset, the upload options stay `None` — the
+    /// call is byte-for-byte today's.
+    #[tokio::test]
+    async fn access_tier_rides_the_upload_options() {
+        use proximadb_storage_filesystem_types::ObjectAccessTier;
+        let staged = StagedSegmentWrite::begin("s3://bucket/coll/data/L1_z.pax")
+            .await
+            .expect("begin");
+        assert!(staged.upload_options().is_none());
+        let staged = staged.with_access_tier(Some(ObjectAccessTier::Cool));
+        let options = staged.upload_options().expect("tiered");
+        assert_eq!(options.access_tier(), Some(ObjectAccessTier::Cool));
+        assert!(options.overwrite, "same semantics as `None` options");
+        // Every upload in this file goes through `upload_options` (none
+        // passes a literal `None` any more).
+        let source = include_str!("staged_write.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+        assert_eq!(production.matches("self.upload_options()").count(), 4);
+        assert!(!production.contains("&self.local_path), None)"));
     }
 
     #[tokio::test]

@@ -692,6 +692,17 @@ impl FilesystemFactory {
 
     /// Cross-storage atomic operations - handles full URLs for source and destination
     pub async fn copy_atomic(&self, from_url: &str, to_url: &str) -> FsResult<()> {
+        self.copy_atomic_with_options(from_url, to_url, None).await
+    }
+
+    /// [`Self::copy_atomic`] applying `options` (the access tier, TD-TIER-1
+    /// SC5) to the destination object. `None` is exactly [`Self::copy_atomic`].
+    pub async fn copy_atomic_with_options(
+        &self,
+        from_url: &str,
+        to_url: &str,
+        options: Option<FileOptions>,
+    ) -> FsResult<()> {
         trace!("📋 [] copy_atomic START");
         trace!("from_url: {}", from_url);
         trace!("to_url: {}", to_url);
@@ -741,7 +752,9 @@ impl FilesystemFactory {
             _ => false,
         };
         if same_cloud_backend || Arc::ptr_eq(&from_fs, &to_fs) {
-            from_fs.copy(&from_path, &to_path).await?;
+            from_fs
+                .copy_with_options(&from_path, &to_path, options)
+                .await?;
             trace!("Same-backend native copy complete");
             debug!("    ✅ [DEBUG] Same-backend native copy complete");
             trace!("📋 [] copy_atomic COMPLETE");
@@ -751,7 +764,7 @@ impl FilesystemFactory {
 
         if from_fs.filesystem_type() == "encrypted" || to_fs.filesystem_type() == "encrypted" {
             let data = from_fs.read(&from_path).await?;
-            to_fs.write_atomic(&to_path, &data, None).await?;
+            to_fs.write_atomic(&to_path, &data, options).await?;
             trace!("Whole-file copy complete");
             debug!("    ✅ [DEBUG] Whole-file copy complete");
             trace!("📋 [] copy_atomic COMPLETE");
@@ -789,6 +802,17 @@ impl FilesystemFactory {
 
     /// Move operation with atomic cross-storage support
     pub async fn move_atomic(&self, from_url: &str, to_url: &str) -> FsResult<()> {
+        self.move_atomic_with_options(from_url, to_url, None).await
+    }
+
+    /// [`Self::move_atomic`] applying `options` (the access tier, TD-TIER-1
+    /// SC5) to the destination object. `None` is exactly [`Self::move_atomic`].
+    pub async fn move_atomic_with_options(
+        &self,
+        from_url: &str,
+        to_url: &str,
+        options: Option<FileOptions>,
+    ) -> FsResult<()> {
         trace!("🚚 [] move_atomic START");
         trace!("from_url: {}", from_url);
         trace!("to_url: {}", to_url);
@@ -799,7 +823,8 @@ impl FilesystemFactory {
         // Copy first using streaming copy
         trace!("Copying file atomically (streaming)...");
         debug!("    📋 [DEBUG] Copying file atomically (streaming)...");
-        self.copy_atomic(from_url, to_url).await?;
+        self.copy_atomic_with_options(from_url, to_url, options)
+            .await?;
         debug!("Streaming copy successful");
         debug!("    ✅ [DEBUG] Streaming copy successful");
 

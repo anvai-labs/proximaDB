@@ -104,6 +104,11 @@ class CreateCollectionV2Request:
                 `not_active` until its residency dependency ships; economy likewise
                 persists intent only. Read `storage_class_status` on the GET response
                 for the observed truth — the class is never a claim.
+            default_access_tier (None | str | Unset): Provider access tier for the collection's FUTURE segment writes
+                (TD-TIER-1 SC5): "hot" | "cool" | "cold". Omitted ⇒ the account/bucket
+                default. Requires an object-store placement (s3/az/gs); "archive" is
+                refused (archived objects cannot serve queries). Existing objects are
+                not rewritten; control objects keep the account default.
     """
 
     name: str
@@ -121,6 +126,7 @@ class CreateCollectionV2Request:
     description: None | str | Unset = UNSET
     index_type: None | str | Unset = UNSET
     storage_class: None | str | Unset = UNSET
+    default_access_tier: None | str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.index_config_input import IndexConfigInput  # noqa: PLC0415
@@ -227,6 +233,12 @@ class CreateCollectionV2Request:
         else:
             storage_class = self.storage_class
 
+        default_access_tier: None | str | Unset
+        if isinstance(self.default_access_tier, Unset):
+            default_access_tier = UNSET
+        else:
+            default_access_tier = self.default_access_tier
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -261,6 +273,8 @@ class CreateCollectionV2Request:
             field_dict["index_type"] = index_type
         if storage_class is not UNSET:
             field_dict["storage_class"] = storage_class
+        if default_access_tier is not UNSET:
+            field_dict["default_access_tier"] = default_access_tier
 
         return field_dict
 
@@ -446,6 +460,17 @@ class CreateCollectionV2Request:
 
         storage_class = _parse_storage_class(d.pop("storage_class", UNSET))
 
+        def _parse_default_access_tier(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        default_access_tier = _parse_default_access_tier(
+            d.pop("default_access_tier", UNSET)
+        )
+
         create_collection_v2_request = cls(
             name=name,
             dimension=dimension,
@@ -462,6 +487,7 @@ class CreateCollectionV2Request:
             description=description,
             index_type=index_type,
             storage_class=storage_class,
+            default_access_tier=default_access_tier,
         )
 
         return create_collection_v2_request

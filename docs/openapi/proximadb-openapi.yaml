@@ -5201,6 +5201,14 @@ components:
             Observed storage-class status — the truth about what SC1 delivers.
             "balanced" ⇒ active; economy/performance persist intent and report
             `not_active` with a reason naming the missing dependency (SC3/SC4).
+        default_access_tier:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Desired access tier for future segment writes (TD-TIER-1 SC5):
+            "hot" | "cool" | "cold"; omitted when unset (the account default).
+            Desired, not observed: an account lifecycle rule may move objects.
         schema:
           oneOf:
           - type: 'null'
@@ -5434,6 +5442,16 @@ components:
             `not_active` until its residency dependency ships; economy likewise
             persists intent only. Read `storage_class_status` on the GET response
             for the observed truth — the class is never a claim.
+        default_access_tier:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Provider access tier for the collection's FUTURE segment writes
+            (TD-TIER-1 SC5): "hot" | "cool" | "cold". Omitted ⇒ the account/bucket
+            default. Requires an object-store placement (s3/az/gs); "archive" is
+            refused (archived objects cannot serve queries). Existing objects are
+            not rewritten; control objects keep the account default.
       additionalProperties: false
     CreateCollectionV2Response:
       type: object

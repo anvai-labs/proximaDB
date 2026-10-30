@@ -2286,6 +2286,8 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         // InvalidArgument here, and a known label flows into the v1 config so
         // manager admission applies identically to REST, gRPC and Flight.
         v1_config.storage_class = v2_storage_class_field(&cfg)?;
+        // TD-TIER-1 SC5: same strict parse as REST; admission is the manager's.
+        v1_config.default_access_tier = v2_access_tier_field(&cfg)?;
 
         let req = CollectionRequest {
             operation: CollectionOperation::CollectionCreate as i32,
@@ -2599,6 +2601,17 @@ fn v2_storage_class_field(cfg: &proximadb_v2::V2CollectionConfig) -> Result<Opti
     }
 }
 
+/// TD-TIER-1 SC5: parse the v2 create request's `default_access_tier` label
+/// (strict, like `storage_class`): unset/empty ⇒ the account default.
+fn v2_access_tier_field(cfg: &proximadb_v2::V2CollectionConfig) -> Result<Option<i32>, Status> {
+    let Some(raw) = cfg.default_access_tier.as_deref() else {
+        return Ok(None);
+    };
+    let tier = crate::services::collection::storage_class::parse_access_tier(raw)
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+    Ok((tier != crate::proto::proximadb_v1::AccessTier::Unspecified).then_some(tier as i32))
+}
+
 fn collection_to_v2(c: crate::proto::proximadb_v1::Collection) -> V2Collection {
     let cfg = c.config.unwrap_or_default();
     let distance_metric = cfg
@@ -2639,6 +2652,10 @@ fn collection_to_v2(c: crate::proto::proximadb_v1::Collection) -> V2Collection {
             storage_engine,
             filterable_columns: cfg.filterable_columns.into_iter().map(|f| f.name).collect(),
             storage_class: Some(storage_class),
+            default_access_tier: crate::services::collection::storage_class::access_tier_label(
+                cfg.default_access_tier,
+            )
+            .map(str::to_string),
             description: cfg.description.unwrap_or_default(),
             index_specs: cfg
                 .index_configs
@@ -2733,6 +2750,7 @@ mod tests {
     fn v2_config_to_canonical_columns_emits_embedding_plus_filterable_scalars() {
         let cfg = proximadb_v2::V2CollectionConfig {
             storage_class: None,
+            default_access_tier: None,
             name: "c".to_string(),
             dimension: 128,
             distance_metric: "cosine".to_string(),

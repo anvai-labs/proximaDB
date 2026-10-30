@@ -881,6 +881,11 @@ pub struct V2CollectionConfig {
     /// here (v1 classes other than balanced are accepted-but-inactive).
     #[prost(string, optional, tag = "10")]
     pub storage_class: ::core::option::Option<::prost::alloc::string::String>,
+    /// TD-TIER-1 SC5: provider access tier for FUTURE segment writes, "hot" |
+    /// "cool" | "cold"; unset ⇒ the account default. Requires an object-store
+    /// placement; "archive" is refused. Desired, not observed.
+    #[prost(string, optional, tag = "11")]
+    pub default_access_tier: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// TD-TIER-1 SC1: observed storage-class status (read-side projection of the
 /// desired policy; never an input). Mirrors the v1 `StorageClassStatus`.

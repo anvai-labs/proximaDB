@@ -106,6 +106,14 @@ message CollectionConfig {
   // (0 if the class was never set, 1 if persisted at create). Same-value
   // re-applies do NOT bump. Read-side projection: `Collection.storage_class_status`.
   optional uint32 policy_generation = 31;
+
+  // TD-TIER-1 SC5: provider access tier for the collection's FUTURE segment
+  // PUTs (flush and compaction output; existing objects are not rewritten).
+  // UNSPECIFIED/absent ⇒ the account/bucket default (today's PUT). Online
+  // tiers only — Archive is not admissible for a serving collection. An
+  // explicit tier requires a tiered object-store placement (S3/Azure/GCS);
+  // control objects (directories, manifests) keep the account default.
+  optional AccessTier default_access_tier = 32;
 }
 
 // Canonical scalar type for a collection's embedding column. Mirrors
@@ -271,6 +279,16 @@ enum StorageClass {
   STORAGE_CLASS_ECONOMY = 1;
   STORAGE_CLASS_BALANCED = 2;
   STORAGE_CLASS_PERFORMANCE = 3;
+}
+
+// TD-TIER-1 SC5: canonical online access tier for future segment PUTs, mapped
+// per provider at the I/O boundary (Azure x-ms-access-tier Hot/Cool/Cold, S3
+// STANDARD/STANDARD_IA/GLACIER_IR, GCS STANDARD/NEARLINE/COLDLINE).
+enum AccessTier {
+  ACCESS_TIER_UNSPECIFIED = 0;
+  ACCESS_TIER_HOT = 1;
+  ACCESS_TIER_COOL = 2;
+  ACCESS_TIER_COLD = 3;
 }
 
 // Observed storage-class status (read-side projection, computed from the

@@ -412,10 +412,23 @@ impl SstEngine {
                 .await
                 .context("Failed to begin recovery publication")?
         } else {
-            self.atomic_coordinator()
+            let operation = self
+                .atomic_coordinator()
                 .begin_atomic_operation(&staging_config)
                 .await
-                .context("Failed to begin atomic flush operation")?
+                .context("Failed to begin atomic flush operation")?;
+            // TD-TIER-1 SC5: the collection's tier lands on the FINAL key at
+            // commit (the move from staging). The staging upload keeps the
+            // account default: a colder tier on an object deleted seconds
+            // later would pay that tier's minimum-duration charge.
+            let access_tier = params
+                .collection_config
+                .as_ref()
+                .and_then(|collection| collection.config.as_ref())
+                .and_then(crate::services::collection::storage_class::collection_access_tier);
+            self.atomic_coordinator()
+                .set_operation_access_tier(&operation.operation_id, access_tier)?;
+            operation
         };
 
         tracing::debug!(staging_url = %atomic_op.staging_url, final_url = %atomic_op.final_url, "Atomic operation initialized");
@@ -956,6 +969,12 @@ impl SstEngine {
                             // sq8 / `pax_vector_format:off` collection is not
                             // silently rewritten as RaBitQ.
                             Some(resolve_pax_vector_quant(params.collection_config.as_ref())),
+                            // TD-TIER-1 SC5: the output object carries the collection's tier.
+                            params
+                                .collection_config
+                                .as_ref()
+                                .and_then(|collection| collection.config.as_ref())
+                                .and_then(crate::services::collection::storage_class::collection_access_tier),
                         )
                         .await
                 }

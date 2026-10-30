@@ -133,6 +133,10 @@ pub struct TransactionalOperationMetadata {
     /// When true, AtomicCoordinator will skip staging operations and not error
     /// if files are not found during finalize/cleanup operations
     pub zero_copy_managed: bool,
+    /// TD-TIER-1 SC5: the access tier finalize applies to every object it
+    /// publishes from staging (`None` ⇒ the account default — today's PUT).
+    /// Set by [`TransactionCoordinator::set_operation_access_tier`].
+    pub access_tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
 }
 
 /// Atomic operation status
@@ -416,6 +420,7 @@ impl UnifiedTransactionCoordinator {
             final_url,
             status: TransactionalOperationStatus::Preparing,
             zero_copy_managed: false, // Default to false for traditional operations
+            access_tier: None,
         };
 
         // Track operation using DashMap
@@ -456,6 +461,7 @@ impl UnifiedTransactionCoordinator {
             final_url,
             status: TransactionalOperationStatus::Preparing,
             zero_copy_managed: true, // This operation is managed by ZeroCopyFilesystem
+            access_tier: None,
         };
 
         // Track operation using DashMap
@@ -596,7 +602,13 @@ impl UnifiedTransactionCoordinator {
                 // Use FilesystemFactory's atomic move which handles cross-storage scenarios
                 match self
                     .filesystem
-                    .move_atomic(&staging_file_url, &final_file_url)
+                    .move_atomic_with_options(
+                        &staging_file_url,
+                        &final_file_url,
+                        proximadb_storage_filesystem_types::FileOptions::for_access_tier(
+                            metadata.access_tier,
+                        ),
+                    )
                     .await
                 {
                     Ok(_) => {
@@ -1205,6 +1217,23 @@ impl UnifiedTransactionCoordinator {
     }
 
     /// Update operation status
+    /// TD-TIER-1 SC5: apply `tier` to every object this operation publishes
+    /// at finalize (a staged segment's final key must carry the collection's
+    /// tier: the move is a copy, and a copy without options would land on the
+    /// account default). Unknown operation ⇒ error, never a silent no-op.
+    pub fn set_operation_access_tier(
+        &self,
+        operation_id: &OperationId,
+        tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
+    ) -> Result<()> {
+        let mut entry = self
+            .active_operations
+            .get_mut(operation_id)
+            .ok_or_else(|| anyhow::anyhow!("Operation not found: {}", operation_id))?;
+        entry.access_tier = tier;
+        Ok(())
+    }
+
     async fn update_operation_status(
         &self,
         operation_id: &OperationId,
@@ -1442,6 +1471,47 @@ mod tests {
                 .get_operation_status(&metadata.operation_id)
                 .await
                 .is_none()
+        );
+    }
+
+    /// TD-TIER-1 SC5: a tiered operation still publishes on an untiered
+    /// (local) backend, and tiering an unknown operation is an error, never a
+    /// silent no-op.
+    #[tokio::test]
+    async fn access_tier_is_recorded_and_finalize_still_publishes() {
+        let (coordinator, temp_dir) = create_test_coordinator().await;
+        let temp_path = temp_dir.path().to_string_lossy().to_string();
+        let config = StagingConfig {
+            base_url: format!("file://{}", temp_path),
+            collection_id: Some("tiered".to_string()),
+            operation_type: TransactionStageType::Flush,
+            ..Default::default()
+        };
+        let metadata = coordinator.begin_atomic_operation(&config).await.unwrap();
+        assert_eq!(metadata.access_tier, None, "account default unless set");
+        coordinator
+            .set_operation_access_tier(
+                &metadata.operation_id,
+                Some(proximadb_storage_filesystem_types::ObjectAccessTier::Cool),
+            )
+            .unwrap();
+        coordinator
+            .write_to_staging(&metadata.operation_id, "L0.pax", b"segment")
+            .await
+            .unwrap();
+        coordinator
+            .finalize_atomic_operation(&metadata.operation_id)
+            .await
+            .unwrap();
+        let published = std::fs::read(
+            std::path::Path::new(metadata.final_url.trim_start_matches("file://")).join("L0.pax"),
+        )
+        .unwrap();
+        assert_eq!(published, b"segment");
+        assert!(
+            coordinator
+                .set_operation_access_tier(&"no-such-op".to_string(), None)
+                .is_err()
         );
     }
 
