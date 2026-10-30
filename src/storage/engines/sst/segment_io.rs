@@ -356,6 +356,108 @@ pub fn spawn_warm_prefixes(
     });
 }
 
+/// TD-TIER-1 SC4-5: what a residency proof observed for one grant.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ResidencyProof {
+    /// Whether a process persistent store is registered at all.
+    pub store_present: bool,
+    /// Objects in the committed set: live segments plus the newest centroid
+    /// directory object ([`residency_objects`]).
+    pub segments: usize,
+    /// Of those, live SEGMENTS (READY needs at least one: a set holding only
+    /// a directory proves nothing about the data — review N-a).
+    pub segment_files: usize,
+    /// Of those, resident in full at their listed size AND protected.
+    pub covered_segments: usize,
+    /// Segment roots examined (0 = the grant names none: nothing can be
+    /// proven).
+    pub roots: usize,
+    /// Sum of the residency objects' listed sizes (segments + the newest
+    /// directory; an object with an unknown size adds 0 and is never
+    /// covered).
+    pub inventory_bytes: u64,
+    /// The same set's STORED size — what pins are charged against the grant
+    /// and the store (header + key + CRC table + value per object).
+    pub inventory_stored_bytes: u64,
+    /// The persistent store's capacity (0 without a store).
+    pub store_capacity: u64,
+    /// Generation `g` of the committed set: a stable hash (FNV-1a 64, masked
+    /// to 53 bits so it is exact in every client — int64 schema, JS numbers)
+    /// of the sorted canonical (url, size) pairs, so any publication or
+    /// retirement changes it.
+    pub generation: u64,
+}
+
+/// Prove (or refute) that every live segment under `prefixes` is resident in
+/// full and protected. One LIST per prefix plus map lookups — a status read,
+/// never the query path. A segment whose listing reports no size counts as
+/// not covered (the proof never guesses).
+pub async fn prove_residency(
+    factory: &crate::storage::persistence::filesystem::FilesystemFactory,
+    prefixes: &[String],
+) -> anyhow::Result<ResidencyProof> {
+    let store = proximadb_cache::process_store();
+    let mut inventory: Vec<(String, Option<u64>)> = Vec::new();
+    for prefix in prefixes {
+        let data_url = prefix.trim_end_matches('/');
+        let fs = factory.get_filesystem(data_url).map_err(|error| {
+            anyhow::anyhow!("residency proof: filesystem for {data_url}: {error}")
+        })?;
+        inventory.extend(residency_objects(fs.as_ref(), data_url).await?);
+    }
+    let mut keyed: Vec<(String, Option<u64>)> = inventory
+        .iter()
+        .map(|(url, size)| (proximadb_cache::canonical_location(url), *size))
+        .collect();
+    keyed.sort();
+    keyed.dedup();
+    let mut generation: u64 = 0xcbf2_9ce4_8422_2325;
+    for (url, size) in &keyed {
+        for byte in url
+            .as_bytes()
+            .iter()
+            .chain(&size.unwrap_or(0).to_le_bytes())
+        {
+            generation ^= u64::from(*byte);
+            generation = generation.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    let mut proof = ResidencyProof {
+        store_present: store.is_some(),
+        roots: prefixes.len(),
+        segments: keyed.len(),
+        segment_files: keyed
+            .iter()
+            .filter(|(url, _)| {
+                url.rsplit('/').next().is_none_or(|name| {
+                    proximadb_storage_common::centroid_directory::parse_object_name(name).is_none()
+                })
+            })
+            .count(),
+        generation: generation & ((1u64 << 53) - 1),
+        store_capacity: store.as_ref().map_or(0, |store| store.capacity()),
+        ..ResidencyProof::default()
+    };
+    for (url, size) in &keyed {
+        proof.inventory_bytes = proof.inventory_bytes.saturating_add(size.unwrap_or(0));
+        proof.inventory_stored_bytes =
+            proof
+                .inventory_stored_bytes
+                .saturating_add(PersistentByteStore::stored_size(
+                    &object_key(url),
+                    size.unwrap_or(0),
+                ));
+        let (Some(store), Some(size)) = (&store, size) else {
+            continue;
+        };
+        let key = object_key(url);
+        if store.entry_len(&key) == Some(*size) && store.is_protected(&key) {
+            proof.covered_segments += 1;
+        }
+    }
+    Ok(proof)
+}
+
 /// The live segment data files of one collection data directory (one LIST,
 /// minus pending retirements — the same rule search discovery applies). A
 /// directory that does not exist yet (no flush) has no segments.
@@ -375,6 +477,49 @@ pub(crate) async fn live_segments(
     Ok(crate::storage::engines::sst::search::live_segment_files(
         entries, &pending,
     ))
+}
+
+/// Everything a query on the vector profile reads under one data directory:
+/// the live segments plus the collection's NEWEST centroid directory object
+/// (read on every cold query when the directory is enabled).
+/// Backfill makes these resident and the READY proof requires them all —
+/// search discovery itself stays segments-only ([`live_segments`]).
+pub(crate) async fn residency_objects(
+    fs: &dyn FileSystem,
+    data_url: &str,
+) -> anyhow::Result<Vec<(String, Option<u64>)>> {
+    let entries = match fs.list(data_url).await {
+        Ok(entries) => entries,
+        Err(FilesystemError::NotFound(_)) => return Ok(Vec::new()),
+        Err(FilesystemError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(error) => anyhow::bail!("list {data_url}: {error}"),
+    };
+    // Only the NEWEST directory generation is read by queries; older ones
+    // linger until GC and must not be required (or warmed) for READY. The
+    // publisher's own selection rule, so the two cannot drift (review N-c).
+    let directories: Vec<(String, Option<u64>)> =
+        crate::storage::engines::sst::centroid_directory_publisher::directory_objects_newest_first(
+            &entries,
+        )
+        .first()
+        .map(|(_, entry)| {
+            (
+                entry.url.clone(),
+                (entry.metadata.size > 0).then_some(entry.metadata.size),
+            )
+        })
+        .into_iter()
+        .collect();
+    let pending = crate::storage::engines::sst::retirement_ledger::pending_paths();
+    let mut objects: Vec<(String, Option<u64>)> =
+        crate::storage::engines::sst::search::live_segment_files(entries, &pending)
+            .into_iter()
+            .map(|segment| (segment.url, segment.size_bytes))
+            .collect();
+    objects.extend(directories);
+    Ok(objects)
 }
 
 /// Outcome of a [`warm_collection`] backfill.
@@ -402,9 +547,9 @@ pub async fn warm_collection(
     if !proximadb_cache::process_store().is_some_and(|store| store.policy_active()) {
         return Ok(WarmReport::default());
     }
-    let segments = live_segments(fs, data_url).await?;
-    let outcomes: Vec<anyhow::Result<bool>> = futures::stream::iter(segments)
-        .map(|segment| async move { warm_object(fs, &segment.url, segment.size_bytes).await })
+    let objects = residency_objects(fs, data_url).await?;
+    let outcomes: Vec<anyhow::Result<bool>> = futures::stream::iter(objects)
+        .map(|(url, size)| async move { warm_object(fs, &url, size).await })
         .buffer_unordered(concurrency.max(1))
         .collect()
         .await;
@@ -656,6 +801,13 @@ mod tests {
             ("segment_format.rs", include_str!("segment_format.rs")),
             ("oid_resolve.rs", include_str!("oid_resolve.rs")),
             ("search/mod.rs", include_str!("search/mod.rs")),
+            (
+                "centroid_directory_reader.rs (non-test)",
+                include_str!("centroid_directory_reader.rs")
+                    .split("#[cfg(test)]")
+                    .next()
+                    .unwrap_or_default(),
+            ),
         ] {
             let heads =
                 source.matches(".metadata(").count() - source.matches(".metadata()").count();

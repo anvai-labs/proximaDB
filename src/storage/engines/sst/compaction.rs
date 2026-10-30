@@ -1712,13 +1712,27 @@ impl Compaction {
             return;
         };
         let dir_url = dir.to_string_lossy();
-        let result = match self.filesystem_factory.get_filesystem(&dir_url) {
-            Ok(fs) => publish_centroid_directory(fs.as_ref(), &dir_url).await,
-            Err(error) => Err(error.into()),
+        let fs = match self.filesystem_factory.get_filesystem(&dir_url) {
+            Ok(fs) => fs,
+            Err(error) => {
+                warn!(dir = %dir_url, %error, "PAX centroid directory not published");
+                return;
+            }
         };
+        let result = publish_centroid_directory(fs.as_ref(), &dir_url).await;
         match result {
             Ok(Some(generation)) => {
-                debug!(dir = %dir_url, generation, "published PAX centroid directory")
+                debug!(dir = %dir_url, generation, "published PAX centroid directory");
+                // TD-TIER-1 SC4-5: queries read the newest directory on every
+                // cold query; a granted collection makes it resident at once
+                // (detached; inert without a grant).
+                crate::storage::engines::sst::segment_io::spawn_warm_object(
+                    fs,
+                    format!(
+                        "{dir_url}/{}",
+                        proximadb_storage_common::centroid_directory::object_name(generation)
+                    ),
+                );
             }
             Ok(None) => {}
             Err(error) => warn!(dir = %dir_url, %error, "PAX centroid directory not published"),

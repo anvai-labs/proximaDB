@@ -767,7 +767,8 @@ message V2CollectionConfig {
 // desired policy; never an input). Mirrors the v1 `StorageClassStatus`.
 message V2StorageClassStatus {
   // "active" (balanced in effect) | "not_active" (policy persisted, dependency
-  // not implemented — the collection serves balanced behavior).
+  // not implemented — the collection serves balanced behavior) | "warming" |
+  // "ready" | "degraded" (TD-TIER-1 SC4-5 PERFORMANCE residency proof).
   string state = 1;
   // Names the missing dependency when state is not_active; empty when active.
   string reason = 2;
@@ -781,6 +782,9 @@ message V2StorageClassStatus {
   uint64 resident_bytes = 5;
   // Bytes covered by the READY coverage set (SC4). 0 until then.
   uint64 covered_bytes = 6;
+  // TD-TIER-1 SC4-5: the committed segment-set generation the coverage was
+  // proven against; 0 when no proof was attempted.
+  uint64 covered_generation = 7;
 }
 
 message V2Collection {

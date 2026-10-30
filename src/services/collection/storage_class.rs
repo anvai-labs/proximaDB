@@ -129,6 +129,7 @@ pub fn storage_class_status(config: &CollectionConfig) -> StorageClassStatus {
             reserved_bytes: 0,
             resident_bytes: 0,
             covered_bytes: 0,
+            covered_generation: 0,
         },
         StorageClass::Economy => StorageClassStatus {
             state: State::NotActive as i32,
@@ -139,6 +140,7 @@ pub fn storage_class_status(config: &CollectionConfig) -> StorageClassStatus {
             reserved_bytes: 0,
             resident_bytes: 0,
             covered_bytes: 0,
+            covered_generation: 0,
         },
         StorageClass::Performance => StorageClassStatus {
             state: State::NotActive as i32,
@@ -151,30 +153,138 @@ pub fn storage_class_status(config: &CollectionConfig) -> StorageClassStatus {
             reserved_bytes: 0,
             resident_bytes: 0,
             covered_bytes: 0,
+            covered_generation: 0,
         },
     }
 }
 
-/// TD-TIER-1 SC4-3: overlay the live residency figures of a PERFORMANCE
-/// collection's grant onto its status. The state stays `not_active`: bytes
-/// are reserved and (partly) protected, but no READY coverage proof exists
-/// yet, so no guarantee is implied — the reason says exactly how far the
-/// grant has got. `covered_bytes` ≤ `resident_bytes` by construction.
-pub fn with_live_residency(
+/// The query profile READY is proven for (SC4-5): default PAX ANN search
+/// (RaBitQ + SQ8 + f32 rerank, payload/metadata, filters) over the SST vector
+/// readers. Other modalities and the DataFusion/legacy readers are not covered.
+pub const READY_PROFILE: &str = "pax-ann-v1";
+
+/// TD-TIER-1 SC4-5: the PERFORMANCE status from a grant and a residency proof
+/// of its committed segment set. READY needs POSITIVE evidence (review B1):
+/// - DEGRADED: the grant names no segment roots; the collection is not served
+///   by [`READY_PROFILE`] (AXIS-routed `index_configs`); no persistent store;
+///   or the set's STORED size exceeds the grant or the store's capacity
+///   (coverage can never complete);
+/// - WARMING: no published segment found under the roots yet (an empty
+///   listing is never proof — the roots may not be where the segments are),
+///   or coverage in progress;
+/// - READY: every residency object is resident in full and protected, for
+///   generation `g` and [`READY_PROFILE`].
+///
+/// Recomputed on every status read, so a lost entry (eviction, corruption,
+/// retirement race) or a new publication drops READY immediately.
+pub fn with_residency_proof(
     mut status: StorageClassStatus,
     reserved_bytes: u64,
     resident_bytes: u64,
     covered_bytes: u64,
+    in_profile: bool,
+    proof: &crate::storage::engines::sst::segment_io::ResidencyProof,
 ) -> StorageClassStatus {
     status.reserved_bytes = reserved_bytes;
     status.resident_bytes = resident_bytes;
     status.covered_bytes = covered_bytes;
-    status.reason = format!(
-        "performance residency is reserved but not READY (TD-TIER-1 SC4): \
-         {reserved_bytes} bytes reserved; {covered_bytes} of {resident_bytes} cached \
-         bytes protected; no coverage proof yet — the collection serves balanced behavior"
-    );
+    status.covered_generation = proof.generation;
+    let capacity = reserved_bytes.min(proof.store_capacity);
+    let (state, reason) = if proof.roots == 0 {
+        (
+            State::Degraded,
+            "the grant names no segment roots (the collection has no storage assignment), \
+             so no coverage can be proven"
+                .to_string(),
+        )
+    } else if !in_profile {
+        (
+            State::Degraded,
+            format!(
+                "the collection is not served by profile {READY_PROFILE} (it must be on the \
+                 SST engine with no AXIS index_configs), so residency cannot be proven for it"
+            ),
+        )
+    } else if !proof.store_present {
+        (
+            State::Degraded,
+            "no persistent local store is configured, so no segment can be resident \
+             (set the cache local-disk path)"
+                .to_string(),
+        )
+    } else if proof.segment_files == 0 {
+        (
+            State::Warming,
+            "no published segment found under the grant's segment roots yet; READY needs a \
+             proven, non-empty segment set"
+                .to_string(),
+        )
+    } else if proof.covered_segments == proof.segments {
+        (
+            State::Ready,
+            format!(
+                "all {} objects of generation {:#x} are resident and protected \
+                 (profile {READY_PROFILE})",
+                proof.segments, proof.generation
+            ),
+        )
+    } else if proof.inventory_stored_bytes > capacity {
+        (
+            State::Degraded,
+            format!(
+                "the committed segment set ({} bytes stored) exceeds what can be held \
+                 ({capacity} bytes: the grant or the store's capacity, whichever is \
+                 smaller); {} of {} objects resident — raise the reservation",
+                proof.inventory_stored_bytes, proof.covered_segments, proof.segments
+            ),
+        )
+    } else {
+        (
+            State::Warming,
+            format!(
+                "{} of {} objects of generation {:#x} resident; warming (profile \
+                 {READY_PROFILE})",
+                proof.covered_segments, proof.segments, proof.generation
+            ),
+        )
+    };
+    status.state = state as i32;
+    status.reason = reason;
     status
+}
+
+/// TD-TIER-1 SC4-5: the PERFORMANCE status when the proof itself failed (e.g.
+/// the listing errored): the progress figures stay, the state is DEGRADED
+/// with the cause (review S5).
+pub fn with_failed_proof(
+    mut status: StorageClassStatus,
+    reserved_bytes: u64,
+    resident_bytes: u64,
+    covered_bytes: u64,
+    error: &str,
+) -> StorageClassStatus {
+    status.reserved_bytes = reserved_bytes;
+    status.resident_bytes = resident_bytes;
+    status.covered_bytes = covered_bytes;
+    status.state = State::Degraded as i32;
+    status.reason = format!("the residency proof could not run: {error}");
+    status
+}
+
+/// The wire label of an observed status state, shared by REST v2 and gRPC v2
+/// so the two surfaces can never disagree ("unspecified" for an unknown
+/// discriminant).
+pub fn state_label(state: i32) -> &'static str {
+    State::try_from(state)
+        .map(|state| match state {
+            State::Active => "active",
+            State::NotActive => "not_active",
+            State::Warming => "warming",
+            State::Ready => "ready",
+            State::Degraded => "degraded",
+            State::Unspecified => "unspecified",
+        })
+        .unwrap_or("unspecified")
 }
 
 /// SC2 admission check for the PERFORMANCE class, evaluated on the final
@@ -326,20 +436,85 @@ mod tests {
     }
 
     /// SC4-3: the status overlay reports the grant's bytes without claiming READY.
+    fn proof(
+        store_present: bool,
+        segments: usize,
+        covered_segments: usize,
+        inventory_bytes: u64,
+    ) -> crate::storage::engines::sst::segment_io::ResidencyProof {
+        crate::storage::engines::sst::segment_io::ResidencyProof {
+            store_present,
+            roots: 1,
+            segments,
+            segment_files: segments,
+            covered_segments,
+            inventory_bytes,
+            inventory_stored_bytes: inventory_bytes + 100 * segments as u64,
+            store_capacity: 1 << 30,
+            generation: 0xabc,
+        }
+    }
+
+    /// SC4-5: READY only with positive evidence; WARMING while the set fits
+    /// but is partial or nothing is published yet; DEGRADED when it can
+    /// never fit (STORED size), has no roots or store, or the collection is
+    /// outside the profile. Bytes and generation are reported in every state.
     #[test]
-    fn live_residency_overlay_reports_bytes_and_stays_not_active() {
-        let base = storage_class_status(&config_with_class(Some(StorageClass::Performance as i32)));
-        let status = with_live_residency(base, 4096, 3000, 1000);
-        assert_eq!(status.state, State::NotActive as i32, "no READY proof yet");
+    fn residency_proof_drives_the_state() {
+        let base =
+            || storage_class_status(&config_with_class(Some(StorageClass::Performance as i32)));
+        let ready = with_residency_proof(base(), 4096, 3000, 3000, true, &proof(true, 3, 3, 3000));
+        assert_eq!(ready.state, State::Ready as i32, "{}", ready.reason);
+        assert_eq!(ready.covered_generation, 0xabc);
+        assert!(ready.reason.contains(READY_PROFILE));
+
+        let warming =
+            with_residency_proof(base(), 4096, 3000, 1000, true, &proof(true, 3, 1, 3000));
+        assert_eq!(warming.state, State::Warming as i32, "{}", warming.reason);
+        assert!(warming.reason.contains("1 of 3"));
+
+        // Fits by value bytes (3000 <= 3100) but not by STORED bytes (3300).
+        let over = with_residency_proof(base(), 3100, 3000, 1000, true, &proof(true, 3, 1, 3000));
+        assert_eq!(over.state, State::Degraded as i32, "{}", over.reason);
+        assert!(over.reason.contains("exceeds"));
+
+        let no_store = with_residency_proof(base(), 4096, 0, 0, true, &proof(false, 3, 0, 3000));
+        assert_eq!(no_store.state, State::Degraded as i32);
+        assert_eq!(state_label(no_store.state), "degraded");
+        assert_eq!(state_label(ready.state), "ready");
+        assert_eq!(state_label(warming.state), "warming");
+
+        // Review B1: an empty set is never proof.
+        let empty = with_residency_proof(base(), 4096, 0, 0, true, &proof(true, 0, 0, 0));
+        assert_eq!(empty.state, State::Warming as i32, "{}", empty.reason);
+        // Review N-a: a set holding only a covered directory is not READY.
+        let mut directory_only = proof(true, 1, 1, 100);
+        directory_only.segment_files = 0;
+        let lone = with_residency_proof(base(), 4096, 100, 100, true, &directory_only);
+        assert_eq!(lone.state, State::Warming as i32, "{}", lone.reason);
+        let mut no_roots = proof(true, 0, 0, 0);
+        no_roots.roots = 0;
+        let rootless = with_residency_proof(base(), 4096, 0, 0, true, &no_roots);
+        assert_eq!(
+            rootless.state,
+            State::Degraded as i32,
+            "{}",
+            rootless.reason
+        );
+        // Review S4: outside the profile, never READY even when covered.
+        let axis = with_residency_proof(base(), 4096, 3000, 3000, false, &proof(true, 3, 3, 3000));
+        assert_eq!(axis.state, State::Degraded as i32, "{}", axis.reason);
+
+        let failed = with_failed_proof(base(), 4096, 10, 5, "list failed");
+        assert_eq!(failed.state, State::Degraded as i32);
         assert_eq!(
             (
-                status.reserved_bytes,
-                status.resident_bytes,
-                status.covered_bytes
+                failed.reserved_bytes,
+                failed.resident_bytes,
+                failed.covered_bytes
             ),
-            (4096, 3000, 1000)
+            (4096, 10, 5)
         );
-        assert!(status.reason.contains("1000 of 3000"), "{}", status.reason);
     }
 
     /// SC4-2: the prefixes are the flush/compaction segment roots, both

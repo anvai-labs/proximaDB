@@ -246,6 +246,18 @@ impl PersistentByteStore {
         self.release_pin(&meta)
     }
 
+    /// The store's capacity in bytes (status: a residency set larger than
+    /// this can never be fully resident).
+    pub fn capacity(&self) -> u64 {
+        self.inner.max_bytes
+    }
+
+    /// The on-disk size an entry of `value_len` bytes under `key` occupies —
+    /// what pins and budgets are charged (SC4-5 proof sizing).
+    pub fn stored_size(key: &str, value_len: u64) -> u64 {
+        stored_len(key, value_len)
+    }
+
     /// A directory on the store's own filesystem for staging values before
     /// [`Self::put_file_range`] (SC4-4: never the system temp dir, which may
     /// be RAM-backed).
