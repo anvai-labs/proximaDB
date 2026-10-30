@@ -1243,16 +1243,17 @@ pub(crate) fn residency_test_gate() -> std::sync::MutexGuard<'static, ()> {
 /// shared-process runner).
 #[cfg(test)]
 pub(crate) fn residency_test_store() -> Arc<proximadb_cache::PersistentByteStore> {
-    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-    let dir = DIR.get_or_init(|| {
+    // Opened and registered ONCE: re-opening would wipe the live store's
+    // staging directory and run eviction on a second, pin-blind instance.
+    static REGISTERED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    REGISTERED.get_or_init(|| {
         let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("test store dir: {error}"));
         let path = dir.path().to_path_buf();
         std::mem::forget(dir);
-        path
-    });
-    if let Ok(store) = proximadb_cache::PersistentByteStore::open(dir, 64 << 20) {
+        let store = proximadb_cache::PersistentByteStore::open(&path, 64 << 20)
+            .unwrap_or_else(|error| panic!("test store: {error}"));
         let _ = proximadb_cache::register_process_store(Arc::new(store));
-    }
+    });
     proximadb_cache::process_store().unwrap_or_else(|| panic!("a process store is registered"))
 }
 

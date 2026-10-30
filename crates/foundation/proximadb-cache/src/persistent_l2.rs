@@ -152,9 +152,12 @@ impl PersistentByteStore {
         std::fs::create_dir_all(&base)?;
         // SC4-4: staging files a crash left behind are garbage (an entry is
         // only ever indexed from a completed write under a shard).
+        // Best-effort: a cleanup failure must never disable the whole tier
+        // (leftover staging files cost disk, not correctness — they are never
+        // indexed). The next successful open reclaims them.
         let staging = base.join("staging");
         if staging.exists() {
-            std::fs::remove_dir_all(&staging)?;
+            let _ = std::fs::remove_dir_all(&staging);
         }
         for shard in 0..SHARDS {
             std::fs::create_dir_all(base.join(format!("shard_{shard:02}")))?;
