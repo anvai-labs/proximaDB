@@ -3632,6 +3632,20 @@ mod compaction_format_tests {
         }
     }
 
+    /// TD-TIER-1 SC5: a follow-up task (the next level of the cascade)
+    /// keeps the collection's tier — config-free producers build it unset.
+    #[test]
+    fn follow_up_tasks_inherit_the_access_tier() {
+        let mut origin = quant_task(None);
+        origin.access_tier = Some(proximadb_storage_filesystem_types::ObjectAccessTier::Cool);
+        let mut follow_up = quant_task(None);
+        follow_up.inherit_collection_intent(&origin);
+        assert_eq!(
+            follow_up.access_tier,
+            Some(proximadb_storage_filesystem_types::ObjectAccessTier::Cool)
+        );
+    }
+
     /// TD-READFID-2 review: the PAX output encoding follows the collection's
     /// resolved base quant, never a hardcoded RaBitQ — and a RawF32 output is
     /// only written when every input is exact, so lossy reconstructions are

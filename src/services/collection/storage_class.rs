@@ -322,6 +322,8 @@ pub fn record_storage_engine(
 pub fn in_ready_profile(config: &CollectionConfig) -> bool {
     config.index_configs.is_empty()
         && effective_storage_engine(config.storage_engine) == Some(StorageEngine::Sst)
+}
+
 /// TD-TIER-1 SC5: the user-facing access-tier labels (REST v2 accepts exactly
 /// these, case-insensitively, plus the proto enum names). Online tiers only.
 pub const ACCESS_TIER_LABELS: [&str; 3] = ["hot", "cool", "cold"];
@@ -635,6 +637,8 @@ mod tests {
         assert!(!in_ready_profile(&config));
         config.storage_engine = Some(9_999);
         assert!(!in_ready_profile(&config));
+    }
+
     /// SC5: the tier vocabulary is strict — archive and typos are refused,
     /// unknown proto numbers are refused, unset is the account default.
     #[test]

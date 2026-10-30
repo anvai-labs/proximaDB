@@ -2151,8 +2151,8 @@ mod access_tier_publish_tests {
     proximadb_storage_filesystem_types::forward_filesystem_impl! {
         impl FileSystem for RecordingCloudFs => inner;
         forward [
-            as_any, filesystem_type, supports_mmap, append, exists, metadata, list,
-            create_dir, create_dir_all, move_file, sync, sync_file, sync_data, open_file,
+            as_any, filesystem_type, supports_mmap, append, exists, metadata,
+            create_dir, move_file, sync, sync_file, sync_data, open_file,
         ];
         {
             async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
@@ -2175,12 +2175,39 @@ mod access_tier_publish_tests {
                 self.record(format!("copy {from} {to}"));
                 Ok(())
             }
+            async fn create_dir_all(&self, _path: &str) -> FsResult<()> {
+                Ok(())
+            }
+            /// A staging prefix lists one staged segment; anything else is
+            /// empty (cloud paths reach the backend as the full URL).
+            async fn list(&self, path: &str) -> FsResult<Vec<DirEntry>> {
+                if !path.contains("/__") {
+                    return Ok(Vec::new());
+                }
+                let url = format!("{}/L1.pax", path.trim_end_matches('/'));
+                Ok(vec![DirEntry {
+                    name: "L1.pax".to_string(),
+                    metadata: FsFileMetadata {
+                        path: url.clone(),
+                        size: 7,
+                        created: None,
+                        modified: None,
+                        is_directory: false,
+                        permissions: None,
+                        etag: None,
+                        storage_class: None,
+                    },
+                    url,
+                }])
+            }
         }
     }
 
     fn factory_with(fs: Arc<RecordingCloudFs>) -> FilesystemFactory {
         let mut filesystems: HashMap<String, Arc<dyn FileSystem>> = HashMap::new();
-        filesystems.insert("s3".to_string(), fs);
+        filesystems.insert("s3".to_string(), fs.clone());
+        // The coordinator resolves a `file://` backend at construction.
+        filesystems.insert("file".to_string(), fs);
         FilesystemFactory {
             config: FilesystemConfig::default(),
             filesystems,
@@ -2236,17 +2263,41 @@ mod access_tier_publish_tests {
         );
     }
 
-    /// The coordinator's finalize hands the recorded tier to this move (a
-    /// source guard: the coordinator cannot be pointed at a recording backend
-    /// without a full staging round-trip).
-    #[test]
-    fn coordinator_finalize_moves_with_the_operation_tier() {
-        let source = include_str!("../../transaction_coordinator.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap_or_default();
-        assert!(production.contains(".move_atomic_with_options("));
-        assert!(production.contains(
-            "FileOptions::for_access_tier(\n                            metadata.access_tier,"
-        ));
-        assert!(!production.contains(".move_atomic(&staging_file_url, &final_file_url)"));
+    /// The coordinator's finalize applies the operation's recorded tier to
+    /// the object it publishes (review round 2: replaces a source guard).
+    #[tokio::test]
+    async fn coordinator_finalize_publishes_at_the_operation_tier() {
+        use crate::storage::transaction_coordinator::{
+            StagingConfig, TransactionStageType, UnifiedTransactionCoordinator,
+        };
+        let fs = RecordingCloudFs::new().await;
+        let coordinator =
+            UnifiedTransactionCoordinator::new(Arc::new(factory_with(fs.clone())), None)
+                .await
+                .expect("coordinator");
+        let config = StagingConfig {
+            base_url: "s3://bucket/tenant".to_string(),
+            collection_id: Some("coll".to_string()),
+            operation_type: TransactionStageType::Compaction,
+            ..Default::default()
+        };
+        let operation = coordinator
+            .begin_atomic_operation(&config)
+            .await
+            .expect("begin");
+        coordinator
+            .set_operation_access_tier(&operation.operation_id, Some(ObjectAccessTier::Cold))
+            .expect("tier");
+        coordinator
+            .finalize_atomic_operation(&operation.operation_id)
+            .await
+            .expect("finalize");
+        let calls = fs.calls();
+        let published = format!("write {}/L1.pax tier=Some(Cold)", operation.final_url);
+        assert!(calls.contains(&published), "{published} not in {calls:?}");
+        assert!(
+            !calls.iter().any(|call| call.starts_with("copy ")),
+            "{calls:?}"
+        );
     }
 }
