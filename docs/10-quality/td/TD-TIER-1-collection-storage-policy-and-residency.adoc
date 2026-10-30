@@ -6,7 +6,7 @@
 [cols="1,3",options="header"]
 |===
 | Field | Value
-| Status | In Progress — SC0 design/harness and pilot merged (#2244/#2249); E1 fixed-object + scale arms measured (#2255). SC1 + SC2 landed (#2259); SC3 landed (#2267, #2269, #2270); SC4 landed (#2276, #2279, #2285, #2295, #2299) plus hardening (orphan-copy sweep, UNSPECIFIED-engine resolution); SC5–SC6 open.
+| Status | In Progress — SC0 design/harness and pilot merged (#2244/#2249); E1 fixed-object + scale arms measured (#2255). SC1 + SC2 landed (#2259); SC3 landed (#2267, #2269, #2270); SC4 landed (#2276, #2279, #2285, #2295, #2299) plus hardening (#2304: orphan-copy sweep, UNSPECIFIED-engine resolution); SC5 implemented (future-PUT access tier on compaction output); SC6 open.
 | Priority | MED — explicit storage economics without changing durability or query correctness.
 | Component | Collection config/catalog/API; storage placement; persistent PAX L2; consumption metrics and durable metering.
 | Design | link:../../current/STORAGE_PLAN.adoc[Review, thought experiments, contracts, financial model and roadmap].
