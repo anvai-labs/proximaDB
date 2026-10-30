@@ -2966,53 +2966,61 @@ impl CollectionService {
 
             match self.filesystem_factory.get_filesystem(base_location) {
                 Ok(filesystem) => {
-                    let mut all_clean = true;
+                    // Every root is attempted (a failure on one never skips
+                    // the others), and only roots proven gone — deleted, or
+                    // absent — have their warm-tier entries purged. A root
+                    // whose existence check fails is left for a retry.
+                    let mut gone: Vec<&String> = Vec::new();
+                    let mut failures: Vec<String> = Vec::new();
                     for collection_dir in &roots {
                         match filesystem.exists(collection_dir).await {
                             Ok(true) => match filesystem.remove_dir_all(collection_dir).await {
                                 Ok(_) => {
-                                    info!("✅ Deleted collection directory: {}", collection_dir)
+                                    info!("✅ Deleted collection directory: {}", collection_dir);
+                                    gone.push(collection_dir);
                                 }
                                 Err(e) => {
                                     error!(
                                         "❌ Failed to delete collection directory {}: {}",
                                         collection_dir, e
                                     );
-                                    return Err(anyhow::anyhow!(
-                                        "Failed to delete collection directory: {}",
-                                        e
-                                    ));
+                                    failures.push(format!("{collection_dir}: {e}"));
                                 }
                             },
-                            Ok(false) => debug!(
-                                "📂 Collection directory {} does not exist (already cleaned up)",
-                                collection_dir
-                            ),
-                            Err(e) => {
-                                all_clean = false;
-                                warn!(
-                                    "⚠️ Failed to check existence of collection directory {}: {}",
-                                    collection_dir, e
+                            Ok(false) => {
+                                debug!(
+                                    "📂 Collection directory {} does not exist (already cleaned up)",
+                                    collection_dir
                                 );
+                                gone.push(collection_dir);
                             }
+                            Err(e) => warn!(
+                                "⚠️ Failed to check existence of collection directory {}: {}",
+                                collection_dir, e
+                            ),
                         }
                     }
-                    if all_clean {
-                        cleaned_components = 3; // All components deleted
-                        for collection_dir in &roots {
-                            let purged =
-                                crate::storage::engines::sst::core::purge_warm_tier_prefix(
-                                    collection_dir,
-                                )
-                                .await;
-                            if purged > 0 {
-                                debug!(
-                                    collection_dir,
-                                    purged,
-                                    "Reclaimed retired collection entries from the PAX warm tier"
-                                );
-                            }
+                    for collection_dir in &gone {
+                        let purged = crate::storage::engines::sst::core::purge_warm_tier_prefix(
+                            collection_dir,
+                        )
+                        .await;
+                        if purged > 0 {
+                            debug!(
+                                collection_dir = collection_dir.as_str(),
+                                purged,
+                                "Reclaimed retired collection entries from the PAX warm tier"
+                            );
                         }
+                    }
+                    if !failures.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "Failed to delete collection directory: {}",
+                            failures.join("; ")
+                        ));
+                    }
+                    if gone.len() == roots.len() {
+                        cleaned_components = 3; // All components deleted
                     }
                 }
                 Err(e) => {
@@ -5543,6 +5551,31 @@ mod tests {
         Ok(())
     }
 
+    /// [`catalog_backed_service`] whose storage location is ALSO under the
+    /// temp dir (`file://{tmp}/data`), so creates make real directories there.
+    async fn catalog_backed_service_with_local_data()
+    -> Result<(tempfile::TempDir, CollectionService)> {
+        let temp_dir = tempfile::TempDir::new().context("temp dir")?;
+        let mgr = Arc::new(CatalogManager::new());
+        mgr.create_native_catalog(
+            "default",
+            &format!("file://{}/catalog", temp_dir.path().display()),
+        )
+        .await
+        .context("create test catalog")?;
+        let svc = CollectionService::new(StorageConfig {
+            storage_locations: vec![crate::core::config::StorageLocation {
+                url: format!("file://{}/data", temp_dir.path().display()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await
+        .context("collection service")?
+        .with_catalog_manager(mgr);
+        Ok((temp_dir, svc))
+    }
+
     /// A collection service over a fresh native catalog in a temp dir (kept
     /// alive by the returned guard), on the default local storage config.
     async fn catalog_backed_service() -> Result<(tempfile::TempDir, CollectionService)> {
@@ -5792,28 +5825,51 @@ mod tests {
         );
     }
 
+    /// The create CALL SITE builds directories under the tenant-scoped base
+    /// the storage assignment records (review SF2: the helper test alone
+    /// would pass with the call reverted to the raw base).
+    #[tokio::test]
+    async fn tenant_create_directories_match_the_storage_assignment() -> Result<()> {
+        let (_temp_dir, svc) = catalog_backed_service_with_local_data().await?;
+        let ctx = crate::storage::tenant::TenantContext::for_tenant_id("acme");
+        let config = CollectionConfig {
+            name: "tenant_dirs".to_string(),
+            dimension: 8,
+            ..Default::default()
+        };
+        assert!(
+            svc.create_collection_with_tenant_context(&config, Some(&ctx))
+                .await
+                .context("create")?
+                .success
+        );
+        let record = svc
+            .get_collection_with_tenant_context("tenant_dirs", Some(&ctx))
+            .await?
+            .context("record")?;
+        let base = record
+            .storage_assignment
+            .as_ref()
+            .context("assignment")?
+            .base_location
+            .clone();
+        assert!(base.ends_with("/tenants/acme"), "{base}");
+        let (_, data, _) = collection_storage_dirs(&base, &record.id, None);
+        let data_dir = std::path::PathBuf::from(data.trim_start_matches("file://"));
+        assert!(
+            data_dir.is_dir(),
+            "create made {} under the assignment base",
+            data_dir.display()
+        );
+        Ok(())
+    }
+
     /// Dropping a typed collection deletes its account-rooted directory too
     /// (cleanup used to delete only the legacy `{base}/{uuid}` root, leaving
     /// every typed segment in storage).
     #[tokio::test]
     async fn drop_cleanup_deletes_the_typed_root() -> Result<()> {
-        let temp_dir = tempfile::TempDir::new().context("temp dir")?;
-        let catalog_url = format!("file://{}/catalog", temp_dir.path().display());
-        let data_url = format!("file://{}/data", temp_dir.path().display());
-        let mgr = Arc::new(CatalogManager::new());
-        mgr.create_native_catalog("default", &catalog_url)
-            .await
-            .context("create test catalog")?;
-        let svc = CollectionService::new(StorageConfig {
-            storage_locations: vec![crate::core::config::StorageLocation {
-                url: data_url.clone(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        })
-        .await
-        .context("collection service")?
-        .with_catalog_manager(mgr);
+        let (_temp_dir, svc) = catalog_backed_service_with_local_data().await?;
         let config = CollectionConfig {
             name: "typed_drop".to_string(),
             dimension: 8,

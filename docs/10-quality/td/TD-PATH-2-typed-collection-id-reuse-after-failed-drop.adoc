@@ -1,0 +1,46 @@
+= TD-PATH-2: A typed collection id can be reused after a failed drop, so the new collection inherits the old one's segments
+:status: Open
+:filed: 2026-10-30
+:priority: P2 — latent while `PROXIMADB_TYPED_PATHS` is default-off; P1 before it defaults on
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** — found in the adversarial review of the typed-path create/drop fix (fix/typed-path-tenant-dirs).
+| Relates to | link:TD-PATH-1-cwd-relative-default-paths-cross-contaminate.adoc[TD-PATH-1], ADR-031 (typed `accounts/{a}/{n}/{c}` layout), ADR-0083 (typed identity on every assignment), link:TD-TIER-1-collection-storage-policy-and-residency.adoc[TD-TIER-1]
+|===
+
+== Finding
+
+The legacy collection root `{base}/{uuid}` is keyed by a UUID that is never reused. The typed root
+`{base}/accounts/{a}/{n}/{c}` is keyed by the catalog's `collection_id`. Its allocation floor is
+recovered as `max(live) + 1` (`SystemCatalog`, `system_catalog.rs` ~211–230). So after the
+highest-id collection is dropped and the process restarts, the next create mints the same
+`(a, n, c)`.
+
+Drop runs storage cleanup synchronously before deleting the catalog record. But
+`delete_collection` only logs a cleanup failure and still deletes the record. A typed root that
+failed to delete therefore survives with no owner, and the next collection minted onto the same
+triple finds the dropped collection's segments in its data directory. Search discovery lists
+that directory, so the dropped rows come back.
+
+`NativeCatalog` is worse. Its floors are recovered lazily, as tables load (`native.rs`
+~1170–1183), and `namespace_registry` does not survive a restart. A fresh create can therefore
+mint the triple of a live collection that has not been loaded yet, and dropping either
+collection would delete the other's segments.
+
+== Proposed fix
+
+* Make the allocator floor durable: persist a monotonic collection-id high-water mark that
+  survives drops and restarts, and is recovered eagerly at open rather than as tables load.
+* Fail closed: when storage cleanup fails, drop either returns an error and keeps the catalog
+  record, or records an orphan obligation, as the TD-COMPACT-13 ledger does, so the triple is
+  never re-minted while its root still exists.
+* Gate: a test that drops the highest-id typed collection with an injected `remove_dir_all`
+  failure, restarts, creates a new collection, and asserts the new collection's data directory
+  is empty (or that the create mints a fresh triple).
+
+== Not in scope
+
+The create/drop path-agreement fix itself (directories under the tenant-scoped base; drop
+deletes both roots and attempts every root) landed with the change that filed this TD.
