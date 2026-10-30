@@ -2637,26 +2637,16 @@ fn stage_f_waves_split_by_bytes_in_order() {
     );
 }
 
-/// PR-D L1a/L1b: Stage F reads its D ranges in bounded-concurrency waves
-/// and takes its header/footer from the invariants cache (warm) or skips the
-/// HEAD with a listed size (cold) — the allow-set is identical on every path,
-/// and the request counts shrink exactly by the elided reads.
-#[tokio::test]
-async fn stage_f_waves_cache_and_known_size_keep_the_allow_set_exact() {
-    enable_coalesced_rabitq();
-    // Waves only fire with an in-flight cap > 1; parsed once per process
-    // (nextest isolates each test), so set before the first read.
-    unsafe {
-        std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "4");
-    }
-    use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
-    use proximadb_storage_common::segment_layout::SegmentHeaderPrefix;
+/// Rows in [`write_stage_f_partition_segment`]. The row-group layout floors
+/// D granules at 256 KiB, so the corpus must be large enough to span several
+/// D blocks (several ranges per wave).
+const STAGE_F_SEGMENT_ROWS: usize = 12_000;
 
+/// A coalesced RaBitQ segment of [`STAGE_F_SEGMENT_ROWS`] 32-d rows whose
+/// `partition` prop is `p{i % 8}` (record oid `r{i}`).
+fn write_stage_f_partition_segment() -> (tempfile::TempDir, std::path::PathBuf) {
     const DIM: usize = 32;
-    // The row-group layout floors D granules at 256 KiB, so the corpus must
-    // be large enough to span several D blocks (several ranges per wave).
-    const N: usize = 12_000;
-    let records: Vec<ProximaRecord> = (0..N)
+    let records: Vec<ProximaRecord> = (0..STAGE_F_SEGMENT_ROWS)
         .map(|i| {
             let v: Vec<f32> = (0..DIM)
                 .map(|d| (((i * 131 + d * 17) % 251) as f32) * 0.01)
@@ -2676,6 +2666,36 @@ async fn stage_f_waves_cache_and_known_size_keep_the_allow_set_exact() {
         None,
     )
     .unwrap();
+    (dir, path)
+}
+
+/// The footer index of a whole segment file's bytes.
+fn parse_segment_footer(
+    bytes: &[u8],
+) -> proximadb_storage_common::segment_layout::SegmentFooterIndex {
+    use proximadb_storage_common::segment_layout::{SegmentFooterIndex, SegmentHeaderPrefix};
+    let header = SegmentHeaderPrefix::parse(bytes).unwrap();
+    let off = header.footer_off as usize;
+    SegmentFooterIndex::parse(&bytes[off..off + header.footer_len as usize]).unwrap()
+}
+
+/// PR-D L1a/L1b: Stage F reads its D ranges in bounded-concurrency waves
+/// and takes its header/footer from the invariants cache (warm) or skips the
+/// HEAD with a listed size (cold) — the allow-set is identical on every path,
+/// and the request counts shrink exactly by the elided reads.
+#[tokio::test]
+async fn stage_f_waves_cache_and_known_size_keep_the_allow_set_exact() {
+    enable_coalesced_rabitq();
+    // Waves only fire with an in-flight cap > 1; parsed once per process
+    // (nextest isolates each test), so set before the first read.
+    unsafe {
+        std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "4");
+    }
+    use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
+    use proximadb_storage_common::segment_layout::SegmentHeaderPrefix;
+
+    const N: usize = STAGE_F_SEGMENT_ROWS;
+    let (_dir, path) = write_stage_f_partition_segment();
     // Tiny coalesce cap ⇒ many D ranges ⇒ more than one per wave.
     unsafe {
         std::env::set_var("PROXIMADB_PAX_COALESCE_RANGE", "4096");
@@ -2689,12 +2709,8 @@ async fn stage_f_waves_cache_and_known_size_keep_the_allow_set_exact() {
     // expected set by an independent decode, as the exact test does.
     let expected: Vec<usize> = {
         use proximadb_block_format::{PaxBlockReader, record::FlatRow};
-        use proximadb_storage_common::segment_layout::SegmentFooterIndex;
         let bytes = std::fs::read(&path).unwrap();
-        let header = SegmentHeaderPrefix::parse(&bytes).unwrap();
-        let off = header.footer_off as usize;
-        let footer =
-            SegmentFooterIndex::parse(&bytes[off..off + header.footer_len as usize]).unwrap();
+        let footer = parse_segment_footer(&bytes);
         let mut expected = Vec::new();
         let mut g = 0usize;
         for b in &footer.blocks {
@@ -2788,6 +2804,86 @@ async fn stage_f_waves_cache_and_known_size_keep_the_allow_set_exact() {
         std::env::remove_var("PROXIMADB_PAX_COALESCE_RANGE");
         std::env::remove_var("PROXIMADB_READ_RANGES_INFLIGHT");
     }
+}
+
+/// The parallel Stage F decode is exact at every degree: serial, several
+/// workers, and more workers than blocks build the same matched ordinals,
+/// pruned-block count and decoded-row count. Called at an explicit degree,
+/// so the parallel branch runs regardless of the host's core count or the
+/// small-wave gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stage_f_parallel_decode_matches_serial_at_every_degree() {
+    const N: usize = STAGE_F_SEGMENT_ROWS;
+    let (_dir, path) = write_stage_f_partition_segment();
+    let bytes = std::fs::read(&path).unwrap();
+    let footer = parse_segment_footer(&bytes);
+    assert!(footer.blocks.len() > 3, "several D blocks");
+    let buf = std::sync::Arc::new(bytes.clone());
+    let jobs = || {
+        let mut start = 0usize;
+        footer
+            .blocks
+            .iter()
+            .map(|b| {
+                let job = StageFBlockJob {
+                    buf: buf.clone(),
+                    range: b.offset as usize..(b.offset + b.size as u64) as usize,
+                    rows: u64::from(b.row_count),
+                    start_ordinal: start,
+                };
+                start += b.row_count as usize;
+                job
+            })
+            .collect::<Vec<_>>()
+    };
+    let field_map = footer
+        .shred_field_map
+        .iter()
+        .map(|c| (c.key.clone(), c.column_id))
+        .collect();
+    let ctx = std::sync::Arc::new(StageFDecodeCtx {
+        path: "seg.pax".to_string(),
+        filter: partition_filter("p3"),
+        field_map,
+    });
+    let summarize = |out: Vec<Option<StageFBlockDecoded>>| {
+        let mut pruned = 0usize;
+        let mut rows = 0u64;
+        let mut matched = Vec::new();
+        for block in out {
+            match block {
+                None => pruned += 1,
+                Some(b) => {
+                    rows += b.rows;
+                    matched.extend(b.matched);
+                }
+            }
+        }
+        matched.sort_unstable();
+        (pruned, rows, matched)
+    };
+    let serial = summarize(
+        decode_stage_f_wave_with_degree(&ctx, jobs(), 1)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(serial.1, N as u64, "every block decoded");
+    assert_eq!(serial.2.len(), N / 8, "one partition in eight matches");
+    let n_blocks = footer.blocks.len();
+    for degree in [2, 3, n_blocks + 5] {
+        let parallel = summarize(
+            decode_stage_f_wave_with_degree(&ctx, jobs(), degree)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(parallel, serial, "degree {degree}");
+    }
+    // A block outside its buffer fails the wave (exact fallback), it is
+    // never silently dropped from the allow-set.
+    let mut bad = jobs();
+    let last = bad.len() - 1;
+    bad[last].range = bytes.len()..bytes.len() + 1;
+    assert!(decode_stage_f_wave_with_degree(&ctx, bad, 3).await.is_err());
 }
 
 /// R5: Stage F evaluates the predicate against the record's PROPS
