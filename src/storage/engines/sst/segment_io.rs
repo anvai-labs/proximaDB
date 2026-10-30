@@ -361,9 +361,12 @@ pub fn spawn_warm_prefixes(
 pub struct ResidencyProof {
     /// Whether a process persistent store is registered at all.
     pub store_present: bool,
-    /// Objects in the committed set: live segments plus centroid directory
-    /// objects ([`residency_objects`]).
+    /// Objects in the committed set: live segments plus the newest centroid
+    /// directory object ([`residency_objects`]).
     pub segments: usize,
+    /// Of those, live SEGMENTS (READY needs at least one: a set holding only
+    /// a directory proves nothing about the data — review N-a).
+    pub segment_files: usize,
     /// Of those, resident in full at their listed size AND protected.
     pub covered_segments: usize,
     /// Segment roots examined (0 = the grant names none: nothing can be
@@ -423,6 +426,14 @@ pub async fn prove_residency(
         store_present: store.is_some(),
         roots: prefixes.len(),
         segments: keyed.len(),
+        segment_files: keyed
+            .iter()
+            .filter(|(url, _)| {
+                url.rsplit('/').next().is_none_or(|name| {
+                    proximadb_storage_common::centroid_directory::parse_object_name(name).is_none()
+                })
+            })
+            .count(),
         generation: generation & ((1u64 << 53) - 1),
         store_capacity: store.as_ref().map_or(0, |store| store.capacity()),
         ..ResidencyProof::default()
@@ -486,15 +497,13 @@ pub(crate) async fn residency_objects(
         Err(error) => anyhow::bail!("list {data_url}: {error}"),
     };
     // Only the NEWEST directory generation is read by queries; older ones
-    // linger until GC and must not be required (or warmed) for READY.
-    let directories: Vec<(String, Option<u64>)> = entries
-        .iter()
-        .filter(|entry| !entry.metadata.is_directory)
-        .filter_map(|entry| {
-            proximadb_storage_common::centroid_directory::parse_object_name(&entry.name)
-                .map(|generation| (generation, entry))
-        })
-        .max_by_key(|(generation, _)| *generation)
+    // linger until GC and must not be required (or warmed) for READY. The
+    // publisher's own selection rule, so the two cannot drift (review N-c).
+    let directories: Vec<(String, Option<u64>)> =
+        crate::storage::engines::sst::centroid_directory_publisher::directory_objects_newest_first(
+            &entries,
+        )
+        .first()
         .map(|(_, entry)| {
             (
                 entry.url.clone(),

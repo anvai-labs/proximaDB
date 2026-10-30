@@ -246,9 +246,6 @@ impl PersistentByteStore {
         self.release_pin(&meta)
     }
 
-    /// A directory on the store's own filesystem for staging values before
-    /// [`Self::put_file_range`] (SC4-4: never the system temp dir, which may
-    /// be RAM-backed).
     /// The store's capacity in bytes (status: a residency set larger than
     /// this can never be fully resident).
     pub fn capacity(&self) -> u64 {
@@ -261,6 +258,9 @@ impl PersistentByteStore {
         stored_len(key, value_len)
     }
 
+    /// A directory on the store's own filesystem for staging values before
+    /// [`Self::put_file_range`] (SC4-4: never the system temp dir, which may
+    /// be RAM-backed).
     pub fn staging_dir(&self) -> std::io::Result<PathBuf> {
         let dir = self.inner.base.join("staging");
         std::fs::create_dir_all(&dir)?;

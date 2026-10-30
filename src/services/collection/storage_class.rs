@@ -201,8 +201,8 @@ pub fn with_residency_proof(
         (
             State::Degraded,
             format!(
-                "the collection is not served by profile {READY_PROFILE} (its index_configs \
-                 route search through AXIS), so residency cannot be proven for it"
+                "the collection is not served by profile {READY_PROFILE} (it must be on the \
+                 SST engine with no AXIS index_configs), so residency cannot be proven for it"
             ),
         )
     } else if !proof.store_present {
@@ -212,7 +212,7 @@ pub fn with_residency_proof(
              (set the cache local-disk path)"
                 .to_string(),
         )
-    } else if proof.segments == 0 {
+    } else if proof.segment_files == 0 {
         (
             State::Warming,
             "no published segment found under the grant's segment roots yet; READY needs a \
@@ -446,6 +446,7 @@ mod tests {
             store_present,
             roots: 1,
             segments,
+            segment_files: segments,
             covered_segments,
             inventory_bytes,
             inventory_stored_bytes: inventory_bytes + 100 * segments as u64,
@@ -486,6 +487,11 @@ mod tests {
         // Review B1: an empty set is never proof.
         let empty = with_residency_proof(base(), 4096, 0, 0, true, &proof(true, 0, 0, 0));
         assert_eq!(empty.state, State::Warming as i32, "{}", empty.reason);
+        // Review N-a: a set holding only a covered directory is not READY.
+        let mut directory_only = proof(true, 1, 1, 100);
+        directory_only.segment_files = 0;
+        let lone = with_residency_proof(base(), 4096, 100, 100, true, &directory_only);
+        assert_eq!(lone.state, State::Warming as i32, "{}", lone.reason);
         let mut no_roots = proof(true, 0, 0, 0);
         no_roots.roots = 0;
         let rootless = with_residency_proof(base(), 4096, 0, 0, true, &no_roots);

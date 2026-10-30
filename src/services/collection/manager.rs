@@ -268,9 +268,13 @@ impl CollectionService {
                 return;
             }
         };
-        // Review S4: AXIS-routed collections (non-empty index_configs) are
-        // outside the proven profile.
-        let in_profile = config.index_configs.is_empty();
+        // Review S4 / S-1: the proven profile is the SST PAX scan — AXIS-routed
+        // collections (non-empty index_configs) and other engines (whose
+        // readers and object kinds the proof does not count) are outside it.
+        let in_profile = config.index_configs.is_empty()
+            && config.storage_engine.is_none_or(|engine| {
+                engine == crate::proto::proximadb_v1::StorageEngine::Sst as i32
+            });
         let base = collection.storage_class_status.take().unwrap_or_else(|| {
             crate::services::collection::storage_class::storage_class_status(config)
         });
