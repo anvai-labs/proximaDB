@@ -162,8 +162,11 @@ impl TestCollectionBuilder {
         let name = self.name.unwrap_or_else(|| id.clone());
 
         let collection = Collection {
+            storage_class_status: None,
             id,
             config: Some(CollectionConfig {
+                storage_class: None,
+                policy_generation: None,
                 name,
                 embedding_config: None,
                 dimension: self.dimension,
@@ -222,8 +225,11 @@ impl TestCollectionBuilder {
         let name = self.name.unwrap_or_else(|| id.clone());
 
         Collection {
+            storage_class_status: None,
             id,
             config: Some(CollectionConfig {
+                storage_class: None,
+                policy_generation: None,
                 name,
                 embedding_config: None,
                 dimension: self.dimension,

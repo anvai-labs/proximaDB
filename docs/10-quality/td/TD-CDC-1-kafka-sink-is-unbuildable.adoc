@@ -1,0 +1,121 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-CDC-1: The cdc-kafka feature is a shell — the Kafka sink references rdkafka, which was never added as a dependency
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open.** Filed 2026-10-23 from the tier-3 codegraph feature-coverage sweep plus compiler probing. The `onnx-cdc-duckdb` feature-matrix leg (this PR) documents the gap; no code change beyond the TD.
+| Severity | Medium. 718 lines (`proximadb-cdc/src/sinks/kafka.rs`) read as a Kafka sink but cannot compile in any configuration. The feature name promises a capability that does not exist.
+| Component | `crates/integrations/proximadb-cdc` (`cdc-kafka = []`), root `Cargo.toml` (`cdc-kafka = []`, gates three `[[test]]` targets)
+| Found | Fresh-context review of the onnx-cdc-duckdb leg flagged that root's `cdc-kafka` does not forward to the cdc crate. Probing the forward revealed the deeper truth: `cargo check -p proximadb-cdc --features cdc-kafka` fails with E0433/E0432 — `rdkafka` is not a dependency of any manifest. The comment "rdkafka dependency would be added when enabling this feature" was never executed.
+| Related | link:TD-TQFEAT-1-experimental-turboquant-not-compiled-in-ci.adoc[TD-TQFEAT-1] (the coverage-sweep method), link:TD-ORPHAN-1-fifty-eight-source-files-are-not-reachable.adoc[TD-ORPHAN-1] (code that reads live but no build reaches)
+|===
+
+== What
+
+Two features named `cdc-kafka` exist and gate different things:
+
+* Root: gates the three cdc `[[test]]` targets via `required-features`. Those tests compile
+  and are now compiled by the `onnx-cdc-duckdb` feature-matrix leg. They do not touch rdkafka.
+* `proximadb-cdc`: `cdc-kafka = []` with a comment saying rdkafka is used "when enabled" —
+  but no manifest declares rdkafka, so enabling the feature opens `cfg` gates onto code that
+  cannot resolve its imports. Unbuildable by construction; nothing in CI or out has ever
+  compiled it.
+
+== Options
+
+. **Wire rdkafka in**: add the optional dep + `dep:rdkafka` forward, pick a version, satisfy
+  its native build (librdkafka) in CI, and fix whatever API drift the 718 lines carry. Real
+  integration work; gate on the cdc e2e tests actually running against a Kafka container.
+. **Delete the sink**: if Kafka CDC is not on the near-term roadmap, 718 lines of unreachable
+  code is exactly the "reads as coverage, compiled by nothing" disease of TD-ORPHAN-1. Delete
+  `sinks/kafka.rs` and both shell features, and reopen when Kafka CDC is scheduled.
+
+== Disposition
+
+Deliberate decision needed (product: is Kafka CDC committed?). Until then the feature is
+recorded here as a sanctioned gap so coverage sweeps stop reporting it as a fixable
+forward.
+
+== Pickup spec (added 2026-10-24, session close-out)
+
+This section is the hand-off record for whoever picks this up — the decision and the
+first moves of both paths are already scoped.
+
+=== Current state (verified 2026-10-23/24)
+
+* `proximadb-cdc/src/sinks/kafka.rs` — 718 lines, every `rdkafka` reference behind
+  `#[cfg(feature = "cdc-kafka")]` with working `#[cfg(not(...))]` stubs; feature OFF
+  compiles as stubs (how CI builds it today), feature ON fails with E0432/E0433 (five
+  sites: kafka.rs:284 field, :320/:321/:384/:428 imports/calls) because NO manifest in
+  the repo declares rdkafka. Unbuildable by construction; never compiled anywhere.
+* Root `cdc-kafka = []` gates the three cdc `[[test]]` targets
+  (`cdc_e2e_test`, `cdc_integration_test`, `cdc_rest_changefeed_e2e`) — these DO
+  compile today via the `onnx-cdc-duckdb` feature-matrix leg (compile-only; they do
+  not run in CI). They do not touch rdkafka.
+* `.github/dependabot.yml` ignores nothing for this — no noise is generated because
+  no dependency exists to bump. The root feature stays declared so the test targets
+  remain reachable.
+
+=== Path A — wire rdkafka (make the sink real)
+
+Spec, in order:
+
+. **Version + linkage research** (the blocking pre-work): pick the rdkafka line
+  compatible with our tokio stack (0.38-era at filing); decide static `cmake-build`
+  vs dynamic linking. Static adds minutes of C++ build to every CI leg that enables
+  it; dynamic needs librdkafka in the runner and release images. Record the choice in
+  this TD before coding.
+. **Dep wiring**: `crates/integrations/proximadb-cdc/Cargo.toml` gains
+  `rdkafka = { version = "<chosen>", features = ["<linkage>"], optional = true }` and
+  `cdc-kafka = ["dep:rdkafka"]`; root gains the forward
+  `cdc-kafka = ["proximadb-cdc/cdc-kafka"]` so the three [[test]] targets compile the
+  REAL sink (this forward was probed in #2184's review and failed only on the missing
+  dep).
+. **API drift pass**: kafka.rs predates the current rdkafka line. Expect churn around
+  producer send futures (the 0.29→0.32 `SendFuture` migration) and delivery-callback
+  shapes; `ClientConfig`/`FutureProducer` construction is stable. Treat the drift fix
+  as mechanical-but-careful; the sink's trait seam (see next) keeps it testable.
+. **Gates** (mandate #8/#13 adapted to an integration surface):
+  ** unit: the sink behind its trait (mock producer) — check `sinks/mod.rs` for the
+     seam; if none exists, extracting one is part of this work, not optional;
+  ** e2e: the three [[test]] targets RUN against a Kafka/Redpanda container in CI
+     (the repo already runs container-gated e2e elsewhere — mirror that pattern), and
+     the feature-matrix serve step is extended from compile-only to run, like the
+     TD-ORT-1 gate on `onnx-cdc-duckdb`;
+  ** round-trip: changefeed → Kafka topic → consume-back equals source rows.
+. **Cost estimate**: a medium PR of its own (dep + drift + unit seam) plus a CI
+  follow-up for the container leg; the 718 lines are ~70% reusable.
+
+=== Path B — delete the sink
+
+. Delete `sinks/kafka.rs` (718 lines), the cdc crate's `cdc-kafka` feature, root's
+  `cdc-kafka` feature + the three [[test]] targets' `required-features` (or the
+  targets themselves if they exist only to test Kafka), and close this TD as
+  Resolved-by-deletion with the reopen trigger recorded.
+. Reopen trigger: Kafka CDC appearing on the roadmap — at which point the git history
+  of this TD's parent commit holds the 718 lines to re-port (they will need the
+  Path-A drift pass anyway).
+
+=== Why it waits (rationale for the deferral)
+
+* Nothing can break by waiting: no build compiles the code, so there is no latent
+  defect surface and no consumer to disappoint. This is a parked decision, not rot
+  (unlike TD-TQFEAT-1-class gaps, which hid *breaking* code).
+* Wiring rdkafka is real integration work — a native dependency, a linkage decision
+  with release-image implications, container-gated e2e — that must not ride on a
+  dependency-bump queue, and doing it speculatively before the product commits to
+  Kafka CDC risks building (and maintaining in every CI leg) a surface nobody uses.
+* Deleting is cheap but direction-setting: removing 718 lines plus a public feature
+  name is a product statement that should be made deliberately, not by a tidy-up PR.
+
+=== Pickup signals
+
+* A customer/partner asks for Kafka CDC, or the CDC roadmap names Kafka.
+* A CDC architecture change that would touch sinks generally (then decide this as
+  part of that work, not after).
+* A dependency or security event that makes carrying dead integration code costly.
+
+Owner: product decision (Path A vs B); implementation is storage/integrations once
+decided.

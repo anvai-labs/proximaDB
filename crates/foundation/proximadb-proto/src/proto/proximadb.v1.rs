@@ -6672,6 +6672,127 @@ pub struct CollectionConfig {
     #[prost(string, optional, tag = "29")]
     #[serde(default)]
     pub pax_vector_quant: ::core::option::Option<::prost::alloc::string::String>,
+    /// TD-TIER-1 SC1: the collection's desired storage class. UNSPECIFIED/absent
+    /// (every pre-SC1 record) resolves to BALANCED — old records decode and serve
+    /// unchanged. ECONOMY/PERFORMANCE persist the intent and report it back with
+    /// a NOT_ACTIVE status until SC3/SC4 land (read
+    /// `Collection.storage_class_status`). Unknown explicit values are rejected
+    /// at admission. `serde(default)` keeps old persisted records readable
+    /// (mixed-read-safe).
+    #[prost(enumeration = "StorageClass", optional, tag = "30")]
+    #[serde(default)]
+    pub storage_class: ::core::option::Option<i32>,
+    /// TD-TIER-1 SC3-2b: monotonic policy generation — bumped on every actual
+    /// storage-class change through the policy-mutation surface (re-admission
+    /// included); absent on legacy records (SC1-era heuristic then: 0 if the
+    /// class was never set, 1 if persisted at create). Same-value re-applies
+    /// do NOT bump. `serde(default)` keeps old persisted records readable.
+    #[prost(uint32, optional, tag = "31")]
+    #[serde(default)]
+    pub policy_generation: ::core::option::Option<u32>,
+}
+/// Per-collection storage class (TD-TIER-1 SC1). The DESIRED policy only —
+/// observed residency is reported separately via `StorageClassStatus` on the
+/// read model. UNSPECIFIED (or an absent field, which is every pre-SC1 record)
+/// resolves to BALANCED for compatibility; unknown explicit values are rejected
+/// at admission on every facade.
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration,
+)]
+#[repr(i32)]
+pub enum StorageClass {
+    Unspecified = 0,
+    Economy = 1,
+    Balanced = 2,
+    Performance = 3,
+}
+impl StorageClass {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "STORAGE_CLASS_UNSPECIFIED",
+            Self::Economy => "STORAGE_CLASS_ECONOMY",
+            Self::Balanced => "STORAGE_CLASS_BALANCED",
+            Self::Performance => "STORAGE_CLASS_PERFORMANCE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "STORAGE_CLASS_UNSPECIFIED" => Some(Self::Unspecified),
+            "STORAGE_CLASS_ECONOMY" => Some(Self::Economy),
+            "STORAGE_CLASS_BALANCED" => Some(Self::Balanced),
+            "STORAGE_CLASS_PERFORMANCE" => Some(Self::Performance),
+            _ => None,
+        }
+    }
+}
+/// Nested state enum of [`StorageClassStatus`].
+pub mod storage_class_status {
+    #[derive(
+        serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration,
+    )]
+    #[repr(i32)]
+    pub enum State {
+        Unspecified = 0,
+        /// The desired class is in effect.
+        Active = 1,
+        /// The policy is persisted but its dependency is not implemented/enabled
+        /// in this build; the collection serves balanced behavior.
+        NotActive = 2,
+    }
+    impl State {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Unspecified => "STATE_UNSPECIFIED",
+                Self::Active => "STATE_ACTIVE",
+                Self::NotActive => "STATE_NOT_ACTIVE",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "STATE_UNSPECIFIED" => Some(Self::Unspecified),
+                "STATE_ACTIVE" => Some(Self::Active),
+                "STATE_NOT_ACTIVE" => Some(Self::NotActive),
+                _ => None,
+            }
+        }
+    }
+}
+/// Observed storage-class status (read-side projection, computed from the
+/// desired policy; never an input). v1 (SC1): BALANCED is ACTIVE; ECONOMY and
+/// PERFORMANCE are accepted-but-NOT_ACTIVE — their residency/reservation
+/// dependencies (SC3/SC4) are not implemented, so the collection keeps serving
+/// with BALANCED behavior and the reason names the missing dependency. The
+/// byte levels stay zero-with-reason until those slices land.
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
+pub struct StorageClassStatus {
+    #[prost(enumeration = "storage_class_status::State", tag = "1")]
+    pub state: i32,
+    /// Human-readable reason when state != ACTIVE (names the missing dependency).
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+    /// Monotonic generation of the desired policy: 0 = never set (pre-SC1
+    /// records), 1 = set at create; a policy-change surface will bump it.
+    #[prost(uint64, tag = "3")]
+    pub policy_generation: u64,
+    /// Reserved bytes under the collection's residency admission (SC3). 0 until then.
+    #[prost(uint64, tag = "4")]
+    pub reserved_bytes: u64,
+    /// Bytes resident in the serving cache (SC4). 0 until then.
+    #[prost(uint64, tag = "5")]
+    pub resident_bytes: u64,
+    /// Bytes covered by the READY coverage set (SC4). 0 until then.
+    #[prost(uint64, tag = "6")]
+    pub covered_bytes: u64,
 }
 /// Canonical scalar type for a collection's embedding column. Mirrors
 /// `proximadb_records::EmbeddingScalarType`.
@@ -6862,6 +6983,11 @@ pub struct Collection {
     pub updated_at: i64,
     #[prost(message, optional, tag = "6")]
     pub storage_assignment: ::core::option::Option<StorageAssignment>,
+    /// Observed storage-class status (read-side projection of
+    /// `config.storage_class`; never an input). Computed on read.
+    #[prost(message, optional, tag = "7")]
+    #[serde(default)]
+    pub storage_class_status: ::core::option::Option<StorageClassStatus>,
 }
 /// Index configuration
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]

@@ -149,17 +149,45 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(common: cli::CommonArgs, serve: cli::ServeArgs) -> anyhow::Result<()> {
+    // Install the OS signal handlers BEFORE any server boots. A `Signal`
+    // created here registers its handler immediately and buffers a
+    // pending receipt, whereas `tokio::signal::ctrl_c()` only registers
+    // when first polled — i.e. when the shutdown select arms, AFTER the
+    // listeners are already serving. A SIGINT/SIGTERM landing in that
+    // boot/serving window previously hit the default disposition and
+    // killed the process with no shutdown flush (seen as the
+    // cold_backup_restore "unclean exit during graceful stop: signal 2"
+    // CI flake; the same window would drop an early `docker stop`).
+    #[cfg(unix)]
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
     // Initialize tracing with rolling file appender
     use tracing_appender::rolling::{RollingFileAppender, Rotation};
     use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-    // Create log directory if it doesn't exist
-    if let Err(e) = std::fs::create_dir_all("./log") {
-        eprintln!("Failed to create log directory: {}", e);
+    // The rolling log lives under the effective data directory when one is
+    // set (TD-PKG-2: a Windows service gets no working directory, so a
+    // cwd-relative ./log would write into System32). Without a data dir the
+    // historical ./log is kept. Same precedence as apply_data_dir_override:
+    // CLI -d, then PROXIMADB_DATA_DIR.
+    let log_dir: std::path::PathBuf = common
+        .data_dir
+        .clone()
+        .or_else(|| std::env::var_os("PROXIMADB_DATA_DIR").map(std::path::PathBuf::from))
+        .map(|d| d.join("log"))
+        .unwrap_or_else(|| std::path::PathBuf::from("./log"));
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!(
+            "Failed to create log directory {}: {}",
+            log_dir.display(),
+            e
+        );
     }
 
     // Create rolling file appender (daily rotation)
-    let file_appender = RollingFileAppender::new(Rotation::DAILY, "./log", "proximadb.log");
+    let file_appender = RollingFileAppender::new(Rotation::DAILY, &log_dir, "proximadb.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     // Create console appender for stdout - production friendly format
@@ -223,17 +251,16 @@ async fn run(common: cli::CommonArgs, serve: cli::ServeArgs) -> anyhow::Result<(
         log_level
     );
 
-    // Override with CLI arguments
-    if let Some(data_dir) = common.data_dir {
-        // TD-PATH-1: `-d` must also rebase the storage/metadata locations that
-        // are still at their BUILT-IN cwd-relative defaults — otherwise every
-        // instance launched from one working directory shares `<cwd>/data` +
-        // `<cwd>/metadata` (one catalog, one collection-id space) regardless
-        // of `-d`, and instances cross-contaminate (observed 2026-07-25).
-        // Explicitly configured URLs are never touched (mixed-safe).
-        rebase_default_relative_paths(&mut config, &data_dir);
-        config.server.data_dir = data_dir;
-    }
+    // Override with the effective data directory.
+    // TD-PATH-1: `-d` must also rebase the storage/metadata locations that
+    // are still at their BUILT-IN cwd-relative defaults — otherwise every
+    // instance launched from one working directory shares `<cwd>/data` +
+    // `<cwd>/metadata` (one catalog, one collection-id space) regardless
+    // of `-d`, and instances cross-contaminate (observed 2026-07-25).
+    // Explicitly configured URLs are never touched (mixed-safe).
+    // TD-PKG-3: PROXIMADB_DATA_DIR gets the same treatment when -d is absent
+    // (the container and the packages' unit set it).
+    apply_data_dir_override(&mut config, common.data_dir.as_deref());
     if let Some(port) = serve.port {
         config.server.port = port;
     }
@@ -429,10 +456,8 @@ async fn run(common: cli::CommonArgs, serve: cli::ServeArgs) -> anyhow::Result<(
     };
     #[cfg(unix)]
     let critical_drainer_stopped = {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = sigint.recv() => {
                 info!("Received SIGINT, stopping server...");
                 false
             },
@@ -486,10 +511,7 @@ fn load_config(path: &std::path::Path) -> anyhow::Result<proximadb::core::Config
 /// server would own.
 fn resolve_admin_config(common: &cli::CommonArgs) -> anyhow::Result<proximadb::core::Config> {
     let mut config = load_config(&common.config)?;
-    if let Some(data_dir) = &common.data_dir {
-        rebase_default_relative_paths(&mut config, data_dir);
-        config.server.data_dir = data_dir.clone();
-    }
+    apply_data_dir_override(&mut config, common.data_dir.as_deref());
     Ok(config)
 }
 
@@ -523,43 +545,130 @@ fn run_admin(common: &cli::CommonArgs, command: cli::AdminCommand) -> anyhow::Re
     Ok(())
 }
 
-/// TD-PATH-1: when `-d <dir>` is given, rewrite any storage/metadata location
-/// still at its built-in cwd-relative default so it lives under `<dir>`.
-/// Explicit (non-default) configuration is left untouched.
+/// Roots still pointing at the shipped development config's `/tmp/proximadb`
+/// tree count as defaults too (TD-PKG-1/2/3): the packages, the container, the
+/// Linux archive and the Homebrew formula all ship that config, and under
+/// `PrivateTmp` / a removed container that tree is not durable. A deployment
+/// that explicitly configured a root keeps it.
+fn rebase_default_root(value: &str, base: &str, url_style: bool) -> Option<String> {
+    for prefix in ["/tmp/proximadb/", "file:///tmp/proximadb/"] {
+        if let Some(rest) = value.strip_prefix(prefix) {
+            return Some(if url_style {
+                format!("file://{base}/{rest}")
+            } else {
+                format!("{base}/{rest}")
+            });
+        }
+    }
+    None
+}
+
+/// TD-PATH-1 / TD-PKG-3: when a data directory is given (CLI `-d` or
+/// `PROXIMADB_DATA_DIR`), rewrite every storage/metadata location still at a
+/// built-in default — the cwd-relative built-ins or the shipped `/tmp/proximadb`
+/// tree — so it lives under it. Explicit configuration is left untouched.
 fn rebase_default_relative_paths(
     config: &mut proximadb::core::config::Config,
     data_dir: &std::path::Path,
 ) {
-    let base = data_dir.display();
+    let base = data_dir.display().to_string();
     let rebased = |suffix: &str| format!("file://{base}/{suffix}");
     for loc in &mut config.storage.storage_locations {
-        if loc.url == "file://./data" || loc.url == "./data" {
+        let url = loc.url.clone();
+        if url == "file://./data" || url == "./data" {
             loc.url = rebased("data");
-            tracing::info!(url = %loc.url, "rebased default storage location under -d");
+            tracing::info!(url = %loc.url, "rebased default storage location under the data dir");
+        } else if let Some(next) = rebase_default_root(&url, &base, true) {
+            loc.url = next;
+            tracing::info!(url = %loc.url, "rebased shipped-/tmp storage location under the data dir");
         }
     }
-    if config.storage.metadata_url == "file://./metadata"
-        || config.storage.metadata_url == "./metadata"
-    {
+    let metadata_url = config.storage.metadata_url.clone();
+    if metadata_url == "file://./metadata" || metadata_url == "./metadata" {
         config.storage.metadata_url = rebased("metadata");
-        tracing::info!(url = %config.storage.metadata_url, "rebased default metadata_url under -d");
+        tracing::info!(url = %config.storage.metadata_url, "rebased default metadata_url under the data dir");
+    } else if let Some(next) = rebase_default_root(&metadata_url, &base, true) {
+        config.storage.metadata_url = next;
+        tracing::info!(url = %config.storage.metadata_url, "rebased shipped-/tmp metadata_url under the data dir");
     }
-    let wal_dir = &mut config.storage.wal_config.write_buffer_directory;
-    if wal_dir == "./data/write_buffer" || wal_dir == "file://./data/write_buffer" {
-        *wal_dir = rebased("data/write_buffer");
-        tracing::info!(url = %wal_dir, "rebased default WAL directory under -d");
-    }
-    if let Some(viper) = config.storage.viper_config.as_mut()
-        && viper.data_directory == "./data/viper_data"
+    if let Some(manifest) = config.storage.wal_config.global_manifest_url.clone()
+        && let Some(next) = rebase_default_root(&manifest, &base, true)
     {
-        viper.data_directory = format!("{base}/data/viper_data");
-        tracing::info!(dir = %viper.data_directory, "rebased default viper directory under -d");
+        tracing::info!(manifest = %next, "rebased shipped-/tmp global_manifest_url under the data dir");
+        config.storage.wal_config.global_manifest_url = Some(next);
+    }
+    let wal_dir_value = config.storage.wal_config.write_buffer_directory.clone();
+    if wal_dir_value == "./data/write_buffer" || wal_dir_value == "file://./data/write_buffer" {
+        config.storage.wal_config.write_buffer_directory = format!("{base}/data/write_buffer");
+        tracing::info!(dir = %config.storage.wal_config.write_buffer_directory, "rebased default WAL directory under the data dir");
+    } else if let Some(next) = rebase_default_root(&wal_dir_value, &base, false) {
+        tracing::info!(dir = %next, "rebased shipped-/tmp WAL directory under the data dir");
+        config.storage.wal_config.write_buffer_directory = next;
+    }
+    if let Some(viper) = config.storage.viper_config.as_mut() {
+        let value = viper.data_directory.clone();
+        if value == "./data/viper_data" {
+            viper.data_directory = format!("{base}/data/viper_data");
+            tracing::info!(dir = %viper.data_directory, "rebased default viper directory under the data dir");
+        } else if let Some(next) = rebase_default_root(&value, &base, false) {
+            tracing::info!(dir = %next, "rebased shipped-/tmp viper directory under the data dir");
+            viper.data_directory = next;
+        }
+    }
+    if let Some(sst) = config.storage.sst_config.as_mut() {
+        let value = sst.data_directory.clone();
+        if value == "./sst_data" {
+            sst.data_directory = format!("{base}/sst_data");
+            tracing::info!(dir = %sst.data_directory, "rebased default sst directory under the data dir");
+        } else if let Some(next) = rebase_default_root(&value, &base, false) {
+            tracing::info!(dir = %next, "rebased shipped-/tmp sst directory under the data dir");
+            sst.data_directory = next;
+        }
+    }
+    if let Some(security) = config.security.as_mut()
+        && let proximadb::security::AuditStorageBackend::File { directory } =
+            &mut security.audit.storage_backend
+        && let Some(next) = rebase_default_root(directory, &base, false)
+    {
+        tracing::info!(dir = %next, "rebased shipped-/tmp audit directory under the data dir");
+        *directory = next;
+    }
+}
+
+/// Apply the effective data directory: CLI `-d` wins, then
+/// `PROXIMADB_DATA_DIR` (TD-PKG-3: the container has always set it; before
+/// this the loader never read it, so every root stayed at the shipped
+/// `/tmp/proximadb` tree and the declared volume received no data).
+fn apply_data_dir_override(
+    config: &mut proximadb::core::config::Config,
+    cli_dir: Option<&std::path::Path>,
+) {
+    let dir = cli_dir
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("PROXIMADB_DATA_DIR").map(std::path::PathBuf::from));
+    if let Some(dir) = dir {
+        rebase_default_relative_paths(config, &dir);
+        config.server.data_dir = dir;
     }
 }
 
 #[cfg(test)]
 mod path_rebase_tests {
     use super::*;
+
+    /// A `SecurityConfig` whose audit backend is a file at `directory` (test
+    /// helper: the full SecurityConfig has many required fields).
+    fn security_config_with_file_audit(directory: &str) -> proximadb::security::SecurityConfig {
+        proximadb::security::SecurityConfig {
+            audit: proximadb::security::AuditConfig {
+                storage_backend: proximadb::security::AuditStorageBackend::File {
+                    directory: directory.to_string(),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
 
     /// TD-PATH-1: `-d` rebases built-in relative defaults; explicit URLs stay.
     #[test]
@@ -580,5 +689,95 @@ mod path_rebase_tests {
         explicit.storage.metadata_url = "file:///somewhere/else".into();
         rebase_default_relative_paths(&mut explicit, std::path::Path::new("/tmp/x"));
         assert_eq!(explicit.storage.metadata_url, "file:///somewhere/else");
+    }
+    /// TD-PKG-3: the shipped development config roots everything under
+    /// /tmp/proximadb; a data dir must move every one of those roots, or the
+    /// packaged artifacts keep their data in a non-durable tree.
+    #[test]
+    fn rebase_moves_shipped_tmp_roots() {
+        let mut config = proximadb::core::config::Config::default();
+        config.storage.metadata_url = "file:///tmp/proximadb/metadata".into();
+        config.storage.storage_locations = vec![
+            proximadb::core::config::StorageLocation {
+                url: "file:///tmp/proximadb/d1".into(),
+                ..Default::default()
+            },
+            proximadb::core::config::StorageLocation {
+                url: "file:///tmp/proximadb/d2".into(),
+                ..Default::default()
+            },
+        ];
+        config.storage.wal_config.global_manifest_url =
+            Some("file:///tmp/proximadb/manifest".into());
+        config.storage.wal_config.write_buffer_directory =
+            "/tmp/proximadb/data/write_buffer".into();
+        config.storage.sst_config = Some(proximadb::core::config::SstConfig {
+            data_directory: "/tmp/proximadb/data/sst_data".into(),
+            ..Default::default()
+        });
+        config.storage.viper_config = Some(proximadb::core::config::ViperConfig {
+            data_directory: "/tmp/proximadb/data/data/viper_data".into(),
+            ..Default::default()
+        });
+        config.security = Some(security_config_with_file_audit("/tmp/proximadb/audit"));
+
+        rebase_default_relative_paths(&mut config, std::path::Path::new("/var/lib/proximadb"));
+
+        assert_eq!(
+            config.storage.metadata_url,
+            "file:///var/lib/proximadb/metadata"
+        );
+        assert_eq!(
+            config
+                .storage
+                .storage_locations
+                .iter()
+                .map(|l| l.url.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "file:///var/lib/proximadb/d1",
+                "file:///var/lib/proximadb/d2"
+            ]
+        );
+        assert_eq!(
+            config.storage.wal_config.global_manifest_url.as_deref(),
+            Some("file:///var/lib/proximadb/manifest")
+        );
+        assert_eq!(
+            config.storage.wal_config.write_buffer_directory,
+            "/var/lib/proximadb/data/write_buffer"
+        );
+        assert_eq!(
+            config.storage.sst_config.as_ref().unwrap().data_directory,
+            "/var/lib/proximadb/data/sst_data"
+        );
+        assert_eq!(
+            config.storage.viper_config.as_ref().unwrap().data_directory,
+            "/var/lib/proximadb/data/data/viper_data"
+        );
+        match &config.security.as_ref().unwrap().audit.storage_backend {
+            proximadb::security::AuditStorageBackend::File { directory } => {
+                assert_eq!(directory, "/var/lib/proximadb/audit");
+            }
+            other => panic!("audit backend changed shape: {other:?}"),
+        }
+    }
+
+    /// An explicit root outside the shipped tree is never moved, even when
+    /// other roots are.
+    #[test]
+    fn rebase_leaves_explicit_roots_alone() {
+        let mut config = proximadb::core::config::Config::default();
+        config.storage.metadata_url = "file:///mnt/nvme/meta".into();
+        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
+            url: "file:///tmp/proximadb/d1".into(),
+            ..Default::default()
+        }];
+        rebase_default_relative_paths(&mut config, std::path::Path::new("/var/lib/proximadb"));
+        assert_eq!(config.storage.metadata_url, "file:///mnt/nvme/meta");
+        assert_eq!(
+            config.storage.storage_locations[0].url,
+            "file:///var/lib/proximadb/d1"
+        );
     }
 }

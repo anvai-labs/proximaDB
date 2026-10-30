@@ -7,12 +7,10 @@
 // - TLS encryption (optional)
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, UdpSocket};
 
 use super::{AdapterConfig, InputAdapter};
@@ -138,36 +136,12 @@ impl SyslogAdapter {
             .await
             .context("Failed to bind TCP socket")?;
 
-        let sender = self.config.sender.clone();
-        let batch_size = self.config.batch_size;
-        let running = Arc::new(AtomicBool::new(true));
-        let events = Arc::new(AtomicU64::new(0));
-
-        tokio::spawn(async move {
-            let mut batch = Vec::with_capacity(batch_size);
-
-            while running.load(Ordering::Relaxed) {
-                match listener.accept().await {
-                    Ok((stream, _addr)) => {
-                        let reader = BufReader::new(stream);
-                        let mut lines = reader.lines();
-
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            if let Some(entry) = Self::parse_line(&line) {
-                                batch.push(entry);
-                                events.fetch_add(1, Ordering::Relaxed);
-
-                                if batch.len() >= batch_size {
-                                    let _ = sender.send(std::mem::take(&mut batch)).await;
-                                    batch = Vec::with_capacity(batch_size);
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => continue,
-                }
-            }
-        });
+        super::pump_tcp(
+            listener,
+            self.config.sender.clone(),
+            self.config.batch_size,
+            Self::parse_line,
+        );
 
         Ok(())
     }
@@ -178,34 +152,12 @@ impl SyslogAdapter {
             .await
             .context("Failed to bind UDP socket")?;
 
-        let sender = self.config.sender.clone();
-        let batch_size = self.config.batch_size;
-        let running = Arc::new(AtomicBool::new(true));
-        let events = Arc::new(AtomicU64::new(0));
-
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 65535];
-            let mut batch = Vec::with_capacity(batch_size);
-
-            while running.load(Ordering::Relaxed) {
-                match socket.recv_from(&mut buf).await {
-                    Ok((len, _addr)) => {
-                        if let Ok(msg) = std::str::from_utf8(&buf[..len])
-                            && let Some(entry) = Self::parse_line(msg)
-                        {
-                            batch.push(entry);
-                            events.fetch_add(1, Ordering::Relaxed);
-
-                            if batch.len() >= batch_size {
-                                let _ = sender.send(std::mem::take(&mut batch)).await;
-                                batch = Vec::with_capacity(batch_size);
-                            }
-                        }
-                    }
-                    Err(_) => continue,
-                }
-            }
-        });
+        super::pump_udp(
+            socket,
+            self.config.sender.clone(),
+            self.config.batch_size,
+            Self::parse_line,
+        );
 
         Ok(())
     }

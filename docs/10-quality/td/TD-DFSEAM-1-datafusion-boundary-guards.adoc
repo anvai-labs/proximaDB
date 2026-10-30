@@ -1,0 +1,16 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-DFSEAM-1-datafusion-boundary-guards: the ADR-039 DataFusion boundary guards have no enforcement
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-26). ADR-039 Verification promises two guards that do not exist; its TD-181 citations were a number collision (TD-181 is the catalog OID migration), reconciled in ADR-039 on 2026-10-15 as: these two guards have no TD of their own. This entry is that TD.
+| Priority | MEDIUM — the boundary can bit-rot silently
+| Component | (see scope)
+| Relates to | ADR-039, ADR-052, TD-USUB-5, TD-181
+|===
+
+== Scope
+
+EXISTS: a no-default-features build of proximadb in the CI feature matrix (the optional-feature floor keeps compiling). MISSING: (1) the datafusion:: leakage ratchet — a CI grep failing when datafusion:: appears outside the ADR-039 adapter allow-list; (2) a Volcano-only test run, so lane discipline (the native lane never importing PaxSplitReader, cf. TD-USUB-5) is executed, not assumed. Fix: add both to CI, the grep as a deterministic guard with tests per the guard convention.

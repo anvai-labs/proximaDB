@@ -45,13 +45,7 @@ fn generate_test_vectors(count: usize, dimension: usize) -> Vec<ProximaRecord> {
                 updated_at_ns: now_ns,
                 record_version: 1,
                 props,
-                embeddings: vec![EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    values: EmbeddingValues::Fp32(values),
-                    dim,
-                    ..Default::default()
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32("default", "vector", dim, values)],
                 ..Default::default()
             }
         })

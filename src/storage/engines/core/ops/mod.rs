@@ -31,6 +31,8 @@
 // NOTE: quantization modules removed - use compute module directly
 pub use proximadb_engine_core::ops_compression::compression_adapter; // extracted TD-DECOMP-81
 pub use proximadb_engine_core::ops_compression::compression_common; // extracted TD-DECOMP-81
+/// Shared ingest_sorted_segment plumbing (redundancy pass 3)
+pub mod bulk_ingest;
 /// Universal performance optimization module for all storage engines
 pub mod performance_optimization;
 
@@ -166,7 +168,7 @@ pub use compression_common::{
 // Universal performance optimization exports
 pub use performance_optimization::{
     AccessStats, UniversalIOConfig, UniversalOptimizationStrategy, UniversalPerformanceOptimizer,
-    UniversallyOptimized,
+    UniversallyOptimized, insert_universal_optimizer_metrics,
 };
 
 // Duplicate zero-copy I/O system export removed - see consolidated version above

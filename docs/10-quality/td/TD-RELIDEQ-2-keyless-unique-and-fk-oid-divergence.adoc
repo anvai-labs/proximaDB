@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open** (filed 2026-10-18, found reviewing the TD-RELIDEQ-1 fix).
+| Status | **Resolved (2026-10-23).** UNIQUE reads a column from the record `oid` only when it is the DECLARED single-column key; every other column (a keyless table's `id`/`record_id`, any column of a composite key) is read from `props`. A FOREIGN KEY may reference the parent's declared key (the `oid`) or one of its UNIQUE sets (`props` values) — the SQL rule — through one shared resolver (`src/services/referential.rs`) used by the DML insert probe, ON DELETE actions and the INSERT…SELECT executor. A UNIQUE-referenced value is guarded by ON UPDATE NO ACTION on SQL UPDATE, UPSERT and ON DELETE SET NULL, with the referencing children locked (also inside atomic transactions). Pinned by `tests/pgwire_keyless_id_predicate_e2e.rs` and `tests/pgwire_atomic_commit_e2e.rs`. Found while fixing: UNIQUE on the first column of a composite key was vacuous the same way, and an UPDATE of a composite-key row rebuilt the first key column from the encoded whole-tuple oid (and let the other key columns be assigned).
 | Priority | **MEDIUM** — silent vacuity (UNIQUE) and wrong rejections (FK) on keyless tables; correct as soon as a primary key is declared.
 | Component | `src/services/record_store.rs` (`record_unique_tuple` reads the fallback column from `record.oid`); `src/services/dml/mod.rs` FK existence probe and cascade matcher
 | Relates to | TD-RELIDEQ-1 (fixed the SELECT/UPDATE/DELETE path)
@@ -32,3 +32,50 @@ UNIQUE on a keyless column compares props values (and rejects, or documents as u
 FK existence and cascade matching on the parent's declared key, falling back to a props-based
 lookup for keyless parents. Tests: duplicate `id` values on a keyless table; child insert and
 cascade delete against a keyless parent.
+
+== Resolution (2026-10-23)
+
+The `id`/`record_id` fallback (`schema_primary_key_column`) is a READ convenience (TD-RELIDEQ-1:
+try the oid, fall through to a scan). It is never the oid of a keyless row: `to_proxima_record`
+sets the oid from the declared key (`relational::effective_primary_key`, now public) or generates
+it, and keeps every column — the key included — in `props`.
+
+* *UNIQUE.* `record_unique_tuple` callers pass `schema_oid_key_column` (the declared
+  single-column key, else `None`): the candidate builder, `check_unique_conflict`, the unique
+  index build and its maintenance all agree. This also fixes UNIQUE on the first column of a
+  composite key, which read the encoded composite oid.
+* *FOREIGN KEY.* `referential::resolve_referenced_key` accepts the declared key or a UNIQUE set,
+  in full and in order. Existence: an oid point lookup (or the CKS) for a key reference, the
+  parent's unique index for a UNIQUE reference. ON DELETE: children are matched against the
+  deleted rows' referenced values (the oid, or the encoded `props` values). The INSERT…SELECT
+  executor uses the same resolver and now also accepts composite FKs.
+* *Matching.* One text per reference kind, used by the existence probe, ON DELETE and ON
+  UPDATE alike: the encoded key (= the parent oid) for a key reference; the parent's unique-index
+  tuple (`record_unique_tuple`) for a UNIQUE reference — so a child the probe accepts is a child
+  the actions find.
+* *Composite keys on UPDATE.* Every declared key column is immutable; the other columns of an
+  updated row come from `props` (only a declared single-column key is read from the oid).
+* *ON UPDATE NO ACTION.* A primary key is immutable on UPDATE; a UNIQUE value is not. UPDATE and
+  UPSERT take the op-locks of the children referencing a written UNIQUE column (sorted, with the
+  target; `lock_unique_referencing_children`) and reject removing a value children still use;
+  ON DELETE SET NULL applies the same check to the grandchildren of the nulled columns. Atomic
+  transactions request the same set (`TxnLockScope::UpdateColumns`). A declared ON UPDATE
+  CASCADE / SET NULL / SET DEFAULT is refused as unsupported, never enforced as NO ACTION. An
+  UPSERT replaces the whole row, so it counts every column as written, not just its column list.
+
+Remaining (not regressions): an FK must name the UNIQUE set's columns in its declared order (SQL
+allows any order of the same set); ON UPDATE CASCADE / SET NULL / SET DEFAULT are refused; a
+UNIQUE-reference existence probe consults the in-memory unique index, which — like UNIQUE
+enforcement itself — does not re-check a parent's TTL expiry after the index was built; the
+DataFusion-route table writer enforces neither UNIQUE nor FOREIGN KEY, and `INSERT OVERWRITE` (snapshot / partition replace) runs no ON DELETE / ON UPDATE check, so it can orphan children of a key or a UNIQUE reference (both pre-existing). Also open: a self-referencing FK is checked on INSERT but gets no ON DELETE / ON UPDATE action
+(`child_references` skips self-references, as it did for key references); the declared-ON UPDATE
+refusal is an untyped error (on pgwire 42P01 via UPSERT, 0A000 via UPDATE — like the ON DELETE SET
+DEFAULT refusal); an UPSERT checks ON UPDATE NO ACTION before its key / UNIQUE / FK checks (so no
+fenced key claim can leak on a rejection), so a statement that is rejected for both reports 23503
+where PostgreSQL reports 21000 / 23505 first; the
+INSERT…SELECT path takes no op-lock, so a child row it writes can race a parent DELETE / UPDATE
+(pre-existing); the REST / gRPC / Flight bulk record paths are not covered by this constraint
+enforcement (pre-existing). Cost: an UPSERT on a table with a UNIQUE set, and an UPDATE of a UNIQUE
+column, walk the tenant's catalog for referencing children; a DELETE, or an UPSERT, on a table with
+UNIQUE-referencing children reads each affected row once. Not yet covered by an e2e test: the
+INSERT…SELECT path's typed 23505 / 23503 and its tenant-scoped UNIQUE probe.

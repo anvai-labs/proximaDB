@@ -1290,6 +1290,7 @@ fn print_dist(label: &str, samples: &[u64]) {
 
 fn make_collection(temp_dir: &TempDir, dim: usize, metric: DistanceMetric) -> Collection {
     Collection {
+        storage_class_status: None, // SC1 (#2259) field; None = NOT_ACTIVE
         id: "bench_warm_profile".to_string(),
         config: Some(CollectionConfig {
             dimension: dim as u32,
@@ -1330,17 +1331,9 @@ fn synthetic_records(
     (0..count)
         .map(|i| proximadb_records::ProximaRecord {
             oid: format!("{}_{:08}", collection_id, i),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                dim: dim as u32,
-                values: proximadb_records::EmbeddingValues::Fp32(
-                    (0..dim)
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32("default", "vector", dim as u32, (0..dim)
                         .map(|j| pseudo_random_f32(i as u64 + 1, j))
-                        .collect(),
-                ),
-                ..Default::default()
-            }],
+                        .collect(),)],
             props: proximadb_records::ProximaTree::new(),
             record_version: 1,
             created_at_ns: 0,

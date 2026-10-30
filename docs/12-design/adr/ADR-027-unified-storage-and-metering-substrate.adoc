@@ -11,7 +11,7 @@
 |Relates to|ADR-024 (single canonical type/schema), ADR-026 (PAX canonical vector path), ADR-020 (canonical WAL authority), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` (vertical-inside/standard-outside), `DATA_WAREHOUSE_AND_ENGINEERING_COURSE_CORRECTION_2026_06_04.adoc`, `NATIVE_OLAP_ENGINE_BLUEPRINT_2026_06_22.adoc`, `OUTGRESS_KOU_MULTICLOUD_COST_MODEL_2026_06_21.adoc`
 |Supersedes|—
 |Tracked under|TD-158, TD-160, TD-161, TD-162 (split → TD-162a writer/reader, TD-162b Parquet arm), TD-164
-|Audit|`docs/_internal/review/PAX_SUBSTRATE_DESIGN_PLAN_2026_06_25.adoc` (validation + implementation-ready plan)
+|Audit|`docs/history/planning/PAX_SUBSTRATE_DESIGN_PLAN_2026_06_25.adoc` (validation + implementation-ready plan)
 |===
 
 == Context
@@ -28,7 +28,7 @@ The SST/LSM **writes PAX for every modality** — vectors *and* relational *and*
 
 [NOTE]
 ====
-**Target vs current state (audited 2026-06-25, see `PAX_SUBSTRATE_DESIGN_PLAN_2026_06_25.adoc`).**
+**Target vs current state (audited 2026-06-25, see `docs/history/planning/PAX_SUBSTRATE_DESIGN_PLAN_2026_06_25.adoc`).**
 This Decision is the *target*. Today `write_pax_segment` is **vector-specific**
 (`segment_format.rs:113` — mandatory `embedding_count` + `VectorQuant`, `.max(1)` clamp);
 the canonical columns (`oids`/timestamps/`edge_*`/`props_bytes`/`labels_bytes`) are already

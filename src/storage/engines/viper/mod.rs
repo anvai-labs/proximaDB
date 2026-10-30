@@ -229,7 +229,6 @@ pub mod extraction;
 pub mod factory;
 pub mod readers;
 // Quantization now handled by unified compute module
-pub mod progressive_stages;
 pub mod utilities; // ISP-compliant progressive search stages
 // Removed indexed_reader - use columnar/parquet_query_engine instead
 // Removed vector_writer - use columnar/parquet_writer instead
@@ -237,7 +236,7 @@ pub mod column_filter;
 
 // New modular structure for better maintainability
 pub mod types;
-// Schema now uses columnar module's ColumnarSchema
+// Schema now uses the shared columnar schema builders (storage-common)
 pub mod codebook_sidecar;
 pub mod compaction;
 pub mod engine;

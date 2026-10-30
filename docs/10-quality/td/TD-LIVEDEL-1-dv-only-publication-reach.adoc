@@ -1,0 +1,63 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-LIVEDEL-1: The live delete publisher only fires when the delete is the sole change since the last publication
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Direction chosen (2026-10-29).** Neither relaxation of the live publisher: MATERIALIZE itself becomes incremental for updates and deletes (carried files + new parts + per-file DVs), which is complete by construction, and the OLAP reader serves an ORDERED DV base (the base IS the recorded publication) beside a non-empty delta. The reader half landed first (#2277, which also closed a live-publisher delete→re-insert hole), then incremental MATERIALIZE behind `PROXIMADB_MATERIALIZE_INCREMENTAL_DV`, armed default-ON on 2026-10-29 after its soak. The live publisher stays default-OFF as a delete-burst option; before it can be armed by default its clock-named `dv-live-*` Puffins need their own collection rule (the generation GC deliberately never touches them, so today they accumulate one per published delete). Original filing: **Open.** Found by the fence soak (TD-USUB-10 3c); gates the activation flip of `PROXIMADB_LIVE_DELETE_PUBLISHER` as a reach question, not a correctness one.
+| Priority | MEDIUM — no wrong result is possible (every refusal is fail-closed and both views stay exact), but under interleaved writes the publisher almost never publishes, so the published view stays stale until the next full MATERIALIZE, exactly as with the knob off.
+| Component | `src/services/dml/mod.rs` (`publish_live_deletes_inner`, completeness precondition); `src/query/execution/datafusion_engine.rs` (`register_merged_olap_table`, the unordered-delta refusal)
+| Relates to | TD-USUB-10, `docs/12-design/PUBLICATION_WAL_VISIBILITY_FENCE_2026_10_27.adoc` (the completeness precondition and the unordered-delta relaxation condition), #2266, #2273
+|===
+
+== The finding
+
+The publisher writes deletion vectors only; it never writes data files. Its successor is
+therefore the parent's files minus vectors — a complete state only at the parent's capture
+LSN plus this delete's tombstones. The completeness precondition (the contract, round 2)
+refuses whenever the changed-set since the parent's recorded LSN contains anything the delete
+is not publishing, because recording the fence LSN would otherwise hide those changes from
+both views.
+
+Consequence, measured by `soak_mixed_workload_holds_the_fence` (tests/iceberg_interop_e2e.rs):
+
+* **Phase A, interleaved inserts and deletes over 40 rounds:** 45 deletes, **0 publications**.
+  The first insert after a publication puts a foreign oid in the changed-set, and every later
+  delete refuses until the next MATERIALIZE re-records the layout. Both views matched the model
+  at every step.
+* **Phase B, a chain of deletes right after a MATERIALIZE with no other writes:** every delete
+  published (one `dv-live-*` Puffin each) and the OLAP view tracked the model with no
+  MATERIALIZE between deletes.
+
+So the fence is correct and works in its eligible shape. That shape (deletes as the only writes
+since the last publication) is narrow for an OLTP-plus-analytics table.
+
+The refusal is also *sticky*. A refusal never reaches the layout flip, so the recorded
+`snapshot_lsn` stays put, and `changed_oids_since(recorded_lsn)` keeps returning every oid
+written after it. The filter removes only the current delete's own oids, so a refused delete's
+own tombstone stays in every later delete's changed-set. The trigger does not have to be an
+insert: any single refusal (a lost lease, an I/O error, schema drift) makes every later delete
+refuse until the next MATERIALIZE re-records the layout, even in the eligible shape.
+
+== Directions (not decided)
+
+. **Ordered-delta reader relaxation** (the contract's "unordered-delta relaxation condition"):
+  let `register_merged_olap_table` serve a DV-carrying base together with a NONEMPTY delta when
+  the suppress-set provably covers every DV'd oid's tombstone. That is a reader change (the reader
+  refuses any nonempty delta against a DV base today, #2256) AND a publisher change: the
+  completeness precondition's bail on unexpected oids has to be relaxed, and the publisher has to
+  record the parent's LSN instead of the fence LSN. Both halves must be proven again under the
+  fence gates.
+. **Write the pending inserts too**: publish the changed rows as an appended data file beside
+  the vectors (an incremental MATERIALIZE inside the delete). This is broader: it turns the
+  delete into a publication of every pending change, with the latency and failure modes that
+  implies.
+. **Accept the reach** and treat the publisher as a delete-burst optimization, documented as
+  such at the activation flip.
+
+== Acceptance
+
+The activation-flip decision records which direction was taken. If the reach is accepted as is
+(direction 3), the soak's Phase A pin (zero publications under interleaved inserts, asserted) is the regression baseline. Any relaxation must
+keep both views exact under the soak's mixed workload **and** show publications firing there.

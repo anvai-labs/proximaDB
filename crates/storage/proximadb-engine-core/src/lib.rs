@@ -11,3 +11,7 @@ pub mod proximablocks;
 pub mod simd_decode;
 pub mod smart_rowgroup_sizing;
 pub mod sst_format_types;
+
+/// Shared test doubles (no-op `FilesystemPort`, …) — test builds only.
+#[cfg(test)]
+pub(crate) mod testutil;

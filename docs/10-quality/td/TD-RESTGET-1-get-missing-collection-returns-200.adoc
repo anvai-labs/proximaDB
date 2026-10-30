@@ -5,7 +5,31 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open** (filed 2026-10-17). Reproduced against the 0.4.1 image.
+| Status | **Resolved (2026-10-24).** Every part, as reproduced on develop `64ddfff4a`:
+
+* **GET of a missing collection** already answered `404 collection_not_found` on develop (fixed after the 0.4.1 report). It is now pinned by `get_missing_collection_is_404_e2e`.
+* **Unknown create fields** are rejected. `CreateCollectionV2Request` and its nested inputs (`index_configs[]` with `hnsw_config`/`ivf_config`, `quantization`, `index_policy`, `schema.columns[]`) are `deny_unknown_fields`, so `"hnsw"` for `"hnsw_config"` is `400 invalid_argument` naming the field, and nothing is created.
+  * The create and schema-PUT handlers share one body policy (`v2::json_body`): a data or syntax error is the 400 in the API's JSON envelope, not axum's plain-text 422, and any other rejection keeps its own status (415 without a JSON content type, 413 for an oversized body).
+  * `metric` and `storage_engine` are accepted as aliases of `distance_metric` and `engine`.
+  * `description` is accepted and persisted on the collection config. The TypeScript SDK sends it, and the Go SDK now does too (it used to drop it).
+* **`index_type`:** the released Rust and TypeScript SDKs send it on every create, defaulting to `"hnsw"`, and the server always ignored it.
+  * `"hnsw"` stays accepted with no effect. Folding it into `index_configs` would opt every such collection into a flush-time AXIS build and a different search route, an unmeasured serving change; round-1 review caught exactly that.
+  * Any other value used to be silently not honoured, and is now a 400 pointing at `index_configs` / `index_policy.mode`.
+* **An invalid quantization `strategy`** is `400` naming the four valid strategies. It used to be replaced by `smart_defaults`.
+* **A schema update rejected for a client reason** is `400 invalid_argument` on REST and `INVALID_ARGUMENT` on gRPC (`CreateSchema`/`EvolveSchema`). It used to be `500`/`INTERNAL`.
+  * The rejections come from `merge_canonical_band`: a duplicate column, a system column, a name with the reserved `__proxima_` prefix (which the catalog rejected later as a 500), an `embedding` of the wrong dimension or type, a type the filterable column cannot hold, or a conflicting filterable type.
+  * They are now a typed `SchemaDeclarationRejected`, found through the error chain as `WalHistoryTruncated` is. Server-side failures stay 500.
+* **SDKs:** the spec change (`additionalProperties: false`, `description`, a deprecated `index_type`) is regenerated into all four transports.
+  * The generated Python `from_dict` silently DROPS keys a strict model does not declare, which would have moved the silent drop into the SDK. `_rest_codegen._from_dict` now raises `ValidationError` naming the dropped key's path before any request is sent.
+
+Remaining:
+
+* `SchemaDefinition` itself (the `columns`/`enforcement`/`allow_additional_fields` object) stays permissive: it is `#[serde(flatten)]`ed into the schema PUT, where serde cannot deny unknown fields. Its columns are strict.
+* `RestColumnDefinition` is also a response type (`SchemaResponse`), so the spec now publishes `additionalProperties: false` on that response shape. A strict third-party client would reject a future column field. The in-repo SDKs read responses permissively. Split the request and response types if that matters.
+
+* The TypeScript builder's `index()` normalizes case and whitespace and throws on an unknown value, so a plain-JS `"HNSW"` is the default route, not a declared index. `engineStr()` and `metric()` still pass strings through unvalidated; applying the same rule to them is a separate follow-up.
+
+Found along the way, filed: TD-COLLTIME-1 (`Collection.created_at` is written in two units; the schema GET renders it as year 58784).
 | Priority | **MEDIUM** — a misspelt setting is accepted and silently replaced.
 | Component | REST v2 `GET /api/v2/collections/{name}` and `POST /api/v2/collections` (request validation)
 | Relates to | TD-GRPCCREATE-1

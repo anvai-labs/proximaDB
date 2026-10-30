@@ -42,92 +42,29 @@ sleep 5
 # 3. Verify it's running
 curl http://localhost:5678/health
 # {"status":"healthy","version":"<installed release>"}
-
-# 4. Create a canonical record collection
-curl -X POST http://localhost:5678/api/v2/collections \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "demo",
-    "dimension": 3,
-    "distance_metric": "cosine",
-    "engine": "sst",
-    "enable_proxima_record": true
-  }'
-
-# 5. Insert ProximaRecords with embeddings
-curl -X POST http://localhost:5678/api/v2/collections/demo/records/batch \
-  -H "Content-Type: application/json" \
-  -d '{
-    "records": [
-      {"id": "1", "vector": [0.1, 0.2, 0.3], "props": {"category": "A"}},
-      {"id": "2", "vector": [0.3, 0.4, 0.5], "props": {"category": "B"}}
-    ]
-  }'
-
-# 6. Search
-curl -X POST http://localhost:5678/api/v2/collections/demo/search \
-  -H "Content-Type: application/json" \
-  -d '{
-    "vector": [0.1, 0.2, 0.3],
-    "top_k": 5
-  }'
 ```
+
+That's the whole smoke test. To go further — create a collection, insert records and run your
+first search — follow the [First Query tutorial](./first-query.md). It carries the canonical
+walkthrough in three forms: raw REST (`curl`), the Python SDK, and SQL over pgwire.
 
 ---
 
 ## Python SDK
 
-```python
-from proximadb_sdk import ProximaDBClient, ProximaRecord, Protocol
-
-# Connect
-client = ProximaDBClient(url="http://localhost:5678", protocol=Protocol.REST)
-
-# Create collection
-client.create_collection(
-    name="demo",
-    dimension=3,
-    distance_metric="cosine"
-)
-
-# Insert records with embeddings
-client.insert_records("demo", [
-    ProximaRecord(id="1", vector=[0.1, 0.2, 0.3]).set_flexible("category", "A"),
-    ProximaRecord(id="2", vector=[0.3, 0.4, 0.5]).set_flexible("category", "B"),
-])
-
-# Search
-results = client.search("demo", vector=[0.1, 0.2, 0.3], top_k=5)
-
-for result in results:
-    print(f"ID: {result.id}, Score: {result.score}")
-```
+The Python SDK (`pip install proximadb`) speaks the same REST API — connect, create a
+collection, insert `ProximaRecord`s with embeddings, search — in a few lines. The
+[First Query tutorial](./first-query.md) builds a complete semantic-search example with it,
+from collection creation to filtered search.
 
 ---
 
 ## SQL Interface
 
-> **Connecting on 5433?** pgwire binds `127.0.0.1:5433` unless the listener enforces its
-> own per-connection authentication (pgwire SCRAM, `TD-PGWIRE-AUTH-1`). So `localhost:5433`
-> works against a locally-run `proximadb-server`, but **not** through a port published from
-> a container — there, reach it from inside the container's network namespace, or enable
-> SCRAM and then set `[api] pg_port`. See `TD-PGWIRE-CONTAINER-1`.
-
-```sql
--- Connect (from a locally run server, or inside the container's network namespace)
--- psql -h 127.0.0.1 -p 5433 -U postgres -d proximadb
-
-CREATE TABLE catalog_items (id INT PRIMARY KEY, name TEXT, price NUMERIC);
-
-INSERT INTO catalog_items (id, name, price)
-VALUES (1, 'Wireless Headphones', 79.99), (2, 'Coffee Maker', 49.99);
-
-SELECT name, price FROM catalog_items WHERE price < 60 ORDER BY price;
-```
-
-`ORDER BY embedding <-> '<literal>'::vector LIMIT k` over collections created through REST or the
-SDK is Beta. `VECTOR(n)` columns created over pgwire work today only in tables that also have a JSON or JSONB column
-(TD-SQLCOLL-1).
+ProximaDB also speaks SQL over the PostgreSQL wire protocol (port 5433): `CREATE TABLE`,
+`INSERT`, `SELECT` with standard ANSI semantics. The canonical quick example — plus the
+pgwire listener's loopback-binding caveat (`TD-PGWIRE-AUTH-1`, `TD-PGWIRE-CONTAINER-1`) —
+lives in the [First Query tutorial's SQL section](./first-query.md#sql-interface).
 
 ---
 

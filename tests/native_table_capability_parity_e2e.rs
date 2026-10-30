@@ -14,7 +14,8 @@
 //!
 //! The feature is default-OFF (mandate #8), so the test enables
 //! `PROXIMADB_NATIVE_TABLE_PROVIDER` for the enabled half and asserts the
-//! default-off half still declines — proving the gate actually gates.
+//! default-off half still declines — proving the gate actually gates — and that a
+//! window function declines with SQLSTATE 0A000 rather than a silently wrong answer.
 
 #[path = "common/pg_server.rs"]
 mod pg_server;
@@ -40,12 +41,6 @@ const CAPABILITY_SHAPES: &[(&str, &str)] = &[
         "select id, val from usub2_t where val > (select avg(val) from usub2_t) order by id",
     ),
 ];
-
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    e.as_db_error()
-        .map(|d| format!("[{}] {}", d.code().code(), d.message()))
-        .unwrap_or_else(|| e.to_string())
-}
 
 #[test]
 fn native_table_capability_parity() {
@@ -115,42 +110,49 @@ async fn body() {
          otherwise this test proves nothing about the gate"
     );
 
-    // KNOWN-BAD, pinned deliberately (ADR-040 pattern).
+    // Fail closed, never silently wrong (mandate #1).
     //
-    // A bare window function over a NATIVE table does not merely decline with the gate
-    // off — it returns a **silently wrong answer**: `val - lag(val) OVER (...)` comes
-    // back as `val` for every row, because `lag(...)` contributes nothing.
-    //
-    // This is the TD-187 defect, which was fixed only for *materialized* tables. The
-    // TD-187 engagement fix makes the query engage the relational pipeline, but with no
-    // DataFusion route available for a native table `try_run_select` returns `None` and
-    // the query falls through to the legacy single-table path, whose projection
-    // extractor has no expression parser and re-reads the bare `val` column.
-    //
-    // So TD-USUB-2 closes a **correctness** bug on this path, not just a capability gap
-    // (mandate #1: fail closed, never silently wrong). When the legacy path is fixed or
-    // the gate becomes default-ON, this assertion trips and should be deleted.
-    let known_bad = client
+    // A bare window function over a NATIVE table with the gate off has no DataFusion
+    // route, and the relational frontend declines `OVER (...)` (TD-187). It used to fall
+    // through to the legacy single-table path, whose projection extractor has no
+    // expression parser and re-read the bare `val` column — so `val - lag(val) OVER
+    // (...)` came back as `val` for every row (the former KNOWN-BAD pin). The pipeline
+    // now declines it with SQLSTATE 0A000 naming the function and the gate to enable.
+    let err = client
         .simple_query(
             "select id, val - lag(val) over (order by id) as delta from usub2_t order by id",
         )
         .await
-        .expect("legacy path currently serves this (wrongly) rather than declining");
-    let bad_deltas: Vec<String> = known_bad
-        .iter()
-        .filter_map(|m| match m {
-            tokio_postgres::SimpleQueryMessage::Row(r) => {
-                Some(r.get(1).unwrap_or("NULL").trim().to_string())
-            }
-            _ => None,
-        })
-        .collect();
+        .expect_err("a window function on a native table must decline with the gate OFF");
+    let db = err
+        .as_db_error()
+        .unwrap_or_else(|| panic!("expected a server error, got {err}"));
     assert_eq!(
-        bad_deltas,
-        vec!["5", "20", "12", "40"],
-        "KNOWN-BAD (TD-187 residual on the native path): with the gate OFF, delta must \
-         still equal val — if this changed, the legacy path was fixed and this pin \
-         should be removed"
+        db.code().code(),
+        "0A000",
+        "window decline must be feature_not_supported: {}",
+        pg_server::db_err(&err)
+    );
+    assert!(
+        db.message().contains("lag") && db.message().contains("PROXIMADB_NATIVE_TABLE_PROVIDER"),
+        "decline must name the window function and the gate: {}",
+        db.message()
+    );
+
+    // A window nested in another expression declines the same way (it used to
+    // escape detection and reach the legacy path).
+    let nested = client
+        .simple_query("select id, coalesce(lag(val) over (order by id), 0) as p from usub2_t")
+        .await
+        .expect_err("a nested window function must decline with the gate OFF");
+    let nested_db = nested
+        .as_db_error()
+        .unwrap_or_else(|| panic!("expected a server error, got {nested}"));
+    assert_eq!(nested_db.code().code(), "0A000");
+    assert!(
+        nested_db.message().contains("lag") && nested_db.message().contains("TD-USUB-2"),
+        "the nested window must be declined by the window decline: {}",
+        nested_db.message()
     );
 
     drop(client);
@@ -182,7 +184,7 @@ async fn body() {
         let rows = client.simple_query(sql).await.unwrap_or_else(|e| {
             panic!(
                 "`{label}` must serve on a NATIVE table: {}",
-                explain_err(&e)
+                pg_server::db_err(&e)
             )
         });
         let n = rows

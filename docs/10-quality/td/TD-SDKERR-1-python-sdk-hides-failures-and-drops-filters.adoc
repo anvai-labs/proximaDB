@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open** (filed 2026-10-17). Reproduced against the 0.4.1 image with the repository SDK and the released `proximadb==0.4.1`.
+| Status | **Resolved (2026-10-24).** No sticky local fallback — EVERY `_activate_local_fallback` site (search, embedded writes, get/list/delete collection, raw-REST create, insert/upsert/delete vectors, get vector) is gated on unreachable-server only, and the gate classifies the SDK's typed transport exceptions (NetworkError/TransportError/TimeoutError) by class while no longer matching a bare "unavailable" (a 503 is a server answer); `filter=` is an alias of `metadata_filter=` (the explicit parameter wins when both are given); gRPC per-record insert failures surface in `BatchResult.errors` (a failures-only batch synthesizes a message when the server sends no detail; the dict branch also reads client_v1's `success_count` spelling); hybrid search raises instead of returning `{'results': []}`; `AuthResult` carries a derived `success` and an `error` field (the old `.success` probe raised AttributeError and every api_key client logged a bogus warning); REST search metadata unwraps `{"type","value"}` cells to plain values, matching gRPC. Pinned by `tests/unit/test_sdkerr_visibility.py` (the fallback gate is mutation-checked). Reproduced against the 0.4.1 image with the repository SDK and the released `proximadb==0.4.1`.
 | Priority | **HIGH** — failed writes and empty results with no error.
 | Component | `clients/python/src/proximadb_sdk/` (gRPC insert result mapping, sticky local fallback in `search_single`, `filter=` keyword collision, REST property cells)
 | Relates to | TD-GRPCCREATE-1, TD-SDKENG-1, TD-SDKDOC-1
@@ -40,3 +40,11 @@ Raise on any failed record (or return the per-record errors); never fall back to
 without an explicit opt-in; accept `filter=` as an alias of `metadata_filter=` (or reject unknown
 keyword arguments); return plain property values on both transports. Test each against a live
 server.
+
+== Resolution note (2026-10-24)
+
+The unit tests drive the real client/adapter code through fake transports — the same seam a live
+server sits behind — and evict any editable-installed SDK copy from `sys.modules` so the worktree
+source under test is unambiguous. The TD's "test each against a live server" remains the better
+end-to-end form; the REST-cells unwrapping and the fallback gate are the two behaviors most worth
+a live-server regression test when the e2e harness next runs.

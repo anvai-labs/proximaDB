@@ -142,22 +142,55 @@ fn extract_json<T>(
     })
 }
 
+/// Unwrap a JSON body, returning the rejection response from the handler on
+/// failure. Stamped prologue of every JSON-accepting handler below.
+macro_rules! parse_body {
+    ($body:expr) => {
+        match extract_json($body) {
+            Ok(req) => req,
+            Err(response) => return response.into_response(),
+        }
+    };
+}
+
+/// 400 for handlers whose port call takes a SQL string: an empty/blank
+/// query never reaches the port.
+fn empty_query_response() -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": "query cannot be empty" })),
+    )
+        .into_response()
+}
+
+/// Map a `UnifiedQueryPort` error to a response: text matching
+/// `not implemented`/`UNIMPLEMENTED` → 501 via [`not_implemented`] with the
+/// port method name; anything else is logged and mapped to 500. The mapping
+/// every handler below applies (the multi-model handler downcasts
+/// `InvalidQueryInput` BEFORE delegating here — client text must not
+/// masquerade as a 501).
+fn port_error_response(op: &str, e: anyhow::Error) -> axum::response::Response {
+    if e.to_string().contains("not implemented") || e.to_string().contains("UNIMPLEMENTED") {
+        not_implemented(op).into_response()
+    } else {
+        error!("{op} failed: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response()
+    }
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 async fn execute_query(
     State(s): State<UnifiedQueryRestState>,
     body: Result<Json<ExecuteQueryRequest>, JsonRejection>,
 ) -> impl IntoResponse {
-    let req = match extract_json(body) {
-        Ok(req) => req,
-        Err(response) => return response.into_response(),
-    };
+    let req = parse_body!(body);
     if req.query.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "query cannot be empty" })),
-        )
-            .into_response();
+        return empty_query_response();
     }
 
     info!(
@@ -172,19 +205,7 @@ async fn execute_query(
         .await
     {
         Ok(result) => Json(result).into_response(),
-        Err(e) => {
-            if e.to_string().contains("not implemented") || e.to_string().contains("UNIMPLEMENTED")
-            {
-                not_implemented("execute_unified_query").into_response()
-            } else {
-                error!("Unified query failed: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                )
-                    .into_response()
-            }
-        }
+        Err(e) => port_error_response("execute_unified_query", e),
     }
 }
 
@@ -192,10 +213,7 @@ async fn execute_multi_model_query(
     State(s): State<UnifiedQueryRestState>,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> impl IntoResponse {
-    let req = match extract_json(body) {
-        Ok(req) => req,
-        Err(response) => return response.into_response(),
-    };
+    let req = parse_body!(body);
     match s.unified_query_port.execute_multi_model_query(req).await {
         Ok(result) => Json(result).into_response(),
         Err(e) => {
@@ -208,17 +226,8 @@ async fn execute_multi_model_query(
                     Json(serde_json::json!({ "error": e.to_string() })),
                 )
                     .into_response()
-            } else if e.to_string().contains("not implemented")
-                || e.to_string().contains("UNIMPLEMENTED")
-            {
-                not_implemented("execute_multi_model_query").into_response()
             } else {
-                error!("Multi-model query failed: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                )
-                    .into_response()
+                port_error_response("execute_multi_model_query", e)
             }
         }
     }
@@ -228,16 +237,9 @@ async fn execute_federated_query(
     State(s): State<UnifiedQueryRestState>,
     body: Result<Json<ExecuteFederatedRequest>, JsonRejection>,
 ) -> impl IntoResponse {
-    let req = match extract_json(body) {
-        Ok(req) => req,
-        Err(response) => return response.into_response(),
-    };
+    let req = parse_body!(body);
     if req.query.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "query cannot be empty" })),
-        )
-            .into_response();
+        return empty_query_response();
     }
 
     let params = json_to_proxima_values(req.parameters);
@@ -247,19 +249,7 @@ async fn execute_federated_query(
         .await
     {
         Ok(result) => Json(result).into_response(),
-        Err(e) => {
-            if e.to_string().contains("not implemented") || e.to_string().contains("UNIMPLEMENTED")
-            {
-                not_implemented("execute_federated_query").into_response()
-            } else {
-                error!("Federated query failed: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                )
-                    .into_response()
-            }
-        }
+        Err(e) => port_error_response("execute_federated_query", e),
     }
 }
 
@@ -267,25 +257,10 @@ async fn execute_distributed_query(
     State(s): State<UnifiedQueryRestState>,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> impl IntoResponse {
-    let req = match extract_json(body) {
-        Ok(req) => req,
-        Err(response) => return response.into_response(),
-    };
+    let req = parse_body!(body);
     match s.unified_query_port.execute_distributed_query(req).await {
         Ok(result) => Json(result).into_response(),
-        Err(e) => {
-            if e.to_string().contains("not implemented") || e.to_string().contains("UNIMPLEMENTED")
-            {
-                not_implemented("execute_distributed_query").into_response()
-            } else {
-                error!("Distributed query failed: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                )
-                    .into_response()
-            }
-        }
+        Err(e) => port_error_response("execute_distributed_query", e),
     }
 }
 
@@ -293,29 +268,14 @@ async fn explain_query(
     State(s): State<UnifiedQueryRestState>,
     body: Result<Json<ExplainQueryRequest>, JsonRejection>,
 ) -> impl IntoResponse {
-    let req = match extract_json(body) {
-        Ok(req) => req,
-        Err(response) => return response.into_response(),
-    };
+    let req = parse_body!(body);
     match s
         .unified_query_port
         .explain_unified_query(req.query, req.collection)
         .await
     {
         Ok(result) => Json(result).into_response(),
-        Err(e) => {
-            if e.to_string().contains("not implemented") || e.to_string().contains("UNIMPLEMENTED")
-            {
-                not_implemented("explain_unified_query").into_response()
-            } else {
-                error!("Explain query failed: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                )
-                    .into_response()
-            }
-        }
+        Err(e) => port_error_response("explain_unified_query", e),
     }
 }
 
@@ -323,10 +283,7 @@ async fn prepare_statement(
     State(s): State<UnifiedQueryRestState>,
     body: Result<Json<PrepareStatementRequest>, JsonRejection>,
 ) -> impl IntoResponse {
-    let req = match extract_json(body) {
-        Ok(req) => req,
-        Err(response) => return response.into_response(),
-    };
+    let req = parse_body!(body);
     match s
         .unified_query_port
         .prepare_statement(req.name, req.query, req.cache_results, req.ttl_seconds)
@@ -337,19 +294,7 @@ async fn prepare_statement(
             Json(serde_json::json!({ "statement_id": statement_id })),
         )
             .into_response(),
-        Err(e) => {
-            if e.to_string().contains("not implemented") || e.to_string().contains("UNIMPLEMENTED")
-            {
-                not_implemented("prepare_statement").into_response()
-            } else {
-                error!("Prepare statement failed: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                )
-                    .into_response()
-            }
-        }
+        Err(e) => port_error_response("prepare_statement", e),
     }
 }
 
@@ -358,10 +303,7 @@ async fn execute_prepared_statement(
     Path(statement_id): Path<String>,
     body: Result<Json<ExecutePreparedRequest>, JsonRejection>,
 ) -> impl IntoResponse {
-    let req = match extract_json(body) {
-        Ok(req) => req,
-        Err(response) => return response.into_response(),
-    };
+    let req = parse_body!(body);
     let params = json_to_proxima_values(req.parameters);
     match s
         .unified_query_port
@@ -369,19 +311,7 @@ async fn execute_prepared_statement(
         .await
     {
         Ok(result) => Json(result).into_response(),
-        Err(e) => {
-            if e.to_string().contains("not implemented") || e.to_string().contains("UNIMPLEMENTED")
-            {
-                not_implemented("execute_prepared").into_response()
-            } else {
-                error!("Execute prepared statement failed: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                )
-                    .into_response()
-            }
-        }
+        Err(e) => port_error_response("execute_prepared", e),
     }
 }
 
@@ -391,19 +321,7 @@ async fn delete_prepared_statement(
 ) -> impl IntoResponse {
     match s.unified_query_port.delete_prepared(statement_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            if e.to_string().contains("not implemented") || e.to_string().contains("UNIMPLEMENTED")
-            {
-                not_implemented("delete_prepared").into_response()
-            } else {
-                error!("Delete prepared statement failed: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                )
-                    .into_response()
-            }
-        }
+        Err(e) => port_error_response("delete_prepared", e),
     }
 }
 
@@ -411,29 +329,14 @@ async fn get_prepared_stats(
     State(s): State<UnifiedQueryRestState>,
     body: Result<Json<PreparedStatsRequest>, JsonRejection>,
 ) -> impl IntoResponse {
-    let req = match extract_json(body) {
-        Ok(req) => req,
-        Err(response) => return response.into_response(),
-    };
+    let req = parse_body!(body);
     match s
         .unified_query_port
         .get_prepared_stats(req.statement_ids)
         .await
     {
         Ok(result) => Json(result).into_response(),
-        Err(e) => {
-            if e.to_string().contains("not implemented") || e.to_string().contains("UNIMPLEMENTED")
-            {
-                not_implemented("get_prepared_stats").into_response()
-            } else {
-                error!("Get prepared stats failed: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                )
-                    .into_response()
-            }
-        }
+        Err(e) => port_error_response("get_prepared_stats", e),
     }
 }
 

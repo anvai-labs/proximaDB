@@ -224,19 +224,11 @@ impl EngineCapabilities for SstCapabilities {
 
     fn scan_capabilities(&self) -> ScanCapabilities {
         ScanCapabilities {
-            supports_predicate_pushdown: false,
-            supports_column_projection: false,
-            supports_row_group_pruning: false,
-            supports_parallel_column_evaluation: false,
             supports_bloom_filters: true,
             supports_block_cache: true,
             supports_range_scans: true,
             supports_index_scans: true,
-            supports_progressive_quantization: false,
-            supports_zone_maps: false,
-            supports_streaming: false,
-            supports_tier_aware_scanning: false,
-            supports_consolidated_reading: false,
+            ..Default::default()
         }
     }
 
@@ -277,18 +269,13 @@ impl EngineCapabilities for HelixCapabilities {
     fn scan_capabilities(&self) -> ScanCapabilities {
         ScanCapabilities {
             supports_predicate_pushdown: true,
-            supports_column_projection: false,
-            supports_row_group_pruning: false,
-            supports_parallel_column_evaluation: false,
             supports_bloom_filters: true,
             supports_block_cache: true,
             supports_range_scans: true,
             supports_index_scans: true,
             supports_progressive_quantization: true,
             supports_zone_maps: true,
-            supports_streaming: false,
-            supports_tier_aware_scanning: false,
-            supports_consolidated_reading: false,
+            ..Default::default()
         }
     }
 
@@ -320,15 +307,9 @@ impl EngineCapabilities for ViperCapabilities {
             supports_column_projection: true,
             supports_row_group_pruning: true,
             supports_parallel_column_evaluation: true,
-            supports_bloom_filters: false,
-            supports_block_cache: false,
-            supports_range_scans: false,
-            supports_index_scans: false,
-            supports_progressive_quantization: false,
             supports_zone_maps: true,
             supports_streaming: true,
-            supports_tier_aware_scanning: false,
-            supports_consolidated_reading: false,
+            ..Default::default()
         }
     }
 
@@ -363,19 +344,12 @@ impl EngineCapabilities for SwiftCapabilities {
 
     fn scan_capabilities(&self) -> ScanCapabilities {
         ScanCapabilities {
-            supports_predicate_pushdown: false,
-            supports_column_projection: false,
-            supports_row_group_pruning: false,
-            supports_parallel_column_evaluation: false,
             supports_bloom_filters: true,
             supports_block_cache: true,
             supports_range_scans: true,
             supports_index_scans: true,
-            supports_progressive_quantization: false,
-            supports_zone_maps: false,
-            supports_streaming: false,
             supports_tier_aware_scanning: true,
-            supports_consolidated_reading: false,
+            ..Default::default()
         }
     }
 
@@ -411,15 +385,10 @@ impl EngineCapabilities for NovaCapabilities {
             supports_column_projection: true,
             supports_row_group_pruning: true,
             supports_parallel_column_evaluation: true,
-            supports_bloom_filters: false,
-            supports_block_cache: false,
-            supports_range_scans: false,
-            supports_index_scans: false,
             supports_progressive_quantization: true,
             supports_zone_maps: true,
             supports_streaming: true,
-            supports_tier_aware_scanning: false,
-            supports_consolidated_reading: false,
+            ..Default::default()
         }
     }
 
@@ -451,15 +420,12 @@ impl EngineCapabilities for TstCapabilities {
             supports_column_projection: true,
             supports_row_group_pruning: true,
             supports_parallel_column_evaluation: true,
-            supports_bloom_filters: false,
             supports_block_cache: true,
             supports_range_scans: true,
-            supports_index_scans: false,
-            supports_progressive_quantization: false,
             supports_zone_maps: true,
             supports_streaming: true,
             supports_tier_aware_scanning: true,
-            supports_consolidated_reading: false,
+            ..Default::default()
         }
     }
 
@@ -489,16 +455,11 @@ impl EngineCapabilities for RaptorCapabilities {
             supports_predicate_pushdown: true,
             supports_column_projection: true,
             supports_row_group_pruning: true,
-            supports_parallel_column_evaluation: false,
             supports_bloom_filters: true,
-            supports_block_cache: false,
-            supports_range_scans: false,
-            supports_index_scans: false,
-            supports_progressive_quantization: false,
-            supports_zone_maps: false,
             supports_streaming: true,
             supports_tier_aware_scanning: true,
             supports_consolidated_reading: true,
+            ..Default::default()
         }
     }
 

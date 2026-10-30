@@ -29,29 +29,16 @@ solution rather than a rule.
 
 == The change
 
-Adopt the Lance 2.1 separation: **structural** encoding (nesting, repetition, validity →
-buffers) is chosen independently of **compressive** encoding (bitpacking, dictionary, FSST,
-zstd). Structure is then selected **per column, by value width**:
-
-[cols="1,1,3", options="header"]
-|===
-| Value width | Structure | Effect
-| ≥ 128 B | **full-zip** | Control word + optional length + value data zipped row-major. 1 IOP random access for fixed-width, 2 for variable. Repetition index kept separate.
-| < 128 B | **mini-block** | 4–8 KiB chunks with a small header; decode cost amortized across ≥32 values.
-|===
-
-A 768-dimension `f32` embedding is ~3 KB, so it lands in full-zip: **a 1-IOP random vector
-fetch**, which is exactly the ANN rerank access pattern the coalesced codecs hand-built. The
-reported effect on the search cache is large — Parquet's ~20 GiB per billion-row vector
-column versus ~1.28 GiB — because large values no longer force one page per value.
-
-`BlockMode` is retained in the header for v2 compatibility but becomes **advisory** in v3;
-the per-column structure marker in `ColumnMeta` is authoritative.
-
-*Composability reference:* Vortex's layout tree (Struct → Zoned → Chunked → Compressor →
-Buffered → Flat) is the model for treating layout as composable rather than as a fixed file
-shape. This TD adopts the *principle* (structure is a per-column, composable decision), not
-Vortex's tree wholesale.
+Adopt the Lance 2.1 separation — **structural** encoding (nesting, repetition, validity →
+buffers) chosen independently of **compressive** encoding (bitpacking, dictionary, FSST,
+zstd), with structure selected **per column, by value width** (full-zip at >= 128 B,
+mini-block below). The authoritative statement of the rule — the width table, the 768-dim
+f32 full-zip example with its measured search-cache effect (~20 GiB vs ~1.28 GiB per
+billion-row vector column), the `BlockMode`-becomes-advisory transition and the Vortex
+composability reference — is the spec (ADR-094):
+link:../../12-design/PAX_V3_UNIFIED_SUBSTRATE_SPEC_2026_09.adoc[PAX v3 unified substrate
+spec] § _2.2 Adaptive structural encoding_. This TD tracks the work, not a second statement
+of the design.
 
 == Constraints
 

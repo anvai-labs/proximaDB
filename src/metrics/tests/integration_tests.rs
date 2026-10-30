@@ -235,13 +235,12 @@ mod tests {
         (0..count)
             .map(|i| proximadb_records::ProximaRecord {
                 oid: format!("integration_vector_{}", i),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "dense_vector".to_string(),
-                    dim: 384,
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![0.1; 384]),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default",
+                    "dense_vector",
+                    384,
+                    vec![0.1; 384],
+                )],
                 record_version: 1,
                 ..proximadb_records::ProximaRecord::default()
             })

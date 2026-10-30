@@ -21,7 +21,16 @@ import argparse
 import html
 import json
 import math
+import sys
 from pathlib import Path
+
+# corpus_io is a sibling module in scripts/bench/. Inject that directory so the
+# import works both when run as a script and when loaded via importlib in tests.
+_BENCH_DIR = str(Path(__file__).resolve().parent)
+if _BENCH_DIR not in sys.path:
+    sys.path.insert(0, _BENCH_DIR)
+
+from corpus_io import sha256_file as _sha256  # noqa: E402  — path-injected sibling bench module
 
 
 def sorted_points(points: list[dict]) -> list[dict]:
@@ -338,16 +347,6 @@ def summarize_matrix(
             key=lambda point: (int(point["top_k"]), int(point["nprobe"])),
         ),
     }
-
-
-def _sha256(path: Path) -> str:
-    import hashlib
-
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _segment_provenance(segment: dict) -> dict:

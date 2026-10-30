@@ -152,28 +152,6 @@ second system; it is retired.
 * **Namespace `u16` wrap (ADR-074 D4):** 65,536 namespaces/account is a hard
   cap, not a silent wrap — fence it. Tracked separately.
 
-== Consequences
-
-* Small collections get fast ACID point-lookup metadata without lakehouse overhead; managed
-  serverless Postgres (Neon/Supabase) and fully embedded SQLite are both viable; routing is
-  transparent behind the one `Catalog` trait.
-* Metadata-only is the intended separation, not a compromise: engines own record durability,
-  xCatalog owns schema and statistics. The 1 GB threshold is configurable
-  (`OltpCatalogConfig.size_threshold_bytes`).
-* Risks that still apply: `sqlx::AnyPool` loses compile-time typing in the fallback path;
-  per-backend DDL (`generate_ddl()`) must track MySQL/SQLite dialect gaps; **without an
-  `oltp-catalog-*` feature, `OltpCatalog` falls back to a non-durable in-memory HashMap.**
-
-== Implementation history
-
-Shipped with the ADR (2026-05-17). Code (re-verified 2026-10-15):
-`crates/control/proximadb-catalog/src/oltp.rs` (`OltpCatalog`, DDL generation, in-memory fallback);
-`crates/control/proximadb-catalog/src/manager.rs` (`create_oltp_catalog`, `catalog_for_size`);
-`OltpCatalogConfig` in `proto/proximadb/v1/catalog.proto`. Backends are features of the
-`proximadb-catalog` crate (`oltp-catalog-postgres` / `-mysql` / `-sqlite`, e.g.
-`cargo build -p proximadb-catalog --features oltp-catalog-postgres`); the root crate does not
-forward them and the `oltp-catalog-full` alias named at filing does not exist.
-
 == Addendum: ABAC `tenant_stable_id` (TD-TENANT-1 item 3)
 
 The ABAC layer keys enforcement on `tenant_stable_id: u64` (the binding filter

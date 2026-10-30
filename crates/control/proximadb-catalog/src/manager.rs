@@ -670,6 +670,49 @@ impl CatalogManager {
         Ok(())
     }
 
+    /// Every table schema in the registered catalogs that `include` selects,
+    /// found by walking each catalog's namespace tree. Fails on the first
+    /// catalog, namespace or table that cannot be read: a caller that needs the
+    /// complete set (the WAL truncation floor) must refuse on that, and a
+    /// best-effort caller logs it and carries on.
+    pub async fn table_schemas(
+        &self,
+        include: impl Fn(&dyn Catalog) -> bool,
+    ) -> Result<Vec<crate::CatalogTableSchema>> {
+        let catalogs: Vec<Arc<dyn Catalog>> =
+            self.catalogs.read().await.values().cloned().collect();
+        let mut schemas = Vec::new();
+        for catalog in catalogs.iter().filter(|c| include(c.as_ref())) {
+            let mut pending: Vec<Option<Vec<String>>> = vec![None];
+            let mut seen = std::collections::HashSet::new();
+            while let Some(parent) = pending.pop() {
+                let namespaces = catalog
+                    .list_namespaces(parent.as_deref())
+                    .await
+                    .map_err(|e| {
+                        anyhow!("listing namespaces of catalog '{}': {e:#}", catalog.name())
+                    })?;
+                for namespace in namespaces {
+                    if !seen.insert(namespace.levels.clone()) {
+                        continue;
+                    }
+                    let tables = catalog.list_tables(&namespace.levels).await.map_err(|e| {
+                        anyhow!(
+                            "listing tables of '{}.{:?}': {e:#}",
+                            catalog.name(),
+                            namespace.levels
+                        )
+                    })?;
+                    for table in tables {
+                        schemas.push(catalog.get_table(&table).await?);
+                    }
+                    pending.push(Some(namespace.levels));
+                }
+            }
+        }
+        Ok(schemas)
+    }
+
     /// List all registered catalogs
     pub async fn list_catalogs(&self) -> Vec<String> {
         let catalogs = self.catalogs.read().await;
@@ -919,3 +962,54 @@ fn ident_case_fold_env_enabled() -> bool {
 // here shadowed the canonical type and caused the in-flight catalog
 // trait migration to keep "two TableIdentifier" type-identity errors.
 // Removed as part of Option B consolidation.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CatalogColumn, CatalogTableSchema};
+    use proximadb_data_model::ProximaType;
+
+    /// `table_schemas` finds tables in nested namespaces exactly once, and
+    /// `include` filters whole catalogs.
+    #[tokio::test]
+    async fn table_schemas_walks_nested_namespaces_of_selected_catalogs() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let manager = CatalogManager::new();
+        let catalog = manager
+            .create_native_catalog("local", &format!("file://{}", dir.path().display()))
+            .await?;
+        let outer = vec!["a".to_string()];
+        let inner = vec!["a".to_string(), "b".to_string()];
+        catalog.create_namespace(&outer, HashMap::new()).await?;
+        catalog.create_namespace(&inner, HashMap::new()).await?;
+        for (namespace, name) in [(&outer, "t1"), (&inner, "t2")] {
+            catalog
+                .create_table(
+                    &TableIdentifier::new(namespace.clone(), name),
+                    CatalogTableSchema::new(name).with_column(CatalogColumn::new(
+                        1,
+                        "id",
+                        ProximaType::Int64,
+                    )),
+                )
+                .await?;
+        }
+
+        let mut names: Vec<String> = manager
+            .table_schemas(|_| true)
+            .await?
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["t1", "t2"], "each table once, nested included");
+        assert!(
+            manager
+                .table_schemas(|c| c.catalog_type() != "native")
+                .await?
+                .is_empty(),
+            "a deselected catalog is not walked"
+        );
+        Ok(())
+    }
+}

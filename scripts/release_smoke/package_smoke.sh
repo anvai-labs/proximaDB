@@ -25,6 +25,25 @@ case "$KIND" in
   *) echo "::error::unknown package kind ${KIND}"; exit 1 ;;
 esac
 
+# TD-PKG-1: the package must install the systemd unit (Type=simple: the
+# server never calls sd_notify, so Type=notify can never report ready) and the
+# state directories must be owned by the service user after install (dpkg/rpm
+# create them root-owned from the payload; postinst chowns unconditionally).
+UNIT=/usr/lib/systemd/system/proximadb.service
+[ -f "$UNIT" ] || UNIT=/lib/systemd/system/proximadb.service
+[ -f "$UNIT" ] || { echo "::error::${KIND} on ${DISTRO}: package installs no systemd unit"; exit 1; }
+grep -q '^Type=simple' "$UNIT" \
+  || { echo "::error::${KIND} on ${DISTRO}: unit is not Type=simple: $(grep '^Type=' "$UNIT")"; exit 1; }
+id proximadb >/dev/null 2>&1 \
+  || { echo "::error::${KIND} on ${DISTRO}: package creates no proximadb user"; exit 1; }
+for d in /var/lib/proximadb /var/log/proximadb; do
+  [ -d "$d" ] || { echo "::error::${KIND} on ${DISTRO}: $d was not created"; exit 1; }
+  owner="$(stat -c '%U:%G' "$d")"
+  [ "$owner" = "proximadb:proximadb" ] \
+    || { echo "::error::${KIND} on ${DISTRO}: $d is ${owner}, not proximadb:proximadb"; exit 1; }
+done
+echo "${KIND} on ${DISTRO}: unit Type=simple; state dirs owned by proximadb"
+
 got="$(proximadb-server --version 2>&1)" \
   || { echo "::error::${KIND} on ${DISTRO}: proximadb-server does not run: ${got}"; exit 1; }
 [ "$got" = "proximadb-server ${V}" ] \

@@ -130,7 +130,6 @@ pub mod unified_metadata_serializer {
 pub mod writer;
 // ivf_manager removed - obsolete with Matrix Trinity (P² + K² + P×K)
 pub mod artus_bloom;
-pub mod progressive_stages;
 pub mod rowgroup_manager;
 pub use proximadb_engine_core::smart_rowgroup_sizing; // extracted to engine-core (TD-DECOMP-69)
 

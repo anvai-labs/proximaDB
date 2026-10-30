@@ -24,22 +24,27 @@ use anyhow::Result;
 
 use super::bitpack;
 use super::helpers;
+use super::helpers::WirePrim;
 
 // ===== Core wire format encoding functions =====
 
-/// Core encoding logic for i32 base + i64 deltas (used by f32 and i32)
-fn encode_pfor_delta_i32_base(wire_values: &[i32], base: i32) -> Result<Vec<u8>> {
+/// Single PForDelta encode core (redundancy pass 4: the i32-base and i64-base
+/// twins differed only in the base slot width — deltas, percentile logic, and
+/// patches were already i64 on both sides). This is the CANONICAL wire format
+/// pinned against the SIMD encoder by TD-CODEC-1; the golden tests pin the
+/// bytes.
+fn encode_pfor_delta_wire<W: WirePrim>(wire_values: &[W], base: W) -> Result<Vec<u8>> {
     if wire_values.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut result = Vec::new();
-    result.extend_from_slice(&base.to_le_bytes());
+    base.write_le(&mut result);
 
-    // Compute deltas in i64 (NO OVERFLOW!)
+    // Compute deltas in i64 (NO OVERFLOW! for the i32 path; wrapping for i64)
     let deltas: Vec<i64> = wire_values
         .iter()
-        .map(|&v| (v as i64) - (base as i64))
+        .map(|&v| v.widen().wrapping_sub(base.widen()))
         .collect();
 
     // Find optimal bit width for 90% of values
@@ -79,73 +84,12 @@ fn encode_pfor_delta_i32_base(wire_values: &[i32], base: i32) -> Result<Vec<u8>>
     let num_patches = patches.len() as u32;
     result.extend_from_slice(&num_patches.to_le_bytes());
 
-    // Bitpack regular values using unsigned variant (no sign extension for sentinels)
+    // Bitpack regular values (decoder uses the unsigned unpack variant — no
+    // sign extension for sentinels)
     let packed = bitpack::bitpack_i64(&regular_values, bits)?;
     result.extend(packed);
 
     // Store patches (position:4 bytes + value:8 bytes = 12 bytes per patch)
-    for (pos, value) in patches {
-        result.extend_from_slice(&pos.to_le_bytes());
-        result.extend_from_slice(&value.to_le_bytes());
-    }
-
-    Ok(result)
-}
-
-/// Core encoding logic for i64 base + i64 deltas
-fn encode_pfor_delta_i64_base(wire_values: &[i64], base: i64) -> Result<Vec<u8>> {
-    if wire_values.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut result = Vec::new();
-    result.extend_from_slice(&base.to_le_bytes());
-
-    // Convert to deltas
-    let deltas: Vec<i64> = wire_values.iter().map(|&v| v.wrapping_sub(base)).collect();
-
-    // Find optimal bit width for 90% of values
-    let mut sorted_deltas: Vec<u64> = deltas.iter().map(|&d| d.unsigned_abs()).collect();
-    sorted_deltas.sort_unstable();
-
-    let percentile_90_idx = (sorted_deltas.len() * 90) / 100;
-    let threshold = sorted_deltas.get(percentile_90_idx).copied().unwrap_or(0);
-    let bits = if threshold == 0 {
-        1
-    } else {
-        64 - threshold.leading_zeros() as u8
-    };
-
-    result.push(bits);
-
-    // Separate regular values and patches
-    let mut regular_values = Vec::with_capacity(deltas.len());
-    let mut patches = Vec::new();
-    let max_regular = if bits >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << bits) - 1
-    };
-
-    for (idx, &delta) in deltas.iter().enumerate() {
-        let abs_delta = delta.unsigned_abs();
-        if abs_delta <= max_regular {
-            regular_values.push(delta);
-        } else {
-            regular_values.push(0); // Sentinel
-            patches.push((idx as u32, delta));
-        }
-    }
-
-    // Store number of patches
-    let num_patches = patches.len() as u32;
-    result.extend_from_slice(&num_patches.to_le_bytes());
-
-    // Bitpack regular values
-    let packed = bitpack::bitpack_i64(&regular_values, bits)?;
-    result.extend(packed);
-
-    // Store patches
     for (pos, value) in patches {
         result.extend_from_slice(&pos.to_le_bytes());
         result.extend_from_slice(&value.to_le_bytes());
@@ -179,61 +123,82 @@ fn encode_pfor_delta_i64_base(wire_values: &[i64], base: i64) -> Result<Vec<u8>>
 /// Raw encoded bytes (NO scheme marker, NO count header)
 pub fn encode_f32(values: &[f32], base: i64) -> Result<Vec<u8>> {
     helpers::encode_generic(values, |wire_values| {
-        encode_pfor_delta_i32_base(wire_values, base as i32)
+        encode_pfor_delta_wire(wire_values, base as i32)
     })
 }
 
 /// Encode i64 values using PForDelta (raw, no headers)
 pub fn encode_i64(values: &[i64], base: i64) -> Result<Vec<u8>> {
     helpers::encode_generic(values, |wire_values| {
-        encode_pfor_delta_i64_base(wire_values, base)
+        encode_pfor_delta_wire(wire_values, base)
     })
 }
 
 /// Encode i32 values using PForDelta (raw, no headers)
 pub fn encode_i32(values: &[i32], base: i64) -> Result<Vec<u8>> {
     helpers::encode_generic(values, |wire_values| {
-        encode_pfor_delta_i32_base(wire_values, base as i32)
+        encode_pfor_delta_wire(wire_values, base as i32)
     })
 }
 
 // ===== Core wire format decoding functions =====
 
-/// Core decoding logic for i32 base + i64 deltas
-fn decode_pfor_delta_i32_base(data: &[u8], count: usize) -> Result<Vec<i32>> {
+/// Single PForDelta decode core; header is
+/// [base:WIRE_BYTES][bits:1][num_patches:u32], the packed regulars and the
+/// (pos, i64) patches are width-independent.
+fn decode_pfor_delta_wire<W: WirePrim>(data: &[u8], count: usize) -> Result<Vec<W>> {
     if count == 0 {
         return Ok(Vec::new());
     }
 
-    if data.len() < 9 {
+    let (base, deltas) = parse_header_and_patches::<W>(data, count)?;
+
+    // Reconstruct values: widen the base, add each i64 delta, narrow back
+    // (truncating for i32 exactly like the old reconstruct helper).
+    Ok(deltas
+        .into_iter()
+        .map(|d| W::from_wide(base.widen().wrapping_add(d)))
+        .collect())
+}
+
+/// Parse the PForDelta header and apply patches to the unpacked deltas
+/// (shared by the width-generic decode core and the SIMD-facing f32 helper).
+fn parse_header_and_patches<W: WirePrim>(data: &[u8], count: usize) -> Result<(W, Vec<i64>)> {
+    let header_len = W::WIRE_BYTES + 5;
+    if data.len() < header_len {
         return Err(anyhow::anyhow!("PForDelta decode: insufficient data"));
     }
 
     // Read base
-    let base = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let base = W::read_le(data)?;
 
     // Read bit width
-    let bits = data[4];
+    let bits = data[W::WIRE_BYTES];
 
     // Read number of patches
-    let num_patches = u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize;
+    let num_patches = u32::from_le_bytes([
+        data[W::WIRE_BYTES + 1],
+        data[W::WIRE_BYTES + 2],
+        data[W::WIRE_BYTES + 3],
+        data[W::WIRE_BYTES + 4],
+    ]) as usize;
 
     // Calculate size of bitpacked data
     let bitpacked_bytes = (count * bits as usize).div_ceil(8);
 
     // Patches are 12 bytes each: 4 (pos) + 8 (value i64)
-    if data.len() < 9 + bitpacked_bytes + num_patches * 12 {
+    if data.len() < header_len + bitpacked_bytes + num_patches * 12 {
         return Err(anyhow::anyhow!(
             "PForDelta decode: insufficient data for patches"
         ));
     }
 
     // Unpack regular values using unsigned variant (no sign extension for sentinels)
-    let bitpacked_data = &data[9..9 + bitpacked_bytes];
+    let bitpacked_data = &data[header_len..header_len + bitpacked_bytes];
     let mut deltas = bitpack::unbitpack_i64_unsigned(bitpacked_data, bits, count)?;
 
     // Apply patches
-    let patch_start = 9 + bitpacked_bytes;
+    let patch_start = header_len + bitpacked_bytes;
     for i in 0..num_patches {
         let offset = patch_start + i * 12;
         let pos = u32::from_le_bytes([
@@ -259,73 +224,7 @@ fn decode_pfor_delta_i32_base(data: &[u8], count: usize) -> Result<Vec<i32>> {
         }
     }
 
-    // Reconstruct values using shared helper
-    Ok(helpers::reconstruct_i32_from_i64(&deltas, base))
-}
-
-/// Core decoding logic for i64 base + i64 deltas
-fn decode_pfor_delta_i64_base(data: &[u8], count: usize) -> Result<Vec<i64>> {
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-
-    if data.len() < 13 {
-        return Err(anyhow::anyhow!("PForDelta decode: insufficient data"));
-    }
-
-    // Read base
-    let base = i64::from_le_bytes([
-        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-    ]);
-
-    // Read bit width
-    let bits = data[8];
-
-    // Read number of patches
-    let num_patches = u32::from_le_bytes([data[9], data[10], data[11], data[12]]) as usize;
-
-    // Calculate size of bitpacked data
-    let bitpacked_bytes = (count * bits as usize).div_ceil(8);
-
-    if data.len() < 13 + bitpacked_bytes + num_patches * 12 {
-        return Err(anyhow::anyhow!(
-            "PForDelta decode: insufficient data for patches"
-        ));
-    }
-
-    // Unpack regular values
-    let bitpacked_data = &data[13..13 + bitpacked_bytes];
-    let mut deltas = bitpack::unbitpack_i64_unsigned(bitpacked_data, bits, count)?;
-
-    // Apply patches
-    let patch_start = 13 + bitpacked_bytes;
-    for i in 0..num_patches {
-        let offset = patch_start + i * 12;
-        let pos = u32::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]) as usize;
-
-        let value = i64::from_le_bytes([
-            data[offset + 4],
-            data[offset + 5],
-            data[offset + 6],
-            data[offset + 7],
-            data[offset + 8],
-            data[offset + 9],
-            data[offset + 10],
-            data[offset + 11],
-        ]);
-
-        if pos < deltas.len() {
-            deltas[pos] = value;
-        }
-    }
-
-    // Reconstruct values using shared helper
-    Ok(helpers::reconstruct_i64_from_i64(&deltas, base))
+    Ok((base, deltas))
 }
 
 // ===== Compatibility helpers for SIMD module =====
@@ -337,50 +236,7 @@ fn decode_pfor_delta_i64_base(data: &[u8], count: usize) -> Result<Vec<i64>> {
 /// # Returns
 /// (base_i32, patched_deltas)
 pub fn parse_header_and_patches_f32(data: &[u8], count: usize) -> Result<(i32, Vec<i64>)> {
-    // Reuse core decode logic but return intermediate results
-    if data.len() < 9 {
-        return Err(anyhow::anyhow!("PForDelta decode: insufficient data"));
-    }
-
-    let base = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    let bits = data[4];
-    let num_patches = u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize;
-
-    let bitpacked_bytes = (count * bits as usize).div_ceil(8);
-    if data.len() < 9 + bitpacked_bytes + num_patches * 12 {
-        return Err(anyhow::anyhow!(
-            "PForDelta decode: insufficient data for patches"
-        ));
-    }
-
-    let bitpacked_data = &data[9..9 + bitpacked_bytes];
-    let mut deltas = bitpack::unbitpack_i64_unsigned(bitpacked_data, bits, count)?;
-
-    let patch_start = 9 + bitpacked_bytes;
-    for i in 0..num_patches {
-        let offset = patch_start + i * 12;
-        let pos = u32::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]) as usize;
-        let value = i64::from_le_bytes([
-            data[offset + 4],
-            data[offset + 5],
-            data[offset + 6],
-            data[offset + 7],
-            data[offset + 8],
-            data[offset + 9],
-            data[offset + 10],
-            data[offset + 11],
-        ]);
-        if pos < deltas.len() {
-            deltas[pos] = value;
-        }
-    }
-
-    Ok((base, deltas))
+    parse_header_and_patches::<i32>(data, count)
 }
 
 /// Reconstruct f32 values from deltas and base (for SIMD compatibility)
@@ -393,77 +249,83 @@ pub fn reconstruct_values_scalar_f32(deltas: &[i64], base_i32: i32) -> Vec<f32> 
 // ===== Public API (thin wrappers using generic helpers) =====
 
 pub fn decode_f32(data: &[u8], count: usize) -> Result<Vec<f32>> {
-    helpers::decode_generic::<f32>(data, count, decode_pfor_delta_i32_base)
+    helpers::decode_generic::<f32>(data, count, decode_pfor_delta_wire::<i32>)
 }
 
 /// Decode i64 values from PForDelta encoded data
 pub fn decode_i64(data: &[u8], count: usize) -> Result<Vec<i64>> {
-    if data.len() < 13 {
-        return Err(anyhow::anyhow!("PForDelta decode: insufficient data"));
-    }
-
-    // Read base
-    let _base = i64::from_le_bytes([
-        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-    ]);
-
-    // Read bit width
-    let bits = data[8];
-
-    // Read number of patches
-    let num_patches = u32::from_le_bytes([data[9], data[10], data[11], data[12]]) as usize;
-
-    // Calculate size of bitpacked data
-    let bitpacked_bytes = (count * bits as usize).div_ceil(8);
-
-    if data.len() < 13 + bitpacked_bytes + num_patches * 12 {
-        return Err(anyhow::anyhow!(
-            "PForDelta decode: insufficient data for patches"
-        ));
-    }
-
-    // Unpack regular values (delegate to shared helper with sign extension)
-    let bitpacked_data = &data[13..13 + bitpacked_bytes];
-    let mut deltas = bitpack::unbitpack_i64_unsigned(bitpacked_data, bits, count)?;
-
-    // Apply patches
-    let patch_start = 13 + bitpacked_bytes;
-    for i in 0..num_patches {
-        let offset = patch_start + i * 12;
-        let pos = u32::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]) as usize;
-
-        let value = i64::from_le_bytes([
-            data[offset + 4],
-            data[offset + 5],
-            data[offset + 6],
-            data[offset + 7],
-            data[offset + 8],
-            data[offset + 9],
-            data[offset + 10],
-            data[offset + 11],
-        ]);
-
-        if pos < deltas.len() {
-            deltas[pos] = value;
-        }
-    }
-
-    helpers::decode_generic::<i64>(data, count, decode_pfor_delta_i64_base)
+    helpers::decode_generic::<i64>(data, count, decode_pfor_delta_wire::<i64>)
 }
 
 /// Decode i32 values from PForDelta encoded data
 pub fn decode_i32(data: &[u8], count: usize) -> Result<Vec<i32>> {
-    helpers::decode_generic::<i32>(data, count, decode_pfor_delta_i32_base)
+    helpers::decode_generic::<i32>(data, count, decode_pfor_delta_wire::<i32>)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== Golden-byte pins (redundancy pass 4) ====================
+    // Wire layout: [base:WIRE_BYTES LE][bits:1 byte][num_patches:u32 LE]
+    // [bitpacked i64 deltas (unsigned unpack, sentinels at patch positions)]
+    // [patches: (pos:u32 LE, value:i64 LE)*]. This is the CANONICAL wire
+    // format TD-CODEC-1 pins against the SIMD encoder — treat any byte
+    // change here as a wire-format change. These pins were verified green
+    // BEFORE the WirePrim consolidation of the baseline cores.
+
+    /// i32 path (4-byte base): 19 zeros + 695 delta from base 5; p90 index
+    /// 18 of 20 sorted |deltas| is 0 -> bits 1, max_regular 1, so the 695
+    /// becomes one patch; 20 one-bit regulars pack to 3 zero bytes.
+    #[test]
+    fn golden_pfor_delta_i32_wire_bytes() {
+        let mut values = vec![5i32; 20];
+        values[19] = 700;
+
+        let encoded = encode_i32(&values, 5).unwrap();
+        assert_eq!(
+            encoded,
+            vec![
+                5, 0, 0, 0, // base 5 LE i32
+                1, // bits = 1 (p90 threshold 0)
+                1, 0, 0, 0, // num_patches = 1
+                0, 0, 0, // packed regulars (20 one-bit zeros)
+                19, 0, 0, 0, // patch pos = 19
+                0xB7, 0x02, 0, 0, 0, 0, 0, 0, // patch value 695 LE i64
+            ]
+        );
+        assert_eq!(decode_i32(&encoded, 20).unwrap(), values);
+    }
+
+    /// i64 path (8-byte base): same shape, 19 zero deltas + 700, one patch.
+    #[test]
+    fn golden_pfor_delta_i64_wire_bytes() {
+        let mut values = vec![7i64; 20];
+        values[19] = 707;
+
+        let encoded = encode_i64(&values, 7).unwrap();
+        assert_eq!(
+            encoded,
+            vec![
+                7, 0, 0, 0, 0, 0, 0, 0, // base 7 LE i64
+                1, // bits = 1
+                1, 0, 0, 0, // num_patches = 1
+                0, 0, 0, // packed regulars
+                19, 0, 0, 0, // patch pos = 19
+                0xBC, 0x02, 0, 0, 0, 0, 0, 0, // patch value 700 LE i64
+            ]
+        );
+        assert_eq!(decode_i64(&encoded, 20).unwrap(), values);
+    }
+
+    /// All-equal data pins the no-patch bits=1 case (4 one-bit zeros -> 1
+    /// byte 0x00).
+    #[test]
+    fn golden_pfor_delta_i32_no_patches() {
+        let encoded = encode_i32(&[5, 5, 5, 5], 5).unwrap();
+        assert_eq!(encoded, vec![5, 0, 0, 0, 1, 0, 0, 0, 0, 0x00]);
+        assert_eq!(decode_i32(&encoded, 4).unwrap(), vec![5, 5, 5, 5]);
+    }
 
     #[test]
     fn test_pfor_f32_roundtrip() {

@@ -412,6 +412,28 @@ impl ProximaDB {
                         // diverge by construction.
                         crate::observability::metering_otlp::record_storage_snapshot(&usage);
                     }
+                    // TD-TIER-1 SC3-2: reservation usage rides the same
+                    // coalesced cadence (parked release-tails + accrual
+                    // intervals; empty when no pools are declared), but does
+                    // NOT depend on the KSU snapshot succeeding — a catalog
+                    // listing failure must not also stall interval draining
+                    // (review SF4). Per-record errors surface: reservation
+                    // billing must not silently drop intervals.
+                    if let Some(registry) = cs.reservations() {
+                        let now_secs = chrono::Utc::now().timestamp();
+                        for interval in registry.take_metering_intervals(now_secs).await {
+                            let record =
+                                crate::metrics::metering_writer::ReservationUsageRecord::from_interval(
+                                    &interval,
+                                );
+                            if let Err(error) = writer.write_reservation_usage(&record, None).await
+                            {
+                                tracing::warn!(
+                                    "TD-TIER-1 SC3: reservation usage write failed: {error}"
+                                );
+                            }
+                        }
+                    }
                 }
             });
         }
@@ -1929,14 +1951,10 @@ mod async_ingest_wiring_tests {
 #[cfg(test)]
 mod security_initialization_tests {
     use super::initialize_configured_security;
-    use crate::security::auth_service::{JwtConfig, SSOConfig};
-    use crate::security::security_coordinator::{ComplianceConfig, TenantTrustConfig, TlsConfig};
+    use crate::security::auth_service::{JwtConfig, MtlsConfig, SSOConfig};
     use crate::security::{
-        AuthenticationConfig, AuthenticationMethod, EncryptionConfig, KeyStoreConfig, MtlsConfig,
-        RBACConfig, SecurityConfig, SecurityMode,
+        AuthenticationConfig, AuthenticationMethod, SecurityConfig, SecurityMode,
     };
-    use proximadb_security::AuditConfig;
-    use std::collections::HashMap;
 
     fn security_config(enabled: bool) -> SecurityConfig {
         SecurityConfig {
@@ -1947,50 +1965,24 @@ mod security_initialization_tests {
                 methods: vec![AuthenticationMethod::ClientCertificate],
                 require_authentication: true,
                 default_session_timeout_minutes: 60,
-                api_keys: HashMap::new(),
-                scram_users: HashMap::new(),
                 jwt: JwtConfig {
-                    enabled: false,
-                    secret: String::new(),
                     access_token_expiration_minutes: 15,
                     refresh_token_expiration_days: 7,
-                    issuer: String::new(),
-                    audience: String::new(),
                     algorithm: "HS256".to_string(),
+                    ..Default::default()
                 },
                 sso: SSOConfig {
-                    enabled: false,
-                    providers: Vec::new(),
                     token_cache_ttl_minutes: 5,
+                    ..Default::default()
                 },
                 mtls: MtlsConfig {
                     enabled: true,
-                    ca_cert_path: None,
                     require_client_cert: true,
-                    cn_role_mapping: HashMap::new(),
+                    ..Default::default()
                 },
-                audit_fail_closed: false,
-                oidc: None,
+                ..Default::default()
             },
-            rbac: RBACConfig::default(),
-            audit: AuditConfig::default(),
-            tls: TlsConfig {
-                enabled: false,
-                require_client_certificates: false,
-                cert_file: None,
-                key_file: None,
-                ca_file: None,
-            },
-            compliance: ComplianceConfig {
-                frameworks: Vec::new(),
-                data_residency: None,
-                encryption_at_rest: false,
-                encryption_in_transit: false,
-            },
-            encryption: EncryptionConfig::default(),
-            key_store: KeyStoreConfig::default(),
-            tenant: TenantTrustConfig::default(),
-            pgwire: crate::security::security_coordinator::PgwireSecurityConfig::default(),
+            ..Default::default()
         }
     }
 

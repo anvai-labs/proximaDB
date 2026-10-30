@@ -4,7 +4,7 @@ Date: 2026-05-12
 
 This design turns the agentic backing-store MVP into concrete contracts while
 staying aligned with `roadmap/MULTIMODAL_OVERHAUL_SPEC_2026_05_08.adoc` and
-`roadmap/techdebt/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc`. It was checked
+`docs/history/planning/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc`. It was checked
 against current LangGraph persistence docs and BaseStore reference material on
 2026-05-12. The implementation strategy is contract-first: keep compatibility
 facades stable during the workspace migration, then extract the same contracts

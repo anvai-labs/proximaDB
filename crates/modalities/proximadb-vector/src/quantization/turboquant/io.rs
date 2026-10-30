@@ -97,8 +97,149 @@ fn calibration_from_tag(tag: u8) -> Result<CalibrationMode, TurboQuantError> {
     }
 }
 
-/// Serialize a `PersistedStore` into the LLD §3 byte sequence.
-pub fn write_to<W: Write>(w: &mut W, store: &PersistedStore) -> Result<(), TurboQuantError> {
+/// The 64-byte file header shared by the `.tq` and `.tvim` formats
+/// (LLD §3). The two formats differ ONLY in magic and version — the field
+/// set and the fixed little-endian offset layout are identical — so the
+/// serialize/parse/invariant logic lives here once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TqHeader {
+    bit_width: u8,
+    calibration_mode: CalibrationMode,
+    rotation_seed: u64,
+    dim: usize,
+    n_vectors: usize,
+    encoded_epoch: u64,
+    codes_offset: u64,
+    scales_offset: u64,
+    calibration_offset: u64,
+}
+
+impl TqHeader {
+    /// Serialize into the fixed 64-byte little-endian layout with the
+    /// caller's format identity (`.tq` or `.tvim` magic/version).
+    fn to_bytes(&self, magic: &[u8; 4], version: u16) -> [u8; HEADER_LEN] {
+        let mut h = [0u8; HEADER_LEN];
+        h[0..4].copy_from_slice(magic);
+        h[4..6].copy_from_slice(&version.to_le_bytes());
+        h[6] = self.bit_width;
+        h[7] = calibration_tag(self.calibration_mode);
+        h[8..16].copy_from_slice(&self.rotation_seed.to_le_bytes());
+        h[16..24].copy_from_slice(&(self.dim as u64).to_le_bytes());
+        h[24..32].copy_from_slice(&(self.n_vectors as u64).to_le_bytes());
+        h[32..40].copy_from_slice(&self.encoded_epoch.to_le_bytes());
+        h[40..48].copy_from_slice(&self.codes_offset.to_le_bytes());
+        h[48..56].copy_from_slice(&self.scales_offset.to_le_bytes());
+        h[56..64].copy_from_slice(&self.calibration_offset.to_le_bytes());
+        h
+    }
+
+    /// Parse + validate the fixed 64-byte layout against the expected
+    /// `magic`/`version`. `format_label` (`""` for `.tq`, `".tvim "` for
+    /// `.tvim`) rides the version-mismatch message so each format keeps
+    /// its distinct historical error text.
+    fn from_bytes(
+        buf: &[u8; HEADER_LEN],
+        magic: &[u8; 4],
+        version: u16,
+        format_label: &str,
+    ) -> Result<Self, TurboQuantError> {
+        if &buf[0..4] != magic {
+            return Err(TurboQuantError::InvalidFileFormat(format!(
+                "bad magic: expected {:?}, got {:?}",
+                magic,
+                &buf[0..4],
+            )));
+        }
+        let file_version = u16::from_le_bytes([buf[4], buf[5]]);
+        if file_version != version {
+            return Err(TurboQuantError::InvalidFileFormat(format!(
+                "unsupported {format_label}version: {file_version} \
+                 (this build supports {version})",
+            )));
+        }
+        let bit_width = buf[6];
+        check_bit_width(bit_width)?;
+        let calibration_mode = calibration_from_tag(buf[7])?;
+        let rotation_seed = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        let dim = u64::from_le_bytes(buf[16..24].try_into().unwrap()) as usize;
+        check_dim(dim)?;
+        let n_vectors = u64::from_le_bytes(buf[24..32].try_into().unwrap()) as usize;
+        Ok(Self {
+            bit_width,
+            calibration_mode,
+            rotation_seed,
+            dim,
+            n_vectors,
+            encoded_epoch: u64::from_le_bytes(buf[32..40].try_into().unwrap()),
+            codes_offset: u64::from_le_bytes(buf[40..48].try_into().unwrap()),
+            scales_offset: u64::from_le_bytes(buf[48..56].try_into().unwrap()),
+            calibration_offset: u64::from_le_bytes(buf[56..64].try_into().unwrap()),
+        })
+    }
+
+    /// Cross-check the body offsets against the length invariants derived
+    /// from `(dim, n_vectors, bit_width, calibration_mode)`. Returns the
+    /// expected `(codes_len, scales_bytes)` section lengths for the body
+    /// read.
+    fn check_offsets(&self) -> Result<(usize, usize), TurboQuantError> {
+        if self.codes_offset != HEADER_LEN as u64 {
+            return Err(TurboQuantError::InvalidFileFormat(format!(
+                "codes_offset {} != HEADER_LEN {}",
+                self.codes_offset, HEADER_LEN,
+            )));
+        }
+
+        let bytes_per_vec = (self.dim * self.bit_width as usize).div_ceil(8);
+        let expected_codes_len = self.n_vectors * bytes_per_vec;
+        let expected_scales_offset = self.codes_offset + expected_codes_len as u64;
+        if self.scales_offset != expected_scales_offset {
+            return Err(TurboQuantError::InvalidFileFormat(format!(
+                "scales_offset {} != codes_offset + n*bytes_per_vec = {}",
+                self.scales_offset, expected_scales_offset,
+            )));
+        }
+
+        let expected_scales_bytes = self.n_vectors * 4;
+        let expected_calibration_offset =
+            if matches!(self.calibration_mode, CalibrationMode::TqPlus) {
+                self.scales_offset + expected_scales_bytes as u64
+            } else {
+                0
+            };
+        if self.calibration_offset != expected_calibration_offset {
+            return Err(TurboQuantError::InvalidFileFormat(format!(
+                "calibration_offset {} != expected {} for mode {:?}",
+                self.calibration_offset, expected_calibration_offset, self.calibration_mode,
+            )));
+        }
+        Ok((expected_codes_len, expected_scales_bytes))
+    }
+
+    /// Assemble the parsed header + body back into a [`PersistedStore`].
+    fn into_store(
+        self,
+        codes: Vec<u8>,
+        scales: Vec<f32>,
+        calibration: Option<Calibration>,
+    ) -> PersistedStore {
+        PersistedStore {
+            bit_width: self.bit_width,
+            calibration_mode: self.calibration_mode,
+            rotation_seed: self.rotation_seed,
+            dim: self.dim,
+            n_vectors: self.n_vectors,
+            encoded_epoch: self.encoded_epoch,
+            codes,
+            scales,
+            calibration,
+        }
+    }
+}
+
+/// Validate a store's length invariants and derive its header (field values
+/// + body offsets). Shared by both writers — `.tq` and `.tvim` serialize the
+/// same `PersistedStore` body.
+fn store_header(store: &PersistedStore) -> Result<TqHeader, TurboQuantError> {
     check_dim(store.dim)?;
     check_bit_width(store.bit_width)?;
     let bytes_per_vec = store.bytes_per_vec();
@@ -145,21 +286,23 @@ pub fn write_to<W: Write>(w: &mut W, store: &PersistedStore) -> Result<(), Turbo
         0
     };
 
-    // Header
-    let mut header = [0u8; HEADER_LEN];
-    header[0..4].copy_from_slice(MAGIC);
-    header[4..6].copy_from_slice(&VERSION.to_le_bytes());
-    header[6] = store.bit_width;
-    header[7] = calibration_tag(store.calibration_mode);
-    header[8..16].copy_from_slice(&store.rotation_seed.to_le_bytes());
-    header[16..24].copy_from_slice(&(store.dim as u64).to_le_bytes());
-    header[24..32].copy_from_slice(&(store.n_vectors as u64).to_le_bytes());
-    header[32..40].copy_from_slice(&store.encoded_epoch.to_le_bytes());
-    header[40..48].copy_from_slice(&codes_offset.to_le_bytes());
-    header[48..56].copy_from_slice(&scales_offset.to_le_bytes());
-    header[56..64].copy_from_slice(&calibration_offset.to_le_bytes());
+    Ok(TqHeader {
+        bit_width: store.bit_width,
+        calibration_mode: store.calibration_mode,
+        rotation_seed: store.rotation_seed,
+        dim: store.dim,
+        n_vectors: store.n_vectors,
+        encoded_epoch: store.encoded_epoch,
+        codes_offset,
+        scales_offset,
+        calibration_offset,
+    })
+}
 
-    w.write_all(&header).map_err(io_err)?;
+/// Write the `.tq` body shared by both formats: bit-packed codes, per-vector
+/// scales as little-endian f32, then the calibration body when present
+/// (shift first, then scale_tq).
+fn write_body<W: Write>(w: &mut W, store: &PersistedStore) -> Result<(), TurboQuantError> {
     w.write_all(&store.codes).map_err(io_err)?;
 
     // Per-vector scales as little-endian f32.
@@ -184,65 +327,16 @@ pub fn write_to<W: Write>(w: &mut W, store: &PersistedStore) -> Result<(), Turbo
     Ok(())
 }
 
-/// Parse a `PersistedStore` from the LLD §3 byte sequence.
-pub fn read_from<R: Read>(r: &mut R) -> Result<PersistedStore, TurboQuantError> {
-    let mut header = [0u8; HEADER_LEN];
-    r.read_exact(&mut header).map_err(io_err)?;
-
-    if &header[0..4] != MAGIC {
-        return Err(TurboQuantError::InvalidFileFormat(format!(
-            "bad magic: expected {:?}, got {:?}",
-            MAGIC,
-            &header[0..4],
-        )));
-    }
-    let version = u16::from_le_bytes([header[4], header[5]]);
-    if version != VERSION {
-        return Err(TurboQuantError::InvalidFileFormat(format!(
-            "unsupported version: {version} (this build supports {VERSION})",
-        )));
-    }
-    let bit_width = header[6];
-    check_bit_width(bit_width)?;
-    let calibration_mode = calibration_from_tag(header[7])?;
-    let rotation_seed = u64::from_le_bytes(header[8..16].try_into().unwrap());
-    let dim = u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize;
-    check_dim(dim)?;
-    let n_vectors = u64::from_le_bytes(header[24..32].try_into().unwrap()) as usize;
-    let encoded_epoch = u64::from_le_bytes(header[32..40].try_into().unwrap());
-    let codes_offset = u64::from_le_bytes(header[40..48].try_into().unwrap());
-    let scales_offset = u64::from_le_bytes(header[48..56].try_into().unwrap());
-    let calibration_offset = u64::from_le_bytes(header[56..64].try_into().unwrap());
-
-    if codes_offset != HEADER_LEN as u64 {
-        return Err(TurboQuantError::InvalidFileFormat(format!(
-            "codes_offset {} != HEADER_LEN {}",
-            codes_offset, HEADER_LEN,
-        )));
-    }
-
-    let bytes_per_vec = (dim * bit_width as usize).div_ceil(8);
-    let expected_codes_len = n_vectors * bytes_per_vec;
-    let expected_scales_offset = codes_offset + expected_codes_len as u64;
-    if scales_offset != expected_scales_offset {
-        return Err(TurboQuantError::InvalidFileFormat(format!(
-            "scales_offset {} != codes_offset + n*bytes_per_vec = {}",
-            scales_offset, expected_scales_offset,
-        )));
-    }
-
-    let expected_scales_bytes = n_vectors * 4;
-    let expected_calibration_offset = if matches!(calibration_mode, CalibrationMode::TqPlus) {
-        scales_offset + expected_scales_bytes as u64
-    } else {
-        0
-    };
-    if calibration_offset != expected_calibration_offset {
-        return Err(TurboQuantError::InvalidFileFormat(format!(
-            "calibration_offset {} != expected {} for mode {:?}",
-            calibration_offset, expected_calibration_offset, calibration_mode,
-        )));
-    }
+/// Read the `.tq` body described by `header`: bit-packed codes, per-vector
+/// LE f32 scales, then the calibration body for TqPlus. Shared by both
+/// readers.
+fn read_body<R: Read>(
+    r: &mut R,
+    header: &TqHeader,
+    expected_codes_len: usize,
+    expected_scales_bytes: usize,
+) -> Result<(Vec<u8>, Vec<f32>, Option<Calibration>), TurboQuantError> {
+    let (dim, n_vectors) = (header.dim, header.n_vectors);
 
     let mut codes = vec![0u8; expected_codes_len];
     r.read_exact(&mut codes).map_err(io_err)?;
@@ -254,7 +348,7 @@ pub fn read_from<R: Read>(r: &mut R) -> Result<PersistedStore, TurboQuantError> 
         scales.push(f32::from_le_bytes(*chunk));
     }
 
-    let calibration = if matches!(calibration_mode, CalibrationMode::TqPlus) {
+    let calibration = if matches!(header.calibration_mode, CalibrationMode::TqPlus) {
         let mut cal_bytes = vec![0u8; 2 * dim * 4];
         r.read_exact(&mut cal_bytes).map_err(io_err)?;
         let mut shift = Vec::with_capacity(dim);
@@ -270,17 +364,25 @@ pub fn read_from<R: Read>(r: &mut R) -> Result<PersistedStore, TurboQuantError> 
         None
     };
 
-    Ok(PersistedStore {
-        bit_width,
-        calibration_mode,
-        rotation_seed,
-        dim,
-        n_vectors,
-        encoded_epoch,
-        codes,
-        scales,
-        calibration,
-    })
+    Ok((codes, scales, calibration))
+}
+
+/// Serialize a `PersistedStore` into the LLD §3 byte sequence.
+pub fn write_to<W: Write>(w: &mut W, store: &PersistedStore) -> Result<(), TurboQuantError> {
+    let header = store_header(store)?;
+    w.write_all(&header.to_bytes(MAGIC, VERSION))
+        .map_err(io_err)?;
+    write_body(w, store)
+}
+
+/// Parse a `PersistedStore` from the LLD §3 byte sequence.
+pub fn read_from<R: Read>(r: &mut R) -> Result<PersistedStore, TurboQuantError> {
+    let mut buf = [0u8; HEADER_LEN];
+    r.read_exact(&mut buf).map_err(io_err)?;
+    let header = TqHeader::from_bytes(&buf, MAGIC, VERSION, "")?;
+    let (codes_len, scales_bytes) = header.check_offsets()?;
+    let (codes, scales, calibration) = read_body(r, &header, codes_len, scales_bytes)?;
+    Ok(header.into_store(codes, scales, calibration))
 }
 
 /// Wrap `std::io::Error` into `TurboQuantError` without exposing the
@@ -330,88 +432,13 @@ pub fn write_id_map_to<W: Write>(
         }
     }
 
-    let store = &persisted.store;
-    check_dim(store.dim)?;
-    check_bit_width(store.bit_width)?;
-    let bytes_per_vec = store.bytes_per_vec();
-    let expected_codes_len = store.n_vectors * bytes_per_vec;
-    if store.codes.len() != expected_codes_len {
-        return Err(TurboQuantError::InvalidFileFormat(format!(
-            "codes length {} mismatch with n_vectors={} bit_width={} dim={} (expected {})",
-            store.codes.len(),
-            store.n_vectors,
-            store.bit_width,
-            store.dim,
-            expected_codes_len,
-        )));
-    }
-    if store.scales.len() != store.n_vectors {
-        return Err(TurboQuantError::InvalidFileFormat(format!(
-            "scales length {} != n_vectors {}",
-            store.scales.len(),
-            store.n_vectors,
-        )));
-    }
-    if matches!(store.calibration_mode, CalibrationMode::TqPlus) {
-        if let Some(cal) = &store.calibration {
-            if cal.shift.len() != store.dim || cal.scale_tq.len() != store.dim {
-                return Err(TurboQuantError::InvalidFileFormat(format!(
-                    "calibration vectors have length ({}, {}) but expected {}",
-                    cal.shift.len(),
-                    cal.scale_tq.len(),
-                    store.dim,
-                )));
-            }
-        }
-    } else if store.calibration.is_some() {
-        return Err(TurboQuantError::InvalidFileFormat(
-            "calibration body present but calibration_mode is Identity".to_string(),
-        ));
-    }
+    // Header — same layout as `.tq` but with the IdMap magic + version —
+    // then the shared `.tq` body, then the IDs footer.
+    let header = store_header(&persisted.store)?;
+    w.write_all(&header.to_bytes(ID_MAP_MAGIC, ID_MAP_VERSION))
+        .map_err(io_err)?;
+    write_body(w, &persisted.store)?;
 
-    let codes_offset = HEADER_LEN as u64;
-    let scales_offset = codes_offset + store.codes.len() as u64;
-    let calibration_offset = if store.calibration.is_some() {
-        scales_offset + (store.scales.len() * 4) as u64
-    } else {
-        0
-    };
-
-    // Header — same layout as `.tq` but with the IdMap magic + version.
-    let mut header = [0u8; HEADER_LEN];
-    header[0..4].copy_from_slice(ID_MAP_MAGIC);
-    header[4..6].copy_from_slice(&ID_MAP_VERSION.to_le_bytes());
-    header[6] = store.bit_width;
-    header[7] = calibration_tag(store.calibration_mode);
-    header[8..16].copy_from_slice(&store.rotation_seed.to_le_bytes());
-    header[16..24].copy_from_slice(&(store.dim as u64).to_le_bytes());
-    header[24..32].copy_from_slice(&(store.n_vectors as u64).to_le_bytes());
-    header[32..40].copy_from_slice(&store.encoded_epoch.to_le_bytes());
-    header[40..48].copy_from_slice(&codes_offset.to_le_bytes());
-    header[48..56].copy_from_slice(&scales_offset.to_le_bytes());
-    header[56..64].copy_from_slice(&calibration_offset.to_le_bytes());
-
-    w.write_all(&header).map_err(io_err)?;
-    w.write_all(&store.codes).map_err(io_err)?;
-
-    let mut scales_bytes = Vec::with_capacity(store.scales.len() * 4);
-    for &s in &store.scales {
-        scales_bytes.extend_from_slice(&s.to_le_bytes());
-    }
-    w.write_all(&scales_bytes).map_err(io_err)?;
-
-    if let Some(cal) = &store.calibration {
-        let mut cal_bytes = Vec::with_capacity(2 * cal.shift.len() * 4);
-        for &s in &cal.shift {
-            cal_bytes.extend_from_slice(&s.to_le_bytes());
-        }
-        for &s in &cal.scale_tq {
-            cal_bytes.extend_from_slice(&s.to_le_bytes());
-        }
-        w.write_all(&cal_bytes).map_err(io_err)?;
-    }
-
-    // IDs footer.
     let mut id_bytes = Vec::with_capacity(persisted.ids.len() * 8);
     for &id in &persisted.ids {
         id_bytes.extend_from_slice(&id.to_le_bytes());
@@ -422,92 +449,16 @@ pub fn write_id_map_to<W: Write>(
 
 /// Parse a `PersistedIdMap` from the `.tvim` byte sequence.
 pub fn read_id_map_from<R: Read>(r: &mut R) -> Result<PersistedIdMap, TurboQuantError> {
-    let mut header = [0u8; HEADER_LEN];
-    r.read_exact(&mut header).map_err(io_err)?;
-
-    if &header[0..4] != ID_MAP_MAGIC {
-        return Err(TurboQuantError::InvalidFileFormat(format!(
-            "bad magic: expected {:?}, got {:?}",
-            ID_MAP_MAGIC,
-            &header[0..4],
-        )));
-    }
-    let version = u16::from_le_bytes([header[4], header[5]]);
-    if version != ID_MAP_VERSION {
-        return Err(TurboQuantError::InvalidFileFormat(format!(
-            "unsupported .tvim version: {version} (this build supports {ID_MAP_VERSION})",
-        )));
-    }
-    let bit_width = header[6];
-    check_bit_width(bit_width)?;
-    let calibration_mode = calibration_from_tag(header[7])?;
-    let rotation_seed = u64::from_le_bytes(header[8..16].try_into().unwrap());
-    let dim = u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize;
-    check_dim(dim)?;
-    let n_vectors = u64::from_le_bytes(header[24..32].try_into().unwrap()) as usize;
-    let encoded_epoch = u64::from_le_bytes(header[32..40].try_into().unwrap());
-    let codes_offset = u64::from_le_bytes(header[40..48].try_into().unwrap());
-    let scales_offset = u64::from_le_bytes(header[48..56].try_into().unwrap());
-    let calibration_offset = u64::from_le_bytes(header[56..64].try_into().unwrap());
-
-    if codes_offset != HEADER_LEN as u64 {
-        return Err(TurboQuantError::InvalidFileFormat(format!(
-            "codes_offset {} != HEADER_LEN {}",
-            codes_offset, HEADER_LEN,
-        )));
-    }
-    let bytes_per_vec = (dim * bit_width as usize).div_ceil(8);
-    let expected_codes_len = n_vectors * bytes_per_vec;
-    let expected_scales_offset = codes_offset + expected_codes_len as u64;
-    if scales_offset != expected_scales_offset {
-        return Err(TurboQuantError::InvalidFileFormat(format!(
-            "scales_offset {} != codes_offset + n*bytes_per_vec = {}",
-            scales_offset, expected_scales_offset,
-        )));
-    }
-    let expected_scales_bytes = n_vectors * 4;
-    let expected_calibration_offset = if matches!(calibration_mode, CalibrationMode::TqPlus) {
-        scales_offset + expected_scales_bytes as u64
-    } else {
-        0
-    };
-    if calibration_offset != expected_calibration_offset {
-        return Err(TurboQuantError::InvalidFileFormat(format!(
-            "calibration_offset {} != expected {} for mode {:?}",
-            calibration_offset, expected_calibration_offset, calibration_mode,
-        )));
-    }
-
-    let mut codes = vec![0u8; expected_codes_len];
-    r.read_exact(&mut codes).map_err(io_err)?;
-
-    let mut scales_bytes = vec![0u8; expected_scales_bytes];
-    r.read_exact(&mut scales_bytes).map_err(io_err)?;
-    let mut scales = Vec::with_capacity(n_vectors);
-    for chunk in scales_bytes.as_chunks::<4>().0 {
-        scales.push(f32::from_le_bytes(*chunk));
-    }
-
-    let calibration = if matches!(calibration_mode, CalibrationMode::TqPlus) {
-        let mut cal_bytes = vec![0u8; 2 * dim * 4];
-        r.read_exact(&mut cal_bytes).map_err(io_err)?;
-        let mut shift = Vec::with_capacity(dim);
-        let mut scale_tq = Vec::with_capacity(dim);
-        for chunk in cal_bytes[..dim * 4].as_chunks::<4>().0 {
-            shift.push(f32::from_le_bytes(*chunk));
-        }
-        for chunk in cal_bytes[dim * 4..].as_chunks::<4>().0 {
-            scale_tq.push(f32::from_le_bytes(*chunk));
-        }
-        Some(Calibration { shift, scale_tq })
-    } else {
-        None
-    };
+    let mut buf = [0u8; HEADER_LEN];
+    r.read_exact(&mut buf).map_err(io_err)?;
+    let header = TqHeader::from_bytes(&buf, ID_MAP_MAGIC, ID_MAP_VERSION, ".tvim ")?;
+    let (codes_len, scales_bytes) = header.check_offsets()?;
+    let (codes, scales, calibration) = read_body(r, &header, codes_len, scales_bytes)?;
 
     // IDs footer — n_vectors u64s.
-    let mut id_bytes = vec![0u8; n_vectors * 8];
+    let mut id_bytes = vec![0u8; header.n_vectors * 8];
     r.read_exact(&mut id_bytes).map_err(io_err)?;
-    let mut ids = Vec::with_capacity(n_vectors);
+    let mut ids = Vec::with_capacity(header.n_vectors);
     for chunk in id_bytes.as_chunks::<8>().0 {
         ids.push(u64::from_le_bytes(*chunk));
     }
@@ -523,17 +474,7 @@ pub fn read_id_map_from<R: Read>(r: &mut R) -> Result<PersistedIdMap, TurboQuant
     }
 
     Ok(PersistedIdMap {
-        store: PersistedStore {
-            bit_width,
-            calibration_mode,
-            rotation_seed,
-            dim,
-            n_vectors,
-            encoded_epoch,
-            codes,
-            scales,
-            calibration,
-        },
+        store: header.into_store(codes, scales, calibration),
         ids,
     })
 }
@@ -892,5 +833,139 @@ mod tests {
             err,
             TurboQuantError::InvalidFileFormat(ref s) if s.contains("unsupported .tvim version")
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // Golden wire bytes — pinned BEFORE the shared-header extraction so the
+    // `.tq`/`.tvim` refactor is provably byte-identical. Header fields
+    // hand-derived from LLD §3 (all multi-byte ints little-endian);
+    // identity fixtures are fully deterministic so the whole file pins.
+    //
+    //   identity header (shared layout, magic/version differ per format):
+    //     [0..4]   magic "PQTQ"/"PQTI"           50 51 54 51 / 50 51 54 49
+    //     [4..6]   version 1                      01 00
+    //     [6]      bit_width 4                    04
+    //     [7]      calibration Identity           00
+    //     [8..16]  seed 0xdead_beef_cafe_babe     be ba fe ca ef be ad de
+    //     [16..24] dim 8                           08 00*7
+    //     [24..32] n_vectors 3                     03 00*7
+    //     [32..40] encoded_epoch 7                 07 00*7
+    //     [40..48] codes_offset 64                 40 00*7
+    //     [48..56] scales_offset 64+12 = 76        4c 00*7
+    //     [56..64] calibration_offset 0 (Identity) 00*8
+    //   body: 12 code bytes, then LE f32 scales 1.0 / 0.5 / 2.0.
+    //   `.tvim` appends ids 1001..1003 as LE u64s.
+    //
+    //   tq_plus header (fixtures compute the calibration floats, so only
+    //   the header pins byte-exactly):
+    //     [6] bit_width 2, [7] 01 (TqPlus), [8..16] seed 42,
+    //     dim 16, n_vectors 2, epoch 1, codes_offset 64,
+    //     scales_offset 72, calibration_offset 80.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn golden_tq_identity_bytes() {
+        let store = sample_store_identity();
+        let mut buf = Vec::new();
+        write_to(&mut buf, &store).unwrap();
+        let expected: Vec<u8> = [
+            // Header
+            &b"PQTQ"[..],
+            &[0x01, 0x00, 0x04, 0x00],
+            &0xdead_beef_cafe_babeu64.to_le_bytes(),
+            &8u64.to_le_bytes(),
+            &3u64.to_le_bytes(),
+            &7u64.to_le_bytes(),
+            &64u64.to_le_bytes(), // codes_offset
+            &76u64.to_le_bytes(), // scales_offset = 64 + 12 code bytes
+            &0u64.to_le_bytes(),  // calibration_offset (Identity)
+            // Body: codes
+            &[
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC,
+            ],
+            // Body: scales 1.0, 0.5, 2.0 as LE f32
+            &1.0f32.to_le_bytes(),
+            &0.5f32.to_le_bytes(),
+            &2.0f32.to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(buf, expected);
+        assert_eq!(buf.len(), 88);
+    }
+
+    #[test]
+    fn golden_tvim_identity_bytes() {
+        let p = sample_id_map_identity();
+        let mut buf = Vec::new();
+        write_id_map_to(&mut buf, &p).unwrap();
+        let expected: Vec<u8> = [
+            // Header — same field values as the `.tq` golden, PQTI magic.
+            &b"PQTI"[..],
+            &[0x01, 0x00, 0x04, 0x00],
+            &0xdead_beef_cafe_babeu64.to_le_bytes(),
+            &8u64.to_le_bytes(),
+            &3u64.to_le_bytes(),
+            &7u64.to_le_bytes(),
+            &64u64.to_le_bytes(),
+            &76u64.to_le_bytes(),
+            &0u64.to_le_bytes(),
+            // Body: codes + scales (identical to `.tq`)
+            &[
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC,
+            ],
+            &1.0f32.to_le_bytes(),
+            &0.5f32.to_le_bytes(),
+            &2.0f32.to_le_bytes(),
+            // IDs footer: 1001, 1002, 1003 as LE u64
+            &1001u64.to_le_bytes(),
+            &1002u64.to_le_bytes(),
+            &1003u64.to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(buf, expected);
+        assert_eq!(buf.len(), 112);
+    }
+
+    #[test]
+    fn golden_tq_plus_header_bytes() {
+        let store = sample_store_tq_plus();
+        let mut buf = Vec::new();
+        write_to(&mut buf, &store).unwrap();
+        assert_eq!(&buf[0..4], b"PQTQ");
+        assert_eq!(&buf[4..6], &1u16.to_le_bytes());
+        assert_eq!(buf[6], 2); // bit_width
+        assert_eq!(buf[7], 1); // TqPlus calibration tag
+        assert_eq!(&buf[8..16], &42u64.to_le_bytes());
+        assert_eq!(&buf[16..24], &16u64.to_le_bytes());
+        assert_eq!(&buf[24..32], &2u64.to_le_bytes());
+        assert_eq!(&buf[32..40], &1u64.to_le_bytes());
+        assert_eq!(&buf[40..48], &64u64.to_le_bytes()); // codes_offset
+        assert_eq!(&buf[48..56], &72u64.to_le_bytes()); // scales_offset
+        assert_eq!(&buf[56..64], &80u64.to_le_bytes()); // calibration_offset
+        // Body: 8×0xAA codes, then 2 LE f32 scales, then 32 LE f32
+        // calibration floats → 64 + 8 + 8 + 128 = 208 bytes.
+        assert_eq!(buf.len(), 208);
+        assert_eq!(&buf[64..72], &[0xAA; 8]);
+    }
+
+    #[test]
+    fn golden_tvim_tq_plus_header_bytes() {
+        let p = sample_id_map_tq_plus();
+        let mut buf = Vec::new();
+        write_id_map_to(&mut buf, &p).unwrap();
+        assert_eq!(&buf[0..4], b"PQTI");
+        assert_eq!(&buf[4..6], &1u16.to_le_bytes());
+        assert_eq!(buf[6], 2);
+        assert_eq!(buf[7], 1);
+        assert_eq!(&buf[8..16], &42u64.to_le_bytes());
+        assert_eq!(&buf[16..24], &16u64.to_le_bytes());
+        assert_eq!(&buf[24..32], &2u64.to_le_bytes());
+        assert_eq!(&buf[40..48], &64u64.to_le_bytes());
+        assert_eq!(&buf[48..56], &72u64.to_le_bytes());
+        assert_eq!(&buf[56..64], &80u64.to_le_bytes());
+        // `.tq` body + 2×8 id bytes: 208 + 16 = 224.
+        assert_eq!(buf.len(), 224);
+        assert_eq!(&buf[208..216], &42u64.to_le_bytes());
+        assert_eq!(&buf[216..224], &43u64.to_le_bytes());
     }
 }

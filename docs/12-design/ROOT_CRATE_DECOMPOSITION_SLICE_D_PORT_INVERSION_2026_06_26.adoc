@@ -6,7 +6,7 @@
 |===
 | Field | Value
 | Status | **Partial (reconciled 2026-10-15).** D0/D1 are done (#370, #377, #379). D2 is partial: `CollectionMetadataPort`, `StorageEventLogPort`, `QuantizationEnginePort` (#822), `StorageQuantizationEnginePort` (#845) and `FilesystemPort` (#943); `IndexPort` is open (`proximadb-index-traits` defines `IndexQuery`/`IndexIngest`/`IndexMaintenance`). D3 is partial (metadata side, tenant resolver, catalog↔Collection mapping). D4/D5 are open. Ratchet today: **183** storage up-edges (compute 145, index 15, query 10, services 13) against a CI ceiling of 197.
-| Relates to | link:ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan] (umbrella), link:STORAGE_INDEX_COMPUTE_DECOUPLING_CONTRACTS_2026_06_21.adoc[decoupling contracts] (overlap: index/compute port shapes — contracts canonical for the trait design, this doc for sequencing), link:QUANTIZATION_KERNEL_SPLIT_2026_06_22.adoc[quantization split]
+| Relates to | link:../history/planning/ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan] (umbrella), link:STORAGE_INDEX_COMPUTE_DECOUPLING_CONTRACTS_2026_06_21.adoc[decoupling contracts] (overlap: index/compute port shapes — contracts canonical for the trait design, this doc for sequencing), link:QUANTIZATION_KERNEL_SPLIT_2026_06_22.adoc[quantization split]
 |===
 
 [abstract]
@@ -296,7 +296,7 @@ ComparisonOperator}` to `proximadb-filter-expression` (61 refs / 31 files). Both
 confirmed re-exports first. Both edge classes now count 0. Current next actions are in the
 2026-07-10 refresh below (D2b landed as #845; D3/D4/D5 remain).
 
-Ref: `ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc` (Slice D row), TD-104.
+Ref: `docs/history/planning/ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc` (Slice D row), TD-104.
 
 == 2026-07-10 refresh — D-quant status + the factory-as-injection-boundary plan
 

@@ -32,9 +32,12 @@ pub mod syslog;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 
 use crate::proto::proximadb_v1::LogEntry;
@@ -93,6 +96,121 @@ impl AdapterConfig {
         self.buffer_size = size;
         self
     }
+}
+
+/// Running state owned by a spawned ingestion pump: the run flag polled
+/// between accepts/datagrams and the count of parsed events.
+///
+/// Each pump allocates its own state when spawned; the adapter's `running`
+/// / `events_received` fields are the external `start`/`stop` view and stay
+/// separate (pre-extraction behaviour: the spawned task never observed
+/// `stop()`).
+pub(super) struct RunningState {
+    /// Whether the pump should keep accepting and parsing.
+    running: Arc<AtomicBool>,
+    /// Events parsed and batched by this pump.
+    events: Arc<AtomicU64>,
+}
+
+impl RunningState {
+    fn new() -> Self {
+        Self {
+            running: Arc::new(AtomicBool::new(true)),
+            events: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+/// Flush `batch` to `sender` when it reaches `batch_size`, leaving a fresh
+/// batch buffer in its place.
+async fn flush_batch(
+    sender: &mpsc::Sender<Vec<LogEntry>>,
+    batch: &mut Vec<LogEntry>,
+    batch_size: usize,
+) {
+    if batch.len() >= batch_size {
+        let _ = sender.send(std::mem::take(batch)).await;
+        *batch = Vec::with_capacity(batch_size);
+    }
+}
+
+/// Spawn the shared TCP line pump: accept connections, split each stream
+/// into lines, parse every line with `parse`, and batch entries to `sender`
+/// (flushing at `batch_size`).
+///
+/// The per-adapter differences — the bind (and its error context) and the
+/// parse function — stay at the call site; everything after a successful
+/// bind is this skeleton (syslog and CEF/LEEF are the twins).
+pub(super) fn pump_tcp<P>(
+    listener: TcpListener,
+    sender: mpsc::Sender<Vec<LogEntry>>,
+    batch_size: usize,
+    parse: P,
+) where
+    P: Fn(&str) -> Option<LogEntry> + Send + Sync + 'static,
+{
+    let state = RunningState::new();
+
+    tokio::spawn(async move {
+        let mut batch = Vec::with_capacity(batch_size);
+
+        while state.running.load(Ordering::Relaxed) {
+            match listener.accept().await {
+                Ok((stream, _addr)) => {
+                    let reader = BufReader::new(stream);
+                    let mut lines = reader.lines();
+
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        if let Some(entry) = parse(&line) {
+                            batch.push(entry);
+                            state.events.fetch_add(1, Ordering::Relaxed);
+
+                            flush_batch(&sender, &mut batch, batch_size).await;
+                        }
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+    });
+}
+
+/// Spawn the shared UDP datagram pump: receive datagrams, decode each as
+/// UTF-8, parse with `parse`, and batch entries to `sender` (flushing at
+/// `batch_size`).
+///
+/// Companion of [`pump_tcp`]; only the transport and the decode step
+/// differ.
+pub(super) fn pump_udp<P>(
+    socket: UdpSocket,
+    sender: mpsc::Sender<Vec<LogEntry>>,
+    batch_size: usize,
+    parse: P,
+) where
+    P: Fn(&str) -> Option<LogEntry> + Send + Sync + 'static,
+{
+    let state = RunningState::new();
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        let mut batch = Vec::with_capacity(batch_size);
+
+        while state.running.load(Ordering::Relaxed) {
+            match socket.recv_from(&mut buf).await {
+                Ok((len, _addr)) => {
+                    if let Ok(msg) = std::str::from_utf8(&buf[..len])
+                        && let Some(entry) = parse(msg)
+                    {
+                        batch.push(entry);
+                        state.events.fetch_add(1, Ordering::Relaxed);
+
+                        flush_batch(&sender, &mut batch, batch_size).await;
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+    });
 }
 
 /// Adapter manager for multiple input adapters

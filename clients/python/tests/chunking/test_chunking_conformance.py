@@ -99,9 +99,7 @@ from proximadb_sdk.chunking_strategies.conformance.evals import (
     run_eval,
     score_case,
 )
-from proximadb_sdk.chunking_strategies.conformance.invariants import (
-    _wall_clock_budget,
-)
+from proximadb_sdk.chunking_strategies.conformance.invariants import _wall_clock_budget
 from proximadb_sdk.chunking_strategies.contracts import (
     ChunkContextRenderer,
     ResolvedInputContract,

@@ -53,13 +53,12 @@ mod tests {
     fn create_test_vector() -> ProximaRecord {
         ProximaRecord {
             oid: "test_vector_1".to_string(),
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.1, 0.2, 0.3, 0.4]),
-                dim: 4,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                4,
+                vec![0.1, 0.2, 0.3, 0.4],
+            )],
             origin: Some("test".to_string()),
             record_version: 1,
             ..Default::default()
@@ -112,13 +111,12 @@ mod tests {
     fn test_high_dimensional_vector() {
         let serializer = BincodeSerializer::new();
         let mut vector = create_test_vector();
-        vector.embeddings = vec![EmbeddingCell {
-            model_id: "default".to_string(),
-            modality: "vector".to_string(),
-            values: proximadb_records::EmbeddingValues::Fp32(vec![0.1; 1024]),
-            dim: 1024,
-            ..Default::default()
-        }];
+        vector.embeddings = vec![EmbeddingCell::new_fp32(
+            "default",
+            "vector",
+            1024,
+            vec![0.1; 1024],
+        )];
 
         let vectors = vec![vector];
         let serialized = serializer

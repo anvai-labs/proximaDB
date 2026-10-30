@@ -319,6 +319,8 @@ docs/log/
 !config/tier-config.json
 !config/tier-config.example.json
 !docs/_internal/roadmap/PANIC_POLICY_BASELINE.json
+!docs/_internal/roadmap/PANIC_POLICY_WORKSPACE_BASELINE.json
+!docs/10-quality/DUP_RATCHET_BASELINE.json
 !docs/_internal/roadmap/V1_PROTO_USAGE_BASELINE.json
 !docs/_internal/roadmap/SILENT_FAILURE_BASELINE.json
 # TD-PROTO-2 known-drift ledger: the v1-mirror conformance ratchet reads this
@@ -540,3 +542,7 @@ clients/python/src/proximadb_sdk/_generated/**/__pycache__/
 **/s3:/
 **/gs:/
 **/gcs:/
+
+# Real v0.4.1 Iceberg output (golden upgrade fixture: metadata JSON + Parquet
+# that the blanket *.json / *.parquet rules above would silently drop).
+!crates/storage/proximadb-iceberg-engine/testdata/v041/**

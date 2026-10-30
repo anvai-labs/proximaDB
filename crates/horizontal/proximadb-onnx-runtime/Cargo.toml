@@ -1,0 +1,16 @@
+[package]
+name = "proximadb-onnx-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The process-wide ONNX Runtime environment, shared by every session (TD-ORT-1)"
+
+[dependencies]
+ort = { version = "2.0.0-rc.15", default-features = false, features = [
+    "std",
+    "download-binaries",
+    "ndarray",
+    "tls-rustls",
+    "half",
+] }
+

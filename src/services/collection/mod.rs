@@ -6,12 +6,15 @@ pub mod engine_selector;
 pub mod manager;
 pub mod owner_backfill;
 pub mod recall_target;
+pub mod reservation;
 pub mod security;
+pub mod storage_class;
 
 pub use manager::{
     CollectionService as Collections, CollectionServiceBuilder as Builder,
     CollectionServiceResponse as Response,
 };
+pub use reservation::ReservationRegistry;
 pub use security::SecureCollectionService;
 
 /// Type alias for [`Collections`] (primary collection management service).

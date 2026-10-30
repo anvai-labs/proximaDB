@@ -1,0 +1,389 @@
+= Native execution differentiation: literature review and falsifiable hypotheses
+:toc:
+:toclevels: 2
+
+Research date: 2026-10-26. Repository baseline: develop `2f5b1ee7d`.
+Status: completed desk research; *no comparative benchmark or novel algorithm claim*.
+This is a dated evidence catalog, not a second execution roadmap. Pending experiments and
+contracts live in link:../../current/LAKEHOUSE_PLAN.adoc#native-execution-research[current plan];
+link:../../current/TRACKER.adoc[tracker] owns assignment. Public documentation can change:
+pin actual engine/extension versions and configurations in each experiment manifest.
+
+== Recommendation
+
+Invest in native execution where owning record visibility, index candidates, object fetches
+and scheduling together eliminates work. Start with a fused multimodal retrieval pipeline,
+not a second complete SQL implementation. Keep the accepted logical IR and substitute native
+physical regions through ADR-097 adapters. A whole native executor becomes justified only
+when measured scheduler/materialization boundaries prevent those substitutions from winning.
+
+The proposed advantage is *governed, fresh multimodal context at predictable cost*: carry
+compact record references through relational predicates, vector ranking and graph expansion;
+resolve versions and authorization consistently; fetch payloads late; share a bounded resource
+budget across index work, WAL reconciliation and object I/O. Each ingredient has prior art.
+Their integration over ProximaDB's authoritative data is an engineering hypothesis, not a
+claim to have invented filtered ANN, late materialization, HTAP or adaptive execution.
+
+== Correct the historical model
+
+Spark did not remove shuffle. It introduced reusable distributed datasets and a more flexible
+execution graph; joins/grouping can still require redistribution, serialization and spill.
+Its current SQL engine also has AQE and storage-partition joins that can avoid exchanges when
+layout permits. Trino uses distributed stages, tasks, drivers and operators; it does not use
+Spark RDDs. Arrow describes a
+columnar interchange/memory layout, not a rule that an engine must load its dataset into RAM.
+Rust does not by itself solve join skew, query admission, shuffle, bad estimates or remote I/O.
+
+Sources: https://spark.apache.org/docs/latest/rdd-programming-guide.html[Spark RDD/shuffle guide],
+https://spark.apache.org/docs/latest/sql-performance-tuning.html[Spark SQL tuning],
+https://trino.io/docs/current/overview/concepts.html[Trino execution concepts],
+https://datafusion.apache.org/blog/2025/09/10/dynamic-filters/[DataFusion execution and dynamic filters].
+
+== Catalog of constraints and existing remedies
+
+The final column is our inference about a testable residual, not a vendor admission of missing
+features. Do not benchmark an untuned legacy configuration against a tuned ProximaDB build.
+
+[cols="1,3,3,3",options="header"]
+|===
+| System / source | Cost or limitation | Already addressed by the system | Residual to test
+| https://spark.apache.org/docs/latest/sql-performance-tuning.html[Spark SQL]
+| Exchanges, skew and inaccurate cardinalities can dominate joins; many small input files impose planning/open work.
+| AQE coalesces partitions, changes join strategy and handles skew. Storage-partition joins avoid exchanges on compatible source layouts.
+| Selective context requests under concurrent ingestion: can we avoid creating large intermediate relations before an ANN/graph operator has reduced the search space? Compare to AQE + partition-aware joins, not fixed shuffle partitions alone.
+
+| https://www.databricks.com/de/wp-content/uploads/2022/07/Photon-A-Fast-Query-Engine-for-Lakehouse-Systems.pdf[Photon, SIGMOD 2022]
+| The paper motivates native execution using JVM ceilings and irregular lakehouse data, while retaining API/SQL semantics.
+| Native C++ vectorization and runtime specialization under the existing Spark interface.
+| A useful precedent for replacing physical execution without replacing semantic planning. Native language or SIMD alone is not a new advantage; measure our particular fused operators.
+
+| https://trino.io/docs/current/admin/dynamic-filtering.html[Trino dynamic filters] / https://trino.io/docs/current/admin/fault-tolerant-execution.html[task retry]
+| Distributed joins move data; memory pressure and failures complicate large queries. Task recovery requires spooled exchange state and can raise short-query latency.
+| Dynamic filtering, connector pushdown, adaptive task execution and exchange-backed retries. Legacy spill is explicitly not the preferred new path.
+| Can selective requests move bounded candidate IDs instead of wide rows and avoid durable exchanges on the interactive path? Recovery still has a cost; any later distributed design must preserve query visibility during retries.
+
+| https://docs.aws.amazon.com/redshift/latest/dg/t_Distributing_data.html[Redshift distribution] / https://docs.aws.amazon.com/redshift/latest/dg/t_Creating_tables.html[automatic table optimization]
+| Redistribution and skew can dominate. One distribution choice cannot simultaneously colocate every unrelated join key.
+| Automatic sort/distribution selection; collocation reduces data movement.
+| Changing context access paths: tenant, entity, time, embedding neighborhood and graph adjacency compete. Compare secondary projections plus write amplification against replicated/denormalized alternatives; do not claim automatic layout is new.
+
+| https://docs.snowflake.com/en/user-guide/performance-query-warehouse-memory[Snowflake spill] / https://docs.snowflake.com/en/user-guide/search-optimization/queries-that-benefit[search optimization]
+| Memory exhaustion spills locally and then remotely. The docs note that very large compressed Parquet files can limit some Iceberg search-optimization benefits.
+| Warehouse sizing, search access paths (including Iceberg), pruning and other acceleration options.
+| Cost/latency under selective lookups plus broad scans sharing resources. Measure file/page fetch granularity and cache churn; do not claim Snowflake lacks indexes/search acceleration or cannot accelerate open tables.
+
+| https://datafusion.apache.org/blog/2025/09/10/dynamic-filters/[DataFusion dynamic filters] / https://datafusion.apache.org/blog/2026/07/20/sort-pushdown/[sort pushdown]
+| A provider must expose useful statistics/order and consume runtime filters. An application that eagerly builds MemTables can erase the toolkit's benefits.
+| Custom physical operators, top-k/runtime filtering, multi-level pruning and scan reordering; not merely in-memory Arrow scans.
+| First separate our integration defects from upstream ceilings. Compare the best custom native operator in the same plan against stock operators; only then investigate a separate scheduler/core.
+
+| https://duckdb.org/2024/07/09/memory-management[DuckDB memory] / https://duckdb.org/2025/09/24/sorting-again[external sort]
+| Blocking operators need state; concurrency, wide values and spill create resource tradeoffs.
+| Streaming, buffer management, disk spill and adaptive parallel external sorting already exist.
+| Use as a strong relational/value baseline. Cross-modal visibility and service-level admission are ProximaDB contracts; faster standalone GROUP BY is a separate claim requiring evidence.
+
+| https://clickhouse.com/blog/clickhouse-gets-lazier-and-faster-introducing-lazy-materialization[ClickHouse lazy materialization]
+| Reading wide payloads before a selective top-N wastes bytes and decode work.
+| Delays payload reads, including top-N use cases; streaming columnar processing was already present.
+| Extend delayed fetch across modality boundaries and version changes, with an explicit identity/locator contract. Merely adding late materialization would be catching up.
+
+| https://velox-lib.io/blog/hash-table-caching/[Velox hash-table reuse]
+| Rebuilding the same broadcast hash table per task wastes CPU, allocation and reads; cached tables currently cannot spill.
+| Worker-local build-once/reuse-many with explicit keys and coordinated consumers.
+| Reuse under snapshot, authorization and memory-budget changes. Cross-query cache reuse is useful only if invalidation and eviction preserve visibility; a path-only key is unsafe.
+
+| https://docs.starrocks.io/docs/faq/shared_data_faq[StarRocks shared-data] / https://docs.starrocks.io/docs/using_starrocks/query_feedback/[query feedback]
+| Cache loss during scaling and excessive segment counts raise remote I/O; estimate errors can select a poor join.
+| Data cache, compaction, query profiles and feedback-driven tuning.
+| Joint admission of query work and background compaction under tenant skew. Cache affinity and feedback are existing techniques, not differentiators by themselves.
+
+| https://turbopuffer.com/docs/architecture[turbopuffer architecture] / https://turbopuffer.com/docs/query[query API]
+| Cold object-store requests and unindexed work contribute latency. Its query API operates within a namespace.
+| NVMe cache affinity, centroid search, WAL-tail inclusion, filters, exact filtered kNN, full text and grouped aggregates; strong query consistency is the documented default.
+| Compare complete cross-relation context assembly, not just ANN. Do not use the obsolete claim that turbopuffer has no aggregation or that exact WAL-tail search is unique to us.
+
+| https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-query.html[S3 Vectors] / https://docs.aws.amazon.com/AmazonS3/latest/API/API_S3VectorBuckets_QueryVectors.html[QueryVectors]
+| The documented operation is index-scoped similarity search with metadata filtering; a full relational/graph context workflow needs additional execution around it.
+| Managed vector persistence, filtered querying and paginated query interfaces as documented at access time.
+| Pure-vector economics may favor the managed service. Measure the added context-assembly layer and freshness/authorization work separately, without charging only the competitor for required plumbing.
+
+| https://docs.lancedb.com/search/filtering[LanceDB] / https://docs.vespa.ai/en/querying/approximate-nn-hnsw.html[Vespa]
+| Predicate selectivity and its correlation with neighborhoods affect candidate generation and recall.
+| Integrated vector/metadata filtering; Vespa also combines nearest-neighbor operators with its broader search/query system.
+| These are closer counterexamples than warehouses to a claim of unique multimodal retrieval. Include them before claiming that one search/filter pipeline is a moat.
+|===
+
+== Quickwit and ClickHouse: inspect the mechanism behind the headline
+
+Quickwit's https://quickwit.io/docs/main-branch/overview/architecture[architecture] combines
+inverted postings, columnar fast fields for aggregation and a document store in immutable
+splits on object storage. Its https://quickwit.io/docs/overview/concepts/querying[query path]
+prunes splits using time/tags, assigns search work for cache locality and merges results.
+The documentation itself calls the distributed pattern map-reduce: the relevant distinction
+is what gets read, materialized and moved, not whether a design contains a map/reduce stage.
+Its split-local document IDs change across merges, which is why ProximaDB must preserve a
+separate stable, versioned record identity when using a similar projection.
+
+The https://quickwit.io/blog/benchmarking-quickwit-engine-on-an-adversarial-dataset[September 2023 benchmark]
+reports sub-second simple search over a 23 TB source dataset with eight CPUs. That is an indexed
+search claim, not scanning 23 TB in one second: its term query matches about 22,000 documents
+and returns ten. The sub-second result uses cached split metadata; the uncached cases expose
+substantial object I/O. The report separates a full-dataset date histogram from selective
+queries and adjusts merge policy during indexing. Its historic prices are not current quotes.
+The https://quickwit.io/blog/benchmarking-quickwit-loki[May 2024 Loki comparison] explicitly
+limits compared query semantics and identifies the ingestion-versus-query cost tradeoff.
+This is useful evidence about mechanisms, not a head-to-head ProximaDB performance result.
+
+ClickHouse's https://clickhouse.com/uploads/Click_House_Schulze_1_c12ecfaed4.pdf[2024 VLDB paper]
+describes sorted immutable parts, compressed columns, pruning, vectorized processing and
+background transformations. Its newer
+https://clickhouse.com/blog/clickhouse-gets-lazier-and-faster-introducing-lazy-materialization[lazy materialization]
+delays wide payload reads. These gains combine avoiding work with executing unavoidable work
+efficiently; they are not explained by C++ alone. Physical ordering, granularity, workload,
+cache preparation and maintenance must be held accountable in a comparison.
+
+Crucially, this is *not* a search-versus-scan dichotomy. ClickHouse announced
+https://clickhouse.com/blog/full-text-search-ga-release[GA inverted text indexes in March 2026],
+integrated with columnar execution. Its claimed 7–10x cold-query gains are vendor-reported
+comparisons with traditional approaches for the described workload, not a universal advantage
+or a Quickwit comparison. Any new ProximaDB search/columnar prototype must face this current
+baseline rather than an old Bloom-only ClickHouse configuration.
+
+What our architecture should permit is a choice within one query: postings for selective
+text/ID predicates, column scans for broad predicates, candidate fusion for vector/graph
+work, and late payload access. It should also allow postings to feed an aggregate over selected
+column values without constructing document objects first. This requires semantic capabilities,
+snapshot-bound locator translation and resource ownership; an opaque execute-query plugin
+or an eager MemTable boundary would lose much of the benefit. Reusing Tantivy is an option to
+measure against our existing index work, not an instruction to clone Quickwit's complete service.
+
+== Follow-up: pinned source inspection (2026-10-26)
+
+A shallow, sparse checkout is useful because it exposes the cost and semantic guards behind
+an optimization. This review inspected code; it did not build or benchmark either engine.
+The snapshots are development heads, *not claims about released/default behavior*:
+
+* Quickwit `a34311570785509837a90ff384f3dfe25d39835a` (2026-10-26): search, directories,
+  indexing, storage, query and document-mapper modules. Sparse checkout about 8 MiB.
+* ClickHouse `5e648963228d84aded99a081b3f517fb8873e0f6` (2026-10-26): MergeTree,
+  processors/query-plan, interpreters, core and I/O. Sparse checkout about 81 MiB.
+
+Local inspection copies are under `/tmp/proximadb-engine-source-review/`; the immutable
+upstream links below are the durable evidence. These mechanisms are prior art. A source
+comment explaining intent is not proof that a runtime estimate or memory bound is sound.
+
+:qwsrc: https://github.com/quickwit-oss/quickwit/blob/a34311570785509837a90ff384f3dfe25d39835a/quickwit
+:chsrc: https://github.com/ClickHouse/ClickHouse/blob/5e648963228d84aded99a081b3f517fb8873e0f6/src
+
+[cols="2,4,4",options="header"]
+|===
+| Source seam | Observed mechanism | Tradeoff and ProximaDB consequence (inference)
+| {qwsrc}/quickwit-search/src/leaf.rs[Quickwit leaf warmup]
+| The synchronous Tantivy search phase follows asynchronous warmup of query/collector dependencies. Fast-field warmup reads the selected column file slices; certain operations request entire dictionaries or postings. A required term proven absent can cancel other warmup work, with a single-segment guard for split-wide absence.
+| Separating I/O from CPU helps scheduling, but broad queries can warm substantially more data than a top-k result suggests. Reuse the async/CPU separation; compare bounded demand reads with upfront warmup. Negative caches need immutable generation and predicate/analyzer identity, not a mutable collection name.
+| {qwsrc}/quickwit-search/src/search_permit_provider.rs[Quickwit permits] and {qwsrc}/quickwit-search/src/cost.rs[cost estimates]
+| Admission reserves download slots and estimated memory; actual warmup memory updates the reservation. Priority and estimated query cost order work. The leaf creates an unbounded request-local byte cache and warns when warmup exceeds its initial allocation.
+| A reservation estimate is not a hard allocation ceiling. ProximaDB must acquire additional byte permits before growing buffers, with bounded batches/cancellation or an explicit decline. Query-shape constants are useful initial estimates, not portable pricing or latency coefficients.
+| {qwsrc}/quickwit-search/src/root.rs[Quickwit root], {qwsrc}/quickwit-search/src/fetch_docs.rs[fetch] and {qwsrc}/quickwit-search/src/search_job_placer.rs[placement]
+| Partial-hit search precedes document fetch. Fetch groups hits by split and orders document addresses. Placement combines split affinity and estimated load; an explicit path skips load probing to save a round trip.
+| Late hydration saves payload I/O but adds a phase and can scatter reads. Affinity can conflict with queueing. Preserve output order after physical grouping, account coordination RTTs, and compare scattered winners against a scan. Carry versioned oids alongside projection-local addresses.
+| {qwsrc}/quickwit-indexing/src/merge_policy/const_write_amplification.rs[Quickwit merge policy] and {qwsrc}/quickwit-indexing/src/actors/publisher.rs[publisher]
+| One available policy caps merge generations instead of repeatedly driving tiny tenant splits toward a uniform document target. Publication includes replacement split IDs, checkpoint delta and publish token; successful publication precedes the truncation suggestion.
+| A single large-object target can overcharge small tenants for compaction. Decide merge work using avoided future read cost versus write/CPU cost and visibility constraints. Retain ProximaDB's stricter all-consumer WAL retirement rule; a search indexer's checkpoint alone is insufficient for multimodal consumers.
+| {chsrc}/Storages/MergeTree/MergeTreeReaderTextIndex.cpp[ClickHouse text reader] and {chsrc}/Processors/QueryPlan/Optimizations/optimizeDirectReadFromTextIndex.cpp[direct-read rewrite]
+| The text path distinguishes exact replacement from hints requiring residual predicates. It can fall back to source evaluation for pattern/phrase cases when dictionary or position work is unattractive. Analyzer, materialization and query-shape checks govern eligibility.
+| Model exactness separately from cost. A cardinality estimate may choose a slower exact path, but must never justify discarding possible answers. Common phrases, absent tokens under OR, incomplete indexes and analyzer mismatches belong in the oracle suite. No universal selectivity threshold follows from this code.
+| {chsrc}/Storages/MergeTree/MergeTreeSplitPrewhereIntoReadSteps.cpp[ClickHouse PREWHERE steps] and {chsrc}/Processors/QueryPlan/Optimizations/lazyFrontier.h[lazy frontier]
+| Predicate steps group shared physical columns/index readers. The source tracks potentially throwing/expensive expressions and order. Lazy planning distinguishes values computed early, carried, deferred or recomputed, including null-padded join sides.
+| Avoid decoding the same column twice, but do not move volatile/throwing expressions or outer-join defaults across filters/limits without equivalence. Deferred payload work needs explicit lineage and semantics, not just an oid column. The source itself notes limits of its can-throw oracle; do not copy that heuristic as a proof.
+| {chsrc}/Processors/Transforms/LazyMaterializingTransform.cpp[ClickHouse lazy transform] and {chsrc}/Processors/QueryPlan/Optimizations/optimizeLazyMaterialization.cpp[eligibility]
+| This transform gathers its main branch before requesting late columns; the inspected optimizer path checks LIMIT, WITH TIES and supported source/shape constraints. Other lazy optimizer paths also exist.
+| Lazy does not mean streaming or constant memory. Bound selected references and sort/join state, and decline or spill a large survivor set. Test duplicate matches, ties, missing-side rows and no/small/large LIMIT; do not infer one path's restrictions apply to every ClickHouse implementation.
+| {chsrc}/Processors/IProcessor.h[ClickHouse processor], {chsrc}/Storages/MergeTree/MergeTreePrefetchedReadPool.cpp[prefetch pool] and {chsrc}/Interpreters/Aggregator.cpp[aggregator]
+| Processors expose readiness/backpressure and asynchronous work separately from CPU work. Prefetch refines ranges before reads and has memory controls. Aggregation includes two-level/adaptive state and external spilling paths.
+| Begin with existing async streams and DataFusion resource hooks. Add measured missing reservations and cancellation propagation; do not clone a scheduler first. Broad aggregation is an essential negative control: inverted indexes cannot remove work when most rows qualify.
+|===
+
+=== Revised tradeoff model
+
+Use two predictions, not one opaque score: critical-path latency and fully allocated cost.
+A useful first approximation is `queue + sum(dependent I/O waves) + CPU critical path`, with
+I/O/CPU overlap measured rather than charged twice. GET count determines request charges;
+sequential dependency depth determines latency. Bytes, concurrency, cache state, metadata
+requests and scattered hydration all matter. The weights in ProximaDB's current route model
+are neutral heuristic units, not dollar prices.
+
+For an optional projection over a declared planning horizon:
+
+----
+ avoided query work * expected query count
+     > build + incremental maintenance + merge + extra storage + recovery
+----
+
+Evaluate both sides at equal correctness/freshness/p99; include idle reservations and uncertainty.
+A performance-oriented tenant may accept more maintenance for lower latency. An economy tenant
+may accept more read amplification within its SLO. Keep one authority and semantic contract;
+change projection coverage, physical layout and admitted resource budget. Do not turn these
+observations into a blanket 40 MiB read cap or a mandatory copy of every field into every index.
+
+Four source-driven extensions fit existing experiments rather than creating another roadmap:
+
+. NE-7: sweep rare/common/absent tokens, phrases and broad histograms; vary selected fast-field
+  width. Compare postings, staged column scans and hybrid execution, including upfront versus
+  bounded demand I/O. Assert exact results before comparing latency.
+. NE-2/3: scattered winners, large LIMIT, duplicate/outer joins, WITH TIES and guarded invalid
+  casts. Race compaction/deletion between references and hydration. Prove equivalent output
+  and bounded memory, including cancellation while a payload fetch is pending.
+. NE-4: launch many broad warmups with underestimated memory plus small latency-sensitive
+  queries. Measure peak reserved/actual bytes and starvation; fail any unaccounted allocation
+  growth. Compare affinity-only placement with load-aware placement including probe RTTs.
+. NE-6: tiny and large tenants with different ingest/query ratios. Compare compaction policies
+  over a fixed horizon, including cache invalidation and index rebuild, and retain losing cases.
+
+The next implementation remains NE-0 instrumentation and one narrow NE-1/NE-7 adapter
+prototype. These source reads strengthen capability, resource and selection contracts; they
+do not justify replacing the logical IR or building a generic native warehouse executor.
+
+== Additional baseline-test sources (2026-10-26)
+
+The current plan now assigns strength and crossover cases to each core baseline, under the
+existing NE experiments. These are test specifications, not executed tests or new performance
+claims. In addition to the sources above:
+
+* https://www.postgresql.org/docs/current/indexes-index-only-scans.html[PostgreSQL covering scans]
+  explains heap visibility checks and visibility-map dependence; an index containing all query
+  columns does not guarantee no heap fetches under write churn.
+* https://www.postgresql.org/docs/current/transaction-iso.html[PostgreSQL isolation]
+  supplies the transaction semantics to test, including serializable abort/retry handling.
+  Matching SQL syntax or final counts does not prove matching isolation.
+* https://docs.aws.amazon.com/redshift/latest/dg/c_ato-enabling-disabling-monitoring.html[Redshift ATO]
+  describes workload-driven sort/distribution changes and their observation period. An untrained
+  AUTO table is not evidence of steady-state optimized warehouse performance.
+* https://docs.snowflake.com/en/user-guide/warehouses-multicluster[Snowflake multi-cluster]
+  addresses concurrent demand; test burst/idle behavior and disclose edition and scaling policy.
+* https://docs.snowflake.com/en/user-guide/dynamic-tables/best-practices[Snowflake dynamic-table lag]
+  distinguishes the staleness target from a guaranteed latency bound or fixed refresh schedule.
+  Compare measured freshness and maintenance cost, not configuration labels alone.
+
+For Spark use AQE/cache/layout-aware controls, for Trino dynamic filtering and separate
+interactive versus fault-tolerant task-retry arms, and for DataFusion/DuckDB use their current
+pushdown/spill implementations. Managed warehouse internals are not open-source equivalents:
+validate documented behavior, plans/profiles and actual runs rather than inventing a source
+inspection or extrapolating local performance into a managed-service result.
+
+== Research that constrains a novelty claim
+
+* https://www.microsoft.com/en-us/research/publication/vbase-unifying-online-vector-similarity-search-and-relational-queries-via-relaxed-monotonicity/[VBASE, OSDI 2023]: fixed top-k interfaces impede complex vector/relational execution; relaxed-monotonicity techniques support more compositional retrieval. Candidate continuation is prior art.
+* https://arxiv.org/abs/2403.04871[ACORN, 2024]: predicate-aware HNSW traversal is prior art. A ProximaDB implementation needs object-store and workload evidence, not an invented name for the same filtering idea.
+* https://arxiv.org/abs/2510.27141v5[Compass, September 2026 revision]: coordinated candidate generation and structured predicate evaluation across existing indexes. The abstract alone invalidates a broad claim that cooperative vector/relational execution is new; detailed algorithm reproduction remains a prototype prerequisite if we borrow it.
+* https://www.vldb.org/cidrdb/papers/2026/p2-liu.pdf[PostgreSQL-V, CIDR 2026]: separating vector indexes from relational execution raises consistency obligations, and the paper describes a mechanism for them. Owning both modalities does not automatically produce coherent visibility.
+
+No speedup reported by these papers is transferred to ProximaDB. No patentability or exhaustive
+novelty search was performed. The defensible product claim must be a reproducible workload
+result plus durable operational semantics, not the absence of an identical marketing phrase.
+
+== Thought experiments and falsifiers
+
+These are analytical experiments, not executed benchmarks. Execution definitions are in the
+current plan. The point is to identify necessary contracts before investing in implementations.
+
+. *The nearest tickets belong to ineligible customers.* Let all globally nearest 1,000 tickets
+belong to active customers, while the request asks for the nearest 20 tickets of churned
+customers. Taking global top-20 and joining later returns nothing. Taking top-1,000 still
+fails. A relational eligibility set followed by distance ordering answers the requested query;
+a resumable candidate source may also work. Fixed oversampling is not a correctness argument.
+Now add one-to-many joins: top-k joined rows and top-k distinct tickets are different queries.
+A generic optimizer cannot silently replace one with the other. This forces explicit candidate
+semantics, cardinality and exact/approximate modes before fusion.
+
+. *The data is the same, the payload is 100 times wider.* Add large documents/log bodies without
+changing any filter or distance. A compact-ID pipeline should mostly leave predicate/search
+work unchanged and fetch bodies only for surviving rows. If latency rises with total payload
+width before final fetch, the pipeline materializes too early. If winners are scattered over
+hundreds of objects, late fetch may lose to a sequential scan: measure that crossover instead
+of asserting it away. ClickHouse/DataFusion already provide meaningful controls for this test.
+
+. *An update arrives between ANN and hydration.* A candidate found in projection generation G
+is updated or deleted before its body is read; an authorization policy also changes. A query
+must use its declared read/policy boundary or fail/restart, not combine a stale score, current
+body and unrelated authorization decision. An oid alone is insufficient: use versioned record
+identity plus a snapshot-bound locator. Explicit emergency revocation can require aborting
+in-flight queries; snapshot authorization does not grant indefinite access after revocation.
+
+. *Ten thousand tenants wake up together.* Cache affinity works for a hot tenant but a bulk scan
+can evict many small working sets. Measure queueing, object GET waves, pinned bytes, query
+state, WAL-tail work and compaction together. More cache can worsen admission pressure; a
+memory-only query limit misses decoded vectors, object buffers and shared resident bytes.
+A cheaper request is not cheaper service if it forces idle reserved capacity for p99.
+
+. *The graph frontier explodes.* A two-hop query from a celebrity node visits millions of edges;
+from an ordinary node it visits dozens. A fixed hop-count rule is not a cost model. Decide
+between indexed expansion, semi-join and scan using frontier size, fanout and locality. Keep
+path multiplicity/cycle semantics distinct from reachable-node sets. Cancellation must bound
+work rather than silently returning an incomplete SQL aggregate.
+
+. *A broad aggregate defeats every index.* Uniform broad filters and high-cardinality joins
+remove most selectivity benefits. ProximaDB should use a mature vectorized/spilling path or
+prove its native equivalent; an indexed pipeline must not grind through random lookups when
+scanning is cheaper. This is the essential negative control against benchmark cherry-picking.
+
+. *A result looks correct only because the tail is small.* Grow unindexed writes, updates and
+tombstones while holding the published snapshot fixed. Merge by record version and reconcile
+both candidate search and payload visibility. When the tail overwhelms the latency budget,
+admit less work, accelerate indexing or offer an explicitly chosen freshness mode; do not
+silently omit it. A scan of the tail for every query may erase the economics of a cheap base.
+
+. *A performance win disappears on the bill.* Compare broad scan, ID-first lookup and cached
+plans at equal recall, freshness, durability and p99 under the same tenant mix. Include idle
+capacity, object requests, bandwidth, cache media, write/compaction amplification, recovery,
+replicas and maintenance. Do not equate total GET count to sequential dependency depth or
+cost per query to the vendor's billed logical bytes. An 8 MiB read is not intrinsically random
+or sequential; access pattern, locality and the device matter, as the storage plan records.
+
+== Cost model and economic tests
+
+Use measured resource demand and service constraints, rather than a universal ranking of
+engine names. ADR-033's depth-first heuristic remains useful for cold remote I/O; warm
+compute-bound or saturated mixed workloads require measured coefficients and queueing.
+
+----
+T_query = queue + planning + critical_path(I/O, decode, search, join, aggregate, spill)
+C_service = capacity + storage + requests + transfer + writes/compaction + recovery + operations
+C_per_success = C_service / successful queries meeting declared correctness/recall/freshness/SLO
+----
+
+Critical-path components overlap; do not sum all CPU and I/O elapsed times as independent
+serial work. Shared capacity has to be allocated once, not charged in full to every query.
+Record both marginal and fully allocated cost. Persist calibrated estimates and their error;
+use conservative admission when inputs are unknown. A recall target is measured against exact
+eligible-set answers on a defined dataset, not guaranteed by an ANN confidence score.
+
+Potential pricing: durable bytes + ingestion + measured execution, with an optional resident
+capacity/SLO tier only after reservation and isolation work lands (SC1–6). Test whether saved
+context-assembly compute pays for ProximaDB's index and maintenance overhead. Do not promise
+lower pure-vector prices than S3 Vectors or turbopuffer before representative measurements.
+Their billing bases differ; use their dated calculators/API pricing alongside our actual bill,
+not a conversion from physical bytes to billed bytes assumed to be universal.
+Sources: https://aws.amazon.com/s3/pricing/[AWS S3 pricing],
+https://turbopuffer.com/pricing[turbopuffer pricing]. No price quote is fixed by this report.
+
+== Repository reality and reconciliation
+
+* `src/query/compute_scheduler.rs::route_select_inner` selects DataFusion for production OLAP
+  shapes, including registerable native relational tables. It is not comparison-only today.
+* `src/query/execution/duckdb_engine.rs` describes the ledger baseline and an optional
+  `PROXIMADB_DUCKDB_ROUTE` route. Keep comparison correctness; this research does not authorize
+  expanding DuckDB's product role or tuning its internals.
+* `crates/query/proximadb-execution-contracts/src/lib.rs` already defines native Arrow batch
+  streams, operators, pipelines and scheduler contracts. Its operator interface does not itself
+  specify a shared visibility token, candidate continuation or common memory/I/O budget.
+  Extend existing contracts if an experiment requires them; do not create a competing IR.
+* Native route/join/morsel gates in `src/query/execution/native_engine.rs` are default OFF.
+  Existing code and old measured wins are reuse candidates, not proof of a general advantage.
+* The June native blueprint/comparative study retain ADR-052-era banners. ADR-054 later reopened
+  measured native operators; ADR-097 fixes the logical-IR boundary. Current planning must read
+  those decisions in sequence, not restart the June proposal or treat its old code audit as current.
+* P2 deletion readers are a correctness dependency of any native executor. The ongoing
+  continuation found wrong DuckDB predicate composition, invalid URI mapping, pruned-row-group
+  count errors, stale cache reuse and unsafe MATERIALIZE rewrite. These illustrate missing
+  visibility contracts, not a reason to optimize another engine's general-purpose kernels.

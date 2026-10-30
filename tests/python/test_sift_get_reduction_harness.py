@@ -959,3 +959,368 @@ def test_server_adaptive_range_policy_removes_inherited_overrides(tmp_path: Path
         "PROXIMADB_PAX_COALESCE_RANGE",
     ):
         assert name not in environment
+
+
+def _wave_scrape(counts: dict[str, float]) -> str:
+    """A Prometheus text body carrying one wave histogram (cumulative)."""
+    lines = ["# TYPE proximadb_pax_query_waves histogram"]
+    for bound, count in counts.items():
+        lines.append(f'proximadb_pax_query_waves_bucket{{le="{bound}"}} {count}')
+    return "\n".join(lines) + "\n"
+
+
+def test_wave_quantiles_come_from_the_histogram_delta() -> None:
+    # TD-PAXDIR-1 D7: before the sweep 5 queries took 7 waves; the sweep adds
+    # 4 queries at 3 waves and 1 at 4. The delta, not the totals, is measured.
+    before = _wave_scrape({"2": 0, "3": 0, "4": 0, "7": 5, "+Inf": 5})
+    after = _wave_scrape({"2": 0, "3": 4, "4": 5, "7": 10, "+Inf": 10})
+    waves = HARNESS.histogram_delta_quantiles(
+        before, after, HARNESS.WAVES_HISTOGRAM, (0.5, 0.95)
+    )
+    assert waves == {"observed": 5.0, "p50": 3.0, "p95": 4.0}
+    empty = HARNESS.histogram_delta_quantiles(
+        after, after, HARNESS.WAVES_HISTOGRAM, (0.5,)
+    )
+    assert empty == {"observed": 0.0, "p50": None}
+    with pytest.raises(RuntimeError, match="backwards"):
+        HARNESS.histogram_delta_quantiles(
+            after, before, HARNESS.WAVES_HISTOGRAM, (0.5,)
+        )
+
+
+def test_request_and_wave_gates_report_breaches_and_missing_waves() -> None:
+    result = {
+        "gets_per_query": 10.0,
+        "requests_per_query": 21.5,
+        "recall_at_k": 0.99,
+        "latency_ms": {"p50": 1.0},
+        "waves": {"observed": 10.0, "p50": 4.0, "p95": 5.0},
+    }
+    failures = HARNESS.gate_failures(
+        "object_cold",
+        result,
+        20.0,
+        0.98,
+        None,
+        require_local_hit=False,
+        max_requests=20.0,
+        max_p50_waves=3.0,
+    )
+    assert failures == [
+        "object_cold: requests/q 21.50 > 20.00",
+        "object_cold: p50 waves 4 > 3",
+    ]
+    result["waves"] = {"observed": 0.0, "p50": None, "p95": None}
+    assert HARNESS.gate_failures(
+        "object_cold",
+        result,
+        None,
+        0.98,
+        None,
+        require_local_hit=False,
+        max_p50_waves=3.0,
+    ) == ["object_cold: no per-query wave observations"]
+    # Unset gates only report.
+    assert HARNESS.gate_failures(
+        "object_cold", result, None, 0.98, None, require_local_hit=False
+    ) == []
+
+
+def test_centroid_directory_arm_sets_every_gate_and_the_global_nprobe(
+    tmp_path: Path,
+) -> None:
+    process = SimpleNamespace(poll=lambda: None)
+
+    def environment(centroid_directory: str) -> dict:
+        server = HARNESS.OwnedServer(
+            tmp_path / "proximadb-server",
+            tmp_path / "benchmark.toml",
+            "http://127.0.0.1:5790",
+            tmp_path / "server.log",
+            None,
+            nprobe=12,
+            centroid_directory=centroid_directory,
+        )
+        inherited = dict.fromkeys(HARNESS.CENTROID_DIRECTORY_GATES, "1")
+        inherited["PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE"] = "99"
+        with (
+            patch.dict(HARNESS.os.environ, inherited),
+            patch.object(HARNESS.subprocess, "Popen", return_value=process) as popen,
+            patch.object(HARNESS, "request_json", return_value={}),
+        ):
+            server.start()
+        return popen.call_args.kwargs["env"]
+
+    on = environment("on")
+    for gate in HARNESS.CENTROID_DIRECTORY_GATES:
+        assert on[gate] == "1", gate
+    # An explicit per-segment nprobe would disable directory planning.
+    assert "PROXIMADB_PAX_READ_COARSE_NPROBE" not in on
+    assert on["PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE"] == "12"
+
+    # The gates default ON since D8: the off arm disables them explicitly.
+    off = environment("off")
+    for gate in HARNESS.CENTROID_DIRECTORY_GATES:
+        assert off[gate] == "0", gate
+    assert off["PROXIMADB_PAX_READ_COARSE_NPROBE"] == "12"
+
+    # The default arm scrubs inherited exports and leaves the gates unset,
+    # so the server's (D8 default-ON) behavior applies.
+    unset = environment("default")
+    for gate in HARNESS.CENTROID_DIRECTORY_GATES:
+        assert gate not in unset, f"inherited {gate} leaked into the default arm"
+    assert unset["PROXIMADB_PAX_READ_CENTROID_DIRECTORY_NPROBE"] == "12"
+
+
+def test_local_geometry_lists_published_directories(tmp_path: Path) -> None:
+    collection = tmp_path / "t" / "c"
+    collection.mkdir(parents=True)
+    (collection / "L1_a.pax").write_bytes(b"x")
+    (collection / "centroids-0000000000000002.pxcd").write_bytes(b"d")
+    geometry = HARNESS.LocalPaxGeometry(tmp_path)
+    assert geometry.directory_objects() == ["t/c/centroids-0000000000000002.pxcd"]
+
+
+def test_unready_segments_name_untrained_tails_and_wrong_layouts() -> None:
+    # TD-PAXDIR-1 D7 finding: a bed can settle on a small untrained L0 flush
+    # tail that training compaction never replaces; the settle loop must name
+    # it instead of timing out silently.
+    geometry = {
+        "segments": [
+            {"path": "L2_a.pax", "layout_version": 1, "coarse_cells": 7, "bytes": 9},
+            {"path": "L0_b.pax", "layout_version": 1, "coarse_cells": 0, "bytes": 2_950_953},
+            {"path": "L1_c.pax", "layout_version": 3, "coarse_cells": 4, "bytes": 5},
+            {"path": "unparsed.pax"},
+        ]
+    }
+    assert HARNESS.unready_segments(geometry, 1) == [
+        "L0_b.pax: untrained (no coarse A0; 2,950,953 bytes)",
+        "L1_c.pax: layout v3",
+    ]
+    # Downloaded (materialized) geometry is fully parsed; there the untrained
+    # tail alone keeps the settle loop waiting.
+    parsed = {"segments": geometry["segments"][:2]}
+    assert not HARNESS.layout_candidate_is_ready(parsed, 1, azure_inventory=False)
+    assert HARNESS.unready_segments(parsed, 1) == [
+        "L0_b.pax: untrained (no coarse A0; 2,950,953 bytes)"
+    ]
+
+
+def test_coalesce_cap_and_gap_come_from_the_cli_and_reach_the_server(
+    tmp_path: Path,
+) -> None:
+    # TD-TIER-1 SC0: the range cap/gap were hard-coded constants in every
+    # arm; they are experiment inputs now, so a sweep arm must actually
+    # change what the server sees (and result.json must record it).
+    process = SimpleNamespace(poll=lambda: None)
+
+    def environment(gap_mb: float, range_mb: float) -> dict:
+        server = HARNESS.OwnedServer(
+            tmp_path / "proximadb-server",
+            tmp_path / "benchmark.toml",
+            "http://127.0.0.1:5790",
+            tmp_path / "server.log",
+            None,
+            coalesce_gap_bytes=int(gap_mb * 1024 * 1024),
+            coalesce_range_bytes=int(range_mb * 1024 * 1024),
+        )
+        with (
+            patch.object(HARNESS.subprocess, "Popen", return_value=process) as popen,
+            patch.object(HARNESS, "request_json", return_value={}),
+        ):
+            server.start()
+        return popen.call_args.kwargs["env"]
+
+    arm = environment(0.5, 16.0)
+    for name in (
+        "PROXIMADB_PAX_VECTOR_COALESCE_GAP",
+        "PROXIMADB_PAX_COALESCE_GAP",
+    ):
+        assert arm[name] == str(int(0.5 * 1024 * 1024)), name
+    for name in (
+        "PROXIMADB_PAX_VECTOR_COALESCE_RANGE",
+        "PROXIMADB_PAX_COALESCE_RANGE",
+    ):
+        assert arm[name] == str(int(16.0 * 1024 * 1024)), name
+
+    # The default arm keeps the historical 1 MiB / 4 MiB constants, so old
+    # arms reproduce byte-for-byte until a sweep opts in.
+    default = environment(
+        HARNESS.AZURE_COALESCE_GAP_BYTES / (1024 * 1024),
+        HARNESS.AZURE_COALESCE_RANGE_BYTES / (1024 * 1024),
+    )
+    assert default["PROXIMADB_PAX_COALESCE_GAP"] == str(HARNESS.AZURE_COALESCE_GAP_BYTES)
+    assert default["PROXIMADB_PAX_COALESCE_RANGE"] == str(HARNESS.AZURE_COALESCE_RANGE_BYTES)
+
+
+def test_server_proc_sampler_parses_rss_and_cpu() -> None:
+    # TD-TIER-1 E1 telemetry: the sampler must parse real /proc shapes and
+    # derive CPU seconds from the tick delta, never from a silent zero.
+    status = "Name: server\nVmRSS:      1234 kB\nThreads: 8\n"
+    # comm contains spaces+parens; utime=100, stime=50 ticks at the start.
+    stat_start = "1 (proximadb server) R 2 3 4 5 6 7 8 9 10 11 100 50 0 0\n"
+    stat_end = "1 (proximadb server) R 2 3 4 5 6 7 8 9 10 11 250 90 0 0\n"
+
+    files = {}
+
+    def fake_read(path: str) -> str:
+        return files[path]
+
+    sampler = HARNESS.ServerProcSampler(pid=99, interval_s=0.001, read=fake_read)
+    files[f"/proc/99/status"] = status
+    files[f"/proc/99/stat"] = stat_start
+    sampler.start()  # real background thread (daemon); start samples once
+    # utime 100->250, stime 50->90 = 190 ticks.
+    files[f"/proc/99/stat"] = stat_end
+    import time as _time
+    _time.sleep(0.01)  # let the thread observe the end state
+    files[f"/proc/99/stat"] = stat_end  # terminal sample sees the same end
+    out = sampler.stop()
+    assert out["peak_rss_bytes"] == 1234 * 1024
+    assert out["cpu_seconds"] == 1.9
+    assert out["complete"] is True
+
+
+def test_server_proc_sampler_reports_unavailable_not_zero() -> None:
+    # Tracker correction: an unreadable process counter must surface as
+    # unavailable (None / complete=false), never as a plausible zero.
+    def always_failing(path: str) -> str:
+        raise FileNotFoundError(path)  # an OSError subclass
+
+    sampler = HARNESS.ServerProcSampler(pid=404, interval_s=0.001, read=always_failing)
+    sampler.start()
+    out = sampler.stop()
+    assert out["peak_rss_bytes"] is None
+    assert out["cpu_seconds"] is None
+    assert out["complete"] is False
+
+
+def test_server_proc_sampler_stop_without_start_returns_unavailable() -> None:
+    # stop() on a never-started sampler must not crash (failure paths in
+    # run_query_sweep can reach it) and must not invent values.
+    sampler = HARNESS.ServerProcSampler(pid=1, interval_s=0.001, read=lambda p: "")
+    out = sampler.stop()
+    assert out["complete"] is False
+    assert out["peak_rss_bytes"] is None
+    assert out["cpu_seconds"] is None
+
+
+def test_skip_ingest_requires_collection_id() -> None:
+    # The fixed-object mode is unusable without the collection to reuse —
+    # fail at argparse time, not after a server has booted.
+    import subprocess, sys as _sys
+
+    proc = subprocess.run(
+        [
+            _sys.executable,
+            str(REPOSITORY_ROOT / "scripts" / "bench" / "sift1m_get_reduction.py"),
+            "--root",
+            "/tmp/whatever",
+            "--skip-ingest",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode != 0
+    assert "--skip-ingest requires --collection-id" in (proc.stderr or proc.stdout)
+
+
+def test_query_sweep_stops_sampler_when_reads_fail() -> None:
+    # Tracker correction: run_query_sweep must stop the sampler on the
+    # read/HTTP failure paths too. A query file that cannot be read raises
+    # inside the try; the sampler's stop() must have run (terminal sample
+    # taken) by the time the exception propagates.
+    import tempfile
+    sampler_calls: list[dict] = []
+
+    class RecordingSampler:
+        def __init__(self, pid: int, interval_s: float = 0.25, read=None):
+            self.pid = pid
+
+        def start(self) -> None:
+            sampler_calls.append({"event": "start"})
+
+        def stop(self) -> dict:
+            sampler_calls.append({"event": "stop"})
+            return {"peak_rss_bytes": None, "cpu_seconds": None, "complete": False}
+
+    with tempfile.NamedTemporaryFile(suffix=".missing", delete=True) as fh:
+        missing = Path(fh.name)
+        with patch.object(HARNESS, "ServerProcSampler", RecordingSampler):
+            with pytest.raises(Exception):
+                HARNESS.run_query_sweep(
+                    "http://127.0.0.1:1",
+                    "1",
+                    missing,
+                    missing,
+                    0,
+                    1,
+                    1,
+                    "fvecs",
+                    "ivecs",
+                    server_pid=123,
+                )
+    assert sampler_calls[0]["event"] == "start"
+    assert sampler_calls[-1]["event"] == "stop", (
+        "sampler.stop() must run on the read-failure path"
+    )
+    assert sampler_calls.count({"event": "stop"}) == 1
+
+
+def _scrape_from(text: str) -> dict:
+    totals = HARNESS.parse_prometheus(text)
+    totals["_text"] = text
+    return totals
+
+
+def test_tier_split_reads_each_tier_and_sums_region_d() -> None:
+    """TD-FPRUNE-1 PR-A: per-tier deltas come from the labelled series, a
+    tier absent on both sides is zero, and Region D = OID + FiltD + Rehyd."""
+    before = _scrape_from(
+        'proximadb_pax_tier_get_ops_agg_total{tier="OID"} 10\n'
+        'proximadb_pax_tier_get_bytes_agg_total{tier="OID"} 1000\n'
+    )
+    after = _scrape_from(
+        'proximadb_pax_tier_get_ops_agg_total{tier="OID"} 14\n'
+        'proximadb_pax_tier_get_bytes_agg_total{tier="OID"} 1400\n'
+        'proximadb_pax_tier_get_ops_agg_total{tier="FiltD"} 400\n'
+        'proximadb_pax_tier_get_bytes_agg_total{tier="FiltD"} 80000\n'
+        'proximadb_pax_tier_get_ops_agg_total{tier="IdxA"} 2\n'
+        'proximadb_pax_tier_get_bytes_agg_total{tier="IdxA"} 9000\n'
+    )
+    split = HARNESS.tier_split(before, after, query_count=2)
+    assert split["tiers"]["OID"] == {"gets_per_query": 2.0, "bytes_per_query": 200.0}
+    assert split["tiers"]["FiltD"]["gets_per_query"] == 200.0
+    assert split["tiers"]["Rehyd"] == {"gets_per_query": 0.0, "bytes_per_query": 0.0}
+    assert split["region_d_bytes_per_query"] == 200.0 + 40000.0
+    assert split["attributed_bytes_per_query"] == 200.0 + 40000.0 + 4500.0
+    assert set(split["tiers"]) == set(HARNESS.PAX_TIER_LABELS)
+
+
+def test_request_cost_prices_lists_separately_from_get_rate_requests() -> None:
+    """$/M queries = GET and HEAD at the GET price, LIST at the LIST price;
+    HEADs are requests that are neither GETs nor LISTs."""
+    cost = HARNESS.request_cost_per_million_queries(
+        gets=2770.0, requests=2786.0, lists=10.0, query_count=10
+    )
+    assert cost["per_query"] == {
+        "ranged_gets": 277.0,
+        "heads_and_whole_gets": 0.6,
+        "lists": 1.0,
+    }
+    assert cost["usd_per_million_queries"] == pytest.approx(277.0 * 0.40 + 0.6 * 0.40 + 5.0)
+    assert cost["prices"]["as_of"] == "2026-10-29"
+
+
+def test_stage_f_summary_is_zero_on_an_unfiltered_phase() -> None:
+    empty = _scrape_from("")
+    summary = HARNESS.stage_f_summary(empty, empty, query_count=5)
+    assert set(summary.values()) == {0.0}
+    after = _scrape_from(
+        "proximadb_stage_f_calls_agg_total 10\n"
+        "proximadb_stage_f_fetch_us_agg_total 50000\n"
+    )
+    summary = HARNESS.stage_f_summary(empty, after, query_count=5)
+    assert summary["builds_per_query"] == 2.0
+    assert summary["fetch_ms_per_query"] == 10.0

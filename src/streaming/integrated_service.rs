@@ -467,13 +467,12 @@ mod tests {
         let records: Vec<ProximaRecord> = (0..10)
             .map(|i| ProximaRecord {
                 oid: format!("vec_{}", i),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    dim: 64,
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![0.1; 64]),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default",
+                    "vector",
+                    64,
+                    vec![0.1; 64],
+                )],
                 record_version: 1,
                 ..Default::default()
             })
@@ -522,13 +521,12 @@ mod tests {
         let records: Vec<ProximaRecord> = (0..5)
             .map(|i| ProximaRecord {
                 oid: format!("vec_{}", i),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    dim: 64,
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![0.1 * (i as f32); 64]),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default",
+                    "vector",
+                    64,
+                    vec![0.1 * (i as f32); 64],
+                )],
                 record_version: 1,
                 ..Default::default()
             })
@@ -563,13 +561,12 @@ mod tests {
 
         let records = vec![ProximaRecord {
             oid: "vec_1".to_string(),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                dim: 64,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.1; 64]),
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                64,
+                vec![0.1; 64],
+            )],
             record_version: 1,
             ..Default::default()
         }];

@@ -501,7 +501,7 @@ WHERE ts.current_drawdown > 0.05;
 == Related Documents
 
 * link:USECASE_CATALOG.adoc[Use Case Catalog]
-* link:../00-product/VISION.adoc[Vision Document]
+* link:../current/VISION.adoc[Vision Document]
 * link:../00-product/PRD.adoc[Product Requirements Document]
 * Strategic Analysis (Section 4: ibkrtrading)
 

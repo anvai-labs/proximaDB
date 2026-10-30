@@ -194,7 +194,7 @@ impl SnapshotPublishCoordinator {
     }
 
     /// Find-or-create the discovery projection, apply `mutate`, and persist via
-    /// the established drop+create update pattern.
+    /// `Catalog::replace_table` (in place, no drop window — TD-CATREPLACE-1).
     async fn upsert_projection<F>(&self, collection_id: &str, mutate: F) -> Result<()>
     where
         F: FnOnce(&mut CatalogProjection),
@@ -230,11 +230,9 @@ impl SnapshotPublishCoordinator {
             }
         }
 
-        // Established update pattern in this codebase: drop + recreate
-        // (see CollectionService::upsert_collection_catalog_asset). No
-        // `Catalog::update_table` trait method exists; reuse drop+create.
-        catalog.drop_table(&identifier, false).await?;
-        catalog.create_table(&identifier, schema).await?;
+        // TD-CATREPLACE-1: replace in place — no drop window (the drop+create
+        // pattern this retires).
+        catalog.replace_table(&identifier, schema).await?;
         Ok(())
     }
 }

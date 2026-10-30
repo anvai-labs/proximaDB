@@ -1,0 +1,309 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-DML-3: INSERT … ON CONFLICT ignored its conflict target and action
+:status: Resolved
+:date: 2026-10-17
+:authors: F5 / OLTP write-path lane
+:found-by: TD-DML-1 resolution, "Out of scope" note
+:lane: services / F5 (OLTP write path) — `src/services/dml/mod.rs`
+:related: TD-DML-1 (UPSERT enforcement), TD-DML-2 (composite-PK fence)
+
+[cols="1,3"]
+|===
+| Status | **Partial:** the core fix shipped 2026-10-17 and was semantically merged onto current develop 2026-10-24 (see <<resolution>>) — target and action follow PostgreSQL over pgwire; open: the three gaps under <<remaining>> (RETURNING, insert-table alias, PK assignment on DO UPDATE), none blocking.
+| Severity | High (correctness): `DO NOTHING` overwrote rows, and `DO UPDATE` silently discarded its SET list
+| Lane | `src/services/dml/mod.rs` (`execute_upsert`), `src/query/sql_frontend/parser.rs`, `crates/query/proximadb-relational-frontend` (`lower_on_conflict_expr`)
+|===
+
+== The defect (verified against `origin/develop` `6bc4bef45`)
+
+`SqlFrontendParser::convert_insert_conflict_clause` reduced the clause to
+`conflict_columns` + literal `update_assignments`, and `DmlService::execute_upsert`
+ignored both (`_conflict_columns`, `_update_assignments`). As a result:
+
+* the conflict was always resolved on the PRIMARY KEY, whatever the target;
+* `DO UPDATE SET …` was never evaluated, so the whole proposed row replaced the
+  existing one. Any non-literal SET value, such as `t.counter + EXCLUDED.counter`,
+  failed to parse with `42601 Unsupported expression in VALUES`;
+* `DO NOTHING` replaced the row instead of skipping it, and counted it;
+* a conflict on a non-PK target (`ON CONFLICT (email)`) failed with 23505
+  instead of applying the action (behaviour since TD-DML-1).
+
+[[resolution]]
+== Resolution
+
+*Statement shape.* `DmlStatement::Upsert` carries an `OnConflictClause`
+(`target` = `AnyUnique` | `Columns` | `Constraint`, `action` = `DoNothing` |
+`DoUpdate { assignments, selection }`). The SET values and the `WHERE` are kept
+as SQL expressions. `DO UPDATE` without a target is rejected at parse time
+(42601), as in PostgreSQL. The MySQL `ON DUPLICATE KEY UPDATE` spelling lowers
+to `AnyUnique` + `DoUpdate`, with `VALUES(col)` rewritten to `EXCLUDED.col`.
+
+*One evaluator.* `DoUpdate` expressions are lowered by
+`proximadb_relational_frontend::lower_on_conflict_expr` (the same `lower_expr`
+SELECT uses) over the row `existing ++ proposed`, and evaluated with
+`Expr::eval` + `proximadb_functions::builtins()`, the Volcano engine's scalar
+evaluator. DML does not get a second expression evaluator. An unqualified or
+table-qualified column names the existing row. `EXCLUDED.col` names the
+proposed row, including its DEFAULT-filled columns. The post-update row is built
+by `updated_record_from_values`, the step UPDATE also uses now.
+
+*Arbitration (`execute_upsert`).* Rows are processed in statement order, under
+the table op-lock. Each proposed row is checked against the arbiter
+constraint(s), first among the rows this statement already wrote and then among
+the committed rows. The committed rows exclude any row a `DO UPDATE` rewrote,
+because its stored image is stale. Only a LIVE row arbitrates (mandate #16a).
+A DELETEd row is removed from the partition and from the UNIQUE index. A
+TTL-expired row (`valid_to_ns` in the past) is recognised as dead in two places.
+On the PK arbiter, `TableRecordStore::get_record_envelope` reports it as dead.
+On a UNIQUE arbiter, the WAL-backed index probe re-reads each owner with
+`RecordStore::get_record_including_dead` and skips a dead one. This also holds
+under the spill store, whose `get_record` hides dead copies; it now overrides
+`get_record_including_dead`, so dead is not read as "absent, so conflict". An
+absent or unknown holder still fails closed. The outcomes:
+
+* no conflict → insert;
+* `DO NOTHING` → skip, without counting the row;
+* `DO UPDATE` → if the holder was already inserted or updated by this statement,
+  raise 21000. Otherwise evaluate `WHERE`; if it is false or NULL, skip the row
+  without counting it. If it is true, apply the assignments, then run CHECK /
+  NOT NULL on the post-update row.
+
+*Arbiters.* `ON CONFLICT (cols)` is the PK or UNIQUE set with exactly those
+columns (order-insensitive). If none matches, it raises **42P10**.
+`ON CONFLICT ON CONSTRAINT n` resolves PostgreSQL's default names
+(`<table>_pkey`, `<table>_<cols>_key`) or a cataloged unique-index name. An
+unknown name raises **42704**. With no target, every unique constraint
+arbitrates.
+
+*Integrity (TD-DML-1 sequence kept).* The surviving rows run
+`enforce_row_write_constraints`, which now has the mode
+`RowWriteConstraintMode::OnConflict { updated }`. New rows get the PK claim
+(CKS `put_if_absent` or probe; a duplicate is 23505). Updated rows hold their PK
+already, and their own old UNIQUE values are excluded from the UNIQUE probe, so
+the post-update row is checked against every *other* row. FKs are checked on
+every written row. Inserts and updates are written in one `write_mutations`
+batch (`Insert` / `Update` kinds). The row-count statistic grows only by the
+inserted rows. pgwire invalidates the OLAP result cache after the statement, as
+for any INSERT (mandate #16b).
+
+*Supporting changes.* `UniqueConflict` carries the holder `oid`, which the
+arbiter needs. It is populated by the default scan, the WAL-backed UNIQUE index
+and the transaction staging store. The in-statement UNIQUE repeat raised by
+`build_unique_candidate_sets` is now a typed 23505; before, it was untyped and
+surfaced as 42P01 on INSERT too. `RelationalConstraintKind` gains
+`NoMatchingConflictTarget` (42P10) and `UndefinedConstraint` (42704). It also
+gains the expression and binding SQLSTATEs of the new path: invalid text for the
+column type (22P02), division by zero (22012), overflow (22003), type mismatch
+(42804), unknown column in a target, SET or expression (42703), duplicate SET
+column (42701) and PK assignment (0A000).
+
+*Review fixes (adversarial review of `c7c5e9f64`).*
+
+* `row_values_from_existing` decoded the encoded PK key into the first PK
+  column only. As a result, every DO UPDATE *and every plain UPDATE* of a
+  composite-PK row targeted a non-existent key (42P01). It now splits the key
+  (`split_primary_key_tuple`) across every PK column.
+* `updated_record_from_values` pins the rewritten record's `oid` / `local_id`
+  to the row being updated. On a PK-less table, re-deriving the identity minted
+  a fresh `<table>:row:<ns>` oid, so DO UPDATE (and UPDATE) missed the row.
+* Fenced PK claims (`oltp-integrity`) are released when the store *rejects*
+  the write before anything is durable (`write_mutations` returning
+  `Ok(!success)`, e.g. the WAL store's pre-append INSERT_CONFLICT check), for
+  both INSERT and ON CONFLICT (`release_pk_claims`). An `Err` from
+  `write_mutations` keeps the claim. It can come *after* a durable WAL append
+  (the memtable-full bail), so the row may exist after recovery, and releasing
+  the claim would be fail-open. *(Superseded in round 3, below: a kept claim
+  is now reconciled rather than left fencing the key.)*
+
+*Delta-review and addendum fixes (review of `e6839c934`).*
+
+* UPDATE rejected only the first PK column (`primary_key_column()` is
+  `.first()`). On `PRIMARY KEY (a, b)`, `SET b = …` succeeded and left the row's
+  identity (oid) out of step with its key columns. That produced a duplicate
+  visible PK, a spurious 23505, and a silent revert on the next update. Every PK
+  column is now rejected with 0A000. As a backstop, `updated_record_from_values`
+  refuses (with an error, not a panic) to pin an identity that differs from the
+  re-derived key of a keyed table.
+* A single-column PK is never split on the composite separator, so a key value
+  containing U+001F updates correctly.
+* Write-expression SQLSTATEs now follow PostgreSQL more closely. An undefined
+  operator is 42883 and an unsupported cast is 42846; a type mismatch stays
+  42804.
+* *Full-envelope reads.* `TableRecordStore::get_record_envelope` returns the
+  whole `ProximaRecord`, classified as live, dead or absent. It is implemented by
+  the WAL-backed store, the record-storage store, the catalog router and the
+  transaction staging store. UPDATE, DO UPDATE and the PK probes read rows
+  through it (`DmlService::row_state`), so:
+  ** a TTL-expired PK holder is no conflict for ON CONFLICT or plain INSERT,
+     including when a fenced claim is still held for that key. A claim whose row
+     is *absent* still conflicts (fail closed);
+  ** the store-level INSERT/UPDATE existence checks and the atomic-commit
+     re-check count only live rows (`live_row_present`), and so does the staging
+     store's `exists`;
+  ** an update now keeps every vector column's own value, the TTL and validity
+     window (`valid_from_ns` / `valid_to_ns`), the tenant stamp and the
+     row-level security envelope. (Round 3: undeclared props are no longer
+     carried.) Before, it rebuilt the row from the
+     `RichSearchResult` projection: one embedding copied into every vector
+     column, and the TTL dropped.
+  ** Stores without envelope reads (the vector-ops and object-store record
+     stores) report `Unsupported` and keep the previous `get_by_key` behaviour.
+
+*Round-3 fixes (review of `206c695eb`).*
+
+* *Claims can no longer fence a key forever* (`oltp-integrity`). The fenced
+  PK-claim store is durable, and most reachable `write_mutations` errors happen
+  *before* the WAL append, so a claim kept on every `Err` permanently fenced the
+  key: every later INSERT or ON CONFLICT got 23505, DELETE could not clear it,
+  and it survived restart. Three layers now fix this:
+  . *Typed failure.* An error raised before anything is durable carries the
+    `RejectedBeforeAppend` marker (`record_store::rejected_before_append`), and
+    DML releases the statement's claims for it, just as for an `Ok(!success)`
+    rejection. It is raised by the WAL store (health check, pre-append existence
+    reads) and by the vector-ops store (tenant-access, schema and dimension
+    validation). An unmarked `Err` still keeps the claim.
+  . *Lazy reconciliation.* When `put_if_absent` conflicts and the holder row is
+    *absent*, the store's durable log is consulted
+    (`TableRecordStore::durable_row_write`, a scan of the canonical WAL on the
+    WAL-backed store). Only when it provably holds no live write of the key is
+    the claim released and re-taken. Otherwise (a live write is durable, or the
+    store cannot tell) the conflict stands.
+  . *Startup sweep.* After WAL replay, `DmlService::reconcile_conditional_key_claims`
+    enumerates every live claim (`ConditionalKeyStore::live_claims`;
+    implemented for the local WAL store) and releases those whose row is absent
+    and not durable, or whose table no longer exists. It is wired at the
+    composition root (`SharedServices::new`).
+* *Claims are tenant-scoped.* The claim identity used the record's
+  `tenant_id`, which is empty for DML. Two tenants' same-named tables therefore
+  shared one PK fence. The identity is now built from the session tenant
+  (`DmlService::cks_identity`) for the claim, its DELETE release and the FK
+  existence check. Claims written earlier under the empty tenant are not
+  migrated: a tenant session no longer sees them (its INSERT is still rejected by
+  the store's own duplicate check), and the startup sweep releases those whose
+  row is gone.
+* *FK existence through the fenced store also requires a live parent row.* A
+  claim whose row is absent or dead is no parent.
+* *Dropped columns never resurrect.* An update rebuilt the row from its
+  envelope and carried forward every undeclared prop, including the values of
+  DROPPED columns, which a later ADD COLUMN then exposed. The same happened
+  without any update, because DROP COLUMN never purged the stored values. Now:
+  ** an update rebuilds props from the declared columns only (write-path system
+     metadata is regenerated by the store);
+  ** `ALTER TABLE … ADD COLUMN c` first purges any stored `c` prop from the
+     existing rows, so they read NULL as in PostgreSQL (fatal if it fails);
+  ** `DROP COLUMN c` then purges the dropped values (best effort, logged).
+     This lives in `DdlService::alter_table`, so it covers every DDL surface
+     with a record store wired.
+* *Vector tables.* A table with VECTOR columns and no JSON column routes to the
+  vector-ops store, and pgwire created its backing collection with `dimension:
+  1`. As a result, every `VECTOR(n≠1)` row was rejected ("dimension 3 …
+  expects 1"), for single- and multi-vector tables alike. The backing collection
+  now declares the first VECTOR column's dimension, and each vector is still
+  validated against its own column's `VECTOR(n)` by the relational row
+  contract. The vector-ops store also implements `get_record_envelope`, so
+  UPDATE / DO UPDATE on vector tables keep every vector column and the TTL, and
+  dead holders are recognised there too. Its scan now returns one current
+  version per oid: the latest by `record_version`, then `updated_at_ns`,
+  chosen before the dead filter. Before, any UPDATE on such a table made SELECT
+  return both the old and the new row; this was a pre-existing bug, reproduced
+  on a pre-fix binary with a `VECTOR(1)` table.
+* `CAST(text AS BOOLEAN)` accepts PostgreSQL's boolean spellings only and
+  otherwise raises 22P02 (it used to return `false`). A value of the wrong type
+  in a DO UPDATE assignment is 42804 (PostgreSQL's "column is of type X but
+  expression is of type Y").
+* *RLS on DO UPDATE* (`abac-policy`). The statement carries the caller identity
+  (set by pgwire). Before rewriting the conflicting row, DO UPDATE evaluates the
+  caller's row policy on it and raises 42501 if the row is not visible, which is
+  PostgreSQL's UPDATE `USING` check on the existing row.
+
+=== Evidence
+
+* Unit tests (`src/services/dml/tests.rs`):
+  `on_conflict_do_nothing_skips_and_counts_only_inserted_rows`,
+  `on_conflict_do_update_evaluates_assignments_against_existing_row` and
+  `on_conflict_rejections_are_typed_and_write_nothing`. On unfixed `6bc4bef45`
+  all 3 fail: DO NOTHING counted 2 instead of 1, `ctr.counter + EXCLUDED.counter`
+  was a parse error, and `SET email = 'a'` was admitted. After the fix, 3/3 pass.
+* Frontend unit test
+  `on_conflict_expr_binds_existing_and_excluded_rows`.
+* pgwire e2e (`tests/pgwire_on_conflict_e2e.rs`, real tokio-postgres client):
+  3/3 fail before the fix and 3/3 pass after it.
+* Review round (`c7c5e9f64` → fix): unit tests
+  `composite_pk_do_update_and_update_rewrite_the_same_row`,
+  `pk_less_do_update_rewrites_the_unique_holder`,
+  `on_conflict_expression_errors_carry_postgres_sqlstates`,
+  `ttl_expired_unique_holder_does_not_arbitrate` and (under `oltp-integrity`)
+  `pk_claims_are_released_when_the_write_fails`, plus the e2e tests
+  `pgwire_on_conflict_composite_pk_and_pk_less_tables` and
+  `pgwire_on_conflict_expression_errors_carry_postgres_sqlstates`. All of them
+  fail on `c7c5e9f64` and pass with the fix. `tests/pgwire_upsert_constraints_e2e.rs`
+  (TD-DML-1) is still green.
+* Delta round (`e6839c934` → fix): unit tests
+  `update_rejects_every_composite_primary_key_column`,
+  `update_of_single_pk_containing_the_key_separator`,
+  `expired_pk_and_unique_holders_never_conflict`,
+  `expired_holders_never_conflict_under_spill_store` and
+  `update_preserves_ttl_and_every_vector_column`. Also extended: the 42883 case
+  in the SQLSTATE tests, and the kept-claim-on-`Err` half of
+  `pk_claims_are_released_when_the_write_fails`. The e2e additions are composite
+  `UPDATE … SET b` / `SET a` (0A000) and 42883. All of them fail on
+  `e6839c934` and pass with the fix.
+
+[[remaining]]
+== Remaining gaps (not done here)
+
+* `RETURNING` is not supported on any DML path; `insert.returning` is ignored
+  by the parser for plain INSERT too. Not added here.
+* `INSERT INTO t AS alias …` does not parse: `SqlFrontendParser` uses
+  `GenericDialect`, which has no insert-table alias. The lowering already honours
+  an alias if one is parsed.
+* `DO UPDATE` cannot assign a PRIMARY KEY column, as with UPDATE (PostgreSQL
+  allows it). Tuple assignment `SET (a, b) = (…)` is rejected.
+* Unqualified `col` in a `DO UPDATE` expression names the existing row.
+  PostgreSQL raises 42702 (ambiguous) for it. This is a deliberate superset, so
+  every PostgreSQL-valid statement evaluates identically.
+* A user-declared constraint name (`CONSTRAINT uq UNIQUE (email)`) is not kept
+  by CREATE TABLE (it is stored as `unique_<cols>`). Use the PostgreSQL default
+  name or the columns.
+* `INSERT … SELECT … ON CONFLICT` is still rejected ("not supported yet").
+* Plain `UPDATE … SET col = <expression>` accepts only literals and column
+  references (e.g. `SET n = n + 1` is a 42601 parse error). This is a
+  pre-existing limitation of the UPDATE parser. `ON CONFLICT DO UPDATE` uses
+  the full scalar evaluator; moving plain UPDATE onto the same binder is the
+  natural follow-up.
+* Inside an explicit transaction, the buffered INSERT tag reports the proposed
+  row count (`INSERT 0 <rows>`), not the post-arbitration count. The statement
+  is only arbitrated when it replays at COMMIT, and pgwire has already sent each
+  statement's CommandComplete by then. Reporting the real count would need the
+  statement to execute against the staged state at statement time (the
+  ADR-095 interactive-transaction model), not a later tag rewrite. The rows
+  written at COMMIT follow the full ON CONFLICT semantics; only the tag is
+  approximate.
+* Vector tables, remaining gaps:
+  ** The vector store checks only a row's FIRST embedding against the backing
+     collection's single dimension. A table whose VECTOR columns have
+     *different* dimensions is accepted, but a row whose first VECTOR column is
+     NULL presents its next vector as the first embedding, and is rejected if
+     that vector's dimension differs.
+  ** ANN indexing in that store is over that first embedding only.
+  ** The vector-ops scan reads only the unflushed WAL view (pre-existing
+     scope, unchanged here).
+  ** A table created *before* this fix keeps its dimension-1 backing
+     collection, and so does a table that gains its first VECTOR column through
+     `ALTER TABLE … ADD COLUMN`. Recreating the table fixes it.
+* The object-store record stores (Iceberg / PAX object-store routes) do not
+  implement envelope reads or durable-log queries. They fall back to the lossy
+  `get_by_key` projection and the conservative claim handling: an absent row
+  with a held claim stays a conflict until the startup sweep.
+* The CKS startup sweep needs a backend that can enumerate claims. The local
+  WAL store can; the object-store CKS backend relies on lazy reconciliation
+  only.
+* RLS (`abac-policy`) is enforced for DO UPDATE's conflicting row. Plain
+  UPDATE / DELETE target reads and the arbiter's conflict detection still use
+  system reads (pre-existing `CLIENT-PLACEHOLDER` read contexts). Conflict
+  detection must see every row anyway, as PostgreSQL's does, so it can raise
+  23505 instead of inserting a duplicate.
+* A dropped column's values are purged at DROP on a best-effort basis. If that
+  purge fails (logged), they stay stored until the name is re-added, and the
+  re-ADD purges them first.

@@ -38,13 +38,12 @@ fn record(row: usize) -> ProximaRecord {
         created_at_ns: 1_000 + row as i64,
         updated_at_ns: 1_000 + row as i64,
         record_version: 1,
-        embeddings: vec![EmbeddingCell {
-            model_id: "test".into(),
-            modality: "dense_vector".into(),
-            dim: DIM as u32,
-            values: EmbeddingValues::Fp32(vector_for(row)),
-            ..Default::default()
-        }],
+        embeddings: vec![EmbeddingCell::new_fp32(
+            "test",
+            "dense_vector",
+            DIM as u32,
+            vector_for(row),
+        )],
         ..ProximaRecord::default()
     }
 }

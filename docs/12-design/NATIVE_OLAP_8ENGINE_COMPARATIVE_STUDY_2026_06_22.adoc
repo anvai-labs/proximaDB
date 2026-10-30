@@ -3,6 +3,10 @@
 :toclevels: 3
 :sectnums:
 
+Current decision chain: ADR-054 reopened measured native physical operators after ADR-052;
+ADR-097 specifies the shared logical IR. Treat the older retirement banners below as history.
+Next experiments: link:../current/LAKEHOUSE_PLAN.adoc#native-execution-research[current plan].
+
 Status: Reference study — **verdict superseded by ADR-052** (Accepted 2026-07-04): the
 native push-based, morsel-driven *operator core* is retired as a build
 target — OLAP operators are DataFusion's vectorized kernels; the native investment is the

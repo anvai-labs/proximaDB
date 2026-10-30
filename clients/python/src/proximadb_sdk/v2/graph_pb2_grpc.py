@@ -7,7 +7,7 @@ import grpc
 
 from proximadb_sdk.v2 import graph_pb2 as proximadb_dot_v2_dot_graph__pb2
 
-GRPC_GENERATED_VERSION = "1.80.0"
+GRPC_GENERATED_VERSION = "1.75.1"
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -23,7 +23,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f"The grpc package installed is at version {GRPC_VERSION},"
-        + " but the generated code in proximadb/v2/graph_pb2_grpc.py depends on"
+        + f" but the generated code in proximadb/v2/graph_pb2_grpc.py depends on"
         + f" grpcio>={GRPC_GENERATED_VERSION}."
         + f" Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}"
         + f" or downgrade your generated code using grpcio-tools<={GRPC_VERSION}."
@@ -39,12 +39,19 @@ class ProximaGraphServiceStub(object):
     `proximadb.v1.GraphService` for SDK and external clients.
 
     TD-124 added the analytic/batch/constraint/streaming RPCs and the declarative
-    `ExecuteQuery` (Cypher subset) below. Still deferred (only reachable on v1
-    behind `enable_grpc_v1_compat`), because they are not backed by a v2-native
-    surface: `ExecuteHybridQuery` (depends on the full vector+graph
+    `ExecuteQuery` (Cypher subset) below.
+
+    NOT carried into v2 (2026-08-29 truth update; this text previously claimed
+    they were "only reachable on v1 behind enable_grpc_v1_compat" — that flag no
+    longer exists and the v1 gRPC surface is removed, so these RPCs are ABSENT,
+    not deferred): `ExecuteHybridQuery` (depended on the full vector+graph
     `UnifiedHandlers` and the large v1 vector message graph, which has no clean
-    v2-native equivalent), and the retired/unimplemented `CreateGraphWithEngine`,
-    `GetPulsarStats`, and the PULSAR/QUASAR shard RPCs.
+    v2-native equivalent — hybrid search is served by REST
+    `/api/v2/hybrid/search`; a v2-native gRPC hybrid RPC is a future design
+    decision, not a port), and the retired/unimplemented
+    `CreateGraphWithEngine`, `GetPulsarStats`, and the PULSAR/QUASAR shard RPCs.
+    Their definitions remain in `v1/graph.proto` as internal (unserved) types
+    only, tracked by the v1-proto-usage ratchet.
     """
 
     def __init__(self, channel):
@@ -196,12 +203,19 @@ class ProximaGraphServiceServicer(object):
     `proximadb.v1.GraphService` for SDK and external clients.
 
     TD-124 added the analytic/batch/constraint/streaming RPCs and the declarative
-    `ExecuteQuery` (Cypher subset) below. Still deferred (only reachable on v1
-    behind `enable_grpc_v1_compat`), because they are not backed by a v2-native
-    surface: `ExecuteHybridQuery` (depends on the full vector+graph
+    `ExecuteQuery` (Cypher subset) below.
+
+    NOT carried into v2 (2026-08-29 truth update; this text previously claimed
+    they were "only reachable on v1 behind enable_grpc_v1_compat" — that flag no
+    longer exists and the v1 gRPC surface is removed, so these RPCs are ABSENT,
+    not deferred): `ExecuteHybridQuery` (depended on the full vector+graph
     `UnifiedHandlers` and the large v1 vector message graph, which has no clean
-    v2-native equivalent), and the retired/unimplemented `CreateGraphWithEngine`,
-    `GetPulsarStats`, and the PULSAR/QUASAR shard RPCs.
+    v2-native equivalent — hybrid search is served by REST
+    `/api/v2/hybrid/search`; a v2-native gRPC hybrid RPC is a future design
+    decision, not a port), and the retired/unimplemented
+    `CreateGraphWithEngine`, `GetPulsarStats`, and the PULSAR/QUASAR shard RPCs.
+    Their definitions remain in `v1/graph.proto` as internal (unserved) types
+    only, tracked by the v1-proto-usage ratchet.
     """
 
     def CreateNode(self, request, context):
@@ -469,12 +483,19 @@ class ProximaGraphService(object):
     `proximadb.v1.GraphService` for SDK and external clients.
 
     TD-124 added the analytic/batch/constraint/streaming RPCs and the declarative
-    `ExecuteQuery` (Cypher subset) below. Still deferred (only reachable on v1
-    behind `enable_grpc_v1_compat`), because they are not backed by a v2-native
-    surface: `ExecuteHybridQuery` (depends on the full vector+graph
+    `ExecuteQuery` (Cypher subset) below.
+
+    NOT carried into v2 (2026-08-29 truth update; this text previously claimed
+    they were "only reachable on v1 behind enable_grpc_v1_compat" — that flag no
+    longer exists and the v1 gRPC surface is removed, so these RPCs are ABSENT,
+    not deferred): `ExecuteHybridQuery` (depended on the full vector+graph
     `UnifiedHandlers` and the large v1 vector message graph, which has no clean
-    v2-native equivalent), and the retired/unimplemented `CreateGraphWithEngine`,
-    `GetPulsarStats`, and the PULSAR/QUASAR shard RPCs.
+    v2-native equivalent — hybrid search is served by REST
+    `/api/v2/hybrid/search`; a v2-native gRPC hybrid RPC is a future design
+    decision, not a port), and the retired/unimplemented
+    `CreateGraphWithEngine`, `GetPulsarStats`, and the PULSAR/QUASAR shard RPCs.
+    Their definitions remain in `v1/graph.proto` as internal (unserved) types
+    only, tracked by the v1-proto-usage ratchet.
     """
 
     @staticmethod

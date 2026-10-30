@@ -1,0 +1,70 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-TQFEAT-1: No CI job compiles `experimental-turboquant`, so its tests rotted unnoticed
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved (2026-10-23).** The test is updated to the current `TraceBuilderInputs`. `proximadb-quantization-model` now forwards the feature to the crate its gated code depends on. A `feature-matrix` leg runs `cargo check -p <crate> --tests --features experimental-turboquant` for the root crate and for each of the five sub-crates that declare the feature.
+| Priority | **MEDIUM.** There is no production impact, since the feature is off by default. But the feature's only end-to-end propagation test could not compile, and nothing reported it.
+| Component | `tests/turboquant_e2e_propagation_test.rs`; `crates/foundation/proximadb-quantization-model/Cargo.toml`; `.github/workflows/ci.yml` (`feature-matrix`)
+| Relates to | ADR-021 (TurboQuant); mandate #9 (feature-gating gaps must surface on the introducing PR); link:TD-ORPHAN-1-fifty-eight-source-files-are-not-reachable.adoc[TD-ORPHAN-1], the same bug class: code that reads as coverage while no build compiles it
+| Found | 2026-10-22, by the adversarial review of the TD-ORPHAN-1 deletion PR (#2168), which built extra feature sets
+|===
+
+== What
+
+`cargo check -p proximadb --all-targets --features experimental-turboquant` failed with
+`E0560: struct TraceBuilderInputs has no field named plan` at
+`tests/turboquant_e2e_propagation_test.rs:292` and `:372`.
+
+The test (`fa6a44291`, 2026-06-02) fell behind three successive `TraceBuilderInputs`
+changes:
+
+. `f2d50aae2` (2026-06-20) added `egress_bytes`. Its message says "All SearchPlanTrace literals
+  updated", but it missed this one.
+. #863 replaced `plan: &PlanOutput` with four flattened fields: `filter_strategy`,
+  `index_route`, `estimated_selectivity` and `gls_score`.
+. #1091 added `object_store_gets` and `object_store_bytes_read`.
+
+Every un-gated caller moved each time, including `src/network/rest/v2/records.rs` and
+`tests/trace_pipeline_integration_test.rs`. The two literals in this test did not, because the
+whole file is behind
+`#![cfg(feature = "experimental-turboquant")]` and no CI job turns that feature on.
+`feature-matrix` covers cluster, the ledger, experimental-engines, cold-deletion-vectors and
+others, but not TurboQuant. There are 11 files in `src/` and `tests/` that gate on it.
+
+Fresh-context review of the fix found the same gap one level down. `-p proximadb --tests`
+builds dependency crates as libraries only, so the feature-gated `#[cfg(test)]` code in
+`proximadb-quantization-types`, `proximadb-distance-kernel` and `proximadb-quantization-kernel`
+was not compiled by any job either. It also found a real latent defect:
+`proximadb-quantization-model` declared `experimental-turboquant = []`, without forwarding
+to `proximadb-quantization-types/experimental-turboquant`, even though its gated code names
+that crate's `CalibrationMode` and `QuantizationType::TurboQuant`. A standalone
+`cargo check -p proximadb-quantization-model --features experimental-turboquant` failed with
+E0433/E0599. The root build only worked because Cargo's feature unification enabled the
+dependency's feature through another path.
+
+== Fix
+
+. The two literals now use the four plan fields from the test's `plan()` fixture, and set
+  the three meter fields to `0`. The builder documents `0` as meaning "no io_trace scope"
+  for the object-store meters and "the free same-AZ path" for `egress_bytes`. The test
+  asserts none of the three. `build()` copies the four plan fields into the trace exactly as
+  it used to through `plan.*`, so the assertions mean what they meant before.
+. `proximadb-quantization-model` forwards its feature to
+  `proximadb-quantization-types/experimental-turboquant`.
+. A new `feature-matrix` leg, `experimental-turboquant`, runs
+  `cargo check -p <crate> --tests --features experimental-turboquant` for `proximadb` and for
+  each sub-crate that declares the feature: `proximadb-quantization-types`,
+  `proximadb-quantization-model`, `proximadb-distance-kernel`, `proximadb-vector` and
+  `proximadb-quantization-kernel`. From now on, a change that breaks this feature's code or
+  tests, in any of those crates, fails on the PR that introduces it.
+
+== Residual
+
+The leg compiles the feature's tests but does not run them, which is the same as most legs.
+A crate that adds the feature later must also be added to the leg's package list.
+Running the two TurboQuant integration binaries would mean linking root-crate test binaries
+on that leg, which adds time. Do that only if the TurboQuant path is promoted beyond
+experimental.

@@ -90,6 +90,16 @@ pub fn decode_identity(types: &[ProximaType], bytes: &[u8]) -> Result<DecodedIde
     })
 }
 
+/// Decode only the `(tenant, keyspace)` scope prefix of a key produced by
+/// [`encode_identity`] — no column types needed. Used to route a stored claim
+/// back to its table (TD-DML-3 claim reconciliation).
+pub fn decode_identity_scope(bytes: &[u8]) -> Result<(String, String)> {
+    let mut r = Reader { b: bytes, pos: 0 };
+    let tenant = String::from_utf8(r.read_str_field()?)?;
+    let keyspace = String::from_utf8(r.read_str_field()?)?;
+    Ok((tenant, keyspace))
+}
+
 // --- encoding ---------------------------------------------------------------
 
 /// Escaped, `0x00`-terminated bytes with no type tag — used for the positional

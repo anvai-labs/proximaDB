@@ -70,6 +70,7 @@ use crate::query::table_write_plan::{
     LogicalTableRef, ReadSource, RoutedExecutionPlan, TableWriteRouteExplanation,
     WriteIntentOverrides, WriteMode,
 };
+use crate::services::layer_a_snapshot::LayerARowAccess;
 use crate::services::operations::VectorOps;
 use crate::services::operations::vectors::RichSearchResult;
 use crate::services::record_store::{
@@ -86,6 +87,9 @@ use crate::storage::tenant::context::TenantContext;
 use crate::storage::trait_components::path_resolver::DrPathBuilder;
 use proximadb_catalog::TableIdentifier;
 use proximadb_storage_common::object_store_bridge::ObjectStoreBridge;
+use proximadb_storage_common::parquet_multipart::MultipartParquetWriter;
+use proximadb_storage_common::parquet_write_policy::{ParquetLayoutHints, ParquetWritePolicy};
+use proximadb_storage_common::proxima_arrow::proxima_records_to_record_batch;
 
 /// Count of Iceberg snapshot publishes that failed during `ALTER TABLE …
 /// MATERIALIZE` (TD-USUB-9).
@@ -104,6 +108,46 @@ static ICEBERG_PUBLISH_FAILURES: std::sync::LazyLock<Option<prometheus::IntCount
         let counter = prometheus::IntCounter::new(
             "proximadb_warehouse_iceberg_publish_failures_total",
             "Iceberg snapshot publishes that failed during warehouse materialization",
+        )
+        .ok()?;
+        let _ = prometheus::register(Box::new(counter.clone()));
+        Some(counter)
+    });
+
+/// Which plan each committed or advanced MATERIALIZE took — `rewrite`,
+/// `append`, `incremental_dv` or `unchanged`: the publication-cost dimension
+/// the incremental path moves (O(table) rewrites vs O(delta) publications),
+/// and how tests prove which path ran. Same registration posture as the
+/// failure counters.
+static MATERIALIZE_PLANS: std::sync::LazyLock<Option<prometheus::IntCounterVec>> =
+    std::sync::LazyLock::new(|| {
+        let counter = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "proximadb_warehouse_materialize_plans_total",
+                "MATERIALIZE publications by the plan they took",
+            ),
+            &["plan"],
+        )
+        .ok()?;
+        let _ = prometheus::register(Box::new(counter.clone()));
+        Some(counter)
+    });
+
+fn count_materialize_plan(plan: &str) {
+    if let Some(counter) = MATERIALIZE_PLANS.as_ref() {
+        counter.with_label_values(&[plan]).inc();
+    }
+}
+
+/// Live-delete publications that refused or failed (the fence gap the
+/// contract's best-effort-with-accounting phase 3 leaves behind: the WAL
+/// delete stands, the published view stays stale until the next full
+/// publication). Same registration posture as the materialize counter.
+static LIVE_DELETE_PUBLISH_FAILURES: std::sync::LazyLock<Option<prometheus::IntCounter>> =
+    std::sync::LazyLock::new(|| {
+        let counter = prometheus::IntCounter::new(
+            "proximadb_warehouse_live_delete_publish_failures_total",
+            "Live-delete deletion-vector publications that failed or refused (fence gaps)",
         )
         .ok()?;
         let _ = prometheus::register(Box::new(counter.clone()));
@@ -187,33 +231,6 @@ pub(crate) fn resolve_cluster_key(schema: &CatalogTableSchema) -> Option<String>
         .map(|c| c.name.clone())
 }
 
-/// Total-order sort key over a record's cluster-key value: temporal and
-/// integer values order numerically, strings lexically; rows whose key is
-/// NULL/absent/unorderable sort LAST (the `(true, ..)` arm). Timestamps
-/// compare within one column, so raw ticks are a valid order (one column ⇒
-/// one unit).
-pub(crate) fn cluster_sort_key(rec: &ProximaRecord, column: &str) -> (bool, i128, String) {
-    let value = match rec.props.get(column) {
-        Some(ProximaTreeNode::Value(v)) => v,
-        _ => return (true, 0, String::new()),
-    };
-    match value {
-        ProximaValue::Date(d) => (false, *d as i128, String::new()),
-        ProximaValue::Timestamp(t, _) | ProximaValue::TimestampTz(t, _) => {
-            (false, *t as i128, String::new())
-        }
-        ProximaValue::Time(t, _) => (false, *t as i128, String::new()),
-        ProximaValue::Int8(v) => (false, *v as i128, String::new()),
-        ProximaValue::Int16(v) => (false, *v as i128, String::new()),
-        ProximaValue::Int32(v) => (false, *v as i128, String::new()),
-        ProximaValue::Int64(v) => (false, *v as i128, String::new()),
-        ProximaValue::UInt32(v) => (false, *v as i128, String::new()),
-        ProximaValue::UInt64(v) => (false, *v as i128, String::new()),
-        ProximaValue::String(s) | ProximaValue::Symbol(s) => (false, 0, s.clone()),
-        _ => (true, 0, String::new()),
-    }
-}
-
 /// TD-OLAP-2 (A2): fold the materialized records into per-column HLL sketches
 /// and publish them to the ADR-037 resident statistics registry, keyed by the
 /// table name — the SAME key `ObjectStoreParquetTable::statistics()` passes to
@@ -235,8 +252,8 @@ pub(crate) fn cluster_sort_key(rec: &ProximaRecord, column: &str) -> (bool, i128
 /// Co-design (TD-OLAP-2 / ADR-037): the dominant cost term moved here is
 /// COMPUTE (the single-threaded join build), and the lever is 1 core → N cores
 /// by feeding the optimizer its missing input — accurate NDV. The sketch is
-/// computed at the write boundary, where the records are already resident in
-/// memory for the Parquet write, so it adds ZERO scans: O(rows × cols) HLL
+/// computed at the write boundary, chunk by chunk as the rows stream to the
+/// Parquet writer, so it adds ZERO scans: O(rows × cols) HLL
 /// inserts (~1 s at SF=0.1 = 600 K rows × 16 cols), acceptable for a
 /// materialize DDL.
 ///
@@ -247,44 +264,58 @@ pub(crate) fn cluster_sort_key(rec: &ProximaRecord, column: &str) -> (bool, i128
 /// not survive. (The SST flush path for vector collections is a follow-on; the
 /// DF/OLAP join path only reads parquet-backed tables, which are always
 /// materialized, so this seam covers the join-parallelism goal.)
-pub(crate) fn publish_ndv_statistics(
-    table_name: &str,
-    tenant: Option<&str>,
-    schema: &CatalogTableSchema,
-    records: &[ProximaRecord],
-) {
-    use proximadb_search_types::sql_value_filter::proxima_value_to_filter_literal;
+///
+/// Streaming: the per-column HLL sketches fold one chunk at a time, so a
+/// bounded-memory MATERIALIZE never holds the table.
+pub(crate) struct NdvAccumulator {
+    summary: crate::core::statistics::StatisticsSummary,
+    /// `(name, type-name)` per column. The type name only feeds
+    /// `is_numeric_type` (quantile tracking); the HLL distinct count is type-
+    /// agnostic (`canonical_string` keys every value), so NDV is correct even
+    /// for types outside the numeric set.
+    cols: Vec<(String, serde_json::Value)>,
+    rows: u64,
+}
 
-    let mut summary = crate::core::statistics::StatisticsSummary::new(
-        crate::core::statistics::table_statistics_key(tenant, table_name),
-    );
-    summary.set_record_count(records.len() as u64);
-    // Pre-compute (name, type-name) once per column. The type name only feeds
-    // `is_numeric_type` (quantile tracking); the HLL distinct count is type-
-    // agnostic (`canonical_string` keys every value), so NDV is correct even
-    // for types outside the numeric set.
-    let cols: Vec<(&str, serde_json::Value)> = schema
-        .columns
-        .iter()
-        .map(|c| {
-            (
-                c.name.as_str(),
-                serde_json::Value::String(format!("{:?}", c.data_type)),
-            )
-        })
-        .collect();
-    for rec in records {
-        for (name, ty) in &cols {
-            // Same leaf extraction as `cluster_sort_key`: NULL/absent/object
-            // nodes observe as `None` (counted in the null rate, not the HLL).
-            let json_val = rec.props.get(*name).and_then(|node| match node {
-                ProximaTreeNode::Value(v) => Some(proxima_value_to_filter_literal(v)),
-                _ => None,
-            });
-            summary.observe_field(name, ty, json_val.as_ref());
+impl NdvAccumulator {
+    pub(crate) fn new(table_name: &str, tenant: Option<&str>, schema: &CatalogTableSchema) -> Self {
+        Self {
+            summary: crate::core::statistics::StatisticsSummary::new(
+                crate::core::statistics::table_statistics_key(tenant, table_name),
+            ),
+            cols: schema
+                .columns
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        serde_json::Value::String(format!("{:?}", c.data_type)),
+                    )
+                })
+                .collect(),
+            rows: 0,
         }
     }
-    crate::core::statistics::statistics_registry().put(summary);
+
+    pub(crate) fn observe(&mut self, records: &[ProximaRecord]) {
+        use proximadb_search_types::sql_value_filter::proxima_value_to_filter_literal;
+        self.rows += records.len() as u64;
+        for rec in records {
+            for (name, ty) in &self.cols {
+                // NULL/absent/object nodes observe as `None` (counted in the null rate, not the HLL).
+                let json_val = rec.props.get(name).and_then(|node| match node {
+                    ProximaTreeNode::Value(v) => Some(proxima_value_to_filter_literal(v)),
+                    _ => None,
+                });
+                self.summary.observe_field(name, ty, json_val.as_ref());
+            }
+        }
+    }
+
+    pub(crate) fn publish(mut self) {
+        self.summary.set_record_count(self.rows);
+        crate::core::statistics::statistics_registry().put(self.summary);
+    }
 }
 
 /// TD-USUB-4: merge `incoming` into `existing` by layout `name`, rather than
@@ -414,63 +445,6 @@ impl RelationalPredicateTree {
 
 /// Map an Arrow column type (the materialized Parquet's physical type) to the Iceberg
 /// primitive type name for the published `TableMetadata` schema. Kept in lock-step with
-/// the Parquet physical types so an external Iceberg reader's schema matches the file.
-/// Timestamps map to the v3 nanosecond types (ProximaDB is nanosecond-native).
-fn iceberg_type_for(arrow: &arrow_schema::DataType) -> String {
-    use arrow_schema::{DataType as D, TimeUnit};
-    match arrow {
-        D::Boolean => "boolean".into(),
-        D::Int8 | D::Int16 | D::Int32 => "int".into(),
-        D::Int64 | D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64 => "long".into(),
-        D::Float16 | D::Float32 => "float".into(),
-        D::Float64 => "double".into(),
-        D::Date32 | D::Date64 => "date".into(),
-        D::Decimal128(p, s) | D::Decimal256(p, s) => format!("decimal({p},{s})"),
-        // Iceberg's v2 `timestamp` is microseconds; nanoseconds need v3's `_ns` types
-        // (see `iceberg_format_version_for`).
-        D::Timestamp(TimeUnit::Nanosecond, Some(_)) => "timestamptz_ns".into(),
-        D::Timestamp(TimeUnit::Nanosecond, None) => "timestamp_ns".into(),
-        D::Timestamp(_, Some(_)) => "timestamptz".into(),
-        D::Timestamp(_, None) => "timestamp".into(),
-        D::Utf8 | D::LargeUtf8 => "string".into(),
-        D::FixedSizeBinary(n) => format!("fixed[{n}]"),
-        D::Binary | D::LargeBinary => "binary".into(),
-        // JSON columns materialize as Utf8 today; v3 `variant` is a follow-up.
-        _ => "string".into(),
-    }
-}
-
-/// ADR-097 D3: publish Iceberg **v2** — the version external readers (PyIceberg,
-/// DuckDB, Trino) verifiably read — unless a column needs a v3-only type
-/// (nanosecond timestamps). v3 deletion vectors / row lineage / `variant` follow
-/// once an external v3 reader is in the read-back gate.
-fn iceberg_needs_v3(
-    fields: &[proximadb_storage_common::object_store_bridge::IcebergSnapshotField],
-) -> bool {
-    fields.iter().any(|f| f.type_name.ends_with("_ns"))
-}
-
-/// A stable, well-formed UUID string derived deterministically from the table's object
-/// prefix, so an Iceberg table keeps the same `table-uuid` across re-materializations
-/// (no `uuid` v5 dependency; two seeded hashes fill the 16 bytes).
-fn deterministic_table_uuid(prefix: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h1 = std::collections::hash_map::DefaultHasher::new();
-    prefix.hash(&mut h1);
-    let a = h1.finish();
-    let mut h2 = std::collections::hash_map::DefaultHasher::new();
-    (prefix, 0x50524f58_4944425fu64).hash(&mut h2); // "PROX_IDB_" salt
-    let b = h2.finish();
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        (a >> 32) as u32,
-        (a >> 16) as u16,
-        a as u16,
-        (b >> 48) as u16,
-        b & 0x0000_ffff_ffff_ffff
-    )
-}
-
 /// Parse a SQL literal into a JSON value for the pushdown filter: integers and
 /// floats become JSON numbers (so i64/f64 zone-map pruning fires); everything
 /// else stays a string (string-equality hash pruning).
@@ -625,7 +599,7 @@ pub enum DmlStatement {
         /// Optional filter restricting which rows are deleted.
         where_clause: Option<WhereClause>,
     },
-    /// INSERT INTO ... ON CONFLICT DO UPDATE
+    /// INSERT INTO ... ON CONFLICT [target] DO NOTHING | DO UPDATE SET ...
     Upsert {
         /// Target table name.
         table_name: String,
@@ -633,10 +607,8 @@ pub enum DmlStatement {
         columns: Vec<String>,
         /// Rows to insert or update; each inner `Vec` is one row of values.
         values: Vec<Vec<SqlValueLiteral>>,
-        /// Columns that define the conflict (unique key).
-        conflict_columns: Vec<String>,
-        /// Column-value pairs applied when a conflict is detected.
-        update_assignments: Vec<(String, SqlValueLiteral)>,
+        /// The conflict target and action (TD-DML-3).
+        on_conflict: OnConflictClause,
     },
     /// INSERT INTO target SELECT ... FROM source.
     InsertSelect {
@@ -667,6 +639,86 @@ impl DmlStatement {
             }
         }
     }
+}
+
+/// TD-DML-3: which unique constraint(s) arbitrate an `INSERT … ON CONFLICT`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnConflictTarget {
+    /// No target: a conflict on ANY unique constraint (PRIMARY KEY or UNIQUE)
+    /// triggers the action. PostgreSQL allows this for `DO NOTHING` only; the
+    /// MySQL `ON DUPLICATE KEY UPDATE` spelling also lowers here.
+    AnyUnique,
+    /// `ON CONFLICT (col, …)`: the unique constraint over exactly these columns
+    /// (order-insensitive). No such constraint is SQLSTATE 42P10.
+    Columns(Vec<String>),
+    /// `ON CONFLICT ON CONSTRAINT name`. An unknown name is SQLSTATE 42704.
+    Constraint(String),
+}
+
+/// TD-DML-3: what `INSERT … ON CONFLICT` does with a conflicting row.
+#[derive(Debug, Clone)]
+pub enum OnConflictAction {
+    /// Skip the proposed row; the existing row is left unchanged.
+    DoNothing,
+    /// Update the existing row. Values and the optional `WHERE` are evaluated
+    /// against the EXISTING row, with `EXCLUDED.col` naming the proposed row.
+    DoUpdate {
+        /// `SET column = expression` pairs, in statement order.
+        assignments: Vec<(String, sqlparser::ast::Expr)>,
+        /// Optional `WHERE` gating the update (false/NULL ⇒ row not updated).
+        selection: Option<Box<sqlparser::ast::Expr>>,
+    },
+}
+
+/// TD-DML-3: the `ON CONFLICT` clause of an `INSERT`.
+#[derive(Debug, Clone)]
+pub struct OnConflictClause {
+    /// Which unique constraint(s) arbitrate.
+    pub target: OnConflictTarget,
+    /// What happens to a conflicting row.
+    pub action: OnConflictAction,
+    /// Qualifier naming the existing row in `DO UPDATE` expressions: the
+    /// `INSERT INTO t AS alias` alias when given, else the table name.
+    pub target_qualifier: String,
+    /// The caller the statement runs for, when the protocol knows one. Under
+    /// `abac-policy` a `DO UPDATE` must be able to SEE the conflicting row
+    /// (PostgreSQL: the UPDATE `USING` policy, else 42501). Set by the
+    /// protocol surface after parsing; `None` ⇒ an internal statement.
+    pub caller_identity: Option<proximadb_runtime::OwnedPortIdentity>,
+}
+
+/// TD-DML-3: a `DO UPDATE` bound against the table — each expression lowered
+/// to the canonical relational [`proximadb_relational_types::Expr`] over the
+/// row `existing ++ proposed` (see `lower_on_conflict_expr`).
+struct BoundOnConflictUpdate {
+    assignments: Vec<(String, proximadb_relational_types::Expr)>,
+    selection: Option<proximadb_relational_types::Expr>,
+}
+
+/// TD-DML-3: an existing row read for UPDATE / DO UPDATE / arbitration.
+enum ExistingRow {
+    /// The full canonical envelope — preserves the TTL, every vector column
+    /// and every non-column prop across an update.
+    Envelope(Box<ProximaRecord>),
+    /// The `get_by_key` projection, for stores without envelope reads (lossy).
+    Projection(RichSearchResult),
+}
+
+impl ExistingRow {
+    /// The row's oid (its identity).
+    fn id(&self) -> &str {
+        match self {
+            Self::Envelope(record) => &record.oid,
+            Self::Projection(projection) => &projection.id,
+        }
+    }
+}
+
+/// TD-DML-3: whether a key holds a row (mandate #16a: dead rows hold nothing).
+enum RowState {
+    Live(ExistingRow),
+    Dead,
+    Absent,
 }
 
 /// SQL value literals for DML operations
@@ -885,14 +937,18 @@ impl ParentTableResolver for CatalogManagerParentResolver {
 }
 
 /// Which row-producing statement `enforce_row_write_constraints` runs for
-/// (TD-DML-1): INSERT and UPSERT share one enforcement sequence and differ only
-/// in what a live PK holder means.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RowWriteConstraintMode {
-    /// A live PK holder is a duplicate (23505).
+/// (TD-DML-1): INSERT and `INSERT … ON CONFLICT` share one enforcement
+/// sequence and differ only in the rows the statement rewrites in place.
+#[derive(Debug, Clone, Copy)]
+enum RowWriteConstraintMode<'a> {
+    /// Every record is a new row: a live PK holder is a duplicate (23505).
     Insert,
-    /// A live PK holder is the row being replaced.
-    Upsert,
+    /// TD-DML-3: records whose oid is in `updated` are existing rows rewritten
+    /// by `DO UPDATE` (their PK is already held; their old UNIQUE values are
+    /// vacated); every other record is a new row, exactly as for `Insert`.
+    OnConflict {
+        updated: &'a std::collections::HashSet<String>,
+    },
 }
 
 /// DML Service for executing DML statements
@@ -912,6 +968,12 @@ pub struct DmlService {
     /// a store is wired only at the composition root under the `oltp-integrity`
     /// feature, so default builds are behaviorally unchanged.
     conditional_key_store: Option<Arc<dyn proximadb_storage_ports::ConditionalKeyStore>>,
+    /// The write-lease authority the live delete publisher consults
+    /// immediately before its successor CAS (the visibility fence contract's
+    /// phase-3 lease, gate 4: a pod that lost its lease cannot publish).
+    /// `None` (the default) ⇒ no lease check — embedded and single-pod
+    /// deployments, the same posture as DDL's inert wiring.
+    publish_lease: Option<Arc<crate::services::write_lease::WriteLeaseAuthority>>,
     /// FA-c Phase 2: optional ABAC enforcer. When present (behind `abac-policy`)
     /// and a client subject is supplied at a read boundary, relational scans
     /// filter rows by the subject's policy. Absent by default.
@@ -985,28 +1047,12 @@ impl crate::query::execution::olap_delta_merge::OlapDeltaSource for DmlService {
         // by the bare name (legacy) OR the stable object_id (post-cutover), so we
         // union both. With the object_id-first design this is the path that lets the
         // tenant predicate drop out at O4 (object_id is globally unique).
-        let mut oids: std::collections::HashSet<String> = self
-            .record_store
-            .read_changes_since_scoped(table, tenant, snapshot_lsn)
-            .await?
-            .into_iter()
-            .map(|c| c.key)
-            .collect();
-        if let Ok((schema, _)) = self.resolve_select_table(table, tenant).await
-            && let Some(oid) = schema.object_id
-        {
-            let oid_key = oid.to_string();
-            if oid_key != table {
-                for c in self
-                    .record_store
-                    .read_changes_since_scoped(&oid_key, tenant, snapshot_lsn)
-                    .await?
-                {
-                    oids.insert(c.key);
-                }
-            }
-        }
-        Ok(oids.into_iter().collect())
+        let object_id = match self.resolve_select_table(table, tenant).await {
+            Ok((schema, _)) => schema.object_id,
+            Err(_) => None,
+        };
+        self.changed_oids_under(table, object_id, snapshot_lsn, tenant)
+            .await
     }
 
     async fn current_records(
@@ -1079,6 +1125,153 @@ impl crate::query::execution::native_table_provider::NativeTableSource for DmlSe
             .collect();
         Ok(Some((schema, records)))
     }
+
+    async fn layer_a_snapshot(
+        &self,
+        table: &str,
+        tenant: Option<&str>,
+        identity: PortIdentity<'_>,
+    ) -> anyhow::Result<Option<crate::services::layer_a_snapshot::NativeLayerASnapshot>> {
+        use crate::services::layer_a_snapshot::NativeLayerASnapshot;
+        let tenant_ctx = tenant.map(TenantContext::for_tenant_id);
+        let (schema, _table_id, access) = self
+            .relational_read_prelude(table, tenant_ctx.as_ref(), identity)
+            .await?;
+        // Denied: the table is empty for this caller, and no partition is read.
+        let Some(access) = access else {
+            return Ok(Some(NativeLayerASnapshot {
+                schema,
+                snapshot: None,
+                access: LayerARowAccess::Unrestricted,
+            }));
+        };
+        let Some(snapshot) = self
+            .record_store
+            .layer_a_snapshot(
+                &schema,
+                tenant_ctx.as_ref(),
+                #[cfg(feature = "abac-policy")]
+                &ReadContext::system(SystemReadReason::Statistics, "dml [CLIENT-PLACEHOLDER]"),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(NativeLayerASnapshot {
+            schema,
+            snapshot: Some(snapshot),
+            access,
+        }))
+    }
+}
+
+/// What a transaction statement's op-lock set must cover beyond its target
+/// table ([`DmlService::transaction_op_lock_set`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxnLockScope {
+    /// INSERT / UPSERT, or an UPDATE of no UNIQUE column: the target only.
+    Target,
+    /// DELETE: the ON DELETE cascade closure.
+    DeleteCascade,
+    /// UPDATE / UPSERT writing these columns (empty = every column, as an
+    /// UPSERT's whole-row replace does): the children referencing any of them
+    /// through a UNIQUE set (TD-RELIDEQ-2, ON UPDATE NO ACTION).
+    UpdateColumns(Vec<String>),
+}
+
+/// TD-110 / TD-RELIDEQ-2: the child tables (anywhere in the tenant's namespace
+/// subtree) whose FOREIGN KEY references `parent_id`'s declared key or one of
+/// its UNIQUE sets, in full and in order. Self-references are excluded.
+async fn child_references(
+    catalog_manager: &CatalogManager,
+    catalog: &Arc<dyn crate::catalog::Catalog>,
+    parent_id: &crate::catalog::TableIdentifier,
+    parent_schema: &CatalogTableSchema,
+    tenant: Option<&str>,
+) -> Result<Vec<ChildReference>> {
+    // Nothing can reference a table with neither a declared key nor a UNIQUE
+    // set — skip the tenant-wide catalog walk (review m3).
+    if crate::services::record_store::schema_declared_primary_key_columns(parent_schema).is_empty()
+        && crate::services::record_store::schema_unique_column_sets(parent_schema).is_empty()
+    {
+        return Ok(Vec::new());
+    }
+    // TD-110 S3: enumerate candidate children across the tenant's WHOLE
+    // namespace subtree (not just the parent's namespace), so a child living
+    // in another namespace whose FK references this parent is found. Scoped
+    // to the tenant (`Some([tenant])`) to keep child discovery intra-tenant;
+    // cross-tenant children are never enumerated. The per-child reference
+    // match below still requires the FK to resolve to THIS parent (name AND
+    // namespace), so a same-named table in another namespace never matches.
+    let tenant_scope = tenant.map(|t| vec![t.to_string()]);
+    let sibling_ids = catalog
+        .list_all_tables_in_scope(tenant_scope.as_deref())
+        .await?;
+    let mut out = Vec::new();
+    for child_id in sibling_ids {
+        if child_id.name == parent_id.name && child_id.namespace == parent_id.namespace {
+            continue; // Self-referencing FK on the same table: out of scope.
+        }
+        let child_schema = catalog.get_table(&child_id).await?;
+        for constraint in &child_schema.relational_capabilities.constraints {
+            let proximadb_catalog::ColumnConstraint::ForeignKey {
+                columns,
+                references_table,
+                references_columns,
+                on_delete,
+                on_update,
+            } = constraint
+            else {
+                continue;
+            };
+            if columns.len() != references_columns.len() {
+                continue; // Malformed FK (mismatched arities): skip.
+            }
+            // Does this FK reference `parent_id`? Resolve under the SAME
+            // tenant scope so cross-tenant FKs never match.
+            let Ok((_, referenced_id)) = catalog_manager
+                .resolve_table_scoped(references_table, tenant)
+                .await
+            else {
+                continue;
+            };
+            if referenced_id.name != parent_id.name
+                || referenced_id.namespace != parent_id.namespace
+            {
+                continue;
+            }
+            // Only FKs referencing the parent's full declared key or a full
+            // UNIQUE set (in order) are enforced (TD-RELIDEQ-2).
+            let Some(referenced_key) = crate::services::referential::resolve_referenced_key(
+                parent_schema,
+                references_columns,
+            ) else {
+                continue;
+            };
+            out.push(ChildReference {
+                child_id: child_id.clone(),
+                child_schema: child_schema.clone(),
+                fk_columns: columns.clone(),
+                references_columns: references_columns.clone(),
+                referenced_key,
+                on_delete: *on_delete,
+                on_update: *on_update,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// TD-110 / TD-RELIDEQ-2: a child table's FOREIGN KEY onto a parent, and how
+/// its referenced columns identify the parent row.
+struct ChildReference {
+    child_id: crate::catalog::TableIdentifier,
+    child_schema: CatalogTableSchema,
+    fk_columns: Vec<String>,
+    references_columns: Vec<String>,
+    referenced_key: crate::services::referential::ReferencedKey,
+    on_delete: Option<proximadb_catalog::ReferentialAction>,
+    on_update: Option<proximadb_catalog::ReferentialAction>,
 }
 
 impl DmlService {
@@ -1187,6 +1380,7 @@ impl DmlService {
             table_write_executor,
             dml_lock_service: None,
             conditional_key_store: None,
+            publish_lease: None,
             #[cfg(feature = "abac-policy")]
             abac_enforcer: None,
             held_op_locks: None,
@@ -1212,6 +1406,7 @@ impl DmlService {
             table_write_executor: self.table_write_executor.clone(),
             dml_lock_service: self.dml_lock_service.clone(),
             conditional_key_store: self.conditional_key_store.clone(),
+            publish_lease: self.publish_lease.clone(),
             #[cfg(feature = "abac-policy")]
             abac_enforcer: self.abac_enforcer.clone(),
             held_op_locks: Some(Arc::new(held_op_locks)),
@@ -1313,17 +1508,19 @@ impl DmlService {
     }
 
     /// The op-lock set a transaction touching `tables` must hold: each table
-    /// plus its ON DELETE cascade closure, resolved in each entry's tenant scope.
+    /// plus what its statement walks ([`TxnLockScope`]), resolved in each
+    /// entry's tenant scope.
     pub async fn transaction_op_lock_set(
         &self,
-        tables: &[(String, Option<TenantContext>, bool)],
+        tables: &[(String, Option<TenantContext>, TxnLockScope)],
     ) -> Result<std::collections::HashSet<TableIdentifier>> {
         let mut set = std::collections::HashSet::new();
-        // The bool asks for the ON DELETE cascade closure — only DELETE walks
-        // it; INSERT/UPDATE/UPSERT hold just their target (`ensure_held` fails
-        // closed if that is ever too small). Skipping it avoids a tenant-wide
-        // catalog scan per statement (review S4a F7).
-        for (table_name, tenant_context, with_cascade_closure) in tables {
+        // Only DELETE walks the ON DELETE cascade closure, and only an UPDATE of
+        // a UNIQUE column its referencing children; everything else holds just
+        // its target (`ensure_held` fails closed if that is ever too small).
+        // Skipping the walk avoids a tenant-wide catalog scan per statement
+        // (review S4a F7).
+        for (table_name, tenant_context, scope) in tables {
             let (catalog, table_id) = self
                 .catalog_manager
                 .resolve_table_scoped(
@@ -1331,18 +1528,37 @@ impl DmlService {
                     tenant_context.as_ref().map(|t| t.tenant_id.as_str()),
                 )
                 .await?;
-            if *with_cascade_closure && catalog.table_exists(&table_id).await? {
+            if !matches!(scope, TxnLockScope::Target) && catalog.table_exists(&table_id).await? {
                 let schema = catalog.get_table(&table_id).await?;
-                for (namespace, name) in self
-                    .discover_cascade_child_set(
-                        &catalog,
-                        &table_id,
-                        &schema,
-                        tenant_context.as_ref(),
-                    )
-                    .await?
-                {
-                    set.insert(TableIdentifier { namespace, name });
+                match scope {
+                    TxnLockScope::Target => {}
+                    TxnLockScope::DeleteCascade => {
+                        for (namespace, name) in self
+                            .discover_cascade_child_set(
+                                &catalog,
+                                &table_id,
+                                &schema,
+                                tenant_context.as_ref(),
+                            )
+                            .await?
+                        {
+                            set.insert(TableIdentifier { namespace, name });
+                        }
+                    }
+                    TxnLockScope::UpdateColumns(columns) => {
+                        for child in self
+                            .children_referencing_columns(
+                                &catalog,
+                                &table_id,
+                                &schema,
+                                columns,
+                                tenant_context.as_ref(),
+                            )
+                            .await?
+                        {
+                            set.insert(child.child_id);
+                        }
+                    }
                 }
             }
             set.insert(table_id);
@@ -1417,6 +1633,155 @@ impl DmlService {
     ) -> Self {
         self.conditional_key_store = Some(store);
         self
+    }
+
+    /// Wire the write-lease authority the live delete publisher consults
+    /// before its successor CAS (the fence contract's gate 4). The SAME
+    /// authority value DDL consults, so the publication lanes cannot
+    /// disagree about who may publish.
+    pub fn with_publish_lease(
+        mut self,
+        lease: Arc<crate::services::write_lease::WriteLeaseAuthority>,
+    ) -> Self {
+        self.publish_lease = Some(lease);
+        self
+    }
+
+    /// Mutating setter for the publish lease — pgwire builds a fresh
+    /// per-connection `DmlService` and attaches the authority after
+    /// assembly (mirroring `DdlService::set_write_lease_authority`); the
+    /// connection owns the Arc uniquely, so `Arc::get_mut` applies.
+    pub fn set_publish_lease(
+        &mut self,
+        lease: Arc<crate::services::write_lease::WriteLeaseAuthority>,
+    ) {
+        self.publish_lease = Some(lease);
+    }
+
+    /// TD-DML-3: the fenced-store identity of a primary-key tuple, scoped by
+    /// the SESSION tenant (the partition the row lives in). DML records carry
+    /// an empty `tenant_id`, so keying on the record alone made two tenants'
+    /// same-named tables share one PK fence.
+    fn cks_identity(
+        tenant_context: Option<&TenantContext>,
+        record_tenant: &str,
+        table: &str,
+        values: &[ProximaValue],
+    ) -> Result<proximadb_storage_ports::Identity> {
+        let tenant = tenant_context
+            .map(|tc| tc.tenant_id.as_str())
+            .filter(|tenant| !tenant.is_empty())
+            .unwrap_or(record_tenant);
+        Ok(proximadb_storage_ports::Identity::from_bytes(
+            proximadb_data_model::key_codec::encode_identity(tenant, table, values)?,
+        ))
+    }
+
+    /// TD-DML-3: startup reconciliation of fenced PK claims against the record
+    /// store (run after WAL replay) — releases every claim whose row does not
+    /// exist and whose write is provably not durable, or whose table no longer
+    /// exists. A claim that cannot be routed or checked is kept (fail closed).
+    /// Returns the number of claims released. No-op without a CKS or when the
+    /// CKS backend cannot enumerate its claims.
+    pub async fn reconcile_conditional_key_claims(&self) -> Result<usize> {
+        let Some(cks) = &self.conditional_key_store else {
+            return Ok(0);
+        };
+        let Some(claims) = cks.live_claims().await? else {
+            return Ok(0);
+        };
+        let mut released = 0usize;
+        for (id, oid) in claims {
+            let Ok((tenant, table)) =
+                proximadb_data_model::key_codec::decode_identity_scope(id.as_bytes())
+            else {
+                continue;
+            };
+            let tenant_scope = (!tenant.is_empty()).then_some(tenant.as_str());
+            let Ok((catalog, table_id)) = self
+                .catalog_manager
+                .resolve_table_scoped(&table, tenant_scope)
+                .await
+            else {
+                continue;
+            };
+            let release = match catalog.table_exists(&table_id).await {
+                Ok(false) => true,
+                Ok(true) => {
+                    let schema = catalog.get_table(&table_id).await?;
+                    let tenant_context = tenant_scope.map(TenantContext::for_tenant_id);
+                    matches!(
+                        self.row_state(&schema, &table_id, &oid.0, tenant_context.as_ref())
+                            .await?,
+                        RowState::Absent
+                    ) && self
+                        .record_store
+                        .durable_row_write(&schema, &oid.0, tenant_context.as_ref())
+                        .await?
+                        != Some(true)
+                }
+                Err(_) => false,
+            };
+            if release {
+                cks.tombstone(&id, proximadb_storage_ports::Generation(0))
+                    .await?;
+                released += 1;
+            }
+        }
+        if released > 0 {
+            info!(
+                released,
+                "released fenced PK claims whose rows do not exist"
+            );
+        }
+        Ok(released)
+    }
+
+    /// TD-DML-3 (`abac-policy`): a `DO UPDATE` may only rewrite a conflicting
+    /// row the caller can see (PostgreSQL's UPDATE `USING` check, 42501).
+    #[cfg(feature = "abac-policy")]
+    fn check_on_conflict_update_visible(
+        &self,
+        identity: Option<&proximadb_runtime::OwnedPortIdentity>,
+        table_schema: &CatalogTableSchema,
+        existing: &ExistingRow,
+    ) -> Result<()> {
+        use crate::security::rls::AbacScanResult;
+        let Some(identity) = identity else {
+            return Ok(()); // internal statement: no caller policy applies
+        };
+        let denied = || -> anyhow::Error {
+            RelationalConstraintViolation::new(
+                RelationalConstraintKind::InsufficientPrivilege,
+                format!(
+                    "new row violates row-level security policy (USING expression) for table \"{}\": ON CONFLICT DO UPDATE cannot update a conflicting row the caller cannot see",
+                    table_schema.name
+                ),
+            )
+            .into()
+        };
+        match self.abac_row_filter(identity.as_borrowed(), table_schema) {
+            None | Some(AbacScanResult::Unrestricted) => Ok(()),
+            Some(AbacScanResult::Denied(_)) => Err(denied()),
+            Some(AbacScanResult::Restricted(visible)) => {
+                let admitted = match existing {
+                    ExistingRow::Envelope(record) => visible(record),
+                    ExistingRow::Projection(projection) => {
+                        let mut record = ProximaRecord {
+                            oid: projection.id.clone(),
+                            ..ProximaRecord::default()
+                        };
+                        for (key, value) in &projection.props {
+                            record
+                                .props
+                                .insert(key.clone(), ProximaTreeNode::Value(value.clone()));
+                        }
+                        visible(&record)
+                    }
+                };
+                if admitted { Ok(()) } else { Err(denied()) }
+            }
+        }
     }
 
     /// T4.1: Get the canonical table-record store.
@@ -1512,18 +1877,10 @@ impl DmlService {
                 table_name,
                 columns,
                 values,
-                conflict_columns,
-                update_assignments,
+                on_conflict,
             } => {
-                self.execute_upsert(
-                    &table_name,
-                    &columns,
-                    values,
-                    &conflict_columns,
-                    update_assignments,
-                    tenant_context,
-                )
-                .await?
+                self.execute_upsert(&table_name, &columns, values, &on_conflict, tenant_context)
+                    .await?
             }
             DmlStatement::InsertSelect { plan, columns }
             | DmlStatement::InsertOverwrite { plan, columns } => {
@@ -1756,6 +2113,21 @@ impl DmlService {
         })
     }
 
+    /// The columns a legacy single-table SELECT returns, resolved exactly as
+    /// [`Self::select_table_records_with_projection_where`] and
+    /// [`Self::select_table_records_with_projection`] resolve them, without
+    /// scanning a row. pgwire's extended protocol uses it to answer
+    /// `Describe` with the shape `Execute` will stream (TD-PGEXT-1).
+    pub async fn describe_select_columns(
+        &self,
+        table_name: &str,
+        projection_column_names: &[String],
+        tenant: Option<&str>,
+    ) -> Result<Vec<CatalogColumn>> {
+        let (table_schema, _) = self.resolve_select_table(table_name, tenant).await?;
+        Self::resolve_select_projection(&table_schema, projection_column_names)
+    }
+
     /// Select current visible records for a catalog table using the same faithful
     /// boolean [`WhereClause`] IR that UPDATE/DELETE use — so OR / mixed-AND-OR /
     /// grouped SELECT predicates push into the scan instead of degrading to a full
@@ -1925,27 +2297,65 @@ impl DmlService {
         Some(enforcer.predicate_for(&subject, tenant, target))
     }
 
-    /// Scan a catalog table for the relational pipeline (PATH B), pushing the
-    /// caller's row predicate + limit into the record-store scan and projecting
-    /// matching records into `output_columns` order (or all columns when `None`).
-    ///
-    /// The predicate is `Expr`-agnostic: callers pass a closure over a FULL row
-    /// (all columns in `schema.columns` order — matching how the relational
-    /// `Expr` binds its column ordinals), so the relational reader can supply
-    /// `|row| expr.eval(row) == true` without coupling DmlService to the algebra
-    /// crate. `MemtableRecordStorage::scan_records_filtered` iterate-filters and
-    /// early-stops at `limit`, so only matching rows are cloned/materialized.
-    pub async fn scan_table_relational(
+    /// Every visible record of a relational table as a bounded-memory, ordered
+    /// chunk stream (P2.4): strictly ascending `oid`, each once, chunks of at
+    /// most `chunk_rows`, the caller's ABAC row access applied per chunk. Returns
+    /// the resolved catalog schema with it. Records keep their real `oid`;
+    /// project them with [`Self::project_one_record`] for column-ordered values.
+    pub async fn scan_table_records_chunked(
         &self,
         table_name: &str,
-        output_columns: Option<&[String]>,
-        full_row_predicate: Option<
-            &(dyn Fn(&[ProximaValue]) -> Result<bool, ExprError> + Send + Sync),
-        >,
-        limit: Option<usize>,
+        chunk_rows: usize,
         tenant_context: Option<&TenantContext>,
         identity: PortIdentity<'_>,
-    ) -> Result<(CatalogTableSchema, Vec<Vec<ProximaValue>>)> {
+    ) -> Result<(
+        CatalogTableSchema,
+        proximadb_records::chunked::RecordChunkStream<'static>,
+    )> {
+        let (table_schema, table_id_name, access) = self
+            .relational_read_prelude(table_name, tenant_context, identity)
+            .await?;
+        let Some(access) = access else {
+            let empty: proximadb_records::chunked::RecordChunkStream<'static> =
+                Box::pin(futures::stream::empty());
+            return Ok((table_schema, empty));
+        };
+        let chunks = self.record_store.clone().scan_records_chunked(
+            table_schema.clone(),
+            TableRecordScanRequest {
+                filter: None,
+                table_id: table_id_name,
+                limit: None,
+                include_vector: true,
+                include_props: true,
+            },
+            chunk_rows,
+            tenant_context.cloned(),
+        );
+        let chunks = match access {
+            LayerARowAccess::Unrestricted => chunks,
+            LayerARowAccess::Restricted(keep) => {
+                proximadb_records::chunked::filter_chunks(chunks, move |r| keep(r))
+            }
+        };
+        Ok((table_schema, chunks))
+    }
+
+    /// The governed-read prelude every relational read of a catalog table runs
+    /// before touching rows: the identity/storage tenant cross-check, table
+    /// resolution, and the ABAC row filter (FA-c Phase 2).
+    ///
+    /// Returns the schema, the resolved table id, and the caller's row access —
+    /// `None` when the subject is denied every row. Shared by
+    /// [`Self::scan_table_relational`] and the Layer A snapshot, so the
+    /// streaming provider cannot drift from the materialized scan on who may
+    /// see what.
+    async fn relational_read_prelude(
+        &self,
+        table_name: &str,
+        tenant_context: Option<&TenantContext>,
+        identity: PortIdentity<'_>,
+    ) -> Result<(CatalogTableSchema, String, Option<LayerARowAccess>)> {
         if identity.subject.is_some() {
             let identity_tenant = identity.tenant_id.ok_or_else(|| {
                 anyhow!("governed relational identity is missing its tenant string")
@@ -1972,6 +2382,48 @@ impl DmlService {
         let (table_schema, table_id_name) = self
             .resolve_select_table(table_name, tenant_context.map(|t| t.tenant_id.as_str()))
             .await?;
+        #[cfg(feature = "abac-policy")]
+        let access = match self.abac_row_filter(identity, &table_schema) {
+            None | Some(crate::security::rls::AbacScanResult::Unrestricted) => {
+                Some(LayerARowAccess::Unrestricted)
+            }
+            Some(crate::security::rls::AbacScanResult::Restricted(p)) => {
+                Some(LayerARowAccess::Restricted(p))
+            }
+            Some(crate::security::rls::AbacScanResult::Denied(_)) => None,
+        };
+        #[cfg(not(feature = "abac-policy"))]
+        let access = {
+            let _ = identity;
+            Some(LayerARowAccess::Unrestricted)
+        };
+        Ok((table_schema, table_id_name, access))
+    }
+
+    /// Scan a catalog table for the relational pipeline (PATH B), pushing the
+    /// caller's row predicate + limit into the record-store scan and projecting
+    /// matching records into `output_columns` order (or all columns when `None`).
+    ///
+    /// The predicate is `Expr`-agnostic: callers pass a closure over a FULL row
+    /// (all columns in `schema.columns` order — matching how the relational
+    /// `Expr` binds its column ordinals), so the relational reader can supply
+    /// `|row| expr.eval(row) == true` without coupling DmlService to the algebra
+    /// crate. `MemtableRecordStorage::scan_records_filtered` iterate-filters and
+    /// early-stops at `limit`, so only matching rows are cloned/materialized.
+    pub async fn scan_table_relational(
+        &self,
+        table_name: &str,
+        output_columns: Option<&[String]>,
+        full_row_predicate: Option<
+            &(dyn Fn(&[ProximaValue]) -> Result<bool, ExprError> + Send + Sync),
+        >,
+        limit: Option<usize>,
+        tenant_context: Option<&TenantContext>,
+        identity: PortIdentity<'_>,
+    ) -> Result<(CatalogTableSchema, Vec<Vec<ProximaValue>>)> {
+        let (table_schema, table_id_name, access) = self
+            .relational_read_prelude(table_name, tenant_context, identity)
+            .await?;
         // Full column set — predicates are evaluated against a complete row.
         let all_columns: Vec<String> = table_schema
             .columns
@@ -1985,21 +2437,12 @@ impl DmlService {
             None => full_selected.clone(),
         };
 
-        // FA-c Phase 2: resolve the ABAC row filter EARLY (before the predicate
-        // borrow, so the deny short-circuit can move `table_schema`). A denied
-        // (or fail-closed) subject sees zero rows.
-        #[cfg(feature = "abac-policy")]
-        let abac_pred: Option<Box<dyn Fn(&ProximaRecord) -> bool + Send + Sync>> =
-            match self.abac_row_filter(identity, &table_schema) {
-                None => None,
-                Some(crate::security::rls::AbacScanResult::Denied(_)) => {
-                    return Ok((table_schema, Vec::new()));
-                }
-                Some(crate::security::rls::AbacScanResult::Restricted(p)) => Some(p),
-                Some(crate::security::rls::AbacScanResult::Unrestricted) => None,
-            };
-        #[cfg(not(feature = "abac-policy"))]
-        let _ = identity;
+        // FA-c Phase 2: a denied (or fail-closed) subject sees zero rows.
+        let abac_pred = match access {
+            None => return Ok((table_schema, Vec::new())),
+            Some(LayerARowAccess::Unrestricted) => None,
+            Some(LayerARowAccess::Restricted(p)) => Some(p),
+        };
 
         // Push the predicate INTO the store scan: project each record to a full
         // row and apply the caller's full-row predicate. The scan-predicate API is
@@ -2028,14 +2471,10 @@ impl DmlService {
             }
         };
         // FA-c Phase 2: AND-combine the ABAC row filter with the user predicate.
-        #[cfg(feature = "abac-policy")]
         let combined_pred = move |record: &ProximaRecord| -> bool {
             record_pred(record) && abac_pred.as_ref().is_none_or(|p| p(record))
         };
-        #[cfg(feature = "abac-policy")]
         let predicate: Option<&proximadb_records::RecordScanPredicate<'_>> = Some(&combined_pred);
-        #[cfg(not(feature = "abac-policy"))]
-        let predicate: Option<&proximadb_records::RecordScanPredicate<'_>> = Some(&record_pred);
 
         let records = self
             .record_store
@@ -2209,20 +2648,7 @@ impl DmlService {
                     })
             })
             .collect::<Result<Vec<_>>>()?;
-        let kernel_metric = match metric {
-            proximadb_distance_types::DistanceMetric::L2 => {
-                proximadb_distance_kernel::DistanceMetric::Euclidean
-            }
-            proximadb_distance_types::DistanceMetric::Cosine => {
-                proximadb_distance_kernel::DistanceMetric::Cosine
-            }
-            proximadb_distance_types::DistanceMetric::InnerProduct => {
-                proximadb_distance_kernel::DistanceMetric::DotProduct
-            }
-            proximadb_distance_types::DistanceMetric::L1 => {
-                proximadb_distance_kernel::DistanceMetric::Manhattan
-            }
-        };
+        let kernel_metric = kernel_distance_metric(metric);
         let distance =
             proximadb_distance_kernel::engine::UnifiedDistanceCompute::new(kernel_metric);
         let mut results = proximadb_search_types::bounded_queue::BoundedPriorityQueue::new(top_k);
@@ -2319,31 +2745,35 @@ impl DmlService {
         Ok(Some(results))
     }
 
-    /// Materialize a relational table's current rows as a Parquet snapshot on object
-    /// storage and flip its catalog storage layout to `Parquet` /
-    /// `ProjectionPublication`, so the OLAP router's `catalog_table_is_parquet_backed`
-    /// check passes and SELECTs over the table route to DataFusion.
-    ///
-    /// This is the explicit-publish half of the dual-path design (course-correction
-    /// §6 P3): OLTP rows stay authoritative in RecordStorage; this publishes a
-    /// read-optimized Parquet projection of the current snapshot. It is triggered
-    /// explicitly (e.g. `ALTER TABLE … MATERIALIZE`), not on every write.
-    ///
-    /// `bridge` is the object store to write into; `warehouse_root_url` is the URL the
-    /// OLAP reader reopens that same physical store from, so the published
-    /// `location = {warehouse_root_url}/{tenant-isolated prefix}` resolves back to the
-    /// data the reader lists as `{location}/data/*.parquet`. Returns the published
-    /// `location`.
-    ///
-    /// MVP scope: a single Parquet object per materialization (full overwrite
-    /// snapshot), schema inferred from the rows. Incremental/atomic manifest
-    /// publication (`IcebergObjectStoreBridge::publish_snapshot`) and the
-    /// catalog-authoritative write schema are follow-ups.
     /// Build a relational `ProximaRecord` from a full column-ordered value row:
     /// every non-NULL column lands in `props` keyed by name (the warehouse
     /// materializer's record shape). Shared by `MATERIALIZE` (cold base) and the
     /// ADR-025 OLAP read-merge (live appends) so both encode identically through
     /// `proxima_records_to_record_batch`.
+    /// ADR-097 P3.1: `record` as the relational row native SQL serves — every
+    /// catalog column materialized in `props` (the shape
+    /// `proxima_records_to_record_batch` expects), built exactly as
+    /// [`NativeTableSource::full_table_records`] builds it, so the streaming
+    /// Layer A provider and the materialized path cannot disagree on a value.
+    ///
+    /// `None` when the row cannot be projected (an unparsable primary-key oid),
+    /// which `scan_table_relational`'s predicate likewise treats as no match.
+    /// `col_names` is `schema`'s column names, in order.
+    ///
+    /// [`NativeTableSource::full_table_records`]: crate::query::execution::native_table_provider::NativeTableSource::full_table_records
+    pub(crate) fn relational_record_for(
+        record: &ProximaRecord,
+        schema: &CatalogTableSchema,
+        col_names: &[String],
+    ) -> Option<ProximaRecord> {
+        let row = Self::project_one_record(record, schema, &schema.columns).ok()?;
+        Some(Self::value_row_to_relational_record(
+            &record.oid,
+            col_names,
+            row,
+        ))
+    }
+
     pub(crate) fn value_row_to_relational_record(
         oid: &str,
         col_names: &[String],
@@ -2362,6 +2792,29 @@ impl DmlService {
         rec
     }
 
+    /// Materialize a relational table's current rows as a Parquet snapshot on object
+    /// storage and flip its catalog storage layout to `Parquet` /
+    /// `ProjectionPublication`, so the OLAP router's `catalog_table_is_parquet_backed`
+    /// check passes and SELECTs over the table route to DataFusion.
+    ///
+    /// This is the explicit-publish half of the dual-path design (course-correction
+    /// §6 P3): OLTP rows stay authoritative in RecordStorage; this publishes a
+    /// read-optimized Parquet projection of the current snapshot. It is triggered
+    /// explicitly (e.g. `ALTER TABLE … MATERIALIZE`), not on every write.
+    ///
+    /// `bridge` is the object store to write into; `warehouse_root_url` is the URL the
+    /// OLAP reader reopens that same physical store from, so the published
+    /// `location = {warehouse_root_url}/{tenant-isolated prefix}/data` resolves back to
+    /// the data files the snapshot's Iceberg manifest names. Returns the published
+    /// `location`.
+    ///
+    /// P2.4: a full rewrite in bounded memory. The rows stream from an ordered,
+    /// chunked scan; the cluster-key sort spills past its memory budget; the output
+    /// is multi-part (`{generation}-{nnnnn}.parquet`, sized by
+    /// `ParquetWritePolicy::target_file_*`); the Iceberg snapshot names exactly
+    /// those parts and is committed BEFORE the catalog layout flips, so no reader
+    /// is ever pointed at a generation without a manifest. Files of generations
+    /// older than the previous version are then deleted.
     pub async fn materialize_table_to_parquet(
         &self,
         bridge: &dyn ObjectStoreBridge,
@@ -2369,55 +2822,73 @@ impl DmlService {
         table_name: &str,
         tenant_context: Option<&TenantContext>,
     ) -> Result<String> {
-        // ADR-025: capture this table's WAL high-water LSN BEFORE snapshotting, so any
-        // write landing during/after the scan has a strictly greater LSN and is caught
-        // by the OLAP read-merge delta (`read_changes_since(.., snapshot_lsn)`). Sequence
-        // numbers are globally monotonic, so the table's own latest change LSN is a safe
-        // floor; a table with no changes yet snapshots at 0.
-        let snapshot_lsn = self
-            .record_store
-            .read_changes_since(table_name, 0)
-            .await
-            .map(|changes| changes.iter().map(|c| c.lsn).max().unwrap_or(0))
-            .unwrap_or(0);
+        self.materialize_table_to_parquet_fenced(
+            bridge,
+            warehouse_root_url,
+            table_name,
+            tenant_context,
+            &crate::services::ddl::NoPublishFence,
+        )
+        .await
+    }
 
-        // 1. Snapshot the table's current rows (all columns, no predicate/limit).
-        let (schema, rows) = self
-            .scan_table_relational(
+    /// [`Self::materialize_table_to_parquet`] with a fenced advance (P2.4):
+    ///
+    /// * one publication per table at a time in this process (a per-table
+    ///   publish lock held from before the snapshot LSN is captured to after the
+    ///   catalog flip);
+    /// * the Iceberg parent version is read before the scan, so a publication
+    ///   that another process committed meanwhile makes this commit's
+    ///   create-only CAS lose (an error, never a silent overwrite);
+    /// * `fence` is re-checked immediately before that commit;
+    /// * the catalog flip is forward-only: it never replaces a layout that
+    ///   already records a newer Iceberg metadata version.
+    pub async fn materialize_table_to_parquet_fenced(
+        &self,
+        bridge: &dyn ObjectStoreBridge,
+        warehouse_root_url: &str,
+        table_name: &str,
+        tenant_context: Option<&TenantContext>,
+        fence: &dyn crate::services::ddl::PublishFence,
+    ) -> Result<String> {
+        use futures::{SinkExt, StreamExt};
+
+        // Serialized per RESOLVED table with every other publisher (the live
+        // delete publisher, the bulk-append lane): see `publish_lock`.
+        let (_, publishing_id) = self
+            .catalog_manager
+            .resolve_table_scoped(table_name, tenant_context.map(|t| t.tenant_id.as_str()))
+            .await?;
+        let _publishing = materialize_stream::publish_lock(&publishing_id).await;
+
+        // ADR-025: capture the snapshot LSN BEFORE scanning, so any write landing
+        // during/after the scan has a strictly greater LSN and is caught by the OLAP
+        // read-merge delta (`read_changes_since(.., snapshot_lsn)`). The capture also
+        // pins the WAL above that LSN until the catalog records it below (TD-SEAM-12):
+        // until then nothing else stops truncation from removing that delta.
+        let snapshot = self.record_store.capture_snapshot_lsn(table_name).await?;
+        let snapshot_lsn = snapshot.lsn;
+
+        // 1. The table's current rows as an ordered, bounded chunk stream (P2.4):
+        //    nothing below holds more than a chunk of records at once.
+        let (schema, chunks) = self
+            .scan_table_records_chunked(
                 table_name,
-                None,
-                None,
-                None,
+                materialize_stream::scan_chunk_rows(),
                 tenant_context,
                 PortIdentity::anonymous(),
             )
             .await?;
 
-        // 2. Column-order ProximaValue rows → ProximaRecord envelopes (props keyed by
-        //    column name; relational tables carry no vectors). NULLs are omitted —
-        //    the schema-driven Arrow mapping null-fills any absent column. Reuses the
-        //    SAME builder as the OLAP read-merge appends so the cold base and the live
-        //    append rows encode identically (ADR-025).
-        let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-        let mut records: Vec<ProximaRecord> = rows
-            .into_iter()
-            .enumerate()
-            .map(|(i, row)| Self::value_row_to_relational_record(&i.to_string(), &col_names, row))
-            .collect();
-
-        // 2b. TD-OLAP-6: cluster the snapshot by the table's cluster key before
-        //     publication, so Parquet row groups carry tight min/max bounds and
-        //     zone-map / runtime-filter pruning can actually skip (the snapshot
-        //     scan otherwise discards row order — every row group spans the whole
-        //     domain, measured 0% skip in TPC_PERF_GATE_EVIDENCE_V2_2026_07_04).
-        //     Key resolution: explicit `cluster_key` table property, else the
-        //     first DATE/TIMESTAMP column (the dominant analytical access shape).
-        //     One sort at materialize time; ordering is reader-neutral
-        //     (mixed-read-safe) and NULL-keyed rows sort last.
+        // 2. TD-OLAP-6: cluster the snapshot by the table's cluster key before
+        //    publication, so Parquet row groups carry tight min/max bounds and
+        //    zone-map / runtime-filter pruning can actually skip (the snapshot
+        //    scan otherwise discards row order — every row group spans the whole
+        //    domain, measured 0% skip in TPC_PERF_GATE_EVIDENCE_V2_2026_07_04).
+        //    Key resolution: explicit `cluster_key` table property, else the
+        //    first DATE/TIMESTAMP column (the dominant analytical access shape).
+        //    Ordering is reader-neutral (mixed-read-safe); NULL keys sort last.
         let cluster_col = resolve_cluster_key(&schema);
-        if let Some(cluster_col) = &cluster_col {
-            records.sort_by_cached_key(|rec| cluster_sort_key(rec, cluster_col));
-        }
 
         // 3. Tenant-isolated object prefix (DrPathBuilder mandate: data/{tenant}/{ns}/{table}).
         //    NOTE (tracked tech-debt): this path does NOT yet route through
@@ -2457,34 +2928,545 @@ impl DmlService {
             schema.object_id,
         )?;
 
-        // 4. Write the snapshot under `{prefix}/data/` — exactly where the OLAP reader
-        //    lists `{location}/data/*.parquet`. Use the CATALOG-AUTHORITATIVE schema
-        //    (not record inference) so the file's columns/types/nullability match the
-        //    catalog exactly — including all-null columns inference would drop — and
-        //    `SELECT *` over the materialized table round-trips. The object `put` is
-        //    atomic, so a re-materialize swaps the snapshot without torn reads;
-        //    multi-file/versioned snapshots (via the atomic manifest committer) are a
-        //    follow-up that also needs manifest-aware reads.
-        let data_object = object_store::path::Path::from(format!("{prefix}/data/part-0.parquet"));
-        //    The cluster sort is declared as Parquet `sorting_columns`, and the
-        //    warehouse write policy adds the page index + spec SBBF Bloom filters.
-        let sort_columns: Vec<String> = cluster_col.into_iter().collect();
-        bridge
-            .write_records_to_parquet_with_layout(
-                &data_object,
-                &records,
-                &schema,
-                &sort_columns,
-                Some(tenant_id),
-            )
-            .await?;
+        // 4. Stream the rows into generation-named parts under `{prefix}/data/`, in
+        //    the CATALOG-AUTHORITATIVE schema (not record inference) so the files'
+        //    columns/types/nullability match the catalog exactly — including
+        //    all-null columns inference would drop. Each chunk is projected to the
+        //    full column set (a row that cannot be projected is skipped, as the
+        //    relational scan does), folded into the NDV sketches, encoded, and
+        //    handed to the sort/writer side over a bounded channel.
+        //    The Iceberg parent is fixed BEFORE the rows are read, and the parts are
+        //    named for the version this publication commits as (see
+        //    `generation_stem`): if another publisher commits meanwhile, the commit
+        //    below loses its create-only CAS rather than racing GC.
+        let metadata_prefix = format!("{prefix}/metadata");
+        let parent = bridge.latest_metadata_version(&metadata_prefix).await?;
+        // Native state is not synchronized with externally published DVs: a
+        // rewrite whose native read predates the DVs would resurrect hidden
+        // rows. The ONE safe relaxation (the visibility fence contract's
+        // guarantee 1): the rewrite may proceed when the DV parent IS the
+        // publication that recorded the layout's (metadata version, snapshot
+        // LSN) pair — the live delete publisher's own output — and the
+        // captured LSN is at or above the recorded one: every DV'd oid's
+        // tombstone is visible in the native read, so the rewritten parts
+        // cannot contain it. Any other DV parent (vectors published
+        // externally, or a publication whose layout flip did not land)
+        // leaves the recorded pair stale, and the refusal stands.
+        if let Some(version) = parent
+            && let parent_snapshot = bridge
+                .read_iceberg_snapshot_files(&metadata_prefix, version)
+                .await?
+            && !parent_snapshot.deletion_vectors.is_empty()
+        {
+            let recorded = catalog
+                .get_table(&table_id)
+                .await
+                .ok()
+                .and_then(|t| materialize_stream::recorded_publication(&t.storage_layouts));
+            let synchronized = recorded.is_some_and(|(recorded_version, recorded_lsn)| {
+                recorded_version == version && snapshot_lsn >= recorded_lsn
+            });
+            // Gate 5 (crash-gap recovery — the contract's "recovery is the
+            // LAYOUT FLIP, not a re-publication"): a publication whose CAS
+            // landed but whose flip was lost leaves the recorded pair one
+            // version behind and every later publication refusing forever.
+            // The adoption invariant (round-1 review, finding 4 — the
+            // stem is a MINTER proof, not a publication-identity proof): a
+            // `dv-live-*` Puffin is minted ONLY by this publisher's
+            // `write_deletion_vectors` call, and every vector it holds was
+            // published under the contract's phase ordering — phase 2 (the
+            // WAL tombstones) durable BEFORE the CAS that named it. A
+            // snapshot REFERENCE to such a Puffin can be acquired later
+            // (MATERIALIZE's append path re-carries DV manifests by
+            // reference; an external conformant engine could too), but the
+            // referenced vectors' deaths are WAL-durable regardless — so a
+            // rewrite captured now scans them dead in native state and
+            // adoption cannot resurrect. An external parent carrying ONLY
+            // its own (non-dv-live) vectors keeps the refusal. The
+            // incremental MATERIALIZE's `dv-mat-*` vectors qualify by the
+            // superseded-version argument instead (see `is_self_minted_dv`):
+            // native state holds every hidden row's newer version.
+            // Round-3 review (MAJOR-1): the predicate is ALL, not ANY — a
+            // MIXED parent (our dv-live vector re-referenced beside a
+            // foreign engine's own positional deletes) must keep the
+            // refusal: the foreign deletes have no WAL tombstones, so the
+            // adoption rewrite would resurrect them. Every legitimate
+            // adoption case carries ONLY dv-live vectors (this publisher's
+            // own snapshots mint exactly one unioned Puffin; the gate-3
+            // competitor and DV-manifest re-carries reference dv-live
+            // entries only).
+            let ours_orphaned = parent_snapshot
+                .deletion_vectors
+                .iter()
+                .all(|dv| materialize_stream::is_self_minted_dv(&dv.puffin_file));
+            // The version-matched case (recorded == parent, captured LSN
+            // below the recorded one — the same store-global inflight floor
+            // can lower THIS capture) is adoption-safe by the identical
+            // argument: the parent is ours, its tombstones are durable.
+            let ours_recorded =
+                recorded.is_some_and(|(recorded_version, _)| recorded_version == version);
+            if !synchronized {
+                if !(ours_orphaned || ours_recorded) {
+                    anyhow::bail!(
+                        "MATERIALIZE {table_name}: published snapshot has deletion vectors \
+                         and the native state is not synchronized with them (the DV parent \
+                         is not the recorded publication, or the captured LSN {snapshot_lsn} \
+                         predates its snapshot_lsn); native-state synchronization is \
+                         required before republication"
+                    );
+                }
+                info!(
+                    table = %table_name,
+                    parent_version = version,
+                    "MATERIALIZE: adopting the orphaned live-delete publication (its layout \
+                     flip was lost; its tombstones are durable by the fence's phase \
+                     ordering)"
+                );
+            }
+        }
+        let successor = parent.map_or(0, |p| p.saturating_add(1));
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let stem = materialize_stream::generation_stem(successor);
 
-        // 5. Flip the catalog layout to a published Parquet projection at the location.
+        // P2.4 slice 2: an insert-only republication appends its new rows as
+        // extra parts and carries the published files into the next snapshot,
+        // instead of rewriting the table (see `materialize_append`).
+        let mut carried: Vec<object_store::path::Path> = Vec::new();
+        let mut appended_rows: Option<Vec<ProximaRecord>> = None;
+        // Incremental update/delete (`AppendPlan::Delta`): the successor's
+        // deletion vectors, planned before any part is written.
+        let mut dv_plan: Option<materialize_dv_plan::DvPlan> = None;
+        if let (Some(previous), Some(max_rows)) =
+            (parent, materialize_append::configured_append_max_rows())
+        {
+            let location = Self::published_location(warehouse_root_url, &prefix);
+            match self
+                .plan_append(
+                    bridge,
+                    &catalog,
+                    &table_id,
+                    &schema,
+                    &location,
+                    &metadata_prefix,
+                    previous,
+                    snapshot_lsn,
+                    scope_tenant,
+                    max_rows,
+                    &materialize_stream::with_oid_field(
+                        proxima_records_to_record_batch(&[], &schema)?.schema(),
+                    ),
+                )
+                .await
+            {
+                Ok((materialize_append::AppendPlan::Append(oids), files)) => {
+                    use crate::query::execution::olap_delta_merge::OlapDeltaSource;
+                    match <Self as OlapDeltaSource>::current_records(
+                        self,
+                        table_name,
+                        &oids,
+                        scope_tenant,
+                    )
+                    .await
+                    {
+                        // Every new row was deleted again: nothing to publish,
+                        // and the published files are exact as of now.
+                        Ok((_, rows)) if rows.is_empty() => {
+                            self.advance_snapshot_lsn(
+                                &catalog,
+                                &table_id,
+                                previous,
+                                snapshot_lsn,
+                                &location,
+                                fence,
+                            )
+                            .await?;
+                            count_materialize_plan("unchanged");
+                            return Ok(location);
+                        }
+                        Ok((_, rows)) => {
+                            carried = files;
+                            appended_rows = Some(rows);
+                        }
+                        Err(e) => warn!(
+                            table = %table_name,
+                            "MATERIALIZE: reading the appended rows failed, rewriting: {e:#}"
+                        ),
+                    }
+                }
+                Ok((
+                    materialize_append::AppendPlan::Delta {
+                        oids,
+                        suspect_files,
+                        file_rows,
+                    },
+                    files,
+                )) => {
+                    match self
+                        .plan_incremental_delta(
+                            bridge,
+                            table_name,
+                            &metadata_prefix,
+                            previous,
+                            &files,
+                            &oids,
+                            &suspect_files,
+                            &file_rows,
+                            scope_tenant,
+                        )
+                        .await
+                    {
+                        // Nothing to publish: no live after-image and no
+                        // published position to hide (the probe's candidates
+                        // were Bloom false positives, or every change was an
+                        // insert-then-delete) — the files are exact as of now.
+                        Ok(Some((rows, plan))) if rows.is_empty() && plan.rewrite.is_empty() => {
+                            self.advance_snapshot_lsn(
+                                &catalog,
+                                &table_id,
+                                previous,
+                                snapshot_lsn,
+                                &location,
+                                fence,
+                            )
+                            .await?;
+                            count_materialize_plan("unchanged");
+                            return Ok(location);
+                        }
+                        Ok(Some((rows, plan))) => {
+                            carried = files;
+                            appended_rows = Some(rows);
+                            dv_plan = Some(plan);
+                        }
+                        Ok(None) => {
+                            info!(
+                                table = %table_name,
+                                "MATERIALIZE: full rewrite (deleted rows over the compaction bound)"
+                            );
+                        }
+                        Err(e) => warn!(
+                            table = %table_name,
+                            "MATERIALIZE: incremental delta planning failed, rewriting: {e:#}"
+                        ),
+                    }
+                }
+                Ok((materialize_append::AppendPlan::Unchanged, _)) => {
+                    // Nothing changed since the published snapshot: its files are
+                    // exact as of now, so only its LSN moves up (which also lets
+                    // WAL truncation pass the old one).
+                    self.advance_snapshot_lsn(
+                        &catalog,
+                        &table_id,
+                        previous,
+                        snapshot_lsn,
+                        &location,
+                        fence,
+                    )
+                    .await?;
+                    count_materialize_plan("unchanged");
+                    return Ok(location);
+                }
+                Ok((materialize_append::AppendPlan::Rewrite(reason), _)) => {
+                    info!(table = %table_name, "MATERIALIZE: full rewrite ({reason})");
+                }
+                Err(e) => {
+                    warn!(table = %table_name, "MATERIALIZE: append plan failed, rewriting: {e:#}");
+                }
+            }
+        }
+        let delta_without_rows =
+            dv_plan.is_some() && appended_rows.as_ref().is_some_and(|rows| rows.is_empty());
+        let data_dir = format!("{prefix}/data");
+        let full_columns = Self::resolve_select_projection(&schema, &[])?;
+        let col_names: Vec<String> = full_columns.iter().map(|c| c.name.clone()).collect();
+        let table_arrow_schema = proxima_records_to_record_batch(&[], &schema)?.schema();
+        let arrow_schema = materialize_stream::with_oid_field(table_arrow_schema);
+        // The cluster sort is declared as Parquet `sorting_columns`, and the
+        // warehouse write policy adds the page index + spec SBBF Bloom filters.
+        let sort_columns: Vec<String> = cluster_col.iter().cloned().collect();
+        let mut writer = MultipartParquetWriter::new(
+            bridge,
+            data_dir.as_str(),
+            stem.as_str(),
+            arrow_schema.clone(),
+            ParquetWritePolicy::from_env(),
+            ParquetLayoutHints {
+                sort_columns: sort_columns.clone(),
+            },
+        );
+        let mut ndv = NdvAccumulator::new(
+            table_name,
+            tenant_context.map(|t| t.tenant_id.as_str()),
+            &schema,
+        );
+        let (tx, rx) = futures::channel::mpsc::channel::<Result<arrow_array::RecordBatch>>(2);
+        let appending = appended_rows.is_some();
+        let produce = async {
+            let mut tx = tx;
+            // An append writes only the new rows, already projected; NDV
+            // sketches over them alone would understate the table, so the
+            // previous publication's stay (see below).
+            if let Some(rows) = appended_rows {
+                for records in rows.chunks(materialize_stream::scan_chunk_rows().max(1)) {
+                    let batch = materialize_stream::with_oid_column(
+                        proxima_records_to_record_batch(records, &schema)?,
+                        records.iter().map(|r| r.oid.as_str()),
+                        arrow_schema.clone(),
+                    )?;
+                    if tx.send(Ok(batch)).await.is_err() {
+                        break;
+                    }
+                }
+                return anyhow::Ok(());
+            }
+            let mut chunks = chunks;
+            while let Some(chunk) = chunks.next().await {
+                let records: Vec<ProximaRecord> = chunk?
+                    .iter()
+                    .filter_map(|record| {
+                        Self::project_one_record(record, &schema, &full_columns)
+                            .ok()
+                            .map(|row| {
+                                Self::value_row_to_relational_record(&record.oid, &col_names, row)
+                            })
+                    })
+                    .collect();
+                if records.is_empty() {
+                    continue;
+                }
+                ndv.observe(&records);
+                let batch = materialize_stream::with_oid_column(
+                    proxima_records_to_record_batch(&records, &schema)?,
+                    records.iter().map(|r| r.oid.as_str()),
+                    arrow_schema.clone(),
+                )?;
+                if tx.send(Ok(batch)).await.is_err() {
+                    break; // the writer side failed; its error is reported
+                }
+            }
+            anyhow::Ok(())
+        };
+        let consume = async {
+            let mut batches = match &cluster_col {
+                Some(column) => {
+                    materialize_stream::sort_batches(rx.boxed(), arrow_schema.clone(), column)?
+                }
+                None => rx.boxed(),
+            };
+            while let Some(batch) = batches.next().await {
+                writer.write(&batch?).await?;
+            }
+            anyhow::Ok(())
+        };
+        if let Err(e) = futures::try_join!(produce, consume) {
+            let _ = writer.abort().await;
+            return Err(e);
+        }
+        let mut parts = writer.finish().await?;
+        // A delete-only delta wrote no after-image: `finish` still emits one
+        // empty part, which would only cost a file toward the compaction cap.
+        if delta_without_rows {
+            let empty: Vec<object_store::path::Path> =
+                parts.iter().map(|p| p.path.clone()).collect();
+            Self::delete_parts(bridge, &empty).await;
+            parts.clear();
+        }
+        let part_keys: Vec<object_store::path::Path> =
+            parts.iter().map(|p| p.path.clone()).collect();
+        // The snapshot names the carried (already published) files too. Only
+        // `part_keys` are this publication's own: a failure deletes only those.
+        let snapshot_keys: Vec<object_store::path::Path> =
+            carried.iter().chain(part_keys.iter()).cloned().collect();
+
+        // 5. Commit the spec-shaped Iceberg snapshot (Avro manifest + manifest list +
+        //    TableMetadata under `{prefix}/metadata`) naming exactly these parts,
+        //    BEFORE the catalog flip. ProximaDB's own readers select files from this
+        //    manifest (they no longer list `data/`), and so do external Iceberg
+        //    engines, so a failure here fails the MATERIALIZE: the parts are
+        //    removed and the previous publication stays current.
+        let iceberg_fields = proximadb_storage_common::object_store_bridge::iceberg_snapshot_fields(
+            &schema.to_arrow_schema(),
+        );
+        let table_uuid =
+            proximadb_storage_common::object_store_bridge::deterministic_table_uuid(&prefix);
+        // The Iceberg table `location` is the table ROOT (`data/` and `metadata/` are
+        // its children), unlike the catalog layout location below, which is the
+        // directory of the data files.
+        let table_root = format!("{}/{prefix}", warehouse_root_url.trim_end_matches('/'));
+        // Incremental delta: write the touched files' complete vectors into one
+        // new Puffin (create-only), named by this publication's generation.
+        let mut dv_written: Vec<
+            proximadb_storage_common::object_store_bridge::IcebergSnapshotDeletion,
+        > = Vec::new();
+        let dv_puffin: Option<object_store::path::Path> = match &dv_plan {
+            Some(plan) if !plan.rewrite.is_empty() => {
+                let key =
+                    object_store::path::Path::from(format!("{data_dir}/dv-mat-{stem}.puffin"));
+                match bridge
+                    .write_deletion_vector_positions(&key, &plan.rewrite)
+                    .await
+                {
+                    Ok(written) => {
+                        dv_written = written;
+                        Some(key)
+                    }
+                    Err(e) => {
+                        Self::delete_parts(bridge, &part_keys).await;
+                        return Err(anyhow!(
+                            "MATERIALIZE {table_name}: writing the deletion vectors: {e}"
+                        ));
+                    }
+                }
+            }
+            _ => None,
+        };
+        // This publication's own objects: a failure deletes only these.
+        let own_keys: Vec<object_store::path::Path> =
+            part_keys.iter().cloned().chain(dv_puffin.clone()).collect();
+        // Fenced advance: the authority to publish is re-checked right before the
+        // commit, which is the point after which the new snapshot is visible.
+        if let Err(e) = fence.check().await {
+            Self::delete_parts(bridge, &own_keys).await;
+            return Err(e.context(format!(
+                "MATERIALIZE {table_name}: publish fence refused the commit"
+            )));
+        }
+        // P2.4 slice 3b: an APPEND (carried non-empty) must carry the parent
+        // snapshot's deletion vectors into the new one — a snapshot that names
+        // the carried files without their vectors resurrects every deleted row.
+        // A full rewrite from a DV parent proceeds only when the entry guard
+        // finds it synchronized (or adopts our own orphan); it never carries.
+        let carried_deletes: Vec<
+            proximadb_storage_common::object_store_bridge::IcebergSnapshotDeletion,
+        > = if let Some(plan) = &dv_plan {
+            // Untouched parent vectors by reference, plus the new Puffin's.
+            plan.carry.iter().cloned().chain(dv_written).collect()
+        } else if carried.is_empty() {
+            Vec::new()
+        } else {
+            match parent {
+                Some(previous) => {
+                    bridge
+                        .read_iceberg_snapshot_files(&metadata_prefix, previous)
+                        .await
+                        .map_err(|e| {
+                            anyhow!("MATERIALIZE {table_name}: reading carried deletes: {e}")
+                        })?
+                        .deletion_vectors
+                }
+                None => Vec::new(),
+            }
+        };
+        // Round-5 triage (finding 5): the snapshot id must advance past the
+        // parent's CURRENT SNAPSHOT id, not just the clock — a live-delete
+        // publication in the same millisecond would otherwise fail the
+        // engine's advancement check once (client-retryable, but avoidable).
+        // Unparseable parent metadata reads as 0 and the engine's own
+        // advancement check remains the backstop.
+        let parent_snap_id = match parent {
+            Some(version) => bridge
+                .read_table_metadata(&metadata_prefix, version)
+                .await
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|meta| proximadb_iceberg_engine::current_snapshot_id_of(&meta))
+                .unwrap_or_else(|| {
+                    tracing::debug!(
+                        "MATERIALIZE: the parent snapshot id was unreadable; minting from \
+                         the clock (the engine's advancement check backstops)"
+                    );
+                    0
+                }),
+            None => 0,
+        };
+        let snapshot_id = now_ms.max(parent_snap_id.saturating_add(1));
+        let committed = if carried_deletes.is_empty() {
+            bridge
+                .publish_iceberg_files(
+                    &snapshot_keys,
+                    parent,
+                    &metadata_prefix,
+                    &table_uuid,
+                    &table_root,
+                    &iceberg_fields,
+                    snapshot_id,
+                    now_ms, // timestamp ms
+                    proximadb_storage_common::object_store_bridge::iceberg_publishes_v3(
+                        &iceberg_fields,
+                        parent.is_none(),
+                    ),
+                )
+                .await
+        } else {
+            bridge
+                .publish_iceberg_files_deleting(
+                    &snapshot_keys,
+                    &carried_deletes,
+                    parent,
+                    &metadata_prefix,
+                    &table_uuid,
+                    &table_root,
+                    &iceberg_fields,
+                    snapshot_id,
+                    now_ms,
+                )
+                .await
+        };
+        let version = match committed {
+            Ok(version) => version,
+            Err(e) => {
+                if let Some(counter) = ICEBERG_PUBLISH_FAILURES.as_ref() {
+                    counter.inc();
+                }
+                // The error may have come after the commit landed: only parts that
+                // no version names are deleted.
+                match materialize_stream::check_commit(
+                    bridge,
+                    &metadata_prefix,
+                    successor,
+                    &part_keys,
+                    dv_puffin.as_ref(),
+                )
+                .await
+                {
+                    materialize_stream::CommitCheck::Landed(version) => {
+                        warn!(
+                            table = %table_name,
+                            version,
+                            "MATERIALIZE: the Iceberg commit reported an error but landed: {e}"
+                        );
+                        version
+                    }
+                    check => {
+                        if check == materialize_stream::CommitCheck::NotLanded {
+                            Self::delete_parts(bridge, &own_keys).await;
+                        }
+                        return Err(anyhow!(
+                            "MATERIALIZE {table_name}: Iceberg snapshot commit failed; the \
+                             previous publication stays current: {e}"
+                        ));
+                    }
+                }
+            }
+        };
+
+        // A Delta plan whose candidates were all Bloom false positives wrote no
+        // vector: it was an append carrying the parent's vectors.
+        count_materialize_plan(if dv_puffin.is_some() {
+            "incremental_dv"
+        } else if appending {
+            "append"
+        } else {
+            "rewrite"
+        });
+
+        // 6. Flip the catalog layout to a published Parquet projection at the location.
         // ADR-059 first-principles: the `location` is the directory where the
-        // parquet files are IMMEDIATE children (Hive/Unity/Polaris model) — NOT the
-        // table base dir with a `data/` subpath. The parquet is written to
-        // `{prefix}/data/part-0.parquet`, so the location = `{root}/{prefix}/data`.
-        let location = format!("{}/{prefix}/data", warehouse_root_url.trim_end_matches('/'));
+        // data files are IMMEDIATE children (Hive/Unity/Polaris model) — NOT the
+        // table base dir with a `data/` subpath.
+        let location = Self::published_location(warehouse_root_url, &prefix);
         let layout = CatalogStorageLayout {
             name: "parquet-snapshot".to_string(),
             authority: proximadb_catalog::CatalogAuthorityMode::ProjectionPublication,
@@ -2492,10 +3474,14 @@ impl DmlService {
             location: Some(location.clone()),
             // ADR-025: record the snapshot LSN so the OLAP read-merge can reconcile
             // this cold base against post-snapshot writes (`read_changes_since`).
-            properties: std::collections::HashMap::from([(
-                "snapshot_lsn".to_string(),
-                snapshot_lsn.to_string(),
-            )]),
+            properties: std::collections::HashMap::from([
+                ("snapshot_lsn".to_string(), snapshot_lsn.to_string()),
+                // Forward-only flips compare this (see `layout_is_newer`).
+                (
+                    materialize_stream::METADATA_VERSION_PROPERTY.to_string(),
+                    version.to_string(),
+                ),
+            ]),
             ..Default::default()
         };
         // TD-USUB-4: additive publication. Read the table's current layouts and upsert
@@ -2512,101 +3498,354 @@ impl DmlService {
             .await
             .map(|s| s.storage_layouts)
             .unwrap_or_default();
-        let layouts = upsert_storage_layout(existing_layouts, layout);
-        catalog.set_storage_layouts(&table_id, layouts).await?;
+        //
+        // Forward-only (P2.4): a publication whose commit was overtaken — another
+        // publisher committed a later metadata version and already flipped the
+        // catalog to it — must not move the layout (and its `snapshot_lsn`) back.
+        let overtaken = materialize_stream::layout_is_newer(&existing_layouts, &layout);
+        if overtaken {
+            info!(
+                table = %table_name,
+                version,
+                "MATERIALIZE: a newer publication already flipped the catalog; keeping it"
+            );
+        } else {
+            let layouts = upsert_storage_layout(existing_layouts, layout);
+            catalog.set_storage_layouts(&table_id, layouts).await?;
+        }
+        // The catalog now records `snapshot_lsn`; published snapshots hold the WAL
+        // truncation floor from here on.
+        drop(snapshot);
 
-        // 5b. TD-OLAP-2 (A2): publish per-column NDV sketches (HLL) from the
-        //     just-written records to the ADR-037 resident statistics registry,
+        // 6b. TD-OLAP-2 (A2): publish per-column NDV sketches (HLL), folded chunk by
+        //     chunk during the scan, to the ADR-037 resident statistics registry,
         //     keyed by table name. The DF reader's `statistics()` overlays
         //     `distinct_count` from this registry, so `EnforceDistribution` can
-        //     pick a partitioned (multi-core) join build. Best-effort + pure
-        //     compute (no scan): the records are already resident, and a miss
-        //     degrades to the pre-A2 `Absent` (never a wrong answer). Run only
-        //     after the write + catalog flip succeed so stats describe data
-        //     that actually landed. See `publish_ndv_statistics`.
-        publish_ndv_statistics(
-            table_name,
-            tenant_context.map(|t| t.tenant_id.as_str()),
-            &schema,
-            &records,
-        );
+        //     pick a partitioned (multi-core) join build. Only after the commit +
+        //     catalog flip, so stats describe data that actually landed — and not
+        //     when the flip was overtaken, so they never replace the newer
+        //     publication's.
+        if !overtaken && !appending {
+            ndv.publish();
+        }
 
-        // 6. Best-effort: also publish a spec-shaped Iceberg snapshot (v2) — Avro manifest
-        //    + manifest list + TableMetadata under `{prefix}/metadata` — so EXTERNAL Iceberg
-        //    engines (Spark/Trino/DuckDB/PyIceberg) can read the table. This is purely
-        //    additive interop: ProximaDB's own SELECT path reads via the catalog storage
-        //    layout above, not the manifest, so a failure here never breaks materialize.
-        let iceberg_fields: Vec<
-            proximadb_storage_common::object_store_bridge::IcebergSnapshotField,
-        > = schema
-            .to_arrow_schema()
-            .fields()
+        // 7. Garbage-collect generations older than the previous version. Best
+        //    effort: a leftover file is unreferenced (readers select from the
+        //    manifest), so a failure here only costs storage until the next run.
+        //    Puffins are kept by the same rule as data files: anything the
+        //    committed or the previous snapshot's vectors name survives. Every
+        //    vector is carried only from the parent, so a Puffin the committed
+        //    snapshot names by reference is also in `keep_previous`; keeping
+        //    the committed set too is defence in depth, not the only guard.
+        let keep_current: std::collections::HashSet<String> = snapshot_keys
             .iter()
-            .enumerate()
-            .map(
-                |(i, f)| proximadb_storage_common::object_store_bridge::IcebergSnapshotField {
-                    id: (i + 1) as i32,
-                    name: f.name().clone(),
-                    type_name: iceberg_type_for(f.data_type()),
-                    required: !f.is_nullable(),
-                },
-            )
+            .chain(carried_deletes.iter().map(|v| &v.puffin_file))
+            .map(|p| p.to_string())
             .collect();
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let table_uuid = deterministic_table_uuid(&prefix);
-        let data_prefix = object_store::path::Path::from(format!("{prefix}/data"));
-        let metadata_prefix = format!("{prefix}/metadata");
-        // The Iceberg table `location` is the table ROOT (`data/` and `metadata/` are
-        // its children), unlike the catalog layout location above, which is the
-        // directory of immediate parquet files.
-        let table_root = format!("{}/{prefix}", warehouse_root_url.trim_end_matches('/'));
-        if let Err(e) = bridge
-            .publish_iceberg_table(
-                &data_prefix,
-                &metadata_prefix,
-                &table_uuid,
-                &table_root,
-                &iceberg_fields,
-                now_ms, // snapshot id (unique per materialize)
-                now_ms, // timestamp ms
-                iceberg_needs_v3(&iceberg_fields),
-            )
-            .await
-        {
-            // TD-USUB-9: this failure used to exist ONLY as a `warn!` line, so a
-            // MATERIALIZE that returned success could leave the Iceberg manifest
-            // absent or stale with nothing to alert on — an external reader
-            // (Spark/Trino) would see no table while ProximaDB reported OK.
-            //
-            // It is deliberately still NOT fatal, and that is the right call: the
-            // Parquet data IS published and the catalog layout IS correct, so
-            // ProximaDB-side reads are complete. Failing the whole statement would
-            // turn a transient interop write error into a failed publish whose
-            // O(table) rewrite the user must repeat, on top of state already
-            // committed. The catalog also does not claim Iceberg — the layout is
-            // `parquet-snapshot` / `CatalogPhysicalFormat::Parquet` — so nothing
-            // advertises a manifest that isn't there.
-            //
-            // What was wrong was the SILENCE. Make it countable so it can be
-            // alerted on, and log at error level so it is not lost in warn noise.
-            if let Some(counter) = ICEBERG_PUBLISH_FAILURES.as_ref() {
-                counter.inc();
+        let keep_previous: std::collections::HashSet<String> = match parent {
+            Some(previous) => {
+                match bridge
+                    .read_iceberg_snapshot_files(&metadata_prefix, previous)
+                    .await
+                {
+                    Ok(snapshot) => snapshot
+                        .data_files
+                        .iter()
+                        .chain(snapshot.deletion_vectors.iter().map(|v| &v.puffin_file))
+                        .map(|p| p.to_string())
+                        .collect(),
+                    Err(e) => {
+                        warn!(table = %table_name, "MATERIALIZE GC skipped: {e}");
+                        return Ok(location);
+                    }
+                }
             }
-            tracing::error!(
-                target: "proximadb::warehouse::iceberg",
-                table = %table_name,
-                location = %location,
-                "Iceberg snapshot publish FAILED — parquet data and catalog layout are \
-                 published and ProximaDB reads are correct, but the Iceberg manifest at \
-                 this location is now absent or stale, so external Iceberg readers will \
-                 not see this materialization: {e}"
-            );
+            None => Default::default(),
+        };
+        match materialize_stream::gc_older_generations(
+            bridge,
+            &object_store::path::Path::from(data_dir.as_str()),
+            &keep_current,
+            &keep_previous,
+            &stem,
+        )
+        .await
+        {
+            Ok(deleted) => debug!(table = %table_name, version, deleted, "MATERIALIZE GC"),
+            Err(e) => warn!(table = %table_name, "MATERIALIZE GC incomplete: {e}"),
         }
 
         Ok(location)
+    }
+
+    /// The oids written to a table since `snapshot_lsn`: the union of its
+    /// name-keyed (legacy) and object_id-keyed (ADR-031) canonical-WAL feeds.
+    /// The name key is not namespace-unique, so the union can include another
+    /// table's oids; a superset is sound for every caller (they re-read rows).
+    async fn changed_oids_under(
+        &self,
+        name_key: &str,
+        object_id: Option<u64>,
+        snapshot_lsn: u64,
+        tenant: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let mut oids: std::collections::HashSet<String> = self
+            .record_store
+            .read_changes_since_scoped(name_key, tenant, snapshot_lsn)
+            .await?
+            .into_iter()
+            .map(|c| c.key)
+            .collect();
+        if let Some(oid) = object_id {
+            let oid_key = oid.to_string();
+            if oid_key != name_key {
+                for c in self
+                    .record_store
+                    .read_changes_since_scoped(&oid_key, tenant, snapshot_lsn)
+                    .await?
+                {
+                    oids.insert(c.key);
+                }
+            }
+        }
+        Ok(oids.into_iter().collect())
+    }
+
+    /// The catalog `location` of a publication under `prefix`: the directory its
+    /// data files are immediate children of.
+    fn published_location(warehouse_root_url: &str, prefix: &str) -> String {
+        format!("{}/{prefix}/data", warehouse_root_url.trim_end_matches('/'))
+    }
+
+    /// Move the published layout's `snapshot_lsn` up to `snapshot_lsn` without a
+    /// new Iceberg version: for a republication that found nothing to publish,
+    /// whose files are therefore exact as of that LSN. Fenced like a commit.
+    async fn advance_snapshot_lsn(
+        &self,
+        catalog: &Arc<dyn proximadb_catalog::Catalog>,
+        table_id: &TableIdentifier,
+        previous: u64,
+        snapshot_lsn: u64,
+        location: &str,
+        fence: &dyn crate::services::ddl::PublishFence,
+    ) -> Result<()> {
+        fence
+            .check()
+            .await
+            .map_err(|e| e.context("MATERIALIZE: publish fence refused the snapshot advance"))?;
+        let mut layouts = catalog.get_table(table_id).await?.storage_layouts;
+        // Only the publication this run planned against: if another one has
+        // flipped the layout since, its LSN describes its own files.
+        // Bound to the location too: the recorded pair is trusted by the OLAP
+        // merge for the files AT this location, and a version number means
+        // nothing against another location's metadata log.
+        if let Some(layout) = layouts.iter_mut().find(|l| {
+            l.name == "parquet-snapshot"
+                && l.location.as_deref() == Some(location)
+                && l.properties
+                    .get(materialize_stream::METADATA_VERSION_PROPERTY)
+                    .and_then(|v| v.parse::<u64>().ok())
+                    == Some(previous)
+        }) {
+            layout
+                .properties
+                .insert("snapshot_lsn".to_string(), snapshot_lsn.to_string());
+            catalog.set_storage_layouts(table_id, layouts).await?;
+        }
+        Ok(())
+    }
+
+    /// Whether a republication of `table` can append (P2.4 slice 2). Every
+    /// condition below must hold, or the plan is a full rewrite:
+    ///
+    /// * the table's writes reach a change feed this service reads
+    ///   (`has_change_feed`): an empty feed proves nothing otherwise;
+    /// * the catalog layout is this publication's (`location`), names the
+    ///   latest Iceberg version (`previous`), and its `snapshot_lsn` is not
+    ///   ahead of the one just captured;
+    /// * every file of that snapshot has exactly the columns this publication
+    ///   writes, the hidden oid column included;
+    /// * the oids written since its `snapshot_lsn` are all new.
+    ///
+    /// Returns the plan and the snapshot's files (the ones an append carries).
+    #[allow(clippy::too_many_arguments)]
+    async fn plan_append(
+        &self,
+        bridge: &dyn ObjectStoreBridge,
+        catalog: &Arc<dyn proximadb_catalog::Catalog>,
+        table_id: &TableIdentifier,
+        schema: &CatalogTableSchema,
+        location: &str,
+        metadata_prefix: &str,
+        previous: u64,
+        captured_lsn: u64,
+        tenant: Option<&str>,
+        max_rows: usize,
+        expected: &arrow_schema::Schema,
+    ) -> Result<(
+        materialize_append::AppendPlan,
+        Vec<object_store::path::Path>,
+    )> {
+        use materialize_append::AppendPlan;
+        if !self.record_store.has_change_feed(schema) {
+            return Ok((
+                AppendPlan::Rewrite("the table's writes have no change feed"),
+                Vec::new(),
+            ));
+        }
+        let layouts = catalog.get_table(table_id).await?.storage_layouts;
+        let Some(layout) = layouts.iter().find(|l| l.name == "parquet-snapshot") else {
+            return Ok((AppendPlan::Rewrite("no published layout"), Vec::new()));
+        };
+        if layout.location.as_deref() != Some(location) {
+            return Ok((
+                AppendPlan::Rewrite("the published layout is at another location"),
+                Vec::new(),
+            ));
+        }
+        let version = layout
+            .properties
+            .get(materialize_stream::METADATA_VERSION_PROPERTY)
+            .and_then(|v| v.parse::<u64>().ok());
+        if version != Some(previous) {
+            return Ok((
+                AppendPlan::Rewrite("the catalog layout is not the latest snapshot"),
+                Vec::new(),
+            ));
+        }
+        let Some(snapshot_lsn) = layout
+            .properties
+            .get("snapshot_lsn")
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            return Ok((AppendPlan::Rewrite("no snapshot LSN"), Vec::new()));
+        };
+        if snapshot_lsn > captured_lsn {
+            return Ok((
+                AppendPlan::Rewrite("the published snapshot LSN is ahead of the WAL"),
+                Vec::new(),
+            ));
+        }
+        // Delete-aware (P2.4 slice 3b): a snapshot carrying deletion vectors
+        // cannot be probed file-list-only — a DV-hidden oid would look present
+        // and be classified an update. The publication entry point refuses
+        // this case until native-state synchronization is available.
+        let snapshot = bridge
+            .read_iceberg_snapshot_files(metadata_prefix, previous)
+            .await
+            .map_err(|e| anyhow!("reading the published snapshot: {e}"))?;
+        // With the incremental gate, a DV-carrying parent is planned exactly:
+        // a probed oid that a vector hides still classifies as possibly
+        // published, which routes it to the Delta plan, and the exact scan +
+        // per-file union make re-marking an already-hidden position a no-op.
+        let incremental = materialize_append::incremental_dv_enabled();
+        if snapshot.has_deletions() && !incremental {
+            return Ok((
+                AppendPlan::Rewrite("the published snapshot carries deletion vectors"),
+                Vec::new(),
+            ));
+        }
+        let files = snapshot.data_files;
+        if files.len() >= materialize_append::APPEND_MAX_FILES {
+            return Ok((
+                AppendPlan::Rewrite("the snapshot has many parts; a rewrite compacts them"),
+                Vec::new(),
+            ));
+        }
+        let Some(published) =
+            materialize_append::PublishedOids::read(bridge, &files, expected).await?
+        else {
+            return Ok((
+                AppendPlan::Rewrite(
+                    "a published file has other columns (schema change, or written before the \
+                     hidden oid column)",
+                ),
+                Vec::new(),
+            ));
+        };
+        // Keyed exactly as the writes are (`wal_collection_id`), from the schema
+        // in hand: re-resolving the bare name would look in the `default`
+        // namespace and could miss every object_id-keyed write.
+        let changed = self
+            .changed_oids_under(&schema.name, schema.object_id, snapshot_lsn, tenant)
+            .await?;
+        Ok((
+            materialize_append::classify(changed, &published, max_rows, incremental),
+            files,
+        ))
+    }
+
+    /// The I/O half of an incremental update/delete (`AppendPlan::Delta`):
+    /// the exact old positions of the changed oids in the suspect files, the
+    /// parent's vectors (only the touched ones decoded), the planned successor
+    /// vectors, and the changed oids' live after-images. `Ok(None)` when the
+    /// successor would carry more deleted rows than the compaction bounds
+    /// allow — the caller rewrites (compacts) instead.
+    ///
+    /// Recording the captured LSN over this successor is sound even though
+    /// the after-images are read now (after the capture): every oid changed
+    /// since the parent's LSN is in `oids`; an oid not in it is exact in the
+    /// parent's files at the capture; one that changed again after the
+    /// capture is in the reader's delta and is suppressed and re-read.
+    #[allow(clippy::too_many_arguments)]
+    async fn plan_incremental_delta(
+        &self,
+        bridge: &dyn ObjectStoreBridge,
+        table_name: &str,
+        metadata_prefix: &str,
+        previous: u64,
+        files: &[object_store::path::Path],
+        oids: &[String],
+        suspect_files: &[object_store::path::Path],
+        file_rows: &HashMap<object_store::path::Path, u64>,
+        tenant: Option<&str>,
+    ) -> Result<Option<(Vec<ProximaRecord>, materialize_dv_plan::DvPlan)>> {
+        use crate::query::execution::olap_delta_merge::OlapDeltaSource;
+
+        let asked: Vec<&str> = oids.iter().map(String::as_str).collect();
+        let fresh: std::collections::BTreeMap<object_store::path::Path, Vec<u64>> = bridge
+            .published_oid_positions(suspect_files, &asked)
+            .await
+            .map_err(|e| anyhow!("mapping changed oids to published positions: {e}"))?
+            .into_iter()
+            .map(|found| (found.file, found.positions))
+            .collect();
+        let parent = bridge
+            .read_iceberg_snapshot_files(metadata_prefix, previous)
+            .await
+            .map_err(|e| anyhow!("reading the parent's deletion vectors: {e}"))?
+            .deletion_vectors;
+        let mut decoded = HashMap::new();
+        for vector in materialize_dv_plan::touched_parent_vectors(&parent, &fresh) {
+            let positions = bridge
+                .read_deletion_vector_positions(vector)
+                .await
+                .map_err(|e| anyhow!("decoding the parent vector of {}: {e}", vector.data_file))?;
+            decoded.insert(vector.data_file.clone(), positions);
+        }
+        let plan = materialize_dv_plan::plan_deletion_vectors(
+            files, &parent, &fresh, &decoded, file_rows,
+        )?;
+        let total_rows: u64 = file_rows.values().sum();
+        if !materialize_dv_plan::within_compaction_bounds(&plan, total_rows) {
+            return Ok(None);
+        }
+        let (_, rows) =
+            <Self as OlapDeltaSource>::current_records(self, table_name, oids, tenant).await?;
+        Ok(Some((rows, plan)))
+    }
+
+    /// Remove the parts of a publication that failed to commit (best effort:
+    /// they are unreferenced either way).
+    async fn delete_parts(bridge: &dyn ObjectStoreBridge, parts: &[object_store::path::Path]) {
+        let store = bridge.inner_store();
+        for part in parts {
+            let _ = object_store::ObjectStoreExt::delete(
+                store.as_ref(),
+                &bridge.object_store_path(part),
+            )
+            .await;
+        }
     }
 
     /// Point-lookup a single relational row by primary key, projected into the
@@ -3185,7 +4424,16 @@ impl DmlService {
             .await?;
         let source_schema = source_metadata.as_ref().map(|(schema, _)| schema);
         let source_stats = source_metadata.as_ref().map(|(_, stats)| stats);
-        let routed = self.route_table_write_with_schemas(
+        // The bulk-append lane must refuse above a DV-carrying parent BEFORE
+        // the executor writes any Parquet (a commit-time refusal strands the
+        // parts; review finding 1). Tenant-scoped like the write itself.
+        let parent_has_deletes = self
+            .published_parent_has_deletes(
+                &plan.target.qualified_name(),
+                tenant_context.map(|tc| tc.tenant_id.as_str()),
+            )
+            .await;
+        let mut routed = self.route_table_write_with_schemas(
             plan,
             target_columns,
             &table_schema,
@@ -3193,7 +4441,45 @@ impl DmlService {
             source_schema,
             source_stats,
             None,
+            parent_has_deletes,
         )?;
+        // The bulk lane commits a warehouse successor without the catalog
+        // layout flip, so it must be serialized with every publisher that
+        // writes deletion vectors (default-ON incremental MATERIALIZE, the live
+        // delete publisher): those hold the publish lock, NOT the DML lock this
+        // statement holds. Under the publish lock, re-read the parent — a
+        // MATERIALIZE that committed vectors since the unlocked read demotes
+        // this statement to the WAL lane — and hold the lock through the
+        // commit. WAL-lane writes never take it.
+        let _publishing = if routed.write_lane_decision.lane == WriteLane::BulkAppendCommit {
+            let guard = materialize_stream::publish_lock(&target_table_id).await;
+            if self
+                .published_parent_has_deletes(
+                    &plan.target.qualified_name(),
+                    tenant_context.map(|tc| tc.tenant_id.as_str()),
+                )
+                .await
+            {
+                // Demoted to the WAL lane, which needs no publish lock:
+                // release it rather than block MATERIALIZE for the statement.
+                drop(guard);
+                routed = self.route_table_write_with_schemas(
+                    plan,
+                    target_columns,
+                    &table_schema,
+                    Some(&target_stats),
+                    source_schema,
+                    source_stats,
+                    None,
+                    true,
+                )?;
+                None
+            } else {
+                Some(guard)
+            }
+        } else {
+            None
+        };
 
         // Fold the namespace/DrPath-aware prefix into the warehouse bulk-append write
         // so its object layout matches the materialize path
@@ -3204,16 +4490,25 @@ impl DmlService {
         // primary-layout location keeps precedence in the executor → no
         // double-prefix). Set on the local, non-persisted schema copy.
         let mut table_schema = table_schema;
+        let mut warehouse_prefix: Option<String> = None;
         if routed.write_lane_decision.lane == WriteLane::BulkAppendCommit
-            && table_schema.location.is_none()
             && let Some(prefix) = self
                 .resolve_warehouse_object_prefix(
                     &plan.target.qualified_name(),
                     tenant_context.map(|tc| tc.tenant_id.as_str()),
+                    table_schema.object_id,
                 )
                 .await?
         {
-            table_schema.location = Some(prefix);
+            // The prefix keys part placement when nothing is pinned (a
+            // materialize-set layout keeps precedence → no double-prefix), and
+            // ALWAYS keys the engine metadata log: one log per table, at the
+            // same root-relative prefix MATERIALIZE publishes under — the only
+            // correct key for a scheme-carrying layout URL (TD-SEAM-1 slice 2).
+            if table_schema.location.is_none() {
+                table_schema.location = Some(prefix.clone());
+            }
+            warehouse_prefix = Some(prefix);
         }
 
         let execution = self
@@ -3223,6 +4518,7 @@ impl DmlService {
                 source_schema,
                 routed_plan: routed,
                 tenant_context,
+                warehouse_prefix: warehouse_prefix.as_deref(),
             })
             .await?;
 
@@ -3244,6 +4540,79 @@ impl DmlService {
         }
     }
 
+    /// The bulk-append lane must not run above a DV-carrying published parent
+    /// (the visibility fence contract's FORBID decision; adversarial review
+    /// finding 1): that lane commits a successor without the publish lock and
+    /// never records the catalog layout flip, so it would strand every later
+    /// publication's (version, LSN) pairing — and after any later WAL delete,
+    /// every read of a nonempty delta against the DV base refuses, permanently.
+    /// `false` when the table has no published layout or parent snapshot (the
+    /// common OLTP case — two catalog reads and no object-store I/O); read
+    /// failures demote to the WAL lane (fail-closed), which is always safe.
+    ///
+    /// Serialization: the bulk lane re-reads this under the table's publish
+    /// lock (`materialize_stream::publish_lock`, keyed on the resolved table)
+    /// and holds that lock through its commit, so in one process neither a
+    /// MATERIALIZE (which does NOT take the DML lock) nor the live delete
+    /// publisher can commit vectors between this read and the bulk commit.
+    /// Residual: publishers in ANOTHER process are not covered by an
+    /// in-process lock; their CAS against the bulk commit is the contract's
+    /// gate 3 (race forcing + the lease fence) — see
+    /// PUBLICATION_WAL_VISIBILITY_FENCE_2026_10_27.adoc.
+    async fn published_parent_has_deletes(&self, table_name: &str, tenant: Option<&str>) -> bool {
+        use proximadb_iceberg_engine::IcebergObjectStoreBridge;
+        use proximadb_storage_common::object_store_bridge::ObjectStoreBridge as _;
+
+        let Ok((catalog, table_id)) = self
+            .catalog_manager
+            .resolve_table_scoped(table_name, tenant)
+            .await
+        else {
+            return false; // routing fails on the missing table anyway
+        };
+        let Ok(table) = catalog.get_table(&table_id).await else {
+            return false;
+        };
+        let Some(location) = table
+            .storage_layouts
+            .iter()
+            .find(|l| l.name == "parquet-snapshot")
+            .and_then(|l| l.location.clone())
+        else {
+            return false; // not published: nothing to carry, nothing to fence
+        };
+        let Some(table_root) = location
+            .trim_end_matches('/')
+            .strip_suffix("/data")
+            .map(str::to_string)
+        else {
+            return false;
+        };
+        let metadata_prefix = "metadata".to_string();
+        let Ok(bridge) = IcebergObjectStoreBridge::from_url(&table_root) else {
+            warn!(table = %table_name, "bulk-lane eligibility: bridge open failed; demoting");
+            return true;
+        };
+        let version = match bridge.latest_metadata_version(&metadata_prefix).await {
+            Ok(Some(version)) => version,
+            Ok(None) => return false, // no parent: the first publication carries nothing
+            Err(e) => {
+                warn!(table = %table_name, error = %e, "bulk-lane eligibility: metadata read failed; demoting");
+                return true;
+            }
+        };
+        match bridge
+            .read_iceberg_snapshot_files(&metadata_prefix, version)
+            .await
+        {
+            Ok(snapshot) => !snapshot.deletion_vectors.is_empty(),
+            Err(e) => {
+                warn!(table = %table_name, error = %e, "bulk-lane eligibility: snapshot read failed; demoting");
+                true
+            }
+        }
+    }
+
     async fn route_table_write_plan_with_overrides(
         &self,
         plan: &CopyIntoPlan,
@@ -3259,6 +4628,12 @@ impl DmlService {
         let source_metadata = self.resolve_table_write_source_metadata(plan, None).await?;
         let source_schema = source_metadata.as_ref().map(|(schema, _)| schema);
         let source_stats = source_metadata.as_ref().map(|(_, stats)| stats);
+        // Computed once per statement, before routing: the lane decision must
+        // refuse the bulk path for a DV-carrying parent BEFORE the executor
+        // writes any Parquet (a commit-time refusal would strand the parts).
+        let parent_has_deletes = self
+            .published_parent_has_deletes(&target_table_name, None)
+            .await;
         self.route_table_write_with_schemas(
             plan,
             target_columns,
@@ -3267,6 +4642,7 @@ impl DmlService {
             source_schema,
             source_stats,
             write_intent_overrides,
+            parent_has_deletes,
         )
     }
 
@@ -3309,6 +4685,7 @@ impl DmlService {
         &self,
         table_name: &str,
         tenant: Option<&str>,
+        object_id: Option<u64>,
     ) -> Result<Option<String>> {
         let Some(tenant_id) = tenant.filter(|t| !t.is_empty()) else {
             return Ok(None);
@@ -3323,13 +4700,10 @@ impl DmlService {
         let ns_meta = catalog.get_namespace(&table_id.namespace).await.ok();
         // The object_id keys the path in lockstep with the primary materialize so
         // bulk-appended rows land under the SAME prefix the published `location`
-        // points at (a miss here would orphan them from reads). A catalog lookup
-        // failure falls back to name-keying (Ok-or-None → None object_id).
-        let table_object_id = catalog
-            .get_table(&table_id)
-            .await
-            .ok()
-            .and_then(|schema| schema.object_id);
+        // points at (a miss here would orphan them from reads). It comes from the
+        // caller's schema — the SAME value MATERIALIZE keyed with — not a re-fetch:
+        // a failed re-fetch would degrade this path to name-keying while the
+        // materialize log stays id-keyed, forking the table's engine log.
         let prefix = resolve_materialize_prefix(
             tenant_id,
             ns_meta
@@ -3342,7 +4716,7 @@ impl DmlService {
                 .map(|n| n.storage_pool_class)
                 .unwrap_or_default(),
             &table_id.name,
-            table_object_id,
+            object_id,
         )?;
         Ok(Some(prefix))
     }
@@ -3356,9 +4730,11 @@ impl DmlService {
         source_schema: Option<&CatalogTableSchema>,
         source_stats: Option<&CatalogTableStatistics>,
         write_intent_overrides: Option<&WriteIntentOverrides>,
+        parent_has_deletes: bool,
     ) -> Result<RoutedExecutionPlan> {
         DmlWritePlanner::default().plan(DmlWritePlanRequest {
             target_schema,
+            published_parent_has_deletes: parent_has_deletes,
             target_stats,
             source_schema,
             source_stats,
@@ -3562,13 +4938,12 @@ impl DmlService {
         let embeddings = if result.vector.is_empty() {
             Vec::new()
         } else {
-            vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                dim: result.vector.len() as u32,
-                values: proximadb_records::EmbeddingValues::Fp32(result.vector),
-                ..Default::default()
-            }]
+            vec![EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                result.vector.len() as u32,
+                result.vector,
+            )]
         };
 
         ProximaRecord {
@@ -3921,14 +5296,8 @@ impl DmlService {
         tenant_context: Option<&TenantContext>,
     ) -> Result<DmlResult> {
         let (catalog, table_id) = self
-            .catalog_manager
-            .resolve_table_scoped(table_name, tenant_context.map(|t| t.tenant_id.as_str()))
+            .resolve_existing_table(table_name, tenant_context)
             .await?;
-
-        // Verify table exists
-        if !catalog.table_exists(&table_id).await? {
-            return Err(anyhow!("Table '{table_name}' does not exist"));
-        }
 
         // Get table schema for column mapping
         let table_schema = catalog.get_table(&table_id).await?;
@@ -3979,14 +5348,15 @@ impl DmlService {
         // secondary UNIQUE and FOREIGN KEY — the ONE enforcement sequence every
         // row-producing DML shares (UPSERT runs the same one). CHECK / NOT NULL /
         // types were already enforced row-locally by `CatalogRow::validate`.
-        self.enforce_row_write_constraints(
-            &table_schema,
-            &table_id,
-            &records,
-            RowWriteConstraintMode::Insert,
-            tenant_context,
-        )
-        .await?;
+        let pk_claims = self
+            .enforce_row_write_constraints(
+                &table_schema,
+                &table_id,
+                &records,
+                RowWriteConstraintMode::Insert,
+                tenant_context,
+            )
+            .await?;
 
         // Compute per-column min/max and NDV from the canonical record props before moving records
         // into mutations. Only orderable types (String, integers) tracked for min/max; floats and
@@ -4001,11 +5371,28 @@ impl DmlService {
             .into_iter()
             .map(|record| TableRecordMutation::new(TableRecordMutationKind::Insert, record))
             .collect::<Vec<_>>();
-        let batch_result = self
+        // PK claims are released when the store says nothing became durable:
+        // a store-reported rejection (`Ok(!success)`) or an `Err` marked
+        // `RejectedBeforeAppend` (validation / health / pre-append reads). Any
+        // other `Err` may follow a durable WAL append (e.g. the memtable-full
+        // bail), so the claim is kept (fail closed) — and reconciled lazily on
+        // the next claim of the key, or by the startup sweep, once the durable
+        // log provably lacks the row.
+        let batch_result = match self
             .record_store
             .write_mutations(&table_schema, mutations, tenant_context)
-            .await?;
+            .await
+        {
+            Ok(batch_result) => batch_result,
+            Err(error) => {
+                if crate::services::record_store::is_rejected_before_append(&error) {
+                    self.release_pk_claims(&table_schema, &pk_claims).await;
+                }
+                return Err(error);
+            }
+        };
         if !batch_result.success {
+            self.release_pk_claims(&table_schema, &pk_claims).await;
             let detail = batch_result
                 .errors
                 .first()
@@ -4058,21 +5445,28 @@ impl DmlService {
         tenant_context: Option<&TenantContext>,
     ) -> Result<DmlResult> {
         let (catalog, table_id) = self
-            .catalog_manager
-            .resolve_table_scoped(table_name, tenant_context.map(|t| t.tenant_id.as_str()))
+            .resolve_existing_table(table_name, tenant_context)
             .await?;
-
-        // Verify table exists
-        if !catalog.table_exists(&table_id).await? {
-            return Err(anyhow!("Table '{table_name}' does not exist"));
-        }
 
         let table_schema = catalog.get_table(&table_id).await?;
         let dml_lock_guard = self
             .acquire_table_dml_lock(&table_id, tenant_context, LockIntent::Write)
             .await?;
-        // TD-110 S1: non-reentrant in-process operation lock (see execute_insert).
-        let _op_lock = self.op_lock(&table_id).await?;
+        // TD-RELIDEQ-2: hold the children that reference an assigned column
+        // through a UNIQUE set (TD-110 S1 op-lock with the target, sorted).
+        let assigned: Vec<String> = assignments
+            .iter()
+            .map(|(column, _)| column.clone())
+            .collect();
+        let (referencing_children, _op_locks, child_dml_locks) = self
+            .lock_unique_referencing_children(
+                &catalog,
+                &table_id,
+                &table_schema,
+                &assigned,
+                tenant_context,
+            )
+            .await?;
         let ids_to_update = if let Some(ref wc) = where_clause {
             self.resolve_matching_ids(&table_schema, &table_id.name, wc, tenant_context)
                 .await?
@@ -4091,22 +5485,13 @@ impl DmlService {
         Self::validate_update_assignments(&assignments, &table_schema)?;
 
         let mut records = Vec::new();
+        let mut old_rows = Vec::new();
         let mut warnings = Vec::new();
         for record_id in &ids_to_update {
-            let Some(existing) = self
-                .record_store
-                .get_by_key(
-                    &table_schema,
-                    TableRecordGetRequest {
-                        table_id: table_id.name.clone(),
-                        key: record_id.clone(),
-                        include_vector: true,
-                        include_props: true,
-                    },
-                    tenant_context,
-                    #[cfg(feature = "abac-policy")]
-                    &ReadContext::system(SystemReadReason::Statistics, "dml [CLIENT-PLACEHOLDER]"),
-                )
+            // TD-DML-3: the full envelope (TTL, every vector column) where the
+            // store serves one; a dead row is not updated (mandate #16a).
+            let RowState::Live(existing) = self
+                .row_state(&table_schema, &table_id, record_id, tenant_context)
                 .await?
             else {
                 warnings.push(format!(
@@ -4116,6 +5501,14 @@ impl DmlService {
                 continue;
             };
 
+            if !referencing_children.is_empty() {
+                old_rows.push(match &existing {
+                    ExistingRow::Envelope(record) => (**record).clone(),
+                    ExistingRow::Projection(projection) => {
+                        Self::rich_result_to_record(projection.clone())
+                    }
+                });
+            }
             records.push(self.build_updated_proxima_record(
                 existing,
                 &assignments,
@@ -4132,7 +5525,8 @@ impl DmlService {
         // rows are excluded so a row keeping or vacating its own unique value is
         // not flagged as a self-conflict. (PK is immutable on UPDATE — rejected by
         // validate_update_assignments — so only non-PK UNIQUE sets apply here.)
-        let primary_key = Self::primary_key_column(&table_schema);
+        // TD-RELIDEQ-2: only a declared single-column key is read from the oid.
+        let primary_key = crate::services::record_store::schema_oid_key_column(&table_schema);
         let candidate_sets =
             Self::build_unique_candidate_sets(&table_schema, &records, primary_key.as_deref())?;
         if !candidate_sets.is_empty() {
@@ -4157,6 +5551,15 @@ impl DmlService {
         // TD-110: an UPDATE may change a FOREIGN KEY column — re-verify references.
         self.enforce_foreign_keys(&table_schema, &records, tenant_context)
             .await?;
+        // TD-RELIDEQ-2: … and may change a value children reference.
+        self.enforce_update_referential_actions(
+            &table_schema,
+            &referencing_children,
+            &old_rows,
+            &records,
+            tenant_context,
+        )
+        .await?;
 
         let updated_count = records.len();
         let mutations = records
@@ -4189,13 +5592,679 @@ impl DmlService {
             format!("Updated {} rows", updated_count),
         );
         result.warnings = warnings;
-        self.finish_dml_guards(dml_lock_guard).await;
+        self.finish_dml_guards(dml_lock_guard.into_iter().chain(child_dml_locks))
+            .await;
         Ok(result)
     }
 
     /// Execute DELETE statement
     ///
     /// Note: DELETE by ID is the primary supported operation.
+    /// Resolve `table_name` in the caller's tenant scope, failing when the table
+    /// does not exist.
+    async fn resolve_existing_table(
+        &self,
+        table_name: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<(Arc<dyn proximadb_catalog::Catalog>, TableIdentifier)> {
+        let (catalog, table_id) = self
+            .catalog_manager
+            .resolve_table_scoped(table_name, tenant_context.map(|t| t.tenant_id.as_str()))
+            .await?;
+        if !catalog.table_exists(&table_id).await? {
+            return Err(anyhow!("Table '{table_name}' does not exist"));
+        }
+        Ok((catalog, table_id))
+    }
+
+    /// Whether the live incremental delete publisher is armed (default OFF;
+    /// the fence contract's activation rung). Unset ⇒ the delete is a pure
+    /// WAL delete and the published view goes stale until the next full
+    /// publication, exactly as before the writer slice.
+    fn live_delete_publisher_enabled() -> bool {
+        std::env::var_os("PROXIMADB_LIVE_DELETE_PUBLISHER").is_some_and(|v| {
+            matches!(
+                v.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    }
+
+    /// TD-USUB-10 3c — the fence contract's phase 3: publish a deletion-vector
+    /// successor for the oids a DELETE just tombstoned. Best-effort-with-
+    /// accounting per the contract (docs/12-design/PUBLICATION_WAL_VISIBILITY_FENCE_2026_10_27.adoc): phase 2 (the
+    /// WAL write) has already committed when this runs, so a failure here
+    /// leaves the fence gap open (WAL dead, published stale) — it is logged
+    /// and counted, never returned as a delete error. Synchronous phase 3
+    /// (the lock-lifetime choice the slice states).
+    async fn publish_live_deletes(
+        &self,
+        table_name: &str,
+        deleted_oids: &[String],
+        tenant_id: Option<&str>,
+        max_tombstone_lsn: Option<u64>,
+    ) {
+        if deleted_oids.is_empty() || !Self::live_delete_publisher_enabled() {
+            return;
+        }
+        let result = self
+            .publish_live_deletes_inner(table_name, deleted_oids, tenant_id, max_tombstone_lsn)
+            .await;
+        match result {
+            Ok(()) => {}
+            Err(e) => {
+                if let Some(counter) = LIVE_DELETE_PUBLISH_FAILURES.as_ref() {
+                    counter.inc();
+                }
+                warn!(
+                    table = %table_name,
+                    "live-delete publication refused (the WAL delete stands; the fence gap stays open until the next publication): {e:#}"
+                );
+            }
+        }
+    }
+
+    async fn publish_live_deletes_inner(
+        &self,
+        table_name: &str,
+        deleted_oids: &[String],
+        tenant_id: Option<&str>,
+        max_tombstone_lsn: Option<u64>,
+    ) -> anyhow::Result<()> {
+        use crate::query::execution::olap_delta_merge::OlapDeltaSource as _;
+        use proximadb_iceberg_engine::IcebergObjectStoreBridge;
+        use proximadb_iceberg_engine::deletion_vector::PositionDeletes;
+        use proximadb_storage_common::object_store_bridge::ObjectStoreBridge as _;
+
+        // COST (stated per the co-design mandate, and the contract): a live
+        // delete reads the ENTIRE __proxima_oid column of every published
+        // file and decodes every parent vector — O(published oid bytes) of
+        // I/O, synchronously under the DML locks. The footer/sidecar index
+        // (TD-FPRUNE-1 pattern) is the follow-up that removes it.
+        let (catalog, table_id) = self
+            .catalog_manager
+            .resolve_table_scoped(table_name, tenant_id)
+            .await
+            .map_err(|e| anyhow!("live delete: resolving the table: {e}"))?;
+        let table = catalog
+            .get_table(&table_id)
+            .await
+            .map_err(|e| anyhow!("live delete: catalog read: {e}"))?;
+        let Some(layout) = table
+            .storage_layouts
+            .iter()
+            .find(|l| l.name == "parquet-snapshot")
+        else {
+            return Ok(()); // no published layout: a pure WAL delete
+        };
+        // The layout location is the DATA directory ({table_root}/data); the
+        // engine's metadata log and every working consumer live at the TABLE
+        // ROOT (round-1 review caught the no-op: a bridge rooted at the data
+        // dir with a full-URL key finds nothing).
+        let data_location = layout
+            .location
+            .clone()
+            .ok_or_else(|| anyhow!("the published layout has no location"))?;
+        let Some(table_root) = data_location
+            .trim_end_matches('/')
+            .strip_suffix("/data")
+            .map(str::to_string)
+        else {
+            return Ok(()); // not a parquet-snapshot location shape
+        };
+        let bridge = IcebergObjectStoreBridge::from_url(&table_root)
+            .map_err(|e| anyhow!("live delete: opening the bridge: {e}"))?;
+        // Bridge-relative, matching engine_metadata_at_root / every consumer.
+        let metadata_prefix = "metadata".to_string();
+
+        // The recorded fence LSN must sit at or above EVERY published
+        // tombstone (the contract's load-bearing rule). A fresh capture
+        // ALONE does not guarantee that (round-4 review, MAJOR-1): the
+        // capture subtracts the STORE-GLOBAL inflight floor, which a
+        // concurrent write on ANY other table can lower below this table's
+        // just-applied tombstones — recording that would durably refuse
+        // every OLAP read (nonempty delta against the DV base). The clamp
+        // uses the batch's max durable LSN, the contract's sanctioned
+        // alternative; both bounds are at or below the WAL head, and the
+        // completeness precondition below keeps the base a complete state
+        // at the max of them.
+        // Round-5 triage (finding 1): a missing max-LSN binding must REFUSE,
+        // not silently degrade the clamp — `unwrap_or(0)` would re-open the
+        // round-4 harm (recording below the tombstones) whenever the
+        // appender skipped the LSN association (count mismatch) or a store
+        // forgets to bind it. Unreachable on the production wiring (the
+        // WAL-backed store always binds; count mismatches poison the store),
+        // but the refusal is cheap and the failure mode it prevents is the
+        // worst class.
+        let max_tombstone_lsn = max_tombstone_lsn.ok_or_else(|| {
+            anyhow!(
+                "live delete: the tombstone batch reported no LSN binding; cannot \
+                 prove a fence LSN at or above the published tombstones; leaving \
+                 the fence gap open"
+            )
+        })?;
+        let fence_lsn = self
+            .record_store
+            .capture_snapshot_lsn(table_name)
+            .await
+            .map_err(|e| anyhow!("live delete: capturing the fence LSN: {e}"))?
+            .lsn
+            .max(max_tombstone_lsn);
+
+        // The fence: the publish lock FIRST (the parent read and the commit
+        // both inside it — round-1 review: reading the parent outside the
+        // lock makes CAS loss the common case), one bounded retry on a lost
+        // race (re-read the parent, re-map: positions are file-relative and
+        // the file set is parent-dependent).
+        let _guard = materialize_stream::publish_lock(&table_id).await;
+        for _attempt in 0..2 {
+            let Some(parent) = bridge
+                .latest_metadata_version(&metadata_prefix)
+                .await
+                .map_err(|e| anyhow!("live delete: latest version: {e}"))?
+            else {
+                return Ok(()); // nothing published yet: nothing to fence
+            };
+            // The parent's own table-uuid and location: the successor must
+            // carry them VERBATIM (a re-derived uuid diverges from the log —
+            // round-1 review's spec-violation finding).
+            let parent_json_bytes = bridge
+                .read_table_metadata(&metadata_prefix, parent)
+                .await
+                .map_err(|e| anyhow!("live delete: parent metadata: {e}"))?;
+            let parent_meta: serde_json::Value = serde_json::from_slice(&parent_json_bytes)
+                .map_err(|e| anyhow!("live delete: parsing the parent metadata: {e}"))?;
+            let parent_uuid = parent_meta
+                .get("table-uuid")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("the parent metadata has no table-uuid"))?
+                .to_string();
+            let parent_location = parent_meta
+                .get("location")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&table_root)
+                .to_string();
+
+            // The publication this fence produces must be a COMPLETE state at
+            // fence_lsn (the contract's recorded-snapshot_lsn rule): the
+            // OLAP delta-merge serves a DV-carrying base bare only when
+            // NOTHING changed after the recorded LSN, so any oid that changed
+            // since the parent's capture — other than the tombstones this
+            // delete is publishing — would be in neither the base nor the
+            // replayed delta: hidden from both views. Refuse instead (the
+            // WAL delete stands; the next full publication reconciles). The
+            // parent must also BE the publication the layout recorded: an
+            // externally published parent's capture LSN is unknown.
+            let recorded = materialize_stream::recorded_publication(
+                &catalog
+                    .get_table(&table_id)
+                    .await
+                    .map_err(|e| anyhow!("live delete: layout re-read: {e}"))?
+                    .storage_layouts,
+            );
+            let Some((recorded_version, recorded_lsn)) = recorded else {
+                anyhow::bail!(
+                    "live delete: the layout records no (metadata version, \
+                     snapshot LSN) pair for the parent publication; leaving \
+                     the fence gap open"
+                );
+            };
+            if recorded_version != parent {
+                anyhow::bail!(
+                    "live delete: the parent publication v{parent} is not the layout's \
+                     recorded v{recorded_version} (an external publication owns \
+                     the parent; its capture LSN is unknown); leaving the fence gap \
+                     open"
+                );
+            }
+            let deleted: std::collections::HashSet<&str> =
+                deleted_oids.iter().map(String::as_str).collect();
+            let changed: Vec<String> = self
+                .changed_oids_since(table_name, recorded_lsn, tenant_id)
+                .await
+                .map_err(|e| anyhow!("live delete: the changed-set read: {e}"))?;
+            // The changed-set proves completeness only if every write
+            // reaches the feed (round-3 finding 8, made unconditional by
+            // round 4: in the nonempty-and-exactly-deleted leg the proof
+            // silently assumed it) — else the precondition is vacuous and
+            // publishing could hide rows from both views.
+            {
+                let (schema, _) = self
+                    .resolve_select_table(table_name, tenant_id)
+                    .await
+                    .map_err(|e| anyhow!("live delete: schema resolve: {e}"))?;
+                if !self.record_store.has_change_feed(&schema) {
+                    anyhow::bail!(
+                        "live delete: cannot prove the changed-set is complete \
+                         (no change feed for this table); leaving the fence gap \
+                         open"
+                    );
+                }
+            }
+            // The feed is name-keyed (legacy entries union a bare-name
+            // partition that is not namespace-unique), so this filter runs on
+            // a SUPERSET: a same-named table's oid can refuse a state that is
+            // actually complete. That direction is the safe one — filtering
+            // it down would risk publishing an incomplete state.
+            let unexpected: Vec<String> = changed
+                .into_iter()
+                .filter(|oid| !deleted.contains(oid.as_str()))
+                .collect();
+            if !unexpected.is_empty() {
+                anyhow::bail!(
+                    "live delete: {} oid(s) changed since the parent snapshot that this \
+                     delete is not publishing (e.g. {:?}); publishing would hide \
+                     them from both views; leaving the fence gap open until the \
+                     next full publication",
+                    unexpected.len(),
+                    unexpected.iter().take(3).collect::<Vec<_>>()
+                );
+            }
+            // The completeness check above compares KEYS — the change feed
+            // drops the op — so a DELETE followed by a re-INSERT of the same
+            // oid (both before the fence capture) passes it, and its vector
+            // would hide a row that is LIVE in the WAL. Every oid this fence
+            // publishes must be dead NOW; one that came back refuses (the
+            // next full publication reconciles). Closed in production only by
+            // the DML lock service, which the fail-open wiring can lack. It
+            // also covers an oid that was only ever WAL-side (inserted,
+            // deleted and re-inserted since the parent): published nowhere,
+            // it would otherwise be in neither the base nor the delta. COST:
+            // O(deleted oids) point lookups, under the publish and DML locks.
+            let (_, revived) = self
+                .current_records(table_name, deleted_oids, tenant_id)
+                .await
+                .map_err(|e| anyhow!("live delete: the liveness re-read: {e}"))?;
+            if !revived.is_empty() {
+                anyhow::bail!(
+                    "live delete: {} deleted oid(s) are live again (re-inserted before the \
+                     fence); publishing their vectors would hide live rows; leaving the \
+                     fence gap open until the next full publication",
+                    revived.len()
+                );
+            }
+
+            // The delete-aware snapshot: its vectors are the set the
+            // successor must carry forward.
+            let snapshot = bridge
+                .read_iceberg_snapshot_with_deletes(&metadata_prefix, parent)
+                .await
+                .map_err(|e| anyhow!("live delete: snapshot read: {e}"))?;
+            let files: Vec<object_store::path::Path> = snapshot.data_files.clone();
+            if files.is_empty() {
+                return Ok(());
+            }
+            let oid_strs: Vec<&str> = deleted_oids.iter().map(String::as_str).collect();
+            let mapping = bridge
+                .published_positions_of(&files, &oid_strs)
+                .await
+                .map_err(|e| anyhow!("live delete: position mapping: {e}"))?;
+            if mapping.per_file.is_empty() {
+                return Ok(()); // never-published oids only: WAL-only rows
+            }
+            // Round-5 triage (finding 4) placed this guard before the
+            // position mapping; round-2 review (MINOR-3) moved it AFTER the
+            // never-published early return — a WAL-only delete on a drifted
+            // table must stay a benign no-op, not a counted fence gap. It
+            // still precedes the Puffin write, so a drifted table never
+            // orphans a Puffin; it does pay the O(published oid bytes)
+            // mapping once per refused delete — correctness of the gap
+            // accounting over the micro-cost.
+            let view_fields =
+                proximadb_storage_common::object_store_bridge::iceberg_snapshot_fields(
+                    &table.to_arrow_schema(),
+                );
+            // Review round 3 (finding 3), hoisted: the successor carries the PARENT's
+            // files but derives its schema from the CURRENT catalog schema —
+            // field ids are positional, so a post-publication ALTER
+            // (DROP/ADD COLUMN) renumbers every following id and external
+            // readers would resolve the carried files' columns to the wrong
+            // ids. Refuse when the derived names no longer match the parent's
+            // recorded schema (a re-MATERIALIZE republishes first); a parent
+            // metadata with no parsable schema also refuses — fail-closed.
+            let parent_field_names: Option<Vec<String>> = parent_meta
+                .get("schemas")
+                .and_then(|schemas| schemas.as_array())
+                .and_then(|schemas| {
+                    let id = parent_meta
+                        .get("current-schema-id")
+                        .and_then(|v| v.as_i64())?;
+                    schemas
+                        .iter()
+                        .find(|sc| sc.get("schema-id").and_then(|v| v.as_i64()) == Some(id))
+                        .and_then(|sc| sc.get("fields").and_then(|f| f.as_array()))
+                        .map(|fields| {
+                            fields
+                                .iter()
+                                .filter_map(|f| f.get("name").and_then(|n| n.as_str()))
+                                .map(String::from)
+                                .collect()
+                        })
+                });
+            let derived_names: Vec<String> = view_fields.iter().map(|f| f.name.clone()).collect();
+            let schema_matches_parent = parent_field_names
+                .clone()
+                .is_some_and(|names| names == derived_names);
+            if !schema_matches_parent {
+                anyhow::bail!(
+                    "live delete: the catalog schema drifted from the parent \
+                     publication (or the parent schema is unparsable): derived \
+                     fields {derived_names:?} vs the parent's {parent_field_names:?}; \
+                     re-MATERIALIZE to republish the new schema first"
+                );
+            }
+            let (engine_fields, _) =
+                proximadb_iceberg_engine::iceberg_fields_of(&view_fields, false);
+
+            // Gate 4, first check (the fence contract's phase-3 lease): after
+            // every benign no-op return (nothing published, no files, only
+            // never-published oids, schema drift) and before ANY publication
+            // I/O — the gate-3 hook's competitor commit and the Puffin write
+            // — so a pod already displaced orphans nothing, and WAL-only
+            // deletes on a displaced pod stay uncounted no-ops (#2275
+            // review, finding 2).
+            if let Some(lease) = &self.publish_lease {
+                lease
+                    .check("live delete", tenant_id, table_name)
+                    .await
+                    .map_err(|e| anyhow!("live delete: the publish lease refused: {e:#}"))?;
+            }
+            // Gate 3's forcing hook (test-only, deterministic): on the first
+            // attempt, commit a LEGITIMATE no-change successor from this
+            // parent (the same files, the parent's vectors re-carried) and
+            // record its layout flip — exactly the state a concurrent
+            // publisher that completed first leaves behind. `continue` re-
+            // enters the loop; the real CAS then loses the successor slot to
+            // the injected competitor and the bounded retry exercises the
+            // re-read/re-map/re-union path for real (no race, no sleeps).
+            if _attempt == 0
+                && cfg!(debug_assertions)
+                && std::env::var_os("PROXIMADB_TEST_FENCE_INJECT_COMPETITOR")
+                    .is_some_and(|v| v == "1")
+            {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or_default();
+                let competitor_id = now_ms.max(
+                    proximadb_iceberg_engine::current_snapshot_id_of(&parent_meta)
+                        .unwrap_or(0)
+                        .saturating_add(1),
+                );
+                // Re-carry the parent's vectors in their MANIFEST form
+                // (IcebergSnapshotDeletion — what the deleting publish takes),
+                // not the decoded form the union below uses.
+                let parent_manifest = bridge
+                    .read_iceberg_snapshot_files(&metadata_prefix, parent)
+                    .await
+                    .map_err(|e| anyhow!("live delete: FENCE TEST competitor parent read: {e}"))?;
+                let competitor_version = bridge
+                    .publish_iceberg_files_deleting(
+                        &files,
+                        &parent_manifest.deletion_vectors,
+                        Some(parent),
+                        &metadata_prefix,
+                        &parent_uuid,
+                        &parent_location,
+                        &view_fields,
+                        competitor_id,
+                        now_ms,
+                    )
+                    .await
+                    .map_err(|e| anyhow!("live delete: FENCE TEST competitor injection: {e:#}"))?;
+                // Round-2 review (MINOR-2): the competitor is a complete
+                // state only at the PARENT's recorded LSN — the state a real
+                // winning publisher leaves. Recording a fresh capture here
+                // would claim completeness ABOVE the delete's tombstones
+                // while the killed rows are live-and-un-DV'd in the
+                // competitor: an orderable-looking wrong state until the
+                // retry lands.
+                let hook_lsn = recorded_lsn;
+                let mut layouts = catalog
+                    .get_table(&table_id)
+                    .await
+                    .map_err(|e| anyhow!("live delete: FENCE TEST competitor layout read: {e}"))?
+                    .storage_layouts;
+                if let Some(l) = layouts.iter_mut().find(|l| {
+                    l.name == "parquet-snapshot"
+                        && l.location.as_deref() == Some(data_location.as_str())
+                }) {
+                    l.properties.insert(
+                        materialize_stream::METADATA_VERSION_PROPERTY.to_string(),
+                        competitor_version.to_string(),
+                    );
+                    l.properties
+                        .insert("snapshot_lsn".to_string(), hook_lsn.to_string());
+                    catalog
+                        .set_storage_layouts(&table_id, layouts)
+                        .await
+                        .map_err(|e| {
+                            anyhow!("live delete: FENCE TEST competitor layout flip: {e}")
+                        })?;
+                }
+                // Fall through WITHOUT re-reading: the attempt's stale
+                // parent makes the REAL CAS below fire against the slot the
+                // competitor took — the engine's AlreadyExists("moved past")
+                // path the retry's error detection matches on, exercised for
+                // real (round-1 review, finding 3: a `continue` here would
+                // test only the re-read mechanics, never the loss branch).
+                warn!(
+                    table = %table_name,
+                    competitor_version,
+                    "FENCE TEST: injected a competing successor; the real CAS below must \
+                     LOSE the slot and the bounded retry must re-map from the new parent"
+                );
+            }
+
+            // Per-file DV UNION (guarantee 1): the parent's vectors plus
+            // this delete's positions, and the parent's vectors re-carried
+            // untouched — a writer publishing only its own positions
+            // resurrects every previously deleted row.
+            let mut all_entries: Vec<(object_store::path::Path, PositionDeletes)> = Vec::new();
+            for file_positions in &mapping.per_file {
+                let mut positions = PositionDeletes::new();
+                for p in &file_positions.positions {
+                    positions.insert(*p as u64);
+                }
+                for parent_dv in &snapshot.deletion_vectors {
+                    if parent_dv.data_file == file_positions.file {
+                        let decoded = bridge
+                            .read_deletion_vector(parent_dv)
+                            .await
+                            .map_err(|e| anyhow!("live delete: decoding a parent vector: {e}"))?;
+                        for p in decoded.positions() {
+                            positions.insert(p);
+                        }
+                    }
+                }
+                all_entries.push((file_positions.file.clone(), positions));
+            }
+            let touched: std::collections::HashSet<_> =
+                mapping.per_file.iter().map(|m| m.file.clone()).collect();
+            for parent_dv in &snapshot.deletion_vectors {
+                if !touched.contains(&parent_dv.data_file) {
+                    let decoded = bridge
+                        .read_deletion_vector(parent_dv)
+                        .await
+                        .map_err(|e| anyhow!("live delete: decoding a parent vector: {e}"))?;
+                    all_entries.push((parent_dv.data_file.clone(), decoded));
+                }
+            }
+            let borrowed: Vec<(object_store::path::Path, &PositionDeletes)> =
+                all_entries.iter().map(|(f, d)| (f.clone(), d)).collect();
+            // The snapshot id shares MATERIALIZE's millisecond scale — the
+            // engine requires a successor id to EXCEED its parent's, and a
+            // nanosecond-scale id would starve every later MATERIALIZE of a
+            // valid id — bumped past the parent snapshot when the clock does
+            // not move, so two publications in one millisecond stay
+            // monotone. The Puffin key keeps nanoseconds: object keys carry
+            // no ordering constraint, only uniqueness, and ns keeps
+            // same-millisecond deletes from silently sharing a file.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or_default();
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or_default();
+            let parent_snap_id =
+                proximadb_iceberg_engine::current_snapshot_id_of(&parent_meta).unwrap_or(0);
+            let snapshot_id = now_ms.max(parent_snap_id.saturating_add(1));
+            let puffin_key =
+                object_store::path::Path::from(format!("data/dv-live-{now_ns}.puffin"));
+            let metas = bridge
+                .write_deletion_vectors(&puffin_key, &borrowed)
+                .await
+                .map_err(|e| anyhow!("live delete: writing the vectors: {e}"))?;
+
+            // Gate 4, second check — IMMEDIATELY before the CAS. The check is
+            // point-in-time (no token reaches the CAS), so its protection is
+            // the window between it and the commit; the first check alone
+            // left the O(published oid bytes) mapping inside that window, and
+            // a pod displaced mid-mapping could publish onto an unchanged
+            // parent (#2275 review, finding 1). The CAS stops forks, not a
+            // displaced pod. A lease lost between the Puffin PUT and this
+            // check orphans that Puffin — the contract's accepted "crash
+            // mid-phase 3" posture.
+            if let Some(lease) = &self.publish_lease {
+                lease
+                    .check("live delete", tenant_id, table_name)
+                    .await
+                    .map_err(|e| anyhow!("live delete: the publish lease refused: {e:#}"))?;
+            }
+            match bridge
+                .publish_iceberg_files_with_deletes(
+                    &files,
+                    &metas,
+                    Some(parent),
+                    &metadata_prefix,
+                    &parent_uuid,
+                    &parent_location,
+                    &engine_fields,
+                    snapshot_id,
+                    now_ms,
+                )
+                .await
+            {
+                Ok(version) => {
+                    // Gate 5's fault point (test-only, the crash matrix's
+                    // CAS-landed/flip-lost window): armed, the publication
+                    // stands and the layout flip is SKIPPED — the state a pod
+                    // crash between the two leaves. Recovery is the guard's
+                    // orphan adoption above (a later MATERIALIZE re-records);
+                    // reads stay correct through the metadata log.
+                    if cfg!(debug_assertions)
+                        && std::env::var_os("PROXIMADB_TEST_FENCE_CRASH_BEFORE_FLIP")
+                            .is_some_and(|v| v == "1")
+                    {
+                        warn!(
+                            table = %table_name,
+                            version,
+                            "FENCE TEST FAULT: skipping the layout flip after the successor \
+                             CAS (crash-gap simulation)"
+                        );
+                        return Ok(());
+                    }
+                    // The contract's recorded snapshot_lsn (load-bearing): a
+                    // value at or above every published tombstone, flipped
+                    // into the layout forward-only like MATERIALIZE's. The
+                    // catalog is re-read here on purpose: the layout map is
+                    // read-modify-write, so the flip must start from the
+                    // freshest state, not the pre-lock snapshot above.
+                    let mut layouts = catalog
+                        .get_table(&table_id)
+                        .await
+                        .map_err(|e| anyhow!("live delete: layout re-read: {e}"))?
+                        .storage_layouts;
+                    // Bound to the location this publication resolved: a
+                    // rename racing this delete (the publish lock is keyed by
+                    // name) must not get this log's version recorded against
+                    // another location's files.
+                    match layouts.iter_mut().find(|l| {
+                        l.name == "parquet-snapshot"
+                            && l.location.as_deref() == Some(data_location.as_str())
+                    }) {
+                        Some(l) => {
+                            // Forward-only (review finding 7): an external
+                            // flip could have recorded a NEWER version between
+                            // our commit and this re-read — never move the
+                            // layout (and its snapshot_lsn) back.
+                            let recorded_version = l
+                                .properties
+                                .get(materialize_stream::METADATA_VERSION_PROPERTY)
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .unwrap_or(0);
+                            if version < recorded_version {
+                                if let Some(counter) = LIVE_DELETE_PUBLISH_FAILURES.as_ref() {
+                                    counter.inc();
+                                }
+                                warn!(
+                                    table = %table_name,
+                                    version,
+                                    recorded_version,
+                                    "live delete: a newer publication already flipped the \
+                                     catalog; keeping it (the publication stands, the fence \
+                                     gap stays open until it is recorded)"
+                                );
+                            } else {
+                                l.properties.insert(
+                                    materialize_stream::METADATA_VERSION_PROPERTY.to_string(),
+                                    version.to_string(),
+                                );
+                                l.properties
+                                    .insert("snapshot_lsn".to_string(), fence_lsn.to_string());
+                                catalog
+                                    .set_storage_layouts(&table_id, layouts)
+                                    .await
+                                    .map_err(|e| anyhow!("live delete: the layout flip: {e}"))?;
+                                info!(
+                                    table = %table_name,
+                                    version,
+                                    files = files.len(),
+                                    vectors = metas.len(),
+                                    "live delete crossed the visibility fence"
+                                );
+                            }
+                        }
+                        None => {
+                            if let Some(counter) = LIVE_DELETE_PUBLISH_FAILURES.as_ref() {
+                                counter.inc();
+                            }
+                            // The layout vanished between the publication and
+                            // the flip (review finding 7): never claim the
+                            // fence closed. The publication stands; the gap
+                            // stays open until the next publication records a
+                            // layout (fail-closed, like the crash gap).
+                            warn!(
+                                table = %table_name,
+                                version,
+                                "live delete: the parquet-snapshot layout vanished before \
+                                 the flip; the publication stands, the fence gap stays open"
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if msg.contains("moved past") || msg.contains("AlreadyExists") {
+                        warn!(
+                            table = %table_name,
+                            "live delete lost the successor race; retrying from the new parent: {e}"
+                        );
+                        continue; // the bounded retry re-maps from the new parent
+                    }
+                    return Err(anyhow!("live delete: the successor commit: {e}"));
+                }
+            }
+        }
+        Err(anyhow!(
+            "live delete: lost the successor race twice; the fence gap stays open until \
+             the next publication"
+        ))
+    }
+
     async fn execute_delete(
         &self,
         table_name: &str,
@@ -4228,14 +6297,8 @@ impl DmlService {
         tenant_context: Option<&TenantContext>,
     ) -> Result<DmlResult> {
         let (catalog, table_id) = self
-            .catalog_manager
-            .resolve_table_scoped(table_name, tenant_context.map(|t| t.tenant_id.as_str()))
+            .resolve_existing_table(table_name, tenant_context)
             .await?;
-
-        // Verify table exists
-        if !catalog.table_exists(&table_id).await? {
-            return Err(anyhow!("Table '{table_name}' does not exist"));
-        }
 
         let table_schema = catalog.get_table(&table_id).await?;
         let dml_lock_guard = self
@@ -4343,13 +6406,13 @@ impl DmlService {
                     .iter()
                     .filter_map(|rec| {
                         let pk_values = Self::record_primary_key_values(rec, &pk_cols)?;
-                        proximadb_data_model::key_codec::encode_identity(
+                        Self::cks_identity(
+                            tenant_context,
                             &rec.tenant_id,
                             &table_schema.name,
                             &pk_values,
                         )
                         .ok()
-                        .map(proximadb_storage_ports::Identity::from_bytes)
                     })
                     .collect()
             } else {
@@ -4374,6 +6437,18 @@ impl DmlService {
                     .unwrap_or_else(|| "unknown error".to_string())
             ));
         }
+
+        // TD-USUB-10 3c, the visibility fence contract's phase 3: publish the
+        // deletion-vector successor (best-effort; the WAL write above is the
+        // authority and already stands). Default OFF.
+        let deleted_oids: Vec<String> = ids_to_delete.to_vec();
+        self.publish_live_deletes(
+            table_name,
+            &deleted_oids,
+            tenant_context.map(|t| t.tenant_id.as_str()),
+            batch_result.max_lsn,
+        )
+        .await;
 
         // F5 (ADR-072): keep the fenced ConditionalKeyStore consistent with the
         // delete — tombstone each removed row's PK Identity so FK existence
@@ -4413,35 +6488,74 @@ impl DmlService {
         Ok(result)
     }
 
-    /// Execute UPSERT statement
+    /// Execute `INSERT … ON CONFLICT [target] DO NOTHING | DO UPDATE` with
+    /// PostgreSQL semantics (TD-DML-3).
+    ///
+    /// Rows are arbitrated one at a time, in statement order, against the
+    /// committed table AND the rows this statement already wrote (a later row
+    /// sees an earlier one, as in PostgreSQL):
+    ///
+    /// * no conflict on an arbiter → the row is inserted;
+    /// * conflict + `DO NOTHING` → the row is skipped, the holder untouched;
+    /// * conflict + `DO UPDATE` → the holder's assignments are evaluated
+    ///   against it (`EXCLUDED` = proposed row); a false `WHERE` skips it; a
+    ///   holder this statement already inserted or updated is 21000.
+    ///
+    /// The surviving inserts and updates then run the ONE TD-DML-1 enforcement
+    /// sequence (PK claim for new rows, UNIQUE on every written row excluding
+    /// the updated rows' own old values, FK), and are written as one batch.
+    /// CHECK / NOT NULL ran row-locally when each row was built — on the
+    /// proposed row (as PostgreSQL does before arbitration) and on every
+    /// post-update row.
     async fn execute_upsert(
         &self,
         table_name: &str,
         columns: &[String],
         values: Vec<Vec<SqlValueLiteral>>,
-        _conflict_columns: &[String],
-        _update_assignments: Vec<(String, SqlValueLiteral)>,
+        on_conflict: &OnConflictClause,
         tenant_context: Option<&TenantContext>,
     ) -> Result<DmlResult> {
         let (catalog, table_id) = self
-            .catalog_manager
-            .resolve_table_scoped(table_name, tenant_context.map(|t| t.tenant_id.as_str()))
+            .resolve_existing_table(table_name, tenant_context)
             .await?;
-
-        // Verify table exists
-        if !catalog.table_exists(&table_id).await? {
-            return Err(anyhow!("Table '{table_name}' does not exist"));
-        }
 
         // Get table schema
         let table_schema = catalog.get_table(&table_id).await?;
+        // Bind the clause before taking any lock: a bad target or expression
+        // is a statement error, not a write.
+        let arbiters = Self::resolve_conflict_arbiters(&table_schema, &on_conflict.target)?;
+        let bound_update = match &on_conflict.action {
+            OnConflictAction::DoNothing => None,
+            OnConflictAction::DoUpdate {
+                assignments,
+                selection,
+            } => Some(self.bind_on_conflict_update(
+                &table_schema,
+                &on_conflict.target_qualifier,
+                assignments,
+                selection.as_deref(),
+            )?),
+        };
+
         let dml_lock_guard = self
             .acquire_table_dml_lock(&table_id, tenant_context, LockIntent::Write)
             .await?;
         // TD-DML-1: the same non-reentrant in-process op-lock INSERT holds (see
         // execute_insert) — the constraint probes below and the write must not
         // interleave with a concurrent writer or a cascading parent DELETE.
-        let _op_lock = self.op_lock(&table_id).await?;
+        // TD-RELIDEQ-2: a replaced row can change a UNIQUE value children
+        // reference, so the referencing children are held too. An UPSERT
+        // replaces the WHOLE row — a column missing from its list is written as
+        // NULL/default — so every column counts as written (`&[]`).
+        let (referencing_children, _op_locks, child_dml_locks) = self
+            .lock_unique_referencing_children(
+                &catalog,
+                &table_id,
+                &table_schema,
+                &[],
+                tenant_context,
+            )
+            .await?;
         let (write_intent, write_lane_decision) = Self::route_row_dml_write_intent(
             &table_schema,
             WriteOperationKind::Upsert,
@@ -4449,76 +6563,659 @@ impl DmlService {
         );
         Self::trace_row_dml_write_lane(&write_intent, &write_lane_decision);
 
-        let mut records = Vec::new();
+        // Rows this statement writes, in order, with their mutation kind.
+        let mut written: Vec<(ProximaRecord, TableRecordMutationKind)> = Vec::new();
+        // Oids this statement inserted or updated (a DO UPDATE hitting one is 21000).
+        let mut touched: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Committed rows rewritten by DO UPDATE (their stored image is stale).
+        let mut updated: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut inserted_ids = Vec::new();
 
         for row in values {
-            let record = self.build_mutation_record(
+            let (proposed, proposed_values) = self.build_mutation_record_with_values(
                 columns,
                 &row,
                 &table_schema,
-                RelationalMutationKind::Upsert,
+                RelationalMutationKind::Insert,
             )?;
-            inserted_ids.push(record.oid.clone());
-            records.push(record);
+            let holder = self
+                .find_conflict_holder(
+                    &table_schema,
+                    &table_id,
+                    &arbiters,
+                    &proposed,
+                    &written,
+                    &updated,
+                    tenant_context,
+                )
+                .await?;
+            let Some((holder_oid, holder_row)) = holder else {
+                touched.insert(proposed.oid.clone());
+                inserted_ids.push(proposed.oid.clone());
+                written.push((proposed, TableRecordMutationKind::Insert));
+                continue;
+            };
+            let Some(update) = &bound_update else {
+                continue; // DO NOTHING
+            };
+            if touched.contains(&holder_oid) {
+                return Err(RelationalConstraintViolation::new(
+                    RelationalConstraintKind::UpsertAffectsRowTwice,
+                    format!(
+                        "ON CONFLICT DO UPDATE command cannot affect row a second time: row '{}' of table '{}' was already inserted or updated by this statement",
+                        holder_oid, table_schema.name
+                    ),
+                )
+                .into());
+            }
+            // A committed holder was read (live) during arbitration; an
+            // in-statement holder was already answered by the 21000 check.
+            let existing = holder_row.ok_or_else(|| {
+                anyhow!(
+                    "ON CONFLICT DO UPDATE: conflicting row '{}' of table '{}' is no longer visible",
+                    holder_oid,
+                    table_schema.name
+                )
+            })?;
+            let existing_values = Self::existing_row_values(&existing, &table_schema)?;
+            let eval_row: proximadb_relational_types::RelationalRow = table_schema
+                .columns
+                .iter()
+                .map(|column| {
+                    existing_values
+                        .get(&column.name)
+                        .cloned()
+                        .unwrap_or(ProximaValue::Null)
+                })
+                .chain(table_schema.columns.iter().map(|column| {
+                    proposed_values
+                        .get(&column.name)
+                        .cloned()
+                        .unwrap_or(ProximaValue::Null)
+                }))
+                .collect();
+            let funcs = proximadb_functions::builtins();
+            if let Some(selection) = &update.selection {
+                let verdict = selection
+                    .eval(&eval_row, funcs)
+                    .map_err(|e| Self::expr_error("ON CONFLICT DO UPDATE WHERE", e))?;
+                // Three-valued logic: NULL and false both leave the row alone.
+                if !matches!(verdict, ProximaValue::Boolean(true)) {
+                    continue;
+                }
+            }
+            // PostgreSQL RLS: DO UPDATE requires the caller to see the
+            // conflicting row (UPDATE USING); otherwise 42501.
+            #[cfg(feature = "abac-policy")]
+            self.check_on_conflict_update_visible(
+                on_conflict.caller_identity.as_ref(),
+                &table_schema,
+                &existing,
+            )?;
+            let mut assigned = Vec::with_capacity(update.assignments.len());
+            let mut assigned_timestamp_ns = None;
+            for (column_name, expr) in &update.assignments {
+                let value = expr.eval(&eval_row, funcs).map_err(|e| {
+                    Self::expr_error(&format!("ON CONFLICT DO UPDATE SET {column_name}"), e)
+                })?;
+                let value = self.coerce_assigned_value(column_name, value, &table_schema)?;
+                if column_name == "timestamp" {
+                    assigned_timestamp_ns = match &value {
+                        ProximaValue::Timestamp(
+                            ms,
+                            proximadb_data_model::TimeUnit::Millisecond,
+                        )
+                        | ProximaValue::TimestampTz(
+                            ms,
+                            proximadb_data_model::TimeUnit::Millisecond,
+                        ) => Some(ms.saturating_mul(1_000_000)),
+                        _ => assigned_timestamp_ns,
+                    };
+                }
+                assigned.push((column_name.clone(), value));
+            }
+            let record = Self::updated_record_from_values(
+                &existing,
+                existing_values,
+                assigned,
+                assigned_timestamp_ns,
+                &table_schema,
+            )?;
+            touched.insert(holder_oid.clone());
+            updated.insert(holder_oid);
+            written.push((record, TableRecordMutationKind::Update));
         }
 
-        // TD-DML-1: an UPSERT writes rows exactly like INSERT does, so it runs
-        // the SAME integrity sequence (PK claim, secondary UNIQUE, FOREIGN KEY);
-        // CHECK / NOT NULL ran row-locally in `build_mutation_record`. The
-        // Upsert mode differs only where the semantics do: a live PK holder is
-        // the row being replaced (not a duplicate), and replaced rows vacate
-        // their own UNIQUE values (no self-conflict).
-        let replaced = self
+        if written.is_empty() {
+            self.finish_dml_guards(dml_lock_guard.into_iter().chain(child_dml_locks))
+                .await;
+            return Ok(DmlResult::success(0, "Inserted 0 rows, updated 0 rows"));
+        }
+
+        // TD-DML-1: the shared integrity sequence over exactly the rows this
+        // statement writes — new rows as INSERT, DO UPDATE rows as in-place
+        // rewrites (UNIQUE probe excludes their own old values).
+        let (records, kinds): (Vec<ProximaRecord>, Vec<TableRecordMutationKind>) =
+            written.into_iter().unzip();
+
+        // TD-RELIDEQ-2: ON UPDATE NO ACTION for the rows being replaced — the
+        // live rows at these oids. Checked BEFORE the integrity sequence below,
+        // which may claim keys in the fenced CKS and releases them only on its
+        // own failure: a rejection here must leave no claim behind.
+        if !referencing_children.is_empty() {
+            let oids: Vec<String> = records.iter().map(|record| record.oid.clone()).collect();
+            let old_rows = self
+                .fetch_rows_by_oid(&table_schema, &table_id.name, &oids, tenant_context)
+                .await?;
+            self.enforce_update_referential_actions(
+                &table_schema,
+                &referencing_children,
+                &old_rows,
+                &records,
+                tenant_context,
+            )
+            .await?;
+        }
+        let pk_claims = self
             .enforce_row_write_constraints(
                 &table_schema,
                 &table_id,
                 &records,
-                RowWriteConstraintMode::Upsert,
+                RowWriteConstraintMode::OnConflict { updated: &updated },
                 tenant_context,
             )
             .await?;
-        let new_rows = replaced.iter().filter(|existed| !**existed).count();
 
-        let num_records = records.len();
+        let inserted_count = inserted_ids.len();
+        let updated_count = updated.len();
         let mutations = records
             .into_iter()
-            .map(|record| TableRecordMutation::new(TableRecordMutationKind::Upsert, record))
+            .zip(kinds)
+            .map(|(record, kind)| TableRecordMutation::new(kind, record))
             .collect::<Vec<_>>();
-        let batch_result = self
+        // PK claims are released when the store says nothing became durable:
+        // a store-reported rejection (`Ok(!success)`) or an `Err` marked
+        // `RejectedBeforeAppend` (validation / health / pre-append reads). Any
+        // other `Err` may follow a durable WAL append (e.g. the memtable-full
+        // bail), so the claim is kept (fail closed) — and reconciled lazily on
+        // the next claim of the key, or by the startup sweep, once the durable
+        // log provably lacks the row.
+        let batch_result = match self
             .record_store
             .write_mutations(&table_schema, mutations, tenant_context)
-            .await?;
+            .await
+        {
+            Ok(batch_result) => batch_result,
+            Err(error) => {
+                if crate::services::record_store::is_rejected_before_append(&error) {
+                    self.release_pk_claims(&table_schema, &pk_claims).await;
+                }
+                return Err(error);
+            }
+        };
         if !batch_result.success {
-            return Err(anyhow!(
-                "Upsert failed: {}",
-                batch_result
-                    .errors
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "unknown error".to_string())
-            ));
+            self.release_pk_claims(&table_schema, &pk_claims).await;
+            let detail = batch_result
+                .errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "unknown error".to_string());
+            if batch_result.error_code.as_deref() == Some("INSERT_CONFLICT") {
+                return Err(RelationalConstraintViolation::new(
+                    RelationalConstraintKind::Unique,
+                    format!("duplicate key value violates primary key: {detail}"),
+                )
+                .into());
+            }
+            return Err(anyhow!("Upsert failed: {detail}"));
         }
 
         info!(
             table = %table_name,
-            rows = num_records,
-            "Upserted rows"
+            inserted = inserted_count,
+            updated = updated_count,
+            "INSERT ON CONFLICT applied"
         );
 
-        // Only rows that did not exist grow the table; replaced rows do not.
+        // Only inserted rows grow the table; updated and skipped rows do not.
         self.bump_row_count_stats(
             table_name,
             tenant_context.map(|t| t.tenant_id.as_str()),
-            new_rows as i64,
+            inserted_count as i64,
         )
         .await;
 
-        let result =
-            DmlResult::success(num_records as u64, format!("Upserted {} rows", num_records))
-                .with_inserted_ids(inserted_ids);
-        self.finish_dml_guards(dml_lock_guard).await;
+        let result = DmlResult::success(
+            (inserted_count + updated_count) as u64,
+            format!("Inserted {inserted_count} rows, updated {updated_count} rows"),
+        )
+        .with_inserted_ids(inserted_ids);
+        self.finish_dml_guards(dml_lock_guard.into_iter().chain(child_dml_locks))
+            .await;
         Ok(result)
+    }
+
+    /// TD-DML-3: [`Self::resolve_declared_column_name`] with the PostgreSQL
+    /// SQLSTATE for an unknown column (42703).
+    fn resolve_declared_column_typed(
+        raw: &str,
+        table_schema: &CatalogTableSchema,
+    ) -> Result<String> {
+        Self::resolve_declared_column_name(raw, table_schema).map_err(|e| {
+            RelationalConstraintViolation::new(
+                RelationalConstraintKind::UndefinedColumn,
+                e.to_string(),
+            )
+            .into()
+        })
+    }
+
+    /// TD-DML-3: a write-expression evaluation error with the SQLSTATE
+    /// PostgreSQL raises for the same failure (22012 / 22003 / 42804 / 42883 /
+    /// 42846); any
+    /// other evaluator error stays untyped.
+    fn expr_error(context: &str, error: proximadb_relational_types::ExprError) -> anyhow::Error {
+        use proximadb_relational_types::ExprError;
+        let kind = match &error {
+            ExprError::DivisionByZero => Some(RelationalConstraintKind::DivisionByZero),
+            ExprError::InvalidTextRepresentation { .. } => {
+                Some(RelationalConstraintKind::InvalidTextRepresentation)
+            }
+            ExprError::ArithmeticOverflow => Some(RelationalConstraintKind::NumericValueOutOfRange),
+            ExprError::TypeMismatch { .. } => Some(RelationalConstraintKind::DatatypeMismatch),
+            ExprError::OperatorNotDefined { .. } | ExprError::UnaryOperatorNotDefined { .. } => {
+                Some(RelationalConstraintKind::UndefinedFunction)
+            }
+            ExprError::UnsupportedCast { .. } => Some(RelationalConstraintKind::CannotCoerce),
+            _ => None,
+        };
+        let message = format!("{context}: {error}");
+        match kind {
+            Some(kind) => RelationalConstraintViolation::new(kind, message).into(),
+            None => anyhow!(message),
+        }
+    }
+
+    /// TD-DML-3: the unique column sets that arbitrate an `ON CONFLICT`, each
+    /// in catalog order (the order the record-store UNIQUE index is keyed by).
+    /// The PRIMARY KEY set, when present, is first.
+    fn resolve_conflict_arbiters(
+        table_schema: &CatalogTableSchema,
+        target: &OnConflictTarget,
+    ) -> Result<Vec<Vec<String>>> {
+        let pk_columns = Self::primary_key_columns(table_schema);
+        let same_set = |a: &[String], b: &[String]| {
+            a.len() == b.len() && a.iter().all(|column| b.contains(column))
+        };
+        let mut all: Vec<Vec<String>> = Vec::new();
+        if !pk_columns.is_empty() {
+            all.push(pk_columns.clone());
+        }
+        for set in crate::services::record_store::schema_unique_column_sets(table_schema) {
+            if !all.iter().any(|known| same_set(known, &set)) {
+                all.push(set);
+            }
+        }
+
+        match target {
+            OnConflictTarget::AnyUnique => Ok(all),
+            OnConflictTarget::Columns(requested) => {
+                let requested = requested
+                    .iter()
+                    .map(|column| Self::resolve_declared_column_typed(column, table_schema))
+                    .collect::<Result<Vec<_>>>()?;
+                let matching: Vec<Vec<String>> = all
+                    .into_iter()
+                    .filter(|set| same_set(set, &requested))
+                    .collect();
+                if matching.is_empty() {
+                    return Err(RelationalConstraintViolation::new(
+                        RelationalConstraintKind::NoMatchingConflictTarget,
+                        format!(
+                            "there is no unique or exclusion constraint matching the ON CONFLICT specification ({}) on table '{}'",
+                            requested.join(", "),
+                            table_schema.name
+                        ),
+                    )
+                    .into());
+                }
+                Ok(matching)
+            }
+            OnConflictTarget::Constraint(name) => {
+                let table = &table_schema.name;
+                let named = |set: &[String]| -> bool {
+                    let default_name = if same_set(set, &pk_columns) {
+                        format!("{table}_pkey")
+                    } else {
+                        format!("{table}_{}_key", set.join("_"))
+                    };
+                    default_name.eq_ignore_ascii_case(name)
+                        || table_schema
+                            .relational_capabilities
+                            .unique_indexes
+                            .iter()
+                            .any(|index| {
+                                index.name.eq_ignore_ascii_case(name)
+                                    && same_set(&index.columns, set)
+                            })
+                };
+                match all.into_iter().find(|set| named(set)) {
+                    Some(set) => Ok(vec![set]),
+                    None => Err(RelationalConstraintViolation::new(
+                        RelationalConstraintKind::UndefinedConstraint,
+                        format!("constraint \"{name}\" for table \"{table}\" does not exist"),
+                    )
+                    .into()),
+                }
+            }
+        }
+    }
+
+    /// TD-DML-3: bind a `DO UPDATE` against the table — resolve each SET target
+    /// to a declared, non-PK column and lower every expression with the
+    /// canonical relational frontend (`lower_on_conflict_expr`), the same
+    /// lowering and evaluator SELECT uses.
+    fn bind_on_conflict_update(
+        &self,
+        table_schema: &CatalogTableSchema,
+        target_qualifier: &str,
+        assignments: &[(String, sqlparser::ast::Expr)],
+        selection: Option<&sqlparser::ast::Expr>,
+    ) -> Result<BoundOnConflictUpdate> {
+        if assignments.is_empty() {
+            return Err(anyhow!(
+                "ON CONFLICT DO UPDATE requires at least one assignment"
+            ));
+        }
+        let relational_schema = proximadb_relational_types::RelationalSchema::new(
+            table_schema
+                .columns
+                .iter()
+                .map(|column| {
+                    proximadb_relational_types::ColumnInfo::new(
+                        column.name.clone(),
+                        column.data_type.clone(),
+                        column.nullable,
+                    )
+                })
+                .collect(),
+        );
+        let lower = |expr: &sqlparser::ast::Expr| {
+            proximadb_relational_frontend::lower_on_conflict_expr(
+                expr,
+                target_qualifier,
+                &relational_schema,
+            )
+            .map_err(|e| {
+                let message = format!("ON CONFLICT DO UPDATE expression `{expr}`: {e}");
+                match e {
+                    proximadb_relational_frontend::FrontendError::ColumnNotFound(_) => {
+                        RelationalConstraintViolation::new(
+                            RelationalConstraintKind::UndefinedColumn,
+                            message,
+                        )
+                        .into()
+                    }
+                    _ => anyhow!(message),
+                }
+            })
+        };
+        let primary_key_columns = Self::primary_key_columns(table_schema);
+        let mut bound = Vec::with_capacity(assignments.len());
+        for (target, expr) in assignments {
+            let column_name = Self::resolve_declared_column_typed(target, table_schema)?;
+            if primary_key_columns.contains(&column_name) {
+                return Err(RelationalConstraintViolation::new(
+                    RelationalConstraintKind::FeatureNotSupported,
+                    format!(
+                        "ON CONFLICT DO UPDATE cannot modify primary key column '{column_name}'"
+                    ),
+                )
+                .into());
+            }
+            if bound.iter().any(|(seen, _)| seen == &column_name) {
+                return Err(RelationalConstraintViolation::new(
+                    RelationalConstraintKind::DuplicateColumn,
+                    format!("multiple assignments to same column \"{column_name}\""),
+                )
+                .into());
+            }
+            // `SET col = DEFAULT` — the column's declared default, typed as for INSERT.
+            let is_default = matches!(
+                expr,
+                sqlparser::ast::Expr::Identifier(ident)
+                    if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("DEFAULT")
+            );
+            let lowered = if is_default {
+                let literal = self.effective_insert_literal(
+                    &column_name,
+                    &SqlValueLiteral::Default,
+                    table_schema,
+                )?;
+                let value =
+                    self.literal_to_proxima_value_for_column(&column_name, &literal, table_schema)?;
+                let ty = table_schema
+                    .columns
+                    .iter()
+                    .find(|column| column.name == column_name)
+                    .map(|column| column.data_type.clone())
+                    .ok_or_else(|| anyhow!("Column '{column_name}' does not exist"))?;
+                proximadb_relational_types::Expr::Literal { value, ty }
+            } else {
+                lower(expr)?
+            };
+            bound.push((column_name, lowered));
+        }
+        let selection = selection.map(lower).transpose()?;
+        Ok(BoundOnConflictUpdate {
+            assignments: bound,
+            selection,
+        })
+    }
+
+    /// TD-DML-3: coerce an evaluated `DO UPDATE` value to its column's type.
+    /// Text goes through the SAME literal coercion INSERT uses (DATE,
+    /// TIMESTAMP, JSON, DECIMAL text); other scalars through the relational
+    /// `cast_value`; NULL and non-scalar values (vectors, JSON documents,
+    /// arrays) pass through for `CatalogRow::validate` to type-check.
+    fn coerce_assigned_value(
+        &self,
+        column_name: &str,
+        value: ProximaValue,
+        table_schema: &CatalogTableSchema,
+    ) -> Result<ProximaValue> {
+        let Some(column) = table_schema
+            .columns
+            .iter()
+            .find(|column| column.name == column_name)
+        else {
+            return Err(anyhow!("Column '{column_name}' does not exist"));
+        };
+        match value {
+            ProximaValue::Null
+            | ProximaValue::Json(_)
+            | ProximaValue::Jsonb(_)
+            | ProximaValue::DenseVector(_)
+            | ProximaValue::SparseVector { .. }
+            | ProximaValue::BinaryVector(_)
+            | ProximaValue::Array(_)
+            | ProximaValue::Map(_)
+            | ProximaValue::Struct(_) => Ok(value),
+            ProximaValue::String(text)
+                if !matches!(column.data_type, ProximaType::String | ProximaType::Uuid) =>
+            {
+                self.literal_to_proxima_value_for_column(
+                    column_name,
+                    &SqlValueLiteral::String(text.clone()),
+                    table_schema,
+                )
+                .map_err(|e| {
+                    RelationalConstraintViolation::new(
+                        RelationalConstraintKind::InvalidTextRepresentation,
+                        format!(
+                            "invalid input syntax for type {:?} of column '{column_name}': \"{text}\" ({e})",
+                            column.data_type
+                        ),
+                    )
+                    .into()
+                })
+            }
+            // An assignment whose value has the wrong type is PostgreSQL's
+            // 42804 ("column is of type X but expression is of type Y"); bad
+            // text for the column type stays 22P02.
+            other => proximadb_relational_types::cast_value(&other, &column.data_type).map_err(
+                |e| {
+                    let message = format!(
+                        "ON CONFLICT DO UPDATE: column '{column_name}' is of type {:?} but the expression is {other:?}: {e}",
+                        column.data_type
+                    );
+                    let kind = match e {
+                        proximadb_relational_types::ExprError::InvalidTextRepresentation {
+                            ..
+                        } => RelationalConstraintKind::InvalidTextRepresentation,
+                        _ => RelationalConstraintKind::DatatypeMismatch,
+                    };
+                    RelationalConstraintViolation::new(kind, message).into()
+                },
+            ),
+        }
+    }
+
+    /// TD-DML-3: the oid of the row `proposed` conflicts with on any of the
+    /// `arbiters`, or `None`. Rows this statement already wrote are checked
+    /// first (they hold the current value of their keys); committed rows are
+    /// probed next, excluding rows a DO UPDATE rewrote (their stored image is
+    /// stale). A NULL in an arbiter column never conflicts.
+    #[allow(clippy::too_many_arguments)]
+    async fn find_conflict_holder(
+        &self,
+        table_schema: &CatalogTableSchema,
+        table_id: &TableIdentifier,
+        arbiters: &[Vec<String>],
+        proposed: &ProximaRecord,
+        written: &[(ProximaRecord, TableRecordMutationKind)],
+        updated: &std::collections::HashSet<String>,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<Option<(String, Option<ExistingRow>)>> {
+        use crate::services::record_store::{UniqueCandidateSet, record_unique_tuple};
+
+        // TD-RELIDEQ-2: declared-key semantics. A keyless table's id/record_id
+        // fallback is NOT the oid — an ON CONFLICT target on it arbitrates by
+        // its column VALUE (the unique-index tuple), never the generated oid.
+        let primary_key = crate::services::record_store::schema_oid_key_column(table_schema);
+        let pk_columns =
+            crate::services::record_store::schema_declared_primary_key_columns(table_schema);
+        for arbiter in arbiters {
+            let is_pk = arbiter.len() == pk_columns.len()
+                && arbiter.iter().all(|column| pk_columns.contains(column));
+            // The PK tuple IS the oid (composite-aware, TD-DML-2).
+            let tuple_of = |record: &ProximaRecord| {
+                if is_pk {
+                    Some(vec![record.oid.clone()])
+                } else {
+                    record_unique_tuple(record, arbiter, primary_key.as_deref())
+                }
+            };
+            let Some(tuple) = tuple_of(proposed) else {
+                continue;
+            };
+            if let Some((holder, _)) = written
+                .iter()
+                .find(|(record, _)| tuple_of(record).as_ref() == Some(&tuple))
+            {
+                return Ok(Some((holder.oid.clone(), None)));
+            }
+            if is_pk {
+                if updated.contains(&proposed.oid) {
+                    continue; // its current image is in `written`, checked above
+                }
+                // Mandate #16a: a dead (tombstoned / TTL-expired) holder holds
+                // nothing — only a LIVE row arbitrates.
+                if let RowState::Live(existing) = self
+                    .row_state(table_schema, table_id, &proposed.oid, tenant_context)
+                    .await?
+                {
+                    return Ok(Some((proposed.oid.clone(), Some(existing))));
+                }
+            } else {
+                let sets = [UniqueCandidateSet {
+                    columns: arbiter.clone(),
+                    candidates: std::iter::once(tuple).collect(),
+                }];
+                if let Some(conflict) = self
+                    .record_store
+                    .check_unique_conflict(
+                        table_schema,
+                        &table_id.name,
+                        primary_key.as_deref(),
+                        &sets,
+                        updated,
+                        tenant_context,
+                    )
+                    .await?
+                {
+                    // Re-validate the indexed holder: only a LIVE row
+                    // arbitrates. (The index probe already skips dead owners
+                    // it can see; this also covers stores without one. A
+                    // holder that is not live here is not a conflict for THIS
+                    // arbiter — the enforcement probe still fails closed.)
+                    if let RowState::Live(existing) = self
+                        .row_state(table_schema, table_id, &conflict.oid, tenant_context)
+                        .await?
+                    {
+                        return Ok(Some((conflict.oid, Some(existing))));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// TD-DML-3: the current state of the row keyed `key` — LIVE (with its
+    /// full envelope where the store serves one), DEAD (tombstoned or
+    /// TTL-expired, mandate #16a) or ABSENT. Stores without envelope reads
+    /// fall back to `get_by_key` (which cannot tell dead from live).
+    async fn row_state(
+        &self,
+        table_schema: &CatalogTableSchema,
+        table_id: &TableIdentifier,
+        key: &str,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<RowState> {
+        use crate::services::record_store::RecordEnvelopeLookup;
+        match self
+            .record_store
+            .get_record_envelope(table_schema, key, tenant_context)
+            .await?
+        {
+            RecordEnvelopeLookup::Live(record) => Ok(RowState::Live(ExistingRow::Envelope(record))),
+            RecordEnvelopeLookup::Dead => Ok(RowState::Dead),
+            RecordEnvelopeLookup::Absent => Ok(RowState::Absent),
+            RecordEnvelopeLookup::Unsupported => Ok(
+                match self
+                    .record_store
+                    .get_by_key(
+                        table_schema,
+                        TableRecordGetRequest {
+                            table_id: table_id.name.clone(),
+                            key: key.to_string(),
+                            include_vector: true,
+                            include_props: true,
+                        },
+                        tenant_context,
+                        #[cfg(feature = "abac-policy")]
+                        &ReadContext::system(
+                            SystemReadReason::ForeignKeyResolution,
+                            "dml::row_state",
+                        ),
+                    )
+                    .await?
+                {
+                    Some(projection) => RowState::Live(ExistingRow::Projection(projection)),
+                    None => RowState::Absent,
+                },
+            ),
+        }
     }
 
     // ========================
@@ -4922,6 +7619,20 @@ impl DmlService {
         table_schema: &CatalogTableSchema,
         mutation_kind: RelationalMutationKind,
     ) -> Result<ProximaRecord> {
+        self.build_mutation_record_with_values(columns, values, table_schema, mutation_kind)
+            .map(|(record, _)| record)
+    }
+
+    /// [`Self::build_mutation_record`], also returning the row's typed column
+    /// values keyed by declared column name (provided values plus DEFAULTs).
+    /// TD-DML-3 uses them as the `EXCLUDED` row of `ON CONFLICT DO UPDATE`.
+    fn build_mutation_record_with_values(
+        &self,
+        columns: &[String],
+        values: &[SqlValueLiteral],
+        table_schema: &CatalogTableSchema,
+        mutation_kind: RelationalMutationKind,
+    ) -> Result<(ProximaRecord, HashMap<String, ProximaValue>)> {
         // `INSERT INTO t VALUES (...)` without an explicit column
         // list is standard SQL — the values are mapped to the table's
         // declared columns in order. Synthesize the column list
@@ -5004,6 +7715,7 @@ impl DmlService {
             row_values.insert(column.name.clone(), proxima_value.clone());
         }
 
+        let typed_values = row_values.clone();
         let catalog_row =
             CatalogRow::validate(table_schema, row_values, &RelationalWriteProfile::oltp())?;
         let record = catalog_row.to_mutation_record(
@@ -5015,7 +7727,7 @@ impl DmlService {
                 ..RelationalRecordOptions::default()
             },
         )?;
-        Ok(record)
+        Ok((record, typed_values))
     }
 
     fn mutation_method(kind: RelationalMutationKind) -> &'static str {
@@ -5193,7 +7905,8 @@ impl DmlService {
             return Err(anyhow!("UPDATE requires at least one assignment"));
         }
 
-        let primary_key_column = Self::primary_key_column(table_schema);
+        let declared_key =
+            crate::services::record_store::schema_declared_primary_key_columns(table_schema);
         for (column_name, value) in assignments {
             let Some(column) = table_schema
                 .columns
@@ -5206,13 +7919,12 @@ impl DmlService {
                     table_schema.name
                 ));
             };
-            if primary_key_column.as_deref() == Some(column_name.as_str())
-                && Self::table_declares_primary_key(table_schema)
-            {
-                return Err(anyhow!(
-                    "UPDATE cannot modify primary key column '{}'",
-                    column_name
-                ));
+            if declared_key.iter().any(|key| key == column_name) {
+                return Err(RelationalConstraintViolation::new(
+                    RelationalConstraintKind::FeatureNotSupported,
+                    format!("UPDATE cannot modify primary key column '{column_name}'"),
+                )
+                .into());
             }
             if Self::literal_is_null(value) && !column.nullable {
                 return Err(anyhow!(
@@ -5231,18 +7943,13 @@ impl DmlService {
 
     fn build_updated_proxima_record(
         &self,
-        existing: RichSearchResult,
+        existing: ExistingRow,
         assignments: &[(String, SqlValueLiteral)],
         table_schema: &CatalogTableSchema,
     ) -> Result<ProximaRecord> {
-        let mut row_values = Self::row_values_from_existing(&existing, table_schema)?;
-        let mut created_at_ns = existing
-            .timestamp
-            .map(|timestamp_ms| timestamp_ms.saturating_mul(1_000_000));
-        let mut updated_at_ns = chrono::Utc::now()
-            .timestamp_millis()
-            .saturating_mul(1_000_000);
-
+        let row_values = Self::existing_row_values(&existing, table_schema)?;
+        let mut assigned = Vec::with_capacity(assignments.len());
+        let mut assigned_timestamp_ns = None;
         for (column_name, value) in assignments {
             let effective_value =
                 self.effective_insert_literal(column_name, value, table_schema)?;
@@ -5251,54 +7958,175 @@ impl DmlService {
                 &effective_value,
                 table_schema,
             )?;
-
             if column_name == "timestamp"
                 && let Some(timestamp_ms) = self.literal_to_timestamp(&effective_value)?
             {
-                let timestamp_ns = timestamp_ms.saturating_mul(1_000_000);
-                created_at_ns = Some(timestamp_ns);
-                updated_at_ns = timestamp_ns;
+                assigned_timestamp_ns = Some(timestamp_ms.saturating_mul(1_000_000));
             }
+            assigned.push((column_name.clone(), proxima_value));
+        }
+        Self::updated_record_from_values(
+            &existing,
+            row_values,
+            assigned,
+            assigned_timestamp_ns,
+            table_schema,
+        )
+    }
 
-            row_values.insert(column_name.clone(), proxima_value);
+    /// The ONE "apply assignments to an existing row" step shared by UPDATE
+    /// and `ON CONFLICT DO UPDATE` (TD-DML-3): overlay the already-typed
+    /// `assigned` values on the existing row's values, re-validate the whole
+    /// row (CHECK / NOT NULL / types) and envelope it as an Update with a
+    /// bumped record version.
+    fn updated_record_from_values(
+        existing: &ExistingRow,
+        mut row_values: HashMap<String, ProximaValue>,
+        assigned: Vec<(String, ProximaValue)>,
+        assigned_timestamp_ns: Option<i64>,
+        table_schema: &CatalogTableSchema,
+    ) -> Result<ProximaRecord> {
+        let mut created_at_ns = match existing {
+            ExistingRow::Envelope(record) => Some(record.created_at_ns),
+            ExistingRow::Projection(projection) => projection
+                .timestamp
+                .map(|timestamp_ms| timestamp_ms.saturating_mul(1_000_000)),
+        };
+        let record_version = match existing {
+            ExistingRow::Envelope(record) => Some(record.record_version.saturating_add(1)),
+            ExistingRow::Projection(projection) => {
+                projection.version.map(|version| version as u64 + 1)
+            }
+        };
+        let mut updated_at_ns = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_mul(1_000_000);
+        if let Some(timestamp_ns) = assigned_timestamp_ns {
+            created_at_ns = Some(timestamp_ns);
+            updated_at_ns = timestamp_ns;
+        }
+        for (column_name, value) in assigned {
+            row_values.insert(column_name, value);
         }
 
         let catalog_row =
             CatalogRow::validate(table_schema, row_values, &RelationalWriteProfile::oltp())?;
-        catalog_row.to_mutation_record(
+        let mut record = catalog_row.to_mutation_record(
             table_schema,
             RelationalMutationKind::Update,
             RelationalRecordOptions {
                 method: Some("sql_dml_update".to_string()),
                 created_at_ns,
                 updated_at_ns: Some(updated_at_ns),
-                record_version: existing.version.map(|version| version as u64 + 1),
+                record_version,
                 // TD-RELIDEQ-1: a keyless row keeps its oid (ignored when the
                 // table declares a key, whose value is the oid).
-                record_id: Some(existing.id.clone()),
+                record_id: Some(existing.id().to_owned()),
                 ..RelationalRecordOptions::default()
             },
-        )
+        )?;
+        let existing_id = existing.id();
+        // TD-DML-3: an update rewrites THIS row. A table with no primary key
+        // has no key to re-derive the identity from (`to_proxima_record` would
+        // mint a fresh `<table>:row:<ns>` oid, so the Update targeted a row
+        // that does not exist); pin the identity to the row being updated.
+        // For a keyed table the re-derived oid MUST already equal it — a
+        // mismatch means a PK column changed, which UPDATE / DO UPDATE reject
+        // up front; refuse rather than write a row whose identity and key
+        // columns disagree.
+        if !Self::primary_key_columns(table_schema).is_empty() && record.oid != existing_id {
+            return Err(anyhow!(
+                "update of row '{}' in table '{}' re-derived a different key '{}'; refusing to rewrite the row's identity",
+                existing_id,
+                table_schema.name,
+                record.oid
+            ));
+        }
+        record.oid = existing_id.to_string();
+        record.local_id = Some(existing_id.to_string());
+        // TD-DML-3: carry the envelope fields that are not columns, so an
+        // update does not silently clear them — the TTL / validity window,
+        // the tenant stamp and the row-level security envelope. Props are
+        // rebuilt from the DECLARED columns only: an undeclared prop is a
+        // dropped column's stale value (carrying it would let a later ADD
+        // COLUMN resurrect it), and write-path system metadata (pseudo-query
+        // props) is regenerated by the store on write.
+        if let ExistingRow::Envelope(previous) = existing {
+            record.valid_from_ns = previous.valid_from_ns;
+            record.valid_to_ns = previous.valid_to_ns;
+            if record.tenant_id.is_empty() {
+                record.tenant_id = previous.tenant_id.clone();
+            }
+            record.permitted_principals = previous.permitted_principals.clone();
+            record.rls_policy_id = previous.rls_policy_id.clone();
+        }
+        Ok(record)
+    }
+
+    /// TD-DML-3: the existing row's typed column values. From a full
+    /// envelope they are the stored column props (every PK column and every
+    /// vector column exactly as written); from a `get_by_key` projection they
+    /// are reconstructed (lossy: one embedding, PK decoded from the key).
+    fn existing_row_values(
+        existing: &ExistingRow,
+        table_schema: &CatalogTableSchema,
+    ) -> Result<HashMap<String, ProximaValue>> {
+        match existing {
+            ExistingRow::Envelope(record) => Ok(table_schema
+                .columns
+                .iter()
+                .filter_map(|column| match record.props.get(&column.name) {
+                    Some(ProximaTreeNode::Value(value)) => {
+                        Some((column.name.clone(), value.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()),
+            ExistingRow::Projection(projection) => {
+                Self::row_values_from_existing(projection, table_schema)
+            }
+        }
     }
 
     fn row_values_from_existing(
         existing: &RichSearchResult,
         table_schema: &CatalogTableSchema,
     ) -> Result<HashMap<String, ProximaValue>> {
-        let primary_key_column = Self::primary_key_column(table_schema);
+        // TD-DML-3: the oid is the ENCODED PK tuple — one `\u{1f}`-joined part
+        // per PK column (TD-110 S2). Decoding it into the FIRST PK column only
+        // (the pre-TD-DML-3 behaviour) put the whole tuple into that column, so
+        // every UPDATE / DO UPDATE of a composite-PK row rewrote a different,
+        // non-existent key.
+        // TD-RELIDEQ-2: DECLARED keys only — a keyless table's id/record_id
+        // fallback column must not receive the generated oid as its value.
+        let primary_key_columns =
+            crate::services::record_store::schema_declared_primary_key_columns(table_schema);
+        // A single-column key is the whole oid — its value may itself contain
+        // the separator, so it is never split.
+        let primary_key_parts: Vec<&str> = if primary_key_columns.len() <= 1 {
+            vec![existing.id.as_str()]
+        } else {
+            split_primary_key_tuple(&existing.id)
+        };
+        if !primary_key_columns.is_empty() && primary_key_parts.len() != primary_key_columns.len() {
+            return Err(anyhow!(
+                "row key '{}' of table '{}' decoded to {} part(s) but its primary key ({}) has {} column(s)",
+                existing.id,
+                table_schema.name,
+                primary_key_parts.len(),
+                primary_key_columns.join(", "),
+                primary_key_columns.len()
+            ));
+        }
         let mut row_values = HashMap::new();
 
         for column in &table_schema.columns {
-            // TD-RELIDEQ-1: only a declared key lives in the oid; a keyless
-            // table's `id`/`record_id` fallback column is an ordinary column.
-            if primary_key_column.as_deref() == Some(column.name.as_str())
-                && Self::table_declares_primary_key(table_schema)
-            {
+            if let Some(position) = primary_key_columns.iter().position(|pk| pk == &column.name) {
                 row_values.insert(
                     column.name.clone(),
                     Self::primary_key_string_to_proxima_value(
                         &column.name,
-                        &existing.id,
+                        primary_key_parts.get(position).copied().unwrap_or_default(),
                         table_schema,
                     )?,
                 );
@@ -5417,19 +8245,19 @@ impl DmlService {
     /// CHECK / NOT NULL / type constraints are row-local and already ran in
     /// `CatalogRow::validate` when the records were built.
     ///
-    /// Returns, per record in order, whether its PK already had a live row. For
-    /// `Insert` a live holder is a 23505 error, so every entry is `false`; for
-    /// `Upsert` it marks the row being replaced. If a later step rejects the
-    /// statement, PK claims this call made in the fenced store are released so
-    /// a rejected statement leaves no claimed-but-rowless key behind.
+    /// Returns the fenced PK claims this call made, so the caller can release
+    /// them if the subsequent `write_mutations` is rejected before anything is
+    /// durable ([`Self::release_pk_claims`]).
+    /// If a later step of THIS sequence rejects the statement, the claims are
+    /// released here, so a rejected statement leaves no claimed-but-rowless key.
     async fn enforce_row_write_constraints(
         &self,
         table_schema: &CatalogTableSchema,
         table_id: &TableIdentifier,
         records: &[ProximaRecord],
-        mode: RowWriteConstraintMode,
+        mode: RowWriteConstraintMode<'_>,
         tenant_context: Option<&TenantContext>,
-    ) -> Result<Vec<bool>> {
+    ) -> Result<Vec<proximadb_storage_ports::Identity>> {
         let mut fresh_claims: Vec<proximadb_storage_ports::Identity> = Vec::new();
         let outcome = self
             .enforce_row_write_constraints_inner(
@@ -5441,23 +8269,42 @@ impl DmlService {
                 &mut fresh_claims,
             )
             .await;
-        if outcome.is_err()
-            && let Some(cks) = &self.conditional_key_store
-        {
-            for id in &fresh_claims {
-                if let Err(release_err) = cks
-                    .tombstone(id, proximadb_storage_ports::Generation(0))
-                    .await
-                {
-                    warn!(
-                        table = %table_schema.name,
-                        error = %release_err,
-                        "failed to release a fenced PK claim after a rejected write"
-                    );
-                }
+        match outcome {
+            Ok(_) => Ok(fresh_claims),
+            Err(error) => {
+                self.release_pk_claims(table_schema, &fresh_claims).await;
+                Err(error)
             }
         }
-        outcome
+    }
+
+    /// Release fenced PK claims this statement made (`cks.tombstone`) when the
+    /// statement is known NOT to have landed — rejected by a later integrity
+    /// step, or rejected by the store before anything is durable
+    /// (`write_mutations` returning `Ok(!success)`, TD-DML-3) — so no
+    /// claimed-but-rowless key is left to spuriously reject the next INSERT of
+    /// it. Never called for an `Err` from `write_mutations` (durability
+    /// unknown; fail closed). No-op without a CKS.
+    async fn release_pk_claims(
+        &self,
+        table_schema: &CatalogTableSchema,
+        claims: &[proximadb_storage_ports::Identity],
+    ) {
+        let Some(cks) = &self.conditional_key_store else {
+            return;
+        };
+        for id in claims {
+            if let Err(release_err) = cks
+                .tombstone(id, proximadb_storage_ports::Generation(0))
+                .await
+            {
+                warn!(
+                    table = %table_schema.name,
+                    error = %release_err,
+                    "failed to release a fenced PK claim after a rejected write"
+                );
+            }
+        }
     }
 
     async fn enforce_row_write_constraints_inner(
@@ -5465,7 +8312,7 @@ impl DmlService {
         table_schema: &CatalogTableSchema,
         table_id: &TableIdentifier,
         records: &[ProximaRecord],
-        mode: RowWriteConstraintMode,
+        mode: RowWriteConstraintMode<'_>,
         tenant_context: Option<&TenantContext>,
         fresh_claims: &mut Vec<proximadb_storage_ports::Identity>,
     ) -> Result<Vec<bool>> {
@@ -5481,23 +8328,27 @@ impl DmlService {
             for (index, record) in records.iter().enumerate() {
                 let key = record.oid.as_str();
                 if !batch_keys.insert(key) {
-                    return Err(match mode {
-                        RowWriteConstraintMode::Insert => RelationalConstraintViolation::new(
-                            RelationalConstraintKind::Unique,
-                            format!(
-                                "duplicate key value violates primary key '{}' on table '{}': '{}' appears more than once in this INSERT",
-                                pk_column, table_schema.name, key
-                            ),
+                    // ON CONFLICT arbitration (execute_upsert) already turned
+                    // every in-statement repeat on an arbiter into a skip, an
+                    // update or 21000, so a repeat reaching here is a new row
+                    // colliding on a NON-arbiter PK: a duplicate, as in INSERT.
+                    return Err(RelationalConstraintViolation::new(
+                        RelationalConstraintKind::Unique,
+                        format!(
+                            "duplicate key value violates primary key '{}' on table '{}': '{}' appears more than once in this INSERT",
+                            pk_column, table_schema.name, key
                         ),
-                        RowWriteConstraintMode::Upsert => RelationalConstraintViolation::new(
-                            RelationalConstraintKind::UpsertAffectsRowTwice,
-                            format!(
-                                "ON CONFLICT DO UPDATE command cannot affect row a second time: primary key '{}' value '{}' appears more than once in this statement on table '{}'",
-                                pk_column, key, table_schema.name
-                            ),
-                        ),
-                    }
+                    )
                     .into());
+                }
+                // TD-DML-3: a DO UPDATE rewrites a row that holds its PK (read
+                // under the op-lock); the PK is immutable, so there is nothing
+                // to claim.
+                if let RowWriteConstraintMode::OnConflict { updated } = mode
+                    && updated.contains(key)
+                {
+                    pk_live[index] = true;
+                    continue;
                 }
                 // F2 (ADR-072 D3): when a fenced ConditionalKeyStore is wired,
                 // claim the PK atomically (oid == primary_key_string, so the row
@@ -5516,7 +8367,7 @@ impl DmlService {
                     .as_ref()
                     .filter(|_| Self::table_declares_primary_key(table_schema))
                 {
-                    use proximadb_storage_ports::{Generation, Identity, Oid, PutOutcome};
+                    use proximadb_storage_ports::{Generation, Oid, PutOutcome};
                     // Key on the F0 typed, order-preserving codec built from the
                     // row's typed PK tuple (every PK column, in catalog order —
                     // TD-DML-2) and its tenant/keyspace scope — not the legacy
@@ -5530,48 +8381,80 @@ impl DmlService {
                                 table_schema.name
                             )
                         })?;
-                    let id =
-                        Identity::from_bytes(proximadb_data_model::key_codec::encode_identity(
-                            &record.tenant_id,
-                            &table_schema.name,
-                            &pk_values,
-                        )?);
+                    let id = Self::cks_identity(
+                        tenant_context,
+                        &record.tenant_id,
+                        &table_schema.name,
+                        &pk_values,
+                    )?;
                     match cks
                         .put_if_absent(&id, &Oid(key.to_string()), Generation(0))
                         .await?
                     {
-                        PutOutcome::Conflict { .. } => true,
+                        // A held claim normally means a live row. TD-DML-3:
+                        // * the holder row is DEAD (TTL-expired) — it occupies
+                        //   nothing; the key is free and the existing claim
+                        //   covers the new row;
+                        // * the holder row is ABSENT — a claim left by a crash
+                        //   or an ambiguous write failure. Reconcile lazily:
+                        //   only when the store's DURABLE log provably holds no
+                        //   live write of the key is the claim released and
+                        //   re-taken; otherwise it stays a conflict (fail
+                        //   closed — the row may reappear on replay).
+                        PutOutcome::Conflict { .. } => {
+                            match self
+                                .row_state(table_schema, table_id, key, tenant_context)
+                                .await?
+                            {
+                                RowState::Live(_) => true,
+                                RowState::Dead => false,
+                                RowState::Absent => {
+                                    if self
+                                        .record_store
+                                        .durable_row_write(table_schema, key, tenant_context)
+                                        .await?
+                                        == Some(false)
+                                    {
+                                        cks.tombstone(&id, Generation(0)).await?;
+                                        match cks
+                                            .put_if_absent(
+                                                &id,
+                                                &Oid(key.to_string()),
+                                                Generation(0),
+                                            )
+                                            .await?
+                                        {
+                                            PutOutcome::Committed { .. } => {
+                                                fresh_claims.push(id);
+                                                false
+                                            }
+                                            PutOutcome::Conflict { .. } => true,
+                                        }
+                                    } else {
+                                        true
+                                    }
+                                }
+                            }
+                        }
                         PutOutcome::Committed { .. } => {
                             fresh_claims.push(id);
                             false
                         }
                     }
                 } else {
-                    self.record_store
-                        .get_by_key(
-                            table_schema,
-                            TableRecordGetRequest {
-                                table_id: table_id.name.clone(),
-                                key: key.to_string(),
-                                include_vector: false,
-                                include_props: false,
-                            },
-                            // The tenant's partition — the one this INSERT writes.
-                            // Probing with `None` looked in the default partition,
-                            // missed the existing row in every tenant-scoped
-                            // session, and let the duplicate surface later as an
-                            // untyped store conflict (42P01 instead of 23505).
-                            tenant_context,
-                            #[cfg(feature = "abac-policy")]
-                            &ReadContext::system(
-                                SystemReadReason::ForeignKeyResolution,
-                                "dml::fk_check",
-                            ),
-                        )
-                        .await?
-                        .is_some()
+                    // The tenant's partition — the one this INSERT writes.
+                    // Probing with `None` looked in the default partition,
+                    // missed the existing row in every tenant-scoped session,
+                    // and let the duplicate surface later as an untyped store
+                    // conflict (42P01 instead of 23505). Only a LIVE row is a
+                    // duplicate (mandate #16a, TD-DML-3).
+                    matches!(
+                        self.row_state(table_schema, table_id, key, tenant_context)
+                            .await?,
+                        RowState::Live(_)
+                    )
                 };
-                if is_live && mode == RowWriteConstraintMode::Insert {
+                if is_live {
                     return Err(RelationalConstraintViolation::new(
                         RelationalConstraintKind::Unique,
                         format!(
@@ -5587,18 +8470,22 @@ impl DmlService {
 
         // TD-110: secondary UNIQUE constraints/indexes — within-statement dedup +
         // cross-existing probe (O(1) on index-backed stores, Slice C). INSERT
-        // excludes nothing (every row is new). UPSERT excludes the statement's
-        // own oids: a replaced row vacates its old UNIQUE values (exactly as
-        // UPDATE excludes its target rows), and a new row's oid is not stored.
-        let primary_key = Self::primary_key_column(table_schema);
+        // TD-RELIDEQ-2: only a declared single-column key is read from the oid.
+        // excludes nothing (every row is new). ON CONFLICT excludes the rows its
+        // DO UPDATE rewrites: an updated row vacates its old UNIQUE values
+        // (exactly as UPDATE excludes its target rows), so the probe checks the
+        // POST-update row against every OTHER row.
+        // TD-RELIDEQ-2 (a14d02e76): only a DECLARED single-column key is read
+        // from the oid — the id/record_id fallback is an ordinary column, and a
+        // composite key's oid is the whole tuple. The store-side unique index
+        // keys the same way, so candidates must too.
+        let primary_key = crate::services::record_store::schema_oid_key_column(table_schema);
         let candidate_sets =
             Self::build_unique_candidate_sets(table_schema, records, primary_key.as_deref())?;
         if !candidate_sets.is_empty() {
             let exclude_oids: std::collections::HashSet<String> = match mode {
                 RowWriteConstraintMode::Insert => std::collections::HashSet::new(),
-                RowWriteConstraintMode::Upsert => {
-                    records.iter().map(|record| record.oid.clone()).collect()
-                }
+                RowWriteConstraintMode::OnConflict { updated } => updated.clone(),
             };
             if let Some(conflict) = self
                 .record_store
@@ -5676,10 +8563,6 @@ impl DmlService {
         deleted_keys: &[String],
         tenant_context: Option<&TenantContext>,
     ) -> Result<()> {
-        let Some(_parent_pk) = Self::primary_key_column(parent_schema) else {
-            return Ok(()); // No PK → nothing can reference these rows.
-        };
-
         // Reject a cyclic CASCADE chain up front, before any mutation, so the
         // error leaves nothing partially deleted. The transitive write locks
         // (in-process op-locks + durable DML locks) for the child set are
@@ -5700,6 +8583,7 @@ impl DmlService {
             parent_table_id,
             parent_schema,
             deleted_keys,
+            None,
             tenant_context,
             std::collections::HashSet::new(),
             0,
@@ -5754,91 +8638,29 @@ impl DmlService {
     /// Factored out so both the discovery pass and the recursive worker share one
     /// copy of the FK-matching logic. Self-references are excluded; only FKs that
     /// reference the parent's FULL PK (in order) are returned — partial / non-PK
-    /// references remain unsupported (S2 scope).
+    /// references remain unsupported (S2 scope). TD-RELIDEQ-2: "PK" is the
+    /// DECLARED key; an FK may also reference a parent UNIQUE set (the SQL
+    /// rule), which is how a keyless parent is referenced.
     async fn child_tables_referencing(
         &self,
         catalog: &Arc<dyn crate::catalog::Catalog>,
         parent_id: &crate::catalog::TableIdentifier,
         parent_schema: &CatalogTableSchema,
         tenant_context: Option<&TenantContext>,
-    ) -> Result<
-        Vec<(
-            crate::catalog::TableIdentifier,
-            CatalogTableSchema,
-            Vec<String>,
-            Option<proximadb_catalog::ReferentialAction>,
-        )>,
-    > {
-        let parent_pk_cols = Self::primary_key_columns(parent_schema);
-        if parent_pk_cols.is_empty() {
-            return Ok(Vec::new());
-        }
-        // TD-110 S3: enumerate candidate children across the tenant's WHOLE
-        // namespace subtree (not just the parent's namespace), so a child living
-        // in another namespace whose FK references this parent is found. Scoped
-        // to the tenant (`Some([tenant])`) to keep child discovery intra-tenant;
-        // cross-tenant children are never enumerated. The per-child reference
-        // match below still requires the FK to resolve to THIS parent (name AND
-        // namespace), so a same-named table in another namespace never matches.
-        let tenant_scope = tenant_context.map(|t| vec![t.tenant_id.clone()]);
-        let sibling_ids = catalog
-            .list_all_tables_in_scope(tenant_scope.as_deref())
-            .await?;
-        let mut out = Vec::new();
-        for child_id in sibling_ids {
-            if child_id.name == parent_id.name && child_id.namespace == parent_id.namespace {
-                continue; // Self-referencing FK on the same table: out of scope.
-            }
-            let child_schema = catalog.get_table(&child_id).await?;
-            for constraint in &child_schema.relational_capabilities.constraints {
-                let proximadb_catalog::ColumnConstraint::ForeignKey {
-                    columns,
-                    references_table,
-                    references_columns,
-                    on_delete,
-                    ..
-                } = constraint
-                else {
-                    continue;
-                };
-                if columns.len() != references_columns.len() {
-                    continue; // Malformed FK (mismatched arities): skip.
-                }
-                // Does this FK reference `parent_id`? Resolve under the SAME
-                // tenant scope so cross-tenant FKs never match.
-                let Ok((_, referenced_id)) = self
-                    .catalog_manager
-                    .resolve_table_scoped(
-                        references_table,
-                        tenant_context.map(|t| t.tenant_id.as_str()),
-                    )
-                    .await
-                else {
-                    continue;
-                };
-                if referenced_id.name != parent_id.name
-                    || referenced_id.namespace != parent_id.namespace
-                {
-                    continue;
-                }
-                // Only FKs referencing the parent's FULL primary key (in order)
-                // are enforced; partial / non-PK references are not (S2 scope).
-                if references_columns.as_slice() != parent_pk_cols.as_slice() {
-                    continue;
-                }
-                out.push((
-                    child_id.clone(),
-                    child_schema.clone(),
-                    columns.clone(),
-                    *on_delete,
-                ));
-            }
-        }
-        Ok(out)
+    ) -> Result<Vec<ChildReference>> {
+        child_references(
+            &self.catalog_manager,
+            catalog,
+            parent_id,
+            parent_schema,
+            tenant_context.map(|t| t.tenant_id.as_str()),
+        )
+        .await
     }
 
     /// TD-110 S1: the transitive closure of child tables reachable from
-    /// `parent_id` via any single-column FK on the parent PK (any action). Used
+    /// `parent_id` via any FK on its declared key or a UNIQUE set (any action,
+    /// see [`child_references`]). Used
     /// to size the DML write-lock set before the cascade. Cycle- and
     /// diamond-safe (each table visited once); excludes the parent itself.
     async fn discover_cascade_child_set(
@@ -5856,7 +8678,11 @@ impl DmlService {
         let mut frontier: Vec<(crate::catalog::TableIdentifier, CatalogTableSchema)> =
             vec![(parent_id.clone(), parent_schema.clone())];
         while let Some((tid, schema)) = frontier.pop() {
-            for (child_id, child_schema, _fk_column, _on_delete) in self
+            for ChildReference {
+                child_id,
+                child_schema,
+                ..
+            } in self
                 .child_tables_referencing(catalog, &tid, &schema, tenant_context)
                 .await?
             {
@@ -5922,7 +8748,12 @@ impl DmlService {
             ));
         }
         gray.insert(key.clone());
-        for (child_id, child_schema, _fk_column, on_delete) in self
+        for ChildReference {
+            child_id,
+            child_schema,
+            on_delete,
+            ..
+        } in self
             .child_tables_referencing(catalog, id, schema, tenant_context)
             .await?
         {
@@ -5946,6 +8777,241 @@ impl DmlService {
         Ok(())
     }
 
+    /// The rows of `child`'s table whose FOREIGN KEY values reference one of
+    /// `referenced` — parent keys in
+    /// [`crate::services::referential::parent_referenced_key_text`] form, which
+    /// [`crate::services::referential::child_reference_text`] matches for both
+    /// key and UNIQUE references, single- and multi-column. MATCH SIMPLE: a
+    /// child with any NULL, absent or non-scalar FK column references nothing.
+    async fn find_referencing_rows(
+        &self,
+        child: &ChildReference,
+        parent_schema: &CatalogTableSchema,
+        referenced: &std::collections::HashSet<String>,
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<Vec<ProximaRecord>> {
+        let pred = |record: &ProximaRecord| {
+            crate::services::referential::record_key_values(record, &child.fk_columns)
+                .and_then(|values| {
+                    crate::services::referential::child_reference_text(
+                        &values,
+                        child.referenced_key,
+                        &child.references_columns,
+                        parent_schema,
+                    )
+                })
+                .is_some_and(|text| referenced.contains(&text))
+        };
+        let predicate: Option<&proximadb_records::RecordScanPredicate<'_>> = Some(&pred);
+        self.record_store
+            .scan_records_filtered(
+                &child.child_schema,
+                TableRecordScanRequest {
+                    filter: None,
+                    table_id: child.child_id.name.clone(),
+                    limit: None,
+                    include_vector: true,
+                    include_props: true,
+                },
+                predicate,
+                tenant_context,
+                #[cfg(feature = "abac-policy")]
+                &ReadContext::system(
+                    SystemReadReason::ForeignKeyResolution,
+                    "dml::referencing_check",
+                ),
+            )
+            .await
+    }
+
+    /// TD-RELIDEQ-2: the op-locks (and cross-pod DML locks) for a write that
+    /// may change `assigned` columns: the target plus every child referencing
+    /// one of them through a UNIQUE set, acquired in the same sorted order as
+    /// DELETE's cascade set (non-reentrant op-locks; no lock inversion). Holding
+    /// the children keeps a child row referencing an old value from slipping in
+    /// mid-statement. Returns those children for the ON UPDATE check.
+    async fn lock_unique_referencing_children(
+        &self,
+        catalog: &Arc<dyn crate::catalog::Catalog>,
+        table_id: &TableIdentifier,
+        table_schema: &CatalogTableSchema,
+        assigned: &[String],
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<(
+        Vec<ChildReference>,
+        Vec<tokio::sync::OwnedSemaphorePermit>,
+        Vec<DmlLockGuard>,
+    )> {
+        let children = self
+            .children_referencing_columns(catalog, table_id, table_schema, assigned, tenant_context)
+            .await?;
+        let child_set: std::collections::BTreeSet<(Vec<String>, String)> = children
+            .iter()
+            .map(|child| {
+                (
+                    child.child_id.namespace.clone(),
+                    child.child_id.name.clone(),
+                )
+            })
+            .collect();
+        let mut tables: Vec<TableIdentifier> = child_set
+            .iter()
+            .map(|(namespace, name)| TableIdentifier {
+                namespace: namespace.clone(),
+                name: name.clone(),
+            })
+            .collect();
+        tables.push(table_id.clone());
+        let op_locks = self.op_locks_sorted(tables).await?;
+        let dml_locks = self
+            .acquire_cascade_child_dml_locks(&child_set, tenant_context)
+            .await?;
+        Ok((children, op_locks, dml_locks))
+    }
+
+    /// TD-RELIDEQ-2: the direct children whose FOREIGN KEY references, through
+    /// a UNIQUE set, a column in `assigned` — the children an UPDATE of those
+    /// columns can orphan. Empty without a catalog scan when no assigned column
+    /// is in a UNIQUE set (the common UPDATE); a primary-key reference never
+    /// qualifies (the key is immutable on UPDATE).
+    async fn children_referencing_columns(
+        &self,
+        catalog: &Arc<dyn crate::catalog::Catalog>,
+        table_id: &crate::catalog::TableIdentifier,
+        table_schema: &CatalogTableSchema,
+        assigned: &[String],
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<Vec<ChildReference>> {
+        // An empty column list (INSERT … VALUES without one) writes every column.
+        let writes = |column: &str| {
+            assigned.is_empty() || assigned.iter().any(|a| a.eq_ignore_ascii_case(column))
+        };
+        let touches_unique = crate::services::record_store::schema_unique_column_sets(table_schema)
+            .iter()
+            .flatten()
+            .any(|column| writes(column));
+        if !touches_unique {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .child_tables_referencing(catalog, table_id, table_schema, tenant_context)
+            .await?
+            .into_iter()
+            .filter(|child| {
+                child.referenced_key == crate::services::referential::ReferencedKey::Unique
+                    && child.references_columns.iter().any(|column| writes(column))
+            })
+            .collect())
+    }
+
+    /// TD-RELIDEQ-2: ON UPDATE NO ACTION for UNIQUE references — reject an
+    /// UPDATE that removes a referenced value children still use. Values the
+    /// statement removes but also re-creates (A→B alongside C→A) stay
+    /// referenced, as in PostgreSQL's end-of-statement check.
+    async fn enforce_update_referential_actions(
+        &self,
+        table_schema: &CatalogTableSchema,
+        referencing_children: &[ChildReference],
+        old_rows: &[ProximaRecord],
+        new_rows: &[ProximaRecord],
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<()> {
+        for child in referencing_children {
+            let key_texts = |rows: &[ProximaRecord]| -> std::collections::HashSet<String> {
+                rows.iter()
+                    .filter_map(|row| {
+                        crate::services::referential::parent_referenced_key_text(
+                            row,
+                            child.referenced_key,
+                            &child.references_columns,
+                            table_schema,
+                        )
+                    })
+                    .collect()
+            };
+            let after = key_texts(new_rows);
+            let removed: std::collections::HashSet<String> = key_texts(old_rows)
+                .into_iter()
+                .filter(|text| !after.contains(text))
+                .collect();
+            if removed.is_empty() {
+                continue;
+            }
+            let referencing = self
+                .find_referencing_rows(child, table_schema, &removed, tenant_context)
+                .await?;
+            if referencing.is_empty() {
+                continue;
+            }
+            // Only NO ACTION / RESTRICT are implemented; a declared CASCADE /
+            // SET NULL / SET DEFAULT must not be silently enforced as NO ACTION.
+            if let Some(
+                action @ (proximadb_catalog::ReferentialAction::Cascade
+                | proximadb_catalog::ReferentialAction::SetNull
+                | proximadb_catalog::ReferentialAction::SetDefault),
+            ) = child.on_update
+            {
+                return Err(anyhow!(
+                    "ON UPDATE {action:?} on table '{}' (FOREIGN KEY {}) is not supported",
+                    child.child_id.name,
+                    child.fk_columns.join(", ")
+                ));
+            }
+            {
+                return Err(RelationalConstraintViolation::new(
+                    RelationalConstraintKind::ForeignKey,
+                    format!(
+                        "changing ({}) on table '{}' violates FOREIGN KEY ({}) on table '{}': {} referencing row(s) still use the old value (ON UPDATE NO ACTION)",
+                        child.references_columns.join(", "),
+                        table_schema.name,
+                        child.fk_columns.join(", "),
+                        child.child_id.name,
+                        referencing.len()
+                    ),
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// TD-RELIDEQ-2: the live rows behind `oids` (props included), for ON
+    /// DELETE matching on a UNIQUE reference. A row that is already gone has
+    /// nothing left to reference it and is skipped.
+    async fn fetch_rows_by_oid(
+        &self,
+        table_schema: &CatalogTableSchema,
+        table_id: &str,
+        oids: &[String],
+        tenant_context: Option<&TenantContext>,
+    ) -> Result<Vec<ProximaRecord>> {
+        let mut rows = Vec::with_capacity(oids.len());
+        for oid in oids {
+            if let Some(row) = self
+                .record_store
+                .get_by_key(
+                    table_schema,
+                    TableRecordGetRequest {
+                        table_id: table_id.to_string(),
+                        key: oid.clone(),
+                        include_vector: false,
+                        include_props: true,
+                    },
+                    tenant_context,
+                    #[cfg(feature = "abac-policy")]
+                    &ReadContext::system(
+                        SystemReadReason::ForeignKeyResolution,
+                        "dml::referential_action",
+                    ),
+                )
+                .await?
+            {
+                rows.push(Self::rich_result_to_record(row));
+            }
+        }
+        Ok(rows)
+    }
+
     /// TD-110 S1: recursive worker that applies ON DELETE actions for one level
     /// and, for CASCADE, descends into the deleted children. `ancestors` is the
     /// set of `(namespace, table)` on the path from the root EXCLUDING the
@@ -5959,6 +9025,7 @@ impl DmlService {
         table_id: &crate::catalog::TableIdentifier,
         table_schema: &CatalogTableSchema,
         deleted_keys: &[String],
+        deleted_rows: Option<&[ProximaRecord]>,
         tenant_context: Option<&TenantContext>,
         ancestors: std::collections::HashSet<(Vec<String>, String)>,
         depth: u32,
@@ -5978,65 +9045,66 @@ impl DmlService {
                 table_id.name
             ));
         }
-        let Some(_pk) = Self::primary_key_column(table_schema) else {
-            return Ok(()); // No PK → nothing can reference these rows.
-        };
-        let deleted: std::collections::HashSet<&str> =
-            deleted_keys.iter().map(String::as_str).collect();
+        let deleted_oids: std::collections::HashSet<String> =
+            deleted_keys.iter().cloned().collect();
+        // TD-RELIDEQ-2: a UNIQUE reference matches children against the deleted
+        // rows' referenced VALUES, not their oids. Below the top level the rows
+        // are passed in (they are already tombstoned); at the top level the
+        // parent rows are still live and are read once, on first need.
+        let mut fetched_rows: Option<Vec<ProximaRecord>> = None;
 
-        for (child_id, child_schema, fk_columns, on_delete) in self
+        for child in self
             .child_tables_referencing(catalog, table_id, table_schema, tenant_context)
             .await?
         {
-            // Find child rows referencing any deleted parent key (tuple). The FK
-            // columns' typed values are extracted from the record and encoded
-            // with the SAME encoder that built the deleted parent oids
-            // (`encode_primary_key_tuple` / `stable_value_string`), so a probe
-            // always matches the oid exactly — for both single- and multi-column
-            // FKs. MATCH SIMPLE: any NULL/absent/non-scalar FK column → exempt.
-            let fk_for_pred = fk_columns.clone();
-            let deleted_ref = &deleted;
-            let pred = move |record: &ProximaRecord| {
-                let mut values: Vec<ProximaValue> = Vec::with_capacity(fk_for_pred.len());
-                for col in &fk_for_pred {
-                    match record.props.get(col) {
-                        Some(ProximaTreeNode::Value(value))
-                            if !matches!(value, ProximaValue::Null) =>
-                        {
-                            values.push(value.clone());
+            let deleted: std::collections::HashSet<String> = match child.referenced_key {
+                crate::services::referential::ReferencedKey::PrimaryKey => deleted_oids.clone(),
+                crate::services::referential::ReferencedKey::Unique => {
+                    let rows: &[ProximaRecord] = match deleted_rows {
+                        Some(rows) => rows,
+                        None => {
+                            if fetched_rows.is_none() {
+                                fetched_rows = Some(
+                                    self.fetch_rows_by_oid(
+                                        table_schema,
+                                        &table_id.name,
+                                        deleted_keys,
+                                        tenant_context,
+                                    )
+                                    .await?,
+                                );
+                            }
+                            fetched_rows.as_deref().unwrap_or(&[])
                         }
-                        _ => return false, // NULL/absent/non-scalar FK → MATCH SIMPLE exempt.
-                    }
-                }
-                match encode_primary_key_tuple(&values) {
-                    Ok(encoded) => deleted_ref.contains(encoded.as_str()),
-                    Err(_) => false,
+                    };
+                    rows.iter()
+                        .filter_map(|row| {
+                            crate::services::referential::parent_referenced_key_text(
+                                row,
+                                child.referenced_key,
+                                &child.references_columns,
+                                table_schema,
+                            )
+                        })
+                        .collect()
                 }
             };
-            let predicate: Option<&proximadb_records::RecordScanPredicate<'_>> = Some(&pred);
+            if deleted.is_empty() {
+                continue;
+            }
             let referencing = self
-                .record_store
-                .scan_records_filtered(
-                    &child_schema,
-                    TableRecordScanRequest {
-                        filter: None,
-                        table_id: child_id.name.clone(),
-                        limit: None,
-                        include_vector: true,
-                        include_props: true,
-                    },
-                    predicate,
-                    tenant_context,
-                    #[cfg(feature = "abac-policy")]
-                    &ReadContext::system(
-                        SystemReadReason::ForeignKeyResolution,
-                        "dml::referencing_check",
-                    ),
-                )
+                .find_referencing_rows(&child, table_schema, &deleted, tenant_context)
                 .await?;
             if referencing.is_empty() {
                 continue;
             }
+            let ChildReference {
+                child_id,
+                child_schema,
+                fk_columns,
+                on_delete,
+                ..
+            } = child;
 
             match on_delete {
                 None
@@ -6105,6 +9173,7 @@ impl DmlService {
                             &child_id,
                             &child_schema,
                             &child_deleted_keys,
+                            Some(&referencing),
                             tenant_context,
                             child_ancestors,
                             depth + 1,
@@ -6113,6 +9182,10 @@ impl DmlService {
                     }
                 }
                 Some(proximadb_catalog::ReferentialAction::SetNull) => {
+                    // Nulling the FK columns is an UPDATE of the child: when they
+                    // are a UNIQUE set referenced in turn, NO ACTION applies to
+                    // the grandchildren (locked with the cascade closure).
+                    let previous = referencing.clone();
                     let mut updated = Vec::with_capacity(referencing.len());
                     for mut record in referencing {
                         // Null ALL FK columns (standard SET NULL on a composite FK).
@@ -6123,6 +9196,23 @@ impl DmlService {
                         }
                         updated.push(record);
                     }
+                    let grandchildren = self
+                        .children_referencing_columns(
+                            catalog,
+                            &child_id,
+                            &child_schema,
+                            &fk_columns,
+                            tenant_context,
+                        )
+                        .await?;
+                    self.enforce_update_referential_actions(
+                        &child_schema,
+                        &grandchildren,
+                        &previous,
+                        &updated,
+                        tenant_context,
+                    )
+                    .await?;
                     let mutations = updated
                         .into_iter()
                         .map(|record| {
@@ -6155,11 +9245,11 @@ impl DmlService {
 
     /// TD-110: enforce FOREIGN KEY references for `records` against parent tables
     /// in the same partition (cross-table state the row-local catalog validator
-    /// cannot check). Supported shape (S2): a single- or multi-column FK
-    /// referencing the parent's FULL primary key (in order) — verified by a point
-    /// `get_by_key` on the parent using the encoded PK tuple. MATCH SIMPLE: any
-    /// NULL/absent FK column exempts the row. Partial / non-PK-referencing FKs
-    /// are cleanly rejected rather than silently accepted.
+    /// cannot check). Supported shape: a single- or multi-column FK referencing
+    /// the parent's FULL declared key (point lookup on the encoded key, or the
+    /// CKS) or one of its UNIQUE sets (the parent's unique index), in order
+    /// (TD-RELIDEQ-2). MATCH SIMPLE: any NULL/absent FK column exempts the row.
+    /// Any other referenced column set is cleanly rejected.
     async fn enforce_foreign_keys(
         &self,
         table_schema: &CatalogTableSchema,
@@ -6208,46 +9298,32 @@ impl DmlService {
                 ));
             }
             let parent_schema = parent_catalog.get_table(&parent_table_id).await?;
-            let parent_pk_cols = Self::primary_key_columns(&parent_schema);
-            // Only FKs referencing the parent's FULL primary key (in order) are
-            // enforced — partial / non-PK references are not (S2 scope).
-            if parent_pk_cols.is_empty()
-                || references_columns.as_slice() != parent_pk_cols.as_slice()
-            {
+            // TD-RELIDEQ-2: the referenced columns must be the parent's
+            // DECLARED primary key (the row oid) or one of its UNIQUE sets
+            // (props values), in order. A keyless parent's `id` is an ordinary
+            // column — referenceable only through a UNIQUE constraint.
+            let Some(referenced_key) = crate::services::referential::resolve_referenced_key(
+                &parent_schema,
+                references_columns,
+            ) else {
                 return Err(anyhow!(
-                    "FOREIGN KEY ({}) REFERENCES {}({}) on table '{}' is only supported when it references the parent primary key ({}) in full, in order",
+                    "FOREIGN KEY ({}) REFERENCES {}({}) on table '{}' must reference the parent's primary key ({}) or a UNIQUE constraint, in full and in order",
                     fk_columns.join(", "),
                     references_table,
                     references_columns.join(", "),
                     table_schema.name,
-                    parent_pk_cols.join(", ")
+                    Self::declared_key_display(&parent_schema)
                 ));
-            }
+            };
 
             for record in records {
-                // Extract the FK columns' typed values. MATCH SIMPLE: any NULL,
-                // absent, or non-scalar FK column → exempt (no reference required).
-                let mut values: Vec<ProximaValue> = Vec::with_capacity(fk_columns.len());
-                let mut exempt = false;
-                for col in fk_columns {
-                    match record.props.get(col) {
-                        Some(ProximaTreeNode::Value(value))
-                            if !matches!(value, ProximaValue::Null) =>
-                        {
-                            values.push(value.clone());
-                        }
-                        _ => {
-                            // NULL / absent / non-scalar FK column → MATCH SIMPLE exempt.
-                            exempt = true;
-                            break;
-                        }
-                    }
-                }
-                if exempt {
+                // MATCH SIMPLE: any NULL, absent, or non-scalar FK column →
+                // exempt (no reference required).
+                let Some(values) =
+                    crate::services::referential::record_key_values(record, fk_columns)
+                else {
                     continue;
-                }
-                // Encode with the same encoder that built the parent oids so the
-                // point lookup matches exactly (single- or multi-column).
+                };
                 let key = encode_primary_key_tuple(&values)?;
                 // F5 (ADR-072): when the fenced ConditionalKeyStore is wired,
                 // resolve FK existence against the SAME store that fences the
@@ -6255,44 +9331,46 @@ impl DmlService {
                 // — "foreign-key existence checks (phase 2) ride this method"),
                 // instead of a check-then-act probe on the record store. This
                 // makes the child-insert see the authoritative uniqueness index
-                // and closes the TOCTOU with a concurrent parent delete. The FK
-                // references the parent's FULL PK in order (checked above), and
-                // the parent claim is keyed on that full tuple (TD-DML-2), so
-                // single- and multi-column FKs both resolve through the CKS.
-                // TD-RELIDEQ-1: only a parent with a DECLARED key is fenced in
-                // the CKS; a keyless parent resolves through the record store.
-                let referenced_exists = if let Some(cks) = self
-                    .conditional_key_store
-                    .as_ref()
-                    .filter(|_| Self::table_declares_primary_key(&parent_schema))
-                {
-                    let id = proximadb_storage_ports::Identity::from_bytes(
-                        proximadb_data_model::key_codec::encode_identity(
-                            &record.tenant_id,
-                            &parent_schema.name,
-                            &values,
-                        )?,
-                    );
+                // and closes the TOCTOU with a concurrent parent delete. The
+                // parent claim is keyed on the full declared-key tuple (TD-DML-2),
+                // so single- and multi-column FKs both resolve through the CKS.
+                // Only a primary-key reference is fenced there; a UNIQUE
+                // reference resolves through the parent's unique index.
+                let referenced_exists = if let Some(cks) =
+                    self.conditional_key_store.as_ref().filter(|_| {
+                        referenced_key == crate::services::referential::ReferencedKey::PrimaryKey
+                    }) {
+                    let id = Self::cks_identity(
+                        tenant_context,
+                        &record.tenant_id,
+                        &parent_schema.name,
+                        &values,
+                    )?;
+                    // TD-DML-3: a claim is necessary but not sufficient — a
+                    // claim whose row is absent (left by a failed write) or
+                    // dead (TTL-expired) is no parent.
                     cks.get(&id).await?.is_some()
-                } else {
-                    self.record_store
-                        .get_by_key(
-                            &parent_schema,
-                            TableRecordGetRequest {
-                                table_id: parent_table_id.name.clone(),
-                                key: key.clone(),
-                                include_vector: false,
-                                include_props: false,
-                            },
-                            tenant_context,
-                            #[cfg(feature = "abac-policy")]
-                            &ReadContext::system(
-                                SystemReadReason::ForeignKeyResolution,
-                                "dml::fk_check",
-                            ),
+                        && matches!(
+                            self.row_state(&parent_schema, &parent_table_id, &key, tenant_context)
+                                .await?,
+                            RowState::Live(_)
                         )
-                        .await?
-                        .is_some()
+                } else {
+                    crate::services::referential::referenced_parent_exists(
+                        self.record_store.as_ref(),
+                        &parent_schema,
+                        &parent_table_id.name,
+                        referenced_key,
+                        references_columns,
+                        &values,
+                        tenant_context,
+                        #[cfg(feature = "abac-policy")]
+                        &ReadContext::system(
+                            SystemReadReason::ForeignKeyResolution,
+                            "dml::fk_check",
+                        ),
+                    )
+                    .await?
                 };
                 if !referenced_exists {
                     return Err(RelationalConstraintViolation::new(
@@ -6474,8 +9552,18 @@ impl DmlService {
     /// `record_id`, which is NOT the record oid for a keyless relational row
     /// (TD-RELIDEQ-1).
     fn table_declares_primary_key(table_schema: &CatalogTableSchema) -> bool {
-        !table_schema.primary_key.is_empty()
-            || !table_schema.relational_capabilities.primary_key.is_empty()
+        !crate::services::record_store::schema_declared_primary_key_columns(table_schema).is_empty()
+    }
+
+    /// The declared primary key for error messages; `none` for a keyless table.
+    fn declared_key_display(table_schema: &CatalogTableSchema) -> String {
+        let columns =
+            crate::services::record_store::schema_declared_primary_key_columns(table_schema);
+        if columns.is_empty() {
+            "none".to_string()
+        } else {
+            columns.join(", ")
+        }
     }
 
     fn extract_pk_candidate_ids(
@@ -7191,7 +10279,12 @@ impl DmlTableMaterializer {
 
 #[async_trait::async_trait]
 impl crate::services::ddl::TableMaterializer for DmlTableMaterializer {
-    async fn materialize(&self, table_name: &str, tenant: Option<&str>) -> Result<String> {
+    async fn materialize(
+        &self,
+        table_name: &str,
+        tenant: Option<&str>,
+        fence: &dyn crate::services::ddl::PublishFence,
+    ) -> Result<String> {
         // Thread the request/connection tenant (TD-113) so the snapshot is scoped
         // and the object prefix is tenant-isolated instead of landing under the
         // DEFAULT_TENANT_PLACEHOLDER. Empty tenant ⇒ None (single-tenant/embedded).
@@ -7199,13 +10292,37 @@ impl crate::services::ddl::TableMaterializer for DmlTableMaterializer {
             .filter(|t| !t.is_empty())
             .map(TenantContext::for_tenant_id);
         self.dml
-            .materialize_table_to_parquet(
+            .materialize_table_to_parquet_fenced(
                 &*self.bridge,
                 &self.warehouse_root_url,
                 table_name,
                 tenant_ctx.as_ref(),
+                fence,
             )
             .await
+    }
+}
+
+mod materialize_append;
+mod materialize_dv_plan;
+mod materialize_stream;
+/// The (metadata version, snapshot LSN) pair a table's `parquet-snapshot`
+/// layout records — shared with the OLAP read merge, which serves a
+/// deletion-vector base only when the base IS that recorded publication.
+#[cfg(feature = "datafusion-integration")]
+pub(crate) use materialize_stream::recorded_publication;
+
+/// The distance-kernel metric that computes a catalog `DistanceMetric`.
+pub(crate) fn kernel_distance_metric(
+    metric: proximadb_distance_types::DistanceMetric,
+) -> proximadb_distance_kernel::DistanceMetric {
+    use proximadb_distance_kernel::DistanceMetric as Kernel;
+    use proximadb_distance_types::DistanceMetric as Catalog;
+    match metric {
+        Catalog::L2 => Kernel::Euclidean,
+        Catalog::Cosine => Kernel::Cosine,
+        Catalog::InnerProduct => Kernel::DotProduct,
+        Catalog::L1 => Kernel::Manhattan,
     }
 }
 

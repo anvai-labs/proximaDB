@@ -1,0 +1,193 @@
+= Release roadmap
+:toc:
+:last-updated: 2026-10-26
+
+Release ordering and exit criteria live here. link:TRACKER.adoc[Tracker] owns delivery status
+and session ownership; the plans own implementation contracts. TDs retain issue-level detail.
+A release gate can remain open after its enabling code lands; the tables below are acceptance
+work, not a second list of every completed PR. Confirm remaining TD slices before pickup.
+link:../SUPPORTED_SURFACE.adoc[Support contract] alone decides supported claims.
+
+== Close a release
+
+Require executable exit checks, no weakened conformance/recall ratchet, crash and protocol
+proof on affected paths, fresh diff review, and ADR-096 consistency across direction,
+requirements, support and diagrams. Explicitly move deferred gates here with a reason.
+Packaging code alone does not prove the published release image. SF1 load/publication memory
+proof is not SF1 query correctness or SF10 readiness.
+
+== Immediate milestone and dependencies
+
+M1: one governed TE-1-shaped query over vectors, customer rows and session logs, over pgwire,
+with pushed predicates and a coherent read token while publication/compaction race the query.
+
+----
+v0.5 recovery + v3 read/write + provider parity
+                  |                         SC0 E1 -> SC1/2 -> SC3/4
+                  v                                      |
+v0.6 FilteredAnnExec -> observability M1                  v
+                  |                         v0.7 cost/scale proof
+                  +----------------------+---------------+
+                                         v
+                              v1.0 supported SQL promise
+----
+
+Native differentiation is evaluated through link:LAKEHOUSE_PLAN.adoc#native-execution-research[NE-0..7]
+within P3/P5/P6: selective multimodal execution, visibility and full-workload cost. These are
+proposed experiments, not another release or authorization for a whole-engine rewrite.
+
+Completed foundation: link:../history/README.adoc[history index]. No completed slice is a
+new implementation target merely because an old release table mentioned it.
+
+== v0.5 — Correct and durable
+
+*Theme:* the SQL front door is correct, durable and tenant-safe before anything is added to it.
+
+[cols="2,3,2", options="header"]
+|===
+| Work | Exit criterion | TDs
+
+| Read correctness
+| One total order for versions of a record on every read surface; standard literal predicates work.
+| TD-MEMTABLE-MVCC-1, TD-PGWIRE-LITPRED-1
+
+| Transactions and recovery
+| Group commit; REST/gRPC writes share the atomic path; writer epoch stamped into the WAL and manifests; reattach smoke in CI.
+| TD-PGOLTP-1 (S3, S4b), TD-PGOLTP-2 (S3)
+
+| Recovery boundary and durability proof
+| Complete object-owner recovery/reattach and all-consumer floor proof; do not rebuild the landed spill/rotation/truncation primitives.
+| TD-SEAM-14, TD-SEAM-12; path residuals TD-CONV-1/2
+
+| Native table provider by default
+| Window functions and ABAC behave the same for every session.
+| TD-USUB-2, TD-USUB-3
+
+| Tenant safety on every surface
+| One admit/deny decision across REST, gRPC, Flight and pgwire; missing identity fails closed; the cross-model policy-matrix tests pass.
+| TD-AUTHZ-1, TD-TENANT-2, TD-PGWIRE-VECTENANT-1, TD-SECSCAN-1
+
+| Startup self-check
+| A loopback Flight call verifies the instance identity at boot.
+| TD-NET-1 (S3)
+
+| pgwire reachable from the published image
+| Authenticated pgwire exposure, so `docker run` plus a Postgres client works (ADR-096 durable outcome 1).
+| TD-PGWIRE-CONTAINER-1
+
+| Published-install proof
+| Run write/restart/read release-workflow smoke for Docker, RPM/DEB and MSI; retain exact artifacts and results.
+| Release-evidence gate; packaging implementation is in history
+
+| Drivers work
+| JDBC, asyncpg and psycopg 3 read relational tables over the extended protocol; smoke-tested against the release image.
+| TD-PGEXT-1
+|===
+
+== v0.6 — Vectors and context inside SQL
+
+*Theme:* everything an application needs from context is expressible in standard SQL and reads
+the one canonical record.
+
+[cols="2,3,2", options="header"]
+|===
+| Work | Exit criterion | TDs
+
+| One vector-SQL plan
+| `vector_search` and `<->` reach the same canonical plan from pgwire; predicate-aware top-k is correct and disclosed.
+| TD-XMODAL-4, TD-XMODAL-10, TD-064, TD-PGVEC-1
+
+| Collections are SQL tables
+| A collection created through REST or the SDK is queryable over pgwire, reading the same rows (end-to-end test: write over REST, read over pgwire).
+| TD-SQLCOLL-1
+
+| Hybrid retrieval
+| BM25 plus vector fusion through one seam, reachable from SQL.
+| TD-138, TD-139, TD-143, TD-062
+
+| Documents and graph as projections
+| JSON and graph queries over the canonical record; graph executor operators; `ExecuteHybridQuery` on v2.
+| TD-035, TD-124 (residual)
+
+| One query path
+| The legacy federated query paths are isolated behind flags; the v1 message types finish migrating to v2.
+| TD-FEDPATH-1, TD-FEDVEC-1, TD-123
+
+| ORM and driver compatibility
+| `pg_catalog` is complete enough for an ORM round trip; constraints are enforced inside the commit (TD-PGOLTP-3 owns this); `ON UPDATE` and composite foreign keys (TD-110 residual).
+| TD-120, TD-PGOLTP-3, TD-110, TD-061
+
+| Engine set
+| VIPER removed (ADR-093 stage 3); SWIFT and RAPTOR deleted (ADR-006 §3, decided 2026-10-17); HELIX recall fixed or HELIX demoted.
+| TD-VIPER-1, TD-HELIX-1, TD-HELIX-2, TD-HELIX-3
+|===
+
+== v0.7 — Evidence on real object stores
+
+*Theme:* the cost and performance claims are measured on the backends customers will use.
+
+[cols="2,3,2", options="header"]
+|===
+| Work | Exit criterion | TDs
+
+| Cloud backends
+| The corridor's crash/restart, bounded-memory and economic suites pass on at least one cloud object store.
+| TD-OBJSTORE-1, MVP corridor
+
+| Scan and cache economics
+| SIFT1M cache acceptance, IVF training, streaming compaction and the SF1/SF10 analytical ledger recorded with dated evidence.
+| TD-CACHE-9, TD-IVF-2, TD-COMPACT-2, TD-COMPACT-10, TD-COMPACT-11, TD-OLAP-2, TD-OLAP-4, TD-OLAP-11
+
+| Storage layout
+| Background compaction runs live; point reads avoid scan-sized I/O; one cache and tier policy.
+| TD-114, TD-088, TD-118
+
+| Cost-based routing
+| `route_select` chooses a route from measured per-query cost, not only from a shape rule.
+| TD-115
+
+| Published comparison
+| Reproducible benchmarks against at least one vector database and one SQL engine, in the evidence ledger.
+| `BENCHMARK_EVIDENCE.toml`
+|===
+
+== v1.0 — SQL front door in the supported promise
+
+*Theme:* pgwire SQL and transactions become Supported, not just built.
+
+[cols="2,3,2", options="header"]
+|===
+| Work | Exit criterion | TDs
+
+| pgwire enters the MVP corridor
+| Session identity, SCRAM and ABAC parity on pgwire; the corridor's suite runs over pgwire.
+| TD-ABAC-10, TD-PGWIRE-AUTH-1
+
+| Declared Postgres compatibility
+| ADR-095's compatibility level is declared and gated by pgbench, isolation, ORM and reattach ratchets; MVCC visibility and row locks; sequences and `RETURNING`.
+| TD-PGOLTP-4, TD-PGOLTP-5, TD-PGOLTP-1..10
+
+| Security operations
+| Security admin and status APIs; online certificate revocation (CRL/OCSP); multi-provider OIDC.
+| TD-SECOPS-1, TD-SSO-2
+
+| Operator documentation
+| Install, upgrade, backup, restore and reattach runbooks tested against a release build.
+| —
+|===
+
+The support contract is updated in the same release to list pgwire SQL and transactions as
+Supported.
+
+== Later (ordered, after v1.0)
+
+. **Scale out**: distributed transport and failover verification (TD-077), then replication and
+  multi-node failure-injection validation, then elastic compute modes (TD-089).
+. **Agent memory**: write surface, framework adapters, branching, and the neutral fusion core
+  (TD-101, TD-102, TD-117, TD-136, TD-137).
+. **Time-series, events and observability** graduate as projections of the canonical record
+  (TD-063); time travel by LSN (TD-116).
+. **Lineage** hooks for vector, document and graph writes, beyond MLOps (TD-MLOPS-1).
+. **Broader interoperability**: Spark/Trino certification beyond the immediate v3 read-back gate (TD-119), Lance (TD-091),
+  Spark and Hadoop connectors (TD-097, TD-099), external collections residual (TD-090).
+. **In-database inference** and **billion-scale vector indexes** (DiskANN, after TD-064).

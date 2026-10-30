@@ -18,14 +18,6 @@ const GRAPH_RATCHET: usize = 10;
 mod pg_server;
 
 use pg_server::TestPgServer;
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    if let Some(db) = e.as_db_error() {
-        format!("[{}] {}", db.code().code(), db.message())
-    } else {
-        e.to_string()
-    }
-}
-
 /// Run a single-column query and parse each row's first cell as `i64`, returned
 /// **sorted** for order-independent set comparison (ADR-040 `canon()`-style — row
 /// order across engines/routes is a separate concern from result correctness; see
@@ -34,7 +26,7 @@ async fn col_ints(client: &tokio_postgres::Client, sql: &str) -> Vec<i64> {
     let mut v: Vec<i64> = client
         .simple_query(sql)
         .await
-        .unwrap_or_else(|e| panic!("query `{sql}`: {}", explain_err(&e)))
+        .unwrap_or_else(|e| panic!("query `{sql}`: {}", pg_server::db_err(&e)))
         .into_iter()
         .filter_map(|m| match m {
             tokio_postgres::SimpleQueryMessage::Row(r) => {
@@ -53,7 +45,7 @@ async fn col_int_pairs(client: &tokio_postgres::Client, sql: &str) -> Vec<(i64, 
     let mut v: Vec<(i64, i64)> = client
         .simple_query(sql)
         .await
-        .unwrap_or_else(|e| panic!("query `{sql}`: {}", explain_err(&e)))
+        .unwrap_or_else(|e| panic!("query `{sql}`: {}", pg_server::db_err(&e)))
         .into_iter()
         .filter_map(|m| match m {
             tokio_postgres::SimpleQueryMessage::Row(r) => Some((
@@ -155,7 +147,7 @@ async fn graph_ldbc_pgwire_conformance_inner() {
         client
             .simple_query(ddl)
             .await
-            .unwrap_or_else(|e| panic!("CREATE {name}: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("CREATE {name}: {}", pg_server::db_err(&e)));
     }
     eprintln!("✓ schema: {} tables created", SCHEMA.len());
 
@@ -163,7 +155,7 @@ async fn graph_ldbc_pgwire_conformance_inner() {
         client
             .simple_query(&sql)
             .await
-            .unwrap_or_else(|e| panic!("INSERT failed: {}\n  sql: {sql}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("INSERT failed: {}\n  sql: {sql}", pg_server::db_err(&e)));
     }
     eprintln!("✓ data: graph loaded");
 
@@ -174,7 +166,7 @@ async fn graph_ldbc_pgwire_conformance_inner() {
             .await
         {
             Ok(_) => materialized += 1,
-            Err(e) => eprintln!("  · MATERIALIZE {name}: {}", explain_err(&e)),
+            Err(e) => eprintln!("  · MATERIALIZE {name}: {}", pg_server::db_err(&e)),
         }
     }
     eprintln!("✓ materialize: {materialized}/{} tables", SCHEMA.len());
@@ -189,8 +181,8 @@ async fn graph_ldbc_pgwire_conformance_inner() {
                 passed.push(*id);
             }
             Err(e) => {
-                eprintln!("  ✗ {id}: {}", explain_err(&e));
-                failed.push((*id, explain_err(&e)));
+                eprintln!("  ✗ {id}: {}", pg_server::db_err(&e));
+                failed.push((*id, pg_server::db_err(&e)));
             }
         }
     }
@@ -316,11 +308,11 @@ async fn graph_deletion_vector_reflects_edge_mutations_inner() {
     client
         .simple_query("CREATE TABLE gperson (p_id INT PRIMARY KEY, name VARCHAR)")
         .await
-        .unwrap_or_else(|e| panic!("create gperson: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("create gperson: {}", pg_server::db_err(&e)));
     client
         .simple_query("CREATE TABLE edge (e_id INT PRIMARY KEY, src INT, dst INT)")
         .await
-        .unwrap_or_else(|e| panic!("create edge: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("create edge: {}", pg_server::db_err(&e)));
     for sql in [
         "INSERT INTO gperson (p_id, name) VALUES (1, 'A')",
         "INSERT INTO gperson (p_id, name) VALUES (2, 'B')",
@@ -333,24 +325,24 @@ async fn graph_deletion_vector_reflects_edge_mutations_inner() {
         client
             .simple_query(sql)
             .await
-            .unwrap_or_else(|e| panic!("seed `{sql}`: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("seed `{sql}`: {}", pg_server::db_err(&e)));
     }
     for t in ["gperson", "edge"] {
         client
             .simple_query(&format!("ALTER TABLE {t} MATERIALIZE"))
             .await
-            .unwrap_or_else(|e| panic!("materialize {t}: {}", explain_err(&e)));
+            .unwrap_or_else(|e| panic!("materialize {t}: {}", pg_server::db_err(&e)));
     }
 
     // Post-snapshot edge mutations: delete edge 1 (drops 1→2), insert edge 4 (2→3).
     client
         .simple_query("DELETE FROM edge WHERE e_id = 1")
         .await
-        .unwrap_or_else(|e| panic!("delete edge: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("delete edge: {}", pg_server::db_err(&e)));
     client
         .simple_query("INSERT INTO edge (e_id, src, dst) VALUES (4, 2, 3)")
         .await
-        .unwrap_or_else(|e| panic!("insert edge: {}", explain_err(&e)));
+        .unwrap_or_else(|e| panic!("insert edge: {}", pg_server::db_err(&e)));
 
     // Out-degree per source = JOIN(edge, gperson) + GROUP BY → DataFusion OLAP route
     // (where the read-merge lives). col_int_pairs sorts → order-independent.

@@ -4,7 +4,7 @@
 
 [.lead]
 Where ProximaDB sits relative to adjacent systems, and where it honestly does not (yet).
-This is a positioning summary derived from link:VISION.adoc[Vision] and link:PRD.adoc[PRD];
+This is a positioning summary derived from link:../current/VISION.adoc[Vision] and link:PRD.adoc[PRD];
 support claims defer to link:../SUPPORTED_SURFACE.adoc[the support contract].
 
 == The Thesis
@@ -67,7 +67,7 @@ It is "not yet a like-for-like replacement for best-in-class distributed vector,
 document, or observability platforms." For petabyte-scale batch analytics, use a
 warehouse (Snowflake, BigQuery, Databricks) today; for general-purpose OLTP with complex
 multi-table transactions, use PostgreSQL today (see the Non-Goals section of
-link:VISION.adoc[Vision]).
+link:../current/VISION.adoc[Vision]).
 
 The long-term bet is that agent context does not need five independently operated systems. The MVP
 tests the smallest valuable portion of that thesis first: typed properties and vectors answered

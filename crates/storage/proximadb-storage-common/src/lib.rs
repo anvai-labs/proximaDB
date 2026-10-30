@@ -6,6 +6,7 @@
 pub mod auto_scheduler;
 pub mod bitmap;
 pub mod cache_config;
+pub mod centroid_directory;
 pub mod coarse_directory;
 pub mod collection_path;
 pub mod column_projector;
@@ -46,6 +47,7 @@ pub mod observability_partitioning;
 pub mod observability_rollups;
 pub mod oid_position_resolver;
 pub mod oid_resolver_cache;
+pub mod parquet_multipart;
 pub mod parquet_page_prune;
 pub mod parquet_write_policy;
 pub mod pax_block;

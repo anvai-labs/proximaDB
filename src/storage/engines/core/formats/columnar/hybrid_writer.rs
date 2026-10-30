@@ -1057,13 +1057,8 @@ mod tests {
                 oid: format!("vec_{i}"),
                 ..Default::default()
             };
-            rec.embeddings.push(EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(values),
-                dim,
-                ..Default::default()
-            });
+            rec.embeddings
+                .push(EmbeddingCell::new_fp32("default", "vector", dim, values));
             let records = vec![rec];
 
             writer
@@ -1105,13 +1100,8 @@ mod tests {
                     oid: format!("vec_{i}"),
                     ..Default::default()
                 };
-                rec.embeddings.push(EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    values: proximadb_records::EmbeddingValues::Fp32(values),
-                    dim,
-                    ..Default::default()
-                });
+                rec.embeddings
+                    .push(EmbeddingCell::new_fp32("default", "vector", dim, values));
                 rec
             })
             .collect();

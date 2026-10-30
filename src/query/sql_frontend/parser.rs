@@ -16,7 +16,8 @@ use std::collections::HashMap;
 // DML types for INSERT/UPDATE/DELETE
 use crate::services::dml::{
     ComparisonOperator as DmlComparisonOperator, Condition, DmlStatement, LogicalOperator,
-    SqlValueLiteral, WhereClause,
+    OnConflictAction as DmlOnConflictAction, OnConflictClause, OnConflictTarget, SqlValueLiteral,
+    WhereClause,
 };
 
 use crate::query::table_write_plan::{
@@ -1181,14 +1182,24 @@ impl SqlFrontendParser {
         let values = self.extract_values_from_source(source)?;
 
         if let Some(on_insert) = &insert.on {
-            let (conflict_columns, update_assignments) =
-                self.convert_insert_conflict_clause(on_insert)?;
+            // TD-DML-3: DO UPDATE expressions name the existing row by the
+            // unqualified table name (or an `AS alias`, should the dialect
+            // parse one — GenericDialect does not, so `INSERT INTO t AS a`
+            // is still a parse error, tracked in TD-DML-3).
+            let target_qualifier = match &insert.table_alias {
+                Some(alias) => unquote_identifier_text(&alias.alias.to_string()),
+                None => table_name
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(table_name.as_str())
+                    .to_string(),
+            };
+            let on_conflict = self.convert_insert_conflict_clause(on_insert, target_qualifier)?;
             return Ok(DmlStatement::Upsert {
                 table_name,
                 columns,
                 values,
-                conflict_columns,
-                update_assignments,
+                on_conflict,
             });
         }
 
@@ -1299,50 +1310,102 @@ impl SqlFrontendParser {
         })
     }
 
+    /// TD-DML-3: lower an INSERT conflict clause to the DML service's
+    /// [`OnConflictClause`]. `DO UPDATE` keeps its SET values and `WHERE` as
+    /// SQL expressions; the DML service binds them against the table schema
+    /// with the canonical relational frontend.
     fn convert_insert_conflict_clause(
         &self,
         on_insert: &OnInsert,
-    ) -> Result<(Vec<String>, Vec<(String, SqlValueLiteral)>)> {
+        target_qualifier: String,
+    ) -> Result<OnConflictClause> {
+        let assignments_of = |assignments: &[sqlparser::ast::Assignment]| {
+            assignments
+                .iter()
+                .map(|assignment| {
+                    if matches!(
+                        assignment.target,
+                        sqlparser::ast::AssignmentTarget::Tuple(_)
+                    ) {
+                        return Err(anyhow!(
+                            "ON CONFLICT DO UPDATE SET (a, b) = (...) tuple assignment is not supported"
+                        ));
+                    }
+                    Ok((
+                        self.assignment_target_to_string(&assignment.target)?,
+                        assignment.value.clone(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()
+        };
         match on_insert {
             OnInsert::OnConflict(on_conflict) => {
-                let conflict_columns = match &on_conflict.conflict_target {
-                    Some(ConflictTarget::Columns(columns)) => columns
-                        .iter()
-                        .map(|column| unquote_identifier_text(&column.to_string()))
-                        .collect(),
+                let target = match &on_conflict.conflict_target {
+                    Some(ConflictTarget::Columns(columns)) => OnConflictTarget::Columns(
+                        columns
+                            .iter()
+                            .map(|column| unquote_identifier_text(&column.to_string()))
+                            .collect(),
+                    ),
                     Some(ConflictTarget::OnConstraint(name)) => {
-                        vec![unquote_object_name(&name.to_string())]
+                        OnConflictTarget::Constraint(unquote_object_name(&name.to_string()))
                     }
-                    None => Vec::new(),
+                    None => OnConflictTarget::AnyUnique,
                 };
-
-                let update_assignments = match &on_conflict.action {
-                    OnConflictAction::DoNothing => Vec::new(),
-                    OnConflictAction::DoUpdate(update) => update
-                        .assignments
-                        .iter()
-                        .map(|assignment| {
-                            Ok((
-                                self.assignment_target_to_string(&assignment.target)?,
-                                self.convert_expr_to_dml_literal(&assignment.value)?,
-                            ))
-                        })
-                        .collect::<Result<Vec<_>>>()?,
+                let action = match &on_conflict.action {
+                    OnConflictAction::DoNothing => DmlOnConflictAction::DoNothing,
+                    OnConflictAction::DoUpdate(update) => {
+                        if target == OnConflictTarget::AnyUnique {
+                            // PostgreSQL rejects this at analysis (42601).
+                            return Err(anyhow!(
+                                "ON CONFLICT DO UPDATE requires inference specification or constraint name"
+                            ));
+                        }
+                        DmlOnConflictAction::DoUpdate {
+                            assignments: assignments_of(&update.assignments)?,
+                            selection: update.selection.clone().map(Box::new),
+                        }
+                    }
                 };
-
-                Ok((conflict_columns, update_assignments))
+                Ok(OnConflictClause {
+                    target,
+                    action,
+                    target_qualifier,
+                    caller_identity: None,
+                })
             }
             OnInsert::DuplicateKeyUpdate(assignments) => {
-                let update_assignments = assignments
-                    .iter()
-                    .map(|assignment| {
-                        Ok((
-                            self.assignment_target_to_string(&assignment.target)?,
-                            self.convert_expr_to_dml_literal(&assignment.value)?,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok((Vec::new(), update_assignments))
+                // MySQL spelling: any unique key arbitrates; `VALUES(col)` names
+                // the proposed row, i.e. PostgreSQL's `EXCLUDED.col`.
+                let mut assignments = assignments_of(assignments)?;
+                for (_, value) in &mut assignments {
+                    let _ = sqlparser::ast::visit_expressions_mut(value, |expr| {
+                        if let SqlExpr::Function(func) = expr
+                            && func.name.to_string().eq_ignore_ascii_case("VALUES")
+                            && let sqlparser::ast::FunctionArguments::List(list) = &func.args
+                            && let [
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Identifier(
+                                    column,
+                                ))),
+                            ] = list.args.as_slice()
+                        {
+                            *expr = SqlExpr::CompoundIdentifier(vec![
+                                sqlparser::ast::Ident::new("excluded"),
+                                column.clone(),
+                            ]);
+                        }
+                        std::ops::ControlFlow::<()>::Continue(())
+                    });
+                }
+                Ok(OnConflictClause {
+                    target: OnConflictTarget::AnyUnique,
+                    action: DmlOnConflictAction::DoUpdate {
+                        assignments,
+                        selection: None,
+                    },
+                    target_qualifier,
+                    caller_identity: None,
+                })
             }
             _ => Err(anyhow!(
                 "Unsupported INSERT conflict clause: {:?}",
@@ -2180,24 +2243,29 @@ mod tests {
             DmlStatement::Upsert {
                 table_name,
                 columns,
-                conflict_columns,
-                update_assignments,
+                on_conflict,
                 ..
             } => {
                 assert_eq!(table_name, "agent_store");
                 assert_eq!(columns, vec!["record_id", "payload", "embedding"]);
-                assert_eq!(conflict_columns, vec!["record_id"]);
-                assert_eq!(update_assignments.len(), 2);
-                assert_eq!(update_assignments[0].0, "payload");
-                assert!(matches!(
-                    &update_assignments[0].1,
-                    SqlValueLiteral::Column(column) if column == "excluded.payload"
-                ));
-                assert_eq!(update_assignments[1].0, "embedding");
-                assert!(matches!(
-                    &update_assignments[1].1,
-                    SqlValueLiteral::Column(column) if column == "excluded.embedding"
-                ));
+                assert_eq!(
+                    on_conflict.target,
+                    OnConflictTarget::Columns(vec!["record_id".to_string()])
+                );
+                assert_eq!(on_conflict.target_qualifier, "agent_store");
+                let DmlOnConflictAction::DoUpdate {
+                    assignments,
+                    selection,
+                } = on_conflict.action
+                else {
+                    panic!("expected DO UPDATE");
+                };
+                assert!(selection.is_none());
+                assert_eq!(assignments.len(), 2);
+                assert_eq!(assignments[0].0, "payload");
+                assert_eq!(assignments[0].1.to_string(), "excluded.payload");
+                assert_eq!(assignments[1].0, "embedding");
+                assert_eq!(assignments[1].1.to_string(), "excluded.embedding");
             }
             other => panic!("expected upsert statement, got {other:?}"),
         }
@@ -2217,13 +2285,12 @@ mod tests {
             .expect("expected upsert dml");
 
         match statement {
-            DmlStatement::Upsert {
-                conflict_columns,
-                update_assignments,
-                ..
-            } => {
-                assert_eq!(conflict_columns, vec!["record_id"]);
-                assert!(update_assignments.is_empty());
+            DmlStatement::Upsert { on_conflict, .. } => {
+                assert_eq!(
+                    on_conflict.target,
+                    OnConflictTarget::Columns(vec!["record_id".to_string()])
+                );
+                assert!(matches!(on_conflict.action, DmlOnConflictAction::DoNothing));
             }
             other => panic!("expected upsert statement, got {other:?}"),
         }

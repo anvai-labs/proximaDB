@@ -3917,7 +3917,9 @@ pub mod types {
     ///    "index_specs",
     ///    "name",
     ///    "proxima_record_enabled",
-    ///    "stats"
+    ///    "stats",
+    ///    "storage_class",
+    ///    "storage_class_status"
     ///  ],
     ///  "properties": {
     ///    "canonical_embedding_precision": {
@@ -3983,6 +3985,13 @@ pub mod types {
     ///    "stats": {
     ///      "$ref": "#/components/schemas/CollectionStatsV2"
     ///    },
+    ///    "storage_class": {
+    ///      "description": "Resolved desired storage class (TD-TIER-1 SC1):\n\"economy\" | \"balanced\" (default) | \"performance\".",
+    ///      "type": "string"
+    ///    },
+    ///    "storage_class_status": {
+    ///      "$ref": "#/components/schemas/StorageClassStatusOutput"
+    ///    },
     ///    "updated_at": {
     ///      "description": "Last update timestamp",
     ///      "type": [
@@ -4029,6 +4038,10 @@ pub mod types {
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub schema: ::std::option::Option<SchemaDefinition>,
         pub stats: CollectionStatsV2,
+        /// Resolved desired storage class (TD-TIER-1 SC1):
+        /// "economy" | "balanced" (default) | "performance".
+        pub storage_class: ::std::string::String,
+        pub storage_class_status: StorageClassStatusOutput,
         ///Last update timestamp
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub updated_at: ::std::option::Option<::std::string::String>,
@@ -4131,12 +4144,14 @@ pub mod types {
     /// "enable_proxima_record": true
     /// }
     /// ```
+    /// Unknown fields are rejected (TD-RESTGET-1): a misspelt setting used to be
+    /// dropped, and the collection silently got the default instead.
     ///
     /// <details><summary>JSON schema</summary>
     ///
     /// ```json
     ///{
-    ///  "description": "Request to create a collection with schema support\n\n## Example JSON\n\n```json\n{\n    \"name\": \"products\",\n    \"dimension\": 768,\n    \"engine\": \"sst\",\n    \"schema\": {\n        \"columns\": [\n            {\"name\": \"category\", \"data_type\": \"text\", \"indexed\": true},\n            {\"name\": \"price\", \"data_type\": \"float\", \"filterable\": true},\n            {\"name\": \"description\", \"data_type\": \"text\", \"max_length\": 10000}\n        ],\n        \"enforcement\": \"hybrid\",\n        \"allow_additional_fields\": true\n    },\n    \"enable_proxima_record\": true\n}\n```",
+    ///  "description": "Request to create a collection with schema support\n\n## Example JSON\n\n```json\n{\n    \"name\": \"products\",\n    \"dimension\": 768,\n    \"engine\": \"sst\",\n    \"schema\": {\n        \"columns\": [\n            {\"name\": \"category\", \"data_type\": \"text\", \"indexed\": true},\n            {\"name\": \"price\", \"data_type\": \"float\", \"filterable\": true},\n            {\"name\": \"description\", \"data_type\": \"text\", \"max_length\": 10000}\n        ],\n        \"enforcement\": \"hybrid\",\n        \"allow_additional_fields\": true\n    },\n    \"enable_proxima_record\": true\n}\n```\nUnknown fields are rejected (TD-RESTGET-1): a misspelt setting used to be\ndropped, and the collection silently got the default instead.",
     ///  "type": "object",
     ///  "required": [
     ///    "dimension",
@@ -4150,6 +4165,13 @@ pub mod types {
     ///        "null"
     ///      ]
     ///    },
+    ///    "description": {
+    ///      "description": "Free-text description, persisted on the collection config.",
+    ///      "type": [
+    ///        "string",
+    ///        "null"
+    ///      ]
+    ///    },
     ///    "dimension": {
     ///      "description": "Vector dimension (required)",
     ///      "type": "integer",
@@ -4157,7 +4179,7 @@ pub mod types {
     ///      "minimum": 1.0
     ///    },
     ///    "distance_metric": {
-    ///      "description": "Distance metric for vector similarity\n\nOptions: \"cosine\", \"euclidean\", \"dot_product\"\nDefault: \"cosine\"",
+    ///      "description": "Distance metric for vector similarity\n\nOptions: \"cosine\", \"euclidean\", \"dot_product\"\nDefault: \"cosine\"\n`metric` is accepted as an alias.",
     ///      "type": [
     ///        "string",
     ///        "null"
@@ -4171,7 +4193,7 @@ pub mod types {
     ///      ]
     ///    },
     ///    "engine": {
-    ///      "description": "Storage engine selection\n\nOptions: \"auto\", \"sst\", \"helix\", \"swift\", \"nova\", \"raptor\", \"tst\"\nDefault: \"auto\" (system selects optimal engine)\n(\"viper\" is no longer accepted — deprecated by ADR-093)",
+    ///      "description": "Storage engine selection\n\nOptions: \"auto\", \"sst\", \"helix\", \"swift\", \"nova\", \"raptor\", \"tst\"\nDefault: \"auto\" (system selects optimal engine)\n(\"viper\" is no longer accepted — deprecated by ADR-093)\n`storage_engine` is accepted as an alias.",
     ///      "type": [
     ///        "string",
     ///        "null"
@@ -4189,6 +4211,14 @@ pub mod types {
     ///    },
     ///    "index_policy": {
     ///      "$ref": "#/components/schemas/IndexPolicyInput"
+    ///    },
+    ///    "index_type": {
+    ///      "description": "Legacy field the released Rust and TypeScript SDKs send on every create\n(default \"hnsw\"). Index selection is cost-derived, so \"hnsw\" is accepted\nand has no effect; any other value is rejected — declare an index with\n`index_configs` or force a route with `index_policy.mode` instead.",
+    ///      "deprecated": true,
+    ///      "type": [
+    ///        "string",
+    ///        "null"
+    ///      ]
     ///    },
     ///    "initial_capacity": {
     ///      "description": "Initial capacity hint for pre-allocation",
@@ -4210,6 +4240,13 @@ pub mod types {
     ///    "schema": {
     ///      "$ref": "#/components/schemas/SchemaDefinition"
     ///    },
+    ///    "storage_class": {
+    ///      "description": "Desired storage class (TD-TIER-1 SC1).\n\nOptions: \"balanced\" (default) | \"economy\" | \"performance\". Omitted ⇒\nbalanced (pre-SC1 collections are unchanged). \"performance\" is admitted\nonly for an object-store-backed SST/PAX placement and reports\n`not_active` until its residency dependency ships; economy likewise\npersists intent only. Read `storage_class_status` on the GET response\nfor the observed truth — the class is never a claim.",
+    ///      "type": [
+    ///        "string",
+    ///        "null"
+    ///      ]
+    ///    },
     ///    "tags": {
     ///      "description": "Operator metadata tags, e.g. `\"recall_target:0.95\"`,\n`\"target_vector_count:1000\"`, `\"modalities:text,image\"`. Consumed by the\nrecall advisor / route-health (`services/collection/recall_target.rs`).",
     ///      "type": [
@@ -4220,11 +4257,13 @@ pub mod types {
     ///        "type": "string"
     ///      }
     ///    }
-    ///  }
+    ///  },
+    ///  "additionalProperties": false
     ///}
     /// ```
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
     pub struct CreateCollectionV2Request {
         /// Canonical embedding precision for stored vectors
         ///
@@ -4235,12 +4274,16 @@ pub mod types {
         /// converge on the same enum discriminant.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub canonical_embedding_precision: ::std::option::Option<::std::string::String>,
+        ///Free-text description, persisted on the collection config.
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub description: ::std::option::Option<::std::string::String>,
         ///Vector dimension (required)
         pub dimension: ::std::num::NonZeroU32,
         /// Distance metric for vector similarity
         ///
         /// Options: "cosine", "euclidean", "dot_product"
         /// Default: "cosine"
+        /// `metric` is accepted as an alias.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub distance_metric: ::std::option::Option<::std::string::String>,
         /// Enable ProximaRecord support for this collection
@@ -4258,6 +4301,7 @@ pub mod types {
         /// Options: "auto", "sst", "helix", "swift", "nova", "raptor", "tst"
         /// Default: "auto" (system selects optimal engine)
         /// ("viper" is no longer accepted — deprecated by ADR-093)
+        /// `storage_engine` is accepted as an alias.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub engine: ::std::option::Option<::std::string::String>,
         /// Index configurations (e.g. an explicit IVF or HNSW index).
@@ -4269,6 +4313,12 @@ pub mod types {
         pub index_configs: ::std::option::Option<::std::vec::Vec<IndexConfigInput>>,
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub index_policy: ::std::option::Option<IndexPolicyInput>,
+        /// Legacy field the released Rust and TypeScript SDKs send on every create
+        /// (default "hnsw"). Index selection is cost-derived, so "hnsw" is accepted
+        /// and has no effect; any other value is rejected — declare an index with
+        /// `index_configs` or force a route with `index_policy.mode` instead.
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub index_type: ::std::option::Option<::std::string::String>,
         ///Initial capacity hint for pre-allocation
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub initial_capacity: ::std::option::Option<i64>,
@@ -4278,6 +4328,16 @@ pub mod types {
         pub quantization: ::std::option::Option<QuantizationConfigInput>,
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub schema: ::std::option::Option<SchemaDefinition>,
+        /// Desired storage class (TD-TIER-1 SC1).
+        ///
+        /// Options: "balanced" (default) | "economy" | "performance". Omitted ⇒
+        /// balanced (pre-SC1 collections are unchanged). "performance" is admitted
+        /// only for an object-store-backed SST/PAX placement and reports
+        /// `not_active` until its residency dependency ships; economy likewise
+        /// persists intent only. Read `storage_class_status` on the GET response
+        /// for the observed truth — the class is never a claim.
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub storage_class: ::std::option::Option<::std::string::String>,
         /// Operator metadata tags, e.g. `"recall_target:0.95"`,
         /// `"target_vector_count:1000"`, `"modalities:text,image"`. Consumed by the
         /// recall advisor / route-health (`services/collection/recall_target.rs`).
@@ -9151,11 +9211,13 @@ pub mod types {
     ///      "format": "int32",
     ///      "minimum": 0.0
     ///    }
-    ///  }
+    ///  },
+    ///  "additionalProperties": false
     ///}
     /// ```
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
     pub struct HnswConfigInput {
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub ef_construction: ::std::option::Option<i32>,
@@ -9462,11 +9524,13 @@ pub mod types {
     ///        "type": "string"
     ///      }
     ///    }
-    ///  }
+    ///  },
+    ///  "additionalProperties": false
     ///}
     /// ```
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
     pub struct IndexConfigInput {
         ///Algorithm: "hnsw", "ivf", "pq", "flat", "annoy", "lsh".
         pub algorithm: ::std::string::String,
@@ -9534,11 +9598,13 @@ pub mod types {
     ///        "null"
     ///      ]
     ///    }
-    ///  }
+    ///  },
+    ///  "additionalProperties": false
     ///}
     /// ```
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
     pub struct IndexPolicyInput {
         /// Exact-scan byte budget override (bytes). 0/omitted ⇒ cost-model default
         /// for the storage class.
@@ -10013,11 +10079,13 @@ pub mod types {
     ///      "format": "int32",
     ///      "minimum": 0.0
     ///    }
-    ///  }
+    ///  },
+    ///  "additionalProperties": false
     ///}
     /// ```
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
     pub struct IvfConfigInput {
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub n_lists: ::std::option::Option<i32>,
@@ -12005,11 +12073,13 @@ pub mod types {
     ///        "null"
     ///      ]
     ///    }
-    ///  }
+    ///  },
+    ///  "additionalProperties": false
     ///}
     /// ```
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
     pub struct QuantizationConfigInput {
         ///Enable quantization for this collection.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
@@ -13148,11 +13218,13 @@ pub mod types {
     ///      "format": "int32",
     ///      "minimum": 0.0
     ///    }
-    ///  }
+    ///  },
+    ///  "additionalProperties": false
     ///}
     /// ```
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
     pub struct RestColumnDefinition {
         /// Data type
         ///
@@ -14085,6 +14157,82 @@ pub mod types {
                 .map_err(|e: self::error::ConversionError| {
                     <D::Error as ::serde::de::Error>::custom(e.to_string())
                 })
+        }
+    }
+    /// REST output for the observed storage-class status (TD-TIER-1 SC1; mirrors
+    /// proto `StorageClassStatus` — a read-side projection, never an input).
+    ///
+    /// <details><summary>JSON schema</summary>
+    ///
+    /// ```json
+    ///{
+    ///  "description": "REST output for the observed storage-class status (TD-TIER-1 SC1; mirrors\nproto `StorageClassStatus` — a read-side projection, never an input).",
+    ///  "type": "object",
+    ///  "required": [
+    ///    "covered_bytes",
+    ///    "policy_generation",
+    ///    "reason",
+    ///    "reserved_bytes",
+    ///    "resident_bytes",
+    ///    "state"
+    ///  ],
+    ///  "properties": {
+    ///    "covered_bytes": {
+    ///      "description": "Bytes covered by the READY coverage set (SC4). 0 until then.",
+    ///      "type": "integer",
+    ///      "format": "int64",
+    ///      "minimum": 0.0
+    ///    },
+    ///    "policy_generation": {
+    ///      "description": "Monotonic generation of the desired policy: 0 = never set (pre-SC1\nrecords), 1 = set at create; a policy-change surface will bump it.",
+    ///      "type": "integer",
+    ///      "format": "int64",
+    ///      "minimum": 0.0
+    ///    },
+    ///    "reason": {
+    ///      "description": "Human-readable reason when `state` is not active (names the missing\ndependency); empty when active.",
+    ///      "type": "string"
+    ///    },
+    ///    "reserved_bytes": {
+    ///      "description": "Reserved bytes under the collection's residency admission (SC3). 0 until then.",
+    ///      "type": "integer",
+    ///      "format": "int64",
+    ///      "minimum": 0.0
+    ///    },
+    ///    "resident_bytes": {
+    ///      "description": "Bytes resident in the serving cache (SC4). 0 until then.",
+    ///      "type": "integer",
+    ///      "format": "int64",
+    ///      "minimum": 0.0
+    ///    },
+    ///    "state": {
+    ///      "description": "\"active\" | \"not_active\" (\"unspecified\" never leaves the server).",
+    ///      "type": "string"
+    ///    }
+    ///  }
+    ///}
+    /// ```
+    /// </details>
+    #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    pub struct StorageClassStatusOutput {
+        ///Bytes covered by the READY coverage set (SC4). 0 until then.
+        pub covered_bytes: i64,
+        /// Monotonic generation of the desired policy: 0 = never set (pre-SC1
+        /// records), 1 = set at create; a policy-change surface will bump it.
+        pub policy_generation: i64,
+        /// Human-readable reason when `state` is not active (names the missing
+        /// dependency); empty when active.
+        pub reason: ::std::string::String,
+        ///Reserved bytes under the collection's residency admission (SC3). 0 until then.
+        pub reserved_bytes: i64,
+        ///Bytes resident in the serving cache (SC4). 0 until then.
+        pub resident_bytes: i64,
+        ///"active" | "not_active" ("unspecified" never leaves the server).
+        pub state: ::std::string::String,
+    }
+    impl StorageClassStatusOutput {
+        pub fn builder() -> builder::StorageClassStatusOutput {
+            Default::default()
         }
     }
     ///`TableWriteCandidateExplanation`
@@ -20954,6 +21102,9 @@ pub mod types {
                 ::std::string::String,
             >,
             stats: ::std::result::Result<super::CollectionStatsV2, ::std::string::String>,
+            storage_class: ::std::result::Result<::std::string::String, ::std::string::String>,
+            storage_class_status:
+                ::std::result::Result<super::StorageClassStatusOutput, ::std::string::String>,
             updated_at: ::std::result::Result<
                 ::std::option::Option<::std::string::String>,
                 ::std::string::String,
@@ -20980,6 +21131,10 @@ pub mod types {
                     quantization: Ok(Default::default()),
                     schema: Ok(Default::default()),
                     stats: Err("no value supplied for stats".to_string()),
+                    storage_class: Err("no value supplied for storage_class".to_string()),
+                    storage_class_status: Err(
+                        "no value supplied for storage_class_status".to_string()
+                    ),
                     updated_at: Ok(Default::default()),
                 }
             }
@@ -21127,6 +21282,26 @@ pub mod types {
                     .map_err(|e| format!("error converting supplied value for stats: {e}"));
                 self
             }
+            pub fn storage_class<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::string::String>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.storage_class = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for storage_class: {e}"));
+                self
+            }
+            pub fn storage_class_status<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<super::StorageClassStatusOutput>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.storage_class_status = value.try_into().map_err(|e| {
+                    format!("error converting supplied value for storage_class_status: {e}")
+                });
+                self
+            }
             pub fn updated_at<T>(mut self, value: T) -> Self
             where
                 T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
@@ -21158,6 +21333,8 @@ pub mod types {
                     quantization: value.quantization?,
                     schema: value.schema?,
                     stats: value.stats?,
+                    storage_class: value.storage_class?,
+                    storage_class_status: value.storage_class_status?,
                     updated_at: value.updated_at?,
                 })
             }
@@ -21179,6 +21356,8 @@ pub mod types {
                     quantization: Ok(value.quantization),
                     schema: Ok(value.schema),
                     stats: Ok(value.stats),
+                    storage_class: Ok(value.storage_class),
+                    storage_class_status: Ok(value.storage_class_status),
                     updated_at: Ok(value.updated_at),
                 }
             }
@@ -21301,6 +21480,10 @@ pub mod types {
                 ::std::option::Option<::std::string::String>,
                 ::std::string::String,
             >,
+            description: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                ::std::string::String,
+            >,
             dimension: ::std::result::Result<::std::num::NonZeroU32, ::std::string::String>,
             distance_metric: ::std::result::Result<
                 ::std::option::Option<::std::string::String>,
@@ -21320,6 +21503,10 @@ pub mod types {
                 ::std::option::Option<super::IndexPolicyInput>,
                 ::std::string::String,
             >,
+            index_type: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                ::std::string::String,
+            >,
             initial_capacity:
                 ::std::result::Result<::std::option::Option<i64>, ::std::string::String>,
             name:
@@ -21332,6 +21519,10 @@ pub mod types {
                 ::std::option::Option<super::SchemaDefinition>,
                 ::std::string::String,
             >,
+            storage_class: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                ::std::string::String,
+            >,
             tags: ::std::result::Result<
                 ::std::option::Option<::std::vec::Vec<::std::string::String>>,
                 ::std::string::String,
@@ -21341,16 +21532,19 @@ pub mod types {
             fn default() -> Self {
                 Self {
                     canonical_embedding_precision: Ok(Default::default()),
+                    description: Ok(Default::default()),
                     dimension: Err("no value supplied for dimension".to_string()),
                     distance_metric: Ok(Default::default()),
                     enable_proxima_record: Ok(Default::default()),
                     engine: Ok(Default::default()),
                     index_configs: Ok(Default::default()),
                     index_policy: Ok(Default::default()),
+                    index_type: Ok(Default::default()),
                     initial_capacity: Ok(Default::default()),
                     name: Err("no value supplied for name".to_string()),
                     quantization: Ok(Default::default()),
                     schema: Ok(Default::default()),
+                    storage_class: Ok(Default::default()),
                     tags: Ok(Default::default()),
                 }
             }
@@ -21366,6 +21560,16 @@ pub mod types {
                         "error converting supplied value for canonical_embedding_precision: {e}"
                     )
                 });
+                self
+            }
+            pub fn description<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.description = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for description: {e}"));
                 self
             }
             pub fn dimension<T>(mut self, value: T) -> Self
@@ -21430,6 +21634,16 @@ pub mod types {
                     .map_err(|e| format!("error converting supplied value for index_policy: {e}"));
                 self
             }
+            pub fn index_type<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.index_type = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for index_type: {e}"));
+                self
+            }
             pub fn initial_capacity<T>(mut self, value: T) -> Self
             where
                 T: ::std::convert::TryInto<::std::option::Option<i64>>,
@@ -21470,6 +21684,16 @@ pub mod types {
                     .map_err(|e| format!("error converting supplied value for schema: {e}"));
                 self
             }
+            pub fn storage_class<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.storage_class = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for storage_class: {e}"));
+                self
+            }
             pub fn tags<T>(mut self, value: T) -> Self
             where
                 T: ::std::convert::TryInto<
@@ -21490,16 +21714,19 @@ pub mod types {
             ) -> ::std::result::Result<Self, super::error::ConversionError> {
                 Ok(Self {
                     canonical_embedding_precision: value.canonical_embedding_precision?,
+                    description: value.description?,
                     dimension: value.dimension?,
                     distance_metric: value.distance_metric?,
                     enable_proxima_record: value.enable_proxima_record?,
                     engine: value.engine?,
                     index_configs: value.index_configs?,
                     index_policy: value.index_policy?,
+                    index_type: value.index_type?,
                     initial_capacity: value.initial_capacity?,
                     name: value.name?,
                     quantization: value.quantization?,
                     schema: value.schema?,
+                    storage_class: value.storage_class?,
                     tags: value.tags?,
                 })
             }
@@ -21508,16 +21735,19 @@ pub mod types {
             fn from(value: super::CreateCollectionV2Request) -> Self {
                 Self {
                     canonical_embedding_precision: Ok(value.canonical_embedding_precision),
+                    description: Ok(value.description),
                     dimension: Ok(value.dimension),
                     distance_metric: Ok(value.distance_metric),
                     enable_proxima_record: Ok(value.enable_proxima_record),
                     engine: Ok(value.engine),
                     index_configs: Ok(value.index_configs),
                     index_policy: Ok(value.index_policy),
+                    index_type: Ok(value.index_type),
                     initial_capacity: Ok(value.initial_capacity),
                     name: Ok(value.name),
                     quantization: Ok(value.quantization),
                     schema: Ok(value.schema),
+                    storage_class: Ok(value.storage_class),
                     tags: Ok(value.tags),
                 }
             }
@@ -33478,6 +33708,116 @@ pub mod types {
                     rows: Ok(value.rows),
                     rows_returned: Ok(value.rows_returned),
                     rows_scanned: Ok(value.rows_scanned),
+                }
+            }
+        }
+        #[derive(Clone, Debug)]
+        pub struct StorageClassStatusOutput {
+            covered_bytes: ::std::result::Result<i64, ::std::string::String>,
+            policy_generation: ::std::result::Result<i64, ::std::string::String>,
+            reason: ::std::result::Result<::std::string::String, ::std::string::String>,
+            reserved_bytes: ::std::result::Result<i64, ::std::string::String>,
+            resident_bytes: ::std::result::Result<i64, ::std::string::String>,
+            state: ::std::result::Result<::std::string::String, ::std::string::String>,
+        }
+        impl ::std::default::Default for StorageClassStatusOutput {
+            fn default() -> Self {
+                Self {
+                    covered_bytes: Err("no value supplied for covered_bytes".to_string()),
+                    policy_generation: Err("no value supplied for policy_generation".to_string()),
+                    reason: Err("no value supplied for reason".to_string()),
+                    reserved_bytes: Err("no value supplied for reserved_bytes".to_string()),
+                    resident_bytes: Err("no value supplied for resident_bytes".to_string()),
+                    state: Err("no value supplied for state".to_string()),
+                }
+            }
+        }
+        impl StorageClassStatusOutput {
+            pub fn covered_bytes<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<i64>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.covered_bytes = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for covered_bytes: {e}"));
+                self
+            }
+            pub fn policy_generation<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<i64>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.policy_generation = value.try_into().map_err(|e| {
+                    format!("error converting supplied value for policy_generation: {e}")
+                });
+                self
+            }
+            pub fn reason<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::string::String>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.reason = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for reason: {e}"));
+                self
+            }
+            pub fn reserved_bytes<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<i64>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.reserved_bytes = value.try_into().map_err(|e| {
+                    format!("error converting supplied value for reserved_bytes: {e}")
+                });
+                self
+            }
+            pub fn resident_bytes<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<i64>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.resident_bytes = value.try_into().map_err(|e| {
+                    format!("error converting supplied value for resident_bytes: {e}")
+                });
+                self
+            }
+            pub fn state<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::string::String>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.state = value
+                    .try_into()
+                    .map_err(|e| format!("error converting supplied value for state: {e}"));
+                self
+            }
+        }
+        impl ::std::convert::TryFrom<StorageClassStatusOutput> for super::StorageClassStatusOutput {
+            type Error = super::error::ConversionError;
+            fn try_from(
+                value: StorageClassStatusOutput,
+            ) -> ::std::result::Result<Self, super::error::ConversionError> {
+                Ok(Self {
+                    covered_bytes: value.covered_bytes?,
+                    policy_generation: value.policy_generation?,
+                    reason: value.reason?,
+                    reserved_bytes: value.reserved_bytes?,
+                    resident_bytes: value.resident_bytes?,
+                    state: value.state?,
+                })
+            }
+        }
+        impl ::std::convert::From<super::StorageClassStatusOutput> for StorageClassStatusOutput {
+            fn from(value: super::StorageClassStatusOutput) -> Self {
+                Self {
+                    covered_bytes: Ok(value.covered_bytes),
+                    policy_generation: Ok(value.policy_generation),
+                    reason: Ok(value.reason),
+                    reserved_bytes: Ok(value.reserved_bytes),
+                    resident_bytes: Ok(value.resident_bytes),
+                    state: Ok(value.state),
                 }
             }
         }

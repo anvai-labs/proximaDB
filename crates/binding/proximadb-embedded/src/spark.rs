@@ -988,14 +988,7 @@ fn record_batch_to_proxima_records(
         out.push(ProximaRecord {
             oid: oid.clone(),
             local_id: Some(oid),
-            embeddings: vec![EmbeddingCell {
-                model_id: "spark".to_string(),
-                modality: "dense_vector".to_string(),
-                dim,
-                values: EmbeddingValues::Fp32(v),
-                precision: EmbeddingScalarType::Fp32,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32("spark", "dense_vector", dim, v)],
             ..ProximaRecord::default()
         });
     }
@@ -1308,14 +1301,12 @@ mod tests {
         ProximaRecord {
             oid: oid.to_string(),
             local_id: Some(oid.to_string()),
-            embeddings: vec![EmbeddingCell {
-                model_id: "spark-test".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: 4,
-                values: EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0, 4.0]),
-                precision: EmbeddingScalarType::Fp32,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "spark-test",
+                "dense_vector",
+                4,
+                vec![1.0, 2.0, 3.0, 4.0],
+            )],
             ..ProximaRecord::default()
         }
     }

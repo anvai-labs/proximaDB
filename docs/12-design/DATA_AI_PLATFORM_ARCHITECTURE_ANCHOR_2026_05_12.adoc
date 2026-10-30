@@ -19,7 +19,7 @@ This is the go-forward architecture anchor for ProximaDB as a comprehensive data
 platform. It complements
 link:../../roadmap/MULTIMODAL_OVERHAUL_SPEC_2026_05_08.adoc[MULTIMODAL_OVERHAUL_SPEC_2026_05_08]
 and
-link:../../roadmap/techdebt/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc[WORKSPACE_REFACTOR_PLAN_2026_05_07].
+link:../history/planning/WORKSPACE_REFACTOR_PLAN_2026_05_07.adoc[WORKSPACE_REFACTOR_PLAN_2026_05_07].
 Those documents remain authoritative for the record envelope, type system, logical algebra,
 storage layers, workspace skeleton, and ADRs. This document anchors product shape,
 competitive strategy, platform phases, ecosystem integrations, and the developer-to-enterprise

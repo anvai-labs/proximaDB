@@ -23,7 +23,11 @@ use tracing::{info, warn};
 use x509_parser::prelude::*;
 
 /// Unified authentication service configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` is the least-privileged posture: authentication disabled, no
+/// methods, no credentials, an inert JWT/SSO/mTLS configuration. Enabling
+/// anything is an explicit act.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthenticationConfig {
     pub enabled: bool,
     pub methods: Vec<AuthenticationMethod>,
@@ -138,10 +142,11 @@ pub static AUDIT_WRITE_FAILURES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Authentication methods supported
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub enum AuthenticationMethod {
     #[serde(rename = "sso")]
     SSO,
+    #[default]
     #[serde(rename = "jwt")]
     JWT,
     #[serde(rename = "api_key")]
@@ -174,7 +179,10 @@ pub struct ApiKeyInfo {
 }
 
 /// JWT configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` = JWT disabled with an empty secret and zero-length expirations
+/// — deliberately unusable; any real deployment overrides every field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JwtConfig {
     pub enabled: bool,
     pub secret: String,
@@ -186,7 +194,9 @@ pub struct JwtConfig {
 }
 
 /// SSO configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` = SSO disabled, no providers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SSOConfig {
     pub enabled: bool,
     pub providers: Vec<String>,
@@ -1518,6 +1528,35 @@ fn create_auth_audit_event(
 mod tests {
     use super::ApiKeyInfo;
 
+    /// Inert base config for the conversion tests: authentication disabled,
+    /// JWT/SSO blocks carrying placeholder credentials that are never
+    /// exercised (`jwt.enabled = false` — nothing signs or verifies with
+    /// them). The method the test drives (`methods`) and any OIDC fixture
+    /// are supplied by the caller through struct-update overrides.
+    fn inert_auth_config(
+        methods: Vec<super::AuthenticationMethod>,
+        jwt_issuer_audience: &str,
+    ) -> super::AuthenticationConfig {
+        super::AuthenticationConfig {
+            methods,
+            default_session_timeout_minutes: 30,
+            jwt: super::JwtConfig {
+                secret: "x".to_string(),
+                access_token_expiration_minutes: 1,
+                refresh_token_expiration_days: 1,
+                issuer: jwt_issuer_audience.to_string(),
+                audience: jwt_issuer_audience.to_string(),
+                algorithm: "HS256".to_string(),
+                ..Default::default()
+            },
+            sso: super::SSOConfig {
+                token_cache_ttl_minutes: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     /// N5 (adversarial review pass 2): the LOCAL-JWT retrofit arm is pinned
     /// too — the same blind-test class as F5, one function below it. With an
     /// OIDC verifier present, a locally-minted token's roles cross the SAME
@@ -1528,16 +1567,7 @@ mod tests {
         use crate::network::auth::oidc::test_fixtures as fx;
         let cfg = super::AuthenticationConfig {
             oidc: Some(fx::verifier(&["analyst"], false)),
-            ..serde_json::from_str(
-                r#"{"enabled":false,"methods":["jwt"],"require_authentication":false,
-                    "default_session_timeout_minutes":30,"api_keys":{},
-                    "jwt":{"enabled":false,"secret":"x","issuer":"t","audience":"t",
-                            "access_token_expiration_minutes":1,
-                            "refresh_token_expiration_days":1,"algorithm":"HS256"},
-                    "sso":{"enabled":false,"providers":[],"token_cache_ttl_minutes":1,
-                            "aws_iam":null,"azure_ad":null}}"#,
-            )
-            .expect("minimal auth config")
+            ..inert_auth_config(vec![super::AuthenticationMethod::JWT], "t")
         };
         let service = super::UnifiedAuthService::new(cfg).expect("service");
         let claims = crate::network::auth::Claims {
@@ -1617,32 +1647,12 @@ mod tests {
         // claim value; only the FETCH goes to the loopback).
         let cfg = super::AuthenticationConfig {
             enabled: true,
-            methods: vec![super::AuthenticationMethod::JWT],
-            require_authentication: false,
-            default_session_timeout_minutes: 30,
-            api_keys: HashMap::new(),
-            scram_users: HashMap::new(),
-            jwt: super::JwtConfig {
-                enabled: false,
-                secret: "x".to_string(),
-                access_token_expiration_minutes: 1,
-                refresh_token_expiration_days: 1,
-                issuer: "local".to_string(),
-                audience: "local".to_string(),
-                algorithm: "HS256".to_string(),
-            },
-            sso: super::SSOConfig {
-                enabled: false,
-                providers: vec![],
-                token_cache_ttl_minutes: 1,
-            },
-            mtls: super::MtlsConfig::default(),
-            audit_fail_closed: false,
             oidc: Some(crate::network::auth::oidc::OidcProviderConfig {
                 jwks_url: Some(format!("{}/jwks", server.base_url())),
                 role_allowlist: vec!["analyst".to_string()],
                 ..fx::verifier(&[], false)
             }),
+            ..inert_auth_config(vec![super::AuthenticationMethod::JWT], "local")
         };
         let service = super::UnifiedAuthService::new(cfg).expect("service");
 
@@ -1690,20 +1700,7 @@ mod tests {
         // The conversion is pure given a config; reach it through a minimal
         // service rather than replicating its logic here. mTLS disabled so
         // ::new never touches the filesystem.
-        let cfg = super::AuthenticationConfig {
-            mtls: super::MtlsConfig::default(),
-            oidc: None,
-            ..serde_json::from_str(
-                r#"{"enabled":false,"methods":["api_key"],"require_authentication":false,
-                    "default_session_timeout_minutes":30,"api_keys":{},
-                    "jwt":{"enabled":false,"secret":"x","issuer":"t","audience":"t",
-                            "access_token_expiration_minutes":1,
-                            "refresh_token_expiration_days":1,"algorithm":"HS256"},
-                    "sso":{"enabled":false,"providers":[],"token_cache_ttl_minutes":1,
-                            "aws_iam":null,"azure_ad":null}}"#,
-            )
-            .expect("minimal auth config")
-        };
+        let cfg = inert_auth_config(vec![super::AuthenticationMethod::ApiKey], "t");
         let svc = super::UnifiedAuthService::new(cfg).expect("service");
         svc.convert_api_key_to_unified(info)
     }
@@ -1874,31 +1871,51 @@ ip_restrictions = []
 
     use super::*;
 
-    fn api_key_test_config(api_keys: HashMap<String, ApiKeyInfo>) -> AuthenticationConfig {
+    /// The enabled config literal shared by the service-construction and
+    /// mTLS role-mapping tests: `enabled: true` with the caller's methods /
+    /// `require_authentication` / session timeout / mTLS block, and
+    /// placeholder JWT credentials (`jwt.enabled = false` — these tests
+    /// never sign a token; the SSO TTL and expirations are inert).
+    fn enabled_test_auth_config(
+        methods: Vec<AuthenticationMethod>,
+        require_authentication: bool,
+        default_session_timeout_minutes: u64,
+        secret: &str,
+        mtls: MtlsConfig,
+    ) -> AuthenticationConfig {
         AuthenticationConfig {
             enabled: true,
-            methods: vec![AuthenticationMethod::ApiKey],
-            require_authentication: false,
-            default_session_timeout_minutes: 480,
-            api_keys,
-            scram_users: HashMap::new(),
+            methods,
+            require_authentication,
+            default_session_timeout_minutes,
             jwt: JwtConfig {
-                enabled: false,
-                secret: "test-secret".to_string(),
+                secret: secret.to_string(),
                 access_token_expiration_minutes: 15,
                 refresh_token_expiration_days: 7,
                 issuer: "test".to_string(),
                 audience: "test".to_string(),
                 algorithm: "HS256".to_string(),
+                ..Default::default()
             },
             sso: SSOConfig {
-                enabled: false,
-                providers: vec![],
                 token_cache_ttl_minutes: 5,
+                ..Default::default()
             },
-            mtls: MtlsConfig::default(),
-            oidc: None,
-            audit_fail_closed: false,
+            mtls,
+            ..Default::default()
+        }
+    }
+
+    fn api_key_test_config(api_keys: HashMap<String, ApiKeyInfo>) -> AuthenticationConfig {
+        AuthenticationConfig {
+            api_keys,
+            ..enabled_test_auth_config(
+                vec![AuthenticationMethod::ApiKey],
+                false,
+                480,
+                "test-secret",
+                MtlsConfig::default(),
+            )
         }
     }
 
@@ -1982,31 +1999,13 @@ ip_restrictions = []
 
     #[tokio::test]
     async fn test_auth_service_service_creation() {
-        let config = AuthenticationConfig {
-            enabled: true,
-            methods: vec![AuthenticationMethod::ApiKey],
-            require_authentication: false,
-            default_session_timeout_minutes: 480,
-            api_keys: HashMap::new(),
-            scram_users: HashMap::new(),
-            jwt: JwtConfig {
-                enabled: false,
-                secret: "test-secret".to_string(),
-                access_token_expiration_minutes: 15,
-                refresh_token_expiration_days: 7,
-                issuer: "test".to_string(),
-                audience: "test".to_string(),
-                algorithm: "HS256".to_string(),
-            },
-            sso: SSOConfig {
-                enabled: false,
-                providers: vec![],
-                token_cache_ttl_minutes: 5,
-            },
-            mtls: MtlsConfig::default(),
-            oidc: None,
-            audit_fail_closed: false,
-        };
+        let config = enabled_test_auth_config(
+            vec![AuthenticationMethod::ApiKey],
+            false,
+            480,
+            "test-secret",
+            MtlsConfig::default(),
+        );
 
         let auth_service = UnifiedAuthService::new(config);
         assert!(auth_service.is_ok());
@@ -2022,31 +2021,13 @@ ip_restrictions = []
 
     #[tokio::test]
     async fn test_permission_string_parsing() {
-        let config = AuthenticationConfig {
-            enabled: true,
-            methods: vec![AuthenticationMethod::ApiKey],
-            require_authentication: false,
-            default_session_timeout_minutes: 480,
-            api_keys: HashMap::new(),
-            scram_users: HashMap::new(),
-            jwt: JwtConfig {
-                enabled: false,
-                secret: "test".to_string(),
-                access_token_expiration_minutes: 15,
-                refresh_token_expiration_days: 7,
-                issuer: "test".to_string(),
-                audience: "test".to_string(),
-                algorithm: "HS256".to_string(),
-            },
-            sso: SSOConfig {
-                enabled: false,
-                providers: vec![],
-                token_cache_ttl_minutes: 5,
-            },
-            mtls: MtlsConfig::default(),
-            oidc: None,
-            audit_fail_closed: false,
-        };
+        let config = enabled_test_auth_config(
+            vec![AuthenticationMethod::ApiKey],
+            false,
+            480,
+            "test",
+            MtlsConfig::default(),
+        );
 
         let auth_service = UnifiedAuthService::new(config).unwrap();
 
@@ -2078,24 +2059,20 @@ ip_restrictions = []
             require_authentication: true,
             default_session_timeout_minutes: 60,
             api_keys,
-            scram_users: HashMap::new(),
             jwt: JwtConfig {
-                enabled: false,
                 secret: "t".to_string(),
                 access_token_expiration_minutes: 15,
                 refresh_token_expiration_days: 7,
                 issuer: "t".to_string(),
                 audience: "t".to_string(),
                 algorithm: "HS256".to_string(),
+                ..Default::default()
             },
             sso: SSOConfig {
-                enabled: false,
-                providers: vec![],
                 token_cache_ttl_minutes: 5,
+                ..Default::default()
             },
-            mtls: MtlsConfig::default(),
-            oidc: None,
-            audit_fail_closed: false,
+            ..Default::default()
         }
     }
 
@@ -2244,36 +2221,16 @@ ip_restrictions = []
         cn_role_mapping.insert("db-admin".to_string(), "admin".to_string());
         cn_role_mapping.insert("service-gateway".to_string(), "gateway".to_string());
 
-        let config = AuthenticationConfig {
-            enabled: true,
-            methods: vec![AuthenticationMethod::ClientCertificate],
-            require_authentication: true,
-            default_session_timeout_minutes: 60,
-            api_keys: HashMap::new(),
-            scram_users: HashMap::new(),
-            jwt: JwtConfig {
-                enabled: false,
-                secret: "test".to_string(),
-                access_token_expiration_minutes: 15,
-                refresh_token_expiration_days: 7,
-                issuer: "test".to_string(),
-                audience: "test".to_string(),
-                algorithm: "HS256".to_string(),
-            },
-            sso: SSOConfig {
-                enabled: false,
-                providers: vec![],
-                token_cache_ttl_minutes: 5,
-            },
-            mtls: MtlsConfig {
-                enabled: false,
-                ca_cert_path: None,
-                require_client_cert: false,
+        let config = enabled_test_auth_config(
+            vec![AuthenticationMethod::ClientCertificate],
+            true,
+            60,
+            "test",
+            MtlsConfig {
                 cn_role_mapping,
+                ..Default::default()
             },
-            audit_fail_closed: false,
-            oidc: None,
-        };
+        );
 
         let service = UnifiedAuthService::new(config).unwrap_or_else(|_| {
             // Service creation does not fail when mtls.enabled is false
@@ -2292,36 +2249,16 @@ ip_restrictions = []
         let mut cn_role_mapping = HashMap::new();
         cn_role_mapping.insert("service-*".to_string(), "service_role".to_string());
 
-        let config = AuthenticationConfig {
-            enabled: true,
-            methods: vec![AuthenticationMethod::ClientCertificate],
-            require_authentication: true,
-            default_session_timeout_minutes: 60,
-            api_keys: HashMap::new(),
-            scram_users: HashMap::new(),
-            jwt: JwtConfig {
-                enabled: false,
-                secret: "test".to_string(),
-                access_token_expiration_minutes: 15,
-                refresh_token_expiration_days: 7,
-                issuer: "test".to_string(),
-                audience: "test".to_string(),
-                algorithm: "HS256".to_string(),
-            },
-            sso: SSOConfig {
-                enabled: false,
-                providers: vec![],
-                token_cache_ttl_minutes: 5,
-            },
-            mtls: MtlsConfig {
-                enabled: false,
-                ca_cert_path: None,
-                require_client_cert: false,
+        let config = enabled_test_auth_config(
+            vec![AuthenticationMethod::ClientCertificate],
+            true,
+            60,
+            "test",
+            MtlsConfig {
                 cn_role_mapping,
+                ..Default::default()
             },
-            audit_fail_closed: false,
-            oidc: None,
-        };
+        );
 
         let service = UnifiedAuthService::new(config).unwrap_or_else(|_| unreachable!());
 
@@ -2341,36 +2278,16 @@ ip_restrictions = []
         let mut cn_role_mapping = HashMap::new();
         cn_role_mapping.insert("*.admin".to_string(), "admin".to_string());
 
-        let config = AuthenticationConfig {
-            enabled: true,
-            methods: vec![AuthenticationMethod::ClientCertificate],
-            require_authentication: true,
-            default_session_timeout_minutes: 60,
-            api_keys: HashMap::new(),
-            scram_users: HashMap::new(),
-            jwt: JwtConfig {
-                enabled: false,
-                secret: "test".to_string(),
-                access_token_expiration_minutes: 15,
-                refresh_token_expiration_days: 7,
-                issuer: "test".to_string(),
-                audience: "test".to_string(),
-                algorithm: "HS256".to_string(),
-            },
-            sso: SSOConfig {
-                enabled: false,
-                providers: vec![],
-                token_cache_ttl_minutes: 5,
-            },
-            mtls: MtlsConfig {
-                enabled: false,
-                ca_cert_path: None,
-                require_client_cert: false,
+        let config = enabled_test_auth_config(
+            vec![AuthenticationMethod::ClientCertificate],
+            true,
+            60,
+            "test",
+            MtlsConfig {
                 cn_role_mapping,
+                ..Default::default()
             },
-            audit_fail_closed: false,
-            oidc: None,
-        };
+        );
 
         let service = UnifiedAuthService::new(config).unwrap_or_else(|_| unreachable!());
 
@@ -2387,36 +2304,18 @@ ip_restrictions = []
 
     #[test]
     fn test_mtls_enabled_without_ca_path_fails() {
-        let config = AuthenticationConfig {
-            enabled: true,
-            methods: vec![AuthenticationMethod::ClientCertificate],
-            require_authentication: true,
-            default_session_timeout_minutes: 60,
-            api_keys: HashMap::new(),
-            scram_users: HashMap::new(),
-            jwt: JwtConfig {
-                enabled: false,
-                secret: "test".to_string(),
-                access_token_expiration_minutes: 15,
-                refresh_token_expiration_days: 7,
-                issuer: "test".to_string(),
-                audience: "test".to_string(),
-                algorithm: "HS256".to_string(),
-            },
-            sso: SSOConfig {
-                enabled: false,
-                providers: vec![],
-                token_cache_ttl_minutes: 5,
-            },
-            mtls: MtlsConfig {
+        let config = enabled_test_auth_config(
+            vec![AuthenticationMethod::ClientCertificate],
+            true,
+            60,
+            "test",
+            // Missing CA path
+            MtlsConfig {
                 enabled: true,
-                ca_cert_path: None, // Missing CA path
                 require_client_cert: true,
-                cn_role_mapping: HashMap::new(),
+                ..Default::default()
             },
-            audit_fail_closed: false,
-            oidc: None,
-        };
+        );
 
         let result = UnifiedAuthService::new(config);
         assert!(result.is_err());
@@ -2426,36 +2325,13 @@ ip_restrictions = []
 
     #[tokio::test]
     async fn test_mtls_disabled_returns_failure() {
-        let config = AuthenticationConfig {
-            enabled: true,
-            methods: vec![AuthenticationMethod::ClientCertificate],
-            require_authentication: true,
-            default_session_timeout_minutes: 60,
-            api_keys: HashMap::new(),
-            scram_users: HashMap::new(),
-            jwt: JwtConfig {
-                enabled: false,
-                secret: "test".to_string(),
-                access_token_expiration_minutes: 15,
-                refresh_token_expiration_days: 7,
-                issuer: "test".to_string(),
-                audience: "test".to_string(),
-                algorithm: "HS256".to_string(),
-            },
-            sso: SSOConfig {
-                enabled: false,
-                providers: vec![],
-                token_cache_ttl_minutes: 5,
-            },
-            mtls: MtlsConfig {
-                enabled: false,
-                ca_cert_path: None,
-                require_client_cert: false,
-                cn_role_mapping: HashMap::new(),
-            },
-            audit_fail_closed: false,
-            oidc: None,
-        };
+        let config = enabled_test_auth_config(
+            vec![AuthenticationMethod::ClientCertificate],
+            true,
+            60,
+            "test",
+            MtlsConfig::default(),
+        );
 
         let service = UnifiedAuthService::new(config).unwrap_or_else(|_| unreachable!());
         let cert_data = ClientCertificateData {

@@ -747,13 +747,12 @@ mod tests {
                 let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
                 ProximaRecord {
                     oid: format!("vec_{}", i),
-                    embeddings: vec![EmbeddingCell {
-                        model_id: "test".to_string(),
-                        modality: "dense_vector".to_string(),
-                        dim: dimension as u32,
-                        values: proximadb_records::EmbeddingValues::Fp32(vec![i as f32; dimension]),
-                        ..Default::default()
-                    }],
+                    embeddings: vec![EmbeddingCell::new_fp32(
+                        "test",
+                        "dense_vector",
+                        dimension as u32,
+                        vec![i as f32; dimension],
+                    )],
                     props: metadata,
                     created_at_ns: now_ns,
                     updated_at_ns: now_ns,

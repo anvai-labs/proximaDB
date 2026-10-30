@@ -12,65 +12,205 @@ use anyhow::Result;
 
 use super::helpers;
 
+/// Unsigned XOR primitive for the Gorilla bit stream (u32 for the f32/i32
+/// wire, u64 for f64/i64).
+///
+/// Redundancy pass 4 (PackPrim/WirePrim precedent): the two wire cores were
+/// byte-identical modulo the value width and the per-width control-field
+/// sizes; the golden tests pin both layouts. The trait stays local to this
+/// codec because only Gorilla works in the unsigned XOR domain.
+trait GorillaPrim: Copy + std::ops::BitAnd<Output = Self> {
+    /// Wire slot size in bytes (4 for u32, 8 for u64).
+    const WIRE_BYTES: usize;
+    /// Total value bits (32 for u32, 64 for u64).
+    const BITS: u8;
+    /// Wire field width for the leading-zero count (5 for u32, 6 for u64).
+    const LEADING_BITS: u8;
+    /// Wire field width for the meaningful-bits count (6 for u32, 7 for u64).
+    const MEANINGFUL_BITS: u8;
+
+    /// Append `self` little-endian to `out`.
+    fn write_le(self, out: &mut Vec<u8>);
+    /// Read `self` little-endian from the first `WIRE_BYTES` bytes of `data`.
+    fn read_le(data: &[u8]) -> Result<Self>;
+    fn bitxor(self, other: Self) -> Self;
+    fn leading_zeros(self) -> u8;
+    fn trailing_zeros(self) -> u8;
+    fn is_zero(self) -> bool;
+    /// Low `width` bits set (`width` may equal `BITS`).
+    fn low_mask(width: u8) -> Self;
+    fn shl(self, n: u8) -> Self;
+    fn shr(self, n: u8) -> Self;
+    fn to_u64(self) -> u64;
+    fn from_u64(v: u64) -> Self;
+}
+
+impl GorillaPrim for u32 {
+    const WIRE_BYTES: usize = 4;
+    const BITS: u8 = 32;
+    const LEADING_BITS: u8 = 5;
+    const MEANINGFUL_BITS: u8 = 6;
+
+    fn write_le(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.to_le_bytes());
+    }
+
+    fn read_le(data: &[u8]) -> Result<Self> {
+        let bytes: [u8; 4] = data
+            .get(..4)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| anyhow::anyhow!("wire read: need 4 bytes, got {}", data.len()))?;
+        Ok(Self::from_le_bytes(bytes))
+    }
+
+    fn bitxor(self, other: Self) -> Self {
+        self ^ other
+    }
+
+    fn leading_zeros(self) -> u8 {
+        self.leading_zeros() as u8
+    }
+
+    fn trailing_zeros(self) -> u8 {
+        self.trailing_zeros() as u8
+    }
+
+    fn is_zero(self) -> bool {
+        self == 0
+    }
+
+    fn low_mask(width: u8) -> Self {
+        if width >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << width) - 1
+        }
+    }
+
+    fn shl(self, n: u8) -> Self {
+        self << n
+    }
+
+    fn shr(self, n: u8) -> Self {
+        self >> n
+    }
+
+    fn to_u64(self) -> u64 {
+        self as u64
+    }
+
+    fn from_u64(v: u64) -> Self {
+        v as u32
+    }
+}
+
+impl GorillaPrim for u64 {
+    const WIRE_BYTES: usize = 8;
+    const BITS: u8 = 64;
+    const LEADING_BITS: u8 = 6;
+    const MEANINGFUL_BITS: u8 = 7;
+
+    fn write_le(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.to_le_bytes());
+    }
+
+    fn read_le(data: &[u8]) -> Result<Self> {
+        let bytes: [u8; 8] = data
+            .get(..8)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| anyhow::anyhow!("wire read: need 8 bytes, got {}", data.len()))?;
+        Ok(Self::from_le_bytes(bytes))
+    }
+
+    fn bitxor(self, other: Self) -> Self {
+        self ^ other
+    }
+
+    fn leading_zeros(self) -> u8 {
+        self.leading_zeros() as u8
+    }
+
+    fn trailing_zeros(self) -> u8 {
+        self.trailing_zeros() as u8
+    }
+
+    fn is_zero(self) -> bool {
+        self == 0
+    }
+
+    fn low_mask(width: u8) -> Self {
+        if width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        }
+    }
+
+    fn shl(self, n: u8) -> Self {
+        self << n
+    }
+
+    fn shr(self, n: u8) -> Self {
+        self >> n
+    }
+
+    fn to_u64(self) -> u64 {
+        self
+    }
+
+    fn from_u64(v: u64) -> Self {
+        v
+    }
+}
+
 // ===== Core wire format encoding functions =====
 
-/// Core encoding logic for u32 wire type (used by f32 and i32)
-fn encode_gorilla_u32_wire(wire_values: &[i32]) -> Result<Vec<u8>> {
-    // Convert i32 wire values to u32 for XOR operations
-    let u32_values: Vec<u32> = wire_values.iter().map(|&v| v as u32).collect();
-
-    if u32_values.is_empty() {
+/// Single Gorilla encode core over the unsigned XOR domain.
+fn encode_gorilla_wire<P: GorillaPrim>(values: &[P]) -> Result<Vec<u8>> {
+    if values.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut result = Vec::new();
-    result.extend_from_slice(&u32_values[0].to_le_bytes());
+    values[0].write_le(&mut result);
 
-    if u32_values.len() == 1 {
+    if values.len() == 1 {
         return Ok(result);
     }
 
     let mut bit_writer = BitWriter::new();
-    let mut prev_value = u32_values[0];
+    let mut prev_value = values[0];
     let mut prev_leading_zeros = 0u8;
     let mut prev_trailing_zeros = 0u8;
 
-    for &current in &u32_values[1..] {
-        let xor = prev_value ^ current;
+    for &current in &values[1..] {
+        let xor = prev_value.bitxor(current);
 
-        if xor == 0 {
+        if xor.is_zero() {
             bit_writer.write_bit(false);
         } else {
             bit_writer.write_bit(true);
 
-            let leading_zeros = xor.leading_zeros() as u8;
-            let trailing_zeros = xor.trailing_zeros() as u8;
-            let meaningful_bits = 32 - leading_zeros - trailing_zeros;
+            let leading_zeros = xor.leading_zeros();
+            let trailing_zeros = xor.trailing_zeros();
+            let meaningful_bits = P::BITS - leading_zeros - trailing_zeros;
 
             if leading_zeros >= prev_leading_zeros
                 && trailing_zeros >= prev_trailing_zeros
-                && prev_leading_zeros + prev_trailing_zeros < 32
+                && prev_leading_zeros + prev_trailing_zeros < P::BITS
             {
                 bit_writer.write_bit(false);
-                let block_size = 32 - prev_leading_zeros - prev_trailing_zeros;
-                let mask = if block_size >= 32 {
-                    u32::MAX
-                } else {
-                    (1u32 << block_size) - 1
-                };
-                let value_bits = (xor >> prev_trailing_zeros) & mask;
-                bit_writer.write_bits(value_bits as u64, block_size);
+                let block_size = P::BITS - prev_leading_zeros - prev_trailing_zeros;
+                let mask = P::low_mask(block_size);
+                let value_bits = xor.shr(prev_trailing_zeros) & mask;
+                bit_writer.write_bits(value_bits.to_u64(), block_size);
             } else {
                 bit_writer.write_bit(true);
-                bit_writer.write_bits(leading_zeros as u64, 5);
-                bit_writer.write_bits(meaningful_bits as u64, 6);
-                let mask = if meaningful_bits >= 32 {
-                    u32::MAX
-                } else {
-                    (1u32 << meaningful_bits) - 1
-                };
-                let value_bits = (xor >> trailing_zeros) & mask;
-                bit_writer.write_bits(value_bits as u64, meaningful_bits);
+                bit_writer.write_bits(leading_zeros as u64, P::LEADING_BITS);
+                bit_writer.write_bits(meaningful_bits as u64, P::MEANINGFUL_BITS);
+                let mask = P::low_mask(meaningful_bits);
+                let value_bits = xor.shr(trailing_zeros) & mask;
+                bit_writer.write_bits(value_bits.to_u64(), meaningful_bits);
                 prev_leading_zeros = leading_zeros;
                 prev_trailing_zeros = trailing_zeros;
             }
@@ -85,74 +225,17 @@ fn encode_gorilla_u32_wire(wire_values: &[i32]) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-/// Core encoding logic for u64 wire type (used by i64)
+/// Core encoding logic for u32 wire type (used by f32 and i32): cast into the
+/// unsigned XOR domain and run the shared core.
+fn encode_gorilla_u32_wire(wire_values: &[i32]) -> Result<Vec<u8>> {
+    let u32_values: Vec<u32> = wire_values.iter().map(|&v| v as u32).collect();
+    encode_gorilla_wire(&u32_values)
+}
+
+/// Core encoding logic for u64 wire type (used by i64): identity cast.
 fn encode_gorilla_u64_wire(wire_values: &[i64]) -> Result<Vec<u8>> {
     let u64_values: Vec<u64> = wire_values.iter().map(|&v| v as u64).collect();
-
-    if u64_values.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut result = Vec::new();
-    result.extend_from_slice(&u64_values[0].to_le_bytes());
-
-    if u64_values.len() == 1 {
-        return Ok(result);
-    }
-
-    let mut bit_writer = BitWriter::new();
-    let mut prev_value = u64_values[0];
-    let mut prev_leading_zeros = 0u8;
-    let mut prev_trailing_zeros = 0u8;
-
-    for &current in &u64_values[1..] {
-        let xor = prev_value ^ current;
-
-        if xor == 0 {
-            bit_writer.write_bit(false);
-        } else {
-            bit_writer.write_bit(true);
-
-            let leading_zeros = xor.leading_zeros() as u8;
-            let trailing_zeros = xor.trailing_zeros() as u8;
-            let meaningful_bits = 64 - leading_zeros - trailing_zeros;
-
-            if leading_zeros >= prev_leading_zeros
-                && trailing_zeros >= prev_trailing_zeros
-                && prev_leading_zeros + prev_trailing_zeros < 64
-            {
-                bit_writer.write_bit(false);
-                let block_size = 64 - prev_leading_zeros - prev_trailing_zeros;
-                let mask = if block_size >= 64 {
-                    u64::MAX
-                } else {
-                    (1u64 << block_size) - 1
-                };
-                let value_bits = (xor >> prev_trailing_zeros) & mask;
-                bit_writer.write_bits(value_bits, block_size);
-            } else {
-                bit_writer.write_bit(true);
-                bit_writer.write_bits(leading_zeros as u64, 6);
-                bit_writer.write_bits(meaningful_bits as u64, 7);
-                let mask = if meaningful_bits >= 64 {
-                    u64::MAX
-                } else {
-                    (1u64 << meaningful_bits) - 1
-                };
-                let value_bits = (xor >> trailing_zeros) & mask;
-                bit_writer.write_bits(value_bits, meaningful_bits);
-                prev_leading_zeros = leading_zeros;
-                prev_trailing_zeros = trailing_zeros;
-            }
-        }
-
-        prev_value = current;
-    }
-
-    let compressed = bit_writer.finish();
-    result.extend(compressed);
-
-    Ok(result)
+    encode_gorilla_wire(&u64_values)
 }
 
 // ===== Public API (thin wrappers using generic helpers) =====
@@ -197,24 +280,25 @@ pub fn encode_i32(values: &[i32]) -> Result<Vec<u8>> {
 
 // ===== Core wire format decoding functions =====
 
-/// Core decoding logic for u32 wire type
-fn decode_gorilla_u32_wire(data: &[u8], count: usize) -> Result<Vec<i32>> {
+/// Single Gorilla decode core over the unsigned XOR domain.
+fn decode_gorilla_wire<P: GorillaPrim>(data: &[u8], count: usize) -> Result<Vec<P>> {
     if count == 0 {
         return Ok(Vec::new());
     }
 
-    if data.len() < 4 {
+    if data.len() < P::WIRE_BYTES {
         return Err(anyhow::anyhow!("Gorilla decode: insufficient data"));
     }
 
-    let first_value = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    let mut result = vec![first_value as i32];
+    let first_value = P::read_le(data)?;
+    let mut result = Vec::with_capacity(count);
+    result.push(first_value);
 
     if count == 1 {
         return Ok(result);
     }
 
-    let mut bit_reader = BitReader::new(&data[4..]);
+    let mut bit_reader = BitReader::new(&data[P::WIRE_BYTES..]);
     let mut prev_value = first_value;
     let mut prev_leading_zeros = 0u8;
     let mut prev_trailing_zeros = 0u8;
@@ -223,26 +307,26 @@ fn decode_gorilla_u32_wire(data: &[u8], count: usize) -> Result<Vec<i32>> {
         let control_bit = bit_reader.read_bit()?;
 
         if !control_bit {
-            result.push(prev_value as i32);
+            result.push(prev_value);
         } else {
             let use_prev_block = !bit_reader.read_bit()?;
 
             let xor = if use_prev_block {
-                let block_size = 32 - prev_leading_zeros - prev_trailing_zeros;
-                let value_bits = bit_reader.read_bits(block_size)? as u32;
-                value_bits << prev_trailing_zeros
+                let block_size = P::BITS - prev_leading_zeros - prev_trailing_zeros;
+                let value_bits = P::from_u64(bit_reader.read_bits(block_size)?);
+                value_bits.shl(prev_trailing_zeros)
             } else {
-                let leading_zeros = bit_reader.read_bits(5)? as u8;
-                let meaningful_bits = bit_reader.read_bits(6)? as u8;
-                let value_bits = bit_reader.read_bits(meaningful_bits)? as u32;
-                let trailing_zeros = 32 - leading_zeros - meaningful_bits;
+                let leading_zeros = bit_reader.read_bits(P::LEADING_BITS)? as u8;
+                let meaningful_bits = bit_reader.read_bits(P::MEANINGFUL_BITS)? as u8;
+                let value_bits = P::from_u64(bit_reader.read_bits(meaningful_bits)?);
+                let trailing_zeros = P::BITS - leading_zeros - meaningful_bits;
                 prev_leading_zeros = leading_zeros;
                 prev_trailing_zeros = trailing_zeros;
-                value_bits << trailing_zeros
+                value_bits.shl(trailing_zeros)
             };
 
-            let current_value = prev_value ^ xor;
-            result.push(current_value as i32);
+            let current_value = prev_value.bitxor(xor);
+            result.push(current_value);
             prev_value = current_value;
         }
     }
@@ -250,59 +334,17 @@ fn decode_gorilla_u32_wire(data: &[u8], count: usize) -> Result<Vec<i32>> {
     Ok(result)
 }
 
-/// Core decoding logic for u64 wire type
+/// Core decoding logic for u32 wire type: decode the unsigned domain and
+/// cast back to i32.
+fn decode_gorilla_u32_wire(data: &[u8], count: usize) -> Result<Vec<i32>> {
+    let values = decode_gorilla_wire::<u32>(data, count)?;
+    Ok(values.into_iter().map(|v| v as i32).collect())
+}
+
+/// Core decoding logic for u64 wire type: cast back to i64.
 fn decode_gorilla_u64_wire(data: &[u8], count: usize) -> Result<Vec<i64>> {
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-
-    if data.len() < 8 {
-        return Err(anyhow::anyhow!("Gorilla decode: insufficient data"));
-    }
-
-    let first_value = u64::from_le_bytes([
-        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-    ]);
-    let mut result = vec![first_value as i64];
-
-    if count == 1 {
-        return Ok(result);
-    }
-
-    let mut bit_reader = BitReader::new(&data[8..]);
-    let mut prev_value = first_value;
-    let mut prev_leading_zeros = 0u8;
-    let mut prev_trailing_zeros = 0u8;
-
-    for _ in 1..count {
-        let control_bit = bit_reader.read_bit()?;
-
-        if !control_bit {
-            result.push(prev_value as i64);
-        } else {
-            let use_prev_block = !bit_reader.read_bit()?;
-
-            let xor = if use_prev_block {
-                let block_size = 64 - prev_leading_zeros - prev_trailing_zeros;
-                let value_bits = bit_reader.read_bits(block_size)?;
-                value_bits << prev_trailing_zeros
-            } else {
-                let leading_zeros = bit_reader.read_bits(6)? as u8;
-                let meaningful_bits = bit_reader.read_bits(7)? as u8;
-                let value_bits = bit_reader.read_bits(meaningful_bits)?;
-                let trailing_zeros = 64 - leading_zeros - meaningful_bits;
-                prev_leading_zeros = leading_zeros;
-                prev_trailing_zeros = trailing_zeros;
-                value_bits << trailing_zeros
-            };
-
-            let current_value = prev_value ^ xor;
-            result.push(current_value as i64);
-            prev_value = current_value;
-        }
-    }
-
-    Ok(result)
+    let values = decode_gorilla_wire::<u64>(data, count)?;
+    Ok(values.into_iter().map(|v| v as i64).collect())
 }
 
 // ===== Public API (thin wrappers using generic helpers) =====
@@ -415,6 +457,49 @@ impl<'a> BitReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== Golden-byte pins (redundancy pass 4) ====================
+    // Wire layout: [first value:WIRE_BYTES LE][bit stream, MSB-first per byte].
+    // Per non-zero XOR: '1' marker, then either '0' (reuse previous block:
+    // value bits only) or '1' (leading-zeros count in LEADING_BITS bits,
+    // meaningful-bits count in MEANINGFUL_BITS bits, then the meaningful
+    // bits). The u32 stream uses 5/6-bit count fields, the u64 stream 6/7.
+    // These pin the CURRENT bytes of both widths BEFORE the GorillaPrim
+    // consolidation; any change is a wire-format change.
+
+    /// u32: [1,2] -> xor 3 reuses the initial full-width block: stream is
+    /// '1','0' + 32 value bits (thirty 0s then '11') = 34 bits -> 5 bytes
+    /// 0x80,0,0,0,0xC0.
+    #[test]
+    fn golden_gorilla_u32_wire_bytes() {
+        let encoded = encode_i32(&[1, 2]).unwrap();
+        assert_eq!(encoded, vec![1, 0, 0, 0, 0x80, 0, 0, 0, 0xC0]);
+        assert_eq!(decode_i32(&encoded, 2).unwrap(), vec![1, 2]);
+    }
+
+    /// u32, identical values: [1,1] -> single '0' control bit -> one 0x00
+    /// byte after the 4-byte header.
+    #[test]
+    fn golden_gorilla_u32_repeat_zero_bit() {
+        let encoded = encode_i32(&[1, 1]).unwrap();
+        assert_eq!(encoded, vec![1, 0, 0, 0, 0x00]);
+        assert_eq!(decode_i32(&encoded, 2).unwrap(), vec![1, 1]);
+    }
+
+    /// u64: [1,2] -> same shape with a 64-bit block: '1','0' + 64 value bits
+    /// (62 zeros then '11') = 66 bits -> 9 bytes, last byte 0xC0.
+    #[test]
+    fn golden_gorilla_u64_wire_bytes() {
+        let encoded = encode_i64(&[1, 2]).unwrap();
+        assert_eq!(
+            encoded,
+            vec![
+                1, 0, 0, 0, 0, 0, 0, 0, // first value 1 LE i64
+                0x80, 0, 0, 0, 0, 0, 0, 0, 0xC0, // bit stream
+            ]
+        );
+        assert_eq!(decode_i64(&encoded, 2).unwrap(), vec![1, 2]);
+    }
 
     #[test]
     fn test_gorilla_identical_values() -> Result<()> {

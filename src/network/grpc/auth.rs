@@ -754,12 +754,10 @@ mod tests {
     use crate::network::auth::JwtService;
     use crate::network::auth::config::JwtAlgorithm;
     use crate::network::auth::jwt::{Claims, TokenType};
+    use crate::security::SecurityConfig;
     use crate::security::auth_service::{
-        AuthenticationConfig, AuthenticationMethod, JwtConfig, MtlsConfig, SSOConfig,
+        AuthenticationConfig, AuthenticationMethod, JwtConfig, SSOConfig,
     };
-    use crate::security::rbac_service::RBACConfig;
-    use crate::security::security_coordinator::{ComplianceConfig, TlsConfig};
-    use crate::security::{AuditConfig, SecurityConfig, SecurityMode};
 
     #[test]
     fn resolved_tenant_id_defaults_in_single_tenant_mode() {
@@ -804,14 +802,11 @@ mod tests {
     fn security_config() -> SecurityConfig {
         SecurityConfig {
             enabled: true,
-            mode: SecurityMode::Development,
             authentication: AuthenticationConfig {
                 enabled: true,
                 methods: vec![AuthenticationMethod::JWT],
                 require_authentication: true,
                 default_session_timeout_minutes: 60,
-                api_keys: HashMap::new(),
-                scram_users: HashMap::new(),
                 jwt: JwtConfig {
                     enabled: true,
                     secret: "dev-jwt-secret".to_string(),
@@ -822,33 +817,12 @@ mod tests {
                     algorithm: "HS256".to_string(),
                 },
                 sso: SSOConfig {
-                    enabled: false,
-                    providers: vec![],
                     token_cache_ttl_minutes: 5,
+                    ..Default::default()
                 },
-                mtls: MtlsConfig::default(),
-                oidc: None,
-                audit_fail_closed: false,
+                ..Default::default()
             },
-            rbac: RBACConfig::default(),
-            audit: AuditConfig::default(),
-            tls: TlsConfig {
-                enabled: false,
-                require_client_certificates: false,
-                cert_file: None,
-                key_file: None,
-                ca_file: None,
-            },
-            compliance: ComplianceConfig {
-                frameworks: vec![],
-                data_residency: None,
-                encryption_at_rest: false,
-                encryption_in_transit: false,
-            },
-            encryption: crate::security::EncryptionConfig::default(),
-            key_store: crate::security::KeyStoreConfig::default(),
-            tenant: Default::default(),
-            pgwire: crate::security::security_coordinator::PgwireSecurityConfig::default(),
+            ..Default::default()
         }
     }
 

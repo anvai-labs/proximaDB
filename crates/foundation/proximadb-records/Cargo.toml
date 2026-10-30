@@ -16,6 +16,7 @@ path = "src/lib.rs"
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+futures.workspace = true
 proximadb-data-model = { workspace = true }
 proximadb-kernel = { workspace = true }
 proximadb-proto = { workspace = true }

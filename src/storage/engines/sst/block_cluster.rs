@@ -253,9 +253,13 @@ pub fn cluster_order_pca_ivf(records: &[ProximaRecord], idx: usize) -> Option<Ve
 /// Below this many usable rows a trained model can't beat the bootstrap.
 const MIN_ROWS_FOR_IVF: usize = 64;
 
-/// Fine IVF cell count ≈ blockcount (ADR-065 co-design): one cell ≈ one
-/// IOP-sized block, so survivors span fewer cells → fewer GETs and each
-/// cell-fetch is one efficient IOP. `PROXIMADB_IVF_K` overrides to map the
+/// Fine IVF cell count (P5b design §3.2, `k_G`, default since TD-PAXDIR-1
+/// D8): one cell's Region-A + Region-B bytes ≈ **half** an IOP-sized block —
+/// `k = N·(a_row + b_row) / (target/2)` — so a probed cell's coalesced A+B
+/// fetch approaches the coalescer's target range. The pre-D8 rule (one cell ≈
+/// one IOP of SQ8 bytes alone) sized SIFT1M at ~15 cells/1M rows; the D7 gate
+/// run measured that 2× too coarse (queries probed ~50% of rows; the passing
+/// geometry was 32–36 cells). `PROXIMADB_IVF_K` overrides to map the
 /// GETs-vs-recall curve (eval knob, not a production setting).
 fn ivf_fine_cell_count(n_usable: usize, dim: usize, destination: Option<&str>) -> usize {
     // Shared with the read-side range planner so both sides agree on what an
@@ -270,7 +274,10 @@ fn ivf_fine_cell_count(n_usable: usize, dim: usize, destination: Option<&str>) -
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or_else(|| ((n_usable * dim) / iop_target.max(1)).clamp(2, 4096))
+        .unwrap_or_else(|| {
+            let per_row = proximadb_block_format::code_stride(dim as u32) + dim;
+            ((n_usable * per_row) / (iop_target / 2).max(1)).clamp(2, 4096)
+        })
 }
 
 /// k-means convergence floor: enough samples per centroid to estimate a stable
@@ -690,6 +697,250 @@ pub(crate) fn finish_ivf_probe_classifier(
     })
 }
 
+/// TD-PAXDIR-1 D3: WRITE gate — compaction classifies its output with the
+/// collection's shared coarse model (the directory's dominant model) instead
+/// of training a new one, so every compacted segment speaks one cell space.
+/// Default ON since D8 (the P5b gate run passed); kill-switch like every
+/// PAXDIR gate.
+pub fn shared_model_enabled() -> bool {
+    env_kill_switch_off("PROXIMADB_PAX_WRITE_SHARED_MODEL")
+}
+
+/// Retrain when more than this fraction of an output's rows fall outside
+/// their cell's trained radius (the data has drifted from the model).
+pub(crate) const SHARED_MODEL_MAX_DRIFT: f64 = 0.05;
+
+/// Retrain when the output alone needs more than this many times the model's
+/// cell count (the collection outgrew the model's granularity).
+pub(crate) const SHARED_MODEL_MAX_GROWTH: usize = 2;
+
+thread_local! {
+    /// The collection model the current thread's compaction write should
+    /// classify with ([`CollectionModelScope`]). The writers are synchronous
+    /// and run inline in the compaction task, so a scoped thread-local reaches
+    /// the plan without widening every writer signature.
+    static COLLECTION_MODEL: std::cell::RefCell<Option<std::sync::Arc<proximadb_storage_common::centroid_directory::SharedCellSpace>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Scope during which `model` is the collection model for IVF planning on this
+/// thread; the previous value is restored on drop (also on early return or
+/// panic). The guard is `!Send`, so a compaction future cannot hold it across
+/// an `.await` — the scope can never leak onto another task's thread.
+pub(crate) struct CollectionModelScope {
+    previous: Option<std::sync::Arc<proximadb_storage_common::centroid_directory::SharedCellSpace>>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl CollectionModelScope {
+    pub(crate) fn enter(
+        model: Option<
+            std::sync::Arc<proximadb_storage_common::centroid_directory::SharedCellSpace>,
+        >,
+    ) -> Self {
+        Self {
+            previous: COLLECTION_MODEL.with(|slot| slot.replace(model)),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for CollectionModelScope {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        COLLECTION_MODEL.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+pub(crate) fn current_collection_model()
+-> Option<std::sync::Arc<proximadb_storage_common::centroid_directory::SharedCellSpace>> {
+    COLLECTION_MODEL.with(|slot| slot.borrow().clone())
+}
+
+impl IvfProbeClassifier {
+    /// A classifier over a persisted model's cells, in their persisted
+    /// (emission) order: assigning with it reproduces the model's cell space
+    /// exactly, so segments written with it share cell indices.
+    pub(crate) fn from_collection_model(
+        model: &proximadb_storage_common::coarse_directory::CoarseModel,
+    ) -> Option<Self> {
+        model.validate().ok()?;
+        let n_comp = model.n_comp as usize;
+        let centroids: Vec<Vec<f32>> = model
+            .centroids
+            .chunks_exact(n_comp)
+            .map(<[f32]>::to_vec)
+            .collect();
+        let k = centroids.len();
+        Some(Self {
+            dim: model.dim as usize,
+            n_comp,
+            pca_mean: model.pca_mean.clone(),
+            pca_components: model.pca_components.clone(),
+            centroids,
+            cell_order: (0..k).collect(),
+            cell_rank: (0..k).collect(),
+            trained_on: usize::try_from(model.trained_on).unwrap_or(usize::MAX),
+        })
+    }
+}
+
+/// Why a shared collection model was not used for an output.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum SharedModelVerdict {
+    /// Use it.
+    Accept,
+    /// Dimensions differ, or the model is malformed.
+    Incompatible,
+    /// This fraction of sampled rows fall outside their cell's trained radius.
+    Drifted(f64),
+    /// The collection now needs this many cells; the model has fewer than half.
+    Outgrown(usize),
+    /// The collection now needs this many cells; the model has more than twice.
+    Oversized(usize),
+}
+
+/// The checks that need no classification: dimension, and whether the
+/// model's cell count still suits the collection. Cells are sized on the
+/// collection's rows (the rows the space covers, or the output if larger),
+/// not on one output — a minor compaction classifying into collection-sized
+/// cells is intended: the directory plans over distinct cells.
+pub(crate) fn shared_model_precheck(
+    space: &proximadb_storage_common::centroid_directory::SharedCellSpace,
+    output_rows: usize,
+    dim: usize,
+    destination: Option<&str>,
+) -> SharedModelVerdict {
+    let model = &space.model;
+    if model.dim as usize != dim || model.validate().is_err() {
+        return SharedModelVerdict::Incompatible;
+    }
+    let rows = usize::try_from(space.covered_rows)
+        .unwrap_or(usize::MAX)
+        .max(output_rows);
+    let needed = ivf_fine_cell_count(rows, dim, destination).min(rows.max(1));
+    let k = model.k_c();
+    if needed > k.saturating_mul(SHARED_MODEL_MAX_GROWTH) {
+        return SharedModelVerdict::Outgrown(needed);
+    }
+    if needed.saturating_mul(SHARED_MODEL_MAX_GROWTH) < k {
+        return SharedModelVerdict::Oversized(needed);
+    }
+    SharedModelVerdict::Accept
+}
+
+/// The drift check over `sampled` classified rows of which `outside` fell
+/// outside their cell's trained radius.
+pub(crate) fn shared_model_drift(outside: usize, sampled: usize) -> SharedModelVerdict {
+    let drift = outside as f64 / sampled.max(1) as f64;
+    if drift > SHARED_MODEL_MAX_DRIFT {
+        SharedModelVerdict::Drifted(drift)
+    } else {
+        SharedModelVerdict::Accept
+    }
+}
+
+/// Rows sampled for the drift check (strided, deterministic).
+pub(crate) const SHARED_MODEL_DRIFT_SAMPLE: usize = 4096;
+
+/// Whether an assignment lies outside its cell's trained radius (radii are the
+/// max member distance at training time, carried unchanged by shared-model
+/// outputs; a small tolerance absorbs f32 rounding).
+pub(crate) fn outside_trained_radius(
+    model: &proximadb_storage_common::coarse_directory::CoarseModel,
+    assignment: &IvfAssignment,
+) -> bool {
+    let radius = model
+        .radii
+        .get(assignment.source_cell)
+        .copied()
+        .unwrap_or(0.0);
+    assignment.distance_sq > radius * radius * 1.0001 + f32::EPSILON
+}
+
+/// The shared-model plan for `usable` rows, or `None` when no collection model
+/// is set for this write or a retrain trigger fires (the caller trains). The
+/// cheap checks run first, then drift on a strided sample, and only then is
+/// every row classified.
+fn shared_model_plan(
+    records: &[ProximaRecord],
+    usable: &[(usize, &[f32])],
+    dim: usize,
+    destination: Option<&str>,
+) -> Option<IvfProbePlan> {
+    let space = current_collection_model()?;
+    let retrain = |verdict: SharedModelVerdict| {
+        tracing::info!(
+            ?verdict,
+            rows = usable.len(),
+            "PAX shared collection model retrained"
+        );
+    };
+    let verdict = shared_model_precheck(&space, usable.len(), dim, destination);
+    if verdict != SharedModelVerdict::Accept {
+        retrain(verdict);
+        return None;
+    }
+    let model = &space.model;
+    let classifier = IvfProbeClassifier::from_collection_model(model)?;
+    let step = usable.len().div_ceil(SHARED_MODEL_DRIFT_SAMPLE).max(1);
+    let (mut sampled, mut outside) = (0usize, 0usize);
+    for (_, vector) in usable.iter().step_by(step) {
+        let assignment = classifier.classify(vector)?;
+        sampled += 1;
+        outside += usize::from(outside_trained_radius(model, &assignment));
+    }
+    let verdict = shared_model_drift(outside, sampled);
+    if verdict != SharedModelVerdict::Accept {
+        retrain(verdict);
+        return None;
+    }
+    let classified = usable
+        .iter()
+        .map(|(_, vector)| classifier.classify(vector))
+        .collect::<Option<Vec<_>>>()?;
+    let (counts, _) = cell_stats(&classified, classifier.cell_count());
+    let usable_orig: Vec<usize> = usable.iter().map(|(i, _)| *i).collect();
+    let pc1: Vec<f32> = classified.iter().map(|a| a.pc1).collect();
+    let assignments: Vec<usize> = classified.iter().map(|a| a.source_cell).collect();
+    let (order, runs) = order_rows_by_cell(
+        records.len(),
+        &usable_orig,
+        &pc1,
+        &assignments,
+        &classifier.cell_rank,
+    );
+    let model = classifier.finish_model(&counts, &frozen_radii_sq(model))?;
+    Some(IvfProbePlan {
+        plan: ClusterPlan { order, runs },
+        model,
+    })
+}
+
+/// The shared space's trained radii, squared, for an output classified with
+/// it. An output keeps the space's radii rather than its own member maxima:
+/// its accepted outliers (up to the drift threshold) would otherwise widen
+/// the radii the next drift test reads, generation after generation. A0
+/// radii have no other consumer.
+pub(crate) fn frozen_radii_sq(
+    model: &proximadb_storage_common::coarse_directory::CoarseModel,
+) -> Vec<f32> {
+    model.radii.iter().map(|r| r * r).collect()
+}
+
+/// Per-cell row counts and max squared member distances of an assignment.
+fn cell_stats(classified: &[IvfAssignment], cell_count: usize) -> (Vec<u64>, Vec<f32>) {
+    let mut radii_sq = vec![0f32; cell_count];
+    let mut counts = vec![0u64; cell_count];
+    for assignment in classified {
+        counts[assignment.source_cell] = counts[assignment.source_cell].saturating_add(1);
+        if assignment.distance_sq > radii_sq[assignment.source_cell] {
+            radii_sq[assignment.source_cell] = assignment.distance_sq;
+        }
+    }
+    (counts, radii_sq)
+}
+
 /// Compaction-grade PCA+IVF plan, including the contiguous IVF-cell runs.
 pub fn cluster_plan_pca_ivf(
     records: &[ProximaRecord],
@@ -841,6 +1092,17 @@ pub fn partition_layout_enabled() -> bool {
 }
 
 /// Boolean gate read: truthy = `1|true|on|yes`.
+pub(crate) fn env_kill_switch_off(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
+
 pub(crate) fn env_gate_on(name: &str) -> bool {
     std::env::var(name)
         .ok()
@@ -911,6 +1173,12 @@ pub fn cluster_plan_ivf_probe(
         return None;
     }
 
+    // TD-PAXDIR-1 D3: classify with the collection's shared model when the
+    // compaction set one and no retrain trigger fires.
+    if let Some(plan) = shared_model_plan(records, &usable, dim, destination) {
+        return Some(plan);
+    }
+
     let trace_ivf = std::env::var_os("PROXIMADB_TRACE_IVF_FLUSH").is_some();
     let t_start = std::time::Instant::now();
 
@@ -951,14 +1219,7 @@ pub fn cluster_plan_ivf_probe(
         .iter()
         .map(|assignment| assignment.source_cell)
         .collect::<Vec<_>>();
-    let mut radii_sq = vec![0f32; cell_count];
-    let mut counts = vec![0u64; cell_count];
-    for assignment in &classified {
-        counts[assignment.source_cell] = counts[assignment.source_cell].saturating_add(1);
-        if assignment.distance_sq > radii_sq[assignment.source_cell] {
-            radii_sq[assignment.source_cell] = assignment.distance_sq;
-        }
-    }
+    let (counts, radii_sq) = cell_stats(&classified, cell_count);
     let t_assign = std::time::Instant::now();
 
     if trace_ivf {
@@ -1403,12 +1664,8 @@ mod tests {
             oid: oid.into(),
             ..Default::default()
         };
-        r.embeddings.push(EmbeddingCell {
-            modality: "dense".into(),
-            dim,
-            values: EmbeddingValues::Fp32(vec),
-            ..Default::default()
-        });
+        r.embeddings
+            .push(EmbeddingCell::new_fp32("", "dense", dim, vec));
         r
     }
 
@@ -1909,5 +2166,129 @@ mod ncomp_floor_tests {
             "the registered budget must move the IOP-derived k"
         );
         assert_eq!(shaped.train_sample, 200_000, "k-scaled sample hits the cap");
+    }
+}
+
+#[cfg(test)]
+mod shared_model_tests {
+    use super::*;
+    use proximadb_records::EmbeddingCell;
+    use proximadb_storage_common::centroid_directory::SharedCellSpace;
+    use std::sync::Arc;
+
+    fn rows(n: usize, shift: f32) -> Vec<ProximaRecord> {
+        (0..n)
+            .map(|i| {
+                let values: Vec<f32> = (0..16)
+                    .map(|d| ((i * 37 + d * 11) % 97) as f32 * 0.1 + shift)
+                    .collect();
+                let mut r = ProximaRecord {
+                    oid: format!("r{i}"),
+                    ..Default::default()
+                };
+                r.embeddings
+                    .push(EmbeddingCell::new_fp32("", "dense", 16, values));
+                r
+            })
+            .collect()
+    }
+
+    fn space(
+        model: proximadb_storage_common::coarse_directory::CoarseModel,
+    ) -> Arc<SharedCellSpace> {
+        let covered_rows = model.rows_covered();
+        Arc::new(SharedCellSpace {
+            model,
+            covered_rows,
+        })
+    }
+
+    fn train(rows_in: &[ProximaRecord]) -> proximadb_storage_common::coarse_directory::CoarseModel {
+        cluster_plan_ivf_probe(rows_in, 0, None).unwrap().model
+    }
+
+    /// With a collection model in scope, the in-memory plan classifies with it
+    /// (same PCA and centroids, rows cell-contiguous in its cell order);
+    /// outside the scope it trains as before.
+    #[test]
+    fn the_in_memory_plan_reuses_the_scoped_model() {
+        let shared = space(train(&rows(400, 0.0)));
+        let plan = {
+            let _scope = CollectionModelScope::enter(Some(Arc::clone(&shared)));
+            cluster_plan_ivf_probe(&rows(400, 0.0), 0, None).unwrap()
+        };
+        assert_eq!(plan.model.centroids, shared.model.centroids);
+        assert_eq!(plan.model.pca_components, shared.model.pca_components);
+        assert!(current_collection_model().is_none(), "scope restored");
+        // One run per non-empty cell, in cell order, covering every row.
+        assert_eq!(plan.model.cell_rows.iter().sum::<u64>(), 400);
+        let non_empty: Vec<u64> = plan
+            .model
+            .cell_rows
+            .iter()
+            .copied()
+            .filter(|&r| r > 0)
+            .collect();
+        let runs: Vec<u64> = plan.plan.runs.iter().map(|r| r.row_count as u64).collect();
+        assert_eq!(runs, non_empty);
+    }
+
+    #[test]
+    fn retrain_triggers_fire_on_drift_size_and_dimension() {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe { std::env::remove_var("PROXIMADB_IVF_K") };
+        let shared = space(train(&rows(400, 0.0)));
+        assert_eq!(
+            shared_model_precheck(&shared, 400, 16, None),
+            SharedModelVerdict::Accept
+        );
+        assert_eq!(
+            shared_model_precheck(&shared, 400, 8, None),
+            SharedModelVerdict::Incompatible
+        );
+        assert!(matches!(
+            shared_model_drift(40, 400),
+            SharedModelVerdict::Drifted(_)
+        ));
+        assert_eq!(shared_model_drift(20, 400), SharedModelVerdict::Accept);
+        // Cells are sized on the collection's rows: a collection that needs
+        // more than twice the model's cells outgrew it.
+        let k = shared.model.k_c();
+        let target = proximadb_storage_common::iops_budget::write_target_block_bytes(None) as usize;
+        let rows_needing = |cells: usize| cells * target / 16;
+        let grown = Arc::new(SharedCellSpace {
+            model: shared.model.clone(),
+            covered_rows: rows_needing(3 * k) as u64,
+        });
+        assert!(matches!(
+            shared_model_precheck(&grown, 400, 16, None),
+            SharedModelVerdict::Outgrown(_)
+        ));
+        // A model with far more cells than the collection needs is oversized.
+        unsafe { std::env::set_var("PROXIMADB_IVF_K", "8") };
+        let fine = space(train(&rows(400, 0.0)));
+        unsafe { std::env::remove_var("PROXIMADB_IVF_K") };
+        assert_eq!(fine.model.k_c(), 8);
+        assert!(matches!(
+            shared_model_precheck(&fine, 400, 16, None),
+            SharedModelVerdict::Oversized(_)
+        ));
+        // Drifted data really does land outside the trained radii.
+        let _scope = CollectionModelScope::enter(Some(Arc::clone(&shared)));
+        let drifted = cluster_plan_ivf_probe(&rows(400, 500.0), 0, None)
+            .unwrap()
+            .model;
+        assert_ne!(drifted.pca_mean, shared.model.pca_mean, "drift retrains");
+    }
+
+    #[test]
+    fn the_scope_is_restored_after_a_panic() {
+        let shared = space(train(&rows(400, 0.0)));
+        let caught = std::panic::catch_unwind(|| {
+            let _scope = CollectionModelScope::enter(Some(shared));
+            panic!("write failed");
+        });
+        assert!(caught.is_err());
+        assert!(current_collection_model().is_none());
     }
 }

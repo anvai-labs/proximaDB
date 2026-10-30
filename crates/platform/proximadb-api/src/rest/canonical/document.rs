@@ -215,6 +215,33 @@ pub fn create_document_router() -> Router<DocumentRestState> {
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
+/// Map a client-supplied index spec (name / path / type string / unique /
+/// sparse) to a proto [`IndexDefinition`]. Shared with the root crate's
+/// legacy document handlers, which mirror this module over the concrete
+/// `DocumentService`.
+pub fn index_definition(
+    name: Option<String>,
+    path: String,
+    index_type: &str,
+    unique: bool,
+    sparse: bool,
+) -> IndexDefinition {
+    IndexDefinition {
+        name,
+        path,
+        index_type: match index_type.to_lowercase().as_str() {
+            "btree" => DocIndexType::Btree as i32,
+            "hash" => DocIndexType::Hash as i32,
+            "inverted" => DocIndexType::Inverted as i32,
+            "fulltext" => DocIndexType::Fulltext as i32,
+            "geo" => DocIndexType::Geo as i32,
+            _ => DocIndexType::Btree as i32,
+        },
+        unique,
+        sparse,
+    }
+}
+
 async fn create_collection(
     State(state): State<DocumentRestState>,
     Extension(tenant): Extension<TenantContext>,
@@ -226,20 +253,7 @@ async fn create_collection(
     let index_definitions: Vec<IndexDefinition> = request
         .indexes
         .into_iter()
-        .map(|idx| IndexDefinition {
-            name: idx.name,
-            path: idx.path,
-            index_type: match idx.index_type.to_lowercase().as_str() {
-                "btree" => DocIndexType::Btree as i32,
-                "hash" => DocIndexType::Hash as i32,
-                "inverted" => DocIndexType::Inverted as i32,
-                "fulltext" => DocIndexType::Fulltext as i32,
-                "geo" => DocIndexType::Geo as i32,
-                _ => DocIndexType::Btree as i32,
-            },
-            unique: idx.unique,
-            sparse: idx.sparse,
-        })
+        .map(|idx| index_definition(idx.name, idx.path, &idx.index_type, idx.unique, idx.sparse))
         .collect();
 
     let config = DocumentCollectionConfig {
@@ -500,38 +514,7 @@ async fn update_document(
 ) -> RestResult<JsonResponse<serde_json::Value>> {
     debug!("Updating document: {}/{}", collection, id);
 
-    let updates: Vec<DocumentUpdate> = request
-        .updates
-        .iter()
-        .map(|v| {
-            let operation = v
-                .get("operation")
-                .and_then(|o| o.as_str())
-                .map(|s| match s.to_lowercase().as_str() {
-                    "set" => UpdateOperation::Set as i32,
-                    "unset" => UpdateOperation::Unset as i32,
-                    "inc" => UpdateOperation::Inc as i32,
-                    "push" => UpdateOperation::Push as i32,
-                    "pull" => UpdateOperation::Pull as i32,
-                    _ => UpdateOperation::Set as i32,
-                })
-                .unwrap_or(UpdateOperation::Set as i32);
-
-            let path = v
-                .get("path")
-                .and_then(|p| p.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let value = v.get("value").map(json_to_sql_value);
-
-            DocumentUpdate {
-                operation,
-                path,
-                value,
-            }
-        })
-        .collect();
+    let updates = json_updates_to_document_updates(&request.updates);
 
     let resp = state
         .document_port
@@ -718,6 +701,44 @@ pub fn json_to_sql_value(value: &serde_json::Value) -> SqlValue {
 
 use proximadb_records::conversions::sql_value_to_json;
 
+/// Convert MongoDB-style JSON update operations
+/// (`{ "operation": "set", "path": ..., "value": ... }`) to proto
+/// [`DocumentUpdate`]s. Shared with the root crate's legacy document
+/// handlers, which mirror this module over the concrete `DocumentService`.
+pub fn json_updates_to_document_updates(updates: &[serde_json::Value]) -> Vec<DocumentUpdate> {
+    updates
+        .iter()
+        .map(|v| {
+            let operation = v
+                .get("operation")
+                .and_then(|o| o.as_str())
+                .map(|s| match s.to_lowercase().as_str() {
+                    "set" => UpdateOperation::Set as i32,
+                    "unset" => UpdateOperation::Unset as i32,
+                    "inc" => UpdateOperation::Inc as i32,
+                    "push" => UpdateOperation::Push as i32,
+                    "pull" => UpdateOperation::Pull as i32,
+                    _ => UpdateOperation::Set as i32,
+                })
+                .unwrap_or(UpdateOperation::Set as i32);
+
+            let path = v
+                .get("path")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let value = v.get("value").map(json_to_sql_value);
+
+            DocumentUpdate {
+                operation,
+                path,
+                value,
+            }
+        })
+        .collect()
+}
+
 pub fn sql_object_to_json(obj: &SqlObject) -> serde_json::Value {
     let map: serde_json::Map<String, serde_json::Value> = obj
         .fields
@@ -727,7 +748,9 @@ pub fn sql_object_to_json(obj: &SqlObject) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
-fn json_to_aggregation_stage(value: &serde_json::Value) -> RestResult<AggregationStage> {
+/// Convert a JSON value into an `AggregationStage` (`{ "$match": ... }`,
+/// `{ "$group": ... }`, etc.; `$limit`/`$skip` accept plain numbers).
+pub fn json_to_aggregation_stage(value: &serde_json::Value) -> RestResult<AggregationStage> {
     let obj = value
         .as_object()
         .ok_or_else(|| RestError::InvalidArgument("Pipeline stage must be a JSON object".into()))?;

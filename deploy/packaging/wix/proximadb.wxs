@@ -54,9 +54,24 @@
       <!-- Description for Add/Remove Programs -->
       <Feature Id="Binaries_Description" Title="ProximaDB" Description="Cloud-native vector database for AI applications" Level="1">
 
-        <!-- Server Binary -->
+        <!-- Server Binary + the Windows service (TD-PKG-2: there was no
+             ServiceInstall at all, so `Start-Service proximadb` failed). The
+             service runs with an explicit config and data dir: its roots live
+             in ProgramData (the shipped config's /tmp defaults are rebased by
+             the data dir flag) instead of the current drive's temp tree. -->
         <Component Id="ServerComponent" Directory="INSTALLFOLDER" Guid="72DB93A3-5809-4B0B-9943-F557E3934990">
           <File Id="ServerFile" Source="proximadb-server.exe" KeyPath="yes" />
+          <ServiceInstall
+            Id="ProximaDBService"
+            Name="proximadb"
+            DisplayName="ProximaDB Server"
+            Description="ProximaDB vector database service"
+            Type="ownProcess"
+            Start="auto"
+            ErrorControl="normal"
+            Arguments="--config &quot;[CONFIGDIR]config.toml&quot; --data-dir &quot;[DATADIR]data&quot;"
+          />
+          <ServiceControl Id="StopProximaDBService" Name="proximadb" Stop="both" Remove="uninstall" Wait="yes" />
         </Component>
 
         <!-- Benchmark Tool -->
@@ -69,10 +84,14 @@
           <File Id="MigrateFile" Source="proximadb-migrate.exe" />
         </Component>
 
-        <!-- Config File (default) -->
-        <Component Id="ConfigComponent" Directory="INSTALLFOLDER" Guid="58303A7C-0A7C-4650-B4FC-0CCD86CC710D">
+        <!-- TD-PKG-2: the config installs into ProgramData, where the Start-menu
+             shortcuts and the service look for it (it used to land next to the
+             binaries in Program Files, which a non-elevated user cannot edit,
+             while CONFIGDIR was created empty). -->
+        <Component Id="ConfigComponent" Directory="CONFIGDIR" Guid="58303A7C-0A7C-4650-B4FC-0CCD86CC710D">
           <File Id="ConfigFile" Source="config.toml" />
         </Component>
+
 
         <!-- PATH Environment Variable -->
         <Component Id="PathComponent" Directory="INSTALLFOLDER" Guid="00203128-4665-47F1-8FF1-7C9F779CCE32">
@@ -91,7 +110,7 @@
       <ComponentRef Id="ConfigComponent" />
 
       <Component Id="StartMenuComponent" Directory="ProgramMenuFolder" Guid="A80E321C-28B4-4765-960B-0A756E049E07">
-        <Shortcut Id="ServerShortcut" Name="ProximaDB Server" Description="Start ProximaDB Server" Target="[INSTALLFOLDER]proximadb-server.exe" Arguments="--config &quot;[CONFIGDIR]config.toml&quot;" WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="ServerShortcut" Name="ProximaDB Server" Description="Start ProximaDB Server" Target="[INSTALLFOLDER]proximadb-server.exe" Arguments="--config &quot;[CONFIGDIR]config.toml&quot; --data-dir &quot;[DATADIR]data&quot;" WorkingDirectory="DATADIR" />
         <Shortcut Id="ConfigShortcut" Name="ProximaDB Config" Description="Edit ProximaDB Configuration" Target="notepad.exe" Arguments="[CONFIGDIR]config.toml" />
         <RemoveFolder Id="RemoveMenuFolder" On="uninstall" />
         <RegistryValue Root="HKCU" Key="Software\ProximaDB\Installer" Name="installed" Type="integer" Value="1" KeyPath="no" />

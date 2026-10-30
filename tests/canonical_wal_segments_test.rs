@@ -8,12 +8,16 @@
 //! * a range read opens only segments whose LSN summary can contain a match;
 //! * a corrupt sealed segment fails closed, while the active file's torn tail is
 //!   still repaired;
-//! * rewrite-compaction refuses a WAL that has sealed segments.
+//! * rewrite-compaction refuses a WAL that has sealed segments;
+//! * the per-segment branch summary (TD-SEAM-12) is rebuilt on reopen, and an
+//!   armed branch fence refuses a truncation that would strip a collection
+//!   branched after the merge-base image was taken.
 //!
 //!   cargo test --test canonical_wal_segments_test
 
 use anyhow::Result;
 use proximadb::services::FramedTableWalAppender;
+use proximadb::services::canonical_wal::{BranchFenceRefused, TenantCollection};
 use proximadb::services::record_store::TableWalAppender;
 use proximadb_records::ProximaRecord;
 use proximadb_storage_common::{CanonicalOperation, CanonicalWalEntry};
@@ -296,5 +300,188 @@ async fn open_shared_returns_one_appender_per_file() -> Result<()> {
         .append_operations(vec![upsert("a", "a3")], None)
         .await?;
     assert_eq!(c[0].sequence_number, 3);
+    Ok(())
+}
+
+fn branch_upsert(collection_id: &str, oid: &str, branch: &str) -> CanonicalOperation {
+    CanonicalOperation::RecordUpsert {
+        collection_id: collection_id.to_string(),
+        record: Box::new(ProximaRecord {
+            oid: oid.to_string(),
+            branch_id: Some(branch.to_string()),
+            ..ProximaRecord::default()
+        }),
+        projections: Vec::new(),
+    }
+}
+
+/// seq 1 `a` main, seq 2 `b` main, seq 3 `a` on branch `x` (tenant `t1`), seq 4
+/// `c` main — each sealed alone — then seq 5 `b` on branch `y` in the active file.
+async fn branched_wal(path: &Path) -> Result<FramedTableWalAppender> {
+    let wal = FramedTableWalAppender::open(path).await?;
+    wal.enable_segment_rotation(1);
+    wal.append_operations(vec![upsert("a", "r1")], None).await?;
+    wal.append_operations(vec![upsert("b", "r2")], None).await?;
+    wal.append_operations(vec![branch_upsert("a", "r3", "x")], Some("t1".into()))
+        .await?;
+    wal.append_operations(vec![upsert("c", "r4")], None).await?;
+    wal.enable_segment_rotation(0);
+    wal.append_operations(vec![branch_upsert("b", "r5", "y")], None)
+        .await?;
+    assert_eq!(sealed_segments(path).len(), 4);
+    Ok(wal)
+}
+
+fn tc(tenant: Option<&str>, collection: &str) -> TenantCollection {
+    TenantCollection::new(tenant, collection)
+}
+
+fn below(wal: &FramedTableWalAppender, floor: u64) -> Vec<(TenantCollection, u64)> {
+    wal.collections_below(floor).into_iter().collect()
+}
+
+#[tokio::test]
+async fn branch_summary_and_collections_below_survive_reopen() -> Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("canonical-records.wal");
+    let wal = branched_wal(&path).await?;
+
+    let summary = wal.branch_summary();
+    assert_eq!(summary.oldest_branch_seq, Some(3));
+    assert_eq!(
+        summary.collections.iter().cloned().collect::<Vec<_>>(),
+        vec![tc(None, "b"), tc(Some("t1"), "a")]
+    );
+    let below_4 = vec![
+        (tc(None, "a"), 1),
+        (tc(None, "b"), 2),
+        (tc(Some("t1"), "a"), 3),
+    ];
+    assert_eq!(
+        below(&wal, 4),
+        below_4,
+        "seq 1..=3 sit in segments wholly below 4; each (tenant, collection) maps to its oldest"
+    );
+    assert!(wal.collections_below(1).is_empty());
+    // The active file (seq 5) counts once the floor passes it: a rotation can
+    // seal it before the truncation runs.
+    assert_eq!(below(&wal, 6).len(), 4);
+    assert_eq!(wal.collections_below(6)[&tc(None, "c")], 4);
+    drop(wal);
+
+    let reopened = FramedTableWalAppender::open(&path).await?;
+    assert_eq!(reopened.branch_summary(), summary);
+    assert_eq!(below(&reopened, 4), below_4);
+
+    // Truncating the main-line prefix keeps every branch entry.
+    reopened.truncate_below(3).await?;
+    assert_eq!(reopened.retained_from(), 3);
+    drop(reopened);
+    let reopened = FramedTableWalAppender::open(&path).await?;
+    assert_eq!(reopened.branch_summary(), summary);
+    assert_eq!(
+        below(&reopened, 5),
+        vec![(tc(None, "c"), 4), (tc(Some("t1"), "a"), 3)]
+    );
+
+    // Truncating the oldest branch entry moves the summary up.
+    reopened.truncate_below(4).await?;
+    assert_eq!(reopened.branch_summary().oldest_branch_seq, Some(5));
+    assert_eq!(
+        reopened
+            .branch_summary()
+            .collections
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec![tc(None, "b")]
+    );
+    Ok(())
+}
+
+fn fence_refusal(error: &anyhow::Error) -> &str {
+    &error
+        .downcast_ref::<BranchFenceRefused>()
+        .expect("a typed fence refusal")
+        .0
+}
+
+#[tokio::test]
+async fn a_branch_fence_refuses_stripping_a_collection_branched_since() -> Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("canonical-records.wal");
+    let wal = FramedTableWalAppender::open(&path).await?;
+    wal.enable_segment_rotation(1);
+    wal.append_operations(vec![upsert("a", "r1")], None).await?;
+    wal.append_operations(vec![upsert("b", "r2")], None).await?;
+    wal.append_operations(vec![branch_upsert("a", "r3", "x")], None)
+        .await?;
+
+    // The image covers `a`, every victim is marked; `b` branches before the
+    // truncation runs.
+    let covered: std::collections::BTreeSet<_> = [tc(None, "a")].into_iter().collect();
+    let marked = wal.collections_below(3).into_keys().collect();
+    wal.fence_branches(covered.clone(), marked);
+    wal.append_operations(vec![branch_upsert("b", "r4", "y")], None)
+        .await?;
+    let refused = wal.truncate_below(3).await.unwrap_err();
+    assert!(fence_refusal(&refused).contains("default/b"), "{refused:#}");
+    assert_eq!(
+        wal.retained_from(),
+        0,
+        "a refused truncation removes nothing"
+    );
+
+    // The fence is consumed: an unfenced run truncates.
+    assert_eq!(wal.truncate_below(3).await?.truncated_through, 2);
+
+    // A victim whose loss the checkpoint did not record is refused too.
+    wal.fence_branches(
+        [tc(None, "a"), tc(None, "b")].into_iter().collect(),
+        Default::default(),
+    );
+    let refused = wal.truncate_below(4).await.unwrap_err();
+    assert!(
+        fence_refusal(&refused).contains("unrecorded"),
+        "{refused:#}"
+    );
+
+    // A collection branched since with no history below the floor does not
+    // trip the fence.
+    let marked = wal.collections_below(4).into_keys().collect();
+    wal.fence_branches(covered, marked);
+    wal.append_operations(vec![branch_upsert("d", "r5", "z")], None)
+        .await?;
+    assert_eq!(wal.truncate_below(4).await?.truncated_through, 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_branch_fence_is_per_tenant_and_consumed_without_victims() -> Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("canonical-records.wal");
+    let wal = FramedTableWalAppender::open(&path).await?;
+    wal.enable_segment_rotation(1);
+    wal.append_operations(vec![upsert("a", "r1")], Some("t2".into()))
+        .await?;
+    wal.append_operations(vec![branch_upsert("a", "r2", "x")], Some("t1".into()))
+        .await?;
+
+    // Nothing below the floor: the fence is consumed anyway.
+    wal.fence_branches(Default::default(), Default::default());
+    assert_eq!(wal.truncate_below(1).await?.segments, 0);
+    assert_eq!(wal.truncate_below(2).await?.truncated_through, 1);
+
+    // t1's `a` branched and is not covered, but only t2's `a` loses history.
+    let wal = FramedTableWalAppender::open(dir.path().join("second.wal")).await?;
+    wal.enable_segment_rotation(1);
+    wal.append_operations(vec![upsert("a", "r1")], Some("t2".into()))
+        .await?;
+    wal.append_operations(vec![branch_upsert("a", "r2", "x")], Some("t1".into()))
+        .await?;
+    wal.fence_branches(
+        Default::default(),
+        [tc(Some("t2"), "a")].into_iter().collect(),
+    );
+    assert_eq!(wal.truncate_below(2).await?.truncated_through, 1);
     Ok(())
 }

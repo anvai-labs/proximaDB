@@ -10,7 +10,7 @@
 |Relates to|ADR-018 (pgwire/SQL parity roadmap — the conformance driver), ADR-033 (own the vertical, keep the standard at the interop seam), ADR-024 (single canonical data type — `ProximaValue`), ADR-034 (route cost model / `ComputeScheduler`), `CODESIGN_DIMENSIONAL_ARCHITECTURE_2026_06_19.adoc` ("vertical inside, standard outside")
 |Co-designed with|The "course-correction §5" guarantee — *shared logical plane, split physical plane* — which this ADR makes a frozen, ratcheted contract
 |Supersedes|—
-|Tracked under|TD-181 (no-DataFusion build CI guard + the leakage ratchet). *Reconciled 2026-10-15:* **ID collision** — the register assigns TD-181 to the catalog-object OID migration (ADR-031), so these two guards have no TD of their own. A `no-default-features` build entry exists in the CI feature matrix; a dedicated `datafusion::` leakage grep ratchet and a Volcano-only *test* run were not found — treat both Verification items 1 and 3 as open until a TD is filed.
+|Tracked under|TD-DFSEAM-1 (no-DataFusion build CI guard + the leakage ratchet). *Reconciled 2026-10-15, filed 2026-10-26:* **ID collision** — the register assigns TD-181 to the catalog-object OID migration (ADR-031); the guards now have their own entry, TD-DFSEAM-1. A `no-default-features` build entry exists in the CI feature matrix; a dedicated `datafusion::` leakage grep ratchet and a Volcano-only *test* run were not found — treat both Verification items 1 and 3 as open until a TD is filed. *(Filed 2026-10-26 as TD-DFSEAM-1; both remain open.)*
 |===
 
 == Context
@@ -134,7 +134,7 @@ adapter ~1 wk, wiring ~1 d. **No frontend/planner/pgwire/storage refactor.**
   (DataFusion + Volcano) already proves the abstraction holds; one function registry keeps the
   two engines semantically identical (no fork); the runtime pays one virtual call per query.
 * **Costs / watch-items:**
-  - The seam can **bit-rot** if the no-DataFusion build is never exercised → TD-181 adds a CI
+  - The seam can **bit-rot** if the no-DataFusion build is never exercised → TD-DFSEAM-1 is to add a CI
     Volcano-only build+test variant.
   - The invariant can **erode** if someone imports a `datafusion::` type into the frontend/result
     path → a grep ratchet (Verification) fails the build.
@@ -151,7 +151,7 @@ adapter ~1 wk, wiring ~1 d. **No frontend/planner/pgwire/storage refactor.**
   the adapter allow-list (+ the fenced embedded file).
 . **Cargo ratchet:** `proximadb-relational-*` / `proximadb-relational-types` / `proximadb-functions`
   have no `datafusion` dependency (grep their `Cargo.toml`).
-. **No-DataFusion build (TD-181):** a feature-matrix CI entry builds with `datafusion-integration`
+. **No-DataFusion build (TD-DFSEAM-1):** a feature-matrix CI entry builds with `datafusion-integration`
   off and runs the Volcano-only relational suite — proving the floor compiles and the seam is real.
 . **Conformance unchanged:** the TPC-H (22) / TPC-DS (16) pgwire ratchets pass identically with the
   engine routed either way (they bind to the seam, not the engine).

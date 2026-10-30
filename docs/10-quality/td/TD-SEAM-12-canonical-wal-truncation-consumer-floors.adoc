@@ -5,8 +5,8 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In Progress.** P2.2a primitives landed 2026-10-19 (see "Landed"); the consumer gaps under "Hazards" items 1–3 remain, so nothing calls truncation in production yet. Filed 2026-10-19 from a survey of every reader of the shared canonical WAL (`data_dir/pgwire/canonical-records.wal`), done before implementing truncation (TD-SEAM-2 / P2.2).
-| Priority | **HIGH as a gate on P2.2.** Zero today: nothing truncates the WAL.
+| Status | **In Progress.** P2.2a primitives landed 2026-10-19; P2.2b checkpoints and the REST 410 on 2026-10-20; the P2.2c truncator on 2026-10-20 (see "Landed"). It is **on by default** since #2146 (`PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS=0` disables it). Since 2026-10-22 the durable branch merge-base (hazard 2) lets it truncate below a branch point and branch merge still compute its base; a merge refuses (410) only for a collection that lost history before it was branched (see "Landed: the durable branch merge-base"). Filed 2026-10-19 from a survey of every reader of the shared canonical WAL (`data_dir/pgwire/canonical-records.wal`), done before implementing truncation (TD-SEAM-2 / P2.2).
+| Priority | **MEDIUM.** Truncation is on by default (#2146); the remaining branch-merge gaps refuse (410) rather than risk history.
 | Component | `src/services/canonical_wal.rs`, `src/services/record_store.rs`, `src/services/{rank_profile_store,function_store}.rs`, `src/graph/merge.rs`, `src/network/rest/v2/records.rs` (change feed), `src/network/postgres/relational_pipeline.rs` (OLAP delta merge)
 | Relates to | TD-SEAM-2, TD-USUB-1 (slice 2b), TD-OLAPFMT-3, ADR-012 (branch merge), ADR-097 S2
 | Blocked by | Nothing.
@@ -125,3 +125,157 @@ Remaining:
 * The snapshot-LSN enumerator for the OLAP delta merge.
 * MATERIALIZE's LSN capture.
 * The truncator itself.
+
+== Landed (P2.2c, 2026-10-20): the truncator
+
+`src/services/wal_truncator.rs`, the first production caller of `truncate_below`.
+
+* **Composition.** Each consumer is a `WalFloorSource`. `run_once` reads the head `W` first, so
+  `floor = min(W + 1, every source)`. One `Err` refuses the whole run and deletes nothing.
+* **Sources, in order** (readers before the checkpoints that append):
+** `branch-merge`: refused while any retained segment held a branch-tagged record (hazard 2).
+   Superseded on 2026-10-22 by `branch-merge-base`; see the section on the durable merge-base.
+** `change-feed-retention`: keeps the newest `PROXIMADB_CANONICAL_WAL_RETAIN_ENTRIES` sequences
+   (default 1,000,000). A client further behind gets 410.
+** `record-tier`: `min(inflight_floor, min_unflushed_lsn)`. Any memtable partition refuses, so
+   truncation needs the spill gate as well.
+** `published-snapshots`: walks every catalog and keeps everything after the lowest
+   `snapshot_lsn`. A catalog that cannot be listed refuses. This is the snapshot-LSN enumerator.
+** `rank-profiles` and `sql-functions`: their checkpoints.
+* **MATERIALIZE's LSN capture.** It used `read_changes_since(table, 0).unwrap_or(0)`. After a
+  truncation that call fails, so the snapshot would have been recorded at LSN 0, which no
+  retained history can serve. It also left the window between capture and catalog publication
+  unprotected.
+** Now `TableRecordStore::capture_snapshot_lsn` returns `SnapshotLsn { lsn, pin }`. The WAL-backed
+   store takes the head, lowered below any appended-but-unapplied write, and pins every entry
+   above it (`FramedTableWalAppender::pin_history`).
+** The pin is taken under the append lock, and `truncate_below` honours the lowest pin under the
+   same lock, so no truncation can fall between the capture and the pin.
+** MATERIALIZE drops the pin after the catalog records `snapshot_lsn`. From then on the
+   `published-snapshots` source holds the floor.
+* **Scheduling.** `spawn` runs every `PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS` (unset or
+  `0` means off) and logs every outcome. A refusal or error is not fatal; the next run starts from
+  scratch. Truncation removes only sealed segments, so it also needs
+  `PROXIMADB_CANONICAL_WAL_SEGMENT_BYTES`.
+* **Gates:** `tests/wal_truncator_test.rs` and `tests/wal_truncation_test.rs` (an in-flight write
+  lowers the snapshot LSN).
+
+Still open:
+
+* **Hazard 2: a durable branch-merge base.** Closed on 2026-10-22 (see below).
+* Orion's checkpoint correlation degrades to `None` once its checkpoint entry is truncated; it is
+  metrics only.
+
+== Correction (2026-10-21): the branch guard alone was not fail-closed
+
+Historical: the blanket 410 below was superseded on 2026-10-23 by the durable merge-base (see
+"Landed: the durable branch merge-base"); `truncated_through_at` no longer exists.
+
+A design review of the durable merge-base found that `BranchEntriesGuard` did not
+make hazard 2 fail-closed, as the "Landed (P2.2c)" section implied:
+
+* it sees only *retained* segments, so a branch created after a truncation passes
+  it, and its merge then reads an incomplete main-line base without error;
+* it runs before the checkpoint sources, which await while appending, so a first
+  branch write landing in that window passes it and its base is truncated by the
+  same run.
+
+**Fix (fail-closed):** `merge_graph_branch_inner` now refuses with **410 Gone**
+whenever the WAL's durable floor marker shows any truncation
+(`FramedTableWalAppender::truncated_through_at`). Both bypasses turn into a loud
+refusal instead of a wrong merge. Branch merge and truncation are therefore
+mutually exclusive until the durable merge-base lands. Gate:
+`merge_endpoint_refuses_when_wal_history_was_truncated`.
+
+**Next (restores merge under truncation):** a main-line base image per branched
+collection, kept by checkpoint-style WAL appends before each truncation, with the
+branch floor at the oldest retained branch entry. The file-level plan is in the
+execution tracker §5.2. Related defects found in the same review, filed as
+follow-ups: write-back keeps the source `branch_id`, so no branch ever closes; the
+default `target_branch = "main"` cannot match untagged main records; and
+`latest_base_records` ignores main-line deletes.
+
+== Landed (2026-10-22): the durable branch merge-base (hazard 2)
+
+Merge after truncation now equals the merge over the untruncated history. Execution tracker §5.2;
+PRs #2124, #2125 and the slice-3–5 follow-ups.
+
+* **WAL summaries** (`canonical_wal.rs`). Each segment summary keeps `first_branch_seq`, the
+  branched `(tenant, collection)` set and the tenants per collection. They are rebuilt on open.
+** `branch_summary()` returns the oldest retained branch-tagged sequence and every branched pair.
+** `collections_below(floor)` returns every `(tenant, collection)` a truncation at `floor` would
+   strip, with the first sequence it loses. The active file counts, because a rotation can seal it.
+** `fence_branches(covered, marked)` arms the next `truncate_below`. Under the append lock, that
+   call refuses (`BranchFenceRefused`, reported as `TruncationRun::Refused { source:
+   "branch-fence" }`) when a victim collection branched outside the imaged set, or its loss is
+   unrecorded. This closes the race where a first branch write lands between the checkpoint and the
+   truncation.
+* **Merge** (`graph/merge.rs`). `MergeBaseImage { through, records, forks }` holds the main-line
+  state at `through`.
+** `advance` folds untagged upserts, `RecordDelete` and `RecordPartitionDrop` (`fold_main_line`).
+   The segment summaries index drops, so a segment holding only a drop is still read.
+   An absent oid is a deleted one, so no tombstones are needed. The full-history merge uses the same
+   fold, which also closes the "`latest_base_records` ignores main-line deletes" follow-up.
+** `merge_branches_with_base` applies the main-line changes in `(through, M]` to the image.
+** It refuses (`BranchForkFolded`) a branch whose fork the image folded past, so a truncated fork
+   can never move the merge base silently. It also refuses `ImageAboveMergeBase`.
+* **Store** (`services/branch_base_store.rs`). Rows live in `__proxima_branch_bases__`, one
+  generation per checkpoint: a marks row, image rows (256 records each), then a header written last.
+** Replay uses the newest complete generation and ignores rows of a crashed one. A header whose
+   rows are missing fails replay.
+** A checkpoint claims its generation number before writing, so a write that fails part-way is
+   never reused by the retry.
+** The record tier's boot replay skips these rows.
+** `BranchBaseStore::checkpoint` runs under its write gate:
+*** the floor is the oldest retained branch-tagged entry;
+*** it marks what the truncation may strip;
+*** it images every branched collection with complete history, through one below the floor, and
+    does so incrementally;
+*** it writes a generation only when something changed, or when its old rows would hold the floor;
+*** it arms the fence.
+* **Truncator.** `BranchMergeBase` replaces `BranchEntriesGuard` and runs last in
+  `shared_services`.
+* **REST.** `merge_graph_branch_inner` pins the retained history for the whole merge, write-back
+  included.
+** It reads the base from the retained history when that is complete for the collection, or from
+   its image otherwise.
+** It returns **410** only when the base cannot be recovered. That happens in three cases:
+*** `MergeBaseTruncated`: the collection lost history before it was branched; history was
+    truncated before any merge base was tracked; or the image no longer reaches the retained
+    history (`through + 1 < retained_from`).
+*** `BranchForkFolded`: the image folded a merged branch's fork.
+*** `ImageAboveMergeBase`: the image runs past the merge base.
+** This replaces the blanket 410 of the 2026-10-21 correction.
+** No branch pair returns 404 whatever the history.
+** A merge-base generation that fails replay ("header but not all rows") returns 500. It does so
+   for every merge on a truncated WAL, and the truncator refuses too. Both fail closed.
+** Recovery from a failed replay: restore the WAL directory from backup, or delete the damaged
+   generation's rows (collection `__proxima_branch_bases__`, generation named in the error) with an
+   offline rewrite. The next truncation run then writes a fresh generation.
+** The WAL-exists check now counts sealed segments, so a merge right after a rotation is no longer
+   a 404.
+* **Gates:**
+** `tests/wal_branch_merge_base_test.rs`:
+*** `a_merge_after_truncating_below_the_branch_point_equals_the_untruncated_merge` (also across a
+    restart);
+*** `a_collection_branched_after_its_history_was_truncated_refuses`.
+** `graph::merge` unit tests:
+*** `base_image_plus_suffix_equals_full_history`;
+*** `an_image_past_a_fork_refuses_even_once_the_fork_is_truncated`;
+*** `main_line_deletes_and_drops_leave_the_base`.
+** `services::branch_base_store` unit tests.
+** `tests/wal_truncator_test.rs`: `a_branch_floors_truncation_at_its_oldest_entry_and_keeps_its_base`,
+   `a_collection_branched_during_a_run_refuses_its_truncation`.
+** `tests/canonical_wal_segments_test.rs`: fence and summary tests.
+
+Still open (follow-ups):
+
+* Write-back keeps the source `branch_id`, so no branch ever closes. The floor therefore never
+  passes the oldest branch entry.
+* The default `target_branch = "main"` cannot match untagged main records.
+* A collection first branched after its history was truncated needs explicit branch registration
+  (`BranchRef`). Until then its merges return 410.
+* A deployment whose WAL was truncated before merge bases were tracked (`tracked_from > 0`) can
+  never image a collection, so every unimaged merge there returns 410. This fails closed.
+* Truncation marks are never cleared, so a collection dropped and re-created under the same name
+  keeps returning 410 even when its post-recreate history is complete. This fails closed.

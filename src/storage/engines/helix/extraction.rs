@@ -16,7 +16,8 @@ use crate::storage::persistence::filesystem::FileSystem;
 use crate::storage::persistence::filesystem::caching_filesystem::UnifiedCachingFilesystem;
 use crate::storage::trait_components::extractor::{
     ExtractedVector, ExtractionCapabilities, ExtractionCost, ExtractionError, ExtractionMode,
-    ExtractionRequest, ExtractionResult, ExtractionStats, VectorExtractor,
+    ExtractionRequest, ExtractionResult, VectorExtractor, finalize_extraction, id_filter_allows,
+    mode_wants_fp32,
 };
 
 /// HELIX Vector Extractor
@@ -114,8 +115,9 @@ impl VectorExtractor for HelixExtractor {
 
         // Filter out non-existent files to handle race conditions gracefully
         // (e.g., temp directories cleaned up before AXIS consumer processes events).
-        // Use the configured filesystem: std::path::Path::exists would classify every
-        // object-store URL as missing and silently skip extraction.
+        // Use the configured filesystem, NOT the shared `filter_existing_files`
+        // helper: std::path::Path::exists would classify every object-store
+        // URL as missing and silently skip extraction.
         let mut existing_files = Vec::with_capacity(request.file_paths.len());
         let mut missing_count = 0;
         for path in &request.file_paths {
@@ -147,6 +149,12 @@ impl VectorExtractor for HelixExtractor {
             return Ok(ExtractionResult::empty());
         }
 
+        // ID filter as a set, built once per extraction (was: a linear
+        // `ids.contains` per record — TD-DSEFF-1 parity with sst/nova/swift).
+        let id_filter = crate::storage::trait_components::extractor::build_id_filter(
+            request.vector_ids.as_ref(),
+        );
+
         let mut all_vectors = Vec::new();
         let mut total_bytes_read = 0usize;
         let mut files_processed = 0usize;
@@ -170,15 +178,14 @@ impl VectorExtractor for HelixExtractor {
             for record in records {
                 let record_id = record.id.clone();
                 // Handle vector filtering based on mode
-                let fp32_vector = match request.mode {
-                    ExtractionMode::Fp32Only | ExtractionMode::Both | ExtractionMode::Auto => {
-                        if record.vector.is_empty() {
-                            None
-                        } else {
-                            Some(record.vector.clone())
-                        }
+                let fp32_vector = if mode_wants_fp32(request.mode) {
+                    if record.vector.is_empty() {
+                        None
+                    } else {
+                        Some(record.vector.clone())
                     }
-                    ExtractionMode::QuantizedOnly => None,
+                } else {
+                    None
                 };
 
                 // HELIX doesn't store quantized vectors inline in VectorRecord
@@ -203,11 +210,7 @@ impl VectorExtractor for HelixExtractor {
                     None
                 };
 
-                // Apply ID filter if selective extraction
-                let should_include = match &request.vector_ids {
-                    Some(ids) => ids.contains(&record_id),
-                    None => true,
-                };
+                let should_include = id_filter_allows(&id_filter, &record_id);
 
                 if should_include && fp32_vector.is_some() {
                     all_vectors.push(ExtractedVector {
@@ -220,39 +223,23 @@ impl VectorExtractor for HelixExtractor {
             }
         }
 
-        // Apply limit and offset if specified
-        let total_before_pagination = all_vectors.len();
-        if let Some(offset) = request.offset {
-            if offset < all_vectors.len() {
-                all_vectors = all_vectors.into_iter().skip(offset).collect();
-            } else {
-                all_vectors.clear();
-            }
-        }
-        if let Some(limit) = request.limit {
-            all_vectors.truncate(limit);
-        }
-
-        let duration_ms = start.elapsed().as_millis() as u64;
+        let result = finalize_extraction(
+            all_vectors,
+            request.offset,
+            request.limit,
+            total_bytes_read,
+            files_processed,
+            start,
+        );
 
         debug!(
             "[HELIX Extractor] Extracted {} vectors from {} files in {}ms",
-            all_vectors.len(),
+            result.vectors.len(),
             files_processed,
-            duration_ms
+            result.stats.duration_ms
         );
 
-        Ok(ExtractionResult {
-            vectors: all_vectors,
-            stats: ExtractionStats {
-                vectors_extracted: total_before_pagination,
-                bytes_read: total_bytes_read,
-                files_processed,
-                duration_ms,
-                vectors_skipped: 0,
-            },
-            continuation_token: None,
-        })
+        Ok(result)
     }
 
     fn extraction_capabilities(&self) -> ExtractionCapabilities {

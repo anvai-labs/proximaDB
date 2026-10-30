@@ -480,7 +480,51 @@ pub trait TableMaterializer: Send + Sync {
     /// snapshot and the tenant-isolated object prefix; `None` means single-tenant
     /// / embedded mode. Threading it (vs the old hardcoded `None`) is what makes
     /// warehouse materialization tenant-isolated (TD-113).
-    async fn materialize(&self, table_name: &str, tenant: Option<&str>) -> Result<String>;
+    ///
+    /// `fence` is re-checked immediately before the publication commits (P2.4): a
+    /// MATERIALIZE can outlive the write lease it started under, and a displaced
+    /// pod must not advance the published snapshot.
+    async fn materialize(
+        &self,
+        table_name: &str,
+        tenant: Option<&str>,
+        fence: &dyn PublishFence,
+    ) -> Result<String>;
+}
+
+/// The authority a publisher re-checks immediately before it commits a new
+/// snapshot (P2.4 fenced advance). `Err` means this process may no longer
+/// publish the table — typically its write lease moved to another pod.
+#[async_trait::async_trait]
+pub trait PublishFence: Send + Sync {
+    async fn check(&self) -> Result<()>;
+}
+
+/// No fence: embedded and single-pod deployments, where no other process
+/// publishes the table.
+pub struct NoPublishFence;
+
+#[async_trait::async_trait]
+impl PublishFence for NoPublishFence {
+    async fn check(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The DDL write-lease check as a [`PublishFence`].
+struct LeasePublishFence<'a> {
+    ddl: &'a DdlService,
+    tenant: Option<&'a str>,
+    table: &'a str,
+}
+
+#[async_trait::async_trait]
+impl PublishFence for LeasePublishFence<'_> {
+    async fn check(&self) -> Result<()> {
+        self.ddl
+            .check_lease_for_write(self.tenant, self.table)
+            .await
+    }
 }
 
 pub struct DdlService {
@@ -636,36 +680,17 @@ impl DdlService {
     /// table-scoped operations; the post-operation check detects displacement
     /// before success/catalog-cache publication.
     async fn check_lease_for_write(&self, tenant: Option<&str>, collection_id: &str) -> Result<()> {
-        use crate::cluster::primary_pod_registry::{
-            WriteRoutingDecision, consult_for_write_leased,
-        };
-        // Inert unless a registry + pod id are wired (the essentials for any
-        // routing decision). The lease manager is optional: present ⇒ lease
-        // acquire/renew; absent ⇒ in-memory registry lookup only.
-        let (registry, pod_id) = match (&self.primary_pod_registry, &self.self_pod_id) {
-            (Some(r), Some(p)) => (r, p),
-            _ => return Ok(()),
-        };
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let decision = consult_for_write_leased(
-            registry,
-            self.partition_lease_manager.as_deref(),
-            pod_id,
-            tenant.unwrap_or("default"),
-            collection_id,
-            now_ms,
+        // The shared write-lease authority (src/services/write_lease.rs): the
+        // same logic the live delete publisher consults before its successor
+        // CAS (the fence contract's gate 4), extracted so DDL and DML cannot
+        // drift on who may publish.
+        crate::services::write_lease::WriteLeaseAuthority::new(
+            self.partition_lease_manager.clone(),
+            self.primary_pod_registry.clone(),
+            self.self_pod_id.clone(),
         )
+        .check("DDL", tenant, collection_id)
         .await
-        .map_err(|e| anyhow!("DDL lease check failed: {e}"))?;
-        match decision {
-            WriteRoutingDecision::Allow => Ok(()),
-            WriteRoutingDecision::Misrouted { target_pod } => Err(anyhow!(
-                "DDL misrouted: write for collection '{collection_id}' must go to pod '{target_pod}'"
-            )),
-        }
     }
 
     /// Execute a DDL statement
@@ -730,9 +755,16 @@ impl DdlService {
                          store (no table materializer is wired)"
                     )
                 })?;
-                let location = materializer.materialize(&name, tenant).await?;
-                // MATERIALIZE can outlive a lease TTL. Revalidate before
-                // publishing success so a displaced pod cannot bless stale work.
+                // MATERIALIZE can outlive a lease TTL. The fence is re-checked
+                // just before the snapshot commits, so a displaced pod cannot
+                // advance it; revalidating after also keeps a takeover during
+                // the catalog flip from reporting success.
+                let fence = LeasePublishFence {
+                    ddl: self,
+                    tenant,
+                    table: &name,
+                };
+                let location = materializer.materialize(&name, tenant, &fence).await?;
                 self.check_lease_for_write(tenant, &name).await?;
                 // TD-OLAP-4: a re-MATERIALIZE republishes the base at this
                 // location, so any cached table-OPEN discovery (schema/splits/
@@ -1112,6 +1144,78 @@ impl DdlService {
     }
 
     /// Apply schema evolution changes (add/drop columns, rename, etc.) to an existing table.
+    /// TD-DML-3: remove the props named `columns` from every live row of the
+    /// table (each row is rewritten as an Update through the record store).
+    /// Returns the number of rows rewritten. No-op without a record store.
+    async fn purge_column_values(
+        &self,
+        schema: &proximadb_catalog::CatalogTableSchema,
+        table_id: &str,
+        columns: &[String],
+        tenant: Option<&str>,
+    ) -> Result<usize> {
+        use crate::services::record_store::{
+            TableRecordMutation, TableRecordMutationKind, TableRecordScanRequest,
+        };
+        let Some(store) = &self.record_store else {
+            return Ok(0);
+        };
+        let tenant_context =
+            tenant.map(crate::storage::tenant::context::TenantContext::for_tenant_id);
+        let records = store
+            .scan_records(
+                schema,
+                TableRecordScanRequest {
+                    filter: None,
+                    table_id: table_id.to_string(),
+                    limit: None,
+                    include_vector: true,
+                    include_props: true,
+                },
+                tenant_context.as_ref(),
+                #[cfg(feature = "abac-policy")]
+                &proximadb_abac::ReadContext::system(
+                    proximadb_abac::SystemReadReason::Compaction,
+                    "ddl::purge_column_values",
+                ),
+            )
+            .await?;
+        let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+        let mutations: Vec<TableRecordMutation> = records
+            .into_iter()
+            .filter(|record| !record.is_dead(now_ns))
+            .filter_map(|mut record| {
+                let mut removed = false;
+                for column in columns {
+                    removed |= record.props.remove(column).is_some();
+                }
+                removed.then(|| {
+                    record.record_version = record.record_version.saturating_add(1);
+                    record.updated_at_ns = now_ns;
+                    TableRecordMutation::new(TableRecordMutationKind::Update, record)
+                })
+            })
+            .collect();
+        let rewritten = mutations.len();
+        for chunk in mutations.chunks(512) {
+            let result = store
+                .write_mutations(schema, chunk.to_vec(), tenant_context.as_ref())
+                .await?;
+            if !result.success {
+                return Err(anyhow!(
+                    "purging column(s) {} of table '{}' failed: {}",
+                    columns.join(", "),
+                    schema.name,
+                    result.errors.first().cloned().unwrap_or_default()
+                ));
+            }
+        }
+        if rewritten > 0 {
+            info!(table = %schema.name, rows = rewritten, columns = %columns.join(", "), "purged column values");
+        }
+        Ok(rewritten)
+    }
+
     async fn alter_table(
         &self,
         table_name: &str,
@@ -1128,11 +1232,61 @@ impl DdlService {
             return Err(anyhow!("Table '{}' does not exist", table_name));
         }
 
+        // TD-DML-3: a dropped column's values must never come back. Rows keep
+        // a column's value as a prop keyed by its name, so (a) before a column
+        // is ADDed, any prop of that name on existing rows is a stale value of
+        // an earlier, dropped column — purge it first (a pre-existing row must
+        // read NULL for a new column, as in PostgreSQL); (b) after a DROP, the
+        // dropped values are purged so they are not retained. (a) is the
+        // correctness guarantee and fails the ALTER if it cannot complete;
+        // (b) is retention hygiene and is logged, not fatal (the catalog
+        // change has committed).
+        let added: Vec<String> = changes
+            .iter()
+            .filter_map(|change| match change {
+                AlterTableChange::AddColumn(column) => Some(column.name.clone()),
+                _ => None,
+            })
+            .collect();
+        let dropped: Vec<String> = changes
+            .iter()
+            .filter_map(|change| match change {
+                AlterTableChange::DropColumn(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        if !added.is_empty() {
+            let schema = catalog.get_table(&table_id).await?;
+            let stale: Vec<String> = added
+                .into_iter()
+                .filter(|name| !schema.columns.iter().any(|column| &column.name == name))
+                .collect();
+            if !stale.is_empty() {
+                self.purge_column_values(&schema, &table_id.name, &stale, tenant)
+                    .await?;
+            }
+        }
+
         // Convert changes to catalog schema evolution
         let evolution = self.build_schema_evolution(changes)?;
 
         // Apply evolution
         catalog.evolve_schema(&table_id, evolution).await?;
+
+        if !dropped.is_empty() {
+            let schema = catalog.get_table(&table_id).await?;
+            if let Err(e) = self
+                .purge_column_values(&schema, &table_id.name, &dropped, tenant)
+                .await
+            {
+                error!(
+                    table = %table_name,
+                    error = %e,
+                    "purging dropped column values failed; they are retained until the column \
+                     name is re-added (which purges them first)"
+                );
+            }
+        }
 
         // Bump corpus_version: a schema change definitionally
         // invalidates cached plans — predicate types may shift,
@@ -2550,7 +2704,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TableMaterializer for LeaseTakeoverMaterializer {
-        async fn materialize(&self, table_name: &str, tenant: Option<&str>) -> Result<String> {
+        async fn materialize(
+            &self,
+            table_name: &str,
+            tenant: Option<&str>,
+            fence: &dyn PublishFence,
+        ) -> Result<String> {
             let future_ms = chrono::Utc::now().timestamp_millis() + 100;
             assert!(
                 self.contender
@@ -2558,6 +2717,9 @@ mod tests {
                     .await?,
                 "the second pod should acquire after the first lease expires"
             );
+            // The publisher's pre-commit check sees the takeover, so nothing is
+            // published by the displaced pod.
+            fence.check().await?;
             Ok("file:///tmp/materialized".to_string())
         }
     }
@@ -2601,7 +2763,7 @@ mod tests {
                 Some("tenant-a"),
             )
             .await
-            .expect_err("post-operation lease validation must detect takeover");
+            .expect_err("the pre-commit publish fence must detect the takeover");
         assert!(err.to_string().contains("pod-b"), "{err}");
     }
 

@@ -24,36 +24,10 @@
 //! scrape cadence.
 
 use lazy_static::lazy_static;
-use prometheus::{CounterVec, IntGaugeVec, Opts, register_counter_vec, register_int_gauge_vec};
-use tracing::error;
+use prometheus::{CounterVec, IntGaugeVec};
 
 use crate::storage::collection_pinning::CollectionPinTarget;
-
-fn register_counter_vec_safe(name: &str, help: &str, labels: &[&str]) -> CounterVec {
-    match register_counter_vec!(name, help, labels) {
-        Ok(metric) => metric,
-        Err(reg_err) => {
-            error!("Failed to register {}: {}", name, reg_err);
-            CounterVec::new(Opts::new(name, help), labels).unwrap_or_else(|_| {
-                CounterVec::new(Opts::new(format!("{}_fallback", name), help), labels)
-                    .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
-            })
-        }
-    }
-}
-
-fn register_int_gauge_vec_safe(name: &str, help: &str, labels: &[&str]) -> IntGaugeVec {
-    match register_int_gauge_vec!(name, help, labels) {
-        Ok(metric) => metric,
-        Err(reg_err) => {
-            error!("Failed to register {}: {}", name, reg_err);
-            IntGaugeVec::new(Opts::new(name, help), labels).unwrap_or_else(|_| {
-                IntGaugeVec::new(Opts::new(format!("{}_fallback", name), help), labels)
-                    .unwrap_or_else(|_| unreachable!("valid gauge metric descriptor"))
-            })
-        }
-    }
-}
+use proximadb_metrics::{register_counter_vec_safe, register_int_gauge_vec_safe};
 
 lazy_static! {
     /// Number of collections currently pinned to each target tier.

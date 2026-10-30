@@ -14,6 +14,24 @@ from enum import Enum
 from typing import Any
 
 
+def _path_node_ids(result: Any) -> list[str] | None:
+    """Node ids of a shortest-path answer, or None when there is no path.
+
+    REST answers ``{"data": {"path": [...], "found": ...}}``; gRPC answers a
+    ``GraphShortestPathResponse`` (``node_ids``, ``found``).
+    """
+    if result is None:
+        return None
+    if isinstance(result, dict):
+        payload = result.get("data", result)
+        path = payload.get("path") if isinstance(payload, dict) else None
+    else:
+        path = list(getattr(result, "node_ids", None) or [])
+        if not getattr(result, "found", bool(path)):
+            return None
+    return list(path) if path else None
+
+
 class GraphAlgorithm(str, Enum):
     """Supported graph algorithms"""
 
@@ -577,15 +595,14 @@ class GraphAnalytics:
             >>> if path:
             ...     print(" -> ".join(path))
         """
-        # Use client's existing shortest_path if available
+        # Use client's existing shortest_path if available. TD-SDKDOC-1: this
+        # used to pass start_node=/end_node= (the client takes positional
+        # start/target ids), so it raised TypeError on every real client.
         if hasattr(self._client, "graph_shortest_path"):
             result = self._client.graph_shortest_path(
-                graph_id=graph_id,
-                start_node=source,
-                end_node=target,
-                edge_types=edge_types,
+                source, target, edge_types=edge_types, graph_id=graph_id
             )
-            return result.get("path") if result else None
+            return _path_node_ids(result)
 
         result = self.run_algorithm(
             graph_id,

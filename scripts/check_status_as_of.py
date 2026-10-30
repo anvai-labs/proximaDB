@@ -36,6 +36,7 @@ from pathlib import Path
 # Docs that present themselves as the current-state baseline. Extend this list
 # when a doc graduates into a status-of-record role (see TD-DOCS-2).
 STATUS_OF_RECORD_DOCS = [
+    "docs/current/TRACKER.adoc",
     "docs/12-design/SYSTEM_MAP_2026_05_30.adoc",
     "docs/12-design/adr/README.adoc",
     "docs/SUPPORTED_SURFACE.adoc",

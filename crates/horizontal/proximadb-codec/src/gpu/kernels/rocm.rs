@@ -25,11 +25,16 @@
 //! - ROCm 5.0+
 //! - hipcc compiler
 //! - `hip-sys` crate for bindings
+//!
+//! Real ROCm/HIP kernel compilation is DEFERRED; every function below runs the
+//! shared scalar CPU fallback from [`super::cpu_fallback`] (redundancy pass 3:
+//! `rocm.rs` used to be a literal fork of `opencl.rs`).
 
 use anyhow::Result;
 use tracing::{debug, trace};
 
-use crate::utils::{GpuBatchConfig, GpuBuffer};
+use super::cpu_fallback;
+use super::utils::GpuBatchConfig;
 use proximadb_hardware_caps::HardwareBackend;
 
 /// ROCm/HIP context wrapper
@@ -80,9 +85,8 @@ pub fn rocm_delta_encode_f32(values: &[f32], base: f32) -> Result<Vec<i64>> {
         base
     );
 
-    // Deferred: Real ROCm/HIP implementation
-    // For now, use CPU fallback (HIP kernels require separate compilation)
-    let deltas: Vec<i64> = values.iter().map(|&v| (v - base) as i64).collect();
+    // Deferred: Real ROCm/HIP implementation (HIP kernels require separate compilation)
+    let deltas = cpu_fallback::delta_encode_f32(values, base);
 
     debug!(
         "✅ [ROCm] Delta encoded {} values → {} deltas",
@@ -113,7 +117,7 @@ pub fn rocm_delta_decode_f32(deltas: &[i64], base: f32) -> Result<Vec<f32>> {
     );
 
     // Deferred: Real ROCm/HIP implementation
-    let values: Vec<f32> = deltas.iter().map(|&d| d as f32 + base).collect();
+    let values = cpu_fallback::delta_decode_f32(deltas, base);
 
     debug!(
         "✅ [ROCm] Delta decoded {} deltas → {} values",
@@ -157,29 +161,7 @@ pub fn rocm_bitpack_encode_f32(values: &[f32], bits: u8) -> Result<Vec<u8>> {
     );
 
     // Deferred: Real ROCm/HIP implementation with parallel bit-packing
-    // For now, use CPU fallback
-    let total_bits = values.len() * bits as usize;
-    let byte_count = (total_bits + 7) / 8;
-    let mut result = vec![0u8; byte_count];
-
-    let mask = if bits == 32 {
-        u32::MAX
-    } else {
-        (1u32 << bits) - 1
-    };
-
-    for (i, &value) in values.iter().enumerate() {
-        let bit_offset = i * bits as usize;
-        let byte_offset = bit_offset / 8;
-        let bit_in_byte = bit_offset % 8;
-
-        let masked_value = value.to_bits() & mask;
-        result[byte_offset] |= ((masked_value << bit_in_byte) & 0xFF) as u8;
-
-        if bit_in_byte + bits as usize > 8 && byte_offset + 1 < result.len() {
-            result[byte_offset + 1] |= (masked_value >> (8 - bit_in_byte)) as u8;
-        }
-    }
+    let result = cpu_fallback::bitpack_encode_f32(values, bits)?;
 
     debug!(
         "✅ [ROCm] BitPacked encoded {} values → {} bytes",
@@ -199,31 +181,7 @@ pub fn rocm_bitpack_decode_f32(packed: &[u8], bits: u8, count: usize) -> Result<
     );
 
     // Deferred: Real ROCm/HIP implementation
-    let mask = if bits == 32 {
-        u32::MAX
-    } else {
-        (1u32 << bits) - 1
-    };
-    let mut result = Vec::with_capacity(count);
-
-    for i in 0..count {
-        let bit_offset = i * bits as usize;
-        let byte_offset = bit_offset / 8;
-        let bit_in_byte = bit_offset % 8;
-
-        if byte_offset >= packed.len() {
-            break;
-        }
-
-        let mut value = (packed[byte_offset] >> bit_in_byte) as u32;
-
-        if bit_in_byte + bits as usize > 8 && byte_offset + 1 < packed.len() {
-            let next_byte = packed[byte_offset + 1] as u32;
-            value |= next_byte << (8 - bit_in_byte);
-        }
-
-        result.push(f32::from_bits(value & mask));
-    }
+    let result = cpu_fallback::bitpack_decode_f32(packed, bits, count)?;
 
     debug!(
         "✅ [ROCm] BitPacked decoded {} bytes → {} values",
@@ -252,34 +210,8 @@ pub fn rocm_frame_of_reference_encode_f32(
         bits
     );
 
-    // Step 1: Compute offsets (parallel in HIP kernel)
-    let reference_f32 = reference as f32;
-    let offsets: Vec<i64> = values.iter().map(|&v| (v - reference_f32) as i64).collect();
-
-    // Step 2: Bit-pack offsets (parallel in HIP kernel)
-    let total_bits = offsets.len() * bits as usize;
-    let byte_count = (total_bits + 7) / 8;
-    let mut result = vec![0u8; byte_count];
-
-    // Deferred: Real ROCm/HIP parallel bit-packing
-    let mask = if bits == 32 {
-        u32::MAX
-    } else {
-        (1u32 << bits) - 1
-    };
-
-    for (i, &offset) in offsets.iter().enumerate() {
-        let bit_offset = i * bits as usize;
-        let byte_offset = bit_offset / 8;
-        let bit_in_byte = bit_offset % 8;
-
-        let masked_value = (offset as u32) & mask;
-        result[byte_offset] |= ((masked_value << bit_in_byte) & 0xFF) as u8;
-
-        if bit_in_byte + bits as usize > 8 && byte_offset + 1 < result.len() {
-            result[byte_offset + 1] |= (masked_value >> (8 - bit_in_byte)) as u8;
-        }
-    }
+    // Deferred: Real ROCm/HIP implementation
+    let result = cpu_fallback::frame_of_reference_encode_f32(values, reference, bits)?;
 
     debug!(
         "✅ [ROCm] FrameOfReference encoded {} values → {} bytes",
@@ -304,47 +236,15 @@ pub fn rocm_frame_of_reference_decode_f32(
         count
     );
 
-    // Step 1: Bit-unpack offsets (parallel in HIP kernel)
-    // Deferred: Real ROCm/HIP parallel bit-unpacking
-    let mask = if bits == 32 {
-        u32::MAX
-    } else {
-        (1u32 << bits) - 1
-    };
-    let mut offsets = Vec::with_capacity(count);
-
-    for i in 0..count {
-        let bit_offset = i * bits as usize;
-        let byte_offset = bit_offset / 8;
-        let bit_in_byte = bit_offset % 8;
-
-        if byte_offset >= packed.len() {
-            break;
-        }
-
-        let mut value = (packed[byte_offset] >> bit_in_byte) as u32;
-
-        if bit_in_byte + bits as usize > 8 && byte_offset + 1 < packed.len() {
-            let next_byte = packed[byte_offset + 1] as u32;
-            value |= next_byte << (8 - bit_in_byte);
-        }
-
-        offsets.push((value & mask) as i32);
-    }
-
-    // Step 2: Add reference back (parallel in HIP kernel)
-    let reference_f32 = reference as f32;
-    let values: Vec<f32> = offsets
-        .iter()
-        .map(|&offset| offset as f32 + reference_f32)
-        .collect();
+    // Deferred: Real ROCm/HIP implementation
+    let result = cpu_fallback::frame_of_reference_decode_f32(packed, reference, bits, count)?;
 
     debug!(
         "✅ [ROCm] FrameOfReference decoded {} bytes → {} values",
         packed.len(),
-        values.len()
+        result.len()
     );
-    Ok(values)
+    Ok(result)
 }
 
 // ============================================================================
@@ -373,38 +273,7 @@ pub fn rocm_zigzag_encode_f32(values: &[f32], bits: u8) -> Result<Vec<u8>> {
     );
 
     // Deferred: Real ROCm/HIP parallel zigzag
-    let zigzag: Vec<i64> = values
-        .iter()
-        .map(|&v| {
-            let n = v.to_bits() as i32;
-            let zz = (n << 1) ^ (n >> 31);
-            zz as i64
-        })
-        .collect();
-
-    // Bit-pack zigzag values
-    let total_bits = zigzag.len() * bits as usize;
-    let byte_count = (total_bits + 7) / 8;
-    let mut result = vec![0u8; byte_count];
-
-    let mask = if bits == 32 {
-        u32::MAX
-    } else {
-        (1u32 << bits) - 1
-    };
-
-    for (i, &zz) in zigzag.iter().enumerate() {
-        let bit_offset = i * bits as usize;
-        let byte_offset = bit_offset / 8;
-        let bit_in_byte = bit_offset % 8;
-
-        let masked_value = (zz as u32) & mask;
-        result[byte_offset] |= ((masked_value << bit_in_byte) & 0xFF) as u8;
-
-        if bit_in_byte + bits as usize > 8 && byte_offset + 1 < result.len() {
-            result[byte_offset + 1] |= (masked_value >> (8 - bit_in_byte)) as u8;
-        }
-    }
+    let result = cpu_fallback::zigzag_encode_f32(values, bits)?;
 
     debug!(
         "✅ [ROCm] Zigzag encoded {} values → {} bytes",
@@ -423,49 +292,15 @@ pub fn rocm_zigzag_decode_f32(packed: &[u8], bits: u8, count: usize) -> Result<V
         count
     );
 
-    // Step 1: Bit-unpack
-    let mask = if bits == 32 {
-        u32::MAX
-    } else {
-        (1u32 << bits) - 1
-    };
-    let mut zigzag = Vec::with_capacity(count);
-
-    for i in 0..count {
-        let bit_offset = i * bits as usize;
-        let byte_offset = bit_offset / 8;
-        let bit_in_byte = bit_offset % 8;
-
-        if byte_offset >= packed.len() {
-            break;
-        }
-
-        let mut value = (packed[byte_offset] >> bit_in_byte) as u32;
-
-        if bit_in_byte + bits as usize > 8 && byte_offset + 1 < packed.len() {
-            let next_byte = packed[byte_offset + 1] as u32;
-            value |= next_byte << (8 - bit_in_byte);
-        }
-
-        zigzag.push((value & mask) as i32);
-    }
-
-    // Step 2: Reverse zigzag (parallel in HIP kernel)
     // Deferred: Real ROCm/HIP parallel zigzag reverse
-    let values: Vec<f32> = zigzag
-        .iter()
-        .map(|&zz| {
-            let n = ((zz as u32) >> 1) as i32 ^ -((zz & 1) as i32);
-            f32::from_bits(n as u32)
-        })
-        .collect();
+    let result = cpu_fallback::zigzag_decode_f32(packed, bits, count)?;
 
     debug!(
         "✅ [ROCm] Zigzag decoded {} bytes → {} values",
         packed.len(),
-        values.len()
+        result.len()
     );
-    Ok(values)
+    Ok(result)
 }
 
 // ============================================================================
@@ -482,7 +317,6 @@ pub fn rocm_pfor_delta_encode_f32(values: &[f32], majority_bits: u8, base: i64) 
     );
 
     // Deferred: Real ROCm/HIP implementation with parallel exception detection
-    // For now, use CPU fallback (complex algorithm)
     anyhow::bail!("ROCm PForDelta encoding not yet implemented - use SIMD fallback")
 }
 
@@ -539,6 +373,22 @@ mod tests {
 
         for (original, recovered) in values.iter().zip(decoded.iter()) {
             assert!((original - recovered).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn test_rocm_bitpack_roundtrip_bits_20() {
+        // Regression for the shared-fallback truncation fix: 20-bit words at
+        // odd byte alignments must round-trip through the ROCm fallback.
+        let words = [0x000F_FFFFu32, 0x000A_5A5A, 0x0000_0001, 0x0008_0001];
+        let values: Vec<f32> = words.iter().map(|&w| f32::from_bits(w)).collect();
+        let mask = (1u32 << 20) - 1;
+
+        let packed = rocm_bitpack_encode_f32(&values, 20).unwrap();
+        let decoded = rocm_bitpack_decode_f32(&packed, 20, values.len()).unwrap();
+
+        for (i, value) in decoded.iter().enumerate() {
+            assert_eq!(value.to_bits(), words[i] & mask, "word {}", i);
         }
     }
 }

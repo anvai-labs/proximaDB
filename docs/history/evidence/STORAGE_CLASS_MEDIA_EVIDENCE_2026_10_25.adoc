@@ -1,0 +1,163 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= Storage-class media evidence: WSL NVMe, local MinIO, EBS scenarios
+// status-as-of: 2026-10-25
+
+== Scope and provenance
+
+Measured on 2026-10-25. These are bounded diagnostics, not production SLO or cloud-price
+benchmarks. No EBS device was attached or measured. No ANN range-cap sweep was run by this
+review. Existing D8 query results were inspected, separately from the new diagnostics.
+Source reconciliation baseline: `c18bb630e` (D8 #2241 merged).
+
+WSL interop inventory (`powershell.exe -NoProfile`, `Get-PhysicalDisk`, `Get-Disk`,
+`Get-Partition`, Ubuntu's registered `BasePath`) identifies a Samsung SSD 990 PRO 2TB,
+NVMe, 2,000,398,934,016 physical bytes, disk 0 / C:. Ubuntu's VHD is on C:.
+Guest `/tmp` is ext4 on `/dev/sde`, a virtual 1 TiB volume. Guest `ROTA=1` describes
+the virtual disk, not the physical medium. Guest has 16 logical CPUs on Ryzen 9 7950X,
+about 126 GiB RAM, kernel `6.18.33.2-microsoft-standard-WSL2`.
+MinIO uses the same host; this does not reproduce a separate cloud storage service.
+
+Artifacts (scripts plus raw values):
+
+* link:storage_class_media_2026_10_25/local_media_probe.py[direct-I/O script]
+  and link:storage_class_media_2026_10_25/local_media_raw.adoc[all 24 local-media arms].
+* link:storage_class_media_2026_10_25/minio_range_probe.py[MinIO script]
+  and link:storage_class_media_2026_10_25/minio_ranges_raw.adoc[all 24 MinIO arms and samples].
+* link:storage_class_media_2026_10_25/d8_existing_result_extract.adoc[D8 extract with source JSON SHA256].
+
+== Local direct-I/O diagnostic: measured
+
+A task-owned 1 GiB file, guest O_DIRECT, aligned mmap buffers, 4/8/16/32/40/64 MiB
+reads, queue depths 1 and 8, contiguous or seeded shuffled offsets. The file was created
+with O_EXCL and removed after the run. No global cache drop or other workload changes.
+At QD8, the contiguous arm distributes consecutive extents across workers; actual device
+completion order is not guaranteed sequential. Wall throughput includes scheduling.
+
+Selected shuffled-offset results:
+
+[cols="1,1,1,1",options="header"]
+|===
+| Queue depth | Read MiB | MiB/s | Median read ms
+| 1 | 8 | 4,273 | 1.76
+| 1 | 40 | 4,794 | 7.52
+| 8 | 8 | 6,348 | 9.12
+| 8 | 40 | 6,480 | 41.09
+|===
+
+At QD1, 40 MiB gives about 12% more bandwidth with 4.27x median latency; at QD8,
+about 2% more bandwidth with 4.51x latency. This compares per-read latency for five
+times the bytes, not equal-work query completion. It does not prove 8 MiB is globally
+optimal. At QD1, adjacent 8/40 MiB reads delivered 4,293/5,143 MiB/s respectively.
+
+Limitations: Windows/VHD caching is uncontrolled despite guest direct I/O, 1 GiB is small
+relative to host RAM, trials share the file, and background workloads were not isolated.
+Reported raw p95 values have only 16–64 samples and are diagnostic, not tail-SLO evidence.
+Do not label the results raw-device sustained bandwidth or cold-NVMe performance.
+
+== Local S3-compatible MinIO: measured
+
+Used existing MinIO `127.0.0.1:12000`; existing Toxiproxy `:12002` adds 5 ms upstream
+and 5 ms downstream latency, zero configured jitter. Proxy settings were read, not changed.
+Created a unique task-owned bucket with one 256 MiB object using multipart upload;
+deleted the experiment object and bucket on completion. Credentials were consumed only
+in memory from the selected local MinIO service, not logged or saved.
+
+Each arm reads eight seeded noncontiguous ranges; response 206 and exact byte count are
+checked. Boto3 drains the body in 1 MiB chunks. QD8 is a single batch of eight requests,
+not a sustained load test. The object and host caches are warm. These results include
+HTTP/client/proxy overhead but no ANN selection, recall, coalescing or decode.
+
+[cols="2,1,1,1,1",options="header"]
+|===
+| Endpoint | QD | Read MiB | MiB/s | Median read ms
+| Direct | 1 | 8 | 1,091 | 7.30
+| Direct | 1 | 40 | 1,438 | 27.77
+| Proxy 5+5 ms | 1 | 8 | 383 | 20.79
+| Proxy 5+5 ms | 1 | 40 | 893 | 44.76
+| Direct | 8 | 8 | 2,627 | 18.14
+| Direct | 8 | 40 | 4,237 | 69.60
+| Proxy 5+5 ms | 8 | 8 | 1,897 | 28.81
+| Proxy 5+5 ms | 8 | 40 | 2,524 | 110.46
+|===
+
+Inference: larger useful transfers amortize fixed request overhead, especially serially.
+Concurrent smaller reads already hide some of it. These runs always requested the full
+range; they do not establish that an ANN query has 40 MiB of useful contiguous bytes.
+With sparse hits, widening reads may increase cost and latency despite higher MiB/s.
+MinIO validates S3-shaped range behavior, not EBS seek time, credits, AWS billing,
+durability, access-tier enforcement or separate-host contention. ds3 was not used.
+
+== Interpolation and EBS extrapolation: derived, not measured
+
+Within the proxy QD1 sample, a simple line through the measured 8 and 40 MiB medians is:
+
+----
+T_ms(size_MiB) ~= 14.80 + 0.7491 * size_MiB
+----
+
+It predicts 26.78 ms at 16 MiB versus measured 26.27, and 38.77 at 32 versus 39.37.
+At 64 MiB it predicts 62.74 versus measured 63.48. This is an in-environment sensitivity
+fit, not a statistical confidence interval or an EBS latency model. Intercept includes
+client/proxy/service overhead and must not be called measured CPU time or pure RTT.
+Larger sizes, sustained concurrency and different hardware need new measurements.
+
+For EBS, replace the media service constraint, not the entire application latency with
+a single NVMe multiplier. A transfer lower bound is `1000 * size_MiB / bandwidth_MiBps`.
+Assume sufficient EC2 EBS bandwidth, no competing traffic, full useful reads and no
+CPU/IOPS/seek bottleneck. HDD rows use credit-depleted 1 TiB baselines:
+
+[cols="2,1,1,1",options="header"]
+|===
+| Scenario | MiB/s | 8 MiB transfer floor | 40 MiB transfer floor
+| gp3 included baseline | 125 | 64 ms | 320 ms
+| gp3 provisioned-throughput scenario | 500 | 16 ms | 80 ms
+| gp2 1 TiB throughput ceiling | 250 | 32 ms | 160 ms
+| st1 1 TiB sustained baseline | 40 | 200 ms | 1,000 ms
+| sc1 1 TiB sustained baseline | 12 | 667 ms | 3,333 ms
+|===
+
+Add backend/seek/queue time and nonoverlapped application work. Small gp2 volumes have
+different capacity-linked limits and credits; the 1 TiB row cannot describe them. SSD
+block I/O accounting may split large application reads; count actual I/Os for the IOPS
+constraint. Eight concurrent requests share the volume bandwidth, not eight copies of it.
+Extra gp3 throughput has a price and provisioning constraints.
+
+Sources checked 2026-10-25:
+https://docs.aws.amazon.com/ebs/latest/userguide/general-purpose.html[SSD limits],
+https://docs.aws.amazon.com/ebs/latest/userguide/hdd-vols.html[HDD baselines],
+https://docs.aws.amazon.com/ebs/latest/userguide/ebs-io-characteristics.html[I/O accounting].
+
+Optimistic bound uses provisioned bandwidth with locality; base includes measured
+application work and expected utilization; pessimistic uses exhausted credits, competing
+traffic and rewarming. No numeric p95/p99 is inferable for unmeasured EBS from this run.
+Use real trace local bytes/query; D8's remote 54.7 MB/query is not a measured L2 demand.
+
+== Existing D8 evidence: inspected, not rerun
+
+Source `/home/vsingh/bench-beds/p5b-runs/d8-10ms-on/result.json`, binary source
+`78e99d2c12b91db42260b63fed9f7ba835600eac`, subsequently merged in #2241.
+The extract records its hash, binary hash, geometry and per-phase counters. One 1M-row,
+128d PAX object; 27 cells; 4 MiB coalescing cap; different 1,000-query sets per phase.
+
+[cols="2,1,1,1,1,1",options="header"]
+|===
+| Phase | GET/q | All requests/q | Remote decimal MB/q | Median ms | Recall@10
+| post-write | 4.874 | 5.875 | 11.286 | 69.42 | 0.9820
+| local disk warm | 4.939 | 5.940 | 11.517 | 105.45 | 0.9813
+| object cold | 18.553 | 19.553 | 54.734 | 107.41 | 0.9822
+|===
+
+Cold wave p50=3, p95=4 (999 observations); warm p50=p95=2. The phase medians are
+observations, not a paired-query causal estimate: query identities differ. Count and
+coverage limitations in TD-PAXDIR-1 remain; these are not provider invoice counts.
+This supports testing the uncovered read paths before promising zero-request residency.
+
+== Decision and remaining gate
+
+Keep the current cap until a controlled production-query sweep proves otherwise. Add cap
+and gap CLI/reporting to the existing harness, verify actual effective sizes, hold geometry
+and query identities fixed, and compare 4/16/40 first, then refine 8/32/64. Record useful
+bytes, request mix, waves, recall, CPU, RSS, p95 and sustained QPS. No global 40 MiB flip.
+Use gp3 as the first EBS candidate; st1/sc1 require demonstrated sequential locality and
+sustained sizing, and gp2 is principally an existing-deployment comparison.

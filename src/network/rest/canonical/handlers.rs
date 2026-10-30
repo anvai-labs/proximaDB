@@ -737,7 +737,9 @@ pub async fn merge_graph_branch(
 /// endpoint that needs the same logic) without service-stub scaffolding.
 ///
 /// Reads the canonical WAL under `data_dir/pgwire/canonical-records.wal`,
-/// filters by `collection`, runs `merge_branches`, and (if `!dry_run`)
+/// filters by `collection`, runs `merge_branches` — or, once the WAL was
+/// truncated, `merge_branches_with_base` over the collection's merge-base
+/// image (410 when its base is gone) — and (if `!dry_run`)
 /// writes the resolutions back through `write_back_merge` with
 /// `origin = "branch_merge:<branch>:<request.target_branch>"`.
 pub async fn merge_graph_branch_inner(
@@ -764,28 +766,56 @@ pub async fn merge_graph_branch_inner(
     }
 
     let wal_path = graph_branch_merge_wal_path(data_dir);
-    if !tokio::fs::try_exists(&wal_path).await.map_err(|err| {
-        ApiError::Internal(format!(
-            "checking canonical WAL {} failed: {}",
-            wal_path.display(),
-            err
-        ))
-    })? {
+    if !crate::services::FramedTableWalAppender::exists_at(&wal_path)
+        .await
+        .map_err(|err| {
+            ApiError::Internal(format!(
+                "checking canonical WAL {} failed: {err:#}",
+                wal_path.display()
+            ))
+        })?
+    {
         return Err(ApiError::NotFound(format!(
             "canonical WAL not found at {}",
             wal_path.display()
         )));
     }
 
-    let entries = crate::services::FramedTableWalAppender::read_entries_from_path(&wal_path)
+    // TD-SEAM-12 hazard 2: the merge base is the main-line history up to the
+    // branch point. Pin everything the WAL still holds for the whole merge
+    // (write-back included), so no truncation runs under it. The base then
+    // comes from the retained history when that is complete for this
+    // collection, or from its merge-base image plus the history above it;
+    // when neither can give it (the collection lost history before it was
+    // branched), refuse with 410 rather than merge against a partial base.
+    let wal = crate::services::FramedTableWalAppender::open_shared(&wal_path)
         .await
         .map_err(|err| {
             ApiError::Internal(format!(
-                "reading canonical WAL {} failed: {}",
-                wal_path.display(),
-                err
+                "opening canonical WAL {} failed: {err:#}",
+                wal_path.display()
             ))
         })?;
+    let (_, _history_pin) = wal
+        .pin_history(&|_| wal.retained_from().saturating_sub(1))
+        .await
+        .map_err(|err| ApiError::Internal(format!("pinning canonical WAL history: {err:#}")))?;
+    let retained_from = wal.retained_from();
+    let entries = wal.read_entries().await.map_err(|err| {
+        ApiError::Internal(format!(
+            "reading canonical WAL {} failed: {err:#}",
+            wal_path.display()
+        ))
+    })?;
+    let bases = if retained_from > 0 {
+        Some(
+            crate::services::branch_base_store::BranchBases::replay(&entries).map_err(|err| {
+                ApiError::Internal(format!("replaying the branch merge bases: {err:#}"))
+            })?,
+        )
+    } else {
+        None
+    };
     // Only this tenant's entries (entries without a tenant are the default
     // tenant's).
     let collection_entries: Vec<_> = filter_canonical_wal_for_collection(entries, collection)
@@ -794,14 +824,48 @@ pub async fn merge_graph_branch_inner(
             proximadb_tenant::resolve_request_tenant(entry.tenant_id.as_deref()) == tenant
         })
         .collect();
-    let report =
-        crate::graph::merge::merge_branches(&collection_entries, branch, &request.target_branch)
-            .ok_or_else(|| {
-                ApiError::NotFound(format!(
-                    "no mergeable branch entries found for collection '{}' source '{}' target '{}'",
-                    collection, branch, request.target_branch
-                ))
-            })?;
+    let not_mergeable = || {
+        ApiError::NotFound(format!(
+            "no mergeable branch entries found for collection '{}' source '{}' target '{}'",
+            collection, branch, request.target_branch
+        ))
+    };
+    // Nothing to merge is a 404 whatever the history: checked before the base,
+    // so an unbranched collection with truncated history is not a 410.
+    if proximadb_storage_common::find_merge_base_lsn(
+        &collection_entries,
+        branch,
+        &request.target_branch,
+    )
+    .is_none()
+    {
+        return Err(not_mergeable());
+    }
+    let gone = |err: &dyn std::fmt::Display| ApiError::Gone(format!("{err} (TD-SEAM-12 hazard 2)"));
+    let base = match &bases {
+        None => crate::services::branch_base_store::MergeBase::Retained,
+        Some(bases) => bases
+            .base_for(
+                &crate::services::canonical_wal::TenantCollection::new(Some(tenant), collection),
+                retained_from,
+            )
+            .map_err(|err| gone(&err))?,
+    };
+    let report = match base {
+        crate::services::branch_base_store::MergeBase::Retained => {
+            crate::graph::merge::merge_branches(&collection_entries, branch, &request.target_branch)
+        }
+        crate::services::branch_base_store::MergeBase::Image(image) => {
+            crate::graph::merge::merge_branches_with_base(
+                &collection_entries,
+                image,
+                branch,
+                &request.target_branch,
+            )
+            .map_err(|err| gone(&err))?
+        }
+    }
+    .ok_or_else(not_mergeable)?;
 
     // If not dry-run, write the merged records to WAL
     let write_back_result = if !request.dry_run {
@@ -1272,6 +1336,10 @@ pub async fn explain_table_write_route(
     let routed = DmlWritePlanner::default()
         .plan(DmlWritePlanRequest {
             target_schema: &target_schema,
+            // The explain path does not resolve the fence eligibility (the
+            // executed route is authoritative); the explained lane may show
+            // bulk where execution would demote to WAL above a DV parent.
+            published_parent_has_deletes: false,
             target_stats: Some(&target_stats),
             source_schema: source_schema.as_ref(),
             source_stats: source_stats.as_ref(),

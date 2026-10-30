@@ -1168,15 +1168,12 @@ mod tests {
             created_at_ns: timestamp_ns,
             updated_at_ns: timestamp_ns,
             record_version: 1,
-            embeddings: vec![EmbeddingCell {
-                model_id: "test".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: dim as u32,
-                values: proximadb_records::EmbeddingValues::Fp32(
-                    (0..dim).map(|i| i as f32 * 0.1).collect(),
-                ),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "test",
+                "dense_vector",
+                dim as u32,
+                (0..dim).map(|i| i as f32 * 0.1).collect(),
+            )],
             ..ProximaRecord::default()
         }
     }
@@ -1275,13 +1272,12 @@ mod tests {
 
         let invalid_records = vec![ProximaRecord {
             oid: "".to_string(), // Empty ID
-            embeddings: vec![EmbeddingCell {
-                model_id: "test".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: 128,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.1; 128]),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "test",
+                "dense_vector",
+                128,
+                vec![0.1; 128],
+            )],
             ..ProximaRecord::default()
         }];
         assert!(bridge.validate_records(&invalid_records).is_err());
@@ -1356,13 +1352,12 @@ mod tests {
 
         let records = vec![ProximaRecord {
             oid: "empty_meta".to_string(),
-            embeddings: vec![EmbeddingCell {
-                model_id: "test".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: 64,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.1; 64]),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "test",
+                "dense_vector",
+                64,
+                vec![0.1; 64],
+            )],
             created_at_ns: 1_234_567_890_000_000,
             updated_at_ns: 1_234_567_890_000_000,
             ..ProximaRecord::default()
@@ -1397,13 +1392,12 @@ mod tests {
         let records = vec![ProximaRecord {
             oid: "nested".to_string(),
             props,
-            embeddings: vec![EmbeddingCell {
-                model_id: "test".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: 32,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.1; 32]),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "test",
+                "dense_vector",
+                32,
+                vec![0.1; 32],
+            )],
             ..ProximaRecord::default()
         }];
 
@@ -1508,13 +1502,12 @@ mod tests {
 
         let rec = ProximaRecord {
             oid: "fp32".to_string(),
-            embeddings: vec![EmbeddingCell {
-                model_id: "test".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: 4,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0, 4.0]),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "test",
+                "dense_vector",
+                4,
+                vec![1.0, 2.0, 3.0, 4.0],
+            )],
             ..ProximaRecord::default()
         };
         let batch = bridge
@@ -1539,13 +1532,12 @@ mod tests {
 
         let fp32_rec = ProximaRecord {
             oid: "fp32".to_string(),
-            embeddings: vec![EmbeddingCell {
-                model_id: "test".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: 2,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![1.0, 2.0]),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "test",
+                "dense_vector",
+                2,
+                vec![1.0, 2.0],
+            )],
             ..ProximaRecord::default()
         };
         let recs = vec![fp32_rec, fp16_record("fp16", &[3.0, 4.0])];

@@ -43,16 +43,12 @@ fn create_test_vectors_with_metadata(
 
             ProximaRecord {
                 oid: format!("vec_{}", i),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    dim: dimension as u32,
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![
-                        (i % 256) as f32;
-                        dimension
-                    ]),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default",
+                    "vector",
+                    dimension as u32,
+                    vec![(i % 256) as f32; dimension],
+                )],
                 props,
                 record_version: 1,
                 created_at_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),

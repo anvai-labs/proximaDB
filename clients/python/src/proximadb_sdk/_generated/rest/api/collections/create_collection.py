@@ -116,6 +116,8 @@ def sync_detailed(
                 "enable_proxima_record": true
             }
             ```
+            Unknown fields are rejected (TD-RESTGET-1): a misspelt setting used to be
+            dropped, and the collection silently got the default instead.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -184,6 +186,8 @@ def sync(
                 "enable_proxima_record": true
             }
             ```
+            Unknown fields are rejected (TD-RESTGET-1): a misspelt setting used to be
+            dropped, and the collection silently got the default instead.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -247,6 +251,8 @@ async def asyncio_detailed(
                 "enable_proxima_record": true
             }
             ```
+            Unknown fields are rejected (TD-RESTGET-1): a misspelt setting used to be
+            dropped, and the collection silently got the default instead.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -313,6 +319,8 @@ async def asyncio(
                 "enable_proxima_record": true
             }
             ```
+            Unknown fields are rejected (TD-RESTGET-1): a misspelt setting used to be
+            dropped, and the collection silently got the default instead.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

@@ -46,6 +46,197 @@ pub struct LocalConfig {
     pub sync_enabled: bool,
 }
 
+/// What this process knows about which directory entries are durable.
+/// Process-wide because directories are; paths are absolute. One small mutex,
+/// held only for set operations, never across I/O.
+#[derive(Default)]
+struct EntryDurability {
+    /// Directories whose own entry (in their parent) is durable: a
+    /// [`sync_new_entries`] walk fsynced every directory above it — up to the
+    /// filesystem root or another such directory — and completed.
+    durable_dirs: std::collections::HashSet<PathBuf>,
+    /// Trees being removed or moved ([`TreeRemoval`]); nothing under them is
+    /// trusted durable.
+    removing: Vec<PathBuf>,
+    /// Bumped by every eviction.
+    epoch: u64,
+    /// The last [`EVICTION_LOG`] evictions, oldest first, with the epoch each
+    /// produced: a walk records nothing under a path evicted while it ran,
+    /// since what it synced there may be gone.
+    evictions: std::collections::VecDeque<(u64, PathBuf)>,
+}
+
+const EVICTION_LOG: usize = 1024;
+
+impl EntryDurability {
+    fn trusted(&self, dir: &Path) -> bool {
+        self.durable_dirs.contains(dir) && !self.removing.iter().any(|r| dir.starts_with(r))
+    }
+
+    fn forget_under(&mut self, path: &Path) {
+        self.epoch += 1;
+        self.evictions.push_back((self.epoch, path.to_path_buf()));
+        if self.evictions.len() > EVICTION_LOG {
+            self.evictions.pop_front();
+        }
+        self.durable_dirs.retain(|dir| !dir.starts_with(path));
+    }
+
+    /// Record what a walk that started at epoch `since` made durable, except
+    /// under paths evicted since — or nothing, if the log no longer reaches
+    /// back that far.
+    fn record_walk(&mut self, since: u64, dirs: Vec<&Path>) {
+        if self.epoch != since
+            && self
+                .evictions
+                .front()
+                .is_none_or(|(oldest, _)| *oldest > since + 1)
+        {
+            return;
+        }
+        let evicted: Vec<PathBuf> = self
+            .evictions
+            .iter()
+            .filter(|(epoch, _)| *epoch > since)
+            .map(|(_, path)| path.clone())
+            .collect();
+        for dir in dirs {
+            if !evicted.iter().any(|path| dir.starts_with(path)) {
+                self.durable_dirs.insert(dir.to_path_buf());
+            }
+        }
+    }
+}
+
+fn entry_durability() -> &'static parking_lot::Mutex<EntryDurability> {
+    static STATE: std::sync::OnceLock<parking_lot::Mutex<EntryDurability>> =
+        std::sync::OnceLock::new();
+    STATE.get_or_init(Default::default)
+}
+
+/// Brackets the removal or move of a directory tree. Until dropped nothing
+/// under it is trusted durable and walks overlapping it record nothing; when
+/// dropped, what was known under it is forgotten — re-created at the same
+/// path, its entries must be synced afresh.
+struct TreeRemoval(Option<PathBuf>);
+
+impl TreeRemoval {
+    fn begin(path: &Path) -> Self {
+        let Ok(path) = std::path::absolute(path) else {
+            return Self(None);
+        };
+        let mut state = entry_durability().lock();
+        state.forget_under(&path);
+        state.removing.push(path.clone());
+        Self(Some(path))
+    }
+}
+
+impl Drop for TreeRemoval {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let mut state = entry_durability().lock();
+            state.forget_under(&path);
+            if let Some(i) = state.removing.iter().position(|r| *r == path) {
+                state.removing.swap_remove(i);
+            }
+        }
+    }
+}
+
+/// Make `path`'s directory entry durable, and the entries of every directory
+/// above it not yet known durable: fsync its parent, then walk up, fsyncing
+/// each parent, until reaching a directory known durable or the filesystem
+/// root. A file's own fsync covers its data, not the entries that name it —
+/// after a power loss the file could otherwise vanish while callers (WAL
+/// truncation) already rely on it.
+///
+/// "Already exists" is not "durable": a concurrent writer may have just
+/// created an ancestor. So a directory is recorded durable only once a whole
+/// walk through it has succeeded — a concurrent walker stops at it trusting
+/// every entry above it — and not under a tree evicted while it ran.
+/// `path_is_dir`: `path` is a directory, itself recorded durable too.
+///
+/// `root` (the configured root) decides which syncs are required: the
+/// parent's, and any inside the root. Above the root (or with none) an
+/// ancestor this process cannot open, or a read-only one, cannot be fsynced by
+/// it at all; failing would break every write for a guarantee no retry gives.
+async fn sync_new_entries(path: &Path, root: Option<&Path>, path_is_dir: bool) -> FsResult<()> {
+    let path = std::path::absolute(path).map_err(FilesystemError::Io)?;
+    let root = root
+        .map(std::path::absolute)
+        .transpose()
+        .map_err(FilesystemError::Io)?;
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let epoch = entry_durability().lock().epoch;
+    let mut made_durable: Vec<&Path> = Vec::new();
+    if path_is_dir {
+        made_durable.push(&path);
+    }
+    let mut dir = parent;
+    loop {
+        let required = dir == parent || root.as_deref().is_some_and(|r| dir.starts_with(r));
+        sync_dir(dir, required).await?;
+        if entry_durability().lock().trusted(dir) {
+            break;
+        }
+        made_durable.push(dir);
+        let Some(up) = dir.parent() else {
+            break;
+        };
+        dir = up;
+    }
+    let mut state = entry_durability().lock();
+    state.record_walk(epoch, made_durable);
+    Ok(())
+}
+
+/// fsync a directory. EINVAL/EBADF — filesystems that cannot fsync a directory
+/// (some FUSE and network mounts) — are tolerated, as PostgreSQL does: there is
+/// nothing stronger to do there, and failing would break every write. Unless
+/// `required`, so are EACCES/EPERM/EROFS (see [`sync_new_entries`]).
+#[cfg(unix)]
+async fn sync_dir(dir: &Path, required: bool) -> FsResult<()> {
+    let dir = dir.to_path_buf();
+    #[cfg(test)]
+    synced_dirs_for_tests().lock().push(dir.clone());
+    let opened = dir.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        std::fs::File::open(&opened).and_then(|d| d.sync_all())
+    })
+    .await
+    .map_err(|e| FilesystemError::Io(std::io::Error::other(e)))?;
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL) | Some(libc::EBADF)) => Ok(()),
+        Err(e)
+            if !required
+                && matches!(
+                    e.raw_os_error(),
+                    Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::EROFS)
+                ) =>
+        {
+            tracing::debug!(dir = %dir.display(), error = %e, "ancestor directory not fsynced");
+            Ok(())
+        }
+        Err(e) => Err(FilesystemError::Io(e)),
+    }
+}
+
+#[cfg(not(unix))]
+async fn sync_dir(_dir: &Path, _required: bool) -> FsResult<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn synced_dirs_for_tests() -> &'static parking_lot::Mutex<Vec<PathBuf>> {
+    static SYNCED: std::sync::OnceLock<parking_lot::Mutex<Vec<PathBuf>>> =
+        std::sync::OnceLock::new();
+    SYNCED.get_or_init(Default::default)
+}
+
 impl Default for LocalConfig {
     fn default() -> Self {
         Self {
@@ -150,6 +341,16 @@ impl LocalFileSystem {
                     "Root path is not a directory: {}",
                     root_dir.display()
                 )));
+            }
+            // Make the root's own entry durable once, so per-write walks stop
+            // at it. If that fails, the root is not recorded durable and those
+            // walks continue above it, under their rules — where an ancestor
+            // this process cannot fsync is tolerated, as it is here only
+            // through this warning.
+            if config.sync_enabled
+                && let Err(e) = sync_new_entries(root_dir, None, true).await
+            {
+                warn!(root = %root_dir.display(), error = %e, "root directory entry not fsynced");
             }
         }
 
@@ -347,6 +548,16 @@ impl LocalFileSystem {
                     root_dir.display()
                 )));
             }
+            // Make the root's own entry durable once, so per-write walks stop
+            // at it. If that fails, the root is not recorded durable and those
+            // walks continue above it, under their rules — where an ancestor
+            // this process cannot fsync is tolerated, as it is here only
+            // through this warning.
+            if config.sync_enabled
+                && let Err(e) = sync_new_entries(root_dir, None, true).await
+            {
+                warn!(root = %root_dir.display(), error = %e, "root directory entry not fsynced");
+            }
         }
 
         Ok(Self {
@@ -456,6 +667,9 @@ impl FileSystem for LocalFileSystem {
     }
 
     async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
+        let started = std::time::Instant::now();
+        #[cfg(test)]
+        super::latency::inject().await;
         // Extract path from URL
         let path_str = self.resolve_path(path)?;
         let resolved_path = PathBuf::from(path_str);
@@ -496,7 +710,7 @@ impl FileSystem for LocalFileSystem {
             },
         };
         if let Ok(ref bytes) = result {
-            super::record_physical_full_read(bytes.len() as u64);
+            super::record_physical_full_read(bytes.len() as u64, started);
         }
         result
     }
@@ -591,6 +805,11 @@ impl FileSystem for LocalFileSystem {
 
             // Sync data to disk to prevent truncation issues
             file.sync_all().await.map_err(FilesystemError::Io)?;
+            // Even an overwrite: "exists" is not "durable" — the entry may be
+            // one an earlier attempt (this process or one that crashed), a
+            // rename, or another writer created and never synced. In a
+            // durable directory this is one fsync.
+            sync_new_entries(&resolved_path, self.config.root_dir.as_deref(), false).await?;
         } else {
             // Fast write without sync (for development/testing only)
             fs::write(&resolved_path, data_to_write)
@@ -653,6 +872,8 @@ impl FileSystem for LocalFileSystem {
             .map_err(FilesystemError::Io)?;
         if self.config.sync_enabled {
             file.sync_all().await.map_err(FilesystemError::Io)?;
+            // The commit point is the directory entry, not only the bytes.
+            sync_new_entries(&resolved_path, self.config.root_dir.as_deref(), false).await?;
         }
         Ok(())
     }
@@ -696,9 +917,15 @@ impl FileSystem for LocalFileSystem {
         }
 
         if resolved_path.is_dir() {
-            fs::remove_dir_all(&resolved_path)
-                .await
-                .map_err(FilesystemError::Io)
+            // The guard lives with the blocking removal: a cancelled caller
+            // must not end it while the removal still runs.
+            tokio::task::spawn_blocking(move || {
+                let _removal = TreeRemoval::begin(&resolved_path);
+                std::fs::remove_dir_all(&resolved_path)
+            })
+            .await
+            .map_err(|e| FilesystemError::Io(std::io::Error::other(e)))?
+            .map_err(FilesystemError::Io)
         } else {
             fs::remove_file(&resolved_path)
                 .await
@@ -707,12 +934,18 @@ impl FileSystem for LocalFileSystem {
     }
 
     async fn exists(&self, path: &str) -> FsResult<bool> {
-        let path_str = self.resolve_path(path)?;
-        let resolved_path = PathBuf::from(path_str);
-        Ok(resolved_path.exists())
+        super::traced_request(super::TracedOp::Head, async move {
+            let path_str = self.resolve_path(path)?;
+            let resolved_path = PathBuf::from(path_str);
+            Ok(resolved_path.exists())
+        })
+        .await
     }
 
     async fn read_range(&self, path: &str, offset: u64, length: u64) -> FsResult<Vec<u8>> {
+        let started = std::time::Instant::now();
+        #[cfg(test)]
+        super::latency::inject().await;
         // ADR-030 / TD-158: this is the leaf physical-GET boundary. Feed the per-query
         // I/O accumulator once per successful ranged read — `UnifiedCachingFilesystem`
         // serves cache hits without delegating here, so `range_gets` reflects TRUE
@@ -843,7 +1076,7 @@ impl FileSystem for LocalFileSystem {
         }
         .await;
         if let Ok(ref bytes) = result {
-            super::record_physical_range_read(bytes.len() as u64);
+            super::record_physical_range_read(bytes.len() as u64, started);
             if std::env::var_os("PROXIMADB_TRACE_GETS").is_some() {
                 eprintln!("[FS GET] {path} off={offset} len={length}");
             }
@@ -852,85 +1085,91 @@ impl FileSystem for LocalFileSystem {
     }
 
     async fn metadata(&self, path: &str) -> FsResult<FileMetadata> {
-        let path_str = self.resolve_path(path)?;
-        let resolved_path = PathBuf::from(path_str);
+        super::traced_request(super::TracedOp::Head, async move {
+            let path_str = self.resolve_path(path)?;
+            let resolved_path = PathBuf::from(path_str);
 
-        let metadata = if self.config.follow_symlinks {
-            fs::metadata(&resolved_path).await
-        } else {
-            fs::symlink_metadata(&resolved_path).await
-        };
+            let metadata = if self.config.follow_symlinks {
+                fs::metadata(&resolved_path).await
+            } else {
+                fs::symlink_metadata(&resolved_path).await
+            };
 
-        match metadata {
-            Ok(meta) => Ok(self.convert_metadata(&resolved_path, &meta)),
-            Err(e) => match e.kind() {
-                std::io::ErrorKind::NotFound => Err(FilesystemError::NotFound(
-                    resolved_path.display().to_string(),
-                )),
-                _ => Err(FilesystemError::Io(e)),
-            },
-        }
+            match metadata {
+                Ok(meta) => Ok(self.convert_metadata(&resolved_path, &meta)),
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::NotFound => Err(FilesystemError::NotFound(
+                        resolved_path.display().to_string(),
+                    )),
+                    _ => Err(FilesystemError::Io(e)),
+                },
+            }
+        })
+        .await
     }
 
     async fn list(&self, path: &str) -> FsResult<Vec<DirEntry>> {
-        // Extract path from URL
-        let path_str = self.resolve_path(path)?;
+        super::traced_request(super::TracedOp::List, async move {
+            // Extract path from URL
+            let path_str = self.resolve_path(path)?;
 
-        let resolved_path = PathBuf::from(path_str);
+            let resolved_path = PathBuf::from(path_str);
 
-        let mut entries = Vec::new();
-        let mut dir = fs::read_dir(&resolved_path)
-            .await
-            .map_err(FilesystemError::Io)?;
+            let mut entries = Vec::new();
+            let mut dir = fs::read_dir(&resolved_path)
+                .await
+                .map_err(FilesystemError::Io)?;
 
-        while let Some(entry) = dir.next_entry().await.map_err(FilesystemError::Io)? {
-            let entry_path = entry.path();
-            let name = entry_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| {
-                    FilesystemError::InvalidPath(format!(
-                        "Invalid filename encoding for path: {}",
-                        entry_path.display()
-                    ))
-                })?
-                .to_string();
+            while let Some(entry) = dir.next_entry().await.map_err(FilesystemError::Io)? {
+                let entry_path = entry.path();
+                let name = entry_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| {
+                        FilesystemError::InvalidPath(format!(
+                            "Invalid filename encoding for path: {}",
+                            entry_path.display()
+                        ))
+                    })?
+                    .to_string();
 
-            let metadata = entry.metadata().await.map_err(FilesystemError::Io)?;
-            let file_metadata = self.convert_metadata(&entry_path, &metadata);
+                let metadata = entry.metadata().await.map_err(FilesystemError::Io)?;
+                let file_metadata = self.convert_metadata(&entry_path, &metadata);
 
-            // Create full URL for entry (stateless design)
-            let entry_url = if path.starts_with("file://./") || path.starts_with("./") {
-                // For relative URLs, preserve the relative nature
-                if let Some(root_dir) = &self.config.root_dir {
-                    let relative_from_root = entry_path.strip_prefix(root_dir).map_or_else(
-                        |_| entry_path.display().to_string(),
-                        |p| p.to_string_lossy().to_string(),
-                    );
-                    format!("file://./{}", relative_from_root)
+                // Create full URL for entry (stateless design)
+                let entry_url = if path.starts_with("file://./") || path.starts_with("./") {
+                    // For relative URLs, preserve the relative nature
+                    if let Some(root_dir) = &self.config.root_dir {
+                        let relative_from_root = entry_path.strip_prefix(root_dir).map_or_else(
+                            |_| entry_path.display().to_string(),
+                            |p| p.to_string_lossy().to_string(),
+                        );
+                        format!("file://./{}", relative_from_root)
+                    } else {
+                        // No root_dir, but path is relative - preserve relative nature
+                        format!("file://{}", entry_path.display())
+                    }
                 } else {
-                    // No root_dir, but path is relative - preserve relative nature
+                    // Absolute path
                     format!("file://{}", entry_path.display())
-                }
-            } else {
-                // Absolute path
-                format!("file://{}", entry_path.display())
-            };
-            // Per-file logging removed - too verbose for production
-            // Use trace only if debugging specific file issues
-            trace!("LocalFileSystem entry: '{}' -> {:?}", entry_url, entry_path);
+                };
+                // Per-file logging removed - too verbose for production
+                // Use trace only if debugging specific file issues
+                trace!("LocalFileSystem entry: '{}' -> {:?}", entry_url, entry_path);
 
-            entries.push(DirEntry {
-                name,
-                url: entry_url, // Use full URL instead of path
-                metadata: file_metadata,
-            });
-        }
+                entries.push(DirEntry {
+                    name,
+                    url: entry_url, // Use full URL instead of path
+                    metadata: file_metadata,
+                });
+            }
 
-        // Sort entries by name for consistent ordering
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
+            // Sort entries by name for consistent ordering
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
 
-        Ok(entries)
+            Ok(entries)
+        })
+        .await
     }
 
     async fn create_dir(&self, path: &str) -> FsResult<()> {
@@ -1017,7 +1256,18 @@ impl FileSystem for LocalFileSystem {
         }
 
         trace!("Attempting rename from {:?} to {:?}", from_path, to_path);
-        let result = fs::rename(&from_path, &to_path).await.map_err(|e| {
+        // A moved directory's guards live with the blocking rename: a
+        // cancelled caller must not end them while the rename still runs.
+        let (from, to) = (from_path.clone(), to_path.clone());
+        let result = tokio::task::spawn_blocking(move || {
+            let _removals = from
+                .is_dir()
+                .then(|| (TreeRemoval::begin(&from), TreeRemoval::begin(&to)));
+            std::fs::rename(&from, &to)
+        })
+        .await
+        .map_err(|e| FilesystemError::Io(std::io::Error::other(e)))?
+        .map_err(|e| {
             debug!("Rename failed, will try copy: {}", e);
             FilesystemError::Io(e)
         });
@@ -2007,6 +2257,130 @@ mod tests {
                 &read_data, expected_data,
                 "Data verification failed after concurrent sync for {}",
                 path
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_synced_write_into_new_directories_creates_and_syncs_the_whole_chain() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().canonicalize().unwrap();
+        let fs = LocalFileSystem::new(LocalConfig {
+            root_dir: Some(root.clone()),
+            sync_enabled: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let options = Some(FileOptions {
+            create_dirs: true,
+            ..Default::default()
+        });
+        fs.write_if_absent("spill/t1/orders/seg.parquet", b"x", options.clone())
+            .await
+            .unwrap();
+        let synced = synced_dirs_for_tests().lock().clone();
+        for dir in [
+            root.join("spill/t1/orders"),
+            root.join("spill/t1"),
+            root.join("spill"),
+            root.clone(),
+        ] {
+            assert!(
+                synced.contains(&dir),
+                "{} was not fsynced: {synced:?}",
+                dir.display()
+            );
+        }
+        let durable = |dir: &Path| entry_durability().lock().trusted(dir);
+        assert!(durable(&root.join("spill/t1/orders")));
+        assert!(
+            durable(&root),
+            "the constructor made the root's entry durable"
+        );
+
+        // A second file in a now-durable directory syncs only its parent.
+        let before = synced_dirs_for_tests().lock().len();
+        fs.write_if_absent("spill/t1/orders/seg2.parquet", b"y", options.clone())
+            .await
+            .unwrap();
+        let after = synced_dirs_for_tests().lock().clone();
+        let new: Vec<_> = after[before..]
+            .iter()
+            .filter(|d| d.starts_with(&root))
+            .collect();
+        assert_eq!(new, vec![&root.join("spill/t1/orders")], "only the parent");
+
+        // An overwrite in a durable directory syncs only its parent.
+        let before = synced_dirs_for_tests().lock().len();
+        fs.write("spill/t1/orders/seg2.parquet", b"z", None)
+            .await
+            .unwrap();
+        let after = synced_dirs_for_tests().lock().clone();
+        let new: Vec<_> = after[before..]
+            .iter()
+            .filter(|d| d.starts_with(&root))
+            .collect();
+        assert_eq!(new, vec![&root.join("spill/t1/orders")], "only the parent");
+        assert_eq!(
+            std::fs::read(root.join("spill/t1/orders/seg2.parquet")).unwrap(),
+            b"z"
+        );
+
+        // A file that already exists is not therefore durable — an earlier
+        // attempt, or a process that crashed, may have created it and never
+        // synced its entry: the overwrite walks the chain.
+        std::fs::create_dir_all(root.join("retry/a")).unwrap();
+        std::fs::write(root.join("retry/a/f"), b"partial").unwrap();
+        let before = synced_dirs_for_tests().lock().len();
+        fs.write("retry/a/f", b"whole", None).await.unwrap();
+        let after = synced_dirs_for_tests().lock().clone();
+        for dir in [root.join("retry/a"), root.join("retry"), root.clone()] {
+            assert!(
+                after[before..].contains(&dir),
+                "{} not fsynced",
+                dir.display()
+            );
+        }
+
+        // While a tree is being removed nothing under it is trusted, and what
+        // a walk overlapping the removal learns is forgotten after it.
+        let removal = TreeRemoval::begin(&root.join("spill"));
+        let before = synced_dirs_for_tests().lock().len();
+        fs.write_if_absent("spill/t1/orders/seg3.parquet", b"w", options.clone())
+            .await
+            .unwrap();
+        let after = synced_dirs_for_tests().lock().clone();
+        assert!(
+            after[before..].contains(&root.join("spill")),
+            "walked past the tree being removed"
+        );
+        drop(removal);
+        assert!(!durable(&root.join("spill/t1/orders")));
+
+        // A deleted directory is forgotten: re-created, it is synced again.
+        fs.write_if_absent("spill/t1/orders/seg4.parquet", b"v", options.clone())
+            .await
+            .unwrap();
+        assert!(durable(&root.join("spill/t1/orders")));
+        fs.delete("spill").await.unwrap();
+        assert!(!durable(&root.join("spill")));
+        assert!(!durable(&root.join("spill/t1/orders")));
+        let before = synced_dirs_for_tests().lock().len();
+        fs.write_if_absent("spill/t1/orders/seg.parquet", b"x", options)
+            .await
+            .unwrap();
+        let after = synced_dirs_for_tests().lock().clone();
+        for dir in [
+            root.join("spill/t1/orders"),
+            root.join("spill/t1"),
+            root.join("spill"),
+            root.clone(),
+        ] {
+            assert!(
+                after[before..].contains(&dir),
+                "{} not re-synced",
+                dir.display()
             );
         }
     }

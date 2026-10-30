@@ -16,8 +16,8 @@
 //! now live here and hold `Arc<dyn ObservabilityStoragePort>`.
 //! The root composition root injects the concrete WAL-backed
 //! `ObservabilityStorage` (which impls the port). The format *adapters*
-//! (OTLP/Syslog/CEF/… ingress servers), `graph_linking` (orphan/dead code), and
-//! `storage/` (WAL up-edges) remain in the root `src/observability/`, as does
+//! (OTLP/Syslog/CEF/… ingress servers) and `storage/` (WAL up-edges) remain in
+//! the root `src/observability/`, as does
 //! the `impl ObservabilityStorageOperations` (root-local trait).
 //!
 //! **Slice 2a** extracted `rank_metrics` (rank-pipeline Prometheus metrics —

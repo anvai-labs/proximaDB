@@ -11,104 +11,18 @@
 //!   3. asserts a SECOND recluster job appears and completes *on its own* — the
 //!      flywheel: writes -> drift -> on_signal -> recluster -> republish.
 //!
-//! Own server harness per the tests/ convention (one ProximaDB boot per process
-//! — the global WAL manifest is a process singleton).
+//! Shared pg_server harness (one ProximaDB boot per process — the global WAL
+//! manifest is a process singleton).
 
-use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
-use proximadb::core::Config;
-use proximadb::database::ProximaDB;
 use serde_json::json;
-use tempfile::TempDir;
 use tokio::time::sleep;
 
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
-}
+#[path = "common/pg_server.rs"]
+mod pg_server;
 
-fn nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
-}
-
-struct DiscoveryServer {
-    rest_port: u16,
-    db: Option<ProximaDB>,
-    _tmp_data: TempDir,
-}
-
-impl DiscoveryServer {
-    async fn start() -> anyhow::Result<Self> {
-        let rest_port = free_port();
-        let grpc_port = free_port();
-        let flight_port = free_port();
-        let pg_port = free_port();
-        let tmp_data = TempDir::new()?;
-
-        let mut config = Config::default();
-        config.server.bind_address = "127.0.0.1".to_string();
-        config.server.port = rest_port;
-        config.server.data_dir = tmp_data.path().to_path_buf();
-        config.api.rest_port = rest_port;
-        config.api.grpc_port = grpc_port;
-        config.api.arrow_flight_port = flight_port;
-        config.api.pg_port = Some(pg_port);
-        config.api.unified_mode = false;
-        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
-            url: format!("file://{}", tmp_data.path().display()),
-            ..Default::default()
-        }];
-        config.storage.wal_config.write_buffer_directory =
-            format!("file://{}/wal", tmp_data.path().display());
-
-        let mut db = ProximaDB::new(config).await?;
-        db.start().await?;
-
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .no_proxy()
-            .build()?;
-        let health_url = format!("http://127.0.0.1:{}/health", rest_port);
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            match http_client.get(&health_url).send().await {
-                Ok(resp) if resp.status().is_success() => break,
-                _ => {
-                    if Instant::now() > deadline {
-                        anyhow::bail!("REST didn't become ready in 15s");
-                    }
-                    sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-
-        Ok(Self {
-            rest_port,
-            db: Some(db),
-            _tmp_data: tmp_data,
-        })
-    }
-
-    fn base_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.rest_port)
-    }
-}
-
-impl Drop for DiscoveryServer {
-    fn drop(&mut self) {
-        if let Some(mut db) = self.db.take() {
-            tokio::spawn(async move {
-                let _ = db.shutdown().await;
-            });
-        }
-    }
-}
+use pg_server::TestPgServer;
 
 /// Count of `complete` recluster jobs for a collection.
 async fn complete_recluster_count(http: &reqwest::Client, base: &str, name: &str) -> usize {
@@ -187,14 +101,9 @@ async fn drift_watcher_auto_reclusters_after_writes() {
         std::env::set_var("PROXIMADB_DRIFT_INTERVAL_SECS", "1");
     }
 
-    let server = DiscoveryServer::start().await.expect("server start");
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .no_proxy()
-        .build()
-        .unwrap();
-    let base = server.base_url();
-    let name = format!("disc_drift_{}", nanos());
+    let server = TestPgServer::start().await.expect("server start");
+    let (http, base) = server.rest_client().expect("rest client");
+    let name = server.unique_name("disc_drift");
     let dim: usize = 8;
 
     // CREATE.
@@ -282,7 +191,7 @@ async fn drift_watcher_auto_reclusters_after_writes() {
     //    be reclustered automatically once its vectors are indexed. This proves
     //    the watcher sweeps served-index collections (not just those with prior
     //    discovery history) — the autonomy gap that history-gating left open.
-    let fresh = format!("disc_bootstrap_{}", nanos());
+    let fresh = server.unique_name("disc_bootstrap");
     let create = http
         .post(format!("{base}/api/v2/collections"))
         .json(&json!({

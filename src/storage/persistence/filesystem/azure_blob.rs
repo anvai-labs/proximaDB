@@ -123,21 +123,12 @@ impl AzureBlobFileSystem {
 
     /// Parse `abfs://container/blob` (or `adls://`/`az://`/`azure://`).
     fn parse(path: &str) -> FsResult<(String, String)> {
-        let rest = path
-            .strip_prefix("abfs://")
-            .or_else(|| path.strip_prefix("adls://"))
-            .or_else(|| path.strip_prefix("az://"))
-            .or_else(|| path.strip_prefix("azure://"))
-            .ok_or_else(|| FilesystemError::InvalidPath(format!("not an azure path: {path}")))?;
-        let (container, blob) = rest.split_once('/').ok_or_else(|| {
-            FilesystemError::InvalidPath(format!("missing blob in azure path: {path}"))
-        })?;
-        if container.is_empty() || blob.is_empty() {
-            return Err(FilesystemError::InvalidPath(format!(
-                "bad azure path: {path}"
-            )));
-        }
-        Ok((container.to_string(), blob.to_string()))
+        super::split_object_url(
+            path,
+            &["abfs://", "adls://", "az://", "azure://"],
+            ("an", "azure"),
+            "blob",
+        )
     }
 
     /// Build (and cache) an `ObjectStore` for a container.
@@ -198,23 +189,25 @@ impl FileSystem for AzureBlobFileSystem {
     }
 
     async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
+        let started = std::time::Instant::now();
         let (container, blob) = Self::parse(path)?;
         let store = self.store_for(&container)?;
         let result = store
             .get(&ObjPath::from(blob))
             .await
-            .map_err(|e| Self::net("Azure get", e))?;
+            .map_err(|e| super::object_store_errors::object_error("Azure get", path, e))?;
         let bytes = result
             .bytes()
             .await
             .map_err(|e| Self::net("Azure body", e))?;
         let bytes = bytes.to_vec();
-        super::record_physical_full_read(bytes.len() as u64);
+        super::record_physical_full_read(bytes.len() as u64, started);
         Ok(bytes)
     }
 
     /// ADR-023 cold path: a TRUE ranged blob GET — fetches only `[offset, +length)`.
     async fn read_range(&self, path: &str, offset: u64, length: u64) -> FsResult<Vec<u8>> {
+        let started = std::time::Instant::now();
         if length == 0 {
             return Ok(Vec::new());
         }
@@ -223,10 +216,10 @@ impl FileSystem for AzureBlobFileSystem {
         let bytes = store
             .get_range(&ObjPath::from(blob), offset..(offset + length))
             .await
-            .map_err(|e| Self::net("Azure get_range", e))?;
+            .map_err(|e| super::object_store_errors::object_error("Azure get_range", path, e))?;
         // ADR-030 / TD-158: physical GET boundary — feed the per-query I/O accumulator
         // (task-local; no-op outside a query scope). Always-on core counters.
-        super::record_physical_range_read(bytes.len() as u64);
+        super::record_physical_range_read(bytes.len() as u64, started);
         Ok(bytes.to_vec())
     }
 
@@ -250,13 +243,13 @@ impl FileSystem for AzureBlobFileSystem {
                 store
                     .put_opts(&dst, payload, opts)
                     .await
-                    .map_err(|e| Self::net("Azure put_opts", e))?;
+                    .map_err(|e| super::object_store_errors::denied("Azure put_opts", e))?;
             }
             None => {
                 store
                     .put(&dst, payload)
                     .await
-                    .map_err(|e| Self::net("Azure put", e))?;
+                    .map_err(|e| super::object_store_errors::denied("Azure put", e))?;
             }
         }
         Ok(())
@@ -348,7 +341,10 @@ impl FileSystem for AzureBlobFileSystem {
             Err(object_store::Error::AlreadyExists { .. }) => {
                 Err(FilesystemError::AlreadyExists(path.to_string()))
             }
-            Err(error) => Err(Self::net("Azure conditional put", error)),
+            Err(error) => Err(super::object_store_errors::denied(
+                "Azure conditional put",
+                error,
+            )),
         }
     }
 
@@ -364,54 +360,66 @@ impl FileSystem for AzureBlobFileSystem {
         store
             .delete(&ObjPath::from(blob))
             .await
-            .map_err(|e| Self::net("Azure delete", e))?;
+            .map_err(|e| super::object_store_errors::object_error("Azure delete", path, e))?;
         Ok(())
     }
 
     async fn exists(&self, path: &str) -> FsResult<bool> {
-        let (container, blob) = Self::parse(path)?;
-        let store = self.store_for(&container)?;
-        Ok(store.head(&ObjPath::from(blob)).await.is_ok())
+        super::traced_request(super::TracedOp::Head, async move {
+            let (container, blob) = Self::parse(path)?;
+            let store = self.store_for(&container)?;
+            super::object_store_errors::exists_from_head(
+                "Azure head",
+                store.head(&ObjPath::from(blob)).await,
+            )
+        })
+        .await
     }
 
     async fn metadata(&self, path: &str) -> FsResult<FsFileMetadata> {
-        let (container, blob) = Self::parse(path)?;
-        let store = self.store_for(&container)?;
-        let meta = store
-            .head(&ObjPath::from(blob))
-            .await
-            .map_err(|e| Self::net("Azure head", e))?;
-        Ok(FsFileMetadata {
-            path: path.to_string(),
-            size: meta.size,
-            is_directory: false,
-            etag: meta.e_tag,
-            ..Default::default()
+        super::traced_request(super::TracedOp::Head, async move {
+            let (container, blob) = Self::parse(path)?;
+            let store = self.store_for(&container)?;
+            let meta = store
+                .head(&ObjPath::from(blob))
+                .await
+                .map_err(|e| super::object_store_errors::object_error("Azure head", path, e))?;
+            Ok(FsFileMetadata {
+                path: path.to_string(),
+                size: meta.size,
+                is_directory: false,
+                etag: meta.e_tag,
+                ..Default::default()
+            })
         })
+        .await
     }
 
     async fn list(&self, path: &str) -> FsResult<Vec<DirEntry>> {
-        let (container, prefix) = Self::parse(path)?;
-        let store = self.store_for(&container)?;
-        let mut stream = store.list(Some(&ObjPath::from(prefix)));
-        let mut entries = Vec::new();
-        while let Some(meta) = stream.next().await {
-            let meta = meta.map_err(|e| Self::net("Azure list", e))?;
-            let key = meta.location.to_string();
-            let name = key.rsplit('/').next().unwrap_or(&key).to_string();
-            entries.push(DirEntry {
-                name,
-                url: format!("az://{container}/{key}"),
-                metadata: FsFileMetadata {
-                    path: format!("az://{container}/{key}"),
-                    size: meta.size,
-                    is_directory: false,
-                    etag: meta.e_tag,
-                    ..Default::default()
-                },
-            });
-        }
-        Ok(entries)
+        super::traced_request(super::TracedOp::List, async move {
+            let (container, prefix) = Self::parse(path)?;
+            let store = self.store_for(&container)?;
+            let mut stream = store.list(Some(&ObjPath::from(prefix)));
+            let mut entries = Vec::new();
+            while let Some(meta) = stream.next().await {
+                let meta = meta.map_err(|e| super::object_store_errors::denied("Azure list", e))?;
+                let key = meta.location.to_string();
+                let name = key.rsplit('/').next().unwrap_or(&key).to_string();
+                entries.push(DirEntry {
+                    name,
+                    url: format!("az://{container}/{key}"),
+                    metadata: FsFileMetadata {
+                        path: format!("az://{container}/{key}"),
+                        size: meta.size,
+                        is_directory: false,
+                        etag: meta.e_tag,
+                        ..Default::default()
+                    },
+                });
+            }
+            Ok(entries)
+        })
+        .await
     }
 
     async fn create_dir(&self, _path: &str) -> FsResult<()> {
@@ -420,16 +428,6 @@ impl FileSystem for AzureBlobFileSystem {
 
     async fn create_dir_all(&self, _path: &str) -> FsResult<()> {
         Ok(())
-    }
-
-    async fn copy(&self, from: &str, to: &str) -> FsResult<()> {
-        let data = self.read(from).await?;
-        self.write(to, &data, None).await
-    }
-
-    async fn move_file(&self, from: &str, to: &str) -> FsResult<()> {
-        self.copy(from, to).await?;
-        self.delete(from).await
     }
 
     fn filesystem_type(&self) -> &'static str {

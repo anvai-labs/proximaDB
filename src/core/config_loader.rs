@@ -188,6 +188,20 @@ impl ConfigLoader {
             },
         )?;
 
+        // TD-TIER-1 SC3: reservation pools validate at startup — per-pool
+        // shape plus duplicate id/path rejection (two pools sharing an id
+        // would collide in the metering namespace; sharing a path would fight
+        // over one exclusive ledger).
+        crate::services::collection::reservation::validate_pool_configs(
+            &config.storage.reservation_pools,
+        )
+        .map_err(|err| {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid reservation pool configuration: {err}"),
+            )) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+
         Ok(())
     }
 

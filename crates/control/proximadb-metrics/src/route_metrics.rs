@@ -22,49 +22,9 @@
 
 use std::time::Duration;
 
+use crate::{register_counter_vec_safe, register_histogram_vec_safe};
 use lazy_static::lazy_static;
-use prometheus::{
-    CounterVec, HistogramOpts, HistogramVec, Opts, register_counter_vec, register_histogram_vec,
-};
-use tracing::error;
-
-fn register_counter_vec_safe(name: &str, help: &str, labels: &[&str]) -> CounterVec {
-    match register_counter_vec!(name, help, labels) {
-        Ok(metric) => metric,
-        Err(reg_err) => {
-            error!("Failed to register {}: {}", name, reg_err);
-            CounterVec::new(Opts::new(name, help), labels).unwrap_or_else(|_| {
-                CounterVec::new(Opts::new(format!("{}_fallback", name), help), labels)
-                    .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
-            })
-        }
-    }
-}
-
-fn register_histogram_vec_safe(
-    name: &str,
-    help: &str,
-    labels: &[&str],
-    buckets: Vec<f64>,
-) -> HistogramVec {
-    match register_histogram_vec!(name, help, labels, buckets.clone()) {
-        Ok(metric) => metric,
-        Err(reg_err) => {
-            error!("Failed to register {}: {}", name, reg_err);
-            HistogramVec::new(
-                HistogramOpts::new(name, help).buckets(buckets.clone()),
-                labels,
-            )
-            .unwrap_or_else(|_| {
-                HistogramVec::new(
-                    HistogramOpts::new(format!("{}_fallback", name), help).buckets(buckets),
-                    labels,
-                )
-                .unwrap_or_else(|_| unreachable!("valid histogram metric descriptor"))
-            })
-        }
-    }
-}
+use prometheus::{CounterVec, HistogramVec};
 
 lazy_static! {
     /// Route decisions by backend, shape-class, and decision source.

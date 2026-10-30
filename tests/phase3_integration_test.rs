@@ -49,13 +49,12 @@ mod streaming_flush_tests {
         (0..count)
             .map(|i| ProximaRecord {
                 oid: format!("vec_{}", start_id + i),
-                embeddings: vec![EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: String::new(),
-                    values: EmbeddingValues::Fp32(vec![0.1 * (i as f32); dimension]),
-                    dim: dimension as u32,
-                    ..Default::default()
-                }],
+                embeddings: vec![EmbeddingCell::new_fp32(
+                    "default",
+                    String::new(),
+                    dimension as u32,
+                    vec![0.1 * (i as f32); dimension],
+                )],
                 ..Default::default()
             })
             .collect()

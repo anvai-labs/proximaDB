@@ -70,12 +70,8 @@ mod tests {
             ..Default::default()
         };
         let vec: Vec<f32> = (0..DIM).map(|d| (i as f32 + d as f32) * 0.1).collect();
-        r.embeddings.push(EmbeddingCell {
-            modality: "dense".into(),
-            dim: DIM as u32,
-            values: EmbeddingValues::Fp32(vec),
-            ..Default::default()
-        });
+        r.embeddings
+            .push(EmbeddingCell::new_fp32("", "dense", DIM as u32, vec));
         r
     }
 

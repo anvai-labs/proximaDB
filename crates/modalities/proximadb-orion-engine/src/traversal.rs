@@ -1875,72 +1875,72 @@ mod tests {
     use proximadb_graph_model::{Edge, Node};
     // PropertyValue is now a struct, not enum - use direct field access;
 
+    /// Plain topology node: label "Node", no properties, no embedding — the
+    /// BFS/DFS/PageRank/chain-graph shape (only `id` varies across tests).
+    fn plain_node(id: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            labels: vec!["Node".to_string()],
+            properties: std::collections::HashMap::new(),
+            embedding: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    /// Node carrying a `model_id "test"` embedding (`dimension = vector.len()`,
+    /// matching every literal). `model_version` drifts per test ("1" vs "1.0")
+    /// and is passed through verbatim.
+    fn emb_node(id: &str, model_version: &str, vector: Vec<f32>) -> Node {
+        Node {
+            embedding: Some(proximadb_graph_model::EmbeddingVersion {
+                model_id: "test".to_string(),
+                model_version: model_version.to_string(),
+                dimension: vector.len() as u32,
+                vector,
+                created_at_ms: 0,
+                model_params: std::collections::HashMap::new(),
+                modality: 0,
+            }),
+            ..plain_node(id)
+        }
+    }
+
+    /// Drop the "Node" label — the alpha-clamp/no-path tests use `labels: vec![]`.
+    fn bare(mut node: Node) -> Node {
+        node.labels = vec![];
+        node
+    }
+
+    /// Directed "CONNECTS" edge with empty properties; only the weight varies
+    /// (`None` for unweighted traversals, `Some(1.0)` where path cost matters).
+    fn edge(id: &str, from: &str, to: &str, weight: Option<f64>) -> Edge {
+        Edge {
+            id: id.to_string(),
+            from_node_id: from.to_string(),
+            to_node_id: to.to_string(),
+            edge_type: "CONNECTS".to_string(),
+            properties: std::collections::HashMap::new(),
+            weight,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
     #[tokio::test]
     async fn test_bfs_basic() {
         let engine = OrionGraphEngine::new();
 
         // Create test graph: 0 -> 1 -> 2
-        let node0 = Node {
-            id: "0".to_string(),
-            labels: vec!["Node".to_string()],
-            properties: std::collections::HashMap::new(),
-            embedding: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
+        for id in ["0", "1", "2"] {
+            engine
+                .insert_node(plain_node(id))
+                .await
+                .expect("Failed to insert node in test");
+        }
 
-        let node1 = Node {
-            id: "1".to_string(),
-            labels: vec!["Node".to_string()],
-            properties: std::collections::HashMap::new(),
-            embedding: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
-
-        let node2 = Node {
-            id: "2".to_string(),
-            labels: vec!["Node".to_string()],
-            properties: std::collections::HashMap::new(),
-            embedding: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
-
-        engine
-            .insert_node(node0)
-            .await
-            .expect("Failed to insert node0 in test");
-        engine
-            .insert_node(node1)
-            .await
-            .expect("Failed to insert node1 in test");
-        engine
-            .insert_node(node2)
-            .await
-            .expect("Failed to insert node2 in test");
-
-        let edge1 = Edge {
-            id: "e1".to_string(),
-            from_node_id: "0".to_string(),
-            to_node_id: "1".to_string(),
-            edge_type: "CONNECTS".to_string(),
-            properties: std::collections::HashMap::new(),
-            weight: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
-
-        let edge2 = Edge {
-            id: "e2".to_string(),
-            from_node_id: "1".to_string(),
-            to_node_id: "2".to_string(),
-            edge_type: "CONNECTS".to_string(),
-            properties: std::collections::HashMap::new(),
-            weight: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
+        let edge1 = edge("e1", "0", "1", None);
+        let edge2 = edge("e2", "1", "2", None);
 
         engine
             .insert_edge(edge1)
@@ -1981,29 +1981,13 @@ mod tests {
         let engine = OrionGraphEngine::new();
         for id in ["0", "1", "2"] {
             engine
-                .insert_node(Node {
-                    id: id.to_string(),
-                    labels: vec!["Node".to_string()],
-                    properties: std::collections::HashMap::new(),
-                    embedding: None,
-                    created_at_ms: 0,
-                    updated_at_ms: 0,
-                })
+                .insert_node(plain_node(id))
                 .await
                 .expect("insert node");
         }
         for (eid, from, to) in [("e1", "0", "1"), ("e2", "1", "2")] {
             engine
-                .insert_edge(Edge {
-                    id: eid.to_string(),
-                    from_node_id: from.to_string(),
-                    to_node_id: to.to_string(),
-                    edge_type: "CONNECTS".to_string(),
-                    properties: std::collections::HashMap::new(),
-                    weight: None,
-                    created_at_ms: 0,
-                    updated_at_ms: 0,
-                })
+                .insert_edge(edge(eid, from, to, None))
                 .await
                 .expect("insert edge");
         }
@@ -2050,43 +2034,14 @@ mod tests {
         let engine = OrionGraphEngine::new();
 
         // Create test graph: 0 -> 1 -> 2
-        let node0 = Node {
-            id: "0".to_string(),
-            labels: vec!["Node".to_string()],
-            properties: std::collections::HashMap::new(),
-            embedding: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
+        for id in ["0", "1"] {
+            engine
+                .insert_node(plain_node(id))
+                .await
+                .expect("Failed to insert node in test");
+        }
 
-        let node1 = Node {
-            id: "1".to_string(),
-            labels: vec!["Node".to_string()],
-            properties: std::collections::HashMap::new(),
-            embedding: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
-
-        engine
-            .insert_node(node0)
-            .await
-            .expect("Failed to insert node0 in test");
-        engine
-            .insert_node(node1)
-            .await
-            .expect("Failed to insert node1 in test");
-
-        let edge1 = Edge {
-            id: "e1".to_string(),
-            from_node_id: "0".to_string(),
-            to_node_id: "1".to_string(),
-            edge_type: "CONNECTS".to_string(),
-            properties: std::collections::HashMap::new(),
-            weight: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
+        let edge1 = edge("e1", "0", "1", None);
 
         engine
             .insert_edge(edge1)
@@ -2116,29 +2071,13 @@ mod tests {
         let engine = OrionGraphEngine::new();
         for id in ["0", "1", "2"] {
             engine
-                .insert_node(Node {
-                    id: id.to_string(),
-                    labels: vec!["Node".to_string()],
-                    properties: std::collections::HashMap::new(),
-                    embedding: None,
-                    created_at_ms: 0,
-                    updated_at_ms: 0,
-                })
+                .insert_node(plain_node(id))
                 .await
                 .expect("insert node");
         }
         for (eid, from, to) in [("e1", "0", "1"), ("e2", "1", "2")] {
             engine
-                .insert_edge(Edge {
-                    id: eid.to_string(),
-                    from_node_id: from.to_string(),
-                    to_node_id: to.to_string(),
-                    edge_type: "CONNECTS".to_string(),
-                    properties: std::collections::HashMap::new(),
-                    weight: None,
-                    created_at_ms: 0,
-                    updated_at_ms: 0,
-                })
+                .insert_edge(edge(eid, from, to, None))
                 .await
                 .expect("insert edge");
         }
@@ -2179,16 +2118,8 @@ mod tests {
 
         // Create nodes
         for i in 0..4 {
-            let node = Node {
-                id: i.to_string(),
-                labels: vec!["Node".to_string()],
-                properties: std::collections::HashMap::new(),
-                embedding: None,
-                created_at_ms: 0,
-                updated_at_ms: 0,
-            };
             engine
-                .insert_node(node)
+                .insert_node(plain_node(&i.to_string()))
                 .await
                 .expect("Failed to insert node in test");
         }
@@ -2202,18 +2133,8 @@ mod tests {
         ];
 
         for (from, to, id) in edges {
-            let edge = Edge {
-                id: id.to_string(),
-                from_node_id: from.to_string(),
-                to_node_id: to.to_string(),
-                edge_type: "CONNECTS".to_string(),
-                properties: std::collections::HashMap::new(),
-                weight: None,
-                created_at_ms: 0,
-                updated_at_ms: 0,
-            };
             engine
-                .insert_edge(edge)
+                .insert_edge(edge(id, from, to, None))
                 .await
                 .expect("Failed to insert edge in test");
         }
@@ -2252,29 +2173,13 @@ mod tests {
         let engine = OrionGraphEngine::new();
         for id in ["0", "1", "2"] {
             engine
-                .insert_node(Node {
-                    id: id.to_string(),
-                    labels: vec!["Node".to_string()],
-                    properties: std::collections::HashMap::new(),
-                    embedding: None,
-                    created_at_ms: 0,
-                    updated_at_ms: 0,
-                })
+                .insert_node(plain_node(id))
                 .await
                 .expect("insert node");
         }
         for (eid, from, to) in [("e1", "0", "1"), ("e2", "1", "2")] {
             engine
-                .insert_edge(Edge {
-                    id: eid.to_string(),
-                    from_node_id: from.to_string(),
-                    to_node_id: to.to_string(),
-                    edge_type: "CONNECTS".to_string(),
-                    properties: std::collections::HashMap::new(),
-                    weight: Some(1.0),
-                    created_at_ms: 0,
-                    updated_at_ms: 0,
-                })
+                .insert_edge(edge(eid, from, to, Some(1.0)))
                 .await
                 .expect("insert edge");
         }
@@ -2328,16 +2233,8 @@ mod tests {
         // Create a simple graph: A -> B -> C, B -> A (cycle)
         let nodes = vec!["A", "B", "C"];
         for id in &nodes {
-            let node = Node {
-                id: id.to_string(),
-                labels: vec!["Node".to_string()],
-                properties: std::collections::HashMap::new(),
-                embedding: None,
-                created_at_ms: 0,
-                updated_at_ms: 0,
-            };
             engine
-                .insert_node(node)
+                .insert_node(plain_node(id))
                 .await
                 .expect("Failed to insert node in test");
         }
@@ -2346,18 +2243,8 @@ mod tests {
         let edges = vec![("A", "B", "e1"), ("B", "C", "e2"), ("B", "A", "e3")];
 
         for (from, to, id) in edges {
-            let edge = Edge {
-                id: id.to_string(),
-                from_node_id: from.to_string(),
-                to_node_id: to.to_string(),
-                edge_type: "CONNECTS".to_string(),
-                properties: std::collections::HashMap::new(),
-                weight: None,
-                created_at_ms: 0,
-                updated_at_ms: 0,
-            };
             engine
-                .insert_edge(edge)
+                .insert_edge(edge(id, from, to, None))
                 .await
                 .expect("Failed to insert edge in test");
         }
@@ -2415,34 +2302,21 @@ mod tests {
 
         // Create a larger graph for parallel testing
         for i in 0..10 {
-            let node = Node {
-                id: i.to_string(),
-                labels: vec!["Node".to_string()],
-                properties: std::collections::HashMap::new(),
-                embedding: None,
-                created_at_ms: 0,
-                updated_at_ms: 0,
-            };
             engine
-                .insert_node(node)
+                .insert_node(plain_node(&i.to_string()))
                 .await
                 .expect("Failed to insert node in test");
         }
 
         // Create edges: chain 0->1->2->...->9
         for i in 0..9 {
-            let edge = Edge {
-                id: format!("e{}", i),
-                from_node_id: i.to_string(),
-                to_node_id: (i + 1).to_string(),
-                edge_type: "CONNECTS".to_string(),
-                properties: std::collections::HashMap::new(),
-                weight: None,
-                created_at_ms: 0,
-                updated_at_ms: 0,
-            };
             engine
-                .insert_edge(edge)
+                .insert_edge(edge(
+                    &format!("e{}", i),
+                    &i.to_string(),
+                    &(i + 1).to_string(),
+                    None,
+                ))
                 .await
                 .expect("Failed to insert edge in test");
         }
@@ -2482,56 +2356,9 @@ mod tests {
         let engine = OrionGraphEngine::new();
 
         // Create nodes with embeddings
-        let node_a = Node {
-            id: "A".to_string(),
-            labels: vec!["Node".to_string()],
-            properties: std::collections::HashMap::new(),
-            embedding: Some(proximadb_graph_model::EmbeddingVersion {
-                model_id: "test".to_string(),
-                model_version: "1".to_string(),
-                vector: vec![0.0, 0.0, 0.0],
-                dimension: 3,
-                created_at_ms: 0,
-                model_params: std::collections::HashMap::new(),
-                modality: 0,
-            }),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
-
-        let node_b = Node {
-            id: "B".to_string(),
-            labels: vec!["Node".to_string()],
-            properties: std::collections::HashMap::new(),
-            embedding: Some(proximadb_graph_model::EmbeddingVersion {
-                model_id: "test".to_string(),
-                model_version: "1".to_string(),
-                vector: vec![1.0, 0.0, 0.0],
-                dimension: 3,
-                created_at_ms: 0,
-                model_params: std::collections::HashMap::new(),
-                modality: 0,
-            }),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
-
-        let node_c = Node {
-            id: "C".to_string(),
-            labels: vec!["Node".to_string()],
-            properties: std::collections::HashMap::new(),
-            embedding: Some(proximadb_graph_model::EmbeddingVersion {
-                model_id: "test".to_string(),
-                model_version: "1".to_string(),
-                vector: vec![2.0, 0.0, 0.0],
-                dimension: 3,
-                created_at_ms: 0,
-                model_params: std::collections::HashMap::new(),
-                modality: 0,
-            }),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
+        let node_a = emb_node("A", "1", vec![0.0, 0.0, 0.0]);
+        let node_b = emb_node("B", "1", vec![1.0, 0.0, 0.0]);
+        let node_c = emb_node("C", "1", vec![2.0, 0.0, 0.0]);
 
         engine
             .insert_node(node_a)
@@ -2547,27 +2374,8 @@ mod tests {
             .expect("Failed to insert node_c in test");
 
         // Create edges: A->B->C
-        let edge1 = Edge {
-            id: "e1".to_string(),
-            from_node_id: "A".to_string(),
-            to_node_id: "B".to_string(),
-            edge_type: "CONNECTS".to_string(),
-            properties: std::collections::HashMap::new(),
-            weight: Some(1.0),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
-
-        let edge2 = Edge {
-            id: "e2".to_string(),
-            from_node_id: "B".to_string(),
-            to_node_id: "C".to_string(),
-            edge_type: "CONNECTS".to_string(),
-            properties: std::collections::HashMap::new(),
-            weight: Some(1.0),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
+        let edge1 = edge("e1", "A", "B", Some(1.0));
+        let edge2 = edge("e2", "B", "C", Some(1.0));
 
         engine
             .insert_edge(edge1)
@@ -2604,62 +2412,14 @@ mod tests {
     async fn test_vector_guided_astar_pure_graph() {
         use proximadb_distance_kernel::UnifiedDistanceCompute;
         use proximadb_graph_engine_traits::GraphEngine;
-        use proximadb_graph_model::EmbeddingVersion;
         use proximadb_proto::proximadb_v1::DistanceMetric;
 
         let engine = OrionGraphEngine::new();
 
         // Create nodes with embeddings
-        let node_a = Node {
-            id: "A".to_string(),
-            labels: vec!["Node".to_string()],
-            properties: std::collections::HashMap::new(),
-            embedding: Some(EmbeddingVersion {
-                model_id: "test".to_string(),
-                model_version: "1.0".to_string(),
-                vector: vec![1.0, 0.0, 0.0],
-                dimension: 3,
-                created_at_ms: 0,
-                model_params: std::collections::HashMap::new(),
-                modality: 0,
-            }),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
-
-        let node_b = Node {
-            id: "B".to_string(),
-            labels: vec!["Node".to_string()],
-            properties: std::collections::HashMap::new(),
-            embedding: Some(EmbeddingVersion {
-                model_id: "test".to_string(),
-                model_version: "1.0".to_string(),
-                vector: vec![0.0, 1.0, 0.0],
-                dimension: 3,
-                created_at_ms: 0,
-                model_params: std::collections::HashMap::new(),
-                modality: 0,
-            }),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
-
-        let node_c = Node {
-            id: "C".to_string(),
-            labels: vec!["Node".to_string()],
-            properties: std::collections::HashMap::new(),
-            embedding: Some(EmbeddingVersion {
-                model_id: "test".to_string(),
-                model_version: "1.0".to_string(),
-                vector: vec![0.0, 0.0, 1.0],
-                dimension: 3,
-                created_at_ms: 0,
-                model_params: std::collections::HashMap::new(),
-                modality: 0,
-            }),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
+        let node_a = emb_node("A", "1.0", vec![1.0, 0.0, 0.0]);
+        let node_b = emb_node("B", "1.0", vec![0.0, 1.0, 0.0]);
+        let node_c = emb_node("C", "1.0", vec![0.0, 0.0, 1.0]);
 
         GraphEngine::insert_node(&engine, node_a)
             .await
@@ -2672,37 +2432,13 @@ mod tests {
             .expect("Failed to insert node_c via GraphEngine in test");
 
         // Create edges
-        GraphEngine::insert_edge(
-            &engine,
-            Edge {
-                id: "e1".to_string(),
-                from_node_id: "A".to_string(),
-                to_node_id: "B".to_string(),
-                edge_type: "CONNECTS".to_string(),
-                properties: std::collections::HashMap::new(),
-                weight: Some(1.0),
-                created_at_ms: 0,
-                updated_at_ms: 0,
-            },
-        )
-        .await
-        .expect("Failed to insert edge e1 in test");
+        GraphEngine::insert_edge(&engine, edge("e1", "A", "B", Some(1.0)))
+            .await
+            .expect("Failed to insert edge e1 in test");
 
-        GraphEngine::insert_edge(
-            &engine,
-            Edge {
-                id: "e2".to_string(),
-                from_node_id: "B".to_string(),
-                to_node_id: "C".to_string(),
-                edge_type: "CONNECTS".to_string(),
-                properties: std::collections::HashMap::new(),
-                weight: Some(1.0),
-                created_at_ms: 0,
-                updated_at_ms: 0,
-            },
-        )
-        .await
-        .expect("Failed to insert edge e2 in test");
+        GraphEngine::insert_edge(&engine, edge("e2", "B", "C", Some(1.0)))
+            .await
+            .expect("Failed to insert edge e2 in test");
 
         let distance_compute = Arc::new(UnifiedDistanceCompute::new(DistanceMetric::Cosine));
         let guide_embedding = vec![0.5, 0.5, 0.5];
@@ -2731,7 +2467,6 @@ mod tests {
     async fn test_vector_guided_astar_balanced_blend() {
         use proximadb_distance_kernel::UnifiedDistanceCompute;
         use proximadb_graph_engine_traits::GraphEngine;
-        use proximadb_graph_model::EmbeddingVersion;
         use proximadb_proto::proximadb_v1::DistanceMetric;
 
         let engine = OrionGraphEngine::new();
@@ -2740,73 +2475,10 @@ mod tests {
         // B is semantically close to guide, C is semantically far
         let guide_embedding = vec![1.0, 0.0, 0.0];
 
-        let node_a = Node {
-            id: "A".to_string(),
-            labels: vec!["Node".to_string()],
-            properties: std::collections::HashMap::new(),
-            embedding: Some(EmbeddingVersion {
-                model_id: "test".to_string(),
-                model_version: "1.0".to_string(),
-                vector: vec![0.5, 0.5, 0.0],
-                dimension: 3,
-                created_at_ms: 0,
-                model_params: std::collections::HashMap::new(),
-                modality: 0,
-            }),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
-
-        let node_b = Node {
-            id: "B".to_string(),
-            labels: vec!["Node".to_string()],
-            properties: std::collections::HashMap::new(),
-            embedding: Some(EmbeddingVersion {
-                model_id: "test".to_string(),
-                model_version: "1.0".to_string(),
-                vector: vec![0.9, 0.1, 0.0], // Close to guide
-                dimension: 3,
-                created_at_ms: 0,
-                model_params: std::collections::HashMap::new(),
-                modality: 0,
-            }),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
-
-        let node_c = Node {
-            id: "C".to_string(),
-            labels: vec!["Node".to_string()],
-            properties: std::collections::HashMap::new(),
-            embedding: Some(EmbeddingVersion {
-                model_id: "test".to_string(),
-                model_version: "1.0".to_string(),
-                vector: vec![0.0, 0.0, 1.0], // Far from guide
-                dimension: 3,
-                created_at_ms: 0,
-                model_params: std::collections::HashMap::new(),
-                modality: 0,
-            }),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
-
-        let node_d = Node {
-            id: "D".to_string(),
-            labels: vec!["Node".to_string()],
-            properties: std::collections::HashMap::new(),
-            embedding: Some(EmbeddingVersion {
-                model_id: "test".to_string(),
-                model_version: "1.0".to_string(),
-                vector: vec![0.8, 0.2, 0.0],
-                dimension: 3,
-                created_at_ms: 0,
-                model_params: std::collections::HashMap::new(),
-                modality: 0,
-            }),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
+        let node_a = emb_node("A", "1.0", vec![0.5, 0.5, 0.0]);
+        let node_b = emb_node("B", "1.0", vec![0.9, 0.1, 0.0]); // Close to guide
+        let node_c = emb_node("C", "1.0", vec![0.0, 0.0, 1.0]); // Far from guide
+        let node_d = emb_node("D", "1.0", vec![0.8, 0.2, 0.0]);
 
         GraphEngine::insert_node(&engine, node_a)
             .await
@@ -2822,69 +2494,21 @@ mod tests {
             .expect("Failed to insert node_d via GraphEngine in test");
 
         // Create diamond topology
-        GraphEngine::insert_edge(
-            &engine,
-            Edge {
-                id: "e1".to_string(),
-                from_node_id: "A".to_string(),
-                to_node_id: "B".to_string(),
-                edge_type: "CONNECTS".to_string(),
-                properties: std::collections::HashMap::new(),
-                weight: Some(1.0),
-                created_at_ms: 0,
-                updated_at_ms: 0,
-            },
-        )
-        .await
-        .expect("Failed to insert edge e1 in test");
+        GraphEngine::insert_edge(&engine, edge("e1", "A", "B", Some(1.0)))
+            .await
+            .expect("Failed to insert edge e1 in test");
 
-        GraphEngine::insert_edge(
-            &engine,
-            Edge {
-                id: "e2".to_string(),
-                from_node_id: "A".to_string(),
-                to_node_id: "C".to_string(),
-                edge_type: "CONNECTS".to_string(),
-                properties: std::collections::HashMap::new(),
-                weight: Some(1.0),
-                created_at_ms: 0,
-                updated_at_ms: 0,
-            },
-        )
-        .await
-        .expect("Failed to insert edge e2 in test");
+        GraphEngine::insert_edge(&engine, edge("e2", "A", "C", Some(1.0)))
+            .await
+            .expect("Failed to insert edge e2 in test");
 
-        GraphEngine::insert_edge(
-            &engine,
-            Edge {
-                id: "e3".to_string(),
-                from_node_id: "B".to_string(),
-                to_node_id: "D".to_string(),
-                edge_type: "CONNECTS".to_string(),
-                properties: std::collections::HashMap::new(),
-                weight: Some(1.0),
-                created_at_ms: 0,
-                updated_at_ms: 0,
-            },
-        )
-        .await
-        .expect("Failed to insert edge e3 in test");
+        GraphEngine::insert_edge(&engine, edge("e3", "B", "D", Some(1.0)))
+            .await
+            .expect("Failed to insert edge e3 in test");
 
-        GraphEngine::insert_edge(
-            &engine,
-            Edge {
-                id: "e4".to_string(),
-                from_node_id: "C".to_string(),
-                to_node_id: "D".to_string(),
-                edge_type: "CONNECTS".to_string(),
-                properties: std::collections::HashMap::new(),
-                weight: Some(1.0),
-                created_at_ms: 0,
-                updated_at_ms: 0,
-            },
-        )
-        .await
-        .expect("Failed to insert edge e4 in test");
+        GraphEngine::insert_edge(&engine, edge("e4", "C", "D", Some(1.0)))
+            .await
+            .expect("Failed to insert edge e4 in test");
 
         let distance_compute = Arc::new(UnifiedDistanceCompute::new(DistanceMetric::Cosine));
 
@@ -2912,44 +2536,12 @@ mod tests {
     async fn test_vector_guided_astar_alpha_clamping() {
         use proximadb_distance_kernel::UnifiedDistanceCompute;
         use proximadb_graph_engine_traits::GraphEngine;
-        use proximadb_graph_model::EmbeddingVersion;
         use proximadb_proto::proximadb_v1::DistanceMetric;
 
         let engine = OrionGraphEngine::new();
 
-        let node_a = Node {
-            id: "A".to_string(),
-            labels: vec![],
-            properties: std::collections::HashMap::new(),
-            embedding: Some(EmbeddingVersion {
-                model_id: "test".to_string(),
-                model_version: "1.0".to_string(),
-                vector: vec![1.0],
-                dimension: 1,
-                created_at_ms: 0,
-                model_params: std::collections::HashMap::new(),
-                modality: 0,
-            }),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
-
-        let node_b = Node {
-            id: "B".to_string(),
-            labels: vec![],
-            properties: std::collections::HashMap::new(),
-            embedding: Some(EmbeddingVersion {
-                model_id: "test".to_string(),
-                model_version: "1.0".to_string(),
-                vector: vec![2.0],
-                dimension: 1,
-                created_at_ms: 0,
-                model_params: std::collections::HashMap::new(),
-                modality: 0,
-            }),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
+        let node_a = bare(emb_node("A", "1.0", vec![1.0]));
+        let node_b = bare(emb_node("B", "1.0", vec![2.0]));
 
         GraphEngine::insert_node(&engine, node_a)
             .await
@@ -2958,21 +2550,9 @@ mod tests {
             .await
             .expect("Failed to insert node_b via GraphEngine in test");
 
-        GraphEngine::insert_edge(
-            &engine,
-            Edge {
-                id: "e1".to_string(),
-                from_node_id: "A".to_string(),
-                to_node_id: "B".to_string(),
-                edge_type: "CONNECTS".to_string(),
-                properties: std::collections::HashMap::new(),
-                weight: Some(1.0),
-                created_at_ms: 0,
-                updated_at_ms: 0,
-            },
-        )
-        .await
-        .expect("Failed to insert edge e1 in test");
+        GraphEngine::insert_edge(&engine, edge("e1", "A", "B", Some(1.0)))
+            .await
+            .expect("Failed to insert edge e1 in test");
 
         let distance_compute = Arc::new(UnifiedDistanceCompute::new(DistanceMetric::Cosine));
         let guide_embedding = vec![1.5];
@@ -3020,45 +2600,13 @@ mod tests {
     async fn test_vector_guided_astar_no_path() {
         use proximadb_distance_kernel::UnifiedDistanceCompute;
         use proximadb_graph_engine_traits::GraphEngine;
-        use proximadb_graph_model::EmbeddingVersion;
         use proximadb_proto::proximadb_v1::DistanceMetric;
 
         let engine = OrionGraphEngine::new();
 
         // Create two disconnected nodes
-        let node_a = Node {
-            id: "A".to_string(),
-            labels: vec![],
-            properties: std::collections::HashMap::new(),
-            embedding: Some(EmbeddingVersion {
-                model_id: "test".to_string(),
-                model_version: "1.0".to_string(),
-                vector: vec![1.0],
-                dimension: 1,
-                created_at_ms: 0,
-                model_params: std::collections::HashMap::new(),
-                modality: 0,
-            }),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
-
-        let node_b = Node {
-            id: "B".to_string(),
-            labels: vec![],
-            properties: std::collections::HashMap::new(),
-            embedding: Some(EmbeddingVersion {
-                model_id: "test".to_string(),
-                model_version: "1.0".to_string(),
-                vector: vec![2.0],
-                dimension: 1,
-                created_at_ms: 0,
-                model_params: std::collections::HashMap::new(),
-                modality: 0,
-            }),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        };
+        let node_a = bare(emb_node("A", "1.0", vec![1.0]));
+        let node_b = bare(emb_node("B", "1.0", vec![2.0]));
 
         GraphEngine::insert_node(&engine, node_a)
             .await

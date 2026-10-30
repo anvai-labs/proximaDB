@@ -42,6 +42,34 @@ pub(crate) const CANONICAL_SCHEMA_PROPERTY: &str = "collection.canonical_schema"
 /// reconstructs `filterable_columns` from `id >= 100`).
 pub(crate) const CANONICAL_COLUMN_ID_BASE: i32 = 200;
 
+/// A schema declaration the caller got wrong — a duplicate, a system column, an
+/// `embedding` that does not match the collection, a type the filterable column
+/// cannot hold. A client error: surfaces map it to HTTP 400 / gRPC
+/// `INVALID_ARGUMENT`, never to an internal error (TD-RESTGET-1). Anything else
+/// the schema update fails with stays a server error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaDeclarationRejected(pub String);
+
+impl std::fmt::Display for SchemaDeclarationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SchemaDeclarationRejected {}
+
+/// The declaration rejection anywhere in `error`'s chain, if the update failed
+/// because of the caller's schema rather than the server.
+pub fn schema_declaration_rejection(error: &anyhow::Error) -> Option<&SchemaDeclarationRejected> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<SchemaDeclarationRejected>())
+}
+
+fn rejected(message: String) -> anyhow::Error {
+    SchemaDeclarationRejected(message).into()
+}
+
 /// ADR-048 P1: map canonical `CollectionSchemaColumn`s to typed `CatalogColumn`s
 /// in the 200+ band. `name`/`data_type`/`nullable` become the typed column; the
 /// per-column hints (indexed/filterable/text_storage/max_length) round-trip via
@@ -138,8 +166,19 @@ pub(crate) fn merge_canonical_band(
     }
     let mut seen = std::collections::HashSet::new();
     for column in canonical {
+        // The catalog reserves this prefix and would reject it later as a
+        // plain error (a 500); it is the caller's declaration (TD-RESTGET-1).
+        if proximadb_catalog::system_columns::is_reserved_column_name(&column.name) {
+            return Err(rejected(format!(
+                "column '{}' uses a name reserved for ProximaDB system metadata",
+                column.name
+            )));
+        }
         if !seen.insert(column.name.clone()) {
-            anyhow::bail!("column '{}' is declared more than once", column.name);
+            return Err(rejected(format!(
+                "column '{}' is declared more than once",
+                column.name
+            )));
         }
         let Some(reserved) = schema
             .columns
@@ -150,10 +189,10 @@ pub(crate) fn merge_canonical_band(
             continue;
         };
         if reserved.id < SYSTEM_COLUMN_ID_LIMIT {
-            anyhow::bail!(
+            return Err(rejected(format!(
                 "column '{}' is a ProximaDB system column and cannot be declared in a schema",
                 column.name
-            );
+            )));
         }
         if reserved.id == EMBEDDING_COLUMN_ID {
             let collection_dim = reserved
@@ -162,43 +201,42 @@ pub(crate) fn merge_canonical_band(
                 .and_then(|d| d.parse::<usize>().ok());
             match (&column.data_type, collection_dim) {
                 (ProximaType::DenseVector { dim, .. }, Some(expected)) if *dim == expected => {}
-                (ProximaType::DenseVector { dim, .. }, Some(expected)) => anyhow::bail!(
-                    "column 'embedding' has dimension {dim}, which conflicts with the collection \
-                     dimension {expected}"
-                ),
-                (other, _) => anyhow::bail!(
-                    "column 'embedding' must be a dense vector matching the collection, not {other:?}"
-                ),
+                (ProximaType::DenseVector { dim, .. }, Some(expected)) => {
+                    return Err(rejected(format!(
+                        "column 'embedding' has dimension {dim}, which conflicts with the \
+                         collection dimension {expected}"
+                    )));
+                }
+                (other, _) => {
+                    return Err(rejected(format!(
+                        "column 'embedding' must be a dense vector matching the collection, not \
+                         {other:?}"
+                    )));
+                }
             }
         } else {
-            // `String` has no arm in the shared partial mapping but IS the v1
-            // filterable vocabulary's string type (the default for gRPC
-            // `filterable_columns`), so it folds into a String filterable
-            // column. Anything else with no filterable projection (Struct,
-            // Map, SparseVector, …) cannot be stored in the filterable column
-            // and is rejected rather than silently accepted.
-            let filterable = match proximadb_runtime::handlers::proxima_type_to_filterable_type(
-                &column.data_type,
-            ) {
-                Some(data_type) => data_type,
-                None if matches!(column.data_type, ProximaType::String) => {
-                    FilterableDataType::FilterableString as i32
-                }
-                None => anyhow::bail!(
-                    "column '{}' is declared as {:?}, which cannot be stored in its filterable \
-                     column",
-                    column.name,
-                    column.data_type
-                ),
-            };
+            // A column with no filterable projection (Struct, Map,
+            // SparseVector, UInt, …) cannot be stored in the filterable column
+            // and is rejected rather than silently accepted. The mapping is
+            // the ONE shared one (TD-CATREPLACE-1), so what folds here is what
+            // the narrow view renders.
+            let filterable =
+                match proximadb_data_model::proxima_type_to_filterable_type(&column.data_type) {
+                    Some(data_type) => data_type,
+                    None => {
+                        return Err(rejected(format!(
+                            "column '{}' is declared as {:?}, which cannot be stored in its \
+                             filterable column",
+                            column.name, column.data_type
+                        )));
+                    }
+                };
             let narrowed = catalog_data_type(filterable);
             if reserved.data_type != narrowed {
-                anyhow::bail!(
+                return Err(rejected(format!(
                     "column '{}' is declared as {:?}, which conflicts with its filterable type {:?}",
-                    column.name,
-                    column.data_type,
-                    reserved.data_type
-                );
+                    column.name, column.data_type, reserved.data_type
+                )));
             }
         }
         let declared = typed_band_columns(std::slice::from_ref(&column));
@@ -554,6 +592,13 @@ pub(crate) fn collection_from_catalog_schema(
         })
     };
 
+    // TD-TIER-1 SC1: the observed status is a pure read-side projection of the
+    // desired policy (services::collection::storage_class) — computed here so
+    // every read surface (REST v2, gRPC, catalog) reports the same truth.
+    // Never persisted, never an input.
+    let storage_class_status =
+        crate::services::collection::storage_class::storage_class_status(&config);
+
     Ok(Some(Collection {
         id,
         config: Some(config),
@@ -577,6 +622,7 @@ pub(crate) fn collection_from_catalog_schema(
         created_at: schema.created_at_ms * 1000,
         updated_at: schema.updated_at_ms * 1000,
         storage_assignment,
+        storage_class_status: Some(storage_class_status),
     }))
 }
 
@@ -900,23 +946,15 @@ fn catalog_index_type(algorithm: i32) -> CatalogIndexType {
     }
 }
 
+/// TD-CATREPLACE-1: the total (catalog→narrow) view of the ONE shared mapping
+/// (`proxima_type_to_filterable_type` in the foundation data-model crate): a
+/// column with no filterable projection still renders as the v1 string type,
+/// exactly as before, while String-like, Json/Jsonb, Binary and array columns
+/// now render the same type in both directions (they used to disagree, so a
+/// schema round-trip flip-flopped the stored narrow type).
 fn filterable_data_type(data_type: &ProximaType) -> i32 {
-    match data_type {
-        ProximaType::Int8 | ProximaType::Int16 | ProximaType::Int32 | ProximaType::Int64 => {
-            FilterableDataType::FilterableInteger as i32
-        }
-        ProximaType::Float32 | ProximaType::Float64 => FilterableDataType::FilterableFloat as i32,
-        ProximaType::Boolean => FilterableDataType::FilterableBoolean as i32,
-        ProximaType::Timestamp(_) => FilterableDataType::FilterableDatetime as i32,
-        ProximaType::TimestampTz(_) => FilterableDataType::FilterableTimestampTz as i32,
-        ProximaType::Decimal { .. } => FilterableDataType::FilterableDecimal as i32,
-        ProximaType::Date => FilterableDataType::FilterableDate as i32,
-        ProximaType::Time(_) => FilterableDataType::FilterableTime as i32,
-        ProximaType::Uuid => FilterableDataType::FilterableUuid as i32,
-        ProximaType::Binary => FilterableDataType::FilterableBinary as i32,
-        ProximaType::Json => FilterableDataType::FilterableJson as i32,
-        _ => FilterableDataType::FilterableString as i32,
-    }
+    proximadb_data_model::proxima_type_to_filterable_type(data_type)
+        .unwrap_or(FilterableDataType::FilterableString as i32)
 }
 
 fn indexing_algorithm(index_type: CatalogIndexType) -> i32 {
@@ -942,6 +980,48 @@ fn storage_engine_from_catalog(engine: &str) -> i32 {
         "TITAN" => StorageEngine::Titan as i32,
         "CHRONO" => StorageEngine::Chrono as i32,
         _ => StorageEngine::Sst as i32,
+    }
+}
+
+#[cfg(test)]
+mod catreplace_tests {
+    use super::*;
+
+    /// TD-CATREPLACE-1: the catalog→narrow view must render the SAME filterable
+    /// type the update direction stores, or a schema round-trip flip-flops the
+    /// stored narrow type and the next update is rejected as a conflict. On the
+    /// old code Jsonb and every array rendered String here while the update
+    /// direction stored Json / Array*.
+    #[test]
+    fn narrow_view_renders_the_shared_filterable_mapping() {
+        for (data_type, expected) in [
+            (
+                ProximaType::Jsonb,
+                FilterableDataType::FilterableJson as i32,
+            ),
+            (
+                ProximaType::Array(Box::new(ProximaType::String)),
+                FilterableDataType::FilterableArrayString as i32,
+            ),
+            (
+                ProximaType::Binary,
+                FilterableDataType::FilterableBinary as i32,
+            ),
+            (
+                ProximaType::String,
+                FilterableDataType::FilterableString as i32,
+            ),
+        ] {
+            assert_eq!(
+                filterable_data_type(&data_type),
+                expected,
+                "{data_type:?} must narrow the same way in both directions"
+            );
+            // The two historical mappings agree wherever the strict one has an
+            // arm (the invariant TD-CATREPLACE-1 pins).
+            let strict = proximadb_data_model::proxima_type_to_filterable_type(&data_type);
+            assert_eq!(strict, Some(expected), "{data_type:?}");
+        }
     }
 }
 

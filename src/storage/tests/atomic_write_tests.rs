@@ -196,24 +196,22 @@ async fn test_atomic_wal_to_storage_flow() {
     let vectors = vec![
         ProximaRecord {
             oid: "vec1".to_string(),
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-                dim: 3,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                3,
+                vec![1.0, 2.0, 3.0],
+            )],
             ..Default::default()
         },
         ProximaRecord {
             oid: "vec2".to_string(),
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vec![4.0, 5.0, 6.0]),
-                dim: 3,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                3,
+                vec![4.0, 5.0, 6.0],
+            )],
             ..Default::default()
         },
     ];

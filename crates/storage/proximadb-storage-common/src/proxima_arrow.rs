@@ -57,9 +57,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use proximadb_kernel::error::StorageError;
-use proximadb_records::{
-    EmbeddingCell, EmbeddingValues, ProximaRecord, ProximaTreeNode, ProximaValue, tree_get,
-};
+use proximadb_records::{EmbeddingCell, ProximaRecord, ProximaTreeNode, ProximaValue, tree_get};
 
 use proximadb_data_model::{ProximaType, TimeUnit as DmTimeUnit, VectorElement as DmVectorElement};
 
@@ -133,6 +131,10 @@ pub const SYS_COL_VALID_FROM_NS: &str = "__proxima_valid_from_ns";
 /// (`ProximaRecord::is_dead`, mandate #16a). Losing it turns a deleted or expired
 /// row into a live one on read-back.
 pub const SYS_COL_VALID_TO_NS: &str = "__proxima_valid_to_ns";
+/// Per-row msgpack residual: the props and embeddings the typed columns do not
+/// reproduce exactly (see [`proxima_records_to_record_batch_with_residual`]).
+/// Binary, nullable; absent from batches that need none.
+pub const SYS_COL_RESIDUAL: &str = "__proxima_residual";
 
 /// Every reserved system column, in the order they are appended to a batch.
 pub const SYSTEM_COLUMNS: &[&str] = &[
@@ -143,6 +145,7 @@ pub const SYSTEM_COLUMNS: &[&str] = &[
     SYS_COL_UPDATED_AT_NS,
     SYS_COL_VALID_FROM_NS,
     SYS_COL_VALID_TO_NS,
+    SYS_COL_RESIDUAL,
 ];
 
 /// True iff `name` is a reserved system column.
@@ -325,6 +328,38 @@ fn build_column(records: &[ProximaRecord], col: &ProximaColumn) -> Result<ArrayR
             col.name, other
         ))),
     }
+}
+
+/// Whether [`build_column`] can materialize a column of this type at all.
+///
+/// Mirrors [`build_column`]'s `ProximaType` match arm for arm: `true` exactly
+/// where the match has a dedicated arm, `false` where it falls to the
+/// `other =>` serialization-error arm — including with zero rows. The spill
+/// encoder's schema gate relies on this staying in sync; the unit test below
+/// enumerates every [`ProximaType`] variant to keep the two honest.
+pub fn column_materializable(ty: &ProximaType) -> bool {
+    matches!(
+        ty,
+        ProximaType::Boolean
+            | ProximaType::Int8
+            | ProximaType::Int16
+            | ProximaType::Int32
+            | ProximaType::Int64
+            | ProximaType::UInt8
+            | ProximaType::UInt16
+            | ProximaType::UInt32
+            | ProximaType::UInt64
+            | ProximaType::Float32
+            | ProximaType::Float64
+            | ProximaType::Decimal { .. }
+            | ProximaType::String
+            | ProximaType::Json
+            | ProximaType::Binary
+            | ProximaType::Date
+            | ProximaType::Timestamp(_)
+            | ProximaType::TimestampTz(_)
+            | ProximaType::DenseVector { .. }
+    )
 }
 
 /// Build the dense-vector column as `FixedSizeBinary(dimension * 4)`, encoding each record's
@@ -651,6 +686,162 @@ fn pv_as_date32(v: &ProximaValue) -> Option<i32> {
 }
 
 // ---------------------------------------------------------------------------
+// Residual (TD-USUB-6's rule, for Layer A Parquet)
+// ---------------------------------------------------------------------------
+
+/// What one row's typed columns do not reproduce exactly, carried beside them
+/// in [`SYS_COL_RESIDUAL`] as msgpack. Read-back applies it last, so it wins.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct Residual {
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    props: HashMap<String, ProximaTreeNode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embeddings: Option<Vec<EmbeddingCell>>,
+}
+
+/// Equality that also holds for NaN payloads: `NaN != NaN` would otherwise make
+/// every row carrying one look lossy forever.
+fn same_bits<T: PartialEq + serde::Serialize>(a: &T, b: &T) -> bool {
+    a == b || matches!((rmp_serde::to_vec(a), rmp_serde::to_vec(b)), (Ok(x), Ok(y)) if x == y)
+}
+
+impl Residual {
+    /// The props and embeddings of `original` that `typed` (its read-back
+    /// through the typed columns alone) does not reproduce exactly — value
+    /// AND type, so a narrowed float or rescaled DECIMAL is kept too.
+    fn between(original: &ProximaRecord, typed: &ProximaRecord) -> Self {
+        let props = original
+            .props
+            .iter()
+            .filter(|(key, node)| typed.props.get(*key).is_none_or(|t| !same_bits(*node, t)))
+            .map(|(key, node)| (key.clone(), node.clone()))
+            .collect();
+        let embeddings = (!same_bits(&original.embeddings, &typed.embeddings))
+            .then(|| original.embeddings.clone());
+        Self { props, embeddings }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.props.is_empty() && self.embeddings.is_none()
+    }
+
+    fn apply(self, record: &mut ProximaRecord) {
+        record.props.extend(self.props);
+        if let Some(embeddings) = self.embeddings {
+            record.embeddings = embeddings;
+        }
+    }
+}
+
+/// [`proxima_records_to_record_batch_with_system_columns`] plus a
+/// [`SYS_COL_RESIDUAL`] column holding, per row, every prop and embedding the
+/// typed columns do not reproduce exactly (the PAX residual-tail rule of
+/// TD-USUB-6, applied to Parquet). Which values those are is decided by
+/// decoding the typed batch, not by a predicate mirroring the encoder, so the
+/// two cannot drift. The column is omitted when no row needs it.
+pub fn proxima_records_to_record_batch_with_residual(
+    records: &[ProximaRecord],
+    schema: &ProximaSchema,
+) -> Result<RecordBatch, StorageError> {
+    let typed = proxima_records_to_record_batch_with_system_columns(records, schema)?;
+    let read_back = record_batch_to_proxima_records(&typed);
+    let mut residuals = BinaryBuilder::new();
+    let mut needed = false;
+    for (original, back) in records.iter().zip(&read_back) {
+        let residual = Residual::between(original, back);
+        if residual.is_empty() {
+            residuals.append_null();
+            continue;
+        }
+        let bytes = rmp_serde::to_vec_named(&residual).map_err(|e| {
+            StorageError::Serialization(format!(
+                "proxima_arrow: residual for record '{}': {e}",
+                original.oid
+            ))
+        })?;
+        residuals.append_value(bytes);
+        needed = true;
+    }
+    if !needed {
+        return Ok(typed);
+    }
+    let mut fields: Vec<ArrowField> = typed
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| (**f).clone())
+        .collect();
+    fields.push(ArrowField::new(
+        SYS_COL_RESIDUAL,
+        ArrowDataType::Binary,
+        true,
+    ));
+    let mut columns = typed.columns().to_vec();
+    columns.push(Arc::new(residuals.finish()) as ArrayRef);
+    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)
+        .map_err(|e| StorageError::Serialization(format!("proxima_arrow: residual batch: {e}")))
+}
+
+/// What one [`SYS_COL_RESIDUAL`] cell overrides: the top-level prop names it
+/// carries (each replaces that prop's typed-column value on read-back) and
+/// whether it replaces the embeddings. Only the names are decoded.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ResidualOverrides {
+    pub props: Vec<String>,
+    pub embeddings: bool,
+}
+
+/// Decode which props and embeddings a residual cell overrides, without
+/// materializing their values.
+pub fn residual_overrides(bytes: &[u8]) -> Result<ResidualOverrides, StorageError> {
+    // Unknown fields fail the decode: a residual field added later may override
+    // something this reader does not account for, and a caller treats an
+    // undecodable residual as overriding everything.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Shape {
+        #[serde(default)]
+        props: HashMap<String, serde::de::IgnoredAny>,
+        #[serde(default)]
+        embeddings: Option<serde::de::IgnoredAny>,
+    }
+    let shape: Shape = rmp_serde::from_slice(bytes)
+        .map_err(|e| StorageError::Serialization(format!("proxima_arrow: residual: {e}")))?;
+    Ok(ResidualOverrides {
+        props: shape.props.into_keys().collect(),
+        embeddings: shape.embeddings.is_some(),
+    })
+}
+
+/// Indices of `records` that would NOT read back identically (props, embeddings
+/// and identity) through [`proxima_records_to_record_batch_with_residual`]. A
+/// durable writer holds these rather than writing them; with the residual
+/// column the set is expected to be empty, so a non-empty answer is a codec
+/// defect worth a metric, not a data shape.
+pub fn records_not_round_tripping(
+    records: &[ProximaRecord],
+    schema: &ProximaSchema,
+) -> Result<Vec<usize>, StorageError> {
+    let batch = proxima_records_to_record_batch_with_residual(records, schema)?;
+    let back = record_batch_to_proxima_records(&batch);
+    Ok(records
+        .iter()
+        .zip(&back)
+        .enumerate()
+        .filter(|(_, (original, back))| {
+            original.oid != back.oid
+                || original.props.len() != back.props.len()
+                || original
+                    .props
+                    .iter()
+                    .any(|(k, v)| back.props.get(k).is_none_or(|b| !same_bits(v, b)))
+                || !same_bits(&original.embeddings, &back.embeddings)
+        })
+        .map(|(i, _)| i)
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
 // Schema inference (for schema-less write paths, e.g. ObjectStoreBridge)
 // ---------------------------------------------------------------------------
 
@@ -935,10 +1126,34 @@ pub fn arrow_cell_to_proxima_value(array: &ArrayRef, row: usize) -> Option<Proxi
     } else if let Some(a) = any.downcast_ref::<Decimal128Array>() {
         // Exact decimal text at the column's scale (`12.50`), the same form INSERT stores.
         Some(ProximaValue::Decimal(a.value_as_string(row)))
+    } else if let Some((ticks, unit, zoned)) = timestamp_cell(array.as_ref(), row) {
+        // The column's own unit, and `TimestampTz` when the column carries a
+        // zone — the inverse of `build_timestamp_column`.
+        Some(if zoned {
+            ProximaValue::TimestampTz(ticks, unit)
+        } else {
+            ProximaValue::Timestamp(ticks, unit)
+        })
     } else {
         any.downcast_ref::<BinaryArray>()
             .map(|a| ProximaValue::Binary(a.value(row).to_vec()))
     }
+}
+
+/// `(ticks, unit, has_zone)` of a timestamp cell, for any of the four units.
+fn timestamp_cell(array: &dyn Array, row: usize) -> Option<(i64, DmTimeUnit, bool)> {
+    let any = array.as_any();
+    let (ticks, unit, zone) = if let Some(a) = any.downcast_ref::<TimestampSecondArray>() {
+        (a.value(row), DmTimeUnit::Second, a.timezone())
+    } else if let Some(a) = any.downcast_ref::<TimestampMillisecondArray>() {
+        (a.value(row), DmTimeUnit::Millisecond, a.timezone())
+    } else if let Some(a) = any.downcast_ref::<TimestampMicrosecondArray>() {
+        (a.value(row), DmTimeUnit::Microsecond, a.timezone())
+    } else {
+        let a = any.downcast_ref::<TimestampNanosecondArray>()?;
+        (a.value(row), DmTimeUnit::Nanosecond, a.timezone())
+    };
+    Some((ticks, unit, zone.is_some()))
 }
 
 /// Reverse of [`proxima_records_to_record_batch`]: materialize the rows of an
@@ -964,6 +1179,7 @@ pub fn arrow_cell_to_proxima_value(array: &ArrayRef, row: usize) -> Option<Proxi
 pub fn record_batch_to_proxima_records(batch: &RecordBatch) -> Vec<ProximaRecord> {
     let n = batch.num_rows();
     let mut out: Vec<ProximaRecord> = (0..n).map(|_| ProximaRecord::default()).collect();
+    let mut residuals: Vec<Option<Vec<u8>>> = vec![None; n];
     let arrow_schema = batch.schema();
 
     for (col_idx, field) in arrow_schema.fields().iter().enumerate() {
@@ -981,11 +1197,9 @@ pub fn record_batch_to_proxima_records(batch: &RecordBatch) -> Vec<ProximaRecord
                     .map(|c| f32::from_le_bytes(*c))
                     .collect();
                 let dim = values.len() as u32;
-                record.embeddings.push(EmbeddingCell {
-                    values: EmbeddingValues::Fp32(values),
-                    dim,
-                    ..Default::default()
-                });
+                record
+                    .embeddings
+                    .push(EmbeddingCell::new_fp32("", "", dim, values));
             }
             continue;
         }
@@ -1026,6 +1240,11 @@ pub fn record_batch_to_proxima_records(batch: &RecordBatch) -> Vec<ProximaRecord
                     }
                     SYS_COL_VALID_FROM_NS => record.valid_from_ns = pv_as_i64(&value),
                     SYS_COL_VALID_TO_NS => record.valid_to_ns = pv_as_i64(&value),
+                    SYS_COL_RESIDUAL => {
+                        if let ProximaValue::Binary(bytes) = value {
+                            residuals[row] = Some(bytes);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1040,13 +1259,81 @@ pub fn record_batch_to_proxima_records(batch: &RecordBatch) -> Vec<ProximaRecord
             }
         }
     }
+    // The residual goes on last, so it wins over the typed columns.
+    for (record, bytes) in out.iter_mut().zip(residuals) {
+        let Some(bytes) = bytes else { continue };
+        match rmp_serde::from_slice::<Residual>(&bytes) {
+            Ok(residual) => residual.apply(record),
+            Err(e) => tracing::error!(
+                oid = %record.oid,
+                error = %e,
+                "proxima_arrow: undecodable residual; the row reads back from its typed columns only"
+            ),
+        }
+    }
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proximadb_records::EmbeddingValues;
     use std::collections::HashMap;
+
+    #[test]
+    fn residual_overrides_names_exactly_what_the_residual_carries() {
+        let with_props = Residual {
+            props: HashMap::from([
+                (
+                    "score".to_string(),
+                    ProximaTreeNode::Value(ProximaValue::Int64(3)),
+                ),
+                (
+                    "Extra".to_string(),
+                    ProximaTreeNode::Value(ProximaValue::Boolean(true)),
+                ),
+            ]),
+            embeddings: None,
+        };
+        let bytes = rmp_serde::to_vec_named(&with_props).unwrap();
+        let mut got = residual_overrides(&bytes).unwrap();
+        got.props.sort();
+        assert_eq!(
+            got,
+            ResidualOverrides {
+                props: vec!["Extra".to_string(), "score".to_string()],
+                embeddings: false,
+            }
+        );
+
+        let embeddings_only = Residual {
+            props: HashMap::new(),
+            embeddings: Some(Vec::new()),
+        };
+        let bytes = rmp_serde::to_vec_named(&embeddings_only).unwrap();
+        assert_eq!(
+            residual_overrides(&bytes).unwrap(),
+            ResidualOverrides {
+                props: Vec::new(),
+                embeddings: true,
+            }
+        );
+        assert!(residual_overrides(b"not msgpack").is_err());
+        #[derive(serde::Serialize)]
+        struct Later {
+            props: HashMap<String, ProximaTreeNode>,
+            identity: bool,
+        }
+        let later = rmp_serde::to_vec_named(&Later {
+            props: HashMap::new(),
+            identity: true,
+        })
+        .unwrap();
+        assert!(
+            residual_overrides(&later).is_err(),
+            "an unknown residual field fails closed"
+        );
+    }
 
     fn col(id: i32, name: &str, dt: ProximaType, nullable: bool) -> ProximaColumn {
         ProximaColumn {
@@ -1076,6 +1363,208 @@ mod tests {
             r.props.insert(k.to_string(), leaf(v));
         }
         r
+    }
+
+    // --- Materializable columns and the residual (spill encoder) ----------
+
+    /// The spill encoder's schema gate trusts `column_materializable` to
+    /// mirror `build_column` exactly: a type the predicate accepts must build
+    /// (even with zero rows), a type it rejects must error. Enumerating every
+    /// [`ProximaType`] variant without a wildcard makes adding one force this
+    /// test to decide which side it belongs on.
+    #[test]
+    fn column_materializable_mirrors_build_column() {
+        for (ty, expected) in [
+            (ProximaType::Boolean, true),
+            (ProximaType::Int8, true),
+            (ProximaType::Int16, true),
+            (ProximaType::Int32, true),
+            (ProximaType::Int64, true),
+            (ProximaType::UInt8, true),
+            (ProximaType::UInt16, true),
+            (ProximaType::UInt32, true),
+            (ProximaType::UInt64, true),
+            (ProximaType::Float32, true),
+            (ProximaType::Float64, true),
+            (
+                ProximaType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                true,
+            ),
+            (ProximaType::String, true),
+            (ProximaType::Json, true),
+            (ProximaType::Binary, true),
+            (ProximaType::Date, true),
+            (ProximaType::Time(DmTimeUnit::Microsecond), false),
+            (ProximaType::Timestamp(DmTimeUnit::Microsecond), true),
+            (ProximaType::TimestampTz(DmTimeUnit::Microsecond), true),
+            (ProximaType::Interval(DmTimeUnit::Nanosecond), false),
+            (ProximaType::Duration(DmTimeUnit::Millisecond), false),
+            (ProximaType::Uuid, false),
+            (ProximaType::ULID, false),
+            (ProximaType::Symbol, false),
+            (ProximaType::Jsonb, false),
+            (ProximaType::Array(Box::new(ProximaType::Int64)), false),
+            (
+                ProximaType::Map {
+                    key: Box::new(ProximaType::String),
+                    value: Box::new(ProximaType::Int64),
+                },
+                false,
+            ),
+            (
+                ProximaType::Struct {
+                    fields: vec![("f".to_string(), ProximaType::Int64)],
+                },
+                false,
+            ),
+            (
+                ProximaType::DenseVector {
+                    element: DmVectorElement::Float32,
+                    dim: 3,
+                },
+                true,
+            ),
+            (
+                ProximaType::SparseVector {
+                    element: DmVectorElement::Float32,
+                },
+                false,
+            ),
+        ] {
+            let column = col(1, "c", ty.clone(), true);
+            let built = build_column(&[], &column);
+            assert_eq!(
+                built.is_ok(),
+                expected,
+                "{ty:?}: build_column vs column_materializable disagree"
+            );
+            assert_eq!(
+                column_materializable(&ty),
+                expected,
+                "{ty:?}: predicate out of sync with build_column"
+            );
+        }
+    }
+
+    /// Every shape the typed columns cannot carry exactly — a nested object, an
+    /// integer in a float column, a NaN, extra and named embeddings, an
+    /// explicit null — comes back identical through the residual.
+    #[test]
+    fn the_residual_makes_every_row_round_trip_exactly() {
+        let schema = ProximaSchema::from_columns(
+            "t".to_string(),
+            vec![
+                col(1, "f", ProximaType::Float64, true),
+                col(2, "s", ProximaType::String, true),
+            ],
+            vec![1],
+        );
+        let mut nested = HashMap::new();
+        nested.insert("inner".to_string(), leaf(ProximaValue::Int64(7)));
+        let mut row = record_with_props(
+            "o1",
+            vec![
+                ("f", ProximaValue::Int64(9_007_199_254_740_993)),
+                ("s", ProximaValue::String("kept typed".into())),
+                ("gone", ProximaValue::Null),
+                ("nan", ProximaValue::Float64(f64::NAN)),
+            ],
+        );
+        row.props
+            .insert("obj".to_string(), ProximaTreeNode::Object(nested));
+        row.embeddings = vec![
+            EmbeddingCell::new_fp32("m1", "text", 2, vec![1.0, 2.0]),
+            EmbeddingCell::new_fp32("m2", "image", 3, vec![3.0, 4.0, 5.0]),
+        ];
+        let plain = record_with_props("o2", vec![("s", ProximaValue::String("x".into()))]);
+        let records = vec![row.clone(), plain];
+
+        assert_eq!(
+            records_not_round_tripping(&records, &schema).expect("encode"),
+            Vec::<usize>::new()
+        );
+        let batch =
+            proxima_records_to_record_batch_with_residual(&records, &schema).expect("encode");
+        let back = record_batch_to_proxima_records(&batch);
+        assert_eq!(back[0].props.get("f"), row.props.get("f"), "int kept exact");
+        assert_eq!(back[0].props.get("obj"), row.props.get("obj"));
+        assert_eq!(back[0].props.get("gone"), Some(&leaf(ProximaValue::Null)));
+        assert!(matches!(
+            back[0].props.get("nan"),
+            Some(ProximaTreeNode::Value(ProximaValue::Float64(x))) if x.is_nan()
+        ));
+        assert_eq!(back[0].embeddings, row.embeddings, "both, names included");
+        assert_eq!(back[1].props, records[1].props);
+    }
+
+    /// No residual column at all when the typed columns already carry every
+    /// row exactly — the common relational case pays nothing.
+    #[test]
+    fn rows_the_typed_columns_carry_need_no_residual_column() {
+        let schema = sys_schema();
+        let rows = vec![record_with_props(
+            "o",
+            vec![("status", ProximaValue::String("open".into()))],
+        )];
+        let batch = proxima_records_to_record_batch_with_residual(&rows, &schema).expect("encode");
+        assert!(batch.schema().field_with_name(SYS_COL_RESIDUAL).is_err());
+        assert_eq!(
+            record_batch_to_proxima_records(&batch)[0].props,
+            rows[0].props
+        );
+    }
+
+    #[test]
+    fn timestamp_columns_decode_in_their_own_unit() {
+        let schema = ProximaSchema::from_columns(
+            "t".to_string(),
+            vec![
+                col(
+                    1,
+                    "at",
+                    ProximaType::Timestamp(DmTimeUnit::Microsecond),
+                    true,
+                ),
+                col(
+                    2,
+                    "at_tz",
+                    ProximaType::TimestampTz(DmTimeUnit::Millisecond),
+                    true,
+                ),
+            ],
+            vec![1],
+        );
+        let rec = record_with_props(
+            "o",
+            vec![
+                ("at", ProximaValue::Timestamp(5, DmTimeUnit::Millisecond)),
+                (
+                    "at_tz",
+                    ProximaValue::TimestampTz(9, DmTimeUnit::Millisecond),
+                ),
+            ],
+        );
+        let batch = proxima_records_to_record_batch_with_system_columns(
+            std::slice::from_ref(&rec),
+            &schema,
+        )
+        .expect("encode");
+        let back = record_batch_to_proxima_records(&batch);
+        assert_eq!(
+            back[0].props.get("at"),
+            Some(&leaf(ProximaValue::Timestamp(
+                5_000,
+                DmTimeUnit::Microsecond
+            ))),
+            "same instant, the column's unit"
+        );
+        assert_eq!(
+            back[0].props.get("at_tz"),
+            Some(&leaf(ProximaValue::TimestampTz(9, DmTimeUnit::Millisecond)))
+        );
     }
 
     // --- TD-USUB-11: faithful canonical-record round trip -------------------
@@ -1424,10 +1913,8 @@ mod tests {
         );
 
         let mut r0 = record_with_props("r0", vec![("id", ProximaValue::String("r0".into()))]);
-        r0.embeddings.push(EmbeddingCell {
-            values: EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-            ..Default::default()
-        });
+        r0.embeddings
+            .push(EmbeddingCell::new_fp32("", "", 0, vec![1.0, 2.0, 3.0]));
         // r1 has NO embedding -> null vector row.
         let r1 = record_with_props("r1", vec![("id", ProximaValue::String("r1".into()))]);
 
@@ -1508,10 +1995,8 @@ mod tests {
                 ("tags", ProximaValue::Null),
             ],
         );
-        r0.embeddings.push(EmbeddingCell {
-            values: EmbeddingValues::Fp32(vec![0.0, 1.0]),
-            ..Default::default()
-        });
+        r0.embeddings
+            .push(EmbeddingCell::new_fp32("", "", 0, vec![0.0, 1.0]));
         let r1 = record_with_props(
             "r1",
             vec![
@@ -1546,10 +2031,8 @@ mod tests {
         // The inferred schema must round-trip the records through the canonical converter.
         let r0b = {
             let mut r = record_with_props("r0", vec![("name", ProximaValue::String("a".into()))]);
-            r.embeddings.push(EmbeddingCell {
-                values: EmbeddingValues::Fp32(vec![0.0, 1.0]),
-                ..Default::default()
-            });
+            r.embeddings
+                .push(EmbeddingCell::new_fp32("", "", 0, vec![0.0, 1.0]));
             r
         };
         let batch = proxima_records_to_record_batch(&[r0b], &schema).unwrap();
@@ -1602,11 +2085,8 @@ mod tests {
                 ("age", ProximaValue::Int64(30)),
             ],
         );
-        r0.embeddings.push(EmbeddingCell {
-            values: EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-            dim: 3,
-            ..Default::default()
-        });
+        r0.embeddings
+            .push(EmbeddingCell::new_fp32("", "", 3, vec![1.0, 2.0, 3.0]));
         let r1 = record_with_props(
             "r1",
             vec![

@@ -145,6 +145,7 @@ impl TableRecordStore for MockTableRecordStore {
             record_ids.push(oid);
         }
         Ok(TableRecordWriteResult {
+            max_lsn: None,
             success: true,
             record_ids,
             metrics: Default::default(),

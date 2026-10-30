@@ -387,10 +387,11 @@ func TestCreateCollectionRequestMatchesSpec(t *testing.T) {
 	a := newTestAdapter(t, srv.URL)
 
 	_, err := a.CreateCollection(context.Background(), &CreateCollectionRequest{
-		Name:      "my_collection",
-		Dimension: 128,
-		Metric:    "cosine",
-		Engine:    "viper",
+		Name:        "my_collection",
+		Dimension:   128,
+		Metric:      "cosine",
+		Engine:      "viper",
+		Description: "a description",
 	})
 	if err != nil {
 		t.Fatalf("CreateCollection: %v", err)
@@ -409,6 +410,10 @@ func TestCreateCollectionRequestMatchesSpec(t *testing.T) {
 	parsed := assertBodyHasRequiredKeys(t, cap.Body, requiredKeysForRequestBody(spec, op))
 	if name, _ := parsed["name"].(string); name != "my_collection" {
 		t.Fatalf("body.name: got %v, want my_collection", parsed["name"])
+	}
+	// TD-RESTGET-1: the server persists it, so the adapter must send it.
+	if desc, _ := parsed["description"].(string); desc != "a description" {
+		t.Fatalf("body.description: got %v, want \"a description\"", parsed["description"])
 	}
 }
 

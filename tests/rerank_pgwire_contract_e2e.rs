@@ -16,12 +16,6 @@
 mod pg_server;
 
 use pg_server::TestPgServer;
-fn explain_err(e: &tokio_postgres::Error) -> String {
-    e.as_db_error()
-        .map(|d| format!("[{}] {}", d.code().code(), d.message()))
-        .unwrap_or_else(|| e.to_string())
-}
-
 #[test]
 fn rerank_over_pgwire_declines_not_silently_wrong() {
     std::thread::Builder::new()
@@ -59,7 +53,7 @@ async fn body() {
             .simple_query(sql)
             .await
             .expect_err("RERANK() over pgwire must not silently succeed");
-        let msg = explain_err(&err);
+        let msg = pg_server::db_err(&err);
         // SQLSTATE 0A000 (feature not supported) either way, whatever the
         // proximate guard — this test pins SAFETY (an honest error), not the
         // exact wording of a message that legitimately belongs to a shared,

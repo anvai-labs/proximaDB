@@ -229,13 +229,12 @@ async fn ingest_documents_inner(
         }
 
         let embeddings = match doc.vector {
-            Some(values) if !values.is_empty() => vec![EmbeddingCell {
-                model_id: "sdk-provided".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: values.len() as u32,
-                values: proximadb_records::EmbeddingValues::Fp32(values),
-                ..Default::default()
-            }],
+            Some(values) if !values.is_empty() => vec![EmbeddingCell::new_fp32(
+                "sdk-provided",
+                "dense_vector",
+                values.len() as u32,
+                values,
+            )],
             _ => vec![],
         };
 

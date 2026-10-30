@@ -5,9 +5,7 @@ from __future__ import annotations
 import pytest
 
 from proximadb_sdk.adapters.embedded_adapter import EmbeddedProtocolAdapter
-from proximadb_sdk.integrations.agentic_io import (
-    ProximaEventStore,
-)
+from proximadb_sdk.integrations.agentic_io import ProximaEventStore
 from proximadb_sdk.integrations.agentic_store import (
     ProximaBaseStore,
     ProximaCheckpointSaver,

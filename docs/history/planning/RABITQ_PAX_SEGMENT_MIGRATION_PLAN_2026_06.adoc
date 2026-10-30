@@ -1,0 +1,49 @@
+= P3: Vector-Segment PAX Migration Plan (enables RaBitQ in ANN search)
+:toc: macro
+
+[IMPORTANT]
+====
+Historical planning snapshot archived 2026-10-26; statements of "current", "open" or
+"done" below describe the source document at its recorded date, not current delivery.
+Current work: link:../../current/PLATFORM_PLAN.adoc[the consolidated plan/tracker].
+Preserved as design rationale and evidence; do not resume its old task list verbatim.
+====
+
+2026-06-19
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Done (2026-06-30).** SST vector segments are written as PAX with RaBitQ codes by default, read mixed-format, compacted, and recall-gated (#106, #109, #111, #116, #120, #580). ADR-049 M1-3 later made PAX the only flush format; the legacy opt-outs now select recall-exact `RawF32` PAX.
+| Component | `src/storage/engines/sst/{flush,readers,compaction}`, `crates/storage/proximadb-block-format`
+| Relates to | RaBitQ scoping (superseded by this plan; removed), link:../../12-design/adr/ADR-026-pax-canonical-vector-path.adoc[ADR-026], link:../../12-design/adr/ADR-062-coalesced-rabitq-header-self-describing-footer-pax-layout.adoc[ADR-062], link:../../12-design/adr/ADR-049-v1-to-v2-migration-to-native-model.adoc[ADR-049]
+|===
+
+== History
+
+*Capability:* every SST flush writes a PAX segment. The default quant is RaBitQ, overridable by the
+per-collection `pax_vector_quant` setting or the `PROXIMADB_PAX_VECTOR_QUANT` env. The cold scan
+ranks by RaBitQ codes, reranks in SQ8/f32 and returns the top-k. Old `ProximaDataBlock` segments are
+still readable.
+
+*The phased pattern is canonical.* Engineering mandate #8 cites this plan as the template for any
+storage-format change. Each phase was independently shippable:
+
+. **A — read-side first:** detect the new format by magic byte; the manifest field defaults to the
+  legacy format when absent. No new bytes are written yet.
+. **B — write side, flag-gated OFF** (`PROXIMADB_PAX_VECTOR_SEGMENTS`).
+. **C — new scoring branch** that activates only for blocks in the new format.
+. **D — per-collection opt-in** replaces the global env gate.
+. **E — compaction + recovery** read both formats and write the configured one (#580 unblocked
+  default-on).
+. **F — extend to the other engines.** The cascade made RaBitQ the deployment default.
+. **G — cold-recall gate** at N ≥ 1000, so the cold path really runs (#106: recall@10 ≥ 0.90).
+
+*Lessons that still apply:*
+
+* Recovery must never assume the new format.
+* Small-N tests are brute-force served and never exercise the cold path.
+* Reuse the existing row↔columnar adapters; never hand-roll a decoder.
+
+*Evidence:* the Phase G cold-recall harness, plus `resolve_pax_vector_quant` precedence tests in
+`src/storage/engines/sst/flush/mod.rs`.

@@ -29,10 +29,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import (
-    Any,
-    Protocol,
-)
+from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
 
@@ -504,10 +501,7 @@ class DocumentProcessor(ABC):
         # a chunk that bypassed it (the deprecated byte-offset code path) is
         # recorded as legacy rather than left ambiguous — an unmarked offset is
         # indistinguishable from an exact one to a later reader.
-        from .chunking_strategies.base import (
-            OFFSET_BASIS_CHAR,
-            OFFSET_CONTRACT_LEGACY,
-        )
+        from .chunking_strategies.base import OFFSET_BASIS_CHAR, OFFSET_CONTRACT_LEGACY
 
         metadata.setdefault("offset_basis", OFFSET_BASIS_CHAR)
         metadata.setdefault("offset_contract", OFFSET_CONTRACT_LEGACY)

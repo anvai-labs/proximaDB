@@ -1,6 +1,6 @@
 [package]
 name = "proximadb"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 autobenches = false
 authors = ["Vijaykumar Singh <vijay@anvaiops.com>"]
@@ -68,6 +68,7 @@ members = [
     "crates/horizontal/proximadb-resilience",
     "crates/horizontal/proximadb-automl",
     "crates/horizontal/proximadb-audit",
+    "crates/horizontal/proximadb-onnx-runtime",
     "crates/horizontal/proximadb-cross-modal-fusion",
     "crates/horizontal/proximadb-utility-scorer",
     "crates/horizontal/proximadb-document-geo-index",
@@ -173,7 +174,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -304,7 +305,7 @@ thiserror = "2.0"
 tokio = { version = "1.37", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", features = ["gzip", "tls-native-roots"] }
-toml = "0.8"
+toml = "1.1"
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 proximadb-vector = { path = "crates/modalities/proximadb-vector" }
@@ -328,6 +329,7 @@ proximadb-tls = { path = "crates/horizontal/proximadb-tls" }
 proximadb-resilience = { path = "crates/horizontal/proximadb-resilience" }
 proximadb-automl = { path = "crates/horizontal/proximadb-automl" }
 proximadb-audit = { path = "crates/horizontal/proximadb-audit" }
+proximadb-onnx-runtime = { path = "crates/horizontal/proximadb-onnx-runtime" }
 proximadb-cross-modal-fusion = { path = "crates/horizontal/proximadb-cross-modal-fusion" }
 proximadb-utility-scorer = { path = "crates/horizontal/proximadb-utility-scorer" }
 proximadb-document-geo-index = { path = "crates/horizontal/proximadb-document-geo-index" }
@@ -571,7 +573,7 @@ proximadb-query-filter = { path = "crates/query/proximadb-query-filter" }
 proximadb-uql = { path = "crates/query/proximadb-uql" }
 proximadb-vector-query = { path = "crates/query/proximadb-vector-query" }
 # Extracted from src/services/catalog_introspection.rs (re-export shim keeps callers stable).
-proximadb-catalog-introspection = { version = "0.4.2", path = "crates/binding/proximadb-catalog-introspection" }
+proximadb-catalog-introspection = { version = "0.5.0", path = "crates/binding/proximadb-catalog-introspection" }
 
 # SQL Parsing
 sqlparser = { version = "0.62", features = ["visitor"] }
@@ -610,32 +612,31 @@ lettre = "0.11"  # Email sending for alert notifications
 
 # OTLP metering push (TD-161 dual-sink, ADR-027). OPTIONAL + default-OFF behind the
 # `otlp-metering` feature: the durable per-tenant `_metering` writer is OSS-native (no
-# deps); only the external OTLP push pulls these. Pinned to the 0.32 line, which is the
+# deps); only the external OTLP push pulls these. On the 0.33 line; 0.32 was the
 # first to resolve against the repo's own `tonic 0.14` / `prost 0.14` with NO duplicate
 # gRPC stack (otlp <=0.30 drags in a second tonic 0.12-0.13 + prost 0.13). `grpc-tonic`
 # reuses the existing tonic transport and avoids pulling reqwest 0.12.
-opentelemetry = { version = "0.32", optional = true }
+opentelemetry = { version = "0.33", optional = true }
 # `rt-tokio` + `experimental_metrics_periodicreader_with_async_runtime` gate
 # `runtime::Tokio` and the async-runtime `PeriodicReader`, which drive export on the
 # tokio runtime — REQUIRED with the grpc-tonic exporter (the default thread-based
 # reader block_on's a tonic call with no reactor → runtime panic). The async-runtime
 # feature transitively enables `experimental_async_runtime`.
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "experimental_metrics_periodicreader_with_async_runtime", "metrics"], optional = true }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "metrics"], optional = true }
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "experimental_metrics_periodicreader_with_async_runtime", "metrics"], optional = true }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "metrics"], optional = true }
 # MLflow UI embedding (TD-MLOPS-3) — optional behind the `mlflow-ui` feature.
 include_dir = { version = "0.7", optional = true }
 mime_guess = { version = "2", optional = true }
 
 # Storage & Memory Management
 memmap2 = "0.9"
-lru = "0.18"  # LRU cache for disk-backed graph storage
 rocksdb = { version = "0.21", optional = true }  # Optional for metadata backend
 tokio-postgres = { version = "0.7", optional = true }  # PostgreSQL client for CDC (experimental-cdc-connectors)
 sqlx = { version = "0.9", features = ["runtime-tokio", "tls-native-tls", "json", "chrono", "uuid"], optional = true }  # OLTP catalog backends (oltp-catalog)
 tempfile = "3.0"
 rayon = "1.10"  # Parallel processing for search optimization
 # Parquet and Arrow dependencies - using v57+ for improved performance and tonic 0.14 compatibility
-parquet = { version = "59", default-features = false, features = ["arrow", "zstd", "lz4", "snap", "brotli", "flate2", "flate2-rust_backened"] }
+parquet = { version = "59", default-features = false, features = ["arrow", "async", "zstd", "lz4", "snap", "brotli", "flate2", "flate2-rust_backened"] }
 # Arrow dependencies matching parquet v57
 arrow = { version = "59", features = ["prettyprint", "ffi"] }
 arrow-array = { version = "59", default-features = false }
@@ -663,14 +664,14 @@ snap = "1.1"             # Snappy compression
 zstd = "0.13"            # Zstandard compression
 flate2 = { version = "1.0", default-features = true }  # Gzip/Deflate/Zlib compression
 brotli = "6.0"           # Brotli compression - Updated from 3.5
-bzip2 = "0.5"            # Bzip2 compression - Updated from 0.4
+bzip2 = "0.6"            # Bzip2 compression - Updated from 0.5
 xz2 = "0.1"              # XZ/LZMA2 compression
 
 # System monitoring
 sysinfo = "0.30"
 
 # Avro serialization with schema evolution
-apache-avro = "0.16"
+apache-avro = "0.21"
 bytes = "1.5"
 
 # Cloud storage: the canonical object_store crate provides true byte-range
@@ -714,8 +715,8 @@ rand_chacha = "0.3"
 rand_distr = "0.4"  # For generating realistic probability distributions
 
 # Cryptographic hashing
-sha2 = "0.10"
-hkdf = "0.12"  # Key derivation function
+sha2 = "0.11"
+hkdf = "0.13"  # Key derivation function
 aes-gcm = "0.10"  # AEAD encryption for field-level encryption
 
 # TLS/mTLS certificate management
@@ -724,7 +725,6 @@ x509-parser = "0.18"             # Certificate parsing and validation
 rustls.workspace = true          # TLS implementation (unified with axum-server 0.7)
 rustls-pemfile = "2.0"           # PEM file parsing (CertificateDer/PrivateKeyDer)
 tokio-rustls = "0.26"            # Async TLS streams (rustls 0.23)
-webpki-roots = "0.25"            # Mozilla root certificates
 axum-server = { version = "0.7", features = ["tls-rustls"] }  # Axum TLS support (hyper 1.0)
 time = { version = "0.3", features = ["std"] }  # Time handling for certificates
 
@@ -733,12 +733,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 prometheus.workspace = true
-metrics = "0.21"
 
 # Configuration
 config = "0.15"
 clap = { version = "4.0", features = ["derive"] }
-toml = "0.8"
+toml = "1.1"
 
 # Benchmarking (HTML reports available via `cargo bench`)
 
@@ -770,10 +769,9 @@ async-trait = "0.1"
 futures = "0.3"
 regex = "1.10"
 nom = "7"
-hostname = "0.3"  # Get hostname for leader election
 
 # Multi-model storage (Document + Observability)
-tantivy = "0.26"  # Full-text search for documents
+tantivy = "0.27"  # Full-text search for documents
 jsonpath-rust = "0.5"  # JSON path queries for document filtering (actively maintained)
 flume = "0.12"  # High-performance MPSC channels for observability
 
@@ -799,10 +797,10 @@ moka = { version = "0.12", features = ["future"] }
 # Provides direct buffer access to numpy arrays without Python .tolist() conversion
 # Java bindings via JNI
 # Node.js bindings via NAPI-RS
-proximadb-raptor-common = { version = "0.4.2", path = "crates/storage/proximadb-raptor-common" }
-proximadb-raptor-engine = { version = "0.4.2", path = "crates/storage/proximadb-raptor-engine" }
-proximadb-engine-core = { version = "0.4.2", path = "crates/storage/proximadb-engine-core" }
-proximadb-mongodb-parser = { version = "0.4.2", path = "crates/binding/proximadb-mongodb-parser" }
+proximadb-raptor-common = { version = "0.5.0", path = "crates/storage/proximadb-raptor-common" }
+proximadb-raptor-engine = { version = "0.5.0", path = "crates/storage/proximadb-raptor-engine" }
+proximadb-engine-core = { version = "0.5.0", path = "crates/storage/proximadb-engine-core" }
+proximadb-mongodb-parser = { version = "0.5.0", path = "crates/binding/proximadb-mongodb-parser" }
 
 # GPU acceleration dependencies (platform-specific)
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
@@ -812,7 +810,7 @@ metal = { version = "0.27", optional = true }  # Metal GPU acceleration for Appl
 [build-dependencies]
 tonic-build = "0.14"
 tonic-prost-build = "0.14"  # Required for prost-based protobuf compilation in tonic-build 0.14+
-apache-avro = "0.16"
+apache-avro = "0.21"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
@@ -998,7 +996,6 @@ compile_protobuf = []
 #   cargo test --features test-full            # All tests
 
 # Default test runs (lean - unit tests only in CI by default)
-comprehensive_tests = []  # Legacy flag for comprehensive tests
 perf_tests = []           # Legacy flag for performance tests
 
 # Strategic test categories for CI/CD
@@ -1042,8 +1039,9 @@ graph-first-sks = []
 datafusion-integration = ["dep:datafusion", "dep:datafusion-common"]
 # ADR-059: in-process DuckDB OLAP engine (default OFF — adds the libduckdb C++
 # build). Enables the perf-ledger harnesses to run DuckDB in-process (io-traced,
-# same parquet/SQL) instead of the CLI subprocess.
-duckdb = ["dep:duckdb"]
+# same parquet/SQL) instead of the CLI subprocess. Needs the DataFusion
+# reader's snapshot-manifest file selection so both engines read one generation.
+duckdb = ["dep:duckdb", "datafusion-integration"]
 
 # Hardware acceleration features
 gpu = ["metal", "proximadb-codec/gpu", "proximadb-hardware-caps/gpu", "proximadb-distance-kernel/gpu"]  # GPU acceleration support (CUDA, ROCm, MPS, OpenCL)

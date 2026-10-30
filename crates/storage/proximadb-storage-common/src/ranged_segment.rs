@@ -673,13 +673,7 @@ mod tests {
             tenant_id: "t".into(),
             created_at_ns: ts,
             updated_at_ns: ts,
-            embeddings: vec![EmbeddingCell {
-                model_id: "m".into(),
-                modality: "dense".into(),
-                values: EmbeddingValues::Fp32(v),
-                dim,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32("m", "dense", dim, v)],
             ..Default::default()
         }
     }

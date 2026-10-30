@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from ..models.index_spec_output import IndexSpecOutput
     from ..models.quantization_config_output import QuantizationConfigOutput
     from ..models.schema_definition import SchemaDefinition
+    from ..models.storage_class_status_output import StorageClassStatusOutput
 
 
 T = TypeVar("T", bound="CollectionV2Response")
@@ -34,6 +35,11 @@ class CollectionV2Response:
         engine (str): Storage engine
         distance_metric (str): Distance metric
         proxima_record_enabled (bool): Whether ProximaRecord is enabled
+        storage_class (str): Resolved desired storage class (TD-TIER-1 SC1):
+            "economy" | "balanced" (default) | "performance".
+        storage_class_status (StorageClassStatusOutput): REST output for the observed storage-class status (TD-TIER-1
+            SC1; mirrors
+            proto `StorageClassStatus` — a read-side projection, never an input).
         stats (CollectionStatsV2): Collection statistics for v2 API
         content_revision (int): Monotonic server-owned content revision for cache revalidation.
         content_revision_token (str): Opaque validator that also fences server restarts.
@@ -56,6 +62,8 @@ class CollectionV2Response:
     engine: str
     distance_metric: str
     proxima_record_enabled: bool
+    storage_class: str
+    storage_class_status: StorageClassStatusOutput
     stats: CollectionStatsV2
     content_revision: int
     content_revision_token: str
@@ -74,6 +82,9 @@ class CollectionV2Response:
             QuantizationConfigOutput,
         )
         from ..models.schema_definition import SchemaDefinition  # noqa: PLC0415
+        from ..models.storage_class_status_output import (  # noqa: PLC0415
+            StorageClassStatusOutput,
+        )
 
         collection_id = self.collection_id
 
@@ -86,6 +97,10 @@ class CollectionV2Response:
         distance_metric = self.distance_metric
 
         proxima_record_enabled = self.proxima_record_enabled
+
+        storage_class = self.storage_class
+
+        storage_class_status = self.storage_class_status.to_dict()
 
         stats = self.stats.to_dict()
 
@@ -138,6 +153,8 @@ class CollectionV2Response:
                 "engine": engine,
                 "distance_metric": distance_metric,
                 "proxima_record_enabled": proxima_record_enabled,
+                "storage_class": storage_class,
+                "storage_class_status": storage_class_status,
                 "stats": stats,
                 "content_revision": content_revision,
                 "content_revision_token": content_revision_token,
@@ -164,6 +181,9 @@ class CollectionV2Response:
             QuantizationConfigOutput,
         )
         from ..models.schema_definition import SchemaDefinition  # noqa: PLC0415
+        from ..models.storage_class_status_output import (  # noqa: PLC0415
+            StorageClassStatusOutput,
+        )
 
         d = dict(src_dict)
         collection_id = d.pop("collection_id")
@@ -177,6 +197,12 @@ class CollectionV2Response:
         distance_metric = d.pop("distance_metric")
 
         proxima_record_enabled = d.pop("proxima_record_enabled")
+
+        storage_class = d.pop("storage_class")
+
+        storage_class_status = StorageClassStatusOutput.from_dict(
+            d.pop("storage_class_status")
+        )
 
         stats = CollectionStatsV2.from_dict(d.pop("stats"))
 
@@ -256,6 +282,8 @@ class CollectionV2Response:
             engine=engine,
             distance_metric=distance_metric,
             proxima_record_enabled=proxima_record_enabled,
+            storage_class=storage_class,
+            storage_class_status=storage_class_status,
             stats=stats,
             content_revision=content_revision,
             content_revision_token=content_revision_token,

@@ -20,10 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 from proximadb_sdk.models import VectorRecord
 
-from .embedded_client_adapter import (
-    PROXIMADB_IMPORT_ERROR,
-    EmbeddedClientAdapter,
-)
+from .embedded_client_adapter import PROXIMADB_IMPORT_ERROR, EmbeddedClientAdapter
 
 
 class BaseProximaDBTest:

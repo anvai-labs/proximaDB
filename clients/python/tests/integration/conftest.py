@@ -15,11 +15,7 @@ from typing import Any
 
 import pytest
 
-from proximadb_sdk import (
-    CollectionConfig,
-    ProximaDBClient,
-    ProximaDBError,
-)
+from proximadb_sdk import CollectionConfig, ProximaDBClient, ProximaDBError
 
 # Configure logging for tests
 logging.basicConfig(

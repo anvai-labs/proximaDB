@@ -1,0 +1,110 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-USUB-21: The INSERT existence probe decodes every spill segment, so bulk load is quadratic once a table spills
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved 2026-10-24** for the load path (per-segment key filters; see Resolution). The P2.4 SF1 gate itself is tracked by TD-SEAM-4 and `docs/history/evidence/P24_SF1_GATE_EVIDENCE_2026_10_23.adoc`. Filed 2026-10-23 by the ADR-097 P2.4 gate run.
+| Priority | **HIGH**: blocks the P2.4 exit gate (TD-SEAM-4: TPC-DS SF1 load), and any bulk INSERT into a table past the spill threshold, on the default configuration since 2026-10-22 (`c62ab32b7`).
+| Component | `src/services/record_spill.rs` (`SpillRecordStorage::get_record`, `read_segment`, `delete_record`), `src/services/record_store.rs` (`DirectWalTableRecordStore::write_mutations`, `commit_atomic`), `src/services/dml/mod.rs` (`enforce_row_write_constraints`)
+| Relates to | TD-USUB-1, TD-SEAM-4, TD-OLAPFMT-3
+| Blocked by | Nothing.
+|===
+
+== The finding
+
+`write_mutations` checks every INSERT (and UPDATE) row for an existing copy with
+`partition.get_record(&key)`, and the legacy partition's during an ADR-031 cutover. In a spill
+partition, a key that is not in the memtable goes through `get_record`'s segment arm: for each
+segment, newest first, `read_segment` reads the whole file, decodes it into `ProximaRecord`s
+(one `HashMap` per row) and searches it linearly. A new key is in no segment, so every INSERT
+row decodes every segment of its table: loading `n` rows decodes about `n²/2` rows (precisely,
+each row decodes the rows already spilled, which lag it by up to one threshold).
+
+The same whole-segment probe runs at other sites, so fixing `write_mutations` alone is not
+enough:
+
+* `commit_atomic` probes each row the same way.
+* Tables with a declared key are probed a **second** time by `enforce_row_write_constraints` →
+  `get_by_key` → `get_record` whenever no `ConditionalKeyStore` is wired: any build without
+  `oltp-integrity`, or without a `data_dir`.
+* During a cutover, migrate-on-write calls `legacy.delete_record` for every written row, and
+  `delete_record`'s segment arm has the same shape.
+
+== Evidence
+
+`docs/history/evidence/P24_SF1_GATE_EVIDENCE_2026_10_23.adoc`, release build:
+
+* TPC-DS SF 0.01 load-only: 6.8 s with spill off; **1,746 s (257×)** with the threshold at
+  16,384, where only `store_sales` (28,800 rows) spills one segment, so 12,416 rows each decode
+  16,384 rows: ≈ 8.6 µs per decoded row.
+* SF 0.1 at the default threshold (65,536): stopped after 712 s with the load unfinished. gdb
+  samples of the busy thread all sit in `record_batch_to_proxima_records` /
+  `ParquetRecordReader::read_records` ← `read_segment_records` ←
+  `SpillRecordStorage::read_segment` ← `get_record` ← `write_mutations` ←
+  `DmlService::execute_insert`.
+* At SF1 the keyed dimension tables pay it too: `customer` and `customer_address` (100,000 rows
+  each) would decode ≈ 34,464 × 65,536 rows twice over, ≈ 11 h each at 8.6 µs.
+
+Segment codec is not the cost: segments are Parquet with no compression set. A faster codec
+changes a constant, not the quadratic.
+
+== Options considered (2026-10-23)
+
+. **Probe a batch, not a row.** Each probe site checks all of a statement's keys against a
+  segment in one pass (decode once, look up every key), so a 200-row INSERT decodes each segment
+  once instead of 200 times. Small and local; it does not remove the quadratic in statements.
+. **Make the point lookup cheap.** Segments are oid-sorted with a page index. Cache each
+  segment's footer at flush and discovery and read only the pages whose oid range can hold the
+  key, by range rather than the whole file. Two corrections to the obvious version:
+  .. there is no oid Bloom filter to use: `ParquetWritePolicy::bloom_columns` skips the leading
+     sort column, which is `__proxima_oid` for spill segments. Turn it on explicitly for spill
+     segments if per-segment Bloom pruning is wanted;
+  .. per-segment oid min/max prunes little for keyed tables: an INT key is encoded as its
+     decimal string, so "2" sorts after "10" and each segment spans almost the whole key domain.
+     Within a segment the oid sort makes row-group ranges disjoint, so the page index bounds the
+     read to one page per segment.
+. **Do not skip the probe for keyless tables.** It looks free (the fact tables are keyless,
+  their oids generated), but the generated oid is `{table}:row:{now_ns}`
+  (`new_local_record_id`, `crates/control/proximadb-catalog/src/relational.rs`): no counter or
+  nonce, so two rows in one clock tick, or after the clock steps back, collide. Today the probe
+  turns that into `INSERT_CONFLICT`; without it, `upsert_resident` silently overwrites a
+  committed row. (Collisions inside one statement are already unguarded, because every probe
+  runs before any row is applied; that is pre-existing.) Make the generator unique first
+  (UUIDv7, or `now_ns` + counter + instance nonce); only then can a generated oid skip the probe.
+
+== Resolution (2026-10-24)
+
+Neither option above as written: each segment carries an in-memory **key filter**, the oid range
+plus a 1 % Bloom filter over every oid the segment holds, persisted tombstones included
+(`SegmentKeyFilter` in `src/services/record_spill.rs`). This is option 2's pruning without
+needing a Parquet oid Bloom filter or a footer read per probe.
+
+* `flush` builds the filter from the rows it writes and inserts it before publishing the path;
+  a segment this process did not write (discovered on open) gets its filter from the segment on
+  first probe; a purge clears the filters with the segments.
+* `get_record` and `delete_record`'s segment arm go through `newest_segment_copy`: newest
+  segment first, skipping every segment whose filter rules the oid out, first hit authoritative.
+  Every probe site above reaches the segments through these two methods.
+* A probe for a new key reads no segment (bar a ~1 % false positive per segment). A probe that
+  hits still decodes that one segment whole, as before; that is the UPDATE / DELETE-of-a-flushed-
+  row path, not the load path.
+* Memory: about 1.2 bytes per flushed row (≈ 79 KB per 65,536-row segment), held for as long as
+  the segment exists. There is no compaction yet, so the total grows with every row a loaded
+  partition has flushed: ≈ 7 MB at TPC-DS SF1, ≈ 1.2 GB per billion flushed rows. A cap or
+  eviction belongs with segment compaction.
+* Behaviour change: a probe for an oid every filter rules out no longer reads, and so no longer
+  fails on, an unreadable segment.
+* The probe is not skipped for generated oids (option 3 stands), so the colliding-generated-oid
+  test the original gate asked for is not needed here: that path is unchanged.
+
+Measured, release build, TPC-DS load-only: SF 0.01 with a 16,384 threshold loads in **7.9 s**
+(was 1,746 s; spill off 6.8 s); SF 0.1 at the default threshold loads in 118 s (was unfinished
+after 712 s) and publishes 22/22 tables.
+
+Gates: `a_probe_for_an_absent_oid_reads_no_segment` (segment files removed from under the store:
+absent oids still answer, a flushed oid still reads its segment),
+`a_discovered_segment_filter_keeps_tombstones_authoritative`,
+`a_flushed_tombstone_is_in_its_segment_filter`,
+`a_key_filter_never_rules_out_an_oid_it_holds`.

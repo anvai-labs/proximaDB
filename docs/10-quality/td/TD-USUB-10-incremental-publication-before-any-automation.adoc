@@ -5,12 +5,16 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **In progress.** Filed 2026-09-21 under ADR-094 Phase 4. **Slice 0 landed 2026-09-23** — manifest-driven file selection, the prerequisite without which the filed plan returns rows from multiple generations (see BLOCKER below). Slices 1–3 remain open.
+| Status | **In progress.** Streaming/multipart and incremental append landed (#2222/#2234); DV infrastructure landed (#2238). Delete-aware readers (#2256), gated v3 policy/lineage (#2260/#2261), oid mapping (#2262) and the default-OFF live-delete publisher (#2266) landed; the fence acceptance gates and crash-gap recovery landed (#2273), and the soak (this slice) showed correctness under mixed load but narrow reach (TD-LIVEDEL-1). The ordered-DV-base reader relaxation landed (#2277), and incremental updates and deletes landed behind `PROXIMADB_MATERIALIZE_INCREMENTAL_DV` (shipped OFF, armed ON 2026-10-29) (carried files + after-image part + `dv-mat-*` vectors). Superseded `dv-mat-*` Puffins are garbage-collected by the generation GC, and a seeded incremental soak (`soak_incremental_materialize_holds_both_views`) pins both views across inserts, updates and deletes. The gate is ON by default since 2026-10-29 (armed on that soak; `0` restores full rewrites). Rollout to automated publication remains open. Current assignment/gates: link:../../current/TRACKER.adoc[tracker].
 | Priority | MEDIUM — a correctness-adjacent scaling limit, and a hard prerequisite for any automated publication policy.
 | Component | `src/services/dml/mod.rs` (`materialize_table_to_parquet`), `crates/storage/proximadb-iceberg-engine/src/manifest.rs`
 | Relates to | ADR-094 (Decision 1 rationale), ADR-062 (fresh-name + atomic manifest advance), TD-USUB-4 (additive layouts), TD-USUB-9
 | Blocked by | Nothing now — TD-USUB-4 (a table must be able to hold more than one representation) landed 2026-09-22 (#1920).
 |===
+
+Current reader review and validation: link:../../history/evidence/P24_DELETION_READER_REVIEW_2026_10_26.adoc[evidence].
+The filed finding and dated sections below preserve historical context; they do not override
+link:../../current/LAKEHOUSE_PLAN.adoc[the current v3-first implementation contract].
 
 == The finding
 
@@ -160,3 +164,175 @@ and asserts the table opens with 2 splits, not 4 — listing would have unioned 
 `proximadb_warehouse_iceberg_publish_failures_total` load-bearing. A failed publish now means
 a stale-or-absent manifest, and reads either fall back to listing (absent) or serve the prior
 snapshot (stale) — so the counter USUB-9 added is the signal that the two have diverged.
+
+=== P2.4 slice 1: readers fail closed (2026-10-22)
+
+Slice 0's fallback listed the directory on *any* manifest failure, including an unreadable
+`metadata.json`. That was safe only while publication wrote one fixed-name object. Multi-part,
+generation-named publication (P2.4, tracker §5.3) leaves several generations in `data/`, and
+listing them would serve rows from several snapshots at once. The selection now fails closed:
+
+* `manifest_selected_files` returns `Ok(None)`, which means list the directory, **only when no
+  metadata log exists**. That covers a non-published layout, or a table published before
+  Iceberg metadata existed.
+* Once a `v*.metadata.json` exists, an unreadable log, or a snapshot that names no parquet
+  files, is an `Err` and the table open fails.
+* The DuckDB engine registers each view as `read_parquet([...])` over the same manifest
+  selection (`manifest_selected_uris`) instead of the directory. Both engines therefore read
+  one generation, and an unreadable log fails the DuckDB query too. The `duckdb` feature now
+  enables `datafusion-integration`, which owns the shared selection.
+
+**Evidence:** `unreadable_manifest_fails_closed` garbles the only `metadata.json` beside a stale
+part, then asserts that the open and `manifest_selected_uris` both error.
+`view_reads_manifest_files_only` (feature `duckdb`) asserts that the DuckDB view returns the
+snapshot's 4 rows, not 8. `without_a_manifest_selection_falls_back_to_listing` still pins the
+no-metadata case.
+=== P2.4 slice 2: publish an explicit file list (2026-10-22)
+
+`publish_iceberg_snapshot` built the manifest by *listing* the data prefix, so it could not
+publish one generation out of several. `ObjectStoreBridge::publish_iceberg_files(files,
+parent, …)` publishes exactly the named files as the successor of metadata version `parent`:
+
+* the Avro manifest and manifest list are named by the metadata version they commit under
+  (`v{N:020}-{snapshot}-m0.avro`, `snap-{snapshot}-v{N:020}-list.avro`) and written
+  `put_if_absent`, so a racing publisher cannot overwrite the winner's manifest;
+* losing the slot is `Err(StorageError::AlreadyExists)`. The old MATERIALIZE caller treated
+  `CommitOutcome::Conflict` as success;
+* a named file whose footer cannot be read fails the publish, where a listed file used to
+  degrade to count 0.
+
+MATERIALIZE publishes its file through this API. Evidence:
+`publish_iceberg_files_publishes_only_the_named_generation`,
+`publish_iceberg_files_on_a_stale_parent_is_an_error`,
+`publish_iceberg_files_requires_readable_footers`.
+
+=== P2.4 slice 4: bounded, oid-ordered chunked scan (2026-10-22)
+
+The MATERIALIZE input no longer has to be the whole table at once. `RecordScan::scan_record_chunks` yields a store's live records in strictly ascending oid order, in bounded chunks:
+
+* `SpillRecordStorage` k-way merges its oid-sorted segments under the resident rows of `view()`. It decodes one row-group batch per segment through `FileSystemParquetReader`.
+* `MemtableRecordStorage` serves a snapshot of its keys.
+
+`TableRecordStore::scan_records_chunked` adds table membership and the primary-over-legacy merge. `DmlService::scan_table_records_chunked` adds the governed-read prelude.
+
+Evidence: `chunked_scan_equals_the_merged_scan` builds several segments, updates, persisted and in-memory deletes, a re-insert and resident rows. It asserts strictly ascending oids, the chunk bound, and equality with `scan_records`.
+
+=== P2.4 slice 2a: published files carry a hidden row key (2026-10-24)
+
+Incremental append (slice 2b) must tell an insert from an update by probing what is already
+published, so every published file now carries each row's oid as a hidden LAST column,
+`__proxima_oid` (Utf8, non-null).
+
+* It is always Bloom-filtered unless it leads the sort (`ParquetWritePolicy::bloom_columns`; spill
+  segments, sorted by oid, are unchanged), subject to the policy's `min_rows` and enable flags.
+* It is not in the Iceberg schema. Every column carries a `PARQUET:field_id` (PyIceberg treats a
+  file with any id-less column as id-less and falls back to name mapping, which rejects an
+  unknown column): table columns keep `1..N`, system columns take `SYSTEM_FIELD_ID_BASE`
+  (2,000,000,000) and up, below Iceberg's reserved metadata range.
+* Readers hide it. DataFusion drops `__proxima_*` columns from its planning schema and resolves
+  each requested column to the file's column by name; the DuckDB view selects
+  `COLUMNS(lambda c: NOT starts_with(c, '__proxima_'))` with `union_by_name`. Catalog validation
+  already rejects user columns with that prefix.
+* Being last keeps every table column at the same position in files written before and after
+  the change. The semi-join Bloom lookup and the native route still index file columns by the
+  table's position, so a snapshot must not mix files of different widths; every publication
+  today is a full rewrite, and slice 2b appends only to files whose columns match exactly.
+
+Gate: `published_files_carry_a_hidden_oid_column` (last column, oids aligned with their rows
+through the cluster sort, field ids `[1, 2, 3, 2000000000]`, `SELECT *` without it).
+
+=== P2.4 slice 2b: insert-only incremental append (2026-10-24)
+
+A republication no longer always rewrites the table. It reads the oids written since the
+published layout's `snapshot_lsn` from the route's change feed and classifies them against the
+published files' hidden oid column (per row group: min/max statistics, then the Bloom filter):
+
+* No changed oid: nothing is published (no new metadata version); the layout's `snapshot_lsn`
+  advances under the publication fence.
+* Every changed oid provably absent from the published files: their current rows are written as
+  extra parts and the snapshot is the carried files plus the new parts; GC keeps the carried
+  files. A changed oid with no current row (inserted and deleted in between) writes nothing.
+* Otherwise a full rewrite, as before. The probe has no false negatives, so an update or delete
+  of a published row always rewrites; a Bloom false positive only costs a rewrite.
+
+An append is attempted only when it is provably sound, and rewrites otherwise:
+
+* the store has a WAL change feed for the table's route (`TableRecordStore::has_change_feed`,
+  which for the WAL-backed store is its appender's `has_readable_log`); an empty answer from a
+  store without one proves nothing;
+* the layout is at the location being published and its `snapshot_lsn` is not newer than the
+  one this run captured;
+* every carried file has exactly the columns this publication writes (a schema change since the
+  last publication rewrites), carries the oid column (files from before slice 2a rewrite) and
+  has oid statistics in every row group;
+* the change feed is read under the keys the writes use (`wal_collection_id`: the table's name
+  and, under `PROXIMADB_WAL_OBJECT_ID_KEY`, its `object_id`), taken from the table's own schema,
+  never by re-resolving its bare name (which would look in `default` and miss every
+  object_id-keyed write of a table elsewhere);
+* the snapshot holds fewer than `APPEND_MAX_FILES` (64) files, so parts stay compacted and the
+  probe, which reads every part's footer, stays bounded;
+* the delta is at most `PROXIMADB_MATERIALIZE_APPEND_MAX_ROWS` rows (default 1,000,000, the rows
+  held in memory while written; `0`/`off` disables append).
+
+Accepted limits, each cleared by the next full rewrite:
+
+* rows that expired by TTL stay in carried files;
+* NDV statistics are not republished on an append;
+* carried files are re-listed as added in each snapshot (an Iceberg `overwrite`), so
+  `added-files`/`added-records` count them and v3 row ids are reassigned on every append.
+
+An unchanged republication advances `snapshot_lsn` only on the layout it planned against (same
+metadata version), so it never relabels a newer publication.
+
+Gates: `an_insert_only_republication_appends_and_an_update_rewrites` (unchanged run publishes no
+metadata version; insert-only carries the file and appends a part holding only the new rows; an
+in-range new oid still appends; insert-then-delete publishes nothing; an update or a delete of a
+published row rewrites; counts and sums correct throughout),
+`an_update_under_object_id_keying_outside_default_rewrites` and
+`classification_appends_only_rows_no_published_file_can_hold`.
+
+=== P2.4 slice 3a: deletion vectors in the Iceberg engine (2026-10-25)
+
+Slice 3 lets a republication delete published rows instead of rewriting the table. The target mechanism is the v3 **deletion vector** (a Puffin blob of deleted
+row positions per data file), not v2 position-delete files, which v3 writers may no longer add.
+Owner decision: v3-first (ADR-097 D3, reaffirmed 2026-10-26); no new v2 delete writer.
+At `69ddbd91b`, schema-driven caller selection still requests v2 except for v3-only types,
+and the engine preserves a v3 parent (#2245). Default v3 and legacy atomic upgrade remain
+activation work; delete-reader/read-back changes are local WIP in `feat/p24-delete-readers`,
+not merged. Validate row lineage, external values and delete carry-through before the live writer.
+It lands in three PRs, readers before the writer, so no reader ever meets a delete it ignores:
+3a (this: format and engine), 3b (the DataFusion and DuckDB readers apply vectors), 3c
+(MATERIALIZE writes vectors for updates and deletes).
+
+* `deletion_vector`: a data file's deleted positions in the portable 64-bit Roaring encoding,
+  inside the spec's `deletion-vector-v1` framing (big-endian length, magic `D1 D3 39 64`,
+  CRC-32). The encoding is pinned byte for byte against CRoaring (`pyroaring` golden vectors);
+  decoding also accepts run containers and the run cookie, which other writers emit, and
+  checks every container against its declared cardinality (ascending arrays, ascending
+  non-overlapping runs), so a hostile vector costs at most one pass per container. In memory
+  each 2^16-position container is a sorted array or a bitmap built in bulk (the in-repo
+  `RoaringBitmap` re-optimizes on every insert and serializes to a private layout).
+* `puffin`: the Puffin file (`PFA1` magic, JSON footer) holding one vector per data file, each
+  blob over `_pos` (field id 2147483645) with the `referenced-data-file` and `cardinality`
+  properties. Compressed footers are rejected.
+* Delete manifests (`iceberg::write_delete_manifest`): content `deletes`, entries
+  POSITION_DELETES / PUFFIN with `referenced_data_file`, `content_offset`,
+  `content_size_in_bytes` (field ids 143–145), inheriting the snapshot's sequence number. The
+  manifest list now records each manifest's `content`. Reading back accepts only deletion
+  vectors: an equality delete or a v2 position-delete file is an error (fail closed).
+* The bridge: `write_deletion_vectors` (Puffin, create-only),
+  `publish_iceberg_files_with_deletes` (v3 only; every vector names a data file of the same
+  snapshot; at most one per file), `read_iceberg_snapshot_with_deletes` (checks both again) and
+  `read_deletion_vector` (a ranged read of one blob, checked against its manifest cardinality).
+* `read_iceberg_snapshot` / `read_iceberg_table` now **refuse** a snapshot that has deletion
+  vectors. Every reader goes through them, and the DataFusion and DuckDB routes fail closed on
+  that error, so until 3b no route can return a deleted row. Nothing writes vectors before 3c.
+
+Interop check (manual, not in CI): a snapshot written by `publish_iceberg_files_with_deletes`
+scans correctly in PyIceberg 0.12 (deleted positions dropped). DuckDB 1.5.6 could not be checked
+in the sandbox (its extension download is blocked); 3c extends the CI read-back gate, which
+installs both readers, to tables with deletion vectors.
+
+Gates: the `deletion_vector`, `puffin`, `iceberg::deletes` and `snapshot_deletes` unit tests
+(round trips, CRoaring byte equality, damaged blobs, invalid publishes refused, data-only reads
+refused).

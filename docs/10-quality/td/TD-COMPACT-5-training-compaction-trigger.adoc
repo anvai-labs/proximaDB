@@ -18,3 +18,18 @@
 * Rejected alternative (still relevant): targeting via `proximadb_ivf_whole_region_fallback_total` — the counter is process-global and unlabeled, so it cannot say which segment is untrained.
 * Lesson: the probe-armed run first measured recall@10 0.9780 < the 0.984 ratchet; the nprobe sweep showed that was slice noise (default nprobe=8 measures 0.9860 on a fixed 100-query slice), and the reader gate went default-ON (#1210). Historical 20–51 GET bands assumed single-file beds.
 * Evidence: 1M all-trained bed with probe armed — 82.9 GETs / 77.5 MB per query, mean 76 ms / p95 90 ms (vs 179.7 GETs untrained).
+* *Liveness fix (2026-10-29, TD-FPRUNE-1 R6).* The count arm counted EVERY level's files against the
+  L0 threshold and returned before the training arm ran. A levelled ladder (L1..L4, one file each) plus
+  one new L0 reached 5, so each flush armed threshold 5; the executor, which counts L0s only, found too few
+  and declined silently, and the training arm was never consulted. The 3M P5 schema bed stranded 4
+  untrained 57–61 MB L0s this way and never settled. The training arm now runs first and wins; the count
+  arm is the fallback (also when the arm is suppressed in flight, TD-COMPACT-8). The sniff now covers
+  L0 files the executor can see, judged by the executor's own `FilenameCodec` (tiered name AND level 0):
+  a threshold-1 task builds an L0 morsel, so an untrained L1+ file or a non-tiered `.pax` (e.g.
+  `L0_recovery_*`, never discovered by the executor) could never self-clear and would re-arm on every
+  flush. Higher levels are deferred, not starved: the training follow-up falls through to L1+ merges once
+  L0 drains, and flushes during the chain take the count arm (guard retained) and enqueue non-overlapping
+  L1+ merges; L1+ waits only while the L0 backlog stays at or above the threshold for the whole chain.
+  Open (pre-existing): ADR-081 L0 admission counts `starts_with("L0_")`, a third L0 rule that counts
+  `L0_recovery_*` forever. Test:
+  `training_arm_fires_even_when_all_level_count_reaches_threshold`.

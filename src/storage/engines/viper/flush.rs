@@ -25,7 +25,6 @@ use crate::storage::transaction_coordinator::{
 };
 
 use crate::proto::proximadb_v1::VectorRecord;
-use crate::storage::engines::core::formats::columnar::columnar_schema::ColumnarSchema;
 use crate::storage::optimization::{MetadataSorter, SortingStats};
 use proximadb_records::ProximaRecord;
 
@@ -33,9 +32,6 @@ use super::viper_meta_collector::{ViperCollectorConfig, ViperMetadataCollector};
 
 /// Flush operations for VIPER storage engine with atomic writes
 pub struct Flush {
-    /// Schema for columnar storage
-    schema: ColumnarSchema,
-
     /// Collection service for metadata access
     collection_service: Arc<RwLock<Option<Arc<dyn CollectionMetadataPort>>>>,
 
@@ -59,7 +55,6 @@ pub struct Flush {
 impl std::fmt::Debug for Flush {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Flush")
-            .field("schema", &self.schema)
             .field("collection_service", &"<dyn CollectionMetadataPort>")
             .field("filesystem_factory", &self.filesystem_factory)
             .field("atomic_coordinator", &self.atomic_coordinator)
@@ -102,7 +97,6 @@ impl Flush {
         ));
 
         Ok(Self {
-            schema: ColumnarSchema::new(),
             collection_service,
             filesystem_factory,
             atomic_coordinator,

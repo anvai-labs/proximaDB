@@ -165,6 +165,35 @@ impl DataFusionLocalEngine {
         if let Some(native) = context.native_tables.as_ref() {
             use proximadb_storage_common::proxima_arrow::proxima_records_to_record_batch;
             for name in native.tables.values() {
+                // ADR-097 P3.1: stream the record tier when the store offers a
+                // snapshot — no row cap, nothing materialized up front. The
+                // snapshot runs the same identity/ABAC prelude as the scan below.
+                if crate::query::execution::layer_a::layer_a_provider_enabled()
+                    && let Some(snapshot) = native
+                        .source
+                        .layer_a_snapshot(
+                            name,
+                            context.identity.tenant_id.as_deref(),
+                            context.identity.as_borrowed(),
+                        )
+                        .await
+                        .map_err(|e| {
+                            ExecutionError::Context(format!("native table snapshot {name}: {e}"))
+                        })?
+                {
+                    let provider =
+                        crate::query::execution::layer_a::LayerATableProvider::new(snapshot);
+                    ctx.register_table(name.as_str(), std::sync::Arc::new(provider))
+                        .map_err(|e| {
+                            ExecutionError::Context(format!("register native table {name}: {e}"))
+                        })?;
+                    tracing::debug!(
+                        target: "proximadb::compute_route",
+                        table = %name,
+                        "registered native relational table as a streaming Layer A provider"
+                    );
+                    continue;
+                }
                 let scanned = native
                     .source
                     .full_table_records(
@@ -180,7 +209,15 @@ impl DataFusionLocalEngine {
                 // `None` ⇒ the table exceeds the row cap. Leave it unregistered: planning
                 // then fails with an explicit unresolved-table error, which the caller
                 // surfaces. Registering a truncated scan would be a silently wrong answer.
+                // In a query that also reads Parquet tables, decline with the marker so
+                // the caller reports an explicit refusal to change visibility authority.
                 let Some((schema, records)) = scanned else {
+                    if !context.parquet_tables.is_empty() {
+                        return Err(ExecutionError::Planning(format!(
+                            "{}: {name}",
+                            crate::query::execution::native_table_provider::MIXED_QUERY_ROW_CAP_DECLINE
+                        )));
+                    }
                     continue;
                 };
                 let row_count = records.len();
@@ -297,7 +334,36 @@ impl DataFusionLocalEngine {
                 // to lowercase, but the registered Parquet schemas keep their
                 // declared (possibly CamelCase) field names — repair unquoted
                 // references to the quoted declared spelling before planning.
-                let repaired = case_repair_sql_for_datafusion(sql, &catalog.schemas);
+                // A query mixing Parquet and native tables repairs against both
+                // sets of spellings, so a native column is never rewritten to a
+                // Parquet table's spelling (ADR-097 P3.1 PR 8).
+                let mut spellings = catalog.schemas.clone();
+                if !context.parquet_tables.is_empty()
+                    && let Some(native) = context.native_tables.as_ref()
+                {
+                    for name in native.tables.values() {
+                        if let Ok(provider) = ctx.table_provider(name.as_str()).await {
+                            spellings.insert(
+                                normalize_table_key(name),
+                                std::sync::Arc::new(RelationalSchema::new(
+                                    provider
+                                        .schema()
+                                        .fields()
+                                        .iter()
+                                        .map(|f| {
+                                            ColumnInfo::new(
+                                                f.name(),
+                                                arrow_type_to_proxima(f.data_type()),
+                                                f.is_nullable(),
+                                            )
+                                        })
+                                        .collect(),
+                                )),
+                            );
+                        }
+                    }
+                }
+                let repaired = case_repair_sql_for_datafusion(sql, &spellings);
                 ctx.sql(&repaired)
                     .await
                     .map_err(|e| ExecutionError::Execution(format!("sql: {e}")))?
@@ -921,6 +987,30 @@ fn measure_logical_geometry_inner(
     (max_depth, nodes, leaves, max_fanout, blocking, ops)
 }
 
+/// Whether a deletion-vector base may serve a NON-EMPTY WAL delta through the
+/// merge: only when the base was opened at exactly the metadata version the
+/// catalog layout records for its publication. Only ProximaDB's own publishers
+/// write that recorded version (MATERIALIZE's flip, `advance_snapshot_lsn`,
+/// the live-delete flip), each recording a base complete apart from the delta
+/// at its snapshot LSN, with every vector backed by a WAL-durable death — so
+/// the merge (base minus vectors, minus every changed oid, plus the current
+/// rows of the changed oids) is exact. Anything else refuses: an external DV
+/// commit or a crash-gap orphan (the latest version moved past the recorded
+/// one), a listed or cached open (no proven version), or no recorded version.
+/// Metadata versions only grow, so a publication racing this read makes the
+/// opened version NEWER than the recorded one — a refusal, never a wrong row.
+#[cfg(feature = "datafusion-integration")]
+fn dv_base_is_ordered(opened: Option<u64>, recorded: Option<u64>, enabled: bool) -> bool {
+    enabled && opened.is_some() && opened == recorded
+}
+
+/// `PROXIMADB_OLAP_ORDERED_DV_BASE` (default ON): `0`/`off` restores the
+/// unconditional refusal of a deletion-vector base with a non-empty delta.
+#[cfg(feature = "datafusion-integration")]
+fn ordered_dv_base_enabled() -> bool {
+    crate::services::storage_format::default_on_gate("PROXIMADB_OLAP_ORDERED_DV_BASE", 1).is_some()
+}
+
 #[cfg(feature = "datafusion-integration")]
 async fn register_merged_olap_table(
     ctx: &datafusion::prelude::SessionContext,
@@ -930,13 +1020,8 @@ async fn register_merged_olap_table(
     source: &dyn crate::query::execution::olap_delta_merge::OlapDeltaSource,
     tenant: Option<&str>,
 ) -> Result<(), ExecutionError> {
-    use crate::services::record_store::proxima_value_to_unique_text;
-    use datafusion::arrow::array::BooleanArray;
-    use datafusion::arrow::compute::filter_record_batch;
     use datafusion::arrow::record_batch::RecordBatch;
-    use proximadb_storage_common::proxima_arrow::{
-        arrow_cell_to_proxima_value, proxima_records_to_record_batch,
-    };
+    use proximadb_storage_common::proxima_arrow::proxima_records_to_record_batch;
     use std::collections::HashSet;
     use std::sync::Arc;
 
@@ -961,90 +1046,70 @@ async fn register_merged_olap_table(
         .map_err(|e| ExecutionError::Context(format!("olap-merge bare register {name}: {e}")))?;
         return Ok(());
     }
-    let suppress: HashSet<String> = changed.iter().cloned().collect();
 
-    // 2. Read the cold Parquet base in an isolated session so the hidden base
-    //    registration never leaks into the query's table namespace.
-    let base_ctx = crate::datafusion::create_session_context()
-        .map_err(|e| ExecutionError::Context(format!("olap-merge base session: {e}")))?;
-    crate::datafusion::register_object_store_parquet_location(
-        &base_ctx,
+    // 2. The cold Parquet base, opened but not registered: the merge wraps it.
+    let base = crate::datafusion::open_object_store_parquet_location(
         name,
         location,
         tenant,
         proximadb_data_model::StatsTrust::Trusted,
     )
     .await
-    .map_err(|e| ExecutionError::Context(format!("olap-merge base register {name}: {e}")))?;
-    let base_schema = base_ctx
-        .table_provider(name)
-        .await
-        .map_err(|e| ExecutionError::Context(format!("olap-merge base provider {name}: {e}")))?
-        .schema();
-    let base_batches = base_ctx
-        .table(name)
-        .await
-        .map_err(|e| ExecutionError::Context(format!("olap-merge base table {name}: {e}")))?
-        .collect()
-        .await
-        .map_err(|e| ExecutionError::Context(format!("olap-merge base collect {name}: {e}")))?;
-
-    // 3. Keep base rows whose recomputed oid is not suppressed. (TTL on the base
-    //    is eventual-until-rematerialize — the snapshot carries no valid_to_ns,
-    //    a documented first-cut limitation; explicit deletes are always caught by
-    //    the suppress-set.)
-    let pk_idx = base_schema
-        .index_of(table.pk_column.as_str())
-        .map_err(|e| {
-            ExecutionError::Context(format!(
-                "olap-merge pk column `{}` not in base {name}: {e}",
-                table.pk_column
-            ))
-        })?;
-    let mut batches: Vec<RecordBatch> = Vec::with_capacity(base_batches.len() + 1);
-    for batch in &base_batches {
-        let pk_array = batch.column(pk_idx);
-        let keep: BooleanArray = (0..batch.num_rows())
-            .map(|row| {
-                let oid = arrow_cell_to_proxima_value(pk_array, row)
-                    .map(|v| proxima_value_to_unique_text(&v))
-                    .unwrap_or_default();
-                Some(!suppress.contains(&oid))
-            })
-            .collect();
-        let kept = filter_record_batch(batch, &keep)
-            .map_err(|e| ExecutionError::Context(format!("olap-merge filter {name}: {e}")))?;
-        // TD-185a: `filter_record_batch` preserves the batch's ORIGINAL schema,
-        // which carries the Parquet file's baked-in field metadata. The table
-        // schema is metadata-normalized (recursive-CTE field comparison), so
-        // re-wrap the columns onto it — MemTable requires every partition batch
-        // to match its schema exactly.
-        let conformed = RecordBatch::try_new(base_schema.clone(), kept.columns().to_vec())
-            .map_err(|e| ExecutionError::Context(format!("olap-merge conform {name}: {e}")))?;
-        batches.push(conformed);
+    .map_err(|e| ExecutionError::Context(format!("olap-merge base open {name}: {e}")))?;
+    // The catalog WAL boundary does not order an independently published DV
+    // snapshot: appending native rows could resurrect records that snapshot
+    // deleted. Such a base is refused. A base that IS our recorded publication
+    // (see `dv_base_is_ordered`) is complete apart from the delta at the
+    // recorded LSN, its vectors ordered against the WAL — the merge below is
+    // exact over it, so it is served.
+    if base.has_deletion_vectors()
+        && !dv_base_is_ordered(
+            base.snapshot_version(),
+            table.recorded_metadata_version,
+            ordered_dv_base_enabled(),
+        )
+    {
+        return Err(ExecutionError::Context(format!(
+            "olap-merge {name}: nonempty WAL delta cannot be ordered against a deletion-vector snapshot"
+        )));
     }
+    let base_schema = datafusion::datasource::TableProvider::schema(base.as_ref());
 
-    // 4. Append the current live rows for the changed oids, encoded with the same
+    // 3. The current live rows for the changed oids, encoded with the same
     //    catalog schema the base was written with and normalized onto the base
-    //    schema so every MemTable partition batch shares one schema.
+    //    schema. (TTL on the base is eventual-until-rematerialize — the snapshot
+    //    carries no valid_to_ns, a documented first-cut limitation; explicit
+    //    deletes are always caught by the suppress-set.)
     let (schema, append_records) = source
         .current_records(name, &changed, tenant)
         .await
         .map_err(|e| ExecutionError::Context(format!("olap-merge appends {name}: {e}")))?;
+    let mut appends = Vec::new();
     if !append_records.is_empty() {
         let append_batch = proxima_records_to_record_batch(&append_records, &schema)
             .map_err(|e| ExecutionError::Context(format!("olap-merge append batch {name}: {e}")))?;
-        let normalized = RecordBatch::try_new(base_schema.clone(), append_batch.columns().to_vec())
+        let normalized = RecordBatch::try_new(base_schema, append_batch.columns().to_vec())
             .map_err(|e| {
                 ExecutionError::Context(format!("olap-merge append schema {name}: {e}"))
             })?;
-        batches.push(normalized);
+        appends.push(normalized);
     }
 
-    // 5. Register the reconciled rows as the table the query reads.
-    let mem = datafusion::datasource::MemTable::try_new(base_schema, vec![batches])
-        .map_err(|e| ExecutionError::Context(format!("olap-merge memtable {name}: {e}")))?;
-    ctx.register_table(name, Arc::new(mem))
+    // 4. Register the merge: the base streams, minus every changed oid's stale
+    //    copy, beside the changed rows (ADR-097 P3.1 PR 9 — no base MemTable).
+    let merged = crate::query::execution::layer_a::olap_merge::OlapMergeTable::try_new(
+        base,
+        table.pk_column.as_str(),
+        changed.into_iter().collect::<HashSet<String>>(),
+        appends,
+    )
+    .map_err(|e| {
+        ExecutionError::Context(format!(
+            "olap-merge pk column `{}` not in base {name}: {e}",
+            table.pk_column
+        ))
+    })?;
+    ctx.register_table(name, Arc::new(merged))
         .map_err(|e| ExecutionError::Context(format!("olap-merge register {name}: {e}")))?;
     Ok(())
 }
@@ -1198,6 +1263,34 @@ fn arrow_cell_to_proxima(
             Err(_) => ProximaValue::Null,
         }
     })
+}
+
+#[cfg(all(test, feature = "datafusion-integration"))]
+mod ordered_dv_base_tests {
+    use super::dv_base_is_ordered;
+
+    /// Only a manifest-opened base at EXACTLY the recorded version, with the
+    /// kill switch on, may serve deletion vectors beside a non-empty delta.
+    #[test]
+    fn only_the_recorded_publication_is_an_ordered_dv_base() {
+        // (opened, recorded, enabled) -> ordered
+        let cases = [
+            ((Some(4), Some(4), true), true),
+            ((Some(5), Some(4), true), false), // a newer (external/orphan) snapshot
+            ((Some(3), Some(4), true), false), // an older base than recorded
+            ((None, Some(4), true), false),    // listed or cached open: unproven
+            ((Some(4), None, true), false),    // the layout records no version
+            ((None, None, true), false),       // None == None must not qualify
+            ((Some(4), Some(4), false), false), // the kill switch
+        ];
+        for ((opened, recorded, enabled), want) in cases {
+            assert_eq!(
+                dv_base_is_ordered(opened, recorded, enabled),
+                want,
+                "opened={opened:?} recorded={recorded:?} enabled={enabled}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

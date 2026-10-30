@@ -26,9 +26,46 @@ pub enum RelationalConstraintKind {
     ForeignKey,
     /// CHECK constraint evaluated to FALSE — SQLSTATE `23514`.
     Check,
-    /// One `INSERT … ON CONFLICT DO UPDATE` statement proposes the same
-    /// conflict key twice — SQLSTATE `21000` (cardinality_violation).
+    /// One `INSERT … ON CONFLICT DO UPDATE` statement would update a row it
+    /// already inserted or updated — SQLSTATE `21000` (cardinality_violation).
     UpsertAffectsRowTwice,
+    /// An `ON CONFLICT (col, …)` target matches no PRIMARY KEY / UNIQUE
+    /// constraint — SQLSTATE `42P10` (invalid_column_reference), TD-DML-3.
+    NoMatchingConflictTarget,
+    /// `ON CONFLICT ON CONSTRAINT name` names no constraint of the table —
+    /// SQLSTATE `42704` (undefined_object), TD-DML-3.
+    UndefinedConstraint,
+    /// A statement names a column the table does not have — SQLSTATE `42703`
+    /// (undefined_column), TD-DML-3.
+    UndefinedColumn,
+    /// One `SET` list assigns the same column twice — SQLSTATE `42701`
+    /// (duplicate_column), TD-DML-3.
+    DuplicateColumn,
+    /// A valid statement shape this engine does not support (e.g. assigning a
+    /// PRIMARY KEY column in `ON CONFLICT DO UPDATE`) — SQLSTATE `0A000`
+    /// (feature_not_supported), TD-DML-3.
+    FeatureNotSupported,
+    /// Text that does not parse as the target column's type — SQLSTATE
+    /// `22P02` (invalid_text_representation), TD-DML-3.
+    InvalidTextRepresentation,
+    /// Division by zero while evaluating a write expression — SQLSTATE
+    /// `22012` (division_by_zero), TD-DML-3.
+    DivisionByZero,
+    /// Arithmetic overflow while evaluating a write expression — SQLSTATE
+    /// `22003` (numeric_value_out_of_range), TD-DML-3.
+    NumericValueOutOfRange,
+    /// An expression's type cannot be assigned or operated on — SQLSTATE
+    /// `42804` (datatype_mismatch), TD-DML-3.
+    DatatypeMismatch,
+    /// No operator matches the operand types — SQLSTATE `42883`
+    /// (undefined_function), TD-DML-3.
+    UndefinedFunction,
+    /// No cast exists between the two types — SQLSTATE `42846`
+    /// (cannot_coerce), TD-DML-3.
+    CannotCoerce,
+    /// The caller's row-level policy does not admit the row — SQLSTATE
+    /// `42501` (insufficient_privilege), TD-DML-3.
+    InsufficientPrivilege,
 }
 
 impl RelationalConstraintKind {
@@ -39,6 +76,18 @@ impl RelationalConstraintKind {
             Self::ForeignKey => "23503",
             Self::Check => "23514",
             Self::UpsertAffectsRowTwice => "21000",
+            Self::NoMatchingConflictTarget => "42P10",
+            Self::UndefinedConstraint => "42704",
+            Self::UndefinedColumn => "42703",
+            Self::DuplicateColumn => "42701",
+            Self::FeatureNotSupported => "0A000",
+            Self::InvalidTextRepresentation => "22P02",
+            Self::DivisionByZero => "22012",
+            Self::NumericValueOutOfRange => "22003",
+            Self::DatatypeMismatch => "42804",
+            Self::UndefinedFunction => "42883",
+            Self::CannotCoerce => "42846",
+            Self::InsufficientPrivilege => "42501",
         }
     }
 }
@@ -496,7 +545,11 @@ impl CatalogRow {
     }
 }
 
-fn effective_primary_key(schema: &CatalogTableSchema) -> Vec<&str> {
+/// The DECLARED primary key — the columns whose encoded values become a row's
+/// `oid` in [`CatalogRow::to_proxima_record`]. Empty for a keyless table: its
+/// rows get a generated `oid`, and a column named `id`/`record_id` is an
+/// ordinary column (TD-RELIDEQ-1/2). Prefers `relational_capabilities`.
+pub fn effective_primary_key(schema: &CatalogTableSchema) -> Vec<&str> {
     if !schema.relational_capabilities.primary_key.is_empty() {
         schema
             .relational_capabilities

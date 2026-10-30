@@ -18,72 +18,41 @@
 use anyhow::Result;
 
 use super::helpers;
+use super::helpers::WirePrim;
 
 // ===== Core wire format encoding functions =====
 
-/// Core encoding logic for i32 wire format (used by f32 and i32)
-fn encode_frame_of_ref_i32_wire(wire_values: &[i32], base: i32) -> Result<Vec<u8>> {
+/// Single FOR encode core (redundancy pass 4: the i32/i64 wire twins were
+/// byte-identical modulo the base slot and offset widths; golden tests pin
+/// the layout).
+fn encode_frame_of_ref_wire<W: WirePrim>(wire_values: &[W], base: W) -> Result<Vec<u8>> {
     if wire_values.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut result = Vec::new();
 
-    // Store base value (4 bytes for i32)
-    result.extend_from_slice(&base.to_le_bytes());
+    // Store base value (WIRE_BYTES for the width)
+    base.write_le(&mut result);
 
     // Compute offsets from base
-    let offsets: Vec<i32> = wire_values.iter().map(|&v| v.wrapping_sub(base)).collect();
+    let offsets: Vec<W> = wire_values.iter().map(|&v| v.wrap_sub(base)).collect();
 
     // Find optimal bit width for offsets
-    let max_offset_abs = offsets.iter().map(|&o| o.unsigned_abs()).max().unwrap_or(0);
+    let max_offset_bits = offsets.iter().map(|&o| o.abs_bit_len()).max().unwrap_or(0);
 
-    let bits = if max_offset_abs == 0 {
+    let bits = if max_offset_bits == 0 {
         1
     } else {
-        // Add 1 bit for sign, but cap at 32
-        ((32 - max_offset_abs.leading_zeros() as u8) + 1).min(32)
+        // Add 1 bit for sign, but cap at the width
+        (max_offset_bits + 1).min(W::BITS)
     };
 
     // Store bit width
     result.push(bits);
 
     // Bit-pack the offsets (delegate to shared helper)
-    let packed = bitpack::bitpack_i32(&offsets, bits)?;
-    result.extend(packed);
-
-    Ok(result)
-}
-
-/// Core encoding logic for i64 wire format
-fn encode_frame_of_ref_i64_wire(wire_values: &[i64], base: i64) -> Result<Vec<u8>> {
-    if wire_values.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut result = Vec::new();
-
-    // Store base value (8 bytes)
-    result.extend_from_slice(&base.to_le_bytes());
-
-    // Compute offsets from base
-    let offsets: Vec<i64> = wire_values.iter().map(|&v| v.wrapping_sub(base)).collect();
-
-    // Find optimal bit width for offsets
-    let max_offset_abs = offsets.iter().map(|&o| o.unsigned_abs()).max().unwrap_or(0);
-
-    let bits = if max_offset_abs == 0 {
-        1
-    } else {
-        // Add 1 bit for sign, but cap at 64
-        ((64 - max_offset_abs.leading_zeros() as u8) + 1).min(64)
-    };
-
-    // Store bit width
-    result.push(bits);
-
-    // Bit-pack the offsets (delegate to shared helper)
-    let packed = bitpack::bitpack_i64(&offsets, bits)?;
+    let packed = W::pack_signed(&offsets, bits)?;
     result.extend(packed);
 
     Ok(result)
@@ -115,72 +84,47 @@ fn encode_frame_of_ref_i64_wire(wire_values: &[i64], base: i64) -> Result<Vec<u8
 /// The bit width is stored in the wire header (not in raw data).
 pub fn encode_f32(values: &[f32], base: i64) -> Result<Vec<u8>> {
     helpers::encode_generic(values, |wire_values| {
-        encode_frame_of_ref_i32_wire(wire_values, base as i32)
+        encode_frame_of_ref_wire(wire_values, base as i32)
     })
 }
 
 /// Encode i64 values using Frame of Reference (raw, no headers)
 pub fn encode_i64(values: &[i64], base: i64) -> Result<Vec<u8>> {
     helpers::encode_generic(values, |wire_values| {
-        encode_frame_of_ref_i64_wire(wire_values, base)
+        encode_frame_of_ref_wire(wire_values, base)
     })
 }
 
 /// Encode i32 values using Frame of Reference (raw, no headers)
 pub fn encode_i32(values: &[i32], base: i64) -> Result<Vec<u8>> {
     helpers::encode_generic(values, |wire_values| {
-        encode_frame_of_ref_i32_wire(wire_values, base as i32)
+        encode_frame_of_ref_wire(wire_values, base as i32)
     })
 }
 
 // ===== Core wire format decoding functions =====
 
-/// Core decoding logic for i32 wire format
-fn decode_frame_of_ref_i32_wire(data: &[u8], count: usize) -> Result<Vec<i32>> {
+/// Single FOR decode core; header is [base:WIRE_BYTES][bits:1].
+fn decode_frame_of_ref_wire<W: WirePrim>(data: &[u8], count: usize) -> Result<Vec<W>> {
     if count == 0 {
         return Ok(Vec::new());
     }
 
-    if data.len() < 5 {
+    if data.len() < W::WIRE_BYTES + 1 {
         return Err(anyhow::anyhow!("FOR decode: insufficient data"));
     }
 
-    // Read base (4 bytes)
-    let base = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    // Read base
+    let base = W::read_le(data)?;
 
     // Read bits (1 byte)
-    let bits = data[4];
+    let bits = data[W::WIRE_BYTES];
 
     // Unpack offsets (delegate to shared helper with sign extension)
-    let offsets = bitpack::unbitpack_i32(&data[5..], bits, count)?;
+    let offsets = W::unpack_signed(&data[W::WIRE_BYTES + 1..], bits, count)?;
 
-    // Reconstruct values using shared helper
-    Ok(helpers::reconstruct_i32_from_i32(&offsets, base))
-}
-
-/// Core decoding logic for i64 wire format
-fn decode_frame_of_ref_i64_wire(data: &[u8], count: usize) -> Result<Vec<i64>> {
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-
-    if data.len() < 9 {
-        return Err(anyhow::anyhow!("FOR decode: insufficient data"));
-    }
-
-    // Read base (8 bytes)
-    let base = i64::from_le_bytes([
-        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-    ]);
-
-    // Read bits (1 byte)
-    let bits = data[8];
-
-    // Unpack offsets (delegate to shared helper with sign extension)
-    let offsets = bitpack::unbitpack_i64(&data[9..], bits, count)?;
-
-    // Reconstruct values using shared helper
-    Ok(helpers::reconstruct_i64_from_i64(&offsets, base))
+    // Reconstruct values (base + offset, wrapping)
+    Ok(offsets.into_iter().map(|o| base.wrap_add(o)).collect())
 }
 
 // ===== Compatibility helpers for SIMD module =====
@@ -224,29 +168,56 @@ pub fn reconstruct_values_scalar_f32(offsets: &[i32], base_i32: i32) -> Vec<f32>
 
 /// Decode f32 values from Frame of Reference encoded data
 pub fn decode_f32(data: &[u8], count: usize) -> Result<Vec<f32>> {
-    helpers::decode_generic::<f32>(data, count, decode_frame_of_ref_i32_wire)
+    helpers::decode_generic::<f32>(data, count, decode_frame_of_ref_wire::<i32>)
 }
 
 /// Decode i64 values from Frame of Reference encoded data
 pub fn decode_i64(data: &[u8], count: usize) -> Result<Vec<i64>> {
-    helpers::decode_generic::<i64>(data, count, decode_frame_of_ref_i64_wire)
+    helpers::decode_generic::<i64>(data, count, decode_frame_of_ref_wire::<i64>)
 }
 
 /// Decode i32 values from Frame of Reference encoded data
 pub fn decode_i32(data: &[u8], count: usize) -> Result<Vec<i32>> {
-    helpers::decode_generic::<i32>(data, count, decode_frame_of_ref_i32_wire)
+    helpers::decode_generic::<i32>(data, count, decode_frame_of_ref_wire::<i32>)
 }
-
-// ===== Bitpacking delegation to shared helpers =====
-//
-// All bitpacking operations now use the shared helpers in bitpack.rs
-// to avoid code duplication and ensure consistent sign extension behavior.
-
-use super::bitpack;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== Golden-byte pins (redundancy pass 4) ====================
+    // Wire layout: [base:WIRE_BYTES LE][bits:1 byte][bitpacked offsets]. Bit
+    // layout of the packed part: little-endian stream, value k occupies
+    // offsets [k*bits,(k+1)*bits), LSB-first. These pin the CURRENT bytes of
+    // both widths BEFORE the WirePrim consolidation; any change is a
+    // wire-format change.
+
+    /// i32: [10,11,12] base 10 -> offsets [0,1,2]; max |offset| 2 needs 2
+    /// bits + 1 sign = 3 bits. Packed: v1 bit0 -> stream bit 3, v2 bit1 ->
+    /// stream bit 7 => 0x88, second byte 0x00.
+    #[test]
+    fn golden_for_i32_wire_bytes() {
+        let encoded = encode_i32(&[10, 11, 12], 10).unwrap();
+        assert_eq!(encoded, vec![10, 0, 0, 0, 3, 0x88, 0x00]);
+        assert_eq!(decode_i32(&encoded, 3).unwrap(), vec![10, 11, 12]);
+    }
+
+    /// i64: [100,102] base 100 -> offsets [0,2]; 2 bits + sign = 3 bits.
+    /// Packed: v1 (=2, 0b010) bit1 -> stream bit 4 => 0x10, one byte total.
+    #[test]
+    fn golden_for_i64_wire_bytes() {
+        let encoded = encode_i64(&[100, 102], 100).unwrap();
+        assert_eq!(encoded, vec![100, 0, 0, 0, 0, 0, 0, 0, 3, 0x10]);
+        assert_eq!(decode_i64(&encoded, 2).unwrap(), vec![100, 102]);
+    }
+
+    /// Constant data pins the bits==1 special case (max offset 0 -> 1 bit).
+    #[test]
+    fn golden_for_i32_constant_offsets_zero_bits() {
+        let encoded = encode_i32(&[7, 7], 7).unwrap();
+        assert_eq!(encoded, vec![7, 0, 0, 0, 1, 0x00]);
+        assert_eq!(decode_i32(&encoded, 2).unwrap(), vec![7, 7]);
+    }
 
     #[test]
     fn test_for_f32_roundtrip() {

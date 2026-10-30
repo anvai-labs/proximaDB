@@ -672,8 +672,13 @@ impl TransactionManager {
         self.active_uows.get(tx_id)
     }
 
-    /// Register a node operation within a transaction
-    pub async fn register_node_insert(&self, tx_id: &TransactionId, node: Node) -> Result<()> {
+    /// Lock the transaction's unit of work for a mutation, failing when the
+    /// transaction is unknown or no longer active — the shared preamble of
+    /// every `register_*` mutator below.
+    async fn with_active_uow_mut<F>(&self, tx_id: &TransactionId, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut UnitOfWork),
+    {
         let uow_ref = self
             .active_uows
             .get(tx_id)
@@ -686,98 +691,44 @@ impl TransactionManager {
                 tx_id
             )));
         }
-        uow.register_node_insert(node);
+        f(&mut uow);
         Ok(())
+    }
+
+    /// Register a node operation within a transaction
+    pub async fn register_node_insert(&self, tx_id: &TransactionId, node: Node) -> Result<()> {
+        self.with_active_uow_mut(tx_id, |uow| uow.register_node_insert(node))
+            .await
     }
 
     /// Register a node update within a transaction
     pub async fn register_node_update(&self, tx_id: &TransactionId, node: Node) -> Result<()> {
-        let uow_ref = self
-            .active_uows
-            .get(tx_id)
-            .ok_or_else(|| ProximaDBError::Internal(format!("Transaction {} not found", tx_id)))?;
-
-        let mut uow = uow_ref.write().await;
-        if !uow.is_active {
-            return Err(ProximaDBError::Internal(format!(
-                "Transaction {} is no longer active",
-                tx_id
-            )));
-        }
-        uow.register_node_update(node);
-        Ok(())
+        self.with_active_uow_mut(tx_id, |uow| uow.register_node_update(node))
+            .await
     }
 
     /// Register a node deletion within a transaction
     pub async fn register_node_delete(&self, tx_id: &TransactionId, node_id: String) -> Result<()> {
-        let uow_ref = self
-            .active_uows
-            .get(tx_id)
-            .ok_or_else(|| ProximaDBError::Internal(format!("Transaction {} not found", tx_id)))?;
-
-        let mut uow = uow_ref.write().await;
-        if !uow.is_active {
-            return Err(ProximaDBError::Internal(format!(
-                "Transaction {} is no longer active",
-                tx_id
-            )));
-        }
-        uow.register_node_delete(node_id);
-        Ok(())
+        self.with_active_uow_mut(tx_id, |uow| uow.register_node_delete(node_id))
+            .await
     }
 
     /// Register an edge insertion within a transaction
     pub async fn register_edge_insert(&self, tx_id: &TransactionId, edge: Edge) -> Result<()> {
-        let uow_ref = self
-            .active_uows
-            .get(tx_id)
-            .ok_or_else(|| ProximaDBError::Internal(format!("Transaction {} not found", tx_id)))?;
-
-        let mut uow = uow_ref.write().await;
-        if !uow.is_active {
-            return Err(ProximaDBError::Internal(format!(
-                "Transaction {} is no longer active",
-                tx_id
-            )));
-        }
-        uow.register_edge_insert(edge);
-        Ok(())
+        self.with_active_uow_mut(tx_id, |uow| uow.register_edge_insert(edge))
+            .await
     }
 
     /// Register an edge update within a transaction
     pub async fn register_edge_update(&self, tx_id: &TransactionId, edge: Edge) -> Result<()> {
-        let uow_ref = self
-            .active_uows
-            .get(tx_id)
-            .ok_or_else(|| ProximaDBError::Internal(format!("Transaction {} not found", tx_id)))?;
-
-        let mut uow = uow_ref.write().await;
-        if !uow.is_active {
-            return Err(ProximaDBError::Internal(format!(
-                "Transaction {} is no longer active",
-                tx_id
-            )));
-        }
-        uow.register_edge_update(edge);
-        Ok(())
+        self.with_active_uow_mut(tx_id, |uow| uow.register_edge_update(edge))
+            .await
     }
 
     /// Register an edge deletion within a transaction
     pub async fn register_edge_delete(&self, tx_id: &TransactionId, edge_id: String) -> Result<()> {
-        let uow_ref = self
-            .active_uows
-            .get(tx_id)
-            .ok_or_else(|| ProximaDBError::Internal(format!("Transaction {} not found", tx_id)))?;
-
-        let mut uow = uow_ref.write().await;
-        if !uow.is_active {
-            return Err(ProximaDBError::Internal(format!(
-                "Transaction {} is no longer active",
-                tx_id
-            )));
-        }
-        uow.register_edge_delete(edge_id);
-        Ok(())
+        self.with_active_uow_mut(tx_id, |uow| uow.register_edge_delete(edge_id))
+            .await
     }
 
     /// Commit a transaction
@@ -1032,13 +983,18 @@ mod tests {
         assert_eq!(uow.pending_node_inserts.len(), 1);
     }
 
-    #[tokio::test]
-    async fn test_transaction_manager_begin_commit() {
+    /// Shared harness: a TransactionManager over one in-memory ORION shard
+    /// (30s default timeout) keyed by `shard_id`.
+    fn manager_over_shard(shard_id: &str) -> TransactionManager {
         let orion = Arc::new(OrionGraphEngine::new());
         let mut shards = HashMap::new();
-        shards.insert("test_graph".to_string(), orion as Arc<dyn GraphEngine>);
+        shards.insert(shard_id.to_string(), orion as Arc<dyn GraphEngine>);
+        TransactionManager::with_defaults(shards, Duration::from_secs(30))
+    }
 
-        let manager = TransactionManager::with_defaults(shards, Duration::from_secs(30));
+    #[tokio::test]
+    async fn test_transaction_manager_begin_commit() {
+        let manager = manager_over_shard("test_graph");
 
         // Test 1: Simple begin/commit without operations
         let tx_id = manager
@@ -1059,11 +1015,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transaction_manager_rollback() {
-        let orion = Arc::new(OrionGraphEngine::new());
-        let mut shards = HashMap::new();
-        shards.insert("shard_test".to_string(), orion as Arc<dyn GraphEngine>);
-
-        let manager = TransactionManager::with_defaults(shards, Duration::from_secs(30));
+        let manager = manager_over_shard("shard_test");
 
         let tx_id = manager
             .begin_transaction("test_graph", vec!["shard_test".to_string()])
@@ -1081,11 +1033,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_isolation_levels() {
-        let orion = Arc::new(OrionGraphEngine::new());
-        let mut shards = HashMap::new();
-        shards.insert("shard_test".to_string(), orion as Arc<dyn GraphEngine>);
-
-        let manager = TransactionManager::with_defaults(shards, Duration::from_secs(30));
+        let manager = manager_over_shard("shard_test");
 
         let tx_id = manager
             .begin_transaction_with_isolation(

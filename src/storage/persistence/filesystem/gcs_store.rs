@@ -169,8 +169,9 @@ impl MetadataClient {
                 serde_json::from_slice(&body).map_err(|e| Self::net("GCS metadata decode", e))?,
             )),
             404 => Ok(None),
-            code => Err(Self::net(
+            code => Err(status_error(
                 "GCS metadata GET",
+                Some(code),
                 format!("HTTP {code}: {}", Self::body_snippet(&body)),
             )),
         }
@@ -184,32 +185,36 @@ impl MetadataClient {
         page_token: Option<&str>,
         max_results: Option<i32>,
     ) -> FsResult<GcsListPage> {
-        let mut url = format!(
-            "{}/storage/v1/b/{}/o?prefix={}",
-            self.base,
-            percent_encode(bucket, true),
-            percent_encode(prefix, true)
-        );
-        if let Some(token) = page_token {
-            url.push_str("&pageToken=");
-            url.push_str(&percent_encode(token, false));
-        }
-        if let Some(max) = max_results {
-            url.push_str(&format!("&maxResults={max}"));
-        }
-        let response = self.get(&url).await?;
-        let status = response.status().as_u16();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| Self::net("GCS list body", e))?;
-        if status != 200 {
-            return Err(Self::net(
-                "GCS list",
-                format!("HTTP {status}: {}", Self::body_snippet(&body)),
-            ));
-        }
-        serde_json::from_slice(&body).map_err(|e| Self::net("GCS list decode", e))
+        super::traced_request(super::TracedOp::List, async move {
+            let mut url = format!(
+                "{}/storage/v1/b/{}/o?prefix={}",
+                self.base,
+                percent_encode(bucket, true),
+                percent_encode(prefix, true)
+            );
+            if let Some(token) = page_token {
+                url.push_str("&pageToken=");
+                url.push_str(&percent_encode(token, false));
+            }
+            if let Some(max) = max_results {
+                url.push_str(&format!("&maxResults={max}"));
+            }
+            let response = self.get(&url).await?;
+            let status = response.status().as_u16();
+            let body = response
+                .bytes()
+                .await
+                .map_err(|e| Self::net("GCS list body", e))?;
+            if status != 200 {
+                return Err(status_error(
+                    "GCS list",
+                    Some(status),
+                    format!("HTTP {status}: {}", Self::body_snippet(&body)),
+                ));
+            }
+            serde_json::from_slice(&body).map_err(|e| Self::net("GCS list decode", e))
+        })
+        .await
     }
 
     fn body_snippet(body: &[u8]) -> String {
@@ -294,17 +299,7 @@ impl GcsFileSystem {
 
     /// Parse `gs://bucket/object` (or `gcs://`) into `(bucket, object)`.
     fn parse(path: &str) -> FsResult<(String, String)> {
-        let rest = path
-            .strip_prefix("gs://")
-            .or_else(|| path.strip_prefix("gcs://"))
-            .ok_or_else(|| FilesystemError::InvalidPath(format!("not a gs:// path: {path}")))?;
-        let (bucket, object) = rest.split_once('/').ok_or_else(|| {
-            FilesystemError::InvalidPath(format!("missing object in gs path: {path}"))
-        })?;
-        if bucket.is_empty() || object.is_empty() {
-            return Err(FilesystemError::InvalidPath(format!("bad gs path: {path}")));
-        }
-        Ok((bucket.to_string(), object.to_string()))
+        super::split_object_url(path, &["gs://", "gcs://"], ("a", "gs"), "object")
     }
 
     fn net(ctx: &str, e: impl std::fmt::Display) -> FilesystemError {
@@ -358,7 +353,15 @@ impl GcsFileSystem {
         if let Some(range) = range {
             builder = builder.set_read_range(range);
         }
-        let mut response = builder.send().await.map_err(|e| Self::net(ctx, e))?;
+        let mut response = builder.send().await.map_err(|e| {
+            // A missing object is `NotFound`, as on the local backend, so
+            // callers can tell "absent" from "unreachable".
+            if e.http_status_code() == Some(404) {
+                FilesystemError::NotFound(format!("gs://{bucket}/{object}"))
+            } else {
+                status_error(ctx, e.http_status_code(), e)
+            }
+        })?;
         let mut out = Vec::new();
         while let Some(chunk) = response.next().await {
             let chunk = chunk.map_err(|e| Self::net(ctx, e))?;
@@ -437,16 +440,18 @@ impl FileSystem for GcsFileSystem {
     }
 
     async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
+        let started = std::time::Instant::now();
         let (bucket, object) = Self::parse(path)?;
         let bytes = self
             .read_all("GCS read_object", &bucket, &object, None)
             .await?;
-        super::record_physical_full_read(bytes.len() as u64);
+        super::record_physical_full_read(bytes.len() as u64, started);
         Ok(bytes)
     }
 
     /// ADR-023 cold path: a ranged object download — fetches only `[offset, +length)`.
     async fn read_range(&self, path: &str, offset: u64, length: u64) -> FsResult<Vec<u8>> {
+        let started = std::time::Instant::now();
         if length == 0 {
             return Ok(Vec::new());
         }
@@ -461,7 +466,7 @@ impl FileSystem for GcsFileSystem {
             .await?;
         // ADR-030 / TD-158: physical GET boundary — feed the per-query I/O accumulator
         // (task-local; no-op outside a query scope). Always-on core counters.
-        super::record_physical_range_read(bytes.len() as u64);
+        super::record_physical_range_read(bytes.len() as u64, started);
         Ok(bytes)
     }
 
@@ -491,7 +496,7 @@ impl FileSystem for GcsFileSystem {
         builder
             .send_unbuffered()
             .await
-            .map_err(|e| Self::net("GCS write_object", e))?;
+            .map_err(|e| status_error("GCS write_object", e.http_status_code(), e))?;
         Ok(())
     }
 
@@ -580,7 +585,11 @@ impl FileSystem for GcsFileSystem {
             Err(e) if Self::is_precondition_conflict(&e) => {
                 Err(FilesystemError::AlreadyExists(path.to_string()))
             }
-            Err(e) => Err(Self::net("GCS conditional upload", e)),
+            Err(e) => Err(status_error(
+                "GCS conditional upload",
+                e.http_status_code(),
+                e,
+            )),
         }
     }
 
@@ -595,46 +604,51 @@ impl FileSystem for GcsFileSystem {
         let url = self.json.object_url(&bucket, &object);
         let response = self.json.delete(&url).await?;
         let status = response.status().as_u16();
-        if status == 200 || status == 204 {
-            Ok(())
-        } else {
-            // Missing-object deletes error (Network) — same contract as the
-            // 0.x backend's delete_object.
-            Err(FilesystemError::Network(format!(
+        match status {
+            200 | 204 => Ok(()),
+            // A missing object is `NotFound`, as on the local backend.
+            404 => Err(FilesystemError::NotFound(path.to_string())),
+            _ => Err(FilesystemError::Network(format!(
                 "GCS delete: HTTP {status} for {path}"
-            )))
+            ))),
         }
     }
 
     async fn exists(&self, path: &str) -> FsResult<bool> {
-        let (bucket, object) = Self::parse(path)?;
-        // Fail-closed: only a well-formed "not found" answer is `false`; any
-        // other failure (auth, quota, 5xx) propagates as `Err`. Deliberately
-        // NOT the 0.x backend's `is_ok()` contract, which reported an auth
-        // outage as "object does not exist" — the object_store-based S3
-        // sibling propagates too, and a caching/skip decision built on a
-        // lying `false` is worse than a surfaced error.
-        Ok(self.json.get_object(&bucket, &object).await?.is_some())
+        super::traced_request(super::TracedOp::Head, async move {
+            let (bucket, object) = Self::parse(path)?;
+            // Fail-closed: only a well-formed "not found" answer is `false`; any
+            // other failure (auth, quota, 5xx) propagates as `Err`. Deliberately
+            // NOT the 0.x backend's `is_ok()` contract, which reported an auth
+            // outage as "object does not exist" — the object_store-based S3
+            // sibling propagates too, and a caching/skip decision built on a
+            // lying `false` is worse than a surfaced error.
+            Ok(self.json.get_object(&bucket, &object).await?.is_some())
+        })
+        .await
     }
 
     async fn metadata(&self, path: &str) -> FsResult<FsFileMetadata> {
-        let (bucket, object) = Self::parse(path)?;
-        let obj = self
-            .json
-            .get_object(&bucket, &object)
-            .await?
-            .ok_or_else(|| FilesystemError::Network(format!("GCS object not found: {path}")))?;
-        Ok(FsFileMetadata {
-            path: path.to_string(),
-            size: obj
-                .get("size")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
-            is_directory: false,
-            etag: obj.get("etag").and_then(|v| v.as_str()).map(str::to_string),
-            ..Default::default()
+        super::traced_request(super::TracedOp::Head, async move {
+            let (bucket, object) = Self::parse(path)?;
+            let obj = self
+                .json
+                .get_object(&bucket, &object)
+                .await?
+                .ok_or_else(|| FilesystemError::NotFound(path.to_string()))?;
+            Ok(FsFileMetadata {
+                path: path.to_string(),
+                size: obj
+                    .get("size")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0),
+                is_directory: false,
+                etag: obj.get("etag").and_then(|v| v.as_str()).map(str::to_string),
+                ..Default::default()
+            })
         })
+        .await
     }
 
     async fn list(&self, path: &str) -> FsResult<Vec<DirEntry>> {
@@ -667,17 +681,9 @@ impl FileSystem for GcsFileSystem {
         Ok(())
     }
 
-    async fn copy(&self, from: &str, to: &str) -> FsResult<()> {
-        // GCS has a native copy/rewrite; download+upload keeps this backend lean
-        // and is sufficient for the cold-path use (small index objects).
-        let data = self.read(from).await?;
-        self.write(to, &data, None).await
-    }
-
-    async fn move_file(&self, from: &str, to: &str) -> FsResult<()> {
-        self.copy(from, to).await?;
-        self.delete(from).await
-    }
+    // `copy` / `move_file`: the trait defaults (download + upload). GCS has a
+    // native copy/rewrite; this keeps the backend lean and is sufficient for
+    // the cold-path use (small index objects).
 
     fn filesystem_type(&self) -> &'static str {
         "gcs"
@@ -691,6 +697,16 @@ impl FileSystem for GcsFileSystem {
         Err(FilesystemError::InvalidOperation(
             "streaming open_file is not supported on the GCS backend".to_string(),
         ))
+    }
+}
+
+/// A 401/403 is a refused credential, not a transient fault: callers that
+/// retry `Network` must not retry it.
+fn status_error(ctx: &str, status: Option<u16>, detail: impl std::fmt::Display) -> FilesystemError {
+    match status {
+        Some(401) => FilesystemError::Auth(format!("{ctx}: {detail}")),
+        Some(403) => FilesystemError::PermissionDenied(format!("{ctx}: {detail}")),
+        _ => FilesystemError::Network(format!("{ctx}: {detail}")),
     }
 }
 

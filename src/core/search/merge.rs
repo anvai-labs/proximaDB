@@ -17,16 +17,23 @@
 //! [`merge_delta_with_directory_results`] combines the two with these
 //! rules:
 //!
-//! * **Delta wins on OID collision.** A record present in both sets
-//!   means the WAL has a newer version (or a tombstone) of the same
-//!   OID. The flushed copy is stale; the delta version is
-//!   authoritative.
-//! * **Tombstones suppress.** A tombstone in the delta removes that
-//!   OID from the merged set entirely, regardless of whether the
-//!   directory had a live copy.
-//! * **Top-k truncation comes last.** After dedupe and tombstone
-//!   handling, results are re-sorted by score (descending) and
+//! * **The freshest copy of an OID wins** ([`resolve_freshest`]): later
+//!   `updated_at` first; on an equal timestamp a tombstone wins (mandate
+//!   16d — tombstones carry `record_version` 0, so versions are compared
+//!   only after), then the higher version, then the delta. The delta
+//!   usually holds the newer version, but NOT always: flush retains
+//!   tombstone-only batches (TD-USUB-1), so a stale delta tombstone can be
+//!   older than a flushed re-insert.
+//! * **Dead winners suppress.** A winning tombstone or TTL-expired copy
+//!   removes the OID from the merged set and is never returned.
+//! * **Top-k truncation comes last.** After resolution and dead
+//!   filtering, results are re-sorted by score (descending) and
 //!   truncated to `top_k`.
+//!
+//! [`reconcile_against_wal_state`] is the two-stage search's merge: it drops a
+//! persisted/indexed candidate whose OID has a live unflushed version (that
+//! version is authoritative even when the query skipped it as non-matching),
+//! and lets a candidate beat a dead unflushed version only if strictly newer.
 //!
 //! The function is a pure data transform: no I/O, no concurrency, no
 //! filesystem. Fully unit-testable.
@@ -66,50 +73,34 @@ pub fn merge_delta_with_directory_results(
     if top_k == 0 {
         return Vec::new();
     }
+    let now_ns = proximadb_kernel::time::now_unix_ns();
 
-    // Pass 1: track tombstoned OIDs. These suppress matching directory
-    // records and are themselves dropped from the output.
-    let mut tombstone_ids: HashMap<String, ()> = HashMap::new();
-    for record in &delta_results {
-        if is_wal_tombstone(record) {
-            tombstone_ids.insert(record.id.clone(), ());
-        }
-    }
+    // Resolve every OID to its FRESHEST copy (the delta wins exact ties, and
+    // a tombstone wins an exact tie within the delta — mandate 16d). The old
+    // rule "a delta tombstone suppresses every copy" let a STALE retained
+    // tombstone (flush keeps tombstone-only batches, TD-USUB-1) hide a newer
+    // flushed re-insert in the directory results.
+    let resolved = resolve_freshest(
+        delta_results
+            .into_iter()
+            .map(|r| (CandidateSource::Wal, r))
+            .chain(
+                directory_results
+                    .into_iter()
+                    .map(|r| (CandidateSource::Storage, r)),
+            ),
+    );
 
-    // Pass 2: build the merged map. Insert delta records first so the
-    // "delta wins" rule is enforced by the subsequent directory pass
-    // skipping any OIDs already seen.
-    //
-    // A tombstone in the delta suppresses *every* copy of that OID — not
-    // just the flushed/directory copy but also the live copy that may sit
-    // beside it in the same unflushed WAL (insert-then-delete before any
-    // flush). Without this guard the live WAL record survives into the
-    // output because it is itself not a tombstone, so `is_wal_tombstone`
-    // returns false and it gets inserted here while the tombstone is dropped.
-    let mut by_oid: HashMap<String, OptimizedSearchRecord> = HashMap::new();
-    for record in delta_results {
-        if is_wal_tombstone(&record) {
-            // Tombstones never appear in the output set.
-            continue;
-        }
-        if tombstone_ids.contains_key(&record.id) {
-            // A tombstone for this OID exists in the same delta — the
-            // delete supersedes this live copy.
-            continue;
-        }
-        by_oid.insert(record.id.clone(), record);
-    }
-    for record in directory_results {
-        if tombstone_ids.contains_key(&record.id) {
-            continue;
-        }
-        // Delta-wins: don't overwrite a delta entry with a stale flushed copy.
-        by_oid.entry(record.id.clone()).or_insert(record);
-    }
-
-    // Pass 3: collect, sort by score desc (ties broken by id for
-    // determinism), truncate to top_k.
-    let mut merged: Vec<OptimizedSearchRecord> = by_oid.into_values().collect();
+    // Dead winners (tombstones, TTL-expired) suppress their OID and are never
+    // returned — canonical `is_record_dead`, never `expires_at`.
+    let mut merged: Vec<OptimizedSearchRecord> = resolved
+        .into_values()
+        .map(|(_, record)| record)
+        .filter(|record| {
+            !is_wal_tombstone(record)
+                && !proximadb_records::is_record_dead(record.valid_to_ns, now_ns)
+        })
+        .collect();
     merged.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -117,6 +108,131 @@ pub fn merge_delta_with_directory_results(
             .then_with(|| a.id.cmp(&b.id))
     });
     merged.truncate(top_k);
+    merged
+}
+
+/// Where a search candidate came from. The discriminant order is the
+/// tie-break priority on an EXACT freshness tie (lower wins): unflushed WAL,
+/// then the in-memory AXIS index, then persisted storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CandidateSource {
+    Wal = 0,
+    Axis = 1,
+    Storage = 2,
+}
+
+fn supersedes(
+    candidate: &(CandidateSource, OptimizedSearchRecord),
+    current: &(CandidateSource, OptimizedSearchRecord),
+) -> bool {
+    let (cu, ru) = (
+        candidate.1.updated_at.unwrap_or(i64::MIN),
+        current.1.updated_at.unwrap_or(i64::MIN),
+    );
+    if cu != ru {
+        return cu > ru;
+    }
+    // Same timestamp: a tombstone wins BEFORE versions are compared (mandate
+    // 16d). Tombstones carry record_version 0 while live versions can carry
+    // >= 1 (SQL UPDATE, gRPC client versions), so a version-first tie-break
+    // let a same-instant live copy beat its own delete.
+    let (ct, rt) = (is_wal_tombstone(&candidate.1), is_wal_tombstone(&current.1));
+    if ct != rt {
+        return ct;
+    }
+    let (cv, rv) = (
+        candidate.1.version.unwrap_or(0),
+        current.1.version.unwrap_or(0),
+    );
+    if cv != rv {
+        return cv > rv;
+    }
+    candidate.0 < current.0
+}
+
+/// Resolve every OID to its FRESHEST candidate across sources.
+///
+/// Replaces the historical source-priority merge (WAL > AXIS > storage, with
+/// "a dead WAL copy beats a live one"). That rule was wrong in two directions:
+/// a STALE retained WAL tombstone (flush keeps tombstone-only batches,
+/// TD-USUB-1) hid a NEWER flushed re-insert, and a delete-then-reinsert in one
+/// unflushed delta stayed deleted. Dead filtering happens AFTER this, never
+/// before (the PR #2063 rule: pick the winner, then dead-filter).
+pub fn resolve_freshest(
+    candidates: impl IntoIterator<Item = (CandidateSource, OptimizedSearchRecord)>,
+) -> HashMap<String, (CandidateSource, OptimizedSearchRecord)> {
+    let mut best: HashMap<String, (CandidateSource, OptimizedSearchRecord)> = HashMap::new();
+    for candidate in candidates {
+        match best.get(&candidate.1.id) {
+            Some(current) if !supersedes(&candidate, current) => {}
+            _ => {
+                best.insert(candidate.1.id.clone(), candidate);
+            }
+        }
+    }
+    best
+}
+
+/// The state of one OID's FRESHEST unflushed version, from the same WAL
+/// snapshot the WAL leg scored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalOidState {
+    /// A live version: authoritative over every persisted / indexed copy
+    /// (the get-by-id rule). If it matched the query and made the WAL leg's
+    /// cut it is already a WAL hit; otherwise the OID is not a valid result.
+    Live,
+    /// A tombstone or TTL-expired version written at `updated_at_ms`. A
+    /// persisted copy survives only if it is STRICTLY newer — a stale retained
+    /// tombstone (flush keeps tombstone-only batches, TD-USUB-1) must not hide
+    /// a newer flushed re-insert; an equal-millisecond copy loses to the delete.
+    Dead { updated_at_ms: i64 },
+}
+
+/// Merge WAL hits with the other sources' candidates, reconciling each
+/// non-WAL candidate against its OID's unflushed state.
+///
+/// `wal_hits` are the WAL leg's live, matching, freshest versions; markers
+/// for dead versions (tombstones and TTL-expired) are skipped — the state
+/// lookup carries their suppression. Every other
+/// candidate is first resolved to its freshest copy across AXIS/storage, then:
+/// * no unflushed version of its OID → kept;
+/// * a live unflushed version → dropped (the WAL copy is authoritative: it is
+///   either already a WAL hit, failed the predicate, or was outside the WAL
+///   leg's top-k over distinct current matches, so cannot be in the global
+///   top-k);
+/// * a dead unflushed version → kept only if strictly newer (ms) than it. A
+///   candidate without version facts can never prove that and is dropped —
+///   the historical "WAL beats storage" outcome.
+pub fn reconcile_against_wal_state(
+    wal_hits: Vec<OptimizedSearchRecord>,
+    others: impl IntoIterator<Item = (CandidateSource, OptimizedSearchRecord)>,
+    wal_state: &dyn Fn(&str) -> Option<WalOidState>,
+    now_ns: i64,
+) -> HashMap<String, OptimizedSearchRecord> {
+    let mut merged: HashMap<String, OptimizedSearchRecord> = HashMap::new();
+    for hit in wal_hits {
+        // Dead-version markers (tombstones AND TTL-expired) are never results;
+        // the state lookup already carries their suppression.
+        if is_wal_tombstone(&hit) || proximadb_records::is_record_dead(hit.valid_to_ns, now_ns) {
+            continue;
+        }
+        merged.insert(hit.id.clone(), hit);
+    }
+    for (oid, (_source, candidate)) in resolve_freshest(others) {
+        if merged.contains_key(&oid) {
+            continue;
+        }
+        let keep = match wal_state(&oid) {
+            None => true,
+            Some(WalOidState::Live) => false,
+            Some(WalOidState::Dead { updated_at_ms }) => {
+                candidate.updated_at.is_some_and(|u| u > updated_at_ms)
+            }
+        };
+        if keep {
+            merged.insert(oid, candidate);
+        }
+    }
     merged
 }
 
@@ -279,5 +395,163 @@ mod tests {
             merged_run1.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
             merged_run2.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
         );
+    }
+
+    fn versioned(id: &str, score: f32, updated_at: i64, dead: bool) -> OptimizedSearchRecord {
+        OptimizedSearchRecord {
+            id: id.to_string(),
+            vector_id: Some(id.to_string()),
+            score,
+            similarity: Some(score),
+            updated_at: Some(updated_at),
+            version: Some(1),
+            valid_to_ns: if dead { Some(0) } else { None },
+            ..Default::default()
+        }
+    }
+
+    /// R7: a STALE delta tombstone (t=200) must not hide a NEWER flushed
+    /// re-insert (t=300) — flush retains tombstone-only batches.
+    #[test]
+    fn stale_delta_tombstone_does_not_hide_newer_flushed_reinsert() {
+        let delta = vec![versioned("x", 0.0, 200, true)];
+        let directory = vec![versioned("x", 0.9, 300, false)];
+        let merged = merge_delta_with_directory_results(delta, directory, 10);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "x");
+        assert_eq!(merged[0].updated_at, Some(300));
+    }
+
+    /// The common case still holds: a NEWER delta tombstone suppresses the
+    /// older flushed copy.
+    #[test]
+    fn newer_delta_tombstone_suppresses_older_flushed_copy() {
+        let delta = vec![versioned("x", 0.0, 300, true)];
+        let directory = vec![versioned("x", 0.9, 200, false)];
+        assert!(merge_delta_with_directory_results(delta, directory, 10).is_empty());
+    }
+
+    /// Mandate 16d: insert and delete both unflushed with the SAME timestamp
+    /// — the tombstone wins the tie and the OID stays deleted.
+    #[test]
+    fn same_instant_insert_then_delete_stays_deleted() {
+        let delta = vec![
+            versioned("x", 0.9, 200, false),
+            versioned("x", 0.0, 200, true),
+        ];
+        assert!(merge_delta_with_directory_results(delta, vec![], 10).is_empty());
+        let delta_rev = vec![
+            versioned("x", 0.0, 200, true),
+            versioned("x", 0.9, 200, false),
+        ];
+        assert!(merge_delta_with_directory_results(delta_rev, vec![], 10).is_empty());
+    }
+
+    /// Delete then re-insert, both unflushed: the newer re-insert is visible
+    /// (the old "dead wins" rule hid it).
+    #[test]
+    fn delete_then_reinsert_in_one_delta_is_visible() {
+        let delta = vec![
+            versioned("x", 0.0, 200, true),
+            versioned("x", 0.8, 300, false),
+        ];
+        let merged = merge_delta_with_directory_results(delta, vec![], 10);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].updated_at, Some(300));
+    }
+
+    fn with_version(mut r: OptimizedSearchRecord, version: u32) -> OptimizedSearchRecord {
+        r.version = Some(version);
+        r
+    }
+
+    /// Review MAJOR-1: production tombstones carry record_version 0, while a
+    /// SQL UPDATE / gRPC client can stamp version >= 1. A same-millisecond
+    /// delete must still win — version must never outrank the tombstone.
+    #[test]
+    fn same_millisecond_version0_tombstone_beats_version2_live_copy() {
+        let tomb = with_version(versioned("x", 0.0, 500, true), 0);
+        let live = with_version(versioned("x", 0.9, 500, false), 2);
+        for delta in [vec![tomb.clone(), live.clone()], vec![live, tomb]] {
+            assert!(
+                merge_delta_with_directory_results(delta, vec![], 10).is_empty(),
+                "a same-ms delete must stay deleted regardless of versions"
+            );
+        }
+    }
+
+    /// R2: a LIVE unflushed version supersedes the persisted copy even when the
+    /// query skipped it (non-matching) — the stale copy must not be returned.
+    #[test]
+    fn live_unflushed_version_supersedes_persisted_copy() {
+        let others = vec![
+            (
+                CandidateSource::Storage,
+                versioned("moved", 0.9, 100, false),
+            ),
+            (CandidateSource::Storage, versioned("stay", 0.8, 100, false)),
+        ];
+        let state = |oid: &str| (oid == "moved").then_some(WalOidState::Live);
+        let merged = reconcile_against_wal_state(vec![], others, &state, 0);
+        let mut kept: Vec<&str> = merged.keys().map(String::as_str).collect();
+        kept.sort();
+        assert_eq!(kept, vec!["stay"]);
+    }
+
+    /// R7: a persisted copy NEWER than a dead unflushed version (a stale
+    /// retained tombstone) wins; an equal-ms or older copy loses.
+    #[test]
+    fn persisted_copy_beats_only_an_older_dead_unflushed_version() {
+        let others = vec![
+            (
+                CandidateSource::Storage,
+                versioned("reborn", 0.9, 300, false),
+            ),
+            (CandidateSource::Storage, versioned("tied", 0.8, 250, false)),
+            (CandidateSource::Storage, versioned("gone", 0.7, 100, false)),
+        ];
+        let state = |_: &str| Some(WalOidState::Dead { updated_at_ms: 250 });
+        let merged = reconcile_against_wal_state(vec![], others, &state, 0);
+        let kept: Vec<&str> = merged.keys().map(String::as_str).collect();
+        assert_eq!(kept, vec!["reborn"]);
+    }
+
+    /// Review MAJOR-2: an unversioned candidate (an AXIS hit) with NO
+    /// unflushed version of its OID is kept; it is dropped only when an
+    /// unflushed version exists (live, or dead with no proof of being newer).
+    #[test]
+    fn unversioned_candidate_kept_unless_its_oid_is_unflushed() {
+        let others = vec![
+            (CandidateSource::Axis, live("indexed_only", 0.9)),
+            (CandidateSource::Axis, live("has_live_wal", 0.8)),
+            (CandidateSource::Axis, live("has_dead_wal", 0.7)),
+        ];
+        let state = |oid: &str| match oid {
+            "has_live_wal" => Some(WalOidState::Live),
+            "has_dead_wal" => Some(WalOidState::Dead { updated_at_ms: 1 }),
+            _ => None,
+        };
+        let merged = reconcile_against_wal_state(vec![], others, &state, 0);
+        let kept: Vec<&str> = merged.keys().map(String::as_str).collect();
+        assert_eq!(kept, vec!["indexed_only"]);
+    }
+
+    /// WAL hits are kept as-is and win over any other copy of the same OID;
+    /// WAL tombstone markers are not returned.
+    #[test]
+    fn wal_hits_win_and_markers_are_not_returned() {
+        let wal_hits = vec![
+            versioned("w", 0.9, 400, false),
+            versioned("t", 0.0, 400, true),
+        ];
+        let others = vec![(CandidateSource::Storage, versioned("w", 0.95, 100, false))];
+        let state = |oid: &str| match oid {
+            "w" => Some(WalOidState::Live),
+            "t" => Some(WalOidState::Dead { updated_at_ms: 400 }),
+            _ => None,
+        };
+        let merged = reconcile_against_wal_state(wal_hits, others, &state, 0);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged["w"].updated_at, Some(400), "the WAL copy wins");
     }
 }

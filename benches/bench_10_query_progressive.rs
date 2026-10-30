@@ -105,6 +105,7 @@ async fn progressive_search_real(
     });
 
     let collection = Arc::new(Collection {
+        storage_class_status: None, // SC1 (#2259) field; None = NOT_ACTIVE
         id: "bench-nova".to_string(),
         config: Some(CollectionConfig {
             name: "bench-nova".to_string(),

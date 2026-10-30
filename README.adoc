@@ -195,7 +195,7 @@ flowchart LR
 [[roadmap]]
 == Roadmap
 
-One plan, by release (link:docs/_internal/roadmap/STRATEGIC_ROADMAP.adoc[STRATEGIC_ROADMAP]); each
+One plan, by release (link:docs/current/ROADMAP.adoc[STRATEGIC_ROADMAP]); each
 release closes on executable exit criteria:
 
 * **v0.5 — Correct and durable.** One total order for record versions on every read surface; group
@@ -400,7 +400,7 @@ SQL editor (Monaco), graph explorer (Cytoscape.js), system metrics, dark/light t
 
 * link:docs/README.md[Documentation home]
 * link:docs/SUPPORTED_SURFACE.adoc[Support contract]: what is Supported / Beta / Experimental / Planned
-* link:docs/00-product/VISION.adoc[Vision]: the Context Database
+* link:docs/current/VISION.adoc[Vision]: the Context Database
 * link:docs/12-design/README.adoc[Architecture index] and
   link:docs/12-design/SYSTEM_MAP_2026_05_30.adoc[system map]
 * link:docs/12-design/adr/README.adoc[Architecture decision records], including

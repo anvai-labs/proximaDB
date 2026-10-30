@@ -19,8 +19,7 @@ mod codebook_integration_test;
 pub use proximablocks::{ProximaBlockMetadata, ProximaDataBlock, SstIOLayer};
 
 pub use columnar::{
-    ColumnarOperations, ColumnarSchema, FooterCache, ParquetIOLayer, ParquetQueryEngine,
-    ParquetWriter,
+    ColumnarOperations, FooterCache, ParquetIOLayer, ParquetQueryEngine, ParquetWriter,
 };
 
 pub use common_quantization::{

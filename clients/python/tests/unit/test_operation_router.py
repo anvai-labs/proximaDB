@@ -345,9 +345,7 @@ class TestBackwardCompatibility:
     def test_imports_work(self):
         """Test that old imports still work"""
         # These imports should work due to backward compatibility
-        from proximadb_sdk.operation_router import (
-            create_operation_router,
-        )
+        from proximadb_sdk.operation_router import create_operation_router
 
         # Create router using old interface
         router = create_operation_router()

@@ -263,6 +263,7 @@ async fn test_viper_engine_flush_creates_compressed_parquet_files() -> anyhow::R
 
     // Register collection (if needed by the engine)
     let collection = Collection {
+        storage_class_status: None,
         id: "test_collection".to_string(),
         config: Some(CollectionConfig {
             name: "test_collection".to_string(),
@@ -383,6 +384,7 @@ async fn test_viper_search_compressed_data() -> anyhow::Result<()> {
 
     // Register collection with filterable columns
     let collection = Collection {
+        storage_class_status: None,
         id: "search_test".to_string(),
         config: Some(CollectionConfig {
             name: "search_test".to_string(),
@@ -770,6 +772,7 @@ async fn test_compressions_comparison() -> anyhow::Result<()> {
 
         // Register collection
         let collection = Collection {
+            storage_class_status: None,
             id: "algo_test".to_string(),
             config: Some(CollectionConfig {
                 name: "algo_test".to_string(),
@@ -910,6 +913,7 @@ async fn test_compression_vs_disabled() -> anyhow::Result<()> {
 
         // Register collection with realistic embedding dimensions
         let collection = Collection {
+            storage_class_status: None,
             id: "compression_test".to_string(),
             config: Some(CollectionConfig {
                 name: "compression_test".to_string(),

@@ -24,65 +24,13 @@
 //! ~10ms → ~1hr in roughly half-decade steps.
 
 use lazy_static::lazy_static;
-use prometheus::{
-    CounterVec, HistogramOpts, HistogramVec, IntGauge, Opts, register_counter_vec,
-    register_histogram_vec, register_int_gauge,
-};
-use tracing::error;
+use prometheus::{CounterVec, HistogramVec, IntGauge};
 
 use crate::storage::tiering::MigrationResult;
 use crate::storage::tiering::policy::PerformanceTier;
-
-fn register_counter_vec_safe(name: &str, help: &str, labels: &[&str]) -> CounterVec {
-    match register_counter_vec!(name, help, labels) {
-        Ok(metric) => metric,
-        Err(reg_err) => {
-            error!("Failed to register {}: {}", name, reg_err);
-            CounterVec::new(Opts::new(name, help), labels).unwrap_or_else(|_| {
-                CounterVec::new(Opts::new(format!("{}_fallback", name), help), labels)
-                    .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
-            })
-        }
-    }
-}
-
-fn register_histogram_vec_safe(
-    name: &str,
-    help: &str,
-    labels: &[&str],
-    buckets: Vec<f64>,
-) -> HistogramVec {
-    match register_histogram_vec!(name, help, labels, buckets.clone()) {
-        Ok(metric) => metric,
-        Err(reg_err) => {
-            error!("Failed to register {}: {}", name, reg_err);
-            HistogramVec::new(
-                HistogramOpts::new(name, help).buckets(buckets.clone()),
-                labels,
-            )
-            .unwrap_or_else(|_| {
-                HistogramVec::new(
-                    HistogramOpts::new(format!("{}_fallback", name), help).buckets(buckets),
-                    labels,
-                )
-                .unwrap_or_else(|_| unreachable!("valid histogram metric descriptor"))
-            })
-        }
-    }
-}
-
-fn register_int_gauge_safe(name: &str, help: &str) -> IntGauge {
-    match register_int_gauge!(name, help) {
-        Ok(metric) => metric,
-        Err(reg_err) => {
-            error!("Failed to register {}: {}", name, reg_err);
-            IntGauge::new(name, help).unwrap_or_else(|_| {
-                IntGauge::new(format!("{}_fallback", name), help)
-                    .unwrap_or_else(|_| unreachable!("valid gauge metric descriptor"))
-            })
-        }
-    }
-}
+use proximadb_metrics::{
+    register_counter_vec_safe, register_histogram_vec_safe, register_int_gauge_safe,
+};
 
 /// Bucket layout for the migration duration histogram. Spans 10ms →
 /// 1hr in roughly half-decade steps so both local renames (~ms) and

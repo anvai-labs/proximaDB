@@ -186,38 +186,28 @@ impl SimdDecoder for ScalarDecoder {
         // Delta encoding format: packed deltas as i32 (reinterpreted from f32 bits)
         // Each delta is the difference in the bit representation
 
-        if input.is_empty() || output.is_empty() {
+        if output.is_empty() {
             return Ok(0);
         }
 
         // Parse the input format:
         // [count: u32][bits: u8][packed_deltas: bytes]
-        if input.len() < 5 {
-            bail!("Input too short for delta header");
-        }
-
-        let count = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
-        let bits = input[4];
-
-        if count == 0 {
+        let Some(header) = super::common::parse_delta_header(input)? else {
             return Ok(0);
-        }
+        };
 
-        let actual_count = count.min(output.len());
-
-        // Decode deltas
-        let base_bits = base.to_bits() as i64;
-        let packed_data = &input[5..];
+        let actual_count = header.count.min(output.len());
 
         // Create temporary i64 buffer for deltas
         let mut deltas = vec![0i64; actual_count];
-        let decoded = self.decode_bitpacked_i64(packed_data, bits, &mut deltas)?;
+        let decoded = self.decode_bitpacked_i64(header.packed, header.bits, &mut deltas)?;
 
         // Reconstruct values: value = base + delta
-        for i in 0..decoded.min(actual_count) {
-            let value_bits = (base_bits + deltas[i]) as u32;
-            output[i] = f32::from_bits(value_bits);
-        }
+        super::common::reconstruct_delta_f32(
+            &deltas,
+            base,
+            &mut output[..decoded.min(actual_count)],
+        );
 
         Ok(decoded.min(actual_count))
     }
@@ -226,37 +216,22 @@ impl SimdDecoder for ScalarDecoder {
         // Delta encoding format: packed deltas
         // Each delta is the difference from the previous value
 
-        if input.is_empty() || output.is_empty() {
+        if output.is_empty() {
             return Ok(0);
         }
 
         // Parse header
-        if input.len() < 5 {
-            bail!("Input too short for delta header");
-        }
-
-        let count = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
-        let bits = input[4];
-
-        if count == 0 {
+        let Some(header) = super::common::parse_delta_header(input)? else {
             return Ok(0);
-        }
+        };
 
-        let actual_count = count.min(output.len());
-        let packed_data = &input[5..];
+        let actual_count = header.count.min(output.len());
 
-        // Decode deltas
-        let decoded = self.decode_bitpacked_i64(packed_data, bits, &mut output[..actual_count])?;
-
-        // Apply prefix sum to reconstruct values
-        // values[0] = base + deltas[0]
-        // values[i] = values[i-1] + deltas[i] for i > 0
-        if decoded > 0 {
-            output[0] += base;
-            for i in 1..decoded {
-                output[i] += output[i - 1];
-            }
-        }
+        // Decode deltas, then apply prefix sum to reconstruct values:
+        // values[0] = base + deltas[0]; values[i] = values[i-1] + deltas[i]
+        let decoded =
+            self.decode_bitpacked_i64(header.packed, header.bits, &mut output[..actual_count])?;
+        super::common::prefix_sum_i64(&mut output[..decoded], base);
 
         Ok(decoded)
     }
@@ -278,157 +253,72 @@ impl SimdDecoder for ScalarDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::simd_decode::test_support;
 
-    fn create_bitpacked_data(values: &[u64], bits: u8) -> Vec<u8> {
-        let total_bits = values.len() * bits as usize;
-        let byte_count = total_bits.div_ceil(8);
-        let mut result = vec![0u8; byte_count];
-
-        let mask = if bits == 64 {
-            u64::MAX
-        } else {
-            (1u64 << bits) - 1
-        };
-
-        for (i, &value) in values.iter().enumerate() {
-            let bit_offset = i * bits as usize;
-            let byte_offset = bit_offset / 8;
-            let bit_in_byte = bit_offset % 8;
-
-            let masked_value = value & mask;
-
-            // Pack bits across byte boundaries
-            let mut remaining_bits = bits as usize;
-            let mut current_byte = byte_offset;
-            let mut current_bit = bit_in_byte;
-            let mut value_bits = masked_value;
-
-            while remaining_bits > 0 {
-                let bits_in_byte = (8 - current_bit).min(remaining_bits);
-                let byte_mask = ((1u64 << bits_in_byte) - 1) as u8;
-                result[current_byte] |= ((value_bits as u8) & byte_mask) << current_bit;
-
-                value_bits >>= bits_in_byte;
-                remaining_bits -= bits_in_byte;
-                current_byte += 1;
-                current_bit = 0;
-            }
-        }
-
-        result
+    #[test]
+    fn test_scalar_golden_decode_battery() {
+        // The reference implementation defines the golden vectors every
+        // hardware target must reproduce.
+        test_support::run_golden_decode_battery(&ScalarDecoder::new());
     }
 
     #[test]
     fn test_scalar_decode_bitpacked_8bit() {
-        let decoder = ScalarDecoder::new();
-
         // 8-bit values, byte-aligned
-        let values: Vec<u64> = vec![0, 1, 127, 255, 128, 64, 32, 16];
-        let packed = create_bitpacked_data(&values, 8);
-
-        let mut output = vec![0i64; values.len()];
-        let count = decoder
-            .decode_bitpacked_i64(&packed, 8, &mut output)
-            .unwrap();
-
-        assert_eq!(count, values.len());
-        for (i, &expected) in values.iter().enumerate() {
-            assert_eq!(output[i] as u64, expected, "Mismatch at index {}", i);
-        }
+        test_support::assert_decodes_i64(
+            &ScalarDecoder::new(),
+            &[0, 1, 127, 255, 128, 64, 32, 16],
+            8,
+        );
     }
 
     #[test]
     fn test_scalar_decode_bitpacked_4bit() {
-        let decoder = ScalarDecoder::new();
-
         // 4-bit values (0-15)
-        let values: Vec<u64> = vec![0, 1, 7, 15, 8, 4, 2, 1, 0, 15, 10, 5];
-        let packed = create_bitpacked_data(&values, 4);
-
-        let mut output = vec![0i64; values.len()];
-        let count = decoder
-            .decode_bitpacked_i64(&packed, 4, &mut output)
-            .unwrap();
-
-        assert_eq!(count, values.len());
-        for (i, &expected) in values.iter().enumerate() {
-            assert_eq!(output[i] as u64, expected, "Mismatch at index {}", i);
-        }
+        test_support::assert_decodes_i64(
+            &ScalarDecoder::new(),
+            &[0, 1, 7, 15, 8, 4, 2, 1, 0, 15, 10, 5],
+            4,
+        );
     }
 
     #[test]
     fn test_scalar_decode_bitpacked_1bit() {
-        let decoder = ScalarDecoder::new();
-
         // 1-bit values (0 or 1)
-        let values: Vec<u64> = vec![1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 1, 0, 0, 1, 0, 1];
-        let packed = create_bitpacked_data(&values, 1);
-
-        let mut output = vec![0i64; values.len()];
-        let count = decoder
-            .decode_bitpacked_i64(&packed, 1, &mut output)
-            .unwrap();
-
-        assert_eq!(count, values.len());
-        for (i, &expected) in values.iter().enumerate() {
-            assert_eq!(output[i] as u64, expected, "Mismatch at index {}", i);
-        }
+        test_support::assert_decodes_i64(
+            &ScalarDecoder::new(),
+            &[1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 1, 0, 0, 1, 0, 1],
+            1,
+        );
     }
 
     #[test]
     fn test_scalar_decode_bitpacked_17bit() {
-        let decoder = ScalarDecoder::new();
-
         // 17-bit values (crossing byte boundaries)
-        let values: Vec<u64> = vec![0, 1, 65535, 131071, 100000, 50000, 25000, 12500];
-        let packed = create_bitpacked_data(&values, 17);
-
-        let mut output = vec![0i64; values.len()];
-        let count = decoder
-            .decode_bitpacked_i64(&packed, 17, &mut output)
-            .unwrap();
-
-        assert_eq!(count, values.len());
-        for (i, &expected) in values.iter().enumerate() {
-            assert_eq!(output[i] as u64, expected, "Mismatch at index {}", i);
-        }
+        test_support::assert_decodes_i64(
+            &ScalarDecoder::new(),
+            &[0, 1, 65535, 131071, 100000, 50000, 25000, 12500],
+            17,
+        );
     }
 
     #[test]
     fn test_scalar_decode_bitpacked_32bit() {
-        let decoder = ScalarDecoder::new();
-
         // 32-bit values
-        let values: Vec<u64> = vec![0, 1, u32::MAX as u64, 2147483648, 1000000000];
-        let packed = create_bitpacked_data(&values, 32);
-
-        let mut output = vec![0i64; values.len()];
-        let count = decoder
-            .decode_bitpacked_i64(&packed, 32, &mut output)
-            .unwrap();
-
-        assert_eq!(count, values.len());
-        for (i, &expected) in values.iter().enumerate() {
-            assert_eq!(output[i] as u64, expected, "Mismatch at index {}", i);
-        }
+        test_support::assert_decodes_i64(
+            &ScalarDecoder::new(),
+            &[0, 1, u32::MAX as u64, 2147483648, 1000000000],
+            32,
+        );
     }
 
     #[test]
     fn test_scalar_decode_bitpacked_i32() {
-        let decoder = ScalarDecoder::new();
-
-        let values: Vec<u64> = vec![0, 1, 127, 255, 65535, 100000, 200000, 300000];
-        let packed = create_bitpacked_data(&values, 20);
-
-        let mut output = vec![0i32; values.len()];
-        let count = decoder
-            .decode_bitpacked_i32(&packed, 20, &mut output)
-            .unwrap();
-
-        assert_eq!(count, values.len());
-        for (i, &expected) in values.iter().enumerate() {
-            assert_eq!(output[i] as u64, expected, "Mismatch at index {}", i);
-        }
+        test_support::assert_decodes_i32(
+            &ScalarDecoder::new(),
+            &[0, 1, 127, 255, 65535, 100000, 200000, 300000],
+            20,
+        );
     }
 
     #[test]
@@ -490,21 +380,7 @@ mod tests {
                 (1u64 << bits) - 1
             };
             let values: Vec<u64> = (0..16).map(|i| i * max_val / 16).collect();
-            let packed = create_bitpacked_data(&values, bits);
-
-            let mut output = vec![0i64; values.len()];
-            let count = decoder
-                .decode_bitpacked_i64(&packed, bits, &mut output)
-                .unwrap();
-
-            assert_eq!(count, values.len(), "Count mismatch for {} bits", bits);
-            for (i, &expected) in values.iter().enumerate() {
-                assert_eq!(
-                    output[i] as u64, expected,
-                    "Mismatch at index {} for {} bits",
-                    i, bits
-                );
-            }
+            test_support::assert_decodes_i64(&decoder, &values, bits);
         }
     }
 }

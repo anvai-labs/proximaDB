@@ -21,10 +21,9 @@ fn init_hardware() {
     });
 }
 
-use proximadb::compute::distance_computation::engine::{DistanceMetric, UnifiedDistanceCompute};
-use proximadb::compute::quantization::{InMemoryCodebookStore, UnifiedQuantizationEngine};
 use proximadb::compute::quantization::{StorageQuantizationConfig, StorageQuantizationEngine};
 use proximadb::core::memory::pool::VectorMemoryPool;
+use proximadb_distance_kernel::DistanceMetric;
 
 /// Generate random vectors for benchmarking
 fn generate_vectors(count: usize, dim: usize) -> Vec<Vec<f32>> {
@@ -67,16 +66,11 @@ fn bench_quantization_speed(c: &mut Criterion) {
 
         // Create and train engine
         let engine = futures::executor::block_on(async {
-            let distance_compute = Arc::new(UnifiedDistanceCompute::default());
-            let codebook_store = Arc::new(InMemoryCodebookStore::new());
-            let unified_engine = Arc::new(UnifiedQuantizationEngine::new(
-                distance_compute.clone(),
-                codebook_store,
-            ));
-
-            let config = StorageQuantizationConfig::default();
+            // Canonical default wiring (redundancy pass 3): builds the
+            // distance compute FROM the config's metric, so the benchmark
+            // metric is always explicit in the config object.
             let mut engine =
-                StorageQuantizationEngine::new(unified_engine, distance_compute, config);
+                StorageQuantizationEngine::new_with_config(StorageQuantizationConfig::default());
 
             // Train the quantization model with sample vectors
             engine
@@ -114,16 +108,11 @@ fn bench_progressive_search(c: &mut Criterion) {
 
         // Setup: Create engine, train, and quantize vectors
         let (engine, quantized) = futures::executor::block_on(async {
-            let distance_compute = Arc::new(UnifiedDistanceCompute::default());
-            let codebook_store = Arc::new(InMemoryCodebookStore::new());
-            let unified_engine = Arc::new(UnifiedQuantizationEngine::new(
-                distance_compute.clone(),
-                codebook_store,
-            ));
-
-            let config = StorageQuantizationConfig::default();
+            // Canonical default wiring (redundancy pass 3): builds the
+            // distance compute FROM the config's metric, so the benchmark
+            // metric is always explicit in the config object.
             let mut engine =
-                StorageQuantizationEngine::new(unified_engine, distance_compute, config);
+                StorageQuantizationEngine::new_with_config(StorageQuantizationConfig::default());
 
             // Train the quantization model
             engine
@@ -221,15 +210,7 @@ fn bench_pq_distance_tables(c: &mut Criterion) {
             //     })),
             // });
 
-            let distance_compute = Arc::new(UnifiedDistanceCompute::default());
-            let codebook_store = Arc::new(InMemoryCodebookStore::new());
-            let unified_engine = Arc::new(UnifiedQuantizationEngine::new(
-                distance_compute.clone(),
-                codebook_store,
-            ));
-
-            let mut engine =
-                StorageQuantizationEngine::new(unified_engine, distance_compute, config);
+            let mut engine = StorageQuantizationEngine::new_with_config(config);
 
             // Train PQ
             engine.train(&vectors).await.unwrap();
@@ -277,16 +258,11 @@ fn bench_compression_ratios(c: &mut Criterion) {
         let original_size = vectors.len() * *dim * 4; // f32 = 4 bytes
 
         let engine = futures::executor::block_on(async {
-            let distance_compute = Arc::new(UnifiedDistanceCompute::default());
-            let codebook_store = Arc::new(InMemoryCodebookStore::new());
-            let unified_engine = Arc::new(UnifiedQuantizationEngine::new(
-                distance_compute.clone(),
-                codebook_store,
-            ));
-
-            let config = StorageQuantizationConfig::default();
+            // Canonical default wiring (redundancy pass 3): builds the
+            // distance compute FROM the config's metric, so the benchmark
+            // metric is always explicit in the config object.
             let mut engine =
-                StorageQuantizationEngine::new(unified_engine, distance_compute, config);
+                StorageQuantizationEngine::new_with_config(StorageQuantizationConfig::default());
 
             // Train the quantization model
             engine
@@ -322,21 +298,12 @@ fn bench_binary_filtering(c: &mut Criterion) {
         let vectors = generate_vectors(*size, 384);
 
         let (engine, quantized) = futures::executor::block_on(async {
-            let distance_compute = Arc::new(UnifiedDistanceCompute::default());
-            let codebook_store = Arc::new(InMemoryCodebookStore::new());
-            let unified_engine = Arc::new(UnifiedQuantizationEngine::new(
-                distance_compute.clone(),
-                codebook_store,
-            ));
-
-            let config = StorageQuantizationConfig {
-                enable_progressive: true,
-                filter_threshold: 0.3,
-                ..Default::default()
-            };
-
             let mut engine =
-                StorageQuantizationEngine::new(unified_engine, distance_compute, config);
+                StorageQuantizationEngine::new_with_config(StorageQuantizationConfig {
+                    enable_progressive: true,
+                    filter_threshold: 0.3,
+                    ..Default::default()
+                });
 
             // Train the quantization model
             engine

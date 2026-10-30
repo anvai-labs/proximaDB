@@ -87,17 +87,7 @@ impl AwsS3FileSystem {
 
     /// Parse `s3://bucket/key` (or `s3a://`).
     fn parse(path: &str) -> FsResult<(String, String)> {
-        let rest = path
-            .strip_prefix("s3://")
-            .or_else(|| path.strip_prefix("s3a://"))
-            .ok_or_else(|| FilesystemError::InvalidPath(format!("not an s3 path: {path}")))?;
-        let (bucket, key) = rest.split_once('/').ok_or_else(|| {
-            FilesystemError::InvalidPath(format!("missing key in s3 path: {path}"))
-        })?;
-        if bucket.is_empty() || key.is_empty() {
-            return Err(FilesystemError::InvalidPath(format!("bad s3 path: {path}")));
-        }
-        Ok((bucket.to_string(), key.to_string()))
+        super::split_object_url(path, &["s3://", "s3a://"], ("an", "s3"), "key")
     }
 
     /// Build (and cache) an `ObjectStore` for a bucket.
@@ -151,20 +141,22 @@ impl FileSystem for AwsS3FileSystem {
     }
 
     async fn read(&self, path: &str) -> FsResult<Vec<u8>> {
+        let started = std::time::Instant::now();
         let (bucket, key) = Self::parse(path)?;
         let store = self.store_for(&bucket)?;
         let result = store
             .get(&ObjPath::from(key))
             .await
-            .map_err(|e| Self::net("S3 get", e))?;
+            .map_err(|e| super::object_store_errors::object_error("S3 get", path, e))?;
         let bytes = result.bytes().await.map_err(|e| Self::net("S3 body", e))?;
         let bytes = bytes.to_vec();
-        super::record_physical_full_read(bytes.len() as u64);
+        super::record_physical_full_read(bytes.len() as u64, started);
         Ok(bytes)
     }
 
     /// ADR-023 cold path: a TRUE ranged S3 GET — fetches only `[offset, +length)`.
     async fn read_range(&self, path: &str, offset: u64, length: u64) -> FsResult<Vec<u8>> {
+        let started = std::time::Instant::now();
         if length == 0 {
             return Ok(Vec::new());
         }
@@ -173,10 +165,10 @@ impl FileSystem for AwsS3FileSystem {
         let bytes = store
             .get_range(&ObjPath::from(key), offset..(offset + length))
             .await
-            .map_err(|e| Self::net("S3 get_range", e))?;
+            .map_err(|e| super::object_store_errors::object_error("S3 get_range", path, e))?;
         // ADR-030 / TD-158: physical GET boundary — feed the per-query I/O accumulator
         // (task-local; no-op outside a query scope). Always-on core counters.
-        super::record_physical_range_read(bytes.len() as u64);
+        super::record_physical_range_read(bytes.len() as u64, started);
         Ok(bytes.to_vec())
     }
 
@@ -199,13 +191,13 @@ impl FileSystem for AwsS3FileSystem {
                 store
                     .put_opts(&dst, payload, opts)
                     .await
-                    .map_err(|e| Self::net("S3 put_opts", e))?;
+                    .map_err(|e| super::object_store_errors::denied("S3 put_opts", e))?;
             }
             None => {
                 store
                     .put(&dst, payload)
                     .await
-                    .map_err(|e| Self::net("S3 put", e))?;
+                    .map_err(|e| super::object_store_errors::denied("S3 put", e))?;
             }
         }
         Ok(())
@@ -297,7 +289,10 @@ impl FileSystem for AwsS3FileSystem {
             Err(object_store::Error::AlreadyExists { .. }) => {
                 Err(FilesystemError::AlreadyExists(path.to_string()))
             }
-            Err(error) => Err(Self::net("S3 conditional put", error)),
+            Err(error) => Err(super::object_store_errors::denied(
+                "S3 conditional put",
+                error,
+            )),
         }
     }
 
@@ -313,54 +308,66 @@ impl FileSystem for AwsS3FileSystem {
         store
             .delete(&ObjPath::from(key))
             .await
-            .map_err(|e| Self::net("S3 delete", e))?;
+            .map_err(|e| super::object_store_errors::object_error("S3 delete", path, e))?;
         Ok(())
     }
 
     async fn exists(&self, path: &str) -> FsResult<bool> {
-        let (bucket, key) = Self::parse(path)?;
-        let store = self.store_for(&bucket)?;
-        Ok(store.head(&ObjPath::from(key)).await.is_ok())
+        super::traced_request(super::TracedOp::Head, async move {
+            let (bucket, key) = Self::parse(path)?;
+            let store = self.store_for(&bucket)?;
+            super::object_store_errors::exists_from_head(
+                "S3 head",
+                store.head(&ObjPath::from(key)).await,
+            )
+        })
+        .await
     }
 
     async fn metadata(&self, path: &str) -> FsResult<FsFileMetadata> {
-        let (bucket, key) = Self::parse(path)?;
-        let store = self.store_for(&bucket)?;
-        let meta = store
-            .head(&ObjPath::from(key))
-            .await
-            .map_err(|e| Self::net("S3 head", e))?;
-        Ok(FsFileMetadata {
-            path: path.to_string(),
-            size: meta.size,
-            is_directory: false,
-            etag: meta.e_tag,
-            ..Default::default()
+        super::traced_request(super::TracedOp::Head, async move {
+            let (bucket, key) = Self::parse(path)?;
+            let store = self.store_for(&bucket)?;
+            let meta = store
+                .head(&ObjPath::from(key))
+                .await
+                .map_err(|e| super::object_store_errors::object_error("S3 head", path, e))?;
+            Ok(FsFileMetadata {
+                path: path.to_string(),
+                size: meta.size,
+                is_directory: false,
+                etag: meta.e_tag,
+                ..Default::default()
+            })
         })
+        .await
     }
 
     async fn list(&self, path: &str) -> FsResult<Vec<DirEntry>> {
-        let (bucket, prefix) = Self::parse(path)?;
-        let store = self.store_for(&bucket)?;
-        let mut stream = store.list(Some(&ObjPath::from(prefix)));
-        let mut entries = Vec::new();
-        while let Some(meta) = stream.next().await {
-            let meta = meta.map_err(|e| Self::net("S3 list", e))?;
-            let key = meta.location.to_string();
-            let name = key.rsplit('/').next().unwrap_or(&key).to_string();
-            entries.push(DirEntry {
-                name,
-                url: format!("s3://{bucket}/{key}"),
-                metadata: FsFileMetadata {
-                    path: format!("s3://{bucket}/{key}"),
-                    size: meta.size,
-                    is_directory: false,
-                    etag: meta.e_tag,
-                    ..Default::default()
-                },
-            });
-        }
-        Ok(entries)
+        super::traced_request(super::TracedOp::List, async move {
+            let (bucket, prefix) = Self::parse(path)?;
+            let store = self.store_for(&bucket)?;
+            let mut stream = store.list(Some(&ObjPath::from(prefix)));
+            let mut entries = Vec::new();
+            while let Some(meta) = stream.next().await {
+                let meta = meta.map_err(|e| super::object_store_errors::denied("S3 list", e))?;
+                let key = meta.location.to_string();
+                let name = key.rsplit('/').next().unwrap_or(&key).to_string();
+                entries.push(DirEntry {
+                    name,
+                    url: format!("s3://{bucket}/{key}"),
+                    metadata: FsFileMetadata {
+                        path: format!("s3://{bucket}/{key}"),
+                        size: meta.size,
+                        is_directory: false,
+                        etag: meta.e_tag,
+                        ..Default::default()
+                    },
+                });
+            }
+            Ok(entries)
+        })
+        .await
     }
 
     async fn create_dir(&self, _path: &str) -> FsResult<()> {
@@ -369,16 +376,6 @@ impl FileSystem for AwsS3FileSystem {
 
     async fn create_dir_all(&self, _path: &str) -> FsResult<()> {
         Ok(())
-    }
-
-    async fn copy(&self, from: &str, to: &str) -> FsResult<()> {
-        let data = self.read(from).await?;
-        self.write(to, &data, None).await
-    }
-
-    async fn move_file(&self, from: &str, to: &str) -> FsResult<()> {
-        self.copy(from, to).await?;
-        self.delete(from).await
     }
 
     fn filesystem_type(&self) -> &'static str {

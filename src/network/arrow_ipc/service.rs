@@ -1141,13 +1141,12 @@ impl ProximaFlightService {
 
         let dim = result.route.dimension() as u32;
         for (slot, vector) in to_embed.iter().zip(result.vectors) {
-            records[*slot].embeddings.push(EmbeddingCell {
-                model_id: "native".to_string(),
-                modality: "dense_vector".to_string(),
+            records[*slot].embeddings.push(EmbeddingCell::new_fp32(
+                "native",
+                "dense_vector",
                 dim,
-                values: proximadb_records::EmbeddingValues::Fp32(vector),
-                ..Default::default()
-            });
+                vector,
+            ));
         }
         Ok(())
     }
@@ -1952,6 +1951,8 @@ impl FlightService for ProximaFlightService {
                 };
 
                 let config = crate::proto::proximadb_v1::CollectionConfig {
+                    storage_class: None,
+                    policy_generation: None,
                     name: name.to_string(),
                     embedding_config: None,
                     dimension,
@@ -2225,13 +2226,9 @@ impl FlightService for ProximaFlightService {
 
                     records.push(ProximaRecord {
                         oid,
-                        embeddings: vec![proximadb_records::EmbeddingCell {
-                            model_id: "default".to_string(),
-                            modality: "vector".to_string(),
-                            dim,
-                            values: proximadb_records::EmbeddingValues::Fp32(values),
-                            ..Default::default()
-                        }],
+                        embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                            "default", "vector", dim, values,
+                        )],
                         props,
                         created_at_ns: now_ns,
                         updated_at_ns: now_ns,

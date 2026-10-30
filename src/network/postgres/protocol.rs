@@ -114,6 +114,25 @@ pub struct PostgresProtocol {
     /// Set only around the extended Execute call; the simple-query path leaves
     /// it false and emits RowDescription as before.
     suppress_row_description: bool,
+    /// TD-PGEXT-1: the fields Describe advertised for the portal being
+    /// executed. While `suppress_row_description` is set, the RowDescription
+    /// Execute would have sent is checked against these; a difference is a
+    /// `DescribeMismatch` (0A000) before any DataRow, never a desynced stream.
+    active_described_fields: Vec<FieldDescription>,
+    /// TD-PGEXT-1: ErrorResponses sent on this connection. The main loop uses
+    /// it to enter the extended protocol's skip-until-Sync state.
+    errors_sent: u64,
+    /// After an ErrorResponse to an extended-protocol message, every message
+    /// until Sync is discarded (PostgreSQL semantics): later Bind/Execute of a
+    /// pipelined batch must not run after an earlier one failed.
+    ignore_until_sync: bool,
+    /// TD-PGEXT-1: per-result-column format codes (1 = binary) and the
+    /// described column types for the portal being executed; empty = all text
+    /// (simple query, or a Bind that requested text). Consulted by the DataRow
+    /// writers so binary-requesting drivers (tokio-postgres, asyncpg, JDBC)
+    /// receive encodable values instead of text bytes they must not parse.
+    active_result_formats: Vec<i16>,
+    active_result_types: Vec<PgType>,
     /// E0 rate-limiting: shared per-IP limiter (None = disabled), checked once at
     /// query entry. Converged with the REST limiter via `RateLimitState`.
     rate_limiter: Option<Arc<crate::network::middleware::rate_limit::RateLimitState>>,
@@ -391,8 +410,16 @@ enum AutocommitFailure {
 /// SQLSTATE for a failed DmlService statement: a typed relational integrity
 /// violation (TD-DML-1) maps to its PostgreSQL class (23505 unique, 23503
 /// foreign key, 23514 check, 21000 cardinality); anything else keeps the
-/// call site's historical `fallback`.
+/// call site's historical `fallback`. A write refused for a spill backlog
+/// (nothing written, retryable) is 53000.
 fn dml_error_sqlstate(err: &anyhow::Error, fallback: &'static str) -> &'static str {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::services::record_spill::SpillBacklogFull>()
+            .is_some()
+    }) {
+        return "53000";
+    }
     proximadb_catalog::relational::find_relational_constraint_violation(err)
         .map(|violation| violation.sqlstate())
         .unwrap_or(fallback)
@@ -431,6 +458,60 @@ fn parse_truncate_tables(query: &str) -> Option<Vec<String>> {
         .filter(|table| !table.is_empty())
         .collect();
     Some(tables).filter(|tables| !tables.is_empty())
+}
+
+/// The three canonical pgwire DML verbs (INSERT/DELETE/UPDATE) that share
+/// one pgwire execution body (`execute_dml_via_dml_service`). Carries the
+/// per-verb wire differences: the misdirected-write phrase, the
+/// CommandComplete tag shape, and the statement-failure mapping.
+#[derive(Clone, Copy, Debug)]
+enum DmlVerb {
+    Insert,
+    Delete,
+    Update,
+}
+
+impl DmlVerb {
+    fn as_str(self) -> &'static str {
+        match self {
+            DmlVerb::Insert => "INSERT",
+            DmlVerb::Delete => "DELETE",
+            DmlVerb::Update => "UPDATE",
+        }
+    }
+
+    /// Phrase completing the misdirected-write message:
+    /// `misdirected_write: <phrase> table '<t>' must go to pod ...`.
+    fn gate_phrase(self) -> &'static str {
+        match self {
+            DmlVerb::Insert => "INSERT for",
+            DmlVerb::Delete => "DELETE for",
+            DmlVerb::Update => "UPDATE for",
+        }
+    }
+
+    /// Label for the statement-failure message `"<label> failed: {e}"`.
+    /// INSERT/DELETE historically rendered title-case there ("Insert
+    /// failed:", "Delete failed:") — distinct from the all-caps verb used
+    /// in logs and the misdirected-write gate phrase.
+    fn failure_label(self) -> &'static str {
+        match self {
+            DmlVerb::Insert => "Insert",
+            DmlVerb::Delete => "Delete",
+            DmlVerb::Update => "Update",
+        }
+    }
+
+    /// CommandComplete tag. INSERT follows the PostgreSQL row-count
+    /// convention `INSERT 0 <rows>` (status string with a leading OID
+    /// column, always 0); DELETE/UPDATE report `<VERB> <rows>`.
+    fn command_tag(self, rows: u64) -> String {
+        match self {
+            DmlVerb::Insert => format!("INSERT 0 {rows}"),
+            DmlVerb::Delete => format!("DELETE {rows}"),
+            DmlVerb::Update => format!("UPDATE {rows}"),
+        }
+    }
 }
 
 /// Buffer-time CommandComplete summary for a DML statement: (kind, row hint,
@@ -635,6 +716,32 @@ fn check_pgwire_primary_pod_gate(
 // 6 variants (Insert/Update/Delete/Upsert/InsertSelect/InsertOverwrite),
 // so the gate just calls that — no local helper needed here.
 
+/// TD-PGEXT-1: Execute produced a different result shape than Describe
+/// advertised (a parameter value or DDL changed the route or the table).
+/// Surfaced as 0A000 before any DataRow, like PostgreSQL's "cached plan must
+/// not change result type".
+#[derive(Debug)]
+struct DescribeMismatch(String);
+
+impl std::fmt::Display for DescribeMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for DescribeMismatch {}
+
+/// TD-PGEXT-1: the result shape a statement will have, resolved at Parse.
+enum DescribedShape {
+    /// Execute will stream exactly these columns (field + its `PgType`).
+    Fields(Vec<(FieldDescription, PgType)>),
+    /// The shape cannot be known without executing: describe it as empty,
+    /// the pre-TD-PGEXT-1 behavior, rather than guess.
+    Unknown,
+    /// The server declines the shape (an unsupported pgvector form).
+    Declined(String),
+}
+
 /// Prepared statement
 struct PreparedStatement {
     /// Original query
@@ -644,6 +751,16 @@ struct PreparedStatement {
     translated: String,
     /// Parameter types
     param_types: Vec<PgType>,
+    /// Result columns resolved at Parse time (TD-PGEXT-1): Describe is the
+    /// authority for the extended protocol (Execute suppresses its own
+    /// RowDescription), so the shape must be computed without executing.
+    /// Empty = unknown (the pre-TD-PGEXT-1 behavior).
+    fields: Vec<FieldDescription>,
+    /// The `PgType` of each described field, used to binary-encode cells.
+    field_types: Vec<PgType>,
+    /// A shape the server declines (an unsupported pgvector form): Describe
+    /// answers 0A000 instead of a description, as before TD-PGEXT-1.
+    describe_error: Option<String>,
 }
 
 /// Portal - a bound statement ready for execution
@@ -651,6 +768,18 @@ struct Portal {
     /// Statement name this portal was bound from
     #[allow(dead_code)]
     statement_name: String,
+    /// Per-result-column format codes from Bind (0 = text, 1 = binary);
+    /// TD-PGEXT-1: the server previously ignored these and always sent text,
+    /// so drivers that request binary results could not decode typed columns.
+    result_formats: Vec<i16>,
+    /// The statement's described result-column types, aligned 1:1 with
+    /// `result_formats` for binary encoding.
+    result_types: Vec<PgType>,
+    /// The statement's described fields, so Describe(portal) answers with the
+    /// same shape (and this portal's format codes) as Describe(statement).
+    result_fields: Vec<FieldDescription>,
+    /// The statement's describe error, echoed by Describe(portal).
+    describe_error: Option<String>,
     /// Bound query with parameters substituted
     bound_query: String,
     /// Original translated query
@@ -878,6 +1007,11 @@ impl PostgresProtocol {
             observability_service,
             primary_pod_gate: None,
             suppress_row_description: false,
+            active_described_fields: Vec::new(),
+            errors_sent: 0,
+            ignore_until_sync: false,
+            active_result_formats: Vec::new(),
+            active_result_types: Vec::new(),
             rate_limiter: None,
             peer_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             result_bytes_pending: 0,
@@ -960,6 +1094,11 @@ impl PostgresProtocol {
             observability_service: None,
             primary_pod_gate: None,
             suppress_row_description: false,
+            active_described_fields: Vec::new(),
+            errors_sent: 0,
+            ignore_until_sync: false,
+            active_result_formats: Vec::new(),
+            active_result_types: Vec::new(),
             rate_limiter: None,
             peer_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             result_bytes_pending: 0,
@@ -1016,6 +1155,11 @@ impl PostgresProtocol {
             observability_service: None,
             primary_pod_gate: None,
             suppress_row_description: false,
+            active_described_fields: Vec::new(),
+            errors_sent: 0,
+            ignore_until_sync: false,
+            active_result_formats: Vec::new(),
+            active_result_types: Vec::new(),
             rate_limiter: None,
             peer_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             result_bytes_pending: 0,
@@ -1241,6 +1385,23 @@ impl PostgresProtocol {
         self
     }
 
+    /// Fence the per-connection DML's live-delete publications on the SAME
+    /// write-lease authority DDL got (the fence contract's gate 4: a pod
+    /// displaced mid-DELETE cannot publish its DV successor).
+    pub fn with_dml_publish_lease(
+        mut self,
+        lease: Arc<crate::services::write_lease::WriteLeaseAuthority>,
+    ) -> Self {
+        if let Some(dml) = self.dml_service.as_mut().and_then(Arc::get_mut) {
+            dml.set_publish_lease(lease);
+        } else {
+            tracing::error!(
+                "pgwire DML publish lease could not be attached to the per-connection service"
+            );
+        }
+        self
+    }
+
     /// Attach catalog-backed DDL/DML services to an existing protocol handler.
     pub fn with_catalog_manager(mut self, catalog_manager: Arc<CatalogManager>) -> Self {
         let dml_service = Arc::new(DmlService::new(
@@ -1389,6 +1550,13 @@ impl PostgresProtocol {
             let body_len = length - 4;
             let body = self.read_bytes(body_len).await?;
 
+            // Extended protocol: after an ErrorResponse, discard every
+            // message until Sync (PostgreSQL semantics).
+            if self.ignore_until_sync && msg_type != b'S' {
+                continue;
+            }
+            let errors_before = self.errors_sent;
+
             // Handle message
             match msg_type {
                 b'Q' => self.handle_query(&body).await?,
@@ -1414,6 +1582,11 @@ impl PostgresProtocol {
                     self.send_error("ERROR", "XX000", "Unknown message type")
                         .await?;
                 }
+            }
+            if matches!(msg_type, b'P' | b'B' | b'E' | b'D' | b'C')
+                && self.errors_sent != errors_before
+            {
+                self.ignore_until_sync = true;
             }
         }
 
@@ -2578,6 +2751,21 @@ impl PostgresProtocol {
                     written_tables: vec![table.to_string()],
                 }))
             }
+            // Durable but not applied (the record store poisoned itself): the
+            // write reappears on restart replay, so it must not read as a plain
+            // statement failure a driver would retry.
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<crate::services::txn_staging::CommitOutcomeUnknown>()
+                        .is_some()
+                }) =>
+            {
+                Err(AutocommitFailure::Atomic(AtomicTxnError::OutcomeUnknown {
+                    reason: format!("{error:#}"),
+                    written_tables: vec![table.to_string()],
+                }))
+            }
             // A poisoned appender refused before writing: nothing landed, but
             // every write will fail until a restart — say so instead of letting
             // the statement fallback (e.g. 42P01) suggest a client error.
@@ -3128,6 +3316,26 @@ impl PostgresProtocol {
                         }
                         _ => None,
                     };
+                    // TD-DML-3: a table with VECTOR columns stores through the
+                    // vector store, which checks a row's (first) embedding
+                    // against the backing collection's dimension. The shim used
+                    // to be dimension 1, so every VECTOR(n≠1) row was rejected.
+                    // Declare the first VECTOR column's dimension instead; each
+                    // vector is also validated against its OWN column's
+                    // VECTOR(n) by the relational row contract.
+                    let backing_dimension: u32 = match &statement {
+                        crate::services::DdlStatement::CreateTable { columns, .. } => columns
+                            .iter()
+                            .find_map(|column| match column.data_type {
+                                crate::services::ddl::SqlDataType::Vector { dimension } => {
+                                    Some(dimension)
+                                }
+                                _ => None,
+                            })
+                            .filter(|dimension| *dimension > 0)
+                            .unwrap_or(1),
+                        _ => 1,
+                    };
                     // TD-064: scope table-targeting DDL (CREATE/DROP/ALTER TABLE,
                     // CREATE/DROP INDEX) onto the connection's tenant so a tenant's
                     // CREATE-then-INSERT address one tenant-prefixed schema row.
@@ -3167,6 +3375,7 @@ impl PostgresProtocol {
                                     &table_name,
                                     ddl_scope.as_deref(),
                                     backing_precision.as_deref(),
+                                    backing_dimension,
                                 )
                                 .await?;
                             }
@@ -3263,6 +3472,7 @@ impl PostgresProtocol {
         table_name: &str,
         tenant_id: Option<&str>,
         canonical_embedding_precision_label: Option<&str>,
+        dimension: u32,
     ) -> Result<()> {
         use crate::proto::proximadb_v1::{CollectionConfig, EmbeddingPrecision, StorageEngine};
 
@@ -3286,12 +3496,12 @@ impl PostgresProtocol {
             })
             .map(|p| p as i32);
 
-        // Relational tables don't carry vectors; the backing collection is a
-        // catalog-visibility shim. CollectionService rejects dimension=0, so
-        // pin the shim at 1 (matches other zero-vector compatibility paths).
+        // A table without VECTOR columns gets a catalog-visibility shim at
+        // dimension 1 (CollectionService rejects 0); a table with VECTOR
+        // columns declares its first VECTOR column's dimension (TD-DML-3).
         let config = CollectionConfig {
             name: table_name.to_string(),
-            dimension: 1,
+            dimension: dimension.max(1),
             storage_engine: Some(StorageEngine::Sst as i32),
             description: Some(format!(
                 "Relational table backing collection: {}",
@@ -3471,24 +3681,23 @@ impl PostgresProtocol {
     /// variant is needed by the new pipeline to round-trip
     /// SQL NULLs correctly.
     async fn send_data_row_nullable(&mut self, values: &[Option<String>]) -> Result<()> {
+        // TD-PGEXT-1: encode cells the client asked for in binary.
+        let cells = self.encode_row_cells(values.iter().map(|v| v.as_deref()).collect())?;
         let mut payload_len: usize = 4 /* msg len */ + 2 /* field count */;
-        for v in values {
-            payload_len += 4;
-            if let Some(s) = v {
-                payload_len += s.len();
-            }
+        for value in &cells {
+            payload_len += 4 + value.as_ref().map_or(0, |bytes| bytes.len());
         }
         self.write_buffer.put_u8(b'D');
         self.write_buffer.put_i32(payload_len as i32);
         self.write_buffer.put_i16(values.len() as i16);
-        for v in values {
-            match v {
+        for value in &cells {
+            match value {
                 None => {
                     self.write_buffer.put_i32(-1);
                 }
-                Some(s) => {
-                    self.write_buffer.put_i32(s.len() as i32);
-                    self.write_buffer.put_slice(s.as_bytes());
+                Some(bytes) => {
+                    self.write_buffer.put_i32(bytes.len() as i32);
+                    self.write_buffer.put_slice(bytes);
                 }
             }
         }
@@ -5812,16 +6021,80 @@ impl PostgresProtocol {
         self.send_command_complete("TRUNCATE TABLE").await
     }
 
-    /// Execute INSERT using the proper SQL parser and DmlService
+    /// TD-PGWIRE-COPY-1 shared write gate: resolve the write tenant (startup
+    /// `database` first, then the session var), then enforce the primary-pod
+    /// gate for a write to `table`. `verb_phrase` completes the
+    /// misdirected-write message — `"INSERT for"`, `"COPY into"`, … Returns
+    /// `Ok(Some(tenant))`, `Ok(None)` once the 57P03 error has been sent
+    /// (the caller must stop processing the statement), or `Err` if the
+    /// error frame itself could not be written.
+    async fn resolve_write_tenant_gated(
+        &mut self,
+        verb_phrase: &str,
+        table: &str,
+    ) -> Result<Option<String>> {
+        let write_tenant = self.pgwire_resolve_write_tenant().await;
+        if let PgwireGateOutcome::Misrouted { target_pod } =
+            check_pgwire_primary_pod_gate(&self.primary_pod_gate, &write_tenant, table)
+        {
+            self.send_error(
+                "ERROR",
+                "57P03",
+                &format!(
+                    "misdirected_write: {verb_phrase} table '{}' must go to pod '{target_pod}' (reconnect to that pod and retry)",
+                    table
+                ),
+            )
+            .await?;
+            return Ok(None);
+        }
+        Ok(Some(write_tenant))
+    }
+
+    /// Execute INSERT through canonical catalog-backed DML (shared body —
+    /// see `execute_dml_via_dml_service`).
     async fn execute_insert_via_dml_service(
         &mut self,
         query: &str,
         dml_service: &Arc<DmlService>,
     ) -> Result<()> {
+        self.execute_dml_via_dml_service(query, dml_service, DmlVerb::Insert)
+            .await
+    }
+
+    /// Shared body of the three canonical pgwire DML paths (INSERT/DELETE/
+    /// UPDATE): parse → primary-pod gate (TD-PGWIRE-COPY-1) → tenant
+    /// visibility gate (TD-064 write-half) → buffer inside an explicit
+    /// transaction (ADR-018 P2.D) or autocommit-execute → mandate-#16b OLAP
+    /// result-cache invalidation → CommandComplete tag.
+    ///
+    /// Per-verb wire differences live in `DmlVerb`: the tag shape
+    /// (`INSERT 0 <n>` vs `<VERB> <n>`) and the statement-failure arm
+    /// (UPDATE is not yet implemented in DmlService → 0A000 with the bare
+    /// message; INSERT/DELETE map catalog/integrity errors via
+    /// `dml_error_sqlstate` with a 42P01 fallback, TD-DML-1).
+    async fn execute_dml_via_dml_service(
+        &mut self,
+        query: &str,
+        dml_service: &Arc<DmlService>,
+        verb: DmlVerb,
+    ) -> Result<()> {
         let parser = SqlFrontendParser::new();
 
         match parser.parse_dml(query) {
-            Ok(Some(statement)) => {
+            Ok(Some(mut statement)) => {
+                // TD-DML-3: an ON CONFLICT DO UPDATE must evaluate the caller's
+                // read policy on the conflicting row (abac-policy), so the
+                // statement carries the session identity — through buffering
+                // too, since it travels with the statement.
+                if let crate::services::dml::DmlStatement::Upsert { on_conflict, .. } =
+                    &mut statement
+                {
+                    on_conflict.caller_identity =
+                        self.session.read().await.identity.as_ref().map(|identity| {
+                            proximadb_runtime::PortIdentity::from(identity).into_owned()
+                        });
+                }
                 // Slice 6.3: gate runs post-parse so the (tenant_id,
                 // target_table) pair is known; pre-execute so a
                 // misroute never touches the catalog or WAL on this
@@ -5830,23 +6103,14 @@ impl PostgresProtocol {
                 // as (startup `database` first, then the session var). Gating on
                 // the session var alone checked `default` for a `database=acme`
                 // client whose write then landed in acme's partition.
-                let write_tenant = self.pgwire_resolve_write_tenant().await;
                 let table = statement.target_table_name().to_string();
-                match check_pgwire_primary_pod_gate(&self.primary_pod_gate, &write_tenant, &table) {
-                    PgwireGateOutcome::Allow => {}
-                    PgwireGateOutcome::Misrouted { target_pod } => {
-                        return self
-                            .send_error(
-                                "ERROR",
-                                "57P03",
-                                &format!(
-                                    "misdirected_write: INSERT for table '{}' must go to pod '{}' (reconnect to that pod and retry)",
-                                    table, target_pod
-                                ),
-                            )
-                            .await;
-                    }
-                }
+                let write_tenant = match self
+                    .resolve_write_tenant_gated(verb.gate_phrase(), &table)
+                    .await?
+                {
+                    Some(tenant) => tenant,
+                    None => return Ok(()),
+                };
 
                 // TD-064 write-half: resolve the tenant scope (catalog/database
                 // binding) and authorize the target table within it. A
@@ -5923,7 +6187,8 @@ impl PostgresProtocol {
                     Ok(result) => {
                         info!(
                             rows_affected = result.rows_affected,
-                            "INSERT executed via DmlService"
+                            "{} executed via DmlService",
+                            verb.as_str()
                         );
                         // Mandate #16b: invalidate the tenant-scoped OLAP result
                         // cache for the written table (default-OFF no-op).
@@ -5932,7 +6197,7 @@ impl PostgresProtocol {
                             &table,
                         )
                         .await;
-                        self.send_command_complete(&format!("INSERT 0 {}", result.rows_affected))
+                        self.send_command_complete(&verb.command_tag(result.rows_affected))
                             .await
                     }
                     Err(AutocommitFailure::Atomic(error)) => {
@@ -5950,26 +6215,47 @@ impl PostgresProtocol {
                                 }
                                 None => format!("lock not available on {resource}"),
                             };
-                            warn!("DmlService INSERT blocked by DML lock: {msg}");
+                            warn!("DmlService {} blocked by DML lock: {msg}", verb.as_str());
                             return self.send_error("ERROR", "55P03", &msg).await;
                         }
-                        warn!("DmlService INSERT failed: {}", e);
-                        // TD-DML-1: an integrity violation (INSERT or any UPSERT
-                        // spelling) carries its own SQLSTATE (23505/23503/23514/
-                        // 21000) so drivers can key on it.
-                        let code = dml_error_sqlstate(&e, "42P01");
-                        self.send_error("ERROR", code, &format!("Insert failed: {}", e))
-                            .await
+                        match verb {
+                            DmlVerb::Update => {
+                                // DmlService UPDATE returns error for
+                                // not-implemented. This is expected — UPDATE
+                                // requires a delete + insert pattern.
+                                warn!("DmlService UPDATE: {}", e);
+                                let code = dml_error_sqlstate(&e, "0A000");
+                                self.send_error("ERROR", code, &format!("{}", e)).await
+                            }
+                            other => {
+                                warn!("DmlService {} failed: {}", other.as_str(), e);
+                                // TD-DML-1: an integrity violation (INSERT or any
+                                // UPSERT spelling) carries its own SQLSTATE
+                                // (23505/23503/23514/21000) so drivers can key
+                                // on it.
+                                let code = dml_error_sqlstate(&e, "42P01");
+                                self.send_error(
+                                    "ERROR",
+                                    code,
+                                    &format!("{} failed: {}", other.failure_label(), e),
+                                )
+                                .await
+                            }
+                        }
                     }
                 }
             }
             Ok(None) => {
-                // Not a DML statement (shouldn't happen for INSERT)
-                self.send_error("ERROR", "42601", "Invalid INSERT statement")
-                    .await
+                // Not a DML statement (shouldn't happen for this verb)
+                self.send_error(
+                    "ERROR",
+                    "42601",
+                    &format!("Invalid {} statement", verb.as_str()),
+                )
+                .await
             }
             Err(e) => {
-                warn!("Failed to parse INSERT: {}", e);
+                warn!("Failed to parse {}: {}", verb.as_str(), e);
                 self.send_error("ERROR", "42601", &format!("Parse error: {}", e))
                     .await
             }
@@ -5997,157 +6283,15 @@ impl PostgresProtocol {
         .await
     }
 
-    /// Execute DELETE using the proper SQL parser and DmlService
+    /// Execute DELETE using the proper SQL parser and DmlService (shared
+    /// body — see `execute_dml_via_dml_service`).
     async fn execute_delete_via_dml_service(
         &mut self,
         query: &str,
         dml_service: &Arc<DmlService>,
     ) -> Result<()> {
-        let parser = SqlFrontendParser::new();
-
-        match parser.parse_dml(query) {
-            Ok(Some(statement)) => {
-                // Slice 6.3: gate before DELETE — symmetric with INSERT.
-                // TD-PGWIRE-COPY-1: gate on the SAME tenant the write executes
-                // as (startup `database` first, then the session var). Gating on
-                // the session var alone checked `default` for a `database=acme`
-                // client whose write then landed in acme's partition.
-                let write_tenant = self.pgwire_resolve_write_tenant().await;
-                let table = statement.target_table_name().to_string();
-                match check_pgwire_primary_pod_gate(&self.primary_pod_gate, &write_tenant, &table) {
-                    PgwireGateOutcome::Allow => {}
-                    PgwireGateOutcome::Misrouted { target_pod } => {
-                        return self
-                            .send_error(
-                                "ERROR",
-                                "57P03",
-                                &format!(
-                                    "misdirected_write: DELETE for table '{}' must go to pod '{}' (reconnect to that pod and retry)",
-                                    table, target_pod
-                                ),
-                            )
-                            .await;
-                    }
-                }
-
-                // TD-064 write-half: tenant scope + cross-tenant 42P01 gate (see INSERT).
-                // `write_tenant` resolved once above, before the gate.
-                let tenant_scope = (!write_tenant.is_empty()).then(|| write_tenant.clone());
-                if let Some(ref tenant) = tenant_scope
-                    && !dml_service
-                        .table_visible_for_tenant(&table, Some(tenant.as_str()))
-                        .await
-                        .unwrap_or(false)
-                {
-                    return self
-                        .send_error(
-                            "ERROR",
-                            "42P01",
-                            &format!("relation \"{}\" does not exist", table),
-                        )
-                        .await;
-                }
-                let tenant_ctx = tenant_scope.as_ref().map(|tenant| {
-                    crate::storage::tenant::context::TenantContext::for_tenant_id(tenant)
-                });
-
-                // ADR-018 P2.D: inside an explicit transaction the write
-                // BUFFERS (the primary-pod + tenant-visibility gates above
-                // already ran at statement time) and replays sequentially at
-                // COMMIT. Read-only transactions reject writes here (25006).
-                if self.transaction_in_progress().await {
-                    if self.transaction_is_read_only().await {
-                        return self
-                            .send_error(
-                                "ERROR",
-                                "25006",
-                                &format!(
-                                    "cannot execute {} in a read-only transaction (ADR-018 P2.D)",
-                                    dml_summary(&statement).0
-                                ),
-                            )
-                            .await;
-                    }
-                    let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
-                    if let Err((sqlstate, reason)) = self
-                        .transaction_push(
-                            statement,
-                            tenant_ctx,
-                            approx_bytes.max(query.len()),
-                            table.clone(),
-                            write_tenant.clone(),
-                        )
-                        .await
-                    {
-                        return self.send_error("ERROR", sqlstate, &reason).await;
-                    }
-                    let tag = if kind == "INSERT" {
-                        format!("INSERT 0 {}", tag_rows.unwrap_or(0))
-                    } else {
-                        format!("{kind} 0")
-                    };
-                    return self.send_command_complete(&tag).await;
-                }
-                match self
-                    .execute_autocommit_dml(
-                        dml_service,
-                        statement,
-                        tenant_ctx.as_ref(),
-                        &table,
-                        &write_tenant,
-                    )
-                    .await
-                {
-                    Ok(result) => {
-                        info!(
-                            rows_affected = result.rows_affected,
-                            "DELETE executed via DmlService"
-                        );
-                        // Mandate #16b: invalidate the tenant-scoped OLAP result
-                        // cache for the written table (default-OFF no-op).
-                        super::relational_pipeline::invalidate_olap_result_cache_for(
-                            &write_tenant,
-                            &table,
-                        )
-                        .await;
-                        self.send_command_complete(&format!("DELETE {}", result.rows_affected))
-                            .await
-                    }
-                    Err(AutocommitFailure::Atomic(error)) => {
-                        return self
-                            .send_autocommit_atomic_failure(error, &write_tenant, &table)
-                            .await;
-                    }
-                    Err(AutocommitFailure::Statement(e)) => {
-                        if let Some((resource, holder)) =
-                            crate::errors::extract_dml_lock_conflict(&e)
-                        {
-                            let msg = match holder {
-                                Some(h) => {
-                                    format!("lock not available on {resource} (held by {h})")
-                                }
-                                None => format!("lock not available on {resource}"),
-                            };
-                            warn!("DmlService DELETE blocked by DML lock: {msg}");
-                            return self.send_error("ERROR", "55P03", &msg).await;
-                        }
-                        warn!("DmlService DELETE failed: {}", e);
-                        let code = dml_error_sqlstate(&e, "42P01");
-                        self.send_error("ERROR", code, &format!("Delete failed: {}", e))
-                            .await
-                    }
-                }
-            }
-            Ok(None) => {
-                self.send_error("ERROR", "42601", "Invalid DELETE statement")
-                    .await
-            }
-            Err(e) => {
-                warn!("Failed to parse DELETE: {}", e);
-                self.send_error("ERROR", "42601", &format!("Parse error: {}", e))
-                    .await
-            }
-        }
+        self.execute_dml_via_dml_service(query, dml_service, DmlVerb::Delete)
+            .await
     }
 
     /// Execute UPDATE through canonical catalog-backed DML.
@@ -6166,158 +6310,15 @@ impl PostgresProtocol {
         .await
     }
 
-    /// Execute UPDATE using the proper SQL parser and DmlService
+    /// Execute UPDATE using the proper SQL parser and DmlService (shared
+    /// body — see `execute_dml_via_dml_service`).
     async fn execute_update_via_dml_service(
         &mut self,
         query: &str,
         dml_service: &Arc<DmlService>,
     ) -> Result<()> {
-        let parser = SqlFrontendParser::new();
-
-        match parser.parse_dml(query) {
-            Ok(Some(statement)) => {
-                // Slice 6.3: gate before UPDATE — symmetric with INSERT/DELETE.
-                // TD-PGWIRE-COPY-1: gate on the SAME tenant the write executes
-                // as (startup `database` first, then the session var). Gating on
-                // the session var alone checked `default` for a `database=acme`
-                // client whose write then landed in acme's partition.
-                let write_tenant = self.pgwire_resolve_write_tenant().await;
-                let table = statement.target_table_name().to_string();
-                match check_pgwire_primary_pod_gate(&self.primary_pod_gate, &write_tenant, &table) {
-                    PgwireGateOutcome::Allow => {}
-                    PgwireGateOutcome::Misrouted { target_pod } => {
-                        return self
-                            .send_error(
-                                "ERROR",
-                                "57P03",
-                                &format!(
-                                    "misdirected_write: UPDATE for table '{}' must go to pod '{}' (reconnect to that pod and retry)",
-                                    table, target_pod
-                                ),
-                            )
-                            .await;
-                    }
-                }
-
-                // TD-064 write-half: tenant scope + cross-tenant 42P01 gate (see INSERT).
-                // `write_tenant` resolved once above, before the gate.
-                let tenant_scope = (!write_tenant.is_empty()).then(|| write_tenant.clone());
-                if let Some(ref tenant) = tenant_scope
-                    && !dml_service
-                        .table_visible_for_tenant(&table, Some(tenant.as_str()))
-                        .await
-                        .unwrap_or(false)
-                {
-                    return self
-                        .send_error(
-                            "ERROR",
-                            "42P01",
-                            &format!("relation \"{}\" does not exist", table),
-                        )
-                        .await;
-                }
-                let tenant_ctx = tenant_scope.as_ref().map(|tenant| {
-                    crate::storage::tenant::context::TenantContext::for_tenant_id(tenant)
-                });
-
-                // ADR-018 P2.D: inside an explicit transaction the write
-                // BUFFERS (the primary-pod + tenant-visibility gates above
-                // already ran at statement time) and replays sequentially at
-                // COMMIT. Read-only transactions reject writes here (25006).
-                if self.transaction_in_progress().await {
-                    if self.transaction_is_read_only().await {
-                        return self
-                            .send_error(
-                                "ERROR",
-                                "25006",
-                                &format!(
-                                    "cannot execute {} in a read-only transaction (ADR-018 P2.D)",
-                                    dml_summary(&statement).0
-                                ),
-                            )
-                            .await;
-                    }
-                    let (kind, tag_rows, approx_bytes) = dml_summary(&statement);
-                    if let Err((sqlstate, reason)) = self
-                        .transaction_push(
-                            statement,
-                            tenant_ctx,
-                            approx_bytes.max(query.len()),
-                            table.clone(),
-                            write_tenant.clone(),
-                        )
-                        .await
-                    {
-                        return self.send_error("ERROR", sqlstate, &reason).await;
-                    }
-                    let tag = if kind == "INSERT" {
-                        format!("INSERT 0 {}", tag_rows.unwrap_or(0))
-                    } else {
-                        format!("{kind} 0")
-                    };
-                    return self.send_command_complete(&tag).await;
-                }
-                match self
-                    .execute_autocommit_dml(
-                        dml_service,
-                        statement,
-                        tenant_ctx.as_ref(),
-                        &table,
-                        &write_tenant,
-                    )
-                    .await
-                {
-                    Ok(result) => {
-                        info!(
-                            rows_affected = result.rows_affected,
-                            "UPDATE executed via DmlService"
-                        );
-                        // Mandate #16b: invalidate the tenant-scoped OLAP result
-                        // cache for the written table (default-OFF no-op).
-                        super::relational_pipeline::invalidate_olap_result_cache_for(
-                            &write_tenant,
-                            &table,
-                        )
-                        .await;
-                        self.send_command_complete(&format!("UPDATE {}", result.rows_affected))
-                            .await
-                    }
-                    Err(AutocommitFailure::Atomic(error)) => {
-                        return self
-                            .send_autocommit_atomic_failure(error, &write_tenant, &table)
-                            .await;
-                    }
-                    Err(AutocommitFailure::Statement(e)) => {
-                        if let Some((resource, holder)) =
-                            crate::errors::extract_dml_lock_conflict(&e)
-                        {
-                            let msg = match holder {
-                                Some(h) => {
-                                    format!("lock not available on {resource} (held by {h})")
-                                }
-                                None => format!("lock not available on {resource}"),
-                            };
-                            warn!("DmlService UPDATE blocked by DML lock: {msg}");
-                            return self.send_error("ERROR", "55P03", &msg).await;
-                        }
-                        // DmlService UPDATE returns error for not-implemented
-                        // This is expected - UPDATE requires delete + insert pattern
-                        warn!("DmlService UPDATE: {}", e);
-                        let code = dml_error_sqlstate(&e, "0A000");
-                        self.send_error("ERROR", code, &format!("{}", e)).await
-                    }
-                }
-            }
-            Ok(None) => {
-                self.send_error("ERROR", "42601", "Invalid UPDATE statement")
-                    .await
-            }
-            Err(e) => {
-                warn!("Failed to parse UPDATE: {}", e);
-                self.send_error("ERROR", "42601", &format!("Parse error: {}", e))
-                    .await
-            }
-        }
+        self.execute_dml_via_dml_service(query, dml_service, DmlVerb::Update)
+            .await
     }
 
     /// Execute DROP TABLE - deletes a ProximaDB collection
@@ -6429,22 +6430,13 @@ impl PostgresProtocol {
         // tenant-scoped insert-only path (`copy_insert`) instead of the unscoped
         // `insert_batch`. Gate BEFORE CopyInResponse so
         // a misrouted client never streams its payload to the wrong pod.
-        let write_tenant = self.pgwire_resolve_write_tenant().await;
-        match check_pgwire_primary_pod_gate(&self.primary_pod_gate, &write_tenant, &table_name) {
-            PgwireGateOutcome::Allow => {}
-            PgwireGateOutcome::Misrouted { target_pod } => {
-                return self
-                    .send_error(
-                        "ERROR",
-                        "57P03",
-                        &format!(
-                            "misdirected_write: COPY into table '{}' must go to pod '{}' (reconnect to that pod and retry)",
-                            table_name, target_pod
-                        ),
-                    )
-                    .await;
-            }
-        }
+        let write_tenant = match self
+            .resolve_write_tenant_gated("COPY into", &table_name)
+            .await?
+        {
+            Some(write_tenant) => write_tenant,
+            None => return Ok(()),
+        };
         let tenant_ctx =
             crate::storage::tenant::context::TenantContext::for_tenant_id(write_tenant.clone());
 
@@ -6705,13 +6697,9 @@ impl PostgresProtocol {
             let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
             records.push(proximadb_records::ProximaRecord {
                 oid: id.to_string(),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    dim,
-                    values: proximadb_records::EmbeddingValues::Fp32(vector),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default", "vector", dim, vector,
+                )],
                 created_at_ns: now_ns,
                 updated_at_ns: now_ns,
                 record_version: 1,
@@ -6768,13 +6756,9 @@ impl PostgresProtocol {
                 let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
                 records.push(proximadb_records::ProximaRecord {
                     oid: id.to_string(),
-                    embeddings: vec![proximadb_records::EmbeddingCell {
-                        model_id: "default".to_string(),
-                        modality: "vector".to_string(),
-                        dim,
-                        values: proximadb_records::EmbeddingValues::Fp32(vector),
-                        ..Default::default()
-                    }],
+                    embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                        "default", "vector", dim, vector,
+                    )],
                     created_at_ns: now_ns,
                     updated_at_ns: now_ns,
                     record_version: 1,
@@ -6863,13 +6847,9 @@ impl PostgresProtocol {
             let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
             records.push(proximadb_records::ProximaRecord {
                 oid: id,
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    dim,
-                    values: proximadb_records::EmbeddingValues::Fp32(vector),
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default", "vector", dim, vector,
+                )],
                 created_at_ns: now_ns,
                 updated_at_ns: now_ns,
                 record_version: 1,
@@ -6886,11 +6866,171 @@ impl PostgresProtocol {
             .await
     }
 
+    /// TD-PGEXT-1: the PostgreSQL binary representation of a cell, from the
+    /// server's text rendering of it (`relational_pipeline::wire_text`, which
+    /// both the legacy reader and the relational pipeline emit). Covers every
+    /// type a statement can be described with (`pg_type_for` and
+    /// `pg_type_for_catalog_data_type`); a cell whose text does not parse as
+    /// its described type is an error — sent to the client as an
+    /// ErrorResponse by `handle_execute` — never miscast bytes.
+    fn encode_binary_cell(text: &str, ty: &PgType) -> Result<Vec<u8>, String> {
+        fn parse<T: std::str::FromStr>(text: &str, what: &str) -> Result<T, String> {
+            text.trim()
+                .parse::<T>()
+                .map_err(|_| format!("cannot encode `{text}` as {what}"))
+        }
+        // PostgreSQL's binary date/timestamp epoch is 2000-01-01.
+        fn pg_epoch() -> Result<chrono::NaiveDateTime, String> {
+            chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .ok_or_else(|| "PostgreSQL epoch is not representable".to_string())
+        }
+        // Hex digit pairs to bytes; `None` on an odd length or a non-hex
+        // (including multi-byte) character — never a slicing panic.
+        fn hex_bytes(hex: &str) -> Option<Vec<u8>> {
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| {
+                    hex.get(i..i + 2)
+                        // `from_str_radix` alone would accept a sign (`+f`).
+                        .filter(|pair| pair.bytes().all(|b| b.is_ascii_hexdigit()))
+                        .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                })
+                .collect()
+        }
+        fn timestamp_micros(text: &str) -> Result<i64, String> {
+            let text = text.trim();
+            let text = text.strip_suffix("+00").unwrap_or(text);
+            let at = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+                .map_err(|_| format!("cannot encode `{text}` as timestamp"))?;
+            (at - pg_epoch()?)
+                .num_microseconds()
+                .ok_or_else(|| format!("timestamp `{text}` is out of range"))
+        }
+        match ty {
+            PgType::Bool => match text.trim() {
+                "t" | "true" | "TRUE" | "True" => Ok(vec![1]),
+                "f" | "false" | "FALSE" | "False" => Ok(vec![0]),
+                other => Err(format!("cannot encode `{other}` as bool")),
+            },
+            PgType::Int2 => parse::<i16>(text, "int2").map(|v| v.to_be_bytes().to_vec()),
+            PgType::Int4 => parse::<i32>(text, "int4").map(|v| v.to_be_bytes().to_vec()),
+            PgType::Int8 => parse::<i64>(text, "int8").map(|v| v.to_be_bytes().to_vec()),
+            PgType::Float4 => parse::<f32>(text, "float4").map(|v| v.to_be_bytes().to_vec()),
+            PgType::Float8 => parse::<f64>(text, "float8").map(|v| v.to_be_bytes().to_vec()),
+            // Text-like and JSON: the binary form is the UTF-8 text; jsonb adds
+            // its version byte (1).
+            PgType::Text | PgType::Varchar | PgType::Unknown | PgType::Json => {
+                Ok(text.as_bytes().to_vec())
+            }
+            PgType::Jsonb => {
+                let mut out = Vec::with_capacity(1 + text.len());
+                out.push(1);
+                out.extend_from_slice(text.as_bytes());
+                Ok(out)
+            }
+            PgType::Bytea => {
+                let hex = text
+                    .strip_prefix("\\x")
+                    .ok_or_else(|| format!("cannot encode `{text}` as bytea"))?;
+                hex_bytes(hex).ok_or_else(|| format!("cannot encode `{text}` as bytea"))
+            }
+            PgType::Date => {
+                let date = chrono::NaiveDate::parse_from_str(text.trim(), "%Y-%m-%d")
+                    .map_err(|_| format!("cannot encode `{text}` as date"))?;
+                let days = (date - pg_epoch()?.date()).num_days();
+                i32::try_from(days)
+                    .map(|d| d.to_be_bytes().to_vec())
+                    .map_err(|_| format!("date `{text}` is out of range"))
+            }
+            PgType::Timestamp | PgType::Timestamptz => {
+                timestamp_micros(text).map(|v| v.to_be_bytes().to_vec())
+            }
+            PgType::Uuid => {
+                let hex: String = text.chars().filter(|c| *c != '-').collect();
+                if hex.len() != 32 {
+                    return Err(format!("cannot encode `{text}` as uuid"));
+                }
+                hex_bytes(&hex).ok_or_else(|| format!("cannot encode `{text}` as uuid"))
+            }
+            // pgvector's binary form: int16 dimension, int16 unused, then
+            // float4 per element (big-endian).
+            PgType::Vector => {
+                let inner = text
+                    .trim()
+                    .strip_prefix('[')
+                    .and_then(|v| v.strip_suffix(']'))
+                    .ok_or_else(|| format!("cannot encode `{text}` as vector"))?;
+                let values = if inner.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    inner
+                        .split(',')
+                        .map(|v| parse::<f32>(v, "vector element"))
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                let dim = i16::try_from(values.len())
+                    .map_err(|_| format!("vector of {} elements is too long", values.len()))?;
+                let mut out = Vec::with_capacity(4 + 4 * values.len());
+                out.extend_from_slice(&dim.to_be_bytes());
+                out.extend_from_slice(&0i16.to_be_bytes());
+                for value in values {
+                    out.extend_from_slice(&value.to_be_bytes());
+                }
+                Ok(out)
+            }
+            other => Err(format!(
+                "binary result encoding for type {other:?} is not implemented"
+            )),
+        }
+    }
+
+    /// TD-PGEXT-1: per-cell result encoding for the portal being executed.
+    /// No active portal formats ⇒ all text, exactly the pre-TD-PGEXT-1
+    /// behavior (simple query, or a Bind that asked for text).
+    fn encode_row_cells(&self, values: Vec<Option<&str>>) -> Result<Vec<Option<Vec<u8>>>> {
+        if self.active_result_formats.is_empty() {
+            return Ok(values
+                .into_iter()
+                .map(|v| v.map(|s| s.as_bytes().to_vec()))
+                .collect());
+        }
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let format = self.active_result_formats.get(index).copied().unwrap_or(0);
+                let ty = self
+                    .active_result_types
+                    .get(index)
+                    .cloned()
+                    .unwrap_or(PgType::Text);
+                // A cell we cannot binary-encode must not be sent miscast.
+                value
+                    .map(|text| {
+                        if format == 0 {
+                            Ok(text.as_bytes().to_vec())
+                        } else {
+                            Self::encode_binary_cell(text, &ty)
+                        }
+                    })
+                    .transpose()
+                    .map_err(|error| anyhow::anyhow!("binary result encoding failed: {error}"))
+            })
+            .collect()
+    }
+
     /// Send a data row
     async fn send_data_row(&mut self, values: &[&str]) -> Result<()> {
         // Calculate message length
+        // TD-PGEXT-1: encode cells the client asked for in binary.
+        let cells: Vec<Vec<u8>> = self
+            .encode_row_cells(values.iter().map(|v| Some(*v)).collect::<Vec<_>>())?
+            .into_iter()
+            .flatten()
+            .collect();
         let mut data_len = 2; // field count (2 bytes)
-        for value in values {
+        for value in &cells {
             data_len += 4 + value.len(); // length (4 bytes) + data
         }
 
@@ -6898,9 +7038,9 @@ impl PostgresProtocol {
         self.write_buffer.put_i32(4 + data_len as i32); // Length including self
         self.write_buffer.put_i16(values.len() as i16); // Field count
 
-        for value in values {
+        for value in &cells {
             self.write_buffer.put_i32(value.len() as i32); // Value length
-            self.write_buffer.put_slice(value.as_bytes()); // Value data
+            self.write_buffer.put_slice(value); // Value data
         }
 
         // KOU result-egress: wire bytes = tag(1) + length(4) + data_len.
@@ -6908,6 +7048,167 @@ impl PostgresProtocol {
             .result_bytes_pending
             .saturating_add(5 + data_len as u64);
         self.flush_write_buffer().await
+    }
+
+    /// TD-PGEXT-1: the result shape `Execute` will produce for `query`,
+    /// resolved without running it. Follows the dispatch `execute_query` uses
+    /// for SELECTs, reusing its predicates so the two cannot drift:
+    ///
+    /// 1. the pgvector shape — its typed lowerer (an unsupported form is
+    ///    declined, as Describe did before);
+    /// 2. statements answered by a special case before the SELECT dispatch
+    ///    (version, settings, catalog introspection, …) — unknown;
+    /// 3. a SELECT the relational pipeline routes — plain columns and
+    ///    `count()` only (`describe::pipeline_projection`), typed from the
+    ///    table schema with the pipeline's own type mapping;
+    /// 4. a SELECT served by the legacy single-table reader — the DML
+    ///    service's own column resolution (`describe_select_columns`), the
+    ///    exact list `execute_relational_query` emits, `SELECT *` included.
+    ///
+    /// Everything else is `Unknown`. `tests/pgwire_extended_relational_e2e.rs`
+    /// checks Describe against the simple protocol's RowDescription.
+    async fn describe_select_shape(&self, query: &str) -> DescribedShape {
+        match crate::network::postgres::pgvector_params::described_result_fields(query) {
+            Ok(fields) if !fields.is_empty() => {
+                return DescribedShape::Fields(
+                    fields
+                        .into_iter()
+                        .map(|field| {
+                            let ty = PgType::from_oid(field.type_oid);
+                            (field, ty)
+                        })
+                        .collect(),
+                );
+            }
+            Err(error) => return DescribedShape::Declined(error),
+            Ok(_) => {}
+        }
+
+        let upper = query.trim().to_uppercase();
+        if !upper.starts_with("SELECT") {
+            return DescribedShape::Unknown;
+        }
+        // Special cases `execute_query` answers before its SELECT dispatch.
+        const SPECIAL: [&str; 13] = [
+            "AS SERVER_VERSION",
+            "VERSION()",
+            "AS SERVER_ENCODING",
+            "AS CLIENT_ENCODING",
+            "AS TIMEZONE",
+            "AS SEARCH_PATH",
+            "CURRENT_SCHEMA()",
+            "CURRENT_DATABASE()",
+            "CURRENT_USER",
+            "SESSION_USER",
+            "FROM PG_CATALOG",
+            "FROM INFORMATION_SCHEMA",
+            "PG_SETTINGS",
+        ];
+        if SPECIAL.iter().any(|marker| upper.contains(marker))
+            || crate::services::CatalogIntrospectionService::is_catalog_query(query)
+        {
+            return DescribedShape::Unknown;
+        }
+        let Some(dml_service) = self.dml_service.clone() else {
+            return DescribedShape::Unknown;
+        };
+        let tenant = self.pgwire_resolve_read_tenant().await;
+        let tenant = (!tenant.is_empty()).then_some(tenant.as_str());
+
+        if super::relational_pipeline::select_engages_relational_engine(query) {
+            // The pipeline resolves tables in the session's `search_path`
+            // namespace; `describe_select_columns` resolves the default one.
+            if self.session.read().await.current_schema() != "public" {
+                return DescribedShape::Unknown;
+            }
+            let Some(projection) = crate::network::postgres::describe::pipeline_projection(query)
+            else {
+                return DescribedShape::Unknown;
+            };
+            let sources: Vec<String> = projection
+                .columns
+                .iter()
+                .filter_map(|column| match column {
+                    crate::network::postgres::describe::PipelineColumn::Column {
+                        source, ..
+                    } => Some(source.clone()),
+                    crate::network::postgres::describe::PipelineColumn::Count { .. } => None,
+                })
+                .collect();
+            // Resolve the table even for a count()-only projection: a name the
+            // catalog does not know is routed elsewhere at Execute (document,
+            // graph, observability executors) with a different shape.
+            let resolved = match dml_service
+                .describe_select_columns(&projection.table, &sources, tenant)
+                .await
+            {
+                // An empty projection resolves to every column (the table
+                // exists); a count()-only SELECT uses none of them.
+                Ok(_) if sources.is_empty() => Vec::new(),
+                Ok(columns) if columns.len() == sources.len() => columns,
+                _ => return DescribedShape::Unknown,
+            };
+            let mut resolved = resolved.into_iter();
+            let mut fields = Vec::with_capacity(projection.columns.len());
+            for column in projection.columns {
+                let (name, ty) = match column {
+                    crate::network::postgres::describe::PipelineColumn::Column { name, .. } => {
+                        let Some(catalog) = resolved.next() else {
+                            return DescribedShape::Unknown;
+                        };
+                        let ty = super::relational_pipeline::pg_type_for(&catalog.data_type);
+                        // Execute types pipeline columns from the plan schema.
+                        // On the DataFusion route (MATERIALIZEd tables) JSON,
+                        // UUID and bytea columns can arrive as Utf8/Binary, so
+                        // only types every route preserves are described.
+                        if matches!(
+                            ty,
+                            PgType::Json | PgType::Jsonb | PgType::Uuid | PgType::Bytea
+                        ) {
+                            return DescribedShape::Unknown;
+                        }
+                        (name, ty)
+                    }
+                    crate::network::postgres::describe::PipelineColumn::Count { name } => {
+                        (name, PgType::Int8)
+                    }
+                };
+                fields.push((FieldDescription::new(&name, ty.clone()), ty));
+            }
+            return DescribedShape::Fields(fields);
+        }
+
+        // The legacy single-table reader's route, with its own predicates.
+        if Self::extract_simple_constant_select(query).is_some()
+            || Self::legacy_unsupported_from_shape(&upper).is_some()
+        {
+            return DescribedShape::Unknown;
+        }
+        let Some(table_name) = self.extract_table_name(query) else {
+            return DescribedShape::Unknown;
+        };
+        if !matches!(
+            self.detect_select_store_type(&table_name, &upper),
+            DataModel::Relational | DataModel::Event
+        ) {
+            return DescribedShape::Unknown;
+        }
+        let projection = Self::extract_selected_column_names(query);
+        match dml_service
+            .describe_select_columns(&table_name, &projection, tenant)
+            .await
+        {
+            Ok(columns) => DescribedShape::Fields(
+                columns
+                    .iter()
+                    .map(|column| {
+                        let ty = pg_type_for_catalog_data_type(&column.data_type);
+                        (FieldDescription::new(&column.name, ty.clone()), ty)
+                    })
+                    .collect(),
+            ),
+            Err(_) => DescribedShape::Unknown,
+        }
     }
 
     /// Handle Parse message (extended query)
@@ -6934,9 +7235,23 @@ impl PostgresProtocol {
         // infer), derive the parameter arity + best-effort types from the
         // `$N` placeholders. Without this `ParameterDescription` reports 0
         // parameters and the client aborts Bind with `Parameters(expected, 0)`.
+        // Client-supplied OIDs (JDBC, Npgsql, psycopg 3, `prepare_typed`) are
+        // kept as sent.
         if param_types.is_empty() {
             param_types = crate::network::postgres::pgvector_params::infer_param_types(&query);
         }
+        // TD-PGEXT-1: resolve the result shape once, here, for EVERY client —
+        // Describe(statement/portal) echoes it and Execute encodes binary
+        // cells with these types.
+        let (parsed_fields, parsed_field_types, describe_error) =
+            match self.describe_select_shape(&query).await {
+                DescribedShape::Fields(fields) => {
+                    let (fields, types): (Vec<_>, Vec<_>) = fields.into_iter().unzip();
+                    (fields, types, None)
+                }
+                DescribedShape::Unknown => (Vec::new(), Vec::new(), None),
+                DescribedShape::Declined(error) => (Vec::new(), Vec::new(), Some(error)),
+            };
 
         // Translate and store prepared statement
         match self.translator.translate(&query) {
@@ -6947,6 +7262,9 @@ impl PostgresProtocol {
                         query: query.clone(),
                         translated,
                         param_types,
+                        fields: parsed_fields,
+                        field_types: parsed_field_types,
+                        describe_error,
                     },
                 );
 
@@ -6996,11 +7314,20 @@ impl PostgresProtocol {
             }
         }
 
-        // Read result format codes (we'll ignore these for now)
-        let result_format_count = cursor.get_i16() as usize;
-        for _ in 0..result_format_count {
-            let _ = cursor.get_i16();
-        }
+        // Read result format codes (TD-PGEXT-1: no longer ignored — the
+        // DataRow writers encode binary cells per these codes).
+        // Bounds-checked: a negative or oversized count is a protocol error,
+        // never a capacity-overflow or short-read panic.
+        let result_format_codes: Vec<i16> = match cursor.try_get_i16() {
+            Ok(count) if count >= 0 && cursor.remaining() >= count as usize * 2 => {
+                (0..count).map(|_| cursor.get_i16()).collect()
+            }
+            _ => {
+                return self
+                    .send_error("ERROR", "08P01", "invalid result format codes in Bind")
+                    .await;
+            }
+        };
 
         // Normalize parameter format codes to one-per-parameter.
         let param_formats: Vec<i16> = (0..param_count)
@@ -7012,12 +7339,25 @@ impl PostgresProtocol {
             .collect();
 
         // Get the prepared statement data (extract to avoid borrow conflicts)
-        let stmt_data = self
-            .prepared_statements
-            .get(&statement_name)
-            .map(|s| (s.query.clone(), s.translated.clone(), s.param_types.clone()));
+        let stmt_data = self.prepared_statements.get(&statement_name).map(|s| {
+            (
+                s.query.clone(),
+                s.translated.clone(),
+                s.param_types.clone(),
+                (
+                    s.fields.clone(),
+                    s.field_types.clone(),
+                    s.describe_error.clone(),
+                ),
+            )
+        });
 
-        let (stmt_query, stmt_translated, stmt_param_types) = match stmt_data {
+        let (
+            stmt_query,
+            stmt_translated,
+            stmt_param_types,
+            (stmt_fields, stmt_field_types, stmt_describe_error),
+        ) = match stmt_data {
             Some(data) => data,
             None => {
                 // If unnamed statement (""), use the query directly
@@ -7034,6 +7374,22 @@ impl PostgresProtocol {
             }
         };
 
+        // TD-PGEXT-1: only text (0) and binary (1) exist, and the count must be
+        // 0, 1 or one per result column (validated below once the statement's
+        // shape is known).
+        if result_format_codes
+            .iter()
+            .any(|code| !matches!(code, 0 | 1))
+        {
+            return self
+                .send_error(
+                    "ERROR",
+                    "22023",
+                    "result format code must be 0 (text) or 1 (binary)",
+                )
+                .await;
+        }
+
         // Bind parameters to the query (format- and type-aware).
         let bound_query = match self.bind_parameters(
             &stmt_query,
@@ -7049,7 +7405,50 @@ impl PostgresProtocol {
         };
 
         // Create portal
+        // TD-PGEXT-1: keep the Bind result-format codes (per column) and the
+        // statement's described types so Execute can encode binary cells.
+        let column_count = stmt_fields.len();
+        if column_count > 0
+            && result_format_codes.len() > 1
+            && result_format_codes.len() != column_count
+        {
+            return self
+                .send_error(
+                    "ERROR",
+                    "08P01",
+                    &format!(
+                        "bind message has {} result formats but query has {} columns",
+                        result_format_codes.len(),
+                        column_count
+                    ),
+                )
+                .await;
+        }
+        let result_formats: Vec<i16> = if column_count == 0 {
+            // Shape unknown at Parse: keep the pre-TD-PGEXT-1 behavior (text).
+            Vec::new()
+        } else {
+            (0..column_count)
+                .map(|i| match result_format_codes.len() {
+                    0 => 0,
+                    1 => result_format_codes[0],
+                    _ => result_format_codes.get(i).copied().unwrap_or(0),
+                })
+                .collect()
+        };
+        let result_fields: Vec<FieldDescription> = stmt_fields
+            .into_iter()
+            .zip(result_formats.iter().copied().chain(std::iter::repeat(0)))
+            .map(|(mut field, format)| {
+                field.format_code = format;
+                field
+            })
+            .collect();
         let portal = Portal {
+            result_formats,
+            result_types: stmt_field_types,
+            result_fields,
+            describe_error: stmt_describe_error,
             statement_name: statement_name.clone(),
             bound_query,
             translated: stmt_translated,
@@ -7114,7 +7513,17 @@ impl PostgresProtocol {
 
         // Get the portal
         let portal_bound_query = match self.portals.get(&portal_name) {
-            Some(p) => p.bound_query.clone(),
+            Some(p) => {
+                // TD-PGEXT-1: activate this portal's result formats for the
+                // DataRow writers (binary cells for binary-requesting drivers).
+                self.active_result_formats = p.result_formats.clone();
+                self.active_result_types = p.result_types.clone();
+                self.active_described_fields = p.result_fields.clone();
+                // Execute dispatches on trimmed text, as the simple protocol
+                // does (`split_sql_statements`): a leading newline must not
+                // turn a described SELECT into a no-row "OK".
+                p.bound_query.trim().to_string()
+            }
             None => {
                 // If unnamed portal (""), execute as simple query
                 if portal_name.is_empty() {
@@ -7145,7 +7554,31 @@ impl PostgresProtocol {
             .execute_portal_query(&portal_name, &portal_bound_query, max_rows)
             .await;
         self.suppress_row_description = false;
-        result
+        self.active_result_formats.clear();
+        self.active_result_types.clear();
+        self.active_described_fields.clear();
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if error.downcast_ref::<DescribeMismatch>().is_some() => {
+                self.send_error("ERROR", "0A000", &error.to_string())
+                    .await?;
+                self.transaction_fail_if_active().await;
+                Ok(())
+            }
+            // A FATAL (atomic commit outcome unknown) was already sent: end the
+            // connection, exactly as the simple-query path does.
+            Err(error) if error.downcast_ref::<AtomicCommitFatal>().is_some() => Err(error),
+            // Any other execution error is a SQL error, not a reason to drop the
+            // socket (TD-PGEXT-1 review: the extended path closed the
+            // connection on every Execute-time error; the simple path has
+            // always answered XX000 and kept it open).
+            Err(error) => {
+                self.send_error("ERROR", "XX000", &format!("execution failed: {error}"))
+                    .await?;
+                self.transaction_fail_if_active().await;
+                Ok(())
+            }
+        }
     }
 
     async fn execute_portal_query(
@@ -7199,6 +7632,22 @@ impl PostgresProtocol {
                     Ok(result) => result,
                     Err(msg) => return self.send_relational_error(&msg).await,
                 };
+                // This route never sends a RowDescription, so check the shape
+                // against Describe here (TD-PGEXT-1).
+                let fields: Vec<FieldDescription> = result
+                    .schema
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        FieldDescription::new(
+                            &c.name,
+                            super::relational_pipeline::pg_type_for(&c.ty),
+                        )
+                    })
+                    .collect();
+                if let Some(mismatch) = self.described_shape_mismatch(&fields) {
+                    return Err(anyhow::Error::new(DescribeMismatch(mismatch)));
+                }
                 if let Some(portal) = self.portals.get_mut(portal_name) {
                     portal.execution_state = Some(PortalExecutionState {
                         result,
@@ -7312,24 +7761,24 @@ impl PostgresProtocol {
             'S' => {
                 // Describe statement - clone the query + param_types to avoid
                 // a borrow conflict with the &mut self sends below.
-                if let Some((stmt_query, param_types)) = self
-                    .prepared_statements
-                    .get(&name)
-                    .map(|s| (s.query.clone(), s.param_types.clone()))
+                if let Some((param_types, fields, describe_error)) =
+                    self.prepared_statements.get(&name).map(|s| {
+                        (
+                            s.param_types.clone(),
+                            s.fields.clone(),
+                            s.describe_error.clone(),
+                        )
+                    })
                 {
-                    // Send parameter description (TD-102: now carries the
-                    // inferred arity so the client binds the right count).
+                    // ParameterDescription: the Parse-time arity and types
+                    // (TD-102).
                     self.send_parameter_description(&param_types).await?;
-                    // TD-102: report the result columns this statement will
-                    // return so the client's column read matches the DataRows
-                    // streamed during Execute. The typed lowerer owns projection
-                    // for both phases; an unsupported vector shape fails here
-                    // instead of advertising no columns and failing later.
-                    match crate::network::postgres::pgvector_params::described_result_fields(
-                        &stmt_query,
-                    ) {
-                        Ok(fields) => self.send_row_description(&fields).await?,
-                        Err(error) => self.send_error("ERROR", "0A000", &error).await?,
+                    // RowDescription: the Parse-time shape (TD-PGEXT-1). Empty
+                    // means unknown — the pre-fix behavior. An unsupported
+                    // pgvector shape fails here, as before (TD-102).
+                    match describe_error {
+                        Some(error) => self.send_error("ERROR", "0A000", &error).await?,
+                        None => self.send_row_description(&fields).await?,
                     }
                 } else {
                     self.send_error("ERROR", "26000", "Prepared statement does not exist")
@@ -7337,8 +7786,27 @@ impl PostgresProtocol {
                 }
             }
             'P' => {
-                // Describe portal
-                self.send_row_description(&[]).await?;
+                // Describe portal: the statement's shape with this portal's
+                // result-format codes (TD-PGEXT-1). libpq (`PQsendQueryParams`,
+                // psql `\bind`, psycopg 3), pgjdbc unnamed statements and
+                // Npgsql describe the portal, not the statement.
+                let portal = self
+                    .portals
+                    .get(&name)
+                    .map(|p| (p.result_fields.clone(), p.describe_error.clone()));
+                match portal {
+                    Some((_, Some(error))) => self.send_error("ERROR", "0A000", &error).await?,
+                    Some((fields, None)) => self.send_row_description(&fields).await?,
+                    None if name.is_empty() => self.send_row_description(&[]).await?,
+                    None => {
+                        self.send_error(
+                            "ERROR",
+                            "34000",
+                            &format!("portal \"{}\" does not exist", name),
+                        )
+                        .await?
+                    }
+                }
             }
             _ => {
                 self.send_error("ERROR", "XX000", "Invalid describe type")
@@ -7351,6 +7819,7 @@ impl PostgresProtocol {
 
     /// Handle Sync message
     async fn handle_sync(&mut self) -> Result<()> {
+        self.ignore_until_sync = false;
         self.send_ready_for_query(self.transaction_status_byte().await)
             .await
     }
@@ -7440,6 +7909,7 @@ impl PostgresProtocol {
                 session.fail_transaction();
             }
         }
+        self.errors_sent = self.errors_sent.wrapping_add(1);
         let len = 4 + 1 + severity.len() + 1 + 1 + code.len() + 1 + 1 + message.len() + 1 + 1;
         self.write_buffer.put_u8(b'E');
         self.write_buffer.put_i32(len as i32);
@@ -7457,11 +7927,42 @@ impl PostgresProtocol {
     }
 
     /// Send row description
+    /// TD-PGEXT-1: `Some(reason)` when Execute's result columns differ from
+    /// what Describe advertised for the active portal. An empty description
+    /// (unknown shape) checks nothing — the pre-TD-PGEXT-1 contract.
+    fn described_shape_mismatch(&self, fields: &[FieldDescription]) -> Option<String> {
+        let described = &self.active_described_fields;
+        if described.is_empty() {
+            return None;
+        }
+        let same = described.len() == fields.len()
+            && described
+                .iter()
+                .zip(fields)
+                .all(|(d, f)| d.name == f.name && d.type_oid == f.type_oid);
+        (!same).then(|| {
+            let show = |fs: &[FieldDescription]| {
+                fs.iter()
+                    .map(|f| format!("{}:{}", f.name, f.type_oid))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!(
+                "cached plan must not change result type: described [{}], executed [{}]",
+                show(described),
+                show(fields)
+            )
+        })
+    }
+
     async fn send_row_description(&mut self, fields: &[FieldDescription]) -> Result<()> {
         // TD-102: extended Execute path already described columns at
         // Describe(statement) time; skip the duplicate emitted here.
         if self.suppress_row_description {
-            return Ok(());
+            return match self.described_shape_mismatch(fields) {
+                Some(mismatch) => Err(anyhow::Error::new(DescribeMismatch(mismatch))),
+                None => Ok(()),
+            };
         }
         let mut len = 4 + 2; // Length + field count
         for field in fields {

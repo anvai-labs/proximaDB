@@ -5,6 +5,7 @@
 //! `CanonicalWalEntry` records instead of vector-specific operation envelopes,
 //! matching the Layer 0 spine described by ADR-010.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -66,15 +67,18 @@ lazy_static! {
 }
 
 /// Env gate for P2.1 segment rotation of the shared canonical WAL: rotate the
-/// active file once it reaches this many bytes. Unset, `0` or unparsable = off.
+/// active file once it reaches this many bytes. Default ON
+/// ([`DEFAULT_WAL_SEGMENT_BYTES`](crate::services::storage_format::DEFAULT_WAL_SEGMENT_BYTES));
+/// `0` or `off` disables it. See [`crate::services::storage_format`].
 pub const SEGMENT_BYTES_ENV: &str = "PROXIMADB_CANONICAL_WAL_SEGMENT_BYTES";
 
 /// The configured rotation size for the shared canonical WAL (`0` = off).
 pub fn canonical_wal_segment_bytes() -> u64 {
-    std::env::var(SEGMENT_BYTES_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(0)
+    crate::services::storage_format::default_on_gate(
+        SEGMENT_BYTES_ENV,
+        crate::services::storage_format::DEFAULT_WAL_SEGMENT_BYTES,
+    )
+    .unwrap_or(0)
 }
 
 /// A reader racing a rotation re-reads (or waits 1 ms while one is mid-rename);
@@ -207,6 +211,101 @@ pub struct FramedTableWalAppender {
     /// restart nor an empty active file can reuse a sequence or present a
     /// truncated history as complete.
     retained_from: AtomicU64,
+    /// Snapshot pins ([`Self::pin_history`]): floor → holder count. Truncation
+    /// never passes the lowest; both sides decide under `append_lock`.
+    pins: Arc<HistoryPins>,
+    /// Armed by [`Self::fence_branches`], consumed by the next
+    /// [`Self::truncate_below`].
+    branch_fence: parking_lot::Mutex<Option<BranchFence>>,
+}
+
+/// What a merge-base checkpoint made durable for the truncation that follows
+/// it ([`FramedTableWalAppender::fence_branches`]).
+#[derive(Debug, Clone, Default)]
+struct BranchFence {
+    /// Branched collections whose base is imaged (or already marked lost).
+    covered: BTreeSet<TenantCollection>,
+    /// Collections whose truncated history is recorded.
+    marked: BTreeSet<TenantCollection>,
+}
+
+/// A `(tenant, collection)` pair. The tenant is resolved as a request's is:
+/// an entry without one belongs to the default tenant.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TenantCollection {
+    pub tenant: String,
+    pub collection: String,
+}
+
+impl TenantCollection {
+    pub fn new(tenant: Option<&str>, collection: &str) -> Self {
+        Self {
+            tenant: proximadb_tenant::resolve_request_tenant(tenant),
+            collection: collection.to_string(),
+        }
+    }
+}
+
+/// [`FramedTableWalAppender::truncate_below`] refused because its branch
+/// fence would let history go unrecorded; nothing was removed. The truncator
+/// reports it as a refusal, not a failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchFenceRefused(pub String);
+
+impl std::fmt::Display for BranchFenceRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BranchFenceRefused {}
+
+/// The tenant of an entry, resolved without allocating (see
+/// [`proximadb_tenant::resolve_request_tenant`]).
+fn tenant_of(raw: Option<&str>) -> &str {
+    raw.map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or(proximadb_tenant::DEFAULT_TENANT)
+}
+
+/// Branch-tagged records in the retained WAL ([`FramedTableWalAppender::branch_summary`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BranchSummary {
+    /// Sequence of the oldest retained branch-tagged record.
+    pub oldest_branch_seq: Option<u64>,
+    /// Every `(tenant, collection)` with a retained branch-tagged record.
+    pub collections: BTreeSet<TenantCollection>,
+}
+
+type HistoryPins = parking_lot::Mutex<std::collections::BTreeMap<u64, usize>>;
+
+/// Keeps every canonical-WAL entry at or above [`Self::floor`] from being
+/// truncated until dropped. Taken by [`FramedTableWalAppender::pin_history`]
+/// for the span between capturing a snapshot LSN and publishing it, during
+/// which no catalog record yet protects the entries after it (TD-SEAM-12).
+#[derive(Debug)]
+pub struct WalHistoryPin {
+    pins: Arc<HistoryPins>,
+    floor: u64,
+}
+
+impl WalHistoryPin {
+    /// The lowest sequence this pin keeps.
+    pub fn floor(&self) -> u64 {
+        self.floor
+    }
+}
+
+impl Drop for WalHistoryPin {
+    fn drop(&mut self) {
+        let mut pins = self.pins.lock();
+        if let Some(count) = pins.get_mut(&self.floor) {
+            *count -= 1;
+            if *count == 0 {
+                pins.remove(&self.floor);
+            }
+        }
+    }
 }
 
 /// What [`FramedTableWalAppender::truncate_below`] removed.
@@ -300,6 +399,14 @@ struct SegmentSummary {
     /// Whether any entry carries no collection (catalog/checkpoint ops), which
     /// a collection-scoped read never needs.
     has_uncollected: bool,
+    /// Sequence of the first branch-tagged record (ADR-012). A branch merge
+    /// reads the main-line history before a branch's first write, so the
+    /// truncator keeps every entry from the oldest one up (TD-SEAM-12 hazard 2).
+    first_branch_seq: Option<u64>,
+    /// Every `(tenant, collection)` with a branch-tagged record here.
+    branched: BTreeSet<TenantCollection>,
+    /// collection id → every tenant with an entry of it here.
+    tenants: std::collections::HashMap<String, BTreeSet<String>>,
 }
 
 impl SegmentSummary {
@@ -318,9 +425,33 @@ impl SegmentSummary {
             Some(c) => {
                 let cur = self.collection_max.entry(c.to_string()).or_insert(0);
                 *cur = (*cur).max(seq);
+                let tenant = tenant_of(entry.tenant_id.as_deref());
+                let tenants = self.tenants.entry(c.to_string()).or_default();
+                if !tenants.contains(tenant) {
+                    tenants.insert(tenant.to_string());
+                }
             }
             None => self.has_uncollected = true,
         }
+        if let CanonicalOperation::RecordUpsert {
+            collection_id,
+            record,
+            ..
+        } = &entry.operation
+            && record.branch_id.is_some()
+        {
+            self.first_branch_seq = Some(self.first_branch_seq.map_or(seq, |f| f.min(seq)));
+            self.branched.insert(TenantCollection::new(
+                entry.tenant_id.as_deref(),
+                collection_id,
+            ));
+        }
+    }
+
+    /// Whether [`FramedTableWalAppender::truncate_below`] at `floor` removes
+    /// this (sealed) segment.
+    fn wholly_below(&self, floor: u64) -> bool {
+        self.first_seq.is_none() || self.last_seq < floor
     }
 
     /// Whether this segment can hold an entry for `collection_id` with
@@ -332,6 +463,29 @@ impl SegmentSummary {
                 .get(collection_id)
                 .is_some_and(|max| *max > since)
     }
+}
+
+/// Every `(tenant, collection)` in `segments` (oldest first) → the first
+/// sequence of the oldest segment holding it.
+fn collections_in<'a>(
+    segments: impl Iterator<Item = &'a SegmentSummary>,
+) -> BTreeMap<TenantCollection, u64> {
+    let mut out = BTreeMap::new();
+    for segment in segments {
+        let Some(first) = segment.first_seq else {
+            continue;
+        };
+        for (collection, tenants) in &segment.tenants {
+            for tenant in tenants {
+                out.entry(TenantCollection {
+                    tenant: tenant.clone(),
+                    collection: collection.clone(),
+                })
+                .or_insert(first);
+            }
+        }
+    }
+    out
 }
 
 /// Live appenders by absolute WAL path, for [`FramedTableWalAppender::open_shared`].
@@ -423,7 +577,8 @@ async fn read_sealed_segment(path: &Path) -> Result<Vec<CanonicalWalEntry>> {
 fn collection_id_of(op: &CanonicalOperation) -> Option<&str> {
     match op {
         CanonicalOperation::RecordUpsert { collection_id, .. }
-        | CanonicalOperation::RecordDelete { collection_id, .. } => Some(collection_id.as_str()),
+        | CanonicalOperation::RecordDelete { collection_id, .. }
+        | CanonicalOperation::RecordPartitionDrop { collection_id } => Some(collection_id.as_str()),
         _ => None,
     }
 }
@@ -556,6 +711,8 @@ impl FramedTableWalAppender {
             } else {
                 0
             }),
+            pins: Arc::default(),
+            branch_fence: parking_lot::Mutex::new(None),
         })
     }
 
@@ -564,9 +721,117 @@ impl FramedTableWalAppender {
         self.next_sequence.load(Ordering::SeqCst)
     }
 
+    /// The retained branch-tagged records: the oldest one's sequence and every
+    /// `(tenant, collection)` holding one (TD-SEAM-12 hazard 2). From the
+    /// segment summaries; no file is read.
+    pub fn branch_summary(&self) -> BranchSummary {
+        // Active first: a rotation publishes the sealed summary before it
+        // resets the active one, so a rotation between the two reads is seen
+        // twice (harmless) rather than missed.
+        let mut out = {
+            let active = self.active.lock();
+            BranchSummary {
+                oldest_branch_seq: active.first_branch_seq,
+                collections: active.branched.clone(),
+            }
+        };
+        for summary in self.sealed.read().iter() {
+            if let Some(seq) = summary.first_branch_seq {
+                out.oldest_branch_seq = Some(out.oldest_branch_seq.map_or(seq, |o| o.min(seq)));
+            }
+            out.collections.extend(summary.branched.iter().cloned());
+        }
+        out
+    }
+
+    /// Collections with entries that [`Self::truncate_below`] at `floor` would
+    /// remove, each mapped to the first sequence of the oldest such segment
+    /// (history from there on is gone once it runs). A pin may make the real
+    /// truncation remove less; never more.
+    ///
+    /// The active file counts too: it is not removable now, but a rotation
+    /// before the truncation runs can seal it, and everything in it is below
+    /// any floor up to `head + 1`. Read before the sealed list, for the same
+    /// reason as in [`Self::branch_summary`].
+    pub fn collections_below(&self, floor: u64) -> BTreeMap<TenantCollection, u64> {
+        let active = self.active.lock().clone();
+        let sealed = self.sealed.read();
+        collections_in(
+            sealed
+                .iter()
+                .chain(std::iter::once(&active))
+                .take_while(|s| s.wholly_below(floor)),
+        )
+    }
+
+    /// Arm the next [`Self::truncate_below`] (which consumes it) to refuse —
+    /// removing nothing, with [`BranchFenceRefused`] — when, by the time it
+    /// runs under the append lock, a victim segment holds history of a
+    /// `(tenant, collection)` that either
+    ///
+    /// * has branched but is outside `covered` (its merge base would go
+    ///   without an image: a first branch write raced the checkpoint), or
+    /// * is outside `marked` (its loss would go unrecorded).
+    ///
+    /// The merge-base checkpoint arms it with what it made durable
+    /// (TD-SEAM-12 hazard 2).
+    pub fn fence_branches(
+        &self,
+        covered: BTreeSet<TenantCollection>,
+        marked: BTreeSet<TenantCollection>,
+    ) {
+        *self.branch_fence.lock() = Some(BranchFence { covered, marked });
+    }
+
+    /// Whether a WAL exists at `path`: its active file, a sealed segment, or
+    /// a truncation floor. The active file alone is not enough — right after
+    /// a rotation it is gone until the next append.
+    pub async fn exists_at(path: &Path) -> Result<bool> {
+        for candidate in [path.to_path_buf(), floor_marker_path(path)] {
+            if tokio::fs::try_exists(&candidate)
+                .await
+                .with_context(|| format!("checking {}", candidate.display()))?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(!discover_sealed_segments(path).await?.is_empty())
+    }
+
     /// First sequence still readable; `0` when nothing was ever truncated.
     pub fn retained_from(&self) -> u64 {
         self.retained_from.load(Ordering::SeqCst)
+    }
+
+    /// Pin the history after a snapshot LSN (TD-SEAM-12). Under the append
+    /// lock — so no append and no truncation interleaves — `snapshot_lsn`
+    /// maps the WAL head to the snapshot's LSN `L` (clamped to the head), and
+    /// every entry above `L` is kept until the pin drops. Fails with
+    /// [`WalHistoryTruncated`] when entries above `L` are already gone.
+    pub async fn pin_history(
+        &self,
+        snapshot_lsn: &(dyn Fn(u64) -> u64 + Send + Sync),
+    ) -> Result<(u64, WalHistoryPin)> {
+        let _guard = self.append_lock.lock().await;
+        let head = self.last_sequence();
+        let lsn = snapshot_lsn(head).min(head);
+        let retained_from = self.retained_from();
+        if retained_from > lsn.saturating_add(1) {
+            return Err(WalHistoryTruncated {
+                since: lsn,
+                retained_from,
+            }
+            .into());
+        }
+        let floor = lsn.saturating_add(1);
+        *self.pins.lock().entry(floor).or_insert(0) += 1;
+        Ok((
+            lsn,
+            WalHistoryPin {
+                pins: self.pins.clone(),
+                floor,
+            },
+        ))
     }
 
     /// P2.2 (TD-SEAM-2 / TD-SEAM-12): delete every sealed segment whose
@@ -582,21 +847,65 @@ impl FramedTableWalAppender {
     ///   is gone and the active file is empty;
     /// * readers overlapping it re-read (the rotation generation is odd while
     ///   the segment list and the files disagree).
+    /// * `floor` is lowered to the lowest [`WalHistoryPin`], decided under the
+    ///   same lock that takes pins;
+    /// * an armed branch fence ([`Self::fence_branches`]) refuses the whole
+    ///   truncation when a collection branched since would lose history.
     ///
     /// Serialized with appends (and so with rotation), which keeps the sealed
     /// list stable while victims are chosen.
     pub async fn truncate_below(&self, floor: u64) -> Result<WalTruncation> {
         let _guard = self.append_lock.lock().await;
+        let floor = self
+            .pins
+            .lock()
+            .keys()
+            .next()
+            .map_or(floor, |&pinned| floor.min(pinned));
+        let fence = self.branch_fence.lock().take();
         let victims: Vec<SegmentSummary> = self
             .sealed
             .read()
             .iter()
-            .take_while(|s| s.first_seq.is_none() || s.last_seq < floor)
+            .take_while(|s| s.wholly_below(floor))
             .cloned()
             .collect();
         let Some(through) = victims.iter().map(|s| s.last_seq).max() else {
             return Ok(WalTruncation::default());
         };
+        if let Some(fence) = fence {
+            let doomed = collections_in(victims.iter());
+            let branched = self.branch_summary().collections;
+            let name = |c: &TenantCollection| format!("{}/{}", c.tenant, c.collection);
+            let uncovered: Vec<String> = doomed
+                .keys()
+                .filter(|c| branched.contains(*c) && !fence.covered.contains(*c))
+                .map(name)
+                .collect();
+            if !uncovered.is_empty() {
+                return Err(BranchFenceRefused(format!(
+                    "canonical WAL truncation through {through} refused: {} gained a branch after \
+                     the merge-base image was taken, and its main-line history would go with no \
+                     image (TD-SEAM-12); the next run images it",
+                    uncovered.join(", ")
+                ))
+                .into());
+            }
+            let unmarked: Vec<String> = doomed
+                .keys()
+                .filter(|c| !fence.marked.contains(*c))
+                .map(name)
+                .collect();
+            if !unmarked.is_empty() {
+                return Err(BranchFenceRefused(format!(
+                    "canonical WAL truncation through {through} refused: the history of {} \
+                     would go unrecorded by the merge-base checkpoint (TD-SEAM-12); the next run \
+                     records it",
+                    unmarked.join(", ")
+                ))
+                .into());
+            }
+        }
         write_floor_marker(&self.path, through).await?;
 
         self.rotations.fetch_add(1, Ordering::SeqCst); // odd: list ≠ disk
@@ -980,6 +1289,10 @@ impl proximadb_storage_ports::CanonicalWalReaderPort for CanonicalWalReaderBridg
 
 #[async_trait]
 impl TableWalAppender for FramedTableWalAppender {
+    fn has_readable_log(&self) -> bool {
+        true
+    }
+
     async fn read_all_entries(&self) -> Result<Vec<CanonicalWalEntry>> {
         self.read_entries().await
     }
@@ -1029,6 +1342,15 @@ impl TableWalAppender for FramedTableWalAppender {
 
     fn retained_from(&self) -> u64 {
         FramedTableWalAppender::retained_from(self)
+    }
+
+    async fn pin_history(
+        &self,
+        snapshot_lsn: &(dyn Fn(u64) -> u64 + Send + Sync),
+    ) -> Result<Option<(u64, WalHistoryPin)>> {
+        FramedTableWalAppender::pin_history(self, snapshot_lsn)
+            .await
+            .map(Some)
     }
 }
 
@@ -1148,6 +1470,10 @@ impl TableWalAppender for MemoryTableWalAppender {
     /// `opt_config = None` boot path that uses this appender. Without this
     /// override the trait default returned empty, so the change-feed was silently
     /// empty for in-memory WALs.
+    fn has_readable_log(&self) -> bool {
+        true
+    }
+
     async fn read_all_entries(&self) -> Result<Vec<CanonicalWalEntry>> {
         Ok(self.entries().await)
     }
@@ -1596,6 +1922,138 @@ mod tests {
     use proximadb_records::ProximaRecord;
     use proximadb_storage_common::ProjectionDirective;
     use std::sync::Arc;
+
+    /// ADR-097 data format 2: the frame layout is frozen — `[magic "PXWAL001"]
+    /// [version u16 LE][codec u8][flags u8][sequence u64 LE][payload_len u32 LE]
+    /// [payload_crc32 u32 LE][payload]`, version 1 for one entry and 2 for a
+    /// group. The frozen frames below were built outside this code (Python:
+    /// `struct` + `zlib.crc32` over the payloads frozen in
+    /// `proximadb-storage-common/tests/wal_format_compat.rs`), so they check
+    /// the codec against an independent oracle. Never regenerate them to make
+    /// a failure go away; a new format adds a new pair.
+    #[tokio::test]
+    async fn format_2_frames_still_decode_and_todays_writer_emits_the_same_header() {
+        const SINGLE_V1: &str = "505857414c303031010001000f000000000000006700000089ed228684af73657175656e63655f6e756d6265720fac74696d657374616d705f6d73cf00000199c82cc000a96f7065726174696f6e81af436174616c6f674d75746174696f6e82a36b6579a9666e3a646f75626c65a5627974657393010203a974656e616e745f6964c0";
+        const GROUP_V2: &str = "505857414c303031020001000e00000000000000d0000000cf35ed209284af73657175656e63655f6e756d6265720eac74696d657374616d705f6d73cf00000199c82cc000a96f7065726174696f6e81b35265636f7264506172746974696f6e44726f7081ad636f6c6c656374696f6e5f6964a66f7264657273a974656e616e745f6964c084af73657175656e63655f6e756d6265720fac74696d657374616d705f6d73cf00000199c82cc000a96f7065726174696f6e81af436174616c6f674d75746174696f6e82a36b6579a9666e3a646f75626c65a5627974657393010203a974656e616e745f6964c0";
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+                .collect()
+        };
+        let entry = |sequence_number, operation| CanonicalWalEntry {
+            sequence_number,
+            timestamp_ms: 1_760_000_000_000,
+            operation,
+            tenant_id: None,
+        };
+        let drop = entry(
+            14,
+            CanonicalOperation::RecordPartitionDrop {
+                collection_id: "orders".to_string(),
+            },
+        );
+        let catalog = entry(
+            15,
+            CanonicalOperation::CatalogMutation {
+                key: "fn:double".to_string(),
+                bytes: vec![1, 2, 3],
+            },
+        );
+        let payloads = |entries: &[CanonicalWalEntry]| -> Vec<Vec<u8>> {
+            entries
+                .iter()
+                .map(|e| rmp_serde::to_vec_named(e).expect("encode"))
+                .collect()
+        };
+
+        for (frozen, expected, version) in [
+            (hex(SINGLE_V1), vec![catalog.clone()], FRAME_VERSION),
+            (
+                hex(GROUP_V2),
+                vec![drop.clone(), catalog.clone()],
+                FRAME_VERSION_GROUP,
+            ),
+        ] {
+            // Readable: what format-2 binaries wrote decodes whole.
+            let (decoded, consumed) = decode_frame(&frozen)
+                .expect("format-2 frame must decode")
+                .expect("complete frame");
+            assert_eq!(consumed, frozen.len());
+            assert_eq!(payloads(&decoded), payloads(&expected));
+
+            // Written the same way today: identical header fields, and the
+            // length and CRC describe the payload actually written.
+            let mut written = Vec::new();
+            if version == FRAME_VERSION {
+                encode_frame(&expected[0], &mut written).expect("encode frame");
+            } else {
+                encode_group_frame(&expected, &mut written).expect("encode group frame");
+            }
+            assert_eq!(FRAME_HEADER_LEN, 28);
+            assert_eq!(
+                &written[..20],
+                &frozen[..20],
+                "magic/version/codec/flags/sequence"
+            );
+            let len = u32::from_le_bytes(written[20..24].try_into().expect("len")) as usize;
+            assert_eq!(len, written.len() - FRAME_HEADER_LEN);
+            let crc = u32::from_le_bytes(written[24..28].try_into().expect("crc"));
+            assert_eq!(crc, checksum(&written[FRAME_HEADER_LEN..]));
+            // And the payload is still named msgpack carrying every key and
+            // value format 2 wrote (added keys allowed): a switch to
+            // positional arrays, or a rename, fails here even though the
+            // writer would agree with itself.
+            let as_json = |bytes: &[u8]| -> serde_json::Value {
+                rmp_serde::from_slice(bytes).expect("msgpack payload")
+            };
+            if let Err(drift) = payload_covers(
+                &as_json(&written[FRAME_HEADER_LEN..]),
+                &as_json(&frozen[FRAME_HEADER_LEN..]),
+                "payload",
+            ) {
+                panic!("format-2 payload drift: {drift}");
+            }
+        }
+
+        // The file scan reads frozen bytes too, and a torn frame after them
+        // (a crash mid-append) is dropped, not misread.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("frozen.wal");
+        let mut file = hex(GROUP_V2);
+        file.extend_from_slice(&hex(SINGLE_V1)[..FRAME_HEADER_LEN + 7]);
+        std::fs::write(&path, &file).expect("write frozen WAL");
+        let read = FramedTableWalAppender::read_entries_from_path(&path)
+            .await
+            .expect("frozen WAL file must read");
+        assert_eq!(payloads(&read), payloads(&[drop, catalog]));
+    }
+
+    /// `new` holds every key and value of `old` (recursively, arrays
+    /// element-wise); keys only `new` has are additions.
+    fn payload_covers(
+        new: &serde_json::Value,
+        old: &serde_json::Value,
+        path: &str,
+    ) -> std::result::Result<(), String> {
+        use serde_json::Value;
+        match (new, old) {
+            (Value::Object(new), Value::Object(old)) => old.iter().try_for_each(|(key, old)| {
+                let path = format!("{path}.{key}");
+                match new.get(key) {
+                    Some(new) => payload_covers(new, old, &path),
+                    None => Err(format!("{path}: written by format 2, missing now")),
+                }
+            }),
+            (Value::Array(new), Value::Array(old)) if new.len() == old.len() => new
+                .iter()
+                .zip(old)
+                .enumerate()
+                .try_for_each(|(i, (new, old))| payload_covers(new, old, &format!("{path}[{i}]"))),
+            _ if new == old => Ok(()),
+            _ => Err(format!("{path}: format 2 wrote {old}, now {new}")),
+        }
+    }
 
     fn upsert_operation(collection_id: &str, oid: &str) -> CanonicalOperation {
         CanonicalOperation::RecordUpsert {

@@ -13,7 +13,6 @@ pub mod bloom_filter;
 pub mod columnar_common;
 pub mod columnar_config_types;
 pub mod columnar_footer_cache;
-pub mod columnar_schema_types;
 pub mod columnar_serialization;
 pub mod columnar_utilities;
 pub mod compression_config;

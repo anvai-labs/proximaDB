@@ -627,56 +627,49 @@ impl Catalog for UnityCatalog {
     }
 
     async fn get_table(&self, identifier: &TableIdentifier) -> Result<CatalogTableSchema> {
-        // Check cache first
-        if let Some(schema) = self.cache.get_table(&self.name, identifier) {
-            return Ok(schema);
-        }
+        crate::cached_table(&self.cache, &self.name, identifier, async {
+            let catalog_name = self.unity_catalog_name();
+            let schema_name = self.schema_name(&identifier.namespace);
 
-        let catalog_name = self.unity_catalog_name();
-        let schema_name = self.schema_name(&identifier.namespace);
+            let path = format!(
+                "/tables/{}.{}.{}",
+                catalog_name, schema_name, identifier.name
+            );
 
-        let path = format!(
-            "/tables/{}.{}.{}",
-            catalog_name, schema_name, identifier.name
-        );
+            let table: UnityTableInfo = self.api_request(reqwest::Method::GET, &path, None).await?;
 
-        let table: UnityTableInfo = self.api_request(reqwest::Method::GET, &path, None).await?;
+            let columns: Vec<CatalogColumn> = table
+                .columns
+                .iter()
+                .map(Self::unity_column_to_column)
+                .collect();
 
-        let columns: Vec<CatalogColumn> = table
-            .columns
-            .iter()
-            .map(Self::unity_column_to_column)
-            .collect();
+            let schema_version = table
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("proximadb.schema_version"))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
 
-        let schema_version = table
-            .properties
-            .as_ref()
-            .and_then(|p| p.get("proximadb.schema_version"))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-
-        let schema = CatalogTableSchema {
-            name: identifier.name.clone(),
-            columns,
-            primary_key: vec![],
-            indexes: vec![],
-            schema_version,
-            properties: table.properties.unwrap_or_default(),
-            location: table.storage_location,
-            created_at_ms: table.created_at.unwrap_or(now),
-            updated_at_ms: table.updated_at.unwrap_or(now),
-            ..Default::default()
-        };
-
-        // Update cache
-        self.cache.put_table(&self.name, identifier, schema.clone());
-
-        Ok(schema)
+            Ok(CatalogTableSchema {
+                name: identifier.name.clone(),
+                columns,
+                primary_key: vec![],
+                indexes: vec![],
+                schema_version,
+                properties: table.properties.unwrap_or_default(),
+                location: table.storage_location,
+                created_at_ms: table.created_at.unwrap_or(now),
+                updated_at_ms: table.updated_at.unwrap_or(now),
+                ..Default::default()
+            })
+        })
+        .await
     }
 
     async fn rename_table(&self, from: &TableIdentifier, to: &TableIdentifier) -> Result<()> {

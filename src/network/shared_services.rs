@@ -1810,6 +1810,8 @@ impl SharedServices {
 
                 // Convert storage metadata to proto collection format
                 let collection_config = crate::proto::proximadb_v1::CollectionConfig {
+                    storage_class: None,
+                    policy_generation: None,
                     name: metadata.name.clone(),
                     embedding_config: None,
                     dimension: metadata.dimension as u32,
@@ -1871,7 +1873,12 @@ impl SharedServices {
                     pax_vector_quant: None,
                 };
 
+                let storage_class_status =
+                    crate::services::collection::storage_class::storage_class_status(
+                        &collection_config,
+                    );
                 let proto_collection = crate::proto::proximadb_v1::Collection {
+                    storage_class_status: Some(storage_class_status),
                     id: format!("recovered-{}", Uuid::new_v4()),
                     config: Some(collection_config),
                     stats: Some(crate::proto::proximadb_v1::CollectionStats {
@@ -1978,15 +1985,23 @@ impl SharedServices {
                 // record; serving without it (the legacy warn-and-continue) would
                 // silently drop committed rows, so failures are fatal.
                 let atomic_commit = crate::services::oltp_gate::atomic_commit_enabled();
+                // ADR-097: record (or check) the data format before anything in
+                // this directory is opened. A directory written by a newer
+                // binary refuses here, whatever the other settings: serving it
+                // could silently drop data.
+                if let Some(dir) = wal_path.parent() {
+                    crate::services::storage_format::ensure_data_format(dir)?;
+                }
                 match crate::services::FramedTableWalAppender::open_shared(&wal_path).await {
                     Ok(appender) => {
                         if atomic_commit {
                             appender.enable_atomic_groups();
                         }
-                        // P2.1 (ADR-097 S2): opt-in segment rotation of the shared
-                        // canonical WAL. Off until P2.2 truncation lands and a
-                        // soak passes: an older binary would not read sealed
-                        // segments (downgrade safety, same stance as ADR-095).
+                        // P2.1 (ADR-097 S2): segment rotation of the shared
+                        // canonical WAL, on by default since the P2.2 soak. An
+                        // older binary would not read sealed segments; the data
+                        // format marker above is what refuses that downgrade
+                        // from now on (`services::storage_format`).
                         let segment_bytes =
                             crate::services::canonical_wal::canonical_wal_segment_bytes();
                         if segment_bytes > 0 {
@@ -2026,20 +2041,38 @@ impl SharedServices {
         // WAL-recover it here, then share it across every surface (REST/gRPC DmlService below
         // + pgwire direct-write path). One store ⇒ one authoritative relational state and one
         // CDC change-feed, regardless of which protocol wrote the data.
+        // Only a COMPLETE recovery may feed the truncator: the record tier's
+        // floor sees only what replay applied, so after a failed or partial
+        // replay it would let truncation drop rows that were never applied.
+        let mut record_store_recovered = false;
         let canonical_record_store: Option<
             Arc<crate::services::record_store::DirectWalTableRecordStore>,
         > = if let Some(appender) = canonical_wal_appender.clone() {
             let atomic_commit = crate::services::oltp_gate::atomic_commit_enabled();
-            // TD-SEAM-3: spill-backed partitions when the spill gate is set
-            // (default unset ⇒ exactly the legacy partitioned memtable), with
-            // segments beside the WAL they recover with.
-            let spill_root = opt_config
-                .map(|cfg| cfg.server.data_dir.join("pgwire").join("record-spill"))
-                .unwrap_or_default();
+            // TD-SEAM-3: spill-backed partitions (default on; `0` ⇒ the legacy
+            // partitioned memtable), with segments beside the WAL they recover
+            // with, or under `PROXIMADB_RELATIONAL_SPILL_URL`. Resolving the
+            // placement refuses — fatally — a move that would strand rows the
+            // truncated WAL no longer holds, and a prefix another data
+            // directory owns.
+            let wal_truncated = appender.retained_from() > 1;
+            let spill_target = match opt_config {
+                Some(cfg) => {
+                    crate::services::spill_placement::resolve_spill_target(
+                        &cfg.server.data_dir.join("pgwire"),
+                        &filesystem_factory,
+                        wal_truncated,
+                    )
+                    .await?
+                }
+                None => crate::services::spill_placement::SpillTarget::Local(Default::default()),
+            };
+            // Probed only if opening fails: listing a prefix is not free.
+            let probe = spill_target.clone();
             let store =
-                match crate::services::record_store::DirectWalTableRecordStore::open_for_server(
+                match crate::services::record_store::DirectWalTableRecordStore::open_for_server_at(
                     appender.clone(),
-                    spill_root,
+                    spill_target,
                 )
                 .await
                 {
@@ -2047,6 +2080,16 @@ impl SharedServices {
                     Err(e) if atomic_commit => {
                         anyhow::bail!(
                             "opening the spill-backed record store failed with [oltp] atomic_commit on: {e:#}"
+                        );
+                    }
+                    // Rows an earlier run spilled that the truncated WAL no
+                    // longer holds (or a target that cannot say): an in-memory
+                    // fallback would serve a silent subset.
+                    Err(e) if wal_truncated && !matches!(probe.has_state().await, Ok(false)) => {
+                        anyhow::bail!(
+                            "opening the spill-backed record store failed and {} holds (or may \
+                             hold) spilled rows; refusing to serve without them: {e:#}",
+                            probe.location()
                         );
                     }
                     Err(e) => {
@@ -2061,9 +2104,34 @@ impl SharedServices {
                     )
                     }
                 };
+            // Seed the spill partitions' catalog schemas before replay, so the
+            // partitions replay creates encode typed columns at once. Only the
+            // local catalogs hold the tables this store replays; a failure only
+            // means typed rows stay resident until their table's first write.
+            match catalog_manager
+                .table_schemas(|catalog| {
+                    let kind = catalog.catalog_type();
+                    kind == "native" || kind.starts_with("oltp")
+                })
+                .await
+            {
+                Ok(schemas) => {
+                    if store.seed_schema_hints(&schemas) > 0 {
+                        info!(
+                            tables = schemas.len(),
+                            "SharedServices: seeded spill schema hints before WAL replay"
+                        );
+                    }
+                }
+                Err(e) => warn!(
+                    "SharedServices: could not seed spill schema hints ({e:#}); typed rows of \
+                     replayed tables stay resident until each table's first write"
+                ),
+            }
             match appender.read_entries().await {
-                Ok(entries) => {
-                    if let Err(e) = store.replay_wal_entries(entries).await {
+                Ok(entries) => match store.replay_wal_entries(entries).await {
+                    Ok(_) => record_store_recovered = true,
+                    Err(e) => {
                         if atomic_commit {
                             anyhow::bail!(
                                 "canonical record-store WAL replay failed with [oltp] atomic_commit on; refusing to serve partial state: {e:#}"
@@ -2071,7 +2139,7 @@ impl SharedServices {
                         }
                         warn!("SharedServices: canonical record-store WAL replay failed: {e}");
                     }
-                }
+                },
                 Err(e) if atomic_commit => {
                     anyhow::bail!(
                         "reading the canonical WAL failed with [oltp] atomic_commit on; refusing to serve: {e:#}"
@@ -2582,6 +2650,52 @@ impl SharedServices {
         // `DdlService` (pgwire) so new `CREATE FUNCTION` statements persist here.
         let function_store = build_function_store(canonical_wal_appender.clone()).await;
 
+        // P2.2c (TD-SEAM-2 / TD-SEAM-12): canonical-WAL truncation, on by
+        // default (PROXIMADB_CANONICAL_WAL_TRUNCATE_INTERVAL_SECS=0 disables it). Every WAL
+        // consumer is a floor source; any refusal skips the run. Read-only
+        // sources first, the appending checkpoints last, the branch
+        // merge-base (which arms the branch fence) very last.
+        // Truncation only removes sealed segments, so without rotation a run
+        // could only append checkpoints; and after an incomplete recovery the
+        // record tier's floor cannot be trusted (see `record_store_recovered`).
+        let truncation_possible = crate::services::canonical_wal::canonical_wal_segment_bytes() > 0;
+        if crate::services::wal_truncator::configured_interval().is_some()
+            && canonical_record_store.is_some()
+            && !(truncation_possible && record_store_recovered)
+        {
+            warn!(
+                rotation = truncation_possible,
+                recovered = record_store_recovered,
+                "SharedServices: canonical WAL truncator NOT scheduled (needs segment rotation \
+                 and a complete WAL recovery); the WAL is retained in full"
+            );
+        }
+        if let (Some(interval), Some(wal), Some(record_store), true) = (
+            crate::services::wal_truncator::configured_interval(),
+            canonical_wal_appender.clone(),
+            canonical_record_store.clone(),
+            truncation_possible && record_store_recovered,
+        ) {
+            use crate::services::wal_truncator as truncator;
+            let sources: Vec<Arc<dyn truncator::WalFloorSource>> = vec![
+                Arc::new(truncator::RecordTierFloor(record_store)),
+                Arc::new(truncator::ChangeFeedRetention(
+                    truncator::configured_retain_entries(),
+                )),
+                Arc::new(truncator::PublishedSnapshotFloor(catalog_manager.clone())),
+                Arc::new(truncator::RankProfileCheckpoint(rank_profile_store.clone())),
+                Arc::new(truncator::FunctionCheckpoint(function_store.clone())),
+                Arc::new(truncator::BranchMergeBase(Arc::new(
+                    crate::services::branch_base_store::BranchBaseStore::new(wal.clone()),
+                ))),
+            ];
+            truncator::spawn(wal, sources, interval);
+            info!(
+                interval_secs = interval.as_secs(),
+                "SharedServices: canonical WAL truncator scheduled"
+            );
+        }
+
         // Backfill collection owner (non-fatal, background): record an owner on
         // collections created before ownership was recorded, so each resolves
         // within its tenant. Until it runs (or if it fails) such a collection
@@ -2784,6 +2898,18 @@ impl SharedServices {
             Some(cks) => base_dml.with_conditional_key_store(cks.clone()),
             None => base_dml,
         };
+        // Fence contract gate 4: the SAME write-lease authority DDL consults
+        // below (registry + pod id + the write-gate lease manager) fences the
+        // live delete publisher's successor CAS.
+        let base_dml = base_dml.with_publish_lease(Arc::new(
+            crate::services::write_lease::WriteLeaseAuthority::new(
+                lease_manager_for_writes.clone(),
+                Some(primary_pod_registry.clone()),
+                Some(crate::cluster::primary_pod_registry::resolve_self_pod_id(
+                    None,
+                )),
+            ),
+        ));
         // TD-ABAC-2 (Phase 5b): construct the durable ABAC enforcer (authority +
         // policy binding store, both at <data_dir>/abac/) and DI it into the
         // DML read funnel. Fully behind `abac-policy` (default-OFF) ⇒ default
@@ -2800,6 +2926,21 @@ impl SharedServices {
             Some(lock_service) => base_dml.with_dml_lock_service(lock_service),
             None => base_dml,
         });
+        // TD-DML-3: the canonical WAL was replayed above, so the record store
+        // now reflects every durable row — release fenced PK claims whose row
+        // does not exist (left by a crash or an ambiguous write failure).
+        // Non-fatal: an unreconciled claim is still reconciled lazily on the
+        // next claim of its key.
+        match dml_service_for_grpc
+            .reconcile_conditional_key_claims()
+            .await
+        {
+            Ok(released) if released > 0 => {
+                info!(released, "reconciled fenced PK claims at startup");
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "startup reconciliation of fenced PK claims failed"),
+        }
 
         // TD-135: one DdlService Arc shared by BOTH the adapter (gRPC port path →
         // adapter.execute_sql) and the RecordOpsService (REST write path), so DDL

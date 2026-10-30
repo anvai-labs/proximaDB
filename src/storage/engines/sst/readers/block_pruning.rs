@@ -381,3 +381,167 @@ mod wlp3_radius_prune_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod zorder_tests {
+    //! Z-Order spatial-code coverage, ported from the orphaned (never
+    //! compiled) sst/readers/tests.rs before its deletion — these are the
+    //! only tests of compute_query_zorder_code / calculate_zorder_epsilon /
+    //! filter_blocks_by_zorder / normalize_coords_for_zorder (of these,
+    //! sst_query_engine currently exercises compute_query_zorder_code; the
+    //! rest are #[allow(dead_code)] pending wider query-side adoption).
+    use super::*;
+    use crate::storage::engines::core::formats::proximablocks::spatial_encoding::SpatialCode;
+
+    /// Compact entry builder (the port also drops the ~20-line exhaustive
+    /// IndexEntry literals the orphaned file repeated per test).
+    fn zorder_entry(
+        block_id: u32,
+        centroid: Vec<f32>,
+        zorder_code: Option<SpatialCode>,
+    ) -> IndexEntry {
+        IndexEntry {
+            key: format!("block_{block_id}"),
+            block_id,
+            block_centroid: centroid,
+            zorder_code,
+            ..Default::default()
+        }
+    }
+
+    /// Trains and caches a 2-component PCA model for `collection`, the
+    /// precondition for the query-side Z-Order code paths.
+    fn cache_pca_model(collection: &str) {
+        use crate::proto::proximadb_v1::VectorRecord;
+        use crate::storage::engines::sst::pca_manager::EnhancedPCAModel;
+
+        let vectors: Vec<VectorRecord> = (0..100)
+            .map(|i| VectorRecord {
+                id: format!("vec_{i}"),
+                vector: vec![i as f32 / 100.0, i as f32 / 50.0],
+                ..Default::default()
+            })
+            .collect();
+        let model = EnhancedPCAModel::train(&vectors, 2).expect("train PCA");
+        crate::storage::engines::sst::core::set_collection_pca_model(collection, model);
+    }
+
+    #[test]
+    fn compute_query_zorder_code_without_pca_model_returns_none() {
+        let entries = vec![
+            zorder_entry(0, vec![0.0, 0.0], Some(SpatialCode::Code64(100))),
+            zorder_entry(1, vec![1.0, 1.0], Some(SpatialCode::Code64(200))),
+        ];
+        // No cached PCA model → graceful fallback to centroid-only pruning.
+        let code = compute_query_zorder_code(&[1.0, 0.5], &entries, "zorder_no_pca");
+        assert!(
+            code.is_none(),
+            "should return None when no PCA model is cached"
+        );
+    }
+
+    #[test]
+    fn compute_query_zorder_code_with_pca_model_returns_some() {
+        cache_pca_model("zorder_with_pca");
+        let entries = vec![zorder_entry(
+            0,
+            vec![0.0, 0.0],
+            Some(SpatialCode::Code64(100)),
+        )];
+        let code = compute_query_zorder_code(&[1.0, 0.5], &entries, "zorder_with_pca");
+        assert!(
+            code.is_some(),
+            "should compute a Z-Order code when PCA is cached"
+        );
+    }
+
+    #[test]
+    fn compute_query_zorder_code_empty_entries_returns_none() {
+        let code = compute_query_zorder_code(&[1.0, 0.5], &[], "zorder_empty");
+        assert!(code.is_none(), "should return None for empty entries");
+    }
+
+    #[test]
+    fn calculate_zorder_epsilon_is_max_of_ten_percent_and_floor() {
+        let entries = vec![
+            zorder_entry(0, vec![0.0, 0.0], Some(SpatialCode::Code64(1000))),
+            zorder_entry(1, vec![10.0, 10.0], Some(SpatialCode::Code64(10000))),
+        ];
+        // 10% of range = 900, but the floor is 1000 → 1000 wins.
+        let epsilon = calculate_zorder_epsilon(&SpatialCode::Code64(5000), &entries);
+        assert_eq!(epsilon, SpatialCode::Code64(1000));
+    }
+
+    #[test]
+    fn calculate_zorder_epsilon_no_codes_is_max() {
+        let entries = vec![zorder_entry(0, vec![0.0, 0.0], None)];
+        let epsilon = calculate_zorder_epsilon(&SpatialCode::Code64(0), &entries);
+        assert_eq!(epsilon, SpatialCode::Code64(u64::MAX));
+    }
+
+    #[test]
+    fn filter_blocks_by_zorder_without_pca_returns_none() {
+        let entries = vec![
+            zorder_entry(0, vec![0.0, 0.0], Some(SpatialCode::Code64(100))),
+            zorder_entry(1, vec![1.0, 1.0], Some(SpatialCode::Code64(5000))),
+            zorder_entry(2, vec![10.0, 10.0], Some(SpatialCode::Code64(10000))),
+        ];
+        let filtered = filter_blocks_by_zorder(&[1.0, 1.0], &entries, "zorder_filter_no_pca");
+        assert!(
+            filtered.is_none(),
+            "should fall back to centroid pruning without PCA"
+        );
+    }
+
+    #[test]
+    fn filter_blocks_by_zorder_with_pca_includes_uncoded_blocks() {
+        cache_pca_model("zorder_filter_pca");
+        let entries = vec![
+            zorder_entry(0, vec![0.0, 0.0], Some(SpatialCode::Code64(100))),
+            zorder_entry(1, vec![1.0, 1.0], Some(SpatialCode::Code64(5000))),
+            zorder_entry(2, vec![10.0, 10.0], Some(SpatialCode::Code64(10000))),
+            // No Z-Order code → always included (backward compatibility).
+            zorder_entry(3, vec![0.5, 0.5], None),
+        ];
+        let filtered = filter_blocks_by_zorder(&[1.0, 1.0], &entries, "zorder_filter_pca")
+            .expect("cached PCA model enables Z-Order filtering");
+        assert!(
+            filtered.contains(&3),
+            "block without a Z-Order code must be included"
+        );
+    }
+
+    #[test]
+    fn filter_blocks_by_zorder_backward_compat_mixed_entries() {
+        cache_pca_model("zorder_backward_compat");
+        let entries = vec![
+            zorder_entry(0, vec![0.0, 0.0], None),
+            zorder_entry(1, vec![1.0, 1.0], Some(SpatialCode::Code64(5000))),
+        ];
+        let filtered = filter_blocks_by_zorder(&[1.0, 1.0], &entries, "zorder_backward_compat")
+            .expect("mixed coded/uncoded blocks are supported");
+        assert!(filtered.contains(&0), "uncoded block must be included");
+    }
+
+    #[test]
+    fn normalize_coords_for_zorder_maps_to_unit_interval() {
+        let normalized = normalize_coords_for_zorder(&[-10.0f32, 0.0, 10.0, 20.0]);
+        assert_eq!(normalized.len(), 4);
+        for &val in &normalized {
+            assert!(val >= 0.0 && val <= 1.0, "{val} not in [0, 1]");
+        }
+        assert!((normalized[0] - 0.0).abs() < 1e-5, "min maps to 0.0");
+        assert!((normalized[3] - 1.0).abs() < 1e-5, "max maps to 1.0");
+    }
+
+    #[test]
+    fn normalize_coords_for_zorder_constant_maps_to_midpoint() {
+        let normalized = normalize_coords_for_zorder(&[5.0f32, 5.0, 5.0]);
+        for &val in &normalized {
+            assert!(
+                (val - 0.5).abs() < 1e-5,
+                "constant coords map to 0.5, got {val}"
+            );
+        }
+    }
+}

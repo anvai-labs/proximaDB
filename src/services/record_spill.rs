@@ -62,37 +62,109 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use proximadb_records::{
-    ProximaRecord, RecordKey, RecordScan, RecordScanOptions, RecordScanPredicate, RecordStore,
-    RecordStoreResult,
+    ProximaRecord, RecordKey, RecordScan, RecordScanOptions, RecordScanPredicate, RecordScanView,
+    RecordStore, RecordStoreResult,
 };
+use proximadb_storage_common::id_index::BloomFilter;
+use proximadb_storage_common::parquet_write_policy::{ParquetLayoutHints, ParquetWritePolicy};
 use proximadb_storage_common::proxima_arrow::{
-    infer_proxima_schema, proxima_records_to_record_batch_with_system_columns,
+    SYS_COL_OID, column_materializable, infer_proxima_schema,
+    proxima_records_to_record_batch_with_residual, records_not_round_tripping,
 };
 use proximadb_storage_common::proxima_parquet::record_batches_to_parquet_bytes;
+use proximadb_storage_common::proxima_schema::ProximaSchema;
 use proximadb_storage_filesystem_types::FileSystem;
 
 use crate::storage::engines::sst::segment_format::read_segment_records;
 
+mod chunked_scan;
+
 /// Flush threshold: resident records after which the memtable is written to a
-/// segment. Unset ⇒ **never flush** (the shipped default — behaviourally
-/// identical to the plain memtable).
+/// segment. Default ON
+/// ([`DEFAULT_SPILL_MAX_RESIDENT`](crate::services::storage_format::DEFAULT_SPILL_MAX_RESIDENT));
+/// `0` or `off` ⇒ **never flush** (the plain memtable). See
+/// [`crate::services::storage_format`].
 pub const SPILL_MAX_RESIDENT_ENV: &str = "PROXIMADB_RELATIONAL_SPILL_MAX_RESIDENT";
 
 /// Read the configured flush threshold. `None` ⇒ never flush.
 ///
-/// A zero or unparsable value reads as unset rather than "flush on every write" —
-/// a typo must not turn every insert into an object write.
+/// An unparsable value keeps the default rather than reading as "flush on
+/// every write" — a typo must not turn every insert into an object write.
 ///
 /// Read at every partition construction rather than cached in a `OnceLock`: the
 /// gate must be observable per store, and a process-lifetime cache is what made
 /// the TD-USUB-6 residual-tail benchmark measure the same mode twice.
 pub(crate) fn configured_flush_threshold() -> Option<usize> {
-    std::env::var(SPILL_MAX_RESIDENT_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
+    crate::services::storage_format::default_on_gate(
+        SPILL_MAX_RESIDENT_ENV,
+        crate::services::storage_format::DEFAULT_SPILL_MAX_RESIDENT,
+    )
+    .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+}
+
+/// Backlog cap, as a multiple of the flush threshold, at which
+/// [`SpillRecordStorage::admit_writes`] refuses new writes. Writes trigger a
+/// flush at the threshold, so a backlog this far past it means flushes are
+/// failing.
+///
+/// A soft bound: writers admitted together, and one large batch, overshoot
+/// it. WAL replay at boot is not admitted at all — it must apply what is
+/// durable — so with the object store down a restart holds the WAL's whole
+/// unflushed tail resident.
+const BACKLOG_FACTOR: usize = 4;
+
+/// How long after a failed flush the post-write path waits before trying
+/// again. With the object store down, every write retrying — and waiting out —
+/// a doomed flush would turn one outage into a stall of every writer.
+const FLUSH_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A write refused before it was made durable: the partition's backlog is at
+/// its cap and its flushes are failing. Nothing was written; retryable.
+/// pgwire reports it as SQLSTATE 53000.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct SpillBacklogFull(pub String);
+
+/// The spill's counters, registered once per process.
+struct SpillMetrics {
+    /// Rows a flush held back because they did not read back identically
+    /// through the segment encoding. Expected to stay 0; anything else is a
+    /// codec defect.
+    rows_held: prometheus::IntCounter,
+    /// Threshold flushes that failed. The rows and tombstones they carried
+    /// stay resident and the WAL is retained until a flush succeeds.
+    flush_failures: prometheus::IntCounter,
+    /// Writes refused before they were made durable because a partition's
+    /// backlog reached its cap with flushes failing.
+    writes_refused: prometheus::IntCounter,
+}
+
+fn spill_metrics() -> &'static SpillMetrics {
+    static METRICS: std::sync::OnceLock<SpillMetrics> = std::sync::OnceLock::new();
+    METRICS.get_or_init(|| {
+        let counter = |name: &str, help: &str| {
+            prometheus::register_int_counter!(name, help).unwrap_or_else(|_| {
+                prometheus::IntCounter::new(format!("{name}_fallback"), "fallback")
+                    .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
+            })
+        };
+        SpillMetrics {
+            rows_held: counter(
+                "proximadb_spill_rows_held_total",
+                "Spill rows held resident because they did not round-trip through the segment encoding",
+            ),
+            flush_failures: counter(
+                "proximadb_spill_flush_failures_total",
+                "Spill threshold flushes that failed (their rows stay resident; the WAL is retained)",
+            ),
+            writes_refused: counter(
+                "proximadb_spill_writes_refused_total",
+                "Writes refused because a spill partition's backlog reached its cap",
+            ),
+        }
+    })
 }
 
 /// One resident row: the value, the write that produced it, and that write's
@@ -131,20 +203,99 @@ struct Resident {
     lsn: Option<u64>,
 }
 
+/// The table's current catalog schema, asked for at each flush (so an
+/// `ALTER TABLE` is picked up by the next segment). `None` when the store does
+/// not know it yet — a partition created by WAL replay before any write.
+#[derive(Clone)]
+pub struct SpillSchemaSource(Arc<dyn Fn() -> Option<ProximaSchema> + Send + Sync>);
+
+impl SpillSchemaSource {
+    pub fn new(source: impl Fn() -> Option<ProximaSchema> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(source))
+    }
+}
+
+impl std::fmt::Debug for SpillSchemaSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpillSchemaSource")
+    }
+}
+
+/// What a point probe needs to rule a segment out without reading it: the oid
+/// range (a flush writes its rows oid-sorted) and a Bloom filter over every oid
+/// the segment holds, its persisted tombstones included (TD-USUB-21).
+///
+/// Without it, a probe for an oid in no segment — every INSERT's existence
+/// check — read and decoded every segment of the partition, so a bulk load
+/// decoded about `n²/2` rows. With it, such a probe reads nothing (bar a ~1 %
+/// false positive per segment). About 1.2 bytes per row, held per segment.
+struct SegmentKeyFilter {
+    /// `None` for a segment with no rows: it holds no oid.
+    range: Option<(String, String)>,
+    bloom: BloomFilter,
+}
+
+/// The range only: the Bloom bits are ~79 KB per segment.
+impl std::fmt::Debug for SegmentKeyFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SegmentKeyFilter")
+            .field("range", &self.range)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SegmentKeyFilter {
+    const FALSE_POSITIVE_RATE: f64 = 0.01;
+
+    fn from_oids<'a>(oids: impl Iterator<Item = &'a str> + Clone) -> Self {
+        let count = oids.clone().count();
+        // `max(1)`: a zero-capacity filter has no bits to index.
+        let mut bloom = BloomFilter::new(count.max(1), Self::FALSE_POSITIVE_RATE);
+        let mut range: Option<(&str, &str)> = None;
+        for oid in oids {
+            bloom.insert(oid);
+            range = Some(match range {
+                None => (oid, oid),
+                Some((lo, hi)) => (lo.min(oid), hi.max(oid)),
+            });
+        }
+        Self {
+            range: range.map(|(lo, hi)| (lo.to_string(), hi.to_string())),
+            bloom,
+        }
+    }
+
+    /// `false` only when the segment certainly holds no row for `oid`.
+    fn may_contain(&self, oid: &str) -> bool {
+        self.range
+            .as_ref()
+            .is_some_and(|(lo, hi)| lo.as_str() <= oid && oid <= hi.as_str())
+            && self.bloom.contains(oid)
+    }
+}
+
 /// A relational record store that keeps recent rows resident and flushes older
 /// ones to durable Parquet segments, serving reads as a merge over both.
 #[derive(Debug)]
 pub struct SpillRecordStorage {
     /// Resident rows. Always strictly newer than any segment copy.
     memtable: DashMap<String, Resident>,
-    /// Oids deleted after having been flushed. Suppresses the segment copy on
-    /// read; cleared for an oid that is re-inserted.
-    tombstones: DashSet<String>,
+    /// Oids deleted after having been flushed, each with the LSN of the WAL
+    /// entry that deleted it (`None`: applied through plain `delete_record`,
+    /// untracked). Suppresses the segment copy on read; cleared for an oid that
+    /// is re-inserted, and once a flush persists it.
+    tombstones: DashMap<String, Option<u64>>,
     /// Source of [`Resident::generation`]: bumped by every write to the
     /// memtable, so two writes of one oid never share a generation.
     next_generation: AtomicU64,
     /// Flushed segment paths, oldest first. Later entries shadow earlier ones.
     segments: parking_lot::RwLock<Vec<String>>,
+    /// Per-segment probe filters, keyed by path (TD-USUB-21). Inserted by
+    /// `flush` before it publishes the path, built on first probe for a
+    /// discovered segment, cleared with the segments by a purge. A path absent
+    /// here is never assumed empty: the filter is built from the segment itself.
+    /// About 1.2 bytes per flushed row, held for as long as the segment is.
+    key_filters: DashMap<String, Arc<SegmentKeyFilter>>,
     /// Serializes `flush` against any other structural mutation of the
     /// segment set — today `delete_record` and `purge_durable_objects`.
     ///
@@ -173,6 +324,19 @@ pub struct SpillRecordStorage {
     /// currently zero and should be *measured* before trading correctness
     /// obviousness for it (mandate #6).
     flush_guard: tokio::sync::Mutex<()>,
+    /// Set by `purge_durable_objects` (under `flush_guard`), cleared by the next
+    /// write to this partition. While set, `flush` writes nothing (TD-USUB-22).
+    ///
+    /// A DROP purges a partition and then removes it from the store's map, but
+    /// a caller that took its handle earlier — the truncator's lag flush, which
+    /// holds handles across awaits — can still call `flush` after the purge,
+    /// and would write the dropped table's resident rows back into the prefix
+    /// the purge just emptied, where a re-created table or the next restart
+    /// adopts them. A dropped partition gets no further writes, so the flag
+    /// stays set and such a flush is a no-op. A LIVE partition whose prefix a
+    /// purge reconciled keeps its resident rows (still retained in the WAL) and
+    /// flushes normally again after its next write.
+    purged_since_write: std::sync::atomic::AtomicBool,
     /// Count of segment writes whose outcome this store never learned, each of
     /// which may have left an ORPHAN: a durable, canonically-named object that is
     /// not in `segments`.
@@ -253,6 +417,13 @@ pub struct SpillRecordStorage {
     /// Guards [`Self::ensure_discovered`] so the listing runs at most once per
     /// store, and so concurrent first-touches cannot both populate `segments`.
     discovered: tokio::sync::OnceCell<()>,
+    /// When the last threshold flush failed; cleared by the next that succeeds.
+    /// Spaces retries out by [`FLUSH_RETRY_BACKOFF`].
+    flush_failed_at: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Set while a threshold flush runs: one at a time, so writers past the
+    /// threshold skip it instead of queueing on `flush_guard` behind a slow,
+    /// failing one, each to run its own.
+    threshold_flush_running: std::sync::atomic::AtomicBool,
     /// Tenant this partition belongs to, used to stamp a SYNTHESISED tombstone
     /// record at flush time.
     ///
@@ -277,10 +448,24 @@ pub struct SpillRecordStorage {
     /// keeps refusing. It does not fail the flush — that would propagate through
     /// `upsert_record`'s `?` and abort WAL replay (see `flush`).
     ///
-    /// Production does not reach that arm: `new_spilling`'s factory hands back a
-    /// plain memtable when the tenant is empty, so a spill partition always has
-    /// one. The arm is defence-in-depth for a directly-constructed store.
+    /// The one deliberate `Some("")` is [`Self::untenanted`]: the partition
+    /// that holds untenanted rows (`tenant_key(None)`, the normal key on a
+    /// single-tenant server). Its live rows already carry `""`, so a
+    /// `""`-stamped tombstone adds no exposure the rows did not already have —
+    /// and suppression works by oid plus `is_dead`, not by tenant. Without it
+    /// that partition could never persist a delete, so the factory had to hand
+    /// it an unbounded memtable and single-tenant servers got no heap bound.
+    /// `with_tenant("")` still normalises to `None`: an accidental empty tenant
+    /// stays the refusing shape; only the explicit opt-in is not.
     tenant_id: Option<String>,
+    /// The warehouse Parquet layout every segment is written with (ADR-097 S3):
+    /// row-group cap, page index, declared sort, Bloom filters — the same policy
+    /// MATERIALIZE uses, so a Layer A segment is a spec-layout lakehouse file
+    /// rather than an Arrow-default blob. Read from the environment at
+    /// construction; see [`Self::with_write_policy`].
+    write_policy: ParquetWritePolicy,
+    /// Where the catalog schema comes from; see [`Self::encode_schema`].
+    schema_source: Option<SpillSchemaSource>,
 }
 
 impl SpillRecordStorage {
@@ -304,18 +489,77 @@ impl SpillRecordStorage {
     ) -> Self {
         Self {
             memtable: DashMap::new(),
-            tombstones: DashSet::new(),
+            tombstones: DashMap::new(),
             next_generation: AtomicU64::new(0),
             segments: parking_lot::RwLock::new(Vec::new()),
+            key_filters: DashMap::new(),
             flush_guard: tokio::sync::Mutex::new(()),
             unresolved_segment_writes: AtomicU64::new(0),
+            purged_since_write: std::sync::atomic::AtomicBool::new(false),
             flush_threshold,
             filesystem,
             base_path: base_path.into(),
             next_segment: AtomicU64::new(0),
             discovered: tokio::sync::OnceCell::new(),
+            flush_failed_at: parking_lot::Mutex::new(None),
+            threshold_flush_running: std::sync::atomic::AtomicBool::new(false),
             tenant_id: None,
+            write_policy: ParquetWritePolicy::from_env(),
+            schema_source: None,
         }
+    }
+
+    /// Encode segments with the table's catalog schema (see
+    /// [`Self::encode_schema`]).
+    pub fn with_schema_source(mut self, source: SpillSchemaSource) -> Self {
+        self.schema_source = Some(source);
+        self
+    }
+
+    /// The schema a segment is encoded with: the catalog schema when known —
+    /// its declared types (DECIMAL, TIMESTAMP, …) are ones inference cannot
+    /// produce — with every prop the catalog lacks appended as inferred, so a
+    /// column the catalog does not (yet) list is still written. Without a
+    /// catalog schema, inference alone.
+    ///
+    /// Catalog columns whose type has no Arrow materialization (`Uuid`,
+    /// `Jsonb`, `Symbol`, …) are DROPPED here rather than passed through:
+    /// `build_column` errors on them unconditionally, and that error would
+    /// brick the flush — the memtable would never shrink and every
+    /// subsequent write to the partition would fail (the exact "worse than
+    /// having no heap bound" shape). Props on a dropped column are carried
+    /// by the segment's residual column instead (see `flush`). Props on a
+    /// *deleted* catalog column are re-added by the inferred loop under an
+    /// inferred type; the residual keeps them exact either way.
+    fn encode_schema(&self, records: &[ProximaRecord]) -> ProximaSchema {
+        let inferred = infer_proxima_schema(records);
+        let Some(mut schema) = self.schema_source.as_ref().and_then(|source| (source.0)()) else {
+            return inferred;
+        };
+        schema
+            .columns
+            .retain(|c| !c.is_deleted && column_materializable(&c.data_type));
+        for column in inferred.columns {
+            if !schema.columns.iter().any(|c| c.name == column.name) {
+                schema.columns.push(column);
+            }
+        }
+        // Every segment column is nullable, whatever the catalog declares: a
+        // segment also carries the synthesised tombstones, which have no props,
+        // so a NOT NULL column (a primary key) would fail the whole batch — and
+        // with it the DELETE or INSERT whose write triggered the flush. A live
+        // row's value still round-trips (the flush verifies it), and a scan
+        // serves rows under the catalog schema, not the segment's.
+        for column in &mut schema.columns {
+            column.nullable = true;
+        }
+        schema
+    }
+
+    /// Override the Parquet layout policy (tests, A/B measurement).
+    pub fn with_write_policy(mut self, write_policy: ParquetWritePolicy) -> Self {
+        self.write_policy = write_policy;
+        self
     }
 
     /// Attach the tenant this partition belongs to, so a tombstone-only flush
@@ -329,6 +573,14 @@ impl SpillRecordStorage {
         // matching ANY tenant. Keeping the two unusable shapes as one value
         // means every consumer has one case to handle, not two.
         self.tenant_id = Some(tenant_id.into()).filter(|t| !t.is_empty());
+        self
+    }
+
+    /// Mark this store as the UNTENANTED partition: tombstones are persisted
+    /// stamped `""`, like the partition's own rows. See the `tenant_id` field
+    /// for why this is safe for exactly that partition and nowhere else.
+    pub fn untenanted(mut self) -> Self {
+        self.tenant_id = Some(String::new());
         self
     }
 
@@ -641,6 +893,11 @@ impl SpillRecordStorage {
         // delete can observe the pre-push segment list for a row this flush is
         // about to make durable (TD-USUB-13). See `flush_guard`.
         let _publish = self.flush_guard.lock().await;
+        // Purged and not written since: possibly a dropped partition's stale
+        // handle, so write nothing (see `purged_since_write`).
+        if self.purged_since_write.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
         // The RESIDENT rows, kept separate from what gets written. These are the
         // only rows this flush may evict from the memtable afterwards.
         //
@@ -665,13 +922,13 @@ impl SpillRecordStorage {
 
         // Whether this flush may persist those tombstones.
         //
-        // No `filter(!is_empty)` here: `tenant_id` is private with exactly two
-        // write sites (the constructor's `None` and `with_tenant`'s normalisation),
-        // so `Some("")` is already unrepresentable, and a second copy of that
-        // predicate would be dead logic arguing an invariant it does not enforce.
-        // The normalisation — and its reason, that `ProximaRecord::matches_tenant`
-        // treats an EMPTY `tenant_id` as matching ANY tenant — lives in
-        // `with_tenant`, which is its one home (mandate #12).
+        // No `filter(!is_empty)` here: `tenant_id` is private, `with_tenant`
+        // normalises an accidental `""` to `None`, and the only `Some("")` is
+        // the explicit `untenanted()` opt-in, which must persist. The reasons —
+        // `ProximaRecord::matches_tenant` treats an EMPTY `tenant_id` as
+        // matching ANY tenant, which is harmless only for the partition whose
+        // rows are themselves untenanted — live on the `tenant_id` field
+        // (mandate #12).
         //
         // An unusable tenant must NOT fail the flush. The production factory
         // derives the tenant from `tenant_key`/the WAL entry, both of which are
@@ -683,9 +940,10 @@ impl SpillRecordStorage {
         // refusing the *flush* converts a correctness guard into an outage.
         //
         // Dropping them from this flush's snapshot is what keeps it safe: they
-        // stay in `self.tombstones`, so `min_unflushed_lsn` keeps failing closed
-        // (identical safety — the WAL entry that reconstructs the delete is
-        // retained) while the resident rows still become durable.
+        // stay in `self.tombstones`, so `min_unflushed_lsn` keeps the WAL from
+        // the earliest of their delete LSNs (or refuses, for an untracked one) —
+        // the entry that reconstructs each delete is retained — while the
+        // resident rows still become durable.
         // ONE binding, deliberately: the write below and the post-commit clear
         // must not be able to drift apart. Before this they were two separate
         // conditions (`tenant.is_none()` cleared the local list; `tenant.is_some()`
@@ -702,8 +960,8 @@ impl SpillRecordStorage {
                     path = %self.base_path.trim_end_matches('/'),
                     "spill: not persisting tombstone(s) — the store has no non-empty tenant, \
                      and an unattributed record must not enter a tenant-scoped segment. They \
-                     stay in memory, so `min_unflushed_lsn` keeps refusing to truncate. \
-                     Construct the store with `with_tenant`."
+                     stay in memory, so `min_unflushed_lsn` keeps retaining the WAL from \
+                     their deletes. Construct the store with `with_tenant`."
                 );
             }
             Vec::new()
@@ -719,8 +977,9 @@ impl SpillRecordStorage {
         // row and a tombstone for one oid.
         //
         // Why neither side may win. The authoritative order is the WAL's LSN
-        // order — and `tombstones` is a `DashSet<String>` of oids that carries NO
-        // LSN, so this store cannot tell which operation came later. An earlier
+        // order — and a tombstone's LSN can be `None` (a plain `delete_record`)
+        // and a resident row's too, so this store cannot always tell which
+        // operation came later. An earlier
         // draft picked the tombstone, reasoning that `get_record` consults
         // `tombstones` first so "absent" is already the answer being served. That
         // was wrong, and the way it was wrong is worth keeping: the post-commit
@@ -733,7 +992,8 @@ impl SpillRecordStorage {
         //
         // So the oid is simply not flushed: no row written, nothing evicted,
         // nothing cleared. It stays in memory, where the tombstone keeps
-        // `min_unflushed_lsn` refusing (mandate #1). This also removes
+        // `min_unflushed_lsn` retaining its delete's WAL entry, or refusing when
+        // that is untracked (mandate #1). This also removes
         // TD-USUB-16's inconsistency at the source: no segment ever holds a live
         // and a dead row for one oid.
         //
@@ -761,9 +1021,9 @@ impl SpillRecordStorage {
                 oids = ambiguous.len(),
                 path = %self.base_path.trim_end_matches('/'),
                 "spill: not flushing oid(s) that are both resident and tombstoned — a concurrent \
-                 upsert and delete left an order this store cannot resolve (tombstones carry no \
-                 LSN). They stay in memory and keep `min_unflushed_lsn` refusing until a later \
-                 write or WAL replay resolves them. See TD-USUB-16."
+                 upsert and delete left an order this store cannot resolve. They stay in memory, \
+                 holding back WAL truncation, until a later write or WAL replay resolves them. \
+                 See TD-USUB-16."
             );
         }
 
@@ -775,6 +1035,38 @@ impl SpillRecordStorage {
             .filter(|r| !ambiguous.contains(&r.record.oid))
             .cloned()
             .collect();
+
+        // Every value the typed columns cannot reproduce exactly — a nested
+        // object, an integer in a float column, a second embedding, a value of
+        // a type with no Arrow column — goes into the segment's residual column
+        // (TD-USUB-6's rule), so every row is writable. What is still checked
+        // is the codec itself: each row is encoded and decoded, and one that
+        // does not come back identical is HELD — not written, not evicted, its
+        // LSN still pinning the WAL entry that rebuilds it — and counted, since
+        // that is a defect to fix, not a data shape to live with.
+        let candidates: Vec<ProximaRecord> = evicting.iter().map(|r| r.record.clone()).collect();
+        let schema = self.encode_schema(&candidates);
+        let lossy: std::collections::HashSet<usize> =
+            records_not_round_tripping(&candidates, &schema)
+                .context("spill: verify the segment encoding round-trips")?
+                .into_iter()
+                .collect();
+        let (evicting, held): (Vec<(usize, Resident)>, Vec<(usize, Resident)>) = evicting
+            .into_iter()
+            .enumerate()
+            .partition(|(i, _)| !lossy.contains(i));
+        let evicting: Vec<Resident> = evicting.into_iter().map(|(_, r)| r).collect();
+        if let Some((_, example)) = held.first() {
+            spill_metrics().rows_held.inc_by(held.len() as u64);
+            tracing::error!(
+                rows = held.len(),
+                example_oid = %example.record.oid,
+                path = %self.base_path.trim_end_matches('/'),
+                "spill: holding row(s) resident — they do not read back identically \
+                 through the segment encoding (a codec defect). They keep \
+                 `min_unflushed_lsn` pinned."
+            );
+        }
         let persisting: Vec<&String> = tombstoned
             .iter()
             .filter(|oid| !ambiguous.contains(*oid))
@@ -854,18 +1146,30 @@ impl SpillRecordStorage {
         // read-back needs no catalog lookup. `with_system_columns` is what keeps
         // identity and `valid_to_ns` intact (TD-USUB-11).
         // `written`, not `residents`: the segment carries the synthesised
-        // tombstones too. `infer_proxima_schema` unions props across records, so
-        // a propless tombstone mixed with full rows is fine — its columns are
-        // simply null.
-        let schema = infer_proxima_schema(&written);
-        let batch = proxima_records_to_record_batch_with_system_columns(&written, &schema)
+        // tombstones too, under the `schema` chosen above. A propless tombstone
+        // mixed with full rows is fine — its columns are simply null.
+        //
+        // Ordered by oid: a flush writes ONE row per oid (residents are a map;
+        // a tombstone is persisted only for an oid with no resident row — the
+        // ambiguity block), so the order carries no meaning and sorting loses
+        // nothing. It makes the oid column's row-group and page min/max exact,
+        // which the declared sort below tells every reader.
+        written.sort_unstable_by(|a, b| a.oid.cmp(&b.oid));
+        let key_filter = SegmentKeyFilter::from_oids(written.iter().map(|r| r.oid.as_str()));
+        let batch = proxima_records_to_record_batch_with_residual(&written, &schema)
             .context("spill: encode resident records and tombstones to Arrow")?;
+        let writer_properties = self.write_policy.writer_properties(
+            &batch,
+            &ParquetLayoutHints {
+                sort_columns: vec![SYS_COL_OID.to_string()],
+            },
+        );
         // The file schema MUST be the batch's own schema, not `schema`: the batch
         // carries the reserved system columns on top of the user columns, and
         // writing it under the bare user schema silently drops them — which is
         // exactly the identity/tombstone loss this store depends on not happening.
         let file_schema = batch.schema();
-        let bytes = record_batches_to_parquet_bytes(&[batch], file_schema, None)
+        let bytes = record_batches_to_parquet_bytes(&[batch], file_schema, Some(writer_properties))
             .context("spill: encode Arrow batch to parquet bytes")?;
 
         // `next_segment` was resumed past every durable segment by
@@ -942,6 +1246,8 @@ impl SpillRecordStorage {
         // Only drop the resident rows AFTER the segment is durable. A crash
         // before this point simply leaves them resident, and the WAL replays
         // them regardless — the store cannot lose a row either way.
+        // The filter first: a probe that sees the path finds it ready.
+        self.key_filters.insert(path.clone(), Arc::new(key_filter));
         self.segments.write().push(path.clone());
         // `evicting`, which is `residents` minus the ambiguous oids — so every
         // row this removes from the memtable is in the object that just landed.
@@ -1084,6 +1390,160 @@ impl SpillRecordStorage {
         Ok(())
     }
 
+    /// The one delete path: `lsn` is the deleting WAL entry's, kept with the
+    /// tombstone this may record (see [`RecordStore::delete_record_at_lsn`]).
+    ///
+    /// Tombstones count toward the flush threshold like resident rows, so a
+    /// delete-heavy workload flushes (and so lets truncation advance) too.
+    /// This delete's own flush runs only after its answer is known: flushing
+    /// first would put the tombstone in the newest segment, and the segment
+    /// probe would then report a removed live row as absent. (A CONCURRENT
+    /// flush can still do that; the answer is advisory — callers apply the
+    /// delete either way.)
+    ///
+    /// The flush is best effort ([`Self::flush_after_write`]).
+    async fn delete_tracked(&self, key: &RecordKey, lsn: Option<u64>) -> Result<bool> {
+        self.purged_since_write.store(false, Ordering::SeqCst);
+        let removed = self.delete_unflushed(key, lsn).await?;
+        self.flush_after_write().await;
+        Ok(removed)
+    }
+
+    /// The flush a write triggers, best effort. The write is already applied
+    /// and its WAL entry durable, so a failed flush loses nothing — the row or
+    /// tombstone stays resident and keeps the WAL from its LSN (and a segment
+    /// write of unknown outcome makes `min_unflushed_lsn` refuse until a purge
+    /// or restart reconciles it). Turning a done write into an error would make
+    /// the caller skip its index maintenance and the rest of its batch, and
+    /// report a durable write as failed. The backlog this leaves is bounded
+    /// before the next write is made durable, by [`RecordStore::admit_writes`].
+    async fn flush_after_write(&self) {
+        self.threshold_flush_best_effort("after a write").await;
+    }
+
+    /// [`Self::flush_if_over_threshold`], logging and counting a failure
+    /// instead of returning it. `when` names the caller in the log.
+    async fn threshold_flush_best_effort(&self, when: &str) {
+        if let Err(error) = self.flush_if_over_threshold().await {
+            spill_metrics().flush_failures.inc();
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                path = %self.base_path.trim_end_matches('/'),
+                backlog = self.backlog(),
+                "spill: flush {when} failed; what it carried stays resident, so the WAL is \
+                 retained until a flush succeeds (or, after a segment write of unknown \
+                 outcome, until a purge or restart reconciles it)"
+            );
+        }
+    }
+
+    async fn delete_unflushed(&self, key: &RecordKey, lsn: Option<u64>) -> Result<bool> {
+        // One instant for both liveness decisions below (the resident copy and
+        // the segment probe), so they cannot disagree about the same row — the
+        // same property `get_record` states for its two arms.
+        let now_ns = now_ns();
+        // BEFORE the guarded block below, for two reasons: `ensure_discovered`
+        // takes the same guard, and the `has_segments` decision it guards is
+        // only correct once discovery has run.
+        self.ensure_discovered().await?;
+        // Exclusive with `flush` (TD-USUB-13): `has_segments` below and the
+        // tombstone insert must not straddle a flush's `segments.push`, or a row
+        // that flush is mid-way through making durable gets no tombstone and
+        // comes back live. Scoped so the guard is released before the segment
+        // READS at the end of this method — those are idempotent and need no
+        // exclusion.
+        let (was_resident, resident_was_dead, has_segments) = {
+            let _exclusive = self.flush_guard.lock().await;
+
+            // Already suppressed: nothing live to remove, so report false even
+            // if a stale segment copy still exists on disk.
+            // Its tombstone keeps the LSN it already has: the earliest WAL
+            // entry that reconstructs this deletion (or `None`, untracked).
+            if self.tombstones.contains_key(&key.oid) {
+                self.memtable.remove(&key.oid);
+                return Ok(false);
+            }
+
+            // Remove unconditionally, and distinguish THREE states rather than
+            // two: absent, resident-and-live, resident-and-dead.
+            //
+            // Collapsing the last two into one `false` was a real defect: a dead
+            // resident copy then fell through to the segment probe below, where a
+            // stale LIVE copy of the same oid reported that this DELETE removed a
+            // row — while `get_record` and `merged_records`, on identical state,
+            // both report the row absent. Mandate #16a names affected-row counts.
+            let removed = self.memtable.remove(&key.oid);
+            let resident_was_dead = removed
+                .as_ref()
+                .is_some_and(|(_, resident)| resident.record.is_dead(now_ns));
+            let was_resident = removed.is_some() && !resident_was_dead;
+            let has_segments = !self.segments.read().is_empty();
+
+            // A row already written to an immutable segment cannot be removed,
+            // so it is suppressed instead. Inside the guard with the
+            // `has_segments` read: deciding and acting on that decision as one
+            // step is what makes the reasoning local, rather than depending on
+            // the separate argument that flush's snapshot could no longer
+            // contain this oid.
+            if has_segments {
+                self.tombstones.insert(key.oid.clone(), lsn);
+            }
+            // The `remove` above also dropped the row's LSN (it lives in the
+            // `Resident`), so its INSERT stops constraining truncation. The
+            // DELETE's own LSN is a separate matter: if the row had been
+            // flushed, the tombstone above is the only in-memory evidence of the
+            // deletion, so `min_unflushed_lsn` retains the WAL from its LSN —
+            // or refuses outright when the delete came without one.
+
+            (was_resident, resident_was_dead, has_segments)
+        };
+
+        // Report truthfully whether a live row went away. The segment read is
+        // paid ONLY when the answer is not already known from the memtable.
+        if was_resident {
+            return Ok(true);
+        }
+        // The memtable is strictly newer than any segment, so a dead resident
+        // copy means the row is dead: do not consult the segments, exactly as
+        // `get_record` does not. The tombstone inserted above is what keeps the
+        // older live segment copy suppressed, so returning here cannot resurrect
+        // it.
+        if resident_was_dead {
+            return Ok(false);
+        }
+        if !has_segments {
+            return Ok(false);
+        }
+        // Newest segment first, and the FIRST hit is authoritative — the same
+        // rule `get_record` states and `merged_records` implements. A dead hit
+        // means the row is gone; it does NOT mean an older segment should be
+        // consulted for a live copy.
+        //
+        // Getting this wrong is subtle, and an earlier version of this commit
+        // did: it filtered dead rows *within* each segment and then CONTINUED to
+        // an older one, so a row dead in the newest segment and live in an older
+        // one reported that this DELETE removed it — while `get_record` and
+        // `merged_records`, on identical state, both reported it absent.
+        // Filtering per-segment answers "does this segment hold a live copy",
+        // which is the wrong question; the right one is "what does the newest
+        // segment holding this oid say".
+        match self.newest_segment_copy(&key.oid).await {
+            Ok(found) => Ok(found.is_some_and(|found| !found.is_dead(now_ns))),
+            // The delete is applied (the removal and tombstone above) and, on
+            // the write path, already durable; only its advisory answer rests
+            // on this read. Failing here would fail a done delete — and make
+            // the caller skip its index maintenance.
+            Err(error) => {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "spill: segment read for a delete's answer failed; the delete stands, \
+                     reported as removing no row"
+                );
+                Ok(false)
+            }
+        }
+    }
+
     /// The one memtable write path: value, fresh generation and LSN replace the
     /// resident entry in a single insert (see [`Resident`]).
     ///
@@ -1096,6 +1556,7 @@ impl SpillRecordStorage {
         record: ProximaRecord,
         lsn: Option<u64>,
     ) -> Result<ProximaRecord> {
+        self.purged_since_write.store(false, Ordering::SeqCst);
         // Re-inserting a previously deleted oid must clear its tombstone, or the
         // new row would stay invisible behind the suppression of the old one.
         self.tombstones.remove(&record.oid);
@@ -1118,12 +1579,65 @@ impl SpillRecordStorage {
             }
         }
 
-        if let Some(threshold) = self.flush_threshold
-            && self.memtable.len() >= threshold
-        {
-            self.flush().await?;
-        }
+        self.flush_after_write().await;
         Ok(record)
+    }
+
+    /// The buffered state a flush drains: resident rows plus the tombstones a
+    /// flush can persist. A store with no tenant cannot persist tombstones (see
+    /// `flush`), so they do not count there: counting state no flush can drain
+    /// would flush on every write.
+    fn backlog(&self) -> usize {
+        let tombstones = if self.tenant_id.is_some() {
+            self.tombstones.len()
+        } else {
+            0
+        };
+        self.memtable.len() + tombstones
+    }
+
+    /// Flush once the backlog reaches the threshold — unless another threshold
+    /// flush is already running, or the last one failed less than
+    /// [`FLUSH_RETRY_BACKOFF`] ago, in which case this skips it (the backlog
+    /// stays resident and the WAL retained).
+    async fn flush_if_over_threshold(&self) -> Result<()> {
+        let Some(threshold) = self.flush_threshold else {
+            return Ok(());
+        };
+        if self.backlog() < threshold {
+            return Ok(());
+        }
+        if self
+            .flush_failed_at
+            .lock()
+            .is_some_and(|failed_at| failed_at.elapsed() < FLUSH_RETRY_BACKOFF)
+        {
+            return Ok(());
+        }
+        /// Clears the flag however the flush ends, cancellation included — a
+        /// flag left set would stop threshold flushes for good.
+        struct Running<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        if self
+            .threshold_flush_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        let _running = Running(&self.threshold_flush_running);
+        match self.flush().await {
+            Ok(_) => *self.flush_failed_at.lock() = None,
+            Err(error) => {
+                *self.flush_failed_at.lock() = Some(std::time::Instant::now());
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     /// Decode one segment back to records through the canonical mixed-format
@@ -1139,28 +1653,96 @@ impl SpillRecordStorage {
             .with_context(|| format!("spill: decode segment '{path}'"))
     }
 
+    /// The probe filter of the segment at `path`, built from the segment on
+    /// first use when this process did not write it (a discovered segment).
+    async fn key_filter(&self, path: &str) -> Result<Arc<SegmentKeyFilter>> {
+        if let Some(filter) = self.key_filters.get(path) {
+            return Ok(filter.clone());
+        }
+        let records = self.read_segment(path).await?;
+        let filter = Arc::new(SegmentKeyFilter::from_oids(
+            records.iter().map(|r| r.oid.as_str()),
+        ));
+        // Insert-if-absent: a filter already there (a concurrent probe's, or
+        // flush's) is never replaced by one built from an earlier read.
+        Ok(self
+            .key_filters
+            .entry(path.to_string())
+            .or_insert(filter)
+            .clone())
+    }
+
+    /// The newest segment copy of `oid`, live or dead, or `None` when no
+    /// segment holds it. Newest segment first and the FIRST hit is
+    /// authoritative (see `get_record`). A segment whose filter rules the oid
+    /// out is not read (TD-USUB-21).
+    async fn newest_segment_copy(&self, oid: &str) -> Result<Option<ProximaRecord>> {
+        let paths = self.segments.read().clone();
+        for path in paths.iter().rev() {
+            if !self.key_filter(path).await?.may_contain(oid) {
+                continue;
+            }
+            if let Some(found) = self
+                .read_segment(path)
+                .await?
+                .into_iter()
+                .find(|r| r.oid == oid)
+            {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The segment list, the resident rows and the tombstones, taken TOGETHER
+    /// under the segments read lock.
+    ///
+    /// `flush` pushes its segment under the write lock and only afterwards
+    /// evicts the rows and clears the tombstones it wrote, so with the lock held
+    /// every row is in a listed segment or in the resident snapshot, and every
+    /// delete is in a listed segment or in the tombstone snapshot. Snapshotting
+    /// the memtable after the (awaited) segment reads instead let a flush land
+    /// in between: its rows were in neither, and its persisted deletes in
+    /// neither — a scan lost rows and could resurrect deleted ones.
+    async fn view(&self) -> Result<RecordScanView> {
+        self.ensure_discovered().await?;
+        let segments = self.segments.read();
+        Ok(RecordScanView {
+            resident: self
+                .memtable
+                .iter()
+                .map(|entry| entry.value().record.clone())
+                .collect(),
+            tombstones: self
+                .tombstones
+                .iter()
+                .map(|oid| oid.key().clone())
+                .collect(),
+            segments: segments.clone(),
+        })
+    }
+
     /// Every live row, newest-wins: segments oldest→newest, then the memtable on
-    /// top, with tombstoned oids removed.
+    /// top, with tombstoned oids removed — [`Self::view`] resolved in memory.
     ///
     /// Known cost, stated rather than hidden: this reads every segment on every
     /// scan. Bounding that is compaction plus a per-segment oid index — slice 2c.
     /// It is acceptable here only because the path is default-OFF.
     async fn merged_records(&self) -> Result<Vec<ProximaRecord>> {
-        self.ensure_discovered().await?;
-        let paths = self.segments.read().clone();
+        let view = self.view().await?;
         let mut merged: std::collections::HashMap<String, ProximaRecord> =
             std::collections::HashMap::new();
 
-        for path in &paths {
+        for path in &view.segments {
             for record in self.read_segment(path).await? {
                 merged.insert(record.oid.clone(), record);
             }
         }
-        for entry in self.memtable.iter() {
-            merged.insert(entry.key().clone(), entry.value().record.clone());
+        for record in view.resident {
+            merged.insert(record.oid.clone(), record);
         }
-        for oid in self.tombstones.iter() {
-            merged.remove(oid.key());
+        for oid in &view.tombstones {
+            merged.remove(oid);
         }
         // Mandate #16a: apply the canonical dead-record predicate at this read
         // boundary. `ProximaRecord::is_dead` covers both the `Some(0)` tombstone
@@ -1202,6 +1784,40 @@ impl RecordStore for SpillRecordStorage {
         self.upsert_resident(record, Some(lsn)).await
     }
 
+    /// Admission, before anything is durable:
+    ///
+    /// 1. Run discovery now. The apply step's delete needs it, and a LIST that
+    ///    fails there would fail a write that is already durable.
+    /// 2. Refuse while the backlog is at [`BACKLOG_FACTOR`] × the flush
+    ///    threshold AND flushes are failing. At the cap this first retries the
+    ///    overdue flush (subject to the retry backoff). A backlog over the cap
+    ///    with flushes succeeding — rows a flush must keep resident — is not a
+    ///    failure this refusal could resolve, so it admits.
+    async fn admit_writes(&self) -> RecordStoreResult<()> {
+        self.ensure_discovered().await?;
+        let Some(threshold) = self.flush_threshold.filter(|threshold| *threshold > 0) else {
+            return Ok(());
+        };
+        let cap = threshold.saturating_mul(BACKLOG_FACTOR);
+        if self.backlog() < cap {
+            return Ok(());
+        }
+        self.threshold_flush_best_effort("overdue at the backlog cap")
+            .await;
+        let backlog = self.backlog();
+        if backlog < cap || self.flush_failed_at.lock().is_none() {
+            return Ok(());
+        }
+        spill_metrics().writes_refused.inc();
+        Err(SpillBacklogFull(format!(
+            "spill partition '{}' holds {backlog} unflushed rows and tombstones (cap {cap}) \
+             because its flushes are failing; refusing new writes until a flush succeeds \
+             (nothing was written; retry)",
+            self.base_path.trim_end_matches('/')
+        ))
+        .into())
+    }
+
     /// Minimum LSN among resident (unflushed) rows.
     ///
     /// Deliberately does NOT call `ensure_discovered`, and must not: it reads
@@ -1227,12 +1843,11 @@ impl RecordStore for SpillRecordStorage {
         // The converse does NOT hold, and the asymmetry is deliberate: a repeat
         // DELETE of an oid whose tombstone is already durable re-inserts one
         // here (`delete_record` inserts whenever segments exist, without
-        // checking that the oid is in any of them), so this can refuse for a
-        // delete that IS durable. That is conservative — it retains more WAL,
+        // checking that the oid is in any of them), so this can retain WAL for
+        // a delete that IS durable. That is conservative — it retains more WAL,
         // never less — which is the only direction that is safe. See TD-USUB-14.
         //
-        // Reporting a minimum while an unpersisted tombstone exists would be
-        // actively wrong:
+        // A minimum over resident rows ALONE would be actively wrong:
         //
         //   row inserted @10 -> flushed (association dropped)
         //   row deleted  @20 -> tombstone in memory only, nothing resident
@@ -1241,9 +1856,9 @@ impl RecordStore for SpillRecordStorage {
         //   -> restart: replay never sees the delete, the segment still holds the
         //      row live, and the DELETED ROW RESURRECTS (mandate #16a).
         //
-        // Persisting tombstones (the 2b precondition TD-USUB-1 names) has
-        // landed, which is what makes the clear above meaningful. An
-        // UNPERSISTED tombstone still makes the question unanswerable.
+        // So each tombstone carries its delete's LSN and joins the minimum
+        // (here: 20 stays). A tombstone without one — applied through plain
+        // `delete_record` — makes the question unanswerable, and this refuses.
         // A failed segment write may have left an orphan that `segments` does
         // not list, which silently disables tombstone recording (see the
         // `unresolved_segment_writes` field). Refuse first: while that count is
@@ -1260,17 +1875,23 @@ impl RecordStore for SpillRecordStorage {
                 self.base_path.trim_end_matches('/')
             ));
         }
-        if !self.tombstones.is_empty() {
+        // A memory-only tombstone is retained from its delete's LSN. One
+        // applied without an LSN leaves the floor unknowable: refuse.
+        let tombstone_lsns: Vec<u64> = self.tombstones.iter().filter_map(|e| *e.value()).collect();
+        if tombstone_lsns.len() < self.tombstones.len() {
             return Err(anyhow::anyhow!(
-                "spill: cannot compute a safe truncation point — {} tombstone(s) are not yet \
-                 persisted into a segment, so the WAL entries that reconstruct them must be \
-                 retained. Flush to persist them, then re-ask. Do not truncate.",
+                "spill: cannot compute a safe truncation point — {} of {} tombstone(s) not yet \
+                 persisted into a segment carry no WAL LSN (deleted through `delete_record` \
+                 instead of `delete_record_at_lsn`), so the WAL entries that reconstruct them \
+                 must be retained. Flush to persist them, then re-ask. Do not truncate.",
+                self.tombstones.len() - tombstone_lsns.len(),
                 self.tombstones.len()
             ));
         }
+        let tombstone_floor = tombstone_lsns.into_iter().min();
         let resident = self.memtable.len();
         if resident == 0 {
-            return Ok(None);
+            return Ok(tombstone_floor);
         }
         let lsns: Vec<u64> = self.memtable.iter().filter_map(|e| e.value().lsn).collect();
         let tracked = lsns.len();
@@ -1284,12 +1905,43 @@ impl RecordStore for SpillRecordStorage {
                 tracked
             ));
         }
-        Ok(lsns.into_iter().min())
+        Ok(lsns.into_iter().chain(tombstone_floor).min())
+    }
+
+    /// TD-DML-3: [`Self::get_record`] without the dead-copy filter. A
+    /// tombstoned oid is still absent (DELETE removed it); a resident or
+    /// segment copy that `is_dead` (TTL-expired) is returned so the caller can
+    /// tell "dead" from "absent". Newest copy wins, as in `get_record`.
+    async fn get_record_including_dead(
+        &self,
+        key: &RecordKey,
+    ) -> RecordStoreResult<Option<ProximaRecord>> {
+        self.ensure_discovered().await?;
+        if self.tombstones.contains_key(&key.oid) {
+            return Ok(None);
+        }
+        // Resident copies are `record`-shaped since the bound-memtable change;
+        // dead copies are intentionally returned (see the doc comment above).
+        if let Some(entry) = self.memtable.get(&key.oid) {
+            return Ok(Some(entry.value().record.clone()));
+        }
+        let paths = self.segments.read().clone();
+        for path in paths.iter().rev() {
+            if let Some(found) = self
+                .read_segment(path)
+                .await?
+                .into_iter()
+                .find(|r| r.oid == key.oid)
+            {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
     }
 
     async fn get_record(&self, key: &RecordKey) -> RecordStoreResult<Option<ProximaRecord>> {
         self.ensure_discovered().await?;
-        if self.tombstones.contains(&key.oid) {
+        if self.tombstones.contains_key(&key.oid) {
             return Ok(None);
         }
         let now_ns = now_ns();
@@ -1307,126 +1959,21 @@ impl RecordStore for SpillRecordStorage {
         // Newest segment first: a later flush shadows an earlier copy.
         // `now_ns` is taken once above and reused, so the memtable and segment
         // arms judge liveness against the same instant.
-        let paths = self.segments.read().clone();
-        for path in paths.iter().rev() {
-            if let Some(found) = self
-                .read_segment(path)
-                .await?
-                .into_iter()
-                .find(|r| r.oid == key.oid)
-            {
-                // Mandate #16a here too. Newest segment first, so the first hit
-                // is authoritative: a dead hit means the row is GONE, not that an
-                // older segment should be consulted for a live copy.
-                if found.is_dead(now_ns) {
-                    return Ok(None);
-                }
-                return Ok(Some(found));
-            }
-        }
-        Ok(None)
+        // Mandate #16a here too. Newest segment first, so the first hit is
+        // authoritative: a dead hit means the row is GONE, not that an older
+        // segment should be consulted for a live copy.
+        Ok(self
+            .newest_segment_copy(&key.oid)
+            .await?
+            .filter(|found| !found.is_dead(now_ns)))
     }
 
     async fn delete_record(&self, key: &RecordKey) -> RecordStoreResult<bool> {
-        // One instant for both liveness decisions below (the resident copy and
-        // the segment probe), so they cannot disagree about the same row — the
-        // same property `get_record` states for its two arms.
-        let now_ns = now_ns();
-        // BEFORE the guarded block below, for two reasons: `ensure_discovered`
-        // takes the same guard, and the `has_segments` decision it guards is
-        // only correct once discovery has run.
-        self.ensure_discovered().await?;
-        // Exclusive with `flush` (TD-USUB-13): `has_segments` below and the
-        // tombstone insert must not straddle a flush's `segments.push`, or a row
-        // that flush is mid-way through making durable gets no tombstone and
-        // comes back live. Scoped so the guard is released before the segment
-        // READS at the end of this method — those are idempotent and need no
-        // exclusion.
-        let (was_resident, resident_was_dead, has_segments) = {
-            let _exclusive = self.flush_guard.lock().await;
+        self.delete_tracked(key, None).await
+    }
 
-            // Already suppressed: nothing live to remove, so report false even
-            // if a stale segment copy still exists on disk.
-            if self.tombstones.contains(&key.oid) {
-                self.memtable.remove(&key.oid);
-                return Ok(false);
-            }
-
-            // Remove unconditionally, and distinguish THREE states rather than
-            // two: absent, resident-and-live, resident-and-dead.
-            //
-            // Collapsing the last two into one `false` was a real defect: a dead
-            // resident copy then fell through to the segment probe below, where a
-            // stale LIVE copy of the same oid reported that this DELETE removed a
-            // row — while `get_record` and `merged_records`, on identical state,
-            // both report the row absent. Mandate #16a names affected-row counts.
-            let removed = self.memtable.remove(&key.oid);
-            let resident_was_dead = removed
-                .as_ref()
-                .is_some_and(|(_, resident)| resident.record.is_dead(now_ns));
-            let was_resident = removed.is_some() && !resident_was_dead;
-            let has_segments = !self.segments.read().is_empty();
-
-            // A row already written to an immutable segment cannot be removed,
-            // so it is suppressed instead. Inside the guard with the
-            // `has_segments` read: deciding and acting on that decision as one
-            // step is what makes the reasoning local, rather than depending on
-            // the separate argument that flush's snapshot could no longer
-            // contain this oid.
-            if has_segments {
-                self.tombstones.insert(key.oid.clone());
-            }
-            // The `remove` above also dropped the row's LSN (it lives in the
-            // `Resident`), so its INSERT stops constraining truncation. The
-            // DELETE's own LSN is a separate matter: if the row had been
-            // flushed, the tombstone above is the only in-memory evidence of the
-            // deletion and `min_unflushed_lsn` fails closed on it — dropping the
-            // association does NOT release that obligation.
-
-            (was_resident, resident_was_dead, has_segments)
-        };
-
-        // Report truthfully whether a live row went away. The segment read is
-        // paid ONLY when the answer is not already known from the memtable.
-        if was_resident {
-            return Ok(true);
-        }
-        // The memtable is strictly newer than any segment, so a dead resident
-        // copy means the row is dead: do not consult the segments, exactly as
-        // `get_record` does not. The tombstone inserted above is what keeps the
-        // older live segment copy suppressed, so returning here cannot resurrect
-        // it.
-        if resident_was_dead {
-            return Ok(false);
-        }
-        if !has_segments {
-            return Ok(false);
-        }
-        let paths = self.segments.read().clone();
-        for path in paths.iter().rev() {
-            // Newest segment first, and the FIRST hit is authoritative — the
-            // same rule `get_record` states and `merged_records` implements. A
-            // dead hit means the row is gone; it does NOT mean an older segment
-            // should be consulted for a live copy.
-            //
-            // Getting this wrong is subtle, and an earlier version of this
-            // commit did: it filtered dead rows *within* each segment and then
-            // CONTINUED to an older one, so a row dead in the newest segment and
-            // live in an older one reported that this DELETE removed it — while
-            // `get_record` and `merged_records`, on identical state, both
-            // reported it absent. Filtering per-segment answers "does this
-            // segment hold a live copy", which is the wrong question; the right
-            // one is "what does the newest segment holding this oid say".
-            if let Some(found) = self
-                .read_segment(path)
-                .await?
-                .into_iter()
-                .find(|r| r.oid == key.oid)
-            {
-                return Ok(!found.is_dead(now_ns));
-            }
-        }
-        Ok(false)
+    async fn delete_record_at_lsn(&self, key: &RecordKey, lsn: u64) -> RecordStoreResult<bool> {
+        self.delete_tracked(key, Some(lsn)).await
     }
 
     /// Delete every spill segment under this partition's prefix.
@@ -1499,7 +2046,12 @@ impl RecordStore for SpillRecordStorage {
         // Every recorded path is gone; the obligation is discharged.
         self.clear_purge_obligation().await?;
         self.segments.write().clear();
+        self.key_filters.clear();
         self.tombstones.clear();
+        // Resident rows stay (a purge may reconcile a LIVE partition's prefix),
+        // but no flush writes them until the next write: under `flush_guard`, so
+        // a flush in progress completes first and is purged with the rest.
+        self.purged_since_write.store(true, Ordering::SeqCst);
         // The prefix has been reconciled by deletion, so any orphan an
         // unresolved write left is gone too — this is the one path that can zero
         // the counter (see the `unresolved_segment_writes` field; re-listing
@@ -1529,7 +2081,7 @@ impl RecordStore for SpillRecordStorage {
 }
 
 /// Wall clock in nanoseconds, for the canonical dead-record predicate.
-fn now_ns() -> i64 {
+pub(crate) fn now_ns() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
@@ -1557,7 +2109,7 @@ fn now_ns() -> i64 {
 ///
 /// Erring toward "real failure" is the safe direction here: a false *absence*
 /// loses data silently, a false *failure* is loud and recorded.
-fn is_absent(err: &proximadb_storage_filesystem_types::FilesystemError) -> bool {
+pub(crate) fn is_absent(err: &proximadb_storage_filesystem_types::FilesystemError) -> bool {
     use proximadb_storage_filesystem_types::FilesystemError;
     match err {
         FilesystemError::NotFound(_) => true,
@@ -1715,6 +2267,10 @@ fn is_spill_segment(name: &str) -> bool {
 
 #[async_trait]
 impl RecordScan for SpillRecordStorage {
+    async fn scan_view(&self) -> RecordStoreResult<RecordScanView> {
+        self.view().await
+    }
+
     async fn scan_records(&self, limit: usize) -> RecordStoreResult<Vec<ProximaRecord>> {
         Ok(self
             .merged_records()
@@ -1751,6 +2307,16 @@ impl RecordScan for SpillRecordStorage {
             .filter(|record| options.matches_record(record) && predicate.is_none_or(|p| p(record)))
             .take(limit)
             .collect())
+    }
+
+    /// Bounded-memory k-way merge over the oid-sorted segments; see
+    /// `chunked_scan`.
+    fn scan_record_chunks(
+        self: Arc<Self>,
+        options: RecordScanOptions,
+        chunk_rows: usize,
+    ) -> proximadb_records::chunked::RecordChunkStream<'static> {
+        self.chunked_scan(options, chunk_rows)
     }
 }
 
@@ -2011,6 +2577,27 @@ mod tests {
         Ok(())
     }
 
+    /// TD-USUB-22: after a purge, a flush writes nothing until the partition is
+    /// written again — a dropped partition's stale handle (the truncator's lag
+    /// flush racing a DROP) cannot write the dropped rows back into the prefix,
+    /// while a live partition resumes flushing after its next write.
+    #[tokio::test]
+    async fn a_purged_partition_is_not_flushed_until_written_again() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let s = SpillRecordStorage::with_flush_threshold(fs, base.clone(), None)
+            .with_tenant("tenant-a");
+        s.upsert_record(record("a", "open")).await?;
+        s.upsert_record(record("b", "open")).await?;
+        s.purge_durable_objects().await?;
+        assert_eq!(s.flush().await?, None, "a purged partition writes nothing");
+        assert_eq!(segment_files_on_disk(&base), 0);
+
+        s.upsert_record(record("c", "open")).await?;
+        assert!(s.flush().await?.is_some(), "a write ends the purge's hold");
+        assert_eq!(segment_files_on_disk(&base), 1);
+        Ok(())
+    }
+
     /// Purge is idempotent: a partition that never flushed, and a re-drop, are
     /// both success. The contract says so, and `drop_table_records` propagates
     /// errors — so a spurious failure here would make DROP TABLE fail outright.
@@ -2096,6 +2683,62 @@ mod tests {
     /// Asserts the OBSERVABLE property — the row is gone from both `get_record`
     /// and a scan — not the presence of a tombstone, so a different fix (an
     /// in-flight oid set, say) still satisfies it.
+    /// A scan racing a flush loses no row and resurrects no delete. The scan
+    /// parks inside its first segment read; a flush then lands — pushing a
+    /// segment with a resident row and a persisted delete, evicting the row
+    /// and clearing the tombstone. Snapshotting the memtable and tombstones
+    /// only after the segment reads (the pre-fix order) returned the deleted
+    /// row and missed the flushed one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scan_racing_a_flush_loses_no_row_and_resurrects_no_delete() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        std::mem::forget(dir);
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let fs = Arc::new(BarrierFs {
+            inner: LocalFileSystem::new(LocalConfig::default())
+                .await
+                .expect("local filesystem"),
+            reached: reached.clone(),
+            release: release.clone(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            fail_writes: std::sync::atomic::AtomicBool::new(false),
+            park_reads: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store = Arc::new(
+            SpillRecordStorage::with_flush_threshold(fs.clone(), base, None)
+                .with_tenant("tenant-a"),
+        );
+        RecordStore::upsert_record_at_lsn(store.as_ref(), record("old", "open"), 1).await?;
+        RecordStore::upsert_record_at_lsn(store.as_ref(), record("gone", "open"), 2).await?;
+        store.flush().await?.expect("segment 1");
+        store
+            .delete_record(&RecordKey::new("gone".to_string()))
+            .await?;
+        RecordStore::upsert_record_at_lsn(store.as_ref(), record("fresh", "open"), 4).await?;
+
+        fs.park_reads
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let scan = {
+            let store = store.clone();
+            tokio::spawn(async move { RecordScan::scan_records(store.as_ref(), 100).await })
+        };
+        reached.notified().await;
+        store.flush().await?.expect("segment 2 lands mid-scan");
+        release.notify_one();
+
+        let mut oids: Vec<String> = scan
+            .await
+            .expect("scan task")?
+            .into_iter()
+            .map(|r| r.oid)
+            .collect();
+        oids.sort();
+        assert_eq!(oids, ["fresh", "old"], "no row lost, no delete resurrected");
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delete_during_a_flush_does_not_resurrect_the_row() -> Result<()> {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2112,6 +2755,7 @@ mod tests {
             release: release.clone(),
             armed: std::sync::atomic::AtomicBool::new(true),
             fail_writes: std::sync::atomic::AtomicBool::new(false),
+            park_reads: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Threshold 2: the second insert triggers the flush that parks.
@@ -2207,6 +2851,9 @@ mod tests {
         /// `write_if_absent` and delegates everything else, and a third copy of
         /// that delegation block would be mandate-#12 duplication.
         fail_writes: std::sync::atomic::AtomicBool,
+        /// Park the FIRST `read` (same `reached`/`release` handshake) — the
+        /// window inside a scan between its snapshot and its segment reads.
+        park_reads: std::sync::atomic::AtomicBool,
     }
 
     impl BarrierFs {
@@ -2220,6 +2867,7 @@ mod tests {
                 release: Arc::new(tokio::sync::Notify::new()),
                 armed: std::sync::atomic::AtomicBool::new(false),
                 fail_writes: std::sync::atomic::AtomicBool::new(true),
+                park_reads: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -2250,6 +2898,13 @@ mod tests {
             self
         }
         async fn read(&self, path: &str) -> proximadb_storage_filesystem_types::FsResult<Vec<u8>> {
+            if self
+                .park_reads
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.reached.notify_one();
+                self.release.notified().await;
+            }
             self.inner.read(path).await
         }
         async fn write(
@@ -2751,7 +3406,7 @@ mod tests {
                 lsn: None,
             },
         );
-        store.tombstones.insert("k".to_string());
+        store.tombstones.insert("k".to_string(), None);
 
         assert!(
             store.flush().await?.is_none(),
@@ -2815,7 +3470,7 @@ mod tests {
                 lsn: None,
             },
         );
-        store.tombstones.insert("k".to_string());
+        store.tombstones.insert("k".to_string(), None);
         RecordStore::upsert_record_at_lsn(&store, record("other", "open"), 9).await?;
 
         let path = store
@@ -2842,7 +3497,7 @@ mod tests {
             "the acknowledged INSERT must still exist — it is durable nowhere else"
         );
         assert!(
-            store.tombstones.contains("k"),
+            store.tombstones.contains_key("k"),
             "and the DELETE must still be pending — it reached no object"
         );
         let err = RecordStore::min_unflushed_lsn(&store)
@@ -2900,6 +3555,7 @@ mod tests {
             release: release.clone(),
             armed: std::sync::atomic::AtomicBool::new(true),
             fail_writes: std::sync::atomic::AtomicBool::new(false),
+            park_reads: std::sync::atomic::AtomicBool::new(false),
         });
         let store = Arc::new(
             SpillRecordStorage::with_flush_threshold(fs, base, None).with_tenant("tenant-a"),
@@ -3088,6 +3744,93 @@ mod tests {
         Ok(())
     }
 
+    /// A delete applied at its WAL LSN retains the WAL from that LSN instead of
+    /// refusing: the floor joins the resident rows' minimum, and an untracked
+    /// tombstone beside it still refuses.
+    #[tokio::test]
+    async fn a_tracked_tombstone_is_a_floor_not_a_refusal() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let store =
+            SpillRecordStorage::with_flush_threshold(fs, base, None).with_tenant("tenant-a");
+        for (oid, lsn) in [("a", 10), ("b", 11), ("c", 12)] {
+            store.upsert_record_at_lsn(record(oid, "open"), lsn).await?;
+        }
+        store.flush().await?;
+
+        assert!(
+            store
+                .delete_record_at_lsn(&RecordKey::new("a".to_string()), 20)
+                .await?,
+            "a live flushed row went away"
+        );
+        assert_eq!(store.min_unflushed_lsn().await?, Some(20));
+        store.upsert_record_at_lsn(record("d", "open"), 30).await?;
+        assert_eq!(store.min_unflushed_lsn().await?, Some(20), "min of both");
+
+        // A repeat delete keeps the earliest LSN that reconstructs it.
+        store
+            .delete_record_at_lsn(&RecordKey::new("a".to_string()), 40)
+            .await?;
+        assert_eq!(store.min_unflushed_lsn().await?, Some(20));
+
+        store
+            .delete_record(&RecordKey::new("b".to_string()))
+            .await?;
+        assert!(
+            store.min_unflushed_lsn().await.is_err(),
+            "an untracked tombstone still refuses"
+        );
+
+        store.flush().await?.expect("tombstone segment");
+        assert_eq!(store.min_unflushed_lsn().await?, None);
+        let live: std::collections::BTreeSet<String> = RecordScan::scan_records(&store, 100)
+            .await?
+            .into_iter()
+            .map(|r| r.oid)
+            .collect();
+        assert_eq!(live, ["c".to_string(), "d".to_string()].into());
+        Ok(())
+    }
+
+    /// Tombstones count toward the flush threshold, so a delete-only workload
+    /// drains to segments too — and each delete still reports the live row it
+    /// removed, because the flush runs after the answer.
+    #[tokio::test]
+    async fn tombstones_count_toward_the_flush_threshold() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let store =
+            SpillRecordStorage::with_flush_threshold(fs, base, Some(3)).with_tenant("tenant-a");
+        for (oid, lsn) in [("a", 1), ("b", 2), ("c", 3)] {
+            store.upsert_record_at_lsn(record(oid, "open"), lsn).await?;
+        }
+        assert_eq!(store.segment_count(), 1, "three rows reached the threshold");
+
+        for (oid, lsn) in [("a", 4), ("b", 5)] {
+            assert!(
+                store
+                    .delete_record_at_lsn(&RecordKey::new(oid.to_string()), lsn)
+                    .await?
+            );
+        }
+        assert_eq!(
+            store.segment_count(),
+            1,
+            "two tombstones: under the threshold"
+        );
+        assert_eq!(store.min_unflushed_lsn().await?, Some(4));
+
+        assert!(
+            store
+                .delete_record_at_lsn(&RecordKey::new("c".to_string()), 6)
+                .await?,
+            "the third delete removed a live row, flush or not"
+        );
+        assert_eq!(store.segment_count(), 2, "the third tombstone flushed");
+        assert_eq!(store.min_unflushed_lsn().await?, None);
+        assert!(RecordScan::scan_records(&store, 100).await?.is_empty());
+        Ok(())
+    }
+
     /// An `upsert` of a TOMBSTONED oid landing after the flush snapshot must not
     /// be evicted by that flush.
     ///
@@ -3119,6 +3862,7 @@ mod tests {
             release: release.clone(),
             armed: std::sync::atomic::AtomicBool::new(false),
             fail_writes: std::sync::atomic::AtomicBool::new(false),
+            park_reads: std::sync::atomic::AtomicBool::new(false),
         });
         let store = Arc::new(
             SpillRecordStorage::with_flush_threshold(fs.clone(), base, None)
@@ -3187,6 +3931,7 @@ mod tests {
             release: release.clone(),
             armed: std::sync::atomic::AtomicBool::new(false),
             fail_writes: std::sync::atomic::AtomicBool::new(false),
+            park_reads: std::sync::atomic::AtomicBool::new(false),
         });
         let store = Arc::new(
             SpillRecordStorage::with_flush_threshold(fs.clone(), base, None)
@@ -3378,6 +4123,226 @@ mod tests {
         Ok(())
     }
 
+    /// A value the segment schema has no column for is written exactly through
+    /// the residual — never as NULL, and no longer held. Inference has no
+    /// column type for a DECIMAL prop, so without a catalog schema this row
+    /// used to stay in memory pinning the WAL floor until a write supplied one.
+    #[tokio::test]
+    async fn a_value_inference_cannot_type_is_written_exactly_through_the_residual() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let store = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None)
+            .with_tenant("tenant-a");
+        let price = ProximaTreeNode::Value(proximadb_data_model::ProximaValue::Decimal(
+            "12.50".to_string(),
+        ));
+        let mut priced = record("priced", "open");
+        priced.props.insert("price".to_string(), price.clone());
+        RecordStore::upsert_record_at_lsn(&store, record("plain", "open"), 1).await?;
+        RecordStore::upsert_record_at_lsn(&store, priced, 2).await?;
+
+        store.flush().await?.expect("both rows publish");
+        assert_eq!(store.resident_len(), 0, "nothing held");
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(&store).await.ok(),
+            Some(None),
+            "both rows are durable"
+        );
+        let fresh = SpillRecordStorage::with_flush_threshold(fs, base, None);
+        let served = fresh
+            .get_record(&RecordKey::new("priced".to_string()))
+            .await?
+            .expect("read back from the segment");
+        assert_eq!(served.props.get("price"), Some(&price), "exact, not NULL");
+        Ok(())
+    }
+
+    /// With the catalog schema the declared types are written — DECIMAL and
+    /// TIMESTAMP, which inference cannot produce — and read back exactly, and a
+    /// prop the catalog does not list is still written, inferred.
+    #[tokio::test]
+    async fn a_catalog_schema_writes_typed_columns_and_keeps_unlisted_props() -> Result<()> {
+        use proximadb_data_model::{ProximaType, ProximaValue, TimeUnit};
+        use proximadb_storage_common::proxima_schema::ProximaColumn;
+
+        let (fs, base) = fs_and_base().await;
+        let catalog = ProximaSchema::from_columns(
+            "orders".to_string(),
+            vec![
+                ProximaColumn::new(1, "status", ProximaType::String),
+                ProximaColumn::new(
+                    2,
+                    "price",
+                    ProximaType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                ),
+                ProximaColumn::new(3, "at", ProximaType::Timestamp(TimeUnit::Millisecond)),
+            ],
+            vec![1],
+        );
+        let store = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None)
+            .with_tenant("tenant-a")
+            .with_schema_source(SpillSchemaSource::new(move || Some(catalog.clone())));
+        let mut row = record("o1", "open");
+        for (key, value) in [
+            ("price", ProximaValue::Decimal("12.50".to_string())),
+            (
+                "at",
+                ProximaValue::Timestamp(1_700_000_000_000, TimeUnit::Millisecond),
+            ),
+            (
+                "note",
+                ProximaValue::String("not in the catalog".to_string()),
+            ),
+        ] {
+            row.props
+                .insert(key.to_string(), ProximaTreeNode::Value(value));
+        }
+        RecordStore::upsert_record_at_lsn(&store, row.clone(), 1).await?;
+        store.flush().await?.expect("publishes");
+        assert_eq!(store.resident_len(), 0, "nothing held back");
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(&store).await.ok(),
+            Some(None)
+        );
+
+        // A fresh instance (no schema source) reads the segment back exactly.
+        let fresh = SpillRecordStorage::with_flush_threshold(fs, base, None);
+        let back = fresh
+            .get_record(&RecordKey::new("o1".to_string()))
+            .await?
+            .expect("flushed row");
+        for key in ["status", "price", "at", "note"] {
+            assert_eq!(back.props.get(key), row.props.get(key), "prop `{key}`");
+        }
+        Ok(())
+    }
+
+    /// A segment is a warehouse-layout Parquet file (ADR-097 S3): written with
+    /// `ParquetWritePolicy` — row-group cap, page index, declared sort — and
+    /// ordered by oid, so the oid column's row-group min/max is exact. The
+    /// policy changes the layout only: every row reads back unchanged.
+    #[tokio::test]
+    async fn segments_are_written_with_the_warehouse_layout_policy() -> Result<()> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use parquet::file::serialized_reader::ReadOptionsBuilder;
+
+        let (fs, base) = fs_and_base().await;
+        let store = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None)
+            .with_tenant("tenant-a")
+            .with_write_policy(ParquetWritePolicy {
+                row_group_rows: 4,
+                data_page_rows: 2,
+                ..ParquetWritePolicy::default()
+            });
+        // Inserted out of order; the segment must come out sorted.
+        let oids = ["k5", "k1", "k9", "k3", "k7", "k2", "k8", "k4", "k6", "k0"];
+        for oid in oids {
+            RecordStore::upsert_record(&store, record(oid, "open")).await?;
+        }
+        store.flush().await?.expect("publishes");
+
+        let path = std::fs::read_dir(&base)?
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| is_spill_segment(&p.file_name().unwrap_or_default().to_string_lossy()))
+            .expect("one segment on disk");
+
+        let reader = SerializedFileReader::new_with_options(
+            std::fs::File::open(&path)?,
+            ReadOptionsBuilder::new().with_page_index().build(),
+        )?;
+        let meta = reader.metadata();
+        assert_eq!(meta.num_row_groups(), 3, "10 rows at 4 per row group");
+        assert!(meta.column_index().is_some(), "page index written");
+        let oid_column = meta
+            .file_metadata()
+            .schema_descr()
+            .columns()
+            .iter()
+            .position(|c| c.name() == SYS_COL_OID)
+            .expect("oid system column");
+        for row_group in meta.row_groups() {
+            let sorting = row_group.sorting_columns().expect("sort declared");
+            assert_eq!(sorting[0].column_idx as usize, oid_column);
+            assert!(!sorting[0].descending);
+        }
+
+        let mut written = Vec::new();
+        for batch in
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path)?)?.build()?
+        {
+            let batch = batch?;
+            let column = batch
+                .column_by_name(SYS_COL_OID)
+                .expect("oid column")
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("utf8 oids");
+            written.extend(column.iter().flatten().map(str::to_string));
+        }
+        let mut sorted = written.clone();
+        sorted.sort();
+        assert_eq!(written, sorted, "rows are ordered by oid");
+
+        let fresh = SpillRecordStorage::with_flush_threshold(fs, base, None);
+        let mut served: Vec<String> = RecordScan::scan_records(&fresh, 100)
+            .await?
+            .into_iter()
+            .map(|r| r.oid)
+            .collect();
+        served.sort();
+        assert_eq!(served, sorted, "every row reads back");
+        Ok(())
+    }
+
+    /// The explicit untenanted partition persists its deletes, so its
+    /// tombstones leave memory and truncation is no longer blocked forever —
+    /// while an accidental empty tenant (`with_tenant("")`) still refuses.
+    #[tokio::test]
+    async fn an_untenanted_partition_persists_its_deletes() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let store =
+            SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None).untenanted();
+        let untenanted_record = |oid: &str| ProximaRecord {
+            tenant_id: String::new(),
+            ..record(oid, "open")
+        };
+        RecordStore::upsert_record_at_lsn(&store, untenanted_record("k"), 1).await?;
+        store.flush().await?;
+        store
+            .delete_record(&RecordKey::new("k".to_string()))
+            .await?;
+        RecordStore::upsert_record_at_lsn(&store, untenanted_record("live"), 3).await?;
+        store.flush().await?.expect("publishes");
+
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(&store).await.ok(),
+            Some(None),
+            "the delete is durable, so nothing constrains truncation"
+        );
+        drop(store);
+
+        // A fresh instance over the prefix serves the delete from the segment.
+        let fresh = SpillRecordStorage::with_flush_threshold(fs, base, None).untenanted();
+        assert!(
+            fresh
+                .get_record(&RecordKey::new("k".to_string()))
+                .await?
+                .is_none(),
+            "the persisted tombstone suppresses the flushed row"
+        );
+        assert!(
+            fresh
+                .get_record(&RecordKey::new("live".to_string()))
+                .await?
+                .is_some()
+        );
+        Ok(())
+    }
+
     /// Default (no threshold) never writes a segment — enabling nothing changes
     /// nothing, so the shipped behaviour is the plain memtable's.
     #[tokio::test]
@@ -3564,6 +4529,69 @@ mod tests {
         Ok(())
     }
 
+    /// `scan_view` lists each part where a reader merging them itself needs it:
+    /// flushed rows behind a segment path, newer writes resident, and a delete of
+    /// a flushed row as a memory tombstone until a flush persists it — after
+    /// which it is only in the newest segment, as a dead row.
+    #[tokio::test]
+    async fn scan_view_exposes_segments_residents_and_tombstones() -> Result<()> {
+        let s = store(None).await.with_tenant("tenant-a");
+        s.upsert_record(record("a", "open")).await?;
+        s.upsert_record(record("b", "open")).await?;
+        let first = s.flush().await?.expect("segment 1");
+        s.delete_record(&RecordKey::new("a".to_string())).await?;
+        s.upsert_record(record("c", "open")).await?;
+
+        let view = RecordScan::scan_view(&s).await?;
+        assert_eq!(view.segments, vec![first.clone()]);
+        let resident: Vec<&str> = view.resident.iter().map(|r| r.oid.as_str()).collect();
+        assert_eq!(resident, ["c"]);
+        assert_eq!(view.tombstones, ["a"]);
+
+        let second = s.flush().await?.expect("segment 2");
+        let view = RecordScan::scan_view(&s).await?;
+        assert_eq!(view.segments, vec![first, second.clone()], "oldest first");
+        assert!(view.resident.is_empty() && view.tombstones.is_empty());
+        let newest = s.read_segment(&second).await?;
+        assert!(
+            newest.iter().any(|r| r.oid == "a" && r.is_dead(now_ns())),
+            "the delete now lives in the newest segment"
+        );
+        Ok(())
+    }
+
+    /// A tombstone has no props, so under a catalog schema with a NOT NULL
+    /// column (any primary key) its segment row is NULL there. The flush that
+    /// persists it must still succeed — it runs inside the DELETE or INSERT whose
+    /// write crossed the threshold, so failing it fails that statement.
+    #[tokio::test]
+    async fn a_tombstone_flushes_under_a_catalog_schema_with_a_not_null_column() -> Result<()> {
+        let mut status = proximadb_storage_common::proxima_schema::ProximaColumn::new(
+            1,
+            "status",
+            proximadb_data_model::ProximaType::String,
+        );
+        status.nullable = false;
+        let schema = ProximaSchema::from_columns("orders".to_string(), vec![status], vec![1]);
+        let s = store(None)
+            .await
+            .with_tenant("tenant-a")
+            .with_schema_source(SpillSchemaSource::new(move || Some(schema.clone())));
+        s.upsert_record(record("a", "open")).await?;
+        s.upsert_record(record("b", "open")).await?;
+        s.flush().await?.expect("rows flushed");
+        s.delete_record(&RecordKey::new("a".to_string())).await?;
+        s.flush().await?.expect("the tombstone flushes");
+        let oids: Vec<String> = s
+            .scan_records(usize::MAX)
+            .await?
+            .into_iter()
+            .map(|r| r.oid)
+            .collect();
+        assert_eq!(oids, ["b"]);
+        Ok(())
+    }
+
     /// Re-inserting a deleted oid must clear the tombstone, or the new row would
     /// stay invisible behind the suppression of the old one.
     #[tokio::test]
@@ -3667,22 +4695,25 @@ mod tests {
         Ok(())
     }
 
-    /// An invalid threshold reads as unset, never as "flush on every write".
+    /// Default ON; `0`/`off` disables; an invalid threshold keeps the default,
+    /// never "flush on every write".
     #[test]
-    fn invalid_threshold_reads_as_never_flush() {
-        for bad in ["0", "-1", "abc", ""] {
-            // SAFETY: single-threaded unit test mutating process env, cleared below.
+    fn the_threshold_defaults_on_and_never_reads_a_typo_as_flush_every_write() {
+        let default = crate::services::storage_format::DEFAULT_SPILL_MAX_RESIDENT as usize;
+        // SAFETY: single-threaded unit test mutating process env, cleared below.
+        unsafe { std::env::remove_var(SPILL_MAX_RESIDENT_ENV) };
+        assert_eq!(configured_flush_threshold(), Some(default), "unset");
+        for off in ["0", "off"] {
+            unsafe { std::env::set_var(SPILL_MAX_RESIDENT_ENV, off) };
+            assert_eq!(configured_flush_threshold(), None, "{off:?}");
+        }
+        for bad in ["-1", "abc", ""] {
             unsafe { std::env::set_var(SPILL_MAX_RESIDENT_ENV, bad) };
-            assert_eq!(
-                configured_flush_threshold(),
-                None,
-                "invalid threshold {bad:?}"
-            );
+            assert_eq!(configured_flush_threshold(), Some(default), "{bad:?}");
         }
         unsafe { std::env::set_var(SPILL_MAX_RESIDENT_ENV, "256") };
         assert_eq!(configured_flush_threshold(), Some(256));
         unsafe { std::env::remove_var(SPILL_MAX_RESIDENT_ENV) };
-        assert_eq!(configured_flush_threshold(), None);
     }
     /// Pins the NAME FORMAT: a lexicographic sort of segment names equals their
     /// numeric order.
@@ -4657,5 +5688,187 @@ mod tests {
              deletion-obligation marker + drain)"
         );
         Ok(())
+    }
+
+    /// A flush that fails after a write was applied must not fail the write:
+    /// its caller already made it durable and goes on to maintain indexes and
+    /// apply the rest of its batch. The backlog that leaves is bounded before
+    /// the NEXT write is made durable: at `BACKLOG_FACTOR` × the threshold,
+    /// `admit_writes` retries the overdue flush and refuses only while it still
+    /// fails — and admits again once one succeeds.
+    #[tokio::test]
+    async fn a_failed_flush_keeps_the_write_and_admission_bounds_the_backlog() -> Result<()> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        let failing = Arc::new(BarrierFs::failing().await);
+        let threshold = 2;
+        let store =
+            SpillRecordStorage::with_flush_threshold(failing.clone(), base, Some(threshold))
+                .with_tenant("tenant-a");
+        let cap = threshold * BACKLOG_FACTOR;
+        for i in 0..cap {
+            RecordStore::admit_writes(&store).await?;
+            RecordStore::upsert_record_at_lsn(
+                &store,
+                record(&format!("k{i}"), "open"),
+                i as u64 + 1,
+            )
+            .await
+            .expect("a failed flush must not fail the applied write");
+        }
+        RecordStore::delete_record_at_lsn(&store, &RecordKey::new("k0".to_string()), 100)
+            .await
+            .expect("nor an applied delete");
+        assert!(
+            store
+                .get_record(&RecordKey::new("k1".to_string()))
+                .await?
+                .is_some(),
+            "the writes stand, resident"
+        );
+        assert_eq!(store.backlog(), cap - 1);
+        RecordStore::upsert_record_at_lsn(&store, record("k0", "open"), 101).await?;
+        assert_eq!(store.backlog(), cap);
+
+        let err = RecordStore::admit_writes(&store)
+            .await
+            .expect_err("at the cap with flushes failing, refuse before anything is durable");
+        assert!(
+            err.downcast_ref::<SpillBacklogFull>().is_some(),
+            "a typed, retryable refusal: {err}"
+        );
+        assert_eq!(
+            RecordStore::min_unflushed_lsn(&store).await.ok(),
+            None,
+            "a failed segment write still keeps truncation closed"
+        );
+
+        // The object store recovers: admission retries the overdue flush (the
+        // retry backoff cleared, as if it had elapsed) and admits again.
+        failing
+            .fail_writes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        *store.flush_failed_at.lock() = None;
+        RecordStore::admit_writes(&store).await?;
+        assert_eq!(store.backlog(), 0, "the flush drained the backlog");
+        assert!(
+            store
+                .get_record(&RecordKey::new("k3".to_string()))
+                .await?
+                .is_some(),
+            "and the rows read back from the segment"
+        );
+        drop(dir);
+        Ok(())
+    }
+    /// TD-USUB-21: a probe for an oid no segment holds — every INSERT's
+    /// existence check — reads no segment. The segment files are removed from
+    /// under the store, so any read would fail: the absent oid must still
+    /// answer cleanly, and a flushed oid must still go to its segment.
+    #[tokio::test]
+    async fn a_probe_for_an_absent_oid_reads_no_segment() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let s = SpillRecordStorage::with_flush_threshold(fs, base.clone(), Some(4));
+        for i in 0..12 {
+            s.upsert_record(record(&format!("o{i:02}"), "open")).await?;
+        }
+        assert!(s.segment_count() >= 3, "precondition: several segments");
+        for path in s.segments.read().iter() {
+            std::fs::remove_file(path)?;
+        }
+
+        // Out of every segment's oid range, and inside it but never written.
+        for absent in ["zz", "o05x"] {
+            assert!(
+                s.get_record(&RecordKey::new(absent.to_string()))
+                    .await?
+                    .is_none()
+            );
+            assert!(!s.delete_record(&RecordKey::new(absent.to_string())).await?);
+        }
+        // A flushed oid passes its segment's filter and reads the segment.
+        assert!(
+            s.get_record(&RecordKey::new("o05".to_string()))
+                .await
+                .is_err(),
+            "a flushed oid must still be looked up in its segment"
+        );
+        Ok(())
+    }
+
+    /// TD-USUB-21: a segment this process did not write gets its filter from
+    /// the segment itself, tombstones included — a persisted tombstone in the
+    /// newest segment still shadows the live copy in an older one.
+    #[tokio::test]
+    async fn a_discovered_segment_filter_keeps_tombstones_authoritative() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        // A tenant, so the flush persists the tombstone (see `with_tenant`).
+        let first = SpillRecordStorage::with_flush_threshold(fs.clone(), base.clone(), None)
+            .with_tenant("tenant-a");
+        first.upsert_record(record("a", "open")).await?;
+        first.upsert_record(record("b", "open")).await?;
+        first.flush().await?;
+        first
+            .delete_record(&RecordKey::new("a".to_string()))
+            .await?;
+        first.upsert_record(record("c", "open")).await?;
+        first.flush().await?;
+        assert_eq!(first.segment_count(), 2);
+        drop(first);
+
+        let second =
+            SpillRecordStorage::with_flush_threshold(fs, base, None).with_tenant("tenant-a");
+        async fn get(s: &SpillRecordStorage, oid: &str) -> Result<Option<ProximaRecord>> {
+            Ok(s.get_record(&RecordKey::new(oid.to_string())).await?)
+        }
+        assert!(
+            get(&second, "a").await?.is_none(),
+            "the persisted tombstone shadows `a`"
+        );
+        assert!(
+            get(&second, "b")
+                .await?
+                .is_some_and(|r| status_is(&r, "open"))
+        );
+        assert!(get(&second, "c").await?.is_some());
+        assert!(get(&second, "zz").await?.is_none());
+        assert_eq!(second.key_filters.len(), 2, "one filter per segment");
+        Ok(())
+    }
+
+    /// TD-USUB-21: the filter a flush builds holds the tombstones it persists.
+    /// With only the OLDER segment's file removed, a tombstone in the newest
+    /// segment answers on its own; a filter that left it out would skip the
+    /// newest segment and fail reading the removed one.
+    #[tokio::test]
+    async fn a_flushed_tombstone_is_in_its_segment_filter() -> Result<()> {
+        let (fs, base) = fs_and_base().await;
+        let s = SpillRecordStorage::with_flush_threshold(fs, base, None).with_tenant("tenant-a");
+        s.upsert_record(record("a", "open")).await?;
+        s.flush().await?;
+        s.delete_record(&RecordKey::new("a".to_string())).await?;
+        s.upsert_record(record("b", "open")).await?;
+        s.flush().await?;
+        let oldest = s.segments.read()[0].clone();
+        std::fs::remove_file(&oldest)?;
+        assert!(
+            s.get_record(&RecordKey::new("a".to_string()))
+                .await?
+                .is_none(),
+            "the newest segment's tombstone is authoritative"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_key_filter_never_rules_out_an_oid_it_holds() {
+        let oids: Vec<String> = (0..5_000).map(|i| format!("t:row:{i:019}")).collect();
+        let filter = SegmentKeyFilter::from_oids(oids.iter().map(String::as_str));
+        assert!(oids.iter().all(|oid| filter.may_contain(oid)));
+        // Past the range: ruled out by the bounds alone.
+        assert!(!filter.may_contain("t:row:9999999999999999999"));
+        assert!(!filter.may_contain("a"));
+        // An empty segment holds nothing.
+        assert!(!SegmentKeyFilter::from_oids(std::iter::empty()).may_contain("x"));
     }
 }

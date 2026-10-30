@@ -70,6 +70,16 @@ impl MetadataCommitter {
         self.store.get(&self.metadata_path(version)).await
     }
 
+    /// The version a commit on top of `parent` lands at (`None` ⇒ `0`).
+    pub fn successor(parent: Option<u64>) -> Result<u64, StorageError> {
+        match parent {
+            Some(p) => p.checked_add(1).ok_or_else(|| {
+                StorageError::Serialization("metadata: version counter overflow".into())
+            }),
+            None => Ok(0),
+        }
+    }
+
     /// Atomically publish `metadata` as the successor of `parent` (`None` ⇒ the first
     /// commit, version `0`).
     ///
@@ -81,12 +91,7 @@ impl MetadataCommitter {
         parent: Option<u64>,
         metadata: Bytes,
     ) -> Result<CommitOutcome, StorageError> {
-        let target = match parent {
-            Some(p) => p.checked_add(1).ok_or_else(|| {
-                StorageError::Serialization("metadata: version counter overflow".into())
-            })?,
-            None => 0,
-        };
+        let target = Self::successor(parent)?;
         match self
             .store
             .put_if_absent(&self.metadata_path(target), metadata)

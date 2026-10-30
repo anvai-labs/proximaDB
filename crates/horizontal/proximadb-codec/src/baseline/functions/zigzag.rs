@@ -27,7 +27,7 @@ fn encode_zigzag_i32_wire(wire_values: &[i32], bits: u8) -> Result<Vec<u8>> {
     let zigzag_values: Vec<u32> = wire_values.iter().map(|&v| zigzag_encode_i32(v)).collect();
 
     // Bit-pack the zigzag encoded values
-    let packed = bitpack_u32(&zigzag_values, bits)?;
+    let packed = super::bitpack::bitpack_u32(&zigzag_values, bits)?;
     result.extend(packed);
 
     Ok(result)
@@ -46,7 +46,7 @@ fn encode_zigzag_i64_wire(wire_values: &[i64], bits: u8) -> Result<Vec<u8>> {
     let zigzag_values: Vec<u64> = wire_values.iter().map(|&v| zigzag_encode_i64(v)).collect();
 
     // Bit-pack the zigzag encoded values
-    let packed = bitpack_u64(&zigzag_values, bits)?;
+    let packed = super::bitpack::bitpack_u64(&zigzag_values, bits)?;
     result.extend(packed);
 
     Ok(result)
@@ -104,7 +104,7 @@ fn decode_zigzag_i32_wire(data: &[u8], count: usize) -> Result<Vec<i32>> {
     let bits = data[0];
 
     // Unpack zigzag values
-    let zigzag_values = bitunpack_u32(&data[1..], bits, count)?;
+    let zigzag_values = super::bitpack::unbitpack_u32(&data[1..], bits, count)?;
 
     // Decode zigzag
     let result = zigzag_values
@@ -125,7 +125,7 @@ fn decode_zigzag_i64_wire(data: &[u8], count: usize) -> Result<Vec<i64>> {
     let bits = data[0];
 
     // Unpack zigzag values
-    let zigzag_values = bitunpack_u64(&data[1..], bits, count)?;
+    let zigzag_values = super::bitpack::unbitpack_u64(&data[1..], bits, count)?;
 
     // Decode zigzag
     let result = zigzag_values
@@ -176,143 +176,19 @@ fn zigzag_decode_u64(n: u64) -> i64 {
     ((n >> 1) as i64) ^ (-((n & 1) as i64))
 }
 
-// ===== Bit-packing helpers for unsigned integers =====
-
-/// Bit-pack u32 values
-fn bitpack_u32(values: &[u32], bits: u8) -> Result<Vec<u8>> {
-    if bits > 32 {
-        return Err(anyhow::anyhow!("Bit width {} exceeds 32", bits));
-    }
-
-    if bits == 0 {
-        return Ok(Vec::new());
-    }
-
-    let total_bits = values.len() * bits as usize;
-    let total_bytes = total_bits.div_ceil(8);
-    let mut result = vec![0u8; total_bytes];
-
-    let mut bit_offset = 0;
-    for &value in values {
-        for bit_pos in 0..bits {
-            let bit = (value >> bit_pos) & 1;
-            let byte_idx = bit_offset / 8;
-            let bit_idx = bit_offset % 8;
-
-            if byte_idx < result.len() {
-                result[byte_idx] |= (bit as u8) << bit_idx;
-            }
-
-            bit_offset += 1;
-        }
-    }
-
-    Ok(result)
-}
-
-/// Bit-pack u64 values
-fn bitpack_u64(values: &[u64], bits: u8) -> Result<Vec<u8>> {
-    if bits > 64 {
-        return Err(anyhow::anyhow!("Bit width {} exceeds 64", bits));
-    }
-
-    if bits == 0 {
-        return Ok(Vec::new());
-    }
-
-    let total_bits = values.len() * bits as usize;
-    let total_bytes = total_bits.div_ceil(8);
-    let mut result = vec![0u8; total_bytes];
-
-    let mut bit_offset = 0;
-    for &value in values {
-        for bit_pos in 0..bits {
-            let bit = (value >> bit_pos) & 1;
-            let byte_idx = bit_offset / 8;
-            let bit_idx = bit_offset % 8;
-
-            if byte_idx < result.len() {
-                result[byte_idx] |= (bit as u8) << bit_idx;
-            }
-
-            bit_offset += 1;
-        }
-    }
-
-    Ok(result)
-}
-
-/// Unpack u32 values from bit-packed data
-fn bitunpack_u32(data: &[u8], bits: u8, count: usize) -> Result<Vec<u32>> {
-    if bits > 32 {
-        return Err(anyhow::anyhow!("Bit width {} exceeds 32", bits));
-    }
-
-    if bits == 0 {
-        return Ok(vec![0; count]);
-    }
-
-    let mut result = Vec::with_capacity(count);
-    let mut bit_offset = 0;
-
-    for _ in 0..count {
-        let mut value = 0u32;
-
-        for bit_pos in 0..bits {
-            let byte_idx = bit_offset / 8;
-            let bit_idx = bit_offset % 8;
-
-            if byte_idx < data.len() {
-                let bit = (data[byte_idx] >> bit_idx) & 1;
-                value |= (bit as u32) << bit_pos;
-            }
-
-            bit_offset += 1;
-        }
-
-        result.push(value);
-    }
-
-    Ok(result)
-}
-
-/// Unpack u64 values from bit-packed data
-fn bitunpack_u64(data: &[u8], bits: u8, count: usize) -> Result<Vec<u64>> {
-    if bits > 64 {
-        return Err(anyhow::anyhow!("Bit width {} exceeds 64", bits));
-    }
-
-    if bits == 0 {
-        return Ok(vec![0; count]);
-    }
-
-    let mut result = Vec::with_capacity(count);
-    let mut bit_offset = 0;
-
-    for _ in 0..count {
-        let mut value = 0u64;
-
-        for bit_pos in 0..bits {
-            let byte_idx = bit_offset / 8;
-            let bit_idx = bit_offset % 8;
-
-            if byte_idx < data.len() {
-                let bit = (data[byte_idx] >> bit_idx) & 1;
-                value |= (bit as u64) << bit_pos;
-            }
-
-            bit_offset += 1;
-        }
-
-        result.push(value);
-    }
-
-    Ok(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== Golden-byte pin (redundancy pass 3) ====================
+    // Cross-module witness: zigzag's wire is [bits:1][packed...]. [-1,1] @2
+    // bits: zz(-1)=1(01), zz(1)=2(10) -> stream 1,0,0,1 -> 2^0+2^3 = 0x09.
+    // Pins that zigzag's private bit-packing stays byte-identical to
+    // bitpack's (the copies are scheduled for consolidation).
+    #[test]
+    fn golden_zigzag_encode_i32_wire_bytes() {
+        assert_eq!(encode_i32(&[-1, 1], 2).unwrap(), vec![0x02, 0x09]);
+    }
 
     #[test]
     fn test_zigzag_encoding() {

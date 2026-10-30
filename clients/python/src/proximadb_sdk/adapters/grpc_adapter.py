@@ -449,15 +449,33 @@ class GrpcProtocolAdapter(BaseProtocolAdapter):
             return result
 
         if isinstance(result, dict):
+            record_errors = result.get("errors") or []
+            failed = result.get("failed_count", 0)
+            error_message = result.get("error_message")
+            if not error_message and (record_errors or failed):
+                # TD-SDKERR-1: per-record failures (RECORD_INSERT_FAILED) used
+                # to vanish here — the batch came back success=0 failed=1
+                # errors=[] with no exception. Surface them in error_message
+                # so BatchResult carries them.
+                parts = [
+                    str(e.get("error_message") or e.get("error_code") or e)
+                    for e in record_errors
+                ] or [f"{failed} record(s) failed with no per-record detail"]
+                error_message = "; ".join(parts)
             return VectorOperationResponse(
                 success=result.get("success", True),
                 operation=operation,
                 metrics=OperationMetrics(
-                    successful_count=result.get("successful_count", total_count),
-                    failed_count=result.get("failed_count", 0),
+                    # client_v1's gRPC path spells it "success_count" (TD-SDKERR-1
+                    # review: reading only "successful_count" reported
+                    # successful=total alongside failed=N).
+                    successful_count=result.get(
+                        "successful_count", result.get("success_count", total_count)
+                    ),
+                    failed_count=failed,
                     total_count=total_count,
                 ),
-                error_message=result.get("error_message"),
+                error_message=error_message,
             )
 
         # Handle wrapper objects
@@ -465,16 +483,29 @@ class GrpcProtocolAdapter(BaseProtocolAdapter):
         metrics = getattr(result, "metrics", None)
 
         if metrics:
+            record_errors = list(getattr(result, "errors", None) or [])
+            failed = getattr(metrics, "failed_count", 0)
+            error_message = getattr(result, "error_message", None)
+            if not error_message and (record_errors or failed):
+                parts = [
+                    str(
+                        getattr(e, "error_message", None)
+                        or getattr(e, "error_code", None)
+                        or e
+                    )
+                    for e in record_errors
+                ] or [f"{failed} record(s) failed with no per-record detail"]
+                error_message = "; ".join(parts)
             return VectorOperationResponse(
                 success=success,
                 operation=operation,
                 metrics=OperationMetrics(
                     successful_count=getattr(metrics, "successful_count", total_count),
-                    failed_count=getattr(metrics, "failed_count", 0),
+                    failed_count=failed,
                     duration_ms=getattr(metrics, "duration_ms", 0),
                     total_count=total_count,
                 ),
-                error_message=getattr(result, "error_message", None),
+                error_message=error_message,
             )
 
         return VectorOperationResponse(

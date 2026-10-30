@@ -23,69 +23,41 @@ use anyhow::Result;
 
 use super::bitpack;
 use super::helpers;
+use super::helpers::WirePrim;
 
 // ===== Core wire format encoding functions =====
 
-/// Core encoding logic for i32 base + i64 deltas (used by f32 and i32)
+/// Single delta encode core (redundancy pass 4: the i32-base and i64-base
+/// twins differed only in the base slot width — deltas were already i64 on
+/// both sides; golden tests pin the layout).
 ///
-/// Uses i64 deltas to prevent overflow when computing differences
-fn encode_delta_i32_base_i64_deltas(wire_values: &[i32], base: i32) -> Result<Vec<u8>> {
+/// Uses i64 deltas to prevent overflow when computing differences (the i32
+/// path widens via `WirePrim::widen`; for i64 the widen is the identity and
+/// the subtraction wraps exactly as the old native core did).
+fn encode_delta_wire<W: WirePrim>(wire_values: &[W], base: W) -> Result<Vec<u8>> {
     if wire_values.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut result = Vec::new();
 
-    // Store base value (4 bytes for i32)
-    result.extend_from_slice(&base.to_le_bytes());
+    // Store base value (WIRE_BYTES for the width)
+    base.write_le(&mut result);
 
     // Compute deltas in i64 (NO OVERFLOW!)
     let deltas: Vec<i64> = wire_values
         .iter()
-        .map(|&v| (v as i64) - (base as i64))
+        .map(|&v| v.widen().wrapping_sub(base.widen()))
         .collect();
 
     // Find optimal bit width for deltas
-    let max_delta_abs = deltas.iter().map(|&d| d.unsigned_abs()).max().unwrap_or(0);
+    let max_delta_bits = deltas.iter().map(|&d| d.abs_bit_len()).max().unwrap_or(0);
 
-    let bits = if max_delta_abs == 0 {
+    let bits = if max_delta_bits == 0 {
         1
     } else {
         // Add 1 bit for sign, but cap at 64
-        ((64 - max_delta_abs.leading_zeros() as u8) + 1).min(64)
-    };
-
-    result.push(bits);
-
-    // Bit-pack the deltas
-    let packed = bitpack::bitpack_i64(&deltas, bits)?;
-    result.extend(packed);
-
-    Ok(result)
-}
-
-/// Core encoding logic for i64 wire format
-fn encode_delta_i64_wire(wire_values: &[i64], base: i64) -> Result<Vec<u8>> {
-    if wire_values.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut result = Vec::new();
-
-    // Store base value (8 bytes)
-    result.extend_from_slice(&base.to_le_bytes());
-
-    // Compute deltas
-    let deltas: Vec<i64> = wire_values.iter().map(|&v| v.wrapping_sub(base)).collect();
-
-    // Find optimal bit width
-    let max_delta_abs = deltas.iter().map(|&d| d.unsigned_abs()).max().unwrap_or(0);
-
-    let bits = if max_delta_abs == 0 {
-        1
-    } else {
-        // Add 1 bit for sign, but cap at 64
-        ((64 - max_delta_abs.leading_zeros() as u8) + 1).min(64)
+        (max_delta_bits + 1).min(64)
     };
 
     result.push(bits);
@@ -120,94 +92,103 @@ fn encode_delta_i64_wire(wire_values: &[i64], base: i64) -> Result<Vec<u8>> {
 /// Raw encoded bytes (NO scheme marker, NO count header)
 pub fn encode_f32(values: &[f32], base: i64) -> Result<Vec<u8>> {
     helpers::encode_generic(values, |wire_values| {
-        encode_delta_i32_base_i64_deltas(wire_values, base as i32)
+        encode_delta_wire(wire_values, base as i32)
     })
 }
 
 /// Encode i64 values using delta encoding (raw, no headers)
 pub fn encode_i64(values: &[i64], base: i64) -> Result<Vec<u8>> {
-    helpers::encode_generic(values, |wire_values| {
-        encode_delta_i64_wire(wire_values, base)
-    })
+    helpers::encode_generic(values, |wire_values| encode_delta_wire(wire_values, base))
 }
 
 /// Encode i32 values using delta encoding (raw, no headers)
 pub fn encode_i32(values: &[i32], base: i64) -> Result<Vec<u8>> {
     helpers::encode_generic(values, |wire_values| {
-        encode_delta_i32_base_i64_deltas(wire_values, base as i32)
+        encode_delta_wire(wire_values, base as i32)
     })
 }
 
 // ===== Core wire format decoding functions =====
 
-/// Core decoding logic for i32 base + i64 deltas
-fn decode_delta_i32_base_i64_deltas(data: &[u8], count: usize) -> Result<Vec<i32>> {
+/// Single delta decode core; header is [base:WIRE_BYTES][bits:1], the packed
+/// payload is always i64 deltas (narrowed back to W on reconstruction).
+fn decode_delta_wire<W: WirePrim>(data: &[u8], count: usize) -> Result<Vec<W>> {
     if count == 0 {
         return Ok(Vec::new());
     }
 
-    if data.len() < 5 {
+    if data.len() < W::WIRE_BYTES + 1 {
         return Err(anyhow::anyhow!("Delta decode: insufficient data"));
     }
 
-    // Read base (4 bytes)
-    let base = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    // Read base
+    let base = W::read_le(data)?;
 
     // Read bits (1 byte)
-    let bits = data[4];
+    let bits = data[W::WIRE_BYTES];
 
     // Unpack deltas (i64)
-    let deltas = bitpack::unbitpack_i64(&data[5..], bits, count)?;
+    let deltas = bitpack::unbitpack_i64(&data[W::WIRE_BYTES + 1..], bits, count)?;
 
-    // Reconstruct values using shared helper
-    Ok(helpers::reconstruct_i32_from_i64(&deltas, base))
-}
-
-/// Core decoding logic for i64 wire format
-fn decode_delta_i64_wire(data: &[u8], count: usize) -> Result<Vec<i64>> {
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-
-    if data.len() < 9 {
-        return Err(anyhow::anyhow!("Delta decode: insufficient data"));
-    }
-
-    // Read base (8 bytes)
-    let base = i64::from_le_bytes([
-        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-    ]);
-
-    // Read bits (1 byte)
-    let bits = data[8];
-
-    // Unpack deltas
-    let deltas = bitpack::unbitpack_i64(&data[9..], bits, count)?;
-
-    // Reconstruct values using shared helper
-    Ok(helpers::reconstruct_i64_from_i64(&deltas, base))
+    // Reconstruct values: widen the base, add each delta in i64, narrow back
+    // (truncating for i32 exactly like the old reconstruct helper).
+    Ok(deltas
+        .into_iter()
+        .map(|d| W::from_wide(base.widen().wrapping_add(d)))
+        .collect())
 }
 
 // ===== Public API (thin wrappers using generic helpers) =====
 
 /// Decode f32 values from delta-encoded data
 pub fn decode_f32(data: &[u8], count: usize) -> Result<Vec<f32>> {
-    helpers::decode_generic::<f32>(data, count, decode_delta_i32_base_i64_deltas)
+    helpers::decode_generic::<f32>(data, count, decode_delta_wire::<i32>)
 }
 
 /// Decode i64 values from delta-encoded data
 pub fn decode_i64(data: &[u8], count: usize) -> Result<Vec<i64>> {
-    helpers::decode_generic::<i64>(data, count, decode_delta_i64_wire)
+    helpers::decode_generic::<i64>(data, count, decode_delta_wire::<i64>)
 }
 
 /// Decode i32 values from delta-encoded data
 pub fn decode_i32(data: &[u8], count: usize) -> Result<Vec<i32>> {
-    helpers::decode_generic::<i32>(data, count, decode_delta_i32_base_i64_deltas)
+    helpers::decode_generic::<i32>(data, count, decode_delta_wire::<i32>)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== Golden-byte pins (redundancy pass 4) ====================
+    // Wire layout: [base:WIRE_BYTES LE][bits:1 byte][bitpacked i64 deltas].
+    // Both widths store i64 deltas; only the base slot width differs. These
+    // pin the CURRENT bytes of both widths BEFORE the WirePrim consolidation;
+    // any change is a wire-format change.
+
+    /// i32 path (4-byte base): [10,13] base 10 -> i64 deltas [0,3], 2 bits +
+    /// sign = 3 bits; packed v1=011 -> stream bits 3,4 => 0x18.
+    #[test]
+    fn golden_delta_i32_base_i64_deltas_wire_bytes() {
+        let encoded = encode_i32(&[10, 13], 10).unwrap();
+        assert_eq!(encoded, vec![10, 0, 0, 0, 3, 0x18]);
+        assert_eq!(decode_i32(&encoded, 2).unwrap(), vec![10, 13]);
+    }
+
+    /// i64 path (8-byte base): [5,8] base 5 -> deltas [0,3], 3 bits, 0x18.
+    #[test]
+    fn golden_delta_i64_wire_bytes() {
+        let encoded = encode_i64(&[5, 8], 5).unwrap();
+        assert_eq!(encoded, vec![5, 0, 0, 0, 0, 0, 0, 0, 3, 0x18]);
+        assert_eq!(decode_i64(&encoded, 2).unwrap(), vec![5, 8]);
+    }
+
+    /// Constant data pins the bits==1 special case.
+    #[test]
+    fn golden_delta_i64_constant_one_bit() {
+        let encoded = encode_i64(&[9, 9], 9).unwrap();
+        assert_eq!(encoded, vec![9, 0, 0, 0, 0, 0, 0, 0, 1, 0x00]);
+        assert_eq!(decode_i64(&encoded, 2).unwrap(), vec![9, 9]);
+    }
 
     #[test]
     fn test_delta_f32_roundtrip() {

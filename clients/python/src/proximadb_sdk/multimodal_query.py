@@ -1389,11 +1389,14 @@ class MultiModalQueryExecutor:
         results with score and metadata.
         """
         try:
+            # TD-SDKDOC-1: this passed collection=/filter=, which search()
+            # does not declare — every vector leg raised TypeError and the
+            # dispatch loop reduced it to a warning (empty results).
             results = self._client.search(
-                collection=component["collection"],
+                component["collection"],
                 vector=component["query_vector"],
                 top_k=component.get("top_k", 10),
-                filter=component.get("filter"),
+                metadata_filter=component.get("filter"),
             )
             return [
                 {

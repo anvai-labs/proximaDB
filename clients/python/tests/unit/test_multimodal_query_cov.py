@@ -422,7 +422,23 @@ class _FakeClient:
     def __init__(self):
         self.graph = self
 
-    def search(self, collection, vector, top_k, filter=None):
+    # ProximaDBClient.search's REAL signature (TD-SDKDOC-1): the fake used to
+    # copy the executor's call shape (collection=/filter=), so the vector leg
+    # raised TypeError against every real client while this fake accepted it.
+    def search(
+        self,
+        collection_id,
+        vector,
+        top_k=10,
+        metadata_filter=None,
+        include_metadata=True,
+        include_vectors=False,
+        **kwargs,
+    ):
+        self.search_calls = getattr(self, "search_calls", [])
+        self.search_calls.append(
+            {"collection_id": collection_id, "metadata_filter": metadata_filter}
+        )
         return [_Hit("v1", 0.9, {"k": 1}), _Hit("v2", 0.5)]
 
     def traverse(self, graph_id, start_nodes, edge_types, max_depth, limit):
@@ -453,6 +469,23 @@ def test_executor_execute_all_components_rrf():
     assert isinstance(res, MultiModalQueryResult)
     assert res.metadata["component_count"] == 5
     assert res.total_count >= 1
+    # The other legs return rows, so total_count alone cannot see a dead
+    # vector leg — assert it ran.
+    assert not any("vector" in k for k in res.component_errors), res.component_errors
+
+
+def test_executor_vector_leg_calls_search_with_the_real_signature():
+    client = _FakeClient()
+    q = (
+        MultiModalQueryBuilder()
+        .vector("c", [0.1], top_k=2, filter={"k": 1})
+        .fuse(FusionStrategy.RRF)
+        .build()
+    )
+    res = MultiModalQueryExecutor(client).execute(q)
+    assert not res.component_errors, res.component_errors
+    assert {r["id"] for r in res.records} == {"v1", "v2"}
+    assert client.search_calls == [{"collection_id": "c", "metadata_filter": {"k": 1}}]
 
 
 def test_executor_with_joins_and_custom_scorer_and_decay():

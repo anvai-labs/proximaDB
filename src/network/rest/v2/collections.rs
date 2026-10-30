@@ -33,6 +33,7 @@
 use axum::{
     Json,
     extract::{Extension, Path, Query, State},
+    response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
@@ -47,7 +48,9 @@ use crate::errors::{ApiError, ApiResult};
 use crate::index::axis::management::AnnIndexAdvisor;
 use crate::network::middleware::tenant::TenantContext;
 use crate::network::rest::canonical::handlers::AppState;
-use crate::proto::proximadb_v1::{CollectionConfig, CollectionOperation, CollectionRequest};
+use crate::proto::proximadb_v1::{
+    CollectionConfig, CollectionOperation, CollectionRequest, CollectionResponse,
+};
 
 fn collection_storage_engine_label(storage_engine: Option<i32>) -> &'static str {
     match storage_engine {
@@ -80,6 +83,68 @@ fn record_count_for_wire(
     stats: Option<&crate::proto::proximadb_v1::CollectionStats>,
 ) -> Option<u64> {
     stats.map(|s| non_negative_stat(s.vector_count))
+}
+
+/// Map a canonical-collection operation error onto its REST v2 wire shape.
+/// "not found" anywhere in the error text reads as 404 CollectionNotFound;
+/// anything else is a 500 carrying the operation context (`op` — "get",
+/// "delete", …). The text match is the current canonical-layer contract
+/// (errors surface as anyhow text, not typed variants); consolidating it in
+/// this one choke point means the eventual typed-error fix is a single-site
+/// change instead of an edit per handler.
+fn collection_op_error(op: &str, collection_id: &str, e: impl std::fmt::Display) -> ApiError {
+    if e.to_string().contains("not found") {
+        ApiError::CollectionNotFound(collection_id.to_string())
+    } else {
+        ApiError::Internal(format!("Failed to {op} collection: {e}"))
+    }
+}
+
+/// Map a collection-create error: a name collision reads as 409
+/// AlreadyExists, anything else a 500 with context.
+fn collection_create_error(collection_name: &str, e: impl std::fmt::Display) -> ApiError {
+    if e.to_string().contains("already exists") {
+        ApiError::AlreadyExists(format!("Collection '{collection_name}' already exists"))
+    } else {
+        ApiError::Internal(format!("Failed to create collection: {e}"))
+    }
+}
+
+/// Build a v1 `CollectionRequest` for `operation` on `collection_id` with
+/// every other field empty; sites that carry a config, query params or
+/// options set them via struct-update.
+fn collection_request(
+    operation: CollectionOperation,
+    collection_id: Option<String>,
+) -> CollectionRequest {
+    CollectionRequest {
+        operation: operation as i32,
+        collection_id,
+        collection_config: None,
+        query_params: Default::default(),
+        options: Default::default(),
+        migration_config: Default::default(),
+    }
+}
+
+/// Tenant-scoped collection GET through the unified handlers; a not-found
+/// error reads as 404 via [`collection_op_error`].
+async fn get_collection_for_tenant(
+    state: &AppState,
+    collection_id: &str,
+    tenant: &TenantContext,
+) -> ApiResult<CollectionResponse> {
+    state
+        .api_handlers
+        .handle_collection_operation_for_tenant(
+            collection_request(
+                CollectionOperation::CollectionGet,
+                Some(collection_id.to_string()),
+            ),
+            Some(&tenant.tenant_id),
+        )
+        .await
+        .map_err(|e| collection_op_error("get", collection_id, e))
 }
 
 fn collection_create_failure_error(collection_name: &str, error_code: Option<&str>) -> ApiError {
@@ -135,7 +200,10 @@ fn collection_embedding_precision_label(precision: Option<i32>) -> Option<String
 ///     "enable_proxima_record": true
 /// }
 /// ```
+/// Unknown fields are rejected (TD-RESTGET-1): a misspelt setting used to be
+/// dropped, and the collection silently got the default instead.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateCollectionV2Request {
     /// Collection name (required)
     #[schema(min_length = 1)]
@@ -148,6 +216,8 @@ pub struct CreateCollectionV2Request {
     /// Options: "auto", "sst", "helix", "swift", "nova", "raptor", "tst"
     /// Default: "auto" (system selects optimal engine)
     /// ("viper" is no longer accepted — deprecated by ADR-093)
+    /// `storage_engine` is accepted as an alias.
+    #[serde(alias = "storage_engine")]
     pub engine: Option<String>,
     /// Schema definition with column types
     pub schema: Option<SchemaDefinition>,
@@ -164,6 +234,8 @@ pub struct CreateCollectionV2Request {
     ///
     /// Options: "cosine", "euclidean", "dot_product"
     /// Default: "cosine"
+    /// `metric` is accepted as an alias.
+    #[serde(alias = "metric")]
     pub distance_metric: Option<String>,
     /// Initial capacity hint for pre-allocation
     pub initial_capacity: Option<u64>,
@@ -193,11 +265,29 @@ pub struct CreateCollectionV2Request {
     /// override here; query-time precedence is per-query `search_mode` > this
     /// policy > cost-model auto-default.
     pub index_policy: Option<IndexPolicyInput>,
+    /// Free-text description, persisted on the collection config.
+    pub description: Option<String>,
+    /// Legacy field the released Rust and TypeScript SDKs send on every create
+    /// (default "hnsw"). Index selection is cost-derived, so "hnsw" is accepted
+    /// and has no effect; any other value is rejected — declare an index with
+    /// `index_configs` or force a route with `index_policy.mode` instead.
+    #[schema(deprecated)]
+    pub index_type: Option<String>,
+    /// Desired storage class (TD-TIER-1 SC1).
+    ///
+    /// Options: "balanced" (default) | "economy" | "performance". Omitted ⇒
+    /// balanced (pre-SC1 collections are unchanged). "performance" is admitted
+    /// only for an object-store-backed SST/PAX placement and reports
+    /// `not_active` until its residency dependency ships; economy likewise
+    /// persists intent only. Read `storage_class_status` on the GET response
+    /// for the observed truth — the class is never a claim.
+    pub storage_class: Option<String>,
 }
 
 /// REST input for the per-collection index routing policy (mirrors proto
 /// `IndexPolicy`; ADR-028).
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IndexPolicyInput {
     /// Routing mode: "auto" (default) | "exact" | "ivf" | "hnsw" | "helix".
     /// "auto"/omitted ⇒ cost-derived. "exact" ⇒ always brute-force (no index).
@@ -279,6 +369,7 @@ fn build_index_policy(
 
 /// REST input for a single index config (mirrors proto `IndexConfig`).
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IndexConfigInput {
     /// Optional index name (defaults to `index_<n>`).
     pub index_name: Option<String>,
@@ -298,6 +389,7 @@ pub struct IndexConfigInput {
 /// REST input for quantization config (mirrors proto `QuantizationConfig`;
 /// gRPC-v2 parity with `V2QuantizationConfig`).
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct QuantizationConfigInput {
     /// Enable quantization for this collection.
     pub enabled: Option<bool>,
@@ -307,6 +399,7 @@ pub struct QuantizationConfigInput {
 
 /// REST input for HNSW index params (mirrors proto `HnswConfig`).
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HnswConfigInput {
     pub m: Option<u32>,
     pub ef_construction: Option<u32>,
@@ -315,6 +408,7 @@ pub struct HnswConfigInput {
 
 /// REST input for IVF index params (mirrors proto `IvfConfig`).
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IvfConfigInput {
     pub n_lists: Option<u32>,
     pub n_probe: Option<u32>,
@@ -345,6 +439,7 @@ pub type ColumnDefinition = RestColumnDefinition;
 
 /// Column definition for schema
 #[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RestColumnDefinition {
     /// Column name
     pub name: String,
@@ -569,7 +664,24 @@ pub struct CreateCollectionV2Response {
 pub async fn create_collection_v2(
     Extension(tenant): Extension<TenantContext>,
     State(state): State<AppState>,
-    Json(mut request): Json<CreateCollectionV2Request>,
+    payload: Result<Json<CreateCollectionV2Request>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    // TD-RESTGET-1: a body the request type rejects — an unknown field (the
+    // request denies them, so `"hnsw"` for `"hnsw_config"` no longer creates an
+    // index without parameters), a wrong type, a missing field — is the
+    // documented 400 in the API's error envelope, not axum's plain-text 422.
+    match super::json_body(payload) {
+        Ok(request) => create_collection_v2_checked(tenant, state, request)
+            .await
+            .into_response(),
+        Err(rejected) => rejected,
+    }
+}
+
+async fn create_collection_v2_checked(
+    tenant: TenantContext,
+    state: AppState,
+    mut request: CreateCollectionV2Request,
 ) -> ApiResult<Json<CreateCollectionV2Response>> {
     info!(
         "V2 API: Creating collection '{}' with dimension {}",
@@ -702,6 +814,24 @@ pub async fn create_collection_v2(
         })
         .map(|p| p as i32);
 
+    // TD-RESTGET-1: `index_type` is what the released Rust and TypeScript SDKs
+    // send on EVERY create, defaulting to "hnsw", and the server has always
+    // ignored it — index selection is cost-derived. "hnsw" therefore stays
+    // accepted with no effect: turning it into `index_configs` would opt every
+    // such collection into a flush-time AXIS build and a different search
+    // route, an unmeasured serving change (co-design mandate). Any other value
+    // was a request the server silently did not honour, so it is now a 400
+    // naming the fields that do express it.
+    if let Some(index_type) = request.index_type.take()
+        && !index_type.trim().eq_ignore_ascii_case("hnsw")
+    {
+        return Err(ApiError::InvalidArgument(format!(
+            "index_type '{index_type}' is not honoured: index selection is cost-derived. \
+             Declare an index with index_configs, or force a route with \
+             index_policy.mode (e.g. \"exact\" for brute force)"
+        )));
+    }
+
     // v1-parity: convert REST index_configs → proto IndexConfig so an explicit
     // IVF/HNSW index is persisted and read back by `active_algorithm_for`.
     let index_configs = match request.index_configs.take() {
@@ -750,17 +880,41 @@ pub async fn create_collection_v2(
     };
 
     // gRPC-v2 parity: map the optional quantization config onto the proto.
-    let quantization = request.quantization.take().map(|q| {
-        use crate::proto::proximadb_v1::{QuantizationConfig, quantization_config::Strategy};
-        QuantizationConfig {
-            enabled: q.enabled,
-            strategy: q.strategy.map(|s| {
-                Strategy::from_str_name(&s.to_ascii_uppercase()).unwrap_or(Strategy::SmartDefaults)
-                    as i32
-            }),
-            ..Default::default()
+    // TD-RESTGET-1: an unknown strategy is a 400 naming the valid ones; it used
+    // to be silently replaced by SMART_DEFAULTS.
+    let quantization = match request.quantization.take() {
+        None => None,
+        Some(q) => {
+            use crate::proto::proximadb_v1::{QuantizationConfig, quantization_config::Strategy};
+            let strategy = match q.strategy {
+                None => None,
+                Some(s) => Some(Strategy::from_str_name(&s.to_ascii_uppercase()).ok_or_else(
+                    || {
+                        ApiError::InvalidArgument(format!(
+                            "quantization.strategy '{s}' is not one of smart_defaults, \
+                             custom_levels, minimal, aggressive"
+                        ))
+                    },
+                )? as i32),
+            };
+            Some(QuantizationConfig {
+                enabled: q.enabled,
+                strategy,
+                ..Default::default()
+            })
         }
-    });
+    };
+
+    // TD-TIER-1 SC1: parse + validate the desired storage class (fail-closed
+    // on unknown strings — the TD-RESTGET-1 failure mode is a silent default).
+    let storage_class = match request.storage_class.take() {
+        None => None,
+        Some(raw) => {
+            let class = crate::services::collection::storage_class::parse_storage_class(&raw)
+                .map_err(|e| ApiError::InvalidArgument(e.to_string()))?;
+            (class != crate::proto::proximadb_v1::StorageClass::Unspecified).then_some(class as i32)
+        }
+    };
 
     // ADR-028: validate + map the optional index routing policy. Fail-closed on
     // nonsensical combinations (the mode×rehydrate/nprobe validity matrix) so a
@@ -781,6 +935,8 @@ pub async fn create_collection_v2(
         index_policy,
         tags: request.tags.take().unwrap_or_default(),
         enable_proxima_record: Some(proxima_record_enabled),
+        description: request.description.take(),
+        storage_class,
         ..Default::default()
     };
 
@@ -796,19 +952,18 @@ pub async fn create_collection_v2(
         );
     }
 
-    let collection_request = CollectionRequest {
-        operation: CollectionOperation::CollectionCreate as i32,
-        collection_id: Some(request.name.clone()),
+    let create_request = CollectionRequest {
         collection_config: Some(collection_config),
-        query_params: Default::default(),
-        options: Default::default(),
-        migration_config: Default::default(),
+        ..collection_request(
+            CollectionOperation::CollectionCreate,
+            Some(request.name.clone()),
+        )
     };
 
     // Create collection via unified handlers
     match state
         .api_handlers
-        .handle_collection_operation_for_tenant(collection_request, Some(&tenant.tenant_id))
+        .handle_collection_operation_for_tenant(create_request, Some(&tenant.tenant_id))
         .await
     {
         Ok(resp) if !resp.success => {
@@ -853,19 +1008,7 @@ pub async fn create_collection_v2(
 
             Ok(Json(response))
         }
-        Err(e) => {
-            if e.to_string().contains("already exists") {
-                Err(ApiError::AlreadyExists(format!(
-                    "Collection '{}' already exists",
-                    request.name
-                )))
-            } else {
-                Err(ApiError::Internal(format!(
-                    "Failed to create collection: {}",
-                    e
-                )))
-            }
-        }
+        Err(e) => Err(collection_create_error(&request.name, e)),
     }
 }
 
@@ -890,6 +1033,13 @@ pub struct CollectionV2Response {
     /// (e.g. "EMBEDDING_PRECISION_FP16"). `None` when the collection didn't
     /// set a non-default (Unspecified/Fp32) precision.
     pub canonical_embedding_precision: Option<String>,
+    /// Resolved desired storage class (TD-TIER-1 SC1):
+    /// "economy" | "balanced" (default) | "performance".
+    pub storage_class: String,
+    /// Observed storage-class status — the truth about what SC1 delivers.
+    /// "balanced" ⇒ active; economy/performance persist intent and report
+    /// `not_active` with a reason naming the missing dependency (SC3/SC4).
+    pub storage_class_status: StorageClassStatusOutput,
     /// Schema definition (if defined)
     pub schema: Option<SchemaDefinition>,
     /// Collection statistics
@@ -907,6 +1057,47 @@ pub struct CollectionV2Response {
     pub created_at: String,
     /// Last update timestamp
     pub updated_at: Option<String>,
+}
+
+/// REST output for the observed storage-class status (TD-TIER-1 SC1; mirrors
+/// proto `StorageClassStatus` — a read-side projection, never an input).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StorageClassStatusOutput {
+    /// "active" | "not_active" ("unspecified" never leaves the server).
+    pub state: String,
+    /// Human-readable reason when `state` is not active (names the missing
+    /// dependency); empty when active.
+    pub reason: String,
+    /// Monotonic generation of the desired policy: 0 = never set (pre-SC1
+    /// records), 1 = set at create; a policy-change surface will bump it.
+    pub policy_generation: u64,
+    /// Reserved bytes under the collection's residency admission (SC3). 0 until then.
+    pub reserved_bytes: u64,
+    /// Bytes resident in the serving cache (SC4). 0 until then.
+    pub resident_bytes: u64,
+    /// Bytes covered by the READY coverage set (SC4). 0 until then.
+    pub covered_bytes: u64,
+}
+
+impl StorageClassStatusOutput {
+    fn from_proto(status: crate::proto::proximadb_v1::StorageClassStatus) -> Self {
+        use crate::proto::proximadb_v1::storage_class_status::State;
+        let state = State::try_from(status.state)
+            .map(|s| match s {
+                State::Active => "active",
+                State::NotActive => "not_active",
+                State::Unspecified => "unspecified",
+            })
+            .unwrap_or("unspecified");
+        Self {
+            state: state.to_string(),
+            reason: status.reason,
+            policy_generation: status.policy_generation,
+            reserved_bytes: status.reserved_bytes,
+            resident_bytes: status.resident_bytes,
+            covered_bytes: status.covered_bytes,
+        }
+    }
 }
 
 /// REST output for a single index config (mirrors gRPC `V2IndexSpec`).
@@ -1009,14 +1200,10 @@ pub async fn get_collection_v2(
     }
 
     // Get collection via unified handlers
-    let request = CollectionRequest {
-        operation: CollectionOperation::CollectionGet as i32,
-        collection_id: Some(collection_id.clone()),
-        collection_config: None,
-        query_params: Default::default(),
-        options: Default::default(),
-        migration_config: Default::default(),
-    };
+    let request = collection_request(
+        CollectionOperation::CollectionGet,
+        Some(collection_id.clone()),
+    );
 
     match state
         .api_handlers
@@ -1153,6 +1340,25 @@ pub async fn get_collection_v2(
                 canonical_embedding_precision: collection_embedding_precision_label(
                     config.canonical_embedding_precision,
                 ),
+                // TD-TIER-1 SC1: echo the resolved desired class and the
+                // observed status (the handler's projection is authoritative;
+                // fall back to computing it from the config for callers whose
+                // Collection predates the field).
+                storage_class: crate::services::collection::storage_class::storage_class_label(
+                    crate::services::collection::storage_class::storage_class_or_balanced(&config),
+                )
+                .to_string(),
+                storage_class_status: collection
+                    .storage_class_status
+                    .clone()
+                    .map(StorageClassStatusOutput::from_proto)
+                    .unwrap_or_else(|| {
+                        StorageClassStatusOutput::from_proto(
+                            crate::services::collection::storage_class::storage_class_status(
+                                &config,
+                            ),
+                        )
+                    }),
                 schema,
                 stats: CollectionStatsV2 {
                     record_count,
@@ -1170,16 +1376,7 @@ pub async fn get_collection_v2(
 
             Ok(Json(response))
         }
-        Err(e) => {
-            if e.to_string().contains("not found") {
-                Err(ApiError::CollectionNotFound(collection_id))
-            } else {
-                Err(ApiError::Internal(format!(
-                    "Failed to get collection: {}",
-                    e
-                )))
-            }
-        }
+        Err(e) => Err(collection_op_error("get", &collection_id, e)),
     }
 }
 
@@ -1286,12 +1483,9 @@ pub async fn list_collections_v2(
     options.insert("include_stats".to_string(), include_stats);
 
     let request = CollectionRequest {
-        operation: CollectionOperation::CollectionList as i32,
-        collection_id: None,
-        collection_config: None,
         query_params,
         options,
-        migration_config: Default::default(),
+        ..collection_request(CollectionOperation::CollectionList, None)
     };
 
     match state
@@ -1387,26 +1581,16 @@ pub async fn delete_collection_v2(
         ));
     }
 
-    let request = CollectionRequest {
-        operation: CollectionOperation::CollectionDelete as i32,
-        collection_id: Some(collection_id.clone()),
-        collection_config: None,
-        query_params: Default::default(),
-        options: Default::default(),
-        migration_config: Default::default(),
-    };
+    let request = collection_request(
+        CollectionOperation::CollectionDelete,
+        Some(collection_id.clone()),
+    );
 
     let response = state
         .api_handlers
         .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
         .await
-        .map_err(|e| {
-            if e.to_string().contains("not found") {
-                ApiError::CollectionNotFound(collection_id.clone())
-            } else {
-                ApiError::Internal(format!("Failed to delete collection: {}", e))
-            }
-        })?;
+        .map_err(|e| collection_op_error("delete", &collection_id, e))?;
     // Nothing deleted: the collection is not one this tenant can resolve
     // (missing, or another tenant's) — answered identically.
     if !response.success {
@@ -2299,26 +2483,7 @@ pub async fn get_collection_statistics_v2(
         ));
     }
 
-    let request = CollectionRequest {
-        operation: CollectionOperation::CollectionGet as i32,
-        collection_id: Some(collection_id.clone()),
-        collection_config: None,
-        query_params: Default::default(),
-        options: Default::default(),
-        migration_config: Default::default(),
-    };
-
-    let resp = state
-        .api_handlers
-        .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("not found") {
-                ApiError::CollectionNotFound(collection_id.clone())
-            } else {
-                ApiError::Internal(format!("Failed to get collection: {}", e))
-            }
-        })?;
+    let resp = get_collection_for_tenant(&state, &collection_id, &tenant).await?;
 
     // A collection this tenant cannot resolve reads exactly as a missing one;
     // statistics are only ever read or written under its canonical id.
@@ -2407,26 +2572,7 @@ pub async fn get_collection_route_health_v2(
         ));
     }
 
-    let request = CollectionRequest {
-        operation: CollectionOperation::CollectionGet as i32,
-        collection_id: Some(collection_id.clone()),
-        collection_config: None,
-        query_params: Default::default(),
-        options: Default::default(),
-        migration_config: Default::default(),
-    };
-
-    let resp = state
-        .api_handlers
-        .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("not found") {
-                ApiError::CollectionNotFound(collection_id.clone())
-            } else {
-                ApiError::Internal(format!("Failed to get collection: {}", e))
-            }
-        })?;
+    let resp = get_collection_for_tenant(&state, &collection_id, &tenant).await?;
 
     let collection = resp
         .collection
@@ -2775,26 +2921,7 @@ pub async fn post_collection_recall_tune_v2(
 
     require_recall_admin(user_context.as_ref().map(|e| &e.0), "recall-tune")?;
 
-    let request = CollectionRequest {
-        operation: CollectionOperation::CollectionGet as i32,
-        collection_id: Some(collection_id.clone()),
-        collection_config: None,
-        query_params: Default::default(),
-        options: Default::default(),
-        migration_config: Default::default(),
-    };
-
-    let resp = state
-        .api_handlers
-        .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("not found") {
-                ApiError::CollectionNotFound(collection_id.clone())
-            } else {
-                ApiError::Internal(format!("Failed to get collection: {}", e))
-            }
-        })?;
+    let resp = get_collection_for_tenant(&state, &collection_id, &tenant).await?;
 
     let collection = resp
         .collection
@@ -3109,25 +3236,7 @@ async fn ensure_collection_exists(
     collection_id: &str,
     tenant: &TenantContext,
 ) -> ApiResult<()> {
-    let request = CollectionRequest {
-        operation: CollectionOperation::CollectionGet as i32,
-        collection_id: Some(collection_id.to_string()),
-        collection_config: None,
-        query_params: Default::default(),
-        options: Default::default(),
-        migration_config: Default::default(),
-    };
-    state
-        .api_handlers
-        .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("not found") {
-                ApiError::CollectionNotFound(collection_id.to_string())
-            } else {
-                ApiError::Internal(format!("Failed to get collection: {e}"))
-            }
-        })?;
+    get_collection_for_tenant(state, collection_id, tenant).await?;
     Ok(())
 }
 
@@ -3260,25 +3369,7 @@ pub async fn post_collection_recluster_v2(
     #[cfg(feature = "axis")]
     {
         // (1) Fetch collection config to read the recall_target tag.
-        let request = CollectionRequest {
-            operation: CollectionOperation::CollectionGet as i32,
-            collection_id: Some(collection_id.clone()),
-            collection_config: None,
-            query_params: Default::default(),
-            options: Default::default(),
-            migration_config: Default::default(),
-        };
-        let resp = state
-            .api_handlers
-            .handle_collection_operation_for_tenant(request, Some(&tenant.tenant_id))
-            .await
-            .map_err(|e| {
-                if e.to_string().contains("not found") {
-                    ApiError::CollectionNotFound(collection_id.clone())
-                } else {
-                    ApiError::Internal(format!("Failed to get collection: {}", e))
-                }
-            })?;
+        let resp = get_collection_for_tenant(&state, &collection_id, &tenant).await?;
 
         let collection = resp
             .collection
@@ -3638,6 +3729,37 @@ mod tests {
         let schema = request.schema.unwrap();
         assert_eq!(schema.columns.len(), 2);
         assert_eq!(schema.enforcement, Some("hybrid".to_string()));
+    }
+
+    /// TD-TIER-1 SC1: `storage_class` round-trips through the strict request
+    /// DTO; an absent field stays `None` (⇒ balanced, never a silent default
+    /// string); the value is gated by `parse_storage_class` at the handler
+    /// (unknown strings are a 400 naming the valid labels); and a completely
+    /// unknown field still trips `deny_unknown_fields` (TD-RESTGET-1).
+    #[test]
+    fn test_create_request_storage_class_deserialization() {
+        let with_class = r#"{
+            "name": "tickets",
+            "dimension": 128,
+            "storage_class": "performance"
+        }"#;
+        let request: CreateCollectionV2Request = serde_json::from_str(with_class).unwrap();
+        assert_eq!(request.storage_class, Some("performance".to_string()));
+
+        let without_class = r#"{ "name": "tickets", "dimension": 128 }"#;
+        let request: CreateCollectionV2Request = serde_json::from_str(without_class).unwrap();
+        assert_eq!(request.storage_class, None);
+
+        // The gate itself: unknown label rejected naming the vocabulary.
+        let error = crate::services::collection::storage_class::parse_storage_class("balenced")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("balenced"), "{error}");
+        assert!(error.contains("balanced"), "{error}");
+
+        // Unknown top-level fields remain a deserialization failure.
+        let unknown_field = r#"{ "name": "t", "dimension": 8, "storage_classz": "x" }"#;
+        assert!(serde_json::from_str::<CreateCollectionV2Request>(unknown_field).is_err());
     }
 
     #[test]
@@ -5102,6 +5224,10 @@ mod tests {
     #[test]
     fn get_response_serializes_index_specs_and_quantization() {
         let resp = CollectionV2Response {
+            storage_class: "balanced".into(),
+            storage_class_status: StorageClassStatusOutput::from_proto(
+                crate::proto::proximadb_v1::StorageClassStatus::default(),
+            ),
             collection_id: "c".into(),
             name: "c".into(),
             dimension: 128,

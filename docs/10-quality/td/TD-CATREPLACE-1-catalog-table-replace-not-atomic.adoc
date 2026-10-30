@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open** (filed 2026-10-18).
+| Status | **Resolved (2026-10-23).** `Catalog::replace_table` replaces a table in place (one `save_table` overwrite on the native catalog — no drop window; the trait default keeps drop+create for backends without an atomic overwrite, validating first). The SDK schema update writes the canonical schema BEFORE the narrow config, so a rejection persists nothing. A schema update (the record-schema switch `apply_schema_update` always sets) replaces `filterable_columns` even when the new list is empty, so removed columns stop being served. The two ProximaType→filterable mappings are ONE function in the foundation data-model crate (`proxima_type_to_filterable_type`), with a test pinning the agreement.
 | Priority | **MEDIUM** — narrower after TD-GRPCCREATE-1 (an invalid schema can no longer cause the drop), but an I/O failure in the window still loses the table.
 | Component | `src/services/collection/manager.rs` (`set_collection_schema_columns`, `upsert_collection_catalog_asset`); catalog `drop_table` / `create_table`
 | Relates to | TD-GRPCCREATE-1
@@ -38,3 +38,44 @@ move the shared mapping to a foundation crate (it currently lives in a module na
 Give the catalog an atomic replace (write the new table version, then swap), and order the schema
 update so the narrow config is persisted only after the catalog write succeeds, or rolled back when
 it fails. Test both with an injected save failure.
+
+== Resolution (2026-10-23)
+
+* *Atomic replace.* `Catalog::replace_table(identifier, schema)`: validates first, then one
+  `save_table` overwrite on the native catalog (the write IS the swap — a reader never sees the
+  table absent, and an I/O failure leaves the previous schema durable). `created_at`, statistics
+  and partition/sort metadata survive; identity follows `create_table` (caller-supplied ids
+  adopted). An adopted `object_id` that differs from the replaced row's removes the old authority
+  copy and index entries after the new write, mirroring `drop_table`; a failed removal is logged).
+  The shared catalog cache is invalidated immediately after the durable write, before any
+  fallible follow-up (mandate 16b); an unreadable previous row fails the replace rather than
+  silently resetting created_at/statistics. Every drop+create site that replaces a collection's
+  catalog asset uses it — the three in
+  `upsert_collection_catalog_asset`/`set_collection_schema_columns`,
+  `write_owner_metadata_in_place` (owner attribution), the external-collection projection
+  writer, and the snapshot publish coordinator (`SnapshotPublishCoordinator::upsert_projection`). The trait default (delta / iceberg-rest / polaris) validates, then drops and creates —
+  the pre-TD semantics, so no backend regresses, but those backends keep the window until they
+  grow an atomic overwrite. With `PROXIMADB_CATALOG_OBJECT_ID_PATHS` on, the native write is two
+  files (legacy + authority, identical bytes) — a crash between them reads-old via the authority
+  copy, which is benign, not a torn schema.
+* *Ordering.* `update_collection_schema_metadata` (the runtime port the SDK uses) runs
+  `set_collection_schema_columns` (canonical, validating) FIRST; only on success does it replace
+  the narrow config. A rejected schema leaves the narrow config untouched.
+* *Empty-list rule.* An update carrying a `record_schema` block (which `apply_schema_update`
+  always writes) replaces `filterable_columns` even when empty (the authoritative full list); a
+  raw config patch without one — including a bare `enable_proxima_record` flip — keeps the
+  legacy non-empty merge. `set_collection_schema_columns` on a collection with no catalog asset
+  now fails loudly instead of silently dropping the canonical columns.
+* *One mapping.* `proxima_type_to_filterable_type` lives in `proximadb-data-model` (foundation);
+  the update direction, the catalog→narrow view and the fold rule all use it. Gained arms:
+  `String`/`Symbol` → String, `Binary` → Binary, `Jsonb` → Json (was: String in the narrow view,
+  Json on update — a round-trip flip-flop), arrays narrow to their element's array type. The
+  catalog→narrow view falls back to String only for types with no filterable projection (UInt,
+  Struct, Map, vectors — display-only, unchanged).
+
+Remaining: an injected-failure e2e for the drop+create window on the non-native backends (the
+window is by construction gone on native, the default); the REST/gRPC raw `update_collection`
+still merges fields partially by design; `catalog_data_type` has no FilterableArray* arm, so an
+array filterable spec still reserves a String-typed column and the config-level round-trip for
+arrays flip-flops (pre-existing, follow-up); `CatalogTableSchema.updated_at_ms` is written with
+seconds in the adopt branch (pre-existing unit muddle, follow-up).

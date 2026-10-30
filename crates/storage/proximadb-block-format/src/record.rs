@@ -378,10 +378,24 @@ impl FlatRow {
     /// full `ProximaRecord` — the filter-aware cascade's Stage-F row predicate
     /// (ADR-089 P1) only needs props for `evaluate_filter_proxima`.
     pub fn props_tree(&self) -> anyhow::Result<proximadb_records::ProximaTree> {
-        match &self.props_bytes {
-            Some(b) => Ok(rmp_serde::from_slice(b)?),
-            None => Ok(Default::default()),
+        // TD-FPRUNE-1 P5: under the residual tail a shredded prop may be
+        // ABSENT from the msgpack bytes (dropped because its typed stripe
+        // reproduces it exactly). The filter predicate must see it — merge
+        // the rebuilt `shredded` values over the tail the same way
+        // `into_record` does (the typed stripe is authoritative; a value
+        // present in both is identical by the losslessness contract).
+        let mut tree: proximadb_records::ProximaTree = match &self.props_bytes {
+            Some(b) => rmp_serde::from_slice(b)?,
+            None => Default::default(),
+        };
+        // Precedence matches `into_record` (or_insert): a key still present
+        // in the tail is one the stripe could NOT reproduce exactly — its
+        // possibly-lossy stripe value must never overwrite the true one.
+        for (key, value) in &self.shredded {
+            tree.entry(key.clone())
+                .or_insert(proximadb_records::ProximaTreeNode::Value(value.clone()));
         }
+        Ok(tree)
     }
 
     pub fn into_record(
@@ -447,16 +461,15 @@ impl FlatRow {
                 let dim = values.len() as u32;
                 // INT-2.5b: FlatRow stores fp32, wrap in the typed
                 // variant on the way out.
-                EmbeddingCell {
-                    model_id: embedding_model_ids
+                EmbeddingCell::new_fp32(
+                    embedding_model_ids
                         .get(i)
                         .cloned()
                         .unwrap_or_else(|| format!("model_{i}")),
-                    modality: "dense".into(),
-                    values: proximadb_records::EmbeddingValues::Fp32(values),
+                    "dense",
                     dim,
-                    ..Default::default()
-                }
+                    values,
+                )
             })
             .collect();
 
@@ -766,13 +779,12 @@ mod tests {
                 edge_type: "knows".into(),
                 weight: Some(0.75),
             }),
-            embeddings: vec![EmbeddingCell {
-                model_id: "text-embed-v1".into(),
-                modality: "text".into(),
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.1, 0.2, 0.3, 0.4]),
-                dim: 4,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "text-embed-v1",
+                "text",
+                4,
+                vec![0.1, 0.2, 0.3, 0.4],
+            )],
             ..Default::default()
         }
     }

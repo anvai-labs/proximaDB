@@ -600,7 +600,7 @@ impl CatalogEmbeddingModelVersion {
         .map_err(|error| CatalogModelContractError::Serialization {
             message: error.to_string(),
         })?;
-        Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+        Ok(format!("sha256:{}", hex::encode(Sha256::digest(bytes))))
     }
 }
 

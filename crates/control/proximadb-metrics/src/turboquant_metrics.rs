@@ -19,26 +19,9 @@
 //! Gated by `experimental-turboquant` so the default build never carries
 //! the additional `prometheus::CounterVec` registration cost.
 
+use crate::register_counter_vec_safe;
 use lazy_static::lazy_static;
-use prometheus::{CounterVec, Opts, register_counter_vec};
-use tracing::error;
-
-/// Same fallback-on-double-register pattern used by `td064_metrics` and
-/// `recall_drift_metrics`. Tests that re-import the metrics module under
-/// `cargo test --lib` would otherwise hit `AlreadyReg` from the global
-/// `prometheus::default_registry()` on the second invocation.
-fn register_counter_vec_safe(name: &str, help: &str, labels: &[&str]) -> CounterVec {
-    match register_counter_vec!(name, help, labels) {
-        Ok(metric) => metric,
-        Err(reg_err) => {
-            error!("Failed to register {}: {}", name, reg_err);
-            CounterVec::new(Opts::new(name, help), labels).unwrap_or_else(|_| {
-                CounterVec::new(Opts::new(format!("{}_fallback", name), help), labels)
-                    .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
-            })
-        }
-    }
-}
+use prometheus::CounterVec;
 
 lazy_static! {
     /// Cumulative count of 32-vector blocks short-circuited by the

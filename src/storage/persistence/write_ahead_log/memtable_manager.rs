@@ -228,13 +228,12 @@ mod tests {
     fn create_test_vector(id: &str) -> ProximaRecord {
         ProximaRecord {
             oid: id.to_string(),
-            embeddings: vec![EmbeddingCell {
-                model_id: "test".to_string(),
-                modality: "dense_vector".to_string(),
-                dim: 4,
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.1, 0.2, 0.3, 0.4]),
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "test",
+                "dense_vector",
+                4,
+                vec![0.1, 0.2, 0.3, 0.4],
+            )],
             created_at_ns: 1_234_567_890_000_000_000,
             updated_at_ns: 1_234_567_890_000_000_000,
             record_version: 1,

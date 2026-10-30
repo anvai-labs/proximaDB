@@ -1,0 +1,44 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-CACHECAS-1: `UnifiedCachingFilesystem` reported conditional replace unsupported
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Resolved (2026-10-25).** `UnifiedCachingFilesystem` forwards `supports_conditional_replace` and `compare_exchange` to the filesystem it caches. The swap drops the cached copy before it runs and again after it. Pinned by `caching_filesystem_forwards_compare_exchange_and_invalidates` (`caching_filesystem.rs`). The test runs a real `LocalFileSystem` underneath and checks four things:
+
+* the layer now reports the capability;
+* the swap succeeds through the cache;
+* the disk cache provably held the old bytes before the swap and dropped them after it;
+* a stale expectation does not swap.
+
+The test fails on the previous code at the capability check.
+| Priority | **LOW**: latent. No production caller performs a conditional replace through this layer today. The durable queue (`queue_fs_adapter.rs`) gets its filesystem from the factory, not the cache.
+| Component | `src/storage/persistence/filesystem/caching_filesystem.rs`
+| Relates to | TD-FSDECOR-1 (same root cause: a hand-written decorator falling back to the trait defaults; recorded there as a deferred item)
+|===
+
+== Problem
+
+`FileSystem::supports_conditional_replace` defaults to `false`. `compare_exchange` defaults to `Err(InvalidOperation)`. `UnifiedCachingFilesystem` wraps a filesystem that supports both, such as `LocalFileSystem` or the object stores, but overrode neither. Through the cache, conditional replace was therefore reported unsupported and failed.
+
+The durable queue and leases are the callers that need it. They currently reach the filesystem without the cache, so nothing broke. Any engine path that adopted conditional writes through the cache would have failed outright. Worse, a naive forward would have kept serving the pre-swap bytes from the disk cache.
+
+== Fix
+
+As described in the Status cell.
+
+Invalidation happens on both sides of the swap:
+
+* **before**, so no stale copy is served while the swap runs;
+* **after**, so a reader whose cache-put landed before the post-swap invalidation does not keep them.
+
+This does not close every interleaving: a reader that missed, read the old bytes from the
+underlying filesystem, and whose `disk_cache.put` lands *after* the post-swap invalidation
+re-inserts a stale entry (`put` has no version or freshness check), and it survives until LRU or
+size eviction. The same race class exists on the plain `write` path (below). Closing it needs a
+version or epoch check on cache admission, out of scope here.
+
+A failed swap leaves the value unchanged, and the post-swap invalidation then costs only one cache miss.
+
+The plain `write` path invalidates only beforehand, so a concurrent reader can re-cache old bytes while a write is in flight. That is a pre-existing window, not changed here.

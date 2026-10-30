@@ -19,9 +19,6 @@ use crate::query::query_optimizer::{
 use crate::storage::engine_capabilities::{
     EngineCapabilities, SearchIndexType, SearchQuantizationLevel, StorageEngine,
 };
-use crate::storage::engines::core::progressive::{
-    ProgressiveEngineType, ProgressivePipelineFactory, ProgressiveSearchCoordinator,
-};
 
 /// Wrapper that adds RL planning capabilities to query optimization
 pub struct RLPlannerIntegration {
@@ -395,52 +392,6 @@ impl RLPlannerIntegration {
     /// Check if RL planning is enabled
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
-    }
-
-    /// Create an ISP-compliant progressive search pipeline from an RL action
-    ///
-    /// This method uses the ProgressivePipelineFactory to create engine-specific
-    /// progressive search stages based on the quantization stages in the action.
-    /// The pipeline follows the Interface Segregation Principle (ISP) from SOLID,
-    /// enabling pluggable, testable stages.
-    ///
-    /// # Arguments
-    /// * `action` - The execution action with quantization stages
-    /// * `context` - The query context to infer the storage engine
-    /// * `factory` - The progressive pipeline factory
-    ///
-    /// # Returns
-    /// A configured ProgressiveSearchCoordinator ready for search execution
-    pub fn create_progressive_pipeline(
-        &self,
-        action: &ExecutionAction,
-        context: &UnifiedQueryContext<'_>,
-        factory: &ProgressivePipelineFactory,
-    ) -> ProgressiveSearchCoordinator {
-        let storage_engine = self.infer_storage_engine(context);
-        let engine_type = self.to_progressive_engine_type(storage_engine);
-
-        // Use the factory to create an ISP-compliant progressive pipeline
-        factory.create_from_action(engine_type, action)
-    }
-
-    /// Convert RL planner's StorageEngineType to ProgressiveEngineType for factory
-    fn to_progressive_engine_type(
-        &self,
-        engine: super::state::StorageEngineType,
-    ) -> ProgressiveEngineType {
-        use super::state::StorageEngineType;
-        match engine {
-            StorageEngineType::SST => ProgressiveEngineType::SST,
-            StorageEngineType::HELIX => ProgressiveEngineType::HELIX,
-            StorageEngineType::VIPER => ProgressiveEngineType::VIPER,
-            StorageEngineType::SWIFT => ProgressiveEngineType::SWIFT,
-            StorageEngineType::NOVA => ProgressiveEngineType::NOVA,
-            StorageEngineType::RAPTOR => ProgressiveEngineType::RAPTOR,
-            // TST (and any engine without a progressive-quantization path)
-            // falls back to SST, the planner's default.
-            _ => ProgressiveEngineType::SST,
-        }
     }
 }
 

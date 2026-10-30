@@ -1,0 +1,16 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-XMODAL-5-per-modality-query-scoped-io-trace: per-modality query-scoped I/O trace
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open, not started** (filed 2026-10-26 from ADR-053 citations).
+| Priority | TBD when picked up
+| Component | (see scope)
+| Relates to | ADR-053, ADR-066, TD-XMODAL-1 (landed)
+|===
+
+== Scope
+
+Per-modality query-scoped I/O trace, so ComputeScheduler costs cross-modal routes from measured quantities (the co-design mandate).

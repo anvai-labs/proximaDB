@@ -1,0 +1,16 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SC-3-object_id-keyed-metadata-layout: object_id-keyed metadata layout
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open, not started** (filed 2026-10-26 from ADR-035 citations; ADR-035 is Proposed — the design and its reconciliation live there, and this lane is gated on its acceptance).
+| Priority | TBD when picked up
+| Component | (see scope)
+| Relates to | ADR-035, ADR-031, ADR-0083
+|===
+
+== Scope
+
+Completes ADR-031 O2 for catalog objects. CONFLICT (per the ADR-035 reconciliation of 2026-10-15): keying on the ADR-031 u64 object_id conflicts with ADR-0083, which retires the u64 as identity — re-key on the composite before implementing.

@@ -906,6 +906,77 @@ pub mod conformance_tests {
                 model_history: std::sync::Mutex::new(Vec::new()),
             }
         }
+
+        /// Clone out the run with `run_id`, or fail with `UnknownRun`.
+        ///
+        /// Shared read path of the run methods (get/log-metric preflight);
+        /// the lock is held only for the clone.
+        fn find_run(&self, run_id: &str) -> Result<RunRecord, RunStoreError> {
+            self.runs
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.run_id == run_id)
+                .cloned()
+                .ok_or_else(|| RunStoreError::UnknownRun {
+                    run_id: run_id.to_string(),
+                })
+        }
+
+        /// Lock the run list, find the run with `run_id`, and apply `f` to
+        /// it under the lock. Fails with `UnknownRun` when absent.
+        ///
+        /// Shared mutation path of the run methods; the guard is held for
+        /// the whole call, matching the pre-extraction single-lock blocks.
+        fn with_run_mut<R>(
+            &self,
+            run_id: &str,
+            f: impl FnOnce(&mut RunRecord) -> R,
+        ) -> Result<R, RunStoreError> {
+            let mut runs = self.runs.lock().unwrap();
+            let run = runs
+                .iter_mut()
+                .find(|r| r.run_id == run_id)
+                .ok_or_else(|| RunStoreError::UnknownRun {
+                    run_id: run_id.to_string(),
+                })?;
+            Ok(f(run))
+        }
+
+        /// Lock the trace list, find the trace with `trace_id`, and apply
+        /// `f` to it under the lock. Fails with `UnknownTrace` when absent.
+        fn with_trace_mut<R>(
+            &self,
+            trace_id: &str,
+            f: impl FnOnce(&mut TraceRecord) -> R,
+        ) -> Result<R, RunStoreError> {
+            let mut traces = self.traces.lock().unwrap();
+            let trace = traces
+                .iter_mut()
+                .find(|t| t.trace_id == trace_id)
+                .ok_or_else(|| RunStoreError::UnknownTrace {
+                    trace_id: trace_id.to_string(),
+                })?;
+            Ok(f(trace))
+        }
+
+        /// Lock the logged-model list, find the model with `model_id`, and
+        /// apply `f` to it under the lock. Fails with `UnknownLoggedModel`
+        /// when absent.
+        fn with_logged_model_mut<R>(
+            &self,
+            model_id: &str,
+            f: impl FnOnce(&mut LoggedModelRecord) -> R,
+        ) -> Result<R, RunStoreError> {
+            let mut models = self.logged_models.lock().unwrap();
+            let model = models
+                .iter_mut()
+                .find(|m| m.model_id == model_id)
+                .ok_or_else(|| RunStoreError::UnknownLoggedModel {
+                    model_id: model_id.to_string(),
+                })?;
+            Ok(f(model))
+        }
     }
 
     #[async_trait::async_trait]
@@ -1037,15 +1108,7 @@ pub mod conformance_tests {
         }
 
         async fn get_run(&self, run_id: &str) -> Result<RunRecord, RunStoreError> {
-            self.runs
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|r| r.run_id == run_id)
-                .cloned()
-                .ok_or_else(|| RunStoreError::UnknownRun {
-                    run_id: run_id.to_string(),
-                })
+            self.find_run(run_id)
         }
 
         async fn list_runs(
@@ -1076,53 +1139,29 @@ pub mod conformance_tests {
             if !status.is_terminal() {
                 return Err(RunStoreError::NotTerminal);
             }
-            let mut runs = self.runs.lock().unwrap();
-            let run = runs
-                .iter_mut()
-                .find(|r| r.run_id == run_id)
-                .ok_or_else(|| RunStoreError::UnknownRun {
-                    run_id: run_id.to_string(),
-                })?;
-            run.status = status;
-            run.end_time_ms = Some(end_time_ms);
-            Ok(())
+            self.with_run_mut(run_id, |run| {
+                run.status = status;
+                run.end_time_ms = Some(end_time_ms);
+            })
         }
 
         async fn reopen_run(&self, run_id: &str) -> Result<(), RunStoreError> {
-            let mut runs = self.runs.lock().unwrap();
-            let run = runs
-                .iter_mut()
-                .find(|r| r.run_id == run_id)
-                .ok_or_else(|| RunStoreError::UnknownRun {
-                    run_id: run_id.to_string(),
-                })?;
-            run.status = RunStatus::Running;
-            run.end_time_ms = None;
-            Ok(())
+            self.with_run_mut(run_id, |run| {
+                run.status = RunStatus::Running;
+                run.end_time_ms = None;
+            })
         }
 
         async fn delete_run(&self, run_id: &str) -> Result<(), RunStoreError> {
-            let mut runs = self.runs.lock().unwrap();
-            let run = runs
-                .iter_mut()
-                .find(|r| r.run_id == run_id)
-                .ok_or_else(|| RunStoreError::UnknownRun {
-                    run_id: run_id.to_string(),
-                })?;
-            run.lifecycle = RunLifecycle::Deleted;
-            Ok(())
+            self.with_run_mut(run_id, |run| {
+                run.lifecycle = RunLifecycle::Deleted;
+            })
         }
 
         async fn restore_run(&self, run_id: &str) -> Result<(), RunStoreError> {
-            let mut runs = self.runs.lock().unwrap();
-            let run = runs
-                .iter_mut()
-                .find(|r| r.run_id == run_id)
-                .ok_or_else(|| RunStoreError::UnknownRun {
-                    run_id: run_id.to_string(),
-                })?;
-            run.lifecycle = RunLifecycle::Active;
-            Ok(())
+            self.with_run_mut(run_id, |run| {
+                run.lifecycle = RunLifecycle::Active;
+            })
         }
 
         async fn log_param(
@@ -1168,32 +1207,16 @@ pub mod conformance_tests {
             run_id: &str,
             point: MetricPoint,
         ) -> Result<MetricAppend, RunStoreError> {
-            {
-                let runs = self.runs.lock().unwrap();
-                let run = runs.iter().find(|r| r.run_id == run_id).ok_or_else(|| {
-                    RunStoreError::UnknownRun {
-                        run_id: run_id.to_string(),
-                    }
-                })?;
-                if run.status.is_terminal() {
-                    return Err(RunStoreError::RunFinished {
-                        run_id: run_id.to_string(),
-                    });
-                }
+            if self.find_run(run_id)?.status.is_terminal() {
+                return Err(RunStoreError::RunFinished {
+                    run_id: run_id.to_string(),
+                });
             }
             {
                 let mut history = self.history.lock().unwrap();
                 history.push((run_id.to_string(), point.clone()));
             }
-            let history_len;
-            {
-                let mut runs = self.runs.lock().unwrap();
-                let run = runs
-                    .iter_mut()
-                    .find(|r| r.run_id == run_id)
-                    .ok_or_else(|| RunStoreError::UnknownRun {
-                        run_id: run_id.to_string(),
-                    })?;
+            let history_len = self.with_run_mut(run_id, |run| {
                 let advances_projection =
                     run.latest_metrics.get(&point.key).is_none_or(|current| {
                         point.timestamp_ms > current.timestamp_ms
@@ -1203,14 +1226,15 @@ pub mod conformance_tests {
                 if advances_projection {
                     run.latest_metrics.insert(point.key.clone(), point.clone());
                 }
-                history_len = self
-                    .history
+                // Same lock ordering as the original block: the run guard is
+                // held while the history count is taken.
+                self.history
                     .lock()
                     .unwrap()
                     .iter()
                     .filter(|(id, p)| id == run_id && p.key == point.key)
-                    .count() as u64;
-            }
+                    .count() as u64
+            })?;
             Ok(MetricAppend { history_len })
         }
 
@@ -1231,27 +1255,15 @@ pub mod conformance_tests {
         }
 
         async fn set_tag(&self, run_id: &str, key: &str, value: &str) -> Result<(), RunStoreError> {
-            let mut runs = self.runs.lock().unwrap();
-            let run = runs
-                .iter_mut()
-                .find(|r| r.run_id == run_id)
-                .ok_or_else(|| RunStoreError::UnknownRun {
-                    run_id: run_id.to_string(),
-                })?;
-            run.tags.insert(key.to_string(), value.to_string());
-            Ok(())
+            self.with_run_mut(run_id, |run| {
+                run.tags.insert(key.to_string(), value.to_string());
+            })
         }
 
         async fn delete_tag(&self, run_id: &str, key: &str) -> Result<(), RunStoreError> {
-            let mut runs = self.runs.lock().unwrap();
-            let run = runs
-                .iter_mut()
-                .find(|r| r.run_id == run_id)
-                .ok_or_else(|| RunStoreError::UnknownRun {
-                    run_id: run_id.to_string(),
-                })?;
-            run.tags.remove(key);
-            Ok(())
+            self.with_run_mut(run_id, |run| {
+                run.tags.remove(key);
+            })
         }
 
         async fn log_dataset_input(
@@ -1384,27 +1396,15 @@ pub mod conformance_tests {
             key: &str,
             value: &str,
         ) -> Result<(), RunStoreError> {
-            let mut traces = self.traces.lock().unwrap();
-            let trace = traces
-                .iter_mut()
-                .find(|t| t.trace_id == trace_id)
-                .ok_or_else(|| RunStoreError::UnknownTrace {
-                    trace_id: trace_id.to_string(),
-                })?;
-            trace.tags.insert(key.to_string(), value.to_string());
-            Ok(())
+            self.with_trace_mut(trace_id, |trace| {
+                trace.tags.insert(key.to_string(), value.to_string());
+            })
         }
 
         async fn delete_trace_tag(&self, trace_id: &str, key: &str) -> Result<(), RunStoreError> {
-            let mut traces = self.traces.lock().unwrap();
-            let trace = traces
-                .iter_mut()
-                .find(|t| t.trace_id == trace_id)
-                .ok_or_else(|| RunStoreError::UnknownTrace {
-                    trace_id: trace_id.to_string(),
-                })?;
-            trace.tags.remove(key);
-            Ok(())
+            self.with_trace_mut(trace_id, |trace| {
+                trace.tags.remove(key);
+            })
         }
 
         async fn upsert_assessment(
@@ -1412,21 +1412,16 @@ pub mod conformance_tests {
             trace_id: &str,
             assessment: AssessmentRecord,
         ) -> Result<AssessmentRecord, RunStoreError> {
-            let mut traces = self.traces.lock().unwrap();
-            let trace = traces
-                .iter_mut()
-                .find(|t| t.trace_id == trace_id)
-                .ok_or_else(|| RunStoreError::UnknownTrace {
-                    trace_id: trace_id.to_string(),
-                })?;
-            match trace
-                .assessments
-                .iter_mut()
-                .find(|a| a.assessment_id == assessment.assessment_id)
-            {
-                Some(existing) => *existing = assessment.clone(),
-                None => trace.assessments.push(assessment.clone()),
-            }
+            self.with_trace_mut(trace_id, |trace| {
+                match trace
+                    .assessments
+                    .iter_mut()
+                    .find(|a| a.assessment_id == assessment.assessment_id)
+                {
+                    Some(existing) => *existing = assessment.clone(),
+                    None => trace.assessments.push(assessment.clone()),
+                }
+            })?;
             Ok(assessment)
         }
 
@@ -1458,18 +1453,14 @@ pub mod conformance_tests {
             trace_id: &str,
             assessment_id: &str,
         ) -> Result<(), RunStoreError> {
-            let mut traces = self.traces.lock().unwrap();
-            let trace = traces
-                .iter_mut()
-                .find(|t| t.trace_id == trace_id)
-                .ok_or_else(|| RunStoreError::UnknownTrace {
-                    trace_id: trace_id.to_string(),
-                })?;
-            let before = trace.assessments.len();
-            trace
-                .assessments
-                .retain(|a| a.assessment_id != assessment_id);
-            if trace.assessments.len() == before {
+            let removed = self.with_trace_mut(trace_id, |trace| {
+                let before = trace.assessments.len();
+                trace
+                    .assessments
+                    .retain(|a| a.assessment_id != assessment_id);
+                trace.assessments.len() != before
+            })?;
+            if !removed {
                 return Err(RunStoreError::UnknownAssessment {
                     trace_id: trace_id.to_string(),
                     assessment_id: assessment_id.to_string(),
@@ -1562,28 +1553,17 @@ pub mod conformance_tests {
             status: LoggedModelStatus,
             now_ms: i64,
         ) -> Result<LoggedModelRecord, RunStoreError> {
-            let mut models = self.logged_models.lock().unwrap();
-            let model = models
-                .iter_mut()
-                .find(|m| m.model_id == model_id)
-                .ok_or_else(|| RunStoreError::UnknownLoggedModel {
-                    model_id: model_id.to_string(),
-                })?;
-            model.status = status;
-            model.last_updated_time_ms = now_ms;
-            Ok(model.clone())
+            self.with_logged_model_mut(model_id, |model| {
+                model.status = status;
+                model.last_updated_time_ms = now_ms;
+                model.clone()
+            })
         }
 
         async fn delete_logged_model(&self, model_id: &str) -> Result<(), RunStoreError> {
-            let mut models = self.logged_models.lock().unwrap();
-            let model = models
-                .iter_mut()
-                .find(|m| m.model_id == model_id)
-                .ok_or_else(|| RunStoreError::UnknownLoggedModel {
-                    model_id: model_id.to_string(),
-                })?;
-            model.lifecycle = RunLifecycle::Deleted;
-            Ok(())
+            self.with_logged_model_mut(model_id, |model| {
+                model.lifecycle = RunLifecycle::Deleted;
+            })
         }
 
         async fn log_logged_model_params(
@@ -1591,28 +1571,23 @@ pub mod conformance_tests {
             model_id: &str,
             params: &BTreeMap<String, String>,
         ) -> Result<(), RunStoreError> {
-            let mut models = self.logged_models.lock().unwrap();
-            let model = models
-                .iter_mut()
-                .find(|m| m.model_id == model_id)
-                .ok_or_else(|| RunStoreError::UnknownLoggedModel {
-                    model_id: model_id.to_string(),
-                })?;
-            for (key, value) in params {
-                match model.params.get(key) {
-                    Some(existing) if existing == value => {}
-                    Some(_) => {
-                        return Err(RunStoreError::ParamImmutable {
-                            key: key.clone(),
-                            run_id: model_id.to_string(),
-                        });
-                    }
-                    None => {
-                        model.params.insert(key.clone(), value.clone());
+            self.with_logged_model_mut(model_id, |model| {
+                for (key, value) in params {
+                    match model.params.get(key) {
+                        Some(existing) if existing == value => {}
+                        Some(_) => {
+                            return Err(RunStoreError::ParamImmutable {
+                                key: key.clone(),
+                                run_id: model_id.to_string(),
+                            });
+                        }
+                        None => {
+                            model.params.insert(key.clone(), value.clone());
+                        }
                     }
                 }
-            }
-            Ok(())
+                Ok(())
+            })?
         }
 
         async fn set_logged_model_tags(
@@ -1620,18 +1595,13 @@ pub mod conformance_tests {
             model_id: &str,
             tags: &BTreeMap<String, String>,
         ) -> Result<LoggedModelRecord, RunStoreError> {
-            let mut models = self.logged_models.lock().unwrap();
-            let model = models
-                .iter_mut()
-                .find(|m| m.model_id == model_id)
-                .ok_or_else(|| RunStoreError::UnknownLoggedModel {
-                    model_id: model_id.to_string(),
-                })?;
-            for (key, value) in tags {
-                model.tags.insert(key.clone(), value.clone());
-            }
-            model.last_updated_time_ms += 1;
-            Ok(model.clone())
+            self.with_logged_model_mut(model_id, |model| {
+                for (key, value) in tags {
+                    model.tags.insert(key.clone(), value.clone());
+                }
+                model.last_updated_time_ms += 1;
+                model.clone()
+            })
         }
 
         async fn delete_logged_model_tag(
@@ -1639,14 +1609,9 @@ pub mod conformance_tests {
             model_id: &str,
             key: &str,
         ) -> Result<(), RunStoreError> {
-            let mut models = self.logged_models.lock().unwrap();
-            let model = models
-                .iter_mut()
-                .find(|m| m.model_id == model_id)
-                .ok_or_else(|| RunStoreError::UnknownLoggedModel {
-                    model_id: model_id.to_string(),
-                })?;
-            if model.tags.remove(key).is_none() {
+            let removed =
+                self.with_logged_model_mut(model_id, |model| model.tags.remove(key).is_some())?;
+            if !removed {
                 return Err(RunStoreError::UnknownLoggedModelTag {
                     model_id: model_id.to_string(),
                     key: key.to_string(),
@@ -1711,15 +1676,9 @@ pub mod conformance_tests {
             run_id: &str,
             outputs: Vec<ModelOutputRef>,
         ) -> Result<(), RunStoreError> {
-            let mut runs = self.runs.lock().unwrap();
-            let run = runs
-                .iter_mut()
-                .find(|r| r.run_id == run_id)
-                .ok_or_else(|| RunStoreError::UnknownRun {
-                    run_id: run_id.to_string(),
-                })?;
-            run.model_outputs.extend(outputs);
-            Ok(())
+            self.with_run_mut(run_id, |run| {
+                run.model_outputs.extend(outputs);
+            })
         }
 
         async fn log_run_model_inputs(
@@ -1727,15 +1686,9 @@ pub mod conformance_tests {
             run_id: &str,
             model_ids: Vec<String>,
         ) -> Result<(), RunStoreError> {
-            let mut runs = self.runs.lock().unwrap();
-            let run = runs
-                .iter_mut()
-                .find(|r| r.run_id == run_id)
-                .ok_or_else(|| RunStoreError::UnknownRun {
-                    run_id: run_id.to_string(),
-                })?;
-            run.model_inputs.extend(model_ids);
-            Ok(())
+            self.with_run_mut(run_id, |run| {
+                run.model_inputs.extend(model_ids);
+            })
         }
     }
 

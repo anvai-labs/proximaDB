@@ -75,6 +75,15 @@ async def test_create_collection_hits_generated_endpoint():
                     "engine": "sst",
                     "name": "products",
                     "proxima_record_enabled": True,
+                    "storage_class": "balanced",
+                    "storage_class_status": {
+                        "state": "ACTIVE",
+                        "reason": "",
+                        "policy_generation": 0,
+                        "reserved_bytes": 0,
+                        "resident_bytes": 0,
+                        "covered_bytes": 0,
+                    },
                 },
             )
         ]
@@ -113,6 +122,15 @@ async def test_get_collection_hits_generated_endpoint():
                     "index_specs": [],
                     "name": "products",
                     "proxima_record_enabled": True,
+                    "storage_class": "balanced",
+                    "storage_class_status": {
+                        "state": "ACTIVE",
+                        "reason": "",
+                        "policy_generation": 0,
+                        "reserved_bytes": 0,
+                        "resident_bytes": 0,
+                        "covered_bytes": 0,
+                    },
                     "stats": {
                         "indexed_fields": 0,
                         "record_count": 3,
@@ -151,6 +169,15 @@ async def test_list_collections_hits_generated_endpoint():
                             "engine": "sst",
                             "name": "products",
                             "proxima_record_enabled": True,
+                            "storage_class": "balanced",
+                            "storage_class_status": {
+                                "state": "ACTIVE",
+                                "reason": "",
+                                "policy_generation": 0,
+                                "reserved_bytes": 0,
+                                "resident_bytes": 0,
+                                "covered_bytes": 0,
+                            },
                             "record_count": 5,
                         }
                     ],

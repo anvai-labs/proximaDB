@@ -1,0 +1,56 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SDKMMQ-1: the client-side multi-modal executor's legs call client methods that do not take their arguments
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open** (filed 2026-10-24, found by the TD-SDKDOC-1 doc smoke). The vector leg is fixed in the same PR; the graph, document, log and metric legs are not.
+| Priority | **MEDIUM** — every affected leg returns empty results and only logs a warning, so a multi-modal query silently answers from fewer modalities than it asked for.
+| Component | `clients/python/src/proximadb_sdk/multimodal_query.py` (`MultiModalQueryExecutor._execute_*`), reached by `MultiModalQueryExecutor.execute` and `semantic_search_with_graph`
+| Relates to | TD-SDKDOC-1 (found it), TD-SDKERR-1 (silent fallbacks), mandate #13 (evals for ranked surfaces)
+|===
+
+== Problem
+
+Each leg calls a `ProximaDBClient` method with keyword arguments that method does not declare. The
+resulting `TypeError` is caught by the dispatch loop, logged as
+`multi-modal component <leg> failed`, and the leg contributes nothing:
+
+|===
+| Leg | Call | Client signature
+| vector (**fixed in TD-SDKDOC-1's PR**) | `search(collection=..., filter=...)` | `search(collection_id, vector, top_k, metadata_filter, ...)`
+| graph | `self._client.graph.traverse(...)`, guarded by `hasattr(client, "graph")` | `ProximaDBClient` has no `.graph`; the leg returns `[]` without even a warning
+| document | `query_documents(collection=..., text_query=...)` | `query_documents(collection_name, filter, projection, limit, **kwargs)`
+| logs | `query_logs(time_range=..., services=..., text_query=...)` | `query_logs(namespace, start_time_ns, end_time_ns, query, limit)`
+| metrics | `aggregate_metrics(metric_names=..., time_range=...)` | `aggregate_metrics(namespace, metric_name, aggregation, start_time, end_time, step_seconds)`
+|===
+
+The unit tests did not catch this because their fake client
+(`tests/unit/test_multimodal_query_cov.py::_FakeClient`) copies the executor's call shapes rather
+than the client's real signatures, so the fake and the executor agree with each other and not
+with `ProximaDBClient`. A `**kwargs` mock hid the `GraphAnalytics.shortest_path` bug the same way.
+TD-SDKDOC-1's PR moved the fake's `search` to the real signature; the other legs' fakes still copy
+the wrong shapes.
+
+Also seen while running the guide (not fixed here):
+
+* A search on a missing collection reports `Collection not found: unknown`, not the collection's name.
+* Creating a graph whose id already exists answers HTTP **500** `INTERNAL_ERROR` (`Invalid input: Graph collection '<id>' already exists`); it should be a 409.
+
+== Fix
+
+1. Rewire each leg to the client's real signatures: translate the component's `time_range` into
+   `start_time_ns`/`end_time_ns`, issue one `aggregate_metrics` call per metric name, and walk the
+   graph leg through `client.traverse_graph(..., graph_id=...)`.
+2. Test every leg through fakes that copy the real `ProximaDBClient` method signatures, as
+   `tests/unit/test_graph_shortest_path_graph_id.py` does, never `**kwargs` mocks or fakes shaped
+   after the executor's calls.
+3. Decide the failure policy explicitly. Today a failed leg is recorded in
+   `MultiModalQueryResult.component_errors` and logged as a warning, but the query still answers
+   as if it succeeded, and none of the guide's examples read `component_errors`. Either a failed
+   leg fails the query (perhaps behind a strict flag), or the documented result handling checks
+   `component_errors`.
+4. Once the legs work, drop the limitation notes from `docs/02-guides/sdk-python-guide.adoc`
+   ("Multi-Modal Queries" and "Convenience Functions"). The doc smoke already fails a block that
+   makes the SDK log a warning.

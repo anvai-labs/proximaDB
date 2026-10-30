@@ -649,40 +649,6 @@ fn abac_security_is_pushdown(
 }
 
 impl VectorOperationsService {
-    /// Create service with a shared context for cross-cutting concerns
-    pub fn new_with_context(
-        storage_engine: Arc<SstEngine>,
-        wal_manager: Arc<crate::storage::persistence::write_ahead_log::WriteAheadLogManager>,
-        #[cfg(feature = "axis")] axis_index_manager: Arc<crate::index::AxisManager>,
-        collection_port: Arc<dyn proximadb_runtime::CollectionPort>,
-        ctx: &crate::core::context::SharedContext,
-    ) -> Self {
-        let mut svc = {
-            #[cfg(feature = "axis")]
-            {
-                Self::new(
-                    storage_engine,
-                    wal_manager,
-                    axis_index_manager,
-                    collection_port,
-                )
-            }
-            #[cfg(not(feature = "axis"))]
-            {
-                Self::new(storage_engine, wal_manager, collection_port)
-            }
-        };
-        svc.orchestrator = ctx.orchestrator.clone();
-        // Tenant integration from shared context
-        if let Some(ref tenant_manager) = ctx.tenant_manager {
-            svc.tenant_manager = Some(tenant_manager.clone());
-        }
-        if let Some(ref rbac_enforcer) = ctx.rbac_enforcer {
-            svc.rbac_enforcer = Some(rbac_enforcer.clone());
-        }
-        svc
-    }
-
     /// Install the FA-2 vector ABAC enforcer (default-OFF behind `abac-policy`).
     /// When set, `unified_search_native` enforces the subject's accessibility
     /// predicate on every vector search (push-down for conjunctive policies,
@@ -1046,6 +1012,23 @@ impl VectorOperationsService {
     /// (gRPC/internal callers). Enforcement is `abac-policy`-gated; default
     /// builds pass the identity through ignored. (TD-ABAC-7: one method,
     /// identity decides — no `_abac` twin.)
+    /// TD-DML-3: the stored canonical record for `record_id` — the FULL
+    /// envelope (every prop, embedding, TTL), dead copies INCLUDED so the
+    /// caller can tell dead from absent (`ProximaRecord::is_dead`). Internal
+    /// (system) read: callers apply their own read policy.
+    pub async fn get_record_envelope_with_tenant_context(
+        &self,
+        collection_id: &str,
+        record_id: &str,
+        tenant_context: Option<&crate::storage::tenant::context::TenantContext>,
+    ) -> Result<Option<ProximaRecord>> {
+        let collection_id = self
+            .validate_tenant_collection_access(collection_id, tenant_context)
+            .await?
+            .to_string();
+        self.vector(&collection_id, record_id, true, true).await
+    }
+
     pub async fn get_record_with_tenant_context(
         &self,
         request: RichRecordGetRequest,
@@ -1191,6 +1174,34 @@ impl VectorOperationsService {
                 record.tenant_id.is_empty() || record.tenant_id == tenant_context.tenant_id
             });
         }
+        // TD-DML-3: one CURRENT version per oid. The raw WAL view holds every
+        // write of a key, and an UPDATE of a relational row on this store
+        // appends a new version — so a SELECT returned the old and the new row
+        // side by side. Latest wins (highest record_version, then
+        // updated_at_ns, then the later write), and it is chosen BEFORE the
+        // dead filter so a newer tombstone / expired version hides its older
+        // live copy (mandate #16d).
+        let mut latest: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::with_capacity(records.len());
+        for (index, record) in records.iter().enumerate() {
+            let newer = match latest.get(&record.oid).and_then(|&kept| records.get(kept)) {
+                Some(kept) => {
+                    (record.record_version, record.updated_at_ns)
+                        >= (kept.record_version, kept.updated_at_ns)
+                }
+                None => true,
+            };
+            if newer {
+                latest.insert(record.oid.clone(), index);
+            }
+        }
+        let current: std::collections::HashSet<usize> = latest.into_values().collect();
+        records = records
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| current.contains(index))
+            .map(|(_, record)| record)
+            .collect();
         // Defense-in-depth: drop dead records (tombstone / TTL-expired) using
         // the canonical ProximaRecord::is_dead on valid_to_ns (ns). Winner
         // selection already drops tombstoned winners; this guarantees no scan
@@ -2624,13 +2635,19 @@ impl VectorOperationsService {
         mut records: Vec<ProximaRecord>,
         tenant_context: Option<&crate::storage::tenant::context::TenantContext>,
     ) -> Result<BatchOperationResult> {
+        use crate::services::record_store::rejected_before_append;
+        // TD-DML-3: every check below precedes the WAL write, so its failure
+        // is marked "rejected before append" — a caller may release state it
+        // reserved for the write (fenced PK claims).
         let collection_id = self
             .validate_tenant_collection_access(collection_id, tenant_context)
-            .await?
+            .await
+            .map_err(rejected_before_append)?
             .to_string();
 
         if let Some(tenant_ctx) = tenant_context {
-            ensure_tenant_on_records(&mut records, &tenant_ctx.tenant_id)?;
+            ensure_tenant_on_records(&mut records, &tenant_ctx.tenant_id)
+                .map_err(rejected_before_append)?;
         }
 
         // PR 3b follow-up: while the precision-schema-v2 feature flag is
@@ -2642,7 +2659,9 @@ impl VectorOperationsService {
         if !cached_precision_config().schema_v2_enabled
             && let Err(e) = validate_records_for_schema_v1(records.iter())
         {
-            return Err(anyhow::anyhow!(e));
+            return Err(crate::services::record_store::rejected_before_append(
+                anyhow::anyhow!(e),
+            ));
         }
 
         let result = self
@@ -4470,18 +4489,24 @@ impl VectorOperationsService {
             "🔍 Stage 1: Searching WAL/memtable for collection {}",
             collection_id
         );
-        let wal_optimized_results = self
-            .wal_manager
-            .search_unflushed_vectors(
-                collection_id,
+        // One WAL snapshot feeds BOTH the WAL leg's scoring and the merge's
+        // reconciliation below, so no write can land between them.
+        let wal_snapshot = self.wal_manager.unflushed_snapshot(collection_id).await?;
+        let wal_index =
+            crate::storage::persistence::write_ahead_log::WriteAheadLogManager::freshest_unflushed_index(
+                &wal_snapshot,
+            );
+        let wal_optimized_results =
+            crate::storage::persistence::write_ahead_log::WriteAheadLogManager::score_unflushed(
+                &wal_snapshot,
+                &wal_index,
                 &query_vector,
                 candidates,
                 distance_metric,
                 filter.as_ref(),
                 true,
                 true,
-            )
-            .await?;
+            );
         debug!(
             "Stage 1 complete: {} WAL results",
             wal_optimized_results.len()
@@ -4592,7 +4617,28 @@ impl VectorOperationsService {
         // collections (no index_configs) the flushed data lives ONLY in storage segments,
         // so WAL alone is insufficient and storage must always be searched; otherwise the
         // entire flushed set is never seen and recall collapses to the tiny WAL window.
-        let total_indexed_results = wal_optimized_results.len() + axis_optimized_results.len();
+        // Count only hits GUARANTEED to survive reconciliation towards skipping
+        // the storage stage: live WAL hits, and AXIS hits whose OID has no
+        // unflushed version (an unflushed version — e.g. a delete, or an update
+        // out of the predicate — supersedes the AXIS copy). Counting droppable
+        // hits could return a short top-k with storage never consulted.
+        let skip_now_ns = proximadb_kernel::time::now_unix_ns();
+        let total_indexed_results = wal_optimized_results
+            .iter()
+            .filter(|r| !r.is_dead(skip_now_ns))
+            .count()
+            + axis_optimized_results
+                .iter()
+                .filter(|r| {
+                    crate::storage::persistence::write_ahead_log::WriteAheadLogManager::unflushed_oid_state(
+                        &wal_snapshot,
+                        &wal_index,
+                        &r.id,
+                        skip_now_ns,
+                    )
+                    .is_none()
+                })
+                .count();
         let storage_results = if collection_has_axis_indexes && total_indexed_results >= candidates
         {
             debug!(
@@ -4605,7 +4651,7 @@ impl VectorOperationsService {
                 "Stage 3: Searching storage engine ({}) for {} (need {} more results)",
                 engine.format_name(),
                 collection_id,
-                candidates - total_indexed_results
+                candidates.saturating_sub(total_indexed_results)
             );
             engine.search_vectors_unified(&search_context).await?
         };
@@ -4621,36 +4667,36 @@ impl VectorOperationsService {
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
 
-        // Build map from results with priority: WAL > AXIS > Storage
-        let mut id_to_result: HashMap<String, crate::core::search::results::OptimizedSearchRecord> =
-            HashMap::new();
-
-        // WAL results have highest priority (fresher data). A dead record
-        // (tombstone/expired) wins over a live one for the same OID: in the
-        // insert-then-delete-before-flush case both copies are unflushed in
-        // the same WAL delta, and the tombstone must survive so the dead-record
-        // filter below removes the OID. Never let a live copy overwrite a dead
-        // record. Uses the canonical is_dead(valid_to_ns) — not expires_at.
-        for result in wal_optimized_results {
-            id_to_result
-                .entry(result.id.clone())
-                .and_modify(|existing| {
-                    if !existing.is_dead(now_ns) && result.is_dead(now_ns) {
-                        *existing = result.clone();
-                    }
-                })
-                .or_insert(result);
-        }
-
-        // AXIS HNSW results second priority (fast indexed search)
-        for result in axis_optimized_results {
-            id_to_result.entry(result.id.clone()).or_insert(result);
-        }
-
-        // Storage results as fallback
-        for result in storage_results {
-            id_to_result.entry(result.id.clone()).or_insert(result);
-        }
+        // MVCC merge against the WAL snapshot (the get-by-id rule, mandate 16;
+        // pick the winner, then dead-filter — PR #2063). WAL hits are the live,
+        // matching, FRESHEST version of each unflushed OID. A persisted or
+        // indexed copy of an OID with a live unflushed version is superseded
+        // (even when the query skipped that version as non-matching); against
+        // a dead unflushed version it survives only if strictly newer, so a
+        // stale retained tombstone no longer hides a newer flushed re-insert.
+        use crate::core::search::merge::{CandidateSource, reconcile_against_wal_state};
+        let wal_state = |oid: &str| {
+            crate::storage::persistence::write_ahead_log::WriteAheadLogManager::unflushed_oid_state(
+                &wal_snapshot,
+                &wal_index,
+                oid,
+                now_ns,
+            )
+        };
+        let id_to_result: HashMap<String, crate::core::search::results::OptimizedSearchRecord> =
+            reconcile_against_wal_state(
+                wal_optimized_results,
+                axis_optimized_results
+                    .into_iter()
+                    .map(|r| (CandidateSource::Axis, r))
+                    .chain(
+                        storage_results
+                            .into_iter()
+                            .map(|r| (CandidateSource::Storage, r)),
+                    ),
+                &wal_state,
+                now_ns,
+            );
 
         // Filter out dead records (tombstone valid_to_ns==Some(0) OR TTL-expired)
         // using the canonical predicate on valid_to_ns (ns) — immune to the
@@ -5819,13 +5865,12 @@ mod tenant_tests {
 
         let rich = vector_record_to_rich_result(ProximaRecord {
             oid: "doc_2".to_string(),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vec![0.3, 0.4]),
-                dim: 2,
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                2,
+                vec![0.3, 0.4],
+            )],
             props,
             created_at_ns: 456_000_000,
             updated_at_ns: 456_000_000,
@@ -5879,13 +5924,12 @@ mod pseudo_query_tests {
         }
         ProximaRecord {
             oid: id.to_string(),
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-                dim: 3,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                3,
+                vec![1.0, 2.0, 3.0],
+            )],
             props: tree,
             ..Default::default()
         }
@@ -6115,13 +6159,12 @@ mod index_first_search_tests {
     fn record_with_vector(id: &str, values: Vec<f32>) -> ProximaRecord {
         ProximaRecord {
             oid: id.to_string(),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                dim: values.len() as u32,
-                values: proximadb_records::EmbeddingValues::Fp32(values),
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                values.len() as u32,
+                values,
+            )],
             ..Default::default()
         }
     }
@@ -6639,13 +6682,12 @@ mod index_first_search_tests {
 
         let record = ProximaRecord {
             oid: "vec1".to_string(),
-            embeddings: vec![proximadb_records::EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-                dim: 3,
-                ..Default::default()
-            }],
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                3,
+                vec![1.0, 2.0, 3.0],
+            )],
             props,
             record_version: 1,
             ..Default::default()
@@ -6768,17 +6810,12 @@ mod index_first_search_tests {
 
             let record = ProximaRecord {
                 oid: format!("vec_{}", i),
-                embeddings: vec![proximadb_records::EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "vector".to_string(),
-                    values: proximadb_records::EmbeddingValues::Fp32(vec![
-                        i as f32,
-                        (i * 2) as f32,
-                        (i * 3) as f32,
-                    ]),
-                    dim: 3,
-                    ..Default::default()
-                }],
+                embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                    "default",
+                    "vector",
+                    3,
+                    vec![i as f32, (i * 2) as f32, (i * 3) as f32],
+                )],
                 props,
                 record_version: 1,
                 ..Default::default()

@@ -6,11 +6,11 @@
 |===
 | Field | Value
 | Status | **Partial (reconciled 2026-10-15).** Lever 1 (extract storage) is partial: see the engines track. Lever 2 (stabilize hubs) is open: `src/services/advisor_observations.rs` and `src/core/metadata_types.rs` are still in root. Lever 3 (god-file splits) is partial: embedded test modules extracted (#871, #873, #874), production bodies unsplit (`services/dml/mod.rs`, `network/postgres/protocol.rs` 7.3K lines). Lever 4 (proto v1 sunset) is partial: the v1 REST/gRPC surfaces were removed (TD-V1SUNSET-1, #1773), but `proximadb.v1.rs` remains the internal domain model (2,681 v1-proto refs). Lever 5 (unit-test time) is done for test-module extraction. The OOM goal (`CARGO_BUILD_JOBS>1`) is unmet.
-| Relates to | link:ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan] (umbrella), link:V1_RETIREMENT_ROADMAP_2026_07_08.adoc[v1 retirement roadmap] (Lever 4), link:ROOT_CRATE_DECOMPOSITION_STORAGE_EXTRACTION_PLAN_2026_07_11.adoc[storage-extraction plan] (overlap: Lever 1/2 targets — canonical there)
+| Relates to | link:../history/planning/ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc[decomposition plan] (umbrella), link:../history/planning/V1_RETIREMENT_ROADMAP_2026_07_08.adoc[v1 retirement roadmap] (Lever 4), link:../history/planning/ROOT_CRATE_DECOMPOSITION_STORAGE_EXTRACTION_PLAN_2026_07_11.adoc[storage-extraction plan] (overlap: Lever 1/2 targets — canonical there)
 |===
 
 [abstract]
-A CI-time-framed companion to `ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc` and the subsystem
+A CI-time-framed companion to `docs/history/planning/ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc` and the subsystem
 coupling reviews (#864 services, #865 network, #867 storage). It uses the code-graph centrality
 and coupling data (`.victor/project.db`, 1.41M nodes / now incl. `src/storage`) to **prioritize
 decomposition for maximum CI speedup** — faster rebuilds, parallelization, and a lower memory

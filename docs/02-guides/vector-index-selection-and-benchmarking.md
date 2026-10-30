@@ -497,7 +497,7 @@ Reading it:
 
 ## See also
 
-* `docs/12-design/RABITQ_PAX_SEGMENT_MIGRATION_PLAN_2026_06.adoc` — the cascade's phased rollout
+* `docs/history/planning/RABITQ_PAX_SEGMENT_MIGRATION_PLAN_2026_06.adoc` — the cascade's phased rollout
 * `docs/12-design/VECTOR_LAKEBASE_ALIGNMENT_2026_05_28.adoc` — the separation/lakehouse trade-offs
 * `crates/storage/proximadb-storage-common/src/iops_budget.rs` — budget resolution order
 * `.github/workflows/ci.yml` (LIGHT tier, N=10 000) and

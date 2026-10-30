@@ -25,7 +25,7 @@ use proximadb_records::ProximaRecord;
 ///
 /// This is the **single source of truth** shared by the bloom *build* site
 /// (`WALVectorBatch::create_bloom_filter`) and every *query* site (the WAL
-/// search path's `filter_batches_with_bloom`). Keeping one helper prevents the
+/// search path's `batch_may_match`). Keeping one helper prevents the
 /// build/query separators from ever drifting apart — a past `=` vs `:` mismatch
 /// silently turned the bloom pre-filter into a false-negative generator that
 /// excluded *every* batch, so a metadata-filtered search returned zero results.
@@ -1670,13 +1670,12 @@ mod tests {
             refs: Vec::new(),
             edge: None,
             embeddings: if !vector.is_empty() {
-                vec![EmbeddingCell {
-                    model_id: "default".to_string(),
-                    modality: "dense_vector".to_string(),
+                vec![EmbeddingCell::new_fp32(
+                    "default",
+                    "dense_vector",
                     dim,
-                    values: proximadb_records::EmbeddingValues::Fp32(vector),
-                    ..Default::default()
-                }]
+                    vector,
+                )]
             } else {
                 vec![]
             },

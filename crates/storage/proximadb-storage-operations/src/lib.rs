@@ -10,7 +10,7 @@
 //! - Provide observability and metrics for operation monitoring
 //!
 //! Extracted from the root crate's `src/storage/operations` as a slice of the root-crate
-//! decomposition (see `docs/12-design/ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc`). The
+//! decomposition (see `docs/history/planning/ROOT_CRATE_DECOMPOSITION_PLAN_2026_06_21.adoc`). The
 //! root crate re-exports it as `crate::storage::operations` for source compatibility.
 
 // Lint posture inherited from the root crate, under which this code was written

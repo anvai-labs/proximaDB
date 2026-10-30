@@ -1964,16 +1964,33 @@ impl PaxSegmentWriter {
             // TD-FPRUNE-1 P2: self-describe the shredded user columns so a
             // filtered read resolves a user-tag field name → col-id with no
             // catalog lookup. Gated with the footer stats (useless without them).
-            shred_field_map: if footer_stats_enabled() {
-                // The SEGMENT footer's map is (name -> col_id) only; the exact
-                // declared type lives in the per-BLOCK shred directory, which is
-                // ungated and self-contained.
+            // TD-FPRUNE-1 P5 slice 3: the segment footer map carries the
+            // FULL typed column (v2 section when any entry is typed) and is
+            // emitted whenever a shred spec exists — compaction needs the
+            // types to preserve residual outputs on rewrite, so gating the
+            // map with the (default-OFF) footer-stats env would silently
+            // undo P5 at every compaction.
+            //
+            // MIXED-READ (review MAJOR-1, corrected): develop-era readers
+            // BAIL on a v2 section version (they know the tag since P2 and
+            // reject unknown versions) — they do NOT skip it. A typed map is
+            // therefore only written when the residual gate is ON:
+            // `PROXIMADB_PAX_RESIDUAL_TAIL=0` strips the types (all-untyped
+            // ⇒ byte-identical v1 section) making the kill-switch a TRUE
+            // byte-level revert — safe for mixed-binary windows (rolling
+            // restart, rollback, replica skew over shared object storage).
+            // A develop-era binary that meets a v2 footer (only possible if
+            // a newer binary wrote it) fails CLOSED at the footer parse; it
+            // never returns wrong results from the section itself.
+            shred_field_map: if self.shred_spec.is_empty() {
+                Vec::new()
+            } else if proximadb_block_format::residual_tail_enabled() {
+                self.shred_spec.clone()
+            } else {
                 self.shred_spec
                     .iter()
-                    .map(|c| (c.key.clone(), c.column_id))
+                    .map(|c| proximadb_block_format::ShredColumn::untyped(&c.key, c.column_id))
                     .collect()
-            } else {
-                Vec::new()
             },
         };
         let footer_body = footer.to_bytes()?;
@@ -2490,16 +2507,33 @@ impl PaxSegmentWriter {
             c_len,
             // TD-FPRUNE-1 P2: self-describe shredded user columns (see the other
             // footer builder). Gated with the footer stats.
-            shred_field_map: if footer_stats_enabled() {
-                // The SEGMENT footer's map is (name -> col_id) only; the exact
-                // declared type lives in the per-BLOCK shred directory, which is
-                // ungated and self-contained.
+            // TD-FPRUNE-1 P5 slice 3: the segment footer map carries the
+            // FULL typed column (v2 section when any entry is typed) and is
+            // emitted whenever a shred spec exists — compaction needs the
+            // types to preserve residual outputs on rewrite, so gating the
+            // map with the (default-OFF) footer-stats env would silently
+            // undo P5 at every compaction.
+            //
+            // MIXED-READ (review MAJOR-1, corrected): develop-era readers
+            // BAIL on a v2 section version (they know the tag since P2 and
+            // reject unknown versions) — they do NOT skip it. A typed map is
+            // therefore only written when the residual gate is ON:
+            // `PROXIMADB_PAX_RESIDUAL_TAIL=0` strips the types (all-untyped
+            // ⇒ byte-identical v1 section) making the kill-switch a TRUE
+            // byte-level revert — safe for mixed-binary windows (rolling
+            // restart, rollback, replica skew over shared object storage).
+            // A develop-era binary that meets a v2 footer (only possible if
+            // a newer binary wrote it) fails CLOSED at the footer parse; it
+            // never returns wrong results from the section itself.
+            shred_field_map: if self.shred_spec.is_empty() {
+                Vec::new()
+            } else if proximadb_block_format::residual_tail_enabled() {
+                self.shred_spec.clone()
+            } else {
                 self.shred_spec
                     .iter()
-                    .map(|c| (c.key.clone(), c.column_id))
+                    .map(|c| proximadb_block_format::ShredColumn::untyped(&c.key, c.column_id))
                     .collect()
-            } else {
-                Vec::new()
             },
         };
         let footer_body = footer.to_bytes()?;
@@ -2905,12 +2939,10 @@ pub fn read_pax_segment_records(
                 if rec.embeddings.is_empty()
                     && let Some(v) = exact.decode_row(i)
                 {
-                    rec.embeddings.push(proximadb_records::EmbeddingCell {
-                        modality: "dense".into(),
-                        dim: exact.dim,
-                        values: proximadb_records::EmbeddingValues::Fp32(v),
-                        ..Default::default()
-                    });
+                    rec.embeddings
+                        .push(proximadb_records::EmbeddingCell::new_fp32(
+                            "", "dense", exact.dim, v,
+                        ));
                 }
             }
         }
@@ -2930,12 +2962,10 @@ pub fn read_pax_segment_records(
                 if rec.embeddings.is_empty()
                     && let Some(v) = sq8.decode_row(i)
                 {
-                    rec.embeddings.push(proximadb_records::EmbeddingCell {
-                        modality: "dense".into(),
-                        dim,
-                        values: proximadb_records::EmbeddingValues::Fp32(v),
-                        ..Default::default()
-                    });
+                    rec.embeddings
+                        .push(proximadb_records::EmbeddingCell::new_fp32(
+                            "", "dense", dim, v,
+                        ));
                 }
             }
         }
@@ -3110,17 +3140,14 @@ mod tests {
         let mut spilled = writer(&spill_path).with_local_spill(scratch.path())?;
         for row in 0..16usize {
             let mut record = make_record(&format!("oid-{row:03}"), "tenant", row as i64);
-            record.embeddings.push(EmbeddingCell {
-                model_id: "model_0".to_string(),
-                modality: "dense".to_string(),
-                dim: DIM as u32,
-                values: EmbeddingValues::Fp32(
-                    (0..DIM)
-                        .map(|dimension| (row * 13 + dimension * 5) as f32 * 0.01)
-                        .collect(),
-                ),
-                ..EmbeddingCell::default()
-            });
+            record.embeddings.push(EmbeddingCell::new_fp32(
+                "model_0",
+                "dense",
+                DIM as u32,
+                (0..DIM)
+                    .map(|dimension| (row * 13 + dimension * 5) as f32 * 0.01)
+                    .collect(),
+            ));
             memory.add_record(&record)?;
             spilled.add_record(&record)?;
         }
@@ -3173,12 +3200,12 @@ mod tests {
         .with_two_level(model);
         for row in 0..4usize {
             let mut record = make_record(&format!("r{row}"), "t", row as i64);
-            record.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim: DIM as u32,
-                values: EmbeddingValues::Fp32(vec![row as f32; DIM]),
-                ..Default::default()
-            });
+            record.embeddings.push(EmbeddingCell::new_fp32(
+                "",
+                "dense",
+                DIM as u32,
+                vec![row as f32; DIM],
+            ));
             writer.add_record(&record)?;
         }
 
@@ -3248,12 +3275,9 @@ mod tests {
                 .map(|lane| center + ((row + lane) % 3) as f32 * 0.01)
                 .collect();
             let mut record = make_record(&format!("r{row}"), "t", 1_000 + row as i64);
-            record.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim: DIM as u32,
-                values: EmbeddingValues::Fp32(values),
-                ..Default::default()
-            });
+            record
+                .embeddings
+                .push(EmbeddingCell::new_fp32("", "dense", DIM as u32, values));
             writer.add_record(&record)?;
         }
         writer.finish()?;
@@ -3308,12 +3332,12 @@ mod tests {
             }
             for oid in &oids {
                 let mut record = make_record(oid, "t", 1);
-                record.embeddings.push(EmbeddingCell {
-                    modality: "dense".into(),
-                    dim: DIM as u32,
-                    values: EmbeddingValues::Fp32(vec![0.5; DIM]),
-                    ..Default::default()
-                });
+                record.embeddings.push(EmbeddingCell::new_fp32(
+                    "",
+                    "dense",
+                    DIM as u32,
+                    vec![0.5; DIM],
+                ));
                 writer.add_record(&record)?;
             }
             writer.finish()?;
@@ -3401,12 +3425,12 @@ mod tests {
         }
         for row in 0..rows {
             let mut record = make_record(&format!("oid-{row}"), "t", 1_000 + row as i64);
-            record.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim: DIM as u32,
-                values: EmbeddingValues::Fp32(vec![0.25 + row as f32 * 0.001; DIM]),
-                ..Default::default()
-            });
+            record.embeddings.push(EmbeddingCell::new_fp32(
+                "",
+                "dense",
+                DIM as u32,
+                vec![0.25 + row as f32 * 0.001; DIM],
+            ));
             writer.add_record(&record)?;
         }
         writer.finish()?;
@@ -3533,12 +3557,12 @@ mod tests {
         let _ = &mut writer;
         for row in 0..ROWS {
             let mut record = make_record(&format!("oid-{row}"), "t", 1_000 + row as i64);
-            record.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim: DIM as u32,
-                values: EmbeddingValues::Fp32(vec![0.5; DIM]),
-                ..Default::default()
-            });
+            record.embeddings.push(EmbeddingCell::new_fp32(
+                "",
+                "dense",
+                DIM as u32,
+                vec![0.5; DIM],
+            ));
             writer.add_record(&record)?;
         }
         writer.finish()?;
@@ -3638,12 +3662,12 @@ mod tests {
         .with_oid_resolver(true);
         for row in 0..64 {
             let mut record = make_record(&format!("oid-{row}"), "t", 1_000 + row as i64);
-            record.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim: DIM as u32,
-                values: EmbeddingValues::Fp32(vec![0.5; DIM]),
-                ..Default::default()
-            });
+            record.embeddings.push(EmbeddingCell::new_fp32(
+                "",
+                "dense",
+                DIM as u32,
+                vec![0.5; DIM],
+            ));
             writer.add_record(&record)?;
         }
         writer.finish()?;
@@ -3739,12 +3763,12 @@ mod tests {
             }
             for row in 0..ROWS {
                 let mut record = make_record(&format!("oid-{row}"), "t", 1_000 + row as i64);
-                record.embeddings.push(EmbeddingCell {
-                    modality: "dense".into(),
-                    dim: DIM as u32,
-                    values: EmbeddingValues::Fp32(vec![0.25 + row as f32 * 0.001; DIM]),
-                    ..Default::default()
-                });
+                record.embeddings.push(EmbeddingCell::new_fp32(
+                    "",
+                    "dense",
+                    DIM as u32,
+                    vec![0.25 + row as f32 * 0.001; DIM],
+                ));
                 writer.add_record(&record)?;
             }
             writer.finish()?;
@@ -3793,12 +3817,8 @@ mod tests {
                 updated_at_ns: 1,
                 ..Default::default()
             };
-            r.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim,
-                values: EmbeddingValues::Fp32(v),
-                ..Default::default()
-            });
+            r.embeddings
+                .push(EmbeddingCell::new_fp32("", "dense", dim, v));
             r
         };
         let dir = tempfile::tempdir().unwrap();
@@ -3864,12 +3884,8 @@ mod tests {
                 updated_at_ns: 1,
                 ..Default::default()
             };
-            r.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim: 1,
-                values: EmbeddingValues::Fp32(vec![0.0]),
-                ..Default::default()
-            });
+            r.embeddings
+                .push(EmbeddingCell::new_fp32("", "dense", 1, vec![0.0]));
             r
         };
         let dir = tempfile::tempdir().unwrap();
@@ -3942,12 +3958,8 @@ mod tests {
                 updated_at_ns: 1,
                 ..Default::default()
             };
-            r.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim,
-                values: EmbeddingValues::Fp32(v),
-                ..Default::default()
-            });
+            r.embeddings
+                .push(EmbeddingCell::new_fp32("", "dense", dim, v));
             r
         };
         let dir = tempfile::tempdir().unwrap();
@@ -4031,12 +4043,12 @@ mod tests {
                 updated_at_ns: 1,
                 ..Default::default()
             };
-            r.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim: dim as u32,
-                values: EmbeddingValues::Fp32(vec![fill; dim]),
-                ..Default::default()
-            });
+            r.embeddings.push(EmbeddingCell::new_fp32(
+                "",
+                "dense",
+                dim as u32,
+                vec![fill; dim],
+            ));
             r
         };
         let dir = tempfile::tempdir().unwrap();
@@ -4077,12 +4089,8 @@ mod tests {
         let path = dir.path().join("seg.pax");
         use proximadb_records::{EmbeddingCell, EmbeddingValues};
         let mut r = make_record("a", "t", 1);
-        r.embeddings.push(EmbeddingCell {
-            modality: "dense".into(),
-            dim: 2,
-            values: EmbeddingValues::Fp32(vec![1.0, 2.0]),
-            ..Default::default()
-        });
+        r.embeddings
+            .push(EmbeddingCell::new_fp32("", "dense", 2, vec![1.0, 2.0]));
         let mut w = PaxSegmentWriter::new(
             &path,
             BlockMode::Pax,
@@ -4285,12 +4293,12 @@ mod tests {
 
         let vector_record = |oid: &str, values: Vec<f32>| {
             let mut record = make_record(oid, "t", 1);
-            record.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim: values.len() as u32,
-                values: EmbeddingValues::Fp32(values),
-                ..Default::default()
-            });
+            record.embeddings.push(EmbeddingCell::new_fp32(
+                "",
+                "dense",
+                values.len() as u32,
+                values,
+            ));
             record
         };
         let dir = tempfile::tempdir().unwrap();
@@ -4470,12 +4478,8 @@ mod tests {
         rich.props
             .insert("qty".into(), ProximaTreeNode::Value(ProximaValue::Int64(7)));
         rich.labels = vec!["a".to_string(), "b".to_string()].into();
-        rich.embeddings.push(EmbeddingCell {
-            modality: "dense".into(),
-            dim: 3,
-            values: EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-            ..Default::default()
-        });
+        rich.embeddings
+            .push(EmbeddingCell::new_fp32("", "dense", 3, vec![1.0, 2.0, 3.0]));
 
         let mut writer = PaxSegmentWriter::new(
             &path,
@@ -4605,12 +4609,8 @@ mod tests {
                 let v: Vec<f32> = (0..DIM)
                     .map(|d| ((row * 7 + d) % 13) as f32 - 6.0)
                     .collect();
-                r.embeddings.push(EmbeddingCell {
-                    modality: "dense".into(),
-                    dim: DIM as u32,
-                    values: EmbeddingValues::Fp32(v),
-                    ..Default::default()
-                });
+                r.embeddings
+                    .push(EmbeddingCell::new_fp32("", "dense", DIM as u32, v));
                 writer.add_record(&r)?;
             }
             for t in 0..(n_rows - n_covered) {
@@ -4727,12 +4727,8 @@ mod tests {
             let v: Vec<f32> = (0..DIM)
                 .map(|d| ((row * 7 + d) % 13) as f32 - 6.0)
                 .collect();
-            r.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim: DIM as u32,
-                values: EmbeddingValues::Fp32(v),
-                ..Default::default()
-            });
+            r.embeddings
+                .push(EmbeddingCell::new_fp32("", "dense", DIM as u32, v));
             w1.add_record(&r)?;
         }
         w1.finish()?;
@@ -4793,12 +4789,12 @@ mod tests {
         };
         for row in 0..n_rows {
             let mut r = make_record(&format!("r{row:05}"), "t", 1);
-            r.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim: DIM as u32,
-                values: EmbeddingValues::Fp32(vec_for(row)),
-                ..Default::default()
-            });
+            r.embeddings.push(EmbeddingCell::new_fp32(
+                "",
+                "dense",
+                DIM as u32,
+                vec_for(row),
+            ));
             writer.add_record(&r)?;
         }
         let meta = writer.finish()?;
@@ -4916,12 +4912,12 @@ mod tests {
         .with_two_level(model);
         for row in 0..10usize {
             let mut r = make_record(&format!("r{row}"), "t", 1);
-            r.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim: DIM as u32,
-                values: EmbeddingValues::Fp32(vec![row as f32; DIM]),
-                ..Default::default()
-            });
+            r.embeddings.push(EmbeddingCell::new_fp32(
+                "",
+                "dense",
+                DIM as u32,
+                vec![row as f32; DIM],
+            ));
             writer.add_record(&r)?;
         }
         let err = writer.finish().unwrap_err();
@@ -4971,14 +4967,12 @@ mod tests {
         .with_two_level(model);
         for row in 0..10usize {
             let mut record = make_record(&format!("oid-{row}"), "t", 1_000 + row as i64);
-            record.embeddings.push(EmbeddingCell {
-                modality: "dense".into(),
-                dim: DIM as u32,
-                values: EmbeddingValues::Fp32(
-                    (0..DIM).map(|d| (row * 7 + d) as f32 * 0.01).collect(),
-                ),
-                ..Default::default()
-            });
+            record.embeddings.push(EmbeddingCell::new_fp32(
+                "",
+                "dense",
+                DIM as u32,
+                (0..DIM).map(|d| (row * 7 + d) as f32 * 0.01).collect(),
+            ));
             writer.add_record(&record)?;
         }
         writer.finish()?;
@@ -5028,12 +5022,12 @@ mod tests {
                 let mut record = make_record(&format!("oid-{row}"), "t", ts);
                 record.created_at_ns = ts;
                 record.updated_at_ns = ts;
-                record.embeddings.push(EmbeddingCell {
-                    modality: "dense".into(),
-                    dim: DIM as u32,
-                    values: EmbeddingValues::Fp32(vec![0.25; DIM]),
-                    ..Default::default()
-                });
+                record.embeddings.push(EmbeddingCell::new_fp32(
+                    "",
+                    "dense",
+                    DIM as u32,
+                    vec![0.25; DIM],
+                ));
                 writer.add_record(&record)?;
             }
             writer.finish()?;
@@ -5084,16 +5078,14 @@ mod tests {
             }
             for row in 0..ROWS {
                 let mut record = make_record(&format!("oid-{row}"), "t", 1_000 + row as i64);
-                record.embeddings.push(EmbeddingCell {
-                    modality: "dense".into(),
-                    dim: DIM as u32,
-                    values: EmbeddingValues::Fp32(
-                        (0..DIM)
-                            .map(|d| (row * 11 + d * 3) as f32 * 0.017)
-                            .collect(),
-                    ),
-                    ..Default::default()
-                });
+                record.embeddings.push(EmbeddingCell::new_fp32(
+                    "",
+                    "dense",
+                    DIM as u32,
+                    (0..DIM)
+                        .map(|d| (row * 11 + d * 3) as f32 * 0.017)
+                        .collect(),
+                ));
                 writer.add_record(&record)?;
             }
             writer.finish()?;

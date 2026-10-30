@@ -174,13 +174,12 @@ mod tests {
 
         let vector = ProximaRecord {
             oid: "test_vector".to_string(),
-            embeddings: vec![EmbeddingCell {
-                model_id: "default".to_string(),
-                modality: "vector".to_string(),
-                values: proximadb_records::EmbeddingValues::Fp32(vec![1.0, 2.0, 3.0]),
-                dim: 3,
-                ..Default::default()
-            }],
+            embeddings: vec![EmbeddingCell::new_fp32(
+                "default",
+                "vector",
+                3,
+                vec![1.0, 2.0, 3.0],
+            )],
             ..Default::default()
         };
 

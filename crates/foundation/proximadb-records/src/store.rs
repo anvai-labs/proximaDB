@@ -200,6 +200,21 @@ pub trait RecordStore: Send + Sync {
         self.upsert_record(record).await
     }
 
+    /// Backpressure, asked BEFORE a write is made durable: `Err` means "do not
+    /// append more writes for me now" — a refusal the caller can report
+    /// truthfully (nothing was written) and the client can retry.
+    ///
+    /// Once a write is durable, applying it must not fail on account of the
+    /// store's own housekeeping (a spill flush): the caller would skip its index
+    /// maintenance and the rest of its batch, and report a durable write as
+    /// failed. A store whose housekeeping can fail keeps it best effort after
+    /// the write and bounds the backlog here instead.
+    ///
+    /// The default admits: a store that buffers nothing has no backlog.
+    async fn admit_writes(&self) -> RecordStoreResult<()> {
+        Ok(())
+    }
+
     /// The lowest WAL LSN this store still needs retained — i.e. the minimum LSN
     /// among records it holds that are **not** yet in a durable segment.
     ///
@@ -226,6 +241,19 @@ pub trait RecordStore: Send + Sync {
 
     async fn get_record(&self, key: &RecordKey) -> RecordStoreResult<Option<ProximaRecord>>;
 
+    /// Point lookup that ALSO returns a copy the store still holds but that is
+    /// dead (`ProximaRecord::is_dead`: tombstoned or TTL-expired), so a caller
+    /// can tell "dead" from "absent" — e.g. an index owner whose row expired
+    /// (TD-DML-3). The default is [`Self::get_record`], which is exact for
+    /// stores whose `get_record` never hides a dead copy; a store that filters
+    /// dead copies out of `get_record` must override this.
+    async fn get_record_including_dead(
+        &self,
+        key: &RecordKey,
+    ) -> RecordStoreResult<Option<ProximaRecord>> {
+        self.get_record(key).await
+    }
+
     /// Batch point-lookup: fetch many records by key in one logical operation,
     /// returning one slot per input key, in order (`None` = absent).
     ///
@@ -247,6 +275,16 @@ pub trait RecordStore: Send + Sync {
     }
 
     async fn delete_record(&self, key: &RecordKey) -> RecordStoreResult<bool>;
+
+    /// [`Self::delete_record`], applied from the durable WAL entry at `lsn` —
+    /// the delete's counterpart of [`Self::upsert_record_at_lsn`], under the
+    /// same durability precondition. A store whose deletes leave in-memory
+    /// state the WAL must reconstruct (a spill tombstone) keeps `lsn` with it,
+    /// so [`Self::min_unflushed_lsn`] can answer a floor instead of refusing.
+    async fn delete_record_at_lsn(&self, key: &RecordKey, lsn: u64) -> RecordStoreResult<bool> {
+        let _ = lsn;
+        self.delete_record(key).await
+    }
 
     async fn upsert_records(
         &self,
@@ -294,6 +332,44 @@ pub trait RecordStore: Send + Sync {
     }
 }
 
+/// A flush-consistent view of a store's state, for readers that merge the
+/// layers themselves instead of asking the store for a merged result (the
+/// streaming Layer A table provider, ADR-097 P3.1).
+///
+/// Consistency with respect to **flushes** is the contract: every live row is
+/// either in `resident` or in a listed segment, and every delete is either in
+/// `tombstones` or persisted in a listed segment — none falls between the
+/// parts because a flush landed while the view was taken.
+///
+/// It is NOT a per-write linearization point. A single upsert or delete
+/// updates the resident map and the tombstone set in two steps, and a view
+/// taken between them can serve the older segment copy of that one oid — the
+/// same exposure `scan_records` has always had. Closing it needs the write
+/// order TD-USUB-16 tracks (an LSN-ordered tombstone/resident pair), not a
+/// reordering of the two steps. The concurrent upsert-vs-delete race has two
+/// failure modes: with the current order it can at worst end with BOTH a
+/// resident row and a tombstone (the tombstone hides the new row — a lost
+/// upsert); any reordering lets it end with NEITHER (a resurrected stale
+/// segment copy), which is worse.
+///
+/// The reader resolves it newest-wins: segments oldest→newest, a later one
+/// shadowing an earlier copy of the same oid; then `resident` on top of every
+/// segment; an oid in `tombstones` is absent whatever the layers hold (a
+/// resident copy too — the unresolvable upsert/delete race of TD-USUB-16 reads
+/// as deleted, as `get_record` serves it). Dead rows (a persisted
+/// tombstone, an expired `valid_to_ns`) can appear in any part and are the
+/// reader's to drop *after* resolution, so a dead newer copy still hides a live
+/// older one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RecordScanView {
+    /// Rows held in memory — the newest copy of their oid.
+    pub resident: Vec<ProximaRecord>,
+    /// Oids deleted after their row reached a segment, not yet persisted.
+    pub tombstones: Vec<String>,
+    /// Durable segment paths, oldest first. Each holds at most one row per oid.
+    pub segments: Vec<String>,
+}
+
 /// Optional scan contract for stores that can expose canonical record ranges.
 ///
 /// Keep this separate from `RecordStore` so point-write stores can implement
@@ -301,6 +377,18 @@ pub trait RecordStore: Send + Sync {
 #[async_trait]
 pub trait RecordScan: Send + Sync {
     async fn scan_records(&self, limit: usize) -> RecordStoreResult<Vec<ProximaRecord>>;
+
+    /// The store's state as a [`RecordScanView`], without reading any segment.
+    ///
+    /// Default: a store with no segments — every current row is resident.
+    /// A segmented store MUST override this, taking all three parts under the
+    /// lock its flush publishes with.
+    async fn scan_view(&self) -> RecordStoreResult<RecordScanView> {
+        Ok(RecordScanView {
+            resident: self.scan_records(usize::MAX).await?,
+            ..RecordScanView::default()
+        })
+    }
 
     async fn scan_records_with_options(
         &self,
@@ -349,6 +437,30 @@ pub trait RecordScan: Send + Sync {
             keep
         });
         Ok(all)
+    }
+
+    /// Every live record matching `options` (its `limit` is ignored) as a
+    /// [`RecordChunkStream`](crate::chunked::RecordChunkStream): chunks of at most
+    /// `chunk_rows`, strictly ascending by `oid`, each oid once. Bounded-memory
+    /// consumers (MATERIALIZE) rely on stores overriding this. Takes the store's
+    /// `Arc` so the stream owns what it reads and can outlive the caller's frame.
+    ///
+    /// Default: correct but not bounded — materializes the scan, then sorts and
+    /// chunks it.
+    fn scan_record_chunks(
+        self: std::sync::Arc<Self>,
+        options: RecordScanOptions,
+        chunk_rows: usize,
+    ) -> crate::chunked::RecordChunkStream<'static>
+    where
+        Self: 'static,
+    {
+        let mut options = options;
+        options.limit = None;
+        crate::chunked::once_then_chunks(
+            async move { self.scan_records_with_options(options).await },
+            chunk_rows,
+        )
     }
 }
 

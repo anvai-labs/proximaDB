@@ -61,10 +61,15 @@ curl -X POST http://localhost:5678/api/v2/collections \
   -d '{
     "name": "products",
     "dimension": 384,
-    "metric": "cosine",
+    "distance_metric": "cosine",
     "engine": "sst"
   }'
 ```
+
+Unknown fields are rejected with `400 invalid_argument` naming the field, and so is an invalid
+value such as an unknown quantization `strategy`. A misspelt setting is never silently replaced
+by a default. `metric` and `storage_engine` are accepted as aliases of `distance_metric` and
+`engine`.
 
 ### Example: Search
 

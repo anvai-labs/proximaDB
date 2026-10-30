@@ -12,15 +12,12 @@ use axum::{
     routing::{delete, get, patch, post},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
 
 use crate::errors::{ApiError, ApiResult};
 use crate::proto::proximadb_v1::{
-    AggregationStage, DocIndexType, DocumentCollectionConfig, DocumentUpdate, GroupStage,
-    IndexDefinition, LimitStage, LookupStage, MatchStage, ProjectStage, SkipStage, SortStage,
-    SqlObject, SqlValue, UnwindStage, UpdateOperation,
+    AggregationStage, DocumentCollectionConfig, IndexDefinition, SqlObject,
 };
 use crate::storage::document::{
     DocumentQueryParams as ServiceQueryParams, DocumentRecord, DocumentService,
@@ -206,23 +203,13 @@ async fn create_collection(
 ) -> ApiResult<JsonResponse<serde_json::Value>> {
     info!("Creating document collection: {}", request.name);
 
-    // Create indexes from request
+    // Create indexes from request (shared mapping with the api-crate
+    // document handlers).
     let index_definitions: Vec<IndexDefinition> = request
         .indexes
         .into_iter()
-        .map(|idx| IndexDefinition {
-            name: idx.name,
-            path: idx.path,
-            index_type: match idx.index_type.to_lowercase().as_str() {
-                "btree" => DocIndexType::Btree as i32,
-                "hash" => DocIndexType::Hash as i32,
-                "inverted" => DocIndexType::Inverted as i32,
-                "fulltext" => DocIndexType::Fulltext as i32,
-                "geo" => DocIndexType::Geo as i32,
-                _ => DocIndexType::Btree as i32,
-            },
-            unique: idx.unique,
-            sparse: idx.sparse,
+        .map(|idx| {
+            api_doc::index_definition(idx.name, idx.path, &idx.index_type, idx.unique, idx.sparse)
         })
         .collect();
 
@@ -453,39 +440,8 @@ async fn update_document(
     debug!("Updating document: {}/{}", collection, id);
 
     // Convert JSON update operations to DocumentUpdate proto objects
-    let updates: Vec<DocumentUpdate> = request
-        .updates
-        .iter()
-        .map(|v| {
-            // Each update value should be an object with operation, path, value fields
-            let operation = v
-                .get("operation")
-                .and_then(|o| o.as_str())
-                .map(|s| match s.to_lowercase().as_str() {
-                    "set" => UpdateOperation::Set as i32,
-                    "unset" => UpdateOperation::Unset as i32,
-                    "inc" => UpdateOperation::Inc as i32,
-                    "push" => UpdateOperation::Push as i32,
-                    "pull" => UpdateOperation::Pull as i32,
-                    _ => UpdateOperation::Set as i32,
-                })
-                .unwrap_or(UpdateOperation::Set as i32);
-
-            let path = v
-                .get("path")
-                .and_then(|p| p.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let value = v.get("value").map(json_to_sql_value);
-
-            DocumentUpdate {
-                operation,
-                path,
-                value,
-            }
-        })
-        .collect();
+    // (shared with the api-crate document handlers).
+    let updates = api_doc::json_updates_to_document_updates(&request.updates);
 
     let record = state
         .document_service
@@ -603,141 +559,38 @@ async fn list_indexes(
     })))
 }
 
-// Helper functions
+// Helper functions — thin delegations to the api-crate document module
+// (the canonical converters; this legacy surface maps their `RestError`s
+// onto this crate's `ApiError`).
 
-/// Convert JSON Value to SqlObject
-fn json_to_sql_object(value: &serde_json::Value) -> ApiResult<SqlObject> {
-    match value {
-        serde_json::Value::Object(map) => {
-            let fields: HashMap<String, SqlValue> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), json_to_sql_value(v)))
-                .collect();
-            Ok(SqlObject { fields })
+use proximadb_api::rest::canonical::document as api_doc;
+
+/// Map the api-crate REST error onto this surface's `ApiError`, preserving
+/// the client/server distinction (400 vs 500) and the message verbatim.
+fn rest_err_to_api(e: proximadb_api::rest::errors::RestError) -> ApiError {
+    match e {
+        proximadb_api::rest::errors::RestError::InvalidArgument(msg) => {
+            ApiError::InvalidArgument(msg)
         }
-        _ => Err(ApiError::InvalidArgument(
-            "Document must be a JSON object".to_string(),
-        )),
+        other => ApiError::Internal(other.to_string()),
     }
 }
 
-/// Convert JSON Value to SqlValue
-fn json_to_sql_value(value: &serde_json::Value) -> SqlValue {
-    use crate::proto::proximadb_v1::SqlArray;
-    use crate::proto::proximadb_v1::sql_value::Value;
-
-    let inner = match value {
-        serde_json::Value::Null => Some(Value::NullValue(0)),
-        serde_json::Value::Bool(b) => Some(Value::BoolValue(*b)),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Some(Value::Int64Value(i))
-            } else if let Some(f) = n.as_f64() {
-                Some(Value::NumberValue(f))
-            } else {
-                Some(Value::StringValue(n.to_string()))
-            }
-        }
-        serde_json::Value::String(s) => Some(Value::StringValue(s.clone())),
-        serde_json::Value::Array(arr) => {
-            let values: Vec<SqlValue> = arr.iter().map(json_to_sql_value).collect();
-            Some(Value::ArrayValue(SqlArray { values }))
-        }
-        serde_json::Value::Object(map) => {
-            let fields: HashMap<String, SqlValue> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), json_to_sql_value(v)))
-                .collect();
-            Some(Value::ObjectValue(SqlObject { fields }))
-        }
-    };
-
-    SqlValue { value: inner }
+/// Convert JSON Value to SqlObject
+fn json_to_sql_object(value: &serde_json::Value) -> ApiResult<SqlObject> {
+    api_doc::json_to_sql_object(value).map_err(rest_err_to_api)
 }
-
-use proximadb_records::conversions::sql_value_to_json;
 
 /// Convert SqlObject to JSON
 fn sql_object_to_json(obj: &SqlObject) -> serde_json::Value {
-    let map: serde_json::Map<String, serde_json::Value> = obj
-        .fields
-        .iter()
-        .map(|(k, v)| (k.clone(), sql_value_to_json(v)))
-        .collect();
-    serde_json::Value::Object(map)
+    api_doc::sql_object_to_json(obj)
 }
 
 /// Convert a JSON value into an AggregationStage.
 ///
 /// Expected format: `{ "$match": {...} }` or `{ "$group": {...} }` etc.
 fn json_to_aggregation_stage(value: &serde_json::Value) -> ApiResult<AggregationStage> {
-    use crate::proto::proximadb_v1::aggregation_stage::Stage;
-
-    let obj = value
-        .as_object()
-        .ok_or_else(|| ApiError::InvalidArgument("Pipeline stage must be a JSON object".into()))?;
-
-    // Determine stage type from the first key
-    if let Some(match_val) = obj.get("$match").or_else(|| obj.get("match")) {
-        let stage: MatchStage = serde_json::from_value(match_val.clone())
-            .map_err(|e| ApiError::InvalidArgument(format!("Invalid $match stage: {}", e)))?;
-        Ok(AggregationStage {
-            stage: Some(Stage::Match(stage)),
-        })
-    } else if let Some(group_val) = obj.get("$group").or_else(|| obj.get("group")) {
-        let stage: GroupStage = serde_json::from_value(group_val.clone())
-            .map_err(|e| ApiError::InvalidArgument(format!("Invalid $group stage: {}", e)))?;
-        Ok(AggregationStage {
-            stage: Some(Stage::Group(stage)),
-        })
-    } else if let Some(project_val) = obj.get("$project").or_else(|| obj.get("project")) {
-        let stage: ProjectStage = serde_json::from_value(project_val.clone())
-            .map_err(|e| ApiError::InvalidArgument(format!("Invalid $project stage: {}", e)))?;
-        Ok(AggregationStage {
-            stage: Some(Stage::Project(stage)),
-        })
-    } else if let Some(sort_val) = obj.get("$sort").or_else(|| obj.get("sort")) {
-        let stage: SortStage = serde_json::from_value(sort_val.clone())
-            .map_err(|e| ApiError::InvalidArgument(format!("Invalid $sort stage: {}", e)))?;
-        Ok(AggregationStage {
-            stage: Some(Stage::Sort(stage)),
-        })
-    } else if let Some(limit_val) = obj.get("$limit").or_else(|| obj.get("limit")) {
-        // $limit can be a plain number: { "$limit": 10 }
-        let limit = limit_val.as_u64().unwrap_or(100) as u32;
-        Ok(AggregationStage {
-            stage: Some(Stage::Limit(LimitStage { limit })),
-        })
-    } else if let Some(skip_val) = obj.get("$skip").or_else(|| obj.get("skip")) {
-        let skip = skip_val.as_u64().unwrap_or(0) as u32;
-        Ok(AggregationStage {
-            stage: Some(Stage::Skip(SkipStage { skip })),
-        })
-    } else if let Some(unwind_val) = obj.get("$unwind").or_else(|| obj.get("unwind")) {
-        let stage: UnwindStage = if unwind_val.is_string() {
-            UnwindStage {
-                path: unwind_val.as_str().unwrap_or("").to_string(),
-                preserve_null: false,
-            }
-        } else {
-            serde_json::from_value(unwind_val.clone())
-                .map_err(|e| ApiError::InvalidArgument(format!("Invalid $unwind stage: {}", e)))?
-        };
-        Ok(AggregationStage {
-            stage: Some(Stage::Unwind(stage)),
-        })
-    } else if let Some(lookup_val) = obj.get("$lookup").or_else(|| obj.get("lookup")) {
-        let stage: LookupStage = serde_json::from_value(lookup_val.clone())
-            .map_err(|e| ApiError::InvalidArgument(format!("Invalid $lookup stage: {}", e)))?;
-        Ok(AggregationStage {
-            stage: Some(Stage::Lookup(stage)),
-        })
-    } else {
-        Err(ApiError::InvalidArgument(format!(
-            "Unknown pipeline stage: {}",
-            value
-        )))
-    }
+    api_doc::json_to_aggregation_stage(value).map_err(rest_err_to_api)
 }
 
 /// Convert DocumentRecord to response
