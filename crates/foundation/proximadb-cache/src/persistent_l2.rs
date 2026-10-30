@@ -907,6 +907,17 @@ impl PersistentByteStore {
         self.remove_indexed(key, true)
     }
 
+    /// The indexed keys matching `predicate` — a lock-free snapshot (entries
+    /// put or removed concurrently may or may not appear).
+    pub fn keys_where(&self, predicate: impl Fn(&str) -> bool) -> Vec<String> {
+        self.inner
+            .entries
+            .iter()
+            .filter(|entry| predicate(entry.key()))
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
     /// Remove every indexed entry whose logical key matches `predicate`.
     ///
     /// The mutation lock serializes the sweep with atomic publication so a

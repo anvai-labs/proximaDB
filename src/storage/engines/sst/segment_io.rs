@@ -541,41 +541,68 @@ pub struct WarmReport {
     pub orphans_dropped: usize,
 }
 
-/// Crash reconciliation: drop every resident whole-object copy directly
-/// under `data_url` whose object the committed set (`objects`, from the same
-/// listing) no longer names. A crash between a segment's delete and its
+/// A resident whole-object copy directly under a segment root, by key and
+/// object name ([`orphan_candidates`]).
+pub(crate) struct ResidentChild {
+    key: String,
+    name: String,
+}
+
+/// Crash reconciliation, step 1 — snapshot BEFORE the listing: the resident
+/// whole-object copies directly under `data_url`. Only these are judged by
+/// [`sweep_orphan_objects`], so a copy made after the snapshot (a segment
+/// published while the LIST is in flight) is never removed for missing from
+/// a listing that predates it (review SF1: nothing would re-warm it).
+///
+/// Matched like the protection groups (`contains` on canonical forms), since
+/// a listing may spell the root differently (`file:///abs/...` for a grant
+/// prefix of `/abs/...`); the FIRST occurrence decides, so a nested key whose
+/// path repeats the root string is never taken for a direct child.
+pub(crate) fn orphan_candidates(store: &PersistentByteStore, data_url: &str) -> Vec<ResidentChild> {
+    let object_prefix = object_key("");
+    let root = proximadb_cache::canonical_location(&format!("{}/", data_url.trim_end_matches('/')));
+    let child_name = |key: &str| -> Option<String> {
+        let location = key.strip_prefix(object_prefix.as_str())?;
+        let at = location.find(root.as_str())?;
+        let name = &location[at + root.len()..];
+        // Direct children only: the listing is not recursive, so a nested
+        // object is not judged by it.
+        (!name.is_empty() && !name.contains('/')).then(|| name.to_string())
+    };
+    store
+        .keys_where(|key| child_name(key).is_some())
+        .into_iter()
+        .filter_map(|key| child_name(&key).map(|name| ResidentChild { key, name }))
+        .collect()
+}
+
+/// Crash reconciliation, step 2: drop each snapshotted copy whose object the
+/// committed set (`objects`, from a listing taken AFTER the snapshot) no
+/// longer names. A crash between a segment's delete and its
 /// [`forget_object`] — or a retirement in another process — otherwise leaves
 /// the copy pinned, charging the grant, until the grant is released.
 ///
-/// Plain removal, NOT [`forget_object`]: an object published after the
-/// listing and warmed before this sweep loses its copy too, and must stay
-/// re-warmable (the retired set would block that). Losing a copy only costs a
-/// re-warm; the proof reports WARMING meanwhile.
-async fn sweep_orphan_objects(data_url: &str, objects: &[(String, Option<u64>)]) -> usize {
-    let Some(store) = proximadb_cache::process_store() else {
+/// Compared by object NAME within the root, so a copy keyed under another
+/// spelling of a listed object is not mistaken for an orphan. Plain removal,
+/// NOT [`forget_object`]: removal is only for objects the listing proves gone.
+pub(crate) async fn sweep_orphan_objects(
+    store: &PersistentByteStore,
+    candidates: Vec<ResidentChild>,
+    objects: &[(String, Option<u64>)],
+) -> usize {
+    let listed: std::collections::HashSet<&str> = objects
+        .iter()
+        .map(|(url, _)| url.rsplit('/').next().unwrap_or(url.as_str()))
+        .collect();
+    let doomed: std::collections::HashSet<String> = candidates
+        .into_iter()
+        .filter(|child| !listed.contains(child.name.as_str()))
+        .map(|child| child.key)
+        .collect();
+    if doomed.is_empty() {
         return 0;
-    };
-    // Matched like the protection groups (`contains` on canonical forms): a
-    // listing may spell the root differently (`file:///abs/...` for a grant
-    // prefix of `/abs/...`), so an exact-prefix match would sweep nothing.
-    let object_prefix = object_key("");
-    let root = proximadb_cache::canonical_location(&format!("{}/", data_url.trim_end_matches('/')));
-    let live: std::collections::HashSet<String> =
-        objects.iter().map(|(url, _)| object_key(url)).collect();
-    store
-        .remove_where(|key| {
-            let Some(location) = key.strip_prefix(object_prefix.as_str()) else {
-                return false;
-            };
-            location
-                .rfind(root.as_str())
-                .map(|at| &location[at + root.len()..])
-                // Direct children only: the listing is not recursive, so a
-                // nested object is not judged by it.
-                .is_some_and(|name| !name.is_empty() && !name.contains('/'))
-                && !live.contains(key)
-        })
-        .await
+    }
+    store.remove_where(|key| doomed.contains(key)).await
 }
 
 /// Backfill: make every live segment under `data_url` resident when a grant
@@ -592,8 +619,14 @@ pub async fn warm_collection(
     if !proximadb_cache::process_store().is_some_and(|store| store.policy_active()) {
         return Ok(WarmReport::default());
     }
+    let candidates = proximadb_cache::process_store()
+        .map(|store| orphan_candidates(&store, data_url))
+        .unwrap_or_default();
     let objects = residency_objects(fs, data_url).await?;
-    let orphans = sweep_orphan_objects(data_url, &objects).await;
+    let orphans = match proximadb_cache::process_store() {
+        Some(store) => sweep_orphan_objects(&store, candidates, &objects).await,
+        None => 0,
+    };
     let outcomes: Vec<anyhow::Result<bool>> = futures::stream::iter(objects)
         .map(|(url, size)| async move { warm_object(fs, &url, size).await })
         .buffer_unordered(concurrency.max(1))
@@ -898,6 +931,40 @@ mod tests {
         assert!(
             armed.store.covered_bytes("orphans") < covered_before,
             "the grant stops paying for the orphan"
+        );
+    }
+
+    /// Review SF1: a copy made after the snapshot (published while the LIST
+    /// was in flight) survives a sweep against the older listing; a
+    /// snapshotted copy the listing lacks does not.
+    #[tokio::test]
+    async fn sweep_spares_copies_made_after_the_snapshot() {
+        let root = tempfile::tempdir().expect("root");
+        let (covered, _) = dirs(root.path());
+        let armed = arm(&covered, "sweep-race", 32 << 20);
+        let data_url = covered.to_string_lossy().to_string();
+        let put = |name: &str| {
+            let store = armed.store.clone();
+            let key = object_key(&format!("{data_url}/{name}"));
+            async move {
+                store
+                    .put(key.clone(), L2Class::Invariants, Arc::from(&b"bytes"[..]))
+                    .await
+                    .expect("put");
+                key
+            }
+        };
+        let stale = put("L0_stale.pax").await;
+        let candidates = orphan_candidates(&armed.store, &data_url);
+        // Published and warmed after the snapshot; absent from the listing.
+        let fresh = put("L0_fresh.pax").await;
+        let listing: Vec<(String, Option<u64>)> = Vec::new();
+        let dropped = sweep_orphan_objects(&armed.store, candidates, &listing).await;
+        assert_eq!(dropped, 1);
+        assert_eq!(armed.store.entry_len(&stale), None);
+        assert!(
+            armed.store.entry_len(&fresh).is_some(),
+            "the fresh copy stays"
         );
     }
 

@@ -271,10 +271,7 @@ impl CollectionService {
         // Review S4 / S-1: the proven profile is the SST PAX scan — AXIS-routed
         // collections (non-empty index_configs) and other engines (whose
         // readers and object kinds the proof does not count) are outside it.
-        let in_profile = config.index_configs.is_empty()
-            && crate::services::collection::storage_class::effective_storage_engine(
-                config.storage_engine,
-            ) == Some(crate::proto::proximadb_v1::StorageEngine::Sst);
+        let in_profile = crate::services::collection::storage_class::in_ready_profile(config);
         let base = collection.storage_class_status.take().unwrap_or_else(|| {
             crate::services::collection::storage_class::storage_class_status(config)
         });
@@ -2338,24 +2335,14 @@ impl CollectionService {
                             // immutable, so create-time admissibility carries).
                             let mut prospective_config = existing_config.clone();
                             prospective_config.storage_class = Some(resolved as i32);
-                            // The engine the record runs on: an assignment's
-                            // UNSPECIFIED (0) defers to the config, and both
-                            // resolve as the engine factory does. An unknown
-                            // number stays unresolved, so admission refuses it.
                             let engine =
-                                crate::services::collection::storage_class::effective_storage_engine(
+                                crate::services::collection::storage_class::record_storage_engine(
                                     previous_record
                                         .storage_assignment
                                         .as_ref()
-                                        .map(|a| a.engine)
-                                        .filter(|engine| {
-                                            *engine
-                                                != crate::proto::proximadb_v1::StorageEngine::Unspecified
-                                                    as i32
-                                        })
-                                        .or(existing_config.storage_engine),
-                                )
-                                .unwrap_or(crate::proto::proximadb_v1::StorageEngine::Unspecified);
+                                        .map(|a| a.engine),
+                                    existing_config.storage_engine,
+                                );
                             let base = previous_record
                                 .storage_assignment
                                 .as_ref()
