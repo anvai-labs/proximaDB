@@ -239,12 +239,16 @@ pub mod types {
             Default::default()
         }
     }
-    ///`AbacComparisonOperator`
+    /// The server additionally accepts the legacy wire names `Equal` and
+    /// `NotEqual` as aliases of `Equals`/`NotEquals` when deserializing
+    /// (mixed-read compatibility); serialization always emits the names
+    /// above.
     ///
     /// <details><summary>JSON schema</summary>
     ///
     /// ```json
     ///{
+    ///  "description": "The server additionally accepts the legacy wire names `Equal` and\n`NotEqual` as aliases of `Equals`/`NotEquals` when deserializing\n(mixed-read compatibility); serialization always emits the names\nabove.\n",
     ///  "type": "string",
     ///  "enum": [
     ///    "Equals",
@@ -261,7 +265,10 @@ pub mod types {
     ///    "Between",
     ///    "IsNull",
     ///    "IsNotNull",
-    ///    "Like"
+    ///    "Like",
+    ///    "Exists",
+    ///    "NotExists",
+    ///    "Regex"
     ///  ]
     ///}
     /// ```
@@ -294,6 +301,9 @@ pub mod types {
         IsNull,
         IsNotNull,
         Like,
+        Exists,
+        NotExists,
+        Regex,
     }
     impl ::std::fmt::Display for AbacComparisonOperator {
         fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
@@ -313,6 +323,9 @@ pub mod types {
                 Self::IsNull => f.write_str("IsNull"),
                 Self::IsNotNull => f.write_str("IsNotNull"),
                 Self::Like => f.write_str("Like"),
+                Self::Exists => f.write_str("Exists"),
+                Self::NotExists => f.write_str("NotExists"),
+                Self::Regex => f.write_str("Regex"),
             }
         }
     }
@@ -335,6 +348,9 @@ pub mod types {
                 "IsNull" => Ok(Self::IsNull),
                 "IsNotNull" => Ok(Self::IsNotNull),
                 "Like" => Ok(Self::Like),
+                "Exists" => Ok(Self::Exists),
+                "NotExists" => Ok(Self::NotExists),
+                "Regex" => Ok(Self::Regex),
                 _ => Err("invalid value".into()),
             }
         }
@@ -520,7 +536,8 @@ pub mod types {
     /// * `{"Comparison": {"field": <string>, "operator": <one of
     ///   "Equals","NotEquals","GreaterThan","GreaterThanOrEqual",
     ///   "LessThan","LessThanOrEqual","In","NotIn","Contains",
-    ///   "StartsWith","EndsWith","Between","IsNull","IsNotNull","Like">,
+    ///   "StartsWith","EndsWith","Between","IsNull","IsNotNull","Like",
+    ///   "Exists","NotExists","Regex">,
     ///   "value": <any JSON value>}}`
     /// * `{"And": [<AbacFilterExpression>, ...]}`
     /// * `{"Or": [<AbacFilterExpression>, ...]}`
@@ -534,7 +551,7 @@ pub mod types {
     ///
     /// ```json
     ///{
-    ///  "description": "A predicate-object row filter — a RECURSIVE, externally-tagged Rust\nenum (`proximadb_filter_expression::FilterExpression`). Modeled\nhere as free-form JSON (rather than a typed `oneOf`) because the\nself-referential union is not representable in a form the SDK\ncodegen tooling can process (openapi-python-client cannot resolve\na `oneOf` branch whose `items` `$ref`s the union being defined);\nthis is the one schema in the ABAC surface where the generated\nclient falls back to an untyped object. Construct exactly one of:\n\n* `{\"Comparison\": {\"field\": <string>, \"operator\": <one of\n  \"Equals\",\"NotEquals\",\"GreaterThan\",\"GreaterThanOrEqual\",\n  \"LessThan\",\"LessThanOrEqual\",\"In\",\"NotIn\",\"Contains\",\n  \"StartsWith\",\"EndsWith\",\"Between\",\"IsNull\",\"IsNotNull\",\"Like\">,\n  \"value\": <any JSON value>}}`\n* `{\"And\": [<AbacFilterExpression>, ...]}`\n* `{\"Or\": [<AbacFilterExpression>, ...]}`\n* `{\"Not\": <AbacFilterExpression>}`\n\nSee [AbacComparisonOperator](#/components/schemas/AbacComparisonOperator)\nfor the authoritative operator enum (referenced here for docs only;\nnot structurally, for the same recursion reason).\n",
+    ///  "description": "A predicate-object row filter — a RECURSIVE, externally-tagged Rust\nenum (`proximadb_filter_expression::FilterExpression`). Modeled\nhere as free-form JSON (rather than a typed `oneOf`) because the\nself-referential union is not representable in a form the SDK\ncodegen tooling can process (openapi-python-client cannot resolve\na `oneOf` branch whose `items` `$ref`s the union being defined);\nthis is the one schema in the ABAC surface where the generated\nclient falls back to an untyped object. Construct exactly one of:\n\n* `{\"Comparison\": {\"field\": <string>, \"operator\": <one of\n  \"Equals\",\"NotEquals\",\"GreaterThan\",\"GreaterThanOrEqual\",\n  \"LessThan\",\"LessThanOrEqual\",\"In\",\"NotIn\",\"Contains\",\n  \"StartsWith\",\"EndsWith\",\"Between\",\"IsNull\",\"IsNotNull\",\"Like\",\n  \"Exists\",\"NotExists\",\"Regex\">,\n  \"value\": <any JSON value>}}`\n* `{\"And\": [<AbacFilterExpression>, ...]}`\n* `{\"Or\": [<AbacFilterExpression>, ...]}`\n* `{\"Not\": <AbacFilterExpression>}`\n\nSee [AbacComparisonOperator](#/components/schemas/AbacComparisonOperator)\nfor the authoritative operator enum (referenced here for docs only;\nnot structurally, for the same recursion reason).\n",
     ///  "type": "object",
     ///  "additionalProperties": true
     ///}

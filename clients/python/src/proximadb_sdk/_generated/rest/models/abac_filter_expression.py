@@ -30,7 +30,8 @@ class AbacFilterExpression:
     * `{"Comparison": {"field": <string>, "operator": <one of
       "Equals","NotEquals","GreaterThan","GreaterThanOrEqual",
       "LessThan","LessThanOrEqual","In","NotIn","Contains",
-      "StartsWith","EndsWith","Between","IsNull","IsNotNull","Like">,
+      "StartsWith","EndsWith","Between","IsNull","IsNotNull","Like",
+      "Exists","NotExists","Regex">,
       "value": <any JSON value>}}`
     * `{"And": [<AbacFilterExpression>, ...]}`
     * `{"Or": [<AbacFilterExpression>, ...]}`

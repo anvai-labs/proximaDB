@@ -22,6 +22,7 @@ const (
 	Contains           AbacComparisonOperator = "Contains"
 	EndsWith           AbacComparisonOperator = "EndsWith"
 	Equals             AbacComparisonOperator = "Equals"
+	Exists             AbacComparisonOperator = "Exists"
 	GreaterThan        AbacComparisonOperator = "GreaterThan"
 	GreaterThanOrEqual AbacComparisonOperator = "GreaterThanOrEqual"
 	In                 AbacComparisonOperator = "In"
@@ -31,7 +32,9 @@ const (
 	LessThanOrEqual    AbacComparisonOperator = "LessThanOrEqual"
 	Like               AbacComparisonOperator = "Like"
 	NotEquals          AbacComparisonOperator = "NotEquals"
+	NotExists          AbacComparisonOperator = "NotExists"
 	NotIn              AbacComparisonOperator = "NotIn"
+	Regex              AbacComparisonOperator = "Regex"
 	StartsWith         AbacComparisonOperator = "StartsWith"
 )
 
@@ -45,6 +48,8 @@ func (e AbacComparisonOperator) Valid() bool {
 	case EndsWith:
 		return true
 	case Equals:
+		return true
+	case Exists:
 		return true
 	case GreaterThan:
 		return true
@@ -64,7 +69,11 @@ func (e AbacComparisonOperator) Valid() bool {
 		return true
 	case NotEquals:
 		return true
+	case NotExists:
+		return true
 	case NotIn:
+		return true
+	case Regex:
 		return true
 	case StartsWith:
 		return true
@@ -544,7 +553,10 @@ type AbacColumnScope struct {
 	Table  uint32 `json:"table"`
 }
 
-// AbacComparisonOperator defines model for AbacComparisonOperator.
+// AbacComparisonOperator The server additionally accepts the legacy wire names `Equal` and
+// `NotEqual` as aliases of `Equals`/`NotEquals` when deserializing
+// (mixed-read compatibility); serialization always emits the names
+// above.
 type AbacComparisonOperator string
 
 // AbacEffect Permit or deny; deny wins during policy resolution.
@@ -566,7 +578,8 @@ type AbacFieldMask string
 //   - `{"Comparison": {"field": <string>, "operator": <one of
 //     "Equals","NotEquals","GreaterThan","GreaterThanOrEqual",
 //     "LessThan","LessThanOrEqual","In","NotIn","Contains",
-//     "StartsWith","EndsWith","Between","IsNull","IsNotNull","Like">,
+//     "StartsWith","EndsWith","Between","IsNull","IsNotNull","Like",
+//     "Exists","NotExists","Regex">,
 //     "value": <any JSON value>}}`
 //   - `{"And": [<AbacFilterExpression>, ...]}`
 //   - `{"Or": [<AbacFilterExpression>, ...]}`
@@ -732,7 +745,8 @@ type AbacPredicateObjectResponse struct {
 	// * `{"Comparison": {"field": <string>, "operator": <one of
 	//   "Equals","NotEquals","GreaterThan","GreaterThanOrEqual",
 	//   "LessThan","LessThanOrEqual","In","NotIn","Contains",
-	//   "StartsWith","EndsWith","Between","IsNull","IsNotNull","Like">,
+	//   "StartsWith","EndsWith","Between","IsNull","IsNotNull","Like",
+	//   "Exists","NotExists","Regex">,
 	//   "value": <any JSON value>}}`
 	// * `{"And": [<AbacFilterExpression>, ...]}`
 	// * `{"Or": [<AbacFilterExpression>, ...]}`

@@ -164,6 +164,19 @@ impl ArrowInMemoryProvider {
     ) -> Result<BooleanArray> {
         use arrow::array::{Float64Array, Int64Array, StringArray};
 
+        // Presence tests and Regex have no vectorized kernel here. The
+        // catch-all below returns an ALL-TRUE mask, which for these
+        // operators would be a silent no-op filter — fail closed instead
+        // (callers surface the error or fall back to a row-wise path).
+        if matches!(
+            op,
+            ComparisonOperator::Exists | ComparisonOperator::NotExists | ComparisonOperator::Regex
+        ) {
+            return Err(anyhow::anyhow!(
+                "operator {op:?} has no vectorized kernel in the Arrow memory provider"
+            ));
+        }
+
         // Handle string comparisons
         if let Some(string_array) = column.as_any().downcast_ref::<StringArray>()
             && let Some(val) = value.as_str()

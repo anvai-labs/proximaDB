@@ -4359,8 +4359,14 @@ export interface components {
         } | {
             List: string[];
         };
-        /** @enum {string} */
-        AbacComparisonOperator: "Equals" | "NotEquals" | "GreaterThan" | "GreaterThanOrEqual" | "LessThan" | "LessThanOrEqual" | "In" | "NotIn" | "Contains" | "StartsWith" | "EndsWith" | "Between" | "IsNull" | "IsNotNull" | "Like";
+        /**
+         * @description The server additionally accepts the legacy wire names `Equal` and
+         *     `NotEqual` as aliases of `Equals`/`NotEquals` when deserializing
+         *     (mixed-read compatibility); serialization always emits the names
+         *     above.
+         * @enum {string}
+         */
+        AbacComparisonOperator: "Equals" | "NotEquals" | "GreaterThan" | "GreaterThanOrEqual" | "LessThan" | "LessThanOrEqual" | "In" | "NotIn" | "Contains" | "StartsWith" | "EndsWith" | "Between" | "IsNull" | "IsNotNull" | "Like" | "Exists" | "NotExists" | "Regex";
         /**
          * @description A predicate-object row filter — a RECURSIVE, externally-tagged Rust
          *     enum (`proximadb_filter_expression::FilterExpression`). Modeled
@@ -4374,7 +4380,8 @@ export interface components {
          *     * `{"Comparison": {"field": <string>, "operator": <one of
          *       "Equals","NotEquals","GreaterThan","GreaterThanOrEqual",
          *       "LessThan","LessThanOrEqual","In","NotIn","Contains",
-         *       "StartsWith","EndsWith","Between","IsNull","IsNotNull","Like">,
+         *       "StartsWith","EndsWith","Between","IsNull","IsNotNull","Like",
+         *       "Exists","NotExists","Regex">,
          *       "value": <any JSON value>}}`
          *     * `{"And": [<AbacFilterExpression>, ...]}`
          *     * `{"Or": [<AbacFilterExpression>, ...]}`
