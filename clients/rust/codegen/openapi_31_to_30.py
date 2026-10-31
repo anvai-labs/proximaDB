@@ -1,1 +1,1 @@
-../../tools/codegen/openapi_31_to_30.py
+../../../tools/codegen/openapi_31_to_30.py
