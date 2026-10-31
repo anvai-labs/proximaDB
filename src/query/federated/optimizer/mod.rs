@@ -5240,10 +5240,9 @@ impl CrossModelOptimizer {
                     node_type: PlanNodeType::VectorSearch {
                         collection: target,
                         top_k: 10,
-                        query_vector_source:
-                            vector_query_parsing::vector_source_from_literal(
-                                right_literal,
-                            ),
+                        query_vector_source: vector_query_parsing::vector_source_from_literal(
+                            right_literal,
+                        ),
                     },
                     estimated_cost: 10.0,
                     estimated_rows: 10,

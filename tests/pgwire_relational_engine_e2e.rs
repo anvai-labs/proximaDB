@@ -58,10 +58,9 @@ fn set(items: &[&str]) -> BTreeSet<String> {
 async fn pgwire_relational_engine_serves_joins_and_aggregates_over_real_data() {
     let server = TestPgServer::start().await.expect("server start");
 
-    let (client, connection) =
-        tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-            .await
-            .expect("tokio-postgres connect");
+    let (client, connection) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
+        .await
+        .expect("tokio-postgres connect");
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("pgwire connection error: {e}");

@@ -47,10 +47,9 @@ fn col_set(messages: &[SimpleQueryMessage], col: &str) -> BTreeSet<String> {
 async fn pgwire_enforces_on_delete_referential_actions() {
     let server = TestPgServer::start().await.expect("server start");
 
-    let (client, connection) =
-        tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-            .await
-            .expect("tokio-postgres connect");
+    let (client, connection) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
+        .await
+        .expect("tokio-postgres connect");
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("pgwire connection error: {e}");
@@ -285,10 +284,9 @@ async fn pgwire_cascade_recurses_and_rejects_cycles_depth_and_concurrency() {
         .unwrap()
         .as_nanos();
 
-    let (client, connection) =
-        tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-            .await
-            .expect("connect");
+    let (client, connection) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
+        .await
+        .expect("connect");
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("pgwire connection error: {e}");
@@ -555,10 +553,9 @@ async fn pgwire_cascade_recurses_and_rejects_cycles_depth_and_concurrency() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pgwire_enforces_composite_fk_referential_actions() {
     let server = TestPgServer::start().await.expect("server start");
-    let (client, connection) =
-        tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-            .await
-            .expect("connect");
+    let (client, connection) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
+        .await
+        .expect("connect");
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("pgwire connection error: {e}");
@@ -755,10 +752,9 @@ async fn pgwire_enforces_composite_fk_referential_actions() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pgwire_enforces_cross_namespace_fk_referential_actions() {
     let server = TestPgServer::start().await.expect("server start");
-    let (client, connection) =
-        tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-            .await
-            .expect("connect");
+    let (client, connection) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
+        .await
+        .expect("connect");
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("pgwire connection error: {e}");

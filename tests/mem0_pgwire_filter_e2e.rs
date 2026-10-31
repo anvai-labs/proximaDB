@@ -20,16 +20,16 @@ use pg_server::TestPgServer;
 
 use std::time::Duration;
 
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pgwire_vector_search_honours_where_metadata_filter() {
-    unsafe { std::env::set_var("PROXIMADB_EMBED_PRECISION_SCHEMA_V2", "true"); }
+    unsafe {
+        std::env::set_var("PROXIMADB_EMBED_PRECISION_SCHEMA_V2", "true");
+    }
     let server = TestPgServer::start().await.expect("server start");
 
-    let (client, connection) =
-        tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-            .await
-            .expect("connect");
+    let (client, connection) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
+        .await
+        .expect("connect");
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("pgwire connection error: {e}");

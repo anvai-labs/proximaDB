@@ -37,10 +37,9 @@ fn col_ordered(messages: &[SimpleQueryMessage], col: &str) -> Vec<Option<String>
 async fn pgwire_renders_sql_null_over_simple_query() {
     let server = TestPgServer::start().await.expect("server start");
 
-    let (client, connection) =
-        tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-            .await
-            .expect("tokio-postgres connect");
+    let (client, connection) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
+        .await
+        .expect("tokio-postgres connect");
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("pgwire connection error: {e}");

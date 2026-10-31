@@ -21,10 +21,11 @@ use pg_server::TestPgServer;
 
 use std::time::Duration;
 
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pgwire_extended_protocol_vector_search_with_bound_params() {
-    unsafe { std::env::set_var("PROXIMADB_EMBED_PRECISION_SCHEMA_V2", "true"); }
+    unsafe {
+        std::env::set_var("PROXIMADB_EMBED_PRECISION_SCHEMA_V2", "true");
+    }
     let server = TestPgServer::start().await.expect("server start");
 
     let (client, connection) =

@@ -28,8 +28,6 @@ use pg_server::TestPgServer;
 
 use std::time::Duration;
 
-
-
 /// In-process test server holding a `ProximaDB` instance bound to a
 /// free pgwire port (plus a REST port so the existing `/health` probe
 /// can report readiness — the pgwire listener doesn't have an
@@ -43,15 +41,16 @@ use std::time::Duration;
 /// in-process API level.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pgwire_create_table_with_canonical_embedding_precision_fp16() {
-    unsafe { std::env::set_var("PROXIMADB_EMBED_PRECISION_SCHEMA_V2", "true"); }
+    unsafe {
+        std::env::set_var("PROXIMADB_EMBED_PRECISION_SCHEMA_V2", "true");
+    }
     let server = TestPgServer::start().await.expect("server start");
 
     // Connect via tokio-postgres. `connect` returns the client and a
     // future that drives the connection — spawn it onto the runtime.
-    let (client, connection) =
-        tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-            .await
-            .expect("tokio-postgres connect");
+    let (client, connection) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
+        .await
+        .expect("tokio-postgres connect");
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {

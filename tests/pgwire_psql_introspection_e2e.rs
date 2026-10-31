@@ -44,10 +44,9 @@ async fn pgwire_dt_dedup_and_d_shape_contract() {
     let server = TestPgServer::start().await.expect("server start");
 
     // --- Session 1: create two distinct tables (mirrors the user's CREATE). ---
-    let (client, connection) =
-        tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-            .await
-            .expect("connect");
+    let (client, connection) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
+        .await
+        .expect("connect");
     tokio::spawn(async move {
         let _ = connection.await;
     });
@@ -62,10 +61,9 @@ async fn pgwire_dt_dedup_and_d_shape_contract() {
     drop(client);
 
     // --- Session 2: reconnect, then run psql-style introspection probes. ---
-    let (client, connection) =
-        tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-            .await
-            .expect("reconnect");
+    let (client, connection) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
+        .await
+        .expect("reconnect");
     tokio::spawn(async move {
         let _ = connection.await;
     });

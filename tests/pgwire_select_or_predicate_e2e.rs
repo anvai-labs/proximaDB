@@ -53,13 +53,14 @@ fn ids_ordered(messages: &[SimpleQueryMessage]) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pgwire_select_or_predicate_returns_union_over_real_data() {
-    unsafe { std::env::set_var("PROXIMADB_PGWIRE_RELATIONAL_PIPELINE", "0"); }
+    unsafe {
+        std::env::set_var("PROXIMADB_PGWIRE_RELATIONAL_PIPELINE", "0");
+    }
     let server = TestPgServer::start().await.expect("server start");
 
-    let (client, connection) =
-        tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
-            .await
-            .expect("tokio-postgres connect");
+    let (client, connection) = tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
+        .await
+        .expect("tokio-postgres connect");
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("pgwire connection error: {e}");
