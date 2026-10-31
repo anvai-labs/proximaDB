@@ -2243,6 +2243,8 @@ mod access_tier_publish_tests {
             config: FilesystemConfig::default(),
             filesystems,
             tier_mapping: HashMap::new(),
+            #[cfg(test)]
+            test_get_counters: None,
         }
     }
 

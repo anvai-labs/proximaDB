@@ -105,17 +105,23 @@ mod tests {
     }
 
     fn enable_env() {
-        // SAFETY: nextest runs each test in its own process.
+        // Pin the WHOLE gate world this file's tests read: under the plain
+        // `cargo test --lib` runner every test shares one process, so a value
+        // an earlier test left behind (decode keys, prefix prefetch, rerank
+        // waves) would otherwise leak into this test's read counts. The tests
+        // are serialized on the shared `#[serial]` lock while they run.
         unsafe {
-            // NB: GET counting is per-factory now (Arm::counters) — the
-            // process-global PROXIMADB_COUNT_FS_IO route would wrap every
-            // concurrent test's filesystem in the shared-process libtest run.
             std::env::set_var("PROXIMADB_PAX_COALESCED_RABITQ", "1");
             std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
             std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "1");
             std::env::set_var("PROXIMADB_IVF_K", "8");
             std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", "1");
             std::env::set_var("PROXIMADB_PAX_WRITE_DIRECTORY_DECODE_KEYS", "1");
+            // Aux gates other tests in this file vary — reset to the defaults.
+            std::env::remove_var("PROXIMADB_PAX_READ_DIRECTORY_DECODE_KEYS");
+            std::env::remove_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES");
+            std::env::remove_var("PROXIMADB_PAX_READ_SAME_WAVE_RERANK");
+            std::env::remove_var("PROXIMADB_PAX_READ_COARSE_NPROBE");
         }
     }
 
