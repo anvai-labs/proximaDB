@@ -94,6 +94,22 @@ lazy_static! {
         "proximadb_rehydrate_us_agg_total",
         "Cumulative top-k rehydration wall microseconds (TD-RDSTRAT-13 PR-B)",
     );
+    pub static ref PAX_DEFERRED_SEARCHES: IntCounter = counter(
+        "proximadb_pax_deferred_searches_agg_total",
+        "Vector searches that resolved OIDs and rehydrated after the cross-segment merge (O1)",
+    );
+    pub static ref PAX_DEFERRED_CANDIDATES: IntCounter = counter(
+        "proximadb_pax_deferred_candidates_agg_total",
+        "Cascade candidates whose OID resolve and rehydrate were deferred to the merge (O1); minus the winners counter = rows never rehydrated",
+    );
+    pub static ref PAX_DEFERRED_WINNERS: IntCounter = counter(
+        "proximadb_pax_deferred_winners_agg_total",
+        "Merged winners rehydrated on the deferred path (O1)",
+    );
+    pub static ref PAX_DEFERRED_REHYDRATE_RETRIES: IntCounter = counter(
+        "proximadb_pax_deferred_rehydrate_retries_agg_total",
+        "Vector searches re-run on the per-segment path because a merged winner could not be rehydrated (O1)",
+    );
     pub static ref STAGE_F_REGION_E: IntCounter = counter(
         "proximadb_stage_f_region_e_agg_total",
         "Filtered Stage-F allow-sets answered from PAX Region E (filter columns) instead of decoding Region D (TD-FPRUNE-1 PR-E)",

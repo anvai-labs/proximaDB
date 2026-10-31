@@ -3786,6 +3786,25 @@ pub(crate) async fn scope_directory_cells<F: std::future::Future>(
     }
 }
 
+tokio::task_local! {
+    /// O1: set by a caller that resolves OIDs itself, after merging every
+    /// segment's candidates (see [`scope_deferred_topk_oids`]).
+    static DEFER_TOPK_OIDS: ();
+}
+
+/// O1: run a segment cascade that stops after the Region-B rerank. Its
+/// [`CascadeHit`]s carry the position and distance of each top-k row and an
+/// EMPTY `oid`; the caller merges candidates across segments first and then
+/// rehydrates only the global winners, whose records carry the OID. Region D
+/// is not read at all here.
+pub(crate) async fn scope_deferred_topk_oids<F: std::future::Future>(scan: F) -> F::Output {
+    DEFER_TOPK_OIDS.scope((), scan).await
+}
+
+fn deferring_topk_oids() -> bool {
+    DEFER_TOPK_OIDS.try_with(|_| ()).is_ok()
+}
+
 /// PR-D L4: per-cascade stash of the top-k blocks the Region-D OID resolve
 /// fetched whole, handed to the same cascade's rehydration — so every query
 /// (not only directory-planned ones, and filtered ones too) pays ONE Region-D
@@ -5605,6 +5624,22 @@ pub async fn rabitq_search_segment_coalesced_allowed(
     let top_k_rows: Vec<usize> = scored.iter().take(k).map(|(g, _)| *g).collect();
 
     drop(prefetched_b); // D5: the same-wave extents are spent
+    if deferring_topk_oids() {
+        // O1: positions + distances only (nearest-first, as step 7 below
+        // orders them); the caller resolves OIDs after the global merge.
+        return Ok(Some(
+            scored
+                .iter()
+                .take(k)
+                .map(|(g, dist)| CascadeHit {
+                    oid: String::new(),
+                    distance: canonical_score_from_rank_score(metric, *dist),
+                    vector: None,
+                    position: *g as u32,
+                })
+                .collect(),
+        ));
+    }
     // 5. ADR-065 Region D: fetch ONLY the top-k OIDs from the row blocks (≤k
     //    coalesced GETs — vs PR2's M-survivor block fetches). Map top-k rows →
     //    blocks via cumulative row counts.
