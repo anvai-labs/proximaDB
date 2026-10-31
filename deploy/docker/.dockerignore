@@ -1,0 +1,50 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+target/
+*.rs.bk
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Tests
+tests/
+*_test.rs
+benches/
+
+# Python SDK (not needed in server image)
+clients/
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Docker build context exclusions
+deploy/terraform/
+deploy/helm/
+
+# Temporary files
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Development data
+/data/
+/tmp/
+
+# Coverage and profiling
+*.profraw
+*.profdata
+coverage/

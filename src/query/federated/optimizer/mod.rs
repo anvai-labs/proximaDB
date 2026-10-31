@@ -2983,91 +2983,6 @@ impl CrossModelOptimizer {
                         required_capabilities: CapabilitySet::new(),
                     }
                 }
-                QuerySourceRef::Extension {
-                    extension: SqlExtension::Logs { namespace },
-                    ..
-                } => PlanNode {
-                    id: self.next_id(),
-                    node_type: PlanNodeType::ObservabilityQuery {
-                        namespace: namespace.clone(),
-                        query_type: ObservabilityQueryType::Logs,
-                        time_range: None,
-                    },
-                    estimated_cost: 20.0,
-                    estimated_rows: 1000,
-                    output_columns: vec![
-                        "timestamp".to_string(),
-                        "level".to_string(),
-                        "message".to_string(),
-                    ],
-                    required_capabilities: CapabilitySet::new(),
-                },
-                QuerySourceRef::Extension {
-                    extension: SqlExtension::Metrics { namespace },
-                    ..
-                } => PlanNode {
-                    id: self.next_id(),
-                    node_type: PlanNodeType::ObservabilityQuery {
-                        namespace: namespace.clone(),
-                        query_type: ObservabilityQueryType::Metrics,
-                        time_range: None,
-                    },
-                    estimated_cost: 20.0,
-                    estimated_rows: 500,
-                    output_columns: vec![
-                        "timestamp".to_string(),
-                        "metric_name".to_string(),
-                        "value".to_string(),
-                    ],
-                    required_capabilities: CapabilitySet::new(),
-                },
-                QuerySourceRef::Extension {
-                    extension: SqlExtension::Traces { namespace },
-                    ..
-                } => PlanNode {
-                    id: self.next_id(),
-                    node_type: PlanNodeType::ObservabilityQuery {
-                        namespace: namespace.clone(),
-                        query_type: ObservabilityQueryType::Traces,
-                        time_range: None,
-                    },
-                    estimated_cost: 20.0,
-                    estimated_rows: 500,
-                    output_columns: vec![
-                        "trace_id".to_string(),
-                        "span_id".to_string(),
-                        "operation".to_string(),
-                        "duration_ns".to_string(),
-                    ],
-                    required_capabilities: CapabilitySet::new(),
-                },
-                QuerySourceRef::Extension {
-                    extension:
-                        SqlExtension::VectorDistance {
-                            left_column,
-                            right_literal,
-                        },
-                    ..
-                } => {
-                    let target = query
-                        .targets
-                        .first()
-                        .map_or("default".to_string(), |t| t.name.clone());
-                    PlanNode {
-                        id: self.next_id(),
-                        node_type: PlanNodeType::VectorSearch {
-                            collection: target,
-                            top_k: 10,
-                            query_vector_source: vector_query_parsing::vector_source_from_literal(
-                                right_literal,
-                            ),
-                        },
-                        estimated_cost: 10.0,
-                        estimated_rows: 10,
-                        output_columns: vec!["id".to_string(), left_column.clone()],
-                        required_capabilities: CapabilitySet::new(),
-                    }
-                }
                 QuerySourceRef::Target(target) => {
                     let rows = stats
                         .get(&target.name)
@@ -3142,6 +3057,9 @@ impl CrossModelOptimizer {
                         required_capabilities: CapabilitySet::new(),
                     }
                 }
+                other => self
+                    .plan_extension_node(other, query)
+                    .ok_or_else(|| anyhow!("unhandled query source in federated plan"))?,
             };
             sub_plans.push(sub_plan);
         }
@@ -3653,91 +3571,6 @@ impl CrossModelOptimizer {
                     output_columns: vec!["id".to_string(), "document".to_string()],
                     required_capabilities: CapabilitySet::new(),
                 },
-                QuerySourceRef::Extension {
-                    extension: SqlExtension::Logs { namespace },
-                    ..
-                } => PlanNode {
-                    id: self.next_id(),
-                    node_type: PlanNodeType::ObservabilityQuery {
-                        namespace: namespace.clone(),
-                        query_type: ObservabilityQueryType::Logs,
-                        time_range: None,
-                    },
-                    estimated_cost: 20.0,
-                    estimated_rows: 1000,
-                    output_columns: vec![
-                        "timestamp".to_string(),
-                        "level".to_string(),
-                        "message".to_string(),
-                    ],
-                    required_capabilities: CapabilitySet::new(),
-                },
-                QuerySourceRef::Extension {
-                    extension: SqlExtension::Metrics { namespace },
-                    ..
-                } => PlanNode {
-                    id: self.next_id(),
-                    node_type: PlanNodeType::ObservabilityQuery {
-                        namespace: namespace.clone(),
-                        query_type: ObservabilityQueryType::Metrics,
-                        time_range: None,
-                    },
-                    estimated_cost: 20.0,
-                    estimated_rows: 500,
-                    output_columns: vec![
-                        "timestamp".to_string(),
-                        "metric_name".to_string(),
-                        "value".to_string(),
-                    ],
-                    required_capabilities: CapabilitySet::new(),
-                },
-                QuerySourceRef::Extension {
-                    extension: SqlExtension::Traces { namespace },
-                    ..
-                } => PlanNode {
-                    id: self.next_id(),
-                    node_type: PlanNodeType::ObservabilityQuery {
-                        namespace: namespace.clone(),
-                        query_type: ObservabilityQueryType::Traces,
-                        time_range: None,
-                    },
-                    estimated_cost: 20.0,
-                    estimated_rows: 500,
-                    output_columns: vec![
-                        "trace_id".to_string(),
-                        "span_id".to_string(),
-                        "operation".to_string(),
-                        "duration_ns".to_string(),
-                    ],
-                    required_capabilities: CapabilitySet::new(),
-                },
-                QuerySourceRef::Extension {
-                    extension:
-                        SqlExtension::VectorDistance {
-                            left_column,
-                            right_literal,
-                        },
-                    ..
-                } => {
-                    let target = query
-                        .targets
-                        .first()
-                        .map_or("default".to_string(), |t| t.name.clone());
-                    PlanNode {
-                        id: self.next_id(),
-                        node_type: PlanNodeType::VectorSearch {
-                            collection: target,
-                            top_k: 10,
-                            query_vector_source: vector_query_parsing::vector_source_from_literal(
-                                right_literal,
-                            ),
-                        },
-                        estimated_cost: 10.0,
-                        estimated_rows: 10,
-                        output_columns: vec!["id".to_string(), left_column.clone()],
-                        required_capabilities: CapabilitySet::new(),
-                    }
-                }
                 QuerySourceRef::Target(target) => PlanNode {
                     id: self.next_id(),
                     node_type: PlanNodeType::Scan {
@@ -3789,6 +3622,9 @@ impl CrossModelOptimizer {
                         required_capabilities: CapabilitySet::new(),
                     }
                 }
+                other => self
+                    .plan_extension_node(other, query)
+                    .ok_or_else(|| anyhow!("unhandled query source in federated plan"))?,
             };
             sub_plans.push(sub_plan);
         }
@@ -5315,6 +5151,110 @@ impl CrossModelOptimizer {
         models.sort_by_key(|m| format!("{:?}", m));
         models.dedup();
         models
+    }
+
+    /// Build a plan node for observability and vector-distance extensions.
+    ///
+    /// Shared by [`plan_federated_query_with_statistics`] and
+    /// [`plan_federated_query`] — both iterate over `QuerySourceRef` values and
+    /// produce identical `PlanNode` shapes for Logs / Metrics / Traces /
+    /// VectorDistance extensions (hardcoded cost estimates, no stats needed).
+    ///
+    /// Only handles `Extension` variants; `Target` is intentionally excluded
+    /// because both callers match `Target` explicitly before delegating here.
+    fn plan_extension_node(
+        &self,
+        source: QuerySourceRef<'_>,
+        query: &FederatedQuery,
+    ) -> Option<PlanNode> {
+        match source {
+            QuerySourceRef::Extension {
+                extension: SqlExtension::Logs { namespace },
+                ..
+            } => Some(PlanNode {
+                id: self.next_id(),
+                node_type: PlanNodeType::ObservabilityQuery {
+                    namespace: namespace.clone(),
+                    query_type: ObservabilityQueryType::Logs,
+                    time_range: None,
+                },
+                estimated_cost: 20.0,
+                estimated_rows: 1000,
+                output_columns: vec![
+                    "timestamp".to_string(),
+                    "level".to_string(),
+                    "message".to_string(),
+                ],
+                required_capabilities: CapabilitySet::new(),
+            }),
+            QuerySourceRef::Extension {
+                extension: SqlExtension::Metrics { namespace },
+                ..
+            } => Some(PlanNode {
+                id: self.next_id(),
+                node_type: PlanNodeType::ObservabilityQuery {
+                    namespace: namespace.clone(),
+                    query_type: ObservabilityQueryType::Metrics,
+                    time_range: None,
+                },
+                estimated_cost: 20.0,
+                estimated_rows: 500,
+                output_columns: vec![
+                    "timestamp".to_string(),
+                    "metric_name".to_string(),
+                    "value".to_string(),
+                ],
+                required_capabilities: CapabilitySet::new(),
+            }),
+            QuerySourceRef::Extension {
+                extension: SqlExtension::Traces { namespace },
+                ..
+            } => Some(PlanNode {
+                id: self.next_id(),
+                node_type: PlanNodeType::ObservabilityQuery {
+                    namespace: namespace.clone(),
+                    query_type: ObservabilityQueryType::Traces,
+                    time_range: None,
+                },
+                estimated_cost: 20.0,
+                estimated_rows: 500,
+                output_columns: vec![
+                    "trace_id".to_string(),
+                    "span_id".to_string(),
+                    "operation".to_string(),
+                    "duration_ns".to_string(),
+                ],
+                required_capabilities: CapabilitySet::new(),
+            }),
+            QuerySourceRef::Extension {
+                extension:
+                    SqlExtension::VectorDistance {
+                        left_column,
+                        right_literal,
+                    },
+                ..
+            } => {
+                let target = query
+                    .targets
+                    .first()
+                    .map_or("default".to_string(), |t| t.name.clone());
+                Some(PlanNode {
+                    id: self.next_id(),
+                    node_type: PlanNodeType::VectorSearch {
+                        collection: target,
+                        top_k: 10,
+                        query_vector_source: vector_query_parsing::vector_source_from_literal(
+                            right_literal,
+                        ),
+                    },
+                    estimated_cost: 10.0,
+                    estimated_rows: 10,
+                    output_columns: vec!["id".to_string(), left_column.clone()],
+                    required_capabilities: CapabilitySet::new(),
+                })
+            }
+            _ => None,
+        }
     }
 
     /// Get next node ID

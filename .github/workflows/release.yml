@@ -685,7 +685,32 @@ jobs:
       - name: Build MSI
         run: |
           $VERSION = "${{ needs.prepare.outputs.version }}"
-          wix build -d "Version=$VERSION" -o "proximadb-$VERSION-x64.msi" deploy\packaging\wix\proximadb.wxs
+          # `-arch x64` is REQUIRED: WiX v4 defaults to an x86 package, and Windows
+          # Installer then rewrites ProgramFiles64Folder to `Program Files (x86)`, so
+          # the 64-bit server installed there (v0.5.0's MSI did; caught by the
+          # release smoke, which only runs after publishing).
+          wix build -arch x64 -d "Version=$VERSION" -o "proximadb-$VERSION-x64.msi" deploy\packaging\wix\proximadb.wxs
+
+      # Install the MSI on this runner BEFORE it can be published: the release
+      # smoke checks the same thing, but only after the GitHub Release exists, so
+      # a packaging bug there is already shipped. This step makes a dry run catch it.
+      - name: Verify MSI installs to Program Files (x64) and runs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $VERSION = "${{ needs.prepare.outputs.version }}"
+          $msi = (Resolve-Path "proximadb-$VERSION-x64.msi").Path
+          $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/i', $msi, '/qn', '/l*v', "$env:RUNNER_TEMP\msi.log")
+          if ($p.ExitCode -ne 0) { Get-Content "$env:RUNNER_TEMP\msi.log" -Tail 50; throw "msiexec exit $($p.ExitCode)" }
+          $exe = "$env:ProgramFiles\ProximaDB\proximadb-server.exe"
+          if (-not (Test-Path $exe)) {
+            Select-String -Path "$env:RUNNER_TEMP\msi.log" -Pattern 'INSTALLFOLDER|ProgramFiles64Folder' | Select-Object -First 5 | ForEach-Object { $_.Line }
+            throw "$exe not installed (an x86 package lands in Program Files (x86))"
+          }
+          $got = (& $exe --version | Out-String).Trim()
+          if ($got -ne "proximadb-server $VERSION") { throw "installed --version printed '$got'" }
+          Write-Output "msi installs to $exe and runs: $got"
+          $u = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @('/x', $msi, '/qn')
+          if ($u.ExitCode -ne 0) { throw "msiexec uninstall exit $($u.ExitCode)" }
 
       - name: Upload MSI Artifact
         uses: actions/upload-artifact@v7

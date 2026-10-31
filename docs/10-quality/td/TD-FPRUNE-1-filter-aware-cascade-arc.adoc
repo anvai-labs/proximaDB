@@ -63,6 +63,33 @@ residual filter as the correctness backstop.
   tier counters also show unfiltered queries reading Region D twice (OID resolve ~41 MB/q, then a
   serial rehydrate ~27 MB/q of the same top-k blocks) — the PR-D L4 target.
 
+* *Stage F latency (2026-10-30, #2298 + #2303).* Read waves, the invariants cache and a one-wave
+  rehydrate (#2298), then per-core parallel block decode (#2303), took filtered `category=3` p50 on
+  the 3M layout-off bed from 5.29 s to 1.39 s (object_cold) at identical recall, GETs and bytes.
+  Cost did not move: 737 MB/q, 634 MB of it Stage F reading every Region-D row in full to answer a
+  one-byte predicate (the zone maps cannot prune an uncorrelated tag).
+
+* *PR-E: Region E (filter columns), opt-in (2026-10-30).* A new optional region inside the segment,
+  `[prefix][A0?][A][B][C?][OPR?][D][E?][footer]`, written in the same pass and the same object as
+  Region D (never a sidecar: one PUT keeps it atomic and ordinal-aligned with D, and it replicates,
+  tiers, caches and GCs as the segment does). Per filterable column, a dictionary of each row's
+  *resolved filter literal* (the value `evaluate_filter_proxima` sees, absent distinct from null —
+  not the shred stripe, whose null conflates absent, null and wrong-typed values) plus bit-packed
+  codes. Entries are MessagePack, which is bit-exact for f64 (JSON text is not without serde_json's
+  `float_roundtrip`: `1/11` re-parses one ULP high and flips `>`), and the writer decodes each new
+  entry back and omits the column unless it is equal; columns over 4096 distinct values are omitted.
+  A corrupt chunk or directory falls back to the Region-D path, never to the whole-object scan. Footer section 8 locates it (old readers
+  skip the tag; this reader skips a future version). Stage F reads one ranged GET per referenced
+  column and runs the same tree evaluator over the literals, so the allow-set is identical by
+  construction; a field Region E does not carry, or a segment without it, decodes Region D as
+  before. Gates: `PROXIMADB_PAX_WRITE_FILTER_REGION` (default OFF) and
+  `PROXIMADB_PAX_READ_FILTER_REGION` (default ON kill-switch). The Region-E fixture also exposed a
+  writer bug: a nullable integer shred stripe's codec is chosen from its non-null values, so it could
+  pick Simple8b, which rejects the `i64::MIN` null sentinel and failed the whole segment write (a
+  failed flush or compaction). Stripes with nulls are now verified by decoding and written Raw unless
+  they round-trip exactly. Open: Region-E codes are held in RAM until the segment finishes (2 B per
+  row per column), including in local-spill mode.
+
 *Evidence:* filtered recall@10 = **0.996** vs filtered brute force (floor 0.90, N=10k, 8 partitions);
 C1 integrated filtered stack **4.2× byte cut** at recall parity (correlated data); C2 unfiltered recall Δ=0.000 (toy scale; superseded at 3M by TD-FPRUNE-3, where the layout cost 0.855 vs 0.9716).
 
