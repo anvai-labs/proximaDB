@@ -29,6 +29,7 @@
 //! - File discovery and routing logic
 
 pub mod coordinator;
+pub(crate) mod deferred;
 pub mod operations;
 pub mod optimizer;
 
@@ -568,6 +569,7 @@ impl SstEngine {
         collection_root: &str,
         snapshot_lsn: u64,
         known_size: Option<u64>,
+        deferred: Option<&deferred::DeferredRehydrate>,
     ) -> anyhow::Result<Option<Vec<OptimizedSearchRecord>>> {
         // PR-D L4: one top-k block stash per segment cascade, shared by its
         // Region-D OID resolve and its rehydration (one block wave, not two).
@@ -581,6 +583,7 @@ impl SstEngine {
             collection_root,
             snapshot_lsn,
             known_size,
+            deferred,
         ))
         .await
     }
@@ -598,6 +601,7 @@ impl SstEngine {
         collection_root: &str,
         snapshot_lsn: u64,
         known_size: Option<u64>,
+        deferred: Option<&deferred::DeferredRehydrate>,
     ) -> anyhow::Result<Option<Vec<OptimizedSearchRecord>>> {
         // TD-RDSTRAT-13 PR-B: umbrella wall over the whole cascade — the four
         // stage timers (probe rank, Region-B, Region-D, rehydrate) decompose
@@ -684,7 +688,9 @@ impl SstEngine {
             // coalesced segment, so no separate 4 B magic-detection GET is needed
             // (collapses the redundant offset-0 prefix read the FS trace found).
             if filter_expression.is_none() || row_allow.is_some() {
-                let coalesced_hits = rabitq_search_segment_coalesced_allowed(
+                // Boxed: the cascade future is large, and it is awaited
+                // under one of two scopes below.
+                let search = Box::pin(rabitq_search_segment_coalesced_allowed(
                     fs.as_ref(),
                     sstable_path,
                     query_vector,
@@ -694,8 +700,15 @@ impl SstEngine {
                     self.survivor_cache.as_deref(),
                     row_allow.as_ref(),
                     known_size,
-                )
-                .await?;
+                ));
+                // O1: with a deferred table, stop after the rerank — the
+                // OIDs come from rehydrating the merged winners.
+                let coalesced_hits = if deferred.is_some() {
+                    crate::storage::engines::sst::segment_format::scope_deferred_topk_oids(search)
+                        .await?
+                } else {
+                    search.await?
+                };
                 if let Some(hits) = coalesced_hits {
                     // TD-DELVEC-1 WI-4 slice 2: merge-on-read on the RaBitQ ANN
                     // path — warm this segment's deletion vector, then drop hits
@@ -721,6 +734,20 @@ impl SstEngine {
                     } else {
                         hits
                     };
+                    if let Some(deferred) = deferred {
+                        debug!(
+                            target: deferred::TRACE_TARGET,
+                            path = sstable_path,
+                            candidates = hits.len(),
+                            "segment cascade: OID resolve deferred to the merge"
+                        );
+                        crate::observability::io_trace::record_vector_ann_proof();
+                        return Ok(Some(
+                            hits.iter()
+                                .map(|h| deferred.placeholder(sstable_path, h, &distance_metric))
+                                .collect(),
+                        ));
+                    }
                     // TD-FPRUNE-1 top-k rehydration: the exact path this cascade
                     // replaces returns full record metadata (props); the cascade
                     // ranks from codes and knows only id+score+vector. Fetch the
@@ -1423,6 +1450,49 @@ impl SstEngine {
         include_vectors: bool,
         include_metadata: bool,
     ) -> Result<Vec<OptimizedSearchRecord>> {
+        // O1 (as in `fallback_to_direct_search_arc`): rehydrate only the
+        // merged winners; an unresolvable winner re-runs per segment.
+        let mut deferred = deferred::maybe_new(collection_id, k);
+        loop {
+            let retryable = deferred.is_some();
+            // Boxed: the scan future is large and this loop may run it twice.
+            let attempt = Box::pin(self.direct_search_with(
+                deferred.take(),
+                ctx,
+                collection_id,
+                storage_url,
+                query_vector,
+                k,
+                distance_metric,
+                filter_expression,
+                include_vectors,
+                include_metadata,
+            ))
+            .await;
+            if let Err(e) = &attempt
+                && deferred::retry_due(retryable, e)
+            {
+                deferred::note_retry(collection_id, e);
+                continue;
+            }
+            return attempt;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn direct_search_with(
+        &self,
+        deferred: Option<std::sync::Arc<deferred::DeferredRehydrate>>,
+        ctx: &StorageQueryContext,
+        collection_id: &str,
+        storage_url: &str,
+        query_vector: &[f32],
+        k: usize,
+        distance_metric: DistanceMetric,
+        filter_expression: Option<&FilterExpression>,
+        include_vectors: bool,
+        include_metadata: bool,
+    ) -> Result<Vec<OptimizedSearchRecord>> {
         tracing::debug!(
             "[SST] Starting direct search for collection {}, storage_url: {}",
             collection_id,
@@ -1580,6 +1650,7 @@ impl SstEngine {
                 let known_size = discovered.size_bytes;
                 let filter_owned = filter_expression.cloned();
                 let directory_choice = directory_cells.get(sstable_path).cloned();
+                let deferred = deferred.clone();
                 // TD-PAXDIR-1 D7: concurrent scans polled in one task each
                 // get their own wave unit (`io_trace::scope_concurrent_unit`).
                 crate::observability::io_trace::scope_concurrent_unit(async move {
@@ -1603,6 +1674,7 @@ self.try_pax_cascade(
                                         storage_url,
                                         snapshot_lsn,
                                         known_size,
+                                        deferred.as_deref(),
 ),
 )
 .await
@@ -1713,6 +1785,7 @@ self.try_pax_cascade(
                                 storage_url,
                                 snapshot_lsn,
                                 known_size,
+                                deferred.as_deref(),
                             ),
                         )
                         .await
@@ -1879,6 +1952,12 @@ self.try_pax_cascade(
 
         // Get sorted results from bounded queue
         let mut all_candidates = priority_queue.into_sorted_vec();
+        if let Some(deferred) = &deferred {
+            all_candidates = deferred
+                .resolve(self, all_candidates, &directory_cells)
+                .await
+                .map_err(anyhow::Error::new)?;
+        }
         let merge_us = merge_start.elapsed().as_micros() as u64;
         tracing::info!(
             target: "sst_warm_phase",
@@ -2014,6 +2093,7 @@ self.try_pax_cascade(
         use_parallel_morsels: bool,
         use_vectorized: bool,
         known_size: Option<u64>,
+        deferred: Option<&deferred::DeferredRehydrate>,
     ) -> Result<Vec<OptimizedSearchRecord>> {
         // TD-DELVEC-1 WI-4: capture the scan's snapshot LSN once per single-file
         // scan (the parallel/arc path's per-file entry) for merge-on-read filtering
@@ -2041,6 +2121,7 @@ self.try_pax_cascade(
                         storage_url,
                         snapshot_lsn,
                         known_size,
+                        deferred,
                     )
                     .await
                 {
@@ -2245,6 +2326,51 @@ self.try_pax_cascade(
         include_vectors: bool,
         include_metadata: bool,
     ) -> Result<Vec<OptimizedSearchRecord>> {
+        // O1: resolve OIDs and rehydrate after the merge. A winner that
+        // cannot be resolved re-runs the search on the per-segment path (the
+        // second pass takes no deferred table), so a deferred placeholder
+        // never reaches the caller.
+        let mut deferred = deferred::maybe_new(collection_id, k);
+        loop {
+            let retryable = deferred.is_some();
+            // Boxed: the scan future is large and this loop may run it twice.
+            let attempt = Box::pin(std::sync::Arc::clone(&self).direct_search_arc_with(
+                ctx,
+                collection_id,
+                storage_url,
+                query_vector,
+                k,
+                distance_metric,
+                filter_expression,
+                include_vectors,
+                include_metadata,
+                deferred.take(),
+            ))
+            .await;
+            if let Err(e) = &attempt
+                && deferred::retry_due(retryable, e)
+            {
+                deferred::note_retry(collection_id, e);
+                continue;
+            }
+            return attempt;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn direct_search_arc_with(
+        self: std::sync::Arc<Self>,
+        ctx: &StorageQueryContext,
+        collection_id: &str,
+        storage_url: &str,
+        query_vector: &[f32],
+        k: usize,
+        distance_metric: DistanceMetric,
+        filter_expression: Option<&FilterExpression>,
+        include_vectors: bool,
+        include_metadata: bool,
+        deferred: Option<std::sync::Arc<deferred::DeferredRehydrate>>,
+    ) -> Result<Vec<OptimizedSearchRecord>> {
         use crate::storage::engines::sst::segment_format::scope_directory_cells;
         // --- discover (mirrors fallback_to_direct_search) ---
         let search_mode = &ctx.search_params.search_mode;
@@ -2342,6 +2468,7 @@ self.try_pax_cascade(
                 let trace = trace_handle.clone();
                 let scan_path = path.clone();
                 let cells = directory_cells.get(&path).cloned();
+                let deferred = deferred.clone();
                 handles.push((
                     path,
                     tokio::spawn(async move {
@@ -2361,6 +2488,7 @@ self.try_pax_cascade(
                             use_parallel_morsels,
                             use_vectorized,
                             known_size,
+                            deferred.as_deref(),
                         );
                         let scan = scope_directory_cells(cells, scan);
                         if let Some(trace) = trace {
@@ -2405,6 +2533,7 @@ self.try_pax_cascade(
                     use_parallel_morsels,
                     use_vectorized,
                     discovered.size_bytes,
+                    deferred.as_deref(),
                 );
                 let cells = directory_cells.get(&discovered.url).cloned();
                 match scope_directory_cells(cells, scan).await {
@@ -2424,6 +2553,12 @@ self.try_pax_cascade(
             priority_queue.try_insert(candidate);
         }
         let mut all_candidates = priority_queue.into_sorted_vec();
+        if let Some(deferred) = &deferred {
+            all_candidates = deferred
+                .resolve(&self, all_candidates, &directory_cells)
+                .await
+                .map_err(anyhow::Error::new)?;
+        }
         self.filter_search_results(&mut all_candidates, include_vectors, include_metadata);
         Ok(all_candidates)
     }
@@ -3465,6 +3600,90 @@ mod tests {
         }
     }
 
+    /// A record with a `half = idx % 2` prop and the given vector.
+    fn half_tagged_record(
+        idx: usize,
+        dim: usize,
+        version: u64,
+        vector: Vec<f32>,
+    ) -> proximadb_records::ProximaRecord {
+        let id = format!("r{idx}");
+        let mut rec = proximadb_records::ProximaRecord {
+            oid: id.clone(),
+            local_id: Some(id),
+            created_at_ns: 1_000 + idx as i64,
+            updated_at_ns: 1_000 + idx as i64,
+            record_version: version,
+            embeddings: vec![proximadb_records::EmbeddingCell::new_fp32(
+                "test",
+                "dense_vector",
+                dim as u32,
+                vector,
+            )],
+            ..proximadb_records::ProximaRecord::default()
+        };
+        rec.props.insert(
+            "half".to_string(),
+            proximadb_records::ProximaTreeNode::Value(proximadb_records::ProximaValue::Int64(
+                (idx % 2) as i64,
+            )),
+        );
+        rec
+    }
+
+    async fn flush_into(
+        engine: &SstEngine,
+        cid: &str,
+        collection: &crate::proto::proximadb_v1::Collection,
+        records: Vec<proximadb_records::ProximaRecord>,
+    ) {
+        let params = crate::storage::traits::FlushParameters {
+            collection_id: Some(cid.to_string()),
+            vector_records: records,
+            force: true,
+            synchronous: true,
+            collection_config: Some(collection.clone()),
+            ..Default::default()
+        };
+        assert!(engine.do_flush(&params).await.unwrap().success);
+    }
+
+    fn half_is_one() -> proximadb_filter_expression::FilterExpression {
+        proximadb_filter_expression::FilterExpression::Comparison {
+            field: "half".to_string(),
+            operator: proximadb_filter_expression::ComparisonOperator::Equals,
+            value: serde_json::json!(1),
+        }
+    }
+
+    /// An Approximate-mode vector query context.
+    fn approximate_ctx(
+        cid: &str,
+        collection: &crate::proto::proximadb_v1::Collection,
+        query: &[f32],
+        top_k: u16,
+        filter: Option<proximadb_filter_expression::FilterExpression>,
+    ) -> crate::storage::traits::StorageQueryContext {
+        crate::storage::traits::StorageQueryContext {
+            search_params: Arc::new(crate::core::search::SearchParams {
+                vector: Some(query.to_vec()),
+                top_k: Some(top_k),
+                filter_expression: filter,
+                search_mode: proximadb_search_types::search_params::SearchMode::Approximate {
+                    nprobe: None,
+                },
+                ..Default::default()
+            }),
+            collection: Arc::new(collection.clone()),
+            metadata: crate::storage::traits::StorageQueryMetadata {
+                collection_id: cid.to_string(),
+                ..Default::default()
+            },
+            user_context: None,
+            tenant_context: None,
+        }
+    }
+
     /// PR-D L4: an Approximate (cascade) query outside any directory scope
     /// reads its top-k Region-D blocks ONCE — the OID resolve fetches them
     /// whole and stashes them, and the rehydration takes them (zero `Rehyd`
@@ -3473,79 +3692,27 @@ mod tests {
     /// under a filter).
     #[tokio::test]
     async fn cascade_rehydrate_reuses_the_top_k_block_fetch() {
-        use crate::core::search::SearchParams;
         use crate::storage::engines::sst::segment_format::CacheTier;
-        use crate::storage::traits::{FlushParameters, StorageQueryContext, StorageQueryMetadata};
-        use proximadb_records::{EmbeddingCell, ProximaRecord};
 
+        // The per-segment OID resolve + rehydrate path (O1 kill switch); the
+        // deferred path is pinned by `deferred_rehydrate_matches_per_segment`.
+        // SAFETY: nextest process-per-test isolation.
+        unsafe { std::env::set_var("PROXIMADB_PAX_READ_DEFERRED_REHYDRATE", "0") };
         let dim = 16usize;
         let cid = "topk_stash";
         let (engine, collection) = file_backed_test_engine(cid, dim, None).await;
-        let recs: Vec<ProximaRecord> = (0..60usize)
+        let recs = (0..60usize)
             .map(|idx| {
-                let id = format!("r{idx}");
-                let mut rec = ProximaRecord {
-                    oid: id.clone(),
-                    local_id: Some(id),
-                    created_at_ns: 1_000,
-                    updated_at_ns: 1_000,
-                    record_version: 1,
-                    embeddings: vec![EmbeddingCell::new_fp32(
-                        "test",
-                        "dense_vector",
-                        dim as u32,
-                        (0..dim).map(|j| (idx * dim + j) as f32 * 0.01).collect(),
-                    )],
-                    ..ProximaRecord::default()
-                };
-                rec.props.insert(
-                    "half".to_string(),
-                    proximadb_records::ProximaTreeNode::Value(
-                        proximadb_records::ProximaValue::Int64((idx % 2) as i64),
-                    ),
-                );
-                rec
+                let vector = (0..dim).map(|j| (idx * dim + j) as f32 * 0.01).collect();
+                half_tagged_record(idx, dim, 1, vector)
             })
             .collect();
-        let params = FlushParameters {
-            collection_id: Some(cid.to_string()),
-            vector_records: recs,
-            force: true,
-            synchronous: true,
-            collection_config: Some(collection.clone()),
-            ..Default::default()
-        };
-        assert!(engine.do_flush(&params).await.unwrap().success);
+        flush_into(&engine, cid, &collection, recs).await;
 
         let engine = Arc::new(engine);
         let query: Vec<f32> = (0..dim).map(|j| (7 * dim + j) as f32 * 0.01).collect();
-        for filter in [
-            None,
-            Some(proximadb_filter_expression::FilterExpression::Comparison {
-                field: "half".to_string(),
-                operator: proximadb_filter_expression::ComparisonOperator::Equals,
-                value: serde_json::json!(1),
-            }),
-        ] {
-            let sp = SearchParams {
-                vector: Some(query.clone()),
-                top_k: Some(5),
-                filter_expression: filter.clone(),
-                search_mode: proximadb_search_types::search_params::SearchMode::Approximate {
-                    nprobe: None,
-                },
-                ..Default::default()
-            };
-            let ctx = StorageQueryContext {
-                search_params: Arc::new(sp),
-                collection: Arc::new(collection.clone()),
-                metadata: StorageQueryMetadata {
-                    collection_id: cid.to_string(),
-                    ..Default::default()
-                },
-                user_context: None,
-                tenant_context: None,
-            };
+        for filter in [None, Some(half_is_one())] {
+            let ctx = approximate_ctx(cid, &collection, &query, 5, filter.clone());
             let (results, snap) = crate::observability::io_trace::scope(async {
                 let results = engine
                     .clone()
@@ -3584,6 +3751,129 @@ mod tests {
                 "filter={filter:?}: rehydration must reuse the top-k block fetch: {:?}",
                 snap.tier_get_ops
             );
+        }
+    }
+
+    /// O1: a winner that cannot be rehydrated is a `DeferredResolveError`
+    /// (the caller's retry trigger), never a placeholder handed back.
+    #[tokio::test]
+    async fn deferred_resolve_fails_closed_on_an_unreadable_winner() {
+        use crate::storage::engines::sst::segment_format::CascadeHit;
+        let (engine, _collection) = file_backed_test_engine("deferred_fail", 8, None).await;
+        let table = deferred::DeferredRehydrate::new();
+        let hit = CascadeHit {
+            oid: String::new(),
+            distance: 0.5,
+            vector: None,
+            position: 0,
+        };
+        let placeholder =
+            table.placeholder("/nonexistent/seg.pax", &hit, &DistanceMetric::Euclidean);
+        let passthrough = OptimizedSearchRecord::new("real-id".to_string(), 0.1);
+        let err = table
+            .resolve(&engine, vec![placeholder, passthrough], &HashMap::new())
+            .await
+            .expect_err("an unreadable segment cannot resolve");
+        let err = anyhow::Error::new(err);
+        assert!(
+            err.downcast_ref::<deferred::DeferredResolveError>()
+                .is_some(),
+            "the retry loop recognizes the error: {err}"
+        );
+    }
+
+    /// O1 parity oracle: rehydrating only the merged winners returns exactly
+    /// the per-segment path's results (ids, scores, metadata, persisted
+    /// versions), filtered and unfiltered, across several segments; and it
+    /// reads no Region-D OID ranges at all.
+    #[tokio::test]
+    async fn deferred_rehydrate_matches_per_segment() {
+        use crate::storage::engines::sst::segment_format::CacheTier;
+
+        let dim = 16usize;
+        let cid = "deferred_rehydrate";
+        let (engine, collection) = file_backed_test_engine(cid, dim, None).await;
+        // Three flushes -> three segments, so each query merges S x k'.
+        for batch in 0..3usize {
+            let recs = (batch * 80..batch * 80 + 80)
+                .map(|idx| {
+                    let vector = (0..dim)
+                        .map(|j| ((idx * 7 + j * 3) % 97) as f32 * 0.01)
+                        .collect();
+                    half_tagged_record(idx, dim, 1 + (idx % 3) as u64, vector)
+                })
+                .collect();
+            flush_into(&engine, cid, &collection, recs).await;
+        }
+        let engine = Arc::new(engine);
+        let query: Vec<f32> = (0..dim).map(|j| (j * 5 % 97) as f32 * 0.01).collect();
+        type Seen = Vec<(String, f32, Option<String>, String, Option<u32>)>;
+        let summarize = |results: &[OptimizedSearchRecord]| -> Seen {
+            results
+                .iter()
+                .map(|r| {
+                    let mut meta: Vec<String> = r
+                        .metadata
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v:?}"))
+                        .collect();
+                    meta.sort();
+                    (
+                        r.id.clone(),
+                        r.score,
+                        r.vector_id.clone(),
+                        meta.join(","),
+                        r.version,
+                    )
+                })
+                .collect()
+        };
+        for filter in [None, Some(half_is_one())] {
+            let ctx = approximate_ctx(cid, &collection, &query, 30, filter.clone());
+            // Both search entry points: the REST/service path
+            // (`search_vectors_unified` -> `fallback_to_direct_search`) and
+            // the coordinator path (`search_vectors_unified_arc`).
+            for arc_entry in [false, true] {
+                let mut runs = Vec::new();
+                for gate in ["0", "1"] {
+                    // SAFETY: nextest process-per-test isolation.
+                    unsafe { std::env::set_var("PROXIMADB_PAX_READ_DEFERRED_REHYDRATE", gate) };
+                    let (results, snap) = crate::observability::io_trace::scope(async {
+                        let results = if arc_entry {
+                            engine.clone().search_vectors_unified_arc(&ctx).await
+                        } else {
+                            engine.search_vectors_unified(&ctx).await
+                        }
+                        .unwrap();
+                        (results, crate::observability::io_trace::snapshot())
+                    })
+                    .await;
+                    runs.push((summarize(&results), snap.expect("io_trace scope")));
+                }
+                let (per_segment, per_segment_io) = &runs[0];
+                let (deferred, deferred_io) = &runs[1];
+                let at = format!("filter={filter:?} arc_entry={arc_entry}");
+                assert!(per_segment.len() >= 10, "{at}: hits {per_segment:?}");
+                assert_eq!(deferred, per_segment, "{at}: deferred == per-segment");
+                assert!(
+                    deferred.iter().all(|(id, ..)| !id.starts_with('\u{0}')),
+                    "{at}: no placeholder escapes"
+                );
+                assert!(
+                    per_segment_io.tier_get_ops[CacheTier::ResultPayload as usize] > 0,
+                    "{at}: the per-segment path resolves OIDs from Region D"
+                );
+                assert_eq!(
+                    deferred_io.tier_get_ops[CacheTier::ResultPayload as usize],
+                    0,
+                    "{at}: deferred reads no Region-D OID ranges: {:?}",
+                    deferred_io.tier_get_ops
+                );
+                assert!(
+                    deferred_io.tier_get_ops[CacheTier::Rehydrate as usize] > 0,
+                    "{at}: deferred rehydrates the winners"
+                );
+            }
         }
     }
 
