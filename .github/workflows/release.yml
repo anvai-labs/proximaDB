@@ -1339,14 +1339,22 @@ jobs:
       - name: Verify the registry actually has this version
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
-          for attempt in 1 2 3 4 5 6; do
+          # v0.5.1: the publish SUCCEEDED but this check failed -- the full
+          # packument comes from npm's CDN and was still serving 0.5.0 two
+          # minutes after publish. The version-specific packument is not
+          # CDN-stale (it 404s until the version exists), so try it first,
+          # then the full packument; allow ~11 minutes of propagation.
+          for attempt in $(seq 1 15); do
             if curl -sf -A "proximadb-release" \
+              "https://registry.npmjs.org/@anvailabs%2fproximadb-client/${VERSION}" \
+              | grep -q "\"version\":\"${VERSION}\"" \
+            || curl -sf -A "proximadb-release" \
               "https://registry.npmjs.org/@anvailabs%2fproximadb-client" \
               | grep -q "\"${VERSION}\""; then
-              echo "npm: @anvailabs/proximadb-client ${VERSION} live"
+              echo "npm: @anvailabs/proximadb-client ${VERSION} live (attempt ${attempt})"
               exit 0
             fi
-            sleep 20
+            sleep 45
           done
           echo "::error::${VERSION} not on npm after publish"
           exit 1
