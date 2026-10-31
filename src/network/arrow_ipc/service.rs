@@ -2032,13 +2032,25 @@ impl FlightService for ProximaFlightService {
 
                 info!(collection_id = %collection_id, "Arrow Flight: delete_collection");
 
-                // Delete collection via service
-                self.collection_service
+                // Delete collection via service, reporting the real outcome
+                // (the response used to be ignored: every drop said success).
+                let response = self
+                    .collection_service
                     .delete_collection_with_tenant_context(collection_id, Some(&tenant_context))
                     .await
                     .map_err(|e| {
                         TonicStatus::internal(format!("Failed to delete collection: {}", e))
                     })?;
+                match crate::services::collection::manager::delete_outcome(collection_id, &response)
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(TonicStatus::not_found(format!(
+                            "Collection '{collection_id}' not found"
+                        )));
+                    }
+                    Err(error) => return Err(TonicStatus::unavailable(error.to_string())),
+                }
 
                 let result_bytes = serde_json::to_vec(&serde_json::json!({
                     "success": true,

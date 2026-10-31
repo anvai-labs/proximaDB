@@ -3536,6 +3536,34 @@ impl std::fmt::Debug for CollectionService {
     }
 }
 
+/// The drop outcome every surface reports: `Ok(true)` — deleted;
+/// `Ok(false)` — no such collection for this tenant (missing and another
+/// tenant's are answered alike); `Err(CollectionDropFailed)` — the drop was
+/// refused or failed and the collection STILL EXISTS. A bare `success: bool`
+/// conflated the last two, so surfaces reported a failed drop as success or
+/// as "does not exist".
+pub fn delete_outcome(identifier: &str, resp: &CollectionServiceResponse) -> anyhow::Result<bool> {
+    if resp.success {
+        return Ok(true);
+    }
+    match resp.error_code.as_deref() {
+        Some("COLLECTION_NOT_FOUND") => Ok(false),
+        code => {
+            // Codes may carry internal detail after `:` (storage URLs, I/O
+            // causes): log it, and give the client the bare code only.
+            let code = code.unwrap_or("DROP_FAILED");
+            warn!("drop of collection '{identifier}' failed: {code}");
+            Err(
+                proximadb_search_types::client_argument::CollectionDropFailed {
+                    identifier: identifier.to_string(),
+                    code: code.split(':').next().unwrap_or(code).trim().to_string(),
+                }
+                .into(),
+            )
+        }
+    }
+}
+
 /// Response for collection operations - includes the full collection data
 #[derive(Debug, Clone)]
 pub struct CollectionServiceResponse {
@@ -4980,6 +5008,29 @@ mod tests {
         Ok(())
     }
 
+    /// Drop outcomes: success, not-found and failure stay distinct, and a
+    /// failure carries its code (a bare bool reported failures as success).
+    #[test]
+    fn delete_outcome_separates_missing_from_failed() {
+        let ok = CollectionServiceResponse::success("id".into(), String::new(), 0);
+        assert!(delete_outcome("c", &ok).unwrap());
+        let missing = CollectionServiceResponse::error("COLLECTION_NOT_FOUND".into(), 0);
+        assert!(!delete_outcome("c", &missing).unwrap());
+        let failed = CollectionServiceResponse::error(
+            "CATALOG_DELETE_FAILED: s3://secret-bucket/x".into(),
+            0,
+        );
+        let error = delete_outcome("c", &failed).unwrap_err();
+        let typed = proximadb_search_types::client_argument::collection_drop_failed(&error)
+            .expect("typed drop failure");
+        assert_eq!(typed.code, "CATALOG_DELETE_FAILED", "no internal detail");
+        assert!(!error.to_string().contains("secret-bucket"), "{error}");
+        assert!(
+            !error.to_string().contains("not found"),
+            "a failed drop must not read as not-found: {error}"
+        );
+    }
+
     #[test]
     fn test_response_conversion() {
         let response = CollectionServiceResponse::success(
@@ -6328,7 +6379,7 @@ impl proximadb_runtime::CollectionPort for CollectionService {
         let resp = self
             .delete_collection_with_tenant_context(id, ctx.as_ref())
             .await?;
-        Ok(resp.success)
+        delete_outcome(id, &resp)
     }
 
     async fn list_collections(

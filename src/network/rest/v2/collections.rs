@@ -92,8 +92,15 @@ fn record_count_for_wire(
 /// (errors surface as anyhow text, not typed variants); consolidating it in
 /// this one choke point means the eventual typed-error fix is a single-site
 /// change instead of an edit per handler.
-fn collection_op_error(op: &str, collection_id: &str, e: impl std::fmt::Display) -> ApiError {
-    if e.to_string().contains("not found") {
+fn collection_op_error(op: &str, collection_id: &str, e: anyhow::Error) -> ApiError {
+    // Typed first: a failed drop leaves the collection in place, so it is a
+    // server failure (retry), never a 404 an idempotent client reads as done.
+    if let Some(failed) = proximadb_search_types::client_argument::collection_drop_failed(&e) {
+        return ApiError::Internal(failed.to_string());
+    }
+    if proximadb_search_types::client_argument::collection_not_found(&e).is_some()
+        || e.to_string().contains("not found")
+    {
         ApiError::CollectionNotFound(collection_id.to_string())
     } else {
         ApiError::Internal(format!("Failed to {op} collection: {e}"))
