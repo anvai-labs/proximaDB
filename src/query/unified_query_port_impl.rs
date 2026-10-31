@@ -581,9 +581,8 @@ impl UnifiedQueryPort for UnifiedQueryPortImpl {
         request: serde_json::Value,
     ) -> Result<serde_json::Value> {
         // Convert the JSON multi-model request to a federated SQL string.
-        // Sibling of multimodal_query::convert_multi_model_to_sql (it already
-        // shares inject_graph_target_into_cypher; tracked: consolidate the
-        // twins — their defaults and limit handling still diverge).
+        // (Formerly a twin of the deleted root multimodal_query module's
+        // convert_multi_model_to_sql; this is now the only copy.)
         let sql = multi_model_sql_from_request(&request)?;
         // chars().take — a byte-indexed slice can land mid-character in
         // the user-controlled cypher/collection text now spliced verbatim.
@@ -793,7 +792,8 @@ fn multi_model_sql_from_request(request: &serde_json::Value) -> Result<String> {
 
 /// Convert a multi-model query JSON to a federated SQL string.
 ///
-/// Mirrors the logic in `src/network/rest/canonical/multimodal_query::convert_multi_model_to_sql`.
+/// (The root canonical multimodal_query module this mirrored was a dead twin and has
+/// been deleted; this is now the only copy.)
 /// Returns `None` when no component request is present and fails closed when
 /// a supplied component is malformed.
 fn json_to_multi_model_sql(req: &serde_json::Value) -> Result<Option<String>> {

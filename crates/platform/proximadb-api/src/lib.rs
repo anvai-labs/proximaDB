@@ -38,9 +38,8 @@ pub use grpc::{GrpcApiHandler, GrpcRequest, GrpcResponse};
 pub use rest::{RestApiHandler, RestRequest, RestResponse};
 
 pub use rest::canonical::{
-    AnalyticsHandler, AqlHandler, DocumentHandler, DocumentQueryHandler, EntityHandler,
-    GraphHandler, GraphTraversalHandler, HybridSearchHandler, LogsHandler, MetricsHandler,
-    ProgressiveSearchHandler, VectorHandler,
+    DocumentHandler, DocumentQueryHandler, EntityHandler, GraphHandler, GraphTraversalHandler,
+    HybridSearchHandler, LogsHandler, MetricsHandler, ProgressiveSearchHandler, VectorHandler,
 };
 
 // Re-export v2 agentic contracts

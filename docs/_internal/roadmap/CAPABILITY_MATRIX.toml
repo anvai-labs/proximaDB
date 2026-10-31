@@ -21,7 +21,7 @@ controlling_td = ["TD-008", "TD-092"]
 evidence = [
   "src/core/search/hybrid/fusion.rs:1",
   "src/network/hybrid_search.rs:40",
-  "src/network/rest/canonical/hybrid.rs:1",
+  "crates/platform/proximadb-api/src/rest/canonical/hybrid.rs:1",
 ]
 
 [[capabilities]]

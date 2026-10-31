@@ -1507,11 +1507,10 @@ struct VectorSearchInput {
 ///
 /// Naming note: this type used to be called `HybridSearchRequest` and
 /// collided with `crate::proto::v1::HybridSearchRequest` (proto wire form
-/// for vector+graph hybrid) AND with
-/// `src/network/rest/canonical/hybrid.rs::ExperimentalHybridSearchRequest`.
-/// Renamed to `LegacyHybridSearchRequest` to mark it as deprecated; the
-/// struct can be deleted once the deserialization tests are moved to the
-/// active proximadb-api hybrid handlers.
+/// for vector+graph hybrid) and with the former root canonical hybrid
+/// module's `ExperimentalHybridSearchRequest` (deleted — the dead twin was
+/// removed; the live handlers live in `proximadb-api`). Renamed to
+/// `LegacyHybridSearchRequest` to mark it as deprecated.
 #[derive(Debug, Deserialize)]
 pub struct LegacyHybridSearchRequest {
     /// Collection to search
@@ -2043,8 +2042,9 @@ pub fn create_router(state: AppState) -> axum::Router {
     // results that misled customers into thinking the endpoint computed real
     // BM25+vector fusion. The production hybrid endpoint at `/api/v1/hybrid/search`
     // (port-backed via `RestHybridPortImpl`) is the supported path; gRPC parity
-    // landed in commit 6a73ead7f. The module at `src/network/rest/canonical/hybrid.rs`
-    // remains in-tree for reference but is no longer mounted.
+    // landed in commit 6a73ead7f. The dead root canonical hybrid module this
+    // note used to reference has been deleted; the live handlers are the
+    // port-backed `proximadb-api` ones.
 
     // Read-only collection analytics (Entanglement Index, etc.) — TD-043 sub-2
     let analytics_router = {
