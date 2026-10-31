@@ -3059,7 +3059,7 @@ impl CrossModelOptimizer {
                 }
                 other => self
                     .plan_extension_node(other, query)
-                    .expect("plan_extension_node handles all remaining extension variants"),
+                    .ok_or_else(|| anyhow!("unhandled query source in federated plan"))?,
             };
             sub_plans.push(sub_plan);
         }
@@ -3624,7 +3624,7 @@ impl CrossModelOptimizer {
                 }
                 other => self
                     .plan_extension_node(other, query)
-                    .expect("plan_extension_node handles all remaining extension variants"),
+                    .ok_or_else(|| anyhow!("unhandled query source in federated plan"))?,
             };
             sub_plans.push(sub_plan);
         }
