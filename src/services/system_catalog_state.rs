@@ -448,26 +448,16 @@ impl SystemCatalogState {
 
     /// TD-PATH-2: the highest typed `collection_id` ever minted (live or
     /// dropped); `None` when none was. The allocator floor sits above it, so a
-    /// dropped collection's typed storage root is never re-issued.
+    /// dropped collection's typed storage root is never re-issued. The
+    /// high-water already covers every live schema: every table enters state
+    /// through `apply` or a snapshot load, and both fold it.
     pub fn max_collection_id_ever(&self) -> Option<u32> {
-        let guard = self.inner.read();
-        let live = guard
-            .tables
-            .values()
-            .filter_map(|schema| schema.stable_collection_id)
-            .max();
-        live.max(Some(guard.ids_high_water.collection_id).filter(|id| *id > 0))
+        Some(self.inner.read().ids_high_water.collection_id).filter(|id| *id > 0)
     }
 
     /// TD-PATH-2: the highest typed namespace id ever minted (live or emptied).
     pub fn max_namespace_id_ever(&self) -> Option<u16> {
-        let guard = self.inner.read();
-        let live = guard
-            .tables
-            .values()
-            .filter_map(|schema| schema.stable_namespace_id)
-            .max();
-        live.max(Some(guard.ids_high_water.namespace_id).filter(|id| *id > 0))
+        Some(self.inner.read().ids_high_water.namespace_id).filter(|id| *id > 0)
     }
 
     /// The highest WAL sequence number folded in (replay watermark / snapshot
@@ -720,13 +710,13 @@ mod tests {
     /// binary decodes a new snapshot (it ignores the additive key).
     #[test]
     fn identity_high_water_is_mixed_read_safe() -> Result<()> {
+        // The pre-TD-PATH-2 snapshot shape (every field is written in both
+        // directions here, so the old `serde(default)`s are immaterial).
         #[derive(Serialize, Deserialize)]
         struct PreHighWaterSnapshot {
-            #[serde(default)]
             account_ids: HashMap<String, u32>,
             namespaces: HashMap<Vec<String>, CatalogNamespace>,
             tables: HashMap<TableIdentifier, CatalogTableSchema>,
-            #[serde(default)]
             statistics: HashMap<TableIdentifier, CatalogTableStatistics>,
             applied_seq: u64,
         }

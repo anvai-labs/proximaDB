@@ -1416,6 +1416,18 @@ mod tests {
         levels.iter().map(|s| s.to_string()).collect()
     }
 
+    async fn create_named(
+        cat: &SystemCatalog,
+        namespace: &[String],
+        name: &str,
+    ) -> Result<CatalogTableSchema> {
+        cat.create_table(
+            &TableIdentifier::new(namespace.to_vec(), name),
+            vec_schema(name),
+        )
+        .await
+    }
+
     fn vec_schema(name: &str) -> CatalogTableSchema {
         CatalogTableSchema::new(name)
             .with_column(CatalogColumn::new(1, "id", ProximaType::Int64).nullable(false))
@@ -1627,19 +1639,14 @@ mod tests {
             let cat = SystemCatalog::open("default", &wal).await?;
             cat.create_namespace(&ns, std::collections::HashMap::new())
                 .await?;
-            cat.create_table(&TableIdentifier::new(ns.clone(), "a"), vec_schema("a"))
-                .await?;
-            let newest = cat
-                .create_table(&TableIdentifier::new(ns.clone(), "b"), vec_schema("b"))
-                .await?;
+            create_named(&cat, &ns, "a").await?;
+            let newest = create_named(&cat, &ns, "b").await?;
             cat.drop_table(&TableIdentifier::new(ns.clone(), "b"), false)
                 .await?;
             newest.object_id.expect("table b minted")
         };
         let reopened = SystemCatalog::open("default", &wal).await?;
-        let c = reopened
-            .create_table(&TableIdentifier::new(ns.clone(), "c"), vec_schema("c"))
-            .await?;
+        let c = create_named(&reopened, &ns, "c").await?;
         let idc = c.object_id.expect("table c minted after restart");
         assert!(
             idc > dropped_id,
@@ -1826,29 +1833,15 @@ mod tests {
             let cat = SystemCatalog::open("default", &wal).await?;
             cat.create_namespace_for_tenant(&namespace, HashMap::new(), Some("acme"))
                 .await?;
-            cat.create_table(
-                &TableIdentifier::new(namespace.clone(), "orders"),
-                vec_schema("orders"),
-            )
-            .await?;
-            let newest = cat
-                .create_table(
-                    &TableIdentifier::new(namespace.clone(), "customers"),
-                    vec_schema("customers"),
-                )
-                .await?;
+            create_named(&cat, &namespace, "orders").await?;
+            let newest = create_named(&cat, &namespace, "customers").await?;
             cat.drop_table(&TableIdentifier::new(namespace.clone(), "customers"), false)
                 .await?;
             cat.checkpoint().await?;
             newest.stable_collection_id.expect("typed collection id")
         };
         let reopened = SystemCatalog::open("default", &wal).await?;
-        let fresh = reopened
-            .create_table(
-                &TableIdentifier::new(namespace.clone(), "invoices"),
-                vec_schema("invoices"),
-            )
-            .await?;
+        let fresh = create_named(&reopened, &namespace, "invoices").await?;
         let minted = fresh.stable_collection_id.expect("typed collection id");
         assert!(
             minted > dropped,
