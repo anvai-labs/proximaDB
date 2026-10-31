@@ -1,0 +1,50 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-REC-1: REST v2 insert silently drops a `metadata` field, so filters over it match nothing
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (filed 2026-10-31).** Found by the v0.5.0 Homebrew smoke (below); not yet reproduced against a debug build, and the owning read/write surfaces are not yet pinned.
+| Surface | REST v2 batch insert (`POST /v2/collections/{c}/records`-shaped flows) and every filtered read over the same field.
+| Severity | High for correctness-of-intent: data the client believes it stored is absent, and the failure is silent on both the write and the read.
+| Evidence | v0.5.0 end-to-end smoke in the official `ghcr.io/homebrew/brew` container (Linux/amd64), 2026-10-31: create collection; batch-insert 3 records each carrying a `metadata` object (e.g. `{"category": "tech"}`); insert reports `3/3, failed_count: 0`; **filtered search `category=tech` returns zero records** while unfiltered fetch and vector search return all 3; the fetched records carry no trace of the field.
+| Hypothesis | The v2 record model stores user key/value data in `props`; a top-level `metadata` key is not a known field, and deserialization drops it without error rather than rejecting the request (fail-open unknown-field handling on the write path).
+|===
+
+== Reproduction sketch
+
+....
+# against any v0.5.0/v0.5.1 server
+curl -X POST :5678/v2/collections/demo/records -d '
+  [{"id":"r1","vector":[...],"metadata":{"category":"tech"}},
+   {"id":"r2","vector":[...],"metadata":{"category":"news"}},
+   {"id":"r3","vector":[...],"metadata":{"category":"tech"}}]'
+# -> {"success_count":3,"failed_count":0}
+curl ":5678/v2/collections/demo/records?filter=category=tech"   # -> empty
+curl ":5678/v2/collections/demo/records/r1"                      # -> no metadata/props
+....
+
+== Decision needed (why this is a TD, not a patch)
+
+Unknown top-level fields on a write can be handled three ways; picking one is a
+contract decision:
+
+1. **Fail closed** — reject the request with a 4xx naming the unknown field.
+   Safest, but breaks any client that sends extra keys (SDK forward-compat).
+2. **Map `metadata` → `props`** — accept the alias on write and serve it on
+   read. Most forgiving, but creates two names for one thing forever.
+3. **Document `props` as the canonical field** and keep dropping unknowns —
+   then the bug is only that the drop is *silent*; add a `warn`-level log or a
+   strict-mode flag (`?strict_fields=1`).
+
+Whichever is chosen, the same audit should cover: the pgwire INSERT path, gRPC,
+Arrow Flight, and the SDKs' generated payload models, since the drop is
+presumably in the shared record decode, not the REST layer.
+
+== Guard to add with the fix
+
+An e2e test that writes a record with a field, reads it back, and asserts the
+field round-trips (or that the write was rejected) — the current suites assert
+`success_count` and vector behavior, which is why 3/3 green masked an empty
+record body.
