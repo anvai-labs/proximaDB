@@ -32,6 +32,7 @@ use moka::future::Cache;
 use moka::notification::RemovalCause;
 
 mod persistent_l2;
+pub mod policy;
 
 pub use persistent_l2::{
     L2Class, PersistentByteStore, ProtectionGroup, ProtectionSweep, canonical_location, object_key,
