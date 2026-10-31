@@ -1952,13 +1952,15 @@ self.try_pax_cascade(
 
         // Get sorted results from bounded queue
         let mut all_candidates = priority_queue.into_sorted_vec();
+        // Merge timing excludes the deferred rehydrate: it is the winners'
+        // I/O, not the merge (the deferred debug logs carry its own timings).
+        let merge_us = merge_start.elapsed().as_micros() as u64;
         if let Some(deferred) = &deferred {
             all_candidates = deferred
                 .resolve(self, all_candidates, &directory_cells)
                 .await
                 .map_err(anyhow::Error::new)?;
         }
-        let merge_us = merge_start.elapsed().as_micros() as u64;
         tracing::info!(
             target: "sst_warm_phase",
             phase = "topk_merge",
