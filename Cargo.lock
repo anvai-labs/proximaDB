@@ -9450,6 +9450,7 @@ version = "0.5.1"
 dependencies = [
  "parking_lot",
  "proximadb-kernel",
+ "proximadb-storage-common",
  "serde",
  "serde_json",
  "tempfile",
