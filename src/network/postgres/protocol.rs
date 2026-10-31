@@ -3405,10 +3405,42 @@ impl PostgresProtocol {
                             return self.send_command_complete(tag).await;
                         }
                         Err(e) => {
-                            warn!("DdlService execution failed: {}", e);
-                            return self
-                                .send_error("ERROR", "42P01", &format!("DDL failed: {}", e))
-                                .await;
+                            // 42P01 ONLY when the object truly is not there
+                            // (missing, or another tenant's). Every other
+                            // failure is a server error: labelling a failed
+                            // DROP TABLE 'does not exist' told the client a
+                            // live table was gone (TD-PATH-2).
+                            let not_found = upper.starts_with("DROP TABLE")
+                                && (e.to_string().contains("does not exist")
+                                    || proximadb_catalog::TableNotVisible::is(&e));
+                            if not_found {
+                                warn!("DdlService: object not found: {}", e);
+                                return self
+                                    .send_error(
+                                        "ERROR",
+                                        "42P01",
+                                        &format!("Table does not exist: {e}"),
+                                    )
+                                    .await;
+                            }
+                            let (sqlstate, message) = if upper.starts_with("DROP TABLE")
+                                && upper.contains("IF EXISTS")
+                            {
+                                // A failed drop still exists: IF EXISTS
+                                // must not read as success either.
+                                warn!("DROP TABLE failed: {e:#}");
+                                (
+                                    "XX000",
+                                    format!(
+                                        "could not drop table ({}); it still exists, retry",
+                                        e.to_string().split(':').next().unwrap_or("error").trim()
+                                    ),
+                                )
+                            } else {
+                                warn!("DdlService execution failed: {e:#}");
+                                ("XX000", format!("DDL failed: {e}"))
+                            };
+                            return self.send_error("ERROR", sqlstate, &message).await;
                         }
                     }
                 }
@@ -6351,28 +6383,21 @@ impl PostgresProtocol {
 
         // Scoped to the connection's tenant (startup `database`).
         let tenant = self.pgwire_resolve_write_tenant().await;
-        match self
+        let outcome = self
             .collection_port
             .delete_collection(&table_name, Some(&tenant))
-            .await
-        {
-            Ok(_) => {
+            .await;
+        match drop_table_reply(&table_name, upper.contains("IF EXISTS"), &outcome) {
+            DropTableReply::Complete => {
                 info!("Dropped collection '{}' via PostgreSQL", table_name);
                 self.send_command_complete("DROP TABLE").await
             }
-            Err(e) => {
-                if upper.contains("IF EXISTS") {
-                    // IF EXISTS - don't error if not found
-                    self.send_command_complete("DROP TABLE").await
-                } else {
-                    warn!("Failed to drop collection '{}': {}", table_name, e);
-                    self.send_error(
-                        "ERROR",
-                        "42P01",
-                        &format!("Table does not exist: {}", table_name),
-                    )
-                    .await
+            DropTableReply::Error { sqlstate, message } => {
+                if let Err(error) = outcome.as_ref() {
+                    // The client message may be generic; the log keeps the cause.
+                    warn!("DROP TABLE '{}' failed: {error:#}", table_name);
                 }
+                self.send_error("ERROR", sqlstate, &message).await
             }
         }
     }
@@ -8274,3 +8299,99 @@ fn decode_binary_vector(bytes: &[u8]) -> std::result::Result<String, String> {
 #[cfg(test)]
 #[path = "protocol_tests.rs"]
 mod tests;
+
+/// The pgwire reply to `DROP TABLE`, from the drop outcome
+/// (`Ok(true)` deleted / `Ok(false)` no such table / `Err` failed).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DropTableReply {
+    Complete,
+    Error {
+        sqlstate: &'static str,
+        message: String,
+    },
+}
+
+/// `DROP TABLE` semantics: a missing table is `42P01` unless `IF EXISTS`; a
+/// drop that FAILED is an error even under `IF EXISTS` (the table still
+/// exists — reporting `DROP TABLE` there told clients a live table was gone,
+/// and the next `CREATE TABLE` then failed with "already exists").
+pub(crate) fn drop_table_reply(
+    table_name: &str,
+    if_exists: bool,
+    outcome: &anyhow::Result<bool>,
+) -> DropTableReply {
+    match outcome {
+        Ok(true) => DropTableReply::Complete,
+        Ok(false) if if_exists => DropTableReply::Complete,
+        Ok(false) => DropTableReply::Error {
+            sqlstate: "42P01",
+            message: format!("table \"{table_name}\" does not exist"),
+        },
+        Err(error) => {
+            if proximadb_search_types::client_argument::collection_not_found(error).is_some() {
+                return if if_exists {
+                    DropTableReply::Complete
+                } else {
+                    DropTableReply::Error {
+                        sqlstate: "42P01",
+                        message: format!("table \"{table_name}\" does not exist"),
+                    }
+                };
+            }
+            let message = proximadb_search_types::client_argument::collection_drop_failed(error)
+                .map(ToString::to_string)
+                .unwrap_or_else(|| format!("could not drop table \"{table_name}\""));
+            DropTableReply::Error {
+                sqlstate: "XX000",
+                message,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod drop_table_reply_tests {
+    use super::*;
+
+    #[test]
+    fn missing_tables_honor_if_exists() {
+        assert_eq!(
+            drop_table_reply("t", false, &Ok(true)),
+            DropTableReply::Complete
+        );
+        assert_eq!(
+            drop_table_reply("t", true, &Ok(false)),
+            DropTableReply::Complete
+        );
+        assert!(matches!(
+            drop_table_reply("t", false, &Ok(false)),
+            DropTableReply::Error {
+                sqlstate: "42P01",
+                ..
+            }
+        ));
+    }
+
+    /// A failed drop is never `DROP TABLE` — not even under `IF EXISTS` —
+    /// and never "does not exist".
+    #[test]
+    fn failed_drops_are_errors_even_under_if_exists() {
+        for if_exists in [false, true] {
+            let failure: anyhow::Error =
+                proximadb_search_types::client_argument::CollectionDropFailed {
+                    identifier: "t".into(),
+                    code: "CATALOG_DELETE_FAILED".into(),
+                }
+                .into();
+            let reply = drop_table_reply("t", if_exists, &Err(failure));
+            assert!(
+                matches!(
+                    &reply,
+                    DropTableReply::Error { sqlstate: "XX000", message }
+                        if message.contains("CATALOG_DELETE_FAILED")
+                ),
+                "a failed drop reported {reply:?}"
+            );
+        }
+    }
+}

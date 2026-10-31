@@ -2411,10 +2411,26 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
             options: Default::default(),
             migration_config: Default::default(),
         };
-        self.api_handlers
+        let resp = self
+            .api_handlers
             .handle_collection_operation_for_tenant(req, Some(tenant_id.as_str()))
             .await
-            .map_err(|e| Status::internal(format!("DeleteCollection failed: {e}")))?;
+            .map_err(|e| {
+                // A drop that failed leaves the collection in place: the
+                // caller must retry, so report it as such (never success).
+                match proximadb_search_types::client_argument::collection_drop_failed(&e) {
+                    Some(failed) => Status::unavailable(failed.to_string()),
+                    None => Status::internal(format!("DeleteCollection failed: {e}")),
+                }
+            })?;
+        // Nothing deleted: no such collection for this tenant (missing and
+        // another tenant's are answered alike). It used to say success.
+        if !resp.success {
+            return Err(Status::not_found(format!(
+                "Collection '{}' not found",
+                req_in.collection_id
+            )));
+        }
         Ok(Response::new(V2DeleteCollectionResponse { success: true }))
     }
 
