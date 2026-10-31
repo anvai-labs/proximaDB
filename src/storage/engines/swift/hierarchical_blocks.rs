@@ -63,34 +63,7 @@ pub enum CompositeIndexType {
 }
 
 /// Wrapper for f64 that implements Ord by treating NaN as greater than all other values
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct OrderedFloat(pub f64);
-
-impl Eq for OrderedFloat {}
-
-impl PartialOrd for OrderedFloat {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for OrderedFloat {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match self.0.partial_cmp(&other.0) {
-            Some(ordering) => ordering,
-            None => {
-                // Handle NaN cases
-                if self.0.is_nan() && other.0.is_nan() {
-                    std::cmp::Ordering::Equal
-                } else if self.0.is_nan() {
-                    std::cmp::Ordering::Greater
-                } else {
-                    std::cmp::Ordering::Less
-                }
-            }
-        }
-    }
-}
+pub use proximadb_records::TotalOrderedF64 as OrderedFloat;
 
 /// Ordered wrapper for JSON values that preserves type-aware ordering
 #[derive(Debug, Clone, PartialEq)]

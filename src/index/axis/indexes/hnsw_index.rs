@@ -23,7 +23,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::{
     Arc, RwLock,
@@ -118,33 +117,7 @@ impl Default for AxisHnswConfig {
 }
 
 /// Wrapper for f32 to implement Ord for use in BinaryHeap
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct OrderedFloat(f32);
-
-impl Eq for OrderedFloat {}
-
-impl PartialOrd for OrderedFloat {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for OrderedFloat {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // For NaN values, treat them as greater than any other value (consistent with IEEE 754)
-        // This is a deterministic ordering for BinaryHeap usage
-        self.0.partial_cmp(&other.0).unwrap_or_else(|| {
-            // If both are NaN, return Equal
-            if self.0.is_nan() && other.0.is_nan() {
-                Ordering::Equal
-            } else if self.0.is_nan() {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        })
-    }
-}
+use proximadb_records::TotalOrderedF32 as OrderedFloat;
 
 /// HNSW index implementation using shared infrastructure with collection partitioning
 /// Migrated to use IndexVectorStore and ConcurrentIdMapping for consistency

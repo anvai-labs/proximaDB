@@ -15,7 +15,6 @@
 //! centralized in `crate::rest::deprecation` (TD-V1SUNSET-1 step 2) and
 //! re-exported below.
 
-pub mod analytics;
 pub mod document;
 pub mod entities;
 pub mod graph;
@@ -34,7 +33,6 @@ pub use crate::rest::deprecation::{
 };
 
 // Re-exports — handler types
-pub use analytics::{AnalyticsHandler, AqlHandler};
 pub use document::{DocumentHandler, DocumentQueryHandler};
 pub use entities::{EntityHandler, VectorHandler};
 pub use graph::{GraphHandler, GraphTraversalHandler};
@@ -42,7 +40,6 @@ pub use hybrid::{HybridSearchHandler, ProgressiveSearchHandler};
 pub use observability::{LogsHandler, MetricsHandler};
 
 // Re-exports — state types
-pub use analytics::AnalyticsRestState;
 pub use document::DocumentRestState;
 pub use graph::GraphRestState;
 pub use hybrid::HybridRestState;
@@ -50,7 +47,6 @@ pub use multimodal_query::UnifiedQueryRestState;
 pub use observability::ObservabilityRestState;
 
 // Re-exports — router builders
-pub use analytics::create_analytics_router;
 pub use document::create_document_router;
 pub use graph::create_graph_router;
 pub use hybrid::{create_health_router, create_hybrid_search_router, execute_sql};
