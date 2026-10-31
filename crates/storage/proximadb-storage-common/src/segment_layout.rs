@@ -52,9 +52,10 @@ pub const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 /// Header layout version — THE coalesced segment layout (TD-PAXRG-1 collapse,
 /// 2026-08): one version, region presence declared by the serialized extents.
 ///
-/// `[prefix][A0?][A][B][C?][OPR?][Region D: row groups][footer]`. The 88 B
+/// `[prefix][A0?][A][B][C?][OPR?][Region D: row groups][E?][footer]`. The 88 B
 /// prefix ALWAYS carries the full region-extent table (`a0_off/len`,
-/// `c_off/len` — zero = region absent); the version byte is therefore
+/// `c_off/len` — zero = region absent); Region E (filter columns,
+/// TD-FPRUNE-1 PR-E) is located by footer section 8 only. The version byte is therefore
 /// vestigial today and RESERVED for the first post-GA successor layout
 /// (pre-GA there is no serialized legacy data to stay read-compatible with,
 /// so the pre-collapse v1/v3/v4 sprawl was deleted rather than maintained —
@@ -532,6 +533,13 @@ const SECTION_BLOCK_FILTERABLE_STATS: u8 = 7;
 /// still resolve via `pax_field_to_col`). Payload:
 /// `[n u16] per entry: [name_len u16][name bytes][col_id i32]`.
 const SECTION_SHRED_FIELD_MAP: u8 = 5;
+/// Optional footer section locating PAX Region E (filter columns,
+/// TD-FPRUNE-1 PR-E): the region extent plus each column chunk's extent
+/// ([`crate::filter_region::FilterRegionDirectory`]). Additive: predating
+/// parsers skip the unknown tag, and this parser skips an unknown version of
+/// it (treated as absent) so a later revision never fails a footer parse.
+/// Absent ⇒ filtered reads use the full-row Stage F.
+const SECTION_FILTER_REGION: u8 = 8;
 
 /// The self-describing footer-index (Parquet-style metadata hub): block table +
 /// schema snapshot + per-stripe encoding map + RaBitQ mirror + row count. Located
@@ -618,6 +626,10 @@ pub struct SegmentFooterIndex {
     /// columns). Empty (legacy/no-shred segments) ⇒ user-tag footer-pruning is a
     /// no-op. Serialized as an optional trailing section (absent ⇒ byte-unchanged).
     pub shred_field_map: Vec<proximadb_block_format::ShredColumn>,
+    /// TD-FPRUNE-1 PR-E: Region E (filter columns) — extent and per-column
+    /// chunk extents. `None` (legacy segments, or the write gate off) ⇒
+    /// filtered reads decode Region D. Serialized as optional section 8.
+    pub filter_region: Option<crate::filter_region::FilterRegionDirectory>,
 }
 
 /// `[footer_len u64][SEGMENT_MAGIC 8B]` — the 16 B tail that locates the footer.
@@ -1044,6 +1056,9 @@ impl SegmentFooterIndex {
                 },
             ));
         }
+        if let Some(region) = &self.filter_region {
+            sections.push((SECTION_FILTER_REGION, region.to_section_payload()?));
+        }
         if !sections.is_empty() {
             let section_count = u16::try_from(sections.len())
                 .map_err(|_| anyhow::anyhow!("footer section count exceeds u16"))?;
@@ -1273,6 +1288,7 @@ impl SegmentFooterIndex {
         let mut c_len = 0u64;
         let mut block_filterable_stats: Vec<(u32, Vec<u8>)> = Vec::new();
         let mut shred_field_map = Vec::new();
+        let mut filter_region = None;
         if p != body.len() {
             let section_count = read_u16(body, &mut p)? as usize;
             if section_count > body.len().saturating_sub(p) / 6 {
@@ -1344,6 +1360,19 @@ impl SegmentFooterIndex {
                     } else {
                         bail!("unsupported shred field-map section version {version}");
                     }
+                } else if tag == SECTION_FILTER_REGION && version == SECTION_VERSION_V1 {
+                    // Region E is an optimization: a malformed directory makes
+                    // it absent (Stage F decodes Region D), never a footer
+                    // failure that would also break the ANN path.
+                    filter_region = match crate::filter_region::FilterRegionDirectory::parse_section(
+                        section,
+                    ) {
+                        Ok(region) => Some(region),
+                        Err(error) => {
+                            tracing::warn!(%error, "ignoring malformed Region-E footer section");
+                            None
+                        }
+                    };
                 }
             }
             if p != body.len() {
@@ -1374,6 +1403,7 @@ impl SegmentFooterIndex {
             c_len,
             block_filterable_stats,
             shred_field_map,
+            filter_region,
         })
     }
 
@@ -1570,6 +1600,7 @@ mod tests {
                 proximadb_block_format::ShredColumn::untyped("partition", 100),
                 proximadb_block_format::ShredColumn::untyped("lang", 101),
             ],
+            filter_region: None,
         }
     }
 
@@ -1775,6 +1806,7 @@ mod tests {
             c_len: 16_384,
             block_filterable_stats: Vec::new(),
             shred_field_map: Vec::new(),
+            filter_region: None,
         };
         let parsed = SegmentFooterIndex::parse(&base.to_bytes().expect("serialize"))
             .expect("parse footer with exact-region section");
@@ -1823,6 +1855,7 @@ mod tests {
             c_len: 0,
             block_filterable_stats: Vec::new(),
             shred_field_map: Vec::new(),
+            filter_region: None,
             blocks: vec![
                 FooterBlockEntry {
                     offset: 1_000,
@@ -2193,6 +2226,63 @@ mod tests {
 
         let parsed = SegmentFooterIndex::parse(&bytes)?;
         assert_eq!(parsed.encoding_map, footer.encoding_map);
+        Ok(())
+    }
+
+    /// TD-FPRUNE-1 PR-E: section 8 carries the Region-E extent and column
+    /// directory; absent ⇒ `None` (byte-unchanged footer).
+    #[test]
+    fn filter_region_section_round_trips_and_absent_is_none() -> Result<()> {
+        let mut footer = sample_typed_footer();
+        let plain = footer.to_bytes()?;
+        assert!(SegmentFooterIndex::parse(&plain)?.filter_region.is_none());
+        footer.filter_region = Some(crate::filter_region::FilterRegionDirectory {
+            e_off: 4096,
+            e_len: 300,
+            columns: vec![("category".into(), 4096, 120), ("half".into(), 4216, 180)],
+        });
+        let with = footer.to_bytes()?;
+        assert!(with.len() > plain.len());
+        let parsed = SegmentFooterIndex::parse(&with)?;
+        assert_eq!(parsed.filter_region, footer.filter_region);
+        assert_eq!(parsed.encoding_map, footer.encoding_map);
+        Ok(())
+    }
+
+    /// A column extent outside the region, or a malformed payload, makes
+    /// Region E absent without failing the footer; a FUTURE section-8 version
+    /// is skipped too, so Region E can never break this reader's ANN path.
+    #[test]
+    fn filter_region_section_validates_and_skips_future_versions() -> Result<()> {
+        let mut footer = sample_typed_footer();
+        footer.filter_region = Some(crate::filter_region::FilterRegionDirectory {
+            e_off: 100,
+            e_len: 10,
+            columns: vec![("c".into(), 105, 6)],
+        });
+        let bytes = footer.to_bytes()?;
+        let parsed = SegmentFooterIndex::parse(&bytes)?;
+        assert!(
+            parsed.filter_region.is_none(),
+            "a column overrunning the region drops Region E"
+        );
+        assert_eq!(
+            parsed.encoding_map, footer.encoding_map,
+            "the rest of the footer still parses"
+        );
+
+        footer.filter_region = Some(crate::filter_region::FilterRegionDirectory {
+            e_off: 100,
+            e_len: 10,
+            columns: vec![("c".into(), 100, 10)],
+        });
+        let mut bytes = footer.to_bytes()?;
+        let tag_at = bytes
+            .windows(2)
+            .rposition(|w| w == [SECTION_FILTER_REGION, SECTION_VERSION_V1])
+            .ok_or_else(|| anyhow::anyhow!("section 8 header"))?;
+        bytes[tag_at + 1] = 9;
+        assert!(SegmentFooterIndex::parse(&bytes)?.filter_region.is_none());
         Ok(())
     }
 }

@@ -2886,6 +2886,260 @@ async fn stage_f_parallel_decode_matches_serial_at_every_degree() {
     assert!(decode_stage_f_wave_with_degree(&ctx, bad, 3).await.is_err());
 }
 
+/// TD-FPRUNE-1 PR-E: a heterogeneous filterable segment written with
+/// Region E — typed columns holding wrong-typed / null / absent / NaN values,
+/// an untyped column, a JSON prop — and the filters exercised against it.
+fn write_region_e_segment(path: &std::path::Path, n: usize) {
+    use proximadb_data_model::{ProximaType, ProximaValue as V};
+    use proximadb_records::ProximaTreeNode;
+    const DIM: usize = 32;
+    let records: Vec<ProximaRecord> = (0..n)
+        .map(|i| {
+            let v: Vec<f32> = (0..DIM)
+                .map(|d| (((i * 131 + d * 17) % 251) as f32) * 0.01)
+                .collect();
+            let mut r = rec(&format!("r{i}"), 1000 + i as i64, v);
+            let mut put = |k: &str, value: Option<V>| {
+                if let Some(value) = value {
+                    r.props.insert(k.into(), ProximaTreeNode::Value(value));
+                }
+            };
+            put(
+                "cat",
+                match i % 23 {
+                    0 => None,
+                    1 => Some(V::Null),
+                    2 => Some(V::Int32(3)),
+                    3 => Some(V::String("3".into())),
+                    4 => Some(V::Float64(3.0)),
+                    _ => Some(V::Int64((i % 10) as i64)),
+                },
+            );
+            put(
+                "score",
+                match i % 17 {
+                    0 => Some(V::Float64(f64::NAN)),
+                    1 => Some(V::Float32(0.5)),
+                    2 => None,
+                    // Floats JSON text does not round-trip bit-exactly.
+                    3 => Some(V::Float64((i % 7) as f64 / 11.0)),
+                    4 => Some(V::Float32(2.59)),
+                    _ => Some(V::Float64((i % 100) as f64 / 10.0)),
+                },
+            );
+            put(
+                "tag",
+                match i % 13 {
+                    0 => Some(V::Symbol("abc".into())),
+                    1 => Some(V::Int64(7)),
+                    _ => Some(V::String(format!("t{}", i % 6))),
+                },
+            );
+            put("flag", (i % 5 != 0).then(|| V::Boolean(i % 2 == 0)));
+            put("doc", Some(V::Json(serde_json::json!({ "x": i % 3 }))));
+            r
+        })
+        .collect();
+    let shred = vec![
+        proximadb_block_format::ShredColumn::typed("cat", 100, ProximaType::Int64),
+        proximadb_block_format::ShredColumn::typed("score", 101, ProximaType::Float64),
+        proximadb_block_format::ShredColumn::typed("tag", 102, ProximaType::String),
+        proximadb_block_format::ShredColumn::untyped("flag", 103),
+        proximadb_block_format::ShredColumn::untyped("doc", 104),
+    ];
+    write_pax_segment_ordered(
+        path,
+        &records,
+        "col",
+        1,
+        VectorQuant::RaBitQ,
+        VectorQuant::Sq8,
+        false,
+        Some(16 * 1024),
+        false,
+        false,
+        None,
+        None,
+        None,
+        &shred,
+    )
+    .unwrap();
+}
+
+fn region_e_filters() -> Vec<proximadb_filter_expression::FilterExpression> {
+    use proximadb_filter_expression::{ComparisonOperator as Op, FilterExpression as F};
+    use serde_json::json;
+    let c = |f: &str, op: Op, v: serde_json::Value| F::Comparison {
+        field: f.into(),
+        operator: op,
+        value: v,
+    };
+    let mut out = Vec::new();
+    for (f, op, v) in [
+        ("cat", Op::Equals, json!(3)),
+        ("cat", Op::Equals, json!(null)),
+        ("cat", Op::NotEquals, json!(3)),
+        ("cat", Op::GreaterThan, json!(6)),
+        ("cat", Op::LessThanOrEqual, json!("3")),
+        ("cat", Op::In, json!([1, 3, "3"])),
+        ("cat", Op::NotIn, json!([1, 2])),
+        ("cat", Op::NotIn, json!([1, null])),
+        ("cat", Op::Between, json!([2, 5])),
+        ("cat", Op::Between, json!([5, 2])),
+        ("cat", Op::IsNull, json!(null)),
+        ("cat", Op::IsNotNull, json!(null)),
+        ("score", Op::GreaterThanOrEqual, json!(5.5)),
+        ("score", Op::Equals, json!(0.5)),
+        ("score", Op::IsNull, json!(null)),
+        ("score", Op::GreaterThan, json!(1.0 / 11.0)),
+        ("score", Op::LessThanOrEqual, json!(3.0 / 11.0)),
+        ("score", Op::Between, json!([1.0 / 11.0, 5.0 / 11.0])),
+        ("score", Op::GreaterThanOrEqual, json!(f64::from(2.59f32))),
+        ("tag", Op::Equals, json!("t2")),
+        ("tag", Op::StartsWith, json!("a")),
+        ("tag", Op::Contains, json!("1")),
+        ("tag", Op::Like, json!("t_")),
+        ("tag", Op::GreaterThan, json!(5)),
+        ("flag", Op::Equals, json!(true)),
+        ("flag", Op::IsNull, json!(null)),
+    ] {
+        let cmp = c(f, op, v);
+        out.push(F::Not(Box::new(cmp.clone())));
+        out.push(cmp);
+    }
+    out.push(F::And(vec![
+        c("cat", Op::Equals, json!(3)),
+        c("flag", Op::Equals, json!(true)),
+    ]));
+    out.push(F::Or(vec![
+        c("tag", Op::Equals, json!("t0")),
+        c("score", Op::LessThan, json!(1.0)),
+    ]));
+    out.push(F::Not(Box::new(F::And(vec![
+        c("cat", Op::GreaterThan, json!(4)),
+        c("flag", Op::IsNotNull, json!(null)),
+    ]))));
+    out.push(F::And(vec![]));
+    out.push(F::Or(vec![]));
+    out
+}
+
+/// TD-FPRUNE-1 PR-E core oracle: for every filter, the Region-E allow-set
+/// is identical to the full-row Stage F (read gate off), and Region E reads
+/// one ranged GET per referenced column instead of every Region-D block.
+#[tokio::test]
+async fn region_e_allow_set_equals_full_row_stage_f() {
+    enable_coalesced_rabitq();
+    unsafe {
+        std::env::set_var("PROXIMADB_PAX_WRITE_FILTER_REGION", "1");
+    }
+    use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
+    const N: usize = 3_000;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("seg.pax");
+    write_region_e_segment(&path, N);
+    let bytes = std::fs::read(&path).unwrap();
+    let footer = parse_segment_footer(&bytes);
+    assert!(footer.filter_region.is_some(), "segment carries Region E");
+    let fs = LocalFileSystem::new_with_encryption(LocalConfig::default(), None)
+        .await
+        .unwrap();
+    let p = path.to_str().unwrap();
+    let run = |filter: proximadb_filter_expression::FilterExpression, region: bool| {
+        let fs = &fs;
+        async move {
+            unsafe {
+                std::env::set_var(
+                    "PROXIMADB_PAX_READ_FILTER_REGION",
+                    if region { "1" } else { "0" },
+                );
+            }
+            crate::observability::io_trace::scope(async {
+                let built = pax_filtered_row_allow(fs, p, &filter, None, None)
+                    .await
+                    .unwrap()
+                    .expect("coalesced segment");
+                (built, crate::observability::io_trace::snapshot().unwrap())
+            })
+            .await
+        }
+    };
+    let rows = |a: &proximadb_block_format::RowAllow| -> Vec<usize> {
+        (0..N).filter(|&r| a.contains(r)).collect()
+    };
+    for filter in region_e_filters() {
+        let ((legacy, legacy_stats), legacy_io) = run(filter.clone(), false).await;
+        let ((fast, fast_stats), fast_io) = run(filter.clone(), true).await;
+        assert!(
+            !legacy_stats.region_e,
+            "read gate off uses Region D: {filter:?}"
+        );
+        assert!(fast_stats.region_e, "Region E answers {filter:?}");
+        assert_eq!(rows(&fast), rows(&legacy), "allow-set for {filter:?}");
+        assert_eq!(fast_stats.rows_matched, legacy_stats.rows_matched);
+        let fields = crate::core::search::sql_value_filter::filter_fields(&filter).len() as u64;
+        assert_eq!(
+            fast_io.range_gets,
+            2 + fields,
+            "header + footer + one GET per column: {filter:?}"
+        );
+        assert!(
+            fast_io.bytes_read * 4 < legacy_io.bytes_read,
+            "Region E reads far fewer bytes ({} vs {}) for {filter:?}",
+            fast_io.bytes_read,
+            legacy_io.bytes_read
+        );
+    }
+    unsafe {
+        std::env::remove_var("PROXIMADB_PAX_WRITE_FILTER_REGION");
+        std::env::remove_var("PROXIMADB_PAX_READ_FILTER_REGION");
+    }
+}
+
+/// A filter on a field Region E does not carry (a dotted JSON path, an
+/// undeclared prop) uses the full-row path — still exact.
+#[tokio::test]
+async fn region_e_falls_back_for_fields_it_does_not_carry() {
+    enable_coalesced_rabitq();
+    unsafe {
+        std::env::set_var("PROXIMADB_PAX_WRITE_FILTER_REGION", "1");
+    }
+    use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
+    use proximadb_filter_expression::{ComparisonOperator as Op, FilterExpression as F};
+    const N: usize = 600;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("seg.pax");
+    write_region_e_segment(&path, N);
+    let fs = LocalFileSystem::new_with_encryption(LocalConfig::default(), None)
+        .await
+        .unwrap();
+    let p = path.to_str().unwrap();
+    for (field, value, expected) in [
+        (
+            "doc.x",
+            serde_json::json!(1),
+            (0..N).filter(|i| i % 3 == 1).count(),
+        ),
+        ("undeclared", serde_json::json!(1), 0),
+    ] {
+        let filter = F::Comparison {
+            field: field.into(),
+            operator: Op::Equals,
+            value,
+        };
+        let (allow, stats) = pax_filtered_row_allow(&fs, p, &filter, None, None)
+            .await
+            .unwrap()
+            .expect("coalesced segment");
+        assert!(!stats.region_e, "{field} is not a Region-E column");
+        assert_eq!(stats.rows_matched, expected, "{field}");
+        assert_eq!((0..N).filter(|&r| allow.contains(r)).count(), expected);
+    }
+    unsafe {
+        std::env::remove_var("PROXIMADB_PAX_WRITE_FILTER_REGION");
+    }
+}
+
 /// R5: Stage F evaluates the predicate against the record's PROPS
 /// (`evaluate_filter_proxima`), so pruning must use only columns that hold
 /// those prop values. A user prop that shares a canonical column's name

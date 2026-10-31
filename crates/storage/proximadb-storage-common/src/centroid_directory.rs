@@ -791,6 +791,7 @@ impl PaxCentroidDirectory {
             c_len: header.c_len,
             block_filterable_stats: Vec::new(),
             shred_field_map: Vec::new(),
+            filter_region: None,
         }
         .to_bytes()?;
         Ok(SegmentDecodeBytes {

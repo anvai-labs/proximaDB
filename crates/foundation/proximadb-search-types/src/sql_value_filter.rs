@@ -662,10 +662,34 @@ where
 /// matching PostgreSQL's `payload->>'key'` semantics without flattening stored
 /// documents into a second metadata representation.
 pub fn evaluate_filter_proxima(expr: &FilterExpression, props: &ProximaTree) -> bool {
-    evaluate_filter_resolved(expr, &|field| {
-        resolve_proxima_value(props, field)
-            .map(|value| proxima_value_to_filter_literal(value.as_ref()))
-    })
+    evaluate_filter_resolved(expr, &|field| resolve_filter_literal(props, field))
+}
+
+/// The literal `field` resolves to in `props` under [`evaluate_filter_proxima`]
+/// (`None` = absent). A column store that records this per row (PAX Region E,
+/// TD-FPRUNE-1 PR-E) and evaluates with [`evaluate_filter_resolved`] gets
+/// exactly the same result as evaluating the row's props.
+pub fn resolve_filter_literal(props: &ProximaTree, field: &str) -> Option<serde_json::Value> {
+    resolve_proxima_value(props, field).map(|value| proxima_value_to_filter_literal(value.as_ref()))
+}
+
+/// Every field a filter's comparisons read, sorted and deduplicated. A
+/// filter with no comparisons (e.g. an empty `And`) reads none.
+pub fn filter_fields(expr: &FilterExpression) -> Vec<&str> {
+    fn walk<'a>(expr: &'a FilterExpression, out: &mut Vec<&'a str>) {
+        match expr {
+            FilterExpression::And(exprs) | FilterExpression::Or(exprs) => {
+                exprs.iter().for_each(|e| walk(e, out))
+            }
+            FilterExpression::Not(e) => walk(e, out),
+            FilterExpression::Comparison { field, .. } => out.push(field),
+        }
+    }
+    let mut out = Vec::new();
+    walk(expr, &mut out);
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 fn resolve_proxima_value<'a>(props: &'a ProximaTree, field: &str) -> Option<Cow<'a, ProximaValue>> {
@@ -2453,5 +2477,124 @@ mod type_strict_proxima_tests {
                 "type strictness changed a same-class comparison"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod filter_literal_tests {
+    //! TD-FPRUNE-1 PR-E (Region E): a column store answers a predicate from
+    //! the literal each row resolves to, so `resolve_filter_literal` must be
+    //! exactly what `evaluate_filter_proxima` sees.
+    use super::*;
+    use proximadb_records::ProximaTree;
+    use serde_json::json;
+
+    fn props() -> Vec<ProximaTree> {
+        let mut rows = Vec::new();
+        let values: Vec<Option<ProximaValue>> = vec![
+            None,
+            Some(ProximaValue::Null),
+            Some(ProximaValue::Int64(3)),
+            Some(ProximaValue::Int32(3)),
+            Some(ProximaValue::UInt64(u64::MAX)),
+            Some(ProximaValue::Float64(3.0)),
+            Some(ProximaValue::Float32(2.5)),
+            Some(ProximaValue::Float64(f64::NAN)),
+            Some(ProximaValue::Float64(f64::INFINITY)),
+            Some(ProximaValue::Boolean(true)),
+            Some(ProximaValue::String("3".to_string())),
+            Some(ProximaValue::String("abc".to_string())),
+            Some(ProximaValue::Json(json!({"x": 3}))),
+        ];
+        for v in values {
+            let mut t = ProximaTree::new();
+            if let Some(v) = v {
+                t.insert("f".to_string(), ProximaTreeNode::Value(v));
+            }
+            rows.push(t);
+        }
+        let mut nested = ProximaTree::new();
+        let mut inner = ProximaTree::new();
+        inner.insert(
+            "x".to_string(),
+            ProximaTreeNode::Value(ProximaValue::Int64(3)),
+        );
+        nested.insert("f".to_string(), ProximaTreeNode::Object(inner));
+        rows.push(nested);
+        rows
+    }
+
+    fn filters() -> Vec<FilterExpression> {
+        use ComparisonOperator::*;
+        let cmp = |field: &str, operator: ComparisonOperator, value: serde_json::Value| {
+            FilterExpression::Comparison {
+                field: field.to_string(),
+                operator,
+                value,
+            }
+        };
+        let mut out = Vec::new();
+        for field in ["f", "f.x", "missing"] {
+            for (op, lit) in [
+                (Equals, json!(3)),
+                (Equals, json!(null)),
+                (NotEquals, json!(3)),
+                (GreaterThan, json!(2)),
+                (LessThanOrEqual, json!("3")),
+                (In, json!([3, "abc"])),
+                (NotIn, json!([3, null])),
+                (NotIn, json!(3)),
+                (Between, json!([1, 4])),
+                (Between, json!([4, 1])),
+                (Contains, json!("b")),
+                (Like, json!("a%")),
+                (IsNull, json!(null)),
+                (IsNotNull, json!(null)),
+            ] {
+                let c = cmp(field, op, lit);
+                out.push(FilterExpression::Not(Box::new(c.clone())));
+                out.push(c);
+            }
+        }
+        out.push(FilterExpression::And(vec![]));
+        out.push(FilterExpression::Or(vec![]));
+        out
+    }
+
+    #[test]
+    fn resolved_literal_evaluation_matches_evaluate_filter_proxima() {
+        let rows = props();
+        for filter in filters() {
+            for (i, row) in rows.iter().enumerate() {
+                let expected = evaluate_filter_proxima(&filter, row);
+                let got = evaluate_filter_resolved(&filter, &|f| resolve_filter_literal(row, f));
+                assert_eq!(got, expected, "row {i} filter {filter:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn filter_fields_lists_every_comparison_field_once() {
+        let f = FilterExpression::And(vec![
+            FilterExpression::Comparison {
+                field: "b".into(),
+                operator: ComparisonOperator::Equals,
+                value: json!(1),
+            },
+            FilterExpression::Not(Box::new(FilterExpression::Or(vec![
+                FilterExpression::Comparison {
+                    field: "a".into(),
+                    operator: ComparisonOperator::IsNull,
+                    value: json!(null),
+                },
+                FilterExpression::Comparison {
+                    field: "b".into(),
+                    operator: ComparisonOperator::GreaterThan,
+                    value: json!(0),
+                },
+            ]))),
+        ]);
+        assert_eq!(filter_fields(&f), vec!["a", "b"]);
+        assert!(filter_fields(&FilterExpression::And(vec![])).is_empty());
     }
 }
