@@ -726,6 +726,8 @@ fn write_pax_segment_ordered(
     .with_lossless_clustered(lossless_clustered)
     .with_lossless_scalar(lossless_scalar)
     .with_shred_columns(shred_spec.to_vec())
+    // TD-FPRUNE-1 PR-E: Region E (filter columns) for the shred-spec columns.
+    .with_filter_region(filter_region_write_enabled())
     .with_block_centroids(cluster)
     // ADR-062 / TD-RDSTRAT-6: hoist the RaBitQ binary tier into a coalesced
     // file-level header region for RaBitQ-quantized writes (default ON per the
@@ -1199,6 +1201,9 @@ pub(crate) struct FilteredRowAllowStats {
     /// `blocks_total`, disjoint from `blocks_pruned`.
     pub blocks_pruned_footer: usize,
     pub rows_matched: usize,
+    /// TD-FPRUNE-1 PR-E: the allow-set came from Region E (filter columns),
+    /// not from decoding Region D.
+    pub region_e: bool,
 }
 
 /// ADR-089 / TD-FPRUNE-1 P1 Stage F: build the predicate row allow-set for a
@@ -1219,7 +1224,7 @@ pub(crate) async fn pax_filtered_row_allow(
     cache: Option<&SegmentInvariantsCache>,
     known_size: Option<u64>,
 ) -> Result<Option<(proximadb_block_format::RowAllow, FilteredRowAllowStats)>> {
-    use proximadb_block_format::{PaxBlockReader, RowAllow, evaluate_block, record::FlatRow};
+    use proximadb_block_format::{RowAllow, evaluate_block};
     use proximadb_storage_common::segment_layout::{SegmentFooterIndex, SegmentHeaderPrefix};
 
     // TD-FPRUNE-1 PR-A: every GET here is attributed to the `FilterRowAllow`
@@ -1243,7 +1248,7 @@ pub(crate) async fn pax_filtered_row_allow(
         (inv.footer_bytes.len() as u64 == header.footer_len)
             .then(|| (header, inv.footer_bytes.clone()))
     });
-    let (_header, footer_bytes) = if let Some(layout) = cached_layout {
+    let (header, footer_bytes) = if let Some(layout) = cached_layout {
         layout
     } else {
         let size = segment_size_or_stat(fs, path, known_size, "filtered stage-F").await?;
@@ -1278,15 +1283,19 @@ pub(crate) async fn pax_filtered_row_allow(
     // TD-FPRUNE-1 P2 engagement: resolve filter field names → PAX col-ids via
     // the segment's self-describing shred field-map (written from the P-Shred
     // spec) — user shreds only, see R5 below. This lets a USER-TAG filter (e.g.
-    // `partition`) prune blocks — without a catalog lookup. Owned map so the
-    // resolver closure can be a per-call `&dyn Fn` temporary at each
-    // `evaluate_block` (a `&dyn Fn` held across `.await` would make the future
-    // `!Send`); the `HashMap` itself is `Send`.
-    let user_field_map: std::collections::HashMap<String, i32> = footer
-        .shred_field_map
-        .iter()
-        .map(|c| (c.key.clone(), c.column_id))
-        .collect();
+    // `partition`) prune blocks — without a catalog lookup. The map lives in
+    // the shared decode context (`Arc`, `Send + Sync`), so each resolver
+    // closure is a per-call `&dyn Fn` temporary at its `evaluate_block` (a
+    // `&dyn Fn` held across `.await` would make the future `!Send`).
+    let ctx = std::sync::Arc::new(StageFDecodeCtx {
+        path: path.to_string(),
+        filter: filter.clone(),
+        field_map: footer
+            .shred_field_map
+            .iter()
+            .map(|c| (c.key.clone(), c.column_id))
+            .collect(),
+    });
     // R5: resolve ONLY to user shred columns. Stage F evaluates the
     // predicate against the record's PROPS (`evaluate_filter_proxima`), so
     // the only sound pruning stats are those of columns holding prop values.
@@ -1295,7 +1304,7 @@ pub(crate) async fn pax_filtered_row_allow(
     // the canonical zone map and every matching block was skipped, and a
     // canonical-name filter with no such prop matches nothing anyway (props
     // never hold the canonical fields), so canonical pruning bought nothing.
-    let resolve_field = |field: &str| -> Option<i32> { user_field_map.get(field).copied() };
+    let resolve_field = |field: &str| -> Option<i32> { ctx.field_map.get(field).copied() };
     let mut block_start: Vec<u64> = Vec::with_capacity(footer.blocks.len());
     let mut acc = 0u64;
     for b in &footer.blocks {
@@ -1308,6 +1317,36 @@ pub(crate) async fn pax_filtered_row_allow(
         blocks_total: footer.blocks.len(),
         ..Default::default()
     };
+
+    // TD-FPRUNE-1 PR-E: when the segment carries Region E for every field the
+    // filter reads, answer it from those column chunks (one ranged GET each)
+    // instead of decoding every Region-D row. Same evaluator, same literals,
+    // so the allow-set is identical.
+    // A Region-E error (a corrupt chunk, a short read) falls through to the
+    // Region-D path below — never to the whole-object exact scan, which an
+    // immutable segment would then pay on every filtered query.
+    match stage_f_from_filter_region(
+        fs,
+        path,
+        filter,
+        &footer,
+        header.footer_off,
+        n_rows,
+        trace_on,
+    )
+    .await
+    {
+        Ok(Some(region)) => {
+            stats.rows_matched = region.rows_matched;
+            stats.region_e = true;
+            record_stage_f_outcome(&stats, 0, fetch_us + region.fetch_us, region.decode_us);
+            return Ok(Some((region.allow, stats)));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(path, %error, "Region E unusable; decoding Region D");
+        }
+    }
 
     // 3. Fetch ALL D-block bodies via the same IOP-aligned coalescing the
     //    cascade's OID resolve uses. (P1 reads the metadata blocks and prunes
@@ -1375,8 +1414,9 @@ pub(crate) async fn pax_filtered_row_allow(
     // PR-D L1a: the D ranges go out in bounded-concurrency waves
     // (`read_ranges_prefetch`, `READ_RANGES_INFLIGHT`) instead of one serial
     // round trip each — ~200 serial GETs per segment were most of the
-    // filtered p50. Waves are byte-bounded so peak memory stays capped; rows
-    // are still decoded in fetch order, so the allow-set is identical.
+    // filtered p50. Waves are byte-bounded so peak memory stays capped. Each
+    // wave's blocks are decoded in parallel (`decode_stage_f_wave`) and merged
+    // into a set, so the allow-set is identical to a serial decode.
     for wave in stage_f_waves(&fetches, STAGE_F_WAVE_MAX_BYTES) {
         let fetch_started = std::time::Instant::now();
         let ranges: Vec<std::ops::Range<u64>> = wave.iter().map(|f| f.start..f.end).collect();
@@ -1395,49 +1435,41 @@ pub(crate) async fn pax_filtered_row_allow(
         crate::observability::io_trace::drain_and_forward_read_ranges_metrics();
         let decode_started = std::time::Instant::now();
         fetch_us += decode_started.duration_since(fetch_started).as_micros() as u64;
-        for (fetch, buf) in wave.iter().zip(bufs) {
+        let bufs: Vec<std::sync::Arc<Vec<u8>>> =
+            bufs.into_iter().map(std::sync::Arc::new).collect();
+        let mut jobs = Vec::new();
+        for (fetch, buf) in wave.iter().zip(&bufs) {
             for &bi in &fetch.blocks {
                 // Fail closed: a block missing from its fetch (short read, EOF
                 // clamp) would silently drop matching rows from the allow-set;
                 // an error sends the segment to the exact path instead.
-                let block_bytes = footer
+                let (range, rows) = footer
                     .blocks
                     .get(bi)
                     .and_then(|b| {
                         let rel = usize::try_from(b.offset.checked_sub(fetch.start)?).ok()?;
-                        buf.get(rel..rel.checked_add(b.size as usize)?)
+                        let end = rel.checked_add(b.size as usize)?;
+                        (end <= buf.len()).then_some((rel..end, u64::from(b.row_count)))
                     })
                     .ok_or_else(|| {
                         anyhow::anyhow!("filtered stage-F {path}: block {bi} is outside its fetch")
                     })?;
-                let reader = PaxBlockReader::open(block_bytes)
-                    .map_err(|e| anyhow::anyhow!("filtered stage-F block open {path}: {e}"))?;
-                // Conservative stats prune: provably-no-match blocks skip decode.
-                // NOTE: `&resolve_field` is a per-call temporary — a `&dyn Fn`
-                // binding held across the fetch `.await` would make this future (and
-                // every async caller up to the REST handlers) `!Send`. `resolve_field`
-                // borrows the owned `user_field_map` (Send), which is fine to hold.
-                if evaluate_block(&reader, filter, &resolve_field)
-                    == proximadb_block_format::PruneResult::Skip
-                {
-                    stats.blocks_pruned += 1;
-                    continue;
-                }
-                let start_ordinal = block_start[bi] as usize;
-                for (local, flat) in FlatRow::from_block_reader(&reader)
-                    .map_err(|e| anyhow::anyhow!("filtered stage-F rows {path}: {e}"))?
-                    .into_iter()
-                    .enumerate()
-                {
-                    let props = flat
-                        .props_tree()
-                        .map_err(|e| anyhow::anyhow!("filtered stage-F props {path}: {e}"))?;
-                    rows_decoded += 1;
-                    if crate::core::search::sql_value_filter::evaluate_filter_proxima(
-                        filter, &props,
-                    ) {
-                        allow.insert(start_ordinal + local);
-                        stats.rows_matched += 1;
+                jobs.push(StageFBlockJob {
+                    buf: buf.clone(),
+                    range,
+                    rows,
+                    start_ordinal: block_start[bi] as usize,
+                });
+            }
+        }
+        for outcome in decode_stage_f_wave(&ctx, jobs).await? {
+            match outcome {
+                None => stats.blocks_pruned += 1,
+                Some(block) => {
+                    rows_decoded += block.rows;
+                    stats.rows_matched += block.matched.len();
+                    for ordinal in block.matched {
+                        allow.insert(ordinal);
                     }
                 }
             }
@@ -1460,6 +1492,16 @@ pub(crate) async fn pax_filtered_row_allow(
         stats.blocks_total as u64,
         stats.blocks_pruned_footer as u64,
     );
+    record_stage_f_outcome(&stats, rows_decoded, fetch_us, decode_us);
+    Ok(Some((allow, stats)))
+}
+
+fn record_stage_f_outcome(
+    stats: &FilteredRowAllowStats,
+    rows_decoded: u64,
+    fetch_us: u64,
+    decode_us: u64,
+) {
     crate::storage::engines::sst::metrics::record_stage_f(
         &crate::storage::engines::sst::metrics::StageFOutcome {
             blocks_total: stats.blocks_total as u64,
@@ -1469,9 +1511,131 @@ pub(crate) async fn pax_filtered_row_allow(
             rows_matched: stats.rows_matched as u64,
             fetch_us,
             decode_us,
+            region_e: stats.region_e,
         },
     );
-    Ok(Some((allow, stats)))
+}
+
+/// A Stage F allow-set answered from Region E.
+struct RegionEAllow {
+    allow: proximadb_block_format::RowAllow,
+    rows_matched: usize,
+    fetch_us: u64,
+    decode_us: u64,
+}
+
+/// TD-FPRUNE-1 PR-E: build the Stage F allow-set from Region E (filter
+/// columns). `Ok(None)` = not applicable (read gate off, no Region E, or a
+/// filter field Region E does not carry) — the caller decodes Region D.
+///
+/// Each referenced column chunk holds, per row, the literal the evaluator
+/// resolves the field to, so evaluating the SAME tree evaluator over those
+/// literals is exactly the full-row result. A single-field filter is
+/// evaluated once per dictionary entry (≤ 4096) and then looked up per row.
+/// Any inconsistency (a chunk overlapping the footer, a corrupt chunk, a
+/// row-count mismatch) is an `Err`, which sends the segment to the exact path.
+async fn stage_f_from_filter_region(
+    fs: &dyn proximadb_storage_filesystem_types::FileSystem,
+    path: &str,
+    filter: &proximadb_filter_expression::FilterExpression,
+    footer: &proximadb_storage_common::segment_layout::SegmentFooterIndex,
+    footer_off: u64,
+    n_rows: usize,
+    trace_on: bool,
+) -> Result<Option<RegionEAllow>> {
+    use crate::core::search::sql_value_filter::{evaluate_filter_resolved, filter_fields};
+    use proximadb_storage_common::filter_region::FilterColumn;
+    let Some(region) = footer.filter_region.as_ref() else {
+        return Ok(None);
+    };
+    if !filter_region_read_enabled() {
+        return Ok(None);
+    }
+    let fields = filter_fields(filter);
+    let mut ranges = Vec::with_capacity(fields.len());
+    for field in &fields {
+        let Some((off, len)) = region.column(field) else {
+            return Ok(None);
+        };
+        if off.checked_add(len).is_none_or(|end| end > footer_off) {
+            anyhow::bail!("filtered stage-F {path}: Region E column {field} overlaps the footer");
+        }
+        ranges.push(off..off + len);
+    }
+    let fetch_started = std::time::Instant::now();
+    let bufs = if ranges.is_empty() {
+        Vec::new()
+    } else {
+        read_ranges_wave_or_serial(fs, path, &ranges, "filtered stage-F region E").await?
+    };
+    if bufs.len() != ranges.len() {
+        anyhow::bail!(
+            "filtered stage-F {path}: region E returned {} buffers for {} columns",
+            bufs.len(),
+            ranges.len()
+        );
+    }
+    for range in &ranges {
+        record_get_physical(CacheTier::FilterRowAllow, range.end - range.start, trace_on);
+    }
+    crate::observability::io_trace::drain_and_forward_read_ranges_metrics();
+    let fetch_us = fetch_started.elapsed().as_micros() as u64;
+
+    let decode_started = std::time::Instant::now();
+    let columns = bufs
+        .iter()
+        .map(|buf| FilterColumn::parse(buf))
+        .collect::<Result<Vec<_>>>()
+        .map_err(|e| anyhow::anyhow!("filtered stage-F {path}: region E: {e}"))?;
+    if let Some(column) = columns.iter().find(|c| c.rows() != n_rows) {
+        anyhow::bail!(
+            "filtered stage-F {path}: region E holds {} rows, segment {n_rows}",
+            column.rows()
+        );
+    }
+    let mut allow = proximadb_block_format::RowAllow::new(n_rows);
+    let mut rows_matched = 0usize;
+    match columns.as_slice() {
+        [] => {
+            if evaluate_filter_resolved(filter, &|_| None) {
+                (0..n_rows).for_each(|row| allow.insert(row));
+                rows_matched = n_rows;
+            }
+        }
+        [column] => {
+            let matches: Vec<bool> = (0..column.dict_len())
+                .map(|code| evaluate_filter_resolved(filter, &|_| column.entry(code).cloned()))
+                .collect();
+            for row in 0..n_rows {
+                if matches.get(column.code(row)?).copied().unwrap_or(false) {
+                    allow.insert(row);
+                    rows_matched += 1;
+                }
+            }
+        }
+        _ => {
+            let mut codes = vec![0usize; columns.len()];
+            for row in 0..n_rows {
+                for (slot, column) in codes.iter_mut().zip(&columns) {
+                    *slot = column.code(row)?;
+                }
+                let resolve = |field: &str| {
+                    let i = fields.iter().position(|f| *f == field)?;
+                    columns.get(i)?.entry(*codes.get(i)?).cloned()
+                };
+                if evaluate_filter_resolved(filter, &resolve) {
+                    allow.insert(row);
+                    rows_matched += 1;
+                }
+            }
+        }
+    }
+    Ok(Some(RegionEAllow {
+        allow,
+        rows_matched,
+        fetch_us,
+        decode_us: decode_started.elapsed().as_micros() as u64,
+    }))
 }
 
 /// TD-RDSTRAT-13 C3: the listed object size when the caller has one (no
@@ -1530,6 +1694,182 @@ async fn read_ranges_wave_or_serial(
 /// in-flight round at the object-store width (16) of the CLOUD/Azure 4 MiB
 /// IOP range, i.e. half a round at the S3/GCS 8 MiB target.
 const STAGE_F_WAVE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Per-query state the Stage F decode workers share.
+struct StageFDecodeCtx {
+    path: String,
+    filter: proximadb_filter_expression::FilterExpression,
+    /// User shred columns only (R5): filter field name → PAX col-id.
+    field_map: std::collections::HashMap<String, i32>,
+}
+
+/// One D block to decode: its bytes inside a fetched wave buffer, and the
+/// segment ordinal of its first row.
+struct StageFBlockJob {
+    buf: std::sync::Arc<Vec<u8>>,
+    range: std::ops::Range<usize>,
+    /// Footer row count (sizes the parallel-decode gate).
+    rows: u64,
+    start_ordinal: usize,
+}
+
+/// A decoded block: rows decoded and the segment ordinals that matched.
+struct StageFBlockDecoded {
+    rows: u64,
+    matched: Vec<usize>,
+}
+
+/// Decode one D block and evaluate the filter on every row. `None` = the
+/// conservative stats prune proved no row can match (decode skipped).
+fn stage_f_decode_block(
+    ctx: &StageFDecodeCtx,
+    job: &StageFBlockJob,
+) -> Result<Option<StageFBlockDecoded>> {
+    use proximadb_block_format::{PaxBlockReader, evaluate_block, record::FlatRow};
+    let path = &ctx.path;
+    let bytes = job
+        .buf
+        .get(job.range.clone())
+        .ok_or_else(|| anyhow::anyhow!("filtered stage-F {path}: block outside its buffer"))?;
+    let reader = PaxBlockReader::open(bytes)
+        .map_err(|e| anyhow::anyhow!("filtered stage-F block open {path}: {e}"))?;
+    let resolve_field = |field: &str| -> Option<i32> { ctx.field_map.get(field).copied() };
+    if evaluate_block(&reader, &ctx.filter, &resolve_field)
+        == proximadb_block_format::PruneResult::Skip
+    {
+        return Ok(None);
+    }
+    let rows = FlatRow::from_block_reader(&reader)
+        .map_err(|e| anyhow::anyhow!("filtered stage-F rows {path}: {e}"))?;
+    let decoded = rows.len() as u64;
+    let mut matched = Vec::new();
+    for (local, flat) in rows.into_iter().enumerate() {
+        let props = flat
+            .props_tree()
+            .map_err(|e| anyhow::anyhow!("filtered stage-F props {path}: {e}"))?;
+        if crate::core::search::sql_value_filter::evaluate_filter_proxima(&ctx.filter, &props) {
+            matched.push(job.start_ordinal + local);
+        }
+    }
+    Ok(Some(StageFBlockDecoded {
+        rows: decoded,
+        matched,
+    }))
+}
+
+/// Process-wide bound on Stage F decode workers: one per core across every
+/// query and segment. `morsel_degree()` alone does not bound the total — the
+/// multi-file search path decodes several segments at once, and not every
+/// search path counts itself in `INFLIGHT_SCANS` — so concurrent filtered
+/// searches queue here for cores instead of oversubscribing them.
+fn stage_f_decode_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        std::sync::Arc::new(tokio::sync::Semaphore::new(cores))
+    })
+}
+
+/// Sets the shared flag when the wave's decode future ends — completed,
+/// failed, or dropped (query cancelled / timed out) — so blocking workers
+/// that cannot be cancelled stop at their next block instead of decoding
+/// the rest of the wave for nobody.
+struct StageFCancelOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StageFCancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Decode a fetched wave's blocks. After the L1a waves, the serial full-row
+/// decode was most of the filtered latency (PR #2298 bench gate, 3M SIFT128
+/// cat3 object_cold: Stage F fetch/decode means 1078/2339 ms per query,
+/// query p50 3136 ms), so a
+/// wave holding at least `MORSEL_MIN_ROWS` rows is decoded on
+/// `morsel_degree()` workers — the Stage-A rank's adaptive degree, where
+/// `PROXIMADB_SEARCH_MORSEL_DEGREE=1` forces the serial path — under the
+/// process-wide [`stage_f_decode_permits`] bound.
+async fn decode_stage_f_wave(
+    ctx: &std::sync::Arc<StageFDecodeCtx>,
+    jobs: Vec<StageFBlockJob>,
+) -> Result<Vec<Option<StageFBlockDecoded>>> {
+    let rows: u64 = jobs.iter().map(|job| job.rows).sum();
+    let degree = if rows < MORSEL_MIN_ROWS as u64 {
+        1
+    } else {
+        crate::storage::engines::sst::search::morsel_degree()
+    };
+    decode_stage_f_wave_with_degree(ctx, jobs, degree).await
+}
+
+/// [`decode_stage_f_wave`] at an explicit degree. Blocks are dealt
+/// round-robin so stats-pruned (cheap) blocks spread across workers. Each
+/// block's result is independent, and callers only sum the counts and union
+/// the ordinals, so every degree builds the identical allow-set. Degree 1
+/// decodes on the calling task (a panic unwinds as before); in parallel, a
+/// worker error or panic is an `Err`, which sends the segment to the exact
+/// path (never a partial allow-set).
+async fn decode_stage_f_wave_with_degree(
+    ctx: &std::sync::Arc<StageFDecodeCtx>,
+    jobs: Vec<StageFBlockJob>,
+    degree: usize,
+) -> Result<Vec<Option<StageFBlockDecoded>>> {
+    let degree = degree.min(jobs.len());
+    if degree <= 1 {
+        return jobs
+            .iter()
+            .map(|job| stage_f_decode_block(ctx, job))
+            .collect();
+    }
+    let mut groups: Vec<Vec<StageFBlockJob>> = (0..degree).map(|_| Vec::new()).collect();
+    for (i, job) in jobs.into_iter().enumerate() {
+        groups[i % degree].push(job);
+    }
+    let cancel = StageFCancelOnDrop(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        false,
+    )));
+    let mut tasks = Vec::with_capacity(degree);
+    for group in groups {
+        let permit = stage_f_decode_permits()
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| anyhow::anyhow!("filtered stage-F decode permits: {e}"))?;
+        let ctx = ctx.clone();
+        let stop = cancel.0.clone();
+        tasks.push(tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut out = Vec::with_capacity(group.len());
+            for job in &group {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    anyhow::bail!("filtered stage-F decode {}: cancelled", ctx.path);
+                }
+                match stage_f_decode_block(&ctx, job) {
+                    Ok(block) => out.push(block),
+                    Err(e) => {
+                        // Stop the sibling workers now, not when the join
+                        // loop reaches this task.
+                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(out)
+        }));
+    }
+    let mut out = Vec::new();
+    for task in tasks {
+        let part = task
+            .await
+            .map_err(|e| anyhow::anyhow!("filtered stage-F decode worker {}: {e}", ctx.path))??;
+        out.extend(part);
+    }
+    Ok(out)
+}
 
 /// Split `fetches` into consecutive waves whose summed lengths stay within
 /// `max_bytes` (a single larger fetch forms its own wave). Order-preserving.
@@ -1753,6 +2093,24 @@ pub(crate) async fn read_records_by_positions(
         rehydrate_started.elapsed().as_micros() as u64,
     );
     Ok(out)
+}
+
+/// TD-FPRUNE-1 PR-E: write PAX **Region E** (filter columns) —
+/// `PROXIMADB_PAX_WRITE_FILTER_REGION=1|on|true|yes`. Default OFF (format
+/// mandate: a new region ships opt-in until baked); readers of segments
+/// without it use the full-row Stage F.
+pub fn filter_region_write_enabled() -> bool {
+    crate::storage::engines::sst::block_cluster::env_gate_on("PROXIMADB_PAX_WRITE_FILTER_REGION")
+}
+
+/// TD-FPRUNE-1 PR-E: answer a filtered query's Stage F from Region E when
+/// the segment carries it. Default ON (a segment without Region E is
+/// unaffected); `PROXIMADB_PAX_READ_FILTER_REGION=0|off|false|no` forces the
+/// full-row path.
+pub fn filter_region_read_enabled() -> bool {
+    crate::storage::engines::sst::block_cluster::env_kill_switch_off(
+        "PROXIMADB_PAX_READ_FILTER_REGION",
+    )
 }
 
 /// Whether the coalesced-RaBitQ layout is engaged for new RaBitQ writes

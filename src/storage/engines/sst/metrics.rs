@@ -94,6 +94,10 @@ lazy_static! {
         "proximadb_rehydrate_us_agg_total",
         "Cumulative top-k rehydration wall microseconds (TD-RDSTRAT-13 PR-B)",
     );
+    pub static ref STAGE_F_REGION_E: IntCounter = counter(
+        "proximadb_stage_f_region_e_agg_total",
+        "Filtered Stage-F allow-sets answered from PAX Region E (filter columns) instead of decoding Region D (TD-FPRUNE-1 PR-E)",
+    );
     pub static ref STAGE_F_CALLS: IntCounter = counter(
         "proximadb_stage_f_calls_agg_total",
         "Filtered Stage-F row allow-set builds, one per coalesced segment per filtered query (TD-FPRUNE-1 PR-A)",
@@ -210,11 +214,16 @@ pub struct StageFOutcome {
     pub rows_matched: u64,
     pub fetch_us: u64,
     pub decode_us: u64,
+    /// Answered from Region E (TD-FPRUNE-1 PR-E).
+    pub region_e: bool,
 }
 
 /// Record one filtered Stage-F build (TD-FPRUNE-1 PR-A).
 pub fn record_stage_f(outcome: &StageFOutcome) {
     STAGE_F_CALLS.inc();
+    if outcome.region_e {
+        STAGE_F_REGION_E.inc();
+    }
     STAGE_F_BLOCKS_TOTAL.inc_by(outcome.blocks_total);
     STAGE_F_BLOCKS_PRUNED_FOOTER.inc_by(outcome.blocks_pruned_footer);
     STAGE_F_BLOCKS_PRUNED_DECODE.inc_by(outcome.blocks_pruned_decode);
