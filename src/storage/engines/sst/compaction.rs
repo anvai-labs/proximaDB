@@ -78,18 +78,58 @@ static GLOBAL_PRECISION_RESOLVER: std::sync::OnceLock<
     Arc<proximadb_catalog::canonical_precision::CanonicalPrecisionResolver>,
 > = std::sync::OnceLock::new();
 
+/// Test-binary override, consulted BEFORE the set-once global: under
+/// `cargo test --lib` every test shares one process, so whichever test (or
+/// in-process database boot) arms the OnceLock first would otherwise pin its
+/// catalog against every other precision-asserting test. In the test binary
+/// a setter that loses the OnceLock race swaps this slot instead (last
+/// setter wins); the production binary keeps first-wins semantics.
+#[cfg(test)]
+static GLOBAL_PRECISION_RESOLVER_TEST: std::sync::Mutex<
+    Option<Arc<proximadb_catalog::canonical_precision::CanonicalPrecisionResolver>>,
+> = std::sync::Mutex::new(None);
+
 /// Set the process-global precision resolver (first writer wins; idempotent
 /// thereafter — mirrors the OnceLock registry pattern). Called once at boot.
 pub fn set_global_precision_resolver(
     resolver: Arc<proximadb_catalog::canonical_precision::CanonicalPrecisionResolver>,
 ) {
-    let _ = GLOBAL_PRECISION_RESOLVER.set(resolver);
+    if GLOBAL_PRECISION_RESOLVER.set(Arc::clone(&resolver)).is_err() {
+        // Already armed. In the test binary, re-arm the override slot so a
+        // shared-process test can install its own catalog; in production the
+        // original first-wins arm stands.
+        #[cfg(test)]
+        {
+            if let Ok(mut slot) = GLOBAL_PRECISION_RESOLVER_TEST.lock() {
+                *slot = Some(resolver);
+            }
+        }
+        #[cfg(not(test))]
+        {
+            let _ = resolver;
+        }
+    }
 }
 
 /// The process-global precision resolver, if boot armed one.
-pub fn get_global_precision_resolver()
--> Option<&'static Arc<proximadb_catalog::canonical_precision::CanonicalPrecisionResolver>> {
-    GLOBAL_PRECISION_RESOLVER.get()
+pub fn get_global_precision_resolver(
+) -> Option<Arc<proximadb_catalog::canonical_precision::CanonicalPrecisionResolver>> {
+    #[cfg(test)]
+    if let Ok(slot) = GLOBAL_PRECISION_RESOLVER_TEST.lock() {
+        if let Some(resolver) = slot.as_ref() {
+            return Some(Arc::clone(resolver));
+        }
+    }
+    GLOBAL_PRECISION_RESOLVER.get().cloned()
+}
+
+/// Test-only: drop a test-armed override so later shared-process tests fall
+/// back to the boot-armed global again.
+#[cfg(test)]
+pub fn clear_global_precision_resolver_for_tests() {
+    if let Ok(mut slot) = GLOBAL_PRECISION_RESOLVER_TEST.lock() {
+        *slot = None;
+    }
 }
 
 /// Stage-boundary process-RSS checkpoints for the unified compaction pipeline
@@ -811,7 +851,7 @@ impl Compaction {
             if let Some(resolver) = self.precision_resolver.get() {
                 Arc::clone(resolver)
             } else {
-                Arc::clone(get_global_precision_resolver()?)
+                get_global_precision_resolver()?
             };
         let table_id = Self::collection_to_table_identifier(collection);
         match resolver.resolve(&table_id).await {

@@ -544,6 +544,9 @@ fn proxima_value_as_string(v: ProximaValue) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    // Pins a process-global gate; must not interleave with other gate-pinning
+    // tests when the plain `cargo test --lib` runner shares one process.
+    use serial_test::serial;
     use super::*;
     use datafusion::prelude::SessionContext;
 
@@ -1121,7 +1124,8 @@ mod tests {
     /// `PROXIMADB_DF_PAX_RANGED`; a selective `amount >= N` predicate must (a) issue ranged GETs
     /// and read materially FEWER bytes than the whole segment (blocks pruned off the wire), and
     /// (b) return exactly the matching rows (the residual `FilterExec` guarantees exactness). Run
-    /// under nextest so the `PROXIMADB_DF_PAX_RANGED` OnceLock is process-isolated.
+    /// with the ranged gate pinned through the test seam (the OnceLock cache cannot
+    /// be re-armed inside the shared `cargo test --lib` process).
     /// TD-USUB-6 2b: with the residual tail ON, a shredded prop is no longer in
     /// the msgpack `PROPS` blob — and this provider decodes that blob as the
     /// DOCUMENT BODY. Without reinstating the typed columns, `SELECT props`
@@ -1235,15 +1239,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     async fn ranged_pushdown_prunes_bytes_and_matches() {
         use proximadb_block_format::{BlockCompression, BlockMode};
         use proximadb_data_model::ProximaType;
         use proximadb_records::{EmbeddingCell, EmbeddingValues};
         use proximadb_storage_common::pax_block::PaxSegmentWriter;
 
-        // SAFETY (edition 2024): under nextest each test owns its process, so this env mutation is
-        // single-threaded and read before any other `pax_ranged_read_enabled()` call in-process.
-        unsafe { std::env::set_var("PROXIMADB_DF_PAX_RANGED", "1") };
+        // Pin the cached gate directly (not via env): the plain `cargo test --lib` runner
+        // shares one process, so the set-once env cache cannot be re-armed mid-run.
+        crate::datafusion::engine_adapters::pax_adapter::set_pax_ranged_gate_for_tests(
+            Some(true),
+        );
 
         let dir = tempfile::tempdir().expect("tempdir");
         let seg_dir = dir.path().join("segments");

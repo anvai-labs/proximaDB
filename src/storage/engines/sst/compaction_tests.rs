@@ -1,6 +1,9 @@
 use super::{
     MergedVectorTracking, retain_training_guard_for_follow_up, training_follow_up_threshold,
 };
+// Tests below pin process-global gates/env; serialized on the shared lock
+// because the plain `cargo test --lib` runner shares one process.
+use serial_test::serial;
 use crate::storage::engines::sst::blocks::SstRecord;
 use crate::storage::engines::sst::{
     Compaction, CompactionPriority, CompactionStats, CompactionTask, SstConfig,
@@ -998,6 +1001,7 @@ async fn check_compaction_needed_stamps_precision_hint_from_resolver() {
 /// fallback reaches unwired instances. (nextest runs each test in its own
 /// process, so the set-once global is fresh here.)
 #[tokio::test]
+#[serial]
 async fn td_global_precision_resolver_stamps_hint_without_per_instance_wiring() {
     use crate::storage::engines::sst::compaction::set_global_precision_resolver;
     use proximadb_catalog::cache::CatalogCache;
@@ -1037,6 +1041,9 @@ async fn td_global_precision_resolver_stamps_hint_without_per_instance_wiring() 
         "the global precision resolver must stamp precision_hint on a Compaction \
          that was never per-instance-wired (the per-collection-SstEngine case)"
     );
+    // Drop the override so later shared-process tests see the boot-armed
+    // global again (the plain `cargo test --lib` runner shares one process).
+    crate::storage::engines::sst::compaction::clear_global_precision_resolver_for_tests();
 }
 
 /// INT-3-followup-d wiring: with `CompactionTask.precision_hint =
@@ -1409,12 +1416,23 @@ async fn spill_declines_a_raw_f32_collection_with_lossy_inputs() -> anyhow::Resu
 /// output and deleted the inputs, the only copies of the exact f32 values.
 /// The probe error must abort the compaction and keep the inputs.
 #[tokio::test]
+#[serial]
 async fn tier_probe_read_error_aborts_and_keeps_exact_inputs() -> anyhow::Result<()> {
     use crate::storage::engines::sst::segment_format::write_pax_segment_full_with_layout;
     use proximadb_block_format::VectorQuant;
-    // SAFETY: isolated nextest process; armed before the factory is built.
+    // Armed before the factory is built, and SCOPED to this test's own temp
+    // dir: under the plain `cargo test --lib` runner every test shares one
+    // process, so an unscoped read-fault would inject failures into every
+    // concurrent test's `.pax` reads.
     unsafe { std::env::set_var("PROXIMADB_TEST_FS_READ_FAIL_AFTER_FIRST", "1") };
     let dir = tempfile::tempdir()?;
+    // The temp dir only exists here — point the fault scope at it now.
+    unsafe {
+        std::env::set_var(
+            "PROXIMADB_TEST_FS_READ_FAIL_SCOPE",
+            dir.path().display().to_string(),
+        )
+    }
     let inputs = [
         dir.path().join("segment_L0_a.pax"),
         dir.path().join("segment_L0_b.pax"),
@@ -1468,6 +1486,10 @@ async fn tier_probe_read_error_aborts_and_keeps_exact_inputs() -> anyhow::Result
         "no lossy output may be published after a probe I/O error"
     );
     assert!(result.is_err(), "the compaction must abort");
+    unsafe {
+        std::env::remove_var("PROXIMADB_TEST_FS_READ_FAIL_SCOPE");
+        std::env::remove_var("PROXIMADB_TEST_FS_READ_FAIL_AFTER_FIRST");
+    }
     Ok(())
 }
 
@@ -1476,6 +1498,7 @@ async fn tier_probe_read_error_aborts_and_keeps_exact_inputs() -> anyhow::Result
 /// (read from the published centroid directory beside the inputs) instead of
 /// training a new model, and republishes the directory for the output.
 #[tokio::test]
+#[serial]
 async fn shared_model_gate_classifies_compaction_output_with_the_collection_model()
 -> anyhow::Result<()> {
     use crate::storage::engines::sst::centroid_directory_publisher::{

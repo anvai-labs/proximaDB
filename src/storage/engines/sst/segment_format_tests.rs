@@ -1,5 +1,10 @@
 use super::*;
 
+// The tests below pin process-global gates (env or cached-once caps); they
+// hold the `#[serial]` env-gate lock so they cannot interleave with other
+// gate-pinning tests in the shared `cargo test --lib` process.
+use serial_test::serial;
+
 /// TD-SECSCAN-1 §5 (review round 2): the RaBitQ survivor pool and the
 /// morsel merge buffer are derived from a client-controlled `top_k`. A
 /// huge `k` (e.g. u32::MAX on an uncapped surface) must never inflate the
@@ -2684,12 +2689,15 @@ fn parse_segment_footer(
 /// HEAD with a listed size (cold) — the allow-set is identical on every path,
 /// and the request counts shrink exactly by the elided reads.
 #[tokio::test]
+#[serial]
 async fn stage_f_waves_cache_and_known_size_keep_the_allow_set_exact() {
+    // Pin the parsed-once inflight cap directly: the plain `cargo test --lib`
+    // runner shares one process, so the env cache cannot be re-armed mid-run.
+    proximadb_storage_filesystem_types::__set_read_ranges_inflight_for_tests(Some(4));
     enable_coalesced_rabitq();
     // Waves only fire with an in-flight cap > 1; parsed once per process
     // (nextest isolates each test), so set before the first read.
     unsafe {
-        std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "4");
     }
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
     use proximadb_storage_common::segment_layout::SegmentHeaderPrefix;
@@ -2802,7 +2810,7 @@ async fn stage_f_waves_cache_and_known_size_keep_the_allow_set_exact() {
     assert_eq!(snap.range_gets, d_ranges, "warm: no header/footer GET");
     unsafe {
         std::env::remove_var("PROXIMADB_PAX_COALESCE_RANGE");
-        std::env::remove_var("PROXIMADB_READ_RANGES_INFLIGHT");
+        proximadb_storage_filesystem_types::__set_read_ranges_inflight_for_tests(None);
     }
 }
 
@@ -3997,7 +4005,11 @@ async fn probe_path_hot_repeat_served_from_cache_seam() {
 /// the gated function. Runs under nextest process-per-test isolation so the
 /// fn-local `OnceLock` env snapshots stay fresh per test.
 #[tokio::test]
+#[serial]
 async fn probe_cold_tail_records_read_ranges_metrics_when_inflight_armed() {
+    // Pin the parsed-once inflight cap directly: the plain `cargo test --lib`
+    // runner shares one process, so the env cache cannot be re-armed mid-run.
+    proximadb_storage_filesystem_types::__set_read_ranges_inflight_for_tests(Some(4));
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
     use proximadb_storage_filesystem_types::counting::{CountingFileSystem, global_counters};
@@ -4008,7 +4020,6 @@ async fn probe_cold_tail_records_read_ranges_metrics_when_inflight_armed() {
         std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
         std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "1");
         std::env::set_var("PROXIMADB_IVF_K", "8");
-        std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "4");
         // Scope: this gates the Region-A cold tail's batching (TD-RDSTRAT-12
         // §3), not D5's same-wave rerank — which changes the rerank's
         // planning shape (split around prefetched B extents vs a later
@@ -4107,7 +4118,7 @@ async fn probe_cold_tail_records_read_ranges_metrics_when_inflight_armed() {
         std::env::remove_var("PROXIMADB_PAX_WRITE_A0_TRAIN");
         std::env::remove_var("PROXIMADB_PAX_READ_COARSE_PROBE");
         std::env::remove_var("PROXIMADB_IVF_K");
-        std::env::remove_var("PROXIMADB_READ_RANGES_INFLIGHT");
+        proximadb_storage_filesystem_types::__set_read_ranges_inflight_for_tests(None);
         std::env::remove_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES");
         std::env::remove_var("PROXIMADB_PAX_VECTOR_COALESCE_GAP");
     }
@@ -4119,7 +4130,11 @@ async fn probe_cold_tail_records_read_ranges_metrics_when_inflight_armed() {
 /// teeth: `tier_get_ops[InvariantMeta] == 1` per query, and the wave
 /// observability still fires on the cold query.
 #[tokio::test]
+#[serial]
 async fn footer_rides_probe_wave_and_is_never_double_billed() {
+    // Pin the parsed-once inflight cap directly: the plain `cargo test --lib`
+    // runner shares one process, so the env cache cannot be re-armed mid-run.
+    proximadb_storage_filesystem_types::__set_read_ranges_inflight_for_tests(Some(4));
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
     use proximadb_storage_filesystem_types::counting::{CountingFileSystem, global_counters};
@@ -4129,7 +4144,6 @@ async fn footer_rides_probe_wave_and_is_never_double_billed() {
         std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
         std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "1");
         std::env::set_var("PROXIMADB_IVF_K", "8");
-        std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "4");
         // Disarm prefix-prefetch and gap-coalescing so the footer AND the
         // probed cells are genuinely cold (the 400-row fixture otherwise
         // fits inside the 1 MiB prefix).
@@ -4231,7 +4245,7 @@ async fn footer_rides_probe_wave_and_is_never_double_billed() {
         std::env::remove_var("PROXIMADB_PAX_WRITE_A0_TRAIN");
         std::env::remove_var("PROXIMADB_PAX_READ_COARSE_PROBE");
         std::env::remove_var("PROXIMADB_IVF_K");
-        std::env::remove_var("PROXIMADB_READ_RANGES_INFLIGHT");
+        proximadb_storage_filesystem_types::__set_read_ranges_inflight_for_tests(None);
         std::env::remove_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES");
         std::env::remove_var("PROXIMADB_PAX_VECTOR_COALESCE_GAP");
     }
@@ -4276,7 +4290,11 @@ fn plan_wave_split_ranges_chunks_and_remainder() {
 /// wave fired and the cache seam serves the repeat with no further
 /// physical reads.
 #[tokio::test]
+#[serial]
 async fn region_b_and_oid_cold_tails_batch_when_inflight_armed() {
+    // Pin the parsed-once inflight cap directly: the plain `cargo test --lib`
+    // runner shares one process, so the env cache cannot be re-armed mid-run.
+    proximadb_storage_filesystem_types::__set_read_ranges_inflight_for_tests(Some(4));
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
     use proximadb_storage_filesystem_types::counting::{CountingFileSystem, global_counters};
@@ -4287,7 +4305,6 @@ async fn region_b_and_oid_cold_tails_batch_when_inflight_armed() {
         std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
         std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "1");
         std::env::set_var("PROXIMADB_IVF_K", "8");
-        std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "4");
         // Scope: this gates the Region-A cold tail's batching (TD-RDSTRAT-12
         // §3), not D5's same-wave rerank — which changes the rerank's
         // planning shape (split around prefetched B extents vs a later
@@ -4375,7 +4392,7 @@ async fn region_b_and_oid_cold_tails_batch_when_inflight_armed() {
         std::env::remove_var("PROXIMADB_PAX_WRITE_A0_TRAIN");
         std::env::remove_var("PROXIMADB_PAX_READ_COARSE_PROBE");
         std::env::remove_var("PROXIMADB_IVF_K");
-        std::env::remove_var("PROXIMADB_READ_RANGES_INFLIGHT");
+        proximadb_storage_filesystem_types::__set_read_ranges_inflight_for_tests(None);
         std::env::remove_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES");
         std::env::remove_var("PROXIMADB_PAX_VECTOR_COALESCE_GAP");
     }

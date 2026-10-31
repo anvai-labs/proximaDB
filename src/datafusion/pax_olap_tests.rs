@@ -9,6 +9,10 @@
 mod tests {
     use std::sync::Arc;
 
+    // These tests pin process-global gates; `cargo test --lib` shares one
+    // process, so they must not interleave with other gate-pinning tests.
+    use serial_test::serial;
+
     use proximadb_catalog::{
         CatalogAuthorityMode, CatalogPhysicalFormat, CatalogStorageLayout, CatalogTableSchema,
     };
@@ -532,11 +536,16 @@ mod tests {
     /// is asserted against values derived from the writer's deterministic
     /// `created_at = (i+1) * 1000` pattern, so a wrong skip cannot hide.
     #[tokio::test]
+    #[serial]
     async fn predicate_pushdown_reduces_iobe() {
         // Ranged reads are what make block pruning visible in I/O terms; the
         // gate is default-off. nextest runs one test per process, so setting it
         // here initializes the OnceLock for THIS test's process only.
-        unsafe { std::env::set_var("PROXIMADB_DF_PAX_RANGED", "1") };
+        // Pin the cached gate directly: the plain `cargo test --lib` runner shares
+        // one process, so the set-once env cache cannot be re-armed mid-run.
+        crate::datafusion::engine_adapters::pax_adapter::set_pax_ranged_gate_for_tests(
+            Some(true),
+        );
         // Diagnostic probe: if this fails, the gate never saw the env var (an
         // earlier init or env mutation failed); if it passes while `range_gets`
         // stays 0 below, load_ranged is silently falling back (index locate).
@@ -714,8 +723,13 @@ mod tests {
     /// * Both contexts run the same SQL and we first assert RESULT PARITY
     ///   (row-exactness across engines) before comparing byte totals.
     #[tokio::test]
+    #[serial]
     async fn pax_scan_reads_fewer_bytes_than_parquet_over_identical_data() {
-        unsafe { std::env::set_var("PROXIMADB_DF_PAX_RANGED", "1") };
+        // Pin the cached gate directly: the plain `cargo test --lib` runner shares
+        // one process, so the set-once env cache cannot be re-armed mid-run.
+        crate::datafusion::engine_adapters::pax_adapter::set_pax_ranged_gate_for_tests(
+            Some(true),
+        );
         assert!(
             crate::datafusion::engine_adapters::pax_adapter::pax_ranged_read_enabled(),
             "ranged gate must be observable"
@@ -1095,8 +1109,13 @@ mod tests {
     /// pruned from the footer's per-RG zone summaries, and only surviving RG
     /// extents come off the wire. Row-exactness guards against wrong skips.
     #[tokio::test]
+    #[serial]
     async fn v4_ranged_scan_prunes_row_groups_off_the_wire() {
-        unsafe { std::env::set_var("PROXIMADB_DF_PAX_RANGED", "1") };
+        // Pin the cached gate directly: the plain `cargo test --lib` runner shares
+        // one process, so the set-once env cache cannot be re-armed mid-run.
+        crate::datafusion::engine_adapters::pax_adapter::set_pax_ranged_gate_for_tests(
+            Some(true),
+        );
         assert!(
             crate::datafusion::engine_adapters::pax_adapter::pax_ranged_read_enabled(),
             "ranged gate must be observable"
@@ -1349,8 +1368,13 @@ mod tests {
     /// a small fraction of that. Measured at the reader seam (ambient io_trace
     /// cannot see provider-partitioned reads).
     #[tokio::test]
+    #[serial]
     async fn v4_floor_kills_microgranule_amplification() {
-        unsafe { std::env::set_var("PROXIMADB_DF_PAX_RANGED", "1") };
+        // Pin the cached gate directly: the plain `cargo test --lib` runner shares
+        // one process, so the set-once env cache cannot be re-armed mid-run.
+        crate::datafusion::engine_adapters::pax_adapter::set_pax_ranged_gate_for_tests(
+            Some(true),
+        );
 
         use arrow_schema::{DataType, Field, Schema};
         use datafusion::logical_expr::Operator;
@@ -1543,8 +1567,13 @@ mod tests {
     /// bytes_read > 0 and range_gets > 0 from a ctx.sql collect (this was
     /// measured 0/0 before the ProximaScanExec scope_with_handle rebind).
     #[tokio::test]
+    #[serial]
     async fn v4_provider_reads_attribute_to_ambient_scope() {
-        unsafe { std::env::set_var("PROXIMADB_DF_PAX_RANGED", "1") };
+        // Pin the cached gate directly: the plain `cargo test --lib` runner shares
+        // one process, so the set-once env cache cannot be re-armed mid-run.
+        crate::datafusion::engine_adapters::pax_adapter::set_pax_ranged_gate_for_tests(
+            Some(true),
+        );
 
         use arrow_schema::{DataType, Field, Schema};
         use datafusion::prelude::SessionContext;

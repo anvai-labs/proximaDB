@@ -4,6 +4,7 @@
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -292,6 +293,7 @@ mod tests {
     /// arm. Each arm has its own segment paths, so no DRAM cache entry is
     /// shared between them.
     #[tokio::test]
+    #[serial]
     async fn a_resident_collection_answers_queries_with_zero_gets() {
         enable_env();
         let rows = corpus();
@@ -427,6 +429,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn global_selection_keeps_recall_and_reads_less() {
         enable_env();
         let rows = corpus();
@@ -493,6 +496,7 @@ mod tests {
     /// clusters, which are as likely to live in another segment as in its own,
     /// so a correct global ranking still touches more than one segment.
     #[tokio::test]
+    #[serial]
     async fn segments_owning_no_selected_cell_are_skipped() {
         const ROWS: usize = 3200;
         enable_env();
@@ -533,6 +537,7 @@ mod tests {
     /// kill-switch and an explicit per-segment probe count all scan more than
     /// the directory's cells, so the directory must stay unused for them.
     #[tokio::test]
+    #[serial]
     async fn the_directory_is_unused_when_planned_segments_would_not_probe() {
         enable_env();
         let rows = corpus();
@@ -588,6 +593,7 @@ mod tests {
     /// selected cell is probed in every segment holding it — at the recall of
     /// the per-segment path.
     #[tokio::test]
+    #[serial]
     async fn shared_model_segments_plan_on_distinct_cells_at_equal_recall() {
         enable_env();
         let rows = corpus();
@@ -648,6 +654,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn segments_the_directory_does_not_cover_are_still_searched() {
         enable_env();
         let rows = corpus();
@@ -682,6 +689,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn a_corrupt_directory_falls_back_to_the_per_segment_path() {
         enable_env();
         let rows = corpus();
@@ -705,7 +713,8 @@ mod tests {
         // SAFETY: nextest runs each test in its own process.
         unsafe {
             std::env::set_var("PROXIMADB_TEST_FS_LATENCY_MS", "20");
-            std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "16");
+            // Parsed-once cap: pin the cache, not the env (shared libtest process).
+            proximadb_storage_filesystem_types::__set_read_ranges_inflight_for_tests(Some(16));
             std::env::set_var("PROXIMADB_SEARCH_PARALLEL_FILES", "4");
             std::env::set_var("PROXIMADB_PAX_READ_SAME_WAVE_RERANK", "1");
             std::env::set_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES", "0");
@@ -813,6 +822,7 @@ mod tests {
     /// budget. Without decode keys the header read adds a wave; with the
     /// directory off, the decode-key gate changes nothing.
     #[tokio::test]
+    #[serial]
     async fn a_covered_segment_cold_query_takes_three_waves() {
         enable_env();
         enable_latency_env();
@@ -871,6 +881,7 @@ mod tests {
     /// whole keep that read — it serves every later byte — so at the default
     /// 1 MiB prefix these small test segments read exactly as without keys.
     #[tokio::test]
+    #[serial]
     async fn decode_keys_keep_recall_and_never_poison_the_metadata_cache() {
         enable_env();
         // SAFETY: nextest runs each test in its own process.
@@ -963,6 +974,7 @@ mod tests {
     /// listing and the scan lists again; the gate run measured that as two
     /// sequential LIST round trips per query. One search lists once.
     #[tokio::test]
+    #[serial]
     async fn an_adaptive_search_lists_the_collection_once() {
         use crate::observability::io_trace;
         enable_env();
@@ -996,6 +1008,7 @@ mod tests {
     /// blocks. The block hand-off used to fire only on decoded scans, so a
     /// warm query paid the OID-chunk wave and then the rehydration wave.
     #[tokio::test]
+    #[serial]
     async fn a_warm_directory_planned_query_also_takes_three_waves() {
         use crate::observability::io_trace;
         enable_env();
@@ -1026,6 +1039,7 @@ mod tests {
     /// run found the directory dark. Through that entry a covered cold query
     /// (directory loaded, decode keys on) takes 3 waves, as on the Arc path.
     #[tokio::test]
+    #[serial]
     async fn the_server_search_path_plans_on_the_directory() {
         use crate::observability::io_trace;
         use proximadb_storage_traits::UnifiedStorageFormat;

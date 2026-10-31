@@ -483,6 +483,7 @@ fn extract_vectors(
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
     use super::*;
     use std::sync::Arc;
 
@@ -608,6 +609,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn read_records_by_ids_returns_props_and_skips_vector_and_unknown() {
         let path = tmp_path("byids");
         write_parquet_with_meta(
@@ -651,6 +653,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn read_records_by_ids_empty_input_is_empty() {
         let path = tmp_path("empty");
         write_parquet_with_meta(&path, &[("a", "alpha", 1, vec![1.0, 0.0])], 2);
@@ -661,6 +664,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn read_external_text_returns_id_text_pairs() {
         let path = tmp_path("text");
         write_parquet_with_meta(
@@ -690,6 +694,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn reads_ids_and_vectors_with_correct_dim() {
         let path = tmp_path("read");
         let ids = ["a", "b", "c"];
@@ -712,6 +717,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn dimension_mismatch_is_rejected() {
         let path = tmp_path("dimmismatch");
         write_parquet(&path, &["a"], &[vec![1.0, 2.0, 3.0, 4.0]], 4);
@@ -722,6 +728,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn fingerprint_is_stable_and_changes_with_content() {
         let dir = std::env::temp_dir().join(format!(
             "proximadb_extsrc_dir_{}",
@@ -747,20 +754,27 @@ mod tests {
 
 #[cfg(test)]
 mod path_confinement_tests {
+    use serial_test::serial;
     //! `rust/path-injection` on `POST /api/v2/external-collections`
     //! (TD-SECSCAN-1). The handler validated only that `location` was non-empty
     //! and handed it to `fs::metadata` / `fs::read_dir`: no allowlist, no
     //! canonicalisation, no tenant prefix.
     //!
-    //! No test here mutates the process environment. `std::env::set_var` is
-    //! `unsafe` in edition 2024 and races the threads `cargo test --lib` uses,
-    //! so each layer is exercised through its own pure entry point. The
-    //! gate-unset case needs no mutation at all -- unset IS the test default,
-    //! and it is also the shipped default.
+    //! Tests here pin the gate to the shipped default (unset) under the
+    //! `#[serial]` env-gate lock and are serialized against the fixture tests
+    //! that allowlist their own directories: the plain `cargo test --lib`
+    //! runner shares one process, where an unpinned read would see another
+    //! test's allowlist. Each layer is still exercised through its own pure
+    //! entry point; unset IS also the shipped default.
     use super::*;
 
     #[test]
+    #[serial]
     fn the_shipped_default_rejects_every_location() {
+        // Pin the shipped default (gate unset). Serialized against every fixture
+        // test that allowlists its own directory: `cargo test --lib` shares one
+        // process, so without the pin another test's allowlist would leak in here.
+        unsafe { std::env::remove_var("PROXIMADB_EXTERNAL_TABLE_ROOTS") };
         // PROXIMADB_EXTERNAL_TABLE_ROOTS is unset here, as it is in production
         // unless an operator opts in. Fail-closed.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -771,7 +785,12 @@ mod path_confinement_tests {
     }
 
     #[test]
+    #[serial]
     fn rejection_is_one_indistinguishable_message() {
+        // Pin the shipped default (gate unset). Serialized against every fixture
+        // test that allowlists its own directory: `cargo test --lib` shares one
+        // process, so without the pin another test's allowlist would leak in here.
+        unsafe { std::env::remove_var("PROXIMADB_EXTERNAL_TABLE_ROOTS") };
         // A specific error is a filesystem oracle: "no such file" vs
         // "forbidden" reveals existence to any caller the surface admits.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -816,7 +835,12 @@ mod path_confinement_tests {
     }
 
     #[test]
+    #[serial]
     fn list_parquet_files_is_confined_at_the_call_site() {
+        // Pin the shipped default (gate unset). Serialized against every fixture
+        // test that allowlists its own directory: `cargo test --lib` shares one
+        // process, so without the pin another test's allowlist would leak in here.
+        unsafe { std::env::remove_var("PROXIMADB_EXTERNAL_TABLE_ROOTS") };
         // Guards the CALL SITE, not just the helpers. Without this, deleting
         // `confine(location)?` from `list_parquet_files` would leave every
         // other test in this module green while restoring the original
@@ -831,7 +855,12 @@ mod path_confinement_tests {
     }
 
     #[test]
+    #[serial]
     fn list_parquet_files_refuses_a_directory_too() {
+        // Pin the shipped default (gate unset). Serialized against every fixture
+        // test that allowlists its own directory: `cargo test --lib` shares one
+        // process, so without the pin another test's allowlist would leak in here.
+        unsafe { std::env::remove_var("PROXIMADB_EXTERNAL_TABLE_ROOTS") };
         // The directory branch enumerated any path it was given.
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("a.parquet"), b"x").expect("write");
@@ -864,7 +893,12 @@ mod path_confinement_tests {
     }
 
     #[test]
+    #[serial]
     fn the_shared_allowlist_is_what_gates_this_surface() {
+        // Pin the shipped default (gate unset). Serialized against every fixture
+        // test that allowlists its own directory: `cargo test --lib` shares one
+        // process, so without the pin another test's allowlist would leak in here.
+        unsafe { std::env::remove_var("PROXIMADB_EXTERNAL_TABLE_ROOTS") };
         // Pin the reuse: external collections must NOT grow a second gate.
         // Unset => denied, same as CREATE EXTERNAL TABLE.
         assert!(!crate::services::ddl::external_location_allowed(

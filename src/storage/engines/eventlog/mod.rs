@@ -751,11 +751,14 @@ impl EventLogEngine {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
     use super::*;
     use crate::storage::persistence::filesystem::UnifiedCachingFilesystem;
 
     #[tokio::test]
+    #[serial]
     async fn test_event_log_creation() {
+        pin_default_layout();
         let base_dir = String::from("/tmp/test_eventlog_creation");
         // Create base directory first
         std::fs::create_dir_all(&base_dir).expect("Failed to create test eventlog directory");
@@ -785,7 +788,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_append_event() {
+        pin_default_layout();
         let base_dir = String::from("/tmp/test_eventlog_append");
         // Create base directory first
         std::fs::create_dir_all(&base_dir)
@@ -832,7 +837,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_read_events_by_entity_prefix() {
+        pin_default_layout();
         let base_dir = String::from("/tmp/test_eventlog_prefix");
         std::fs::create_dir_all(&base_dir).expect("create dir");
         let config = EventLogConfig {
@@ -915,7 +922,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_regulatory_compliance() {
+        pin_default_layout();
         let base_dir = String::from("/tmp/test_eventlog_reg");
         // Create base directory first
         std::fs::create_dir_all(&base_dir)
@@ -960,7 +969,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_immutable_audit_trail() {
+        pin_default_layout();
         let base_dir = String::from("/tmp/test_eventlog_immutable");
         // Create base directory first
         std::fs::create_dir_all(&base_dir)
@@ -1070,7 +1081,9 @@ mod tests {
     /// Defect B (the destructive one): a restart must not reuse sequences and
     /// overwrite the events already on disk.
     #[tokio::test]
+    #[serial]
     async fn open_resumes_sequence_so_restart_does_not_overwrite() {
+        pin_default_layout();
         let base = recovery_base().await;
         {
             let engine = EventLogEngine::new(cfg(&base), fs_for("rec_a1").await).expect("engine");
@@ -1098,7 +1111,9 @@ mod tests {
 
     /// Defect A: events already on disk must be readable after a restart.
     #[tokio::test]
+    #[serial]
     async fn open_rebuilds_index_so_reads_survive_restart() {
+        pin_default_layout();
         let base = recovery_base().await;
         {
             let engine = EventLogEngine::new(cfg(&base), fs_for("rec_b1").await).expect("engine");
@@ -1127,7 +1142,9 @@ mod tests {
 
     /// Recovery must be inert on a fresh base — no spurious sequence skew.
     #[tokio::test]
+    #[serial]
     async fn open_on_a_fresh_base_is_a_noop() {
+        pin_default_layout();
         let base = recovery_base().await;
         let engine = EventLogEngine::open(cfg(&base), fs_for("rec_c").await)
             .await
@@ -1144,7 +1161,9 @@ mod tests {
     /// a two-level walk passes every other test here and still silently
     /// recovers nothing in production.
     #[tokio::test]
+    #[serial]
     async fn recovery_handles_flat_object_store_listing_shape() {
+        pin_default_layout();
         let base = recovery_base().await;
         let fs = fs_for("rec_flat").await;
         {
@@ -1194,7 +1213,9 @@ mod tests {
     /// reproduces the defect. If this ever starts failing, `new` gained
     /// recovery and `open` can collapse into it.
     #[tokio::test]
+    #[serial]
     async fn new_without_open_reproduces_the_defect() {
+        pin_default_layout();
         let base = recovery_base().await;
         {
             let engine = EventLogEngine::new(cfg(&base), fs_for("rec_d1").await).expect("engine");
@@ -1227,6 +1248,15 @@ mod tests {
     // file's parent dir) — NO per-event GET. O(N) GETs → O(entities) LISTs.
     // nextest isolates each test in its own process, so the env var is process-local.
 
+    /// Pin the DEFAULT (partition-keyed) layout for this test. The entity-keyed
+    /// tests below flip the process-global gate; under `cargo test --lib` (one
+    /// shared process) every default-layout test must re-pin at entry, holding
+    /// the same `#[serial]` env-gate lock.
+    fn pin_default_layout() {
+        // SAFETY: serialized against enable_entity_keyed() callers.
+        unsafe { std::env::remove_var("PROXIMADB_EVENTLOG_ENTITY_KEYED") };
+    }
+
     fn enable_entity_keyed() {
         // SAFETY: nextest runs each test in its own process; set before any
         // async/concurrent work, so there is no concurrent env read to race.
@@ -1236,6 +1266,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn entity_keyed_round_trip_writes_and_reads_by_entity() {
         enable_entity_keyed();
         let base = recovery_base().await;
@@ -1259,6 +1290,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn entity_keyed_restart_survives_via_path_index() {
         enable_entity_keyed();
         let base = recovery_base().await;
@@ -1299,6 +1331,7 @@ mod tests {
     /// costs ~LISTs (O(entities)), not 200 GETs (O(N)). A per-entity read then
     /// GETs only that entity's events lazily.
     #[tokio::test]
+    #[serial]
     async fn entity_keyed_recovery_indexes_many_events_from_paths() {
         enable_entity_keyed();
         let base = recovery_base().await;

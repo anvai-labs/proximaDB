@@ -47,14 +47,22 @@ pub const OBJECT_STORE_READ_RANGES_INFLIGHT: usize = 16;
 /// - unset: [`OBJECT_STORE_READ_RANGES_INFLIGHT`] on object-store paths
 ///   ([`object_store_scheme::ObjectStoreScheme`]), else defer to `PARALLEL`
 ///   (local disk is unchanged).
+///
+/// `cargo test --lib` runs all unit tests in one process, where "parsed once"
+/// means the first test to touch the cap pins it for every other test. Tests
+/// that need a specific cap therefore pin it through
+/// [`__set_read_ranges_inflight_for_tests`] instead of the env var.
 pub fn read_ranges_prefetch_inflight(path: &str) -> usize {
     static INFLIGHT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     static PARALLEL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let configured = *INFLIGHT.get_or_init(|| {
-        std::env::var("PROXIMADB_READ_RANGES_INFLIGHT")
-            .ok()
-            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
-    });
+    let configured = match inflight_test_override() {
+        Some(v) => v,
+        None => *INFLIGHT.get_or_init(|| {
+            std::env::var("PROXIMADB_READ_RANGES_INFLIGHT")
+                .ok()
+                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+        }),
+    };
     let parallel = || {
         *PARALLEL.get_or_init(|| {
             std::env::var("PROXIMADB_FS_READ_RANGES_PARALLEL")
@@ -70,6 +78,38 @@ pub fn read_ranges_prefetch_inflight(path: &str) -> usize {
             OBJECT_STORE_READ_RANGES_INFLIGHT
         }
         None => parallel(),
+    }
+}
+
+/// Test-only override state for the inflight cap: 0 = none (env decides),
+/// 1 = forced unset, 2 = forced to [`INFLIGHT_TEST_VALUE`].
+static INFLIGHT_TEST_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static INFLIGHT_TEST_VALUE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn inflight_test_override() -> Option<Option<usize>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    match INFLIGHT_TEST_OVERRIDE.load(Relaxed) {
+        0 => None,
+        1 => Some(None),
+        _ => Some(Some(INFLIGHT_TEST_VALUE.load(Relaxed))),
+    }
+}
+
+/// Test-only pin of the `read_ranges_prefetch` concurrency for the rest of
+/// the process (the plain `cargo test --lib` runner shares one process, so
+/// the parsed-once env cache cannot be re-armed mid-run). `None` restores
+/// "consult the environment". A test that pins must serialize against every
+/// other test that pins or asserts wave shapes.
+#[doc(hidden)]
+pub fn __set_read_ranges_inflight_for_tests(cap: Option<usize>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    match cap {
+        Some(n) => {
+            INFLIGHT_TEST_VALUE.store(n, Relaxed);
+            INFLIGHT_TEST_OVERRIDE.store(2, Relaxed);
+        }
+        None => INFLIGHT_TEST_OVERRIDE.store(1, Relaxed),
     }
 }
 
