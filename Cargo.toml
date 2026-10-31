@@ -423,8 +423,9 @@ serde_urlencoded.workspace = true
 # Sandhi neutral usage parsers (TD-SANDHI-2 / ADR-0047 D10a): single-sourced, fixture-proven
 # (Sandhi TD-0001 W1) usage/cache-split extraction adopted by the generation LLM path — not a
 # hand-rolled 4th extractor. `sandhi-core` is serde-only (no reqwest/tokio); dependency direction
-# one-way (ProximaDB → Sandhi, ADR-060). Registry release since sandhi v0.1.1; 0.2.0 (the S2
-# release) adds only a std-only usage-event sink module — wire types identical to 0.1.6.
+# one-way (ProximaDB → Sandhi, ADR-060). Consumed API surface: UsageBasis, UsageCompleteness,
+# UsageEvent, Backend, usage::{parse_anthropic_usage, parse_cohere_usage, parse_ollama_usage,
+# parse_openai_usage}. Wire types verified compatible across 0.2→0.14 jump.
 sandhi-core = "0.14"
 
 # OpenAPI spec-from-code (TD-126 Phase 1). The `ToSchema`/`IntoParams`/`path`

@@ -41,7 +41,7 @@ Extracted `plan_extension_node()` helper method on `CrossModelOptimizer` that co
 ```rust
 other => self
     .plan_extension_node(other, query)
-    .expect("plan_extension_node handles all remaining extension variants"),
+    .ok_or_else(|| anyhow!("unhandled query source in federated plan"))?,
 ```
 
 **Design principle:** Single Responsibility — extension→PlanNode mapping lives in one place. Adding a new observability extension type requires editing exactly one method.

@@ -5159,6 +5159,9 @@ impl CrossModelOptimizer {
     /// [`plan_federated_query`] — both iterate over `QuerySourceRef` values and
     /// produce identical `PlanNode` shapes for Logs / Metrics / Traces /
     /// VectorDistance extensions (hardcoded cost estimates, no stats needed).
+    ///
+    /// Only handles `Extension` variants; `Target` is intentionally excluded
+    /// because both callers match `Target` explicitly before delegating here.
     fn plan_extension_node(
         &self,
         source: QuerySourceRef<'_>,
