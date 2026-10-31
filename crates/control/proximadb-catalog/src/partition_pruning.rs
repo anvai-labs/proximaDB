@@ -404,7 +404,10 @@ impl PartitionPruner {
             | ComparisonOperator::Between
             | ComparisonOperator::IsNull
             | ComparisonOperator::IsNotNull
-            | ComparisonOperator::Like => true, // Can't prune, include partition
+            | ComparisonOperator::Like
+            | ComparisonOperator::Exists
+            | ComparisonOperator::NotExists
+            | ComparisonOperator::Regex => true, // Can't prune, include partition
         }
     }
 

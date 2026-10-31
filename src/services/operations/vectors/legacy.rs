@@ -4890,6 +4890,30 @@ impl VectorOperationsService {
                             value,
                         }
                     }
+                    // Presence tests and Regex evaluate as their real
+                    // predicates (the FilterExpression evaluators all support
+                    // them) instead of the catch-all dummy below.
+                    FilterCondition::IsNull { column } => {
+                        crate::core::search::FilterExpression::Comparison {
+                            field: column,
+                            operator: crate::core::search::ComparisonOperator::IsNull,
+                            value: serde_json::Value::Null,
+                        }
+                    }
+                    FilterCondition::IsNotNull { column } => {
+                        crate::core::search::FilterExpression::Comparison {
+                            field: column,
+                            operator: crate::core::search::ComparisonOperator::IsNotNull,
+                            value: serde_json::Value::Null,
+                        }
+                    }
+                    FilterCondition::Regex { column, pattern } => {
+                        crate::core::search::FilterExpression::Comparison {
+                            field: column,
+                            operator: crate::core::search::ComparisonOperator::Regex,
+                            value: serde_json::Value::String(pattern),
+                        }
+                    }
                     // Default case for other variants - map them to Equals for simplicity
                     _ => crate::core::search::FilterExpression::Comparison {
                         field: "unknown".to_string(),
