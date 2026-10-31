@@ -5767,13 +5767,19 @@ mod tests {
             data,
             "s3://bucket/data/tenants/acme/accounts/000007/005/000009/data"
         );
+        // No "{wal}"/"{indexes}" in the assert messages: CodeQL's
+        // clear-text-logging rule treats an assert! format message as a log
+        // sink, and these paths are built from collection_uuid + path
+        // segments, so the interpolated form flagged HIGH on the qa->main
+        // promotion (the fixture data is not sensitive, but the gate must
+        // stay green). The expected layouts are asserted literally above.
         assert!(
             wal.starts_with("s3://bucket/data/tenants/acme/accounts/"),
-            "{wal}"
+            "wal path must live under the tenant accounts prefix"
         );
         assert!(
             indexes.starts_with("s3://bucket/data/tenants/acme/accounts/"),
-            "{indexes}"
+            "indexes path must live under the tenant accounts prefix"
         );
         assert_eq!(
             format!("{data}/"),
