@@ -297,7 +297,8 @@ Regions C and D are implemented, closing the two open targets above:
   micro-block baseline on identical data) is pinned in TD-PAXRG-1.
 * **Region C is a hoisted exact-f32 region** — same ordinal space as A/B, extent
   in the header prefix + footer section 6, written only under the existing
-  `pax_f32_tier` opt-in (Q4's evidence gate governs per-collection activation).
+  `pax_f32_tier` opt-in (Q4's evidence gate governs per-collection activation;
+  since 2026-10-30 the tier is on by default for the RaBitQ base, storage-only).
   Reconstruction parity with in-block stripes is bitwise (pinned).
 * **Single layout version (pre-GA collapse)**: nothing serialized predates this
   change, so the v1/v3/v4 version sprawl Q2 anticipated was deleted rather than
