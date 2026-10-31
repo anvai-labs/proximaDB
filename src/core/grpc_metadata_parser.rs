@@ -132,8 +132,8 @@ fn parse_json_field_query(
 
             for (op, value) in operators {
                 let operator = match op.as_str() {
-                    "$eq" | "eq" => ComparisonOperator::Equal,
-                    "$ne" | "ne" => ComparisonOperator::NotEqual,
+                    "$eq" | "eq" => ComparisonOperator::Equals,
+                    "$ne" | "ne" => ComparisonOperator::NotEquals,
                     "$gt" | "gt" => ComparisonOperator::GreaterThan,
                     "$gte" | "gte" => ComparisonOperator::GreaterThanOrEqual,
                     "$lt" | "lt" => ComparisonOperator::LessThan,

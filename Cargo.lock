@@ -9146,6 +9146,7 @@ dependencies = [
  "proximadb-proto",
  "proximadb-quantization-model",
  "proximadb-records",
+ "regex",
  "serde",
  "serde_json",
 ]

@@ -36,38 +36,7 @@ pub struct FieldQuery {
     pub value: JsonValue,
 }
 
-/// Comparison operators for metadata fields
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ComparisonOperator {
-    /// Exact equality (==)
-    Equal,
-    /// Not equal (!=)
-    NotEqual,
-    /// Less than (<)
-    LessThan,
-    /// Less than or equal (<=)
-    LessThanOrEqual,
-    /// Greater than (>)
-    GreaterThan,
-    /// Greater than or equal (>=)
-    GreaterThanOrEqual,
-    /// String contains substring
-    Contains,
-    /// String starts with prefix
-    StartsWith,
-    /// String ends with suffix
-    EndsWith,
-    /// Value exists in array
-    In,
-    /// Value does not exist in array
-    NotIn,
-    /// Field exists (not null)
-    Exists,
-    /// Field does not exist or is null
-    NotExists,
-    /// Regular expression match
-    Regex,
-}
+pub use crate::ComparisonOperator;
 
 /// Metadata query engine for evaluating complex queries
 #[derive(Debug)]
@@ -122,8 +91,8 @@ impl MetadataQueryEngine {
         let field_value = metadata.get(&field_query.field);
 
         match field_query.operator {
-            ComparisonOperator::Equal => Ok(field_value == Some(&field_query.value)),
-            ComparisonOperator::NotEqual => Ok(field_value != Some(&field_query.value)),
+            ComparisonOperator::Equals => Ok(field_value == Some(&field_query.value)),
+            ComparisonOperator::NotEquals => Ok(field_value != Some(&field_query.value)),
             ComparisonOperator::LessThan => {
                 self.compare_numeric_or_string(field_value, &field_query.value, |a, b| a < b)
             }
@@ -159,6 +128,43 @@ impl MetadataQueryEngine {
             ComparisonOperator::NotExists => Ok(field_value.is_none_or(|v| v.is_null())),
             ComparisonOperator::Regex => {
                 self.regex_operation(&field_query.field, field_value, &field_query.value)
+            }
+            ComparisonOperator::Between => {
+                // Canonical Between: value carries the inclusive [lo, hi]
+                // bounds as a two-element JSON array.
+                if let Some(actual) = field_value
+                    && let JsonValue::Array(bounds) = &field_query.value
+                    && bounds.len() == 2
+                {
+                    let ge =
+                        self.compare_numeric_or_string(Some(actual), &bounds[0], |a, b| a >= b)?;
+                    let le =
+                        self.compare_numeric_or_string(Some(actual), &bounds[1], |a, b| a <= b)?;
+                    Ok(ge && le)
+                } else {
+                    Ok(false)
+                }
+            }
+            ComparisonOperator::IsNull => Ok(field_value.is_none_or(|v| v.is_null())),
+            ComparisonOperator::IsNotNull => Ok(field_value.is_some_and(|v| !v.is_null())),
+            ComparisonOperator::Like => {
+                // SQL-style LIKE: `%` matches any run, `_` any single char,
+                // everything else literal — translated to an anchored regex.
+                self.string_operation(field_value, &field_query.value, |text, pattern| {
+                    let mut src = String::with_capacity(pattern.len() * 2);
+                    src.push('^');
+                    for ch in pattern.chars() {
+                        match ch {
+                            '%' => src.push_str(".*"),
+                            '_' => src.push('.'),
+                            c => src.push_str(&regex::escape(&c.to_string())),
+                        }
+                    }
+                    src.push('$');
+                    regex::Regex::new(&src)
+                        .map(|re| re.is_match(text))
+                        .unwrap_or(false)
+                })
             }
         }
     }
@@ -276,7 +282,7 @@ impl MetadataQueryBuilder {
     pub fn field_equals(mut self, field: &str, value: JsonValue) -> Self {
         let field_query = MetadataQuery::Field(FieldQuery {
             field: field.to_string(),
-            operator: ComparisonOperator::Equal,
+            operator: ComparisonOperator::Equals,
             value,
         });
         self.query = self.combine_with_and(field_query);
@@ -340,7 +346,7 @@ impl MetadataQuery {
     pub fn field_eq(field: &str, value: JsonValue) -> Self {
         Self::Field(FieldQuery {
             field: field.to_string(),
-            operator: ComparisonOperator::Equal,
+            operator: ComparisonOperator::Equals,
             value,
         })
     }
@@ -631,13 +637,13 @@ mod tests {
             ("missing", ComparisonOperator::GreaterThan, json!(1), false),
             (
                 "category",
-                ComparisonOperator::NotEqual,
+                ComparisonOperator::NotEquals,
                 json!("books"),
                 true,
             ),
             (
                 "category",
-                ComparisonOperator::NotEqual,
+                ComparisonOperator::NotEquals,
                 json!("electronics"),
                 false,
             ),
