@@ -191,22 +191,7 @@ impl TypedAttributes {
 }
 
 /// Wrapper for f64 that implements Eq and Hash
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct OrderedFloat(pub f64);
-
-impl PartialEq for OrderedFloat {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.to_bits() == other.0.to_bits()
-    }
-}
-
-impl Eq for OrderedFloat {}
-
-impl std::hash::Hash for OrderedFloat {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.to_bits().hash(state);
-    }
-}
+pub use proximadb_records::BitKeyF64 as OrderedFloat;
 
 /// Metadata extraction errors
 #[derive(Debug, thiserror::Error)]

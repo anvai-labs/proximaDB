@@ -39,6 +39,8 @@ pub use proximadb_data_model::ProximaValue;
 
 pub mod chunked;
 pub mod conversions;
+pub mod ordered_float;
+pub use ordered_float::{BitKeyF32, BitKeyF64, TotalOrderedF32, TotalOrderedF64};
 pub mod proto_v2;
 pub mod store;
 pub mod wire_v2;
