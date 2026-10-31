@@ -3093,6 +3093,7 @@ mod minimal_compaction_tests {
             config: Some(crate::proto::proximadb_v1::CollectionConfig {
                 storage_class: None,
                 policy_generation: None,
+                default_access_tier: None,
                 name: collection_id.to_string(),
                 embedding_config: None,
                 dimension: 128,

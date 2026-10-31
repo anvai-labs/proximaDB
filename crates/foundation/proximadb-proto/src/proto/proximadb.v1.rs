@@ -6690,6 +6690,14 @@ pub struct CollectionConfig {
     #[prost(uint32, optional, tag = "31")]
     #[serde(default)]
     pub policy_generation: ::core::option::Option<u32>,
+    /// TD-TIER-1 SC5: provider access tier for the collection's FUTURE
+    /// compacted segment PUTs (fresh L0 flush output keeps the account
+    /// default; existing objects are not rewritten). UNSPECIFIED/absent ⇒ the account/bucket default. Online
+    /// tiers only; an explicit tier requires a tiered object-store placement.
+    /// `serde(default)` keeps old persisted records readable.
+    #[prost(enumeration = "AccessTier", optional, tag = "32")]
+    #[serde(default)]
+    pub default_access_tier: ::core::option::Option<i32>,
 }
 /// Per-collection storage class (TD-TIER-1 SC1). The DESIRED policy only —
 /// observed residency is reported separately via `StorageClassStatus` on the
@@ -6726,6 +6734,41 @@ impl StorageClass {
             "STORAGE_CLASS_ECONOMY" => Some(Self::Economy),
             "STORAGE_CLASS_BALANCED" => Some(Self::Balanced),
             "STORAGE_CLASS_PERFORMANCE" => Some(Self::Performance),
+            _ => None,
+        }
+    }
+}
+/// TD-TIER-1 SC5: canonical online access tier for future segment PUTs.
+#[derive(
+    serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration,
+)]
+#[repr(i32)]
+pub enum AccessTier {
+    Unspecified = 0,
+    Hot = 1,
+    Cool = 2,
+    Cold = 3,
+}
+impl AccessTier {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ACCESS_TIER_UNSPECIFIED",
+            Self::Hot => "ACCESS_TIER_HOT",
+            Self::Cool => "ACCESS_TIER_COOL",
+            Self::Cold => "ACCESS_TIER_COLD",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ACCESS_TIER_UNSPECIFIED" => Some(Self::Unspecified),
+            "ACCESS_TIER_HOT" => Some(Self::Hot),
+            "ACCESS_TIER_COOL" => Some(Self::Cool),
+            "ACCESS_TIER_COLD" => Some(Self::Cold),
             _ => None,
         }
     }
