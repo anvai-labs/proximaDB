@@ -1290,6 +1290,18 @@ impl MultiModalQueryExecutor {
                     Op::Between => false, // Deferred: implement between logic
                     Op::IsNull => lv.is_null(),
                     Op::IsNotNull => !lv.is_null(),
+                    // Presence tests folded in from the former metadata_query
+                    // vocabulary; same semantics as the null tests above.
+                    Op::NotExists => lv.is_null(),
+                    Op::Exists => !lv.is_null(),
+                    Op::Regex => match (&lv, value) {
+                        (serde_json::Value::String(text), serde_json::Value::String(pattern)) => {
+                            regex::Regex::new(pattern)
+                                .map(|re| re.is_match(text))
+                                .unwrap_or(false)
+                        }
+                        _ => false,
+                    },
                 }
             }
             FilterExpression::And(exprs) => exprs.iter().all(|expr| self.eval_having(row, expr)),

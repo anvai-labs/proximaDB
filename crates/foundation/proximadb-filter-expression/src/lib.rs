@@ -31,11 +31,20 @@ pub enum FilterExpression {
 }
 
 /// Comparison operators for metadata filtering.
+///
+/// Canonical vocabulary: the union of this enum and the former
+/// `metadata_query::ComparisonOperator`, which had drifted apart (same
+/// intent, diverged variant names and variant sets). The legacy
+/// `metadata_query` wire names still deserialize via `serde(alias)`, so
+/// persisted/parsed payloads from either vocabulary remain readable
+/// (mixed-read-safe); serialization always emits the canonical names.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ComparisonOperator {
-    /// Equal to.
+    /// Equal to (legacy `metadata_query` wire name: `Equal`).
+    #[serde(alias = "Equal")]
     Equals,
-    /// Not equal to.
+    /// Not equal to (legacy `metadata_query` wire name: `NotEqual`).
+    #[serde(alias = "NotEqual")]
     NotEquals,
     /// Greater than.
     GreaterThan,
@@ -63,6 +72,12 @@ pub enum ComparisonOperator {
     IsNotNull,
     /// SQL-style LIKE pattern matching (supports `%` and `_` wildcards).
     Like,
+    /// Field exists and is not null.
+    Exists,
+    /// Field is absent or null.
+    NotExists,
+    /// Regular expression match.
+    Regex,
 }
 
 /// Convert a [`FilterExpression`] into AXIS index metadata filters

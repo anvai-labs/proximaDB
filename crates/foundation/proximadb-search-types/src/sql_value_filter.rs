@@ -399,6 +399,11 @@ pub fn compare_json_op(
     match operator {
         ComparisonOperator::IsNull => return json_val.is_null(),
         ComparisonOperator::IsNotNull => return !json_val.is_null(),
+        // Presence tests folded in from the former metadata_query vocabulary:
+        // Exists ≡ IsNotNull and NotExists ≡ IsNull in this codebase's
+        // document semantics (absence and present-and-null are conflated).
+        ComparisonOperator::Exists => return !json_val.is_null(),
+        ComparisonOperator::NotExists => return json_val.is_null(),
         _ => {}
     }
     // Null LITERAL semantics: `= null` matches a null field (pinned);
@@ -426,6 +431,22 @@ pub fn compare_json_op(
         // a future operator fails compilation here rather than silently
         // falling through.
         ComparisonOperator::IsNull | ComparisonOperator::IsNotNull => false,
+        // Presence tests were decided in the early-return block above.
+        ComparisonOperator::Exists | ComparisonOperator::NotExists => false,
+        // Regex from the former metadata_query vocabulary. Compiled per
+        // call: the hot path for Regex today is the metadata engine (which
+        // keeps its own cached evaluator); this spine arm exists so the
+        // vocabulary stays total and fails closed on non-strings.
+        ComparisonOperator::Regex => {
+            json_val
+                .as_str()
+                .zip(value.as_str())
+                .is_some_and(|(text, pattern)| {
+                    regex::Regex::new(pattern)
+                        .map(|re| re.is_match(text))
+                        .unwrap_or(false)
+                })
+        }
         ComparisonOperator::Equals => json_eq(json_val, value),
         ComparisonOperator::NotEquals => !json_eq(json_val, value),
         ComparisonOperator::LessThan => compare_json_lt(json_val, value),
@@ -543,7 +564,10 @@ where
                 } = &**e
                 && !matches!(
                     operator,
-                    ComparisonOperator::IsNull | ComparisonOperator::IsNotNull
+                    ComparisonOperator::IsNull
+                        | ComparisonOperator::IsNotNull
+                        | ComparisonOperator::Exists
+                        | ComparisonOperator::NotExists
                 )
                 && resolve(field).is_none_or(|v| v.is_null())
             {
@@ -564,6 +588,13 @@ where
             // reached for these.
             ComparisonOperator::IsNull => resolve(field).is_none_or(|json_val| json_val.is_null()),
             ComparisonOperator::IsNotNull => {
+                resolve(field).is_some_and(|json_val| !json_val.is_null())
+            }
+            // Presence tests share the null tests' absence-aware semantics.
+            ComparisonOperator::NotExists => {
+                resolve(field).is_none_or(|json_val| json_val.is_null())
+            }
+            ComparisonOperator::Exists => {
                 resolve(field).is_some_and(|json_val| !json_val.is_null())
             }
             _ => match resolve(field) {
@@ -623,7 +654,10 @@ where
             } = &**e
                 && !matches!(
                     operator,
-                    ComparisonOperator::IsNull | ComparisonOperator::IsNotNull
+                    ComparisonOperator::IsNull
+                        | ComparisonOperator::IsNotNull
+                        | ComparisonOperator::Exists
+                        | ComparisonOperator::NotExists
                 )
                 && resolve(field).is_none_or(|v| v.is_null())
             {
@@ -642,6 +676,14 @@ where
                 Ok(resolve(field).is_none_or(|json_val| json_val.is_null()))
             }
             ComparisonOperator::IsNotNull => {
+                Ok(resolve(field).is_some_and(|json_val| !json_val.is_null()))
+            }
+            // Presence tests share the null tests' absence-aware semantics
+            // (never an error, like the null tests).
+            ComparisonOperator::NotExists => {
+                Ok(resolve(field).is_none_or(|json_val| json_val.is_null()))
+            }
+            ComparisonOperator::Exists => {
                 Ok(resolve(field).is_some_and(|json_val| !json_val.is_null()))
             }
             _ => match resolve(field) {
@@ -829,7 +871,10 @@ pub fn evaluate_filter_proxima_strict(
             } = &**e
                 && !matches!(
                     operator,
-                    ComparisonOperator::IsNull | ComparisonOperator::IsNotNull
+                    ComparisonOperator::IsNull
+                        | ComparisonOperator::IsNotNull
+                        | ComparisonOperator::Exists
+                        | ComparisonOperator::NotExists
                 )
                 && proximadb_records::tree_get(props, field)
                     .is_none_or(|pv| matches!(pv, ProximaValue::Null))
@@ -848,6 +893,11 @@ pub fn evaluate_filter_proxima_strict(
             ComparisonOperator::IsNull => Ok(resolve_proxima_value(props, field)
                 .is_none_or(|pv| matches!(pv.as_ref(), ProximaValue::Null))),
             ComparisonOperator::IsNotNull => Ok(resolve_proxima_value(props, field)
+                .is_some_and(|pv| !matches!(pv.as_ref(), ProximaValue::Null))),
+            // Presence tests share the null tests' absence-aware semantics.
+            ComparisonOperator::NotExists => Ok(resolve_proxima_value(props, field)
+                .is_none_or(|pv| matches!(pv.as_ref(), ProximaValue::Null))),
+            ComparisonOperator::Exists => Ok(resolve_proxima_value(props, field)
                 .is_some_and(|pv| !matches!(pv.as_ref(), ProximaValue::Null))),
             _ => match resolve_proxima_value(props, field) {
                 Some(pv) => Ok(compare_proxima_op(pv.as_ref(), operator, value)),
@@ -1775,8 +1825,21 @@ pub fn compare_json_op_type_strict(
 
     match operator {
         // Null tests are decided by presence — handled by the walker, never None.
-        ComparisonOperator::IsNull | ComparisonOperator::IsNotNull => {
-            Some(compare_json_op(operator, json_val, value))
+        // Presence tests (Exists/NotExists, folded in from the former
+        // metadata_query vocabulary) share that contract: they are decided
+        // by presence/nullness of the field value, never by class.
+        ComparisonOperator::IsNull
+        | ComparisonOperator::IsNotNull
+        | ComparisonOperator::Exists
+        | ComparisonOperator::NotExists => Some(compare_json_op(operator, json_val, value)),
+
+        // Regex is meaningful only between two strings.
+        ComparisonOperator::Regex => {
+            if json_val.is_string() && value.is_string() {
+                Some(compare_json_op(operator, json_val, value))
+            } else {
+                None
+            }
         }
 
         // String operators are meaningful only between two strings.
@@ -2156,6 +2219,15 @@ where
                 Some(resolve(field).is_none_or(|json_val| json_val.is_null()))
             }
             ComparisonOperator::IsNotNull => {
+                Some(resolve(field).is_some_and(|json_val| !json_val.is_null()))
+            }
+            // Presence tests share the null tests' absence-aware semantics
+            // (Exists ≡ IsNotNull, NotExists ≡ IsNull in this codebase's
+            // document semantics — absent and present-and-null conflated).
+            ComparisonOperator::NotExists => {
+                Some(resolve(field).is_none_or(|json_val| json_val.is_null()))
+            }
+            ComparisonOperator::Exists => {
                 Some(resolve(field).is_some_and(|json_val| !json_val.is_null()))
             }
             _ => match resolve(field) {
