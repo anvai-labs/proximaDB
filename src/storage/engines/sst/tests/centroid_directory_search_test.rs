@@ -11,7 +11,7 @@ mod tests {
 
     use crate::core::search::SearchParams;
     use crate::proto::proximadb_v1::{
-        Collection, CollectionConfig, StorageAssignment, StorageEngine,
+        Collection, CollectionConfig, StorageAssignment, StorageEngine, storage_class_status,
     };
     use crate::storage::engines::sst::SstConfig;
     use crate::storage::engines::sst::centroid_directory_publisher::publish_centroid_directory;
@@ -424,6 +424,127 @@ mod tests {
             (hot_recall - cold_recall).abs() < 1e-9,
             "residency never changes results: {hot_recall} vs {cold_recall}"
         );
+    }
+
+    /// TD-TIER-1 SC6 groundwork: truthful readiness under coverage loss.
+    /// Forgetting one resident copy drops the proof to partial coverage — the
+    /// status projection reports WARMING (coverage in progress), never READY;
+    /// DEGRADED is for out-of-profile / over-budget / store-missing — queries
+    /// keep their recall by falling back to the object store (metered GETs
+    /// return), and a backfill restores full coverage — the "correct fallback
+    /// after disk loss" invariant, engine-level.
+    #[tokio::test]
+    async fn readiness_tracks_coverage_loss_and_recovery() {
+        enable_env();
+        let rows = corpus();
+        let cold = arm("sc6-cold", &rows).await;
+        let (cold_recall, cold_reads) = measure(&cold, &rows, false).await;
+        assert!(cold_reads > 0);
+
+        struct GrantCleanup(String);
+        impl Drop for GrantCleanup {
+            fn drop(&mut self) {
+                // Shared-process runners: a mid-test assert must not leak the
+                // group/budget into later tests (segment_io::Armed pattern).
+                proximadb_cache::unregister_protection_group(&self.0);
+                proximadb_cache::set_process_reserved_budget(0);
+            }
+        }
+        let _gate = crate::services::collection::reservation::residency_test_gate();
+        let store = crate::services::collection::reservation::residency_test_store();
+        let hot = arm("sc6-hot", &rows).await;
+        let _grant = GrantCleanup("sc6-grant".to_string());
+        proximadb_cache::set_process_reserved_budget(1 << 30);
+        proximadb_cache::register_protection_group(proximadb_cache::ProtectionGroup {
+            id: "sc6-grant".to_string(),
+            prefixes: vec![format!("{}/", hot.storage_url.trim_end_matches('/'))],
+            budget_bytes: 1 << 30,
+        });
+        let fs = hot
+            .engine
+            .filesystem()
+            .get_filesystem(&hot.storage_url)
+            .unwrap();
+        crate::storage::engines::sst::segment_io::warm_collection(fs.as_ref(), &hot.storage_url, 4)
+            .await
+            .unwrap();
+
+        let prefixes = vec![format!("{}/", hot.storage_url.trim_end_matches('/'))];
+        let factory = hot.engine.filesystem().clone();
+        let state_of = |proof: &_| {
+            crate::services::collection::storage_class::with_residency_proof(
+                crate::services::collection::storage_class::storage_class_status(
+                    &hot.collection.config.clone().unwrap(),
+                ),
+                1 << 30,
+                0,
+                0,
+                true,
+                proof,
+            )
+            .state
+        };
+        let ready = crate::storage::engines::sst::segment_io::prove_residency(&factory, &prefixes)
+            .await
+            .unwrap();
+        assert_eq!(ready.covered_segments, ready.segments, "{ready:?}");
+        assert_eq!(state_of(&ready), storage_class_status::State::Ready as i32);
+
+        // Loss: one live segment's resident copy is dropped (an eviction the
+        // protection could not refuse, or local-disk loss).
+        let live =
+            crate::storage::engines::sst::segment_io::live_segments(fs.as_ref(), &hot.storage_url)
+                .await
+                .unwrap();
+        // Local-disk loss = EVICTION, not retirement: remove the store entry
+        // directly. `forget_object` would mark the segment retired, and a
+        // retired segment is never re-warmed by design (the racing-backfill
+        // guard) — so the recovery below would be refused.
+        store.remove(&proximadb_cache::object_key(&live[0].url));
+        let degraded =
+            crate::storage::engines::sst::segment_io::prove_residency(&factory, &prefixes)
+                .await
+                .unwrap();
+        assert_eq!(
+            (degraded.segments, degraded.covered_segments),
+            (ready.segments, ready.segments - 1),
+            "{degraded:?}"
+        );
+        assert_eq!(
+            state_of(&degraded),
+            storage_class_status::State::Warming as i32,
+            "partial coverage is WARMING; DEGRADED is out-of-profile/over-budget/no-store"
+        );
+
+        // Serving through the loss: recall parity with the ungranted arm is
+        // preserved (the missing range falls back to the object store) — and
+        // the fallback costs metered GETs again.
+        let (degraded_recall, degraded_reads) = measure(&hot, &rows, false).await;
+        assert!(
+            (degraded_recall - cold_recall).abs() < 1e-9,
+            "partial coverage must not change results: {degraded_recall} vs {cold_recall}"
+        );
+        assert!(
+            degraded_reads > 0 && degraded_reads < cold_reads,
+            "only the uncovered segment is read remotely again \
+             ({degraded_reads} fallback GETs vs {cold_reads} fully cold)"
+        );
+
+        // Recovery: a backfill restores full coverage (READY under the same g).
+        crate::storage::engines::sst::segment_io::warm_collection(fs.as_ref(), &hot.storage_url, 4)
+            .await
+            .unwrap();
+        let healed = crate::storage::engines::sst::segment_io::prove_residency(&factory, &prefixes)
+            .await
+            .unwrap();
+        assert_eq!(
+            healed.generation, ready.generation,
+            "no publication happened"
+        );
+        assert_eq!(healed.covered_segments, ready.segments, "{healed:?}");
+        assert_eq!(state_of(&healed), storage_class_status::State::Ready as i32);
+
+        drop(_grant);
     }
 
     #[tokio::test]
