@@ -175,7 +175,8 @@ pub fn write_pax_segment(
 /// D). When `f32_tier` is true, each embedding also gets a co-located raw-f32
 /// stripe at `col_id::F32_TIER_BASE + i` for an exact
 /// final rerank / `include_vectors`. The flush path calls this with the resolved
-/// `pax_f32_tier` opt-in; compaction/tests use [`write_pax_segment`] (no tier).
+/// `pax_f32_tier` decision (default ON for lossy bases); tests use
+/// [`write_pax_segment`] (no tier).
 pub fn write_pax_segment_with_f32_tier(
     path: &Path,
     records: &[ProximaRecord],

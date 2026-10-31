@@ -394,6 +394,20 @@ fn resolve_exact_budget(policy: Option<&crate::proto::proximadb_v1::IndexPolicy>
     }
 }
 
+/// Whether `collection`'s f32 tier may make its segments an Adaptive
+/// exact-scan authority: only when the collection explicitly asked for the
+/// tier (tag, env, declared fp32), or its base column is itself exact
+/// (`RawF32`). A tier the default wrote, or one the collection has since
+/// opted out of, stays storage-only.
+fn f32_tier_exact_route_eligible(collection: &crate::proto::proximadb_v1::Collection) -> bool {
+    use crate::storage::engines::sst::flush::{
+        resolve_pax_f32_tier_decision, resolve_pax_vector_quant,
+    };
+    let quant = resolve_pax_vector_quant(Some(collection));
+    quant == proximadb_block_format::VectorQuant::RawF32
+        || resolve_pax_f32_tier_decision(Some(collection), quant).explicitly_requested()
+}
+
 impl SstEngine {
     /// TD-165: best-effort total vector count across a collection's segments, read
     /// cheaply from each segment header (8-byte prefix + the bincode header — no
@@ -1934,6 +1948,14 @@ self.try_pax_cascade(
                 if pin_exact {
                     // Owner pinned exact — always brute-force, any N.
                     true
+                } else if !f32_tier_exact_route_eligible(&ctx.collection) {
+                    // A tier the DEFAULT wrote is storage-only (exact
+                    // compaction, retraining and point reads); it must not
+                    // move a small collection's queries from the cascade to a
+                    // whole-segment exact scan, nor may a later opt-out. Only
+                    // an explicit request (or a RawF32 base) keeps the
+                    // small-collection exact route below.
+                    false
                 } else {
                     let count = self.segment_vector_count(storage_url).await;
                     let dim = query_vector.len().max(1);
@@ -3247,6 +3269,92 @@ mod tests {
             ..Default::default()
         };
         (engine, collection)
+    }
+
+    /// The f32 tier written by the DEFAULT is storage-only: Adaptive keeps a
+    /// small all-tiered collection on the ANN cascade. A collection that asks
+    /// for the tier (`pax_f32_tier:on`) keeps today's small-collection exact
+    /// route.
+    #[tokio::test]
+    async fn default_f32_tier_does_not_move_adaptive_to_exact() {
+        use crate::core::search::{SearchMode, SearchParams};
+        use crate::storage::traits::{FlushParameters, StorageQueryContext, StorageQueryMetadata};
+        use proximadb_records::{EmbeddingCell, ProximaRecord};
+        // SAFETY: nextest process-per-test isolation.
+        unsafe { std::env::remove_var("PROXIMADB_PAX_F32_TIER") };
+        let dim = 16usize;
+        let mut routes = Vec::new();
+        // Cases: the default tier; an explicit request; an opt-out set AFTER
+        // default-tiered flushes (the segments keep the tier, and the route
+        // must not flip to exact).
+        for (tag, tag_after_flush) in [
+            (None, None),
+            (Some("pax_f32_tier:on"), None),
+            (None, Some("pax_f32_tier:off")),
+        ] {
+            let cid = format!("f32_route_{}_{}", tag.is_some(), tag_after_flush.is_some());
+            let (engine, mut collection) = file_backed_test_engine(&cid, dim, Some("pax")).await;
+            if let (Some(tag), Some(config)) = (tag, collection.config.as_mut()) {
+                config.tags.push(tag.to_string());
+            }
+            let records: Vec<ProximaRecord> = (0..300usize)
+                .map(|i| ProximaRecord {
+                    oid: format!("r{i}"),
+                    record_version: 1,
+                    embeddings: vec![EmbeddingCell::new_fp32(
+                        "test",
+                        "dense_vector",
+                        dim as u32,
+                        (0..dim)
+                            .map(|j| ((i * 7 + j) as f32 * 0.01).sin())
+                            .collect(),
+                    )],
+                    ..ProximaRecord::default()
+                })
+                .collect();
+            let flushed = engine
+                .do_flush(&FlushParameters {
+                    collection_id: Some(cid.clone()),
+                    vector_records: records,
+                    force: true,
+                    synchronous: true,
+                    collection_config: Some(collection.clone()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(flushed.success);
+            if let (Some(tag), Some(config)) = (tag_after_flush, collection.config.as_mut()) {
+                config.tags.push(tag.to_string());
+            }
+            let query: Vec<f32> = (0..dim).map(|j| (j as f32 * 0.01).sin()).collect();
+            let ctx = StorageQueryContext {
+                search_params: Arc::new(SearchParams {
+                    vector: Some(query.clone()),
+                    top_k: Some(10),
+                    search_mode: SearchMode::Adaptive { threshold: 100_000 },
+                    ..Default::default()
+                }),
+                collection: Arc::new(collection.clone()),
+                metadata: StorageQueryMetadata {
+                    collection_id: cid.clone(),
+                    ..Default::default()
+                },
+                user_context: None,
+                tenant_context: None,
+            };
+            let storage_url = ctx.collection_storage_path().expect("storage path");
+            assert!(
+                engine.segment_vector_count(&storage_url).await > 0,
+                "both flushes carry the tier, so the segments count as exact authority"
+            );
+            routes.push(engine.want_exact_search(&ctx, &query, &storage_url).await);
+        }
+        assert_eq!(
+            routes,
+            vec![false, true, false],
+            "default tier: cascade; requested tier: exact; later opt-out: cascade"
+        );
     }
 
     /// TD-SEARCH-2 S2: multi-core (`tokio::spawn`) inter-file search is

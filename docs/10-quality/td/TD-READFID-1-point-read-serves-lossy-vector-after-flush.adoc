@@ -64,6 +64,8 @@ Storage cost: for fp32 collections only, about +4·dim bytes per row. That is th
 [[residual]]
 == Residual (Open)
 
+* **Resolved (2026-10-30): the tier is on by default for the RaBitQ base.** Undeclared RaBitQ collections now keep the exact-f32 tier too, so point reads, `include_vectors`, compaction and retraining stay exact. SQ8/FP16 bases stay opt-in (their segments are read whole per query). The default tier is storage-only: only an explicit request (`pax_f32_tier:on`, env `=1`, declared `fp32`) or a RawF32 base makes a collection an exact-scan authority for Adaptive queries; an opt-out never does. Existing collections gain it only on new flushes, and compaction keeps a tier only when every input has one, so a collection with pre-flip segments stays tierless until those are rewritten.
+
 * **Resolved (fix/readfid2-compaction-f32-tier): production opt-out for declared-fp32 collections.** The flush DTO now carries `tags`, so `pax_f32_tier:off` opts a declared-`fp32` collection out of the exact tier (tag > declaration > env). `PROXIMADB_PAX_F32_TIER=0` is still outranked by the declaration, by design: the per-collection tag is the opt-out. Test: `flush_materializer::tests::pax_f32_tier_tag_takes_effect_on_the_production_flush`.
 * **Resolved (fix/readfid2-compaction-f32-tier): the transitional flush DTO dropped `tags` and `pax_vector_quant`.** `CollectionFlushPlan` now carries both from the catalog meta into the engine DTO (`materialize_collection_with_coordinator`). Every per-collection knob the SST flush reads from them is now live on the production flush, and each has a test that drives the real materializer into a real `SstEngine` and inspects the written segment:
 ** `pax_f32_tier:on|off`: tier emitted or suppressed.

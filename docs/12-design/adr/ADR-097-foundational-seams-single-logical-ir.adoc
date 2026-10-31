@@ -136,7 +136,7 @@ Owner direction: keep AXIS's HNSW engine and change its role, not its implementa
 * Deletes are tombstones until a set ratio triggers a rebuild.
 * The S8 cost spine routes to HNSW only within a per-node memory budget.
 * **Prerequisite:** exact vectors.
-** Default PAX keeps no exact copy, so TD-PAXPREC-1 (an fp16 exact tier) lands first.
+** Default PAX keeps no exact copy, so TD-PAXPREC-1 (an fp16 exact tier) lands first. _(Superseded 2026-10-30: the exact-f32 tier is now on by default for the RaBitQ base; see `PROXIMADB_PAX_F32_TIER` in ENV_GATE_REGISTRY.)_
 ** Until then, HNSW is refused for collections without a declared exact tier.
 
 Tracked as TD-SEAM-13.

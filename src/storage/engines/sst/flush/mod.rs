@@ -573,7 +573,7 @@ impl SstEngine {
                 // P3 Phase D f32 tier: per-collection `pax_f32_tier` tag > a declared
                 // `fp32` canonical precision (TD-READFID-1: the written f32 IS the
                 // record, so a lossy base column must carry the exact tier) > env
-                // `PROXIMADB_PAX_F32_TIER` > default off. Emits an exact-f32 stripe
+                // `PROXIMADB_PAX_F32_TIER` > default on (RaBitQ base). Emits an exact-f32 stripe
                 // (read lazily) that point reads / exact scans materialize.
                 let f32_tier = resolve_pax_f32_tier(params.collection_config.as_ref(), quant);
                 // Extract the tag list here (flush config is the legacy v1 proto
@@ -1501,7 +1501,16 @@ pub(crate) fn resolve_pax_rg_layout(tags: &[String]) -> bool {
 ///
 /// Precedence: per-collection `pax_f32_tier` tag (explicit opt-in/out) > the
 /// collection's declared canonical precision > env `PROXIMADB_PAX_F32_TIER` >
-/// default OFF.
+/// default ON for the RaBitQ base column (OFF for SQ8/FP16, whose
+/// non-coalesced segments are read whole by every query, and for `RawF32`,
+/// which is already exact).
+///
+/// Default ON (2026-10-30): the tier is storage-only — the ANN cascade never
+/// reads Region C, so query GETs are unchanged — and at-rest bytes cost
+/// cents per million vectors, while without it every compaction and
+/// retraining works from SQ8 reconstructions and re-quantizes, a loss that
+/// compounds across compaction generations. `PROXIMADB_PAX_F32_TIER=0` or the
+/// `pax_f32_tier:off` tag opts out.
 ///
 /// TD-READFID-1: a collection declared `canonical_embedding_precision = fp32`
 /// promises that the stored value IS the written f32. When the base embedding
@@ -1511,26 +1520,78 @@ pub(crate) fn resolve_pax_rg_layout(tags: &[String]) -> bool {
 /// tier would only duplicate bytes there. The tier is an existing, footer-
 /// declared, mixed-read-safe section: readers that predate it ignore it, and
 /// segments without it still read (lossy) exactly as before.
-fn resolve_pax_f32_tier(
+pub(crate) fn resolve_pax_f32_tier(
     collection_config: Option<&crate::proto::proximadb_v1::Collection>,
     quant: proximadb_block_format::VectorQuant,
 ) -> bool {
+    resolve_pax_f32_tier_decision(collection_config, quant).enabled()
+}
+
+/// Where a flush's f32-tier decision came from (see [`resolve_pax_f32_tier`]).
+/// The search route needs the source: only a tier the collection asked for
+/// may make its segments an exact-scan authority for Adaptive queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum F32TierDecision {
+    /// The `pax_f32_tier:on|off` tag.
+    Tag(bool),
+    /// A declared `fp32` canonical precision over a lossy base.
+    DeclaredFp32,
+    /// `PROXIMADB_PAX_F32_TIER` is set.
+    Env(bool),
+    /// Nothing asked: on for the RaBitQ base, off otherwise.
+    Default(bool),
+}
+
+impl F32TierDecision {
+    pub(crate) fn enabled(self) -> bool {
+        match self {
+            Self::Tag(on) | Self::Env(on) | Self::Default(on) => on,
+            Self::DeclaredFp32 => true,
+        }
+    }
+
+    /// The collection explicitly asked for the tier (tag, env or a declared
+    /// fp32 precision). Only such a tier may make its segments an exact-scan
+    /// authority for Adaptive queries; an opt-out never does.
+    pub(crate) fn explicitly_requested(self) -> bool {
+        matches!(self, Self::Tag(true) | Self::Env(true) | Self::DeclaredFp32)
+    }
+}
+
+pub(crate) fn resolve_pax_f32_tier_decision(
+    collection_config: Option<&crate::proto::proximadb_v1::Collection>,
+    quant: proximadb_block_format::VectorQuant,
+) -> F32TierDecision {
     let config = collection_config.as_ref().and_then(|c| c.config.as_ref());
     if let Some(explicit) = config.and_then(pax_f32_tier_tag) {
-        return explicit;
+        return F32TierDecision::Tag(explicit);
     }
     if config.is_some_and(declares_fp32_canonical_precision)
         && quant != proximadb_block_format::VectorQuant::RawF32
     {
-        return true;
+        return F32TierDecision::DeclaredFp32;
     }
-    env_truthy("PROXIMADB_PAX_F32_TIER")
+    match f32_tier_env_decision(std::env::var("PROXIMADB_PAX_F32_TIER").ok().as_deref()) {
+        Some(on) => F32TierDecision::Env(on),
+        None => F32TierDecision::Default(quant == proximadb_block_format::VectorQuant::RaBitQ),
+    }
+}
+
+/// `PROXIMADB_PAX_F32_TIER` when set: `1|true|on|yes` is on, any other value
+/// off; unset (`None`) leaves the default.
+fn f32_tier_env_decision(raw: Option<&str>) -> Option<bool> {
+    raw.map(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
 }
 
 /// True when the collection explicitly declares `fp32` as its canonical
 /// embedding precision. `Unspecified` is NOT treated as a declaration: the
-/// storage cost of retaining f32 for every undeclared collection is a separate,
-/// evidence-gated default decision (see TD-READFID-1).
+/// tier is ON by default anyway (see [`resolve_pax_f32_tier`]); a declaration
+/// additionally outranks the env setting.
 fn declares_fp32_canonical_precision(
     config: &crate::proto::proximadb_v1::CollectionConfig,
 ) -> bool {
@@ -1833,8 +1894,10 @@ mod tests {
         // An explicit per-collection tag wins over the declaration.
         let opted_out = mk(Some(EmbeddingPrecision::Fp32), &["pax_f32_tier:off"]);
         assert!(!resolve_pax_f32_tier(Some(&opted_out), VectorQuant::RaBitQ));
-        // Undeclared / non-fp32 precisions are unchanged by this fix (env-gated,
-        // default off). Only asserted when the env override is absent.
+        // Undeclared / non-fp32 precisions take the default: ON for a lossy
+        // base (compaction and retraining then work from exact vectors), OFF
+        // for a RawF32 base (already exact; the tier would only duplicate it).
+        // Only asserted when the env override is absent.
         if std::env::var("PROXIMADB_PAX_F32_TIER").is_err() {
             for precision in [
                 None,
@@ -1843,11 +1906,68 @@ mod tests {
                 Some(EmbeddingPrecision::Int8),
             ] {
                 assert!(
-                    !resolve_pax_f32_tier(Some(&mk(precision, &[])), VectorQuant::RaBitQ),
-                    "{precision:?} must not silently gain the tier"
+                    resolve_pax_f32_tier(Some(&mk(precision, &[])), VectorQuant::RaBitQ),
+                    "{precision:?} with a RaBitQ base keeps the exact tier by default"
                 );
+                for quant in [VectorQuant::RawF32, VectorQuant::Sq8, VectorQuant::Fp16] {
+                    assert!(
+                        !resolve_pax_f32_tier(Some(&mk(precision, &[])), quant),
+                        "{precision:?} with a {quant:?} base stays opt-in"
+                    );
+                }
             }
-            assert!(!resolve_pax_f32_tier(None, VectorQuant::RaBitQ));
+            assert!(resolve_pax_f32_tier(None, VectorQuant::RaBitQ));
+            // The opt-out tag still wins over the new default.
+            let off = mk(None, &["pax_f32_tier:off"]);
+            assert!(!resolve_pax_f32_tier(Some(&off), VectorQuant::RaBitQ));
+        }
+    }
+
+    /// The decision records WHY the tier is on, so the search route can tell a
+    /// requested tier from the default one.
+    #[test]
+    fn f32_tier_decision_names_its_source() {
+        use crate::proto::proximadb_v1::{Collection, CollectionConfig};
+        use proximadb_block_format::VectorQuant;
+        let mk = |tags: &[&str]| Collection {
+            config: Some(CollectionConfig {
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        if std::env::var("PROXIMADB_PAX_F32_TIER").is_err() {
+            let default = resolve_pax_f32_tier_decision(Some(&mk(&[])), VectorQuant::RaBitQ);
+            assert_eq!(default, F32TierDecision::Default(true));
+            assert!(default.enabled() && !default.explicitly_requested());
+            for quant in [VectorQuant::RawF32, VectorQuant::Sq8, VectorQuant::Fp16] {
+                let other = resolve_pax_f32_tier_decision(Some(&mk(&[])), quant);
+                assert_eq!(other, F32TierDecision::Default(false), "{quant:?}");
+            }
+        }
+        let tagged =
+            resolve_pax_f32_tier_decision(Some(&mk(&["pax_f32_tier:on"])), VectorQuant::RaBitQ);
+        assert_eq!(tagged, F32TierDecision::Tag(true));
+        assert!(tagged.enabled() && tagged.explicitly_requested());
+        let opted_out =
+            resolve_pax_f32_tier_decision(Some(&mk(&["pax_f32_tier:off"])), VectorQuant::RaBitQ);
+        assert_eq!(opted_out, F32TierDecision::Tag(false));
+        assert!(
+            !opted_out.explicitly_requested(),
+            "an opt-out never unlocks the exact route"
+        );
+    }
+
+    /// The env value decides when set (`1|true|on|yes` on, anything else off);
+    /// unset means the default.
+    #[test]
+    fn f32_tier_env_value_decides_when_set() {
+        assert_eq!(f32_tier_env_decision(None), None);
+        for on in ["1", "true", "on", "yes", " ON "] {
+            assert_eq!(f32_tier_env_decision(Some(on)), Some(true), "{on}");
+        }
+        for off in ["0", "false", "off", "no", "garbage"] {
+            assert_eq!(f32_tier_env_decision(Some(off)), Some(false), "{off}");
         }
     }
 

@@ -1593,6 +1593,36 @@ mod tests {
             pax_segment_has_exact_vector_authority(&opted_in.only_segment()),
             "pax_f32_tier:on must emit the exact tier for an undeclared collection"
         );
+        // The tier is on by default, so the tag that can change an
+        // undeclared collection's flush is `:off`.
+        let undeclared_off = flush_via_materializer(
+            204,
+            CollectionConfig {
+                tags: vec!["compaction:off".into(), "pax_f32_tier:off".into()],
+                ..Default::default()
+            },
+            1,
+        )
+        .await;
+        assert!(
+            !pax_segment_has_exact_vector_authority(&undeclared_off.only_segment()),
+            "pax_f32_tier:off must opt an undeclared collection out of the default tier"
+        );
+        if std::env::var("PROXIMADB_PAX_F32_TIER").is_err() {
+            let undeclared_default = flush_via_materializer(
+                205,
+                CollectionConfig {
+                    tags: vec!["compaction:off".into()],
+                    ..Default::default()
+                },
+                1,
+            )
+            .await;
+            assert!(
+                pax_segment_has_exact_vector_authority(&undeclared_default.only_segment()),
+                "an undeclared collection flushes the exact tier by default"
+            );
+        }
     }
 
     /// `pax_rg_layout:off` keeps the exact tier in-block (no Region C); the
