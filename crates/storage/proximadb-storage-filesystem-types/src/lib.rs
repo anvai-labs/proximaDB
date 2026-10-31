@@ -275,6 +275,19 @@ pub struct FileOptions {
 }
 
 impl FileOptions {
+    /// Options that only set the destination's access tier, with every other
+    /// field matching what `None` options mean to the backends (notably
+    /// `overwrite: true` — a local backend reads `Some` options with
+    /// `overwrite: false` as create-only). `None` tier ⇒ `None` options, so
+    /// an untiered write is byte-for-byte today's call (TD-TIER-1 SC5).
+    pub fn for_access_tier(tier: Option<ObjectAccessTier>) -> Option<Self> {
+        tier.map(|tier| Self {
+            overwrite: true,
+            storage_class: Some(tier.as_canonical_str().to_string()),
+            ..Self::default()
+        })
+    }
+
     /// Resolve [`FileOptions::storage_class`] to a canonical [`ObjectAccessTier`].
     /// Returns `None` when unset or unrecognized — the caller then uses the
     /// backend/account default tier rather than failing the write.
@@ -1014,6 +1027,29 @@ pub trait FileSystem: Send + Sync + std::fmt::Debug {
     async fn copy(&self, from: &str, to: &str) -> FsResult<()> {
         let data = self.read(from).await?;
         self.write(to, &data, None).await
+    }
+
+    /// Copy, applying `options` to the DESTINATION object — today its access
+    /// tier (TD-TIER-1 SC5): a staged segment's final key must carry the
+    /// collection's tier, and a native copy keeps the SOURCE's. Default:
+    /// without a tier, exactly [`Self::copy`]; with one, read whole and write
+    /// whole with the options (what [`Self::copy`] does on object stores
+    /// anyway, so the request cost is unchanged).
+    async fn copy_with_options(
+        &self,
+        from: &str,
+        to: &str,
+        options: Option<FileOptions>,
+    ) -> FsResult<()> {
+        if options
+            .as_ref()
+            .and_then(FileOptions::access_tier)
+            .is_none()
+        {
+            return self.copy(from, to).await;
+        }
+        let data = self.read(from).await?;
+        self.write(to, &data, options).await
     }
 
     /// Move/rename file. Default: copy, then delete the source (not atomic).
@@ -2036,5 +2072,24 @@ mod read_ranges_prefetch_inflight_tests {
         unsafe { std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "4") };
         assert_eq!(read_ranges_prefetch_inflight("s3://b/seg.pax"), 4);
         assert_eq!(read_ranges_prefetch_inflight("/data/seg.pax"), 4);
+    }
+}
+
+#[cfg(test)]
+mod access_tier_copy_tests {
+    //! TD-TIER-1 SC5: tier-only options keep `None`'s write semantics. The
+    //! `copy_with_options` default is exercised through the factory's move in
+    //! `src/storage/persistence/filesystem/mod.rs` (`access_tier_publish_tests`).
+    use super::{FileOptions, ObjectAccessTier};
+
+    /// Tier-only options keep `None`'s overwrite semantics (a local backend
+    /// reads `Some(default)` as create-only).
+    #[test]
+    fn tier_options_keep_untiered_write_semantics() {
+        assert!(FileOptions::for_access_tier(None).is_none());
+        let options = FileOptions::for_access_tier(Some(ObjectAccessTier::Cold)).unwrap();
+        assert!(options.overwrite);
+        assert!(!options.create_dirs);
+        assert_eq!(options.access_tier(), Some(ObjectAccessTier::Cold));
     }
 }

@@ -1462,6 +1462,12 @@ impl CollectionService {
             &base_location,
             admission_tenant_id,
         )?;
+        // TD-TIER-1 SC5: an explicit access tier is validated and needs a
+        // tiered object store on the same resolved placement.
+        crate::services::collection::storage_class::check_access_tier_admission(
+            &enriched_config,
+            &base_location,
+        )?;
 
         // ADR-031 Phase 4c: pre-mint the typed collection identity
         // `(account, namespace, collection)` BEFORE storage-dir creation, so the
@@ -2391,6 +2397,29 @@ impl CollectionService {
                             Some(resolved == crate::proto::proximadb_v1::StorageClass::Performance);
                     }
                 }
+                // TD-TIER-1 SC5: the tier governs FUTURE segment PUTs only
+                // (nothing is rewritten), so a change needs no reservation
+                // effects — just re-admission on the EXISTING placement,
+                // refused before the config persists. Omitted/UNSPECIFIED
+                // preserves the recorded tier; an unknown number is refused.
+                if let Some(raw_tier) = new_config.default_access_tier
+                    && raw_tier != 0
+                {
+                    let base = previous_record
+                        .storage_assignment
+                        .as_ref()
+                        .map(|a| a.base_location.clone())
+                        .unwrap_or_default();
+                    let prospective = crate::proto::proximadb_v1::CollectionConfig {
+                        default_access_tier: Some(raw_tier),
+                        ..Default::default()
+                    };
+                    crate::services::collection::storage_class::check_access_tier_admission(
+                        &prospective,
+                        &base,
+                    )?;
+                    existing_config.default_access_tier = Some(raw_tier);
+                }
                 if !new_config.tags.is_empty() {
                     existing_config.tags = new_config.tags;
                 }
@@ -2429,10 +2458,13 @@ impl CollectionService {
                 // cannot ride this defensive branch — it would bypass the
                 // entire policy surface (SC2 floor, registry peek,
                 // generation, grant effects). Refuse it explicitly.
-                if new_config.storage_class.is_some_and(|class| class != 0) {
+                if new_config.storage_class.is_some_and(|class| class != 0)
+                    || new_config.default_access_tier.is_some_and(|tier| tier != 0)
+                {
                     return Err(anyhow::anyhow!(
-                        "storage_class cannot be set on a record without a \
-                         recorded config; recreate the collection instead"
+                        "storage_class / default_access_tier cannot be set on a \
+                         record without a recorded config; recreate the collection \
+                         instead"
                     ));
                 }
                 record.config = Some(new_config);
@@ -3624,6 +3656,7 @@ mod tests {
             pax_vector_quant: None,
             storage_class: None,
             policy_generation: None,
+            default_access_tier: None,
         }
     }
 
@@ -5492,16 +5525,10 @@ mod tests {
         Ok(())
     }
 
-    /// TD-TIER-1 SC1/SC2: economy persists intent and reports NOT_ACTIVE with
-    /// a reason naming the missing dependency; performance is admitted only
-    /// with an object-store-backed SST placement (rejected with an actionable
-    /// message otherwise — never accepted and silently degraded).
-    #[tokio::test]
-    async fn economy_persists_intent_and_performance_requires_object_backed_sst() -> Result<()> {
-        use crate::proto::proximadb_v1::StorageClass;
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().context("temp dir")?;
+    /// A collection service over a fresh native catalog in a temp dir (kept
+    /// alive by the returned guard), on the default local storage config.
+    async fn catalog_backed_service() -> Result<(tempfile::TempDir, CollectionService)> {
+        let temp_dir = tempfile::TempDir::new().context("temp dir")?;
         let temp_path = format!("file://{}", temp_dir.path().display());
         let mgr = Arc::new(CatalogManager::new());
         mgr.create_native_catalog("default", &temp_path)
@@ -5511,6 +5538,18 @@ mod tests {
             .await
             .context("collection service")?
             .with_catalog_manager(mgr);
+        Ok((temp_dir, svc))
+    }
+
+    /// TD-TIER-1 SC1/SC2: economy persists intent and reports NOT_ACTIVE with
+    /// a reason naming the missing dependency; performance is admitted only
+    /// with an object-store-backed SST placement (rejected with an actionable
+    /// message otherwise — never accepted and silently degraded).
+    #[tokio::test]
+    async fn economy_persists_intent_and_performance_requires_object_backed_sst() -> Result<()> {
+        use crate::proto::proximadb_v1::StorageClass;
+
+        let (_temp_dir, svc) = catalog_backed_service().await?;
 
         // Economy: accepted, persisted, NOT_ACTIVE with a dependency-naming reason.
         let economy = CollectionConfig {
@@ -5660,6 +5699,101 @@ mod tests {
         Ok(())
     }
 
+    /// TD-TIER-1 SC5 (review S2): the access tier is admitted on the resolved
+    /// placement at create and on the existing placement at update — refused
+    /// on local storage (it would be dropped silently), refused for unknown
+    /// numbers (incl. archive's raw 4), admitted on an object-store path.
+    #[tokio::test]
+    async fn access_tier_admission_on_create_and_update() -> Result<()> {
+        use crate::proto::proximadb_v1::AccessTier;
+
+        let (_temp_dir, svc) = catalog_backed_service().await?;
+
+        // Local default placement: an explicit tier is refused, by name.
+        let local_tiered = CollectionConfig {
+            name: "tier_local".to_string(),
+            dimension: 8,
+            default_access_tier: Some(AccessTier::Cool as i32),
+            ..Default::default()
+        };
+        let message = svc
+            .create_collection(&local_tiered)
+            .await
+            .expect_err("a tier on local storage is refused")
+            .to_string();
+        assert!(message.contains("object-store placement"), "{message}");
+
+        // Archive's provider number (4) is not an AccessTier: refused.
+        let archive = CollectionConfig {
+            name: "tier_archive".to_string(),
+            dimension: 8,
+            default_access_tier: Some(4),
+            storage_config: Some(crate::proto::proximadb_v1::StorageConfig {
+                storage_path: Some("s3://bench/collections/tier_archive".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let message = svc
+            .create_collection(&archive)
+            .await
+            .expect_err("unknown tier number is refused")
+            .to_string();
+        assert!(message.contains("default_access_tier"), "{message}");
+
+        // Object-store path: ADMITTED (the in-process create then fails only
+        // at storage-directory creation — no S3 backend here).
+        let s3_tiered = CollectionConfig {
+            name: "tier_s3".to_string(),
+            dimension: 8,
+            default_access_tier: Some(AccessTier::Cold as i32),
+            storage_config: Some(crate::proto::proximadb_v1::StorageConfig {
+                storage_path: Some("s3://bench/collections/tier_s3".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let message = svc
+            .create_collection(&s3_tiered)
+            .await
+            .expect_err("no S3 backend in-process")
+            .to_string();
+        assert!(
+            !message.contains("default_access_tier") && !message.contains("object-store placement"),
+            "admission must have passed; got: {message}"
+        );
+
+        // Update on a local collection: refused before persisting; the
+        // recorded tier stays unset.
+        let plain = CollectionConfig {
+            name: "tier_update".to_string(),
+            dimension: 8,
+            ..Default::default()
+        };
+        assert!(
+            svc.create_collection(&plain)
+                .await
+                .context("create")?
+                .success
+        );
+        let update = CollectionConfig {
+            default_access_tier: Some(AccessTier::Cool as i32),
+            ..Default::default()
+        };
+        let message = svc
+            .update_collection("tier_update", Some(update))
+            .await
+            .expect_err("a tier on a local placement is refused at update")
+            .to_string();
+        assert!(message.contains("object-store placement"), "{message}");
+        let read_back = svc.collection("tier_update").await?.context("read")?;
+        assert_eq!(
+            read_back.config.context("config")?.default_access_tier,
+            None
+        );
+        Ok(())
+    }
+
     /// TD-TIER-1 SC1/SC2 update semantics: an unrelated update preserves the
     /// recorded class (no silent reset); an unknown number is rejected; a
     /// class change re-runs admission; and a storage-path mutation is
@@ -5668,18 +5802,8 @@ mod tests {
     #[tokio::test]
     async fn update_collection_storage_class_semantics() -> Result<()> {
         use crate::proto::proximadb_v1::StorageClass;
-        use tempfile::TempDir;
 
-        let temp_dir = TempDir::new().context("temp dir")?;
-        let temp_path = format!("file://{}", temp_dir.path().display());
-        let mgr = Arc::new(CatalogManager::new());
-        mgr.create_native_catalog("default", &temp_path)
-            .await
-            .context("create test catalog")?;
-        let svc = CollectionService::new(StorageConfig::default())
-            .await
-            .context("collection service")?
-            .with_catalog_manager(mgr);
+        let (_temp_dir, svc) = catalog_backed_service().await?;
 
         let config = CollectionConfig {
             name: "sc_update".to_string(),

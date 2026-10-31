@@ -282,6 +282,16 @@ pub struct CreateCollectionV2Request {
     /// persists intent only. Read `storage_class_status` on the GET response
     /// for the observed truth — the class is never a claim.
     pub storage_class: Option<String>,
+    /// Provider access tier for the collection's FUTURE compacted segments
+    /// (TD-TIER-1 SC5): "hot" | "cool" | "cold". Omitted ⇒ the account/bucket
+    /// default. Requires an object-store placement (s3/az/gs); "archive" is
+    /// refused (archived objects cannot serve queries). Fresh flush (L0)
+    /// segments keep the account default — they are compacted away long
+    /// before a cool/cold tier's minimum storage duration. Existing objects
+    /// are not rewritten; control objects keep the account default. Once
+    /// set, a tier can be changed but not cleared back to the default.
+    #[serde(default)]
+    pub default_access_tier: Option<String>,
 }
 
 /// REST input for the per-collection index routing policy (mirrors proto
@@ -916,6 +926,17 @@ async fn create_collection_v2_checked(
         }
     };
 
+    // TD-TIER-1 SC5: parse + validate the future-PUT access tier (strict:
+    // a misspelt tier must never silently become the account default).
+    let default_access_tier = match request.default_access_tier.take() {
+        None => None,
+        Some(raw) => {
+            let tier = crate::services::collection::storage_class::parse_access_tier(&raw)
+                .map_err(|e| ApiError::InvalidArgument(e.to_string()))?;
+            (tier != crate::proto::proximadb_v1::AccessTier::Unspecified).then_some(tier as i32)
+        }
+    };
+
     // ADR-028: validate + map the optional index routing policy. Fail-closed on
     // nonsensical combinations (the mode×rehydrate/nprobe validity matrix) so a
     // bad policy is rejected at create rather than silently ignored at query time.
@@ -937,6 +958,7 @@ async fn create_collection_v2_checked(
         enable_proxima_record: Some(proxima_record_enabled),
         description: request.description.take(),
         storage_class,
+        default_access_tier,
         ..Default::default()
     };
 
@@ -1040,6 +1062,11 @@ pub struct CollectionV2Response {
     /// "balanced" ⇒ active; economy/performance persist intent and report
     /// `not_active` with a reason naming the missing dependency (SC3/SC4).
     pub storage_class_status: StorageClassStatusOutput,
+    /// Desired access tier for future segment writes (TD-TIER-1 SC5):
+    /// "hot" | "cool" | "cold"; omitted when unset (the account default).
+    /// Desired, not observed: an account lifecycle rule may move objects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_access_tier: Option<String>,
     /// Schema definition (if defined)
     pub schema: Option<SchemaDefinition>,
     /// Collection statistics
@@ -1350,6 +1377,10 @@ pub async fn get_collection_v2(
                     crate::services::collection::storage_class::storage_class_or_balanced(&config),
                 )
                 .to_string(),
+                default_access_tier: crate::services::collection::storage_class::access_tier_label(
+                    config.default_access_tier,
+                )
+                .map(str::to_string),
                 storage_class_status: collection
                     .storage_class_status
                     .clone()
@@ -5227,6 +5258,7 @@ mod tests {
     fn get_response_serializes_index_specs_and_quantization() {
         let resp = CollectionV2Response {
             storage_class: "balanced".into(),
+            default_access_tier: None,
             storage_class_status: StorageClassStatusOutput::from_proto(
                 crate::proto::proximadb_v1::StorageClassStatus::default(),
             ),

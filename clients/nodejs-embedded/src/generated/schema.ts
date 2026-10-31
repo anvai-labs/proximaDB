@@ -2561,6 +2561,12 @@ export interface components {
              *     `not_active` with a reason naming the missing dependency (SC3/SC4).
              */
             storage_class_status: components["schemas"]["StorageClassStatusOutput"];
+            /**
+             * @description Desired access tier for future segment writes (TD-TIER-1 SC5):
+             *     "hot" | "cool" | "cold"; omitted when unset (the account default).
+             *     Desired, not observed: an account lifecycle rule may move objects.
+             */
+            default_access_tier?: string | null;
             schema?: null | components["schemas"]["SchemaDefinition"];
             /** @description Collection statistics */
             stats: components["schemas"]["CollectionStatsV2"];
@@ -2717,6 +2723,17 @@ export interface components {
              *     for the observed truth — the class is never a claim.
              */
             storage_class?: string | null;
+            /**
+             * @description Provider access tier for the collection's FUTURE compacted segments
+             *     (TD-TIER-1 SC5): "hot" | "cool" | "cold". Omitted ⇒ the account/bucket
+             *     default. Requires an object-store placement (s3/az/gs); "archive" is
+             *     refused (archived objects cannot serve queries). Fresh flush (L0)
+             *     segments keep the account default — they are compacted away long
+             *     before a cool/cold tier's minimum storage duration. Existing objects
+             *     are not rewritten; control objects keep the account default. Once
+             *     set, a tier can be changed but not cleared back to the default.
+             */
+            default_access_tier?: string | null;
         };
         /** @description Response for collection creation */
         CreateCollectionV2Response: {

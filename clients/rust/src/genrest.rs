@@ -3947,6 +3947,13 @@ pub mod types {
     ///      "description": "Creation timestamp",
     ///      "type": "string"
     ///    },
+    ///    "default_access_tier": {
+    ///      "description": "Desired access tier for future segment writes (TD-TIER-1 SC5):\n\"hot\" | \"cool\" | \"cold\"; omitted when unset (the account default).\nDesired, not observed: an account lifecycle rule may move objects.",
+    ///      "type": [
+    ///        "string",
+    ///        "null"
+    ///      ]
+    ///    },
     ///    "dimension": {
     ///      "description": "Vector dimension",
     ///      "type": "integer",
@@ -4020,6 +4027,11 @@ pub mod types {
         pub content_revision_token: ::std::string::String,
         ///Creation timestamp
         pub created_at: ::std::string::String,
+        /// Desired access tier for future segment writes (TD-TIER-1 SC5):
+        /// "hot" | "cool" | "cold"; omitted when unset (the account default).
+        /// Desired, not observed: an account lifecycle rule may move objects.
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub default_access_tier: ::std::option::Option<::std::string::String>,
         ///Vector dimension
         pub dimension: i32,
         ///Distance metric
@@ -4165,6 +4177,13 @@ pub mod types {
     ///        "null"
     ///      ]
     ///    },
+    ///    "default_access_tier": {
+    ///      "description": "Provider access tier for the collection's FUTURE compacted segments\n(TD-TIER-1 SC5): \"hot\" | \"cool\" | \"cold\". Omitted ⇒ the account/bucket\ndefault. Requires an object-store placement (s3/az/gs); \"archive\" is\nrefused (archived objects cannot serve queries). Fresh flush (L0)\nsegments keep the account default — they are compacted away long\nbefore a cool/cold tier's minimum storage duration. Existing objects\nare not rewritten; control objects keep the account default. Once\nset, a tier can be changed but not cleared back to the default.",
+    ///      "type": [
+    ///        "string",
+    ///        "null"
+    ///      ]
+    ///    },
     ///    "description": {
     ///      "description": "Free-text description, persisted on the collection config.",
     ///      "type": [
@@ -4274,6 +4293,16 @@ pub mod types {
         /// converge on the same enum discriminant.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub canonical_embedding_precision: ::std::option::Option<::std::string::String>,
+        /// Provider access tier for the collection's FUTURE compacted segments
+        /// (TD-TIER-1 SC5): "hot" | "cool" | "cold". Omitted ⇒ the account/bucket
+        /// default. Requires an object-store placement (s3/az/gs); "archive" is
+        /// refused (archived objects cannot serve queries). Fresh flush (L0)
+        /// segments keep the account default — they are compacted away long
+        /// before a cool/cold tier's minimum storage duration. Existing objects
+        /// are not rewritten; control objects keep the account default. Once
+        /// set, a tier can be changed but not cleared back to the default.
+        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        pub default_access_tier: ::std::option::Option<::std::string::String>,
         ///Free-text description, persisted on the collection config.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub description: ::std::option::Option<::std::string::String>,
@@ -21100,6 +21129,10 @@ pub mod types {
             content_revision_token:
                 ::std::result::Result<::std::string::String, ::std::string::String>,
             created_at: ::std::result::Result<::std::string::String, ::std::string::String>,
+            default_access_tier: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                ::std::string::String,
+            >,
             dimension: ::std::result::Result<i32, ::std::string::String>,
             distance_metric: ::std::result::Result<::std::string::String, ::std::string::String>,
             engine: ::std::result::Result<::std::string::String, ::std::string::String>,
@@ -21136,6 +21169,7 @@ pub mod types {
                         "no value supplied for content_revision_token".to_string()
                     ),
                     created_at: Err("no value supplied for created_at".to_string()),
+                    default_access_tier: Ok(Default::default()),
                     dimension: Err("no value supplied for dimension".to_string()),
                     distance_metric: Err("no value supplied for distance_metric".to_string()),
                     engine: Err("no value supplied for engine".to_string()),
@@ -21206,6 +21240,16 @@ pub mod types {
                 self.created_at = value
                     .try_into()
                     .map_err(|e| format!("error converting supplied value for created_at: {e}"));
+                self
+            }
+            pub fn default_access_tier<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.default_access_tier = value.try_into().map_err(|e| {
+                    format!("error converting supplied value for default_access_tier: {e}")
+                });
                 self
             }
             pub fn dimension<T>(mut self, value: T) -> Self
@@ -21340,6 +21384,7 @@ pub mod types {
                     content_revision: value.content_revision?,
                     content_revision_token: value.content_revision_token?,
                     created_at: value.created_at?,
+                    default_access_tier: value.default_access_tier?,
                     dimension: value.dimension?,
                     distance_metric: value.distance_metric?,
                     engine: value.engine?,
@@ -21363,6 +21408,7 @@ pub mod types {
                     content_revision: Ok(value.content_revision),
                     content_revision_token: Ok(value.content_revision_token),
                     created_at: Ok(value.created_at),
+                    default_access_tier: Ok(value.default_access_tier),
                     dimension: Ok(value.dimension),
                     distance_metric: Ok(value.distance_metric),
                     engine: Ok(value.engine),
@@ -21496,6 +21542,10 @@ pub mod types {
                 ::std::option::Option<::std::string::String>,
                 ::std::string::String,
             >,
+            default_access_tier: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                ::std::string::String,
+            >,
             description: ::std::result::Result<
                 ::std::option::Option<::std::string::String>,
                 ::std::string::String,
@@ -21548,6 +21598,7 @@ pub mod types {
             fn default() -> Self {
                 Self {
                     canonical_embedding_precision: Ok(Default::default()),
+                    default_access_tier: Ok(Default::default()),
                     description: Ok(Default::default()),
                     dimension: Err("no value supplied for dimension".to_string()),
                     distance_metric: Ok(Default::default()),
@@ -21575,6 +21626,16 @@ pub mod types {
                     format!(
                         "error converting supplied value for canonical_embedding_precision: {e}"
                     )
+                });
+                self
+            }
+            pub fn default_access_tier<T>(mut self, value: T) -> Self
+            where
+                T: ::std::convert::TryInto<::std::option::Option<::std::string::String>>,
+                T::Error: ::std::fmt::Display,
+            {
+                self.default_access_tier = value.try_into().map_err(|e| {
+                    format!("error converting supplied value for default_access_tier: {e}")
                 });
                 self
             }
@@ -21730,6 +21791,7 @@ pub mod types {
             ) -> ::std::result::Result<Self, super::error::ConversionError> {
                 Ok(Self {
                     canonical_embedding_precision: value.canonical_embedding_precision?,
+                    default_access_tier: value.default_access_tier?,
                     description: value.description?,
                     dimension: value.dimension?,
                     distance_metric: value.distance_metric?,
@@ -21751,6 +21813,7 @@ pub mod types {
             fn from(value: super::CreateCollectionV2Request) -> Self {
                 Self {
                     canonical_embedding_precision: Ok(value.canonical_embedding_precision),
+                    default_access_tier: Ok(value.default_access_tier),
                     description: Ok(value.description),
                     dimension: Ok(value.dimension),
                     distance_metric: Ok(value.distance_metric),

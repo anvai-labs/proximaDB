@@ -219,6 +219,10 @@ pub struct SstCompactionTask {
     /// RaBitQ, silently re-encoding an sq8 or RawF32 collection on its first
     /// compaction.
     pub vector_quant: Option<proximadb_block_format::VectorQuant>,
+    /// TD-TIER-1 SC5: the collection's access tier for the compaction OUTPUT
+    /// object, resolved by the task producer from the collection config.
+    /// `None` = the account default (also what config-free producers set).
+    pub access_tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
 }
 
 impl SstCompactionTask {
@@ -270,6 +274,7 @@ impl SstCompactionTask {
         self.precision_hint = origin.precision_hint;
         self.block_size_kb = origin.block_size_kb;
         self.compression_config = origin.compression_config.clone();
+        self.access_tier = origin.access_tier;
     }
 }
 
@@ -1052,6 +1057,7 @@ impl Compaction {
         precision_hint: Option<proximadb_records::EmbeddingScalarType>,
         rg_layout: Option<bool>,
         vector_quant: Option<proximadb_block_format::VectorQuant>,
+        access_tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
     ) -> Result<bool> {
         let Some(mut task) = self
             .check_compaction_needed(
@@ -1066,6 +1072,7 @@ impl Compaction {
         };
         task.rg_layout = rg_layout;
         task.vector_quant = vector_quant;
+        task.access_tier = access_tier;
         task.collection_identity = collection_identity;
         // TD-COMPACT-6 D1: the worker clears the shared training_in_flight guard
         // for this collection on completion. It derives the collection dir from
@@ -1187,6 +1194,7 @@ impl Compaction {
                 precision_hint,
                 rg_layout: None,
                 vector_quant: None,
+                access_tier: None,
             }));
         }
 
@@ -2082,6 +2090,12 @@ impl Compaction {
                 } else {
                     coordinator.begin_atomic_operation(&staging_config).await
                 }
+                .and_then(|operation| {
+                    // TD-TIER-1 SC5: the move to the final key carries the tier.
+                    coordinator
+                        .set_operation_access_tier(&operation.operation_id, task.access_tier)?;
+                    Ok(operation)
+                })
                 .map_err(|error| {
                     crate::core::StorageError::SstEngine(format!(
                         "begin local-spill atomic publication: {error}"
@@ -2125,7 +2139,15 @@ impl Compaction {
                 crate::core::StorageError::SstEngine(format!(
                     "prepare local-spill publication: {error}"
                 ))
-            })?;
+            })?
+            // TD-TIER-1 SC5: a direct remote publication uploads to the FINAL
+            // key, so the upload itself carries the tier; a staged upload
+            // keeps the account default (the move applies it).
+            .with_access_tier(if direct_remote_publication {
+                task.access_tier
+            } else {
+                None
+            });
             let target_block = task
                 .block_size_kb
                 .and_then(|kilobytes| usize::try_from(kilobytes).ok())
@@ -2683,6 +2705,11 @@ impl Compaction {
                         e
                     ))
                 })?;
+
+            // TD-TIER-1 SC5: the move to the final key carries the tier.
+            coordinator
+                .set_operation_access_tier(&atomic_op.operation_id, task.access_tier)
+                .map_err(|e| crate::core::StorageError::SstEngine(e.to_string()))?;
 
             debug!(
                 "Started atomic operation {} for compaction_info",
@@ -3601,7 +3628,22 @@ mod compaction_format_tests {
             precision_hint: None,
             rg_layout: None,
             vector_quant,
+            access_tier: None,
         }
+    }
+
+    /// TD-TIER-1 SC5: a follow-up task (the next level of the cascade)
+    /// keeps the collection's tier — config-free producers build it unset.
+    #[test]
+    fn follow_up_tasks_inherit_the_access_tier() {
+        let mut origin = quant_task(None);
+        origin.access_tier = Some(proximadb_storage_filesystem_types::ObjectAccessTier::Cool);
+        let mut follow_up = quant_task(None);
+        follow_up.inherit_collection_intent(&origin);
+        assert_eq!(
+            follow_up.access_tier,
+            Some(proximadb_storage_filesystem_types::ObjectAccessTier::Cool)
+        );
     }
 
     /// TD-READFID-2 review: the PAX output encoding follows the collection's

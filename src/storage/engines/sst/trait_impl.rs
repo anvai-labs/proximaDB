@@ -238,6 +238,12 @@ impl UnifiedStorageFormat for SstEngine {
                 Some(super::flush::resolve_pax_vector_quant(
                     params.collection_config.as_ref(),
                 )),
+                // TD-TIER-1 SC5: the output object carries the collection's tier.
+                params
+                    .collection_config
+                    .as_ref()
+                    .and_then(|collection| collection.config.as_ref())
+                    .and_then(crate::services::collection::storage_class::collection_access_tier),
             )
             .await?;
 

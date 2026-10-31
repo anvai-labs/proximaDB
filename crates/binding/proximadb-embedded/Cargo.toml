@@ -130,10 +130,11 @@ python = [
     "dep:tracing-subscriber",
     "dep:proximadb-storage-common",
     "arrow/pyarrow",
-    # Statically build OpenSSL for the wheel; the OSS server build never
-    # enables `python`, so it keeps dynamic system openssl (see dep comment).
+    # Use system OpenSSL (via Homebrew on macOS, system package on Linux).
+    # The OSS server build never enables `python`, so it keeps dynamic system
+    # openssl. For CI wheel builds that need portable binaries, enable the
+    # separate `vendored-openssl` feature (like the server crate does).
     "dep:openssl",
-    "openssl/vendored",
 ]
 # Java bindings (JNI).
 java = ["dep:jni"]
@@ -141,6 +142,12 @@ java = ["dep:jni"]
 nodejs = ["dep:napi", "dep:napi-derive"]
 # C FFI bindings.
 c_ffi = []
+# Vendored OpenSSL: compile OpenSSL from source and link statically. OFF by
+# default — local dev uses system OpenSSL (Homebrew on macOS, system package
+# on Linux). CI wheel builds enable this for portable PyPI wheels that must
+# work on any Linux distro regardless of the installed OpenSSL version.
+# Mirrors the same feature in `apps/proximadb-server/Cargo.toml`.
+vendored-openssl = ["openssl/vendored"]
 
 [dev-dependencies]
 tempfile = "3"

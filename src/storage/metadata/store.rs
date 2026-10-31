@@ -490,6 +490,7 @@ impl MetadataStoreInterface for MetadataStore {
                 let config = CollectionConfig {
                     storage_class: None,
                     policy_generation: None,
+                    default_access_tier: None,
                     name: versioned.name.clone(),
                     embedding_config: None,
                     dimension: versioned.dimension as u32,
@@ -613,6 +614,7 @@ impl MetadataStoreInterface for MetadataStore {
                     let config = CollectionConfig {
                         storage_class: None,
                         policy_generation: None,
+                        default_access_tier: None,
                         name: versioned.name.clone(),
                         embedding_config: None,
                         dimension: versioned.dimension as u32,

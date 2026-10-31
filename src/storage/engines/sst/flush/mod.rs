@@ -412,6 +412,11 @@ impl SstEngine {
                 .await
                 .context("Failed to begin recovery publication")?
         } else {
+            // TD-TIER-1 SC5 (review S1): L0 flush output keeps the account
+            // default — it is compacted away within minutes to hours, and a
+            // Cool/Cold object deleted that soon still pays the tier's
+            // minimum duration (30-90 days). The collection's tier lands on
+            // the long-lived COMPACTION output (passed at the enqueue below).
             self.atomic_coordinator()
                 .begin_atomic_operation(&staging_config)
                 .await
@@ -956,6 +961,12 @@ impl SstEngine {
                             // sq8 / `pax_vector_format:off` collection is not
                             // silently rewritten as RaBitQ.
                             Some(resolve_pax_vector_quant(params.collection_config.as_ref())),
+                            // TD-TIER-1 SC5: the output object carries the collection's tier.
+                            params
+                                .collection_config
+                                .as_ref()
+                                .and_then(|collection| collection.config.as_ref())
+                                .and_then(crate::services::collection::storage_class::collection_access_tier),
                         )
                         .await
                 }
