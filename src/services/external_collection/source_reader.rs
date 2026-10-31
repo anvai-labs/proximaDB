@@ -754,7 +754,6 @@ mod tests {
 
 #[cfg(test)]
 mod path_confinement_tests {
-    use serial_test::serial;
     //! `rust/path-injection` on `POST /api/v2/external-collections`
     //! (TD-SECSCAN-1). The handler validated only that `location` was non-empty
     //! and handed it to `fs::metadata` / `fs::read_dir`: no allowlist, no
@@ -766,6 +765,8 @@ mod path_confinement_tests {
     //! runner shares one process, where an unpinned read would see another
     //! test's allowlist. Each layer is still exercised through its own pure
     //! entry point; unset IS also the shipped default.
+    use serial_test::serial;
+
     use super::*;
 
     #[test]

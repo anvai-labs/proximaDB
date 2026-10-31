@@ -1478,7 +1478,13 @@ mod tests {
     /// (local) backend, and tiering an unknown operation is an error, never a
     /// silent no-op.
     #[tokio::test]
+    #[serial_test::serial]
     async fn access_tier_is_recorded_and_finalize_still_publishes() {
+        // Serialized: finalize's tiered publish takes copy_atomic's same-backend
+        // fast path only when the filesystem Arcs are identical — a concurrent
+        // test arming the (per-call-minted) fault/counting wrappers would
+        // reroute it to the streaming path, which refuses a tier.
+
         let (coordinator, temp_dir) = create_test_coordinator().await;
         let temp_path = temp_dir.path().to_string_lossy().to_string();
         let config = StagingConfig {

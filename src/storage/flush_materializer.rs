@@ -1632,6 +1632,10 @@ mod tests {
     #[serial]
     async fn pax_rg_layout_tag_takes_effect_on_the_production_flush() {
         unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_RG_LAYOUT") };
+        // The layout the writer/reader pick is env-sensitive; pin the shipped
+        // default too (the rerank-quant test opts RaBitQ coalescing OFF and the
+        // shared `cargo test --lib` process keeps that set otherwise).
+        unsafe { std::env::remove_var("PROXIMADB_PAX_COALESCED_RABITQ") };
         let default_layout = flush_via_materializer(211, fp32_config(&["compaction:off"]), 1).await;
         let default_footer = footer(&default_layout.only_segment());
         assert!(default_footer.has_f32_tier);

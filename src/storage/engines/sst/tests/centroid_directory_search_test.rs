@@ -24,7 +24,6 @@ mod tests {
     use proximadb_distance_kernel::DistanceMetric;
     use proximadb_distance_kernel::engine::UnifiedDistanceCompute;
     use proximadb_records::{EmbeddingCell, ProximaRecord};
-    use proximadb_storage_filesystem_types::counting::global_counters;
 
     const DIM: usize = 32;
     const SEGMENTS: usize = 4;
@@ -108,7 +107,9 @@ mod tests {
     fn enable_env() {
         // SAFETY: nextest runs each test in its own process.
         unsafe {
-            std::env::set_var("PROXIMADB_COUNT_FS_IO", "1");
+            // NB: GET counting is per-factory now (Arm::counters) — the
+            // process-global PROXIMADB_COUNT_FS_IO route would wrap every
+            // concurrent test's filesystem in the shared-process libtest run.
             std::env::set_var("PROXIMADB_PAX_COALESCED_RABITQ", "1");
             std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
             std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "1");
@@ -133,6 +134,10 @@ mod tests {
         engine: Arc<SstEngine>,
         collection: Collection,
         storage_url: String,
+        /// Per-arm GET counters (injected into the factory): private to this
+        /// arm, so `measure` sees only this arm's reads even while other tests
+        /// run concurrently in the shared `cargo test --lib` process.
+        counters: Arc<proximadb_storage_filesystem_types::counting::GetCounters>,
     }
 
     /// A collection of `SEGMENTS` trained segments (`rows` split evenly), with
@@ -150,7 +155,10 @@ mod tests {
         let collection = collection(id, &temp);
         let mut fs_config = FilesystemConfig::default();
         fs_config.default_fs = Some(format!("file://{base}"));
-        let factory = Arc::new(FilesystemFactory::create(fs_config).await.unwrap());
+        let counters = Arc::new(proximadb_storage_filesystem_types::counting::GetCounters::default());
+        let mut factory = FilesystemFactory::create(fs_config).await.unwrap();
+        factory.set_test_get_counters(Arc::clone(&counters));
+        let factory = Arc::new(factory);
         let engine = Arc::new(
             SstEngine::new_with_config(
                 SstConfig::default(),
@@ -211,6 +219,7 @@ mod tests {
             engine,
             collection,
             storage_url,
+            counters,
         }
     }
 
@@ -275,7 +284,7 @@ mod tests {
     /// arm has its own segment paths, so no cache entry is shared).
     async fn measure(arm: &Arm, rows: &[Vec<f32>], directory: bool) -> (f64, u64) {
         set_directory_read(directory);
-        let counters = global_counters();
+        let counters = &arm.counters;
         let before = counters.total_gets();
         let mut hits = 0usize;
         for query in queries(rows) {

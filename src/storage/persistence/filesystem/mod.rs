@@ -266,6 +266,15 @@ pub struct FilesystemFactory {
     config: FilesystemConfig,
     filesystems: HashMap<String, Arc<dyn FileSystem>>,
     tier_mapping: HashMap<FileStorageTier, String>,
+    /// Test-only per-factory GET counters: when set, every `get_filesystem`
+    /// wraps the backend in a `CountingFileSystem` sharing THESE counters
+    /// instead of the process-global env-gated ones. `cargo test --lib` runs
+    /// all tests in one process, where the global counters would collect every
+    /// concurrent test's reads (the `PROXIMADB_COUNT_FS_IO` route also mints a
+    /// fresh wrapper Arc per lookup, defeating copy_atomic's ptr_eq fast path
+    /// for bystander tests).
+    #[cfg(test)]
+    test_get_counters: Option<std::sync::Arc<proximadb_storage_filesystem_types::counting::GetCounters>>,
 }
 
 impl std::fmt::Debug for FilesystemFactory {
@@ -437,6 +446,8 @@ impl FilesystemFactory {
             config,
             filesystems: HashMap::new(),
             tier_mapping: HashMap::new(),
+            #[cfg(test)]
+            test_get_counters: None,
         };
 
         // Pre-initialize configured filesystems
@@ -446,6 +457,17 @@ impl FilesystemFactory {
         factory.initialize_tier_mapping();
 
         Ok(factory)
+    }
+
+    /// Test-only: count every GET this factory hands out into `counters`
+    /// (see the `test_get_counters` field). Must be called before the engines
+    /// built on this factory perform any I/O.
+    #[cfg(test)]
+    pub fn set_test_get_counters(
+        &mut self,
+        counters: std::sync::Arc<proximadb_storage_filesystem_types::counting::GetCounters>,
+    ) {
+        self.test_get_counters = Some(counters);
     }
 
     /// Initialize all configured filesystem backends
@@ -618,6 +640,15 @@ impl FilesystemFactory {
         } else {
             fs
         };
+        #[cfg(test)]
+        if let Some(counters) = &self.test_get_counters {
+            return Ok(Arc::new(
+                proximadb_storage_filesystem_types::counting::CountingFileSystem::new(
+                    fs,
+                    std::sync::Arc::clone(counters),
+                ),
+            ));
+        }
         if std::env::var_os("PROXIMADB_COUNT_FS_IO").is_some() {
             Ok(Arc::new(
                 proximadb_storage_filesystem_types::counting::CountingFileSystem::new(
