@@ -53,7 +53,7 @@
 // The package version. Kept equal to package.json `version` by
 // scripts/version-sync.sh (`set` rewrites it, `check` fails on drift) and by
 // tests/package_entry.test.ts.
-export const VERSION = "0.5.0";
+export const VERSION = "0.5.1";
 
 // ============================================================================
 // TYPES

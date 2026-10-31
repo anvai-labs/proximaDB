@@ -2,6 +2,31 @@
 
 All notable changes to ProximaDB will be documented in this file.
 
+## [0.5.1] - 2026-10-31
+
+Patch release, one purpose: the **Windows MSI is now a real x64 package**.
+
+### Fixed
+- **Windows MSI installs to `C:\Program Files\ProximaDB`** (was `C:\Program Files (x86)\ProximaDB`).
+  v0.5.0's MSI was built without `-arch`, so WiX v4 produced an x86 package and
+  Windows Installer redirected `ProgramFiles64Folder`; the 64-bit server ran,
+  but from the compatibility location, and the package was not truly x64
+  (#2317). `release.yml` now builds with `-arch x64` and verifies the install
+  path + `--version` on a Windows runner **before** anything can publish, so a
+  release dry run catches this class of bug.
+- **npm publishes from CI again**: `@anvailabs/proximadb-client` 0.5.0 went out
+  through OIDC trusted publishing with signed provenance, after the npm-side
+  trusted-publisher entry dropped its `environment` field (that field made npm's
+  OIDC exchange return "package not found"). No repo change; noted because
+  0.4.1 had to be published by hand.
+
+### Also in this release (merged to develop since v0.5.0)
+- Stage-F parallel decode (#2303) and PAX Region E filter columns (#2312,
+  writer default-OFF, reader on with a kill-switch).
+- Tenant-scoped collection paths (#2311) and the TD-PATH-2 catalog identity
+  high-water mark (#2316) — both additive and mixed-read safe.
+- jscpd dedup threshold 500 tokens (#2315).
+
 ## [0.5.0] - 2026-10-29
 
 Lakehouse-publication release: **211** merged PRs (203 merge commits plus 8

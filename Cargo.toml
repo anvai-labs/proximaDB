@@ -1,6 +1,6 @@
 [package]
 name = "proximadb"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 autobenches = false
 authors = ["Vijaykumar Singh <vijay@anvaiops.com>"]
@@ -174,7 +174,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -423,9 +423,10 @@ serde_urlencoded.workspace = true
 # Sandhi neutral usage parsers (TD-SANDHI-2 / ADR-0047 D10a): single-sourced, fixture-proven
 # (Sandhi TD-0001 W1) usage/cache-split extraction adopted by the generation LLM path — not a
 # hand-rolled 4th extractor. `sandhi-core` is serde-only (no reqwest/tokio); dependency direction
-# one-way (ProximaDB → Sandhi, ADR-060). Registry release since sandhi v0.1.1; 0.2.0 (the S2
-# release) adds only a std-only usage-event sink module — wire types identical to 0.1.6.
-sandhi-core = "0.2"
+# one-way (ProximaDB → Sandhi, ADR-060). Consumed API surface: UsageBasis, UsageCompleteness,
+# UsageEvent, Backend, usage::{parse_anthropic_usage, parse_cohere_usage, parse_ollama_usage,
+# parse_openai_usage}. Wire types verified compatible across 0.2→0.14 jump.
+sandhi-core = "0.14"
 
 # OpenAPI spec-from-code (TD-126 Phase 1). The `ToSchema`/`IntoParams`/`path`
 # derives annotate the v2 REST DTOs + handlers so `docs/openapi/proximadb-openapi.yaml`
@@ -573,7 +574,7 @@ proximadb-query-filter = { path = "crates/query/proximadb-query-filter" }
 proximadb-uql = { path = "crates/query/proximadb-uql" }
 proximadb-vector-query = { path = "crates/query/proximadb-vector-query" }
 # Extracted from src/services/catalog_introspection.rs (re-export shim keeps callers stable).
-proximadb-catalog-introspection = { version = "0.5.0", path = "crates/binding/proximadb-catalog-introspection" }
+proximadb-catalog-introspection = { version = "0.5.1", path = "crates/binding/proximadb-catalog-introspection" }
 
 # SQL Parsing
 sqlparser = { version = "0.62", features = ["visitor"] }
@@ -797,10 +798,10 @@ moka = { version = "0.12", features = ["future"] }
 # Provides direct buffer access to numpy arrays without Python .tolist() conversion
 # Java bindings via JNI
 # Node.js bindings via NAPI-RS
-proximadb-raptor-common = { version = "0.5.0", path = "crates/storage/proximadb-raptor-common" }
-proximadb-raptor-engine = { version = "0.5.0", path = "crates/storage/proximadb-raptor-engine" }
-proximadb-engine-core = { version = "0.5.0", path = "crates/storage/proximadb-engine-core" }
-proximadb-mongodb-parser = { version = "0.5.0", path = "crates/binding/proximadb-mongodb-parser" }
+proximadb-raptor-common = { version = "0.5.1", path = "crates/storage/proximadb-raptor-common" }
+proximadb-raptor-engine = { version = "0.5.1", path = "crates/storage/proximadb-raptor-engine" }
+proximadb-engine-core = { version = "0.5.1", path = "crates/storage/proximadb-engine-core" }
+proximadb-mongodb-parser = { version = "0.5.1", path = "crates/binding/proximadb-mongodb-parser" }
 
 # GPU acceleration dependencies (platform-specific)
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
