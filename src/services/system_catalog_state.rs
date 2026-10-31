@@ -136,6 +136,43 @@ struct CatalogInner {
     object_ids: HashMap<u64, TableIdentifier>,
     /// Highest WAL sequence number folded in (the replay watermark).
     applied_seq: u64,
+    /// TD-PATH-2: the highest identity ever minted, which drops never lower.
+    /// The allocator floors used to be derived only from LIVE schemas, so
+    /// dropping the newest table and restarting re-issued its ids — a typed
+    /// `collection_id` re-minted the dropped collection's
+    /// `accounts/{a}/{n}/{c}` root, and an `object_id` handed a new table the
+    /// dead one's grants. WAL replay rebuilds these from the create deltas;
+    /// the snapshot carries them so compaction cannot forget a dropped id.
+    ids_high_water: IdsHighWater,
+}
+
+/// TD-PATH-2: monotonic identity high-water marks (see `CatalogInner`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct IdsHighWater {
+    object_id: u64,
+    collection_id: u32,
+}
+
+impl IdsHighWater {
+    fn fold_table(&mut self, schema: &CatalogTableSchema) {
+        let ids = schema
+            .object_id
+            .into_iter()
+            .chain(schema.columns.iter().filter_map(|c| c.object_id))
+            .chain(schema.indexes.iter().filter_map(|i| i.object_id));
+        for id in ids {
+            self.object_id = self.object_id.max(id);
+        }
+        if let Some(id) = schema.stable_collection_id {
+            self.collection_id = self.collection_id.max(id);
+        }
+    }
+
+    fn fold_namespace(&mut self, namespace: &CatalogNamespace) {
+        if let Some(id) = namespace.object_id {
+            self.object_id = self.object_id.max(id);
+        }
+    }
 }
 
 impl CatalogInner {
@@ -145,6 +182,7 @@ impl CatalogInner {
                 self.account_ids.insert(account, stable_id);
             }
             CatalogDelta::UpsertNamespace { namespace } => {
+                self.ids_high_water.fold_namespace(&namespace);
                 let key = namespace.levels.clone();
                 self.ns_children.entry(key.clone()).or_default();
                 self.namespaces.insert(key, *namespace);
@@ -164,6 +202,7 @@ impl CatalogInner {
                 }
             }
             CatalogDelta::UpsertTable { identifier, schema } => {
+                self.ids_high_water.fold_table(&schema);
                 if let Some(previous) = self.tables.get(&identifier)
                     && let Some(object_id) = previous.object_id
                 {
@@ -208,6 +247,11 @@ struct CatalogSnapshot {
     #[serde(default)]
     statistics: HashMap<TableIdentifier, CatalogTableStatistics>,
     applied_seq: u64,
+    /// TD-PATH-2: additive and optional — an older binary ignores the key, and
+    /// a snapshot written before it decodes as `None` (the live schemas then
+    /// bound the floor, as before).
+    #[serde(default)]
+    ids_high_water: Option<IdsHighWater>,
 }
 
 /// In-RAM authoritative system-catalog state.
@@ -390,7 +434,22 @@ impl SystemCatalogState {
             .values()
             .filter_map(|namespace| namespace.object_id)
             .max();
-        from_tables.max(from_namespaces)
+        // TD-PATH-2: ids of DROPPED objects stay reserved.
+        let high_water = Some(guard.ids_high_water.object_id).filter(|id| *id > 0);
+        from_tables.max(from_namespaces).max(high_water)
+    }
+
+    /// TD-PATH-2: the highest typed `collection_id` ever minted (live or
+    /// dropped); `None` when none was. The allocator floor sits above it, so a
+    /// dropped collection's typed storage root is never re-issued.
+    pub fn max_collection_id_ever(&self) -> Option<u32> {
+        let guard = self.inner.read();
+        let live = guard
+            .tables
+            .values()
+            .filter_map(|schema| schema.stable_collection_id)
+            .max();
+        live.max(Some(guard.ids_high_water.collection_id).filter(|id| *id > 0))
     }
 
     /// The highest WAL sequence number folded in (replay watermark / snapshot
@@ -414,6 +473,7 @@ impl SystemCatalogState {
                 .collect(),
             statistics: inner.statistics.clone(),
             applied_seq: inner.applied_seq,
+            ids_high_water: Some(inner.ids_high_water),
         };
         rmp_serde::to_vec_named(&snapshot).context("encoding catalog snapshot")
     }
@@ -455,7 +515,12 @@ impl SystemCatalogState {
         }
         let mut tables = HashMap::with_capacity(snapshot.tables.len());
         let mut object_ids = HashMap::with_capacity(snapshot.tables.len());
+        let mut ids_high_water = snapshot.ids_high_water.unwrap_or_default();
+        for namespace in snapshot.namespaces.values() {
+            ids_high_water.fold_namespace(namespace);
+        }
         for (id, schema) in snapshot.tables {
+            ids_high_water.fold_table(&schema);
             ns_children
                 .entry(id.namespace.clone())
                 .or_default()
@@ -473,6 +538,7 @@ impl SystemCatalogState {
             statistics: snapshot.statistics,
             object_ids,
             applied_seq: snapshot.applied_seq,
+            ids_high_water,
         })
     }
 }
@@ -594,6 +660,73 @@ mod tests {
                 .map(|s| s.name.clone()),
             Some("returns".to_string())
         );
+        Ok(())
+    }
+
+    /// TD-PATH-2: a dropped table's typed collection id and object ids stay
+    /// reserved through WAL replay AND through a snapshot round trip (where
+    /// its create delta is gone).
+    #[test]
+    fn dropped_identities_stay_reserved_through_replay_and_snapshot() -> Result<()> {
+        let state = SystemCatalogState::new();
+        let mut schema = CatalogTableSchema::new("newest");
+        schema.object_id = Some(50);
+        schema.stable_collection_id = Some(7);
+        let deltas = [
+            CatalogDelta::UpsertNamespace {
+                namespace: Box::new(ns(&["t"])),
+            },
+            CatalogDelta::UpsertTable {
+                identifier: tid(&["t"], "newest"),
+                schema: Box::new(schema),
+            },
+            CatalogDelta::DropTable {
+                identifier: tid(&["t"], "newest"),
+            },
+        ];
+        for (seq, delta) in deltas.into_iter().enumerate() {
+            state.apply_committed(seq as u64 + 1, delta);
+        }
+        assert_eq!(state.max_collection_id_ever(), Some(7));
+        assert_eq!(state.max_object_id(), Some(50));
+
+        let restored = SystemCatalogState::from_snapshot_bytes(&state.to_snapshot_bytes()?)?;
+        assert!(!restored.table_exists(&tid(&["t"], "newest")));
+        assert_eq!(restored.max_collection_id_ever(), Some(7));
+        assert_eq!(restored.max_object_id(), Some(50));
+        Ok(())
+    }
+
+    /// TD-PATH-2 mixed-read safety: a snapshot written before the high-water
+    /// existed decodes (live schemas bound the floor, as before), and an older
+    /// binary decodes a new snapshot (it ignores the additive key).
+    #[test]
+    fn identity_high_water_is_mixed_read_safe() -> Result<()> {
+        #[derive(Serialize, Deserialize)]
+        struct PreHighWaterSnapshot {
+            #[serde(default)]
+            account_ids: HashMap<String, u32>,
+            namespaces: HashMap<Vec<String>, CatalogNamespace>,
+            tables: HashMap<TableIdentifier, CatalogTableSchema>,
+            #[serde(default)]
+            statistics: HashMap<TableIdentifier, CatalogTableStatistics>,
+            applied_seq: u64,
+        }
+        let mut live = CatalogTableSchema::new("live");
+        live.stable_collection_id = Some(3);
+        let old = PreHighWaterSnapshot {
+            account_ids: HashMap::new(),
+            namespaces: HashMap::from([(vec!["t".to_string()], ns(&["t"]))]),
+            tables: HashMap::from([(tid(&["t"], "live"), live)]),
+            statistics: HashMap::new(),
+            applied_seq: 9,
+        };
+        let restored = SystemCatalogState::from_snapshot_bytes(&rmp_serde::to_vec_named(&old)?)?;
+        assert_eq!(restored.max_collection_id_ever(), Some(3));
+
+        let new_bytes = restored.to_snapshot_bytes()?;
+        let decoded_by_old: PreHighWaterSnapshot = rmp_serde::from_slice(&new_bytes)?;
+        assert_eq!(decoded_by_old.applied_seq, 9);
         Ok(())
     }
 

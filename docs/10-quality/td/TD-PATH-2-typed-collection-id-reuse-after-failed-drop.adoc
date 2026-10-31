@@ -1,12 +1,12 @@
 = TD-PATH-2: A typed collection id can be reused after a failed drop, so the new collection inherits the old one's segments
-:status: Open
+:status: Partial — durable identity high-water shipped (SystemCatalog); NativeCatalog lazy floors open
 :filed: 2026-10-30
 :priority: P2 — latent while `PROXIMADB_TYPED_PATHS` is default-off; P1 before it defaults on
 
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open** — found in the adversarial review of the typed-path create/drop fix (fix/typed-path-tenant-dirs).
+| Status | **Partial.** Shipped (fix/td-path-2-collection-id-hwm): `SystemCatalog` keeps a monotonic identity high-water (`IdsHighWater`: typed `collection_id` and `object_id`) that drops never lower — folded from every upserted table/namespace on WAL replay, and carried in the snapshot as an additive optional field (an older binary ignores it; an older snapshot decodes as `None` and the live schemas bound the floor, as before). Both allocator floors sit above it, so a dropped collection's typed root and a dropped object's id (and its grants) are never re-issued, whatever the drop's storage cleanup did. Open: `NativeCatalog`'s lazily recovered floors; a rollback to a binary that predates the field writes snapshots without it (the high-water then restarts from live state). Rejected: a fail-closed drop — every network surface reported a refused drop as success or 404, the `exists` probe is a no-op on S3/Azure/GCS prefixes, and a local refusal can already have deleted segments (review of the abandoned slice); the misreporting of failed drops (e.g. `CATALOG_DELETE_FAILED`) is a separate pre-existing surface bug.
 | Relates to | link:TD-PATH-1-cwd-relative-default-paths-cross-contaminate.adoc[TD-PATH-1], ADR-031 (typed `accounts/{a}/{n}/{c}` layout), ADR-0083 (typed identity on every assignment), link:TD-TIER-1-collection-storage-policy-and-residency.adoc[TD-TIER-1]
 |===
 

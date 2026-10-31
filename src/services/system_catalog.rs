@@ -229,6 +229,10 @@ impl SystemCatalog {
                 collection_floor = collection_floor.max(u64::from(collection_id) + 1);
             }
         }
+        // TD-PATH-2: above every collection id ever minted, dropped ones too.
+        if let Some(collection_id) = state.max_collection_id_ever() {
+            collection_floor = collection_floor.max(u64::from(collection_id) + 1);
+        }
         (
             object_floor,
             namespace_floor,
@@ -1604,6 +1608,39 @@ mod tests {
             "an object_id minted after restart ({idc}) must be above every id \
              minted before it ({first_id}) — re-issuing one would grant a new \
              table the policy bindings and grants of a dead one"
+        );
+        Ok(())
+    }
+
+    /// TD-PATH-2: dropping the NEWEST table and restarting must not re-issue
+    /// its object_id (the floor used to be derived from live tables only, so
+    /// the dropped table's id — and its grants — came back).
+    #[tokio::test]
+    async fn a_dropped_tables_object_id_is_not_reissued_after_restart() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = dir.path().join("catalog.wal");
+        let ns = nslevels(&["t"]);
+        let dropped_id = {
+            let cat = SystemCatalog::open("default", &wal).await?;
+            cat.create_namespace(&ns, std::collections::HashMap::new())
+                .await?;
+            cat.create_table(&TableIdentifier::new(ns.clone(), "a"), vec_schema("a"))
+                .await?;
+            let newest = cat
+                .create_table(&TableIdentifier::new(ns.clone(), "b"), vec_schema("b"))
+                .await?;
+            cat.drop_table(&TableIdentifier::new(ns.clone(), "b"), false)
+                .await?;
+            newest.object_id.expect("table b minted")
+        };
+        let reopened = SystemCatalog::open("default", &wal).await?;
+        let c = reopened
+            .create_table(&TableIdentifier::new(ns.clone(), "c"), vec_schema("c"))
+            .await?;
+        let idc = c.object_id.expect("table c minted after restart");
+        assert!(
+            idc > dropped_id,
+            "{idc} re-issues (or precedes) the dropped table's id {dropped_id}"
         );
         Ok(())
     }
