@@ -19,102 +19,14 @@
 //! so it is a faithful in-process proxy for the real client without needing the
 //! `psql` binary.
 
-use std::net::TcpListener;
+#[path = "common/pg_server.rs"]
+mod pg_server;
+
+use pg_server::TestPgServer;
+
 use std::time::Duration;
 
-use proximadb::core::Config;
-use proximadb::database::ProximaDB;
-use tempfile::TempDir;
-use tokio::time::sleep;
 use tokio_postgres::SimpleQueryMessage;
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind port 0");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
-}
-
-struct PgwireTestServer {
-    pg_port: u16,
-    db: Option<ProximaDB>,
-    _tmp_data: TempDir,
-}
-
-impl PgwireTestServer {
-    async fn start() -> anyhow::Result<Self> {
-        let pg_port = free_port();
-        let rest_port = free_port();
-        let grpc_port = free_port();
-        let tmp_data = TempDir::new()?;
-
-        let mut config = Config::default();
-        config.server.bind_address = "127.0.0.1".to_string();
-        config.server.port = rest_port;
-        config.server.data_dir = tmp_data.path().to_path_buf();
-        config.api.rest_port = rest_port;
-        config.api.grpc_port = grpc_port;
-        config.api.unified_mode = false;
-        config.api.pg_port = Some(pg_port);
-        config.storage.storage_locations = vec![proximadb::core::config::StorageLocation {
-            url: format!("file://{}", tmp_data.path().display()),
-            ..Default::default()
-        }];
-        // Isolate the catalog WAL + global manifest to the temp dir so the test
-        // is reproducible across runs (otherwise the default `./metadata`
-        // persists tables like `b` and CREATE fails with "already exists").
-        config.storage.metadata_url = format!("file://{}/metadata", tmp_data.path().display());
-        config.storage.wal_config.global_manifest_url =
-            Some(format!("file://{}/manifest", tmp_data.path().display()));
-        config.storage.wal_config.write_buffer_directory =
-            format!("file://{}/wal", tmp_data.path().display());
-
-        let mut db = ProximaDB::new(config).await?;
-        db.start().await?;
-
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .no_proxy()
-            .build()?;
-        let health_url = format!("http://127.0.0.1:{}/health", rest_port);
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        loop {
-            match http_client.get(&health_url).send().await {
-                Ok(resp) if resp.status().is_success() => break,
-                _ => {
-                    if std::time::Instant::now() > deadline {
-                        anyhow::bail!("REST not ready on port {}", rest_port);
-                    }
-                    sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-        sleep(Duration::from_millis(200)).await;
-
-        Ok(Self {
-            pg_port,
-            db: Some(db),
-            _tmp_data: tmp_data,
-        })
-    }
-
-    fn pg_connection_string(&self) -> String {
-        format!(
-            "host=127.0.0.1 port={} user=postgres dbname=proximadb sslmode=disable",
-            self.pg_port
-        )
-    }
-}
-
-impl Drop for PgwireTestServer {
-    fn drop(&mut self) {
-        if let Some(mut db) = self.db.take() {
-            tokio::spawn(async move {
-                let _ = db.shutdown().await;
-            });
-        }
-    }
-}
 
 /// Collect `SimpleQueryMessage::Row`s from a `simple_query` result.
 fn rows_of(messages: Vec<SimpleQueryMessage>) -> Vec<tokio_postgres::SimpleQueryRow> {
@@ -129,11 +41,11 @@ fn rows_of(messages: Vec<SimpleQueryMessage>) -> Vec<tokio_postgres::SimpleQuery
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pgwire_dt_dedup_and_d_shape_contract() {
-    let server = PgwireTestServer::start().await.expect("server start");
+    let server = TestPgServer::start().await.expect("server start");
 
     // --- Session 1: create two distinct tables (mirrors the user's CREATE). ---
     let (client, connection) =
-        tokio_postgres::connect(&server.pg_connection_string(), tokio_postgres::NoTls)
+        tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
             .await
             .expect("connect");
     tokio::spawn(async move {
@@ -151,7 +63,7 @@ async fn pgwire_dt_dedup_and_d_shape_contract() {
 
     // --- Session 2: reconnect, then run psql-style introspection probes. ---
     let (client, connection) =
-        tokio_postgres::connect(&server.pg_connection_string(), tokio_postgres::NoTls)
+        tokio_postgres::connect(&server.conn_str(), tokio_postgres::NoTls)
             .await
             .expect("reconnect");
     tokio::spawn(async move {
