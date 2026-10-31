@@ -2,12 +2,14 @@
 # Tuned to avoid memory pressure on 64GB / 10-core machines
 
 [build]
-# Use 3 of 10 cores — each rustc instance can use 2-6GB on this codebase
-# Prevents OOM-triggered kernel panics / forced reboots
-jobs = 3
+# Use 5 of 10 cores — balances parallelism against memory pressure (each rustc
+# instance uses 2-6GB on this codebase; 5 jobs peaks at ~10-30GB on a 64GB machine).
+# The previous value of 3 was tuned for GitHub Actions runners (4 vcores / 20GB).
+jobs = 5
 
-# Fewer codegen units = lower peak memory per crate (at slight compile speed cost)
-rustflags = ["-C", "codegen-units=4"]
+# More codegen units = faster compilation at slight runtime perf cost.
+# 8 units allows good parallelism within each crate's LLVM codegen phase.
+rustflags = ["-C", "codegen-units=8"]
 
 [env]
 # Run tests sequentially for integration tests that share resources
@@ -80,11 +82,11 @@ ledger-clickbench = "test --release --features duckdb --test clickbench_ledger_e
 # rustc's default target-cpu for this triple is the portable Apple baseline
 # (NEON/AES/SHA2 already on) — optimized for Apple Silicon AND portable/ring-safe.
 rustflags = [
-    "-C", "codegen-units=4",
+    "-C", "codegen-units=8",
 ]
 
 [target.x86_64-unknown-linux-gnu]
 # Linux x86_64 optimizations - use mold linker if available
 # Uncomment if mold is installed: linker = "clang"
 # rustflags = ["-C", "link-arg=-fuse-ld=mold"]
-rustflags = ["-C", "codegen-units=4"]
+rustflags = ["-C", "codegen-units=8"]
