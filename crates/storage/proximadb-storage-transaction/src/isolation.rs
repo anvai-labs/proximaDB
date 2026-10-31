@@ -19,57 +19,10 @@
 use serde::{Deserialize, Serialize};
 
 /// Transaction isolation level
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum IsolationLevel {
-    /// Read uncommitted - lowest isolation, highest concurrency
-    /// Allows dirty reads (reading uncommitted changes)
-    ReadUncommitted,
-
-    /// Read committed - prevents dirty reads
-    /// Only sees data committed before the statement began
-    #[default]
-    ReadCommitted,
-
-    /// Repeatable read - prevents non-repeatable reads
-    /// Same query returns same results within transaction
-    RepeatableRead,
-
-    /// Snapshot isolation - each transaction sees a consistent snapshot
-    /// Prevents phantom reads for most operations
-    Snapshot,
-
-    /// Serializable - highest isolation, lowest concurrency
-    /// Transactions appear to execute sequentially
-    Serializable,
-}
-
-impl IsolationLevel {
-    /// Get the strictness level (higher = more strict)
-    pub fn strictness(&self) -> u8 {
-        match self {
-            IsolationLevel::ReadUncommitted => 0,
-            IsolationLevel::ReadCommitted => 1,
-            IsolationLevel::RepeatableRead => 2,
-            IsolationLevel::Snapshot => 3,
-            IsolationLevel::Serializable => 4,
-        }
-    }
-
-    /// Check if this level prevents dirty reads
-    pub fn prevents_dirty_reads(&self) -> bool {
-        self.strictness() >= 1
-    }
-
-    /// Check if this level prevents non-repeatable reads
-    pub fn prevents_non_repeatable_reads(&self) -> bool {
-        self.strictness() >= 2
-    }
-
-    /// Check if this level prevents phantom reads
-    pub fn prevents_phantom_reads(&self) -> bool {
-        self.strictness() >= 4
-    }
-}
+/// Canonical isolation levels live in `proximadb-storage-common`
+/// (dedup wave 5): this crate's former copy was identical in spirit with a
+/// drifted variant set and is now a re-export.
+pub use proximadb_storage_common::IsolationLevel;
 
 /// Conflict resolution strategy for concurrent transactions
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

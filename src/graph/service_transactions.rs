@@ -33,6 +33,7 @@ use crate::graph::engines::GraphEngine;
 use crate::graph::{Edge, Node};
 use dashmap::DashMap;
 use proximadb_kernel::error::ProximaDBError;
+pub use proximadb_storage_common::IsolationLevel;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -422,18 +423,6 @@ impl LocalTransactionCoordinator {
 // ============================================================================
 // Transaction Isolation Levels
 // ============================================================================
-
-/// Transaction isolation levels
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum IsolationLevel {
-    /// Transactions see only committed data from other transactions
-    #[default]
-    ReadCommitted,
-    /// Full serializability with distributed locking
-    Serializable,
-    /// Snapshot isolation (reads from transaction start point)
-    SnapshotIsolation,
-}
 
 /// Unit of Work tracks all changes within a transaction
 ///
