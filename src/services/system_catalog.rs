@@ -229,6 +229,13 @@ impl SystemCatalog {
                 collection_floor = collection_floor.max(u64::from(collection_id) + 1);
             }
         }
+        // TD-PATH-2: above every typed id ever minted, dropped ones too.
+        if let Some(collection_id) = state.max_collection_id_ever() {
+            collection_floor = collection_floor.max(u64::from(collection_id) + 1);
+        }
+        if let Some(namespace_id) = state.max_namespace_id_ever() {
+            namespace_floor = namespace_floor.max(u64::from(namespace_id) + 1);
+        }
         (
             object_floor,
             namespace_floor,
@@ -1409,6 +1416,18 @@ mod tests {
         levels.iter().map(|s| s.to_string()).collect()
     }
 
+    async fn create_named(
+        cat: &SystemCatalog,
+        namespace: &[String],
+        name: &str,
+    ) -> Result<CatalogTableSchema> {
+        cat.create_table(
+            &TableIdentifier::new(namespace.to_vec(), name),
+            vec_schema(name),
+        )
+        .await
+    }
+
     fn vec_schema(name: &str) -> CatalogTableSchema {
         CatalogTableSchema::new(name)
             .with_column(CatalogColumn::new(1, "id", ProximaType::Int64).nullable(false))
@@ -1608,6 +1627,34 @@ mod tests {
         Ok(())
     }
 
+    /// TD-PATH-2: dropping the NEWEST table and restarting must not re-issue
+    /// its object_id (the floor used to be derived from live tables only, so
+    /// the dropped table's id — and its grants — came back).
+    #[tokio::test]
+    async fn a_dropped_tables_object_id_is_not_reissued_after_restart() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = dir.path().join("catalog.wal");
+        let ns = nslevels(&["t"]);
+        let dropped_id = {
+            let cat = SystemCatalog::open("default", &wal).await?;
+            cat.create_namespace(&ns, std::collections::HashMap::new())
+                .await?;
+            create_named(&cat, &ns, "a").await?;
+            let newest = create_named(&cat, &ns, "b").await?;
+            cat.drop_table(&TableIdentifier::new(ns.clone(), "b"), false)
+                .await?;
+            newest.object_id.expect("table b minted")
+        };
+        let reopened = SystemCatalog::open("default", &wal).await?;
+        let c = create_named(&reopened, &ns, "c").await?;
+        let idc = c.object_id.expect("table c minted after restart");
+        assert!(
+            idc > dropped_id,
+            "{idc} re-issues (or precedes) the dropped table's id {dropped_id}"
+        );
+        Ok(())
+    }
+
     /// A caller-supplied object_id is ADOPTED, not overwritten — this is what
     /// preserves the ADR-031 unification where a vector collection pre-sets
     /// `schema.object_id` from `collection.id` before create_table runs.
@@ -1769,6 +1816,37 @@ mod tests {
         let right = right?;
         assert_eq!(left, right);
         assert_eq!(cat.account_id_u32_lookup("acme"), left);
+        Ok(())
+    }
+
+    /// TD-PATH-2 end to end: dropping the tenant table with the HIGHEST typed
+    /// collection id, compacting the WAL (so its create delta is gone) and
+    /// restarting must not re-issue that id — it names the dropped
+    /// collection's `accounts/{a}/{n}/{c}` storage root.
+    #[tokio::test]
+    async fn a_dropped_typed_collection_id_is_not_reissued_after_checkpoint_and_restart()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = dir.path().join("catalog.wal");
+        let namespace = nslevels(&["acme", "default"]);
+        let dropped = {
+            let cat = SystemCatalog::open("default", &wal).await?;
+            cat.create_namespace_for_tenant(&namespace, HashMap::new(), Some("acme"))
+                .await?;
+            create_named(&cat, &namespace, "orders").await?;
+            let newest = create_named(&cat, &namespace, "customers").await?;
+            cat.drop_table(&TableIdentifier::new(namespace.clone(), "customers"), false)
+                .await?;
+            cat.checkpoint().await?;
+            newest.stable_collection_id.expect("typed collection id")
+        };
+        let reopened = SystemCatalog::open("default", &wal).await?;
+        let fresh = create_named(&reopened, &namespace, "invoices").await?;
+        let minted = fresh.stable_collection_id.expect("typed collection id");
+        assert!(
+            minted > dropped,
+            "{minted} re-issues (or precedes) the dropped collection's id {dropped}"
+        );
         Ok(())
     }
 
