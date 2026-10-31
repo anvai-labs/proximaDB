@@ -229,9 +229,12 @@ impl SystemCatalog {
                 collection_floor = collection_floor.max(u64::from(collection_id) + 1);
             }
         }
-        // TD-PATH-2: above every collection id ever minted, dropped ones too.
+        // TD-PATH-2: above every typed id ever minted, dropped ones too.
         if let Some(collection_id) = state.max_collection_id_ever() {
             collection_floor = collection_floor.max(u64::from(collection_id) + 1);
+        }
+        if let Some(namespace_id) = state.max_namespace_id_ever() {
+            namespace_floor = namespace_floor.max(u64::from(namespace_id) + 1);
         }
         (
             object_floor,
@@ -1806,6 +1809,51 @@ mod tests {
         let right = right?;
         assert_eq!(left, right);
         assert_eq!(cat.account_id_u32_lookup("acme"), left);
+        Ok(())
+    }
+
+    /// TD-PATH-2 end to end: dropping the tenant table with the HIGHEST typed
+    /// collection id, compacting the WAL (so its create delta is gone) and
+    /// restarting must not re-issue that id — it names the dropped
+    /// collection's `accounts/{a}/{n}/{c}` storage root.
+    #[tokio::test]
+    async fn a_dropped_typed_collection_id_is_not_reissued_after_checkpoint_and_restart()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wal = dir.path().join("catalog.wal");
+        let namespace = nslevels(&["acme", "default"]);
+        let dropped = {
+            let cat = SystemCatalog::open("default", &wal).await?;
+            cat.create_namespace_for_tenant(&namespace, HashMap::new(), Some("acme"))
+                .await?;
+            cat.create_table(
+                &TableIdentifier::new(namespace.clone(), "orders"),
+                vec_schema("orders"),
+            )
+            .await?;
+            let newest = cat
+                .create_table(
+                    &TableIdentifier::new(namespace.clone(), "customers"),
+                    vec_schema("customers"),
+                )
+                .await?;
+            cat.drop_table(&TableIdentifier::new(namespace.clone(), "customers"), false)
+                .await?;
+            cat.checkpoint().await?;
+            newest.stable_collection_id.expect("typed collection id")
+        };
+        let reopened = SystemCatalog::open("default", &wal).await?;
+        let fresh = reopened
+            .create_table(
+                &TableIdentifier::new(namespace.clone(), "invoices"),
+                vec_schema("invoices"),
+            )
+            .await?;
+        let minted = fresh.stable_collection_id.expect("typed collection id");
+        assert!(
+            minted > dropped,
+            "{minted} re-issues (or precedes) the dropped collection's id {dropped}"
+        );
         Ok(())
     }
 

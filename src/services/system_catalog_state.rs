@@ -151,6 +151,10 @@ struct CatalogInner {
 struct IdsHighWater {
     object_id: u64,
     collection_id: u32,
+    /// Typed namespace ids (`{n}` of `accounts/{a}/{n}/{c}`), recovered from
+    /// table schemas: emptying the highest namespace must not free its id.
+    #[serde(default)]
+    namespace_id: u16,
 }
 
 impl IdsHighWater {
@@ -165,6 +169,9 @@ impl IdsHighWater {
         }
         if let Some(id) = schema.stable_collection_id {
             self.collection_id = self.collection_id.max(id);
+        }
+        if let Some(id) = schema.stable_namespace_id {
+            self.namespace_id = self.namespace_id.max(id);
         }
     }
 
@@ -452,6 +459,17 @@ impl SystemCatalogState {
         live.max(Some(guard.ids_high_water.collection_id).filter(|id| *id > 0))
     }
 
+    /// TD-PATH-2: the highest typed namespace id ever minted (live or emptied).
+    pub fn max_namespace_id_ever(&self) -> Option<u16> {
+        let guard = self.inner.read();
+        let live = guard
+            .tables
+            .values()
+            .filter_map(|schema| schema.stable_namespace_id)
+            .max();
+        live.max(Some(guard.ids_high_water.namespace_id).filter(|id| *id > 0))
+    }
+
     /// The highest WAL sequence number folded in (replay watermark / snapshot
     /// cutover LSN).
     pub fn applied_seq(&self) -> u64 {
@@ -727,6 +745,18 @@ mod tests {
         let new_bytes = restored.to_snapshot_bytes()?;
         let decoded_by_old: PreHighWaterSnapshot = rmp_serde::from_slice(&new_bytes)?;
         assert_eq!(decoded_by_old.applied_seq, 9);
+        assert!(
+            decoded_by_old
+                .namespaces
+                .contains_key(&vec!["t".to_string()])
+        );
+        assert_eq!(
+            decoded_by_old
+                .tables
+                .get(&tid(&["t"], "live"))
+                .and_then(|schema| schema.stable_collection_id),
+            Some(3)
+        );
         Ok(())
     }
 
