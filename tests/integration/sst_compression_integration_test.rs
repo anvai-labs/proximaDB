@@ -270,6 +270,7 @@ async fn test_sst_compaction_preserves_compression_integrity() -> anyhow::Result
     // Trigger compaction using unified helper (which would handle the collection config properly)
     let collection_config = env.create_test_collection_for_engine(StorageEngine::Sst);
     let compact_params = proximadb::storage::traits::CompactionParameters {
+        full: false,
         collection_id: Some(env.collection_id().to_string()),
         force: true,
         synchronous: true,

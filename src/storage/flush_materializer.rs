@@ -1455,8 +1455,25 @@ mod tests {
     /// the production materializer into a real SST engine.
     async fn flush_via_materializer(
         collection_object_id: u64,
+        config: CollectionConfig,
+        flushes: usize,
+    ) -> KnobFlush {
+        flush_via_materializer_cfg(
+            collection_object_id,
+            config,
+            flushes,
+            crate::core::SstConfig::default(),
+        )
+        .await
+    }
+
+    /// [`flush_via_materializer`] with an explicit engine config (used to pin
+    /// the FULL-compaction knobs).
+    async fn flush_via_materializer_cfg(
+        collection_object_id: u64,
         mut config: CollectionConfig,
         flushes: usize,
+        sst_config: crate::core::SstConfig,
     ) -> KnobFlush {
         let dir = tempfile::tempdir().expect("knob tempdir");
         let root = dir.path().to_path_buf();
@@ -1484,7 +1501,7 @@ mod tests {
         );
         let engine = Arc::new(
             crate::storage::engines::sst::SstEngine::new_with_config(
-                crate::core::SstConfig::default(),
+                sst_config,
                 filesystem,
                 Arc::new(proximadb_distance_kernel::engine::UnifiedDistanceCompute::default()),
             )
@@ -2121,6 +2138,7 @@ mod tests {
 
         // Exactly what `StorageCompactor::compact_collection` sends.
         let explicit = crate::storage::traits::CompactionParameters {
+            full: false,
             collection_id: Some("281".to_string()),
             collection_config: Some(meta),
             force: false,
@@ -2141,6 +2159,197 @@ mod tests {
             flushed.pax_files().len(),
             1,
             "an explicit operator compaction must not be disarmed by compaction:off"
+        );
+    }
+
+    /// TD-COMPACT-14: an operator FULL compaction collapses a cross-level
+    /// layout (auto-compacted L1 + fresh L0s — geometry the background policy
+    /// never merges) to a single segment and reports the summary.
+    #[tokio::test]
+    async fn full_compaction_collapses_cross_level_layout_to_one_segment() {
+        // Eight flushes under the default threshold: the flush arm compacts
+        // the first five into an L1, the last three stay L0.
+        let flushed = flush_via_materializer(282, CollectionConfig::default(), 8).await;
+        assert!(
+            flushed.pax_files().len() >= 3,
+            "cross-level layout expected, got {:?}",
+            flushed.pax_files()
+        );
+        let compaction = flushed
+            .engine
+            .compaction_manager()
+            .expect("sst compaction manager");
+        let full = crate::storage::traits::CompactionParameters {
+            collection_id: Some("282".to_string()),
+            collection_config: Some(knob_meta(282, &flushed.root, CollectionConfig::default())),
+            force: true,
+            synchronous: true,
+            full: true,
+            ..Default::default()
+        };
+        let result = flushed
+            .engine
+            .do_compact(&full)
+            .await
+            .expect("FULL compaction");
+        assert!(
+            compaction
+                .await_compaction_quiescence(std::time::Duration::from_secs(60))
+                .await
+        );
+        let files = flushed.pax_files();
+        assert_eq!(files.len(), 1, "collapsed to one segment: {files:?}");
+        // The pairwise output lands at L1; the worker's training follow-up
+        // may then promote it — only the count and tier-ness are asserted.
+        assert!(
+            files[0]
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('L') && n.ends_with(".pax")),
+            "FULL outputs a tiered segment: {:?}",
+            files[0]
+        );
+        let metrics = &result.engine_metrics;
+        assert_eq!(metrics.get("full"), Some(&serde_json::json!(true)));
+        assert_eq!(metrics.get("segments_after"), Some(&serde_json::json!(1)));
+        assert_eq!(
+            metrics.get("reached_target"),
+            Some(&serde_json::json!(true))
+        );
+        assert!(
+            metrics
+                .get("segments_before")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                >= 3,
+            "summary reports the starting geometry: {metrics:?}"
+        );
+        assert!(
+            metrics.get("passes").and_then(|v| v.as_u64()).unwrap_or(0) >= 1,
+            "at least one pairwise pass ran: {metrics:?}"
+        );
+    }
+
+    /// `full_max_passes` bounds the loop's OWN pairwise passes; the worker's
+    /// regular follow-up chain may still finish the collapse for free. The
+    /// reported summary must match the on-disk reality either way.
+    #[tokio::test]
+    async fn full_compaction_reports_a_consistent_summary_when_passes_bounded() {
+        let mut sst_config = crate::core::SstConfig::default();
+        sst_config.compaction_config = Some(crate::core::config::CompactionConfig {
+            full_max_passes: 1,
+            ..Default::default()
+        });
+        // More flushes than the L0 threshold: the flush arm compacts the
+        // first five into an L1, the rest stay L0 (multi-segment).
+        let flushed =
+            flush_via_materializer_cfg(283, CollectionConfig::default(), 8, sst_config).await;
+        assert!(
+            flushed.pax_files().len() >= 2,
+            "multi-segment fixture: {:?}",
+            flushed.pax_files()
+        );
+        let meta = knob_meta(283, &flushed.root, CollectionConfig::default());
+        let full = crate::storage::traits::CompactionParameters {
+            collection_id: Some("283".to_string()),
+            collection_config: Some(meta),
+            force: true,
+            synchronous: true,
+            full: true,
+            ..Default::default()
+        };
+        let result = flushed
+            .engine
+            .do_compact(&full)
+            .await
+            .expect("bounded FULL");
+        let files = flushed.pax_files();
+        let metrics = &result.engine_metrics;
+        let reported_after = metrics
+            .get("segments_after")
+            .and_then(|value| value.as_u64())
+            .expect("segments_after reported") as usize;
+        assert_eq!(
+            reported_after,
+            files.len(),
+            "the summary must match the on-disk segment count"
+        );
+        assert!(
+            metrics.get("passes").and_then(|v| v.as_u64()).unwrap_or(0) <= 1,
+            "the loop itself ran at most one pairwise pass: {metrics:?}"
+        );
+        assert_eq!(
+            metrics.get("reached_target").and_then(|v| v.as_bool()),
+            Some(files.len() <= 1),
+            "reached_target reflects the actual geometry: {metrics:?}"
+        );
+    }
+
+    /// An operator FULL request is never disarmed by `compaction:off` (the
+    /// tag gates background producers only), and reports its summary.
+    #[tokio::test]
+    async fn full_compaction_is_never_disarmed_by_compaction_off() {
+        let config = CollectionConfig {
+            tags: vec!["compaction:off".into()],
+            ..Default::default()
+        };
+        let flushed = flush_via_materializer(284, config.clone(), 5).await;
+        assert_eq!(flushed.pax_files().len(), 5);
+        let full = crate::storage::traits::CompactionParameters {
+            collection_id: Some("284".to_string()),
+            collection_config: Some(knob_meta(284, &flushed.root, config)),
+            force: true,
+            synchronous: true,
+            full: true,
+            ..Default::default()
+        };
+        flushed
+            .engine
+            .do_compact(&full)
+            .await
+            .expect("FULL ignores arming");
+        assert_eq!(
+            flushed.pax_files().len(),
+            1,
+            "collapsed despite compaction:off"
+        );
+    }
+
+    /// When even the largest pair cannot fit the memory admission and spill
+    /// is disabled, FULL fails with an actionable message naming the budget
+    /// and the spill switch.
+    #[tokio::test]
+    async fn full_compaction_over_budget_errors_actionably_when_spill_disabled() {
+        let mut sst_config = crate::core::SstConfig::default();
+        sst_config.compaction_config = Some(crate::core::config::CompactionConfig {
+            max_memory_mb: 1,
+            // A huge amplification factor drives max_input_bytes to ~0, so
+            // even the tiny knob-bed pair exceeds the budget.
+            memory_amplification_factor: 1_000_000_000_000.0,
+            spill_enabled: false,
+            ..Default::default()
+        });
+        let flushed =
+            flush_via_materializer_cfg(285, CollectionConfig::default(), 3, sst_config).await;
+        assert_eq!(flushed.pax_files().len(), 3);
+        let full = crate::storage::traits::CompactionParameters {
+            collection_id: Some("285".to_string()),
+            collection_config: Some(knob_meta(285, &flushed.root, CollectionConfig::default())),
+            force: true,
+            synchronous: true,
+            full: true,
+            ..Default::default()
+        };
+        let err = flushed
+            .engine
+            .do_compact(&full)
+            .await
+            .expect_err("over-budget pair must fail, not thrash");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("no segment pair fits the compaction input budget")
+                && message.contains("spill_enabled"),
+            "actionable budget error: {message}"
         );
     }
 

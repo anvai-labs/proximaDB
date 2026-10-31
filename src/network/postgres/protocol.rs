@@ -1409,7 +1409,13 @@ impl PostgresProtocol {
             self.vector_ops.clone(),
         ));
         self.ddl_service = Some(Arc::new(
-            DdlService::new(catalog_manager.clone()).with_record_store(dml_service.record_store()),
+            DdlService::new(catalog_manager.clone())
+                .with_record_store(dml_service.record_store())
+                .with_collection_compactor(std::sync::Arc::new(
+                    crate::services::operations::vectors::VectorOpsCollectionCompactor {
+                        vector_ops: self.vector_ops.clone(),
+                    },
+                )),
         ));
         self.dml_service = Some(dml_service);
         self.catalog_manager = Some(catalog_manager);
@@ -1436,7 +1442,13 @@ impl PostgresProtocol {
         }
         let dml = Arc::new(dml);
         self.ddl_service = Some(Arc::new(
-            DdlService::new(catalog_manager.clone()).with_record_store(dml.record_store()),
+            DdlService::new(catalog_manager.clone())
+                .with_record_store(dml.record_store())
+                .with_collection_compactor(std::sync::Arc::new(
+                    crate::services::operations::vectors::VectorOpsCollectionCompactor {
+                        vector_ops: self.vector_ops.clone(),
+                    },
+                )),
         ));
         self.dml_service = Some(dml);
         self.catalog_manager = Some(catalog_manager);
@@ -1464,7 +1476,12 @@ impl PostgresProtocol {
         let mut ddl = DdlService::new(catalog_manager)
             .with_rank_profile_store(store)
             .with_rank_services(services)
-            .with_function_store(function_store);
+            .with_function_store(function_store)
+            .with_collection_compactor(std::sync::Arc::new(
+                crate::services::operations::vectors::VectorOpsCollectionCompactor {
+                    vector_ops: self.vector_ops.clone(),
+                },
+            ));
         if let Some(dml) = self.dml_service.as_ref() {
             ddl = ddl.with_record_store(dml.record_store());
         }
@@ -2168,7 +2185,8 @@ impl PostgresProtocol {
         if (upper.starts_with("CREATE")
             || upper.starts_with("ALTER")
             || upper.starts_with("DROP")
-            || upper.starts_with("COPY"))
+            || upper.starts_with("COPY")
+            || upper.starts_with("COMPACT"))
             && self.transaction_in_progress().await
         {
             self.send_error(
@@ -3109,7 +3127,8 @@ impl PostgresProtocol {
             if (upper_for_ddl.starts_with("CREATE")
                 || upper_for_ddl.starts_with("ALTER")
                 || upper_for_ddl.starts_with("DROP")
-                || upper_for_ddl.starts_with("COPY"))
+                || upper_for_ddl.starts_with("COPY")
+                || upper_for_ddl.starts_with("COMPACT"))
                 && self.transaction_in_progress().await
             {
                 return self
@@ -3295,7 +3314,8 @@ impl PostgresProtocol {
 
         if (upper.starts_with("CREATE ")
             || upper.starts_with("ALTER ")
-            || upper.starts_with("DROP "))
+            || upper.starts_with("DROP ")
+            || upper.starts_with("COMPACT "))
             && let Some(ddl_service) = self.ddl_service.clone()
         {
             let parser = SqlFrontendParser::new();
@@ -3355,6 +3375,9 @@ impl PostgresProtocol {
                         crate::services::DdlStatement::MaterializeTable { name, .. } => {
                             Some(name.clone())
                         }
+                        crate::services::DdlStatement::CompactTable { name, .. } => {
+                            Some(name.clone())
+                        }
                         _ => None,
                     };
                     match ddl_service
@@ -3389,6 +3412,8 @@ impl PostgresProtocol {
                                 "DROP TABLE"
                             } else if upper.starts_with("DROP INDEX") {
                                 "DROP INDEX"
+                            } else if upper.starts_with("COMPACT TABLE") {
+                                "COMPACT TABLE"
                             } else {
                                 "OK"
                             };

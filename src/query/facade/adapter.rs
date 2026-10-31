@@ -881,13 +881,16 @@ pub async fn try_sql_write_dispatch(
     use crate::query::sql_frontend::SqlFrontendParser;
     use crate::services::dml::DmlStatement;
 
-    let leading = query.trim_start().get(..7).map(str::to_ascii_uppercase);
+    // 8 chars: the longest DDL keyword + its space ("COMPACT ") must fit in
+    // the window for the prefix tests below to be able to match.
+    let leading = query.trim_start().get(..8).map(str::to_ascii_uppercase);
     let leading = leading.as_deref().unwrap_or("");
 
-    // DDL: CREATE / ALTER / DROP.
+    // DDL: CREATE / ALTER / DROP / COMPACT.
     if (leading.starts_with("CREATE ")
         || leading.starts_with("ALTER ")
-        || leading.starts_with("DROP "))
+        || leading.starts_with("DROP ")
+        || leading.starts_with("COMPACT "))
         && let Some(ddl) = ddl
     {
         match SqlFrontendParser::new().parse_ddl(query) {

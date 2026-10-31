@@ -2610,6 +2610,7 @@ def storage_action_via_flight(
     action_type: str,
     expected_operation: str,
     flight_module=None,
+    extra_body: dict | None = None,
 ) -> dict:
     if flight_module is None:
         try:
@@ -2625,7 +2626,7 @@ def storage_action_via_flight(
     try:
         action = flight_module.Action(
             action_type,
-            json.dumps({"collection_id": collection_id}).encode(),
+            json.dumps({"collection_id": collection_id, **(extra_body or {})}).encode(),
         )
         responses = list(client.do_action(action))
     finally:
@@ -2660,8 +2661,10 @@ def force_flush_via_flight(
 
 
 def compact_via_flight(
-    host: str, port: int, collection_id: str, flight_module=None
+    host: str, port: int, collection_id: str, flight_module=None, full: bool = False
 ) -> dict:
+    """Trigger a compaction. ``full=True`` asks for the cross-level collapse
+    (TD-COMPACT-14); the action body carries the flag through."""
     return storage_action_via_flight(
         host,
         port,
@@ -2669,6 +2672,7 @@ def compact_via_flight(
         "compact_collection",
         "compact",
         flight_module,
+        extra_body={"full": full},
     )
 
 

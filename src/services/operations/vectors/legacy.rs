@@ -526,6 +526,31 @@ fn quantization_strategy_to_level(strategy: &QuantizationStrategy) -> UnifiedQua
 }
 
 /// Updated Vector Operations Service using consolidated optimizer
+/// `CollectionCompactor` capability for `DdlService` (`COMPACT TABLE`):
+/// resolves the table tenant-scoped via the collection port, then runs the
+/// operator compaction on the unified engine.
+pub struct VectorOpsCollectionCompactor {
+    pub vector_ops: std::sync::Arc<VectorOperationsService>,
+}
+
+#[async_trait::async_trait]
+impl crate::services::ddl::CollectionCompactor for VectorOpsCollectionCompactor {
+    async fn compact(
+        &self,
+        tenant: Option<&str>,
+        table: &str,
+        full: bool,
+    ) -> anyhow::Result<crate::services::ddl::CompactSummary> {
+        let result = self
+            .vector_ops
+            .compact_collection_named(tenant, table, full)
+            .await?;
+        Ok(crate::services::ddl::CompactSummary::from_result(
+            table, full, &result,
+        ))
+    }
+}
+
 pub struct VectorOperationsService {
     /// Default storage engine (SST) - used for fallback and WAL coordination
     storage_engine: Arc<SstEngine>,
@@ -5275,6 +5300,27 @@ impl VectorOperationsService {
     /// delegates to `super::flush::FlushCompactionCoordinator`.
     pub async fn force_flush_all(&self) -> Result<()> {
         self.flush_coordinator().force_flush_all().await
+    }
+
+    /// TD-COMPACT-14: resolve `identifier` (name or id) within `tenant` and
+    /// run an operator compaction; `full` collapses across levels toward
+    /// `[storage.compaction_config] full_target_segments`.
+    pub async fn compact_collection_named(
+        &self,
+        tenant: Option<&str>,
+        identifier: &str,
+        full: bool,
+    ) -> Result<crate::storage::traits::CompactionResult> {
+        let collection = self
+            .collection_port
+            .get_collection(identifier, tenant)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("collection '{identifier}' does not exist for this tenant")
+            })?;
+        self.unified_engine()
+            .compact_collection_full(&collection.id, Some(&collection), full)
+            .await
     }
 
     /// Flush all pending WAL entries for a specific collection to durable storage.

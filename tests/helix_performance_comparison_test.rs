@@ -173,6 +173,7 @@ mod performance_comparison_tests {
         let (compaction_time, compaction_throughput) = if engine_name != "viper" {
             let compact_start = Instant::now();
             let compact_params = CompactionParameters {
+                full: false,
                 collection_id: Some(collection_id.to_string()),
                 force: true,
                 synchronous: true,
@@ -675,6 +676,7 @@ mod performance_comparison_tests {
 
         // Force compaction to organize data
         let compact_params = CompactionParameters {
+            full: false,
             collection_id: Some("test_collection".to_string()),
             force: true,
             synchronous: true,
