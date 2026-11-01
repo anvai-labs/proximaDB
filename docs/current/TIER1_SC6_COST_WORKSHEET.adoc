@@ -1,0 +1,66 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-TIER-1 SC6 groundwork: comparison and cost worksheet
+// status-as-of: 2026-10-31
+
+[cols="1,3",options="header"]
+|===
+| Field | Value
+| Status | Worksheet — the SC6 release runs fill the measured columns; rate cards are AnvaiOps inputs and are NOT quoted here.
+| Design | link:STORAGE_PLAN.adoc[STORAGE_PLAN] (SC6 row, "Normalize competing offers before pricing", the co-design cost spine) and the dated worksheet in link:../history/planning/STORAGE_CLASS_SEAMS_REVIEW_2026_10_25.adoc[the storage seams review] — re-rate that one before quoting any price.
+| Relates to | link:../10-quality/td/TD-TIER-1-collection-storage-policy-and-residency.adoc[TD-TIER-1], the E1 evidence artifacts (link:../history/evidence/TIER1_E1_FIXED_OBJECT_CAP_SWEEP_2026_10_26.adoc[fixed-object], link:../history/evidence/TIER1_E1_SCALE_CAP_SWEEP_2026_10_27.adoc[scale], link:../history/evidence/TIER1_E1_FRAGMENT_LADDER_2026_10_27.adoc[fragment ladder]).
+|===
+
+== What is measured today (inputs, not conclusions)
+
+Request-column entries from the E1 sweeps (n=1–2 per cell; directions, not
+distributions; production S3 already targets 8 MiB ranges, so the 16 MiB
+column is the candidate, not a regression):
+
+[cols="1,2,2,2",options="header"]
+|===
+| Corpus (shape) | Requests/q at cap 4 MiB | Requests/q at cap 16 MiB | Delta
+| 1M, single segment | baseline | −28.67% requests, +4.50% bytes | candidate
+| 3M, single segment | 36.342 | 23.634 (−34.97%), one fewer wave | candidate
+| 10M, 3-segment bed | baseline | −5.54% (segment fan-out dominates) | weak
+| Fragmented (1→4 segs, 3M) | — | cap lever collapses at first fragmentation (−33% → −13/−16% plateau) | bounded
+|===
+
+Read-model terms, per the design: the persistent store serves whole-object
+reads for a granted collection (SC4), so the *object request* column above
+is the COLD/balanced term; a granted collection's steady-state payload GETs
+are zero by the SC4 gate (control requests are metered separately). Bytes/q
+and p50/p99 for both arms come from the same runs.
+
+== Worksheet columns the SC6 release runs must fill
+
+[cols="1,3",options="header"]
+|===
+| Column | Source
+| Cold GETs/q, cold bytes/q, p50/p99 (balanced) | release run, balanced arm (exists today as the E1 cold arm)
+| Warm GETs/q (payload + control separately), warm bytes/q | release run, PERFORMANCE granted arm (SC4 gate shape)
+| Reservation GB-month per collection | SC3 ledger: Σ charged-effective bytes × hours (the metering writer already accrues intervals); utilization = resident / reserved
+| Warm fraction (resident / total segment bytes) | status: covered_bytes vs the segment inventory; drift over the soak
+| Tier mix at rest | SC5: objects published per access tier (desired tier from the collection config; observed tier from provider inventory where supported)
+| Retrieval + minimum-duration exposure | SC5 residuals: L0/L1 churn at cold tiers pays minimums — quantify from the tier mix and segment lifetimes before enabling cold tiers on churny collections
+| Pool limits | declared reservation-pool capacity and per-tenant limits (config), not measured
+|===
+
+== Competitor normalization (structure only)
+
+Compare at equal: region, dimension/precision, keys/attributes, filters,
+recall target, freshness, QPS/concurrency, result bytes, availability,
+churn, namespace size. Logical vendor bytes ≠ our compressed physical
+traffic; account for query fan-out and request minimums (sharding to exploit
+a floor may raise total cost). Vendors in scope per the design: S3 Vectors,
+turbopuffer. Each column names its source (vendor list price / our run) and
+its date. Finance owns the final comparison; this worksheet only fixes the
+columns and the measurement protocol.
+
+== Explicit boundaries
+
+* No price is quoted here; rate cards are AnvaiOps.
+* No default flip (range cap, residency, tier) is claimed; every default
+  change needs the soak in the rollout runbook.
+* n=1–2 cells do not establish optima; the fragmented/filtered finalists
+  remain the design's gate for any global range-cap change.

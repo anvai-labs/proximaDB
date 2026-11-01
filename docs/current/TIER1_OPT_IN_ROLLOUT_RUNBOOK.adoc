@@ -1,0 +1,72 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-TIER-1 opt-in rollout runbook (residency + access tier)
+// status-as-of: 2026-10-31
+
+[cols="1,3",options="header"]
+|===
+| Field | Value
+| Status | Runbook for the opt-in rollout of admitted residency (SC3/SC4) and the future-PUT access tier (SC5). SC6's integrated release runs and the soak gate below must pass before any default-on step.
+| Design | link:STORAGE_PLAN.adoc[STORAGE_PLAN]; link:../10-quality/td/TD-TIER-1-collection-storage-policy-and-residency.adoc[TD-TIER-1]; worksheet: link:TIER1_SC6_COST_WORKSHEET.adoc[TIER1_SC6_COST_WORKSHEET].
+|===
+
+== Everything is opt-in today
+
+* **Residency** requires three operator choices, all absent by default:
+  1. a pool declared in `storage.reservation_pools` (id, local-disk path,
+     capacity) — an empty list leaves the registry closed and every
+     PERFORMANCE admission refused with an actionable error;
+  2. `default_grant_bytes` on the default pool (0 ⇒ refuse);
+  3. a collection created (or updated) with `storage_class: "performance"`
+     on an object-store-backed SST placement (SC2 admission).
+  Kill switch: `PROXIMADB_TIER1_RESERVATIONS_OFF=1` refuses admission
+  without erasing the ledger (fail-closed on a non-UTF-8 value).
+* **Access tier** is per-collection `default_access_tier` (hot/cool/cold),
+  applied to future compaction output only; omitted ⇒ the account default.
+  L0 flush output and staging keep the account default (minimum-duration
+  economics — see the worksheet).
+* **Balanced** collections are byte-for-byte today's behavior: no pool, no
+  admission, no tier, no status change beyond the `active` projection.
+
+== Rollout phases and exit gates
+
+[cols="1,2,3",options="header"]
+|===
+| Phase | Action | Exit gate
+| 0. Soak beds | Integrated MinIO release runs (SC6): balanced vs granted arms on the release binary, Toxiproxy latency; fill the worksheet's measured columns | Same correctness/recall across classes; zero payload GETs on the granted arm; bounded resource use; metrics complete
+| 1. Single tenant | One pool, one PERFORMANCE collection, `hot` tier | Status reaches READY(g) and stays through flush/compaction cycles; metering intervals accrue; a disk-loss drill serves correctly and reports WARMING while coverage is partial (DEGRADED only when the store is absent/unopenable or over budget — see the drill below; the SC6 groundwork gate, engine-level)
+| 2. Multi-tenant soak | Pools shared across tenants; mixed balanced/performance | No capacity overcommit under concurrency (SC-TE3); idle reservation accrual matches the ledger; drops/updates release cleanly
+| 3. Tier pilots | `cool` on low-churn collections only (segment lifetime ≫ tier minimums) | Retrieval + minimum-duration exposure in the worksheet is acceptable; L0/L1 churn stays on the account default
+| 4. Defaults | Any default-on flip (range cap, reservation arming) | Design stop rule: fragmented/filtered finalists measured + this soak green; SUPPORTED_SURFACE updated in the same PR for proven scope only
+|===
+
+== Operator drills (each names its invariant)
+
+* **Disk loss:** revoke a pool's disk → serving continues remotely at recall
+  parity, and the status depends on the failure shape: the store re-opening
+  EMPTY reports WARMING (coverage 0-of-N within capacity — never read
+  WARMING as a gate failure); the store absent or failing to open reports
+  DEGRADED; a surviving inventory over budget reports DEGRADED. Re-provision
+  → the backfill restores READY (SC-TE7).
+* **Capacity pressure:** fill the disk with an over-admitted grant → pins
+  hold until their grant is released; oversize pins are refused at admission
+  (SC-TE4/6).
+* **Restart:** reopen with live grants → budget re-armed at open, groups
+  re-registered, backfill warms live segments, READY returns under the same
+  g once coverage completes.
+* **Idle accounting:** an untouched granted collection accrues reservation
+  intervals hourly (coalesced writes), independent of query traffic (SC-TE9).
+
+== What NOT to do
+
+* Do not point a pool at a RAM-backed path (tmpfs) — the reservation
+  contract assumes real local disk.
+* Do not set `default_access_tier` on a local placement (refused: the tier
+  would be silently dropped) or `archive` (refused: archived objects cannot
+  serve).
+* Do not quote prices from the worksheet before re-rating the dated
+  competitor worksheet per the design's normalization rules.
+* Do not enable `PROXIMADB_TYPED_PATHS` mid-soak for collections whose
+  grants were admitted under the legacy layout without re-checking grant
+  prefixes (both layouts are registered, but a flip changes where flush
+  writes).
