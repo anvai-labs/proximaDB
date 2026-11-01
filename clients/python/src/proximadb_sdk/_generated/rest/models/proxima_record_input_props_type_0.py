@@ -18,7 +18,16 @@ T = TypeVar("T", bound="ProximaRecordInputPropsType0")
 
 @_attrs_define
 class ProximaRecordInputPropsType0:
-    """Canonical rich property map."""
+    """Canonical rich property map.
+
+    `metadata` is accepted as an alias: the documents API advertises that
+    spelling ("Arbitrary metadata fields. Stored as ProximaRecord props")
+    and maps it here, so the records API must accept it too — before the
+    alias it was silently dropped and filters over it matched nothing
+    (TD-REC-1). The OpenAPI contract stays `props`; the alias is
+    lenience for the already-advertised spelling, not a second field.
+
+    """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

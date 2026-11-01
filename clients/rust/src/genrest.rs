@@ -9748,7 +9748,7 @@ pub mod types {
     ///      "type": "string"
     ///    },
     ///    "metadata": {
-    ///      "description": "Arbitrary metadata fields. Stored as ProximaRecord props.",
+    ///      "description": "Arbitrary metadata fields. Stored as ProximaRecord props.\n\n`props` is accepted as an alias (TD-REC-1): the records surface\ndocuments `props` as the canonical map and accepts `metadata` as its\nalias, so this surface accepts both spellings of the same map too.",
     ///      "type": "object",
     ///      "additionalProperties": {}
     ///    },
@@ -9777,7 +9777,11 @@ pub mod types {
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
     pub struct IngestDocument {
         pub id: ::std::string::String,
-        ///Arbitrary metadata fields. Stored as ProximaRecord props.
+        /// Arbitrary metadata fields. Stored as ProximaRecord props.
+        ///
+        /// `props` is accepted as an alias (TD-REC-1): the records surface
+        /// documents `props` as the canonical map and accepts `metadata` as its
+        /// alias, so this surface accepts both spellings of the same map too.
         #[serde(default, skip_serializing_if = "::serde_json::Map::is_empty")]
         pub metadata: ::serde_json::Map<::std::string::String, ::serde_json::Value>,
         /// Raw text content. Required when `X-Embed-Source: native` (default);
@@ -12046,7 +12050,7 @@ pub mod types {
     ///      ]
     ///    },
     ///    "props": {
-    ///      "description": "Canonical rich property map.",
+    ///      "description": "Canonical rich property map.\n\n`metadata` is accepted as an alias: the documents API advertises that\nspelling (\"Arbitrary metadata fields. Stored as ProximaRecord props\")\nand maps it here, so the records API must accept it too — before the\nalias it was silently dropped and filters over it matched nothing\n(TD-REC-1). The OpenAPI contract stays `props`; the alias is\nlenience for the already-advertised spelling, not a second field.",
     ///      "type": [
     ///        "object",
     ///        "null"
@@ -12080,7 +12084,14 @@ pub mod types {
         ///Record ID (optional, will be auto-generated if not provided)
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub id: ::std::option::Option<::std::string::String>,
-        ///Canonical rich property map.
+        /// Canonical rich property map.
+        ///
+        /// `metadata` is accepted as an alias: the documents API advertises that
+        /// spelling ("Arbitrary metadata fields. Stored as ProximaRecord props")
+        /// and maps it here, so the records API must accept it too — before the
+        /// alias it was silently dropped and filters over it matched nothing
+        /// (TD-REC-1). The OpenAPI contract stays `props`; the alias is
+        /// lenience for the already-advertised spelling, not a second field.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub props:
             ::std::option::Option<::serde_json::Map<::std::string::String, ::serde_json::Value>>,
