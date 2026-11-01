@@ -198,8 +198,16 @@ class TestGraphDelegation:
             "a", "b", algorithm="BELLMAN_FORD", k=3, graph_id="social"
         )
         mock_adapter.graph_shortest_path.assert_called_once_with(
-            "a", "b", None, None, "BELLMAN_FORD", 3, None, None,
-            timeout=None, graph_id="social",
+            "a",
+            "b",
+            None,
+            None,
+            "BELLMAN_FORD",
+            3,
+            None,
+            None,
+            timeout=None,
+            graph_id="social",
         )
 
     def test_graph_traverse_forwards_graph_id(self, client, mock_adapter):
@@ -207,8 +215,17 @@ class TestGraphDelegation:
         mock_adapter.graph_traverse.return_value = {"nodes": []}
         client.graph_traverse("a", max_depth=4, graph_id="social")
         mock_adapter.graph_traverse.assert_called_once_with(
-            "a", 4, None, "BFS", None, None, None, None, None,
-            timeout=None, graph_id="social",
+            "a",
+            4,
+            None,
+            "BFS",
+            None,
+            None,
+            None,
+            None,
+            None,
+            timeout=None,
+            graph_id="social",
         )
 
 
@@ -357,16 +374,33 @@ class TestRestWireEquivalence:
 
     def test_analytics_positional_v1_shape(self, rest_adapter):
         rest_adapter.graph_shortest_path(
-            "a", "b", None, ["KNOWS"], "DIJKSTRA", 2, True, 64,
-            timeout=1.5, graph_id="social",
+            "a",
+            "b",
+            None,
+            ["KNOWS"],
+            "DIJKSTRA",
+            2,
+            True,
+            64,
+            timeout=1.5,
+            graph_id="social",
         )
         name, args, kwargs = rest_adapter._recorder.calls[0]
         assert name == "graph_shortest_path"
         assert args == ("a", "b", None, ["KNOWS"], "DIJKSTRA", 2, True, 64)
         assert kwargs == {"timeout": 1.5, "graph_id": "social"}
         rest_adapter.graph_traverse(
-            "a", 3, None, "BFS", 10, 100, 50, True, 64,
-            timeout=2.0, graph_id="social",
+            "a",
+            3,
+            None,
+            "BFS",
+            10,
+            100,
+            50,
+            True,
+            64,
+            timeout=2.0,
+            graph_id="social",
         )
         name, args, kwargs = rest_adapter._recorder.calls[1]
         assert name == "graph_traverse"
@@ -424,8 +458,13 @@ class TestEmbeddedGraphCompatibility:
 
         class GraphEdge:
             def __init__(
-                self, from_node_id, to_node_id, edge_type, id=None,
-                weight=None, properties=None,
+                self,
+                from_node_id,
+                to_node_id,
+                edge_type,
+                id=None,
+                weight=None,
+                properties=None,
             ):
                 made_edges[id] = (from_node_id, to_node_id, edge_type, weight)
 
@@ -475,17 +514,17 @@ class TestEmbeddedGraphCompatibility:
 class TestParityCensus:
     def test_every_ported_method_exists_on_v2(self):
         for name in PORTED_GRAPH_METHODS:
-            assert callable(getattr(ProximaDBClient, name, None)), (
-                f"TD-SDK-3 ratchet: {name} missing from the v2 client"
-            )
+            assert callable(
+                getattr(ProximaDBClient, name, None)
+            ), f"TD-SDK-3 ratchet: {name} missing from the v2 client"
 
     def test_base_adapter_defines_the_whole_family(self):
         """The canonical protocol surface exists on the base class, so every
         adapter (real or mocked) accepts the full family."""
         for name in PORTED_GRAPH_METHODS:
-            assert hasattr(BaseProtocolAdapter, name), (
-                f"TD-SDK-3 ratchet: {name} missing from BaseProtocolAdapter"
-            )
+            assert hasattr(
+                BaseProtocolAdapter, name
+            ), f"TD-SDK-3 ratchet: {name} missing from BaseProtocolAdapter"
 
     def test_ported_set_matches_v1_public_graph_surface(self):
         """The pinned set IS v1's public graph family (the 2026-10-31 AST

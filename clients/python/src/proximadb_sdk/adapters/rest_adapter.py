@@ -1065,9 +1065,7 @@ class RestProtocolAdapter(BaseProtocolAdapter):
             graph_id=graph_id or "default",
         )
 
-    def delete_node(
-        self, node_id: str, graph_id: str | None = None, **kwargs
-    ) -> bool:
+    def delete_node(self, node_id: str, graph_id: str | None = None, **kwargs) -> bool:
         """Delete a graph node by ID via REST."""
         result = self._client.delete_node(
             node_id=node_id, graph_id=graph_id or "default"

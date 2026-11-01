@@ -792,9 +792,7 @@ class ProximaDBClient:
 
     def delete_node(self, node_id: str, graph_id: str | None = None) -> bool:
         """Delete a graph node by ID."""
-        return bool(
-            self._graph_call("delete_node", node_id=node_id, graph_id=graph_id)
-        )
+        return bool(self._graph_call("delete_node", node_id=node_id, graph_id=graph_id))
 
     def query_nodes(
         self,
