@@ -584,8 +584,11 @@ class TestRestCrudWireEquivalence:
         )
 
         mock_sync.return_value = _ok_response()
-        doc = IngestDocument(id="r4", text="x")
-        doc.additional_properties["custom_extra"] = 42
+        # Construct via the generated from_dict (extras ride the model's
+        # additional_properties without touching the attribute directly —
+        # attrs' init=False factory behavior for it varies across attrs
+        # versions, and CI resolves a different one than the dev venv).
+        doc = IngestDocument.from_dict({"id": "r4", "text": "x", "custom_extra": 42})
 
         rest_client.ingest_documents("coll", [doc])
 
