@@ -3902,7 +3902,9 @@ def main() -> int:
             # server too; its id must reproduce the fixture's (objects live
             # under <id>/data/) — a fresh catalog assigns the same first id;
             # anything else fails closed rather than querying a wrong prefix.
-            collection_id = create_collection(server_url, base_path, args.base_format)
+            collection_id = create_collection(
+                server_url, base_path, args.base_format, storage_class=args.storage_class
+            )
             if collection_id != args.collection_id:
                 raise RuntimeError(
                     "skip-ingest id mismatch: fixture collection "
