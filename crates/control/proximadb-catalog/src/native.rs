@@ -162,6 +162,18 @@ pub struct NativeCatalog {
     /// persisted schemas on load (the u16 lives denormalized on each schema).
     namespace_registry: DashMap<String, u16>,
     namespace_floor: AtomicU32,
+    /// TD-PATH-2: the durable identity high-water — the highest object /
+    /// typed collection / typed namespace id EVER minted, which drops never
+    /// lower (see [`IdentityHighWaterFile`]). Mirrored in atomics because the
+    /// mint choke points are sync; persisted to the sidecar on mint and at
+    /// open. 0 = none minted.
+    identity_hw_object: AtomicU64,
+    identity_hw_collection: AtomicU32,
+    identity_hw_namespace: AtomicU32,
+    /// Serializes sidecar writes so a slow writer cannot persist a stale
+    /// (smaller) snapshot after a newer one (TD-PATH-2: the file must be
+    /// monotone). Mints themselves stay lock-free.
+    identity_hw_persist_lock: tokio::sync::Mutex<()>,
 }
 
 /// Table metadata stored in storage
@@ -215,6 +227,26 @@ struct ObjectIndexEntry {
     name: String,
 }
 
+/// TD-PATH-2: durable identity high-water sidecar
+/// (`_syscat/identity_high_water.json`) — the highest object / typed
+/// collection / typed namespace id EVER minted, which drops never lower.
+/// NativeCatalog recovers its allocator floors from LIVE table files as they
+/// load, so dropping the newest table and restarting re-issued its ids: a
+/// typed `collection_id` re-minted the dropped collection's
+/// `accounts/{a}/{n}/{c}` root, and an `object_id` handed a new table the
+/// dead one's grants. Seeded once from the table files, then monotonic.
+/// `serde(default)` in every direction (an old binary ignores the file; an
+/// old catalog seeds it from a one-time scan).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct IdentityHighWaterFile {
+    #[serde(default)]
+    object_id: u64,
+    #[serde(default)]
+    collection_id: u32,
+    #[serde(default)]
+    namespace_id: u32,
+}
+
 /// ADR-031 Phase 4b: durable account-string → u32 registry sidecar
 /// (`_syscat/account_registry.json`). Keeps the typed path's account segment
 /// stable across restarts.
@@ -249,9 +281,22 @@ impl NativeCatalog {
         match existing {
             Some(id) => {
                 self.object_id_allocator.raise_floor(id + 1);
+                self.identity_hw_object.fetch_max(id, Ordering::Relaxed);
                 id
             }
-            None => self.object_id_allocator.allocate(),
+            None => {
+                // TD-PATH-2: mint above every id EVER minted — the durable
+                // high-water covers DROPPED objects, which the live-recovered
+                // floor does not (drop removes the index entry).
+                let floor = self
+                    .identity_hw_object
+                    .load(Ordering::Relaxed)
+                    .saturating_add(1);
+                self.object_id_allocator.raise_floor(floor);
+                let id = self.object_id_allocator.allocate();
+                self.identity_hw_object.fetch_max(id, Ordering::Relaxed);
+                id
+            }
         }
     }
 
@@ -301,6 +346,8 @@ impl NativeCatalog {
     fn raise_object_id_floor(&self, existing: Option<u64>) {
         if let Some(id) = existing {
             self.object_id_allocator.raise_floor(id + 1);
+            // TD-PATH-2: recovered LIVE ids feed the durable high-water too.
+            self.identity_hw_object.fetch_max(id, Ordering::Relaxed);
         }
     }
 
@@ -370,6 +417,17 @@ impl NativeCatalog {
         existing_coll: Option<u32>,
     ) -> Option<(u32, u16, u32)> {
         let account = self.account_u32(account_str).await?; // None → legacy
+        // TD-PATH-2: a fresh process's per-scope allocators start at 1, so a
+        // scope whose tables never loaded this run would re-mint from 1 —
+        // possibly a DROPPED collection's id (its `accounts/{a}/{n}/{c}` root
+        // would be resurrected). Raise the scope above the durable high-water
+        // BEFORE minting; fetch_max makes re-enforcement free.
+        self.stable_ids.raise_namespace_floor(
+            account,
+            self.identity_hw_namespace
+                .load(Ordering::Relaxed)
+                .saturating_add(1),
+        );
         let ns = existing_ns.unwrap_or_else(|| {
             // First collection in this namespace (this run) → mint a per-account
             // namespace u16 + remember it so siblings reuse it.
@@ -378,7 +436,24 @@ impl NativeCatalog {
                 .entry(namespace_key.to_string())
                 .or_insert_with(|| self.stable_ids.mint_namespace_id(account))
         });
+        self.identity_hw_namespace
+            .fetch_max(u32::from(ns), Ordering::Relaxed);
+        self.stable_ids.raise_collection_floor(
+            account,
+            ns,
+            self.identity_hw_collection
+                .load(Ordering::Relaxed)
+                .saturating_add(1),
+        );
         let coll = existing_coll.unwrap_or_else(|| self.stable_ids.mint_collection_id(account, ns));
+        self.identity_hw_collection
+            .fetch_max(coll, Ordering::Relaxed);
+        // Durable before the caller can stamp the id onto a schema. A failed
+        // write degrades to today's behavior (the created table's own metadata
+        // still records the id), never worse.
+        if let Err(error) = self.persist_identity_high_water().await {
+            warn!("identity high-water sidecar write failed: {error}");
+        }
         Some((account, ns, coll))
     }
 
@@ -432,6 +507,11 @@ impl NativeCatalog {
                 .or_insert(ns);
             if let Some(coll) = schema.stable_collection_id {
                 self.stable_ids.recover_collection_floor(account, ns, coll);
+                // TD-PATH-2: recovered LIVE typed ids feed the high-water.
+                self.identity_hw_collection
+                    .fetch_max(coll, Ordering::Relaxed);
+                self.identity_hw_namespace
+                    .fetch_max(u32::from(ns), Ordering::Relaxed);
             }
         }
     }
@@ -495,10 +575,19 @@ impl NativeCatalog {
             account_floor: AtomicU64::new(1),
             namespace_registry: DashMap::new(),
             namespace_floor: AtomicU32::new(1),
+            identity_hw_object: AtomicU64::new(0),
+            identity_hw_collection: AtomicU32::new(0),
+            identity_hw_namespace: AtomicU32::new(0),
+            identity_hw_persist_lock: tokio::sync::Mutex::new(()),
         };
 
         // Ensure the base location exists (local mkdir; object-store no-op).
         catalog.io_init().await?;
+
+        // TD-PATH-2: the durable identity high-water must be in place before
+        // ANY mint — including load_namespaces' legacy object_id backfill.
+        // (The one-time seed scan runs later, once the index is loaded.)
+        let sidecar_loaded = catalog.load_identity_high_water_file().await?;
 
         // Load existing namespaces
         catalog.load_namespaces().await?;
@@ -514,6 +603,19 @@ impl NativeCatalog {
         // after upgrade). After this, oid↔name resolution is available without a
         // name-keyed load, which oid-keyed reads (S2) and WAL-oid depend on.
         catalog.load_object_index().await?;
+
+        // TD-PATH-2: absent sidecar = written before this change → seed once
+        // from the authoritative table files (the index-rebuild precedent),
+        // so even a boot → drop-newest → restart cycle on the first
+        // new-binary run cannot re-issue. Persisting at open makes the
+        // recovered maxima durable immediately (warn-only: a read-only
+        // location must not refuse an otherwise-openable catalog).
+        if !sidecar_loaded {
+            catalog.seed_identity_high_water_from_files().await?;
+        }
+        if let Err(error) = catalog.persist_identity_high_water().await {
+            warn!("identity high-water sidecar write failed at open: {error}");
+        }
 
         Ok(catalog)
     }
@@ -572,7 +674,7 @@ impl NativeCatalog {
                         ns_id_backfilled += 1;
                     }
                     if ns.object_id.is_none() {
-                        ns.object_id = Some(self.object_id_allocator.allocate());
+                        ns.object_id = Some(self.mint_object_id(None));
                         oid_backfilled += 1;
                     }
                 }
@@ -690,6 +792,78 @@ impl NativeCatalog {
         "_syscat/account_registry.json".to_string()
     }
 
+    /// TD-PATH-2: durable identity high-water sidecar path.
+    fn identity_high_water_rel() -> String {
+        "_syscat/identity_high_water.json".to_string()
+    }
+
+    /// Snapshot the identity high-water atomics to the sidecar. Called on
+    /// every mint (typed ids; object ids via the create paths) and once at
+    /// open, so ids of DROPPED objects stay reserved across restarts even if
+    /// their table files — the only other record of an id — are gone.
+    async fn persist_identity_high_water(&self) -> Result<()> {
+        let _guard = self.identity_hw_persist_lock.lock().await;
+        let file = IdentityHighWaterFile {
+            object_id: self.identity_hw_object.load(Ordering::Relaxed),
+            collection_id: self.identity_hw_collection.load(Ordering::Relaxed),
+            namespace_id: self.identity_hw_namespace.load(Ordering::Relaxed),
+        };
+        let data = serde_json::to_vec_pretty(&file)?;
+        self.io_write(&Self::identity_high_water_rel(), &data).await
+    }
+
+    /// TD-PATH-2: fold a schema's persisted identity ids (object + typed)
+    /// into the durable high-water. Used by the one-time seed scan.
+    fn fold_identity_high_water(&self, schema: &crate::CatalogTableSchema) {
+        // The global max is often a COLUMN/INDEX id (mint_table_identity mints
+        // table first, then columns, then indexes) — fold them all.
+        let ids = schema
+            .object_id
+            .into_iter()
+            .chain(schema.columns.iter().filter_map(|c| c.object_id))
+            .chain(schema.indexes.iter().filter_map(|i| i.object_id));
+        for id in ids {
+            self.identity_hw_object.fetch_max(id, Ordering::Relaxed);
+        }
+        if let Some(ns) = schema.stable_namespace_id {
+            self.identity_hw_namespace
+                .fetch_max(u32::from(ns), Ordering::Relaxed);
+        }
+        if let Some(coll) = schema.stable_collection_id {
+            self.identity_hw_collection
+                .fetch_max(coll, Ordering::Relaxed);
+        }
+    }
+
+    /// Load the durable sidecar, if present. Returns whether it existed
+    /// (absent = written before this change, or a fresh catalog: mixed-read
+    /// no-op — the per-load recovery of LIVE ids keeps working as before).
+    async fn load_identity_high_water_file(&self) -> Result<bool> {
+        let Some(data) = self.io_read_opt(&Self::identity_high_water_rel()).await? else {
+            return Ok(false);
+        };
+        let file: IdentityHighWaterFile = serde_json::from_slice(&data)?;
+        self.identity_hw_object
+            .fetch_max(file.object_id, Ordering::Relaxed);
+        self.identity_hw_collection
+            .fetch_max(file.collection_id, Ordering::Relaxed);
+        self.identity_hw_namespace
+            .fetch_max(file.namespace_id, Ordering::Relaxed);
+        debug!(
+            "Loaded identity high-water: object={}, collection={}, namespace={}",
+            file.object_id, file.collection_id, file.namespace_id
+        );
+        Ok(true)
+    }
+
+    /// One-time seed (sidecar absent): fold every persisted identity id from
+    /// the authoritative table files — the same full-read precedent as the
+    /// index rebuild.
+    async fn seed_identity_high_water_from_files(&self) -> Result<()> {
+        let _ = self.scan_object_index_entries().await?;
+        Ok(())
+    }
+
     /// Persist the current account-string → u32 map (called on every mint).
     async fn save_account_registry(&self) -> Result<()> {
         let entries: Vec<(String, u32)> = self
@@ -774,6 +948,7 @@ impl NativeCatalog {
                 let id = TableIdentifier::new(ns.clone(), name);
                 if let Some(data) = self.io_read_opt(&Self::table_metadata_rel(&id)).await? {
                     let meta: TableMetadata = serde_json::from_slice(&data)?;
+                    self.fold_identity_high_water(&meta.schema);
                     if let Some(object_id) = meta.schema.object_id {
                         push(&id, object_id);
                     }
@@ -789,6 +964,7 @@ impl NativeCatalog {
             };
             if let Some(data) = self.io_read_opt(&Self::object_file_rel(oid)).await? {
                 let meta: TableMetadata = serde_json::from_slice(&data)?;
+                self.fold_identity_high_water(&meta.schema);
                 let id = TableIdentifier::new(
                     meta.identifier.namespace.clone(),
                     meta.identifier.name.clone(),
@@ -1308,7 +1484,7 @@ impl NativeCatalog {
             // ADR-031 / TD-181 P0: mint the stable catalog object_id from the same
             // single system-wide sequence that mints table object_ids (one sequence,
             // not per-type — ADR-031 reconciliation amendment 1). Native-minted only.
-            object_id: Some(self.object_id_allocator.allocate()),
+            object_id: Some(self.mint_object_id(None)),
             // Opaque, rename-stable server-issued id that drives physical paths
             // (DrPathBuilder). `tenant_id` is the owning tenant when created in a
             // tenant scope; together they make the namespace DR-addressable.
@@ -1341,6 +1517,11 @@ impl NativeCatalog {
                 .insert(oid, ns.levels.clone());
         }
         self.save_namespaces().await?;
+        // TD-PATH-2: the namespace's freshly minted object_id is durable with
+        // the metadata that uses it.
+        if let Err(error) = self.persist_identity_high_water().await {
+            warn!("identity high-water sidecar write failed: {error}");
+        }
 
         info!("Created namespace: {}", key);
         Ok(ns)
@@ -1588,6 +1769,11 @@ impl Catalog for NativeCatalog {
         self.check_namespace_and_mint_identity(identifier, &mut schema)
             .await?;
         self.mint_table_identity(identifier, &mut schema);
+        // TD-PATH-2: the object ids just minted (table + columns + indexes)
+        // are durable before the metadata that uses them is written.
+        if let Err(error) = self.persist_identity_high_water().await {
+            warn!("identity high-water sidecar write failed: {error}");
+        }
 
         // Check table doesn't exist
         if self.table_exists(identifier).await? {
@@ -1643,6 +1829,11 @@ impl Catalog for NativeCatalog {
         self.check_namespace_and_mint_identity(identifier, &mut schema)
             .await?;
         self.mint_table_identity(identifier, &mut schema);
+        // TD-PATH-2: the object ids just minted (table + columns + indexes)
+        // are durable before the metadata that uses them is written.
+        if let Err(error) = self.persist_identity_high_water().await {
+            warn!("identity high-water sidecar write failed: {error}");
+        }
 
         // Only a genuinely absent table may be replaced into existence; an
         // unreadable previous row must fail the replace rather than silently
@@ -1700,6 +1891,13 @@ impl Catalog for NativeCatalog {
     }
 
     async fn drop_table(&self, identifier: &TableIdentifier, purge: bool) -> Result<bool> {
+        // TD-PATH-2: persist the high-water BEFORE removing anything — the
+        // dropped table's file is the only other record of its ids once the
+        // index entry goes, and this process may hold mints (object-only:
+        // namespaces, indexes) no sidecar write has flushed yet.
+        if let Err(error) = self.persist_identity_high_water().await {
+            warn!("identity high-water sidecar write failed: {error}");
+        }
         // TD-181 P3: resolve the oid from the durable index BEFORE the entry is
         // removed, so we can delete the oid-keyed authority copy too. Delete
         // BOTH copies (authority-first, before the index entry). Removal counts
@@ -2006,6 +2204,12 @@ impl Catalog for NativeCatalog {
         meta.updated_at = Self::now_millis();
 
         self.save_table(&meta).await?;
+        // TD-PATH-2: the index's freshly minted object_id is durable with the
+        // metadata that uses it (its only other record is this lazily-loaded
+        // table file, which a drop can remove before any load folds it).
+        if let Err(error) = self.persist_identity_high_water().await {
+            warn!("identity high-water sidecar write failed: {error}");
+        }
 
         // Invalidate cache
         self.cache
@@ -2336,14 +2540,18 @@ mod tests {
         );
         assert_eq!(a2.stable_collection_id, Some(2), "second coll in ns1 = 2");
 
-        // Different namespace → NEXT namespace id, collection restarts at 1.
+        // Different namespace → NEXT namespace id. TD-PATH-2: collection ids
+        // are per-scope ADDRESSED but globally NON-REUSING — the durable
+        // high-water ratchets every mint above all predecessors, so a new
+        // namespace's first collection is 3 (not 1): re-starting at 1 would
+        // re-issue a dropped collection's `accounts/{a}/{n}/{c}` root.
         let mut b1 = CatalogTableSchema::new("b1");
         cat.mint_stable_identity("acct", "ns2", &mut b1).await;
         assert_eq!(b1.stable_namespace_id, Some(2), "new ns = 2");
         assert_eq!(
             b1.stable_collection_id,
-            Some(1),
-            "new ns → coll restarts at 1"
+            Some(3),
+            "new ns → coll above the global high-water (2), not 1"
         );
     }
 
@@ -2550,6 +2758,175 @@ mod tests {
             legacy_created.stable_namespace_id.is_none()
                 && legacy_created.stable_collection_id.is_none(),
             "tenant-less collection has no typed identity (legacy, mixed-read-safe)"
+        );
+    }
+
+    /// Reopen `catalog_in_tempdir`'s dir as a fresh process would.
+    async fn reopen_same_dir(dir: &tempfile::TempDir) -> NativeCatalog {
+        let cfg = NativeCatalogConfig {
+            storage_url: format!("file://{}", dir.path().join("cat").display()),
+            metadata_format: "json".into(),
+            versioned: false,
+            max_versions: 100,
+        };
+        NativeCatalog::new(
+            "t".into(),
+            cfg,
+            Arc::new(crate::cache::CatalogCache::new(64, 60)),
+        )
+        .await
+        .expect("reopen catalog")
+    }
+
+    fn id_schema(name: &str) -> crate::CatalogTableSchema {
+        crate::CatalogTableSchema::new(name).with_column(crate::CatalogColumn::new(
+            1,
+            "id",
+            proximadb_data_model::ProximaType::Int64,
+        ))
+    }
+
+    /// TD-PATH-2 (NativeCatalog): dropping the NEWEST table and restarting
+    /// must not re-issue its ids. The allocator floors recover from LIVE
+    /// files only (lazily), and the drop removes the newest file — so a fresh
+    /// process used to re-mint from 1: the dropped collection's
+    /// `accounts/{a}/{n}/{c}` root (typed id) and the dropped table's
+    /// grants-bearing object_id both came back.
+    #[tokio::test]
+    async fn dropped_typed_and_object_ids_are_not_reissued_after_restart() {
+        use crate::{Catalog, TableIdentifier};
+        let ns_key = vec!["tdp2".to_string()];
+        let (cat, dir) = catalog_in_tempdir().await;
+        cat.create_namespace_for_tenant(&ns_key, HashMap::new(), Some("tdp2_acct"))
+            .await
+            .expect("tenant namespace");
+
+        let a = cat
+            .create_table(&TableIdentifier::new(ns_key.clone(), "a"), id_schema("a"))
+            .await
+            .expect("create a");
+        let newest = cat
+            .create_table(
+                &TableIdentifier::new(ns_key.clone(), "newest"),
+                id_schema("newest"),
+            )
+            .await
+            .expect("create newest");
+        let dropped_coll = newest.stable_collection_id.expect("typed coll");
+        let dropped_object = newest.object_id.expect("object id");
+        assert!(
+            dropped_coll > a.stable_collection_id.expect("coll a"),
+            "sanity: newest holds the highest typed id"
+        );
+
+        assert!(
+            cat.drop_table(&TableIdentifier::new(ns_key.clone(), "newest"), true)
+                .await
+                .expect("drop newest")
+        );
+        drop(cat);
+
+        let reopened = reopen_same_dir(&dir).await;
+        // Typed mint sits above the DROPPED id (its storage root).
+        let (_acct, _ns, coll) = reopened
+            .mint_collection_typed_identity("tdp2_acct", "tdp2")
+            .await
+            .expect("mint after restart")
+            .expect("triple");
+        assert!(
+            coll > dropped_coll,
+            "{coll} re-issues (or precedes) the dropped collection's id {dropped_coll}"
+        );
+        // A fresh create's object_id sits above the dropped table's id.
+        let c = reopened
+            .create_table(&TableIdentifier::new(ns_key.clone(), "c"), id_schema("c"))
+            .await
+            .expect("create c after restart");
+        assert!(
+            c.object_id.expect("obj c") > dropped_object,
+            "object_id re-issues (or precedes) the dropped table's {}",
+            dropped_object
+        );
+    }
+
+    /// TD-PATH-2: drops never lower the high-water — dropping EVERY typed
+    /// table and restarting still mints above the maximum ever minted.
+    #[tokio::test]
+    async fn identity_high_water_survives_dropping_every_table() {
+        use crate::{Catalog, TableIdentifier};
+        let ns_key = vec!["tdp2b".to_string()];
+        let (cat, dir) = catalog_in_tempdir().await;
+        cat.create_namespace_for_tenant(&ns_key, HashMap::new(), Some("tdp2b_acct"))
+            .await
+            .expect("tenant namespace");
+        let first = cat
+            .create_table(&TableIdentifier::new(ns_key.clone(), "t1"), id_schema("t1"))
+            .await
+            .expect("t1");
+        let second = cat
+            .create_table(&TableIdentifier::new(ns_key.clone(), "t2"), id_schema("t2"))
+            .await
+            .expect("t2");
+        let max_coll = second.stable_collection_id.expect("coll t2");
+        assert!(max_coll > first.stable_collection_id.expect("coll t1"));
+        assert!(
+            cat.drop_table(&TableIdentifier::new(ns_key.clone(), "t1"), true)
+                .await
+                .expect("drop t1")
+        );
+        assert!(
+            cat.drop_table(&TableIdentifier::new(ns_key.clone(), "t2"), true)
+                .await
+                .expect("drop t2")
+        );
+        drop(cat);
+
+        let reopened = reopen_same_dir(&dir).await;
+        let (_acct, _ns, coll) = reopened
+            .mint_collection_typed_identity("tdp2b_acct", "tdp2b")
+            .await
+            .expect("mint after full drop")
+            .expect("triple");
+        assert!(
+            coll > max_coll,
+            "{coll} re-issues a dropped id (max ever minted {max_coll})"
+        );
+    }
+
+    /// TD-PATH-2 mixed-read: a catalog written before the sidecar existed
+    /// (sidecar deleted = old-binary write) still mints above every LIVE id
+    /// after restart — the one-time seed scan — strictly better than the
+    /// fresh-process collision the lazy floors had.
+    #[tokio::test]
+    async fn absent_identity_high_water_seeds_from_live_files() {
+        use crate::{Catalog, TableIdentifier};
+        let ns_key = vec!["tdp2c".to_string()];
+        let (cat, dir) = catalog_in_tempdir().await;
+        cat.create_namespace_for_tenant(&ns_key, HashMap::new(), Some("tdp2c_acct"))
+            .await
+            .expect("tenant namespace");
+        let live = cat
+            .create_table(
+                &TableIdentifier::new(ns_key.clone(), "keep"),
+                id_schema("keep"),
+            )
+            .await
+            .expect("keep");
+        let live_coll = live.stable_collection_id.expect("coll keep");
+        drop(cat);
+        // Simulate an old-binary write: no sidecar on disk.
+        std::fs::remove_file(dir.path().join("cat/_syscat/identity_high_water.json"))
+            .expect("sidecar present after create");
+
+        let reopened = reopen_same_dir(&dir).await;
+        let (_acct, _ns, coll) = reopened
+            .mint_collection_typed_identity("tdp2c_acct", "tdp2c")
+            .await
+            .expect("mint with seeded high-water")
+            .expect("triple");
+        assert!(
+            coll > live_coll,
+            "{coll} must sit above the live collection's {live_coll} even without a sidecar"
         );
     }
 

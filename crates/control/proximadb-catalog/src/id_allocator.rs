@@ -196,6 +196,29 @@ impl CatalogIdService {
             .fetch_max(max_existing + 1, RELAXED);
     }
 
+    /// TD-PATH-2: raise a (possibly not-yet-created) account's namespace
+    /// allocator above the durable identity high-water BEFORE minting — a
+    /// fresh process has per-account allocators at 1, so without this the
+    /// first mint after a restart could re-issue a DROPPED table's id.
+    pub fn raise_namespace_floor(&self, account_id: u32, floor: u32) {
+        // Clamp, never truncate: a foreign/corrupt sidecar value above the u16
+        // space must not silently defeat the floor.
+        let floor = u16::try_from(floor).unwrap_or(u16::MAX);
+        self.namespace_allocators
+            .entry(account_id)
+            .or_insert(AtomicU16::new(1))
+            .fetch_max(floor, RELAXED);
+    }
+
+    /// TD-PATH-2: raise a (possibly not-yet-created) `(account, namespace)`
+    /// collection allocator above the durable identity high-water.
+    pub fn raise_collection_floor(&self, account_id: u32, namespace_id: u16, floor: u32) {
+        self.collection_allocators
+            .entry((account_id, namespace_id))
+            .or_insert(AtomicU32::new(1))
+            .fetch_max(floor, RELAXED);
+    }
+
     /// Recover the segment allocator floor for `collection_id`.
     pub fn recover_segment_floor(&self, collection_id: u32, max_existing: u32) {
         self.segment_allocators
