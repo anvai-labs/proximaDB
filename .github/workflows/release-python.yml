@@ -150,7 +150,8 @@ jobs:
     needs: [version-gate]
     runs-on: ${{ matrix.os }}
     # Slowest leg governs: max 59 min green step span (`windows-2022 x86_64`),
-    # then `macos-14 aarch64` at 53 min, over 16 runs since 2026-07-06 (3-5
+    # then `macos-14 aarch64` at 53 min (pre-#2307 measurement; the leg moved to
+    # `macos-15`, unmeasured since), over 16 runs since 2026-07-06 (3-5
     # green per leg). 1.5x of 59 -> 90. Legs measured under their EXPANDED
     # names; the pre-rename `(x86_64)`/`(aarch64)` spellings in the API are the
     # same legs under the older `name:` template and are included.
