@@ -382,8 +382,18 @@ pub(super) fn parse_with_clause(input: &str) -> IResult<&str, WithClause> {
     )(input)
 }
 
-// Parse a full Cypher query with all clause types
-pub(super) fn parse_cypher_query(input: &str) -> IResult<&str, CypherQuery> {
+/// Parse a full Cypher query with all clause types.
+///
+/// `pub` as the crate's declared convergence surface (TD-GRAPH-4): the
+/// modality crate's corpus pin (and, per the TD's convergence design, the
+/// clause ports that follow) drive the grammar through this entry — never
+/// through the private combinators below, which stay `pub(super)`.
+///
+/// NOTE: this is a nom parser and does NOT require eof — `Ok((rest, _))`
+/// with a non-empty `rest` means the input was NOT fully parsed and must
+/// be treated as a rejection. Callers MUST check the remainder (the corpus
+/// pin's `rest.trim().is_empty()` assertion is the standard).
+pub fn parse_cypher_query(input: &str) -> IResult<&str, CypherQuery> {
     map(
         tuple((
             // Reading clauses (MATCH, OPTIONAL MATCH)

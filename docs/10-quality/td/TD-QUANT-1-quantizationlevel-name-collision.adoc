@@ -1,0 +1,45 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-QUANT-1: disambiguate the QuantizationLevel name collision — rename the model crate's strategy enum
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (filed 2026-11-01 by the victor clone-scan dedup program, item-9 residual — "file a rename TD, don't merge anything").**
+| Priority | P3 — no current bug; the hazard is reader confusion and import-site aliasing that grows with every new consumer of either crate.
+| Relates to | CLAUDE.md directive 19 (consolidate duplicates / same-named types in two crates is a duplicate to collapse), the 2026-10-31 dedup program item 9 (quantization crates census)
+| Component | `crates/foundation/proximadb-quantization-types` (precision ladder), `crates/foundation/proximadb-quantization-model` (strategy/config enum), and ~20 consumer files.
+| Evidence | Two same-named public enums with DIFFERENT semantics. **types crate** `QuantizationLevel`: flat precision ladder `None/Int4/Int8/UInt8/FP16/FP32`, serde lowercase, the wire/config vocabulary (proto conversion, `proximadb-search-types`). **model crate** `QuantizationLevel`: tagged strategy enum `None(NoQuantization)/Uniform/Pq/Scalar/Binary/Custom/…` each variant carrying parameter structs (bits/scale/codebook…), plus a wrapper `UnifiedQuantizationLevel { level_type: Option<QuantizationLevel> }` whose name says "level" but wraps the strategy. Import census 2026-11-01: 18 files import the model crate (excluding its own lib.rs, where the crate name appears only in a comment), 25 the types crate; dual-import sites already exist (`proximadb-vector` quantization `internal_types.rs`, engines' progressive search) and must alias to compile. ~243 `QuantizationLevel` mentions in model-importing files (largest: quantization-kernel 126, model crate 39).
+|===
+
+== The finding
+
+The item-9 census DISSOLVED most of the quantization "duplication": the model/types crate pair is a
+deliberate contract/model split (not twins), and the nova/optimizer/rl_planner enums are distinct
+concepts (engine config vs RL action space). The REAL residual hazard is the NAME: two sibling
+foundation crates export `QuantizationLevel` meaning different things, so a bare
+`QuantizationLevel` at any import site is ambiguous, dual-import sites must alias, and a future
+`use` fix can silently swap the vocabulary enum for the strategy enum (or vice versa) with no
+compile error at sites that import via re-exports.
+
+== Direction
+
+1. **Rename the MODEL crate's enum** `QuantizationLevel` → `QuantizationMethod` (it selects a
+   quantization method with parameters; "level" belongs to the types crate's precision ladder,
+   which keeps the name unchanged — it is the wire vocabulary and the larger, safer surface).
+   The wrapper `UnifiedQuantizationLevel` and its field `level_type` follow in the same rename PR
+   (`QuantizationSpec`/`method` are the natural targets) — or are explicitly deferred with a note
+   here; the enum collision is the required core.
+2. **Clean break, no deprecated alias**: a `pub use QuantizationMethod as QuantizationLevel`
+   alias would resurrect the exact collision this TD removes (both crates exporting the bare name
+   again). Pre-GA renames in this repo are clean breaks (env-gate registry precedent); fix all
+   consumer sites in the same, single-purpose PR.
+3. **Mechanical-only PR**: rename + imports, zero behavior change, no variant reordering. Gate =
+   `cargo check --workspace` + the feature lanes the census sites live behind
+   (`experimental-turboquant` gates a variant) + `cargo check -p proximadb --tests` (test-file
+   literals — the struct-field PR lesson).
+
+== Non-goals
+
+Merging the two enums (they are different concepts — precision ladder vs strategy config);
+touching the nova/rl_planner enums; any behavior or serde-representation change.
