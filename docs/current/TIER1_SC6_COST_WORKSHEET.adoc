@@ -32,6 +32,33 @@ is the COLD/balanced term; a granted collection's steady-state payload GETs
 are zero by the SC4 gate (control requests are metered separately). Bytes/q
 and p50/p99 for both arms come from the same runs.
 
+== Measured — first integrated run (2026-11-01, SIFT 1M, MinIO, release binary)
+
+link:../history/evidence/TIER1_SC6_INTEGRATED_MINIO_2026_11_01.adoc[Evidence] · n=1, directions not distributions.
+
+[cols="1,2,2",options="header"]
+|===
+| Column | Balanced | Granted (PERFORMANCE, READY-gated)
+| Cold GETs/q (payload) | 18.22 | 17.53 (independent bed; not an exact contrast)
+| Cold bytes/q | 56.93 MB | 53.09 MB
+| Cold p50 / p99 | 57.3 / 103.2 ms | 56.9 / 100.1 ms
+| Warm GETs/q (payload) — restart + store | 4.95 (best-effort, ungranted) | **0.00**
+| Warm bytes/q | 12.29 MB | **0 B**
+| Warm p50 (restart) | 70.5 ms | 65.2 ms
+| Warm fraction | n/a (no grant) | 1.0 (757.8 MB of 757.8 MB, protected, generation-gated)
+| Reservation (ledger) | — | 4 GiB Reserved, utilization 0.176, both prefixes registered, epoch-3 handoff
+| Recall@10 (all phases) | 0.9828–0.9847 | 0.9827–0.9842 (parity within 0.0005)
+|===
+
+Latency sensitivity (owned Toxiproxy, granted bed reused, identical objects):
+granted warm p50 is flat in RTT (65→256 ms over 0→100 ms; 0.00 GETs/q
+throughout) while cold scales linearly (57→376 ms) — the granted arm wins by
+32% at +100 ms; crossover between +50 and +100 ms. See the evidence doc's
+added-latency curve.
+Control-plane split and tier mix remain unfilled (next arms). Both arms missed the
+50 ms cold-p50 gate identically (57.3/56.9 ms, local conditions) — disclosed in the
+evidence doc.
+
 == Worksheet columns the SC6 release runs must fill
 
 [cols="1,3",options="header"]
