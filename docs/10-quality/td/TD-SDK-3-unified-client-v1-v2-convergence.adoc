@@ -1,0 +1,39 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SDK-3: unified_client v1/v2 convergence — port the 54-method delta onto v2, then swap the default
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (decision recorded 2026-10-31, product sign-off: keep v2 as the target, port incrementally).**
+| Priority | P2 — twin client classes are the drift disease this program exists to cure; v2 is exported but covers 38% of v1's surface, so every month both exist the gap (and the temptation to "just use v1") grows.
+| Relates to | link:TD-SDK-1-sdk-codegen-doctrine-migration.adoc[TD-SDK-1] (SDK doctrine), the 2026-10-31 victor clone-scan dedup program (wave inventory in the program notes)
+| Component | `clients/python/src/proximadb_sdk/unified_client.py` (v1, 4,938 ln, 81 public methods, the default `ProximaDBClient`), `unified_client_v2.py` (696 ln, 31 methods, exported as `ProximaDBClientV2` + `connect_embedded`), `adapters/*`, `__init__.py`.
+| Evidence | 2026-10-31 AST census: v1-only methods = 54 (graph CRUD `create_edge`/`batch_create_nodes`/…, document collections, timeseries, observability namespaces, routing rules, `aggregate_metrics`, …); v2-only = 4 (`explain_query`, `get_vectors`, `update_vector_metadata`, `adapter`). v2's sole consumers are its own tests + the `__init__` export; v1 is consumed by `cli.py` and the victor integrations. Both classes already use the protocol-adapter pattern; v2's architectural edge is the elimination of protocol-specific branching.
+|===
+
+== The finding
+
+The SDK ships two parallel "unified" clients. v2 was authored as the replacement ("eliminates
+protocol-specific branching by delegating all operations to protocol adapters") but landed
+covering only the vector core. It is public API (`ProximaDBClientV2`), so it must either be
+completed or it will drift — a smaller, subtly different twin of the main client, exactly the
+failure mode CLAUDE.md #19 forbids.
+
+== Decision (2026-10-31)
+
+Keep **v2 as the architectural target**; port the 54-method delta onto it incrementally. v1
+remains the default `ProximaDBClient` until parity + soak; the swap then happens with one
+release of deprecation warnings. Deletion of v1 is a separate, later decision.
+
+== Program
+
+1. **Batches**: port in consumer-visible batches (graph CRUD; document collections; timeseries +
+   observability; routing/metrics; remainder), each batch landing with the v1 tests mirrored onto
+   v2 plus an equivalence test (same adapter config → same wire calls).
+2. **Parity gate**: a census test asserting `set(dir(v2_public)) >= set(dir(v1_public))` turns
+   the 54-method gap into a ratchet (counts only go up).
+3. **Swap**: flip `ProximaDBClient = v2` behind the deprecation cycle; v1 exported as
+   `ProximaDBClientLegacy` for one minor release.
+4. **Ratchet**: the duplication census should drop the unified_client family counts as batches
+   land (v1 bodies replaced by delegation or deleted at swap time).
