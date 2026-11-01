@@ -710,6 +710,11 @@ class TestEmbeddedGraphCompatibility:
         engine_module.GraphNode = GraphNode
         engine_module.GraphEdge = GraphEdge
         monkeypatch.setitem(sys.modules, "proximadb", engine_module)
+        # hermetic: neutralize the canonical candidate so a real engine wheel
+        # installed in the environment cannot shadow the layout under test
+        monkeypatch.setitem(
+            sys.modules, "proximadb_embedded", types.ModuleType("proximadb_embedded")
+        )
 
         class Db:  # PyO3-style: __module__ is "builtins", NOT the engine pkg
             def create_nodes(self, graph_id, nodes):
@@ -845,6 +850,24 @@ class TestParityCensus:
         assert v1_graph_names == set(PORTED_GRAPH_METHODS), (
             f"v1 graph surface drifted: extra={v1_graph_names - set(PORTED_GRAPH_METHODS)} "
             f"missing={set(PORTED_GRAPH_METHODS) - v1_graph_names}"
+        )
+
+    def test_v2_graph_surface_equals_the_pinned_set(self):
+        """Symmetric ratchet: v2's graph-visible surface IS the pinned set —
+        a graph method added to v2 outside PORTED_GRAPH_METHODS (skipping the
+        census pin) fails here rather than drifting silently."""
+        v2_graph_names = {
+            name
+            for name in dir(ProximaDBClient)
+            if not name.startswith("_")
+            and any(
+                k in name
+                for k in ("graph", "node", "edge", "traverse", "neighbor", "vertex")
+            )
+        }
+        assert v2_graph_names == set(PORTED_GRAPH_METHODS), (
+            f"v2 graph surface drifted: extra={v2_graph_names - set(PORTED_GRAPH_METHODS)} "
+            f"missing={set(PORTED_GRAPH_METHODS) - v2_graph_names}"
         )
 
     def test_v2_does_not_invent_graph_names(self):
