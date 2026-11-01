@@ -814,7 +814,7 @@ class GrpcProtocolAdapter(BaseProtocolAdapter):
             k,
             enable_prefetch,
             prefetch_budget,
-            graph_id=graph_id,
+            graph_id=graph_id or "default",
         )
 
     # ==========================================================================

@@ -43,6 +43,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .exceptions import ProximaDBNotSupportedError
+
 
 @dataclass
 class GraphNode:
@@ -469,7 +471,7 @@ class ProximaDBGraph:
                     for err in data.get("errors", []) or []:
                         failed.append({"batch": i // batch_size, "error": err})
                     continue
-                except AttributeError:
+                except (AttributeError, ProximaDBNotSupportedError):
                     batch_method = None  # transport has no batch surface
                 except Exception as e:
                     failed_count += len(batch)
@@ -581,7 +583,7 @@ class ProximaDBGraph:
                     for err in data.get("errors", []) or []:
                         failed.append({"batch": i // batch_size, "error": err})
                     continue
-                except AttributeError:
+                except (AttributeError, ProximaDBNotSupportedError):
                     batch_method = None
                 except Exception as e:
                     failed_count += len(batch)

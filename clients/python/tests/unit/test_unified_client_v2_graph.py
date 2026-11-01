@@ -263,12 +263,56 @@ class TestGraphValidation:
 # ---------------------------------------------------------------------------
 
 
-def test_adapter_not_implemented_becomes_proximadb_error(client, mock_adapter):
+def test_adapter_not_implemented_becomes_typed_capability_error(client, mock_adapter):
+    """NotImplementedError → ProximaDBNotSupportedError (a ProximaDBError
+    subclass — one vocabulary, but recognizably a capability signal so
+    compatibility wrappers can fall back instead of failing the batch)."""
+    from proximadb_sdk.exceptions import ProximaDBNotSupportedError
+
     mock_adapter.delete_graph.side_effect = NotImplementedError(
         "RestProtocolAdapter does not support graph collection deletion"
     )
-    with pytest.raises(ProximaDBError, match="does not support delete_graph"):
+    with pytest.raises(
+        ProximaDBNotSupportedError, match="does not support delete_graph"
+    ):
         client.delete_graph("g")
+    # still the base vocabulary for generic handlers
+    try:
+        client.delete_graph("g")
+    except ProximaDBError:
+        pass
+
+
+def test_graph_py_batch_falls_back_on_typed_capability_error():
+    """Review finding 2: graph.py's per-item fallback must engage on the v2
+    typed not-supported signal exactly as it did on v1's AttributeError —
+    not record the whole batch as failed."""
+    from proximadb_sdk.exceptions import ProximaDBNotSupportedError
+    from proximadb_sdk.graph import ProximaDBGraph
+
+    created = []
+
+    class V2LikeClient:
+        def batch_create_nodes(self, nodes, graph_id=None):
+            raise ProximaDBNotSupportedError(
+                "grpc adapter does not support batch_create_nodes"
+            )
+
+        def create_node(self, graph_id, node_id, labels, properties):
+            created.append(node_id)
+            return {"success": True}
+
+    graph = ProximaDBGraph(V2LikeClient(), "social")
+    result = graph.batch_create_nodes(
+        [
+            {"id": "n1", "labels": ["P"], "properties": {}},
+            {"id": "n2", "labels": ["P"], "properties": {}},
+        ]
+    )
+    assert created == ["n1", "n2"]  # per-item fallback engaged
+    assert result["created"] == 2
+    assert result["success"] is True
+    assert result["errors"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +450,110 @@ class TestRestWireEquivalence:
         assert name == "graph_traverse"
         assert kwargs["graph_id"] == "social"
 
+    def test_analytics_normalize_none_graph_id(self, rest_adapter):
+        """Review finding 3: an explicit None must never reach the URL builder
+        as a literal (``/graphs/None/…``) on the analytics pair either."""
+        rest_adapter.graph_shortest_path("a", "b", graph_id=None)
+        _, _, kwargs = rest_adapter._recorder.calls[0]
+        assert kwargs["graph_id"] == "default"
+        rest_adapter.graph_traverse("a", graph_id=None)
+        _, _, kwargs = rest_adapter._recorder.calls[1]
+        assert kwargs["graph_id"] == "default"
+
+
+# ---------------------------------------------------------------------------
+# 4a. gRPC adapter forwarding (review finding 5 — the riskiest delegation
+# shape: shortest_path is renamed, 8 positional args, NO timeout forward)
+# ---------------------------------------------------------------------------
+
+
+class TestGrpcWireForwarding:
+    @pytest.fixture
+    def grpc_adapter(self):
+        from proximadb_sdk.adapters.grpc_adapter import GrpcProtocolAdapter
+
+        adapter = GrpcProtocolAdapter.__new__(GrpcProtocolAdapter)
+        recorder = _Recorder()
+        adapter._client = recorder
+        adapter._recorder = recorder
+        return adapter
+
+    def test_shortest_path_renamed_and_positional_without_timeout(self, grpc_adapter):
+        grpc_adapter.graph_shortest_path(
+            "a",
+            "b",
+            None,
+            ["KNOWS"],
+            "DIJKSTRA",
+            2,
+            True,
+            64,
+            timeout=9.9,
+            graph_id="social",
+        )
+        name, args, kwargs = grpc_adapter._recorder.calls[0]
+        assert name == "shortest_path"  # transport name, not the facade's
+        assert args == ("a", "b", None, ["KNOWS"], "DIJKSTRA", 2, True, 64)
+        assert kwargs == {"graph_id": "social"}  # timeout deliberately not forwarded
+
+    def test_shortest_path_normalizes_none_graph_id(self, grpc_adapter):
+        grpc_adapter.graph_shortest_path("a", "b", graph_id=None)
+        _, _, kwargs = grpc_adapter._recorder.calls[0]
+        assert kwargs == {"graph_id": "default"}
+
+    def test_crud_forwarding_shapes(self, grpc_adapter):
+        grpc_adapter.create_node("n1", ["P"], properties={"k": 1}, graph_id="g")
+        name, _, kwargs = grpc_adapter._recorder.calls[0]
+        assert (name, kwargs) == (
+            "create_node",
+            {
+                "node_id": "n1",
+                "labels": ["P"],
+                "properties": {"k": 1},
+                "embedding": None,
+                "graph_id": "g",
+            },
+        )
+        grpc_adapter.delete_node("n1")
+        name, _, kwargs = grpc_adapter._recorder.calls[1]
+        assert kwargs == {"node_id": "n1", "graph_id": "default"}
+        grpc_adapter.traverse_graph("n1", max_depth=2, algorithm="DFS")
+        name, _, kwargs = grpc_adapter._recorder.calls[2]
+        assert kwargs == {
+            "start_node_id": "n1",
+            "max_depth": 2,
+            "edge_types": None,
+            "node_labels": None,
+            "algorithm": "DFS",
+            "limit": None,
+            "graph_id": "default",
+        }
+
+    def test_unsupported_family_stays_on_base_defaults(self):
+        """The 5 graph-collection methods + tuned graph_traverse are NOT
+        implemented on the gRPC adapter — they inherit the base class's
+        NotImplementedError (documented, not papered over)."""
+        from proximadb_sdk.adapters.grpc_adapter import GrpcProtocolAdapter
+
+        adapter = GrpcProtocolAdapter.__new__(GrpcProtocolAdapter)
+        for name in (
+            "create_graph",
+            "delete_graph",
+            "get_graph",
+            "list_graphs",
+            "get_graph_stats",
+            "graph_traverse",
+        ):
+            impl = getattr(GrpcProtocolAdapter, name)
+            assert impl is getattr(
+                BaseProtocolAdapter, name
+            ), f"{name} should be inherited from BaseProtocolAdapter on gRPC"
+            with pytest.raises(NotImplementedError):
+                if name == "graph_traverse":
+                    impl(adapter, "start", graph_id="g")
+                else:
+                    impl(adapter, graph_id="g")
+
 
 # ---------------------------------------------------------------------------
 # 4b. Embedded adapter: canonical kwarg compatibility + batch degradation
@@ -437,18 +585,13 @@ class TestEmbeddedGraphCompatibility:
         assert result["success"] is True
         assert seen["args"][0] == "social"
 
-    def test_batch_degrades_without_engine_classes(self):
-        class Db:  # has the method but the module exposes no GraphNode class
-            def create_nodes(self, graph_id, nodes):
-                return len(nodes)
-
-        adapter = self._embedded_adapter(Db())
-        with pytest.raises(NotImplementedError):
-            adapter.batch_create_nodes([{"id": "n1"}], graph_id="g")
-
-    def test_batch_maps_dicts_to_engine_objects(self):
-        import sys as _sys
-        import types as _types
+    def test_batch_maps_dicts_on_real_pyo3_layout(self, monkeypatch):
+        """Regression (review finding 1): a ``#[pyclass]`` without
+        ``module = "..."`` reports ``__module__ == "builtins"`` — so class
+        resolution must go through the ENGINE PACKAGE (``proximadb``), not
+        ``type(db).__module__``. Model exactly that layout."""
+        import sys
+        import types
 
         made_nodes, made_edges = {}, {}
 
@@ -468,14 +611,12 @@ class TestEmbeddedGraphCompatibility:
             ):
                 made_edges[id] = (from_node_id, to_node_id, edge_type, weight)
 
-        # Model the real layout: the PyO3 engine exposes GraphNode/GraphEdge
-        # at MODULE level of the db object's module — not as class attributes.
-        fake_module = _types.ModuleType("fake_embedded_engine")
-        fake_module.GraphNode = GraphNode
-        fake_module.GraphEdge = GraphEdge
-        _sys.modules["fake_embedded_engine"] = fake_module
+        engine_module = types.ModuleType("proximadb")
+        engine_module.GraphNode = GraphNode
+        engine_module.GraphEdge = GraphEdge
+        monkeypatch.setitem(sys.modules, "proximadb", engine_module)
 
-        class Db:
+        class Db:  # PyO3-style: __module__ is "builtins", NOT the engine pkg
             def create_nodes(self, graph_id, nodes):
                 made_nodes["__graph__"] = graph_id
                 return len(nodes)
@@ -484,7 +625,7 @@ class TestEmbeddedGraphCompatibility:
                 made_edges["__graph__"] = graph_id
                 return len(edges)
 
-        Db.__module__ = "fake_embedded_engine"
+        Db.__module__ = "builtins"
 
         adapter = self._embedded_adapter(Db())
         result = adapter.batch_create_nodes(
@@ -504,6 +645,61 @@ class TestEmbeddedGraphCompatibility:
         )
         assert result["created_count"] == 1
         assert made_edges["__graph__"] == "social"
+
+    def test_batch_resolves_pure_python_engine_by_db_module(self, monkeypatch):
+        """Fallback path 2: a pure-Python engine that defines the classes in
+        the db object's own module resolves there (and an engine-package
+        entry without the classes does not shadow it)."""
+        import sys
+        import types
+
+        made = {}
+
+        class GraphNode:
+            def __init__(self, id, labels=None, properties=None):
+                made[id] = (labels, properties)
+
+        class GraphEdge:
+            def __init__(self, *args, **kwargs):
+                pass
+
+        # engine package present but WITHOUT the classes — must fall through
+        monkeypatch.setitem(sys.modules, "proximadb", types.ModuleType("proximadb"))
+
+        pure_module = types.ModuleType("pure_engine")
+        pure_module.GraphNode = GraphNode
+        pure_module.GraphEdge = GraphEdge
+        monkeypatch.setitem(sys.modules, "pure_engine", pure_module)
+
+        class Db:
+            def create_nodes(self, graph_id, nodes):
+                return len(nodes)
+
+        Db.__module__ = "pure_engine"
+
+        adapter = self._embedded_adapter(Db())
+        result = adapter.batch_create_nodes([{"id": "n1"}], graph_id="g")
+        assert result["created_count"] == 1
+        assert made["n1"] == (None, None)
+
+    def test_batch_degrades_without_engine_classes_anywhere(self, monkeypatch):
+        """Deterministic degradation: neither the engine package nor the db
+        module exposes the classes — regardless of whether a real ``proximadb``
+        wheel is importable in this environment."""
+        import sys
+        import types
+
+        monkeypatch.setitem(
+            sys.modules, "proximadb", types.ModuleType("proximadb")
+        )  # engine package without classes
+
+        class Db:  # db module (this test module) has no GraphNode/GraphEdge
+            def create_nodes(self, graph_id, nodes):
+                return len(nodes)
+
+        adapter = self._embedded_adapter(Db())
+        with pytest.raises(NotImplementedError):
+            adapter.batch_create_nodes([{"id": "n1"}], graph_id="g")
 
 
 # ---------------------------------------------------------------------------

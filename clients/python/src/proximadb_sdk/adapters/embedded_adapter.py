@@ -1274,21 +1274,53 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
             logger.error(f"Failed to get graph stats: {e}")
             raise
 
+    # NOTE (canonical-contract divergences, TD-SDK-3 batch 1 review): the
+    # pre-existing graph methods below predate the base-class canonical
+    # signatures and are kept kwargs-compatible rather than reordered — live
+    # callers pass the legacy spellings positionally/kwarg-wise
+    # (agentic_io.py ``from_node=``, embedded cov tests pass ``edge_type``
+    # as the 2nd positional). Call them with KEYWORDS per the canonical
+    # names (``from_node_id``/``to_node_id`` are popped from kwargs). Known
+    # engine limitations, documented rather than faked: the engine's
+    # ``traverse_graph`` has no ``algorithm``/``node_labels`` params (a DFS
+    # request runs BFS), ``create_graph`` ignores ``name``/``description``/
+    # ``schema``, and ``create_node`` ignores ``embedding``. Canonicalizing
+    # these belongs to the v1→v2 swap batch (TD-SDK-3 step 3) together with
+    # the agentic_io migration.
     def _engine_graph_classes(self) -> tuple[type, type] | None:
-        """Resolve ``(GraphNode, GraphEdge)`` from the engine's own module.
+        """Resolve ``(GraphNode, GraphEdge)`` from the engine package.
 
-        The PyO3 engine (``proximadb``) exposes both constructors at module
-        level; a pure-Python engine that does not yields ``None`` and the
-        batch methods degrade to the base class's NotImplementedError.
+        Resolution order:
+
+        1. The engine package this adapter itself imports (``proximadb``) —
+           the PyO3 classes are registered there. This is the only reliable
+           path for PyO3 classes: a ``#[pyclass]`` without ``module = "..."``
+           reports ``__module__ == "builtins"``, so deriving the module from
+           ``type(self._db)`` silently misses and the batch surface would be
+           dead-on-arrival despite the engine implementing it.
+        2. The db object's own module — correct for pure-Python engines that
+           define the classes next to the db class.
+
+        ``None`` → the batch methods degrade to the base class's
+        NotImplementedError (graph.py then falls back to per-item creates).
         """
+        import importlib
         import sys
 
-        module = sys.modules.get(type(self._db).__module__)
-        node_cls = getattr(module, "GraphNode", None)
-        edge_cls = getattr(module, "GraphEdge", None)
-        if node_cls is None or edge_cls is None:
-            return None
-        return node_cls, edge_cls
+        candidates: list[str] = ["proximadb"]
+        db_module = type(self._db).__module__
+        if db_module and db_module not in ("builtins", "proximadb"):
+            candidates.append(db_module)
+        for name in candidates:
+            try:
+                module = sys.modules.get(name) or importlib.import_module(name)
+            except Exception:
+                continue
+            node_cls = getattr(module, "GraphNode", None)
+            edge_cls = getattr(module, "GraphEdge", None)
+            if node_cls is not None and edge_cls is not None:
+                return node_cls, edge_cls
+        return None
 
     def batch_create_nodes(
         self, nodes: list[dict[str, Any]], graph_id: str | None = None, **kwargs

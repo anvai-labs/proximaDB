@@ -18,7 +18,7 @@ import numpy as np
 
 from .adapters import BaseProtocolAdapter, create_adapter
 from .config import ClientConfig, Protocol, load_config
-from .exceptions import ProximaDBError
+from .exceptions import ProximaDBError, ProximaDBNotSupportedError
 from .models import (
     BatchResult,
     Collection,
@@ -641,16 +641,26 @@ class ProximaDBClient:
     # Thin delegations: the facade validates protocol-independent inputs and
     # the adapter owns everything wire-shaped (``graph_id=None`` → the
     # server's "default" graph is normalized adapter-side). Adapter
-    # NotImplementedError surfaces as ProximaDBError so callers see one error
-    # vocabulary across the graph namespace.
+    # NotImplementedError surfaces as ProximaDBNotSupportedError (a typed
+    # capability signal — a ProximaDBError subclass — so callers see one
+    # error vocabulary while compatibility wrappers can still detect the
+    # fallback condition).
     # ==========================================================================
 
     def _graph_call(self, method: str, *args, **kwargs) -> Any:
-        """Delegate a graph op to the adapter, normalizing the error surface."""
+        """Delegate a graph op to the adapter, normalizing the error surface.
+
+        Adapter ``NotImplementedError`` (transport lacks the operation)
+        becomes :class:`ProximaDBNotSupportedError` — a typed capability
+        signal, still a ``ProximaDBError`` for generic handlers, but
+        recognizable by compatibility wrappers (``graph.py`` batch helpers)
+        so they can fall back to per-item operations exactly as they did on
+        the v1-era ``AttributeError`` instead of failing the whole batch.
+        """
         try:
             return getattr(self._adapter, method)(*args, **kwargs)
         except NotImplementedError as e:
-            raise ProximaDBError(
+            raise ProximaDBNotSupportedError(
                 f"{self._adapter.protocol_name} adapter does not support "
                 f"{method}: {e}"
             ) from e

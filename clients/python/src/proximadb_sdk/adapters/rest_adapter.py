@@ -1169,7 +1169,7 @@ class RestProtocolAdapter(BaseProtocolAdapter):
             enable_prefetch,
             prefetch_budget,
             timeout=timeout,
-            graph_id=graph_id,
+            graph_id=graph_id or "default",
         )
 
     def graph_traverse(
@@ -1204,7 +1204,7 @@ class RestProtocolAdapter(BaseProtocolAdapter):
             enable_prefetch,
             prefetch_budget,
             timeout=timeout,
-            graph_id=graph_id,
+            graph_id=graph_id or "default",
         )
 
     # ==========================================================================
