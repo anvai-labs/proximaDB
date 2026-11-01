@@ -2054,6 +2054,7 @@ mod kmeans_seed_gate_tests {
 #[cfg(test)]
 mod ncomp_floor_tests {
     use super::{IVF_NCOMP_FLOOR_CEILING, parse_ncomp_floor, projection_dims_with_floor};
+    use serial_test::serial;
 
     /// The three geometries the width study measured. With the floor disabled
     /// the policy must reproduce the widths those beds actually ran at, or every
@@ -2207,6 +2208,7 @@ mod shared_model_tests {
     use super::*;
     use proximadb_records::EmbeddingCell;
     use proximadb_storage_common::centroid_directory::SharedCellSpace;
+    use serial_test::serial;
     use std::sync::Arc;
 
     fn rows(n: usize, shift: f32) -> Vec<ProximaRecord> {
