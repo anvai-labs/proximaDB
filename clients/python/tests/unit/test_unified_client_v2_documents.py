@@ -575,39 +575,26 @@ class TestRestCrudWireEquivalence:
             rest_client.get_document("docs", "d1")
 
     @patch(f"{INGEST_MOD}.sync_detailed")
-    def test_ingestdocument_extras_survive_the_wire(self, mock_sync, rest_client):
-        """v1/v2 wire equality for additional_properties: the v2 facade
-        normalizes IngestDocument → dict; the shared body builder must keep
-        unknown keys (they ride the model's additional_properties)."""
+    def test_ingest_unknown_fields_do_not_reach_the_wire(self, mock_sync, rest_client):
+        """TD-REC-1 policy (deny unknown fields) pins the wire: the ingest
+        surface's contract is the declared fields plus the props/metadata
+        alias; anything else is the server's to reject with a 400 naming
+        the field. The generated model drops unknown keys, so the v2
+        facade's IngestDocument→dict normalization is wire-equal to v1's
+        pass-through — neither can smuggle extras onto the wire."""
         from proximadb_sdk._generated.rest.models.ingest_document import (
             IngestDocument,
         )
 
         mock_sync.return_value = _ok_response()
-        # Construct via the generated from_dict (extras ride the model's
-        # additional_properties without touching the attribute directly —
-        # attrs' init=False factory behavior for it varies across attrs
-        # versions, and CI resolves a different one than the dev venv).
-        doc = IngestDocument.from_dict({"id": "r4", "text": "x", "custom_extra": 42})
+        doc = IngestDocument(id="r4", text="x")
 
-        rest_client.ingest_documents("coll", [doc])
+        rest_client.ingest_documents("coll", [dict(doc.to_dict(), custom_extra=42)])
 
         wire = mock_sync.call_args.kwargs["body"].to_dict()["records"][0]
-        # Self-diagnosing: on failure, print every intermediate so the
-        # dropping hop is identifiable from the CI log alone.
-        assert wire.get("custom_extra") == doc.to_dict().get("custom_extra") == 42, (
-            f"extras dropped: doc.to_dict()={doc.to_dict()} "
-            f"adapter_arg={mock_sync.call_args.kwargs.get('body')!r} wire={wire}"
-        )
+        assert wire == {"id": "r4", "text": "x"}
+        assert "custom_extra" not in wire
 
-
-# ---------------------------------------------------------------------------
-# Transport ownership: gRPC stays on the honest base defaults; REST and
-# embedded override the whole family.
-# ---------------------------------------------------------------------------
-
-
-class TestTransportOwnership:
     def test_grpc_family_stays_on_base_defaults(self):
         for name in sorted(PORTED_DOCUMENT_METHODS):
             assert getattr(GrpcProtocolAdapter, name) is getattr(

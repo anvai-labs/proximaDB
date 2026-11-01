@@ -64,10 +64,14 @@ def build_ingest_request_body(
             body_records.append(rec)
             continue
         # Build through from_dict: it maps the known fields (converting
-        # ``metadata`` dicts) AND carries unknown keys into the model's
-        # ``additional_properties`` — so a rebuilt record (the v2 facade
-        # normalizes ``IngestDocument``→dict before delegating) is
-        # wire-equal to one passed straight through (the v1 path).
+        # ``metadata`` dicts). Unknown keys are DROPPED here by design —
+        # the ingest surface denies unknown fields (TD-REC-1 policy,
+        # additionalProperties:false in the spec): the contract is the
+        # declared fields plus the props/metadata alias, and the server
+        # rejects anything else with a 400 naming the field. A rebuilt
+        # record (the v2 facade normalizes ``IngestDocument``→dict before
+        # delegating) is therefore wire-equal to one passed straight
+        # through (the v1 path).
         item: dict[str, Any] = {"id": str(rec["id"])}
         if "text" in rec:
             item["text"] = rec["text"]
@@ -75,13 +79,6 @@ def build_ingest_request_body(
             item["vector"] = rec["vector"]
         if rec.get("metadata") is not None:
             item["metadata"] = rec["metadata"]
-        item.update(
-            {
-                k: v
-                for k, v in rec.items()
-                if k not in ("id", "text", "vector", "metadata")
-            }
-        )
         body_records.append(IngestDocument.from_dict(item))
     return IngestDocumentsRequest(records=body_records)
 
