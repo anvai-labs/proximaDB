@@ -16,6 +16,10 @@ from typing import Any
 
 import numpy as np
 
+from ._document_ingest import (
+    insert_records_locally,
+    validate_ingest_records,
+)
 from ._graph_validation import (
     validate_create_edge_args,
     validate_create_node_args,
@@ -79,6 +83,7 @@ class ProximaDBClient:
         self.config = config
         self._protocol = Protocol(protocol) if isinstance(protocol, str) else protocol
         self._adapter: BaseProtocolAdapter | None = None
+        self._document_repository = None
         self._url = url
         self._data_dir = data_dir
         self._timeout = timeout
@@ -652,8 +657,8 @@ class ProximaDBClient:
     # fallback condition).
     # ==========================================================================
 
-    def _graph_call(self, method: str, *args, **kwargs) -> Any:
-        """Delegate a graph op to the adapter, normalizing the error surface.
+    def _adapter_call(self, method: str, *args, **kwargs) -> Any:
+        """Delegate an op to the adapter, normalizing the error surface.
 
         Adapter ``NotImplementedError`` (transport lacks the operation)
         becomes :class:`ProximaDBNotSupportedError` — a typed capability
@@ -689,7 +694,7 @@ class ProximaDBClient:
         """
         validate_create_node_args(node_id, labels, properties, embedding)
 
-        return self._graph_call(
+        return self._adapter_call(
             "create_node",
             node_id=node_id,
             labels=labels,
@@ -724,7 +729,7 @@ class ProximaDBClient:
             edge_id, from_node_id, to_node_id, edge_type, properties, weight
         )
 
-        return self._graph_call(
+        return self._adapter_call(
             "create_edge",
             edge_id=edge_id,
             from_node_id=from_node_id,
@@ -739,19 +744,19 @@ class ProximaDBClient:
         self, nodes: list[dict[str, Any]], graph_id: str | None = None
     ) -> dict[str, Any]:
         """Create many nodes in one request (admissions per server engine)."""
-        return self._graph_call("batch_create_nodes", nodes=nodes, graph_id=graph_id)
+        return self._adapter_call("batch_create_nodes", nodes=nodes, graph_id=graph_id)
 
     def batch_create_edges(
         self, edges: list[dict[str, Any]], graph_id: str | None = None
     ) -> dict[str, Any]:
         """Create many edges in one request with per-edge admission."""
-        return self._graph_call("batch_create_edges", edges=edges, graph_id=graph_id)
+        return self._adapter_call("batch_create_edges", edges=edges, graph_id=graph_id)
 
     def get_node(
         self, node_id: str, graph_id: str | None = None
     ) -> dict[str, Any] | None:
         """Get a graph node by ID (``None`` when absent)."""
-        return self._graph_call("get_node", node_id=node_id, graph_id=graph_id)
+        return self._adapter_call("get_node", node_id=node_id, graph_id=graph_id)
 
     def get_outgoing_edges(
         self,
@@ -760,7 +765,7 @@ class ProximaDBClient:
         graph_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Get a node's outgoing edges."""
-        return self._graph_call(
+        return self._adapter_call(
             "get_outgoing_edges",
             node_id=node_id,
             edge_types=edge_types,
@@ -774,7 +779,7 @@ class ProximaDBClient:
         graph_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Get a node's incoming edges."""
-        return self._graph_call(
+        return self._adapter_call(
             "get_incoming_edges",
             node_id=node_id,
             edge_types=edge_types,
@@ -783,7 +788,9 @@ class ProximaDBClient:
 
     def delete_node(self, node_id: str, graph_id: str | None = None) -> bool:
         """Delete a graph node by ID."""
-        return bool(self._graph_call("delete_node", node_id=node_id, graph_id=graph_id))
+        return bool(
+            self._adapter_call("delete_node", node_id=node_id, graph_id=graph_id)
+        )
 
     def query_nodes(
         self,
@@ -794,7 +801,7 @@ class ProximaDBClient:
         graph_id: str | None = None,
     ) -> dict[str, Any]:
         """Query nodes by labels and properties."""
-        return self._graph_call(
+        return self._adapter_call(
             "query_nodes",
             labels=labels,
             properties=properties,
@@ -830,7 +837,7 @@ class ProximaDBClient:
             start_node_id, max_depth, edge_types, node_labels, algorithm, limit
         )
 
-        return self._graph_call(
+        return self._adapter_call(
             "traverse_graph",
             start_node_id=start_node_id,
             max_depth=max_depth,
@@ -849,7 +856,7 @@ class ProximaDBClient:
         schema: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Create a graph collection."""
-        return self._graph_call(
+        return self._adapter_call(
             "create_graph",
             graph_id=graph_id,
             name=name,
@@ -859,19 +866,19 @@ class ProximaDBClient:
 
     def delete_graph(self, graph_id: str) -> dict[str, Any]:
         """Delete a graph collection."""
-        return self._graph_call("delete_graph", graph_id=graph_id)
+        return self._adapter_call("delete_graph", graph_id=graph_id)
 
     def get_graph(self, graph_id: str) -> dict[str, Any]:
         """Get graph-collection metadata."""
-        return self._graph_call("get_graph", graph_id=graph_id)
+        return self._adapter_call("get_graph", graph_id=graph_id)
 
     def list_graphs(self) -> dict[str, Any]:
         """List all graph collections."""
-        return self._graph_call("list_graphs")
+        return self._adapter_call("list_graphs")
 
     def get_graph_stats(self, graph_id: str) -> dict[str, Any]:
         """Get statistics (node/edge counts, …) for a graph collection."""
-        return self._graph_call("get_graph_stats", graph_id=graph_id)
+        return self._adapter_call("get_graph_stats", graph_id=graph_id)
 
     def graph_shortest_path(
         self,
@@ -891,7 +898,7 @@ class ProximaDBClient:
         ``graph_id`` names the graph (TD-SDKDOC-1: dropping it silently ran
         every call on ``default``).
         """
-        return self._graph_call(
+        return self._adapter_call(
             "graph_shortest_path",
             start_node_id,
             target_node_id,
@@ -925,7 +932,7 @@ class ProximaDBClient:
         has accepted it since TD-SDKDOC-1; v1 dropped it, running every tuned
         traversal on ``default``.
         """
-        return self._graph_call(
+        return self._adapter_call(
             "graph_traverse",
             start_node_id,
             max_depth,
@@ -938,6 +945,170 @@ class ProximaDBClient:
             prefetch_budget,
             timeout=timeout,
             graph_id=graph_id,
+        )
+
+    # ==========================================================================
+    # Document Collections Operations (TD-SDK-3 batch 2 — the document family,
+    # ported from the v1 unified client onto the adapter protocol)
+    #
+    # Thin delegations: the facade validates protocol-independent inputs
+    # (ingest records) and the adapter owns everything wire-shaped. Adapter
+    # NotImplementedError surfaces as ProximaDBNotSupportedError. Unlike v1's
+    # wrappers there is NO silent in-memory fallback on adapter errors — a
+    # server-backed client surfaces failures; local mode is the embedded
+    # adapter, or the caller-opted ``allow_local_fallback`` on ingest.
+    #
+    # REST error semantics (spec-driven ops, one vocabulary): transport
+    # failures raise NetworkError, server rejections raise ServerError,
+    # 404 maps to the not-found contract (get_document → None, deletes →
+    # False). The previous rest_adapter code never issued a request at all
+    # (it called a nonexistent protocol-client attribute and swallowed the
+    # AttributeError into None/False/[]) — fixed in this batch.
+    # ==========================================================================
+
+    def _get_document_repository(self):
+        """Lazily build the in-memory repository (caller-opted local mode)."""
+        if self._document_repository is None:
+            from .document import DocumentRepository
+
+            self._document_repository = DocumentRepository(client=self)
+        return self._document_repository
+
+    def create_document_collection(
+        self, name: str, config: dict[str, Any] | None = None, **kwargs
+    ) -> dict[str, Any]:
+        """Create a document collection."""
+        return self._adapter_call("create_document_collection", name, config, **kwargs)
+
+    def ingest_documents(
+        self,
+        collection_id: str,
+        records: list[dict[str, Any]],
+        *,
+        tenant_id: str | None = None,
+        ingest_mode: str | None = None,
+        embed_source: str = "native",
+        allow_local_fallback: bool = False,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Ingest documents for native server-side embedding (ADR-041).
+
+        Records are validated protocol-independently (each is a ``dict`` with
+        at least ``id``, optionally ``text``/``metadata``/``vector``;
+        ``IngestDocument`` records are normalized to plain dicts at the
+        facade — adapters receive dicts), then the wire is the adapter's:
+        REST runs the shared ``_document_ingest`` generated-op protocol (the
+        same one v1's canonical path uses — per-call
+        ``X-Embed-Source``/``X-Tenant-ID``/``X-Ingest-Mode`` headers, no
+        accumulation), embedded uses the engine's insert path.
+
+        Args:
+            collection_id: Target collection id.
+            records: Ergonomic record dicts (or ``IngestDocument``s).
+            tenant_id: Optional tenant scope -> ``X-Tenant-ID``.
+            ingest_mode: Optional billing/metering mode -> ``X-Ingest-Mode``.
+            embed_source: Embedding source -> ``X-Embed-Source`` (default
+                ``"native"``). Pass ``""`` or ``None`` to omit the header.
+            allow_local_fallback: If ``True`` and the adapter lacks the
+                ingest capability (typed ``ProximaDBNotSupportedError``, e.g.
+                the gRPC transport), store the records in the in-memory
+                ``DocumentRepository`` instead of raising. Default ``False`` —
+                a server-backed client must surface failures. Transport and
+                server errors (``NetworkError``/``ServerError``) always
+                propagate.
+
+        Returns:
+            The parsed ``IngestDocumentsResponse`` as a dict; ``{"mode":
+            "local", ...}`` on the opted-in fallback path.
+
+        Raises:
+            ProximaDBError: A record is malformed, or the adapter lacks the
+                capability and ``allow_local_fallback`` is False.
+            ProximaDBNotSupportedError: The adapter transport has no ingest
+                path (without fallback).
+            NetworkError: Transport-level failure talking to the server.
+            ServerError: The server returned a documented error envelope or
+                an unexpected status.
+        """
+        validate_ingest_records(records)
+        # Facade contract: adapters receive plain dicts. ``IngestDocument``
+        # records (accepted for signature parity with v1) are normalized
+        # here — the embedded adapter (and any future one) must not have to
+        # know the generated model.
+        records = [rec if isinstance(rec, dict) else rec.to_dict() for rec in records]
+        try:
+            return self._adapter_call(
+                "ingest_documents",
+                collection_id,
+                records,
+                tenant_id=tenant_id,
+                ingest_mode=ingest_mode,
+                embed_source=embed_source,
+                **kwargs,
+            )
+        except ProximaDBNotSupportedError:
+            if not allow_local_fallback:
+                raise
+            return insert_records_locally(
+                self._get_document_repository(), collection_id, records
+            )
+
+    def get_document(
+        self,
+        collection_name: str,
+        doc_id: str,
+        projection: list[str] | None = None,
+        **kwargs,
+    ) -> dict[str, Any] | None:
+        """Get a document by ID."""
+        return self._adapter_call(
+            "get_document", collection_name, doc_id, projection, **kwargs
+        )
+
+    def query_documents(
+        self,
+        collection_name: str,
+        filter: dict[str, Any] | None = None,
+        projection: list[str] | None = None,
+        limit: int = 100,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Query documents."""
+        return self._adapter_call(
+            "query_documents",
+            collection_name,
+            filter=filter,
+            projection=projection,
+            limit=limit,
+            **kwargs,
+        )
+
+    def update_document(
+        self,
+        collection_name: str,
+        doc_id: str,
+        updates: list[dict[str, Any]],
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Update a document."""
+        return self._adapter_call(
+            "update_document", collection_name, doc_id, updates, **kwargs
+        )
+
+    def delete_document(self, collection_name: str, doc_id: str, **kwargs) -> bool:
+        """Delete a document."""
+        return bool(
+            self._adapter_call("delete_document", collection_name, doc_id, **kwargs)
+        )
+
+    def list_document_collections(self, **kwargs) -> list[dict[str, Any]]:
+        """List document collections."""
+        return self._adapter_call("list_document_collections", **kwargs)
+
+    def delete_document_collection(self, collection_name: str, **kwargs) -> bool:
+        """Delete a document collection."""
+        return bool(
+            self._adapter_call("delete_document_collection", collection_name, **kwargs)
         )
 
     # ==========================================================================

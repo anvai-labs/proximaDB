@@ -12,6 +12,8 @@ import logging
 import time
 from typing import Any
 
+import httpx
+
 from ..models import (
     BatchResult,
     Collection,
@@ -68,6 +70,7 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         self._client = ProximaDBClient(config=config)
         self._url = url
         self._connected = True
+        self._generated_document_client = None
 
     @property
     def protocol_name(self) -> str:
@@ -645,24 +648,128 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
 
     # ==========================================================================
     # Document Operations
+    #
+    # The whole family runs the SPEC-DRIVEN generated openapi ops
+    # (``_generated/rest/api/documents/*``) through the adapter's shared
+    # generated client — one URL/auth/TLS/timeout source (the resolved
+    # config) and one outcome vocabulary (``_document_ingest``). The
+    # previous hand-rolled ``self._client._session.*`` calls could never
+    # execute: the protocol client has no ``_session`` attribute, so every
+    # call raised AttributeError before any I/O — masked upstream by v1's
+    # broad-except local fallback (and by these methods' own try/except
+    # returning None/False/[]).
     # ==========================================================================
+
+    def _generated_document_client_kwargs(self) -> dict[str, Any]:
+        """Construction kwargs for a generated document client, from ONE
+        source of truth: the resolved ``config`` the protocol session uses
+        — its URL, auth headers (``get_base_headers``), TLS material, and
+        timeouts — never the constructor ``url`` kwarg, which can diverge
+        when the caller passes ``config=`` explicitly or the URL comes from
+        the environment (auth for one host must not be sent to another).
+        Mirrors the protocol session's httpx construction (timeouts, pool
+        limits, client cert, UDS transport, HTTP/2).
+        """
+        from .._generated.rest.client import Client as GeneratedClient  # noqa: F401
+
+        cfg = self._client.config
+        timeout = httpx.Timeout(
+            connect=cfg.connection.connect_timeout,
+            read=cfg.connection.read_timeout,
+            write=cfg.timeout,
+            pool=cfg.connection.total_timeout,
+        )
+        limits = httpx.Limits(
+            max_keepalive_connections=cfg.connection.pool_size,
+            max_connections=cfg.connection.pool_maxsize,
+            keepalive_expiry=cfg.connection.keepalive_timeout,
+        )
+        uds_path = getattr(cfg, "uds_path", None)
+        if uds_path:
+            # Portless embedded mode (same rationale as the protocol
+            # session): connect through the Unix-domain socket; TLS and
+            # HTTP/2 do not apply once a transport is supplied.
+            httpx_args: dict[str, Any] = {
+                "transport": httpx.HTTPTransport(uds=uds_path, limits=limits),
+            }
+        else:
+            httpx_args = {
+                "limits": limits,
+                "http2": cfg.enable_http2,
+            }
+            if cfg.tls.cert_file:
+                httpx_args["cert"] = (cfg.tls.cert_file, cfg.tls.key_file)
+
+        return {
+            "base_url": cfg.url,
+            "headers": cfg.get_base_headers(),
+            "timeout": timeout,
+            "verify_ssl": cfg.tls.verify,
+            "httpx_args": httpx_args,
+            "raise_on_unexpected_status": True,
+            "follow_redirects": False,
+        }
+
+    def _get_generated_document_client(self):
+        """The adapter's shared generated openapi client (the document CRUD
+        ops — which carry no per-call headers). Built lazily from
+        :meth:`_generated_document_client_kwargs`; ``close()`` releases and
+        resets it. Never call ``with_headers`` on it: the generated
+        ``with_headers`` mutates a materialized httpx pool's headers IN
+        PLACE, which would permanently bleed per-call headers (e.g.
+        ``X-Tenant-ID``) onto every later request — a tenancy-isolation
+        defect. Per-call headers use
+        :meth:`_fresh_generated_document_client` instead.
+        """
+        if self._generated_document_client is None:
+            from .._generated.rest.client import Client as GeneratedClient
+
+            self._generated_document_client = GeneratedClient(
+                **self._generated_document_client_kwargs()
+            )
+        return self._generated_document_client
+
+    def _fresh_generated_document_client(self, extra_headers: dict[str, str]):
+        """A FRESH generated client for a single call carrying per-call
+        headers (``X-Tenant-ID`` / ``X-Ingest-Mode`` / ``X-Embed-Source``).
+
+        Built from the same config snapshot, with the per-call headers
+        merged into the base headers at construction — the shared client
+        is never touched, so headers cannot bleed between calls (same
+        per-call-pool shape as v1's canonical ingest path).
+        """
+        from .._generated.rest.client import Client as GeneratedClient
+
+        kwargs = self._generated_document_client_kwargs()
+        kwargs["headers"] = {**kwargs["headers"], **extra_headers}
+        return GeneratedClient(**kwargs)
 
     def create_document_collection(
         self, name: str, config: dict[str, Any] | None = None, **kwargs
     ) -> dict[str, Any]:
-        """Create a document collection via REST."""
-        try:
+        """Create a document collection (spec-driven op)."""
+        from .._document_ingest import execute_document_op
+        from .._generated.rest.api.documents.create_document_collection import (
+            sync_detailed,
+        )
+        from .._generated.rest.models.create_document_collection_request import (
+            CreateDocumentCollectionRequest,
+        )
 
-            response = self._client._session.post(
-                f"{self._url}/api/v2/document-collections",
-                json={"name": name, **(config or {})},
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"Failed to create document collection: {e}")
-            raise
+        # The positional ``name`` is authoritative — a config dict keyed
+        # "name" must not silently override it.
+        body = CreateDocumentCollectionRequest.from_dict(
+            {
+                "name": name,
+                **{k: v for k, v in (config or {}).items() if k != "name"},
+            }
+        )
+        return execute_document_op(
+            "create_document_collection",
+            lambda: sync_detailed(
+                client=self._get_generated_document_client(), body=body
+            ),
+        )
 
     def ingest_documents(
         self,
@@ -676,17 +783,26 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
     ) -> dict[str, Any]:
         """Ingest documents via the canonical generated client (ADR-041).
 
-        Targets the **collections** vector-store document surface with server-side
-        embedding. For the separate JSON **document-collections** surface (no
-        embedding) see :meth:`insert_document`.
+        Targets the **collections** vector-store document surface with
+        server-side embedding. For the separate JSON **document-collections**
+        surface (no embedding) see :meth:`insert_document`.
+
+        The wire protocol — record validation, per-call header shaping, and
+        outcome mapping — is the shared ``_document_ingest`` module (the same
+        one the v1 client's canonical path uses), so the adapter path and the
+        client path cannot drift.
         """
-        return self._client.ingest_documents(
-            collection_id,
-            records,
-            tenant_id=tenant_id,
-            ingest_mode=ingest_mode,
-            embed_source=embed_source,
-            **kwargs,
+        from .._document_ingest import (
+            build_ingest_request_body,
+            execute_ingest_documents,
+            ingest_per_call_headers,
+        )
+
+        client = self._fresh_generated_document_client(
+            ingest_per_call_headers(tenant_id, ingest_mode, embed_source)
+        )
+        return execute_ingest_documents(
+            client, collection_id, build_ingest_request_body(records)
         )
 
     def insert_document(
@@ -699,24 +815,27 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         """Insert a JSON document into a document-collection (spec-driven, ADR-041).
 
         Targets the **document-collections** surface
-        (`POST /api/v2/document-collections/{c}/documents`) via the GENERATED client
-        op — pure JSON storage, no server-side embedding. For semantic content with
-        embedding use :meth:`ingest_documents` (the collections vector store).
+        (`POST /api/v2/document-collections/{c}/documents`) via the GENERATED
+        client op — pure JSON storage, no server-side embedding. For semantic
+        content with embedding use :meth:`ingest_documents` (the collections
+        vector store). One outcome vocabulary with the rest of the family:
+        transport → ``NetworkError``, documented errors and undocumented
+        statuses → ``ServerError`` (the op documents 200/400/500).
         """
+        from .._document_ingest import execute_document_op
         from .._generated.rest.api.documents.insert_document import sync_detailed
-        from .._generated.rest.client import Client as GeneratedClient
         from .._generated.rest.models.doc_insert_request import DocInsertRequest
 
         # Wave-9 typed the previously free-form request body
         # (InsertDocumentBody) into DocInsertRequest {id?, document}.
         body = DocInsertRequest.from_dict({"id": id, "document": document})
-        client = GeneratedClient(base_url=self._url, raise_on_unexpected_status=False)
-        response = sync_detailed(collection=collection_name, client=client, body=body)
-        if response.status_code in (200, 201, 202):
-            return response.parsed.to_dict() if response.parsed is not None else {}
-        raise RuntimeError(
-            f"insert_document (document-collections) failed {response.status_code}: "
-            f"{response.content!r}"
+        return execute_document_op(
+            "insert_document",
+            lambda: sync_detailed(
+                collection=collection_name,
+                client=self._get_generated_document_client(),
+                body=body,
+            ),
         )
 
     def get_document(
@@ -726,24 +845,22 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         projection: list[str] | None = None,
         **kwargs,
     ) -> dict[str, Any] | None:
-        """Get a document by ID via REST."""
-        try:
+        """Get a document by ID (spec-driven op; 404 → ``None``)."""
+        from .._document_ingest import execute_document_op
+        from .._generated.rest.api.documents.get_document import sync_detailed
+        from .._generated.rest.types import UNSET
 
-            params = {}
-            if projection:
-                params["projection"] = ",".join(projection)
-            response = self._client._session.get(
-                f"{self._url}/api/v2/document-collections/{collection_name}/documents/{doc_id}",
-                params=params,
-                timeout=self._client._timeout,
-            )
-            if response.status_code == 404:
-                return None
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.debug(f"Document not found: {doc_id} - {e}")
-            return None
+        projection_csv = ",".join(projection) if projection else UNSET
+        return execute_document_op(
+            "get_document",
+            lambda: sync_detailed(
+                collection=collection_name,
+                id=doc_id,
+                client=self._get_generated_document_client(),
+                projection=projection_csv,
+            ),
+            not_found=None,
+        )
 
     def query_documents(
         self,
@@ -753,86 +870,93 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         limit: int = 100,
         **kwargs,
     ) -> dict[str, Any]:
-        """Query documents with filter via REST."""
-        try:
+        """Query documents with filter (spec-driven op; filter → JSON param)."""
+        import json as _json
 
-            body = {}
-            if filter:
-                body["filter"] = filter
-            if projection:
-                body["projection"] = projection
-            body["limit"] = limit
-            response = self._client._session.post(
-                f"{self._url}/api/v2/document-collections/{collection_name}/documents",
-                json=body,
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"Failed to query documents: {e}")
-            raise
+        from .._document_ingest import execute_document_op
+        from .._generated.rest.api.documents.query_documents import sync_detailed
+        from .._generated.rest.types import UNSET
+
+        return execute_document_op(
+            "query_documents",
+            lambda: sync_detailed(
+                collection=collection_name,
+                client=self._get_generated_document_client(),
+                filter_=_json.dumps(filter) if filter is not None else UNSET,
+                projection=",".join(projection) if projection else UNSET,
+                limit=limit if limit is not None else UNSET,
+            ),
+        )
 
     def update_document(
         self, collection_name: str, doc_id: str, updates: list[dict[str, Any]], **kwargs
     ) -> dict[str, Any]:
-        """Update a document via REST."""
-        try:
+        """Update a document (spec-driven op)."""
+        from .._document_ingest import execute_document_op
+        from .._generated.rest.api.documents.update_document import sync_detailed
+        from .._generated.rest.models.doc_update_request import DocUpdateRequest
 
-            response = self._client._session.put(
-                f"{self._url}/api/v2/document-collections/{collection_name}/documents/{doc_id}",
-                json={"updates": updates},
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"Failed to update document: {e}")
-            raise
+        body = DocUpdateRequest.from_dict({"updates": updates})
+        return execute_document_op(
+            "update_document",
+            lambda: sync_detailed(
+                collection=collection_name,
+                id=doc_id,
+                client=self._get_generated_document_client(),
+                body=body,
+            ),
+        )
 
     def delete_document(self, collection_name: str, doc_id: str, **kwargs) -> bool:
-        """Delete a document via REST."""
-        try:
+        """Delete a document (spec-driven op; 404 → ``False``)."""
+        from .._document_ingest import execute_document_op
+        from .._generated.rest.api.documents.delete_document import sync_detailed
 
-            response = self._client._session.delete(
-                f"{self._url}/api/v2/document-collections/{collection_name}/documents/{doc_id}",
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            result = response.json()
-            return result.get("deleted", False)
-        except Exception as e:
-            logger.error(f"Failed to delete document: {e}")
-            return False
+        result = execute_document_op(
+            "delete_document",
+            lambda: sync_detailed(
+                collection=collection_name,
+                id=doc_id,
+                client=self._get_generated_document_client(),
+            ),
+            # Ack-shaped so the uniform ``result["success"]`` flow works on
+            # both the parsed and the 404 paths.
+            not_found={"success": False},
+        )
+        return bool(result.get("success", False))
 
     def list_document_collections(self, **kwargs) -> list[dict[str, Any]]:
-        """List all document collections via REST."""
-        try:
+        """List all document collections (spec-driven op)."""
+        from .._document_ingest import execute_document_op
+        from .._generated.rest.api.documents.list_document_collections import (
+            sync_detailed,
+        )
 
-            response = self._client._session.get(
-                f"{self._url}/api/v2/document-collections",
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            return response.json().get("collections", [])
-        except Exception as e:
-            logger.error(f"Failed to list document collections: {e}")
-            return []
+        result = execute_document_op(
+            "list_document_collections",
+            lambda: sync_detailed(client=self._get_generated_document_client()),
+        )
+        collections = result.get("collections", [])
+        return collections if isinstance(collections, list) else []
 
     def delete_document_collection(self, collection_name: str, **kwargs) -> bool:
-        """Delete a document collection via REST."""
-        try:
+        """Delete a document collection (spec-driven op; 404 → ``False``)."""
+        from .._document_ingest import execute_document_op
+        from .._generated.rest.api.documents.delete_document_collection import (
+            sync_detailed,
+        )
 
-            response = self._client._session.delete(
-                f"{self._url}/api/v2/document-collections/{collection_name}",
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            result = response.json()
-            return result.get("success", False)
-        except Exception as e:
-            logger.error(f"Failed to delete document collection: {e}")
-            return False
+        result = execute_document_op(
+            "delete_document_collection",
+            lambda: sync_detailed(
+                collection=collection_name,
+                client=self._get_generated_document_client(),
+            ),
+            # Ack-shaped so the uniform ``result["success"]`` flow works on
+            # both the parsed and the 404 paths.
+            not_found={"success": False},
+        )
+        return bool(result.get("success", False))
 
     # ==========================================================================
     # Hybrid Search Operations
@@ -1080,4 +1204,15 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         """Close the REST client connection."""
         if hasattr(self._client, "close"):
             self._client.close()
+        # The shared generated document client's httpx pool is only
+        # materialized once an op ran; close it so adapters don't leak a
+        # connection pool until GC.
+        if self._generated_document_client is not None:
+            try:
+                self._generated_document_client.get_httpx_client().close()
+            except Exception as e:  # closing is best-effort
+                logger.debug(f"Could not close generated document client: {e}")
+            # Reset so a later op builds a fresh client instead of hitting
+            # httpx's raw use-after-close RuntimeError.
+            self._generated_document_client = None
         self._connected = False
