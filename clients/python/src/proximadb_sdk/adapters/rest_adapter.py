@@ -68,6 +68,7 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         self._client = ProximaDBClient(config=config)
         self._url = url
         self._connected = True
+        self._generated_document_client = None
 
     @property
     def protocol_name(self) -> str:
@@ -664,6 +665,28 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
             logger.error(f"Failed to create document collection: {e}")
             raise
 
+    def _get_generated_document_client(self):
+        """Lazily build the adapter's shared base generated openapi ``Client``.
+
+        Carries ``base_url`` + the resolved config's auth headers (the same
+        ``get_base_headers`` the protocol session uses, so auth is not dropped
+        at the adapter boundary); it is never used to issue a request
+        directly. Per-call headers (``X-Tenant-ID`` / ``X-Ingest-Mode`` /
+        ``X-Embed-Source``) are attached per :meth:`ingest_documents` call via
+        ``Client.with_headers(...)`` — a fresh ``evolve(...)`` client each
+        time, so per-call headers never accumulate on this shared base.
+        """
+        if self._generated_document_client is None:
+            from .._generated.rest.client import Client as GeneratedClient
+
+            self._generated_document_client = GeneratedClient(
+                base_url=self._url,
+                headers=self._client.config.get_base_headers(),
+                raise_on_unexpected_status=True,
+                follow_redirects=False,
+            )
+        return self._generated_document_client
+
     def ingest_documents(
         self,
         collection_id: str,
@@ -676,17 +699,26 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
     ) -> dict[str, Any]:
         """Ingest documents via the canonical generated client (ADR-041).
 
-        Targets the **collections** vector-store document surface with server-side
-        embedding. For the separate JSON **document-collections** surface (no
-        embedding) see :meth:`insert_document`.
+        Targets the **collections** vector-store document surface with
+        server-side embedding. For the separate JSON **document-collections**
+        surface (no embedding) see :meth:`insert_document`.
+
+        The wire protocol — record validation, per-call header shaping, and
+        outcome mapping — is the shared ``_document_ingest`` module (the same
+        one the v1 client's canonical path uses), so the adapter path and the
+        client path cannot drift.
         """
-        return self._client.ingest_documents(
-            collection_id,
-            records,
-            tenant_id=tenant_id,
-            ingest_mode=ingest_mode,
-            embed_source=embed_source,
-            **kwargs,
+        from .._document_ingest import (
+            build_ingest_request_body,
+            execute_ingest_documents,
+            ingest_per_call_headers,
+        )
+
+        client = self._get_generated_document_client().with_headers(
+            ingest_per_call_headers(tenant_id, ingest_mode, embed_source)
+        )
+        return execute_ingest_documents(
+            client, collection_id, build_ingest_request_body(records)
         )
 
     def insert_document(

@@ -2008,44 +2008,15 @@ class ProximaDBClient:
             ServerError: The server returned a documented error envelope
                 (HTTP 400/404) or an unexpected status.
         """
-        from ._generated.rest.api.documents.ingest_documents import sync_detailed
-        from ._generated.rest.models.error_response import ErrorResponse
-        from ._generated.rest.models.ingest_document import IngestDocument
-        from ._generated.rest.models.ingest_document_metadata import (
-            IngestDocumentMetadata,
+        from ._document_ingest import (
+            build_ingest_request_body,
+            execute_ingest_documents,
+            ingest_per_call_headers,
+            insert_records_locally,
         )
-        from ._generated.rest.models.ingest_documents_request import (
-            IngestDocumentsRequest,
-        )
-        from ._generated.rest.types import UNSET
 
-        # 1. Build the request body from ergonomic record dicts.
-        body_records: list[IngestDocument] = []
-        for rec in records:
-            if isinstance(rec, IngestDocument):
-                body_records.append(rec)
-                continue
-            if not isinstance(rec, dict):
-                raise ProximaDBError(
-                    "ingest_documents record must be a dict or IngestDocument, "
-                    f"got {type(rec).__name__}"
-                )
-            if "id" not in rec:
-                raise ProximaDBError("ingest_documents record missing 'id'")
-            metadata = rec.get("metadata")
-            body_records.append(
-                IngestDocument(
-                    id=str(rec["id"]),
-                    text=rec.get("text", UNSET),
-                    vector=rec.get("vector", UNSET),
-                    metadata=(
-                        IngestDocumentMetadata.from_dict(metadata)
-                        if metadata is not None
-                        else UNSET
-                    ),
-                )
-            )
-        request_body = IngestDocumentsRequest(records=body_records)
+        # 1. Build the request body from ergonomic record dicts (validates).
+        request_body = build_ingest_request_body(records)
 
         # 2. Resolve the generated client. No server -> caller-controlled fallback.
         base_client = self._get_generated_document_client()
@@ -2056,59 +2027,16 @@ class ProximaDBClient:
                     "configured). Set allow_local_fallback=True to store records "
                     "in the in-memory repository."
                 )
-            repo = self._get_document_repository()
-            inserted = []
-            for rec in records:
-                doc = rec if isinstance(rec, dict) else rec.to_dict()
-                doc_id = rec.get("id") if isinstance(rec, dict) else rec.id
-                inserted.append(repo.insert(collection_id, doc, doc_id))
-            return {
-                "mode": "local",
-                "records": [
-                    {
-                        "id": getattr(d, "id", None),
-                        "version": getattr(d, "version", None),
-                    }
-                    for d in inserted
-                ],
-            }
-
-        # 3. Per-call headers on a fresh evolved client (no accumulation).
-        per_call_headers: dict[str, str] = {}
-        if embed_source:
-            per_call_headers["X-Embed-Source"] = embed_source
-        if tenant_id is not None:
-            per_call_headers["X-Tenant-ID"] = str(tenant_id)
-        if ingest_mode is not None:
-            per_call_headers["X-Ingest-Mode"] = str(ingest_mode)
-        client = base_client.with_headers(per_call_headers)
-
-        # 4. Call the generated op and map outcomes.
-        try:
-            response = sync_detailed(
-                collection_id=collection_id, client=client, body=request_body
+            return insert_records_locally(
+                self._get_document_repository(), collection_id, records
             )
-        except httpx.HTTPError as e:
-            raise NetworkError(
-                f"ingest_documents transport error: {e}", original_error=e
-            ) from e
 
-        parsed = response.parsed
-        if isinstance(parsed, ErrorResponse):
-            detail = getattr(getattr(parsed, "error", None), "message", None)
-            raise ServerError(
-                "ingest_documents rejected by server"
-                f"{f': {detail}' if detail else ''}",
-                status_code=response.status_code,
-            )
-        if parsed is None:
-            # raise_on_unexpected_status=True makes this unreachable in practice;
-            # guard anyway so a future regression can't silently return None.
-            raise ServerError(
-                "ingest_documents returned no body",
-                status_code=response.status_code,
-            )
-        return parsed.to_dict()
+        # 3. Per-call headers on a fresh evolved client (no accumulation), then
+        # 4. call the generated op and map outcomes (shared ADR-041 protocol).
+        client = base_client.with_headers(
+            ingest_per_call_headers(tenant_id, ingest_mode, embed_source)
+        )
+        return execute_ingest_documents(client, collection_id, request_body)
 
     def get_document(
         self,
