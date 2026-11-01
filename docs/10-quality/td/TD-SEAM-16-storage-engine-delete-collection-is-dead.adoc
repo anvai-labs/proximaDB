@@ -1,0 +1,48 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-SEAM-16: `StorageEngine::delete_collection` is dead code that looks like a DROP path — wire it or delete it
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (filed 2026-11-01).** Surfaced by the TD-SSTCLEAN-1 triage + adversarial review (PR #2338): the function and its whole cleanup branch are unreachable in production, and nothing on the record said so until now.
+| Priority | **Medium.** No production bug today (the real DROP path is correct), but this is a trap: a reader (human or agent) reasonably assumes `StorageEngine::delete_collection` performs storage cleanup on DROP, and its `sst_storages`-gated branch invites someone to "fix" the registry without noticing the production path never comes here.
+| Component | `src/storage/engine.rs` (`delete_collection`, ~1134) and the `sst_storages` registry it gates on; adjacent: `cleanup_collection_files` (`src/storage/engines/sst/collections.rs`).
+| Relates to | TD-163 (whose RCA documents the never-populated `sst_storages` registry), TD-SSTCLEAN-1 (whose review established the reachability facts)
+| Blocked by | Nothing.
+|===
+
+== The facts (established 2026-11-01, PR #2338 review)
+
+1. `StorageEngine::delete_collection` has exactly one repo-wide caller: a unit
+   test (`src/storage/tests/storage_engine_simple_tests.rs`) that asserts
+   `Ok(false)`. No REST/gRPC/pgwire/Flight surface reaches it. The production
+   DROP path is `CollectionManager::delete_collection` →
+   `cleanup_storage_directories` (`src/services/collection/manager.rs`), which
+   recursively removes both the legacy `{base}/{uuid}` and typed
+   `{base}/accounts/{a}/{n}/{c}` roots.
+2. Even if called, its cleanup branch is gated on
+   `self.sst_storages.contains_key(collection_id)`; `sst_storages` is
+   initialized empty and never populated anywhere in the tree (TD-163's
+   registry), so the function would return `Ok(false)` before any cleanup.
+3. The cleanup it would have performed had the registry been populated was
+   itself broken until PR #2338 (TD-SSTCLEAN-1: never-assigned `unified_fs()`,
+   root listing, basename deletes) — i.e. the trap was armed twice over.
+
+== Decision needed
+
+Either:
+
+* **Wire it** — make the engine-level path real (populate `sst_storages` or
+  replace the registry lookup, carry typed identity through the resolver seam
+  per TD-SSTCLEAN-1's residual (a), and route some surface through it) — only
+  if a caller actually needs engine-level cleanup; or
+
+* **Delete it** — remove `delete_collection`'s cleanup branch and the
+  `sst_storages` registry (with TD-163's registry), keeping
+  `cleanup_collection_files` only if another caller appears, and leaving DROP
+  storage cleanup solely to `CollectionManager` where it already correctly
+  handles both roots.
+
+Until one is chosen, this records that the path is dead — the misleading
+appearance of a cleanup route is the debt.

@@ -2,8 +2,84 @@
 mod tests {
     use crate::storage::engines::sst::{SstConfig, SstEngine};
     use crate::storage::persistence::filesystem::FilesystemFactory;
+    use crate::storage::trait_components::path_resolver::ConfigFallbackResolver;
     use proximadb_distance_kernel::engine::UnifiedDistanceCompute;
     use std::sync::Arc;
+
+    /// TD-SSTCLEAN-1: DROP COLLECTION's SST cleanup must delete exactly the
+    /// dropped collection's segment files and leave every other collection's
+    /// files untouched. The unfixed code listed the filesystem ROOT and deleted
+    /// by bare basename, so it never reached the collection's own files (a
+    /// silent leak) and was one flat layout away from deleting another
+    /// collection's files. This test pins the isolation property both ways:
+    /// the dropped collection's files are gone AND the surviving collection's
+    /// files are all still present.
+    #[tokio::test]
+    async fn cleanup_collection_files_deletes_only_the_dropped_collection() {
+        let base = tempfile::tempdir().expect("unique tempdir");
+        let root = base.path().to_path_buf();
+
+        let mut fs_config = crate::storage::persistence::filesystem::FilesystemConfig::default();
+        fs_config.local = Some(
+            crate::storage::persistence::filesystem::local::LocalConfig {
+                root_dir: Some(root.clone()),
+                ..Default::default()
+            },
+        );
+        let filesystem = Arc::new(FilesystemFactory::create(fs_config).await.unwrap());
+        let distance_compute = Arc::new(UnifiedDistanceCompute::default());
+        let engine = SstEngine::new_with_config(SstConfig::default(), filesystem, distance_compute)
+            .await
+            .unwrap()
+            .with_path_resolver(Arc::new(ConfigFallbackResolver::new(format!(
+                "file://{}",
+                root.display()
+            ))));
+
+        // Plant segment files for two collections under each one's `…/data`
+        // prefix — the extensions the readers recognize (.sst/.proximablock/
+        // .pax, plus .arrow for ArrowBlock-configured collections) and the
+        // ancillary .bloom/.meta/.idx this cleanup has always claimed to
+        // remove.
+        let segment_files = [
+            "L0_20261031T000000_aa00.sst",
+            "L0_20261031T000000_aa00.bloom",
+            "L0_20261031T000000_aa00.meta",
+            "L0_20261031T000000_aa00.idx",
+            "L00_20261031T000001_bb11.pax",
+            "L00_20261031T000002_cc22.arrow",
+        ];
+        for collection in ["dropped_collection", "surviving_collection"] {
+            let data_dir = root.join(collection).join("data");
+            std::fs::create_dir_all(&data_dir).unwrap();
+            for file in segment_files {
+                std::fs::write(data_dir.join(file), b"payload").unwrap();
+            }
+        }
+
+        engine
+            .cleanup_collection_files("dropped_collection")
+            .await
+            .unwrap();
+
+        // The dropped collection's segment files are gone.
+        let dropped_dir = root.join("dropped_collection").join("data");
+        for file in segment_files {
+            assert!(
+                !dropped_dir.join(file).exists(),
+                "dropped collection's {file} must be deleted"
+            );
+        }
+
+        // The surviving collection's files are ALL still present.
+        let surviving_dir = root.join("surviving_collection").join("data");
+        for file in segment_files {
+            assert!(
+                surviving_dir.join(file).exists(),
+                "surviving collection's {file} must NOT be deleted by dropping another collection"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_collection_stats() {
