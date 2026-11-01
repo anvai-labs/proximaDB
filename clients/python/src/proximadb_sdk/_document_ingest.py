@@ -178,7 +178,8 @@ def map_document_response(
     and status), ``UnexpectedStatus`` → :class:`ServerError`, no body →
     :class:`ServerError`; success → the parsed model as a dict. A 404
     maps to ``not_found`` when the caller configured one (``get`` →
-    ``None``, deletes → ``False``) — the established not-found contracts.
+    ``None``; the deletes pass an ack-shaped ``{"success": False}`` and
+    surface ``False``) — the established not-found contracts.
     """
     parsed = response.parsed
     if isinstance(parsed, ErrorResponse):

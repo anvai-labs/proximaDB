@@ -986,6 +986,91 @@ def test_insert_document_errors_are_in_vocabulary(doc_adapter):
             doc_adapter.insert_document("docs", {"title": "x"})
 
 
+def test_ingest_per_call_headers_never_bleed_onto_the_shared_pool(doc_adapter):
+    """Round-4 MAJOR regression gate: the generated ``with_headers``
+    mutates a MATERIALIZED httpx pool's headers in place — attaching
+    per-call ingest headers to the shared base permanently bled a stale
+    ``X-Tenant-ID`` onto every later document request. Per-call clients
+    are now built fresh from the config snapshot; the shared pool must
+    stay untouched no matter the call ordering."""
+    from unittest.mock import patch
+
+    import httpx
+
+    from proximadb_sdk._generated.rest.api.documents.ingest_documents import (
+        sync_detailed as ingest_sync,
+    )
+    from proximadb_sdk._generated.rest.models.ingest_documents_response import (
+        IngestDocumentsResponse,
+    )
+    from proximadb_sdk._generated.rest.models.ingested_record import IngestedRecord
+    from proximadb_sdk._generated.rest.types import Response
+
+    # Materialize the shared base's httpx pool FIRST (a CRUD op does this).
+    base = doc_adapter._get_generated_document_client()
+    base_http = base.get_httpx_client()
+    assert isinstance(base_http, httpx.Client)
+
+    ok = Response(
+        status_code=200,
+        content=b"{}",
+        headers={},
+        parsed=IngestDocumentsResponse(
+            mode="native", records=[IngestedRecord(dim=4, id="r1")]
+        ),
+    )
+    with patch(
+        "proximadb_sdk._generated.rest.api.documents.ingest_documents.sync_detailed",
+        return_value=ok,
+    ) as mock_sync:
+        doc_adapter.ingest_documents("coll", [{"id": "r1"}], tenant_id="TENANT-A")
+        doc_adapter.ingest_documents("coll", [{"id": "r2"}], tenant_id="TENANT-B")
+
+    # Each call carried its OWN tenant header on a fresh client...
+    c1 = mock_sync.call_args_list[0].kwargs["client"]
+    c2 = mock_sync.call_args_list[1].kwargs["client"]
+    assert c1._headers["X-Tenant-ID"] == "TENANT-A"
+    assert c2._headers["X-Tenant-ID"] == "TENANT-B"
+    assert c1 is not c2 and c1 is not base
+
+    # ...and the shared pool never saw ANY per-call header (httpx headers
+    # are case-insensitive — this is exactly where the old code bled).
+    assert "x-tenant-id" not in base_http.headers
+    assert "x-embed-source" not in base_http.headers
+    assert "x-ingest-mode" not in base_http.headers
+
+
+def test_ops_after_close_rebuild_the_client(doc_adapter):
+    """close() resets the shared-client cache, so a later document op
+    builds a fresh client instead of hitting httpx's raw use-after-close
+    RuntimeError outside the error vocabulary."""
+    from unittest.mock import patch
+
+    from proximadb_sdk._generated.rest.models.doc_collection_list_response import (
+        DocCollectionListResponse,
+    )
+
+    op = (
+        "proximadb_sdk._generated.rest.api.documents"
+        ".list_document_collections.sync_detailed"
+    )
+    with patch(op) as mock_op:
+        mock_op.return_value = _doc_resp(
+            DocCollectionListResponse.from_dict({"collections": []})
+        )
+        doc_adapter.list_document_collections()
+    first = doc_adapter._get_generated_document_client()
+
+    doc_adapter.close()
+    with patch(op) as mock_op:
+        mock_op.return_value = _doc_resp(
+            DocCollectionListResponse.from_dict({"collections": []})
+        )
+        assert doc_adapter.list_document_collections() == []
+    rebuilt = doc_adapter._get_generated_document_client()
+    assert rebuilt is not first
+
+
 def test_close_releases_the_shared_generated_client(doc_adapter):
     from unittest.mock import patch
 

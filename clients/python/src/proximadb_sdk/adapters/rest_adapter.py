@@ -660,63 +660,89 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
     # returning None/False/[]).
     # ==========================================================================
 
-    def _get_generated_document_client(self):
-        """Lazily build the adapter's shared base generated openapi ``Client``.
+    def _generated_document_client_kwargs(self) -> dict[str, Any]:
+        """Construction kwargs for a generated document client, from ONE
+        source of truth: the resolved ``config`` the protocol session uses
+        — its URL, auth headers (``get_base_headers``), TLS material, and
+        timeouts — never the constructor ``url`` kwarg, which can diverge
+        when the caller passes ``config=`` explicitly or the URL comes from
+        the environment (auth for one host must not be sent to another).
+        Mirrors the protocol session's httpx construction (timeouts, pool
+        limits, client cert, UDS transport, HTTP/2).
+        """
+        from .._generated.rest.client import Client as GeneratedClient  # noqa: F401
 
-        ONE source of truth: the resolved ``config`` the protocol session
-        uses — its URL, auth headers (``get_base_headers``), TLS material,
-        and timeouts — never the constructor ``url`` kwarg, which can
-        diverge when the caller passes ``config=`` explicitly or the URL
-        comes from the environment (auth for one host must not be sent to
-        another). Mirrors the protocol session's httpx construction
-        (timeouts, pool limits, client cert, UDS transport, HTTP/2). The
-        base client is never used to issue a request directly; per-call
-        headers (``X-Tenant-ID`` / ``X-Ingest-Mode`` / ``X-Embed-Source``)
-        are attached per :meth:`ingest_documents` call via
-        ``Client.with_headers(...)`` — a fresh ``evolve(...)`` client each
-        time, so per-call headers never accumulate on this shared base.
+        cfg = self._client.config
+        timeout = httpx.Timeout(
+            connect=cfg.connection.connect_timeout,
+            read=cfg.connection.read_timeout,
+            write=cfg.timeout,
+            pool=cfg.connection.total_timeout,
+        )
+        limits = httpx.Limits(
+            max_keepalive_connections=cfg.connection.pool_size,
+            max_connections=cfg.connection.pool_maxsize,
+            keepalive_expiry=cfg.connection.keepalive_timeout,
+        )
+        uds_path = getattr(cfg, "uds_path", None)
+        if uds_path:
+            # Portless embedded mode (same rationale as the protocol
+            # session): connect through the Unix-domain socket; TLS and
+            # HTTP/2 do not apply once a transport is supplied.
+            httpx_args: dict[str, Any] = {
+                "transport": httpx.HTTPTransport(uds=uds_path, limits=limits),
+            }
+        else:
+            httpx_args = {
+                "limits": limits,
+                "http2": cfg.enable_http2,
+            }
+            if cfg.tls.cert_file:
+                httpx_args["cert"] = (cfg.tls.cert_file, cfg.tls.key_file)
+
+        return {
+            "base_url": cfg.url,
+            "headers": cfg.get_base_headers(),
+            "timeout": timeout,
+            "verify_ssl": cfg.tls.verify,
+            "httpx_args": httpx_args,
+            "raise_on_unexpected_status": True,
+            "follow_redirects": False,
+        }
+
+    def _get_generated_document_client(self):
+        """The adapter's shared generated openapi client (the document CRUD
+        ops — which carry no per-call headers). Built lazily from
+        :meth:`_generated_document_client_kwargs`; ``close()`` releases and
+        resets it. Never call ``with_headers`` on it: the generated
+        ``with_headers`` mutates a materialized httpx pool's headers IN
+        PLACE, which would permanently bleed per-call headers (e.g.
+        ``X-Tenant-ID``) onto every later request — a tenancy-isolation
+        defect. Per-call headers use
+        :meth:`_fresh_generated_document_client` instead.
         """
         if self._generated_document_client is None:
             from .._generated.rest.client import Client as GeneratedClient
 
-            cfg = self._client.config
-            timeout = httpx.Timeout(
-                connect=cfg.connection.connect_timeout,
-                read=cfg.connection.read_timeout,
-                write=cfg.timeout,
-                pool=cfg.connection.total_timeout,
-            )
-            limits = httpx.Limits(
-                max_keepalive_connections=cfg.connection.pool_size,
-                max_connections=cfg.connection.pool_maxsize,
-                keepalive_expiry=cfg.connection.keepalive_timeout,
-            )
-            uds_path = getattr(cfg, "uds_path", None)
-            if uds_path:
-                # Portless embedded mode (same rationale as the protocol
-                # session): connect through the Unix-domain socket; TLS and
-                # HTTP/2 do not apply once a transport is supplied.
-                httpx_args: dict[str, Any] = {
-                    "transport": httpx.HTTPTransport(uds=uds_path, limits=limits),
-                }
-            else:
-                httpx_args = {
-                    "limits": limits,
-                    "http2": cfg.enable_http2,
-                }
-                if cfg.tls.cert_file:
-                    httpx_args["cert"] = (cfg.tls.cert_file, cfg.tls.key_file)
-
             self._generated_document_client = GeneratedClient(
-                base_url=cfg.url,
-                headers=cfg.get_base_headers(),
-                timeout=timeout,
-                verify_ssl=cfg.tls.verify,
-                httpx_args=httpx_args,
-                raise_on_unexpected_status=True,
-                follow_redirects=False,
+                **self._generated_document_client_kwargs()
             )
         return self._generated_document_client
+
+    def _fresh_generated_document_client(self, extra_headers: dict[str, str]):
+        """A FRESH generated client for a single call carrying per-call
+        headers (``X-Tenant-ID`` / ``X-Ingest-Mode`` / ``X-Embed-Source``).
+
+        Built from the same config snapshot, with the per-call headers
+        merged into the base headers at construction — the shared client
+        is never touched, so headers cannot bleed between calls (same
+        per-call-pool shape as v1's canonical ingest path).
+        """
+        from .._generated.rest.client import Client as GeneratedClient
+
+        kwargs = self._generated_document_client_kwargs()
+        kwargs["headers"] = {**kwargs["headers"], **extra_headers}
+        return GeneratedClient(**kwargs)
 
     def create_document_collection(
         self, name: str, config: dict[str, Any] | None = None, **kwargs
@@ -772,7 +798,7 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
             ingest_per_call_headers,
         )
 
-        client = self._get_generated_document_client().with_headers(
+        client = self._fresh_generated_document_client(
             ingest_per_call_headers(tenant_id, ingest_mode, embed_source)
         )
         return execute_ingest_documents(
@@ -1186,4 +1212,7 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
                 self._generated_document_client.get_httpx_client().close()
             except Exception as e:  # closing is best-effort
                 logger.debug(f"Could not close generated document client: {e}")
+            # Reset so a later op builds a fresh client instead of hitting
+            # httpx's raw use-after-close RuntimeError.
+            self._generated_document_client = None
         self._connected = False
