@@ -585,6 +585,101 @@ class TestEmbeddedGraphCompatibility:
         assert result["success"] is True
         assert seen["args"][0] == "social"
 
+    def _make_engine_classes(self):
+        made_nodes, made_edges = {}, {}
+
+        class GraphNode:
+            def __init__(self, id, labels=None, properties=None):
+                made_nodes[id] = (labels, properties)
+
+        class GraphEdge:
+            def __init__(
+                self,
+                from_node_id,
+                to_node_id,
+                edge_type,
+                id=None,
+                weight=None,
+                properties=None,
+            ):
+                made_edges[id] = (from_node_id, to_node_id, edge_type, weight)
+
+        return GraphNode, GraphEdge, made_nodes, made_edges
+
+    class _EngineDb:
+        """PyO3-style db: ``__module__ == "builtins"`` (pyclass without
+        ``module = "..."``) and the module-level batch methods."""
+
+        def __init__(self, made_nodes, made_edges):
+            self._made_nodes = made_nodes
+            self._made_edges = made_edges
+
+        def create_nodes(self, graph_id, nodes):
+            self._made_nodes["__graph__"] = graph_id
+            return len(nodes)
+
+        def create_edges(self, graph_id, edges):
+            self._made_edges["__graph__"] = graph_id
+            return len(edges)
+
+    def test_batch_maps_dicts_on_canonical_wheel_layout(self, monkeypatch):
+        """Regression (review round 2, residual HIGH): the canonical
+        ``proximadb_embedded`` wheel re-exports GraphNode/GraphEdge while its
+        ``proximadb`` compat shim does NOT — and the db class still reports
+        ``__module__ == "builtins"``. Resolution must find the classes via
+        ``proximadb_embedded`` (the adapter's primary engine import)."""
+        import sys
+        import types
+
+        GraphNode, GraphEdge, made_nodes, made_edges = self._make_engine_classes()
+        canonical = types.ModuleType("proximadb_embedded")
+        canonical.GraphNode = GraphNode
+        canonical.GraphEdge = GraphEdge
+        monkeypatch.setitem(sys.modules, "proximadb_embedded", canonical)
+        # the wheel's compat shim: present, but WITHOUT the graph classes
+        monkeypatch.setitem(sys.modules, "proximadb", types.ModuleType("proximadb"))
+
+        db = self._EngineDb(made_nodes, made_edges)
+        db.__class__.__module__ = "builtins"
+
+        adapter = self._embedded_adapter(db)
+        result = adapter.batch_create_nodes(
+            [{"id": "n1", "labels": ["P"], "properties": {"k": 1}}], graph_id="social"
+        )
+        assert result["created_count"] == 1
+        assert made_nodes["n1"] == (["P"], {"k": 1})
+        assert made_nodes["__graph__"] == "social"
+
+        result = adapter.batch_create_edges(
+            [{"from_node_id": "a", "to_node_id": "b", "edge_type": "KNOWS"}],
+            graph_id="social",
+        )
+        assert result["created_count"] == 1
+        assert made_edges["__graph__"] == "social"
+
+    def test_batch_maps_dicts_on_legacy_engine_layout(self, monkeypatch):
+        """Legacy layout: the raw top-level ``proximadb`` module carries the
+        classes (pre-wheel installs). Also proves a ``proximadb_embedded``
+        module WITHOUT the classes does not shadow the legacy fallback."""
+        import sys
+        import types
+
+        GraphNode, GraphEdge, made_nodes, made_edges = self._make_engine_classes()
+        monkeypatch.setitem(
+            sys.modules, "proximadb_embedded", types.ModuleType("proximadb_embedded")
+        )
+        legacy = types.ModuleType("proximadb")
+        legacy.GraphNode = GraphNode
+        legacy.GraphEdge = GraphEdge
+        monkeypatch.setitem(sys.modules, "proximadb", legacy)
+
+        db = self._EngineDb(made_nodes, made_edges)
+        db.__class__.__module__ = "builtins"
+
+        adapter = self._embedded_adapter(db)
+        result = adapter.batch_create_nodes([{"id": "n1"}], graph_id="g")
+        assert result["created_count"] == 1
+
     def test_batch_maps_dicts_on_real_pyo3_layout(self, monkeypatch):
         """Regression (review finding 1): a ``#[pyclass]`` without
         ``module = "..."`` reports ``__module__ == "builtins"`` — so class
@@ -663,8 +758,12 @@ class TestEmbeddedGraphCompatibility:
             def __init__(self, *args, **kwargs):
                 pass
 
-        # engine package present but WITHOUT the classes — must fall through
+        # both engine packages present but WITHOUT the classes — must fall
+        # through to the db module
         monkeypatch.setitem(sys.modules, "proximadb", types.ModuleType("proximadb"))
+        monkeypatch.setitem(
+            sys.modules, "proximadb_embedded", types.ModuleType("proximadb_embedded")
+        )
 
         pure_module = types.ModuleType("pure_engine")
         pure_module.GraphNode = GraphNode
@@ -691,7 +790,10 @@ class TestEmbeddedGraphCompatibility:
 
         monkeypatch.setitem(
             sys.modules, "proximadb", types.ModuleType("proximadb")
-        )  # engine package without classes
+        )  # engine packages without classes
+        monkeypatch.setitem(
+            sys.modules, "proximadb_embedded", types.ModuleType("proximadb_embedded")
+        )
 
         class Db:  # db module (this test module) has no GraphNode/GraphEdge
             def create_nodes(self, graph_id, nodes):

@@ -1290,16 +1290,19 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
     def _engine_graph_classes(self) -> tuple[type, type] | None:
         """Resolve ``(GraphNode, GraphEdge)`` from the engine package.
 
-        Resolution order:
+        Resolution order mirrors the adapter's own engine import:
 
-        1. The engine package this adapter itself imports (``proximadb``) —
-           the PyO3 classes are registered there. This is the only reliable
-           path for PyO3 classes: a ``#[pyclass]`` without ``module = "..."``
-           reports ``__module__ == "builtins"``, so deriving the module from
-           ``type(self._db)`` silently misses and the batch surface would be
-           dead-on-arrival despite the engine implementing it.
-        2. The db object's own module — correct for pure-Python engines that
-           define the classes next to the db class.
+        1. ``proximadb_embedded`` — the CANONICAL wheel module (the adapter
+           imports it first at connect time) and the one that re-exports
+           GraphNode/GraphEdge in its ``__init__``.
+        2. ``proximadb`` — the legacy top-level engine module (also shipped
+           as a compat shim by the wheel, but WITHOUT the graph classes; it
+           resolves here only for the raw legacy layout).
+        3. The db object's own module — for pure-Python engines that co-locate
+           the classes with the db class. This is the ONLY path that could
+           work for PyO3 classes derived from ``type(db).__module__``, and it
+           never fires there: a ``#[pyclass]`` without ``module = "..."``
+           reports ``__module__ == "builtins"``, which is skipped.
 
         ``None`` → the batch methods degrade to the base class's
         NotImplementedError (graph.py then falls back to per-item creates).
@@ -1307,9 +1310,9 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
         import importlib
         import sys
 
-        candidates: list[str] = ["proximadb"]
+        candidates = ["proximadb_embedded", "proximadb"]
         db_module = type(self._db).__module__
-        if db_module and db_module not in ("builtins", "proximadb"):
+        if db_module and db_module != "builtins" and db_module not in candidates:
             candidates.append(db_module)
         for name in candidates:
             try:
