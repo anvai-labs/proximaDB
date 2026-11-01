@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 
 from ._generated.rest.api.documents import ingest_documents as _ingest_op
+from ._generated.rest.errors import UnexpectedStatus
 from ._generated.rest.models.error_response import ErrorResponse
 from ._generated.rest.models.ingest_document import IngestDocument
 from ._generated.rest.models.ingest_document_metadata import (
@@ -151,6 +152,14 @@ def execute_ingest_documents(
     except httpx.HTTPError as e:
         raise NetworkError(
             f"ingest_documents transport error: {e}", original_error=e
+        ) from e
+    except UnexpectedStatus as e:
+        # raise_on_unexpected_status=True raises BEFORE the response is
+        # returned, so undocumented statuses (e.g. HTTP 500) map to
+        # ServerError here — the generated exception never escapes the SDK.
+        raise ServerError(
+            f"ingest_documents unexpected status: {e.status_code}",
+            status_code=e.status_code,
         ) from e
 
     parsed = response.parsed

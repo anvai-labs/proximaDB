@@ -25,8 +25,9 @@ from proximadb_sdk.config import Protocol
 from proximadb_sdk.exceptions import NetworkError, ProximaDBError, ServerError
 from proximadb_sdk.unified_client import ProximaDBClient
 
-# The lazy `from ... import sync_detailed` inside ingest_documents re-reads this
-# attribute at call time, so patching the module attribute is what the method sees.
+# The shared _document_ingest protocol resolves sync_detailed as a module
+# attribute at call time, so patching the module attribute is what every
+# consumer (v1 client, v2 facade, REST adapter) sees.
 INGEST_MOD = "proximadb_sdk._generated.rest.api.documents.ingest_documents"
 
 

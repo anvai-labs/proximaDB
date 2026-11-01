@@ -12,6 +12,8 @@ import logging
 import time
 from typing import Any
 
+import httpx
+
 from ..models import (
     BatchResult,
     Collection,
@@ -668,20 +670,43 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
     def _get_generated_document_client(self):
         """Lazily build the adapter's shared base generated openapi ``Client``.
 
-        Carries ``base_url`` + the resolved config's auth headers (the same
-        ``get_base_headers`` the protocol session uses, so auth is not dropped
-        at the adapter boundary); it is never used to issue a request
-        directly. Per-call headers (``X-Tenant-ID`` / ``X-Ingest-Mode`` /
-        ``X-Embed-Source``) are attached per :meth:`ingest_documents` call via
-        ``Client.with_headers(...)`` — a fresh ``evolve(...)`` client each
-        time, so per-call headers never accumulate on this shared base.
+        ONE source of truth: the resolved ``config`` the protocol session
+        uses — its URL, auth headers (``get_base_headers``), TLS material,
+        and timeouts — never the constructor ``url`` kwarg, which can
+        diverge when the caller passes ``config=`` explicitly or the URL
+        comes from the environment (auth for one host must not be sent to
+        another). The base client is never used to issue a request directly;
+        per-call headers (``X-Tenant-ID`` / ``X-Ingest-Mode`` /
+        ``X-Embed-Source``) are attached per :meth:`ingest_documents` call
+        via ``Client.with_headers(...)`` — a fresh ``evolve(...)`` client
+        each time, so per-call headers never accumulate on this shared base.
         """
         if self._generated_document_client is None:
             from .._generated.rest.client import Client as GeneratedClient
 
+            cfg = self._client.config
+            timeout = httpx.Timeout(
+                connect=cfg.connection.connect_timeout,
+                read=cfg.connection.read_timeout,
+                write=cfg.timeout,
+                pool=cfg.connection.total_timeout,
+            )
+            httpx_args = {
+                "limits": httpx.Limits(
+                    max_keepalive_connections=cfg.connection.pool_size,
+                    max_connections=cfg.connection.pool_maxsize,
+                    keepalive_expiry=cfg.connection.keepalive_timeout,
+                ),
+            }
+            if cfg.tls.cert_file:
+                httpx_args["cert"] = (cfg.tls.cert_file, cfg.tls.key_file)
+
             self._generated_document_client = GeneratedClient(
-                base_url=self._url,
-                headers=self._client.config.get_base_headers(),
+                base_url=cfg.url or self._url,
+                headers=cfg.get_base_headers(),
+                timeout=timeout,
+                verify_ssl=cfg.tls.verify,
+                httpx_args=httpx_args,
                 raise_on_unexpected_status=True,
                 follow_redirects=False,
             )

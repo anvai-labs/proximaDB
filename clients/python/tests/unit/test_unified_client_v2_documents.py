@@ -170,6 +170,23 @@ class TestDocumentDelegation:
         assert client.delete_document_collection("docs") is True
         mock_adapter.delete_document_collection.assert_called_once_with("docs")
 
+    def test_ingestdocument_records_normalized_to_dicts(self, client, mock_adapter):
+        """Facade contract: adapters receive plain dicts — ``IngestDocument``
+        inputs (blessed for v1 parity) never reach an adapter (the embedded
+        one would crash on ``rec.get``)."""
+        from proximadb_sdk._generated.rest.models.ingest_document import (
+            IngestDocument,
+        )
+
+        mock_adapter.ingest_documents.return_value = {"mode": "native"}
+        client.ingest_documents("coll", [IngestDocument(id="r9", text="raw")])
+
+        call_args, call_kwargs = mock_adapter.ingest_documents.call_args
+        records = call_args[1]
+        assert all(isinstance(r, dict) for r in records), records
+        assert records[0]["id"] == "r9"
+        assert "embed_source" in call_kwargs  # shape unchanged otherwise
+
     def test_ingest_documents_delegates(self, client, mock_adapter):
         mock_adapter.ingest_documents.return_value = {"mode": "native"}
         out = client.ingest_documents(
@@ -325,6 +342,37 @@ class TestRestIngestWireEquivalence:
         wire_client = mock_sync.call_args.kwargs["client"]
         assert "X-Embed-Source" not in wire_client._headers
 
+    @patch(f"{INGEST_MOD}.sync_detailed")
+    def test_unexpected_status_mapped_to_server_error(self, mock_sync, rest_client):
+        """Undocumented statuses (e.g. HTTP 500) raise before the response is
+        returned — they must surface as ServerError, never as the generated
+        client's raw UnexpectedStatus exception."""
+        from proximadb_sdk._generated.rest.errors import UnexpectedStatus
+
+        mock_sync.side_effect = UnexpectedStatus(500, b"boom")
+        with pytest.raises(ServerError, match="unexpected status") as exc:
+            rest_client.ingest_documents("coll", [{"id": "r1", "text": "hi"}])
+        assert exc.value.status_code == 500
+
+    def test_generated_client_takes_url_from_config_not_ctor_kwarg(self):
+        """The ingest wire client and its auth headers come from ONE source:
+        the resolved config the protocol session uses. A caller passing
+        config= explicitly (URL from env or ClientConfig) must not get a
+        token for that host sent to the constructor-kwarg host."""
+        from proximadb_sdk.config import load_config
+
+        cfg = load_config(
+            url="http://config-server:5678",
+            api_key="test-api-key-0123456789abcdef",
+        )
+        adapter = RestProtocolAdapter(url="http://ctor-server:5678", config=cfg)
+        base = adapter._get_generated_document_client()
+        assert base._base_url == "http://config-server:5678"
+        assert base._headers.get("Authorization") == (
+            "Bearer test-api-key-0123456789abcdef"
+        )
+        assert base._timeout is not None  # config timeouts honored
+
     def test_auth_headers_survive_the_adapter_boundary(self, rest_client):
         base = rest_client._adapter._get_generated_document_client()
         expected = rest_client._adapter._client.config.get_base_headers()
@@ -399,8 +447,11 @@ class TestParityCensus:
             ), f"TD-SDK-3 ratchet: {name} missing from BaseProtocolAdapter"
 
     def test_ported_set_matches_v1_public_document_surface(self):
-        """The pinned set IS v1's public document family (the 2026-11-01 AST
-        census: 8 public methods). If this fails, v1's surface changed —
+        """The pinned set IS v1's public document family (the 2026-11-01
+        name-filter census: v1 public methods containing "document" — 8).
+        Lexical, not semantic: a future document-semantics method named
+        without "document" escapes BOTH sides of this pin. If this fails,
+        v1's surface changed —
         re-census and update the pin deliberately."""
         from proximadb_sdk.unified_client import ProximaDBClient as V1Client
 

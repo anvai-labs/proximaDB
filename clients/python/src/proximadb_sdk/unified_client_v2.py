@@ -957,6 +957,14 @@ class ProximaDBClient:
     # wrappers there is NO silent in-memory fallback on adapter errors — a
     # server-backed client surfaces failures; local mode is the embedded
     # adapter, or the caller-opted ``allow_local_fallback`` on ingest.
+    #
+    # DISCLOSED adapter quirk (pre-existing rest_adapter behavior, surfaced
+    # directly here instead of behind v1's local fallback): get_document
+    # returns None on ANY error (a 500 is indistinguishable from absent),
+    # delete_document/delete_document_collection return False, and
+    # list_document_collections returns []. Tightening those to raise is
+    # adapter work, not facade work — until then, treat those results as
+    # "not found/ok-not-verified", not as health signals.
     # ==========================================================================
 
     def _get_document_repository(self):
@@ -987,8 +995,9 @@ class ProximaDBClient:
         """Ingest documents for native server-side embedding (ADR-041).
 
         Records are validated protocol-independently (each is a ``dict`` with
-        at least ``id``, optionally ``text``/``metadata``/``vector``; an
-        ``IngestDocument`` passes through), then the wire is the adapter's:
+        at least ``id``, optionally ``text``/``metadata``/``vector``;
+        ``IngestDocument`` records are normalized to plain dicts at the
+        facade — adapters receive dicts), then the wire is the adapter's:
         REST runs the shared ``_document_ingest`` generated-op protocol (the
         same one v1's canonical path uses — per-call
         ``X-Embed-Source``/``X-Tenant-ID``/``X-Ingest-Mode`` headers, no
@@ -1023,6 +1032,11 @@ class ProximaDBClient:
                 an unexpected status.
         """
         validate_ingest_records(records)
+        # Facade contract: adapters receive plain dicts. ``IngestDocument``
+        # records (accepted for signature parity with v1) are normalized
+        # here — the embedded adapter (and any future one) must not have to
+        # know the generated model.
+        records = [rec if isinstance(rec, dict) else rec.to_dict() for rec in records]
         try:
             return self._adapter_call(
                 "ingest_documents",
