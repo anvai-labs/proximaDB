@@ -315,6 +315,11 @@ for evidence/provenance, and event/history records for temporal state. The v1
 | `VECTOR_SEARCH(...)`, `GRAPH_QUERY(...)`, `DOCUMENT_QUERY(...)`, `LOGS(...)`, and `METRICS(...)` run through the federated engine with cache support. Phase 2.5: pipeline-based execution, morsel-driven parallelism, Arrow-native cross-model format for LATERAL joins, batch SIMD distance.
 | Strongest on function-backed sources; generic relational scans and remote distributed execution are still incomplete.
 
+| Operator compaction (`COMPACT TABLE ... [FULL]`, `POST /api/v2/collections/{id}/compact`, Flight `"compact_collection"` with `"full": true`)
+| Beta
+| Cross-level collapse toward `[storage.compaction_config] full_target_segments` (TD-COMPACT-14). Operator class like suspend/resume: tenant-scoped, `SystemAdmin | ConfigureSystem | MaintainCollections` when an authenticated context is present; the REST endpoint is not part of the published OpenAPI spec.
+| Plain `COMPACT` runs one explicit policy pass (never disarmed by `compaction:off`); FULL is synchronous with a `full_timeout_ms` request budget.
+
 | Document CRUD, query, and aggregation
 | Beta
 | WAL-backed collections, CRUD, aggregation, change events, and in-memory query execution are implemented. Canonical `ProximaRecord` storage exists as the convergence path.

@@ -1196,6 +1196,33 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
             logger.error(f"Failed to get node: {e}")
             raise
 
+    def _directional_edges(
+        self,
+        direction: str,
+        node_id: str,
+        graph: str | None,
+        edge_types: list[str] | None,
+        kwargs: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Shared body for the outgoing/incoming edge readers (same shape,
+        one engine method name — a twin pair is how the adapters drifted)."""
+        try:
+            graph_id = self._graph_id_from_args(graph, kwargs)
+            engine_method = f"get_{direction}_edges"
+            if hasattr(self._db, engine_method):
+                edges = getattr(self._db, engine_method)(
+                    graph_id=graph_id,
+                    node_id=node_id,
+                    edge_types=edge_types,
+                )
+                return [self._normalize_graph_edge(edge) for edge in (edges or [])]
+            raise NotImplementedError(
+                f"{engine_method} not implemented in embedded API"
+            )
+        except Exception as e:
+            logger.error(f"Failed to get {direction} edges: {e}")
+            raise
+
     def get_outgoing_edges(
         self,
         node_id: str,
@@ -1204,21 +1231,7 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
         **kwargs,
     ) -> list[dict[str, Any]]:
         """Get outgoing graph edges via embedded API."""
-        try:
-            graph_id = self._graph_id_from_args(graph, kwargs)
-            if hasattr(self._db, "get_outgoing_edges"):
-                edges = self._db.get_outgoing_edges(
-                    graph_id=graph_id,
-                    node_id=node_id,
-                    edge_types=edge_types,
-                )
-                return [self._normalize_graph_edge(edge) for edge in (edges or [])]
-            raise NotImplementedError(
-                "get_outgoing_edges not implemented in embedded API"
-            )
-        except Exception as e:
-            logger.error(f"Failed to get outgoing edges: {e}")
-            raise
+        return self._directional_edges("outgoing", node_id, graph, edge_types, kwargs)
 
     def get_incoming_edges(
         self,
@@ -1228,21 +1241,7 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
         **kwargs,
     ) -> list[dict[str, Any]]:
         """Get incoming graph edges via embedded API."""
-        try:
-            graph_id = self._graph_id_from_args(graph, kwargs)
-            if hasattr(self._db, "get_incoming_edges"):
-                edges = self._db.get_incoming_edges(
-                    graph_id=graph_id,
-                    node_id=node_id,
-                    edge_types=edge_types,
-                )
-                return [self._normalize_graph_edge(edge) for edge in (edges or [])]
-            raise NotImplementedError(
-                "get_incoming_edges not implemented in embedded API"
-            )
-        except Exception as e:
-            logger.error(f"Failed to get incoming edges: {e}")
-            raise
+        return self._directional_edges("incoming", node_id, graph, edge_types, kwargs)
 
     def delete_node(
         self,
@@ -1272,6 +1271,130 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
             raise NotImplementedError("graph_stats not implemented in embedded API")
         except Exception as e:
             logger.error(f"Failed to get graph stats: {e}")
+            raise
+
+    # NOTE (canonical-contract divergences, TD-SDK-3 batch 1 review): the
+    # pre-existing graph methods below predate the base-class canonical
+    # signatures and are kept kwargs-compatible rather than reordered — live
+    # callers pass the legacy spellings positionally/kwarg-wise
+    # (agentic_io.py ``from_node=``, embedded cov tests pass ``edge_type``
+    # as the 2nd positional). Call them with KEYWORDS per the canonical
+    # names (``from_node_id``/``to_node_id`` are popped from kwargs). Known
+    # engine limitations, documented rather than faked: the engine's
+    # ``traverse_graph`` has no ``algorithm``/``node_labels`` params (a DFS
+    # request runs BFS), ``create_graph`` ignores ``name``/``description``/
+    # ``schema``, and ``create_node`` ignores ``embedding``. Canonicalizing
+    # these belongs to the v1→v2 swap batch (TD-SDK-3 step 3) together with
+    # the agentic_io migration.
+    def _engine_graph_classes(self) -> tuple[type, type] | None:
+        """Resolve ``(GraphNode, GraphEdge)`` from the engine package.
+
+        Resolution order mirrors the adapter's own engine import:
+
+        1. ``proximadb_embedded`` — the CANONICAL wheel module (the adapter
+           imports it first at connect time) and the one that re-exports
+           GraphNode/GraphEdge in its ``__init__``.
+        2. ``proximadb`` — the legacy top-level engine module (also shipped
+           as a compat shim by the wheel, but WITHOUT the graph classes; it
+           resolves here only for the raw legacy layout).
+        3. The db object's own module — for pure-Python engines that co-locate
+           the classes with the db class. This is the ONLY path that could
+           work for PyO3 classes derived from ``type(db).__module__``, and it
+           never fires there: a ``#[pyclass]`` without ``module = "..."``
+           reports ``__module__ == "builtins"``, which is skipped.
+
+        ``None`` → the batch methods degrade to the base class's
+        NotImplementedError (graph.py then falls back to per-item creates).
+        """
+        import importlib
+        import sys
+
+        candidates = ["proximadb_embedded", "proximadb"]
+        db_module = type(self._db).__module__
+        if db_module and db_module != "builtins" and db_module not in candidates:
+            candidates.append(db_module)
+        for name in candidates:
+            try:
+                module = sys.modules.get(name) or importlib.import_module(name)
+            except Exception:
+                continue
+            node_cls = getattr(module, "GraphNode", None)
+            edge_cls = getattr(module, "GraphEdge", None)
+            if node_cls is not None and edge_cls is not None:
+                return node_cls, edge_cls
+        return None
+
+    def batch_create_nodes(
+        self, nodes: list[dict[str, Any]], graph_id: str | None = None, **kwargs
+    ) -> dict[str, Any]:
+        """Batch-create nodes via the embedded engine's ``create_nodes``.
+
+        Returns the same ``{success, created_count, nodes}`` shape as the
+        REST/gRPC batch endpoints (a bare count would break facade parity).
+        """
+        try:
+            gid = graph_id or kwargs.pop("graph_id", None) or "default"
+            if hasattr(self._db, "create_nodes"):
+                classes = self._engine_graph_classes()
+                if classes is not None:
+                    node_cls, _ = classes
+                    items = [
+                        node_cls(
+                            n.get("id") or n.get("node_id"),
+                            n.get("labels"),
+                            n.get("properties"),
+                        )
+                        for n in nodes
+                    ]
+                    created = self._db.create_nodes(gid, items)
+                    return {
+                        "success": True,
+                        "created_count": int(created),
+                        "nodes": nodes,
+                    }
+            raise NotImplementedError(
+                "batch_create_nodes not implemented in embedded API"
+            )
+        except Exception as e:
+            logger.error(f"Failed to batch create nodes: {e}")
+            raise
+
+    def batch_create_edges(
+        self, edges: list[dict[str, Any]], graph_id: str | None = None, **kwargs
+    ) -> dict[str, Any]:
+        """Batch-create edges via the embedded engine's ``create_edges``.
+
+        Returns the same ``{success, created_count, edges}`` shape as the
+        REST/gRPC batch endpoints.
+        """
+        try:
+            gid = graph_id or kwargs.pop("graph_id", None) or "default"
+            if hasattr(self._db, "create_edges"):
+                classes = self._engine_graph_classes()
+                if classes is not None:
+                    _, edge_cls = classes
+                    items = [
+                        edge_cls(
+                            e.get("from_node_id") or e.get("source"),
+                            e.get("to_node_id") or e.get("target"),
+                            e.get("edge_type") or e.get("type") or "RELATED",
+                            e.get("id") or e.get("edge_id"),
+                            e.get("weight"),
+                            e.get("properties"),
+                        )
+                        for e in edges
+                    ]
+                    created = self._db.create_edges(gid, items)
+                    return {
+                        "success": True,
+                        "created_count": int(created),
+                        "edges": edges,
+                    }
+            raise NotImplementedError(
+                "batch_create_edges not implemented in embedded API"
+            )
+        except Exception as e:
+            logger.error(f"Failed to batch create edges: {e}")
             raise
 
     def execute_graph_query(self, graph: str, query: str, **kwargs) -> dict[str, Any]:

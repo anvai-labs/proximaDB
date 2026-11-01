@@ -159,6 +159,13 @@ pub struct CompactionParameters {
 
     /// Estimated input size in bytes for metrics tracking
     pub estimated_input_size: usize,
+
+    /// Operator-requested cross-level collapse (`COMPACT ... FULL`): merge
+    /// toward `CompactionConfig::full_target_segments`, pairing the largest
+    /// segments across levels. Engines without a cross-level mode treat it
+    /// as an explicit single pass.
+    #[serde(default)]
+    pub full: bool,
 }
 
 impl CompactionParameters {

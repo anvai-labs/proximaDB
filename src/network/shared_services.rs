@@ -2954,6 +2954,12 @@ impl SharedServices {
         // so DDL and DML share one ownership view.
         let mut ddl = crate::services::DdlService::new(catalog_manager.clone())
             .with_record_store(dml_service_for_grpc.record_store())
+            // TD-COMPACT-14: COMPACT TABLE over the REST/gRPC SQL facade.
+            .with_collection_compactor(std::sync::Arc::new(
+                crate::services::operations::vectors::VectorOpsCollectionCompactor {
+                    vector_ops: vector_operations_service.clone(),
+                },
+            ))
             .with_primary_pod_registry(primary_pod_registry.clone())
             .with_self_pod_id(crate::cluster::primary_pod_registry::resolve_self_pod_id(
                 None,

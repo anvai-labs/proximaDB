@@ -234,43 +234,83 @@ impl SstEngine {
     }
 
     /// Clean up all files for a collection
+    ///
+    /// TD-SSTCLEAN-1 (review-corrected scope): this function is
+    /// DEFENSE-IN-DEPTH, not the production DROP path — production DROP goes
+    /// through `CollectionManager::cleanup_storage_directories`, which
+    /// `remove_dir_all`s both the legacy and typed roots. This engine-level
+    /// path is only reachable via `StorageEngine::delete_collection`, whose
+    /// `sst_storages` guard is never populated (TD-163's registry) — so it
+    /// currently runs only under test. It is kept correct-if-ever-wired:
+    ///
+    /// It previously went through `unified_fs()` — a field that is never
+    /// assigned (`new_with_config` hands that instance only to the sstable
+    /// reader) — so it always failed with "Unified filesystem not
+    /// initialized". The dead code behind it listed the filesystem ROOT and
+    /// deleted by bare basename, which would have swept every collection's
+    /// matching files had the filesystem ever been wired.
+    ///
+    /// Now it mirrors `collection_stats`: resolve the collection's legacy
+    /// `storage_url`, list exactly that prefix on the filesystem for that URL
+    /// (scheme-aware: local, S3, Azure…), and delete by `entry.url` — the
+    /// locator the listing itself denotes, never a basename. SCOPE LIMIT
+    /// (recorded on the TD): under a typed identity the writers use
+    /// `{base}/accounts/{a}/{n}/{c}/data` (`collection_data_path_typed`),
+    /// which this path CANNOT reconstruct — the engine resolver seam
+    /// (`CollectionPathResolver::resolve_storage_assignment` → ports
+    /// `StorageAssignment`) carries no typed ids. Pinned by
+    /// `cleanup_collection_files_deletes_only_the_dropped_collection`.
     pub async fn cleanup_collection_files(&self, collection_id: &str) -> Result<()> {
         info!("🧹 SST: Cleaning up files for collection {}", collection_id);
 
-        let _storage_url = self.get_collection_storage_url(collection_id).await?;
-        let unified_fs = self
-            .unified_fs()
-            .ok_or_else(|| SstError::Internal("Unified filesystem not initialized".to_string()))?;
+        let storage_url = self.get_collection_storage_url(collection_id).await?;
+        let fs = self.filesystem().get_filesystem(&storage_url)?;
 
-        // List all files for the collection
-        let files = match unified_fs.list("/").await {
+        // Fail-open here is DELIBERATE (decision recorded on TD-SSTCLEAN-1):
+        // DROP must not strand the collection half-dropped because cleanup
+        // could not list — the catalog entry is already gone by this point.
+        // The `warn` (not `debug`) keeps the residual leak observable.
+        let files = match fs.list(&storage_url).await {
             Ok(files) => files,
             Err(e) => {
-                warn!("Failed to list collection files for cleanup: {}", e);
-                return Ok(()); // Don't fail cleanup
+                warn!(
+                    "Failed to list files for cleanup of collection {}: {}",
+                    collection_id, e
+                );
+                return Ok(());
             }
         };
 
         let mut deleted_count = 0;
         let mut error_count = 0;
 
-        // Clean up SST files, bloom filters, and metadata files
+        // Segment files the readers recognize (.sst/.proximablock/.pax; the
+        // current flush writer emits .pax, .proximablock survives only in the
+        // readers' legacy filters) + .arrow (ArrowBlock-configured writers)
+        // + the ancillary bloom/meta/idx.
         for entry in &files {
-            if entry.name.ends_with(".sst")
-                || entry.name.ends_with(".bloom")
-                || entry.name.ends_with(".meta")
-                || entry.name.ends_with(".idx")
-            {
-                match unified_fs.delete(&entry.name).await {
-                    Ok(_) => {
-                        deleted_count += 1;
-                        debug!("🗑️ Deleted file: {}", entry.name);
-                    }
-                    Err(e) => {
-                        error_count += 1;
-                        warn!("Failed to delete collection file {}: {}", entry.name, e);
-                        // Continue with other files
-                    }
+            if entry.metadata.is_directory {
+                continue;
+            }
+            let is_collection_file = entry.url.ends_with(".sst")
+                || entry.url.ends_with(".proximablock")
+                || entry.url.ends_with(".pax")
+                || entry.url.ends_with(".arrow")
+                || entry.url.ends_with(".bloom")
+                || entry.url.ends_with(".meta")
+                || entry.url.ends_with(".idx");
+            if !is_collection_file {
+                continue;
+            }
+            match fs.delete(&entry.url).await {
+                Ok(_) => {
+                    deleted_count += 1;
+                    debug!("🗑️ Deleted file: {}", entry.url);
+                }
+                Err(e) => {
+                    error_count += 1;
+                    warn!("Failed to delete collection file {}: {}", entry.url, e);
+                    // Continue with other files
                 }
             }
         }

@@ -619,8 +619,10 @@ pub(crate) fn collection_from_catalog_schema(
                 .and_then(|value| value.parse().ok())
                 .unwrap_or_default(),
         }),
-        created_at: schema.created_at_ms * 1000,
-        updated_at: schema.updated_at_ms * 1000,
+        // TD-COLLTIME-1: proto is milliseconds; the catalog row already holds
+        // milliseconds (legacy rows too — the old adapter stored ms correctly).
+        created_at: schema.created_at_ms,
+        updated_at: schema.updated_at_ms,
         storage_assignment,
         storage_class_status: Some(storage_class_status),
     }))
@@ -802,8 +804,11 @@ pub(crate) fn catalog_schema_from_collection(
         .as_ref()
         .map(|assignment| assignment.base_location.clone())
         .filter(|location| !location.is_empty());
-    schema.created_at_ms = collection.created_at / 1000;
-    schema.updated_at_ms = collection.updated_at / 1000;
+    // TD-COLLTIME-1: proto Collection timestamps are epoch MILLISECONDS — the
+    // old /1000 was the µs→ms adapter for the pre-fix convention; the catalog's
+    // *_ms fields now receive genuine milliseconds like every other writer.
+    schema.created_at_ms = collection.created_at;
+    schema.updated_at_ms = collection.updated_at;
     schema
         .properties
         .insert("asset.kind".to_string(), "collection".to_string());

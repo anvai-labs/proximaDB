@@ -46,6 +46,18 @@ class ProximaDBError(Exception):
         return " | ".join(parts)
 
 
+class ProximaDBNotSupportedError(ProximaDBError):
+    """The active transport/adapter lacks the requested operation.
+
+    Raised by the v2 facade when an adapter declines an operation with
+    ``NotImplementedError`` (an optional-namespace method the transport
+    does not implement — e.g. graph-collection management on gRPC). This is
+    a *capability* signal, not a request failure: compatibility wrappers
+    (``graph.py`` batch helpers) treat it like the v1-era ``AttributeError``
+    and fall back to per-item operations instead of failing the batch.
+    """
+
+
 class AuthenticationError(ProximaDBError):
     """Authentication failed - invalid API key or token"""
 

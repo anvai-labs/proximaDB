@@ -924,8 +924,10 @@ pub struct V2Collection {
     pub id: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
     pub config: ::core::option::Option<V2CollectionConfig>,
+    /// Unix epoch MILLISECONDS (TD-COLLTIME-1; normalized on the way out).
     #[prost(int64, tag = "3")]
     pub created_at: i64,
+    /// Unix epoch MILLISECONDS (TD-COLLTIME-1).
     #[prost(int64, tag = "4")]
     pub updated_at: i64,
     /// TD-TIER-1 SC1: observed status alongside the echoed desired class in

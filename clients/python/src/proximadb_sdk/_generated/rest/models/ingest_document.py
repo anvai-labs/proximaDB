@@ -32,6 +32,10 @@ class IngestDocument:
             embedding for this record. Use case: SDK that already embedded
             locally (legacy path).
         metadata (IngestDocumentMetadata | Unset): Arbitrary metadata fields. Stored as ProximaRecord props.
+
+            `props` is accepted as an alias (TD-REC-1): the records surface
+            documents `props` as the canonical map and accepts `metadata` as its
+            alias, so this surface accepts both spellings of the same map too.
     """
 
     id: str

@@ -289,6 +289,7 @@ async fn test_viper_flush_and_compaction_debug() -> Result<()> {
     debug!("\n🗜️ Step 4: Running compaction_info");
 
     let compact_params = crate::storage::traits::CompactionParameters {
+        full: false,
         collection_id: Some(collection_id.to_string()),
         force: true,
         synchronous: true,

@@ -84,6 +84,7 @@ pub trait StorageCompactor: StorageIdentity + Send + Sync {
         collection_config: Option<&Collection>,
     ) -> Result<CompactionResult> {
         let params = CompactionParameters {
+            full: false,
             collection_id: Some(collection_id.to_string()),
             collection_config: collection_config.cloned(),
             force: false,

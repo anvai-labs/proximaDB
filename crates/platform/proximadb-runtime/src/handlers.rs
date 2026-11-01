@@ -180,12 +180,27 @@ impl UnifiedHandlers {
     }
 }
 
+/// TD-COLLTIME-1: `Collection.created_at`/`updated_at` are Unix epoch
+/// MILLISECONDS, but collections created before the unit fix carry
+/// MICROseconds (the manager and engine paths wrote `timestamp_micros()`).
+/// A millisecond epoch is ~1.7-2.0e12 today; a microsecond epoch is ~1000x
+/// that — anything above 1e14 is unambiguously microseconds, and normalizing
+/// on read makes stored pre-fix collections render correctly without a
+/// migration (pre-GA: no back-compat gate, per the 2026-07-14 directive).
+pub fn normalize_epoch_ms(value: i64) -> i64 {
+    if value > 100_000_000_000_000 {
+        value / 1000
+    } else {
+        value
+    }
+}
+
 fn schema_metadata_from_collection(collection: &Collection) -> CollectionSchemaMetadata {
     let Some(config) = collection.config.as_ref() else {
         return CollectionSchemaMetadata {
             collection_id: collection.id.clone(),
-            created_at_ms: collection.created_at,
-            updated_at_ms: collection.updated_at,
+            created_at_ms: normalize_epoch_ms(collection.created_at),
+            updated_at_ms: normalize_epoch_ms(collection.updated_at),
             ..CollectionSchemaMetadata::default()
         };
     };
@@ -246,8 +261,8 @@ fn schema_metadata_from_collection(collection: &Collection) -> CollectionSchemaM
     let record_schema = config.record_schema.as_ref();
     CollectionSchemaMetadata {
         collection_id: collection.id.clone(),
-        created_at_ms: collection.created_at,
-        updated_at_ms: collection.updated_at,
+        created_at_ms: normalize_epoch_ms(collection.created_at),
+        updated_at_ms: normalize_epoch_ms(collection.updated_at),
         schema_id: record_schema.map(|schema| schema.schema_id.clone()),
         schema_version: record_schema.map(|schema| schema.schema_version.clone()),
         enforcement: record_schema.map(|schema| enforcement_from_i32(schema.enforcement)),
@@ -703,6 +718,19 @@ impl ApiHandlersPort for UnifiedHandlers {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn normalize_epoch_ms_converts_stored_microsecond_values() {
+        // TD-COLLTIME-1: pre-fix writers stored microseconds; anything above
+        // 1e14 is unambiguously µs and is divided to milliseconds, while
+        // correct millisecond values (and 0/negative sentinels) pass through.
+        let ms_now = 1_735_000_000_123_i64; // ~2024-11, epoch ms
+        assert_eq!(normalize_epoch_ms(ms_now), ms_now);
+        assert_eq!(normalize_epoch_ms(0), 0);
+        assert_eq!(normalize_epoch_ms(-1), -1);
+        let us_now = ms_now * 1000; // the same instant, stored in µs
+        assert_eq!(normalize_epoch_ms(us_now), ms_now);
+    }
 
     use proximadb_proto::v1::{Collection, CollectionConfig, VectorRecord, sql_value};
     use serde_json::json;

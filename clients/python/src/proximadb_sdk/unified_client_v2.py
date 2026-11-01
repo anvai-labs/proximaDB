@@ -16,9 +16,14 @@ from typing import Any
 
 import numpy as np
 
+from ._graph_validation import (
+    validate_create_edge_args,
+    validate_create_node_args,
+    validate_traverse_graph_args,
+)
 from .adapters import BaseProtocolAdapter, create_adapter
 from .config import ClientConfig, Protocol, load_config
-from .exceptions import ProximaDBError
+from .exceptions import ProximaDBError, ProximaDBNotSupportedError
 from .models import (
     BatchResult,
     Collection,
@@ -632,6 +637,307 @@ class ProximaDBClient:
             )
         return self._adapter.explain_query(
             query, language=language, collection=collection
+        )
+
+    # ==========================================================================
+    # Graph Operations (TD-SDK-3 batch 1 — the graph-CRUD family, ported from
+    # the v1 unified client onto the adapter protocol)
+    #
+    # Thin delegations: the facade validates protocol-independent inputs and
+    # the adapter owns everything wire-shaped (``graph_id=None`` → the
+    # server's "default" graph is normalized adapter-side). Adapter
+    # NotImplementedError surfaces as ProximaDBNotSupportedError (a typed
+    # capability signal — a ProximaDBError subclass — so callers see one
+    # error vocabulary while compatibility wrappers can still detect the
+    # fallback condition).
+    # ==========================================================================
+
+    def _graph_call(self, method: str, *args, **kwargs) -> Any:
+        """Delegate a graph op to the adapter, normalizing the error surface.
+
+        Adapter ``NotImplementedError`` (transport lacks the operation)
+        becomes :class:`ProximaDBNotSupportedError` — a typed capability
+        signal, still a ``ProximaDBError`` for generic handlers, but
+        recognizable by compatibility wrappers (``graph.py`` batch helpers)
+        so they can fall back to per-item operations exactly as they did on
+        the v1-era ``AttributeError`` instead of failing the whole batch.
+        """
+        try:
+            return getattr(self._adapter, method)(*args, **kwargs)
+        except NotImplementedError as e:
+            raise ProximaDBNotSupportedError(
+                f"{self._adapter.protocol_name} adapter does not support "
+                f"{method}: {e}"
+            ) from e
+
+    def create_node(
+        self,
+        node_id: str,
+        labels: list[str],
+        properties: dict[str, Any] | None = None,
+        embedding: list[float] | None = None,
+        graph_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a graph node.
+
+        Example:
+            >>> client.create_node(
+            ...     node_id="person_123",
+            ...     labels=["Person"],
+            ...     properties={"name": "Alice", "age": 30},
+            ... )
+        """
+        validate_create_node_args(node_id, labels, properties, embedding)
+
+        return self._graph_call(
+            "create_node",
+            node_id=node_id,
+            labels=labels,
+            properties=properties,
+            embedding=embedding,
+            graph_id=graph_id,
+        )
+
+    def create_edge(
+        self,
+        edge_id: str,
+        from_node_id: str,
+        to_node_id: str,
+        edge_type: str,
+        properties: dict[str, Any] | None = None,
+        weight: float | None = None,
+        graph_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a graph edge between two nodes.
+
+        Example:
+            >>> client.create_edge(
+            ...     edge_id="edge_123",
+            ...     from_node_id="person_123",
+            ...     to_node_id="person_456",
+            ...     edge_type="KNOWS",
+            ...     properties={"since": 2020},
+            ...     weight=1.0,
+            ... )
+        """
+        validate_create_edge_args(
+            edge_id, from_node_id, to_node_id, edge_type, properties, weight
+        )
+
+        return self._graph_call(
+            "create_edge",
+            edge_id=edge_id,
+            from_node_id=from_node_id,
+            to_node_id=to_node_id,
+            edge_type=edge_type,
+            properties=properties,
+            weight=weight,
+            graph_id=graph_id,
+        )
+
+    def batch_create_nodes(
+        self, nodes: list[dict[str, Any]], graph_id: str | None = None
+    ) -> dict[str, Any]:
+        """Create many nodes in one request (admissions per server engine)."""
+        return self._graph_call("batch_create_nodes", nodes=nodes, graph_id=graph_id)
+
+    def batch_create_edges(
+        self, edges: list[dict[str, Any]], graph_id: str | None = None
+    ) -> dict[str, Any]:
+        """Create many edges in one request with per-edge admission."""
+        return self._graph_call("batch_create_edges", edges=edges, graph_id=graph_id)
+
+    def get_node(
+        self, node_id: str, graph_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Get a graph node by ID (``None`` when absent)."""
+        return self._graph_call("get_node", node_id=node_id, graph_id=graph_id)
+
+    def get_outgoing_edges(
+        self,
+        node_id: str,
+        edge_types: list[str] | None = None,
+        graph_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get a node's outgoing edges."""
+        return self._graph_call(
+            "get_outgoing_edges",
+            node_id=node_id,
+            edge_types=edge_types,
+            graph_id=graph_id,
+        )
+
+    def get_incoming_edges(
+        self,
+        node_id: str,
+        edge_types: list[str] | None = None,
+        graph_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get a node's incoming edges."""
+        return self._graph_call(
+            "get_incoming_edges",
+            node_id=node_id,
+            edge_types=edge_types,
+            graph_id=graph_id,
+        )
+
+    def delete_node(self, node_id: str, graph_id: str | None = None) -> bool:
+        """Delete a graph node by ID."""
+        return bool(self._graph_call("delete_node", node_id=node_id, graph_id=graph_id))
+
+    def query_nodes(
+        self,
+        labels: list[str] | None = None,
+        properties: dict[str, Any] | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        graph_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Query nodes by labels and properties."""
+        return self._graph_call(
+            "query_nodes",
+            labels=labels,
+            properties=properties,
+            limit=limit,
+            offset=offset,
+            graph_id=graph_id,
+        )
+
+    def traverse_graph(
+        self,
+        start_node_id: str,
+        max_depth: int = 3,
+        edge_types: list[str] | None = None,
+        node_labels: list[str] | None = None,
+        algorithm: str = "BFS",
+        limit: int | None = None,
+        graph_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Traverse the graph from a starting node.
+
+        Returns a dict with ``nodes``, ``edges``, ``paths`` and ``stats``.
+
+        Example:
+            >>> result = client.traverse_graph(
+            ...     start_node_id="person_123",
+            ...     max_depth=2,
+            ...     edge_types=["KNOWS"],
+            ...     algorithm="BFS",
+            ...     limit=50,
+            ... )
+        """
+        validate_traverse_graph_args(
+            start_node_id, max_depth, edge_types, node_labels, algorithm, limit
+        )
+
+        return self._graph_call(
+            "traverse_graph",
+            start_node_id=start_node_id,
+            max_depth=max_depth,
+            edge_types=edge_types,
+            node_labels=node_labels,
+            algorithm=algorithm,
+            limit=limit,
+            graph_id=graph_id,
+        )
+
+    def create_graph(
+        self,
+        graph_id: str,
+        name: str | None = None,
+        description: str | None = None,
+        schema: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create a graph collection."""
+        return self._graph_call(
+            "create_graph",
+            graph_id=graph_id,
+            name=name,
+            description=description,
+            schema=schema,
+        )
+
+    def delete_graph(self, graph_id: str) -> dict[str, Any]:
+        """Delete a graph collection."""
+        return self._graph_call("delete_graph", graph_id=graph_id)
+
+    def get_graph(self, graph_id: str) -> dict[str, Any]:
+        """Get graph-collection metadata."""
+        return self._graph_call("get_graph", graph_id=graph_id)
+
+    def list_graphs(self) -> dict[str, Any]:
+        """List all graph collections."""
+        return self._graph_call("list_graphs")
+
+    def get_graph_stats(self, graph_id: str) -> dict[str, Any]:
+        """Get statistics (node/edge counts, …) for a graph collection."""
+        return self._graph_call("get_graph_stats", graph_id=graph_id)
+
+    def graph_shortest_path(
+        self,
+        start_node_id: str,
+        target_node_id: str,
+        max_depth: int | None = None,
+        edge_types: list[str] | None = None,
+        algorithm: str = "DIJKSTRA",
+        k: int | None = None,
+        enable_prefetch: bool | None = None,
+        prefetch_budget: int | None = None,
+        timeout: float | None = None,
+        graph_id: str = "default",
+    ) -> dict[str, Any]:
+        """Compute shortest path(s) with optional prefetch overrides.
+
+        ``graph_id`` names the graph (TD-SDKDOC-1: dropping it silently ran
+        every call on ``default``).
+        """
+        return self._graph_call(
+            "graph_shortest_path",
+            start_node_id,
+            target_node_id,
+            max_depth,
+            edge_types,
+            algorithm,
+            k,
+            enable_prefetch,
+            prefetch_budget,
+            timeout=timeout,
+            graph_id=graph_id,
+        )
+
+    def graph_traverse(
+        self,
+        start_node_id: str,
+        max_depth: int = 3,
+        edge_types: list[str] | None = None,
+        algorithm: str = "BFS",
+        limit: int | None = None,
+        timeout_ms: int | None = None,
+        max_frontier: int | None = None,
+        enable_prefetch: bool | None = None,
+        prefetch_budget: int | None = None,
+        timeout: float | None = None,
+        graph_id: str = "default",
+    ) -> dict[str, Any]:
+        """Tuned traversal with prefetch/timeout overrides (analytics surface).
+
+        Unlike the v1 wrapper, ``graph_id`` is honored — the REST transport
+        has accepted it since TD-SDKDOC-1; v1 dropped it, running every tuned
+        traversal on ``default``.
+        """
+        return self._graph_call(
+            "graph_traverse",
+            start_node_id,
+            max_depth,
+            edge_types,
+            algorithm,
+            limit,
+            timeout_ms,
+            max_frontier,
+            enable_prefetch,
+            prefetch_budget,
+            timeout=timeout,
+            graph_id=graph_id,
         )
 
     # ==========================================================================

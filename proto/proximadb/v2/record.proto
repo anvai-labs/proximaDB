@@ -794,7 +794,9 @@ message V2StorageClassStatus {
 message V2Collection {
   string id = 1;
   V2CollectionConfig config = 2;
+  // Unix epoch MILLISECONDS (TD-COLLTIME-1; normalized on the way out).
   int64 created_at = 3;
+  // Unix epoch MILLISECONDS (TD-COLLTIME-1).
   int64 updated_at = 4;
   // TD-TIER-1 SC1: observed status alongside the echoed desired class in
   // `V2CollectionConfig.storage_class` — desired and observed are distinct.

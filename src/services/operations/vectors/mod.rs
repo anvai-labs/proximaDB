@@ -78,7 +78,7 @@ pub(crate) use legacy::rich_filters_to_filter_expression;
 pub use legacy::{
     RichFilterCondition, RichFilterOperator, RichRecordBatchRequest, RichRecordDeleteBatchRequest,
     RichRecordGetRequest, RichRecordGetResponse, RichSearchRequest, RichSearchResponse,
-    RichSearchResult, VectorOperationsService,
+    RichSearchResult, VectorOperationsService, VectorOpsCollectionCompactor,
 };
 pub use search::{
     executor::{VectorSearchExecutorResult, proto_results_to_vector_records},

@@ -419,6 +419,27 @@ pub enum CompactionPriority {
     Critical = 3, // When storage is nearly full
 }
 
+/// Terminal outcome of one scheduled compaction morsel, keyed by its output
+/// path; written by the worker, consumed (removed) by the FULL collapse loop
+/// so declines and failures surface typed instead of silent.
+#[derive(Debug, Clone)]
+pub enum PassOutcome {
+    Completed,
+    Declined(&'static str),
+    Failed(String),
+}
+
+/// Outcome of one FULL collapse request (TD-COMPACT-14).
+#[derive(Debug, Clone, Copy)]
+pub struct FullCompactionSummary {
+    pub segments_before: usize,
+    pub segments_after: usize,
+    pub passes_executed: usize,
+    pub reached_target: bool,
+    pub stop_reason: Option<&'static str>,
+    pub pending_files: usize,
+}
+
 /// Backwards-compat alias for [`SstCompactionStats`].
 pub type CompactionStats = SstCompactionStats;
 
@@ -506,6 +527,10 @@ pub struct Compaction {
     /// New compaction orchestrator
     #[allow(dead_code)]
     compaction_orchestrator: Option<Arc<CompactionOrchestrator>>,
+    /// Journal of finished morsels awaiting collection by
+    /// [`Compaction::take_pass_outcome`] (the FULL collapse loop). Bounded;
+    /// entries nobody reads are dropped.
+    pass_outcomes: Arc<tokio::sync::RwLock<HashMap<String, PassOutcome>>>,
     /// Set-once resolver — initialized after bootstrap once the catalog
     /// handle becomes available (the storage engine constructs Compaction
     /// before SharedServices does, so the resolver can't be injected at
@@ -740,6 +765,7 @@ impl Compaction {
             stats: Arc::new(RwLock::new(SstCompactionStats::default())),
             active_compactions: Arc::new(RwLock::new(HashMap::new())),
             atomic_coordinator,
+            pass_outcomes: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             unified_reader,
             sst_compactor,
             filesystem_factory,
@@ -1132,6 +1158,216 @@ impl Compaction {
     /// per-collection value resolved from the `l0_threshold:` tag, so this stays
     /// consistent with the flush-path `should_trigger_compaction` decision.
     /// `None` uses the deployment `CompactionConfig` default.
+    /// Take (and remove) the recorded outcome of the morsel that wrote
+    /// `output_key`, if any.
+    pub async fn take_pass_outcome(&self, output_key: &str) -> Option<PassOutcome> {
+        self.pass_outcomes.write().await.remove(output_key)
+    }
+
+    /// Operator FULL compaction: collapse the collection toward
+    /// `full_target_segments` by repeatedly pairing the two largest live
+    /// segments ACROSS levels — geometry the background policy never merges
+    /// (one file per level never triggers; morsels are single-level). Every
+    /// pass uses the same admission, dedup and executors as a normal morsel.
+    /// Partial progress is durable and idempotent: every stop except an error
+    /// is reported in the summary, not raised.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn compact_collection_full(
+        &self,
+        collection_object_id: crate::core::stable_id::CollectionObjectId,
+        collection_dir: &Path,
+        precision_hint: Option<proximadb_records::EmbeddingScalarType>,
+        rg_layout: Option<bool>,
+        vector_quant: Option<proximadb_block_format::VectorQuant>,
+        access_tier: Option<proximadb_storage_filesystem_types::ObjectAccessTier>,
+        timeout: std::time::Duration,
+    ) -> Result<FullCompactionSummary> {
+        use crate::storage::common::compaction_memory::current_compaction_input_budget;
+        use crate::storage::common::compaction_utils::CompactionFileDiscovery;
+
+        let cfg = self.config.compaction_config.clone().unwrap_or_default();
+        let target = cfg.full_target_segments.max(1);
+        let max_passes = cfg.full_max_passes.max(1);
+        let deadline = std::time::Instant::now() + timeout;
+
+        let collection_path = collection_dir.to_string_lossy().to_string();
+        let collection_id_text = collection_object_id.to_string();
+        let discovery = CompactionFileDiscovery::new(self.filesystem_factory.clone());
+
+        let mut segments_before: Option<usize> = None;
+        let mut passes = 0usize;
+        let mut no_progress_rounds = 0usize;
+        let stop_reason = loop {
+            let files = discovery
+                .discover_compactable_files(
+                    &collection_id_text,
+                    &collection_path,
+                    "pax",
+                    CompactionEngineType::SST,
+                )
+                .await
+                .map_err(|e| crate::core::StorageError::SstEngine(e.to_string()))?;
+            let mut pair: Vec<(String, u64, u32)> = files
+                .compactable_files
+                .values()
+                .flatten()
+                .map(|f| (f.path.clone(), f.size_bytes, f.level))
+                .collect();
+            let pending: usize = files.pending_files.values().map(Vec::len).sum();
+            let live = pair.len();
+            if segments_before.is_none() {
+                segments_before = Some(live + pending);
+            }
+            if live <= target {
+                // At target, but AXIS-pending segments would push past it once
+                // their rebuild publishes: report why the count can still move.
+                if pending > 0 && live + pending > target {
+                    break Some("axis_pending");
+                }
+                break None;
+            }
+            if passes >= max_passes {
+                break Some("max_passes");
+            }
+            if std::time::Instant::now() >= deadline {
+                break Some("deadline");
+            }
+            // Largest-first preference: each pass merges the largest viable
+            // pair (see the fallback below), so morsels stay within the
+            // standing memory admission as long as any pair does.
+            pair.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let budget = current_compaction_input_budget(&cfg);
+            // Prefer the two largest; when they cannot fit the standing
+            // memory admission (and spill cannot raise it), fall back to the
+            // largest pair that does — a dominant segment must not abort the
+            // whole collapse with zero progress. Only NO viable pair errors.
+            let viable = |a: &(String, u64, u32), b: &(String, u64, u32)| {
+                a.1 + b.1 <= budget.max_input_bytes || cfg.spill_enabled
+            };
+            let mut chosen: Option<(usize, usize)> = None;
+            'pairs: for first in 0..pair.len() {
+                for second in (first + 1)..pair.len() {
+                    if viable(&pair[first], &pair[second]) {
+                        chosen = Some((first, second));
+                        break 'pairs;
+                    }
+                }
+            }
+            let (first, second) = match chosen {
+                Some(indices) => indices,
+                None => {
+                    return Err(crate::core::StorageError::SstEngine(format!(
+                        "FULL compaction stalled: no segment pair fits the compaction \
+                         input budget ({} bytes) and local-spill is disabled; raise \
+                         [storage.compaction_config] memory budget/ceiling or set \
+                         spill_enabled = true",
+                        budget.max_input_bytes
+                    )));
+                }
+            };
+            let pair: Vec<(String, u64, u32)> = vec![pair[first].clone(), pair[second].clone()];
+            let pair_bytes: u64 = pair.iter().map(|(_, size, _)| *size).sum();
+            let source_level = pair.iter().map(|(_, _, level)| *level).min().unwrap_or(1);
+            let input_files: Vec<PathBuf> = pair
+                .iter()
+                .map(|(path, _, _)| PathBuf::from(path))
+                .collect();
+            let output_file = self.generate_output_file_path(
+                collection_object_id,
+                collection_dir,
+                // The level lives only in the `L{n}_` filename; L1 outputs
+                // re-pair on the next pass, and re-min with a fresh L0.
+                1,
+                compaction_output_format(&input_files),
+            );
+            let task = SstCompactionTask {
+                collection_object_id,
+                collection_identity: crate::core::stable_id::CollectionIdentity::default(),
+                // min input level keeps the training follow-up threshold
+                // armed when a pair spans L0.
+                level: source_level as u8,
+                input_files,
+                input_bytes: pair_bytes,
+                output_file: output_file.clone(),
+                priority: CompactionPriority::High,
+                block_size_kb: None,
+                compression_config: None,
+                // The collection intent MUST ride the task (the config-free
+                // task RaBitQ drift bug; see `inherit_collection_intent`).
+                precision_hint,
+                rg_layout,
+                vector_quant,
+                access_tier,
+            };
+            let output_key = task.output_file.to_string_lossy().to_string();
+            if !self.schedule_compaction(task).await? {
+                // A background morsel owns one of our inputs. It is also
+                // reducing the segment count; let it finish instead of
+                // fighting it.
+                no_progress_rounds += 1;
+                if no_progress_rounds >= 3 {
+                    break Some("contended");
+                }
+                continue;
+            }
+            // The REQUEST deadline bounds the total; each pass waits at most
+            // what remains of it (full_timeout_ms is not per-pass).
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if !self.await_compaction_quiescence(remaining).await {
+                return Err(crate::core::StorageError::SstEngine(format!(
+                    "FULL compaction for {collection_object_id} did not quiesce within the \
+                     request deadline ({}ms remaining); a pass may still be in flight",
+                    remaining.as_millis()
+                )));
+            }
+            match self.take_pass_outcome(&output_key).await {
+                Some(PassOutcome::Completed) => {
+                    passes += 1;
+                    no_progress_rounds = 0;
+                    // The worker's follow-up chain may have merged more; the
+                    // next discovery reflects it.
+                }
+                Some(PassOutcome::Declined(label)) => {
+                    return Err(crate::core::StorageError::SstEngine(format!(
+                        "FULL compaction pass declined ({label}); typical causes: \
+                         spill_base_quant_unsupported (an SQ8 base has no spill form) or \
+                         spill_inputs_not_exact (a RawF32 base paired with a lossy input); \
+                         see proximadb_compaction_declined_total"
+                    )));
+                }
+                Some(PassOutcome::Failed(message)) => {
+                    return Err(crate::core::StorageError::SstEngine(format!(
+                        "FULL compaction pass failed: {message}"
+                    )));
+                }
+                None => {
+                    no_progress_rounds += 1;
+                    if no_progress_rounds >= 3 {
+                        break Some("no_progress");
+                    }
+                }
+            }
+        };
+        let files = discovery
+            .discover_compactable_files(
+                &collection_id_text,
+                &collection_path,
+                "pax",
+                CompactionEngineType::SST,
+            )
+            .await
+            .map_err(|e| crate::core::StorageError::SstEngine(e.to_string()))?;
+        let after: usize = files.total_files;
+        Ok(FullCompactionSummary {
+            segments_before: segments_before.unwrap_or(after),
+            segments_after: after,
+            passes_executed: passes,
+            reached_target: after <= target,
+            stop_reason,
+            pending_files: files.pending_files.values().map(Vec::len).sum(),
+        })
+    }
+
     pub async fn check_compaction_needed(
         &self,
         collection_object_id: crate::core::stable_id::CollectionObjectId,
@@ -1397,7 +1633,7 @@ impl Compaction {
                 // hung on the worker. `perform_compaction` only reads through
                 // the Arc-shared reader/compactor/factory, so concurrent
                 // invocation across workers + flush is safe.
-                let succeeded = match compaction
+                let (succeeded, journal_outcome) = match compaction
                     .perform_compaction_with_plan(&task, resource_plan)
                     .await
                 {
@@ -1412,7 +1648,7 @@ impl Compaction {
                             "Compaction declined for level {}",
                             task.level
                         );
-                        false
+                        (false, Some(PassOutcome::Declined(reason.label())))
                     }
                     Ok(CompactionOutcome::Completed(compaction_stats)) => {
                         info!(
@@ -1441,7 +1677,7 @@ impl Compaction {
                                     (stats_guard.avg_compaction_time_ms + elapsed_ms) / 2;
                             }
                         }
-                        true
+                        (true, Some(PassOutcome::Completed))
                     }
                     Err(e) => {
                         error!(
@@ -1450,9 +1686,19 @@ impl Compaction {
                             task.output_file.display(),
                             e
                         );
-                        false
+                        (false, Some(PassOutcome::Failed(e.to_string())))
                     }
                 };
+                if let Some(outcome) = journal_outcome {
+                    let mut journal = compaction.pass_outcomes.write().await;
+                    if journal.len() >= 64 {
+                        // Bounded: drop an arbitrary (oldest-iteration) entry.
+                        if let Some(key) = journal.keys().next().cloned() {
+                            journal.remove(&key);
+                        }
+                    }
+                    journal.insert(compaction_key.clone(), outcome);
+                }
                 drop(resource_reservation);
                 // TD-COMPACT-13: debounced reconciliation sweep (runs on both
                 // success and failure paths so a failed retirement is re-driven

@@ -2845,6 +2845,39 @@ pub async fn get_collection_route_health_v2(
 /// `endpoint` is the operator-facing label used in the error
 /// message + audit log so the caller can tell which mutation was
 /// rejected.
+/// Gate for operator maintenance endpoints (`COMPACT` / `POST .../compact`):
+/// accepts `SystemAdmin | ConfigureSystem | MaintainCollections` — the PG17
+/// `MAINTAIN` analog (TD-COMPACT-14). Same envelope as
+/// [`require_recall_admin`]: no auth context (unified-port dev mode) passes
+/// with the documented dev marker; an attached context without one of the
+/// three permissions is a 403.
+fn require_maintain(
+    user_context: Option<&crate::security::rbac_service::UnifiedUserContext>,
+    endpoint: &'static str,
+) -> ApiResult<String> {
+    use crate::security::rbac_service::UnifiedPermission;
+
+    let Some(ctx) = user_context else {
+        return Ok("dev:unified-port-no-auth".to_string());
+    };
+    let allowed = ctx
+        .effective_permissions
+        .contains(&UnifiedPermission::SystemAdmin)
+        || ctx
+            .effective_permissions
+            .contains(&UnifiedPermission::ConfigureSystem)
+        || ctx
+            .effective_permissions
+            .contains(&UnifiedPermission::MaintainCollections);
+    if allowed {
+        Ok(ctx.user_id.clone())
+    } else {
+        Err(ApiError::Forbidden(format!(
+            "{endpoint}: requires SystemAdmin, ConfigureSystem or MaintainCollections permission"
+        )))
+    }
+}
+
 fn require_recall_admin(
     user_context: Option<&crate::security::rbac_service::UnifiedUserContext>,
     endpoint: &'static str,
@@ -3283,6 +3316,83 @@ async fn ensure_collection_exists(
 /// `POST /api/v2/collections/:id/suspend` — Phase 8 F4a. Evicts the collection's
 /// in-memory IVF index to free memory (the persisted `ivf.bin` + catalog
 /// metadata stay); the next query (or `/resume`) warm-loads it. Admin-gated.
+/// `POST /api/v2/collections/{id}/compact` body `{"full": bool}` (an
+/// omitted body — no Content-Type — compacts plainly). Operator endpoint (TD-COMPACT-14): NOT utoipa-annotated, so it is
+/// not part of the published OpenAPI spec — same convention as
+/// suspend/resume and the `_diagnostics` actions.
+#[derive(Debug, serde::Deserialize)]
+pub struct CompactRequest {
+    #[serde(default)]
+    pub full: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct CompactResponse {
+    pub collection_id: String,
+    pub full: bool,
+    pub segments_before: Option<usize>,
+    pub segments_after: Option<usize>,
+    pub passes: Option<usize>,
+    pub reached_target: Option<bool>,
+    pub stop_reason: Option<String>,
+}
+
+pub async fn post_collection_compact_v2(
+    Path(collection_id): Path<String>,
+    Extension(tenant): Extension<TenantContext>,
+    user_context: Option<Extension<crate::security::rbac_service::UnifiedUserContext>>,
+    State(state): State<AppState>,
+    body: Option<axum::Json<CompactRequest>>,
+) -> ApiResult<Json<CompactResponse>> {
+    if collection_id.is_empty() {
+        return Err(ApiError::InvalidArgument(
+            "Collection ID is required".to_string(),
+        ));
+    }
+    require_maintain(user_context.as_ref().map(|e| &e.0), "compact")?;
+    // The engine needs the full Collection proto (storage_assignment + tags
+    // resolve the output encoding), so resolve via the tenant-scoped
+    // collection service rather than the metadata-only existence check.
+    let storage_tenant = crate::storage::tenant::context::StorageTenantContext::from(&tenant);
+    let Some(collection) = state
+        .collection_service
+        .get_collection_with_tenant_context(&collection_id, Some(&storage_tenant))
+        .await
+        .map_err(|e| ApiError::Internal(format!("collection lookup: {e}")))?
+    else {
+        return Err(ApiError::CollectionNotFound(collection_id.clone()));
+    };
+    let full = body.map(|Json(request)| request.full).unwrap_or(false);
+    let result = state
+        .vector_operations_service
+        .unified_engine()
+        .compact_collection_full(&collection.id, Some(&collection), full)
+        .await
+        .map_err(|e| ApiError::Internal(format!("compaction: {e}")))?;
+    let metric = |key: &str| {
+        result
+            .engine_metrics
+            .get(key)
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+    };
+    Ok(Json(CompactResponse {
+        collection_id,
+        full,
+        segments_before: metric("segments_before"),
+        segments_after: metric("segments_after"),
+        passes: metric("passes"),
+        reached_target: result
+            .engine_metrics
+            .get("reached_target")
+            .and_then(|value| value.as_bool()),
+        stop_reason: result
+            .engine_metrics
+            .get("stop_reason")
+            .and_then(|value| value.as_str().map(str::to_string)),
+    }))
+}
+
 pub async fn post_collection_suspend_v2(
     Path(collection_id): Path<String>,
     Extension(tenant): Extension<TenantContext>,
@@ -4240,6 +4350,50 @@ mod tests {
     }
 
     #[test]
+    fn require_maintain_allows_when_no_context_in_unified_port_mode() {
+        assert_eq!(
+            require_maintain(None, "compact").expect("dev fallback"),
+            "dev:unified-port-no-auth"
+        );
+    }
+
+    #[test]
+    fn require_maintain_accepts_its_three_permissions() {
+        use crate::security::rbac_service::UnifiedPermission;
+        for permission in [
+            UnifiedPermission::SystemAdmin,
+            UnifiedPermission::ConfigureSystem,
+            UnifiedPermission::MaintainCollections,
+        ] {
+            let ctx = ctx_with_permissions(vec![permission]);
+            let user = require_maintain(Some(&ctx), "compact")
+                .unwrap_or_else(|e| panic!("accepted permission rejected: {e}"));
+            assert_eq!(user, ctx.user_id);
+        }
+    }
+
+    #[test]
+    fn require_maintain_rejects_other_permissions() {
+        use crate::security::rbac_service::UnifiedPermission;
+        for permissions in [
+            vec![UnifiedPermission::TenantRead],
+            vec![
+                UnifiedPermission::CollectionCreate,
+                UnifiedPermission::ListCollections,
+            ],
+            vec![UnifiedPermission::AuditRead],
+        ] {
+            let ctx = ctx_with_permissions(permissions);
+            let error = require_maintain(Some(&ctx), "compact")
+                .expect_err("insufficient permission must be a 403");
+            assert!(
+                matches!(&error, ApiError::Forbidden(message) if message.contains("MaintainCollections")),
+                "{:?}: {error:?}",
+                ctx.effective_permissions
+            );
+        }
+    }
+
     fn require_recall_admin_allows_when_no_context_in_unified_port_mode() {
         // The unified-port REST server doesn't attach
         // auth_middleware_unified, so Option<Extension<...>> resolves
