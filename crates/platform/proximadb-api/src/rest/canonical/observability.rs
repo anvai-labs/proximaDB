@@ -133,13 +133,9 @@ pub struct LogQueryRequest {
     pub services: Vec<String>,
     #[serde(default)]
     pub sources: Vec<String>,
-    #[serde(default = "default_limit")]
+    #[serde(default = "super::default_limit")]
     pub limit: u32,
     pub cursor: Option<String>,
-}
-
-fn default_limit() -> u32 {
-    100
 }
 
 #[derive(Debug, Deserialize)]
@@ -872,7 +868,7 @@ mod tests {
         assert_eq!(default_warm(), 7);
         assert_eq!(default_cold(), 30);
         assert_eq!(default_severity_str(), "info");
-        assert_eq!(default_limit(), 100);
+        assert_eq!(crate::rest::canonical::default_limit(), 100);
         assert_eq!(default_aggregation(), "avg");
         assert_eq!(default_step(), 60);
 

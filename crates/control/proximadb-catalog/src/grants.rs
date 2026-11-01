@@ -367,19 +367,7 @@ impl FileSystemGrantStore {
     }
 }
 
-fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
-    match lock.read() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
-    match lock.write() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
+use crate::lock_util::{read_lock, write_lock};
 
 // ---------------------------------------------------------------------------
 // The specification (ADR-090 L1.1 / TD-AUTHZ-1). Written before the
