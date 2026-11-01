@@ -2190,6 +2190,7 @@ def write_config(
     compaction_spill_scratch_amplification_factor: float = 10.0,
     compaction_spill_available_disk_fraction: float = 0.5,
     compaction_spill_max_disk_mb: int = 0,
+    reservation_pool: tuple[str, int, int] | None = None,
 ) -> None:
     data = root / "data"
     if compaction_spill_enabled and compaction_spill_directory is None:
@@ -2199,6 +2200,17 @@ def write_config(
         if compaction_spill_directory is not None
         else ""
     )
+    pool_section = ""
+    if reservation_pool is not None:
+        pool_id, allocatable_gb, default_grant_gb = reservation_pool
+        pool_section = (
+            "# TD-TIER-1 SC6: admitted-residency pool (opt-in; SC2/SC3/SC4).\n"
+            "[[storage.reservation_pools]]\n"
+            f'id = "{pool_id}"\n'
+            f'path = "{root / "pool"}"\n'
+            f"allocatable_bytes = {allocatable_gb << 30}\n"
+            f"default_grant_bytes = {default_grant_gb << 30}\n\n"
+        )
     config = f"""[server]
 node_id = "sift1m-get-reduction"
 bind_address = "127.0.0.1"
@@ -2252,7 +2264,7 @@ segment_invariants_cache_mb = 256
 survivor_cache_mb = 1024
 cache_on_write = "all"
 
-[api]
+{pool_section}[api]
 unified_mode = true
 unified_port = {port}
 rest_port = {port}
@@ -2727,22 +2739,32 @@ def post_flush_compaction_observation(
     }
 
 
-def create_collection(server: str, base_path: Path, base_format: str) -> str:
+def create_collection(
+    server: str,
+    base_path: Path,
+    base_format: str,
+    storage_class: str | None = None,
+) -> str:
     """Create the (empty) benchmark collection and return its id — the same
     call ingest() makes, without inserting vectors. TD-TIER-1 E1 --skip-ingest
     uses it to register the collection in a fresh server's catalog so the
-    object prefix a prior run built (which contains <id>/data/...) resolves."""
+    object prefix a prior run built (which contains <id>/data/...) resolves.
+    TD-TIER-1 SC6: `storage_class` (e.g. "performance") requests admitted
+    residency at create (SC2 admission against the configured pool)."""
     _, dimension, _ = vector_source_geometry(base_path, base_format)
-    response = request_json(
-        server + "/api/v2/collections",
-        method="POST",
-        body={
+    body = {
             "name": "sift1m_get_reduction",
             "dimension": dimension,
             "engine": "sst",
             "enable_proxima_record": True,
             "distance_metric": "euclidean",
-        },
+    }
+    if storage_class is not None:
+        body["storage_class"] = storage_class
+    response = request_json(
+        server + "/api/v2/collections",
+        method="POST",
+        body=body,
     )
     collection_id = str(response.get("collection_id") or response.get("id") or "")
     if not collection_id:
@@ -2762,18 +2784,22 @@ def ingest(
     explicit_flush_every_rows: int | None,
     explicit_geometry: AzureCliPaxGeometry | None,
     metadata_cols: dict[str, str] | None = None,
+    storage_class: str | None = None,
 ) -> tuple[str, float, dict[int, int], list[dict], dict | None]:
     _, dimension, _ = vector_source_geometry(base_path, base_format)
+    create_body = {
+        "name": "sift1m_get_reduction",
+        "dimension": dimension,
+        "engine": "sst",
+        "enable_proxima_record": True,
+        "distance_metric": "euclidean",
+    }
+    if storage_class is not None:
+        create_body["storage_class"] = storage_class
     response = request_json(
         server + "/api/v2/collections",
         method="POST",
-        body={
-            "name": "sift1m_get_reduction",
-            "dimension": dimension,
-            "engine": "sst",
-            "enable_proxima_record": True,
-            "distance_metric": "euclidean",
-        },
+        body=create_body,
     )
     collection_id = str(response.get("collection_id") or response.get("id") or "")
     if not collection_id:
@@ -3158,6 +3184,31 @@ def main() -> int:
         ),
     )
     parser.add_argument("--queries", type=int, default=1_000)
+    parser.add_argument(
+        "--storage-class",
+        default=None,
+        help="TD-TIER-1 SC6: storage_class on collection create (e.g. performance; "
+        "requires --reservation-pool-allocatable-gb for admission)",
+    )
+    parser.add_argument(
+        "--reservation-pool-allocatable-gb",
+        type=int,
+        default=0,
+        help="TD-TIER-1 SC6: [[storage.reservation_pools]] allocatable_bytes (GiB); 0 = no pool",
+    )
+    parser.add_argument(
+        "--reservation-pool-grant-gb",
+        type=int,
+        default=0,
+        help="TD-TIER-1 SC6: pool default_grant_bytes (GiB)",
+    )
+    parser.add_argument(
+        "--residency-ready-timeout-secs",
+        type=int,
+        default=600,
+        help="TD-TIER-1 SC6: wait for storage_class_status READY before the warm "
+        "sweep when a storage_class was requested (0 = skip the wait)",
+    )
     parser.add_argument(
         "--skip-ingest",
         action="store_true",
@@ -3620,6 +3671,11 @@ def main() -> int:
         args.compaction_spill_scratch_amplification_factor,
         args.compaction_spill_available_disk_fraction,
         args.compaction_spill_max_disk_mb,
+        reservation_pool=(
+            ("sc6", args.reservation_pool_allocatable_gb, args.reservation_pool_grant_gb)
+            if args.reservation_pool_allocatable_gb > 0
+            else None
+        ),
     )
     server_url = f"http://127.0.0.1:{args.port}"
     local_disk = root / "local-disk-cache"
@@ -3893,6 +3949,7 @@ def main() -> int:
                     if args.metadata_cols
                     else None
                 ),
+                storage_class=args.storage_class,
             )
             result["collection_id"] = collection_id
             result["ingest"] = {
@@ -4027,6 +4084,37 @@ def main() -> int:
         active = spawn_server("server-local-disk-warm.log", local_disk)
         active.start()
         active_pid = active.process.pid if active.process is not None else None
+        if args.storage_class and args.residency_ready_timeout_secs > 0:
+            # TD-TIER-1 SC6: the granted arm serves from residency only once
+            # the grant is READY(g) — poll storage_class_status, then pin the
+            # status (state, coverage, generation) into the result.
+            import urllib.error as _urlerror
+
+            deadline = time.monotonic() + args.residency_ready_timeout_secs
+            status = None
+            while time.monotonic() < deadline:
+                try:
+                    detail = request_json(
+                        f"{server_url}/api/v2/collections/{collection_id}",
+                        method="GET",
+                    )
+                except Exception:
+                    detail = None
+                status = (
+                    detail.get("storage_class_status") if isinstance(detail, dict) else None
+                )
+                if isinstance(status, dict) and str(status.get("state", "")).upper() == "READY":
+                    break
+                time.sleep(2.0)
+            if not (isinstance(status, dict) and str(status.get("state", "")).upper() == "READY"):
+                raise RuntimeError(
+                    f"TD-TIER-1 SC6: residency never reached READY within "
+                    f"{args.residency_ready_timeout_secs}s: {status!r}"
+                )
+            result["residency"] = {
+                "ready_status": status,
+                "waited_for": "storage_class_status.state == READY",
+            }
         local_warm = phase_sweep("local_disk_warm", args.queries)
         result["phases"]["local_disk_warm"] = local_warm
         failures.extend(
