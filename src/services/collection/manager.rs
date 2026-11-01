@@ -1454,7 +1454,10 @@ impl CollectionService {
         // Collection IDs are UUIDs. Legacy base62/time IDs remain resolvable from older metadata,
         // but new catalog assets use opaque UUID identity and keep names as stable logical aliases.
         let uuid = self.generate_unique_collection_id().await?;
-        let now = chrono::Utc::now().timestamp_micros();
+        // TD-COLLTIME-1: Collection.created_at/updated_at are Unix epoch
+        // MILLISECONDS (documented on the proto field); this `now` feeds only
+        // those two fields. Was timestamp_micros() — rendered as year 58784.
+        let now = chrono::Utc::now().timestamp_millis();
 
         // Get storage location - use provided or pick randomly from config
         let base_location = if let Some(ref storage_config) = enriched_config.storage_config {
@@ -3167,7 +3170,8 @@ impl CollectionService {
                 existing
                     .properties
                     .insert("vector.dimension".to_string(), config.dimension.to_string());
-                existing.updated_at_ms = collection.updated_at / 1000;
+                // TD-COLLTIME-1: proto is milliseconds now — no µs→ms adapter.
+                existing.updated_at_ms = collection.updated_at;
                 if existing.storage_layouts.is_empty() {
                     existing.storage_layouts = schema.storage_layouts.clone();
                 }
