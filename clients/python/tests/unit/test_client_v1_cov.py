@@ -305,7 +305,10 @@ def test_insert_records_rest_vectorrecord(rest_client, monkeypatch):
     rest_client.insert_vectors("col", [rec])
     payload = captured["json"]["records"][0]
     assert payload["id"] == "v1"
-    assert payload["source"] == "hello"
+    # TD-REC-1: no top-level `source` on the wire (it was always silently
+    # dropped server-side and is now a contract 400) — the content rides in
+    # text_fields, where it persists.
+    assert "source" not in payload
     assert payload["text_fields"][0]["content"] == "hello"
 
 

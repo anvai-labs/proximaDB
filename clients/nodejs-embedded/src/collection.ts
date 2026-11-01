@@ -35,12 +35,18 @@ function recordPayload(record: {
   props?: Record<string, JsonValue>;
   source?: string;
 }): ProximaRecord {
-  return {
+  const built: ProximaRecord = {
     id: record.id,
     vector: record.vector ?? [],
     props: record.props ?? record.metadata ?? {},
-    source: record.source,
   };
+  // TD-REC-1: `source` is not a contract field at a record's top level
+  // (silently dropped server-side before, a 400 on REST now). Route it into
+  // the text field where it persists instead of dropping it client-side.
+  if (record.source !== undefined) {
+    built.textFields = [{ name: "text", content: record.source }];
+  }
+  return built;
 }
 
 function insertedCount(response: RecordBatchResponse): number {

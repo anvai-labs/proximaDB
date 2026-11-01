@@ -250,7 +250,8 @@ def test_langchain_add_texts_generates_ids_and_inserts():
     coll, records = client.inserted[0]
     assert coll == "docs"
     assert records[0]["id"] == ids[0]
-    assert records[0]["source"] == "hello"
+    # TD-REC-1: text rides in text_fields, not a top-level source.
+    assert records[0]["text_fields"][0]["content"] == "hello"
     assert records[0]["props"] == {"a": 1}
 
 

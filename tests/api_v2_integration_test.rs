@@ -362,16 +362,22 @@ fn generate_test_records(count: usize, dimension: usize) -> Vec<JsonValue> {
                 .map(|j| (i * dimension + j) as f32 / (count * dimension) as f32)
                 .collect();
 
+            // TD-REC-1: the record contract is {id, vector, props (alias
+            // metadata), text_fields} with unknown fields rejected. The old
+            // `typed_fields` key was never a contract field — the server
+            // silently dropped it, so the filter assertions over `category`
+            // were vacuous. The typed values now ride in `props` (merged with
+            // the former `metadata` map: both keys in one record is a
+            // duplicate-field rejection), making this suite actually
+            // exercise persistence + filtering.
             json!({
                 "id": format!("record_{}", i),
                 "vector": vector,
-                "typed_fields": {
+                "props": {
                     "category": format!("category_{}", i % 3),
                     "price": 10.0 + (i as f64 * 5.0),
                     "in_stock": i % 2 == 0,
-                    "quantity": i * 10
-                },
-                "metadata": {
+                    "quantity": i * 10,
                     "source": "test",
                     "index": i
                 }
@@ -391,9 +397,10 @@ fn generate_test_records_with_text(count: usize, dimension: usize) -> Vec<JsonVa
             json!({
                 "id": format!("doc_{}", i),
                 "vector": vector,
-                "typed_fields": {
+                "props": {
                     "title": format!("Document Title {}", i),
-                    "category": format!("cat_{}", i % 5)
+                    "category": format!("cat_{}", i % 5),
+                    "author": format!("author_{}", i % 3)
                 },
                 "text_fields": [
                     {
@@ -401,10 +408,7 @@ fn generate_test_records_with_text(count: usize, dimension: usize) -> Vec<JsonVa
                         "content": format!("This is the description for document {}. It contains sample text for testing purposes.", i),
                         "storage_hint": "adaptive"
                     }
-                ],
-                "metadata": {
-                    "author": format!("author_{}", i % 3)
-                }
+                ]
             })
         })
         .collect()
@@ -1198,7 +1202,7 @@ async fn test_insert_records_empty_vector() {
     let records = vec![json!({
         "id": "empty_vec_record",
         "vector": [],
-        "typed_fields": {
+        "props": {
             "test": "value"
         }
     })];

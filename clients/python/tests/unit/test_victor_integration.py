@@ -89,7 +89,8 @@ class TestIndexDocument:
         records = call_kwargs.args[1]
         assert len(records) == 1
         assert records[0]["id"] == "doc1"
-        assert records[0]["source"] == "hello world"
+        # TD-REC-1: text rides in text_fields, not a top-level source.
+        assert records[0]["text_fields"][0]["content"] == "hello world"
         assert records[0]["props"]["file_path"] == "src/main.py"
 
     @pytest.mark.asyncio
@@ -111,7 +112,8 @@ class TestIndexDocumentsBatch:
         records = mock_client.insert_records.call_args.args[1]
         assert len(records) == 2
         assert records[0]["id"] == "a"
-        assert records[0]["source"] == "alpha"
+        # TD-REC-1: text rides in text_fields, not a top-level source.
+        assert records[0]["text_fields"][0]["content"] == "alpha"
         assert records[1]["id"] == "b"
 
     @pytest.mark.asyncio

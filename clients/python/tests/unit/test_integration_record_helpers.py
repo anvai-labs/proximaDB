@@ -37,11 +37,12 @@ def test_record_payload_preserves_text_and_props():
         metadata={"kind": "note"},
     )
 
+    # TD-REC-1: no top-level `source` (never a contract field — silently
+    # dropped server-side before, a 400 now); the text rides in text_fields.
     assert payload == {
         "id": "r1",
         "vector": [1, 2],
         "props": {"kind": "note"},
-        "source": "hello",
         "text_fields": [{"name": "text", "content": "hello"}],
     }
 

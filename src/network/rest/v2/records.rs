@@ -33,7 +33,8 @@
 
 use axum::{
     Json,
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Path, Query, State, rejection::JsonRejection},
+    response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -322,13 +323,17 @@ fn convert_typed_filters_to_clauses(
 ///                     "content": "A detailed product description...",
 ///                     "storage_hint": "adaptive"
 ///                 }
-///             ],
-///             "source": "catalog_import"
+///             ]
 ///         }
 ///     ],
 ///     "validate_schema": true
 /// }
 /// ```
+///
+/// (A record top level accepts exactly `id`, `vector`, `props` — or its
+/// advertised alias `metadata` — and `text_fields`; anything else is a 400
+/// naming the unknown field. The example used to show a `"source"` key: it
+/// was never a contract field and was silently dropped before TD-REC-1.)
 /// Not supported in v0.2: optimistic versioning, conditional-write predicates,
 /// update-by-filter, delete-by-filter, and patch / partial-record update. The
 /// live contract is exposed via `WriteContractHealth` on the route-health
@@ -1084,7 +1089,28 @@ pub async fn insert_records(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
     capability: Option<Extension<DataPlaneCapability>>,
-    Json(request): Json<InsertRecordsRequest>,
+    payload: Result<Json<InsertRecordsRequest>, JsonRejection>,
+) -> Response {
+    // TD-REC-1: with `deny_unknown_fields` on the record DTO, a rejected body
+    // must be the documented 400 ApiError envelope naming the unknown field —
+    // not axum's plain-text 422 (the same reason `json_body` exists,
+    // TD-RESTGET-1).
+    let request = match super::json_body(payload) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match insert_records_inner(collection, state, tenant, capability, request).await {
+        Ok(response) => response.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn insert_records_inner(
+    collection: String,
+    state: AppState,
+    tenant: TenantContext,
+    capability: Option<Extension<DataPlaneCapability>>,
+    request: InsertRecordsRequest,
 ) -> ApiResult<Json<InsertRecordsResponse>> {
     info!(
         "V2 API: Inserting {} records into collection '{}'",
