@@ -361,7 +361,15 @@ pub struct ProximaRecordInput {
     #[schema(value_type = Vec<f32>)]
     pub vector: Vec<f32>,
     /// Canonical rich property map.
+    ///
+    /// `metadata` is accepted as an alias: the documents API advertises that
+    /// spelling ("Arbitrary metadata fields. Stored as ProximaRecord props")
+    /// and maps it here, so the records API must accept it too — before the
+    /// alias it was silently dropped and filters over it matched nothing
+    /// (TD-REC-1). The OpenAPI contract stays `props`; the alias is
+    /// lenience for the already-advertised spelling, not a second field.
     #[schema(value_type = Option<HashMap<String, Value>>)]
+    #[serde(alias = "metadata")]
     pub props: Option<HashMap<String, RestProximaValue>>,
     /// Dedicated TEXT fields with storage hints
     pub text_fields: Option<Vec<TextFieldInput>>,
@@ -2624,6 +2632,34 @@ mod tests {
 
     fn rv(value: serde_json::Value) -> RestProximaValue {
         RestProximaValue::Inferred(value)
+    }
+
+    #[test]
+    fn record_input_accepts_the_documents_api_metadata_spelling() {
+        // TD-REC-1: the documents API advertises `metadata` ("stored as
+        // ProximaRecord props") while the records API took only `props`, so a
+        // record POSTed to /records with the advertised field name was
+        // silently dropped (insert 3/3 success, filters over it empty). The
+        // two v2 surfaces must accept the same user-field spelling.
+        for field in ["props", "metadata"] {
+            let json =
+                format!(r#"{{"id":"r1","vector":[0.1,0.2],"{field}":{{"category":"tech"}}}}"#);
+            let input: ProximaRecordInput = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("{field} must deserialize: {e}"));
+            let props = input
+                .props
+                .unwrap_or_else(|| panic!("{field} must land in props, got None"));
+            assert!(props.contains_key("category"), "{field}: {props:?}");
+        }
+
+        // Both keys in one object must fail loud (serde: "duplicate field"),
+        // never silently prefer one map over the other.
+        let both = serde_json::json!({
+            "id": "r1", "vector": [0.1, 0.2],
+            "props": {"category": "tech"},
+            "metadata": {"category": "news"},
+        });
+        assert!(serde_json::from_str::<ProximaRecordInput>(&both.to_string()).is_err());
     }
 
     #[test]
