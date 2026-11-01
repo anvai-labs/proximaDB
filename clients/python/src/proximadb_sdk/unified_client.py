@@ -4156,8 +4156,13 @@ class ProximaDBClient:
         # The adapter chain owns its own resources (the REST adapter's
         # shared generated document client holds an httpx pool); in REST
         # mode `_client` and `_adapter` are separate objects, so close the
-        # adapter chain too or its pool leaks until GC.
-        for adapter in (self._adapter, getattr(self, "_rest_adapter", None)):
+        # adapter chain too or its pool leaks until GC. getattr throughout:
+        # close() runs from __del__ on partially-constructed clients (an
+        # __init__ that raised before the adapter assignments).
+        for adapter in (
+            getattr(self, "_adapter", None),
+            getattr(self, "_rest_adapter", None),
+        ):
             if adapter is not None and hasattr(adapter, "close"):
                 try:
                     adapter.close()
