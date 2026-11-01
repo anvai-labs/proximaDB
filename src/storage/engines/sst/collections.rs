@@ -284,9 +284,10 @@ impl SstEngine {
         let mut deleted_count = 0;
         let mut error_count = 0;
 
-        // Segment files the readers recognize (.sst/.proximablock/.pax — the
-        // current flush writer emits .pax; .arrow covers ArrowBlock-configured
-        // collections) plus the ancillary bloom/meta/idx.
+        // Segment files the readers recognize (.sst/.proximablock/.pax; the
+        // current flush writer emits .pax, .proximablock survives only in the
+        // readers' legacy filters) + .arrow (ArrowBlock-configured writers)
+        // + the ancillary bloom/meta/idx.
         for entry in &files {
             if entry.metadata.is_directory {
                 continue;
