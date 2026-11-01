@@ -353,7 +353,17 @@ pub struct InsertRecordsRequest {
 /// This is the JSON-serializable input format for ProximaRecord.
 /// It uses serde_json::Value for typed fields to support dynamic typing
 /// at the API boundary, with validation happening during conversion.
+///
+/// Unknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy): a
+/// write that carries a field this contract does not know must fail loud at
+/// the boundary, not report success while silently discarding data — which
+/// is exactly how the `metadata` drop shipped. The grandfathered spellings
+/// are the ones the contract itself advertises: `props` and its `metadata`
+/// alias. Generated SDKs (regenerated in #2337) send only declared fields,
+/// so the deny cannot break them; a hand-rolled client sending something
+/// else gets a 400 naming the problem instead of a silent no-op filter.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProximaRecordInput {
     /// Record ID (optional, will be auto-generated if not provided)
     pub id: Option<String>,
@@ -368,6 +378,9 @@ pub struct ProximaRecordInput {
     /// alias it was silently dropped and filters over it matched nothing
     /// (TD-REC-1). The OpenAPI contract stays `props`; the alias is
     /// lenience for the already-advertised spelling, not a second field.
+    /// It composes with `deny_unknown_fields`: an alias is a KNOWN field
+    /// name, so `metadata` passes the deny while any other unknown key is
+    /// rejected.
     #[schema(value_type = Option<HashMap<String, Value>>)]
     #[serde(alias = "metadata")]
     pub props: Option<HashMap<String, RestProximaValue>>,
@@ -2660,6 +2673,34 @@ mod tests {
             "metadata": {"category": "news"},
         });
         assert!(serde_json::from_str::<ProximaRecordInput>(&both.to_string()).is_err());
+    }
+
+    #[test]
+    fn record_input_rejects_unknown_fields() {
+        // TD-REC-1 policy: a field outside the contract (and outside the
+        // grandfathered `metadata` alias) must FAIL LOUD at the boundary —
+        // the silent drop is the bug class this TD exists to close. Any other
+        // historical spelling (e.g. a `metadata`-shaped `attributes`) gets a
+        // 400 naming the unknown field instead of a success + no-op filter.
+        let unknown = serde_json::json!({
+            "id": "r1", "vector": [0.1, 0.2],
+            "attributes": {"category": "tech"},
+        });
+        let err = serde_json::from_str::<ProximaRecordInput>(&unknown.to_string())
+            .expect_err("unknown field must be rejected");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "error must name the unknown field, got: {err}"
+        );
+
+        // The declared fields and the grandfathered alias still pass the deny.
+        for field in ["props", "metadata"] {
+            let json = format!(r#"{{"id":"r1","vector":[0.1],"{field}":{{"k":"v"}}}}"#);
+            assert!(
+                serde_json::from_str::<ProximaRecordInput>(&json).is_ok(),
+                "{field} must still deserialize under deny_unknown_fields"
+            );
+        }
     }
 
     #[test]
