@@ -9,7 +9,7 @@
 | Priority | P2 — two live nom-based Cypher grammars with 34 shared function names and drifted bodies is the standard fork disease; every parser fix must currently land twice or silently miss one path.
 | Relates to | link:TD-GRAPH-3-cypher-variable-length-multihop.adoc[TD-GRAPH-3] (variable-length parsing), the 2026-10-31 victor clone-scan dedup program (wave 3)
 | Component | `crates/query/proximadb-graph-query/src/parser/` (read path + `write_seam.rs`), `crates/modalities/proximadb-graph/src/cypher_parser.rs` (the graph-API grammar), `src/query/parsers/cypher.rs` + `src/graph/query/graph_parser.rs` (its consumers).
-| Evidence | 2026-10-31 scan: two parsers, 54 vs 43 top-level fns, 34 shared names, drifted bodies (`ParseResult` vs `IResult`, combinator reorg); graph-consumer analysis: the graph-query crate's ONLY runtime consumer is `proximadb-query/src/graph_lowering.rs` (`QueryParser`, the read path), while its full-Cypher write grammar (CREATE/MERGE/DELETE/SET/REMOVE/WITH/OPTIONAL MATCH over `CypherQuery`) is unwired — exercised solely by its own 36 tests. The modality crate's parser is the live full-Cypher implementation (graph API path).
+| Evidence | 2026-10-31 scan: two parsers, 54 vs 43 top-level fns, 34 shared names, drifted bodies (`ParseResult` vs `IResult`, combinator reorg); graph-consumer analysis: the graph-query crate's ONLY runtime consumer is `proximadb-query/src/graph_lowering.rs` (`QueryParser`, the read path), while its full-Cypher write grammar (CREATE/MERGE/DELETE/SET/REMOVE/WITH/OPTIONAL MATCH over `CypherQuery`) is unwired — exercised solely by its own 19 tests in the parser test module. The modality crate's parser is the live full-Cypher implementation (graph API path).
 |===
 
 == The finding
@@ -24,7 +24,7 @@ drifted twin.
 
 1. **Seam made explicit** (landed): the write grammar lives in
    `parser/write_seam.rs` with its rationale, a single documented module-level `dead_code`
-   allowance, and its 36 tests intact (47/47 green; pure code motion).
+   allowance, and its 19 tests intact (parser module: 19 seam + 17 read-path = 36; crate total 47/47 green; pure code motion).
 2. **Convergence design** (open): new full-Cypher parsing work belongs behind the seam. When
    the modality parser next needs a grammar change, port the clause parsers onto the seam
    (shared lexemes → shared patterns → clause-by-clause), keeping the modality's

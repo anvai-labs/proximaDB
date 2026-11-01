@@ -36,7 +36,6 @@ pub(super) fn parse_property_value_map(
 }
 
 // Parse a CREATE node specification (n:Label {props})
-#[allow(dead_code)]
 pub(super) fn parse_create_node_spec(input: &str) -> IResult<&str, CreateNodeSpec> {
     map(
         delimited(
@@ -57,7 +56,6 @@ pub(super) fn parse_create_node_spec(input: &str) -> IResult<&str, CreateNodeSpe
 }
 
 // Parse a CREATE edge specification (a)-[r:TYPE {props}]->(b)
-#[allow(dead_code)]
 pub(super) fn parse_create_edge_pattern(
     input: &str,
 ) -> IResult<&str, (CreateNodeSpec, CreateEdgeSpec, CreateNodeSpec)> {
@@ -91,7 +89,6 @@ pub(super) fn parse_create_edge_pattern(
 }
 
 // Parse edge spec for CREATE: -[r:TYPE {props}]->
-#[allow(dead_code)]
 pub(super) fn parse_create_edge_spec(input: &str) -> IResult<&str, CreateEdgeSpecParts> {
     map(
         tuple((
@@ -124,7 +121,6 @@ pub(super) fn parse_create_edge_spec(input: &str) -> IResult<&str, CreateEdgeSpe
 }
 
 // Parse CREATE clause
-#[allow(dead_code)]
 pub(super) fn parse_create_clause(input: &str) -> IResult<&str, CreateClause> {
     preceded(
         tag("CREATE"),
@@ -157,7 +153,6 @@ pub(super) fn parse_create_clause(input: &str) -> IResult<&str, CreateClause> {
 }
 
 // Parse DELETE clause
-#[allow(dead_code)]
 pub(super) fn parse_delete_clause(input: &str) -> IResult<&str, DeleteClause> {
     map(
         tuple((
@@ -178,7 +173,6 @@ pub(super) fn parse_delete_clause(input: &str) -> IResult<&str, DeleteClause> {
 }
 
 // Parse SET item: n.prop = value OR n:Label OR n = {props} OR n += {props}
-#[allow(dead_code)]
 pub(super) fn parse_set_item(input: &str) -> IResult<&str, SetItem> {
     alt((
         // Property assignment: n.prop = value
@@ -229,7 +223,6 @@ pub(super) fn parse_set_item(input: &str) -> IResult<&str, SetItem> {
 }
 
 // Parse SET clause
-#[allow(dead_code)]
 pub(super) fn parse_set_clause(input: &str) -> IResult<&str, SetClause> {
     preceded(
         tag("SET"),
@@ -247,7 +240,6 @@ pub(super) fn parse_set_clause(input: &str) -> IResult<&str, SetClause> {
 }
 
 // Parse REMOVE item: n.prop OR n:Label
-#[allow(dead_code)]
 pub(super) fn parse_remove_item(input: &str) -> IResult<&str, RemoveItem> {
     alt((
         // Remove property: n.prop
@@ -264,7 +256,6 @@ pub(super) fn parse_remove_item(input: &str) -> IResult<&str, RemoveItem> {
 }
 
 // Parse REMOVE clause
-#[allow(dead_code)]
 pub(super) fn parse_remove_clause(input: &str) -> IResult<&str, RemoveClause> {
     preceded(
         tag("REMOVE"),
@@ -282,7 +273,6 @@ pub(super) fn parse_remove_clause(input: &str) -> IResult<&str, RemoveClause> {
 }
 
 // Parse MERGE clause
-#[allow(dead_code)]
 pub(super) fn parse_merge_clause(input: &str) -> IResult<&str, MergeClause> {
     map(
         tuple((
@@ -335,7 +325,6 @@ pub(super) fn parse_merge_clause(input: &str) -> IResult<&str, MergeClause> {
 }
 
 // Parse OPTIONAL MATCH clause
-#[allow(dead_code)]
 pub(super) fn parse_optional_match_clause(
     input: &str,
 ) -> IResult<&str, (Vec<NodePattern>, Vec<EdgePattern>)> {
@@ -363,7 +352,6 @@ pub(super) fn parse_optional_match_clause(
 }
 
 // Parse WITH clause
-#[allow(dead_code)]
 pub(super) fn parse_with_clause(input: &str) -> IResult<&str, WithClause> {
     preceded(
         tag("WITH"),
@@ -457,5 +445,3 @@ pub(super) fn parse_cypher_query(input: &str) -> IResult<&str, CypherQuery> {
         },
     )(input)
 }
-
-// Main query parser

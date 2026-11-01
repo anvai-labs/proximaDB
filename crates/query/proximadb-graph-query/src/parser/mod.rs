@@ -747,6 +747,7 @@ mod write_seam;
 #[cfg(test)]
 use write_seam::*;
 
+// Main query parser
 fn parse_query(input: &str) -> IResult<&str, CompiledPattern> {
     map(
         tuple((
