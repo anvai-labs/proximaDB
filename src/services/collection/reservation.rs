@@ -1887,6 +1887,11 @@ mod tests {
     // must carry pid 1's REAL start ticks — a mismatched-ticks token means
     // "the pid lives but the recorded holder doesn't" (pid reuse), which the
     // authority correctly reclaims.
+    //
+    // Linux-only: the assertions probe `/proc/1/stat` for a foreign pid's
+    // real start ticks. Off Linux there is no liveness probe (owner_is_live is
+    // fail-closed), so both branches below would take the same path.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn foreign_live_owner_rejected_and_pid_reuse_reclaimed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1913,6 +1918,10 @@ mod tests {
     // Verification round 2 (B1 residual): a LIVE takeover claim slot backs
     // the opener off — bounded attempts, then fail-closed — and never touches
     // the (stale) owner.lock it was judging.
+    //
+    // Linux-only: it needs a provably-LIVE claimer (pid 1's real start ticks
+    // from `/proc/1/stat`). Off Linux every foreign pid already looks live.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn live_claim_slot_backs_off_without_touching_the_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -1944,6 +1953,11 @@ mod tests {
     // A stale lock (dead foreign pid) is taken over by exactly one opener —
     // crash recovery. 4194303 is the PID_MAX_LIMIT ceiling: astronomically
     // unlikely to be live; if it somehow is, this test fails closed instead.
+    //
+    // Linux-only: proving a foreign pid dead requires `/proc/{pid}/stat`.
+    // Off Linux `owner_is_live` cannot prove death and is deliberately
+    // fail-closed — that contract is pinned by the cfg(not(linux)) test below.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn stale_lock_is_taken_over() {
         let dir = tempfile::tempdir().unwrap();
@@ -1952,6 +1966,24 @@ mod tests {
             .await
             .unwrap();
         ReservationAuthority::open(cfg).await.unwrap();
+    }
+
+    // The off-Linux face of the same coin: without a portable liveness probe
+    // a foreign holder can never be PROVEN dead, so the takeover must be
+    // refused (fail-closed, `SecondOwner`) rather than guessed at.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn stale_lock_is_fail_closed_off_linux() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = pool(&dir);
+        tokio::fs::write(owner_lock_path(dir.path()), "4194303:999999")
+            .await
+            .unwrap();
+        let err = ReservationAuthority::open(cfg).await.unwrap_err();
+        assert!(
+            err.to_string().contains("exclusively owned"),
+            "off-Linux a foreign holder must fail closed: {err}"
+        );
     }
 
     // Our own pid with a DIFFERENT start token (pid reuse after our crash) is

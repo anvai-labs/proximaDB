@@ -287,11 +287,13 @@ mod tests {
     use super::*;
     use crate::storage::engines::sst::centroid_directory_publisher::publish_centroid_directory;
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
+    use serial_test::serial;
 
     /// A key is used only for the object whose listed ETag it recorded: a
     /// rewritten object (another ETag) or a listing without one keeps the
     /// segment on its own metadata reads, while its cells are still planned.
     #[tokio::test]
+    #[serial]
     async fn a_decode_key_is_used_only_for_the_listed_object_it_recorded() {
         // SAFETY: nextest runs each test in its own process.
         unsafe {

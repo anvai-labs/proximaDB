@@ -1,5 +1,10 @@
 use super::*;
 
+// The tests below pin process-global gates (env or cached-once caps); they
+// hold the `#[serial]` env-gate lock so they cannot interleave with other
+// gate-pinning tests in the shared `cargo test --lib` process.
+use serial_test::serial;
+
 /// TD-SECSCAN-1 §5 (review round 2): the RaBitQ survivor pool and the
 /// morsel merge buffer are derived from a client-controlled `top_k`. A
 /// huge `k` (e.g. u32::MAX on an uncapped surface) must never inflate the
@@ -130,6 +135,7 @@ fn exact_authority_holds_for_region_c_segment() {
 /// (same Region A/B encodes ⇒ identical distances), and (b) strictly fewer
 /// ranged bytes at no more GETs — request economy at parity, byte win.
 #[tokio::test]
+#[serial]
 async fn v4_oid_chunk_fetch_parity_and_byte_win_vs_v3() {
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
@@ -555,6 +561,7 @@ async fn legacy_oid_block_corruption_fails_closed() {
 }
 
 #[tokio::test]
+#[serial]
 async fn oid_prefetch_fallback_records_each_physical_get_once() {
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
 
@@ -1061,6 +1068,7 @@ fn probe_range_coalescing_keeps_only_selected_cell_slices() {
 }
 
 #[test]
+#[serial]
 fn adaptive_range_policy_obeys_gate_knee_and_explicit_override_precedence() {
     use crate::storage::engines::core::coalesce_strategy::RangePlanEstimate;
 
@@ -1515,6 +1523,7 @@ fn parquet_segment_routes_to_the_parquet_reader() {
 /// falls). Mixed-read-safe: block size is a per-segment write choice, opaque
 /// to the magic-detected read router.
 #[test]
+#[serial]
 fn larger_target_block_yields_fewer_blocks() {
     // TD-PAXRG-1: post-flip the default write is the row-group layout,
     // whose 256 KiB floor clamps sub-floor targets — this test pins the
@@ -1560,6 +1569,7 @@ fn disable_coalesced_rabitq() {
 }
 
 #[test]
+#[serial]
 fn coalesced_requested_f32_tier_is_emitted_and_materializes_exact() {
     enable_coalesced_rabitq();
     // Post-flip the default write is the row-group layout, where the exact
@@ -1635,6 +1645,7 @@ fn coalesced_requested_f32_tier_is_emitted_and_materializes_exact() {
 }
 
 #[tokio::test]
+#[serial]
 async fn mixed_exact_and_lossy_inputs_do_not_claim_exact_output() {
     disable_coalesced_rabitq();
     let dir = tempfile::tempdir().unwrap();
@@ -1689,6 +1700,7 @@ async fn mixed_exact_and_lossy_inputs_do_not_claim_exact_output() {
 }
 
 #[tokio::test]
+#[serial]
 async fn coalesced_lossy_segment_does_not_claim_exact_authority_vacuously() {
     enable_coalesced_rabitq();
     let dir = tempfile::tempdir().unwrap();
@@ -1758,6 +1770,7 @@ fn tier_records() -> Vec<ProximaRecord> {
 /// production default (coalesced, row-group layout => Region C) and the
 /// legacy in-block tier, for `file://` URLs and bare paths alike.
 #[tokio::test]
+#[serial]
 async fn file_url_compaction_inputs_keep_the_f32_tier() {
     enable_coalesced_rabitq();
     let dir = tempfile::tempdir().unwrap();
@@ -1799,6 +1812,7 @@ async fn file_url_compaction_inputs_keep_the_f32_tier() {
 /// TD-READFID-2 (rerank half): a configured FP16 rerank column must survive
 /// compaction for `file://` inputs too (it used to silently fall to SQ8).
 #[tokio::test]
+#[serial]
 async fn file_url_compaction_inputs_keep_the_fp16_rerank() {
     disable_coalesced_rabitq();
     let dir = tempfile::tempdir().unwrap();
@@ -1842,6 +1856,7 @@ async fn file_url_compaction_inputs_keep_the_fp16_rerank() {
 /// "not exact". Classifying it as lossy let compaction write a tierless
 /// output and delete the inputs — the only copies of the exact values.
 #[tokio::test]
+#[serial]
 async fn unreadable_compaction_input_is_an_error_not_lossy() {
     enable_coalesced_rabitq();
     let dir = tempfile::tempdir().unwrap();
@@ -2045,6 +2060,7 @@ impl proximadb_storage_ports::FilesystemPort for CountingPort {
 /// answered from ranged footer reads with ZERO whole-object GETs; only a
 /// legacy block-layout segment (per-block exactness) costs one whole read.
 #[tokio::test]
+#[serial]
 async fn object_store_inputs_resolve_through_the_port_footer_first() {
     use std::sync::atomic::Ordering;
     enable_coalesced_rabitq();
@@ -2225,6 +2241,7 @@ fn fused_sq8_rerank_matches_decode_then_score_for_every_metric() {
 /// the block's EMBED_BASE is SQ8 (the rerank data), which the reader
 /// reconstructs via the unchanged SQ8 decode path.
 #[test]
+#[serial]
 fn coalesced_rabitq_segment_round_trips_and_detects_as_pax() {
     enable_coalesced_rabitq();
     let dir = tempfile::tempdir().unwrap();
@@ -2273,6 +2290,7 @@ fn coalesced_rabitq_segment_round_trips_and_detects_as_pax() {
 /// one (mixed-read): opt-out writes carry no RaBitQ region and are NOT
 /// coalesced; opt-in writes are. Both detect as Pax.
 #[test]
+#[serial]
 fn coalesced_presence_field_distinguishes_legacy_from_coalesced() {
     let mk = |coalesced: bool, name: &str| -> (Vec<u8>, u64) {
         if coalesced {
@@ -2315,6 +2333,7 @@ fn coalesced_presence_field_distinguishes_legacy_from_coalesced() {
 /// and the footer's block table + rabitq mirror match the SegmentMeta. This
 /// ties the writer (2d), scanner footer parse (2e), and region codec (2a).
 #[test]
+#[serial]
 fn coalesced_region_and_footer_parse_from_written_segment() {
     enable_coalesced_rabitq();
     use proximadb_block_format::{RaBitQRegion, col_id};
@@ -2402,6 +2421,7 @@ fn coalesced_region_and_footer_parse_from_written_segment() {
 /// nearest neighbours. (The GET-count win is quantified by the SIFT ratchet;
 /// this proves correctness of the new read path end-to-end.)
 #[tokio::test]
+#[serial]
 async fn coalesced_scan_then_rerank_recall_vs_bruteforce() {
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
@@ -2503,6 +2523,7 @@ fn partition_filter(value: &str) -> proximadb_filter_expression::FilterExpressio
 /// exactly the segment rows whose props match the predicate, in global
 /// (cluster-ordered) row-ordinal space, verified by an independent decode.
 #[tokio::test]
+#[serial]
 async fn stage_f_row_allow_set_is_exact() {
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
@@ -2684,13 +2705,12 @@ fn parse_segment_footer(
 /// HEAD with a listed size (cold) — the allow-set is identical on every path,
 /// and the request counts shrink exactly by the elided reads.
 #[tokio::test]
+#[serial]
 async fn stage_f_waves_cache_and_known_size_keep_the_allow_set_exact() {
+    // Pin the parsed-once inflight cap directly: the plain `cargo test --lib`
+    // runner shares one process, so the env cache cannot be re-armed mid-run.
+    proximadb_storage_filesystem_types::__set_read_ranges_inflight_for_tests(Some(4));
     enable_coalesced_rabitq();
-    // Waves only fire with an in-flight cap > 1; parsed once per process
-    // (nextest isolates each test), so set before the first read.
-    unsafe {
-        std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "4");
-    }
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
     use proximadb_storage_common::segment_layout::SegmentHeaderPrefix;
 
@@ -2802,7 +2822,7 @@ async fn stage_f_waves_cache_and_known_size_keep_the_allow_set_exact() {
     assert_eq!(snap.range_gets, d_ranges, "warm: no header/footer GET");
     unsafe {
         std::env::remove_var("PROXIMADB_PAX_COALESCE_RANGE");
-        std::env::remove_var("PROXIMADB_READ_RANGES_INFLIGHT");
+        proximadb_storage_filesystem_types::__set_read_ranges_inflight_for_tests(None);
     }
 }
 
@@ -3028,6 +3048,7 @@ fn region_e_filters() -> Vec<proximadb_filter_expression::FilterExpression> {
 /// is identical to the full-row Stage F (read gate off), and Region E reads
 /// one ranged GET per referenced column instead of every Region-D block.
 #[tokio::test]
+#[serial]
 async fn region_e_allow_set_equals_full_row_stage_f() {
     enable_coalesced_rabitq();
     unsafe {
@@ -3099,6 +3120,7 @@ async fn region_e_allow_set_equals_full_row_stage_f() {
 /// A filter on a field Region E does not carry (a dotted JSON path, an
 /// undeclared prop) uses the full-row path — still exact.
 #[tokio::test]
+#[serial]
 async fn region_e_falls_back_for_fields_it_does_not_carry() {
     enable_coalesced_rabitq();
     unsafe {
@@ -3147,6 +3169,7 @@ async fn region_e_falls_back_for_fields_it_does_not_carry() {
 /// pruned on the canonical column's zone map — the canonical stats describe
 /// different data, and every block would be wrongly skipped.
 #[tokio::test]
+#[serial]
 async fn stage_f_never_prunes_a_user_prop_on_a_same_named_canonical_column() {
     enable_coalesced_rabitq();
     unsafe {
@@ -3199,6 +3222,7 @@ async fn stage_f_never_prunes_a_user_prop_on_a_same_named_canonical_column() {
 /// data the predicate never sees; user-tag zero-GET pruning is pinned by
 /// `stage_f_user_tag_footer_prune_via_self_describing_segment`.
 #[tokio::test]
+#[serial]
 async fn stage_f_does_not_prune_on_canonical_column_stats() {
     enable_coalesced_rabitq();
     // Arm P2 footer-stats population at write. Process-global env is safe
@@ -3284,6 +3308,7 @@ async fn stage_f_does_not_prune_on_canonical_column_stats() {
 /// benchmark (partition/lang filters), and the allow-set stays EXACT
 /// (row-match via props is unchanged).
 #[tokio::test]
+#[serial]
 async fn stage_f_user_tag_footer_prune_via_self_describing_segment() {
     enable_coalesced_rabitq();
     unsafe {
@@ -3425,6 +3450,7 @@ async fn stage_f_user_tag_footer_prune_via_self_describing_segment() {
 /// predicate-matching hits, at recall parity with a filtered brute-force
 /// ground truth (same bar as the unfiltered cascade's recall test).
 #[tokio::test]
+#[serial]
 async fn filtered_cascade_matches_filtered_bruteforce() {
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
@@ -3527,6 +3553,7 @@ async fn filtered_cascade_matches_filtered_bruteforce() {
 
 /// ADR-089 P1: the filter-aware cascade is DEFAULT-OFF (mixed-read-safe).
 #[test]
+#[serial]
 fn filtered_cascade_gate_defaults_on() {
     // FLIPPED default-ON 2026-08-31 (see the gate's doc comment). Pinned
     // explicitly so this assertion cannot race another test's env pinning
@@ -3670,6 +3697,7 @@ async fn p1_evidence_filtered_exact_vs_cascade() {
 /// (header/footer/A0) so a subsequent cold search issues fewer control
 /// GETs than a fully cold one — without touching Region A/B payloads.
 #[tokio::test]
+#[serial]
 async fn prefetch_invariants_reduces_first_search_control_gets() {
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::FileSystem;
@@ -3774,6 +3802,7 @@ async fn prefetch_invariants_reduces_first_search_control_gets() {
 /// invariants cache is intentionally NOT injected, so the GET reduction is
 /// attributable solely to the survivor cache.
 #[tokio::test]
+#[serial]
 async fn survivor_cache_reduces_gets_on_hot_repeat_query() {
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::FileSystem;
@@ -3885,6 +3914,7 @@ async fn survivor_cache_reduces_gets_on_hot_repeat_query() {
 /// returns identical results. Before the fix, probe fetches read the fs
 /// directly and every repeat re-paid the full GET chain.
 #[tokio::test]
+#[serial]
 async fn probe_path_hot_repeat_served_from_cache_seam() {
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
@@ -3997,7 +4027,11 @@ async fn probe_path_hot_repeat_served_from_cache_seam() {
 /// the gated function. Runs under nextest process-per-test isolation so the
 /// fn-local `OnceLock` env snapshots stay fresh per test.
 #[tokio::test]
+#[serial]
 async fn probe_cold_tail_records_read_ranges_metrics_when_inflight_armed() {
+    // Pin the parsed-once inflight cap directly: the plain `cargo test --lib`
+    // runner shares one process, so the env cache cannot be re-armed mid-run.
+    proximadb_storage_filesystem_types::__set_read_ranges_inflight_for_tests(Some(4));
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
     use proximadb_storage_filesystem_types::counting::{CountingFileSystem, global_counters};
@@ -4008,7 +4042,6 @@ async fn probe_cold_tail_records_read_ranges_metrics_when_inflight_armed() {
         std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
         std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "1");
         std::env::set_var("PROXIMADB_IVF_K", "8");
-        std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "4");
         // Scope: this gates the Region-A cold tail's batching (TD-RDSTRAT-12
         // §3), not D5's same-wave rerank — which changes the rerank's
         // planning shape (split around prefetched B extents vs a later
@@ -4107,7 +4140,7 @@ async fn probe_cold_tail_records_read_ranges_metrics_when_inflight_armed() {
         std::env::remove_var("PROXIMADB_PAX_WRITE_A0_TRAIN");
         std::env::remove_var("PROXIMADB_PAX_READ_COARSE_PROBE");
         std::env::remove_var("PROXIMADB_IVF_K");
-        std::env::remove_var("PROXIMADB_READ_RANGES_INFLIGHT");
+        proximadb_storage_filesystem_types::__set_read_ranges_inflight_for_tests(None);
         std::env::remove_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES");
         std::env::remove_var("PROXIMADB_PAX_VECTOR_COALESCE_GAP");
     }
@@ -4119,7 +4152,11 @@ async fn probe_cold_tail_records_read_ranges_metrics_when_inflight_armed() {
 /// teeth: `tier_get_ops[InvariantMeta] == 1` per query, and the wave
 /// observability still fires on the cold query.
 #[tokio::test]
+#[serial]
 async fn footer_rides_probe_wave_and_is_never_double_billed() {
+    // Pin the parsed-once inflight cap directly: the plain `cargo test --lib`
+    // runner shares one process, so the env cache cannot be re-armed mid-run.
+    proximadb_storage_filesystem_types::__set_read_ranges_inflight_for_tests(Some(4));
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
     use proximadb_storage_filesystem_types::counting::{CountingFileSystem, global_counters};
@@ -4129,7 +4166,6 @@ async fn footer_rides_probe_wave_and_is_never_double_billed() {
         std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
         std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "1");
         std::env::set_var("PROXIMADB_IVF_K", "8");
-        std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "4");
         // Disarm prefix-prefetch and gap-coalescing so the footer AND the
         // probed cells are genuinely cold (the 400-row fixture otherwise
         // fits inside the 1 MiB prefix).
@@ -4231,7 +4267,7 @@ async fn footer_rides_probe_wave_and_is_never_double_billed() {
         std::env::remove_var("PROXIMADB_PAX_WRITE_A0_TRAIN");
         std::env::remove_var("PROXIMADB_PAX_READ_COARSE_PROBE");
         std::env::remove_var("PROXIMADB_IVF_K");
-        std::env::remove_var("PROXIMADB_READ_RANGES_INFLIGHT");
+        proximadb_storage_filesystem_types::__set_read_ranges_inflight_for_tests(None);
         std::env::remove_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES");
         std::env::remove_var("PROXIMADB_PAX_VECTOR_COALESCE_GAP");
     }
@@ -4276,7 +4312,11 @@ fn plan_wave_split_ranges_chunks_and_remainder() {
 /// wave fired and the cache seam serves the repeat with no further
 /// physical reads.
 #[tokio::test]
+#[serial]
 async fn region_b_and_oid_cold_tails_batch_when_inflight_armed() {
+    // Pin the parsed-once inflight cap directly: the plain `cargo test --lib`
+    // runner shares one process, so the env cache cannot be re-armed mid-run.
+    proximadb_storage_filesystem_types::__set_read_ranges_inflight_for_tests(Some(4));
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
     use proximadb_storage_filesystem_types::counting::{CountingFileSystem, global_counters};
@@ -4287,7 +4327,6 @@ async fn region_b_and_oid_cold_tails_batch_when_inflight_armed() {
         std::env::set_var("PROXIMADB_PAX_WRITE_A0_TRAIN", "1");
         std::env::set_var("PROXIMADB_PAX_READ_COARSE_PROBE", "1");
         std::env::set_var("PROXIMADB_IVF_K", "8");
-        std::env::set_var("PROXIMADB_READ_RANGES_INFLIGHT", "4");
         // Scope: this gates the Region-A cold tail's batching (TD-RDSTRAT-12
         // §3), not D5's same-wave rerank — which changes the rerank's
         // planning shape (split around prefetched B extents vs a later
@@ -4375,13 +4414,14 @@ async fn region_b_and_oid_cold_tails_batch_when_inflight_armed() {
         std::env::remove_var("PROXIMADB_PAX_WRITE_A0_TRAIN");
         std::env::remove_var("PROXIMADB_PAX_READ_COARSE_PROBE");
         std::env::remove_var("PROXIMADB_IVF_K");
-        std::env::remove_var("PROXIMADB_READ_RANGES_INFLIGHT");
+        proximadb_storage_filesystem_types::__set_read_ranges_inflight_for_tests(None);
         std::env::remove_var("PROXIMADB_PAX_PREFIX_PREFETCH_BYTES");
         std::env::remove_var("PROXIMADB_PAX_VECTOR_COALESCE_GAP");
     }
 }
 
 #[tokio::test]
+#[serial]
 async fn ivf_probe_compaction_gate_and_v3_read_compat() {
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
@@ -4516,6 +4556,7 @@ async fn ivf_probe_compaction_gate_and_v3_read_compat() {
 /// only the nprobe nearest cells — holding recall on clustered data while
 /// reading materially fewer bytes than the whole-region single-level scan.
 #[tokio::test]
+#[serial]
 async fn coarse_probe_holds_recall_and_cuts_bytes() {
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
@@ -4885,6 +4926,7 @@ async fn coarse_probe_holds_recall_and_cuts_bytes() {
 /// that touches only relevant cells. This asserts (a) recall parity vs the
 /// FILTERED brute-force truth and (b) the probe engaged (a strict cell subset).
 #[tokio::test]
+#[serial]
 async fn filtered_coarse_probe_holds_recall_and_cuts_bytes() {
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
@@ -5100,6 +5142,7 @@ async fn filtered_coarse_probe_holds_recall_and_cuts_bytes() {
 /// (layout ON vs OFF) and asserts the ON segment reads strictly fewer rows to
 /// serve the same filtered top-K, at recall parity and with no leakage.
 #[tokio::test]
+#[serial]
 async fn partition_layout_prunes_uncorrelated_tag() {
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
@@ -5294,6 +5337,7 @@ async fn partition_layout_prunes_uncorrelated_tag() {
 /// the allow-set build dominate? → P3 per-cell stats is justified). Assertions
 /// are the regression guards; the eprintln is the evidence.
 #[tokio::test]
+#[serial]
 async fn filtered_stack_get_byte_breakdown() {
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
@@ -5568,6 +5612,7 @@ async fn filtered_stack_get_byte_breakdown() {
 /// layout to hold recall within tolerance of the global layout. It is the eval
 /// that gates any M2 default change.
 #[tokio::test]
+#[serial]
 async fn m2_unfiltered_recall_neutral_vs_global() {
     enable_coalesced_rabitq();
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};

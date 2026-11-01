@@ -2797,10 +2797,11 @@ mod tests {
             .expect("manager acquires the lease (no contention) => Allow");
     }
 
-    // External-location allowlist (Path Isolation, fail-closed). Serialized by
-    // the shared env var; nextest's process-per-test isolation keeps these from
-    // racing other tests.
+    // External-location allowlist (Path Isolation, fail-closed). Serialized on
+    // the shared env-gate lock: this test sets AND clears the process env var,
+    // which the plain `cargo test --lib` runner shares across all tests.
     #[test]
+    #[serial_test::serial]
     fn external_location_allowlist_is_fail_closed_and_boundary_aware() {
         // Unset ⇒ everything rejected (feature off by default).
         unsafe { std::env::remove_var("PROXIMADB_EXTERNAL_TABLE_ROOTS") };

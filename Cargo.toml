@@ -846,6 +846,11 @@ serde_yaml = "0.9"
 # Test-only: integration tests use EmbeddedProximaDB from the embedded crate.
 # Dev-deps don't create build cycles (test-mode only).
 proximadb-embedded = { path = "crates/binding/proximadb-embedded" }
+# `cargo test --lib` runs every unit test in ONE process, so tests that mutate
+# process-global state (env gates, global counters, fault injection) must be
+# mutually serialized; nextest isolates them per process but the plain
+# libtest runner does not. `#[serial]` gives those tests one shared lock.
+serial_test = "3"
 
 [features]
 # Default feature set as of 2026-05-26 (ADR-020 Tier 2.2 / TD-065 default-enable).

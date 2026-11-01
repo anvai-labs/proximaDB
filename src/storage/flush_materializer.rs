@@ -797,6 +797,7 @@ mod tests {
         CompactionParameters, CompactionResult, FlushResult, StorageEngineStrategy,
         StorageQueryContext,
     };
+    use serial_test::serial;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1628,8 +1629,13 @@ mod tests {
     /// `pax_rg_layout:off` keeps the exact tier in-block (no Region C); the
     /// default (row-group layout ON) hoists it into Region C.
     #[tokio::test]
+    #[serial]
     async fn pax_rg_layout_tag_takes_effect_on_the_production_flush() {
         unsafe { std::env::remove_var("PROXIMADB_PAX_WRITE_RG_LAYOUT") };
+        // The layout the writer/reader pick is env-sensitive; pin the shipped
+        // default too (the rerank-quant test opts RaBitQ coalescing OFF and the
+        // shared `cargo test --lib` process keeps that set otherwise).
+        unsafe { std::env::remove_var("PROXIMADB_PAX_COALESCED_RABITQ") };
         let default_layout = flush_via_materializer(211, fp32_config(&["compaction:off"]), 1).await;
         let default_footer = footer(&default_layout.only_segment());
         assert!(default_footer.has_f32_tier);
@@ -1692,6 +1698,7 @@ mod tests {
     /// coalesced layout hoists rerank to Region B, which is SQ8), so this pins
     /// that layout via its env gate.
     #[tokio::test]
+    #[serial]
     async fn pax_rerank_quant_tag_takes_effect_on_the_production_flush() {
         use proximadb_block_format::vparam::QUANT_FP16;
         unsafe { std::env::set_var("PROXIMADB_PAX_COALESCED_RABITQ", "0") };
@@ -1836,7 +1843,11 @@ mod tests {
 
     /// Default unchanged: an untagged collection still compacts to coalesced RaBitQ.
     #[tokio::test]
+    #[serial]
     async fn untagged_compaction_still_writes_rabitq() {
+        // Pin the shipped default: the rerank-quant test above opts this gate
+        // OFF, and the plain `cargo test --lib` runner shares one process.
+        unsafe { std::env::remove_var("PROXIMADB_PAX_COALESCED_RABITQ") };
         let merged = compacted_segment(
             253,
             CollectionConfig {

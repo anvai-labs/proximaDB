@@ -1376,10 +1376,28 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_recovery_manager_direct_to_storage() {
         let (disk_manager, _flush_coordinator, recovery_manager, temp_dir) =
             create_test_managers().await;
         let collection_id = "test_collection";
+
+        // The global WAL manifest is a process-global singleton whose background
+        // worker is spawned on the runtime of whichever test initialized it. In
+        // the shared `cargo test --lib` process that runtime has usually shut
+        // down by now, leaving every append on a closed channel ("Failed to
+        // send append request"). Re-arm the singleton on THIS test's runtime
+        // (the embedded-mode reset), scoped to this test's temp dir.
+        {
+            let mut wal_config =
+                crate::storage::persistence::write_ahead_log::config::WALConfig::default();
+            wal_config.multi_disk.data_directories =
+                vec![temp_dir.path().to_str().unwrap().to_string()];
+            let _ = crate::storage::persistence::write_ahead_log::manifest::reset().await;
+            crate::storage::persistence::write_ahead_log::manifest::init(&wal_config)
+                .await
+                .expect("re-init global manifest on this test's runtime");
+        }
 
         // Create WAL directory structure for collection
         // Use collection_id directly to match the actual directory structure used by disk_manager
@@ -1457,6 +1475,10 @@ mod tests {
             .expect("Failed to get stats");
         assert_eq!(stats.total_vectors_recovered, 3);
         assert_eq!(stats.total_files_recovered, 3);
+
+        // Drop the singleton again: this test's runtime dies with it, and a
+        // leftover service would hand later tests the same closed channel.
+        let _ = crate::storage::persistence::write_ahead_log::manifest::reset().await;
     }
 
     /// Issue #1125 regression: candidate bases must union the catalog-assigned
