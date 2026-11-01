@@ -353,6 +353,190 @@ class BaseProtocolAdapter(ABC):
         )
 
     # ==========================================================================
+    # Graph Operations (TD-SDK-3 batch 1 — the graph-CRUD family)
+    #
+    # Optional namespace, same pattern as documents/timeseries above: adapters
+    # implement what their transport supports and let the rest fall through to
+    # these NotImplementedError defaults. Canonical signatures mirror the v1
+    # unified client's public graph surface so v2 methods are drop-in; the
+    # ``graph_id`` keyword (``None`` → the server's "default" graph) is the one
+    # canonical spelling — adapters translate, never the facade.
+    # ==========================================================================
+
+    def create_node(
+        self,
+        node_id: str,
+        labels: list[str],
+        properties: dict[str, Any] | None = None,
+        embedding: list[float] | None = None,
+        graph_id: str | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph node creation"
+        )
+
+    def create_edge(
+        self,
+        edge_id: str,
+        from_node_id: str,
+        to_node_id: str,
+        edge_type: str,
+        properties: dict[str, Any] | None = None,
+        weight: float | None = None,
+        graph_id: str | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph edge creation"
+        )
+
+    def batch_create_nodes(
+        self, nodes: list[dict[str, Any]], graph_id: str | None = None, **kwargs
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph node batches"
+        )
+
+    def batch_create_edges(
+        self, edges: list[dict[str, Any]], graph_id: str | None = None, **kwargs
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph edge batches"
+        )
+
+    def get_node(
+        self, node_id: str, graph_id: str | None = None, **kwargs
+    ) -> dict[str, Any] | None:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph node reads"
+        )
+
+    def get_outgoing_edges(
+        self,
+        node_id: str,
+        edge_types: list[str] | None = None,
+        graph_id: str | None = None,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph edge reads"
+        )
+
+    def get_incoming_edges(
+        self,
+        node_id: str,
+        edge_types: list[str] | None = None,
+        graph_id: str | None = None,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph edge reads"
+        )
+
+    def delete_node(self, node_id: str, graph_id: str | None = None, **kwargs) -> bool:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph node deletion"
+        )
+
+    def query_nodes(
+        self,
+        labels: list[str] | None = None,
+        properties: dict[str, Any] | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        graph_id: str | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph node queries"
+        )
+
+    def traverse_graph(
+        self,
+        start_node_id: str,
+        max_depth: int = 3,
+        edge_types: list[str] | None = None,
+        node_labels: list[str] | None = None,
+        algorithm: str = "BFS",
+        limit: int | None = None,
+        graph_id: str | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph traversal"
+        )
+
+    def create_graph(
+        self,
+        graph_id: str,
+        name: str | None = None,
+        description: str | None = None,
+        schema: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph collection creation"
+        )
+
+    def delete_graph(self, graph_id: str, **kwargs) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph collection deletion"
+        )
+
+    def get_graph(self, graph_id: str, **kwargs) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph collection reads"
+        )
+
+    def list_graphs(self, **kwargs) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph collection listing"
+        )
+
+    def get_graph_stats(self, graph_id: str, **kwargs) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph collection stats"
+        )
+
+    def graph_shortest_path(
+        self,
+        start_node_id: str,
+        target_node_id: str,
+        max_depth: int | None = None,
+        edge_types: list[str] | None = None,
+        algorithm: str = "DIJKSTRA",
+        k: int | None = None,
+        enable_prefetch: bool | None = None,
+        prefetch_budget: int | None = None,
+        timeout: float | None = None,
+        graph_id: str = "default",
+        **kwargs,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support graph shortest path"
+        )
+
+    def graph_traverse(
+        self,
+        start_node_id: str,
+        max_depth: int = 3,
+        edge_types: list[str] | None = None,
+        algorithm: str = "BFS",
+        limit: int | None = None,
+        timeout_ms: int | None = None,
+        max_frontier: int | None = None,
+        enable_prefetch: bool | None = None,
+        prefetch_budget: int | None = None,
+        timeout: float | None = None,
+        graph_id: str = "default",
+        **kwargs,
+    ) -> dict[str, Any]:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support tuned graph traversal"
+        )
+
+    # ==========================================================================
     # Lifecycle Methods
     # ==========================================================================
 

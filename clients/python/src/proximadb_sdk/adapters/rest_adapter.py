@@ -27,12 +27,13 @@ from ..models import (
 )
 from ..models_v2 import ProximaRecord
 from ..proto_conversion import ProtoConverter
+from ._sync_graph_delegations import SyncGraphDelegations
 from .base import BaseProtocolAdapter
 
 logger = logging.getLogger(__name__)
 
 
-class RestProtocolAdapter(BaseProtocolAdapter):
+class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
     """REST protocol adapter implementing BaseProtocolAdapter.
 
     Wraps the existing ProximaDBClient (REST) to provide a consistent
@@ -965,6 +966,111 @@ class RestProtocolAdapter(BaseProtocolAdapter):
         except Exception as e:
             logger.error(f"Failed to delete time-series collection: {e}")
             return False
+
+    # ==========================================================================
+    # Graph Operations (TD-SDK-3 batch 1)
+    #
+    # The 10 CRUD/traversal delegations shared with gRPC live once in
+    # SyncGraphDelegations (listed first in the bases so its concrete
+    # methods win over the base-class defaults). REST-specific below:
+    # graph-collection management and the analytics pair (prefetch overrides
+    # travel as headers to keep the body stable).
+    # ==========================================================================
+
+    def create_graph(
+        self,
+        graph_id: str,
+        name: str | None = None,
+        description: str | None = None,
+        schema: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Create a graph collection via REST."""
+        return self._client.create_graph(
+            graph_id=graph_id,
+            name=name,
+            description=description,
+            schema=schema,
+        )
+
+    def delete_graph(self, graph_id: str, **kwargs) -> dict[str, Any]:
+        """Delete a graph collection via REST."""
+        return self._client.delete_graph(graph_id=graph_id)
+
+    def get_graph(self, graph_id: str, **kwargs) -> dict[str, Any]:
+        """Get graph-collection metadata via REST."""
+        return self._client.get_graph(graph_id=graph_id)
+
+    def list_graphs(self, **kwargs) -> dict[str, Any]:
+        """List all graph collections via REST."""
+        return self._client.list_graphs()
+
+    def get_graph_stats(self, graph_id: str, **kwargs) -> dict[str, Any]:
+        """Get statistics for a graph collection via REST."""
+        return self._client.get_graph_stats(graph_id=graph_id)
+
+    def graph_shortest_path(
+        self,
+        start_node_id: str,
+        target_node_id: str,
+        max_depth: int | None = None,
+        edge_types: list[str] | None = None,
+        algorithm: str = "DIJKSTRA",
+        k: int | None = None,
+        enable_prefetch: bool | None = None,
+        prefetch_budget: int | None = None,
+        timeout: float | None = None,
+        graph_id: str = "default",
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Compute shortest path(s) via REST (prefetch overrides as headers)."""
+        return self._client.graph_shortest_path(
+            start_node_id,
+            target_node_id,
+            max_depth,
+            edge_types,
+            algorithm,
+            k,
+            enable_prefetch,
+            prefetch_budget,
+            timeout=timeout,
+            graph_id=graph_id or "default",
+        )
+
+    def graph_traverse(
+        self,
+        start_node_id: str,
+        max_depth: int = 3,
+        edge_types: list[str] | None = None,
+        algorithm: str = "BFS",
+        limit: int | None = None,
+        timeout_ms: int | None = None,
+        max_frontier: int | None = None,
+        enable_prefetch: bool | None = None,
+        prefetch_budget: int | None = None,
+        timeout: float | None = None,
+        graph_id: str = "default",
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Tuned traversal via REST (overrides as headers).
+
+        Unlike the v1 wrapper, ``graph_id`` is honored (the transport has
+        accepted it since TD-SDKDOC-1; v1 dropped it, running every tuned
+        traversal on ``default``).
+        """
+        return self._client.graph_traverse(
+            start_node_id,
+            max_depth,
+            edge_types,
+            algorithm,
+            limit,
+            timeout_ms,
+            max_frontier,
+            enable_prefetch,
+            prefetch_budget,
+            timeout=timeout,
+            graph_id=graph_id or "default",
+        )
 
     # ==========================================================================
     # Lifecycle Methods
