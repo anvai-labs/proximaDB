@@ -84,8 +84,7 @@ pub fn read_ranges_prefetch_inflight(path: &str) -> usize {
 /// Test-only override state for the inflight cap: 0 = none (env decides),
 /// 1 = forced unset, 2 = forced to [`INFLIGHT_TEST_VALUE`].
 static INFLIGHT_TEST_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-static INFLIGHT_TEST_VALUE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static INFLIGHT_TEST_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn inflight_test_override() -> Option<Option<usize>> {
     use std::sync::atomic::Ordering::Relaxed;

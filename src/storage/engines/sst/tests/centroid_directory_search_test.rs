@@ -161,7 +161,8 @@ mod tests {
         let collection = collection(id, &temp);
         let mut fs_config = FilesystemConfig::default();
         fs_config.default_fs = Some(format!("file://{base}"));
-        let counters = Arc::new(proximadb_storage_filesystem_types::counting::GetCounters::default());
+        let counters =
+            Arc::new(proximadb_storage_filesystem_types::counting::GetCounters::default());
         let mut factory = FilesystemFactory::create(fs_config).await.unwrap();
         factory.set_test_get_counters(Arc::clone(&counters));
         let factory = Arc::new(factory);

@@ -789,7 +789,6 @@ async fn materialize_collection_with_coordinator_mode(
 
 #[cfg(test)]
 mod tests {
-    use serial_test::serial;
     use super::*;
     use crate::storage::memtable::core::MemtableConfig;
     use crate::storage::memtable::specialized::wal_behavior::WALVectorBatch;
@@ -798,6 +797,7 @@ mod tests {
         CompactionParameters, CompactionResult, FlushResult, StorageEngineStrategy,
         StorageQueryContext,
     };
+    use serial_test::serial;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

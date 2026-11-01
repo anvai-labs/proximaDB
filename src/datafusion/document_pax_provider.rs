@@ -546,9 +546,9 @@ fn proxima_value_as_string(v: ProximaValue) -> Option<String> {
 mod tests {
     // Pins a process-global gate; must not interleave with other gate-pinning
     // tests when the plain `cargo test --lib` runner shares one process.
-    use serial_test::serial;
     use super::*;
     use datafusion::prelude::SessionContext;
+    use serial_test::serial;
 
     use crate::storage::document::DocumentRecord;
     use crate::storage::document::canonical_adapter::legacy_document_to_proxima_record;
@@ -1248,9 +1248,7 @@ mod tests {
 
         // Pin the cached gate directly (not via env): the plain `cargo test --lib` runner
         // shares one process, so the set-once env cache cannot be re-armed mid-run.
-        crate::datafusion::engine_adapters::pax_adapter::set_pax_ranged_gate_for_tests(
-            Some(true),
-        );
+        crate::datafusion::engine_adapters::pax_adapter::set_pax_ranged_gate_for_tests(Some(true));
 
         let dir = tempfile::tempdir().expect("tempdir");
         let seg_dir = dir.path().join("segments");

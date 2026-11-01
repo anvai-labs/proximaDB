@@ -483,8 +483,8 @@ fn extract_vectors(
 
 #[cfg(test)]
 mod tests {
-    use serial_test::serial;
     use super::*;
+    use serial_test::serial;
     use std::sync::Arc;
 
     use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, StringBuilder};

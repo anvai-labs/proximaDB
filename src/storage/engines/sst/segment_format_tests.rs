@@ -2710,8 +2710,7 @@ async fn stage_f_waves_cache_and_known_size_keep_the_allow_set_exact() {
     enable_coalesced_rabitq();
     // Waves only fire with an in-flight cap > 1; parsed once per process
     // (nextest isolates each test), so set before the first read.
-    unsafe {
-    }
+    unsafe {}
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
     use proximadb_storage_common::segment_layout::SegmentHeaderPrefix;
 

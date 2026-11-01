@@ -751,9 +751,9 @@ impl EventLogEngine {
 
 #[cfg(test)]
 mod tests {
-    use serial_test::serial;
     use super::*;
     use crate::storage::persistence::filesystem::UnifiedCachingFilesystem;
+    use serial_test::serial;
 
     #[tokio::test]
     #[serial]

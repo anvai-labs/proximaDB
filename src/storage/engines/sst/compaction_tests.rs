@@ -3,11 +3,11 @@ use super::{
 };
 // Tests below pin process-global gates/env; serialized on the shared lock
 // because the plain `cargo test --lib` runner shares one process.
-use serial_test::serial;
 use crate::storage::engines::sst::blocks::SstRecord;
 use crate::storage::engines::sst::{
     Compaction, CompactionPriority, CompactionStats, CompactionTask, SstConfig,
 };
+use serial_test::serial;
 use std::collections::HashMap as StdHashMap;
 use std::path::PathBuf;
 use std::sync::Arc;

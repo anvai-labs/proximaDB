@@ -752,8 +752,8 @@ mod pool_tests {
 
 #[cfg(all(test, feature = "axis"))]
 mod tests {
-    use serial_test::serial;
     use super::*;
+    use serial_test::serial;
     use std::sync::Arc;
 
     use arrow_array::RecordBatch;

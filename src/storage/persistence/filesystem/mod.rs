@@ -274,7 +274,8 @@ pub struct FilesystemFactory {
     /// fresh wrapper Arc per lookup, defeating copy_atomic's ptr_eq fast path
     /// for bystander tests).
     #[cfg(test)]
-    test_get_counters: Option<std::sync::Arc<proximadb_storage_filesystem_types::counting::GetCounters>>,
+    test_get_counters:
+        Option<std::sync::Arc<proximadb_storage_filesystem_types::counting::GetCounters>>,
 }
 
 impl std::fmt::Debug for FilesystemFactory {

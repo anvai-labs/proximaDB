@@ -94,7 +94,10 @@ static GLOBAL_PRECISION_RESOLVER_TEST: std::sync::Mutex<
 pub fn set_global_precision_resolver(
     resolver: Arc<proximadb_catalog::canonical_precision::CanonicalPrecisionResolver>,
 ) {
-    if GLOBAL_PRECISION_RESOLVER.set(Arc::clone(&resolver)).is_err() {
+    if GLOBAL_PRECISION_RESOLVER
+        .set(Arc::clone(&resolver))
+        .is_err()
+    {
         // Already armed. In the test binary, re-arm the override slot so a
         // shared-process test can install its own catalog; in production the
         // original first-wins arm stands.
@@ -112,8 +115,8 @@ pub fn set_global_precision_resolver(
 }
 
 /// The process-global precision resolver, if boot armed one.
-pub fn get_global_precision_resolver(
-) -> Option<Arc<proximadb_catalog::canonical_precision::CanonicalPrecisionResolver>> {
+pub fn get_global_precision_resolver()
+-> Option<Arc<proximadb_catalog::canonical_precision::CanonicalPrecisionResolver>> {
     #[cfg(test)]
     if let Ok(slot) = GLOBAL_PRECISION_RESOLVER_TEST.lock() {
         if let Some(resolver) = slot.as_ref() {
