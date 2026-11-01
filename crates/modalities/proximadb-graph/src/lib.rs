@@ -38,6 +38,10 @@ pub mod storage;
 pub mod topology_codec;
 pub mod traversal;
 
+// TD-GRAPH-4 §3: the Cypher corpus pin (test-only — see the module docs).
+#[cfg(test)]
+mod cypher_corpus_pin;
+
 // Re-export core types
 pub use core::{DirectedGraph, Edge, EdgeId, Graph, GraphId, Node, NodeId, UndirectedGraph};
 pub use graphwalk::{GraphWalkRequest, GraphWalkResult, GraphWalkStep, GraphWalkTool};

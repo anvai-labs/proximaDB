@@ -736,14 +736,17 @@ fn parse_return_clause(input: &str) -> IResult<&str, ReturnSpec> {
 
 // The write-clause seam: intentionally-retained full-Cypher grammar that no
 // runtime path wires up yet (see parser/write_seam.rs for the rationale and
-// the convergence plan). `dead_code` is allowed HERE, once, with that
-// rationale — not scattered across the grammar.
-#[allow(dead_code)]
-mod write_seam;
+// the convergence plan). The module is `pub` because its full-query entry
+// is the crate's declared convergence surface (TD-GRAPH-4); its private
+// combinators are exercised by the tests below and need no allowance.
+pub mod write_seam;
 
 // The seam re-exports through this scope so the ported tests (mod tests
 // below) and future callers resolve the grammar names via `super::*`,
-// exactly as when everything was one file.
+// exactly as when everything was one file. The module itself is `pub`
+// because its full-query entry (`write_seam::parse_cypher_query`) is the
+// crate's declared convergence surface — TD-GRAPH-4's corpus pin (in the
+// modality crate, which depends on this one) drives it from outside.
 #[cfg(test)]
 use write_seam::*;
 
