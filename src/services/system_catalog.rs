@@ -43,13 +43,7 @@ fn version_is_newer(loaded: u64, candidate: u64) -> bool {
     loaded == NO_VERSION || candidate > loaded
 }
 
-/// Current wall-clock milliseconds since the Unix epoch.
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
+use proximadb_kernel::time::now_unix_ms;
 
 /// Default number of committed mutations between automatic snapshots; mirrors
 /// the legacy metastore's compaction threshold. Override with
@@ -1050,7 +1044,7 @@ impl Catalog for SystemCatalog {
         for k in removals {
             ns.properties.remove(&k);
         }
-        ns.updated_at_ms = now_millis();
+        ns.updated_at_ms = now_unix_ms();
         self.commit(CatalogDelta::UpsertNamespace {
             namespace: Box::new(ns),
         })
@@ -1172,7 +1166,7 @@ impl Catalog for SystemCatalog {
             return Err(anyhow!("Table '{}' already exists", to));
         }
         schema.name = to.name.clone();
-        schema.updated_at_ms = now_millis();
+        schema.updated_at_ms = now_unix_ms();
         // Atomic batch: drop the old key + insert the new one in one durable
         // append, so a crash between them can't leave the table doubly-present.
         self.commit_batch(vec![
@@ -1254,7 +1248,7 @@ impl Catalog for SystemCatalog {
         }
         index.object_id = Some(self.mint_object_id(index.object_id)?);
         schema.indexes.push(index.clone());
-        schema.updated_at_ms = now_millis();
+        schema.updated_at_ms = now_unix_ms();
         self.commit(CatalogDelta::UpsertTable {
             identifier: identifier.clone(),
             schema: Box::new(schema),
@@ -1270,7 +1264,7 @@ impl Catalog for SystemCatalog {
         if schema.indexes.len() == initial {
             return Ok(false);
         }
-        schema.updated_at_ms = now_millis();
+        schema.updated_at_ms = now_unix_ms();
         self.commit(CatalogDelta::UpsertTable {
             identifier: identifier.clone(),
             schema: Box::new(schema),
@@ -1316,7 +1310,7 @@ impl Catalog for SystemCatalog {
     ) -> Result<()> {
         let mut schema = self.require_table(identifier)?;
         schema.primary_pod = primary;
-        schema.updated_at_ms = now_millis();
+        schema.updated_at_ms = now_unix_ms();
         self.commit(CatalogDelta::UpsertTable {
             identifier: identifier.clone(),
             schema: Box::new(schema),
@@ -1331,7 +1325,7 @@ impl Catalog for SystemCatalog {
     ) -> Result<CatalogTableSchema> {
         let mut schema = self.require_table(identifier)?;
         schema.storage_layouts = layouts;
-        schema.updated_at_ms = now_millis();
+        schema.updated_at_ms = now_unix_ms();
         self.commit(CatalogDelta::UpsertTable {
             identifier: identifier.clone(),
             schema: Box::new(schema.clone()),
@@ -1375,7 +1369,7 @@ impl Catalog for SystemCatalog {
             .map_err(anyhow::Error::new)?;
         asset.validate().map_err(anyhow::Error::new)?;
         schema.set_mlops_asset_typed(asset);
-        schema.updated_at_ms = now_millis();
+        schema.updated_at_ms = now_unix_ms();
         self.commit_batch_locked(vec![CatalogDelta::UpsertTable {
             identifier: identifier.clone(),
             schema: Box::new(schema.clone()),

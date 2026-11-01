@@ -1554,13 +1554,7 @@ fn dml_lock_outcome_label(outcome: &LockOutcome) -> &'static str {
 // Lease Types
 ////////////////////////////////////////////////////////////////////////////////
 
-/// Current wall-clock milliseconds since the Unix epoch.
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
+use proximadb_kernel::time::now_unix_ms;
 
 /// Error returned by [`validate_fencing`] when a write carries a fencing
 /// generation older than the current durable lease generation.
@@ -2645,7 +2639,7 @@ impl PartitionLeaseManager {
             ticker.tick().await; // consume the immediate first tick
             loop {
                 ticker.tick().await;
-                if let Err(e) = self.renew_held(now_millis()).await {
+                if let Err(e) = self.renew_held(now_unix_ms()).await {
                     tracing::warn!(error = %e, "partition-lease renew loop pass failed");
                 }
             }
@@ -2943,7 +2937,7 @@ impl DmlLockService {
     /// This is called periodically by the background reconciliation loop.
     /// It scans all locks and removes those that have expired.
     async fn reconcile_expired_locks(active_locks: &Arc<RwLock<HashMap<String, ActiveLock>>>) {
-        let now_ms = now_millis();
+        let now_ms = now_unix_ms();
         let mut locks = active_locks.write().await;
         let initial_count = locks.len();
 
@@ -3166,7 +3160,7 @@ impl DmlLockService {
         // Best-effort; `release_with_key` is fail-open to TTL internally.
         let _ = self
             .lease_manager
-            .release_with_key(&key, now_millis())
+            .release_with_key(&key, now_unix_ms())
             .await;
     }
 
@@ -3618,7 +3612,7 @@ mod tests {
             100,
         ));
         let key = ResourceKey::legacy_collection("t1", "c1");
-        assert!(mgr.acquire_with_key(&key, now_millis()).await?);
+        assert!(mgr.acquire_with_key(&key, now_unix_ms()).await?);
 
         // Renew every 40ms (≤ TTL/2), fire-and-forget like production.
         let renew_handle = mgr.clone().spawn_renew_loop(Duration::from_millis(40));
@@ -3633,7 +3627,7 @@ mod tests {
             .expect("lease still present");
         assert_eq!(lease.holder_pod, "pod-A");
         assert!(
-            !lease.is_expired(now_millis()),
+            !lease.is_expired(now_unix_ms()),
             "renewal must push expiry forward past now"
         );
         assert_eq!(
@@ -4453,7 +4447,7 @@ mod tests {
         };
 
         // Manually insert locks with different expiry times
-        let now_ms = now_millis();
+        let now_ms = now_unix_ms();
         let mut locks = lock_service.active_locks.write().await;
         locks.insert(
             DmlLockService::scoped_lock_key("tenant1", None, &scope1),
