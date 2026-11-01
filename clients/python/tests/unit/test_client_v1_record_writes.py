@@ -47,12 +47,14 @@ def test_client_v1_insert_vectors_uses_v2_record_batch(monkeypatch) -> None:
     url, payload, timeout = calls[0]
     assert url == "http://localhost:5678/api/v2/collections/items/records/batch"
     assert timeout == 3.0
+    # TD-REC-1: `source` rides in text_fields only — a top-level `source` was
+    # always silently dropped by the server and is now a contract 400
+    # (deny_unknown_fields on ProximaRecordInput).
     assert payload["records"] == [
         {
             "id": "r1",
             "vector": [1.0, 2.0],
             "props": {"kind": "note"},
-            "source": "hello",
             "text_fields": [{"name": "text", "content": "hello"}],
         }
     ]

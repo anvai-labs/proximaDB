@@ -56,8 +56,9 @@ class TestAddTexts:
         mock_client.insert_records.assert_called_once()
         records = mock_client.insert_records.call_args.args[1]
         assert len(records) == 2
-        assert records[0]["source"] == "hello"
-        assert records[1]["source"] == "world"
+        # TD-REC-1: text rides in text_fields, not a top-level source.
+        assert records[0]["text_fields"][0]["content"] == "hello"
+        assert records[1]["text_fields"][0]["content"] == "world"
         assert records[0]["text_fields"] == [{"name": "text", "content": "hello"}]
 
     def test_add_texts_with_metadata(self, store, mock_client):
@@ -164,7 +165,8 @@ class TestClassMethods:
         )
         assert isinstance(store, ProximaDBVectorStore)
         records = mock_client.insert_records.call_args.args[1]
-        assert records[0]["source"] == "doc1"
+        # TD-REC-1: text rides in text_fields, not a top-level source.
+        assert records[0]["text_fields"][0]["content"] == "doc1"
         assert records[0]["props"]["src"] == "test"
 
 

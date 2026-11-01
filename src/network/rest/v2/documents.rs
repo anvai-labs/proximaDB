@@ -39,7 +39,13 @@ use crate::services::{
 // ── Request / response DTOs ────────────────────────────────────────────────
 
 /// A single record submitted for native embedding + indexing.
+///
+/// Unknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy — the
+/// same rule as the records surface): the declared fields plus the
+/// `props`/`metadata` alias pair are the contract; anything else is a 400
+/// naming the unknown field instead of a silently dropped write.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IngestDocument {
     pub id: String,
     /// Raw text content. Required when `X-Embed-Source: native` (default);
@@ -112,8 +118,15 @@ pub async fn ingest_documents(
     Extension(tenant): Extension<TenantContext>,
     capability: Option<Extension<DataPlaneCapability>>,
     headers: HeaderMap,
-    Json(request): Json<IngestDocumentsRequest>,
+    payload: Result<Json<IngestDocumentsRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    // TD-REC-1: `deny_unknown_fields` on IngestDocument means a rejected
+    // body must be the documented 400 ApiError envelope naming the unknown
+    // field, not axum's plain-text 422 (same as `insert_records`).
+    let request = match super::json_body(payload) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     match ingest_documents_inner(
         collection,
         state,

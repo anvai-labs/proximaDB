@@ -324,7 +324,8 @@ def test_create_records_basic_shape():
     r0 = recs[0]
     assert r0["id"] == "docX_0"
     assert r0["vector"] == [0.1, 0.2]
-    assert r0["source"] == "short text"
+    # TD-REC-1: no top-level source; the text rides in text_fields.
+    assert "source" not in r0
     assert r0["text_fields"][0]["content"] == "short text"
     assert r0["props"]["embedding_dimension"] == 2
     # short text -> no ellipsis
@@ -367,6 +368,8 @@ def test_create_vector_records_wrapper():
     assert len(vrecs) == 2
     assert vrecs[0].id == "docX_0"
     assert vrecs[0].vector == [0.1, 0.2]
+    # TD-REC-1: the wrapper keeps the record-level source attribute; the
+    # WIRE payload carries the text in text_fields (asserted elsewhere).
     assert vrecs[0].source == "short text"
 
 

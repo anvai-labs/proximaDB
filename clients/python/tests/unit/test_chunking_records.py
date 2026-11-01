@@ -34,7 +34,7 @@ def test_create_records_returns_proximarecord_payloads():
                 "text_preview": "hello world",
                 "embedding_dimension": 2,
             },
-            "source": "hello world",
+            # TD-REC-1: no top-level source; text rides in text_fields.
             "text_fields": [{"name": "chunk_text", "content": "hello world"}],
         }
     ]
@@ -71,7 +71,8 @@ def test_prepare_records_returns_props_and_source_text():
     assert records[0]["props"]["source_id"] == "doc1"
     assert records[0]["props"]["source_type"] == "catalog"
     assert records[0]["props"]["embedding_model"] == "test-model"
-    assert records[0]["source"] == "Product"
+    # TD-REC-1: no top-level source; the content is in text_fields.
+    assert records[0]["text_fields"][0]["content"] == "Product"
 
 
 def test_prepare_vector_records_is_compatibility_wrapper():

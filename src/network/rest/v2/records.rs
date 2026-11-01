@@ -33,7 +33,8 @@
 
 use axum::{
     Json,
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Path, Query, State, rejection::JsonRejection},
+    response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -322,13 +323,17 @@ fn convert_typed_filters_to_clauses(
 ///                     "content": "A detailed product description...",
 ///                     "storage_hint": "adaptive"
 ///                 }
-///             ],
-///             "source": "catalog_import"
+///             ]
 ///         }
 ///     ],
 ///     "validate_schema": true
 /// }
 /// ```
+///
+/// (A record top level accepts exactly `id`, `vector`, `props` — or its
+/// advertised alias `metadata` — and `text_fields`; anything else is a 400
+/// naming the unknown field. The example used to show a `"source"` key: it
+/// was never a contract field and was silently dropped before TD-REC-1.)
 /// Not supported in v0.2: optimistic versioning, conditional-write predicates,
 /// update-by-filter, delete-by-filter, and patch / partial-record update. The
 /// live contract is exposed via `WriteContractHealth` on the route-health
@@ -353,7 +358,17 @@ pub struct InsertRecordsRequest {
 /// This is the JSON-serializable input format for ProximaRecord.
 /// It uses serde_json::Value for typed fields to support dynamic typing
 /// at the API boundary, with validation happening during conversion.
+///
+/// Unknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy): a
+/// write that carries a field this contract does not know must fail loud at
+/// the boundary, not report success while silently discarding data — which
+/// is exactly how the `metadata` drop shipped. The grandfathered spellings
+/// are the ones the contract itself advertises: `props` and its `metadata`
+/// alias. Generated SDKs (regenerated in #2337) send only declared fields,
+/// so the deny cannot break them; a hand-rolled client sending something
+/// else gets a 400 naming the problem instead of a silent no-op filter.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProximaRecordInput {
     /// Record ID (optional, will be auto-generated if not provided)
     pub id: Option<String>,
@@ -368,6 +383,9 @@ pub struct ProximaRecordInput {
     /// alias it was silently dropped and filters over it matched nothing
     /// (TD-REC-1). The OpenAPI contract stays `props`; the alias is
     /// lenience for the already-advertised spelling, not a second field.
+    /// It composes with `deny_unknown_fields`: an alias is a KNOWN field
+    /// name, so `metadata` passes the deny while any other unknown key is
+    /// rejected.
     #[schema(value_type = Option<HashMap<String, Value>>)]
     #[serde(alias = "metadata")]
     pub props: Option<HashMap<String, RestProximaValue>>,
@@ -1071,7 +1089,28 @@ pub async fn insert_records(
     State(state): State<AppState>,
     Extension(tenant): Extension<TenantContext>,
     capability: Option<Extension<DataPlaneCapability>>,
-    Json(request): Json<InsertRecordsRequest>,
+    payload: Result<Json<InsertRecordsRequest>, JsonRejection>,
+) -> Response {
+    // TD-REC-1: with `deny_unknown_fields` on the record DTO, a rejected body
+    // must be the documented 400 ApiError envelope naming the unknown field —
+    // not axum's plain-text 422 (the same reason `json_body` exists,
+    // TD-RESTGET-1).
+    let request = match super::json_body(payload) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match insert_records_inner(collection, state, tenant, capability, request).await {
+        Ok(response) => response.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn insert_records_inner(
+    collection: String,
+    state: AppState,
+    tenant: TenantContext,
+    capability: Option<Extension<DataPlaneCapability>>,
+    request: InsertRecordsRequest,
 ) -> ApiResult<Json<InsertRecordsResponse>> {
     info!(
         "V2 API: Inserting {} records into collection '{}'",
@@ -2660,6 +2699,34 @@ mod tests {
             "metadata": {"category": "news"},
         });
         assert!(serde_json::from_str::<ProximaRecordInput>(&both.to_string()).is_err());
+    }
+
+    #[test]
+    fn record_input_rejects_unknown_fields() {
+        // TD-REC-1 policy: a field outside the contract (and outside the
+        // grandfathered `metadata` alias) must FAIL LOUD at the boundary —
+        // the silent drop is the bug class this TD exists to close. Any other
+        // historical spelling (e.g. a `metadata`-shaped `attributes`) gets a
+        // 400 naming the unknown field instead of a success + no-op filter.
+        let unknown = serde_json::json!({
+            "id": "r1", "vector": [0.1, 0.2],
+            "attributes": {"category": "tech"},
+        });
+        let err = serde_json::from_str::<ProximaRecordInput>(&unknown.to_string())
+            .expect_err("unknown field must be rejected");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "error must name the unknown field, got: {err}"
+        );
+
+        // The declared fields and the grandfathered alias still pass the deny.
+        for field in ["props", "metadata"] {
+            let json = format!(r#"{{"id":"r1","vector":[0.1],"{field}":{{"k":"v"}}}}"#);
+            assert!(
+                serde_json::from_str::<ProximaRecordInput>(&json).is_ok(),
+                "{field} must still deserialize under deny_unknown_fields"
+            );
+        }
     }
 
     #[test]
