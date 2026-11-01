@@ -516,9 +516,12 @@ class TestRestCrudWireEquivalence:
         mock_op.return_value = self._resp({"success": True}, DocDeleteAck)
         assert rest_client.delete_document("docs", "d1") is True
 
-        mock_op.return_value = self._resp(
-            {"success": False}, DocDeleteAck, status=HTTPStatus.NOT_FOUND
-        )
+        # A REAL 404 on the delete ops raises the generated
+        # UnexpectedStatus (only 200/500 are documented) — the not-found
+        # contract must hold on that path too, not just on a parsed 404.
+        from proximadb_sdk._generated.rest.errors import UnexpectedStatus
+
+        mock_op.side_effect = UnexpectedStatus(404, b"gone")
         assert rest_client.delete_document("docs", "gone") is False
 
     @patch(

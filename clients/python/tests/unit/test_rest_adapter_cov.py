@@ -895,15 +895,16 @@ def test_delete_document(doc_adapter):
 
 
 def test_delete_document_404(doc_adapter):
+    """The delete ops document only 200/500, so a REAL 404 raises the
+    generated UnexpectedStatus (never a parsed response) — the shared
+    executor must still honor the not-found contract on that path."""
     from unittest.mock import patch
 
-    from proximadb_sdk._generated.rest.models.doc_delete_ack import DocDeleteAck
+    from proximadb_sdk._generated.rest.errors import UnexpectedStatus
 
     op = "proximadb_sdk._generated.rest.api.documents.delete_document.sync_detailed"
     with patch(op) as mock_op:
-        mock_op.return_value = _doc_resp(
-            DocDeleteAck.from_dict({"success": False}), status_code=404
-        )
+        mock_op.side_effect = UnexpectedStatus(404, b"gone")
         assert doc_adapter.delete_document("docs", "gone") is False
 
 
@@ -943,6 +944,65 @@ def test_list_document_collections_error(doc_adapter):
         mock_op.return_value = _error_resp(500, "boom")
         with pytest.raises(ServerError):
             doc_adapter.list_document_collections()
+
+
+def test_create_document_collection_name_is_authoritative(doc_adapter):
+    from unittest.mock import patch
+
+    from proximadb_sdk._generated.rest.models.doc_create_collection_response import (
+        DocCreateCollectionResponse,
+    )
+
+    op = "proximadb_sdk._generated.rest.api.documents.create_document_collection.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.return_value = _doc_resp(
+            DocCreateCollectionResponse.from_dict(
+                {"success": True, "collection": {"name": "docs"}}
+            )
+        )
+        doc_adapter.create_document_collection("docs", {"name": "evil", "shards": 2})
+    assert mock_op.call_args.kwargs["body"].to_dict() == {
+        "name": "docs",
+        "shards": 2,
+    }
+
+
+def test_insert_document_errors_are_in_vocabulary(doc_adapter):
+    """insert_document shares the family's outcome vocabulary (transport →
+    NetworkError; documented errors → ServerError) — previously raw
+    httpx/RuntimeError."""
+    from unittest.mock import patch
+
+    import httpx
+
+    op = "proximadb_sdk._generated.rest.api.documents.insert_document.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.side_effect = httpx.ConnectError("x")
+        with pytest.raises(NetworkError, match="transport error"):
+            doc_adapter.insert_document("docs", {"title": "x"})
+    with patch(op) as mock_op:
+        mock_op.return_value = _error_resp(400, "bad doc")
+        with pytest.raises(ServerError, match="bad doc"):
+            doc_adapter.insert_document("docs", {"title": "x"})
+
+
+def test_close_releases_the_shared_generated_client(doc_adapter):
+    from unittest.mock import patch
+
+    from proximadb_sdk._generated.rest.models.doc_collection_list_response import (
+        DocCollectionListResponse,
+    )
+
+    op = "proximadb_sdk._generated.rest.api.documents.list_document_collections.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.return_value = _doc_resp(
+            DocCollectionListResponse.from_dict({"collections": []})
+        )
+        doc_adapter.list_document_collections()  # materialize the base client
+
+    httpx_client = doc_adapter._get_generated_document_client().get_httpx_client()
+    doc_adapter.close()
+    assert httpx_client.is_closed
 
 
 def test_delete_document_collection(doc_adapter):

@@ -913,6 +913,27 @@ class ProximaDBClient:
         return self._generated_document_client
 
     def _call_document_adapter(self, method_name: str, *args, **kwargs):
+        """Dispatch a document op to the adapter chain, or None to fall back.
+
+        Two REST-path caveats to know about (disclosed by TD-SDK-3 batch 2,
+        which made the REST adapter's document family actually work — it
+        previously crashed with AttributeError before any I/O and this
+        fallback always fired):
+
+        1. RESPONSE-SHAPE DIVERGENCE: when the adapter succeeds, the dict
+           comes from the server's spec-driven models (create →
+           ``{"success", "collection"}``; get → ``{"id", "document",
+           "version"}`` without ``found``; update → without ``document``),
+           which differs from the in-memory fallback's local shapes
+           (``collection_id``, ``found: True``, ...). Callers that relied on
+           the local keys — only ever produced on this previously
+           always-local path — should read the server shapes; the adapter
+           does not mash the two into a third shape.
+        2. The None SENTINEL: ``get_document`` legitimately returns None on
+           a server 404, which this dispatch cannot distinguish from
+           "adapter unavailable" — it then probes the in-memory repository,
+           which may hold a locally-stored id the server says is absent.
+        """
         candidates: list[BaseProtocolAdapter] = []
         if self._adapter:
             candidates.append(self._adapter)

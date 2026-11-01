@@ -207,18 +207,32 @@ def execute_document_op(op: str, call: Any, *, not_found: Any = _NOT_FOUND_UNSET
     offline test seam — patching the generated module — keeps working).
     Transport failures, undocumented statuses, error envelopes, and
     missing bodies all surface as typed SDK errors; the generated
-    exceptions never escape.
+    exceptions never escape. A 404 maps to ``not_found`` when configured —
+    whether it arrives as a documented ``ErrorResponse`` (get_document)
+    or as an undocumented-status ``UnexpectedStatus`` (the delete ops
+    document only 200/500, so a real 404 — gateway, unmounted route —
+    raises before a response is parsed).
     """
     try:
         response = call()
     except httpx.HTTPError as e:
         raise NetworkError(f"{op} transport error: {e}", original_error=e) from e
     except UnexpectedStatus as e:
+        if e.status_code == 404 and not (not_found is _NOT_FOUND_UNSET):
+            return not_found
         # raise_on_unexpected_status=True raises BEFORE the response is
         # returned, so undocumented statuses (e.g. HTTP 500) map to
         # ServerError here — the generated exception never escapes the SDK.
         raise ServerError(
             f"{op} unexpected status: {e.status_code}",
             status_code=e.status_code,
+        ) from e
+    except ValueError as e:
+        # json.JSONDecodeError subclasses ValueError: a non-JSON body on a
+        # DOCUMENTED status (LB/gateway garbage at 500) must not escape as
+        # a decoding error — it is still a server-side failure.
+        raise ServerError(
+            f"{op} returned a malformed body: {e}",
+            status_code=None,
         ) from e
     return map_document_response(op, response, not_found=not_found)

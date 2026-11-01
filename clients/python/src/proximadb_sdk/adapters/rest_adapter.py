@@ -730,8 +730,13 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
             CreateDocumentCollectionRequest,
         )
 
+        # The positional ``name`` is authoritative — a config dict keyed
+        # "name" must not silently override it.
         body = CreateDocumentCollectionRequest.from_dict(
-            {"name": name, **(config or {})}
+            {
+                "name": name,
+                **{k: v for k, v in (config or {}).items() if k != "name"},
+            }
         )
         return execute_document_op(
             "create_document_collection",
@@ -784,23 +789,27 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         """Insert a JSON document into a document-collection (spec-driven, ADR-041).
 
         Targets the **document-collections** surface
-        (`POST /api/v2/document-collections/{c}/documents`) via the GENERATED client
-        op — pure JSON storage, no server-side embedding. For semantic content with
-        embedding use :meth:`ingest_documents` (the collections vector store).
+        (`POST /api/v2/document-collections/{c}/documents`) via the GENERATED
+        client op — pure JSON storage, no server-side embedding. For semantic
+        content with embedding use :meth:`ingest_documents` (the collections
+        vector store). One outcome vocabulary with the rest of the family:
+        transport → ``NetworkError``, documented errors and undocumented
+        statuses → ``ServerError`` (the op documents 200/400/500).
         """
+        from .._document_ingest import execute_document_op
         from .._generated.rest.api.documents.insert_document import sync_detailed
         from .._generated.rest.models.doc_insert_request import DocInsertRequest
 
         # Wave-9 typed the previously free-form request body
         # (InsertDocumentBody) into DocInsertRequest {id?, document}.
         body = DocInsertRequest.from_dict({"id": id, "document": document})
-        client = self._get_generated_document_client()
-        response = sync_detailed(collection=collection_name, client=client, body=body)
-        if response.status_code in (200, 201, 202):
-            return response.parsed.to_dict() if response.parsed is not None else {}
-        raise RuntimeError(
-            f"insert_document (document-collections) failed {response.status_code}: "
-            f"{response.content!r}"
+        return execute_document_op(
+            "insert_document",
+            lambda: sync_detailed(
+                collection=collection_name,
+                client=self._get_generated_document_client(),
+                body=body,
+            ),
         )
 
     def get_document(
@@ -884,7 +893,9 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
                 id=doc_id,
                 client=self._get_generated_document_client(),
             ),
-            not_found=False,
+            # Ack-shaped so the uniform ``result["success"]`` flow works on
+            # both the parsed and the 404 paths.
+            not_found={"success": False},
         )
         return bool(result.get("success", False))
 
@@ -915,7 +926,9 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
                 collection=collection_name,
                 client=self._get_generated_document_client(),
             ),
-            not_found=False,
+            # Ack-shaped so the uniform ``result["success"]`` flow works on
+            # both the parsed and the 404 paths.
+            not_found={"success": False},
         )
         return bool(result.get("success", False))
 
@@ -1165,4 +1178,12 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         """Close the REST client connection."""
         if hasattr(self._client, "close"):
             self._client.close()
+        # The shared generated document client's httpx pool is only
+        # materialized once an op ran; close it so adapters don't leak a
+        # connection pool until GC.
+        if self._generated_document_client is not None:
+            try:
+                self._generated_document_client.get_httpx_client().close()
+            except Exception as e:  # closing is best-effort
+                logger.debug(f"Could not close generated document client: {e}")
         self._connected = False
