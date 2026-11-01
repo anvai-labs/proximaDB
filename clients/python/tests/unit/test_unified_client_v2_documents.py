@@ -593,7 +593,12 @@ class TestRestCrudWireEquivalence:
         rest_client.ingest_documents("coll", [doc])
 
         wire = mock_sync.call_args.kwargs["body"].to_dict()["records"][0]
-        assert wire["custom_extra"] == 42, "extras dropped by the rebuild"
+        # Self-diagnosing: on failure, print every intermediate so the
+        # dropping hop is identifiable from the CI log alone.
+        assert wire.get("custom_extra") == doc.to_dict().get("custom_extra") == 42, (
+            f"extras dropped: doc.to_dict()={doc.to_dict()} "
+            f"adapter_arg={mock_sync.call_args.kwargs.get('body')!r} wire={wire}"
+        )
 
 
 # ---------------------------------------------------------------------------
