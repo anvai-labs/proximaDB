@@ -27,12 +27,13 @@ from ..models import (
 )
 from ..models_v2 import ProximaRecord
 from ..proto_conversion import ProtoConverter
+from ._sync_graph_delegations import SyncGraphDelegations
 from .base import BaseProtocolAdapter
 
 logger = logging.getLogger(__name__)
 
 
-class RestProtocolAdapter(BaseProtocolAdapter):
+class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
     """REST protocol adapter implementing BaseProtocolAdapter.
 
     Wraps the existing ProximaDBClient (REST) to provide a consistent
@@ -969,148 +970,12 @@ class RestProtocolAdapter(BaseProtocolAdapter):
     # ==========================================================================
     # Graph Operations (TD-SDK-3 batch 1)
     #
-    # Thin delegations to the REST transport (protocols.rest_sync), which owns
-    # the spec-driven graph surface. Kwarg names match the transport's
-    # signatures EXACTLY; the only shaping is normalizing ``graph_id=None`` to
-    # the transport's "default" (an explicit None would reach the URL builder).
+    # The 10 CRUD/traversal delegations shared with gRPC live once in
+    # SyncGraphDelegations (listed first in the bases so its concrete
+    # methods win over the base-class defaults). REST-specific below:
+    # graph-collection management and the analytics pair (prefetch overrides
+    # travel as headers to keep the body stable).
     # ==========================================================================
-
-    def create_node(
-        self,
-        node_id: str,
-        labels: list[str],
-        properties: dict[str, Any] | None = None,
-        embedding: list[float] | None = None,
-        graph_id: str | None = None,
-        **kwargs,
-    ) -> dict[str, Any]:
-        """Create a graph node via REST."""
-        return self._client.create_node(
-            node_id=node_id,
-            labels=labels,
-            properties=properties,
-            embedding=embedding,
-            graph_id=graph_id or "default",
-        )
-
-    def create_edge(
-        self,
-        edge_id: str,
-        from_node_id: str,
-        to_node_id: str,
-        edge_type: str,
-        properties: dict[str, Any] | None = None,
-        weight: float | None = None,
-        graph_id: str | None = None,
-        **kwargs,
-    ) -> dict[str, Any]:
-        """Create a graph edge via REST."""
-        return self._client.create_edge(
-            edge_id=edge_id,
-            from_node_id=from_node_id,
-            to_node_id=to_node_id,
-            edge_type=edge_type,
-            properties=properties,
-            weight=weight,
-            graph_id=graph_id or "default",
-        )
-
-    def batch_create_nodes(
-        self, nodes: list[dict[str, Any]], graph_id: str | None = None, **kwargs
-    ) -> dict[str, Any]:
-        """Create many nodes in one request via the batch endpoint."""
-        return self._client.batch_create_nodes(
-            nodes=nodes, graph_id=graph_id or "default"
-        )
-
-    def batch_create_edges(
-        self, edges: list[dict[str, Any]], graph_id: str | None = None, **kwargs
-    ) -> dict[str, Any]:
-        """Create many edges in one request (per-edge admission server-side)."""
-        return self._client.batch_create_edges(
-            edges=edges, graph_id=graph_id or "default"
-        )
-
-    def get_node(
-        self, node_id: str, graph_id: str | None = None, **kwargs
-    ) -> dict[str, Any] | None:
-        """Get a graph node by ID via REST."""
-        return self._client.get_node(node_id=node_id, graph_id=graph_id or "default")
-
-    def get_outgoing_edges(
-        self,
-        node_id: str,
-        edge_types: list[str] | None = None,
-        graph_id: str | None = None,
-        **kwargs,
-    ) -> list[dict[str, Any]]:
-        """Get a node's outgoing edges via REST."""
-        return self._client.get_outgoing_edges(
-            node_id=node_id,
-            edge_types=edge_types,
-            graph_id=graph_id or "default",
-        )
-
-    def get_incoming_edges(
-        self,
-        node_id: str,
-        edge_types: list[str] | None = None,
-        graph_id: str | None = None,
-        **kwargs,
-    ) -> list[dict[str, Any]]:
-        """Get a node's incoming edges via REST."""
-        return self._client.get_incoming_edges(
-            node_id=node_id,
-            edge_types=edge_types,
-            graph_id=graph_id or "default",
-        )
-
-    def delete_node(self, node_id: str, graph_id: str | None = None, **kwargs) -> bool:
-        """Delete a graph node by ID via REST."""
-        result = self._client.delete_node(
-            node_id=node_id, graph_id=graph_id or "default"
-        )
-        return bool(result)
-
-    def query_nodes(
-        self,
-        labels: list[str] | None = None,
-        properties: dict[str, Any] | None = None,
-        limit: int | None = None,
-        offset: int | None = None,
-        graph_id: str | None = None,
-        **kwargs,
-    ) -> dict[str, Any]:
-        """Query nodes by labels and properties via REST."""
-        return self._client.query_nodes(
-            labels=labels,
-            properties=properties,
-            limit=limit,
-            offset=offset,
-            graph_id=graph_id or "default",
-        )
-
-    def traverse_graph(
-        self,
-        start_node_id: str,
-        max_depth: int = 3,
-        edge_types: list[str] | None = None,
-        node_labels: list[str] | None = None,
-        algorithm: str = "BFS",
-        limit: int | None = None,
-        graph_id: str | None = None,
-        **kwargs,
-    ) -> dict[str, Any]:
-        """Traverse the graph from a starting node via REST."""
-        return self._client.traverse_graph(
-            start_node_id=start_node_id,
-            max_depth=max_depth,
-            edge_types=edge_types,
-            node_labels=node_labels,
-            algorithm=algorithm,
-            limit=limit,
-            graph_id=graph_id or "default",
-        )
 
     def create_graph(
         self,

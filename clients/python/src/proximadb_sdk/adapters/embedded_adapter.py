@@ -1196,6 +1196,33 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
             logger.error(f"Failed to get node: {e}")
             raise
 
+    def _directional_edges(
+        self,
+        direction: str,
+        node_id: str,
+        graph: str | None,
+        edge_types: list[str] | None,
+        kwargs: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Shared body for the outgoing/incoming edge readers (same shape,
+        one engine method name — a twin pair is how the adapters drifted)."""
+        try:
+            graph_id = self._graph_id_from_args(graph, kwargs)
+            engine_method = f"get_{direction}_edges"
+            if hasattr(self._db, engine_method):
+                edges = getattr(self._db, engine_method)(
+                    graph_id=graph_id,
+                    node_id=node_id,
+                    edge_types=edge_types,
+                )
+                return [self._normalize_graph_edge(edge) for edge in (edges or [])]
+            raise NotImplementedError(
+                f"{engine_method} not implemented in embedded API"
+            )
+        except Exception as e:
+            logger.error(f"Failed to get {direction} edges: {e}")
+            raise
+
     def get_outgoing_edges(
         self,
         node_id: str,
@@ -1204,21 +1231,7 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
         **kwargs,
     ) -> list[dict[str, Any]]:
         """Get outgoing graph edges via embedded API."""
-        try:
-            graph_id = self._graph_id_from_args(graph, kwargs)
-            if hasattr(self._db, "get_outgoing_edges"):
-                edges = self._db.get_outgoing_edges(
-                    graph_id=graph_id,
-                    node_id=node_id,
-                    edge_types=edge_types,
-                )
-                return [self._normalize_graph_edge(edge) for edge in (edges or [])]
-            raise NotImplementedError(
-                "get_outgoing_edges not implemented in embedded API"
-            )
-        except Exception as e:
-            logger.error(f"Failed to get outgoing edges: {e}")
-            raise
+        return self._directional_edges("outgoing", node_id, graph, edge_types, kwargs)
 
     def get_incoming_edges(
         self,
@@ -1228,21 +1241,7 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
         **kwargs,
     ) -> list[dict[str, Any]]:
         """Get incoming graph edges via embedded API."""
-        try:
-            graph_id = self._graph_id_from_args(graph, kwargs)
-            if hasattr(self._db, "get_incoming_edges"):
-                edges = self._db.get_incoming_edges(
-                    graph_id=graph_id,
-                    node_id=node_id,
-                    edge_types=edge_types,
-                )
-                return [self._normalize_graph_edge(edge) for edge in (edges or [])]
-            raise NotImplementedError(
-                "get_incoming_edges not implemented in embedded API"
-            )
-        except Exception as e:
-            logger.error(f"Failed to get incoming edges: {e}")
-            raise
+        return self._directional_edges("incoming", node_id, graph, edge_types, kwargs)
 
     def delete_node(
         self,

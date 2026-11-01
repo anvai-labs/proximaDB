@@ -372,7 +372,6 @@ class BaseProtocolAdapter(ABC):
         graph_id: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Create a graph node."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support graph node creation"
         )
@@ -388,7 +387,6 @@ class BaseProtocolAdapter(ABC):
         graph_id: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Create a graph edge between two nodes."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support graph edge creation"
         )
@@ -396,7 +394,6 @@ class BaseProtocolAdapter(ABC):
     def batch_create_nodes(
         self, nodes: list[dict[str, Any]], graph_id: str | None = None, **kwargs
     ) -> dict[str, Any]:
-        """Create many nodes in one request (per-item fallback is the caller's)."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support graph node batches"
         )
@@ -404,7 +401,6 @@ class BaseProtocolAdapter(ABC):
     def batch_create_edges(
         self, edges: list[dict[str, Any]], graph_id: str | None = None, **kwargs
     ) -> dict[str, Any]:
-        """Create many edges in one request with per-edge admission."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support graph edge batches"
         )
@@ -412,7 +408,6 @@ class BaseProtocolAdapter(ABC):
     def get_node(
         self, node_id: str, graph_id: str | None = None, **kwargs
     ) -> dict[str, Any] | None:
-        """Get a graph node by ID (``None`` when absent)."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support graph node reads"
         )
@@ -424,7 +419,6 @@ class BaseProtocolAdapter(ABC):
         graph_id: str | None = None,
         **kwargs,
     ) -> list[dict[str, Any]]:
-        """Get a node's outgoing edges."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support graph edge reads"
         )
@@ -436,13 +430,11 @@ class BaseProtocolAdapter(ABC):
         graph_id: str | None = None,
         **kwargs,
     ) -> list[dict[str, Any]]:
-        """Get a node's incoming edges."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support graph edge reads"
         )
 
     def delete_node(self, node_id: str, graph_id: str | None = None, **kwargs) -> bool:
-        """Delete a graph node by ID."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support graph node deletion"
         )
@@ -456,7 +448,6 @@ class BaseProtocolAdapter(ABC):
         graph_id: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Query nodes by labels and properties."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support graph node queries"
         )
@@ -472,7 +463,6 @@ class BaseProtocolAdapter(ABC):
         graph_id: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Traverse the graph from a starting node (nodes/edges/paths/stats)."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support graph traversal"
         )
@@ -485,31 +475,26 @@ class BaseProtocolAdapter(ABC):
         schema: dict[str, Any] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Create a graph collection."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support graph collection creation"
         )
 
     def delete_graph(self, graph_id: str, **kwargs) -> dict[str, Any]:
-        """Delete a graph collection."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support graph collection deletion"
         )
 
     def get_graph(self, graph_id: str, **kwargs) -> dict[str, Any]:
-        """Get graph-collection metadata."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support graph collection reads"
         )
 
     def list_graphs(self, **kwargs) -> dict[str, Any]:
-        """List all graph collections."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support graph collection listing"
         )
 
     def get_graph_stats(self, graph_id: str, **kwargs) -> dict[str, Any]:
-        """Get statistics for a graph collection."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support graph collection stats"
         )
@@ -528,7 +513,6 @@ class BaseProtocolAdapter(ABC):
         graph_id: str = "default",
         **kwargs,
     ) -> dict[str, Any]:
-        """Compute shortest path(s) with optional prefetch overrides."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support graph shortest path"
         )
@@ -548,7 +532,6 @@ class BaseProtocolAdapter(ABC):
         graph_id: str = "default",
         **kwargs,
     ) -> dict[str, Any]:
-        """Tuned traversal with prefetch/timeout overrides (analytics surface)."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support tuned graph traversal"
         )
