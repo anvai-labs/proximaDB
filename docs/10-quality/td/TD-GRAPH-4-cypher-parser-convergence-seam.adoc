@@ -1,0 +1,40 @@
+// Copyright (C) 2026 ProximaDB
+// SPDX-License-Identifier: Apache-2.0
+= TD-GRAPH-4: Cypher parser convergence — one grammar behind the graph-query seam, not two drifting forks
+
+[cols="1,3", options="header"]
+|===
+| Field | Value
+| Status | **Open (seam extracted 2026-11-01; convergence design pending).**
+| Priority | P2 — two live nom-based Cypher grammars with 34 shared function names and drifted bodies is the standard fork disease; every parser fix must currently land twice or silently miss one path.
+| Relates to | link:TD-GRAPH-3-cypher-variable-length-multihop.adoc[TD-GRAPH-3] (variable-length parsing), the 2026-10-31 victor clone-scan dedup program (wave 3)
+| Component | `crates/query/proximadb-graph-query/src/parser/` (read path + `write_seam.rs`), `crates/modalities/proximadb-graph/src/cypher_parser.rs` (the graph-API grammar), `src/query/parsers/cypher.rs` + `src/graph/query/graph_parser.rs` (its consumers).
+| Evidence | 2026-10-31 scan: two parsers, 54 vs 43 top-level fns, 34 shared names, drifted bodies (`ParseResult` vs `IResult`, combinator reorg); graph-consumer analysis: the graph-query crate's ONLY runtime consumer is `proximadb-query/src/graph_lowering.rs` (`QueryParser`, the read path), while its full-Cypher write grammar (CREATE/MERGE/DELETE/SET/REMOVE/WITH/OPTIONAL MATCH over `CypherQuery`) is unwired — exercised solely by its own 36 tests. The modality crate's parser is the live full-Cypher implementation (graph API path).
+|===
+
+== The finding
+
+The repository carries two independently evolved Cypher grammars. The graph-query crate's
+full-query grammar sat inside `parser.rs` behind a single scattered `#[allow(dead_code)]`,
+reading as accidental residue rather than what the owner has declared it: **an intentional seam
+to build upon** (owner decision 2026-11-01) and the convergence target for the modality crate's
+drifted twin.
+
+== Direction
+
+1. **Seam made explicit** (landed): the write grammar lives in
+   `parser/write_seam.rs` with its rationale, a single documented module-level `dead_code`
+   allowance, and its 36 tests intact (47/47 green; pure code motion).
+2. **Convergence design** (open): new full-Cypher parsing work belongs behind the seam. When
+   the modality parser next needs a grammar change, port the clause parsers onto the seam
+   (shared lexemes → shared patterns → clause-by-clause), keeping the modality's
+   `CypherQuery`→`query_ast` mapping as a thin conversion over the seam's AST, until the
+   modality file reduces to the conversion layer.
+3. **Contract pinning** (open): before the first port, snapshot the modality parser's current
+   behavior as a corpus test at the seam (the two grammars' clause-level outputs), so each
+   ported clause is differential-checked against the behavior the graph API path shipped.
+
+== Non-goals
+
+Deleting the seam grammar (rejected — owner decision), and merging the READ path into the
+modality parser (the `CompiledPattern` contract serves the SQL-lowering pipeline and stays).
