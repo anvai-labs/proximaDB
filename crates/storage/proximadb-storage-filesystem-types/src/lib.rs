@@ -97,9 +97,11 @@ fn inflight_test_override() -> Option<Option<usize>> {
 
 /// Test-only pin of the `read_ranges_prefetch` concurrency for the rest of
 /// the process (the plain `cargo test --lib` runner shares one process, so
-/// the parsed-once env cache cannot be re-armed mid-run). `None` restores
-/// "consult the environment". A test that pins must serialize against every
-/// other test that pins or asserts wave shapes.
+/// the parsed-once env cache cannot be re-armed mid-run). `None` FORCES the
+/// unset default (equivalent to the ambient state in that shared process,
+/// where nothing else arms the env var); there is deliberately no path back
+/// to override=0 (env-decides). A test that pins must serialize against
+/// every other test that pins or asserts wave shapes.
 #[doc(hidden)]
 pub fn __set_read_ranges_inflight_for_tests(cap: Option<usize>) {
     use std::sync::atomic::Ordering::Relaxed;

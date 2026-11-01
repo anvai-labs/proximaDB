@@ -3351,6 +3351,7 @@ mod tests {
     use crate::storage::persistence::filesystem::FilesystemFactory;
     use proximadb_data_model::ProximaValue;
     use proximadb_distance_kernel::engine::UnifiedDistanceCompute;
+    use serial_test::serial;
     use std::sync::Arc;
 
     /// TD-SEARCH-2 S2b: the adaptive degree formula divides the base degree
@@ -3500,6 +3501,7 @@ mod tests {
     /// (sequential) and degree=4 (multi-core spawn) and asserts the returned
     /// id-sets agree. Process-per-test isolation (nextest) makes the env-set safe.
     #[tokio::test]
+    #[serial]
     async fn s2_multicore_arc_matches_sequential() {
         use crate::core::search::SearchParams;
         use crate::storage::traits::{FlushParameters, StorageQueryContext, StorageQueryMetadata};

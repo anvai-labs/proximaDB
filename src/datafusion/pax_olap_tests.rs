@@ -976,8 +976,11 @@ mod tests {
     /// The env var is deliberately still set: the property must hold with the
     /// gate ON, because "gate on" is exactly when the old code lied.
     #[tokio::test]
+    #[serial]
     async fn pax_backed_shape_stamps_the_backend_that_actually_serves() {
-        unsafe { std::env::set_var("PROXIMADB_DF_PAX_READER", "1") };
+        // Pin the cached reader gate directly (same shared-process reason as the
+        // ranged gate above).
+        crate::datafusion::engine_adapters::pax_adapter::set_pax_reader_gate_for_tests(Some(true));
 
         use crate::query::compute_scheduler::{ComputeScheduler, QueryShape};
         use crate::query::table_write_plan::ComputeBackend;
@@ -1010,8 +1013,11 @@ mod tests {
     /// analytical shape on native storage stays on Volcano, which is still worth
     /// holding.
     #[tokio::test]
+    #[serial]
     async fn non_pax_olap_shape_stays_volcano_despite_gate() {
-        unsafe { std::env::set_var("PROXIMADB_DF_PAX_READER", "1") };
+        // Pin the cached reader gate directly (same shared-process reason as the
+        // ranged gate above).
+        crate::datafusion::engine_adapters::pax_adapter::set_pax_reader_gate_for_tests(Some(true));
 
         use crate::query::compute_scheduler::{ComputeScheduler, QueryShape};
         use crate::query::table_write_plan::ComputeBackend;

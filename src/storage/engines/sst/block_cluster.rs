@@ -1634,6 +1634,7 @@ fn sign_gray_key(v: &[f32], mean: &[f64]) -> Vec<u8> {
 mod tests {
     use super::*;
     use proximadb_records::EmbeddingCell;
+    use serial_test::serial;
 
     /// TD-FPRUNE-3: the partition layout is opt-in — unset (or any
     /// non-truthy value) is the global layout; only an explicit truthy value
@@ -1941,6 +1942,7 @@ mod tests {
     /// model (cell_rows partition the usable rows, arrays sized by k), puts
     /// no-embedding rows in the tail outside every cell, and is deterministic.
     #[test]
+    #[serial]
     fn cluster_plan_ivf_probe_groups_cells_and_is_deterministic() {
         // Force k=2 so the two synthetic clusters map 1:1 to cells (the shared
         // IOP-derived override, since the plan we persist IS the single-level
@@ -2152,6 +2154,7 @@ mod ncomp_floor_tests {
     /// (nextest process isolation covers the registry; the Drop guard restores
     /// the env vars for shared-process legacy `cargo test` runs.)
     #[test]
+    #[serial]
     fn destination_url_resolves_the_iop_target() {
         use proximadb_storage_common::iops_budget::{IopsBudget, register_location_budget};
         struct RestoreEnvs;
@@ -2264,6 +2267,7 @@ mod shared_model_tests {
     }
 
     #[test]
+    #[serial]
     fn retrain_triggers_fire_on_drift_size_and_dimension() {
         // SAFETY: nextest runs each test in its own process.
         unsafe { std::env::remove_var("PROXIMADB_IVF_K") };

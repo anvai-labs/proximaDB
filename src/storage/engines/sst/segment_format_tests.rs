@@ -561,6 +561,7 @@ async fn legacy_oid_block_corruption_fails_closed() {
 }
 
 #[tokio::test]
+#[serial]
 async fn oid_prefetch_fallback_records_each_physical_get_once() {
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
 
@@ -1067,6 +1068,7 @@ fn probe_range_coalescing_keeps_only_selected_cell_slices() {
 }
 
 #[test]
+#[serial]
 fn adaptive_range_policy_obeys_gate_knee_and_explicit_override_precedence() {
     use crate::storage::engines::core::coalesce_strategy::RangePlanEstimate;
 
@@ -1521,6 +1523,7 @@ fn parquet_segment_routes_to_the_parquet_reader() {
 /// falls). Mixed-read-safe: block size is a per-segment write choice, opaque
 /// to the magic-detected read router.
 #[test]
+#[serial]
 fn larger_target_block_yields_fewer_blocks() {
     // TD-PAXRG-1: post-flip the default write is the row-group layout,
     // whose 256 KiB floor clamps sub-floor targets — this test pins the
@@ -2708,9 +2711,6 @@ async fn stage_f_waves_cache_and_known_size_keep_the_allow_set_exact() {
     // runner shares one process, so the env cache cannot be re-armed mid-run.
     proximadb_storage_filesystem_types::__set_read_ranges_inflight_for_tests(Some(4));
     enable_coalesced_rabitq();
-    // Waves only fire with an in-flight cap > 1; parsed once per process
-    // (nextest isolates each test), so set before the first read.
-    unsafe {}
     use crate::storage::persistence::filesystem::local::{LocalConfig, LocalFileSystem};
     use proximadb_storage_common::segment_layout::SegmentHeaderPrefix;
 
@@ -3553,6 +3553,7 @@ async fn filtered_cascade_matches_filtered_bruteforce() {
 
 /// ADR-089 P1: the filter-aware cascade is DEFAULT-OFF (mixed-read-safe).
 #[test]
+#[serial]
 fn filtered_cascade_gate_defaults_on() {
     // FLIPPED default-ON 2026-08-31 (see the gate's doc comment). Pinned
     // explicitly so this assertion cannot race another test's env pinning
