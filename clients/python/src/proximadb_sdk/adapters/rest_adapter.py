@@ -967,6 +967,249 @@ class RestProtocolAdapter(BaseProtocolAdapter):
             return False
 
     # ==========================================================================
+    # Graph Operations (TD-SDK-3 batch 1)
+    #
+    # Thin delegations to the REST transport (protocols.rest_sync), which owns
+    # the spec-driven graph surface. Kwarg names match the transport's
+    # signatures EXACTLY; the only shaping is normalizing ``graph_id=None`` to
+    # the transport's "default" (an explicit None would reach the URL builder).
+    # ==========================================================================
+
+    def create_node(
+        self,
+        node_id: str,
+        labels: list[str],
+        properties: dict[str, Any] | None = None,
+        embedding: list[float] | None = None,
+        graph_id: str | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Create a graph node via REST."""
+        return self._client.create_node(
+            node_id=node_id,
+            labels=labels,
+            properties=properties,
+            embedding=embedding,
+            graph_id=graph_id or "default",
+        )
+
+    def create_edge(
+        self,
+        edge_id: str,
+        from_node_id: str,
+        to_node_id: str,
+        edge_type: str,
+        properties: dict[str, Any] | None = None,
+        weight: float | None = None,
+        graph_id: str | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Create a graph edge via REST."""
+        return self._client.create_edge(
+            edge_id=edge_id,
+            from_node_id=from_node_id,
+            to_node_id=to_node_id,
+            edge_type=edge_type,
+            properties=properties,
+            weight=weight,
+            graph_id=graph_id or "default",
+        )
+
+    def batch_create_nodes(
+        self, nodes: list[dict[str, Any]], graph_id: str | None = None, **kwargs
+    ) -> dict[str, Any]:
+        """Create many nodes in one request via the batch endpoint."""
+        return self._client.batch_create_nodes(
+            nodes=nodes, graph_id=graph_id or "default"
+        )
+
+    def batch_create_edges(
+        self, edges: list[dict[str, Any]], graph_id: str | None = None, **kwargs
+    ) -> dict[str, Any]:
+        """Create many edges in one request (per-edge admission server-side)."""
+        return self._client.batch_create_edges(
+            edges=edges, graph_id=graph_id or "default"
+        )
+
+    def get_node(
+        self, node_id: str, graph_id: str | None = None, **kwargs
+    ) -> dict[str, Any] | None:
+        """Get a graph node by ID via REST."""
+        return self._client.get_node(node_id=node_id, graph_id=graph_id or "default")
+
+    def get_outgoing_edges(
+        self,
+        node_id: str,
+        edge_types: list[str] | None = None,
+        graph_id: str | None = None,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        """Get a node's outgoing edges via REST."""
+        return self._client.get_outgoing_edges(
+            node_id=node_id,
+            edge_types=edge_types,
+            graph_id=graph_id or "default",
+        )
+
+    def get_incoming_edges(
+        self,
+        node_id: str,
+        edge_types: list[str] | None = None,
+        graph_id: str | None = None,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        """Get a node's incoming edges via REST."""
+        return self._client.get_incoming_edges(
+            node_id=node_id,
+            edge_types=edge_types,
+            graph_id=graph_id or "default",
+        )
+
+    def delete_node(
+        self, node_id: str, graph_id: str | None = None, **kwargs
+    ) -> bool:
+        """Delete a graph node by ID via REST."""
+        result = self._client.delete_node(
+            node_id=node_id, graph_id=graph_id or "default"
+        )
+        return bool(result)
+
+    def query_nodes(
+        self,
+        labels: list[str] | None = None,
+        properties: dict[str, Any] | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        graph_id: str | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Query nodes by labels and properties via REST."""
+        return self._client.query_nodes(
+            labels=labels,
+            properties=properties,
+            limit=limit,
+            offset=offset,
+            graph_id=graph_id or "default",
+        )
+
+    def traverse_graph(
+        self,
+        start_node_id: str,
+        max_depth: int = 3,
+        edge_types: list[str] | None = None,
+        node_labels: list[str] | None = None,
+        algorithm: str = "BFS",
+        limit: int | None = None,
+        graph_id: str | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Traverse the graph from a starting node via REST."""
+        return self._client.traverse_graph(
+            start_node_id=start_node_id,
+            max_depth=max_depth,
+            edge_types=edge_types,
+            node_labels=node_labels,
+            algorithm=algorithm,
+            limit=limit,
+            graph_id=graph_id or "default",
+        )
+
+    def create_graph(
+        self,
+        graph_id: str,
+        name: str | None = None,
+        description: str | None = None,
+        schema: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Create a graph collection via REST."""
+        return self._client.create_graph(
+            graph_id=graph_id,
+            name=name,
+            description=description,
+            schema=schema,
+        )
+
+    def delete_graph(self, graph_id: str, **kwargs) -> dict[str, Any]:
+        """Delete a graph collection via REST."""
+        return self._client.delete_graph(graph_id=graph_id)
+
+    def get_graph(self, graph_id: str, **kwargs) -> dict[str, Any]:
+        """Get graph-collection metadata via REST."""
+        return self._client.get_graph(graph_id=graph_id)
+
+    def list_graphs(self, **kwargs) -> dict[str, Any]:
+        """List all graph collections via REST."""
+        return self._client.list_graphs()
+
+    def get_graph_stats(self, graph_id: str, **kwargs) -> dict[str, Any]:
+        """Get statistics for a graph collection via REST."""
+        return self._client.get_graph_stats(graph_id=graph_id)
+
+    def graph_shortest_path(
+        self,
+        start_node_id: str,
+        target_node_id: str,
+        max_depth: int | None = None,
+        edge_types: list[str] | None = None,
+        algorithm: str = "DIJKSTRA",
+        k: int | None = None,
+        enable_prefetch: bool | None = None,
+        prefetch_budget: int | None = None,
+        timeout: float | None = None,
+        graph_id: str = "default",
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Compute shortest path(s) via REST (prefetch overrides as headers)."""
+        return self._client.graph_shortest_path(
+            start_node_id,
+            target_node_id,
+            max_depth,
+            edge_types,
+            algorithm,
+            k,
+            enable_prefetch,
+            prefetch_budget,
+            timeout=timeout,
+            graph_id=graph_id,
+        )
+
+    def graph_traverse(
+        self,
+        start_node_id: str,
+        max_depth: int = 3,
+        edge_types: list[str] | None = None,
+        algorithm: str = "BFS",
+        limit: int | None = None,
+        timeout_ms: int | None = None,
+        max_frontier: int | None = None,
+        enable_prefetch: bool | None = None,
+        prefetch_budget: int | None = None,
+        timeout: float | None = None,
+        graph_id: str = "default",
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Tuned traversal via REST (overrides as headers).
+
+        Unlike the v1 wrapper, ``graph_id`` is honored (the transport has
+        accepted it since TD-SDKDOC-1; v1 dropped it, running every tuned
+        traversal on ``default``).
+        """
+        return self._client.graph_traverse(
+            start_node_id,
+            max_depth,
+            edge_types,
+            algorithm,
+            limit,
+            timeout_ms,
+            max_frontier,
+            enable_prefetch,
+            prefetch_budget,
+            timeout=timeout,
+            graph_id=graph_id,
+        )
+
+    # ==========================================================================
     # Lifecycle Methods
     # ==========================================================================
 

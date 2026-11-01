@@ -1274,6 +1274,95 @@ class EmbeddedProtocolAdapter(BaseProtocolAdapter):
             logger.error(f"Failed to get graph stats: {e}")
             raise
 
+    def _engine_graph_classes(self) -> tuple[type, type] | None:
+        """Resolve ``(GraphNode, GraphEdge)`` from the engine's own module.
+
+        The PyO3 engine (``proximadb``) exposes both constructors at module
+        level; a pure-Python engine that does not yields ``None`` and the
+        batch methods degrade to the base class's NotImplementedError.
+        """
+        import sys
+
+        module = sys.modules.get(type(self._db).__module__)
+        node_cls = getattr(module, "GraphNode", None)
+        edge_cls = getattr(module, "GraphEdge", None)
+        if node_cls is None or edge_cls is None:
+            return None
+        return node_cls, edge_cls
+
+    def batch_create_nodes(
+        self, nodes: list[dict[str, Any]], graph_id: str | None = None, **kwargs
+    ) -> dict[str, Any]:
+        """Batch-create nodes via the embedded engine's ``create_nodes``.
+
+        Returns the same ``{success, created_count, nodes}`` shape as the
+        REST/gRPC batch endpoints (a bare count would break facade parity).
+        """
+        try:
+            gid = graph_id or kwargs.pop("graph_id", None) or "default"
+            if hasattr(self._db, "create_nodes"):
+                classes = self._engine_graph_classes()
+                if classes is not None:
+                    node_cls, _ = classes
+                    items = [
+                        node_cls(
+                            n.get("id") or n.get("node_id"),
+                            n.get("labels"),
+                            n.get("properties"),
+                        )
+                        for n in nodes
+                    ]
+                    created = self._db.create_nodes(gid, items)
+                    return {
+                        "success": True,
+                        "created_count": int(created),
+                        "nodes": nodes,
+                    }
+            raise NotImplementedError(
+                "batch_create_nodes not implemented in embedded API"
+            )
+        except Exception as e:
+            logger.error(f"Failed to batch create nodes: {e}")
+            raise
+
+    def batch_create_edges(
+        self, edges: list[dict[str, Any]], graph_id: str | None = None, **kwargs
+    ) -> dict[str, Any]:
+        """Batch-create edges via the embedded engine's ``create_edges``.
+
+        Returns the same ``{success, created_count, edges}`` shape as the
+        REST/gRPC batch endpoints.
+        """
+        try:
+            gid = graph_id or kwargs.pop("graph_id", None) or "default"
+            if hasattr(self._db, "create_edges"):
+                classes = self._engine_graph_classes()
+                if classes is not None:
+                    _, edge_cls = classes
+                    items = [
+                        edge_cls(
+                            e.get("from_node_id") or e.get("source"),
+                            e.get("to_node_id") or e.get("target"),
+                            e.get("edge_type") or e.get("type") or "RELATED",
+                            e.get("id") or e.get("edge_id"),
+                            e.get("weight"),
+                            e.get("properties"),
+                        )
+                        for e in edges
+                    ]
+                    created = self._db.create_edges(gid, items)
+                    return {
+                        "success": True,
+                        "created_count": int(created),
+                        "edges": edges,
+                    }
+            raise NotImplementedError(
+                "batch_create_edges not implemented in embedded API"
+            )
+        except Exception as e:
+            logger.error(f"Failed to batch create edges: {e}")
+            raise
+
     def execute_graph_query(self, graph: str, query: str, **kwargs) -> dict[str, Any]:
         """Execute a graph query via embedded API."""
         try:
