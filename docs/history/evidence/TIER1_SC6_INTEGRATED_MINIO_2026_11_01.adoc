@@ -12,7 +12,9 @@ link:../../current/TIER1_SC6_COST_WORKSHEET.adoc[worksheet].)
 
 == Protocol
 
-* Binary: `release-server` profile, `--features aws`, source `efa9517d3` (harness
+* Binary: `release-server` profile, `--features aws`, source `ebb54d764` (the
+  bench branch; Rust-identical to develop `efa9517d3` — the intervening commits touch
+  only `scripts/bench/` and docs). Harness
   revision `bench/sc6-release-runs` adds `--storage-class`,
   `--reservation-pool-{allocatable,grant}-gb`, and a `storage_class_status` READY gate
   that pins the status into `result.json`).
@@ -45,12 +47,13 @@ link:../../current/TIER1_SC6_COST_WORKSHEET.adoc[worksheet].)
   `--max-recall-regression` tolerance): the runbook's correctness gate holds.
 * Residency status at sweep time (granted): `ready` — "all 2 objects of generation
   0xf8dea49957b4d are resident and protected (profile pax-ann-v1)";
-  covered = resident = 757,830,877 B; reserved 4 GiB → utilization 0.177.
+  covered = resident = 757,830,877 B; reserved 4 GiB → utilization 0.176.
 * Pool ledger (`pool/reservations.json`): one grant, tenant `default`, 4 GiB
   `Reserved`, **both residency prefixes registered** (legacy `{id}/data/` and typed
   `accounts/000001/001/000001/data/`), clean ownership handoff across three server
-  generations (`producer_epoch` 3). GB-month accrual inputs: 4 GiB × the run window
-  (~40 min ≈ 0.0027 GiB-month); the idle-month case is the priced one.
+  generations (`producer_epoch` 3). GB-month accrual inputs: 4 GiB × the measured
+  run window (~4.4 min ≈ 0.0004 GiB-month for this run); the idle-month case is the
+  priced one.
 
 == Disclosures
 

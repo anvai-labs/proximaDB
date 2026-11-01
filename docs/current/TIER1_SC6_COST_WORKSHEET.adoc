@@ -46,7 +46,7 @@ link:../history/evidence/TIER1_SC6_INTEGRATED_MINIO_2026_11_01.adoc[Evidence] ·
 | Warm bytes/q | 12.29 MB | **0 B**
 | Warm p50 (restart) | 70.5 ms | 65.2 ms
 | Warm fraction | n/a (no grant) | 1.0 (757.8 MB of 757.8 MB, protected, generation-gated)
-| Reservation (ledger) | — | 4 GiB Reserved, utilization 0.177, both prefixes registered, epoch-3 handoff
+| Reservation (ledger) | — | 4 GiB Reserved, utilization 0.176, both prefixes registered, epoch-3 handoff
 | Recall@10 (all phases) | 0.9828–0.9847 | 0.9827–0.9842 (parity within 0.0005)
 |===
 

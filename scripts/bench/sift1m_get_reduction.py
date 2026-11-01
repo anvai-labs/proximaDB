@@ -4090,7 +4090,6 @@ def main() -> int:
             # TD-TIER-1 SC6: the granted arm serves from residency only once
             # the grant is READY(g) — poll storage_class_status, then pin the
             # status (state, coverage, generation) into the result.
-            import urllib.error as _urlerror
 
             deadline = time.monotonic() + args.residency_ready_timeout_secs
             status = None
