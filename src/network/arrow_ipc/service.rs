@@ -1008,15 +1008,17 @@ impl ProximaFlightService {
             .read_collection_file(&collection, &file_ticket.file_path)
     }
 
-    async fn trigger_collection_compaction(&self, collection_id: &str) -> Result<()> {
+    async fn trigger_collection_compaction(&self, collection_id: &str, full: bool) -> Result<()> {
         let collection = self
             .collection_service
             .collection(collection_id)
             .await?
             .with_context(|| format!("Collection not found: {collection_id}"))?;
         let storage_engine = self.vector_operations_service.unified_engine();
+        // TD-COMPACT-14: `full` collapses across levels toward
+        // `[storage.compaction_config] full_target_segments`.
         storage_engine
-            .compact_collection(&collection.id, Some(&collection))
+            .compact_collection_full(&collection.id, Some(&collection), full)
             .await
             .with_context(|| format!("Failed to compact collection '{}'", collection_id))?;
         Ok(())
@@ -1839,7 +1841,7 @@ impl FlightService for ProximaFlightService {
                 collection_id = %write_target,
                 "Arrow Flight: triggering compaction after DoPut"
             );
-            self.trigger_collection_compaction(&write_target)
+            self.trigger_collection_compaction(&write_target, false)
                 .await
                 .map_err(|e| TonicStatus::internal(format!("Compaction failed: {}", e)))?;
         }
@@ -2497,7 +2499,7 @@ impl FlightService for ProximaFlightService {
             }
 
             "compact_collection" => {
-                // Body: {"collection_id": "..."}
+                // Body: {"collection_id": "...", "full": bool} (TD-COMPACT-14)
                 let params: serde_json::Value =
                     serde_json::from_slice(&action.body).map_err(|e| {
                         TonicStatus::invalid_argument(format!("Invalid JSON body: {}", e))
@@ -2526,7 +2528,11 @@ impl FlightService for ProximaFlightService {
                     )));
                 }
 
-                self.trigger_collection_compaction(collection_id)
+                let full = params
+                    .get("full")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                self.trigger_collection_compaction(collection_id, full)
                     .await
                     .map_err(|e| {
                         TonicStatus::internal(format!("Failed to compact collection: {}", e))
@@ -2586,7 +2592,7 @@ impl FlightService for ProximaFlightService {
                         TonicStatus::internal(format!("Failed to flush collection: {}", e))
                     })?;
 
-                self.trigger_collection_compaction(collection_id)
+                self.trigger_collection_compaction(collection_id, false)
                     .await
                     .map_err(|e| {
                         TonicStatus::internal(format!("Failed to compact collection: {}", e))

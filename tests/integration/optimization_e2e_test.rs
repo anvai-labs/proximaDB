@@ -545,6 +545,7 @@ async fn test_optimization_end_to_end() -> anyhow::Result<()> {
 
     // Trigger compaction on SST to test compressed block handling
     let compact_params = proximadb::storage::traits::CompactionParameters {
+        full: false,
         collection_id: Some("optimization_test".to_string()),
         ..Default::default()
     };

@@ -1,0 +1,119 @@
+= TD-COMPACT-14: Operator COMPACT statement (PG VACUUM / Delta OPTIMIZE analog)
+:status: Accepted
+:date: 2026-10-31
+:tags: [compaction, sql, rest, operations]
+
+== Problem
+
+The background compaction policy never merges across levels and never
+triggers on one file per level (`higher_level_compaction_reduces_fanout(1, _)
+== false`). A settled collection (e.g. L1 + L3 + L5) therefore cannot be
+collapsed by any user action — there was no `VACUUM`/`OPTIMIZE` analog. The
+S=1 bench experiment hit exactly this: `--max-segments 1` cannot settle a
+3-level bed.
+
+Segment count is also a per-query cost dial: each segment pays its own
+header/footer/probe overhead (measured ~10 GETs/query of per-segment fixed
+cost at S=3 on the Region-E bed, TD-FPRUNE-1 O1 work).
+
+== Decision
+
+Add an operator-triggered compaction with PostgreSQL-style permissioning:
+
+=== Surfaces
+
+- **SQL (pgwire + REST/gRPC SQL):** `COMPACT TABLE <name> [FULL]` — a
+  pre-parser statement (the `ALTER TABLE ... MATERIALIZE` pattern) lowering
+  to `DdlStatement::CompactTable`, executed via an injected
+  `CollectionCompactor` capability on `DdlService`. CommandComplete tag
+  `COMPACT TABLE`; inside a transaction it is rejected like other DDL
+  (`0A000`, ADR-018 P2.D parity).
+- **REST v2:** `POST /api/v2/collections/{id}/compact` body `{"full": bool}`
+  (an omitted body — no Content-Type — compacts plainly; a JSON Content-Type
+  with an empty body is a 400). An operator endpoint following the
+  suspend/resume convention: NOT in the published OpenAPI spec (no utoipa
+  annotation), so no SDK regeneration is required.
+- **Arrow Flight:** the existing `compact_collection` / `flush_and_compact`
+  actions accept an optional `"full": true`.
+
+=== Semantics
+
+- Plain `COMPACT` = today's explicit operator pass (one admitted policy
+  morsel; never disarmed by `compaction:off` — the tag gates background
+  producers only).
+- `FULL` = iterative pairwise cross-level collapse: repeatedly pair the two
+  LARGEST live segments across ALL levels (falling back to the largest pair
+  that FITS the memory admission when the two largest cannot — a dominant
+  segment never aborts the collapse; only NO viable pair errors), one
+  admitted morsel per pass through the existing `schedule_compaction` dedup,
+  resource admission and canonical/spill executors; output level L1 so
+  passes re-pair. `full_timeout_ms` bounds the WHOLE request (each pass
+  waits at most the remaining deadline). Partial progress is durable and
+  idempotent: stops are REPORTED (`max_passes` / `deadline` / `axis_pending`
+  / `contended` / `no_progress`), not raised.
+- Fail-closed, actionable errors: an over-budget pair with spill disabled
+  names the budget bytes and the `spill_enabled` switch; a declined spill
+  pass names the decline kind (`spill_base_quant_unsupported`,
+  `spill_inputs_not_exact`).
+- The summary (segments_before/after, passes, reached_target, stop_reason,
+  pending_files) rides `CompactionResult.engine_metrics` to every surface.
+
+=== Config (`[storage.compaction_config]`)
+
+|===
+|key |default |meaning
+|full_target_segments |1 |target live segment count for FULL
+|full_max_passes |16 |bound on pairwise passes per request
+|full_timeout_ms |3_600_000 |wall-clock budget incl. quiescence waits
+|===
+
+=== Permissions
+
+- **REST:** owning-tenant visibility is inherent (the collection is resolved
+  tenant-scoped), plus a privilege gate when an authenticated context is
+  present: `require_maintain` accepts `SystemAdmin | ConfigureSystem |
+  MaintainCollections` (new `UnifiedPermission` — the PG17 `MAINTAIN`
+  analog). `MaintainCollections` is granted by the default `tenant_admin`
+  role (and by `SystemAdmin` via the hierarchy resolution). No auth context
+  (unified-port dev mode) passes with the documented
+  `dev:unified-port-no-auth` marker, like suspend/resume.
+- **pgwire:** tenant-scoped via `pgwire_resolve_write_tenant` + the
+  collection port lookup — parity with every other DDL (DROP/ALTER carry no
+  privilege check either; pgwire sessions have no roles to check).
+
+== Limitations
+
+- Synchronous request with a 1 h default budget; REST clients may time out
+  first — the operation continues server-side and a re-run reports current
+  counts (idempotent).
+- `.arrow`/Parquet-backed tables are out of scope (discovery filters `.pax`);
+  FULL on them is a no-op summary.
+- No auto-backoff for a persistently bad block (every query pays a 2-pass
+  retry until compaction); `proximadb_pax_deferred_rehydrate_retries`-style
+  exposure via the compaction decline counters.
+
+== Evidence
+
+- Engine tests: cross-level collapse to one L1 segment with summary;
+  `full_max_passes` partial progress; never disarmed by `compaction:off`;
+  over-budget actionable error. `src/storage/flush_materializer.rs`
+  (`full_compaction_*`).
+- Parser test: `parse_ddl_compact_table_routes_through_pre_parser`
+  (`src/query/sql_frontend/parser.rs`).
+- DdlService tests: `compact_table_without_capability_errors_cleanly` and
+  `compact_table_runs_the_capability_and_reports_the_summary` (the statement
+  arm, the tenant/mode plumbing and the summary message) — the pgwire byte
+  path follows the MATERIALIZE pre-parser/gate wiring, covered by its
+  existing tests.
+- Real-server end-to-end (planned, same harness as the bench): S=1 bed
+  collapse via `compact_via_flight(full=True)` + `wait_for_materialization`
+  in the bench harness — the experiment that motivated this TD.
+
+== Relations
+
+- ADR-076 (async compaction admission), ADR-086 (byte-weighted admission),
+  ADR-088 (deterministic local spill) — FULL reuses their machinery.
+- TD-WLP-7 (arming/threshold tags): explicit operator requests bypass
+  arming, unchanged.
+- TD-TIER-1 E1 fragment ladder: the admission ceiling is the dial that made
+  few-segment beds hard; FULL sidesteps it pairwise.

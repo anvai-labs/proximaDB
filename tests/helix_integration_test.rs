@@ -249,6 +249,7 @@ mod helix_integration_tests {
 
         // Trigger manual compaction
         let compact_params = CompactionParameters {
+            full: false,
             collection_id: Some("test_collection".to_string()),
             force: true,
             synchronous: true,

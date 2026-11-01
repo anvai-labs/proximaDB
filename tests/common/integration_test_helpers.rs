@@ -1040,6 +1040,7 @@ pub mod operations {
     ) -> CompactionParameters {
         let collection_config = environment.create_test_collection_for_engine(engine);
         CompactionParameters {
+            full: false,
             collection_id: Some(environment.collection_id().to_string()),
             force: true,
             synchronous: true,
@@ -1057,6 +1058,7 @@ pub mod operations {
         let collection_config =
             environment.create_test_collection_with_settings(engine, dimension, None);
         CompactionParameters {
+            full: false,
             collection_id: Some(environment.collection_id().to_string()),
             force: true,
             synchronous: true,
@@ -1071,6 +1073,7 @@ pub mod operations {
         collection: Collection,
     ) -> CompactionParameters {
         CompactionParameters {
+            full: false,
             collection_id: Some(environment.collection_id().to_string()),
             force: true,
             synchronous: true,

@@ -2748,6 +2748,48 @@ mod tests {
     }
 
     #[test]
+    fn parse_ddl_compact_table_routes_through_pre_parser() {
+        let parser = SqlFrontendParser::new();
+
+        for (sql, expect_full, expect_name) in [
+            ("COMPACT TABLE inv", false, "inv"),
+            ("compact table \"inv\";", false, "inv"),
+            (
+                "COMPACT TABLE \"Tenant One\".\"Event Store\" FULL",
+                true,
+                "Tenant One.Event Store",
+            ),
+            ("COMPACT TABLE events FULL", true, "events"),
+        ] {
+            let statement = parser
+                .parse_ddl(sql)
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+                .unwrap_or_else(|| panic!("{sql}: expected a compact ddl"));
+            match statement {
+                DdlStatement::CompactTable { name, full } => {
+                    assert_eq!(name, expect_name, "{sql}");
+                    assert_eq!(full, expect_full, "{sql}");
+                }
+                other => panic!("{sql}: wrong statement {other:?}"),
+            }
+        }
+
+        // Not this statement's shape: falls through to sqlparser (and errors
+        // there), never silently mis-parses.
+        for sql in [
+            "DROP TABLE inv;",
+            "COMPACT TABLE inv FULL NOW",
+            "COMPACT INDEX inv",
+        ] {
+            let fell_through = match parser.parse_ddl(sql) {
+                Ok(Some(DdlStatement::DropTable { .. })) => true,
+                Ok(_) => false,
+                Err(_) => true,
+            };
+            assert!(fell_through, "{sql}: must fall through to sqlparser");
+        }
+    }
+
     fn parse_ddl_alter_table_materialize_routes_through_pre_parser() {
         let parser = SqlFrontendParser::new();
 
@@ -3089,6 +3131,10 @@ impl SqlFrontendParser {
         if let Some(result) = self.try_parse_materialize_table(sql)? {
             return Ok(Some(result));
         }
+        // Pattern: COMPACT TABLE <name> [FULL] (operator compaction; TD-COMPACT-14)
+        if let Some(result) = self.try_parse_compact_table(sql)? {
+            return Ok(Some(result));
+        }
 
         let statements = Parser::parse_sql(&self.dialect, sql)
             .map_err(|e| anyhow!("SQL parsing failed: {}", e))?;
@@ -3112,6 +3158,35 @@ impl SqlFrontendParser {
     /// ProximaDB extension sqlparser does not understand). Publishes the table's
     /// current rows as a Parquet snapshot and marks it Parquet-backed for the OLAP
     /// route. Returns `Ok(Some(..))` on match, `Ok(None)` otherwise.
+    /// `COMPACT TABLE <name> [FULL]` — ProximaDB extension (PG `VACUUM` /
+    /// Delta `OPTIMIZE` analog). FULL collapses the collection toward
+    /// `[storage.compaction_config] full_target_segments`, crossing levels
+    /// the background policy never crosses.
+    fn try_parse_compact_table(&self, sql: &str) -> Result<Option<DdlStatement>> {
+        let normalised = sql.trim().trim_end_matches(';').trim();
+        let upper = normalised.to_uppercase();
+        if !upper.contains("COMPACT") {
+            return Ok(None);
+        }
+        let tokens = split_sql_words_respecting_quotes(normalised, "COMPACT TABLE FULL")?;
+        if !(tokens.len() == 3 || tokens.len() == 4) {
+            return Ok(None);
+        }
+        let word = |index: usize| tokens.get(index).map(|token| token.to_uppercase());
+        if word(0).as_deref() != Some("COMPACT") || word(1).as_deref() != Some("TABLE") {
+            return Ok(None);
+        }
+        let full = word(3).as_deref() == Some("FULL");
+        if tokens.len() == 4 && !full {
+            return Ok(None);
+        }
+        let name = unquote_object_name(&tokens[2]);
+        if name.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(DdlStatement::CompactTable { name, full }))
+    }
+
     fn try_parse_materialize_table(&self, sql: &str) -> Result<Option<DdlStatement>> {
         let normalised = sql.trim().trim_end_matches(';').trim();
         let upper = normalised.to_uppercase();
