@@ -235,19 +235,30 @@ impl SstEngine {
 
     /// Clean up all files for a collection
     ///
-    /// TD-SSTCLEAN-1: this previously went through `unified_fs()` — a field
-    /// that is never assigned (`new_with_config` hands that instance only to
-    /// the sstable reader), so cleanup ALWAYS failed with "Unified filesystem
-    /// not initialized" and DROP COLLECTION silently leaked every segment
-    /// file. The dead code behind it also listed the filesystem ROOT and
+    /// TD-SSTCLEAN-1 (review-corrected scope): this function is
+    /// DEFENSE-IN-DEPTH, not the production DROP path — production DROP goes
+    /// through `CollectionManager::cleanup_storage_directories`, which
+    /// `remove_dir_all`s both the legacy and typed roots. This engine-level
+    /// path is only reachable via `StorageEngine::delete_collection`, whose
+    /// `sst_storages` guard is never populated (TD-163's registry) — so it
+    /// currently runs only under test. It is kept correct-if-ever-wired:
+    ///
+    /// It previously went through `unified_fs()` — a field that is never
+    /// assigned (`new_with_config` hands that instance only to the sstable
+    /// reader) — so it always failed with "Unified filesystem not
+    /// initialized". The dead code behind it listed the filesystem ROOT and
     /// deleted by bare basename, which would have swept every collection's
     /// matching files had the filesystem ever been wired.
     ///
-    /// The fix mirrors the readers (`read_all_records` / `collection_stats`):
-    /// resolve the collection's `storage_url`, list exactly that prefix on the
-    /// filesystem for that URL (scheme-aware: local, S3, Azure…), and delete
-    /// by `entry.url` — the locator the listing itself denotes, never a
-    /// basename. Pinned by
+    /// Now it mirrors `collection_stats`: resolve the collection's legacy
+    /// `storage_url`, list exactly that prefix on the filesystem for that URL
+    /// (scheme-aware: local, S3, Azure…), and delete by `entry.url` — the
+    /// locator the listing itself denotes, never a basename. SCOPE LIMIT
+    /// (recorded on the TD): under a typed identity the writers use
+    /// `{base}/accounts/{a}/{n}/{c}/data` (`collection_data_path_typed`),
+    /// which this path CANNOT reconstruct — the engine resolver seam
+    /// (`CollectionPathResolver::resolve_storage_assignment` → ports
+    /// `StorageAssignment`) carries no typed ids. Pinned by
     /// `cleanup_collection_files_deletes_only_the_dropped_collection`.
     pub async fn cleanup_collection_files(&self, collection_id: &str) -> Result<()> {
         info!("🧹 SST: Cleaning up files for collection {}", collection_id);
@@ -274,7 +285,8 @@ impl SstEngine {
         let mut error_count = 0;
 
         // Segment files the readers recognize (.sst/.proximablock/.pax — the
-        // current flush writer emits .pax) plus the ancillary bloom/meta/idx.
+        // current flush writer emits .pax; .arrow covers ArrowBlock-configured
+        // collections) plus the ancillary bloom/meta/idx.
         for entry in &files {
             if entry.metadata.is_directory {
                 continue;
@@ -282,6 +294,7 @@ impl SstEngine {
             let is_collection_file = entry.url.ends_with(".sst")
                 || entry.url.ends_with(".proximablock")
                 || entry.url.ends_with(".pax")
+                || entry.url.ends_with(".arrow")
                 || entry.url.ends_with(".bloom")
                 || entry.url.ends_with(".meta")
                 || entry.url.ends_with(".idx");

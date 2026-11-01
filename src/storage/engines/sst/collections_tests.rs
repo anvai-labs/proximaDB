@@ -38,14 +38,16 @@ mod tests {
 
         // Plant segment files for two collections under each one's `…/data`
         // prefix — the extensions the readers recognize (.sst/.proximablock/
-        // .pax) plus the ancillary .bloom/.meta/.idx this cleanup has always
-        // claimed to remove.
+        // .pax, plus .arrow for ArrowBlock-configured collections) and the
+        // ancillary .bloom/.meta/.idx this cleanup has always claimed to
+        // remove.
         let segment_files = [
             "L0_20261031T000000_aa00.sst",
             "L0_20261031T000000_aa00.bloom",
             "L0_20261031T000000_aa00.meta",
             "L0_20261031T000000_aa00.idx",
             "L00_20261031T000001_bb11.pax",
+            "L00_20261031T000002_cc22.arrow",
         ];
         for collection in ["dropped_collection", "surviving_collection"] {
             let data_dir = root.join(collection).join("data");
