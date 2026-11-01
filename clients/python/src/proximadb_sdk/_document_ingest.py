@@ -19,9 +19,6 @@ from ._generated.rest.api.documents import ingest_documents as _ingest_op
 from ._generated.rest.errors import UnexpectedStatus
 from ._generated.rest.models.error_response import ErrorResponse
 from ._generated.rest.models.ingest_document import IngestDocument
-from ._generated.rest.models.ingest_document_metadata import (
-    IngestDocumentMetadata,
-)
 from ._generated.rest.models.ingest_documents_request import (
     IngestDocumentsRequest,
 )
@@ -55,7 +52,10 @@ def build_ingest_request_body(
 
     ``IngestDocument`` records pass through unchanged; dict records map
     ``{id, text?, metadata?, vector?}`` onto the generated model with unset
-    fields omitted.
+    fields omitted. Keys beyond the four known fields ride through the
+    model's ``additional_properties`` so a rebuilt record (the v2 facade
+    normalizes ``IngestDocument``→dict before delegating) is wire-equal to
+    one passed straight through (the v1 path).
     """
     validate_ingest_records(records)
     body_records: list[IngestDocument] = []
@@ -63,19 +63,26 @@ def build_ingest_request_body(
         if isinstance(rec, IngestDocument):
             body_records.append(rec)
             continue
-        metadata = rec.get("metadata")
-        body_records.append(
-            IngestDocument(
-                id=str(rec["id"]),
-                text=rec.get("text", UNSET),
-                vector=rec.get("vector", UNSET),
-                metadata=(
-                    IngestDocumentMetadata.from_dict(metadata)
-                    if metadata is not None
-                    else UNSET
-                ),
-            )
+        # Build through from_dict: it maps the known fields (converting
+        # ``metadata`` dicts) AND carries unknown keys into the model's
+        # ``additional_properties`` — so a rebuilt record (the v2 facade
+        # normalizes ``IngestDocument``→dict before delegating) is
+        # wire-equal to one passed straight through (the v1 path).
+        item: dict[str, Any] = {"id": str(rec["id"])}
+        if "text" in rec:
+            item["text"] = rec["text"]
+        if "vector" in rec:
+            item["vector"] = rec["vector"]
+        if rec.get("metadata") is not None:
+            item["metadata"] = rec["metadata"]
+        item.update(
+            {
+                k: v
+                for k, v in rec.items()
+                if k not in ("id", "text", "vector", "metadata")
+            }
         )
+        body_records.append(IngestDocument.from_dict(item))
     return IngestDocumentsRequest(records=body_records)
 
 
@@ -142,38 +149,76 @@ def execute_ingest_documents(
         NetworkError: Transport-level failure.
         ServerError: Documented error envelope or an unexpected status.
     """
-    try:
-        # Attribute lookup at call time (not a frozen import) so the offline
-        # test seam — patching the generated module's ``sync_detailed`` —
-        # keeps working for every consumer of this shared protocol.
-        response = _ingest_op.sync_detailed(
+    # Attribute lookup at call time (not a frozen import) so the offline
+    # test seam — patching the generated module's ``sync_detailed`` —
+    # keeps working for every consumer of this shared protocol.
+    return execute_document_op(
+        "ingest_documents",
+        lambda: _ingest_op.sync_detailed(
             collection_id=collection_id, client=client, body=body
-        )
-    except httpx.HTTPError as e:
-        raise NetworkError(
-            f"ingest_documents transport error: {e}", original_error=e
-        ) from e
-    except UnexpectedStatus as e:
-        # raise_on_unexpected_status=True raises BEFORE the response is
-        # returned, so undocumented statuses (e.g. HTTP 500) map to
-        # ServerError here — the generated exception never escapes the SDK.
-        raise ServerError(
-            f"ingest_documents unexpected status: {e.status_code}",
-            status_code=e.status_code,
-        ) from e
+        ),
+    )
 
+
+#: Sentinel distinguishing "no not-found mapping configured" from a
+#: legitimate ``None`` not-found value.
+_NOT_FOUND_UNSET = object()
+
+
+def map_document_response(
+    op: str,
+    response: Any,
+    *,
+    not_found: Any = _NOT_FOUND_UNSET,
+) -> dict[str, Any]:
+    """Map a generated document-op ``Response`` to a dict, or raise.
+
+    One outcome vocabulary for every document op (ingest and CRUD):
+    ``ErrorResponse`` → :class:`ServerError` (with the documented detail
+    and status), ``UnexpectedStatus`` → :class:`ServerError`, no body →
+    :class:`ServerError`; success → the parsed model as a dict. A 404
+    maps to ``not_found`` when the caller configured one (``get`` →
+    ``None``, deletes → ``False``) — the established not-found contracts.
+    """
     parsed = response.parsed
     if isinstance(parsed, ErrorResponse):
+        if response.status_code == 404 and not (not_found is _NOT_FOUND_UNSET):
+            return not_found
         detail = getattr(getattr(parsed, "error", None), "message", None)
         raise ServerError(
-            "ingest_documents rejected by server" f"{f': {detail}' if detail else ''}",
+            f"{op} rejected by server" f"{f': {detail}' if detail else ''}",
             status_code=response.status_code,
         )
     if parsed is None:
         # raise_on_unexpected_status=True makes this unreachable in practice;
         # guard anyway so a future regression can't silently return None.
         raise ServerError(
-            "ingest_documents returned no body",
+            f"{op} returned no body",
             status_code=response.status_code,
         )
     return parsed.to_dict()
+
+
+def execute_document_op(op: str, call: Any, *, not_found: Any = _NOT_FOUND_UNSET):
+    """Run a generated document op and map outcomes to SDK exceptions.
+
+    ``call`` is a zero-argument callable invoking the generated
+    ``sync_detailed`` (attribute lookup happens at call time so the
+    offline test seam — patching the generated module — keeps working).
+    Transport failures, undocumented statuses, error envelopes, and
+    missing bodies all surface as typed SDK errors; the generated
+    exceptions never escape.
+    """
+    try:
+        response = call()
+    except httpx.HTTPError as e:
+        raise NetworkError(f"{op} transport error: {e}", original_error=e) from e
+    except UnexpectedStatus as e:
+        # raise_on_unexpected_status=True raises BEFORE the response is
+        # returned, so undocumented statuses (e.g. HTTP 500) map to
+        # ServerError here — the generated exception never escapes the SDK.
+        raise ServerError(
+            f"{op} unexpected status: {e.status_code}",
+            status_code=e.status_code,
+        ) from e
+    return map_document_response(op, response, not_found=not_found)

@@ -958,13 +958,12 @@ class ProximaDBClient:
     # server-backed client surfaces failures; local mode is the embedded
     # adapter, or the caller-opted ``allow_local_fallback`` on ingest.
     #
-    # DISCLOSED adapter quirk (pre-existing rest_adapter behavior, surfaced
-    # directly here instead of behind v1's local fallback): get_document
-    # returns None on ANY error (a 500 is indistinguishable from absent),
-    # delete_document/delete_document_collection return False, and
-    # list_document_collections returns []. Tightening those to raise is
-    # adapter work, not facade work — until then, treat those results as
-    # "not found/ok-not-verified", not as health signals.
+    # REST error semantics (spec-driven ops, one vocabulary): transport
+    # failures raise NetworkError, server rejections raise ServerError,
+    # 404 maps to the not-found contract (get_document → None, deletes →
+    # False). The previous rest_adapter code never issued a request at all
+    # (it called a nonexistent protocol-client attribute and swallowed the
+    # AttributeError into None/False/[]) — fixed in this batch.
     # ==========================================================================
 
     def _get_document_repository(self):

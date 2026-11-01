@@ -6,9 +6,11 @@ provides the ``_session`` / ``_timeout`` attributes and the protocol methods use
 the adapter. No sockets, no servers, no sleeps.
 """
 
+import httpx
 import pytest
 
 from proximadb_sdk.adapters.rest_adapter import RestProtocolAdapter
+from proximadb_sdk.exceptions import NetworkError, ServerError
 from proximadb_sdk.models import (
     BatchResult,
     Collection,
@@ -691,26 +693,71 @@ def test_batch_search_native_none(adapter):
 
 
 # ---------------------------------------------------------------------------
-# Document operations (HTTP via _session)
+# Document operations (spec-driven generated ops)
+#
+# These previously pinned hand-rolled ``_client._session`` calls that could
+# never execute against the REAL protocol client (it has no ``_session``
+# attribute — the fakes below masked it). The family now runs the generated
+# openapi ops through the adapter's shared config-sourced client; these
+# tests pin that surface at the ADAPTER level (the v2 facade's
+# test_unified_client_v2_documents.py pins the same ops one layer up).
 # ---------------------------------------------------------------------------
 
 
-def test_create_document_collection(adapter):
-    adapter._client._session.program("post", FakeResp({"name": "docs"}))
-    out = adapter.create_document_collection("docs", config={"shards": 2})
-    assert out == {"name": "docs"}
-    verb, url, kw = adapter._client._session.calls[-1]
-    assert verb == "post"
-    assert "document-collections" in url
+@pytest.fixture
+def doc_adapter():
+    return RestProtocolAdapter(url="http://testserver:5678")
 
 
-def test_create_document_collection_error(adapter):
-    adapter._client._session.program("post", RuntimeError("boom"))
-    with pytest.raises(RuntimeError):
-        adapter.create_document_collection("docs")
+def _doc_resp(parsed, status_code=200):
+    from proximadb_sdk._generated.rest.types import Response
+
+    return Response(status_code=status_code, content=b"{}", headers={}, parsed=parsed)
 
 
-def test_insert_document_delegates_to_generated_document_collections_op(adapter):
+def _error_resp(status_code, message):
+    from proximadb_sdk._generated.rest.models.error_body import ErrorBody
+    from proximadb_sdk._generated.rest.models.error_response import ErrorResponse
+
+    return _doc_resp(
+        ErrorResponse(error=ErrorBody(code=status_code, message=message, type_="e")),
+        status_code=status_code,
+    )
+
+
+def test_create_document_collection(doc_adapter):
+    from unittest.mock import patch
+
+    from proximadb_sdk._generated.rest.models.doc_create_collection_response import (
+        DocCreateCollectionResponse,
+    )
+
+    op = "proximadb_sdk._generated.rest.api.documents.create_document_collection.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.return_value = _doc_resp(
+            DocCreateCollectionResponse.from_dict(
+                {"success": True, "collection": {"name": "docs"}}
+            )
+        )
+        out = doc_adapter.create_document_collection("docs", config={"shards": 2})
+    assert out["success"] is True
+    kwargs = mock_op.call_args.kwargs
+    assert kwargs["body"].to_dict() == {"name": "docs", "shards": 2}
+    # ONE config-sourced client (the adapter's shared base).
+    assert kwargs["client"] is doc_adapter._get_generated_document_client()
+
+
+def test_create_document_collection_error(doc_adapter):
+    from unittest.mock import patch
+
+    op = "proximadb_sdk._generated.rest.api.documents.create_document_collection.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.return_value = _error_resp(400, "bad config")
+        with pytest.raises(ServerError, match="bad config"):
+            doc_adapter.create_document_collection("docs")
+
+
+def test_insert_document_delegates_to_generated_document_collections_op(doc_adapter):
     """insert_document targets the document-collections surface via the generated op (ADR-041)."""
     from types import SimpleNamespace
     from unittest.mock import patch
@@ -722,90 +769,201 @@ def test_insert_document_delegates_to_generated_document_collections_op(adapter)
             content=b"{}",
             parsed=SimpleNamespace(to_dict=lambda: {"id": "d1"}),
         )
-        out = adapter.insert_document("docs", {"title": "x"}, id="d1")
+        out = doc_adapter.insert_document("docs", {"title": "x"}, id="d1")
 
     mock_op.assert_called_once()
     kwargs = mock_op.call_args.kwargs
     assert kwargs["collection"] == "docs"
     # The generated InsertDocumentBody carries the {id, document} document-collections payload.
     assert kwargs["body"].to_dict() == {"id": "d1", "document": {"title": "x"}}
-    assert "testserver" in str(kwargs["client"]._base_url)
+    # Now on the shared config-sourced client (same URL/auth/TLS source as ingest).
+    assert kwargs["client"] is doc_adapter._get_generated_document_client()
     assert out == {"id": "d1"}
 
 
-def test_get_document(adapter):
-    adapter._client._session.program("get", FakeResp({"id": "d1", "title": "x"}))
-    out = adapter.get_document("docs", "d1", projection=["title"])
-    assert out["id"] == "d1"
-    verb, url, kw = adapter._client._session.calls[-1]
-    assert kw["params"]["projection"] == "title"
+def test_get_document(doc_adapter):
+    from unittest.mock import patch
+
+    from proximadb_sdk._generated.rest.models.doc_response import DocResponse
+
+    op = "proximadb_sdk._generated.rest.api.documents.get_document.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.return_value = _doc_resp(
+            DocResponse.from_dict(
+                {"id": "d1", "document": {"title": "x"}, "version": 1}
+            )
+        )
+        out = doc_adapter.get_document("docs", "d1", projection=["title"])
+        assert out["id"] == "d1"
+        kwargs = mock_op.call_args.kwargs
+        assert kwargs["collection"] == "docs" and kwargs["id"] == "d1"
+        assert kwargs["projection"] == "title"
 
 
-def test_get_document_404(adapter):
-    adapter._client._session.program("get", FakeResp({}, status_code=404))
-    assert adapter.get_document("docs", "missing") is None
+def test_get_document_404(doc_adapter):
+    from unittest.mock import patch
+
+    op = "proximadb_sdk._generated.rest.api.documents.get_document.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.return_value = _error_resp(404, "gone")
+        assert doc_adapter.get_document("docs", "missing") is None
 
 
-def test_get_document_error(adapter):
-    adapter._client._session.program("get", RuntimeError("x"))
-    assert adapter.get_document("docs", "d1") is None
+def test_get_document_error(doc_adapter):
+    """Transport failures raise NetworkError — no more swallow-to-None."""
+    from unittest.mock import patch
+
+    import httpx
+
+    op = "proximadb_sdk._generated.rest.api.documents.get_document.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.side_effect = httpx.ConnectError("x")
+        with pytest.raises(NetworkError, match="transport error"):
+            doc_adapter.get_document("docs", "d1")
 
 
-def test_query_documents(adapter):
-    adapter._client._session.program("post", FakeResp({"documents": [1, 2]}))
-    out = adapter.query_documents(
-        "docs", filter={"a": 1}, projection=["title"], limit=5
+def test_query_documents(doc_adapter):
+    from unittest.mock import patch
+
+    from proximadb_sdk._generated.rest.models.doc_query_response import (
+        DocQueryResponse,
     )
-    assert out["documents"] == [1, 2]
+
+    op = "proximadb_sdk._generated.rest.api.documents.query_documents.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.return_value = _doc_resp(
+            DocQueryResponse.from_dict({"documents": [], "has_more": False})
+        )
+        out = doc_adapter.query_documents(
+            "docs", filter={"a": 1}, projection=["title"], limit=5
+        )
+        assert out["documents"] == []
+        kwargs = mock_op.call_args.kwargs
+        assert kwargs["filter_"] == '{"a": 1}'
+        assert kwargs["projection"] == "title"
+        assert kwargs["limit"] == 5
 
 
-def test_query_documents_error(adapter):
-    adapter._client._session.program("post", RuntimeError("x"))
-    with pytest.raises(RuntimeError):
-        adapter.query_documents("docs")
+def test_query_documents_error(doc_adapter):
+    from unittest.mock import patch
+
+    op = "proximadb_sdk._generated.rest.api.documents.query_documents.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.return_value = _error_resp(500, "boom")
+        with pytest.raises(ServerError):
+            doc_adapter.query_documents("docs")
 
 
-def test_update_document(adapter):
-    adapter._client._session.program("put", FakeResp({"updated": True}))
-    out = adapter.update_document("docs", "d1", [{"set": {"a": 1}}])
-    assert out["updated"] is True
+def test_update_document(doc_adapter):
+    from unittest.mock import patch
+
+    from proximadb_sdk._generated.rest.models.doc_update_response import (
+        DocUpdateResponse,
+    )
+
+    op = "proximadb_sdk._generated.rest.api.documents.update_document.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.return_value = _doc_resp(
+            DocUpdateResponse.from_dict({"success": True, "id": "d1", "new_version": 2})
+        )
+        out = doc_adapter.update_document("docs", "d1", [{"set": {"a": 1}}])
+        assert out["new_version"] == 2
+        assert mock_op.call_args.kwargs["body"].to_dict()["updates"] == [
+            {"set": {"a": 1}}
+        ]
 
 
-def test_update_document_error(adapter):
-    adapter._client._session.program("put", RuntimeError("x"))
-    with pytest.raises(RuntimeError):
-        adapter.update_document("docs", "d1", [])
+def test_update_document_error(doc_adapter):
+    from unittest.mock import patch
+
+    op = "proximadb_sdk._generated.rest.api.documents.update_document.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.side_effect = RuntimeError("x")
+        with pytest.raises(RuntimeError):
+            doc_adapter.update_document("docs", "d1", [])
 
 
-def test_delete_document(adapter):
-    adapter._client._session.program("delete", FakeResp({"deleted": True}))
-    assert adapter.delete_document("docs", "d1") is True
+def test_delete_document(doc_adapter):
+    from unittest.mock import patch
+
+    from proximadb_sdk._generated.rest.models.doc_delete_ack import DocDeleteAck
+
+    op = "proximadb_sdk._generated.rest.api.documents.delete_document.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.return_value = _doc_resp(DocDeleteAck.from_dict({"success": True}))
+        assert doc_adapter.delete_document("docs", "d1") is True
 
 
-def test_delete_document_error(adapter):
-    adapter._client._session.program("delete", RuntimeError("x"))
-    assert adapter.delete_document("docs", "d1") is False
+def test_delete_document_404(doc_adapter):
+    from unittest.mock import patch
+
+    from proximadb_sdk._generated.rest.models.doc_delete_ack import DocDeleteAck
+
+    op = "proximadb_sdk._generated.rest.api.documents.delete_document.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.return_value = _doc_resp(
+            DocDeleteAck.from_dict({"success": False}), status_code=404
+        )
+        assert doc_adapter.delete_document("docs", "gone") is False
 
 
-def test_list_document_collections(adapter):
-    adapter._client._session.program("get", FakeResp({"collections": [{"name": "a"}]}))
-    out = adapter.list_document_collections()
-    assert out == [{"name": "a"}]
+def test_delete_document_error(doc_adapter):
+    """Transport failures raise NetworkError — no more swallow-to-False."""
+    from unittest.mock import patch
+
+    import httpx
+
+    op = "proximadb_sdk._generated.rest.api.documents.delete_document.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.side_effect = httpx.ConnectError("x")
+        with pytest.raises(NetworkError, match="transport error"):
+            doc_adapter.delete_document("docs", "d1")
 
 
-def test_list_document_collections_error(adapter):
-    adapter._client._session.program("get", RuntimeError("x"))
-    assert adapter.list_document_collections() == []
+def test_list_document_collections(doc_adapter):
+    from unittest.mock import patch
+
+    from proximadb_sdk._generated.rest.models.doc_collection_list_response import (
+        DocCollectionListResponse,
+    )
+
+    op = "proximadb_sdk._generated.rest.api.documents.list_document_collections.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.return_value = _doc_resp(
+            DocCollectionListResponse.from_dict({"collections": [{"name": "a"}]})
+        )
+        assert doc_adapter.list_document_collections() == [{"name": "a"}]
 
 
-def test_delete_document_collection(adapter):
-    adapter._client._session.program("delete", FakeResp({"success": True}))
-    assert adapter.delete_document_collection("docs") is True
+def test_list_document_collections_error(doc_adapter):
+    from unittest.mock import patch
+
+    op = "proximadb_sdk._generated.rest.api.documents.list_document_collections.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.return_value = _error_resp(500, "boom")
+        with pytest.raises(ServerError):
+            doc_adapter.list_document_collections()
 
 
-def test_delete_document_collection_error(adapter):
-    adapter._client._session.program("delete", RuntimeError("x"))
-    assert adapter.delete_document_collection("docs") is False
+def test_delete_document_collection(doc_adapter):
+    from unittest.mock import patch
+
+    from proximadb_sdk._generated.rest.models.doc_delete_ack import DocDeleteAck
+
+    op = "proximadb_sdk._generated.rest.api.documents.delete_document_collection.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.return_value = _doc_resp(DocDeleteAck.from_dict({"success": True}))
+        assert doc_adapter.delete_document_collection("docs") is True
+
+
+def test_delete_document_collection_error(doc_adapter):
+    from unittest.mock import patch
+
+    op = "proximadb_sdk._generated.rest.api.documents.delete_document_collection.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.side_effect = httpx.ConnectError("x")
+        with pytest.raises(NetworkError, match="transport error"):
+            doc_adapter.delete_document_collection("docs")
 
 
 # ---------------------------------------------------------------------------

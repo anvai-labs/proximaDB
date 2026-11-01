@@ -406,6 +406,191 @@ class TestRestIngestWireEquivalence:
 
 
 # ---------------------------------------------------------------------------
+# CRUD wire equivalence — the REAL REST adapter over the generated ops.
+# These tests exist because round 2 proved the previous hand-rolled
+# ``_client._session`` calls could never execute (AttributeError before any
+# I/O); every test here would fail loudly if that class of bug returned.
+# ---------------------------------------------------------------------------
+
+
+class TestRestCrudWireEquivalence:
+    @pytest.fixture
+    def rest_client(self):
+        adapter = RestProtocolAdapter(url="http://testserver:5678")
+        with patch.object(uc, "create_adapter", return_value=adapter):
+            c = ProximaDBClient(url="http://testserver:5678", protocol=Protocol.REST)
+        return c
+
+    @staticmethod
+    def _resp(model_dict, model_cls, status=HTTPStatus.OK):
+        parsed = model_cls.from_dict(model_dict)
+        return Response(status_code=status, content=b"{}", headers={}, parsed=parsed)
+
+    @patch(
+        "proximadb_sdk._generated.rest.api.documents.create_document_collection.sync_detailed"
+    )
+    def test_create_collection_body_and_config_sourced_client(
+        self, mock_op, rest_client
+    ):
+        from proximadb_sdk._generated.rest.models.doc_create_collection_response import (
+            DocCreateCollectionResponse,
+        )
+
+        mock_op.return_value = self._resp(
+            {"success": True, "collection": {"name": "docs"}},
+            DocCreateCollectionResponse,
+        )
+        out = rest_client.create_document_collection("docs", {"enable_fulltext": True})
+        assert out["success"] is True
+        body = mock_op.call_args.kwargs["body"]
+        assert body.to_dict() == {"name": "docs", "enable_fulltext": True}
+        # ONE config-sourced client: the adapter's shared base, not a
+        # ctor-kwarg-URL client.
+        assert (
+            mock_op.call_args.kwargs["client"]
+            is rest_client._adapter._get_generated_document_client()
+        )
+
+    @patch("proximadb_sdk._generated.rest.api.documents.get_document.sync_detailed")
+    def test_get_document_projection_csv_and_404_none(self, mock_op, rest_client):
+        from proximadb_sdk._generated.rest.models.doc_response import DocResponse
+
+        mock_op.return_value = self._resp(
+            {"id": "d1", "document": {"a": 1}, "version": 3}, DocResponse
+        )
+        out = rest_client.get_document("docs", "d1", projection=["$.a", "$.b"])
+        assert out["id"] == "d1" and out["version"] == 3
+        kwargs = mock_op.call_args.kwargs
+        assert kwargs["collection"] == "docs" and kwargs["id"] == "d1"
+        assert kwargs["projection"] == "$.a,$.b"
+
+        from proximadb_sdk._generated.rest.models.error_body import ErrorBody as _EB
+        from proximadb_sdk._generated.rest.models.error_response import (
+            ErrorResponse as _ER,
+        )
+
+        mock_op.return_value = Response(
+            status_code=HTTPStatus.NOT_FOUND,
+            content=b"{}",
+            headers={},
+            parsed=_ER(error=_EB(code=404, message="gone", type_="not_found")),
+        )
+        assert rest_client.get_document("docs", "missing") is None
+
+    @patch("proximadb_sdk._generated.rest.api.documents.query_documents.sync_detailed")
+    def test_query_documents_params(self, mock_op, rest_client):
+        from proximadb_sdk._generated.rest.models.doc_query_response import (
+            DocQueryResponse,
+        )
+
+        mock_op.return_value = self._resp(
+            {"documents": [], "has_more": False, "total_count": 0},
+            DocQueryResponse,
+        )
+        out = rest_client.query_documents(
+            "docs", filter={"a": 1}, projection=["$.a"], limit=5
+        )
+        assert out["total_count"] == 0
+        kwargs = mock_op.call_args.kwargs
+        assert kwargs["filter_"] == '{"a": 1}'
+        assert kwargs["projection"] == "$.a"
+        assert kwargs["limit"] == 5
+
+    @patch("proximadb_sdk._generated.rest.api.documents.update_document.sync_detailed")
+    def test_update_document_body(self, mock_op, rest_client):
+        from proximadb_sdk._generated.rest.models.doc_update_response import (
+            DocUpdateResponse,
+        )
+
+        mock_op.return_value = self._resp(
+            {"success": True, "id": "d1", "new_version": 4}, DocUpdateResponse
+        )
+        out = rest_client.update_document("docs", "d1", [{"op": "set"}])
+        assert out["new_version"] == 4
+        assert mock_op.call_args.kwargs["body"].to_dict()["updates"] == [{"op": "set"}]
+
+    @patch("proximadb_sdk._generated.rest.api.documents.delete_document.sync_detailed")
+    def test_delete_document_ack_and_404_false(self, mock_op, rest_client):
+        from proximadb_sdk._generated.rest.models.doc_delete_ack import DocDeleteAck
+
+        mock_op.return_value = self._resp({"success": True}, DocDeleteAck)
+        assert rest_client.delete_document("docs", "d1") is True
+
+        mock_op.return_value = self._resp(
+            {"success": False}, DocDeleteAck, status=HTTPStatus.NOT_FOUND
+        )
+        assert rest_client.delete_document("docs", "gone") is False
+
+    @patch(
+        "proximadb_sdk._generated.rest.api.documents.list_document_collections.sync_detailed"
+    )
+    def test_list_collections_passthrough(self, mock_op, rest_client):
+        from proximadb_sdk._generated.rest.models.doc_collection_list_response import (
+            DocCollectionListResponse,
+        )
+
+        mock_op.return_value = self._resp(
+            {"collections": [{"name": "docs"}]}, DocCollectionListResponse
+        )
+        assert rest_client.list_document_collections() == [{"name": "docs"}]
+
+    @patch(
+        "proximadb_sdk._generated.rest.api.documents.delete_document_collection.sync_detailed"
+    )
+    def test_delete_collection_ack(self, mock_op, rest_client):
+        from proximadb_sdk._generated.rest.models.doc_delete_ack import DocDeleteAck
+
+        mock_op.return_value = self._resp({"success": True}, DocDeleteAck)
+        assert rest_client.delete_document_collection("docs") is True
+
+    @patch(
+        "proximadb_sdk._generated.rest.api.documents.create_document_collection.sync_detailed"
+    )
+    def test_crud_errors_raise_not_swallow(self, mock_op, rest_client):
+        """A 400 must surface as ServerError — the old adapter swallowed
+        every failure into None/False/[] (or never issued a request)."""
+        from proximadb_sdk._generated.rest.models.error_body import ErrorBody
+        from proximadb_sdk._generated.rest.models.error_response import ErrorResponse
+
+        mock_op.return_value = Response(
+            status_code=HTTPStatus.BAD_REQUEST,
+            content=b"{}",
+            headers={},
+            parsed=ErrorResponse(
+                error=ErrorBody(code=400, message="bad config", type_="invalid")
+            ),
+        )
+        with pytest.raises(ServerError, match="bad config"):
+            rest_client.create_document_collection("docs", {"enable_fulltext": True})
+
+    @patch("proximadb_sdk._generated.rest.api.documents.get_document.sync_detailed")
+    def test_crud_unexpected_status_maps_to_server_error(self, mock_op, rest_client):
+        from proximadb_sdk._generated.rest.errors import UnexpectedStatus
+
+        mock_op.side_effect = UnexpectedStatus(500, b"boom")
+        with pytest.raises(ServerError, match="unexpected status"):
+            rest_client.get_document("docs", "d1")
+
+    @patch(f"{INGEST_MOD}.sync_detailed")
+    def test_ingestdocument_extras_survive_the_wire(self, mock_sync, rest_client):
+        """v1/v2 wire equality for additional_properties: the v2 facade
+        normalizes IngestDocument → dict; the shared body builder must keep
+        unknown keys (they ride the model's additional_properties)."""
+        from proximadb_sdk._generated.rest.models.ingest_document import (
+            IngestDocument,
+        )
+
+        mock_sync.return_value = _ok_response()
+        doc = IngestDocument(id="r4", text="x")
+        doc.additional_properties["custom_extra"] = 42
+
+        rest_client.ingest_documents("coll", [doc])
+
+        wire = mock_sync.call_args.kwargs["body"].to_dict()["records"][0]
+        assert wire["custom_extra"] == 42, "extras dropped by the rebuild"
+
+
+# ---------------------------------------------------------------------------
 # Transport ownership: gRPC stays on the honest base defaults; REST and
 # embedded override the whole family.
 # ---------------------------------------------------------------------------
