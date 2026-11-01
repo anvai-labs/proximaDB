@@ -55,6 +55,40 @@ link:../../current/TIER1_SC6_COST_WORKSHEET.adoc[worksheet].)
   run window (~4.4 min ≈ 0.0004 GiB-month for this run); the idle-month case is the
   priced one.
 
+== Added-latency curve (owned Toxiproxy; the granted bed reused via --skip-ingest)
+
+Identical objects across every point; only the downstream latency toxic on the
+MinIO proxy changes (5 → 50 → 100 ms; each setting verified via the proxy API
+before launch). One lesson recorded: updating an existing toxic requires
+delete-then-create — a plain POST silently no-ops, and one "lat50" run was
+actually a 5 ms replicate (kept as `sc6-granted-1m-lat5-r2`).
+
+[cols="1,2,2,3",options="header"]
+|===
+| Added RTT | Granted warm p50 (0.00 GETs/q) | Cold p50 (17.54 GETs/q) | Note
+| +0 ms (banked arms) | 65.2 ms | 56.9 ms | localhost MinIO: throughput beats requests
+| +5 ms | 202.8 / 192.7 ms (n=2) | 79.1 / 76.0 ms (n=2) | cold pays ≈ waves × RTT
+| +50 ms | 230.1 ms | 219.1 ms | parity
+| +100 ms | **255.5 ms** | **376.0 ms** | granted wins by 120 ms (−32%)
+|===
+
+* **The crossover sits between +50 and +100 ms RTT**: the granted payload path
+  never reads remotely (GET count 0.000 at every point), so its p50 is flat in
+  RTT (the mild growth tracks its one per-query control request), while cold
+  scales linearly (56.9 → 376 ms). At LAN-ish RTT the request-elimination does
+  not yet win p50 — local-disk throughput dominates — but at real
+  object-store RTT it wins outright.
+* Recall parity holds on the curve (0.9824–0.9845 everywhere); GET counts are
+  IDENTICAL across RTT points (17.538 cold / 0.000 warm) — the probe plan is
+  RTT-invariant, as the fixed-object protocol promises.
+* `post_write` in fixture-reuse arms is a cold-cache variant (17 GETs/q), not
+  the ingest arms' warm phase — excluded from contrasts, disclosed here.
+* Two +100 ms attempts failed before this one: a query stack exceeded the
+  server's 60 s default API timeout (connection closed mid-sweep), and a port
+  collision with a concurrent lane's replicate. The bench config now sets
+  `timeout_seconds = 300` for latency arms (API timeout is not a measured
+  dimension).
+
 == Disclosures
 
 * Both arms miss the harness's default `object_cold: p50 ≤ 50 ms` gate by the same
@@ -71,5 +105,5 @@ link:../../current/TIER1_SC6_COST_WORKSHEET.adoc[worksheet].)
 
 == Artifacts
 
-* `~/bench-beds/sc6-runs/{sc6-balanced-1m,sc6-granted-1m,smoke-granted}/result.json`
+* `~/bench-beds/sc6-runs/{sc6-balanced-1m,sc6-granted-1m,sc6-granted-1m-lat5,sc6-granted-1m-lat5-r2,sc6-granted-1m-lat50,sc6-granted-1m-lat100,smoke-granted}/result.json`
   (+ per-phase server logs, `benchmark.toml`, MinIO at `~/bench-beds/sc6-minio`).

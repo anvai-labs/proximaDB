@@ -50,6 +50,11 @@ link:../history/evidence/TIER1_SC6_INTEGRATED_MINIO_2026_11_01.adoc[Evidence] ·
 | Recall@10 (all phases) | 0.9828–0.9847 | 0.9827–0.9842 (parity within 0.0005)
 |===
 
+Latency sensitivity (owned Toxiproxy, granted bed reused, identical objects):
+granted warm p50 is flat in RTT (65→256 ms over 0→100 ms; 0.00 GETs/q
+throughout) while cold scales linearly (57→376 ms) — the granted arm wins by
+32% at +100 ms; crossover between +50 and +100 ms. See the evidence doc's
+added-latency curve.
 Control-plane split and tier mix remain unfilled (next arms). Both arms missed the
 50 ms cold-p50 gate identically (57.3/56.9 ms, local conditions) — disclosed in the
 evidence doc.
