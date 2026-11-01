@@ -187,7 +187,7 @@ impl UnifiedHandlers {
 /// that — anything above 1e14 is unambiguously microseconds, and normalizing
 /// on read makes stored pre-fix collections render correctly without a
 /// migration (pre-GA: no back-compat gate, per the 2026-07-14 directive).
-fn normalize_epoch_ms(value: i64) -> i64 {
+pub fn normalize_epoch_ms(value: i64) -> i64 {
     if value > 100_000_000_000_000 {
         value / 1000
     } else {

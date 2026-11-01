@@ -2697,8 +2697,11 @@ fn collection_to_v2(c: crate::proto::proximadb_v1::Collection) -> V2Collection {
                     strategy: quantization_strategy_to_str(q.strategy),
                 }),
         }),
-        created_at: c.created_at,
-        updated_at: c.updated_at,
+        // TD-COLLTIME-1: epoch milliseconds. Normalize on the way out: the
+        // catalog serves genuine ms (legacy rows included), but WAL-era
+        // recovery reconstruction can still surface microsecond values.
+        created_at: proximadb_runtime::handlers::normalize_epoch_ms(c.created_at),
+        updated_at: proximadb_runtime::handlers::normalize_epoch_ms(c.updated_at),
     }
 }
 

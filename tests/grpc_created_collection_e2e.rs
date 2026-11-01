@@ -263,6 +263,29 @@ async fn collection_created_at_renders_in_the_present_e2e() {
             "{name} created_at {created_at} is {delta}s from now — the microsecond-as-millisecond bug (TD-COLLTIME-1)"
         );
     }
+
+    // The gRPC v2 surface serves the raw int64 field (epoch milliseconds per
+    // the proto doc, normalized on the way out) — pin it against the same
+    // within-a-minute bound so a unit regression cannot hide behind the REST
+    // renderer (review round 1, finding 2).
+    let listed = grpc
+        .list_collections(V2ListCollectionsRequest::default())
+        .await
+        .expect("gRPC ListCollections")
+        .into_inner();
+    for name in ["colltime_grpc", "colltime_rest"] {
+        let v2 = listed
+            .collections
+            .iter()
+            .find(|c| c.config.as_ref().is_some_and(|cfg| cfg.name == name))
+            .unwrap_or_else(|| panic!("{name} missing from gRPC v2 listing"));
+        let delta = (v2.created_at - chrono::Utc::now().timestamp_millis()).abs();
+        assert!(
+            delta < 60_000,
+            "{name} gRPC v2 created_at {} is {delta}ms from now — not epoch milliseconds (TD-COLLTIME-1)",
+            v2.created_at
+        );
+    }
 }
 
 #[tokio::test]

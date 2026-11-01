@@ -3170,7 +3170,8 @@ impl CollectionService {
                 existing
                     .properties
                     .insert("vector.dimension".to_string(), config.dimension.to_string());
-                existing.updated_at_ms = collection.updated_at / 1000;
+                // TD-COLLTIME-1: proto is milliseconds now — no µs→ms adapter.
+                existing.updated_at_ms = collection.updated_at;
                 if existing.storage_layouts.is_empty() {
                     existing.storage_layouts = schema.storage_layouts.clone();
                 }
