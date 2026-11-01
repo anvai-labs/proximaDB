@@ -2265,6 +2265,11 @@ survivor_cache_mb = 1024
 cache_on_write = "all"
 
 {pool_section}[api]
+# TD-TIER-1 SC6 latency arms: a query that stacks many object-store round
+# trips behind an added-RTT proxy can exceed the 60 s default API timeout —
+# the server then closes the connection mid-sweep (RemoteDisconnected). 300 s
+# keeps the sweep alive; the API timeout is not a measured dimension.
+timeout_seconds = 300
 unified_mode = true
 unified_port = {port}
 rest_port = {port}
