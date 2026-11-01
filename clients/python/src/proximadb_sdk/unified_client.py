@@ -2388,6 +2388,11 @@ class ProximaDBClient:
             if "props" not in payload and "metadata" in payload:
                 payload["props"] = payload.pop("metadata")
             payload.setdefault("id", payload.get("oid") or f"record_{index}")
+            # TD-REC-1: `oid` is a client-side seeding value, not a contract
+            # field — drop it once it has seeded `id`. Other unknown keys stay
+            # IN so the server's deny returns a 400 naming the field.
+            if "id" in payload:
+                payload.pop("oid", None)
             return payload
 
         payload: dict[str, Any] = {
@@ -2399,9 +2404,10 @@ class ProximaDBClient:
             ),
             "props": dict(record.metadata or {}),
         }
+        # TD-REC-1: no top-level `source` on the wire — the content rides
+        # in text_fields, where it persists.
         source = getattr(record, "source", None)
         if source:
-            payload["source"] = source
             payload["text_fields"] = [{"name": "text", "content": source}]
         return payload
 

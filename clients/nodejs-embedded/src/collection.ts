@@ -43,8 +43,13 @@ function recordPayload(record: {
   // TD-REC-1: `source` is not a contract field at a record's top level
   // (silently dropped server-side before, a 400 on REST now). Route it into
   // the text field where it persists instead of dropping it client-side.
+  // The WIRE key is snake_case `text_fields` (ProximaRecordInput contract;
+  // the transport stringifies the body as-is — the TS type's camelCase
+  // `textFields` is a display-side alias and must NOT go on the wire).
   if (record.source !== undefined) {
-    built.textFields = [{ name: "text", content: record.source }];
+    (built as Record<string, unknown>)["text_fields"] = [
+      { name: "text", content: record.source },
+    ];
   }
   return built;
 }

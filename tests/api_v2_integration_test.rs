@@ -1431,7 +1431,7 @@ async fn test_search_with_eq_filter() {
 
             // All results should have category_0
             for result in results {
-                let typed_fields = result.get("typed_fields");
+                let typed_fields = result.get("props");
                 if let Some(fields) = typed_fields
                     && let Some(category) = fields.get("category")
                 {

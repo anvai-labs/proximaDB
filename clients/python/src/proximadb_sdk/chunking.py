@@ -457,7 +457,8 @@ def create_records(
             "id": chunk.chunk_id,
             "vector": embedding,
             "props": all_metadata,
-            "source": chunk.text,
+            # TD-REC-1: no top-level `source` on the wire (silently dropped
+            # server-side before, a 400 now); the text rides in text_fields.
             "text_fields": [{"name": "chunk_text", "content": chunk.text}],
         }
 
@@ -878,7 +879,8 @@ def prepare_records(
             "id": chunk_id,
             "vector": embedding,
             "props": metadata,
-            "source": text,
+            # TD-REC-1: no top-level `source` on the wire (silently dropped
+            # server-side before, a 400 now); the text rides in text_fields.
             "text_fields": [{"name": "chunk_text", "content": text}],
         }
 
