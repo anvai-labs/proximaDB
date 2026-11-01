@@ -26,6 +26,9 @@ class ProximaRecordInputPropsType0:
     alias it was silently dropped and filters over it matched nothing
     (TD-REC-1). The OpenAPI contract stays `props`; the alias is
     lenience for the already-advertised spelling, not a second field.
+    It composes with `deny_unknown_fields`: an alias is a KNOWN field
+    name, so `metadata` passes the deny while any other unknown key is
+    rejected.
 
     """
 

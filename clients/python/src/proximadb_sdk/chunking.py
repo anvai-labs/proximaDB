@@ -371,7 +371,12 @@ def _records_to_vector_records(records: list[RecordPayload]) -> list[VectorRecor
             id=record.get("id"),
             vector=record.get("vector") or [],
             metadata=record.get("props") or {},
-            source=record.get("source"),
+            # TD-REC-1: the wire payload carries the text in text_fields (no
+            # top-level source); recover the legacy attribute from there.
+            source=next(
+                (f["content"] for f in record.get("text_fields", []) if f.get("name") == "chunk_text"),
+                None,
+            ),
         )
         for record in records
     ]

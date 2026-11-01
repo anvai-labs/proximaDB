@@ -47,7 +47,7 @@ function recordPayload(record: {
   // the transport stringifies the body as-is — the TS type's camelCase
   // `textFields` is a display-side alias and must NOT go on the wire).
   if (record.source !== undefined) {
-    (built as Record<string, unknown>)["text_fields"] = [
+    (built as unknown as Record<string, unknown>)["text_fields"] = [
       { name: "text", content: record.source },
     ];
   }

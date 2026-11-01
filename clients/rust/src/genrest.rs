@@ -9732,13 +9732,18 @@ pub mod types {
             Default::default()
         }
     }
-    ///A single record submitted for native embedding + indexing.
+    /// A single record submitted for native embedding + indexing.
+    ///
+    /// Unknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy — the
+    /// same rule as the records surface): the declared fields plus the
+    /// `props`/`metadata` alias pair are the contract; anything else is a 400
+    /// naming the unknown field instead of a silently dropped write.
     ///
     /// <details><summary>JSON schema</summary>
     ///
     /// ```json
     ///{
-    ///  "description": "A single record submitted for native embedding + indexing.",
+    ///  "description": "A single record submitted for native embedding + indexing.\n\nUnknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy — the\nsame rule as the records surface): the declared fields plus the\n`props`/`metadata` alias pair are the contract; anything else is a 400\nnaming the unknown field instead of a silently dropped write.",
     ///  "type": "object",
     ///  "required": [
     ///    "id"
@@ -9770,11 +9775,13 @@ pub mod types {
     ///        "format": "float"
     ///      }
     ///    }
-    ///  }
+    ///  },
+    ///  "additionalProperties": false
     ///}
     /// ```
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
     pub struct IngestDocument {
         pub id: ::std::string::String,
         /// Arbitrary metadata fields. Stored as ProximaRecord props.
@@ -9977,13 +9984,17 @@ pub mod types {
     ///                 "content": "A detailed product description...",
     ///                 "storage_hint": "adaptive"
     ///             }
-    ///         ],
-    ///         "source": "catalog_import"
+    ///         ]
     ///     }
     /// ],
     /// "validate_schema": true
     /// }
     /// ```
+    ///
+    /// (A record top level accepts exactly `id`, `vector`, `props` — or its
+    /// advertised alias `metadata` — and `text_fields`; anything else is a 400
+    /// naming the unknown field. The example used to show a `"source"` key: it
+    /// was never a contract field and was silently dropped before TD-REC-1.)
     /// Not supported in v0.2: optimistic versioning, conditional-write predicates,
     /// update-by-filter, delete-by-filter, and patch / partial-record update. The
     /// live contract is exposed via `WriteContractHealth` on the route-health
@@ -9994,7 +10005,7 @@ pub mod types {
     ///
     /// ```json
     ///{
-    ///  "description": "Request to insert ProximaRecords\n\n## Example JSON\n\n```json\n{\n    \"records\": [\n        {\n            \"id\": \"doc_1\",\n            \"vector\": [0.1, 0.2, 0.3],\n            \"props\": {\n                \"category\": \"electronics\",\n                \"price\": 299.99,\n                \"in_stock\": true\n            },\n            \"text_fields\": [\n                {\n                    \"name\": \"description\",\n                    \"content\": \"A detailed product description...\",\n                    \"storage_hint\": \"adaptive\"\n                }\n            ],\n            \"source\": \"catalog_import\"\n        }\n    ],\n    \"validate_schema\": true\n}\n```\nNot supported in v0.2: optimistic versioning, conditional-write predicates,\nupdate-by-filter, delete-by-filter, and patch / partial-record update. The\nlive contract is exposed via `WriteContractHealth` on the route-health\ndiagnostic endpoint (`GET /api/v2/_diagnostics/collections/{id}/route-health`);\nsee also `docs/SUPPORTED_SURFACE.adoc` \"Not Supported in v0.2\".",
+    ///  "description": "Request to insert ProximaRecords\n\n## Example JSON\n\n```json\n{\n    \"records\": [\n        {\n            \"id\": \"doc_1\",\n            \"vector\": [0.1, 0.2, 0.3],\n            \"props\": {\n                \"category\": \"electronics\",\n                \"price\": 299.99,\n                \"in_stock\": true\n            },\n            \"text_fields\": [\n                {\n                    \"name\": \"description\",\n                    \"content\": \"A detailed product description...\",\n                    \"storage_hint\": \"adaptive\"\n                }\n            ]\n        }\n    ],\n    \"validate_schema\": true\n}\n```\n\n(A record top level accepts exactly `id`, `vector`, `props` — or its\nadvertised alias `metadata` — and `text_fields`; anything else is a 400\nnaming the unknown field. The example used to show a `\"source\"` key: it\nwas never a contract field and was silently dropped before TD-REC-1.)\nNot supported in v0.2: optimistic versioning, conditional-write predicates,\nupdate-by-filter, delete-by-filter, and patch / partial-record update. The\nlive contract is exposed via `WriteContractHealth` on the route-health\ndiagnostic endpoint (`GET /api/v2/_diagnostics/collections/{id}/route-health`);\nsee also `docs/SUPPORTED_SURFACE.adoc` \"Not Supported in v0.2\".",
     ///  "type": "object",
     ///  "required": [
     ///    "records"
@@ -12032,11 +12043,20 @@ pub mod types {
     /// It uses serde_json::Value for typed fields to support dynamic typing
     /// at the API boundary, with validation happening during conversion.
     ///
+    /// Unknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy): a
+    /// write that carries a field this contract does not know must fail loud at
+    /// the boundary, not report success while silently discarding data — which
+    /// is exactly how the `metadata` drop shipped. The grandfathered spellings
+    /// are the ones the contract itself advertises: `props` and its `metadata`
+    /// alias. Generated SDKs (regenerated in #2337) send only declared fields,
+    /// so the deny cannot break them; a hand-rolled client sending something
+    /// else gets a 400 naming the problem instead of a silent no-op filter.
+    ///
     /// <details><summary>JSON schema</summary>
     ///
     /// ```json
     ///{
-    ///  "description": "Input format for ProximaRecord (JSON-friendly)\n\nThis is the JSON-serializable input format for ProximaRecord.\nIt uses serde_json::Value for typed fields to support dynamic typing\nat the API boundary, with validation happening during conversion.",
+    ///  "description": "Input format for ProximaRecord (JSON-friendly)\n\nThis is the JSON-serializable input format for ProximaRecord.\nIt uses serde_json::Value for typed fields to support dynamic typing\nat the API boundary, with validation happening during conversion.\n\nUnknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy): a\nwrite that carries a field this contract does not know must fail loud at\nthe boundary, not report success while silently discarding data — which\nis exactly how the `metadata` drop shipped. The grandfathered spellings\nare the ones the contract itself advertises: `props` and its `metadata`\nalias. Generated SDKs (regenerated in #2337) send only declared fields,\nso the deny cannot break them; a hand-rolled client sending something\nelse gets a 400 naming the problem instead of a silent no-op filter.",
     ///  "type": "object",
     ///  "required": [
     ///    "vector"
@@ -12050,7 +12070,7 @@ pub mod types {
     ///      ]
     ///    },
     ///    "props": {
-    ///      "description": "Canonical rich property map.\n\n`metadata` is accepted as an alias: the documents API advertises that\nspelling (\"Arbitrary metadata fields. Stored as ProximaRecord props\")\nand maps it here, so the records API must accept it too — before the\nalias it was silently dropped and filters over it matched nothing\n(TD-REC-1). The OpenAPI contract stays `props`; the alias is\nlenience for the already-advertised spelling, not a second field.",
+    ///      "description": "Canonical rich property map.\n\n`metadata` is accepted as an alias: the documents API advertises that\nspelling (\"Arbitrary metadata fields. Stored as ProximaRecord props\")\nand maps it here, so the records API must accept it too — before the\nalias it was silently dropped and filters over it matched nothing\n(TD-REC-1). The OpenAPI contract stays `props`; the alias is\nlenience for the already-advertised spelling, not a second field.\nIt composes with `deny_unknown_fields`: an alias is a KNOWN field\nname, so `metadata` passes the deny while any other unknown key is\nrejected.",
     ///      "type": [
     ///        "object",
     ///        "null"
@@ -12075,11 +12095,13 @@ pub mod types {
     ///        "format": "float"
     ///      }
     ///    }
-    ///  }
+    ///  },
+    ///  "additionalProperties": false
     ///}
     /// ```
     /// </details>
     #[derive(::serde::Deserialize, ::serde::Serialize, Clone, Debug)]
+    #[serde(deny_unknown_fields)]
     pub struct ProximaRecordInput {
         ///Record ID (optional, will be auto-generated if not provided)
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
@@ -12092,6 +12114,9 @@ pub mod types {
         /// alias it was silently dropped and filters over it matched nothing
         /// (TD-REC-1). The OpenAPI contract stays `props`; the alias is
         /// lenience for the already-advertised spelling, not a second field.
+        /// It composes with `deny_unknown_fields`: an alias is a KNOWN field
+        /// name, so `metadata` passes the deny while any other unknown key is
+        /// rejected.
         #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
         pub props:
             ::std::option::Option<::serde_json::Map<::std::string::String, ::serde_json::Value>>,

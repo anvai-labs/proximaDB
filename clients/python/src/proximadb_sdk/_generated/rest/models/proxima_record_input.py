@@ -29,6 +29,15 @@ class ProximaRecordInput:
     It uses serde_json::Value for typed fields to support dynamic typing
     at the API boundary, with validation happening during conversion.
 
+    Unknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy): a
+    write that carries a field this contract does not know must fail loud at
+    the boundary, not report success while silently discarding data — which
+    is exactly how the `metadata` drop shipped. The grandfathered spellings
+    are the ones the contract itself advertises: `props` and its `metadata`
+    alias. Generated SDKs (regenerated in #2337) send only declared fields,
+    so the deny cannot break them; a hand-rolled client sending something
+    else gets a 400 naming the problem instead of a silent no-op filter.
+
         Attributes:
             vector (list[float]): Vector embedding (required)
             id (None | str | Unset): Record ID (optional, will be auto-generated if not provided)
@@ -40,6 +49,9 @@ class ProximaRecordInput:
                 alias it was silently dropped and filters over it matched nothing
                 (TD-REC-1). The OpenAPI contract stays `props`; the alias is
                 lenience for the already-advertised spelling, not a second field.
+                It composes with `deny_unknown_fields`: an alias is a KNOWN field
+                name, so `metadata` passes the deny while any other unknown key is
+                rejected.
             text_fields (list[TextFieldInput] | None | Unset): Dedicated TEXT fields with storage hints
     """
 
@@ -47,7 +59,6 @@ class ProximaRecordInput:
     id: None | str | Unset = UNSET
     props: None | ProximaRecordInputPropsType0 | Unset = UNSET
     text_fields: list[TextFieldInput] | None | Unset = UNSET
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.proxima_record_input_props_type_0 import (  # noqa: PLC0415
@@ -84,7 +95,7 @@ class ProximaRecordInput:
             text_fields = self.text_fields
 
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update(
             {
                 "vector": vector,
@@ -166,21 +177,4 @@ class ProximaRecordInput:
             text_fields=text_fields,
         )
 
-        proxima_record_input.additional_properties = d
         return proxima_record_input
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

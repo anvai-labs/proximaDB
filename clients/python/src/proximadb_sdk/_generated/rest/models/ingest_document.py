@@ -24,25 +24,29 @@ T = TypeVar("T", bound="IngestDocument")
 class IngestDocument:
     """A single record submitted for native embedding + indexing.
 
-    Attributes:
-        id (str):
-        text (None | str | Unset): Raw text content. Required when `X-Embed-Source: native` (default);
-            optional when the client also supplied a vector.
-        vector (list[float] | None | Unset): Optional client-provided vector. When present, the server skips
-            embedding for this record. Use case: SDK that already embedded
-            locally (legacy path).
-        metadata (IngestDocumentMetadata | Unset): Arbitrary metadata fields. Stored as ProximaRecord props.
+    Unknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy — the
+    same rule as the records surface): the declared fields plus the
+    `props`/`metadata` alias pair are the contract; anything else is a 400
+    naming the unknown field instead of a silently dropped write.
 
-            `props` is accepted as an alias (TD-REC-1): the records surface
-            documents `props` as the canonical map and accepts `metadata` as its
-            alias, so this surface accepts both spellings of the same map too.
+        Attributes:
+            id (str):
+            text (None | str | Unset): Raw text content. Required when `X-Embed-Source: native` (default);
+                optional when the client also supplied a vector.
+            vector (list[float] | None | Unset): Optional client-provided vector. When present, the server skips
+                embedding for this record. Use case: SDK that already embedded
+                locally (legacy path).
+            metadata (IngestDocumentMetadata | Unset): Arbitrary metadata fields. Stored as ProximaRecord props.
+
+                `props` is accepted as an alias (TD-REC-1): the records surface
+                documents `props` as the canonical map and accepts `metadata` as its
+                alias, so this surface accepts both spellings of the same map too.
     """
 
     id: str
     text: None | str | Unset = UNSET
     vector: list[float] | None | Unset = UNSET
     metadata: IngestDocumentMetadata | Unset = UNSET
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.ingest_document_metadata import (  # noqa: PLC0415
@@ -71,7 +75,7 @@ class IngestDocument:
             metadata = self.metadata.to_dict()
 
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update(
             {
                 "id": id,
@@ -135,21 +139,4 @@ class IngestDocument:
             metadata=metadata,
         )
 
-        ingest_document.additional_properties = d
         return ingest_document
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

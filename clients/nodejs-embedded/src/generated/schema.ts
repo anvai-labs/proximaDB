@@ -3012,7 +3012,14 @@ export interface components {
             /** @description Whether this is the collection's primary ANN index. */
             is_primary: boolean;
         };
-        /** @description A single record submitted for native embedding + indexing. */
+        /**
+         * @description A single record submitted for native embedding + indexing.
+         *
+         *     Unknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy — the
+         *     same rule as the records surface): the declared fields plus the
+         *     `props`/`metadata` alias pair are the contract; anything else is a 400
+         *     naming the unknown field instead of a silently dropped write.
+         */
         IngestDocument: {
             id: string;
             /**
@@ -3082,13 +3089,17 @@ export interface components {
          *                         "content": "A detailed product description...",
          *                         "storage_hint": "adaptive"
          *                     }
-         *                 ],
-         *                 "source": "catalog_import"
+         *                 ]
          *             }
          *         ],
          *         "validate_schema": true
          *     }
          *     ```
+         *
+         *     (A record top level accepts exactly `id`, `vector`, `props` — or its
+         *     advertised alias `metadata` — and `text_fields`; anything else is a 400
+         *     naming the unknown field. The example used to show a `"source"` key: it
+         *     was never a contract field and was silently dropped before TD-REC-1.)
          *     Not supported in v0.2: optimistic versioning, conditional-write predicates,
          *     update-by-filter, delete-by-filter, and patch / partial-record update. The
          *     live contract is exposed via `WriteContractHealth` on the route-health
@@ -3204,6 +3215,15 @@ export interface components {
          *     This is the JSON-serializable input format for ProximaRecord.
          *     It uses serde_json::Value for typed fields to support dynamic typing
          *     at the API boundary, with validation happening during conversion.
+         *
+         *     Unknown fields are REJECTED (`deny_unknown_fields`, TD-REC-1 policy): a
+         *     write that carries a field this contract does not know must fail loud at
+         *     the boundary, not report success while silently discarding data — which
+         *     is exactly how the `metadata` drop shipped. The grandfathered spellings
+         *     are the ones the contract itself advertises: `props` and its `metadata`
+         *     alias. Generated SDKs (regenerated in #2337) send only declared fields,
+         *     so the deny cannot break them; a hand-rolled client sending something
+         *     else gets a 400 naming the problem instead of a silent no-op filter.
          */
         ProximaRecordInput: {
             /** @description Record ID (optional, will be auto-generated if not provided) */
@@ -3219,6 +3239,9 @@ export interface components {
              *     alias it was silently dropped and filters over it matched nothing
              *     (TD-REC-1). The OpenAPI contract stays `props`; the alias is
              *     lenience for the already-advertised spelling, not a second field.
+             *     It composes with `deny_unknown_fields`: an alias is a KNOWN field
+             *     name, so `metadata` passes the deny while any other unknown key is
+             *     rejected.
              */
             props?: {
                 [key: string]: unknown;
