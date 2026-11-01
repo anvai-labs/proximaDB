@@ -226,7 +226,10 @@ message Collection {
   string id = 1;
   CollectionConfig config = 2;
   CollectionStats stats = 3;
+  // Unix epoch MILLISECONDS (TD-COLLTIME-1). Values written before the
+  // unit fix may be microseconds; readers normalize via the >10^14 heuristic.
   int64 created_at = 4;
+  // Unix epoch MILLISECONDS (TD-COLLTIME-1).
   int64 updated_at = 5;
   optional StorageAssignment storage_assignment = 6;
   // Observed storage-class status (read-side projection of config.storage_class;

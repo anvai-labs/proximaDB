@@ -1095,8 +1095,9 @@ impl StorageEngine {
                                                 data_size_bytes: (entries.len() * dimension * 4) as i64,
                                                 ..Default::default()
                                             }),
-                                            created_at: chrono::Utc::now().timestamp_micros(),
-                                            updated_at: chrono::Utc::now().timestamp_micros(),
+                                            // TD-COLLTIME-1: epoch milliseconds (see the proto field).
+                                            created_at: chrono::Utc::now().timestamp_millis(),
+                                            updated_at: chrono::Utc::now().timestamp_millis(),
                                             ..Default::default()
                                         };
 

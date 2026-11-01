@@ -205,6 +205,66 @@ async fn grpc_create_cosine_3d(
     .expect("gRPC CreateCollection");
 }
 
+/// TD-COLLTIME-1: `Collection.created_at` must render in the present on the
+/// schema GET for BOTH create transports. The manager and engine paths wrote
+/// `timestamp_micros()` while every `*_ms` consumer (and the REST renderer's
+/// `/1000`) assumes milliseconds — a REST-v2-created collection answered
+/// `+58784-04-29T04:37:30+00:00`. Pinned for both the gRPC create path and
+/// the REST v2 create path: within a minute of now, not 58 millennia out.
+#[tokio::test]
+async fn collection_created_at_renders_in_the_present_e2e() {
+    let server = Server::start().await.expect("server start");
+    let mut grpc = connect_grpc(server.grpc_port).await;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .no_proxy()
+        .build()
+        .unwrap();
+    let base = format!("http://127.0.0.1:{}", server.rest_port);
+
+    // Create one collection per transport.
+    grpc_create_cosine_3d(&mut grpc, "colltime_grpc").await;
+    let rest_create = http
+        .post(format!("{base}/api/v2/collections"))
+        .json(&serde_json::json!({
+            "name": "colltime_rest",
+            "dimension": 3,
+            "distance_metric": "cosine"
+        }))
+        .send()
+        .await
+        .expect("REST create");
+    assert!(
+        rest_create.status().is_success(),
+        "REST create: {} {}",
+        rest_create.status(),
+        rest_create.text().await.unwrap_or_default()
+    );
+
+    for name in ["colltime_grpc", "colltime_rest"] {
+        let schema = http
+            .get(format!("{base}/api/v2/collections/{name}/schema"))
+            .send()
+            .await
+            .expect("schema GET");
+        assert!(schema.status().is_success(), "{name}: {}", schema.status());
+        let body: serde_json::Value = schema.json().await.expect("schema json");
+        let created_at = body
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("{name} schema GET has no created_at: {body}"));
+        let parsed = chrono::DateTime::parse_from_rfc3339(created_at)
+            .unwrap_or_else(|e| panic!("{name} created_at not RFC3339 ({created_at}): {e}"));
+        let delta = (parsed.with_timezone(&chrono::Utc) - chrono::Utc::now())
+            .num_seconds()
+            .abs();
+        assert!(
+            delta < 60,
+            "{name} created_at {created_at} is {delta}s from now — the microsecond-as-millisecond bug (TD-COLLTIME-1)"
+        );
+    }
+}
+
 #[tokio::test]
 async fn grpc_created_collection_stores_and_serves_records_e2e() {
     let server = Server::start().await.expect("server start");
