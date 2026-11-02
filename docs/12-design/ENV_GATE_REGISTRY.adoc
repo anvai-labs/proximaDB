@@ -41,6 +41,7 @@ the emergency off) · *config-mirror* (env overrides a config field) ·
 |===
 | Variable | Semantic | Default | Tier; Owner | Declared in
 
+| `PROXIMADB_COMPACTION_SOAK_CHILD` | Recursion marker set only in the isolated Iceberg compaction soak child; the parent spawns the exact test with two-row target files to exercise the 64-part rewrite threshold. | unset = launch isolated child | test-only; TD-GCRETAIN-1 | `tests/iceberg_interop_e2e.rs`
 | `PROXIMADB_ICEBERG_READBACK_REQUIRE` | Comma-separated external readers required by the Iceberg interoperability harness (`pyiceberg-rest`, `pyiceberg-static`, `duckdb`); unavailable required readers fail instead of skipping. CI requires all three. | unset = optional local external readback | test-only; TD-LIVEDEL-1 | `tests/iceberg_interop_e2e.rs`; `.github/workflows/ci.yml`
 | `PROXIMADB_INCR_SOAK_CHILD` | Recursion marker set only in the isolated incremental-materialization soak child; the parent spawns the exact test with case-specific gates. | unset = launch isolated child | test-only; TD-LIVEDEL-1 | `tests/iceberg_interop_e2e.rs`
 | `PROXIMADB_PYTHON` | Python executable used by the Iceberg interoperability harness for external-reader probes and readback. | `python3` | test-only; TD-LIVEDEL-1 | `tests/iceberg_interop_e2e.rs`
