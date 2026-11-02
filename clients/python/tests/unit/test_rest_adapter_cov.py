@@ -692,6 +692,10 @@ def test_batch_search_native_none(adapter):
     assert adapter.batch_search("c1", [[0.1]]) == []
 
 
+def _ok_ts(parsed, status_code=200):
+    return _doc_resp(parsed, status_code=status_code)
+
+
 # ---------------------------------------------------------------------------
 # Document operations (spec-driven generated ops)
 #
@@ -997,9 +1001,6 @@ def test_ingest_per_call_headers_never_bleed_onto_the_shared_pool(doc_adapter):
 
     import httpx
 
-    from proximadb_sdk._generated.rest.api.documents.ingest_documents import (
-        sync_detailed as ingest_sync,
-    )
     from proximadb_sdk._generated.rest.models.ingest_documents_response import (
         IngestDocumentsResponse,
     )
@@ -1136,79 +1137,170 @@ def test_hybrid_search_error(adapter):
 # ---------------------------------------------------------------------------
 
 
-def test_create_timeseries_collection(adapter):
-    adapter._client._session.program("post", FakeResp({"name": "ts"}))
-    out = adapter.create_timeseries_collection("ts", config={"retention": "7d"})
-    assert out["name"] == "ts"
+def test_create_timeseries_collection(doc_adapter):
+    from unittest.mock import patch
 
-
-def test_create_timeseries_collection_error(adapter):
-    adapter._client._session.program("post", RuntimeError("x"))
-    with pytest.raises(RuntimeError):
-        adapter.create_timeseries_collection("ts")
-
-
-def test_ingest_timeseries(adapter):
-    adapter._client._session.program("post", FakeResp({"ingested": 2}))
-    out = adapter.ingest_timeseries("ts", [{"t": 1, "v": 1.0}, {"t": 2, "v": 2.0}])
-    assert out["ingested"] == 2
-
-
-def test_ingest_timeseries_error(adapter):
-    adapter._client._session.program("post", RuntimeError("x"))
-    with pytest.raises(RuntimeError):
-        adapter.ingest_timeseries("ts", [])
-
-
-def test_query_timeseries_full(adapter):
-    adapter._client._session.program("post", FakeResp({"points": [1, 2]}))
-    out = adapter.query_timeseries(
-        "ts",
-        start_time="2024-01-01",
-        end_time="2024-01-02",
-        aggregation="sum",
-        bucket_ms=60000,
-        tag_filters={"host": "a"},
+    from proximadb_sdk._generated.rest.models.ts_create_response import (
+        TsCreateResponse,
     )
-    assert out["points"] == [1, 2]
-    verb, url, kw = adapter._client._session.calls[-1]
-    assert kw["json"]["bucket_ms"] == 60000
-    assert kw["json"]["tag_filters"] == {"host": "a"}
+
+    op = (
+        "proximadb_sdk._generated.rest.api.timeseries"
+        ".create_timeseries_collection.sync_detailed"
+    )
+    with patch(op) as mock_op:
+        mock_op.return_value = _doc_resp(TsCreateResponse.from_dict({"name": "ts"}))
+        out = doc_adapter.create_timeseries_collection("ts", {"retention": "7d"})
+    assert out["name"] == "ts"
+    body = mock_op.call_args.kwargs["body"].to_dict()
+    assert body["name"] == "ts"
+    assert body["retention"] == "7d"  # rides additional_properties
 
 
-def test_query_timeseries_minimal(adapter):
-    adapter._client._session.program("post", FakeResp({"points": []}))
-    out = adapter.query_timeseries("ts", start_time="a", end_time="b")
-    verb, url, kw = adapter._client._session.calls[-1]
-    assert "bucket_ms" not in kw["json"]
-    assert "tag_filters" not in kw["json"]
-    assert out["points"] == []
+def test_create_timeseries_collection_error(doc_adapter):
+    from unittest.mock import patch
+
+    op = (
+        "proximadb_sdk._generated.rest.api.timeseries"
+        ".create_timeseries_collection.sync_detailed"
+    )
+    with patch(op) as mock_op:
+        mock_op.return_value = _error_resp(400, "bad ts")
+        with pytest.raises(ServerError, match="bad ts"):
+            doc_adapter.create_timeseries_collection("ts")
 
 
-def test_query_timeseries_error(adapter):
-    adapter._client._session.program("post", RuntimeError("x"))
-    with pytest.raises(RuntimeError):
-        adapter.query_timeseries("ts", "a", "b")
+def test_ingest_timeseries(doc_adapter):
+    from unittest.mock import patch
+
+    from proximadb_sdk._generated.rest.models.ts_ingest_response import (
+        TsIngestResponse,
+    )
+
+    op = (
+        "proximadb_sdk._generated.rest.api.timeseries"
+        ".ingest_timeseries.sync_detailed"
+    )
+    with patch(op) as mock_op:
+        mock_op.return_value = _ok_ts(TsIngestResponse.from_dict({"ingested": 2}))
+        out = doc_adapter.ingest_timeseries("ts", [{"timestamp": 1}, {"timestamp": 2}])
+    assert out["ingested"] == 2
+    assert mock_op.call_args.kwargs["collection_id"] == "ts"
 
 
-def test_list_timeseries_collections(adapter):
-    adapter._client._session.program("get", FakeResp({"collections": ["ts1"]}))
-    assert adapter.list_timeseries_collections() == ["ts1"]
+def test_ingest_timeseries_error(doc_adapter):
+    from unittest.mock import patch
+
+    import httpx
+
+    op = (
+        "proximadb_sdk._generated.rest.api.timeseries"
+        ".ingest_timeseries.sync_detailed"
+    )
+    with patch(op) as mock_op:
+        mock_op.side_effect = httpx.ConnectError("x")
+        with pytest.raises(NetworkError, match="transport error"):
+            doc_adapter.ingest_timeseries("ts", [{"timestamp": 1}])
 
 
-def test_list_timeseries_collections_error(adapter):
-    adapter._client._session.program("get", RuntimeError("x"))
-    assert adapter.list_timeseries_collections() == []
+def test_query_timeseries_full(doc_adapter):
+    # aggregation/bucket_ms/tag_filters raise the honest capability
+    # signal (the server's QueryRequest drops unknown fields — shipping
+    # them would silently return raw points).
+    with pytest.raises(NotImplementedError):
+        doc_adapter.query_timeseries(
+            "ts", 1, 2, aggregation="avg", bucket_ms=60, tag_filters={"h": "a"}
+        )
 
 
-def test_delete_timeseries_collection(adapter):
-    adapter._client._session.program("delete", FakeResp({"success": True}))
-    assert adapter.delete_timeseries_collection("ts") is True
+def test_query_timeseries_minimal(doc_adapter):
+    from unittest.mock import patch
+
+    from proximadb_sdk._generated.rest.models.ts_query_response import (
+        TsQueryResponse,
+    )
+
+    op = (
+        "proximadb_sdk._generated.rest.api.timeseries" ".query_timeseries.sync_detailed"
+    )
+    with patch(op) as mock_op:
+        mock_op.return_value = _ok_ts(TsQueryResponse.from_dict({"points": []}))
+        out = doc_adapter.query_timeseries("ts", 1, 2)
+    assert out == {"points": []}
 
 
-def test_delete_timeseries_collection_error(adapter):
-    adapter._client._session.program("delete", RuntimeError("x"))
-    assert adapter.delete_timeseries_collection("ts") is False
+def test_query_timeseries_error(doc_adapter):
+    from unittest.mock import patch
+
+    op = (
+        "proximadb_sdk._generated.rest.api.timeseries" ".query_timeseries.sync_detailed"
+    )
+    with patch(op) as mock_op:
+        mock_op.return_value = _error_resp(500, "boom")
+        with pytest.raises(ServerError):
+            doc_adapter.query_timeseries("ts", 1, 2)
+
+
+def test_list_timeseries_collections(doc_adapter):
+    from unittest.mock import patch
+
+    from proximadb_sdk._generated.rest.models.ts_list_response import (
+        TsListResponse,
+    )
+
+    op = (
+        "proximadb_sdk._generated.rest.api.timeseries"
+        ".list_timeseries_collections.sync_detailed"
+    )
+    with patch(op) as mock_op:
+        mock_op.return_value = _ok_ts(
+            TsListResponse.from_dict({"collections": [{"name": "ts"}]})
+        )
+        assert doc_adapter.list_timeseries_collections() == [{"name": "ts"}]
+
+
+def test_list_timeseries_collections_error(doc_adapter):
+    from unittest.mock import patch
+
+    op = (
+        "proximadb_sdk._generated.rest.api.timeseries"
+        ".list_timeseries_collections.sync_detailed"
+    )
+    with patch(op) as mock_op:
+        mock_op.return_value = _error_resp(500, "boom")
+        with pytest.raises(ServerError):
+            doc_adapter.list_timeseries_collections()
+
+
+def test_delete_timeseries_collection(doc_adapter):
+    from unittest.mock import patch
+
+    from proximadb_sdk._generated.rest.models.ts_delete_response import (
+        TsDeleteResponse,
+    )
+
+    op = (
+        "proximadb_sdk._generated.rest.api.timeseries"
+        ".delete_timeseries_collection.sync_detailed"
+    )
+    with patch(op) as mock_op:
+        mock_op.return_value = _ok_ts(TsDeleteResponse.from_dict({"success": True}))
+        assert doc_adapter.delete_timeseries_collection("ts") is True
+
+
+def test_delete_timeseries_collection_error(doc_adapter):
+    from unittest.mock import patch
+
+    import httpx
+
+    op = (
+        "proximadb_sdk._generated.rest.api.timeseries"
+        ".delete_timeseries_collection.sync_detailed"
+    )
+    with patch(op) as mock_op:
+        mock_op.side_effect = httpx.ConnectError("x")
+        with pytest.raises(NetworkError, match="transport error"):
+            doc_adapter.delete_timeseries_collection("ts")
 
 
 # ---------------------------------------------------------------------------

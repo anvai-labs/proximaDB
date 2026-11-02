@@ -960,6 +960,16 @@ class ProximaDBClient:
         return None
 
     def _call_timeseries_adapter(self, method_name: str, *args, **kwargs):
+        """Dispatch a timeseries op to the adapter chain, or None to fall back.
+
+        Same REST-path caveat as the document family (disclosed by TD-SDK-3
+        batch 3, which made the REST adapter's timeseries methods actually
+        work — the previous hand-rolled code crashed with AttributeError
+        before any I/O, so this fallback always fired): when the adapter
+        succeeds, the dict comes from the server's spec-driven models and
+        differs from the in-memory fallback's local shapes; and the None
+        sentinel cannot distinguish a server 404 from adapter-unavailable.
+        """
         candidates: list[BaseProtocolAdapter] = []
         if self._adapter:
             candidates.append(self._adapter)
@@ -3870,7 +3880,18 @@ class ProximaDBClient:
         name: str,
         retention_days: int | None = None,
     ) -> dict[str, Any]:
-        """Create a namespace for logs, metrics, and traces."""
+        """Create a namespace for logs, metrics, and traces.
+
+        REST-path note (TD-SDK-3 batch 3): the adapter now implements the
+        namespace/logs/metrics ops over the spec-driven endpoints, so a
+        REST client no longer falls through to the "embedded mode only"
+        NotImplementedError — these calls perform real HTTP (traces remain
+        embedded-only; no REST endpoints). ``retention_days`` is DAYS on
+        both transports; the divergence to know: REST maps it to the HOT
+        tier only (``hot_retention_days``; warm/cold keep their spec
+        defaults), while the embedded engine applies it as the overall
+        retention.
+        """
         if self._active_protocol == Protocol.EMBEDDED and self._client is not None:
             try:
                 result = self._client.create_observability_namespace(
