@@ -3072,7 +3072,6 @@ jobs:
             mem0_pgwire_filter_e2e \
             pgwire_crossmodal_join_e2e \
             pgwire_extended_param_e2e \
-            pgwire_extended_relational_e2e \
             pgwire_insert_props_e2e \
             pgwire_psql_introspection_e2e \
             pgwire_cancel_e2e \

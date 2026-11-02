@@ -20,6 +20,7 @@ counting_filesystem.rs  # FakeFs unit test misplaced under tests/ — permanent 
 cpg_fragment_pax_contract.rs
 cross_model_transaction_e2e.rs
 cross_surface_unification_e2e.rs
+dedup_utility_contracts.rs  # arrived on develop via #2360 mid-flight; lane wiring is the dedup-wave owner's call
 discovery_drift_watcher_e2e.rs
 discovery_job_republish_test.rs
 distance_metric_consistency_test.rs
