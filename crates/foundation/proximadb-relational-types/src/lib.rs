@@ -1046,7 +1046,7 @@ fn eval_arithmetic(
             // same documented precision caveat for very large i64. Terminates:
             // the retry hits the (Float64, Float64) arm above. Non-numeric
             // operands still error loudly.
-            if let (Some(lf), Some(rf)) = (try_to_f64(l), try_to_f64(r)) {
+            if let (Some(lf), Some(rf)) = (l.as_numeric_f64(), r.as_numeric_f64()) {
                 return eval_arithmetic(op, &Float64(lf), &Float64(rf));
             }
             Err(ExprError::OperatorNotDefined {
@@ -1098,7 +1098,7 @@ fn values_equal(l: &ProximaValue, r: &ProximaValue) -> Result<bool, ExprError> {
             // and integer-vs-integer comparisons must succeed.
             // (Precision loss for very large i64 values is the
             // documented Phase 3 follow-up.)
-            if let (Some(lf), Some(rf)) = (try_to_f64(l), try_to_f64(r)) {
+            if let (Some(lf), Some(rf)) = (l.as_numeric_f64(), r.as_numeric_f64()) {
                 return Ok(lf == rf);
             }
             return Err(ExprError::OperatorNotDefined {
@@ -1142,7 +1142,7 @@ fn compare_ord(l: &ProximaValue, r: &ProximaValue) -> Result<std::cmp::Ordering,
             }
             // Mixed numeric types: widen to f64 and compare.
             // Mirrors `values_equal`'s widening path.
-            if let (Some(lf), Some(rf)) = (try_to_f64(l), try_to_f64(r)) {
+            if let (Some(lf), Some(rf)) = (l.as_numeric_f64(), r.as_numeric_f64()) {
                 return Ok(lf.partial_cmp(&rf).unwrap_or(std::cmp::Ordering::Equal));
             }
             return Err(ExprError::OperatorNotDefined {
@@ -1154,12 +1154,8 @@ fn compare_ord(l: &ProximaValue, r: &ProximaValue) -> Result<std::cmp::Ordering,
     })
 }
 
-/// Best-effort widening of any numeric ProximaValue to `f64`. Used
-/// to support SQL's implicit cross-type numeric comparisons
-/// (e.g. `int_col > 25` where `25` parses as Int64 and the column
-/// is Int32). Returns `None` for non-numeric values.
-/// True for the numeric `ProximaType`s that widen to f64 in mixed-type
-/// arithmetic/comparison (the `try_to_f64` value-level counterpart).
+/// Whether a type supports implicit widening through
+/// [`ProximaValue::as_numeric_f64`] for mixed numeric arithmetic/comparisons.
 fn numeric_type(t: &ProximaType) -> bool {
     matches!(
         t,
@@ -1175,23 +1171,6 @@ fn numeric_type(t: &ProximaType) -> bool {
             | ProximaType::Float32
             | ProximaType::Float64
     )
-}
-
-fn try_to_f64(v: &ProximaValue) -> Option<f64> {
-    use ProximaValue as V;
-    match v {
-        V::Int8(x) => Some(*x as f64),
-        V::Int16(x) => Some(*x as f64),
-        V::Int32(x) => Some(*x as f64),
-        V::Int64(x) => Some(*x as f64),
-        V::UInt8(x) => Some(*x as f64),
-        V::UInt16(x) => Some(*x as f64),
-        V::UInt32(x) => Some(*x as f64),
-        V::UInt64(x) => Some(*x as f64),
-        V::Float16(x) | V::Float32(x) => Some(*x as f64),
-        V::Float64(x) => Some(*x),
-        _ => None,
-    }
 }
 
 /// Unwrap a JSON SCALAR (`number`/`bool`/`string`) into the matching `ProximaValue`,

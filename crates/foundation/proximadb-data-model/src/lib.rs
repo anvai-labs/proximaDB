@@ -690,6 +690,30 @@ pub enum ProximaValue {
 pub const JSONB_LEGACY_MAGIC: &[u8] = b"\xff\xfeJSNB";
 
 impl ProximaValue {
+    /// Read a primitive integer or floating-point value as `f64`.
+    ///
+    /// Uses Rust's numeric casts: large integers may lose precision, and
+    /// floating-point NaN, infinities, and signed zero are preserved.
+    /// `Float16` uses its in-memory `f32` value. Decimal, textual, temporal,
+    /// boolean, structured, vector, and null values return `None`; this does
+    /// not parse strings or perform SQL casts. Callers retain their own
+    /// type-acceptance policy and error reporting.
+    pub fn as_numeric_f64(&self) -> Option<f64> {
+        match self {
+            Self::Int8(x) => Some(*x as f64),
+            Self::Int16(x) => Some(*x as f64),
+            Self::Int32(x) => Some(*x as f64),
+            Self::Int64(x) => Some(*x as f64),
+            Self::UInt8(x) => Some(*x as f64),
+            Self::UInt16(x) => Some(*x as f64),
+            Self::UInt32(x) => Some(*x as f64),
+            Self::UInt64(x) => Some(*x as f64),
+            Self::Float16(x) | Self::Float32(x) => Some(*x as f64),
+            Self::Float64(x) => Some(*x),
+            _ => None,
+        }
+    }
+
     /// Serialize a `serde_json::Value` to MessagePack bytes for `Jsonb`.
     pub fn to_jsonb_vec(val: &serde_json::Value) -> anyhow::Result<Vec<u8>> {
         let mut buf = Vec::new();
@@ -796,6 +820,60 @@ mod catreplace_mapping_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_f64_conversion_preserves_rust_cast_semantics() {
+        use ProximaValue as V;
+        for (value, expected) in [
+            (V::Int8(i8::MIN), i8::MIN as f64),
+            (V::Int16(i16::MIN), i16::MIN as f64),
+            (V::Int32(i32::MIN), i32::MIN as f64),
+            (V::Int64(i64::MIN), i64::MIN as f64),
+            (V::UInt8(u8::MAX), u8::MAX as f64),
+            (V::UInt16(u16::MAX), u16::MAX as f64),
+            (V::UInt32(u32::MAX), u32::MAX as f64),
+            (V::UInt64(u64::MAX), u64::MAX as f64),
+            (V::Float16(1.5), 1.5),
+            (V::Float32(f32::INFINITY), f64::INFINITY),
+            (V::Float64(-0.0), -0.0),
+        ] {
+            assert_eq!(
+                value.as_numeric_f64().map(f64::to_bits),
+                Some(expected.to_bits())
+            );
+        }
+        assert!(
+            V::Float32(f32::NAN)
+                .as_numeric_f64()
+                .is_some_and(f64::is_nan)
+        );
+        assert!(
+            V::Float64(f64::NAN)
+                .as_numeric_f64()
+                .is_some_and(f64::is_nan)
+        );
+    }
+
+    #[test]
+    fn numeric_f64_conversion_declines_other_value_kinds() {
+        use ProximaValue as V;
+        for value in [
+            V::Null,
+            V::Boolean(true),
+            V::String("42".into()),
+            V::Symbol("42".into()),
+            V::Decimal("42.5".into()),
+            V::Date(42),
+            V::Timestamp(42, TimeUnit::Millisecond),
+            V::Json(serde_json::json!(42)),
+            V::Jsonb(serde_json::json!(42)),
+            V::Binary(vec![42]),
+            V::Array(vec![V::Int64(42)]),
+            V::DenseVector(vec![42.0]),
+        ] {
+            assert_eq!(value.as_numeric_f64(), None, "{value:?}");
+        }
+    }
 
     #[test]
     fn display_uses_stable_lowercase_names() {
