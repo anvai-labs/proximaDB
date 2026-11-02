@@ -28,7 +28,6 @@ from proximadb_sdk.config import Protocol
 from proximadb_sdk.exceptions import (
     ProximaDBError,
     ProximaDBNotSupportedError,
-    ServerError,
 )
 from proximadb_sdk.unified_client_v2 import ProximaDBClient
 
@@ -474,10 +473,11 @@ class TestParityCensus:
         )
 
     def test_observability_pin_is_subset_of_v1_until_batch4(self):
-        """v1's name-filter set also contains three batch-4 names
-        (get_protocol_metrics, reset_routing_metrics, logout), so this
-        census is subset-directional on the v1 side until batch 4 pins
-        them; the v2 side below is exact."""
+        """v1's name-filter set also contains TWO batch-4 names
+        (get_protocol_metrics, reset_routing_metrics), so this census is
+        subset-directional on the v1 side until batch 4 pins them; the
+        v2 side below is exact over the filtered vocabulary (`logout`
+        contains no filter key and escapes it entirely)."""
         from proximadb_sdk.unified_client import ProximaDBClient as V1Client
 
         v1_names = {name for name in dir(V1Client) if not name.startswith("_")}

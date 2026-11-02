@@ -3886,9 +3886,11 @@ class ProximaDBClient:
         namespace/logs/metrics ops over the spec-driven endpoints, so a
         REST client no longer falls through to the "embedded mode only"
         NotImplementedError — these calls perform real HTTP (traces remain
-        embedded-only; no REST endpoints). ``retention_days`` means DAYS
-        on REST (hot_retention_days) but HOURS on the embedded engine — a
-        pre-existing divergence now visible because both paths work.
+        embedded-only; no REST endpoints). ``retention_days`` is DAYS on
+        both transports; the divergence to know: REST maps it to the HOT
+        tier only (``hot_retention_days``; warm/cold keep their spec
+        defaults), while the embedded engine applies it as the overall
+        retention.
         """
         if self._active_protocol == Protocol.EMBEDDED and self._client is not None:
             try:

@@ -1147,9 +1147,9 @@ class ProximaDBClient:
         **kwargs,
     ) -> dict[str, Any]:
         """Query time-series data (see the adapter for the wire contract:
-        the spec's window is integer epoch time; ``aggregation``/
-        ``bucket_ms``/``tag_filters`` ride the body model's
-        additional_properties)."""
+        the spec's window is integer epoch time). REST does not support
+        ``aggregation``/``bucket_ms``/``tag_filters`` (raises the typed
+        capability error); the embedded adapter honors them."""
         return self._adapter_call(
             "query_timeseries",
             collection_name,

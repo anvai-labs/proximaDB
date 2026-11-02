@@ -1059,11 +1059,12 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
 
         The spec's query window (``start_time``/``end_time``) is integer
         epoch time; the v1-era ``str`` signature is preserved for
-        compatibility — pass what the server expects. ``aggregation`` /
-        ``bucket_ms`` / ``tag_filters`` are not declared fields of the
-        spec's query body and ride the model's ``additional_properties``
-        (the tuned aggregation surface is the separate
-        ``aggregate_timeseries`` op, outside the ported family).
+        compatibility — pass what the server expects. REST does NOT
+        support ``aggregation``/``bucket_ms``/``tag_filters`` (the
+        server's query body declares only the window and limit, and
+        drops unknown fields) — passing any of them raises
+        NotImplementedError here rather than silently shipping ignored
+        keys. The EMBEDDED adapter honors all three.
         """
         from .._generated.rest.api.timeseries.query_timeseries import sync_detailed
         from .._generated.rest.models.ts_query_request import TsQueryRequest

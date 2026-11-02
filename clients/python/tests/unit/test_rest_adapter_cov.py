@@ -1001,9 +1001,6 @@ def test_ingest_per_call_headers_never_bleed_onto_the_shared_pool(doc_adapter):
 
     import httpx
 
-    from proximadb_sdk._generated.rest.api.documents.ingest_documents import (
-        sync_detailed as ingest_sync,
-    )
     from proximadb_sdk._generated.rest.models.ingest_documents_response import (
         IngestDocumentsResponse,
     )
@@ -1207,15 +1204,6 @@ def test_ingest_timeseries_error(doc_adapter):
 
 
 def test_query_timeseries_full(doc_adapter):
-    from unittest.mock import patch
-
-    from proximadb_sdk._generated.rest.models.ts_query_response import (
-        TsQueryResponse,
-    )
-
-    op = (
-        "proximadb_sdk._generated.rest.api.timeseries" ".query_timeseries.sync_detailed"
-    )
     # aggregation/bucket_ms/tag_filters raise the honest capability
     # signal (the server's QueryRequest drops unknown fields — shipping
     # them would silently return raw points).
