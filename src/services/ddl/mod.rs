@@ -2148,6 +2148,17 @@ impl DdlService {
                     }
                 }
                 AlterTableChange::SetTableOption { key, value } => {
+                    // TD-COMPACT-2b: validate cache.* keys at SET time so a
+                    // typo fails immediately rather than silently doing nothing.
+                    if key.trim().to_ascii_lowercase().starts_with("cache.") {
+                        let mut probe = std::collections::HashMap::new();
+                        probe.insert(key.clone(), value.clone());
+                        if let Err(error) =
+                            proximadb_cache::policy::validate_cache_properties(&probe)
+                        {
+                            anyhow::bail!("invalid cache property: {error}");
+                        }
+                    }
                     SchemaChange::SetTableOption { key, value }
                 }
             };

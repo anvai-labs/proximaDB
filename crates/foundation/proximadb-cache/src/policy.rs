@@ -18,11 +18,10 @@
 //! advisor is `on`, only for fields no layer above set), then the built-in
 //! default. Each field records its [`Provenance`].
 //!
-//! The built-in defaults describe the caching the engine does today at the
-//! shipped default config (`cache_on_write = invariant`, a configured
-//! persistent disk store, non-zero cache budgets). Step 2b derives them from
-//! the live engine config instead, so a server that changes those knobs
-//! reports its real behaviour:
+//! The built-in defaults describe the caching the engine does today, derived
+//! from its own cache config ([`EngineCacheBaseline`]: `cache_on_write`, the
+//! persistent disk store, the cache budgets), so a server that changes those
+//! knobs reports its real behaviour. At the shipped default config:
 //! - the invariants cache seeds control and Region A on publish (RAM, then
 //!   the persistent disk store), evicting Region A last;
 //! - the survivor range cache serves Region B ranges and Region D OID chunks
@@ -390,15 +389,64 @@ pub struct ServerCachePolicy {
     pub advisor: AdvisorMode,
 }
 
-/// The built-in policy of `group`: today's caching (see the module docs).
-/// Every class shares it; PERFORMANCE adds whole-segment residency on top.
-pub fn builtin_group_policy(group: RegionGroup) -> GroupPolicy {
+/// What the engine's own cache config does, independent of any policy: the
+/// built-in layer describes this, so a server that changes these knobs
+/// reports its real behaviour (with `Builtin` provenance) instead of the
+/// shipped defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineCacheBaseline {
+    /// `cache_on_write` seeds control + Region A on publish (`invariant` or
+    /// `all`).
+    pub seeds_invariants: bool,
+    /// `cache_on_write = all` also seeds Region B on publish.
+    pub seeds_survivors: bool,
+    /// A persistent local-disk store is configured.
+    pub disk_store: bool,
+    /// The invariants cache has a non-zero budget.
+    pub invariants_cache: bool,
+    /// The survivor range cache has a non-zero budget.
+    pub survivor_cache: bool,
+}
+
+impl Default for EngineCacheBaseline {
+    /// The shipped default config.
+    fn default() -> Self {
+        Self {
+            seeds_invariants: true,
+            seeds_survivors: false,
+            disk_store: true,
+            invariants_cache: true,
+            survivor_cache: true,
+        }
+    }
+}
+
+/// The built-in policy of `group` under `engine`: today's caching (see the
+/// module docs). Every class shares it; PERFORMANCE adds whole-segment
+/// residency on top.
+pub fn builtin_group_policy(engine: EngineCacheBaseline, group: RegionGroup) -> GroupPolicy {
     use GroupMode::*;
-    use Placement::*;
+    let placement = if engine.disk_store {
+        Placement::RamThenDisk
+    } else {
+        Placement::Ram
+    };
+    let cached = |enabled: bool, seeded: bool| match (enabled, seeded) {
+        (false, _) => Off,
+        (true, true) => Warm,
+        (true, false) => OnDemand,
+    };
     match group {
-        RegionGroup::Control | RegionGroup::Index => GroupPolicy::new(Warm, RamThenDisk),
-        RegionGroup::Rerank | RegionGroup::Payload => GroupPolicy::new(OnDemand, RamThenDisk),
-        RegionGroup::Filter | RegionGroup::Exact => GroupPolicy::new(Off, Disk),
+        RegionGroup::Control | RegionGroup::Index => GroupPolicy::new(
+            cached(engine.invariants_cache, engine.seeds_invariants),
+            placement,
+        ),
+        RegionGroup::Rerank => GroupPolicy::new(
+            cached(engine.survivor_cache, engine.seeds_survivors),
+            placement,
+        ),
+        RegionGroup::Payload => GroupPolicy::new(cached(engine.survivor_cache, false), placement),
+        RegionGroup::Filter | RegionGroup::Exact => GroupPolicy::new(Off, Placement::Disk),
     }
 }
 
@@ -480,6 +528,7 @@ pub struct ResolvedGroup {
 /// What [`resolve_cache_policy`] resolves from.
 #[derive(Debug, Clone, Copy)]
 pub struct ResolveInput<'a> {
+    pub engine: EngineCacheBaseline,
     pub collection: &'a CollectionCacheProperties,
     pub server: &'a ServerCachePolicy,
     pub class: StorageClassHint,
@@ -530,7 +579,7 @@ fn layered<T: Copy>(collection: Option<T>, server: Option<T>, builtin: T) -> (T,
 pub fn resolve_cache_policy(input: ResolveInput<'_>) -> EffectivePolicy {
     let advisor = input.collection.advisor.unwrap_or(input.server.advisor);
     let mut groups = RegionGroup::ALL.map(|group| {
-        let builtin = builtin_group_policy(group);
+        let builtin = builtin_group_policy(input.engine, group);
         let (mode, mode_from) = layered(
             input.collection.mode(group),
             input.server.modes.get(&group).copied(),
@@ -645,6 +694,7 @@ mod tests {
         recommendations: &[Recommendation],
     ) -> EffectivePolicy {
         resolve_cache_policy(ResolveInput {
+            engine: EngineCacheBaseline::default(),
             collection,
             server,
             class: StorageClassHint::Balanced,
@@ -720,7 +770,8 @@ mod tests {
     #[test]
     fn builtin_defaults_describe_todays_caching() {
         use GroupMode::*;
-        let mode = |g| builtin_group_policy(g).mode;
+        let engine = EngineCacheBaseline::default();
+        let mode = |g| builtin_group_policy(engine, g).mode;
         // Invariants cache seeds control + Region A on publish.
         assert_eq!(mode(RegionGroup::Control), Warm);
         assert_eq!(mode(RegionGroup::Index), Warm);
@@ -737,10 +788,45 @@ mod tests {
             RegionGroup::Payload,
         ] {
             assert_eq!(
-                builtin_group_policy(g).placement,
+                builtin_group_policy(engine, g).placement,
                 Placement::RamThenDisk,
                 "{g:?}"
             );
+        }
+    }
+
+    #[test]
+    fn builtin_follows_the_engine_cache_config() {
+        use GroupMode::*;
+        let base = EngineCacheBaseline::default();
+        let at = |engine, g| builtin_group_policy(engine, g);
+        // cache_on_write = none: nothing seeded, reads still cached.
+        let none = EngineCacheBaseline {
+            seeds_invariants: false,
+            ..base
+        };
+        assert_eq!(at(none, RegionGroup::Index).mode, OnDemand);
+        // cache_on_write = all: Region B seeded too.
+        let all = EngineCacheBaseline {
+            seeds_survivors: true,
+            ..base
+        };
+        assert_eq!(at(all, RegionGroup::Rerank).mode, Warm);
+        assert_eq!(at(all, RegionGroup::Payload).mode, OnDemand);
+        // No disk store: RAM only.
+        let ram = EngineCacheBaseline {
+            disk_store: false,
+            ..base
+        };
+        assert_eq!(at(ram, RegionGroup::Control).placement, Placement::Ram);
+        // Zero budgets disable the caches.
+        let off = EngineCacheBaseline {
+            invariants_cache: false,
+            survivor_cache: false,
+            ..base
+        };
+        for g in RegionGroup::ALL {
+            assert_eq!(at(off, g).mode, Off, "{g:?}");
         }
     }
 
@@ -750,6 +836,7 @@ mod tests {
         let server = ServerCachePolicy::default();
         let at = |class, performance_grant| {
             resolve_cache_policy(ResolveInput {
+                engine: EngineCacheBaseline::default(),
                 collection: &none,
                 server: &server,
                 class,
@@ -779,6 +866,7 @@ mod tests {
         };
         server.modes.insert(RegionGroup::Index, GroupMode::Off);
         let p = resolve_cache_policy(ResolveInput {
+            engine: EngineCacheBaseline::default(),
             collection: &collection,
             server: &server,
             class: StorageClassHint::Performance,
