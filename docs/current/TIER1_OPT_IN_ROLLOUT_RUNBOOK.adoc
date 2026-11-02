@@ -61,8 +61,9 @@
 
 * **Idle reclaim:** arm a short TTL on a test pool, stop querying a granted
   collection past the TTL, confirm the metering loop's sweep releases it
-  (status leaves READY; the ledger's accrual tail closes at the reclaim) and
-  that the next query re-admits through the normal path.
+  (status leaves READY; the ledger's accrual tail closes at the reclaim).
+  Re-admission is NOT automatic: the next storage-class update (or recreate)
+  re-reserves through the normal admission path.
 * **Warm budget:** arm `warm_bandwidth_mib_per_s` on a shared pool, start two
   re-warms at once, confirm neither starves the other's READY window and the
   aggregate stays under the budget.

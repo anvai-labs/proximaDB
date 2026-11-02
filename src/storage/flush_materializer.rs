@@ -1555,6 +1555,40 @@ mod tests {
         }
     }
 
+    /// TD-TIER-1 SC6 (review SF5): `pool_id` must ride the flush plan and
+    /// survive the rebuilt minimal config DTO — the DTO-drop class this trio
+    /// exists to catch (a flushed collection that drops its pool silently
+    /// reroutes a later re-admission to the default pool).
+    #[test]
+    fn pool_id_rides_the_flush_plan_and_the_rebuilt_config() {
+        let meta = crate::proto::proximadb_v1::Collection {
+            id: "7".to_string(),
+            config: Some({
+                let mut config = CollectionConfig::default();
+                config.name = "pooled".to_string();
+                config.dimension = 2;
+                config.pool_id = Some("enterprise".to_string());
+                config
+            }),
+            ..Default::default()
+        };
+        let plan = flush_plan_from_collection_meta(&meta).expect("valid flush plan");
+        assert_eq!(plan.pool_id.as_deref(), Some("enterprise"));
+        let rebuilt = crate::proto::proximadb_v1::CollectionConfig {
+            pool_id: plan.pool_id.clone(),
+            ..Default::default()
+        };
+        assert_eq!(rebuilt.pool_id.as_deref(), Some("enterprise"));
+        // And the default stays the default (byte-compatible None).
+        let plain = flush_plan_from_collection_meta(&crate::proto::proximadb_v1::Collection {
+            id: "8".to_string(),
+            config: Some(CollectionConfig::default()),
+            ..Default::default()
+        })
+        .expect("valid flush plan");
+        assert_eq!(plain.pool_id, None);
+    }
+
     fn fp32_config(tags: &[&str]) -> CollectionConfig {
         CollectionConfig {
             canonical_embedding_precision: Some(

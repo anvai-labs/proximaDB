@@ -213,6 +213,26 @@ pub fn validate_pool_configs(pools: &[ReservationPoolConfig]) -> anyhow::Result<
             );
         }
     }
+    for pool in pools {
+        if pool.dram_budget_bytes == Some(0) {
+            anyhow::bail!(
+                "reservation pool '{}' sets dram_budget_bytes = 0; no grant could \
+                 ever be admitted (use None to uncap)",
+                pool.id
+            );
+        }
+        if pool.idle_reclaim_secs > 0
+            && pool.idle_reclaim_min_lifetime_secs > pool.idle_reclaim_secs
+        {
+            anyhow::bail!(
+                "reservation pool '{}' idle_reclaim_min_lifetime_secs ({}) exceeds \
+                 idle_reclaim_secs ({}) — the TTL could never fire",
+                pool.id,
+                pool.idle_reclaim_min_lifetime_secs,
+                pool.idle_reclaim_secs
+            );
+        }
+    }
     let defaults = pools.iter().filter(|p| p.is_default).count();
     if defaults > 1 {
         anyhow::bail!("at most one reservation pool may set is_default (found {defaults})");
@@ -469,11 +489,14 @@ impl ReservationRegistry {
     /// persists so a refusal keeps the old policy unchanged; the residual
     /// peek→reserve window (a concurrent reserve taking the headroom) is
     /// the recorded SC4 reconciliation seam.
-    pub async fn peek_performance_admission(&self) -> Result<(), ReservationError> {
+    pub async fn peek_performance_admission(
+        &self,
+        pool_id: Option<&str>,
+    ) -> Result<(), ReservationError> {
         if kill_switch_armed() {
             return Err(ReservationError::KillSwitch);
         }
-        let (config, authority) = self.armed_default_pool()?;
+        let (config, authority) = self.resolve_pool(pool_id)?;
         let needed = config.effective_bytes(config.default_grant_bytes);
         let charged = authority.charged_effective_bytes().await;
         if needed > config.allocatable_bytes.saturating_sub(charged) {
@@ -1367,6 +1390,7 @@ impl ReservationAuthority {
         let new_effective = self.config.effective_bytes(bytes);
         // Credit the grant's own current charge first: shrinking always fits.
         self.ensure_capacity(&prospective, bytes, new_effective, old_effective)?;
+        self.ensure_dram_budget(&prospective, bytes, new_effective, old_effective)?;
         self.ensure_tenant_limit(&prospective, tenant_id, bytes, Some(live.id.as_str()))?;
         let grant = grant_by_id_mut(&mut prospective, &live.id)?;
         grant.bytes = bytes;
@@ -3124,7 +3148,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let err = registry
-            .peek_performance_admission()
+            .peek_performance_admission(None)
             .await
             .unwrap_err()
             .to_string();
@@ -3142,7 +3166,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let err = registry
-            .peek_performance_admission()
+            .peek_performance_admission(None)
             .await
             .unwrap_err()
             .to_string();
@@ -3153,7 +3177,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        registry.peek_performance_admission().await.unwrap();
+        registry.peek_performance_admission(None).await.unwrap();
     }
 
     #[tokio::test]
@@ -3169,14 +3193,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        registry.peek_performance_admission().await.unwrap();
+        registry.peek_performance_admission(None).await.unwrap();
         registry
             .reserve_for_performance("t1", "c-uuid-1", current_unix_secs(), &[], None)
             .await
             .unwrap();
         // 4000 charged of 5000: a second default grant no longer fits.
         let err = registry
-            .peek_performance_admission()
+            .peek_performance_admission(None)
             .await
             .unwrap_err()
             .to_string();
@@ -3194,7 +3218,7 @@ mod tests {
             .unwrap();
         let guard = env_lock::scoped_set(RESERVATIONS_KILL_SWITCH_ENV, "1");
         let err = registry
-            .peek_performance_admission()
+            .peek_performance_admission(None)
             .await
             .unwrap_err()
             .to_string();

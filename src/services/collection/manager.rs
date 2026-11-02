@@ -2298,6 +2298,9 @@ impl CollectionService {
         // TD-TIER-1 SC6: the pool the re-admission charges — the merged
         // config's `pool_id` (explicit new value, else the recorded one).
         let mut performance_pool_id: Option<String> = None;
+        // A pool-only reroute on a live PERFORMANCE grant: release the old
+        // grant (every pool) before the re-reserve lands in the new pool.
+        let mut pool_reroute = false;
         // SF1: a post-persist reserve failure surfaces here (policy durable,
         // grant missing) instead of a quiet success.
         let mut reservation_pending: Option<String> = None;
@@ -2429,7 +2432,16 @@ impl CollectionService {
                             // declared) also refuses — PERFORMANCE without a
                             // reservation admission would be a silent lie.
                             match &self.reservations {
-                                Some(registry) => registry.peek_performance_admission().await?,
+                                Some(registry) => {
+                                    registry
+                                        .peek_performance_admission(
+                                            new_config
+                                                .pool_id
+                                                .as_deref()
+                                                .or(existing_config.pool_id.as_deref()),
+                                        )
+                                        .await?
+                                }
                                 None => {
                                     return Err(anyhow::anyhow!(
                                         "storage_class 'performance' requires a \
@@ -2450,13 +2462,36 @@ impl CollectionService {
                         existing_config.policy_generation =
                             Some(u32::try_from(generation.saturating_add(1)).unwrap_or(u32::MAX));
                         existing_config.storage_class = Some(resolved as i32);
-                        if new_config.pool_id.is_some() {
-                            existing_config.pool_id = new_config.pool_id.clone();
+                        if resolved != crate::proto::proximadb_v1::StorageClass::Performance {
+                            // A demoted collection has no grant to route: a
+                            // stale pool_id would re-reserve a retired pool on
+                            // a later re-promotion.
+                            existing_config.pool_id = None;
                         }
-                        performance_pool_id = existing_config.pool_id.clone();
                         policy_side_effect =
                             Some(resolved == crate::proto::proximadb_v1::StorageClass::Performance);
                     }
+                }
+                // TD-TIER-1 SC6 (review BLOCKER): a pool_id-only update on an
+                // already-PERFORMANCE collection must take effect — the merge
+                // used to live inside the class-change branch, so it silently
+                // dropped (validated, reported success, grant unmoved: the
+                // DTO-drop class). Hoisted: any explicit pool change re-routes
+                // the live grant — the old one releases (release sweeps every
+                // pool) and policy_side_effect forces the re-reserve.
+                if new_config.pool_id.is_some()
+                    && new_config.pool_id != existing_config.pool_id
+                    && crate::services::collection::storage_class::storage_class_or_balanced(
+                        existing_config,
+                    ) == crate::proto::proximadb_v1::StorageClass::Performance
+                {
+                    existing_config.pool_id = new_config.pool_id.clone();
+                    performance_pool_id = existing_config.pool_id.clone();
+                    policy_side_effect = Some(true);
+                    pool_reroute = true;
+                } else if new_config.pool_id.is_some() {
+                    existing_config.pool_id = new_config.pool_id.clone();
+                    performance_pool_id = existing_config.pool_id.clone();
                 }
                 // TD-TIER-1 SC5: the tier governs FUTURE segment PUTs only
                 // (nothing is rewritten), so a change needs no reservation
@@ -2590,6 +2625,14 @@ impl CollectionService {
             let now = chrono::Utc::now().timestamp();
             if to_performance {
                 let tenant = owner.unwrap_or_else(|| Self::DEFAULT_VERSION_TENANT.to_string());
+                if pool_reroute {
+                    // The old grant may live in ANY pool: release everywhere
+                    // (idempotent) so the re-reserve lands in the new pool
+                    // without double-charging capacity.
+                    registry
+                        .release_for_collection(&tenant, &collection_id, now)
+                        .await;
+                }
                 // SC4-2: protection prefixes from the record's own storage
                 // assignment (the exact base + typed triple flush uses).
                 let protect_prefixes = previous_record

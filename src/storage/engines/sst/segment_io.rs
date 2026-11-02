@@ -352,11 +352,20 @@ pub async fn warm_object(
         }
     };
     // Process-wide limit, then re-judge the budget: a warm that waited may
-    // find the room taken by the ones ahead of it.
-    let _permit = warm_permits()
-        .acquire()
-        .await
-        .map_err(|error| anyhow::anyhow!("warm permit for {path}: {error}"))?;
+    // find the room taken by the ones ahead of it. The setup permit is
+    // dropped before the chunk loop: each chunk reacquires (the RAM bound is
+    // one chunk per permit), and S3 pacing sleeps BETWEEN permits — a
+    // budgeted pool must never pin the process-wide permits while it sleeps
+    // (review SF1), or a slow pool starves every other pool's warm.
+    {
+        let _setup_permit = warm_permits()
+            .acquire()
+            .await
+            .map_err(|error| anyhow::anyhow!("warm permit for {path}: {error}"))?;
+        if warm_target(path, len).is_none() {
+            return Ok(false);
+        }
+    }
     let Some((store, key)) = warm_target(path, len) else {
         return Ok(false);
     };
@@ -375,17 +384,25 @@ pub async fn warm_object(
         let mut out = tokio::fs::File::from_std(file);
         let mut offset = 0u64;
         // TD-TIER-1 SC6 S3: pace this object's chunks against its pool's
-        // aggregate warm budget, when one is installed for the path.
+        // aggregate warm budget, when one is installed for the path. Pacing
+        // happens OUTSIDE the warm permit (review SF1): a budgeted pool must
+        // not pin the process-wide permits while it sleeps, or a slow pool
+        // starves every other pool's warm.
         let budget = warm_budget_for(path);
         while offset < len {
             let chunk = WARM_CHUNK_BYTES.min(len - offset);
-            let bytes = fs
-                .read_range(path, offset, chunk)
-                .await
-                .map_err(|error| anyhow::anyhow!("warm read {path}@{offset}: {error}"))?;
             if let Some(budget) = &budget {
                 budget.pace(chunk).await;
             }
+            let bytes = {
+                let _chunk_permit = warm_permits()
+                    .acquire()
+                    .await
+                    .map_err(|error| anyhow::anyhow!("warm permit for {path}: {error}"))?;
+                fs.read_range(path, offset, chunk)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("warm read {path}@{offset}: {error}"))?
+            };
             if bytes.len() as u64 != chunk {
                 anyhow::bail!("warm read {path}@{offset}: short read");
             }
