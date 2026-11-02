@@ -969,36 +969,100 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         query_vector: list[float],
         fusion_strategy: str = "rrf",
         top_k: int = 10,
+        fusion_params: dict[str, Any] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Execute hybrid search via REST."""
-        try:
+        """Execute hybrid search (spec-driven op).
 
-            response = self._client._session.post(
-                f"{self._url}/api/v2/hybrid/search",
-                json={
-                    "collection": collection,
-                    "text_query": text_query,
-                    "query_vector": query_vector,
-                    "fusion_strategy": fusion_strategy,
-                    "top_k": top_k,
-                },
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"Hybrid search failed: {e}")
-            raise
+        Replaces hand-rolled ``_client._session`` calls that could never
+        execute (the protocol client has no ``_session`` attribute) — the
+        same dead-code disease as the document/timeseries families.
+        ``fusion_params`` rides the body model's additional_properties.
+        """
+        from .._generated.rest.api.hybrid.hybrid_search import sync_detailed
+        from .._generated.rest.models.hybrid_search_body import HybridSearchBody
+        from .._generated_op_exec import execute_generated_op
 
-    # ==========================================================================
-    # Time-Series Operations — the SPEC-DRIVEN generated ops (TD-SDK-3
-    # batch 3). These replace hand-rolled ``_client._session`` calls that
-    # could never execute (the protocol client has no ``_session``
-    # attribute — the same dead-code disease the document family carried
-    # until batch 2); one config-sourced client and one outcome vocabulary
-    # (``_generated_op_exec``).
-    # ==========================================================================
+        payload: dict[str, Any] = {
+            "collection": collection,
+            "text_query": text_query,
+            "vector": query_vector,
+            "fusion_strategy": fusion_strategy,
+            "top_k": top_k,
+        }
+        if fusion_params is not None:
+            payload["fusion_params"] = fusion_params
+        return execute_generated_op(
+            "hybrid_search",
+            lambda: sync_detailed(
+                client=self._get_generated_document_client(),
+                body=HybridSearchBody.from_dict(payload),
+            ),
+        )
+
+    def scan_page(
+        self,
+        collection_id: str,
+        *,
+        filter=None,
+        limit: int | None = None,
+        cursor: str | None = None,
+        include_vectors: bool = False,
+        include_text: bool = False,
+    ):
+        """Scan one page via the protocol client's REST-only scan endpoint."""
+        return self._client.scan_records(
+            collection_id,
+            filter=filter,
+            limit=limit,
+            cursor=cursor,
+            include_vectors=include_vectors,
+            include_text=include_text,
+        )
+
+    def search_envelope(
+        self,
+        collection_id: str,
+        vector: list[float],
+        top_k: int = 10,
+        include_vectors: bool = False,
+        include_metadata: bool = True,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Run the paged search envelope via the protocol client."""
+        return self._client.search_envelope(
+            collection_id=collection_id,
+            vector=vector,
+            top_k=top_k,
+            include_vectors=include_vectors,
+            include_metadata=include_metadata,
+            **kwargs,
+        )
+
+    def execute_sql(
+        self,
+        query: str,
+        parameters: list[Any] | None = None,
+        collection: str | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Execute SQL (spec-driven op; replaces v1's dead ``_session`` path)."""
+        from .._generated.rest.api.sql.execute_sql import sync_detailed
+        from .._generated.rest.models.sql_request import SqlRequest
+        from .._generated_op_exec import execute_generated_op
+
+        payload: dict[str, Any] = {"query": query}
+        if parameters is not None:
+            payload["parameters"] = parameters
+        if collection is not None:
+            payload["collection"] = collection
+        return execute_generated_op(
+            "execute_sql",
+            lambda: sync_detailed(
+                client=self._get_generated_document_client(),
+                body=SqlRequest.from_dict(payload),
+            ),
+        )
 
     def create_timeseries_collection(
         self, name: str, config: dict[str, Any] | None = None, **kwargs

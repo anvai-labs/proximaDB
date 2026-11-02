@@ -291,6 +291,66 @@ class BaseProtocolAdapter(ABC):
     # Hybrid Search Operations
     # ==========================================================================
 
+    # ==========================================================================
+    # Search/Scan/Query Extensions (TD-SDK-3 batch 4) — optional namespace,
+    # same pattern: REST implements over the spec-driven ops / protocol
+    # surfaces, embedded over the engine, gRPC stays on these defaults.
+    # ==========================================================================
+
+    def scan_page(
+        self,
+        collection_id: str,
+        *,
+        filter: list[dict[str, Any]] | dict[str, Any] | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+        include_vectors: bool = False,
+        include_text: bool = False,
+    ) -> tuple[list, str | None]:
+        """Scan one page of records via the vector-free metadata-scan
+        endpoint (REST-only surface). Returns ``(records, next_cursor)``."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support metadata scans"
+        )
+
+    def search_envelope(
+        self,
+        collection_id: str,
+        vector: list[float],
+        top_k: int = 10,
+        include_vectors: bool = False,
+        include_metadata: bool = True,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Run the paged REST OpenAPI v2 search envelope."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support the paged search envelope"
+        )
+
+    def execute_sql(
+        self,
+        query: str,
+        parameters: list[Any] | None = None,
+        collection: str | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Execute a SQL query (the spec-driven sql op / engine SQL)."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support SQL execution"
+        )
+
+    def execute_unified_query(
+        self,
+        query: str,
+        query_vector: list[float] | None = None,
+        fusion_strategy: str | None = None,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        """Execute a federated multi-model (UQL) query — embedded native."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support unified queries"
+        )
+
     def hybrid_search(
         self,
         collection: str,

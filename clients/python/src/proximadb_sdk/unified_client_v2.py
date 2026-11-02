@@ -53,6 +53,10 @@ class ProximaDBClient:
     Uses Protocol Adapter Pattern for clean, maintainable code.
     """
 
+    #: Scan pagination bounds (v1-compatible class contract).
+    SCAN_MAX_PAGE = 10_000
+    SCAN_DEFAULT_MAX_ROWS = 1_000_000
+
     def __init__(
         self,
         url: str | None = None,
@@ -1291,6 +1295,254 @@ class ProximaDBClient:
     def get_trace(self, namespace: str, trace_id: str, **kwargs) -> dict[str, Any]:
         """Get all spans for a specific trace ID."""
         return self._adapter_call("get_trace", namespace, trace_id=trace_id, **kwargs)
+
+    # ==========================================================================
+    # Search / Scan / Query Extensions (TD-SDK-3 batch 4)
+    # ==========================================================================
+
+    def scan_page(
+        self,
+        collection_id: str,
+        *,
+        filter: list[dict[str, Any]] | dict[str, Any] | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
+        include_vectors: bool = False,
+        include_text: bool = False,
+    ):
+        """Scan one page of records (REST-only surface; see the adapter)."""
+        return self._adapter_call(
+            "scan_page",
+            collection_id,
+            filter=filter,
+            limit=limit,
+            cursor=cursor,
+            include_vectors=include_vectors,
+            include_text=include_text,
+        )
+
+    def scan(
+        self,
+        collection_id: str,
+        *,
+        filter: list[dict[str, Any]] | dict[str, Any] | None = None,
+        page_size: int | None = None,
+        max_rows: int | None = None,
+        include_vectors: bool = False,
+        include_text: bool = False,
+    ):
+        """Scan ALL matching records via cursor pagination over
+        :meth:`scan_page` (bounded by ``max_rows``; guards cursor loops)."""
+        cap = self.SCAN_DEFAULT_MAX_ROWS if max_rows is None else max_rows
+        per_page = self.SCAN_MAX_PAGE if page_size is None else page_size
+        per_page = max(1, min(per_page, self.SCAN_MAX_PAGE))
+        out = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        while len(out) < cap:
+            page, cursor = self.scan_page(
+                collection_id,
+                filter=filter,
+                limit=per_page,
+                cursor=cursor,
+                include_vectors=include_vectors,
+                include_text=include_text,
+            )
+            out.extend(page)
+            if cursor is None or len(out) >= cap:
+                break
+            if cursor in seen_cursors:
+                break
+            seen_cursors.add(cursor)
+        return out[:cap]
+
+    def search_envelope(
+        self,
+        collection_id: str,
+        vector,
+        top_k: int = 10,
+        include_vectors: bool = False,
+        include_metadata: bool = True,
+        **kwargs,
+    ):
+        """Run the paged REST OpenAPI v2 search envelope."""
+        if hasattr(vector, "tolist"):
+            vector = vector.tolist()
+        return self._adapter_call(
+            "search_envelope",
+            collection_id,
+            vector=vector,
+            top_k=top_k,
+            include_vectors=include_vectors,
+            include_metadata=include_metadata,
+            **kwargs,
+        )
+
+    def search_iter(
+        self,
+        collection_id: str,
+        vector,
+        top_k: int = 10,
+        include_metadata: bool = True,
+        include_vectors: bool = False,
+        page_limit: int | None = None,
+    ):
+        """Iterate search result pages: the envelope's cursor on REST;
+        transports without the envelope surface fall back to a single
+        :meth:`search` page (v1's shape)."""
+        if hasattr(vector, "tolist"):
+            vector = vector.tolist()
+        try:
+            env = self.search_envelope(
+                collection_id,
+                vector,
+                top_k=top_k,
+                include_vectors=include_vectors,
+                include_metadata=include_metadata,
+            )
+        except ProximaDBNotSupportedError:
+            results = self.search(collection_id, vector, top_k=top_k, **{})
+            yield list(getattr(results, "results", results) or [])
+            return
+        page = getattr(env, "results", None) or (
+            env.get("results", []) if isinstance(env, dict) else []
+        )
+        yield list(page)
+        cursor = (
+            getattr(env, "next_cursor", None)
+            if not isinstance(env, dict)
+            else env.get("next_cursor")
+        )
+        while cursor:
+            env = self.search_envelope(
+                collection_id,
+                vector,
+                top_k=top_k,
+                include_vectors=include_vectors,
+                include_metadata=include_metadata,
+                cursor=cursor,
+            )
+            page = getattr(env, "results", None) or (
+                env.get("results", []) if isinstance(env, dict) else []
+            )
+            yield list(page)
+            cursor = (
+                getattr(env, "next_cursor", None)
+                if not isinstance(env, dict)
+                else env.get("next_cursor")
+            )
+
+    def hybrid_search(
+        self,
+        collection: str,
+        text_query: str,
+        query_vector: list[float],
+        fusion_strategy: str = "rrf",
+        top_k: int = 10,
+        fusion_params: dict[str, Any] | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Execute hybrid search (BM25 + vector; see the adapter)."""
+        return self._adapter_call(
+            "hybrid_search",
+            collection,
+            text_query,
+            query_vector,
+            fusion_strategy=fusion_strategy,
+            top_k=top_k,
+            fusion_params=fusion_params,
+            **kwargs,
+        )
+
+    def execute_sql(
+        self,
+        query: str,
+        parameters: list[Any] | None = None,
+        collection: str | None = None,
+    ) -> dict[str, Any]:
+        """Execute SQL (the adapter's spec-driven op / engine SQL)."""
+        return self._adapter_call(
+            "execute_sql", query, parameters=parameters, collection=collection
+        )
+
+    def execute_unified_query(
+        self,
+        query: str,
+        query_vector: list[float] | None = None,
+        fusion_strategy: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Execute a federated multi-model (UQL) query — embedded native;
+        transports without the surface raise the typed capability error."""
+        return list(
+            self._adapter_call(
+                "execute_unified_query",
+                query,
+                query_vector=query_vector,
+                fusion_strategy=fusion_strategy,
+            )
+        )
+
+    # ==========================================================================
+    # Routing / Protocol-Selection / Auth surfaces (TD-SDK-3 batch 4)
+    #
+    # v2's architecture is a SINGLE adapter chosen at construction — the v1
+    # multiprotocol operation-router/protocol-selector machinery is
+    # deliberately absent. These surfaces keep v1's response shapes for
+    # drop-in compatibility; ``force_protocol_switch`` rebuilds the adapter
+    # for the target protocol (the meaningful v2 equivalent).
+    # ==========================================================================
+
+    def add_routing_rule(self, rule) -> None:
+        """No-op (v1's operation router is not part of v2)."""
+        logger.warning("Operation routing is not part of the v2 client; ignoring rule")
+
+    def get_routing_stats(self) -> dict[str, Any]:
+        """v1-shape response; routing is not part of v2."""
+        return {"error": "Operation routing not enabled"}
+
+    def reset_routing_metrics(self) -> None:
+        """No-op (v1's operation router is not part of v2)."""
+
+    def get_protocol_metrics(self) -> dict[str, Any]:
+        """Protocol metrics for the ACTIVE adapter (v2 is single-adapter)."""
+        return {
+            "protocol": self._adapter.protocol_name if self._adapter else None,
+            "selection": "static (v2 single-adapter)",
+        }
+
+    def get_selection_stats(self) -> dict[str, Any]:
+        """v1-shape response; protocol selection is not part of v2."""
+        return {"error": "Intelligent protocol selection not enabled"}
+
+    def force_protocol_switch(self, target_protocol):
+        """Rebuild the adapter for ``target_protocol`` — the v2 equivalent
+        of v1's forced switch (v2 holds one adapter at a time)."""
+        if self._adapter is not None:
+            try:
+                self._adapter.close()
+            except Exception:
+                pass
+        self._adapter = create_adapter(
+            target_protocol,
+            url=self._url or "http://localhost:5678",
+            api_key=self.config.api_key,
+        )
+        self._protocol = target_protocol
+
+    def get_auth_status(self) -> dict[str, Any]:
+        """Config-derived auth status (v2 has no auth manager)."""
+        return {
+            "authenticated": bool(self.config.api_key),
+            "method": "api_key" if self.config.api_key else None,
+        }
+
+    def refresh_authentication(self) -> bool:
+        """No-op (v2 has no token refresh; static api_key auth)."""
+        return False
+
+    def logout(self) -> bool:
+        """No-op (v2 has no auth session to clear)."""
+        return True
 
     # ==========================================================================
     # Lifecycle Methods
