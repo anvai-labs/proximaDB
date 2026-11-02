@@ -141,9 +141,7 @@ class TestRestWireEquivalence:
             mock_op.return_value = _ok(
                 HybridSearchResponse200.from_dict({"results": []})
             )
-            out = rest_client.hybrid_search(
-                "c1", "hello", [0.1, 0.2], top_k=5, fusion_params={"k": 60}
-            )
+            out = rest_client.hybrid_search("c1", "hello", [0.1, 0.2], top_k=5)
         assert out["results"] == []
         body = mock_op.call_args.kwargs["body"].to_dict()
         assert body["collection"] == "c1"
@@ -151,12 +149,24 @@ class TestRestWireEquivalence:
         assert body["vector"] == [0.1, 0.2]
         assert body["fusion_strategy"] == "rrf"
         assert body["top_k"] == 5
-        assert body["fusion_params"] == {"k": 60}  # rides extras
+
+    def test_hybrid_fusion_params_raise_honestly(self, rest_client):
+        """The server's hybrid body has NO fusion_params field (it reads
+        rrf_k/vector_weight; serde drops unknown keys) — shipping it would
+        be a silent no-op. The adapter raises instead (v2: typed error)."""
+        with pytest.raises(ProximaDBNotSupportedError):
+            rest_client.hybrid_search("c1", "hello", [0.1], fusion_params={"k": 60})
 
     def test_execute_sql_body_and_error(self, rest_client):
         from proximadb_sdk._generated.rest.models.error_body import ErrorBody
         from proximadb_sdk._generated.rest.models.error_response import ErrorResponse
         from proximadb_sdk._generated.rest.models.sql_response import SqlResponse
+
+        # parameters are rejected on REST: the server's SQL contract
+        # deliberately does not advertise parameter binding ("callers must
+        # not be offered a field that an adapter would silently ignore").
+        with pytest.raises(ProximaDBNotSupportedError):
+            rest_client.execute_sql("SELECT 1", parameters=[1])
 
         op = "proximadb_sdk._generated.rest.api.sql.execute_sql.sync_detailed"
         with patch(op) as mock_op:
@@ -192,21 +202,49 @@ class TestRestWireEquivalence:
                 rest_client.execute_sql("NOPE")
 
     def test_scan_and_envelope_delegate_to_protocol_client(self, rest_client):
+        protocol_client = rest_client._adapter._client
         with patch.object(
-            rest_client._adapter._client,
+            protocol_client,
             "scan_records",
             return_value=([], None),
         ) as scan_rec:
             out = rest_client.scan_page("c1", limit=5)
+        # The protocol surface's kwarg is the SINGULAR include_vector —
+        # pinned against the REAL protocol client (round 1's mock-only
+        # test shipped the plural and crashed every production call).
         scan_rec.assert_called_once_with(
             "c1",
             filter=None,
             limit=5,
             cursor=None,
-            include_vectors=False,
+            include_vector=False,
             include_text=False,
         )
         assert out == ([], None)
+
+    def test_search_envelope_reads_the_real_model(self, rest_client):
+        """The protocol client returns models.SearchEnvelope (.items/.cursor/
+        .has_more) — NOT a results/next_cursor dict. Pin the real shape."""
+        from proximadb_sdk.models import SearchEnvelope, SearchResult
+
+        env = SearchEnvelope(
+            items=[SearchResult(id="r1", score=0.9, metadata={})],
+            total=1,
+            cursor=None,
+            has_more=False,
+        )
+        with patch.object(
+            rest_client._adapter._client, "search_envelope", return_value=env
+        ) as se:
+            out = rest_client.search_envelope("c1", [0.1])
+        assert out is env
+        se.assert_called_once_with(
+            collection_id="c1",
+            vector=[0.1],
+            top_k=10,
+            include_vectors=False,
+            include_metadata=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -237,19 +275,70 @@ class TestCompositions:
         out = client.scan("c1", max_rows=1)
         assert out == [{"id": 1}]
 
-    def test_search_iter_pages_and_falls_back(self, client, mock_adapter):
-        envs = [
-            {"results": [{"id": 1}], "next_cursor": "k2"},
-            {"results": [{"id": 2}], "next_cursor": None},
-        ]
-        mock_adapter.search_envelope.side_effect = envs
-        pages = list(client.search_iter("c1", [0.1]))
-        assert pages == [[{"id": 1}], [{"id": 2}]]
+    def test_search_iter_yields_items_over_real_envelopes(self, client):
+        """v1's yield semantics: ITEMS, not pages — over the REAL
+        models.SearchEnvelope shape (.items/.cursor/.has_more)."""
+        from proximadb_sdk.models import SearchEnvelope, SearchResult
 
+        def item(i):
+            return SearchResult(id=f"r{i}", score=0.9, metadata={})
+
+        envs = [
+            SearchEnvelope(
+                items=[item(1), item(2)], total=2, cursor="k2", has_more=True
+            ),
+            SearchEnvelope(items=[item(3)], total=3, cursor=None, has_more=False),
+        ]
+        client._adapter.search_envelope = MagicMock(side_effect=envs)
+        got = list(client.search_iter("c1", [0.1]))
+        assert [r.id for r in got] == ["r1", "r2", "r3"]
+
+    def test_search_iter_stops_on_empty_page(self, client):
+        from proximadb_sdk.models import SearchEnvelope
+
+        envs = [
+            SearchEnvelope(items=[], total=0, cursor="k2", has_more=True),
+            SearchEnvelope(items=[], total=0, cursor="k3", has_more=True),
+        ]
+        client._adapter.search_envelope = MagicMock(side_effect=envs)
+        assert list(client.search_iter("c1", [0.1])) == []
+        assert client._adapter.search_envelope.call_count == 2  # empty page stops
+
+    def test_search_iter_falls_back_to_single_search(self, client, mock_adapter):
         mock_adapter.search_envelope.side_effect = ProximaDBNotSupportedError("x")
-        mock_adapter.search.return_value = MagicMock(results=[{"id": 9}])
-        pages = list(client.search_iter("c1", [0.1]))
-        assert pages == [[{"id": 9}]]
+        result = MagicMock(results=[MagicMock(id="r9")])
+        mock_adapter.search.return_value = result
+        got = list(client.search_iter("c1", [0.1]))
+        assert [r.id for r in got] == ["r9"]
+        # fallback forwards the include flags
+        _, kwargs = mock_adapter.search.call_args
+        assert kwargs["include_vectors"] is False
+
+    def test_force_switch_failure_keeps_old_adapter(self, mock_adapter):
+        with patch.object(uc, "create_adapter", return_value=mock_adapter):
+            c = ProximaDBClient(url="http://testserver:5678", protocol=Protocol.REST)
+        with patch.object(
+            uc, "create_adapter", side_effect=ValueError("unknown protocol")
+        ):
+            with pytest.raises(ValueError):
+                c.force_protocol_switch("bogus")
+        # build-then-swap: the OLD adapter is untouched and still usable
+        assert c._adapter is mock_adapter
+        mock_adapter.close.assert_not_called()
+
+    def test_force_switch_passes_resolved_config(self, mock_adapter):
+        with patch.object(uc, "create_adapter", return_value=mock_adapter):
+            c = ProximaDBClient(url="http://testserver:5678", protocol=Protocol.REST)
+        new_adapter = MagicMock()
+        new_adapter.protocol_name = "grpc"
+        with patch.object(uc, "create_adapter", return_value=new_adapter) as mk:
+            c.force_protocol_switch(Protocol.GRPC)
+        kwargs = mk.call_args.kwargs
+        # the resolved config rides through (endpoint/auth/timeout) instead
+        # of ad-hoc url/api_key kwargs the gRPC adapter would ignore
+        assert kwargs["config"] is c.config
+        assert c._adapter is new_adapter
+        mock_adapter.close.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +365,7 @@ class TestCompatSurfaces:
         assert client.logout() is True
 
     def test_force_protocol_switch_rebuilds_adapter(self, mock_adapter):
-        with patch.object(uc, "create_adapter", return_value=mock_adapter) as mk:
+        with patch.object(uc, "create_adapter", return_value=mock_adapter):
             c = ProximaDBClient(url="http://testserver:5678", protocol=Protocol.REST)
         new_adapter = MagicMock()
         new_adapter.protocol_name = "grpc"

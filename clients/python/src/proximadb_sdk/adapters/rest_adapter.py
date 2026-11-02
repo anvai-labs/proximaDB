@@ -977,12 +977,20 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         Replaces hand-rolled ``_client._session`` calls that could never
         execute (the protocol client has no ``_session`` attribute) — the
         same dead-code disease as the document/timeseries families.
-        ``fusion_params`` rides the body model's additional_properties.
+        ``fusion_params`` is NOT a server field (the REST surface reads
+        ``rrf_k``/``vector_weight`` and serde drops unknown keys) — raising
+        the honest capability signal instead of silently shipping a no-op.
         """
         from .._generated.rest.api.hybrid.hybrid_search import sync_detailed
         from .._generated.rest.models.hybrid_search_body import HybridSearchBody
         from .._generated_op_exec import execute_generated_op
 
+        if fusion_params is not None:
+            raise NotImplementedError(
+                "hybrid_search(fusion_params) is not supported by the REST "
+                "op (the server's body has no fusion_params field; tune "
+                "rrf_k/vector_weight at the server or use the embedded path)"
+            )
         payload: dict[str, Any] = {
             "collection": collection,
             "text_query": text_query,
@@ -990,8 +998,6 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
             "fusion_strategy": fusion_strategy,
             "top_k": top_k,
         }
-        if fusion_params is not None:
-            payload["fusion_params"] = fusion_params
         return execute_generated_op(
             "hybrid_search",
             lambda: sync_detailed(
@@ -1010,13 +1016,14 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         include_vectors: bool = False,
         include_text: bool = False,
     ):
-        """Scan one page via the protocol client's REST-only scan endpoint."""
+        """Scan one page via the protocol client's REST-only scan endpoint
+        (note the protocol surface's SINGULAR ``include_vector``)."""
         return self._client.scan_records(
             collection_id,
             filter=filter,
             limit=limit,
             cursor=cursor,
-            include_vectors=include_vectors,
+            include_vector=include_vectors,
             include_text=include_text,
         )
 
@@ -1046,14 +1053,24 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         collection: str | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Execute SQL (spec-driven op; replaces v1's dead ``_session`` path)."""
+        """Execute SQL (spec-driven op; replaces v1's dead ``_session`` path).
+
+        ``parameters`` is rejected on REST: the server's SQL contract
+        deliberately does not advertise parameter binding yet ("callers
+        must not be offered a field that an adapter would silently
+        ignore"); the embedded adapter honors it.
+        """
         from .._generated.rest.api.sql.execute_sql import sync_detailed
         from .._generated.rest.models.sql_request import SqlRequest
         from .._generated_op_exec import execute_generated_op
 
-        payload: dict[str, Any] = {"query": query}
         if parameters is not None:
-            payload["parameters"] = parameters
+            raise NotImplementedError(
+                "execute_sql(parameters) is not supported by the REST op "
+                "(the server's SQL contract does not advertise parameter "
+                "binding); the embedded adapter honors parameters"
+            )
+        payload: dict[str, Any] = {"query": query}
         if collection is not None:
             payload["collection"] = collection
         return execute_generated_op(

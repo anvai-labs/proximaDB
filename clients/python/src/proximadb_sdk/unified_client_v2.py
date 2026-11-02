@@ -1343,11 +1343,13 @@ class ProximaDBClient:
             page, cursor = self.scan_page(
                 collection_id,
                 filter=filter,
-                limit=per_page,
+                limit=min(per_page, cap - len(out)),
                 cursor=cursor,
                 include_vectors=include_vectors,
                 include_text=include_text,
             )
+            if not page:
+                break  # empty page + cursor => stop (v1's defense)
             out.extend(page)
             if cursor is None or len(out) >= cap:
                 break
@@ -1387,50 +1389,70 @@ class ProximaDBClient:
         include_vectors: bool = False,
         page_limit: int | None = None,
     ):
-        """Iterate search result pages: the envelope's cursor on REST;
+        """Iterate search result ITEMS (v1's yield semantics): the envelope's
+        SKS cursor pages on REST (``page_limit`` bounds each fetch);
         transports without the envelope surface fall back to a single
-        :meth:`search` page (v1's shape)."""
+        :meth:`search` page."""
         if hasattr(vector, "tolist"):
             vector = vector.tolist()
+
+        def _page(env):
+            items = getattr(env, "items", None)
+            if items is None and isinstance(env, dict):
+                items = env.get("items", [])
+            return list(items or [])
+
+        def _cursor(env):
+            return (
+                getattr(env, "cursor", None)
+                if not isinstance(env, dict)
+                else env.get("cursor")
+            )
+
+        def _has_more(env):
+            return (
+                getattr(env, "has_more", False)
+                if not isinstance(env, dict)
+                else bool(env.get("has_more", False))
+            )
+
         try:
             env = self.search_envelope(
                 collection_id,
                 vector,
-                top_k=top_k,
+                top_k=page_limit or top_k,
                 include_vectors=include_vectors,
                 include_metadata=include_metadata,
             )
         except ProximaDBNotSupportedError:
-            results = self.search(collection_id, vector, top_k=top_k, **{})
-            yield list(getattr(results, "results", results) or [])
-            return
-        page = getattr(env, "results", None) or (
-            env.get("results", []) if isinstance(env, dict) else []
-        )
-        yield list(page)
-        cursor = (
-            getattr(env, "next_cursor", None)
-            if not isinstance(env, dict)
-            else env.get("next_cursor")
-        )
-        while cursor:
-            env = self.search_envelope(
+            results = self.search(
                 collection_id,
                 vector,
                 top_k=top_k,
                 include_vectors=include_vectors,
                 include_metadata=include_metadata,
+            )
+            items = getattr(results, "results", None)
+            if items is None and isinstance(results, dict):
+                items = results.get("results", [])
+            yield from list(items or [])
+            return
+        yield from _page(env)
+        cursor = _cursor(env)
+        while cursor and _has_more(env):
+            env = self.search_envelope(
+                collection_id,
+                vector,
+                top_k=page_limit or top_k,
+                include_vectors=include_vectors,
+                include_metadata=include_metadata,
                 cursor=cursor,
             )
-            page = getattr(env, "results", None) or (
-                env.get("results", []) if isinstance(env, dict) else []
-            )
-            yield list(page)
-            cursor = (
-                getattr(env, "next_cursor", None)
-                if not isinstance(env, dict)
-                else env.get("next_cursor")
-            )
+            page = _page(env)
+            if not page:
+                break
+            yield from page
+            cursor = _cursor(env)
 
     def hybrid_search(
         self,
@@ -1442,7 +1464,10 @@ class ProximaDBClient:
         fusion_params: dict[str, Any] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Execute hybrid search (BM25 + vector; see the adapter)."""
+        """Execute hybrid search (BM25 + vector). REST runs the spec-driven
+        op; transports without it raise the typed capability error — v2
+        deliberately has no local-fusion fallback (v1's silent local path
+        is gone; see the PR's disclosure)."""
         return self._adapter_call(
             "hybrid_search",
             collection,
@@ -1460,7 +1485,10 @@ class ProximaDBClient:
         parameters: list[Any] | None = None,
         collection: str | None = None,
     ) -> dict[str, Any]:
-        """Execute SQL (the adapter's spec-driven op / engine SQL)."""
+        """Execute SQL. REST runs the spec-driven sql op (no parameter
+        binding — the server contract does not advertise it; embedded
+        honors parameters); gRPC raises the typed capability error
+        (v1's silent local-SQL fallback is gone)."""
         return self._adapter_call(
             "execute_sql", query, parameters=parameters, collection=collection
         )
@@ -1516,21 +1544,23 @@ class ProximaDBClient:
 
     def force_protocol_switch(self, target_protocol):
         """Rebuild the adapter for ``target_protocol`` — the v2 equivalent
-        of v1's forced switch (v2 holds one adapter at a time)."""
-        if self._adapter is not None:
+        of v1's forced switch (v2 holds one adapter at a time). Builds the
+        replacement BEFORE closing the old adapter, so a failed build
+        leaves the client untouched."""
+        candidate = create_adapter(target_protocol, config=self.config, **self._kwargs)
+        old_adapter = self._adapter
+        self._adapter = candidate
+        self._protocol = target_protocol
+        if old_adapter is not None:
             try:
-                self._adapter.close()
+                old_adapter.close()
             except Exception:
                 pass
-        self._adapter = create_adapter(
-            target_protocol,
-            url=self._url or "http://localhost:5678",
-            api_key=self.config.api_key,
-        )
-        self._protocol = target_protocol
 
     def get_auth_status(self) -> dict[str, Any]:
-        """Config-derived auth status (v2 has no auth manager)."""
+        """Config-derived auth status (v2 has no auth manager; unlike v1's
+        token-manager shape there are no expires_at/roles/permissions keys,
+        and an api_key reports authenticated=True)."""
         return {
             "authenticated": bool(self.config.api_key),
             "method": "api_key" if self.config.api_key else None,
