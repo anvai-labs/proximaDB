@@ -840,21 +840,13 @@ fn cell_value(array: &dyn arrow::array::Array, row: usize) -> Result<ProximaValu
 
 /// Numeric coercion to f64 for SUM/AVG.
 fn numeric_to_f64(v: &ProximaValue) -> Result<f64, ExecutionError> {
-    match v {
-        ProximaValue::Int8(x) => Ok(*x as f64),
-        ProximaValue::Int16(x) => Ok(*x as f64),
-        ProximaValue::Int32(x) => Ok(*x as f64),
-        ProximaValue::Int64(x) => Ok(*x as f64),
-        ProximaValue::UInt8(x) => Ok(*x as f64),
-        ProximaValue::UInt16(x) => Ok(*x as f64),
-        ProximaValue::UInt32(x) => Ok(*x as f64),
-        ProximaValue::UInt64(x) => Ok(*x as f64),
-        ProximaValue::Float32(x) => Ok(*x as f64),
-        ProximaValue::Float64(x) => Ok(*x),
-        other => Err(ExecutionError::Execution(format!(
-            "non-numeric value in SUM/AVG: {other:?}"
-        ))),
-    }
+    // Preserve the native path's narrower acceptance policy: it has never
+    // accepted Float16, unlike the relational row executor.
+    let numeric = match v {
+        ProximaValue::Float16(_) => None,
+        _ => v.as_numeric_f64(),
+    };
+    numeric.ok_or_else(|| ExecutionError::Execution(format!("non-numeric value in SUM/AVG: {v:?}")))
 }
 
 /// Total ordering over `ProximaValue` for MIN/MAX + deterministic group output.
@@ -1873,6 +1865,21 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use futures::StreamExt;
+
+    #[test]
+    fn aggregate_numeric_conversion_preserves_rejected_types() {
+        for value in [
+            ProximaValue::Float16(1.5),
+            ProximaValue::Decimal("1.5".into()),
+            ProximaValue::String("1.5".into()),
+            ProximaValue::Null,
+        ] {
+            let result = numeric_to_f64(&value);
+            assert!(matches!(result, Err(ExecutionError::Execution(ref msg))
+                if msg == &format!("non-numeric value in SUM/AVG: {value:?}")));
+        }
+        assert_eq!(numeric_to_f64(&ProximaValue::UInt16(42)).unwrap(), 42.0);
+    }
 
     fn int64_schema(name: &str) -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, true)]))
