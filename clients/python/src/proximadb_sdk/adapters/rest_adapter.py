@@ -748,7 +748,7 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         self, name: str, config: dict[str, Any] | None = None, **kwargs
     ) -> dict[str, Any]:
         """Create a document collection (spec-driven op)."""
-        from .._document_ingest import execute_document_op
+        from .._generated_op_exec import execute_generated_op
         from .._generated.rest.api.documents.create_document_collection import (
             sync_detailed,
         )
@@ -764,7 +764,7 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
                 **{k: v for k, v in (config or {}).items() if k != "name"},
             }
         )
-        return execute_document_op(
+        return execute_generated_op(
             "create_document_collection",
             lambda: sync_detailed(
                 client=self._get_generated_document_client(), body=body
@@ -822,14 +822,14 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         transport → ``NetworkError``, documented errors and undocumented
         statuses → ``ServerError`` (the op documents 200/400/500).
         """
-        from .._document_ingest import execute_document_op
+        from .._generated_op_exec import execute_generated_op
         from .._generated.rest.api.documents.insert_document import sync_detailed
         from .._generated.rest.models.doc_insert_request import DocInsertRequest
 
         # Wave-9 typed the previously free-form request body
         # (InsertDocumentBody) into DocInsertRequest {id?, document}.
         body = DocInsertRequest.from_dict({"id": id, "document": document})
-        return execute_document_op(
+        return execute_generated_op(
             "insert_document",
             lambda: sync_detailed(
                 collection=collection_name,
@@ -846,12 +846,12 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         **kwargs,
     ) -> dict[str, Any] | None:
         """Get a document by ID (spec-driven op; 404 → ``None``)."""
-        from .._document_ingest import execute_document_op
+        from .._generated_op_exec import execute_generated_op
         from .._generated.rest.api.documents.get_document import sync_detailed
         from .._generated.rest.types import UNSET
 
         projection_csv = ",".join(projection) if projection else UNSET
-        return execute_document_op(
+        return execute_generated_op(
             "get_document",
             lambda: sync_detailed(
                 collection=collection_name,
@@ -873,11 +873,11 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         """Query documents with filter (spec-driven op; filter → JSON param)."""
         import json as _json
 
-        from .._document_ingest import execute_document_op
+        from .._generated_op_exec import execute_generated_op
         from .._generated.rest.api.documents.query_documents import sync_detailed
         from .._generated.rest.types import UNSET
 
-        return execute_document_op(
+        return execute_generated_op(
             "query_documents",
             lambda: sync_detailed(
                 collection=collection_name,
@@ -892,12 +892,12 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         self, collection_name: str, doc_id: str, updates: list[dict[str, Any]], **kwargs
     ) -> dict[str, Any]:
         """Update a document (spec-driven op)."""
-        from .._document_ingest import execute_document_op
+        from .._generated_op_exec import execute_generated_op
         from .._generated.rest.api.documents.update_document import sync_detailed
         from .._generated.rest.models.doc_update_request import DocUpdateRequest
 
         body = DocUpdateRequest.from_dict({"updates": updates})
-        return execute_document_op(
+        return execute_generated_op(
             "update_document",
             lambda: sync_detailed(
                 collection=collection_name,
@@ -909,10 +909,10 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
 
     def delete_document(self, collection_name: str, doc_id: str, **kwargs) -> bool:
         """Delete a document (spec-driven op; 404 → ``False``)."""
-        from .._document_ingest import execute_document_op
+        from .._generated_op_exec import execute_generated_op
         from .._generated.rest.api.documents.delete_document import sync_detailed
 
-        result = execute_document_op(
+        result = execute_generated_op(
             "delete_document",
             lambda: sync_detailed(
                 collection=collection_name,
@@ -927,12 +927,12 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
 
     def list_document_collections(self, **kwargs) -> list[dict[str, Any]]:
         """List all document collections (spec-driven op)."""
-        from .._document_ingest import execute_document_op
+        from .._generated_op_exec import execute_generated_op
         from .._generated.rest.api.documents.list_document_collections import (
             sync_detailed,
         )
 
-        result = execute_document_op(
+        result = execute_generated_op(
             "list_document_collections",
             lambda: sync_detailed(client=self._get_generated_document_client()),
         )
@@ -941,12 +941,12 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
 
     def delete_document_collection(self, collection_name: str, **kwargs) -> bool:
         """Delete a document collection (spec-driven op; 404 → ``False``)."""
-        from .._document_ingest import execute_document_op
+        from .._generated_op_exec import execute_generated_op
         from .._generated.rest.api.documents.delete_document_collection import (
             sync_detailed,
         )
 
-        result = execute_document_op(
+        result = execute_generated_op(
             "delete_document_collection",
             lambda: sync_detailed(
                 collection=collection_name,
@@ -992,104 +992,287 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
             raise
 
     # ==========================================================================
-    # Time-Series Operations
+    # Time-Series Operations — the SPEC-DRIVEN generated ops (TD-SDK-3
+    # batch 3). These replace hand-rolled ``_client._session`` calls that
+    # could never execute (the protocol client has no ``_session``
+    # attribute — the same dead-code disease the document family carried
+    # until batch 2); one config-sourced client and one outcome vocabulary
+    # (``_generated_op_exec``).
     # ==========================================================================
 
     def create_timeseries_collection(
         self, name: str, config: dict[str, Any] | None = None, **kwargs
     ) -> dict[str, Any]:
-        """Create a time-series collection via REST."""
-        try:
+        """Create a time-series collection (spec-driven op)."""
+        from .._generated.rest.api.timeseries.create_timeseries_collection import (
+            sync_detailed,
+        )
+        from .._generated.rest.models.ts_collection_config import TsCollectionConfig
+        from .._generated_op_exec import execute_generated_op
 
-            response = self._client._session.post(
-                f"{self._url}/api/v2/timeseries/collections",
-                json={"name": name, **(config or {})},
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"Failed to create time-series collection: {e}")
-            raise
+        # The positional ``name`` is authoritative; config keys (known or
+        # additional) ride the model's additional_properties.
+        body = TsCollectionConfig.from_dict(
+            {
+                "name": name,
+                **{k: v for k, v in (config or {}).items() if k != "name"},
+            }
+        )
+        return execute_generated_op(
+            "create_timeseries_collection",
+            lambda: sync_detailed(
+                client=self._get_generated_document_client(),
+                body=TsCollectionConfig.from_dict(
+                    {
+                        "name": name,
+                        **{k: v for k, v in (config or {}).items() if k != "name"},
+                    }
+                ),
+            ),
+        )
 
     def ingest_timeseries(
         self, collection_name: str, points: list[dict[str, Any]], **kwargs
     ) -> dict[str, Any]:
-        """Ingest time-series data points via REST."""
-        try:
+        """Ingest time-series data points (spec-driven op)."""
+        from .._generated.rest.api.timeseries.ingest_timeseries import sync_detailed
+        from .._generated.rest.models.ts_ingest_request import TsIngestRequest
+        from .._generated_op_exec import execute_generated_op
 
-            response = self._client._session.post(
-                f"{self._url}/api/v2/timeseries/collections/{collection_name}/ingest",
-                json={"points": points},
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"Failed to ingest time-series data: {e}")
-            raise
+        return execute_generated_op(
+            "ingest_timeseries",
+            lambda: sync_detailed(
+                collection_id=collection_name,
+                client=self._get_generated_document_client(),
+                body=TsIngestRequest.from_dict({"points": points}),
+            ),
+        )
 
     def query_timeseries(
         self,
         collection_name: str,
         start_time: str,
         end_time: str,
-        aggregation: str = "avg",
+        aggregation: str | None = None,
         bucket_ms: int | None = None,
         tag_filters: dict[str, str] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Query time-series data with optional aggregation via REST."""
-        try:
+        """Query time-series data (spec-driven op).
 
-            body = {
-                "start_time": start_time,
-                "end_time": end_time,
-                "aggregation": aggregation,
-            }
-            if bucket_ms:
-                body["bucket_ms"] = bucket_ms
-            if tag_filters:
-                body["tag_filters"] = tag_filters
-            response = self._client._session.post(
-                f"{self._url}/api/v2/timeseries/collections/{collection_name}/query",
-                json=body,
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"Failed to query time-series data: {e}")
-            raise
+        The spec's query window (``start_time``/``end_time``) is integer
+        epoch time; the v1-era ``str`` signature is preserved for
+        compatibility — pass what the server expects. ``aggregation`` /
+        ``bucket_ms`` / ``tag_filters`` are not declared fields of the
+        spec's query body and ride the model's ``additional_properties``
+        (the tuned aggregation surface is the separate
+        ``aggregate_timeseries`` op, outside the ported family).
+        """
+        from .._generated.rest.api.timeseries.query_timeseries import sync_detailed
+        from .._generated.rest.models.ts_query_request import TsQueryRequest
+        from .._generated_op_exec import execute_generated_op
+
+        payload: dict[str, Any] = {
+            "start_time": start_time,
+            "end_time": end_time,
+        }
+        if aggregation is not None:
+            payload["aggregation"] = aggregation
+        if bucket_ms is not None:
+            payload["bucket_ms"] = bucket_ms
+        if tag_filters is not None:
+            payload["tag_filters"] = tag_filters
+        if "limit" in kwargs:
+            payload["limit"] = kwargs["limit"]
+        return execute_generated_op(
+            "query_timeseries",
+            lambda: sync_detailed(
+                collection_id=collection_name,
+                client=self._get_generated_document_client(),
+                body=TsQueryRequest.from_dict(payload),
+            ),
+        )
 
     def list_timeseries_collections(self, **kwargs) -> list[dict[str, Any]]:
-        """List all time-series collections via REST."""
-        try:
+        """List all time-series collections (spec-driven op)."""
+        from .._generated.rest.api.timeseries.list_timeseries_collections import (
+            sync_detailed,
+        )
+        from .._generated_op_exec import execute_generated_op
 
-            response = self._client._session.get(
-                f"{self._url}/api/v2/timeseries/collections",
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            return response.json().get("collections", [])
-        except Exception as e:
-            logger.error(f"Failed to list time-series collections: {e}")
-            return []
+        result = execute_generated_op(
+            "list_timeseries_collections",
+            lambda: sync_detailed(client=self._get_generated_document_client()),
+        )
+        collections = result.get("collections", [])
+        return collections if isinstance(collections, list) else []
 
     def delete_timeseries_collection(self, collection_name: str, **kwargs) -> bool:
-        """Delete a time-series collection via REST."""
-        try:
+        """Delete a time-series collection (spec-driven op; 404 → ``False``)."""
+        from .._generated.rest.api.timeseries.delete_timeseries_collection import (
+            sync_detailed,
+        )
+        from .._generated_op_exec import execute_generated_op
 
-            response = self._client._session.delete(
-                f"{self._url}/api/v2/timeseries/collections/{collection_name}",
-                timeout=self._client._timeout,
-            )
-            response.raise_for_status()
-            result = response.json()
-            return result.get("success", False)
-        except Exception as e:
-            logger.error(f"Failed to delete time-series collection: {e}")
-            return False
+        result = execute_generated_op(
+            "delete_timeseries_collection",
+            lambda: sync_detailed(
+                collection_id=collection_name,
+                client=self._get_generated_document_client(),
+            ),
+            not_found={"success": False},
+        )
+        return bool(result.get("success", False))
+
+    # ==========================================================================
+    # Observability Operations (TD-SDK-3 batch 3) — namespace/logs/metrics
+    # over the SPEC-DRIVEN generated ops; the TRACES family has no spec
+    # endpoints and deliberately stays on the base NotImplementedError
+    # defaults (embedded-only, exactly as v1 discloses).
+    # ==========================================================================
+
+    def create_observability_namespace(
+        self,
+        name: str,
+        retention_days: int | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Create an observability namespace (spec-driven op).
+
+        ``retention_days`` maps to the spec's ``hot_retention_days`` (the
+        closest single-knob semantic; warm/cold keep their spec defaults).
+        """
+        from .._generated.rest.api.observability.create_observability_namespace import (
+            sync_detailed,
+        )
+        from .._generated.rest.models.create_observability_namespace_request import (
+            CreateObservabilityNamespaceRequest,
+        )
+        from .._generated_op_exec import execute_generated_op
+
+        payload: dict[str, Any] = {"name": name}
+        if retention_days is not None:
+            payload["hot_retention_days"] = retention_days
+        return execute_generated_op(
+            "create_observability_namespace",
+            lambda: sync_detailed(
+                client=self._get_generated_document_client(),
+                body=CreateObservabilityNamespaceRequest.from_dict(payload),
+            ),
+        )
+
+    def ingest_logs(self, namespace: str, logs: list[dict[str, Any]], **kwargs) -> int:
+        """Ingest structured log events (spec-driven op; returns the count)."""
+        from .._generated.rest.api.observability.ingest_logs import sync_detailed
+        from .._generated.rest.models.bulk_log_ingest_request import (
+            BulkLogIngestRequest,
+        )
+        from .._generated_op_exec import execute_generated_op
+
+        result = execute_generated_op(
+            "ingest_logs",
+            lambda: sync_detailed(
+                namespace=namespace,
+                client=self._get_generated_document_client(),
+                body=BulkLogIngestRequest.from_dict({"logs": logs}),
+            ),
+        )
+        return int(result.get("ingested", 0))
+
+    def query_logs(
+        self,
+        namespace: str,
+        start_time_ns: int,
+        end_time_ns: int,
+        query: str | None = None,
+        limit: int = 100,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        """Query log events (spec-driven op; the body model is open, all
+        filter fields ride its additional_properties)."""
+        from .._generated.rest.api.observability.query_logs import sync_detailed
+        from .._generated.rest.models.query_logs_body import QueryLogsBody
+        from .._generated_op_exec import execute_generated_op
+
+        payload: dict[str, Any] = {
+            "start_time_ns": start_time_ns,
+            "end_time_ns": end_time_ns,
+            "limit": limit,
+        }
+        if query is not None:
+            payload["query"] = query
+        result = execute_generated_op(
+            "query_logs",
+            lambda: sync_detailed(
+                namespace=namespace,
+                client=self._get_generated_document_client(),
+                body=QueryLogsBody.from_dict(payload),
+            ),
+        )
+        logs = result.get("logs", [])
+        return logs if isinstance(logs, list) else []
+
+    def ingest_metrics(
+        self, namespace: str, samples: list[dict[str, Any]], **kwargs
+    ) -> int:
+        """Ingest metric samples (spec-driven op; returns the count)."""
+        from .._generated.rest.api.observability.ingest_metrics import sync_detailed
+        from .._generated.rest.models.bulk_metric_ingest_request import (
+            BulkMetricIngestRequest,
+        )
+        from .._generated_op_exec import execute_generated_op
+
+        result = execute_generated_op(
+            "ingest_metrics",
+            lambda: sync_detailed(
+                namespace=namespace,
+                client=self._get_generated_document_client(),
+                body=BulkMetricIngestRequest.from_dict({"metrics": samples}),
+            ),
+        )
+        return int(result.get("ingested", 0))
+
+    def aggregate_metrics(
+        self,
+        namespace: str,
+        metric_name: str,
+        aggregation: str = "avg",
+        start_time: str | None = None,
+        end_time: str | None = None,
+        step_seconds: int = 60,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        """Aggregate metrics (spec-driven op).
+
+        The spec's window is ``start_time_ns``/``end_time_ns`` (integer);
+        the v1-era ``str`` signature is preserved for compatibility — pass
+        epoch-ns integers for a real server.
+        """
+        from .._generated.rest.api.observability.aggregate_metrics import sync_detailed
+        from .._generated.rest.models.metric_aggregation_input import (
+            MetricAggregationInput,
+        )
+        from .._generated_op_exec import execute_generated_op
+
+        payload: dict[str, Any] = {
+            "metric_name": metric_name,
+            "aggregation": aggregation,
+            "step_seconds": step_seconds,
+        }
+        if start_time is not None:
+            payload["start_time_ns"] = start_time
+        if end_time is not None:
+            payload["end_time_ns"] = end_time
+        result = execute_generated_op(
+            "aggregate_metrics",
+            lambda: sync_detailed(
+                namespace=namespace,
+                client=self._get_generated_document_client(),
+                body=MetricAggregationInput.from_dict(payload),
+            ),
+        )
+        series = result.get("series", [])
+        return series if isinstance(series, list) else []
 
     # ==========================================================================
     # Graph Operations (TD-SDK-3 batch 1)

@@ -353,6 +353,104 @@ class BaseProtocolAdapter(ABC):
         )
 
     # ==========================================================================
+    # Observability Operations (TD-SDK-3 batch 3 — logs, metrics, traces)
+    #
+    # Optional namespace, same pattern as documents/timeseries: adapters
+    # implement what their transport supports (embedded implements the whole
+    # family; REST covers namespace/logs/metrics where the spec defines
+    # endpoints) and the rest fall through to these NotImplementedError
+    # defaults — the honest capability signal, surfacing as the typed
+    # ProximaDBNotSupportedError on the v2 facade. Canonical signatures
+    # mirror the v1 unified client's public observability surface.
+    # ==========================================================================
+
+    def create_observability_namespace(
+        self,
+        name: str,
+        retention_days: int | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Create a namespace for logs, metrics, and traces."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support observability namespaces"
+        )
+
+    def ingest_logs(self, namespace: str, logs: list[dict[str, Any]], **kwargs) -> int:
+        """Ingest structured log events into an observability namespace."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support log ingest"
+        )
+
+    def query_logs(
+        self,
+        namespace: str,
+        start_time_ns: int,
+        end_time_ns: int,
+        query: str | None = None,
+        limit: int = 100,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        """Query log events from an observability namespace."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support log queries"
+        )
+
+    def ingest_metrics(
+        self, namespace: str, samples: list[dict[str, Any]], **kwargs
+    ) -> int:
+        """Ingest metric samples into an observability namespace."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support metric ingest"
+        )
+
+    def aggregate_metrics(
+        self,
+        namespace: str,
+        metric_name: str,
+        aggregation: str = "avg",
+        start_time: str | None = None,
+        end_time: str | None = None,
+        step_seconds: int = 60,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        """Aggregate metrics from an observability namespace."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support metric aggregation"
+        )
+
+    def ingest_traces(
+        self, namespace: str, traces: list[dict[str, Any]], **kwargs
+    ) -> int:
+        """Ingest trace spans into an observability namespace."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support trace ingest"
+        )
+
+    def query_traces(
+        self,
+        namespace: str,
+        start_time_ns: int,
+        end_time_ns: int,
+        trace_id: str | None = None,
+        service: str | None = None,
+        operation: str | None = None,
+        min_duration_ns: int | None = None,
+        status: str | None = None,
+        limit: int = 100,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        """Query trace spans in an observability namespace."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support trace queries"
+        )
+
+    def get_trace(self, namespace: str, trace_id: str, **kwargs) -> dict[str, Any]:
+        """Get all spans for a specific trace ID."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support trace reads"
+        )
+
+    # ==========================================================================
     # Graph Operations (TD-SDK-3 batch 1 — the graph-CRUD family)
     #
     # Optional namespace, same pattern as documents/timeseries above: adapters

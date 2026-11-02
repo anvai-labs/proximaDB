@@ -1112,6 +1112,187 @@ class ProximaDBClient:
         )
 
     # ==========================================================================
+    # Time-Series Operations (TD-SDK-3 batch 3 — ported from the v1 client
+    # onto the adapter protocol; the REST methods run the spec-driven
+    # generated ops, replacing hand-rolled code that never executed)
+    # ==========================================================================
+
+    def create_timeseries_collection(
+        self, name: str, config: dict[str, Any] | None = None, **kwargs
+    ) -> dict[str, Any]:
+        """Create a time-series collection."""
+        return self._adapter_call(
+            "create_timeseries_collection", name, config, **kwargs
+        )
+
+    def ingest_timeseries(
+        self,
+        collection_name: str,
+        points: list[dict[str, Any]],
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Ingest time-series points."""
+        return self._adapter_call(
+            "ingest_timeseries", collection_name, points, **kwargs
+        )
+
+    def query_timeseries(
+        self,
+        collection_name: str,
+        start_time: str,
+        end_time: str,
+        aggregation: str | None = None,
+        bucket_ms: int | None = None,
+        tag_filters: dict[str, str] | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Query time-series data (see the adapter for the wire contract:
+        the spec's window is integer epoch time; ``aggregation``/
+        ``bucket_ms``/``tag_filters`` ride the body model's
+        additional_properties)."""
+        return self._adapter_call(
+            "query_timeseries",
+            collection_name,
+            start_time,
+            end_time,
+            aggregation=aggregation,
+            bucket_ms=bucket_ms,
+            tag_filters=tag_filters,
+            **kwargs,
+        )
+
+    def list_timeseries_collections(self, **kwargs) -> list[dict[str, Any]]:
+        """List time-series collections."""
+        return self._adapter_call("list_timeseries_collections", **kwargs)
+
+    def delete_timeseries_collection(self, collection_name: str, **kwargs) -> bool:
+        """Delete a time-series collection."""
+        return bool(
+            self._adapter_call(
+                "delete_timeseries_collection", collection_name, **kwargs
+            )
+        )
+
+    # ==========================================================================
+    # Observability Operations (TD-SDK-3 batch 3 — logs, metrics, traces).
+    # Embedded implements the whole family; REST covers namespace/logs/
+    # metrics over the spec-driven ops; the TRACES family has no REST spec
+    # endpoints and stays on the honest NotImplementedError defaults
+    # (surfacing as the typed ProximaDBNotSupportedError) — exactly the
+    # capability split v1 documents ("embedded mode only" for traces).
+    # ==========================================================================
+
+    def create_observability_namespace(
+        self,
+        name: str,
+        retention_days: int | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Create a namespace for logs, metrics, and traces."""
+        return self._adapter_call(
+            "create_observability_namespace",
+            name,
+            retention_days=retention_days,
+            **kwargs,
+        )
+
+    def ingest_logs(self, namespace: str, logs: list[dict[str, Any]], **kwargs) -> int:
+        """Ingest structured log events into an observability namespace."""
+        return int(self._adapter_call("ingest_logs", namespace, logs, **kwargs))
+
+    def query_logs(
+        self,
+        namespace: str,
+        start_time_ns: int,
+        end_time_ns: int,
+        query: str | None = None,
+        limit: int = 100,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        """Query log events from an observability namespace."""
+        return list(
+            self._adapter_call(
+                "query_logs",
+                namespace,
+                start_time_ns=start_time_ns,
+                end_time_ns=end_time_ns,
+                query=query,
+                limit=limit,
+                **kwargs,
+            )
+        )
+
+    def ingest_metrics(
+        self, namespace: str, samples: list[dict[str, Any]], **kwargs
+    ) -> int:
+        """Ingest metric samples into an observability namespace."""
+        return int(self._adapter_call("ingest_metrics", namespace, samples, **kwargs))
+
+    def aggregate_metrics(
+        self,
+        namespace: str,
+        metric_name: str,
+        aggregation: str = "avg",
+        start_time: str | None = None,
+        end_time: str | None = None,
+        step_seconds: int = 60,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        """Aggregate metrics from an observability namespace."""
+        return list(
+            self._adapter_call(
+                "aggregate_metrics",
+                namespace,
+                metric_name=metric_name,
+                aggregation=aggregation,
+                start_time=start_time,
+                end_time=end_time,
+                step_seconds=step_seconds,
+                **kwargs,
+            )
+        )
+
+    def ingest_traces(
+        self, namespace: str, traces: list[dict[str, Any]], **kwargs
+    ) -> int:
+        """Ingest trace spans into an observability namespace."""
+        return int(self._adapter_call("ingest_traces", namespace, traces, **kwargs))
+
+    def query_traces(
+        self,
+        namespace: str,
+        start_time_ns: int,
+        end_time_ns: int,
+        trace_id: str | None = None,
+        service: str | None = None,
+        operation: str | None = None,
+        min_duration_ns: int | None = None,
+        status: str | None = None,
+        limit: int = 100,
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        """Query trace spans in an observability namespace."""
+        return list(
+            self._adapter_call(
+                "query_traces",
+                namespace,
+                start_time_ns=start_time_ns,
+                end_time_ns=end_time_ns,
+                trace_id=trace_id,
+                service=service,
+                operation=operation,
+                min_duration_ns=min_duration_ns,
+                status=status,
+                limit=limit,
+                **kwargs,
+            )
+        )
+
+    def get_trace(self, namespace: str, trace_id: str, **kwargs) -> dict[str, Any]:
+        """Get all spans for a specific trace ID."""
+        return self._adapter_call("get_trace", namespace, trace_id=trace_id, **kwargs)
+
+    # ==========================================================================
     # Lifecycle Methods
     # ==========================================================================
 

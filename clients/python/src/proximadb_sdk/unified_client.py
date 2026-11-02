@@ -960,6 +960,16 @@ class ProximaDBClient:
         return None
 
     def _call_timeseries_adapter(self, method_name: str, *args, **kwargs):
+        """Dispatch a timeseries op to the adapter chain, or None to fall back.
+
+        Same REST-path caveat as the document family (disclosed by TD-SDK-3
+        batch 3, which made the REST adapter's timeseries methods actually
+        work — the previous hand-rolled code crashed with AttributeError
+        before any I/O, so this fallback always fired): when the adapter
+        succeeds, the dict comes from the server's spec-driven models and
+        differs from the in-memory fallback's local shapes; and the None
+        sentinel cannot distinguish a server 404 from adapter-unavailable.
+        """
         candidates: list[BaseProtocolAdapter] = []
         if self._adapter:
             candidates.append(self._adapter)
