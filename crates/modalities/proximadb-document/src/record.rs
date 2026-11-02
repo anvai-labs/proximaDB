@@ -241,8 +241,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proximadb_records::test_support::MemoryRecordStore;
     use std::collections::HashMap;
-    use std::sync::RwLock;
 
     fn value_string(value: &str) -> ProximaTreeNode {
         ProximaTreeNode::Value(ProximaValue::String(value.to_string()))
@@ -250,40 +250,6 @@ mod tests {
 
     fn value_int(value: i64) -> ProximaTreeNode {
         ProximaTreeNode::Value(ProximaValue::Int64(value))
-    }
-
-    #[derive(Default)]
-    struct MemoryRecordStore {
-        records: RwLock<HashMap<String, ProximaRecord>>,
-    }
-
-    #[async_trait]
-    impl RecordStore for MemoryRecordStore {
-        async fn upsert_record(&self, record: ProximaRecord) -> anyhow::Result<ProximaRecord> {
-            self.records
-                .write()
-                .expect("memory record store write lock")
-                .insert(record.oid.clone(), record.clone());
-            Ok(record)
-        }
-
-        async fn get_record(&self, key: &RecordKey) -> anyhow::Result<Option<ProximaRecord>> {
-            Ok(self
-                .records
-                .read()
-                .expect("memory record store read lock")
-                .get(&key.oid)
-                .cloned())
-        }
-
-        async fn delete_record(&self, key: &RecordKey) -> anyhow::Result<bool> {
-            Ok(self
-                .records
-                .write()
-                .expect("memory record store write lock")
-                .remove(&key.oid)
-                .is_some())
-        }
     }
 
     #[test]

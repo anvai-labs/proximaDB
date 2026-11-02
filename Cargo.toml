@@ -819,6 +819,7 @@ tracing-subscriber = "0.3"
 
 # Development dependencies
 [dev-dependencies]
+proximadb-records = { path = "crates/foundation/proximadb-records", features = ["test-support"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 proptest = "1.0"
 # In-process gather of the default prometheus registry where the per-tenant
