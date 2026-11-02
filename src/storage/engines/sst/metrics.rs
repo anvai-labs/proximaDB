@@ -14,14 +14,9 @@
 //! per-collection demand — keeping cardinality intentional, not eager.
 
 use lazy_static::lazy_static;
-use prometheus::{IntCounter, IntCounterVec, register_int_counter, register_int_counter_vec};
+use prometheus::{IntCounter, IntCounterVec, register_int_counter_vec};
 
-fn counter(name: &str, help: &str) -> IntCounter {
-    register_int_counter!(name, help).unwrap_or_else(|_| {
-        IntCounter::new(format!("{name}_fallback"), help)
-            .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
-    })
-}
+use crate::metrics::operational_metrics::counter;
 
 // NOTE: unlabeled AGGREGATE operator surface. The per-tenant billing versions
 // in metrics/consumption_metrics.rs own the canonical

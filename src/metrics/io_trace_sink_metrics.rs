@@ -4,21 +4,9 @@
 //! Low-cardinality delivery-state metrics for the ADR-066 trace sink.
 
 use lazy_static::lazy_static;
-use prometheus::{IntCounter, IntGauge, register_int_counter, register_int_gauge};
+use prometheus::{IntCounter, IntGauge};
 
-fn counter(name: &str, help: &str) -> IntCounter {
-    register_int_counter!(name, help).unwrap_or_else(|_| {
-        IntCounter::new(format!("{name}_fallback"), help)
-            .unwrap_or_else(|_| unreachable!("valid counter metric descriptor"))
-    })
-}
-
-fn gauge(name: &str, help: &str) -> IntGauge {
-    register_int_gauge!(name, help).unwrap_or_else(|_| {
-        IntGauge::new(format!("{name}_fallback"), help)
-            .unwrap_or_else(|_| unreachable!("valid gauge metric descriptor"))
-    })
-}
+use super::operational_metrics::{counter, gauge};
 
 lazy_static! {
     pub static ref RECORDS_DROPPED_TOTAL: IntCounter = counter(
