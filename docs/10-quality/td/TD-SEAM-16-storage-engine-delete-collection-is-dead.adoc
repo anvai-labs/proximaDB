@@ -5,7 +5,7 @@
 [cols="1,3", options="header"]
 |===
 | Field | Value
-| Status | **Open (filed 2026-11-01).** Surfaced by the TD-SSTCLEAN-1 triage + adversarial review (PR #2338): the function and its whole cleanup branch are unreachable in production, and nothing on the record said so until now.
+| Status | **Resolved (2026-11-02) — DELETED, the second arm of the decision.** The whole dead chain is removed: `StorageEngine::delete_collection` (unreachable: gated on the never-populated `sst_storages` registry, whose only callers were two tests: a unit test asserting `Ok(false)` and the concurrency test's delete arm), the registry itself (field, init, `.clear()`, and its two other always-None read branches — the SST bloom-check arm in `contains_vector` and the per-collection scan in `all_vectors`, whose enclosing fn had no non-test callers and always returned empty and is deleted with its vacuous test), and `cleanup_collection_files` + its isolation test (TD-SSTCLEAN-1's correct-if-ever-wired defense-in-depth — dead once its only caller went; the production DROP path, `CollectionManager::cleanup_storage_directories` removing both storage roots, is unchanged and remains the single authority). Rationale for delete-over-wire: pre-GA no-backcompat directive (2026-07-14); zero production callers; the trap a dead lookalike DROP path poses to future readers (this TD's own filing reason). Behavior-identical by construction — every deleted branch was unreachable.
 | Priority | **Medium.** No production bug today (the real DROP path is correct), but this is a trap: a reader (human or agent) reasonably assumes `StorageEngine::delete_collection` performs storage cleanup on DROP, and its `sst_storages`-gated branch invites someone to "fix" the registry without noticing the production path never comes here.
 | Component | `src/storage/engine.rs` (`delete_collection`, ~1134) and the `sst_storages` registry it gates on; adjacent: `cleanup_collection_files` (`src/storage/engines/sst/collections.rs`).
 | Relates to | TD-163 (whose RCA documents the never-populated `sst_storages` registry), TD-SSTCLEAN-1 (whose review established the reachability facts)
@@ -14,9 +14,10 @@
 
 == The facts (established 2026-11-01, PR #2338 review)
 
-1. `StorageEngine::delete_collection` has exactly one repo-wide caller: a unit
-   test (`src/storage/tests/storage_engine_simple_tests.rs`) that asserts
-   `Ok(false)`. No REST/gRPC/pgwire/Flight surface reaches it. The production
+1. `StorageEngine::delete_collection` has exactly two repo-wide callers, both
+   tests: a unit test asserting `Ok(false)`
+   (`src/storage/tests/storage_engine_simple_tests.rs`) and the concurrency
+   test's delete arm (`storage_engine_concurrency_tests.rs`). No REST/gRPC/pgwire/Flight surface reaches it. The production
    DROP path is `CollectionManager::delete_collection` →
    `cleanup_storage_directories` (`src/services/collection/manager.rs`), which
    recursively removes both the legacy `{base}/{uuid}` and typed

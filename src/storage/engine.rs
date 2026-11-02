@@ -6,15 +6,14 @@ use crate::storage::{
     engines::sst::{Compaction, SstEngine},
     persistence::disk_manager::DiskManager,
 };
-use proximadb_records::{EmbeddingCell, ProximaRecord};
+use proximadb_records::ProximaRecord;
 // Import ProximaBlockCollectionMetadata from the appropriate location
 use crate::storage::engines::core::formats::proximablocks::header_metadata::ProximaBlockCollectionMetadata;
-use dashmap::DashMap;
 use rand::seq::SliceRandom;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 // Note: Distance computation is handled by the unified compute module
 // at src/compute/distance_computation/ which provides SIMD-accelerated
@@ -22,7 +21,6 @@ use tracing::{debug, error, info, warn};
 
 pub struct StorageEngine {
     config: StorageConfig,
-    sst_storages: Arc<DashMap<String, Arc<SstEngine>>>,
     canonical_sst_storage: Arc<SstEngine>,
     #[allow(dead_code)]
     disk_manager: Arc<DiskManager>,
@@ -187,7 +185,6 @@ impl StorageEngine {
 
         Ok(Self {
             config,
-            sst_storages: Arc::new(DashMap::new()), // Now uses DashMap for per-collection storages
             canonical_sst_storage,
             disk_manager,
             write_ahead_log_manager,
@@ -792,24 +789,9 @@ impl StorageEngine {
             return Ok(true);
         }
 
-        // Check SST storages for vector existence
-        if let Some(sst_storage) = self.sst_storages.get(collection_id) {
-            // Use SST bloom filters for fast existence check
-            match sst_storage.value().contains_vector(collection_id, id).await {
-                Ok(exists) => {
-                    debug!(
-                        "SST existence check for {}/{}: {}",
-                        collection_id, id, exists
-                    );
-                    return Ok(exists);
-                }
-                Err(e) => {
-                    tracing::warn!("SST existence check failed: {}", e);
-                    // Fall through to return false
-                }
-            }
-        }
-
+        // TD-SEAM-16: the never-populated `sst_storages` registry and its
+        // per-collection bloom-check branch are deleted (unreachable since
+        // the SST singleton rework — the registry was never written).
         tracing::debug!("Vector {}/{} not found in any storage", collection_id, id);
         Ok(false)
     }
@@ -1131,64 +1113,11 @@ impl StorageEngine {
     // Collection metadata operations should be performed directly through CollectionService.
     // Storage layer focuses only on data persistence, not metadata management.
 
-    /// Delete collection and all its data
-    pub async fn delete_collection(&self, collection_id: &str) -> crate::storage::Result<bool> {
-        // Remove from in-memory structures using DashMap
-        // Note: SST storage is now singleton - no per-collection removal needed
-        let collection_exists = self.sst_storages.contains_key(collection_id);
-
-        // Check if collection exists in storage
-        if collection_exists {
-            // Collection-aware WAL cleanup - remove only this collection's entries
-            tracing::debug!(
-                "🧹 Performing collection-aware WAL cleanup for: {}",
-                collection_id
-            );
-            // Note: WAL no longer handles collection operations - handled by CollectionService
-            if let Err(e) = self
-                .write_ahead_log_manager
-                .flush(Some(&collection_id.to_string()))
-                .await
-            {
-                tracing::warn!(
-                    "Failed to cleanup WAL entries for collection {}: {}",
-                    collection_id,
-                    e
-                );
-            }
-
-            // Remove AXIS indexes for collection
-            #[cfg(feature = "axis")]
-            if self.axis_runtime_enabled {
-                self.axis_index_manager
-                    .drop_collection(collection_id)
-                    .await?;
-            }
-
-            // Clean up SST files for the dropped collection
-            if let Some(sst_storage) = self.sst_storages.get(collection_id) {
-                match sst_storage
-                    .value()
-                    .cleanup_collection_files(collection_id)
-                    .await
-                {
-                    Ok(()) => {
-                        info!("Cleaned up SST files for collection {}", collection_id);
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to cleanup SST files for collection {}: {}",
-                            collection_id, e
-                        );
-                    }
-                }
-            }
-
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
+    // TD-SEAM-16: `delete_collection` is DELETED. It was reachable only from
+    // a unit test: gated on the never-populated `sst_storages` registry, it
+    // always returned Ok(false) without doing anything. Production DROP
+    // COLLECTION flows through `CollectionManager::delete_collection` →
+    // `cleanup_storage_directories`, which removes both storage roots.
 
     /// Get the shared distance computation engine
     pub fn distance_compute(
@@ -1373,88 +1302,11 @@ impl StorageEngine {
         // Collection deletion now flows through the catalog; no provider-driven
         // deletion is performed here during test cleanup.
 
-        // Clear in-memory structures using DashMap
-        // Note: SST storage is now singleton - no clearing needed
-        self.sst_storages.clear();
+        // TD-SEAM-16: the never-populated `sst_storages` registry is deleted;
+        // there is nothing per-collection left to clear.
 
         tracing::debug!("✅ Completed storage cleanup for tests");
         Ok(())
-    }
-
-    /// Get all vectors from a collection for linear search
-    /// Retrieves vectors from both SST tree (recent writes) and MMAP readers (historical data)
-    pub async fn all_vectors(
-        &self,
-        collection_id: &str,
-    ) -> crate::storage::Result<Vec<ProximaRecord>> {
-        let mut vectors: Vec<ProximaRecord> = Vec::new();
-
-        tracing::debug!(
-            "Scanning vectors for collection {} via SST storage",
-            collection_id
-        );
-
-        if let Some(sst_storage) = self.sst_storages.get(collection_id) {
-            match sst_storage
-                .value()
-                .scan_all_vectors(collection_id, 0, None)
-                .await
-            {
-                Ok(sst_vectors) => {
-                    debug!(
-                        "Retrieved {} vectors from SST storage for collection {}",
-                        sst_vectors.len(),
-                        collection_id
-                    );
-                    let converted: Vec<ProximaRecord> = sst_vectors
-                        .into_iter()
-                        .map(|v| {
-                            let dim = v.vector.len() as u32;
-                            let now_ns = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_nanos() as i64;
-                            ProximaRecord {
-                                oid: v.id,
-                                created_at_ns: v
-                                    .timestamp
-                                    .map(|ms| ms * 1_000_000)
-                                    .unwrap_or(now_ns),
-                                updated_at_ns: v
-                                    .updated_at
-                                    .map(|ms| ms * 1_000_000)
-                                    .unwrap_or(now_ns),
-                                valid_to_ns: v.expires_at.map(|ms| ms * 1_000_000),
-                                record_version: v.version.map(|v| v as u64).unwrap_or(0),
-                                embeddings: if !v.vector.is_empty() {
-                                    vec![EmbeddingCell::new_fp32(
-                                        "default", "vector", dim, v.vector,
-                                    )]
-                                } else {
-                                    vec![]
-                                },
-                                ..ProximaRecord::default()
-                            }
-                        })
-                        .collect();
-                    vectors.extend(converted);
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to scan SST vectors for collection {}: {}",
-                        collection_id, e
-                    );
-                }
-            }
-        }
-
-        tracing::info!(
-            "all_vectors retrieved {} records for collection {}",
-            vectors.len(),
-            collection_id
-        );
-
-        Ok(vectors)
     }
 }
 
