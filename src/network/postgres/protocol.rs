@@ -7193,25 +7193,11 @@ impl PostgresProtocol {
         if !upper.starts_with("SELECT") {
             return DescribedShape::Unknown;
         }
-        // Special cases `execute_query` answers before its SELECT dispatch.
-        const SPECIAL: [&str; 13] = [
-            "AS SERVER_VERSION",
-            "VERSION()",
-            "AS SERVER_ENCODING",
-            "AS CLIENT_ENCODING",
-            "AS TIMEZONE",
-            "AS SEARCH_PATH",
-            "CURRENT_SCHEMA()",
-            "CURRENT_DATABASE()",
-            "CURRENT_USER",
-            "SESSION_USER",
-            "FROM PG_CATALOG",
-            "FROM INFORMATION_SCHEMA",
-            "PG_SETTINGS",
-        ];
-        if SPECIAL.iter().any(|marker| upper.contains(marker))
-            || crate::services::CatalogIntrospectionService::is_catalog_query(query)
-        {
+        // Special cases `execute_query` answers before its SELECT dispatch —
+        // the SAME shared predicate the portal legacy branch excludes by
+        // (TD-PGPORTAL-1 review round 2, N1): Describe's classification and
+        // Execute's routing must not drift apart.
+        if Self::is_pre_dispatch_special(&upper) {
             return DescribedShape::Unknown;
         }
         let Some(dml_service) = self.dml_service.clone() else {
