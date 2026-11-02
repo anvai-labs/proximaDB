@@ -496,7 +496,13 @@ class TestParityCensus:
             for name in dir(ProximaDBClient)
             if not name.startswith("_") and any(k in name for k in _OBS_KEYS)
         }
-        assert v2_obs == set(PORTED_OBSERVABILITY_METHODS), (
+        # Batch 4 ported the two "metric"-keyed stragglers
+        # (get_protocol_metrics, reset_routing_metrics) — the v2 surface is
+        # the 8 observability methods plus those routing/metrics surfaces.
+        assert v2_obs == set(PORTED_OBSERVABILITY_METHODS) | {
+            "get_protocol_metrics",
+            "reset_routing_metrics",
+        }, (
             f"v2 observability surface drifted: "
             f"extra={v2_obs - set(PORTED_OBSERVABILITY_METHODS)} "
             f"missing={set(PORTED_OBSERVABILITY_METHODS) - v2_obs}"

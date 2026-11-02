@@ -969,36 +969,138 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
         query_vector: list[float],
         fusion_strategy: str = "rrf",
         top_k: int = 10,
+        fusion_params: dict[str, Any] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
-        """Execute hybrid search via REST."""
-        try:
+        """Execute hybrid search (spec-driven op).
 
-            response = self._client._session.post(
-                f"{self._url}/api/v2/hybrid/search",
-                json={
-                    "collection": collection,
-                    "text_query": text_query,
-                    "query_vector": query_vector,
-                    "fusion_strategy": fusion_strategy,
-                    "top_k": top_k,
-                },
-                timeout=self._client._timeout,
+        Replaces hand-rolled ``_client._session`` calls that could never
+        execute (the protocol client has no ``_session`` attribute) — the
+        same dead-code disease as the document/timeseries families.
+        ``fusion_params`` is NOT a server field (the REST surface reads
+        ``rrf_k``/``vector_weight`` and serde drops unknown keys) — raising
+        the honest capability signal instead of silently shipping a no-op.
+        """
+        from .._generated.rest.api.hybrid.hybrid_search import sync_detailed
+        from .._generated.rest.models.hybrid_search_body import HybridSearchBody
+        from .._generated_op_exec import execute_generated_op
+
+        if fusion_params is not None:
+            raise NotImplementedError(
+                "hybrid_search(fusion_params) is not supported by the REST "
+                "op (the server's body has no fusion_params field; tune "
+                "rrf_k/vector_weight at the server or use the embedded path)"
             )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"Hybrid search failed: {e}")
-            raise
+        payload: dict[str, Any] = {
+            "collection": collection,
+            "text_query": text_query,
+            "vector": query_vector,
+            "fusion_strategy": fusion_strategy,
+            "top_k": top_k,
+        }
+        return execute_generated_op(
+            "hybrid_search",
+            lambda: sync_detailed(
+                client=self._get_generated_document_client(),
+                body=HybridSearchBody.from_dict(payload),
+            ),
+        )
 
-    # ==========================================================================
-    # Time-Series Operations — the SPEC-DRIVEN generated ops (TD-SDK-3
-    # batch 3). These replace hand-rolled ``_client._session`` calls that
-    # could never execute (the protocol client has no ``_session``
-    # attribute — the same dead-code disease the document family carried
-    # until batch 2); one config-sourced client and one outcome vocabulary
-    # (``_generated_op_exec``).
-    # ==========================================================================
+    def scan_page(
+        self,
+        collection_id: str,
+        *,
+        filter=None,
+        limit: int | None = None,
+        cursor: str | None = None,
+        include_vectors: bool = False,
+        include_text: bool = False,
+    ):
+        """Scan one page via the protocol client's REST-only scan endpoint
+        (note the protocol surface's SINGULAR ``include_vector``)."""
+        return self._client.scan_records(
+            collection_id,
+            filter=filter,
+            limit=limit,
+            cursor=cursor,
+            include_vector=include_vectors,
+            include_text=include_text,
+        )
+
+    def search_envelope(
+        self,
+        collection_id: str,
+        vector,
+        top_k: int = 10,
+        include_vectors: bool = False,
+        include_metadata: bool = True,
+        **kwargs,
+    ) -> Any:
+        """Run the first-page search envelope via the protocol client
+        (returns ``models.SearchEnvelope``; cursored continuation is
+        :meth:`search_next_page`)."""
+        return self._client.search_envelope(
+            collection_id=collection_id,
+            vector=vector,
+            top_k=top_k,
+            include_vectors=include_vectors,
+            include_metadata=include_metadata,
+            **kwargs,
+        )
+
+    def search_next_page(
+        self,
+        collection_id: str,
+        cursor: str,
+        include_vectors: bool = False,
+        include_metadata: bool = True,
+        **kwargs,
+    ) -> Any:
+        """Fetch the next SKS search page by cursor (the protocol
+        surface's continuation primitive; ``search_envelope`` takes no
+        cursor parameter)."""
+        return self._client.search_next_page(
+            collection_id,
+            cursor,
+            include_vectors=include_vectors,
+            include_metadata=include_metadata,
+            **kwargs,
+        )
+
+    def execute_sql(
+        self,
+        query: str,
+        parameters: list[Any] | None = None,
+        collection: str | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Execute SQL (spec-driven op; replaces v1's dead ``_session`` path).
+
+        ``parameters`` is rejected on REST: the server's SQL contract
+        deliberately does not advertise parameter binding yet ("callers
+        must not be offered a field that an adapter would silently
+        ignore"); the embedded adapter honors it.
+        """
+        from .._generated.rest.api.sql.execute_sql import sync_detailed
+        from .._generated.rest.models.sql_request import SqlRequest
+        from .._generated_op_exec import execute_generated_op
+
+        if parameters is not None:
+            raise NotImplementedError(
+                "execute_sql(parameters) is not supported by the REST op "
+                "(the server's SQL contract does not advertise parameter "
+                "binding); the embedded adapter honors parameters"
+            )
+        payload: dict[str, Any] = {"query": query}
+        if collection is not None:
+            payload["collection"] = collection
+        return execute_generated_op(
+            "execute_sql",
+            lambda: sync_detailed(
+                client=self._get_generated_document_client(),
+                body=SqlRequest.from_dict(payload),
+            ),
+        )
 
     def create_timeseries_collection(
         self, name: str, config: dict[str, Any] | None = None, **kwargs

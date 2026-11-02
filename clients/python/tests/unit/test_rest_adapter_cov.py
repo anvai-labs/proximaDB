@@ -1117,19 +1117,37 @@ def test_delete_document_collection_error(doc_adapter):
 # ---------------------------------------------------------------------------
 
 
-def test_hybrid_search(adapter):
-    adapter._client._session.program("post", FakeResp({"results": [1]}))
-    out = adapter.hybrid_search("c1", "find me", [0.1, 0.2], top_k=3)
-    assert out["results"] == [1]
-    verb, url, kw = adapter._client._session.calls[-1]
-    assert "hybrid/search" in url
-    assert kw["json"]["fusion_strategy"] == "rrf"
+def test_hybrid_search(doc_adapter):
+    from unittest.mock import patch
+
+    from proximadb_sdk._generated.rest.models.hybrid_search_response_200 import (
+        HybridSearchResponse200,
+    )
+
+    op = "proximadb_sdk._generated.rest.api.hybrid.hybrid_search.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.return_value = _doc_resp(
+            HybridSearchResponse200.from_dict({"results": [{"id": "r1"}]})
+        )
+        out = doc_adapter.hybrid_search("c1", "find me", [0.1, 0.2], top_k=3)
+    assert out["results"] == [{"id": "r1"}]
+    body = mock_op.call_args.kwargs["body"].to_dict()
+    assert body["collection"] == "c1"
+    assert body["text_query"] == "find me"
+    assert body["top_k"] == 3
+    assert body["fusion_strategy"] == "rrf"
 
 
-def test_hybrid_search_error(adapter):
-    adapter._client._session.program("post", RuntimeError("x"))
-    with pytest.raises(RuntimeError):
-        adapter.hybrid_search("c1", "q", [0.1])
+def test_hybrid_search_error(doc_adapter):
+    from unittest.mock import patch
+
+    import httpx
+
+    op = "proximadb_sdk._generated.rest.api.hybrid.hybrid_search.sync_detailed"
+    with patch(op) as mock_op:
+        mock_op.side_effect = httpx.ConnectError("x")
+        with pytest.raises(NetworkError, match="transport error"):
+            doc_adapter.hybrid_search("c1", "q", [0.1])
 
 
 # ---------------------------------------------------------------------------
