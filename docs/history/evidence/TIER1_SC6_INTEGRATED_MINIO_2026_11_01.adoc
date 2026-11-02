@@ -58,8 +58,9 @@ link:../../current/TIER1_SC6_COST_WORKSHEET.adoc[worksheet].)
 == Added-latency curve (owned Toxiproxy; the granted bed reused via --skip-ingest)
 
 Identical objects across every point; only the downstream latency toxic on the
-MinIO proxy changes (5 → 50 → 100 ms; each setting verified via the proxy API
-before launch). One lesson recorded: updating an existing toxic requires
+MinIO proxy changes (5 → 50 → 100 ms; each setting applied via the proxy
+API before launch — "applied", not "verified": the delete-then-create lesson
+below is exactly why a plain update silently no-ops). One lesson recorded: updating an existing toxic requires
 delete-then-create — a plain POST silently no-ops, and one "lat50" run was
 actually a 5 ms replicate (kept as `sc6-granted-1m-lat5-r2`).
 
