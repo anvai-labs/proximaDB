@@ -500,6 +500,16 @@ async fn budgeted_portal_selects_are_rate_limited_e2e() {
         rows, 0,
         "an over-quota budgeted portal SELECT must serve NO rows (53400)"
     );
+
+    // The UNBUDGETED arm (max_rows=0 — tokio-postgres/asyncpg/libpq's
+    // default shape): it takes the fall-through, which must ALSO arrive
+    // metered. Review round 2 caught this arm going unmetered when the
+    // check sat inside the max_rows>0 gate.
+    let (rows, _, _, _) = execute_round(&mut stream, 0).await;
+    assert_eq!(
+        rows, 0,
+        "an over-quota UNBUDGETED portal SELECT must serve NO rows (53400)"
+    );
 }
 
 /// TD-PGPORTAL-1 (review round 1, finding 1): a budgeted portal must honor

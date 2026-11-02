@@ -3043,7 +3043,8 @@ impl PostgresProtocol {
     ///
     /// E0 (TD-PGPORTAL-1 follow-up): the rate-limit check lives in the TWO
     /// metered entry points — here (every simple-protocol statement) and
-    /// `execute_portal_query` (every budgeted Execute that runs a query) — so
+    /// `execute_portal_query` (every Execute that runs a query, budgeted or
+    /// not) — so
     /// each query pays exactly once regardless of which path serves it: a
     /// Declined budgeted Execute falls through to
     /// `execute_query_with_controls` UNMETERED (see its comment).
@@ -3057,10 +3058,12 @@ impl PostgresProtocol {
 
     /// E0 (TD-PGPORTAL-1 follow-up): the converged rate-limit check (the SAME
     /// `RateLimitState` REST uses). Called by the two metered entry points —
-    /// `execute_query` and `execute_portal_query` — NEVER by
-    /// `execute_query_with_controls` itself (the Declined-portal fall-through
-    /// reaches it already metered; a check there would double-charge budgeted
-    /// Executes). Returns `true` when the query was REFUSED (53400 sent).
+    /// `execute_query` (every simple-protocol statement) and
+    /// `execute_portal_query` (EVERY Execute that runs a query: budgeted
+    /// fast-path or unbudgeted fall-through) — NEVER by
+    /// `execute_query_with_controls` itself (both of its arrival paths are
+    /// already metered; a check there would double-charge). Returns `true`
+    /// when the query was REFUSED (53400 sent).
     async fn check_pgwire_rate_limit(&mut self) -> Result<bool> {
         if let Some(limiter) = self.rate_limiter.clone()
             && limiter.enabled()
@@ -7737,17 +7740,23 @@ impl PostgresProtocol {
                 .await;
         }
 
+        // E0 rate limiting (TD-PGPORTAL-1 follow-up, review round 2): EVERY
+        // Execute that runs a query pays exactly one token — budgeted
+        // (max_rows > 0: either fast path) AND unbudgeted (max_rows == 0: the
+        // fall-through, the DEFAULT shape for tokio-postgres/asyncpg/libpq —
+        // which would otherwise be the one unmetered query path left). Page
+        // EMISSION on later rounds (the hoisted drain above) is not metered:
+        // the query already paid when it ran.
+        if self.check_pgwire_rate_limit().await? {
+            return Ok(());
+        }
+
         if max_rows > 0 {
-            // E0 governance (TD-PGPORTAL-1 follow-up): both fast paths return
-            // before `execute_query_with_controls`, so they get the SAME
-            // governance the general path provides — the rate-limit check up
-            // front, and the request-id + per-query io_trace span around the
-            // query execution (materialization + the first page emit). Page
-            // EMISSION on later rounds (the hoisted drain above) is not
-            // metered: the query already paid when it ran.
-            if self.check_pgwire_rate_limit().await? {
-                return Ok(());
-            }
+            // E0 span governance (TD-PGPORTAL-1 follow-up): both fast paths
+            // return before `execute_query_with_controls`, so they run inside
+            // the SAME request-id + per-query io_trace scope the general path
+            // provides (around the query execution — materialization + the
+            // first page emit). The fall-through carries its own scope.
             let tenant = self.pgwire_resolve_read_tenant().await;
             let request_id = crate::network::middleware::request_id::RequestId::generate();
             let outcome = proximadb_api::rest::errors::REQUEST_ID
