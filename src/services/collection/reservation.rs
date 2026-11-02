@@ -108,6 +108,23 @@ pub struct ReservationPoolConfig {
     /// marker (implied default).
     #[serde(default)]
     pub is_default: bool,
+    /// TD-TIER-1 SC6 S2: idle-reclaim TTL for this pool's grants, seconds —
+    /// a grant whose group has seen no read hit for this long (and is older
+    /// than `idle_reclaim_min_lifetime_secs`) is released by the reclaim
+    /// sweep: unregistered, unpinned, accrual stopped. `0` (default) = never
+    /// reclaim (enterprise pools stay persistent).
+    #[serde(default)]
+    pub idle_reclaim_secs: u64,
+    /// Guardrail against reclaim/re-grant flapping and against reaping a
+    /// just-admitted grant whose warm has not finished: a grant younger than
+    /// this is never reclaimed, idle or not.
+    #[serde(default = "default_idle_reclaim_min_lifetime_secs")]
+    pub idle_reclaim_min_lifetime_secs: u64,
+}
+
+/// Default grant age floor before idle reclaim may act (1 h).
+fn default_idle_reclaim_min_lifetime_secs() -> u64 {
+    3600
 }
 
 fn default_overhead_factor() -> f64 {
@@ -468,6 +485,75 @@ impl ReservationRegistry {
     /// (a dropped release, then a new reserve) are not ordered — tokio's
     /// mutex is fair only among already-queued waiters — so a late release
     /// can remove the newer grant.
+    /// TD-TIER-1 SC6 S2: reclaim this pool's idle grants — released exactly
+    /// like a drop releases them (group unregistered, pins released, accrual
+    /// closed at now, intervals parked) — then re-sync the budget. Returns
+    /// the reclaimed grants (empty when no pool arms a TTL). Bounded per
+    /// call so a sweep tick stays light; the metering loop rides it hourly.
+    pub async fn reclaim_idle_grants(&self, now_unix_secs: i64) -> Vec<Grant> {
+        const MAX_PER_TICK: usize = 64;
+        let activity: std::collections::HashMap<String, i64> = proximadb_cache::process_store()
+            .map(|store| {
+                store
+                    .group_activity_snapshot()
+                    .into_iter()
+                    .map(|(id, _hits, last_hit)| (id, last_hit))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut reclaimed = Vec::new();
+        let _gate = self.mutation_gate.lock().await;
+        for (config, authority) in self.pools.values() {
+            if config.idle_reclaim_secs == 0 {
+                continue;
+            }
+            for grant in authority.grants_snapshot().await {
+                if reclaimed.len() >= MAX_PER_TICK {
+                    break;
+                }
+                // Released grants stay in the ledger (billing history); only
+                // live ones charge capacity and can be reclaimed.
+                if !grant.state.charges_capacity() {
+                    continue;
+                }
+                let last_use = activity
+                    .get(&grant.id)
+                    .copied()
+                    .filter(|hit| *hit > 0)
+                    .unwrap_or(grant.created_unix_secs);
+                let idle = (now_unix_secs - last_use).max(0) as u64;
+                let age = (now_unix_secs - grant.created_unix_secs).max(0) as u64;
+                if idle <= config.idle_reclaim_secs || age < config.idle_reclaim_min_lifetime_secs {
+                    continue;
+                }
+                match authority
+                    .release(&grant.tenant_id, &grant.collection_id, now_unix_secs)
+                    .await
+                {
+                    Ok(closed) => {
+                        self.park_intervals(closed);
+                        proximadb_cache::unregister_protection_group(&grant.id);
+                        tracing::info!(
+                            pool = %config.id,
+                            grant = %grant.id,
+                            idle_secs = idle,
+                            "TD-TIER-1 SC6 S2: idle grant reclaimed                              (re-admission follows the normal path)"
+                        );
+                        reclaimed.push(grant);
+                    }
+                    Err(error) => tracing::warn!(
+                        "TD-TIER-1 SC6 S2: idle reclaim failed for {}: {error}",
+                        grant.id
+                    ),
+                }
+            }
+        }
+        if !reclaimed.is_empty() {
+            self.sync_residency_budget().await;
+        }
+        reclaimed
+    }
+
     pub async fn release_for_collection(
         self: &Arc<Self>,
         tenant_id: &str,
@@ -1759,6 +1845,8 @@ mod tests {
             overhead_factor: 0.1,
             default_grant_bytes: 0,
             is_default: false,
+            idle_reclaim_secs: 0,
+            idle_reclaim_min_lifetime_secs: 3600,
         }
     }
 
@@ -1771,6 +1859,8 @@ mod tests {
             overhead_factor: 0.1,
             default_grant_bytes: 1024 * 1024 * 1024,
             is_default: default,
+            idle_reclaim_secs: 0,
+            idle_reclaim_min_lifetime_secs: 3600,
         }
     }
 
@@ -1836,6 +1926,84 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    /// TD-TIER-1 SC6 S2: an idle grant past its pool's TTL is reclaimed —
+    /// released like a drop (accrual closed, group unregistered), and the
+    /// sweep is idempotent. A touched grant and a too-young grant survive;
+    /// pools without a TTL never reclaim.
+    #[tokio::test]
+    async fn idle_grants_are_reclaimed_touched_and_young_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut freemium = armed_pool(&dir, "freemium", true);
+        freemium.idle_reclaim_secs = 3600;
+        freemium.idle_reclaim_min_lifetime_secs = 60;
+        let enterprise = armed_pool(&dir, "enterprise", false);
+        let registry = ReservationRegistry::open_from_config(&[freemium, enterprise])
+            .await
+            .unwrap()
+            .expect("registry");
+        let t0 = 1_700_000_000i64;
+        // The liveness signal lives in the process store's protection
+        // groups — arm the test store so a grant's hit can be recorded.
+        let _gate = crate::services::collection::reservation::residency_test_gate();
+        let _store = crate::services::collection::reservation::residency_test_store();
+        let touched_prefixes = vec!["s3://bed/c-touched/data/".to_string()];
+
+        // Idle beyond TTL (created at t0, no hits, "now" = t0 + 2h).
+        registry
+            .reserve_for_performance("t1", "c-idle", t0, &[], Some("freemium"))
+            .await
+            .unwrap();
+        // Same pool, but its group will record a read hit (armed below).
+        registry
+            .reserve_for_performance("t1", "c-touched", t0, &touched_prefixes, Some("freemium"))
+            .await
+            .unwrap();
+        // Younger than min-lifetime.
+        registry
+            .reserve_for_performance("t1", "c-young", t0 + 7_200, &[], Some("freemium"))
+            .await
+            .unwrap();
+        // Idle, but in a pool with no TTL.
+        registry
+            .reserve_for_performance("t2", "c-enterprise", t0, &[], Some("enterprise"))
+            .await
+            .unwrap();
+
+        // Record a hit for c-touched's group: the store's activity snapshot
+        // keys by grant id — take it from the registry.
+        let touched_grant = registry
+            .live_grant_for_collection("c-touched")
+            .await
+            .expect("live");
+        let store = proximadb_cache::process_store().expect("test store armed");
+        store.register_group_hit_for_test(&touched_grant.id, t0 + 6_000);
+
+        let reclaimed = registry.reclaim_idle_grants(t0 + 7_200).await;
+        let ids: Vec<&str> = reclaimed.iter().map(|g| g.collection_id.as_str()).collect();
+        assert_eq!(ids, vec!["c-idle"], "only the idle-beyond-TTL grant");
+        assert!(
+            registry
+                .live_grant_for_collection("c-touched")
+                .await
+                .is_some()
+        );
+        assert!(
+            registry
+                .live_grant_for_collection("c-young")
+                .await
+                .is_some()
+        );
+        assert!(
+            registry
+                .live_grant_for_collection("c-enterprise")
+                .await
+                .is_some(),
+            "no TTL configured: never reclaimed"
+        );
+        // Idempotent.
+        assert!(registry.reclaim_idle_grants(t0 + 7_200).await.is_empty());
     }
 
     /// TD-TIER-1 SC6: an unknown pool id is refused fail-closed with the
@@ -2700,6 +2868,8 @@ mod tests {
             overhead_factor: 0.1,
             default_grant_bytes: grant_bytes,
             is_default: false,
+            idle_reclaim_secs: 0,
+            idle_reclaim_min_lifetime_secs: 3600,
         }
     }
 
