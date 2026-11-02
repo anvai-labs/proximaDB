@@ -692,7 +692,7 @@ async fn a_poisoned_store_refuses_wal_truncation_so_its_committed_entry_survives
     assert!(
         matches!(&run, TruncationRun::Refused { source, reason } if source == "record-tier"
             && reason.contains("poisoned")),
-        "a poisoned record tier must refuse WAL truncation for the poison reason (not, say, a          shared-storage or memtable refusal): {run:?}"
+        "a poisoned record tier must refuse WAL truncation for the poison reason (not, say, a shared-storage or memtable refusal): {run:?}"
     );
     assert_eq!(
         wal.retained_from(),

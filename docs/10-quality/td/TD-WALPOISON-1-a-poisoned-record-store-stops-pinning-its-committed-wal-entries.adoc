@@ -8,7 +8,7 @@
 | Status | **Fixed (fail-closed refusal), 2026-11-01.** Found by the v0.4.x→v0.5.1 release review (finding F1, `RELEASE_REVIEW_v0.4_to_v0.5.1.md`); the precision poison-floor alternative remains a follow-up below.
 | Priority | **HIGH.** The bug class is the one TD-SEAM-2/P2.2 was designed to kill — a flush-time answer that loses a durable write — wearing a new costume: the reservation protocol is correct while the write is in flight and dropped the moment the write *fails*.
 | Component | `src/services/record_store.rs` (`write_mutations`'s apply error arm, `InflightReservation`'s drop, `DirectWalTableRecordStore::min_unflushed_lsn`, `poisoned`)
-| Relates to | TD-SEAM-2 (truncation only at `min_unflushed_lsn`), TD-SEAM-12 (in-flight reservations), TD-USUB-19 (a different unbounded WAL pin, also fail-closed), ADR-095 (the poison flag's origin, "ADR-095 review F2")
+| Relates to | TD-SEAM-2 (truncation only at `min_unflushed_lsn`), TD-SEAM-12 (in-flight reservations), TD-USUB-19 (a different unbounded WAL pin, also fail-closed), ADR-095 (the poison flag's origin, per the field's own doc comment in `record_store.rs`, which cites "ADR-095 review F2")
 |===
 
 == The finding
@@ -59,12 +59,21 @@ the unfixed tree the same test fails by truncating the entry and losing the row 
   writes; retention-until-restart is the honest posture and matches how the poison already
   treats reads. Recorded here as the follow-up if WAL growth during poison windows ever
   becomes the measured problem (measure first: the window is bounded by operator restart
-  latency, and `admit_writes` already refuses new writes on the poisoned store).
+  latency, and `ensure_healthy` already refuses reads and writes on the poisoned store).
 * *Keep the reservation on error.* Equivalent to the poison-floor through existing machinery,
   but leaves a half-open reservation protocol (who releases a reservation whose owner has
   returned?) for no additional guarantee over refusing.
 
 == Follow-ups filed here
+
+* **The cancellation exit still loses committed entries (adversarial-review round 1).**
+  `poisoned` is armed only in `apply_storage_actions`'s `map_err` — the *error* exit. A future
+  DROPPED between the durable append and apply completion releases the `InflightReservation`
+  ("every exit path — success, error, cancellation — clears it") without poisoning, leaving a
+  durable entry in no partition, unpoisoned and unreserved: the same loss class this TD fixes,
+  reachable by a client disconnect mid-apply (the spill-PUT window is seconds). Candidate fix:
+  a drop-guard that poisons when the append already succeeded. Pre-existing; filed here so it
+  does not evaporate.
 
 * **Replay-failure fatality gate (release-review F7, shipped in the same PR):** a WAL replay
   failure over a **truncated** WAL (`retained_from() > 1`, the spill-off refusal's own

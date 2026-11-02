@@ -434,6 +434,17 @@ impl MultiServer {
         if crate::services::oltp_gate::atomic_commit_enabled() {
             wal_appender.enable_atomic_groups();
         }
+        // P2.1 (ADR-097 S2), review round 1: the fallback arms above open the
+        // WAL directly, so they must arm segment rotation themselves —
+        // SharedServices' call does not cover a custom `direct_record_wal_path`.
+        // Without it a custom-path WAL never seals a segment, and truncation
+        // (which only removes sealed segments) can never reclaim it: unbounded
+        // growth for the process lifetime. The `ensure_data_format` call above
+        // is what makes sealing this directory downgrade-safe.
+        let segment_bytes = crate::services::canonical_wal::canonical_wal_segment_bytes();
+        if segment_bytes > 0 {
+            wal_appender.enable_segment_rotation(segment_bytes);
+        }
         // TD-064: the canonical store is per-(tenant, collection) partitioned and
         // shared across all pgwire connections. Build it once, recover its
         // partitions from the canonical WAL (routing each entry by its
