@@ -266,6 +266,19 @@ pub struct FilesystemFactory {
     config: FilesystemConfig,
     filesystems: HashMap<String, Arc<dyn FileSystem>>,
     tier_mapping: HashMap<FileStorageTier, String>,
+    /// Memoized decorator stacks, keyed by (scheme, gate-state bits).
+    ///
+    /// The wrappers themselves are stateless, but minting a FRESH wrapper
+    /// `Arc` per lookup broke `Arc::ptr_eq` identity between two handles of
+    /// the SAME backend — `copy_atomic`'s same-backend fast path then fell
+    /// through to the streaming path, which refuses an access tier, so arming
+    /// a pure-diagnostics/fault gate changed routing OUTCOMES (a local tiered
+    /// publish failed instead of riding the native copy). Returning one
+    /// stable `Arc` per (backend, gate state) keeps the env gates live per
+    /// call while identity holds. Bounded: at most 4 states per scheme in
+    /// production builds (6 in test builds, where the injected-counters
+    /// bit adds two).
+    wrapper_memo: std::sync::Mutex<HashMap<(String, u8), Arc<dyn FileSystem>>>,
     /// Test-only per-factory GET counters: when set, every `get_filesystem`
     /// wraps the backend in a `CountingFileSystem` sharing THESE counters
     /// instead of the process-global env-gated ones. `cargo test --lib` runs
@@ -447,6 +460,7 @@ impl FilesystemFactory {
             config,
             filesystems: HashMap::new(),
             tier_mapping: HashMap::new(),
+            wrapper_memo: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             test_get_counters: None,
         };
@@ -469,6 +483,11 @@ impl FilesystemFactory {
         counters: std::sync::Arc<proximadb_storage_filesystem_types::counting::GetCounters>,
     ) {
         self.test_get_counters = Some(counters);
+        // Memoized counting stacks captured the OLD counters Arc — drop them
+        // so a re-point counts into the new one (must precede any I/O).
+        if let Ok(mut memo) = self.wrapper_memo.lock() {
+            memo.clear();
+        }
     }
 
     /// Initialize all configured filesystem backends
@@ -633,33 +652,81 @@ impl FilesystemFactory {
         // TD-COMPACT-13 TDD: the env-gated delete-fault wrapper sits INSIDE the
         // counting wrapper so retirement tests observe the fault while the
         // counters keep counting the inner backend. Unset = byte-identical.
-        let fs: Arc<dyn FileSystem> = if std::env::var_os("PROXIMADB_TEST_FS_DELETE_FAIL_FIRST")
-            .is_some()
-            || proximadb_storage_filesystem_types::faults::read_fault_requested()
+        //
+        // The stack is MEMOIZED per (scheme, gate state): the decorators are
+        // stateless, so one stable Arc per state is equivalent — and minting a
+        // fresh Arc per call used to defeat `Arc::ptr_eq` in copy_atomic's
+        // same-backend fast path (see `wrapper_memo`). The gates themselves
+        // stay live: a state change mints the new stack on the next lookup.
+        #[cfg(test)]
+        let (test_count, test_counters) = match &self.test_get_counters {
+            Some(counters) => (true, Some(std::sync::Arc::clone(counters))),
+            None => (false, None),
+        };
+        #[cfg(not(test))]
+        let test_count = false;
+        let count_env = std::env::var_os("PROXIMADB_COUNT_FS_IO").is_some();
+        let fault = std::env::var_os("PROXIMADB_TEST_FS_DELETE_FAIL_FIRST").is_some()
+            || proximadb_storage_filesystem_types::faults::read_fault_requested();
+        // bit0 = counting (test-injected wins over env), bit1 = fault, bit2 =
+        // test-injected counters (distinguishes the two counting stacks).
+        let state = (fault as u8) * 2 + (test_count || count_env) as u8 + (test_count as u8) * 4;
+        let key = (scheme_str.to_string(), state);
+
+        if let Ok(memo) = self.wrapper_memo.lock()
+            && let Some(memoized) = memo.get(&key)
         {
+            return Ok(Arc::clone(memoized));
+        }
+        let fs: Arc<dyn FileSystem> = if fault {
             Arc::new(proximadb_storage_filesystem_types::faults::FaultInjectingFileSystem::new(fs))
         } else {
             fs
         };
+        // Test-injected counters take precedence over the env route (the
+        // pre-fix early return skipped the env check for the same effect).
         #[cfg(test)]
-        if let Some(counters) = &self.test_get_counters {
-            return Ok(Arc::new(
+        let wrapped: Arc<dyn FileSystem> = if test_count {
+            Arc::new(
                 proximadb_storage_filesystem_types::counting::CountingFileSystem::new(
                     fs,
-                    std::sync::Arc::clone(counters),
+                    test_counters.expect("test_count implies counters"),
                 ),
-            ));
-        }
-        if std::env::var_os("PROXIMADB_COUNT_FS_IO").is_some() {
-            Ok(Arc::new(
+            )
+        } else if count_env {
+            Arc::new(
                 proximadb_storage_filesystem_types::counting::CountingFileSystem::new(
                     fs,
                     proximadb_storage_filesystem_types::counting::global_counters(),
                 ),
-            ))
+            )
         } else {
-            Ok(fs)
+            fs
+        };
+        #[cfg(not(test))]
+        let wrapped: Arc<dyn FileSystem> = if count_env {
+            Arc::new(
+                proximadb_storage_filesystem_types::counting::CountingFileSystem::new(
+                    fs,
+                    proximadb_storage_filesystem_types::counting::global_counters(),
+                ),
+            )
+        } else {
+            fs
+        };
+        // A poisoned memo must never fail I/O: skip memoizing instead. The
+        // get-then-insert is CANONICAL: a racer may have installed this very
+        // state while we were building — hand back THEIR Arc so one state is
+        // always exactly one handle (two cold-start builders each returning
+        // their own wrapper is precisely the identity bug this memo exists
+        // to kill).
+        if let Ok(mut memo) = self.wrapper_memo.lock() {
+            if let Some(existing) = memo.get(&key) {
+                return Ok(Arc::clone(existing));
+            }
+            memo.insert(key, Arc::clone(&wrapped));
         }
+        Ok(wrapped)
     }
 
     /// Create filesystem with unified caching
@@ -2244,9 +2311,67 @@ mod access_tier_publish_tests {
             config: FilesystemConfig::default(),
             filesystems,
             tier_mapping: HashMap::new(),
+            wrapper_memo: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             test_get_counters: None,
         }
+    }
+
+    /// Regression (surfaced by the #2335 flaky-test audit): the env-gated
+    /// decorators used to mint a FRESH wrapper `Arc` on every
+    /// `get_filesystem` call, so two handles for the SAME backend compared
+    /// unequal and `copy_atomic_with_options` fell through its `Arc::ptr_eq`
+    /// same-backend fast path into the streaming path — which refuses a tier
+    /// ("access tier 'cool' cannot be applied by a streaming copy"). Arming
+    /// the pure-diagnostics `PROXIMADB_COUNT_FS_IO` gate therefore FAILED a
+    /// local tiered publish instead of leaving it untouched.
+    ///
+    /// Pins both properties: stable handle identity per (backend, gate
+    /// state), and the tiered same-backend copy taking the native fast path.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn counting_gate_keeps_identity_and_the_tiered_local_copy_fast_path() {
+        struct RestoreCountGate;
+        impl Drop for RestoreCountGate {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("PROXIMADB_COUNT_FS_IO") };
+            }
+        }
+        let _gate = RestoreCountGate;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("L0.pax");
+        std::fs::write(&src, b"segment").expect("write staged segment");
+        let from = format!("file://{}", src.display());
+        let to = format!("file://{}/L0.published.pax", dir.path().display());
+
+        let factory = FilesystemFactory::create(FilesystemConfig::default())
+            .await
+            .expect("factory");
+
+        // Arm the diagnostics gate AFTER factory construction: the gate is
+        // read live, exactly as an operator would on a running deployment.
+        unsafe { std::env::set_var("PROXIMADB_COUNT_FS_IO", "1") };
+        let a = factory.get_filesystem(&from).expect("handle for source");
+        let b = factory.get_filesystem(&to).expect("handle for destination");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "one backend + one gate state must yield ONE handle, not fresh wrappers per lookup"
+        );
+
+        // End to end: the tiered same-backend publish must ride the native
+        // fast path, never the tier-refusing streaming path.
+        factory
+            .copy_atomic_with_options(
+                &from,
+                &to,
+                FileOptions::for_access_tier(Some(ObjectAccessTier::Cool)),
+            )
+            .await
+            .expect("tiered same-backend copy must take the fast path");
+        let published = std::fs::read(dir.path().join("L0.published.pax"))
+            .expect("published segment must exist");
+        assert_eq!(published, b"segment");
     }
 
     #[tokio::test]
