@@ -81,9 +81,9 @@ impl QueryParser {
     pub fn parse(&self, input: &str) -> QueryResult<CompiledPattern> {
         match parse_query(input) {
             // Full-consumption discipline (TD-GRAPH-4 step 2): leftover
-            // input is a parse error, not silently discarded —
-            // `MATCH (n) RETURN ngarbage` must not truncate to a valid
-            // MATCH-only plan.
+            // input is a parse error, not silently discarded — trailing
+            // garbage (`@@@`, comments, a stray `;`) must not silently
+            // truncate the query into a "valid" prefix.
             Ok((remaining, compiled_pattern)) if remaining.trim().is_empty() => {
                 Ok(compiled_pattern)
             }
