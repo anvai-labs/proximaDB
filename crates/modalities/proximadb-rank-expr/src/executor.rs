@@ -124,9 +124,10 @@ impl FeatureExecutor for ExprExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proximadb_rank_core::test_support::MapAttributeAccess;
     use proximadb_rank_core::{
-        AttributeAccess, BlueprintFactory, CandidateData, ExecutorIdx, FeatureArena,
-        NoopAttributeAccess, NoopCandidateData, NoopMetricsSink, NoopModelCache, RankProgram,
+        BlueprintFactory, CandidateData, ExecutorIdx, FeatureArena, NoopAttributeAccess,
+        NoopCandidateData, NoopMetricsSink, NoopModelCache, RankProgram,
     };
     use std::collections::HashMap;
 
@@ -303,12 +304,6 @@ mod tests {
             .compile_str("clamp(attr(\"score\") * 2, 0, 100)", &q)
             .unwrap();
 
-        struct M(HashMap<(u32, String), f32>);
-        impl AttributeAccess for M {
-            fn read_f32(&self, doc: DocHandle, f: &str) -> Option<f32> {
-                self.0.get(&(doc.0, f.to_string())).copied()
-            }
-        }
         struct NoCand;
         impl CandidateData for NoCand {
             fn retrieval_distance(&self, _doc: DocHandle) -> Option<f32> {
@@ -318,7 +313,9 @@ mod tests {
                 None
             }
         }
-        let attrs = M(HashMap::from([((0, "score".into()), 30.0)]));
+        let attrs = MapAttributeAccess {
+            values: HashMap::from([((0, "score".into()), 30.0)]),
+        };
 
         let mut wrap = exec;
         let arena = FeatureArena::new();

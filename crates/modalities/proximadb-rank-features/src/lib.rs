@@ -86,20 +86,13 @@ impl proximadb_rank_core::Blueprint for BlueprintWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proximadb_rank_core::test_support::MapAttributeAccess;
     use proximadb_rank_core::{
-        AttributeAccess, BlueprintFactory, CandidateData, DocHandle, FeatureArena, NoopMetricsSink,
-        NoopModelCache, PhaseConfig, QueryContext, RankProgram, ScoreCtx,
+        BlueprintFactory, CandidateData, DocHandle, FeatureArena, NoopMetricsSink, NoopModelCache,
+        PhaseConfig, QueryContext, RankProgram, ScoreCtx,
     };
     use std::collections::HashMap;
 
-    struct AllAttrs {
-        values: HashMap<(u32, String), f32>,
-    }
-    impl AttributeAccess for AllAttrs {
-        fn read_f32(&self, doc: DocHandle, field: &str) -> Option<f32> {
-            self.values.get(&(doc.0, field.to_string())).copied()
-        }
-    }
     struct AllCands {
         d: HashMap<u32, f32>,
         b: HashMap<u32, f32>,
@@ -143,7 +136,7 @@ mod tests {
         b.set_score(idx);
         let mut prog = b.build().unwrap();
 
-        let attrs = AllAttrs {
+        let attrs = MapAttributeAccess {
             values: HashMap::from([((42, "price".into()), 99.5)]),
         };
         let cands = AllCands {
@@ -173,7 +166,7 @@ mod tests {
         b.set_score(idx);
         let mut prog = b.build().unwrap();
 
-        let attrs = AllAttrs {
+        let attrs = MapAttributeAccess {
             values: HashMap::new(),
         };
         let cands = AllCands {

@@ -96,10 +96,10 @@ mod tests {
     use crate::bytecode::Code;
     use crate::lowering::lower;
     use crate::parser::parse;
+    use proximadb_rank_core::test_support::MapAttributeAccess;
     use proximadb_rank_core::{
-        AttributeAccess, Blueprint, BlueprintFactory, FeatureArena, NoopAttributeAccess,
-        NoopCandidateData, NoopMetricsSink, NoopModelCache, OutputSpec, PhaseConfig, QueryContext,
-        RankResult,
+        Blueprint, BlueprintFactory, FeatureArena, NoopAttributeAccess, NoopCandidateData,
+        NoopMetricsSink, NoopModelCache, OutputSpec, PhaseConfig, QueryContext, RankResult,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -313,16 +313,9 @@ mod tests {
         f.register(Arc::new(AttrLikeBp));
         let (code, mut subs) = lower_str("attr(\"a\") * 2 + attr(\"b\")", &f);
 
-        struct M(HashMap<(u32, String), f32>);
-        impl AttributeAccess for M {
-            fn read_f32(&self, doc: DocHandle, f: &str) -> Option<f32> {
-                self.0.get(&(doc.0, f.to_string())).copied()
-            }
-        }
-        let attrs = M(HashMap::from([
-            ((0, "a".into()), 3.0),
-            ((0, "b".into()), 4.0),
-        ]));
+        let attrs = MapAttributeAccess {
+            values: HashMap::from([((0, "a".into()), 3.0), ((0, "b".into()), 4.0)]),
+        };
         let q = QueryContext::default();
         let arena = FeatureArena::new();
         let (c, m, met) = (NoopCandidateData, NoopModelCache, NoopMetricsSink);

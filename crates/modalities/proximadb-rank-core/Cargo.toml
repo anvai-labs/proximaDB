@@ -13,6 +13,11 @@ description = "ProximaDB multi-phase ranking framework — Blueprint/Executor/La
 name = "proximadb_rank_core"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Shared fixtures for downstream ranking tests; enable only in dev-dependencies.
+test-support = []
+
 [dependencies]
 proximadb-kernel = { workspace = true }
 anyhow.workspace = true
