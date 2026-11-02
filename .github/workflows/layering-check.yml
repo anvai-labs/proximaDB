@@ -41,6 +41,10 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v7
+      with:
+        # Full history: the range scan below must see the PR's own commits —
+        # a shallow merge-ref checkout has neither them nor a merge base.
+        fetch-depth: 0
 
     - name: Set up Python
       uses: actions/setup-python@v7
@@ -79,7 +83,11 @@ jobs:
         && github.head_ref != 'main'
       run: |
         git fetch --no-tags origin "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
-        python3 scripts/check_no_agent_attribution.py --range "origin/${{ github.base_ref }}...HEAD"
+        # TWO dots, not three: `base...head` is the symmetric difference and
+        # would also sweep commits that landed on develop AFTER this PR
+        # branched (an admin merge bypassing the body check would then red
+        # every open clean PR). `base..head` is exactly the PR's own commits.
+        python3 scripts/check_no_agent_attribution.py --range "origin/${{ github.base_ref }}..HEAD"
 
     - name: Run layering validation
       run: |

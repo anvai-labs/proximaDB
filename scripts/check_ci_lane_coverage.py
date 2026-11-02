@@ -60,14 +60,33 @@ def integration_targets() -> list[Path]:
 
 
 def run_block_text() -> str:
-    """Concatenate only `run:` block contents across workflows.
+    """Concatenate `run:` block contents across workflows, comment-stripped,
+    plus the bodies of repo scripts those blocks invoke.
 
-    Coverage must mean EXECUTION. Path filters (`changes:`/`filters:` lists)
-    and compile-step globs (`tests/**`) reference files without running them,
-    so they must not certify anything. A `run: |` block is every
-    more-indented line after it; `run: <one line>` contributes that line.
+    Coverage must mean EXECUTION. Three consequences:
+
+    * Path filters (`changes:`/`filters:` lists) and compile-step globs
+      (`tests/**`) reference files without running them, so they are never
+      read.
+    * Shell comments cannot certify: a run block saying
+      `# FIXME: wire tests/alpha_e2e.rs into a lane` is the natural lazy
+      non-fix, so each line is cut at its first `#`.
+    * Execution routed through a repo script counts: a block running
+      `bash scripts/run_cloud_emulator_tests.sh` executes whatever
+      `--test` targets that script names, so invoked script bodies are
+      appended to the search text (adversarial-review round 1 found
+      `objstore_backend_contract_test.rs` certified exactly that way while
+      the guard called it unexecuted).
     """
     chunks: list[str] = []
+    invoked: set[Path] = set()
+
+    def harvest_script_invocations(text: str) -> None:
+        for match in re.finditer(r"(?:bash |sh |python3 )([^\s;|&]+\.sh\b)", text):
+            candidate = ROOT / match.group(1).lstrip("./")
+            if candidate.is_file():
+                invoked.add(candidate)
+
     for path in sorted(WORKFLOWS_DIR.glob("*.yml")):
         lines = path.read_text(encoding="utf-8").splitlines()
         for index, line in enumerate(lines):
@@ -75,14 +94,20 @@ def run_block_text() -> str:
             if not (stripped == "run: |" or stripped.startswith("run:")):
                 continue
             if stripped == "run: |":
-                if ":" in line:
-                    indent = len(line) - len(line.lstrip())
-                    for follow in lines[index + 1:]:
-                        if follow.strip() and len(follow) - len(follow.lstrip()) <= indent:
-                            break
-                        chunks.append(follow)
+                indent = len(line) - len(line.lstrip())
+                block: list[str] = []
+                for follow in lines[index + 1:]:
+                    if follow.strip() and len(follow) - len(follow.lstrip()) <= indent:
+                        break
+                    block.append(follow)
             else:
-                chunks.append(stripped[len("run:"):])
+                block = [stripped[len("run:"):]]
+            # Cut shell comments: nothing after '#' may certify coverage.
+            block = [piece.split("#", 1)[0] for piece in block]
+            harvest_script_invocations("\n".join(block))
+            chunks.extend(block)
+    for script in sorted(invoked):
+        chunks.append(script.read_text(encoding="utf-8"))
     return "\n".join(chunks)
 
 

@@ -16,7 +16,7 @@ cdc_rest_changefeed_e2e.rs
 clickbench_ledger_e2e.rs
 corpus_version_restart_safety_test.rs
 cost_trace_pgwire_multimodal_e2e.rs
-counting_filesystem.rs
+counting_filesystem.rs  # FakeFs unit test misplaced under tests/ — permanent resident
 cpg_fragment_pax_contract.rs
 cross_model_transaction_e2e.rs
 cross_surface_unification_e2e.rs
@@ -60,19 +60,18 @@ helix_prune_debug_test.rs
 hmgi_integration_test.rs
 ident_case_fold_e2e.rs
 infrastructure_integration_test.rs
-integration.rs
+integration.rs  # helper module, not a test target — permanent
 ivf_ingest_asymptotic_test.rs
 jsonb_integration_test.rs
-lib.rs
+lib.rs  # helper module root, not a test target — permanent
 logical_operators_tests.rs
 mtls_integration_test.rs
 multimodal_integration_test.rs
 nova_ingest_sorted_segment.rs
-objstore_backend_contract_test.rs
 objstore_segment_path_guard_test.rs
 objstore_url_construction_test.rs
 objstore_zero_vector_recovery_test.rs
-openapi_helpers.rs
+openapi_helpers.rs  # #[path]-included helper, not a test target — permanent
 orion_canonical_checkpoint_read_test.rs
 pax_cascade_prod_search_test.rs
 pax_kill_switch_rawf32_exact_read_test.rs

@@ -835,6 +835,10 @@ jobs:
         run: python3 -m unittest discover -s tests/scripts -p 'test_ci_tree_reuse.py'
       - name: CI lane coverage guard tests
         run: python3 -m unittest discover -s tests/scripts -p 'test_ci_lane_coverage.py'
+      - name: CI lane coverage (the guard itself — a PR that adds an unwired
+          tests/*.rs must fail HERE, not only on a maintainer's laptop; the
+          env-gate check moved into CI for exactly this reason)
+        run: python3 scripts/check_ci_lane_coverage.py
       - name: Test panic-policy scanner scopes (legacy vs workspace)
         run: python3 -m unittest discover -s tests/scripts -p 'test_count_panic_patterns.py'
       - name: Test Flake Rerun infra-kill matcher (fixture job logs)

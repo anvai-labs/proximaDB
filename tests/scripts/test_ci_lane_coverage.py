@@ -16,7 +16,10 @@ wrong, found the hard way on the real tree:
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
+import re
 import sys
 import tempfile
 import unittest
@@ -126,10 +129,11 @@ class BaselineRatchet(unittest.TestCase):
     def test_new_uncovered_fails(self):
         tree = GuardTree(
             ["alpha_e2e.rs", "orphan_e2e.rs"], [WORKFLOW_WITH_RUN_LIST],
-            baseline_text="alpha_missing.rs\n",
+            baseline_text="",
         )
         with tree.patch(), mock.patch.object(sys, "argv", ["check"]):
-            self.assertEqual(guard.main(), 1)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(guard.main(), 1)
 
     def test_stale_baseline_fails(self):
         # alpha_e2e is executed by the run list AND still on the baseline.
@@ -138,7 +142,8 @@ class BaselineRatchet(unittest.TestCase):
             baseline_text="alpha_e2e.rs\norphan_e2e.rs\n",
         )
         with tree.patch(), mock.patch.object(sys, "argv", ["check"]):
-            self.assertEqual(guard.main(), 1)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(guard.main(), 1)
 
     def test_consistent_baseline_passes(self):
         tree = GuardTree(
@@ -146,7 +151,8 @@ class BaselineRatchet(unittest.TestCase):
             baseline_text="orphan_e2e.rs\n",
         )
         with tree.patch(), mock.patch.object(sys, "argv", ["check"]):
-            self.assertEqual(guard.main(), 0)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(guard.main(), 0)
 
     def test_update_baseline_records_exactly_the_uncovered(self):
         tree = GuardTree(
@@ -159,6 +165,32 @@ class BaselineRatchet(unittest.TestCase):
             tree.baseline.read_text(encoding="utf-8"),
             "orphan_a_e2e.rs\norphan_b_e2e.rs\n",
         )
+
+
+class EvasionClasses(unittest.TestCase):
+    """The evasions the adversarial review demonstrated — pinned so they
+    cannot return: shell comments must not certify, and neither may a
+    comment-embedded glob."""
+
+    COMMENT_ONLY_WORKFLOW = """
+jobs:
+  lane:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          # FIXME: tests/alpha_e2e.rs is not wired into any lane yet
+          # the convergence suite (tests/*conv*.rs) still needs a lane
+          cargo build
+"""
+
+    def test_comment_mentions_do_not_certify(self):
+        tree = GuardTree(["alpha_e2e.rs", "conv_e2e.rs"], [self.COMMENT_ONLY_WORKFLOW])
+        with tree.patch():
+            text = guard.run_block_text()
+            patterns = sorted(set(re.findall(guard.TESTS_TOKEN_RE, text))) if hasattr(
+                guard, "TESTS_TOKEN_RE") else sorted(set(re.findall(r"(tests/[^\s'\";)]+)", text)))
+            self.assertFalse(guard.is_covered("alpha_e2e", "alpha_e2e.rs", text, patterns))
+            self.assertFalse(guard.is_covered("conv_e2e", "conv_e2e.rs", text, patterns))
 
 
 if __name__ == "__main__":
