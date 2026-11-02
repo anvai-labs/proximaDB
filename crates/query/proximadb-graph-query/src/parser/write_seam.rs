@@ -29,15 +29,19 @@ pub(super) fn parse_create_node_spec(input: &str) -> IResult<&str, CreateNodeSpe
         delimited(
             char('('),
             tuple((
-                opt(identifier),                                      // Optional variable
-                opt(preceded(char(':'), identifier)),                 // Optional label
+                opt(identifier), // Optional variable
+                // Labels: :A or :A:B (multi-label — the modality grammar's
+                // shape; previously single-only, which left the seam
+                // internally inconsistent: MERGE multi-label parsed via the
+                // shared node pattern while CREATE did not)
+                many0(preceded(char(':'), identifier)),
                 opt(preceded(multispace0, parse_property_value_map)), // Optional properties
             )),
             char(')'),
         ),
-        |(variable, label_opt, properties_opt)| CreateNodeSpec {
+        |(variable, labels, properties_opt)| CreateNodeSpec {
             variable,
-            labels: label_opt.map(|l| vec![l]).unwrap_or_default(),
+            labels,
             properties: properties_opt.unwrap_or_default(),
         },
     )(input)

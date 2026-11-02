@@ -37,9 +37,9 @@ use super::ast::{
 use nom::{
     IResult,
     branch::alt,
-    bytes::complete::{tag, tag_no_case, take_while},
+    bytes::complete::{tag, tag_no_case},
     character::complete::{char, digit1, multispace0, multispace1},
-    combinator::{map, map_res, opt, recognize, value},
+    combinator::{map, map_res, opt, value},
     multi::{many0, separated_list0, separated_list1},
     sequence::{delimited, preceded, separated_pair, tuple},
 };
@@ -111,6 +111,14 @@ fn identifier(input: &str) -> IResult<&str, String> {
     lexemes::identifier(input)
 }
 
+fn any_identifier(input: &str) -> IResult<&str, String> {
+    lexemes::any_identifier(input)
+}
+
+fn string_literal(input: &str) -> IResult<&str, String> {
+    lexemes::string_literal(input)
+}
+
 fn property_value(input: &str) -> IResult<&str, serde_json::Value> {
     lexemes::property_value::<nom::error::Error<&str>>(input)
 }
@@ -132,15 +140,16 @@ fn parse_node_pattern(input: &str) -> IResult<&str, NodePattern> {
         delimited(
             char('('),
             tuple((
-                opt(identifier), // Optional variable (anonymous if absent)
+                preceded(multispace0, opt(any_identifier)), // Optional variable (backticks ok)
                 // Labels: :A or :A:B (multi-label, TD-GRAPH-4 step 3 —
                 // the modality grammar's shape; previously single-only)
-                many0(preceded(char(':'), identifier)),
+                many0(preceded(char(':'), any_identifier)),
                 opt(preceded(multispace0, property_map)), // Optional Properties
+                multispace0,
             )),
             char(')'),
         ),
-        move |(variable_opt, labels, properties_opt)| NodePattern {
+        move |(variable_opt, labels, properties_opt, _)| NodePattern {
             variable: variable_opt.unwrap_or_else(|| format!("__anon_{anon_seed}")),
             labels,
             properties: properties_opt.unwrap_or_default(),
@@ -339,7 +348,7 @@ fn parse_where_condition(input: &str) -> IResult<&str, WhereClause> {
             tuple((
                 parse_where_primary,
                 preceded(
-                    delimited(multispace1, tag("AND"), multispace1),
+                    delimited(multispace1, tag_no_case("AND"), multispace1),
                     parse_where_condition,
                 ),
             )),
@@ -350,11 +359,22 @@ fn parse_where_condition(input: &str) -> IResult<&str, WhereClause> {
             tuple((
                 parse_where_primary,
                 preceded(
-                    delimited(multispace1, tag("OR"), multispace1),
+                    delimited(multispace1, tag_no_case("OR"), multispace1),
                     parse_where_condition,
                 ),
             )),
             |(left, right)| WhereClause::Or(Box::new(left), Box::new(right)),
+        ),
+        // Logical XOR (the modality grammar's combinator)
+        map(
+            tuple((
+                parse_where_primary,
+                preceded(
+                    delimited(multispace1, tag_no_case("XOR"), multispace1),
+                    parse_where_condition,
+                ),
+            )),
+            |(left, right)| WhereClause::Xor(Box::new(left), Box::new(right)),
         ),
         // Primary condition
         parse_where_primary,
@@ -363,9 +383,91 @@ fn parse_where_condition(input: &str) -> IResult<&str, WhereClause> {
 
 fn parse_where_primary(input: &str) -> IResult<&str, WhereClause> {
     alt((
+        // STARTS WITH / ENDS WITH / CONTAINS (the modality grammar's string
+        // predicates; TD-GRAPH-4 step-3 parity)
+        map(
+            tuple((
+                any_identifier,
+                char('.'),
+                any_identifier,
+                delimited(multispace1, tag_no_case("STARTS"), multispace1),
+                tag_no_case("WITH"),
+                multispace1,
+                string_literal,
+            )),
+            |(variable, _, property, _, _, _, value)| WhereClause::Property {
+                variable,
+                property,
+                constraint: PropertyConstraint::StartsWith(value),
+            },
+        ),
+        map(
+            tuple((
+                any_identifier,
+                char('.'),
+                any_identifier,
+                delimited(multispace1, tag_no_case("ENDS"), multispace1),
+                tag_no_case("WITH"),
+                multispace1,
+                string_literal,
+            )),
+            |(variable, _, property, _, _, _, value)| WhereClause::Property {
+                variable,
+                property,
+                constraint: PropertyConstraint::EndsWith(value),
+            },
+        ),
+        map(
+            tuple((
+                any_identifier,
+                char('.'),
+                any_identifier,
+                delimited(multispace1, tag_no_case("CONTAINS"), multispace1),
+                string_literal,
+            )),
+            |(variable, _, property, _, value)| WhereClause::Property {
+                variable,
+                property,
+                constraint: PropertyConstraint::Contains(value),
+            },
+        ),
+        // IS NULL / IS NOT NULL (the modality grammar's shapes)
+        map(
+            tuple((
+                any_identifier,
+                char('.'),
+                any_identifier,
+                delimited(multispace1, tag_no_case("IS"), multispace1),
+                tag_no_case("NULL"),
+            )),
+            |(variable, _, property, _, _)| WhereClause::Property {
+                variable,
+                property,
+                constraint: PropertyConstraint::NotExists,
+            },
+        ),
+        map(
+            tuple((
+                any_identifier,
+                char('.'),
+                any_identifier,
+                delimited(multispace1, tag_no_case("IS"), multispace1),
+                tag_no_case("NOT"),
+                multispace1,
+                tag_no_case("NULL"),
+            )),
+            |(variable, _, property, _, _, _, _)| WhereClause::Property {
+                variable,
+                property,
+                constraint: PropertyConstraint::Exists,
+            },
+        ),
         // NOT condition
         map(
-            preceded(tuple((tag("NOT"), multispace1)), parse_where_primary),
+            preceded(
+                tuple((tag_no_case("NOT"), multispace1)),
+                parse_where_primary,
+            ),
             |cond| WhereClause::Not(Box::new(cond)),
         ),
         // Parenthesized condition
@@ -386,9 +488,9 @@ fn parse_where_property_condition(input: &str) -> IResult<&str, WhereClause> {
         // using IN failed the whole WHERE parse).
         map(
             tuple((
-                identifier,
+                any_identifier,
                 char('.'),
-                identifier,
+                any_identifier,
                 delimited(multispace1, tag_no_case("IN"), multispace1),
                 delimited(
                     char('['),
@@ -408,9 +510,9 @@ fn parse_where_property_condition(input: &str) -> IResult<&str, WhereClause> {
         // Comparison: n.age > 30
         map(
             tuple((
-                identifier, // variable
+                any_identifier, // variable (backticks ok — modality shape)
                 char('.'),
-                identifier, // property
+                any_identifier, // property
                 delimited(multispace0, parse_comparison_op, multispace0),
                 property_value, // value
             )),
@@ -423,7 +525,11 @@ fn parse_where_property_condition(input: &str) -> IResult<&str, WhereClause> {
                     "<" => PropertyConstraint::LessThan(value),
                     ">=" => PropertyConstraint::GreaterOrEqual(value),
                     "<=" => PropertyConstraint::LessOrEqual(value),
-                    "!=" => PropertyConstraint::NotEquals(value),
+                    "!=" | "<>" => PropertyConstraint::NotEquals(value),
+                    "=~" => match value {
+                        serde_json::Value::String(re) => PropertyConstraint::Regex(re),
+                        other => PropertyConstraint::Regex(other.to_string()),
+                    },
                     _ => PropertyConstraint::Equals(value),
                 },
             },
@@ -436,6 +542,8 @@ fn parse_comparison_op(input: &str) -> IResult<&str, &str> {
         tag(">="),
         tag("<="),
         tag("!="),
+        tag("<>"), // NotEquals alias (the modality grammar's shape)
+        tag("=~"), // Regex match (the modality grammar's shape)
         tag("="),
         tag(">"),
         tag("<"),
@@ -459,12 +567,20 @@ fn parse_aggregation(input: &str) -> IResult<&str, PropertyProjection> {
                     char('('),
                     delimited(
                         multispace0,
+                        // Both branches discard their output (unified to
+                        // &str): `*`, or DISTINCT + exactly one identifier
+                        // (the modality grammar's shape — review F2: the
+                        // take_while form accepted arbitrary garbage and
+                        // misparsed nested close-parens).
                         alt((
-                            tag("*"),
-                            recognize(preceded(
-                                tuple((tag_no_case("DISTINCT"), multispace1)),
-                                take_while(|c| c != ')'),
-                            )),
+                            map(tag("*"), |_| ""),
+                            map(
+                                preceded(
+                                    tuple((tag_no_case("DISTINCT"), multispace1)),
+                                    any_identifier,
+                                ),
+                                |_| "",
+                            ),
                         )),
                         multispace0,
                     ),
@@ -590,7 +706,7 @@ fn parse_return_item(input: &str) -> IResult<&str, (String, PropertyProjection)>
             tuple((
                 parse_aggregation,
                 opt(preceded(
-                    delimited(multispace1, tag("AS"), multispace1),
+                    delimited(multispace1, tag_no_case("AS"), multispace1),
                     identifier,
                 )),
             )),
@@ -613,7 +729,7 @@ fn parse_return_item(input: &str) -> IResult<&str, (String, PropertyProjection)>
                 char('.'),
                 identifier,
                 opt(preceded(
-                    delimited(multispace1, tag("AS"), multispace1),
+                    delimited(multispace1, tag_no_case("AS"), multispace1),
                     identifier,
                 )),
             )),
@@ -635,7 +751,7 @@ fn parse_return_item(input: &str) -> IResult<&str, (String, PropertyProjection)>
             tuple((
                 identifier,
                 opt(preceded(
-                    delimited(multispace1, tag("AS"), multispace1),
+                    delimited(multispace1, tag_no_case("AS"), multispace1),
                     identifier,
                 )),
             )),

@@ -17,10 +17,17 @@
 //! runtime-minted identifiers (node `id`, edge `from`/`to`) are elided —
 //! fresh UUIDs per parse are not grammar behavior.
 //!
-//! Corpus EXTENDED 41→45 in TD-GRAPH-4 step 3 (deliberate pin update):
-//! the seam gained the modality's IN / multi-label / WITH-AS / COUNT(DISTINCT)
-//! constructs, so four formerly modality-only shapes joined the BOTH
-//! intersection and are now differentially pinned.
+//! Corpus EXTENDED twice in TD-GRAPH-4 step 3 (deliberate, reviewed pin
+//! updates): 41→45 (the seam gained IN / multi-label / WITH-AS /
+//! COUNT(DISTINCT n)), then 45→54 after round-1 review proved the
+//! "no modality-only constructs remain" claim premature — the seam also
+//! gained CONTAINS / STARTS WITH / ENDS WITH, IS [NOT] NULL, <> and =~,
+//! XOR, backtick-quoted identifiers everywhere (vars, labels, WHERE
+//! operands), lowercase `as`, permissive node-pattern spacing, and
+//! write-path multi-label CREATE. Every newly-shared shape is pinned.
+//! Known NEITHER-grammar shapes (kept out by construction): ORDER BY over
+//! properties, UNION, UNWIND, FOREACH, CALL, COUNT(n),
+//! COUNT(DISTINCT n.name) (DISTINCT takes exactly one bare identifier).
 //!
 //! Coverage note: entries are the BOTH-grammar intersection (full input
 //! consumed on both sides — the seam parser does NOT require eof, so an
@@ -174,6 +181,21 @@ const CORPUS: &[(&str, &str)] = &[
         "count_distinct",
         "MATCH (n:Person) RETURN COUNT(DISTINCT n)",
     ),
+    (
+        "where_contains",
+        "MATCH (n) WHERE n.name CONTAINS \"Al\" RETURN n",
+    ),
+    (
+        "where_starts_with",
+        "MATCH (n) WHERE n.name STARTS WITH \"A\" RETURN n",
+    ),
+    ("where_is_null", "MATCH (n) WHERE n.x IS NULL RETURN n"),
+    ("where_ne_alias", "MATCH (n) WHERE n.age <> 30 RETURN n"),
+    ("where_regex", "MATCH (n) WHERE n.name =~ \"A.*\" RETURN n"),
+    ("where_xor", "MATCH (n) WHERE n.a = 1 XOR n.b = 2 RETURN n"),
+    ("read_quoted_label", "MATCH (n:`My Label`) RETURN n"),
+    ("with_var_alias_lower", "MATCH (n) WITH n as x RETURN x"),
+    ("write_multi_label", "CREATE (n:A:B {k: 1})"),
 ];
 
 /// The frozen clause-level behavior of both grammars over {CORPUS}.
@@ -359,6 +381,42 @@ S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":
 Q: MATCH (n:Person) RETURN COUNT(DISTINCT n)
 M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":"Person","labels":["Person"],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null,"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["count"],"limit":null,"order_by":[],"projections":["Count"],"skip":null,"variables":["count"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
 S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":["Person"],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":["Count"],"skip":null,"variables":["count"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+=== where_contains
+Q: MATCH (n) WHERE n.name CONTAINS "Al" RETURN n
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":null,"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Property":{"constraint":{"Contains":"Al"},"property":"name","variable":"n"}},"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["n"],"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Property":{"constraint":{"Contains":"Al"},"property":"name","variable":"n"}}}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+=== where_starts_with
+Q: MATCH (n) WHERE n.name STARTS WITH "A" RETURN n
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":null,"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Property":{"constraint":{"StartsWith":"A"},"property":"name","variable":"n"}},"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["n"],"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Property":{"constraint":{"StartsWith":"A"},"property":"name","variable":"n"}}}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+=== where_is_null
+Q: MATCH (n) WHERE n.x IS NULL RETURN n
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":null,"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Property":{"constraint":"NotExists","property":"x","variable":"n"}},"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["n"],"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Property":{"constraint":"NotExists","property":"x","variable":"n"}}}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+=== where_ne_alias
+Q: MATCH (n) WHERE n.age <> 30 RETURN n
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":null,"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Property":{"constraint":{"NotEquals":30},"property":"age","variable":"n"}},"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["n"],"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Property":{"constraint":{"NotEquals":30},"property":"age","variable":"n"}}}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+=== where_regex
+Q: MATCH (n) WHERE n.name =~ "A.*" RETURN n
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":null,"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Property":{"constraint":{"Regex":"A.*"},"property":"name","variable":"n"}},"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["n"],"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Property":{"constraint":{"Regex":"A.*"},"property":"name","variable":"n"}}}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+=== where_xor
+Q: MATCH (n) WHERE n.a = 1 XOR n.b = 2 RETURN n
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":null,"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"And":[{"Or":[{"Property":{"constraint":{"Equals":1},"property":"a","variable":"n"}},{"Property":{"constraint":{"Equals":2},"property":"b","variable":"n"}}]},{"Not":{"And":[{"Property":{"constraint":{"Equals":1},"property":"a","variable":"n"}},{"Property":{"constraint":{"Equals":2},"property":"b","variable":"n"}}]}}]},"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["n"],"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Xor":[{"Property":{"constraint":{"Equals":1},"property":"a","variable":"n"}},{"Property":{"constraint":{"Equals":2},"property":"b","variable":"n"}}]}}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+=== read_quoted_label
+Q: MATCH (n:`My Label`) RETURN n
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":"My Label","labels":["My Label"],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null,"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["n"],"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":["My Label"],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+=== with_var_alias_lower
+Q: MATCH (n) WITH n as x RETURN x
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":null,"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null,"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["x"],"limit":null,"order_by":[],"projections":[{"Variable":"x"}],"skip":null,"variables":["x"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"where_clause":null}]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"x"}],"skip":null,"variables":["x"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[{"distinct":false,"limit":null,"order_by":[],"projections":[["x",{"Variable":"n"}]],"skip":null,"where_clause":null}]}
+=== write_multi_label
+Q: CREATE (n:A:B {k: 1})
+M: {"clauses":[],"reading_clauses":[],"return_spec":null,"union_clauses":[],"updating_clauses":[{"Create":{"edges":[],"nodes":[{"labels":["A","B"],"properties":{"k":1},"variable":"n"}]}}],"with_clauses":[]}
+S: {"reading_clauses":[],"return_spec":null,"union_clauses":[],"updating_clauses":[{"Create":{"edges":[],"nodes":[{"labels":["A","B"],"properties":{"k":1},"variable":"n"}]}}],"with_clauses":[]}
 "#;
 
 /// Deterministic JSON rendering: object keys sorted at every level.
