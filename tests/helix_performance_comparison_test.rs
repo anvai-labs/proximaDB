@@ -221,6 +221,7 @@ mod performance_comparison_tests {
                 storage_class_status: None,
                 id: collection_id.to_string(),
                 config: Some(proximadb::proto::proximadb_v1::CollectionConfig {
+                    pool_id: None,
                     storage_class: None,
                     policy_generation: None,
                     default_access_tier: None,
@@ -721,6 +722,7 @@ mod performance_comparison_tests {
                 storage_class_status: None,
                 id: "test_collection".to_string(),
                 config: Some(proximadb::proto::proximadb_v1::CollectionConfig {
+                    pool_id: None,
                     storage_class: None,
                     policy_generation: None,
                     default_access_tier: None,
@@ -969,6 +971,7 @@ mod performance_comparison_tests {
                             storage_class_status: None,
                             id: "test_collection".to_string(),
                             config: Some(proximadb::proto::proximadb_v1::CollectionConfig {
+                                pool_id: None,
                                 storage_class: None,
                                 policy_generation: None,
                                 default_access_tier: None,

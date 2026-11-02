@@ -99,6 +99,10 @@ pub struct CollectionFlushPlan {
     /// without it the flush — and the compaction it enqueues — never saw the
     /// tier (review B1).
     pub default_access_tier: Option<i32>,
+    /// TD-TIER-1 SC6: the reservation pool a re-admission charges. Rides the
+    /// plan like the tier — a flushed DTO that drops it would silently
+    /// reroute a later grant to the default pool (the DTO-drop class).
+    pub pool_id: Option<String>,
 }
 
 /// Build a [`CollectionFlushPlan`] from a collection's catalog metadata. The single
@@ -167,6 +171,7 @@ pub fn flush_plan_from_collection_meta(
         tags: config.map(|c| c.tags.clone()).unwrap_or_default(),
         pax_vector_quant: config.and_then(|c| c.pax_vector_quant.clone()),
         default_access_tier: config.and_then(|c| c.default_access_tier),
+        pool_id: config.and_then(|c| c.pool_id.clone()),
     })
 }
 
@@ -626,6 +631,7 @@ async fn materialize_collection_with_coordinator_mode(
             tags: plan.tags.clone(),
             pax_vector_quant: plan.pax_vector_quant.clone(),
             default_access_tier: plan.default_access_tier,
+            pool_id: plan.pool_id.clone(),
             ..Default::default()
         }),
         ..Default::default()
@@ -972,6 +978,7 @@ mod tests {
             tags: Vec::new(),
             pax_vector_quant: None,
             default_access_tier: None,
+            pool_id: None,
         }
     }
 

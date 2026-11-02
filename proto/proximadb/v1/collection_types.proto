@@ -116,6 +116,14 @@ message CollectionConfig {
   // explicit tier requires a tiered object-store placement (S3/Azure/GCS);
   // control objects (directories, manifests) keep the account default.
   optional AccessTier default_access_tier = 32;
+
+  // TD-TIER-1 SC6 policy seam: the reservation pool this PERFORMANCE
+  // collection's grant charges. Absent ⇒ the configured default pool (the
+  // only behavior before this field; multi-pool deployments route freemium /
+  // team / enterprise tiers to their own pools). An explicit id must name a
+  // pool in `storage.reservation_pools` — unknown ids are refused at
+  // admission with the configured ids listed.
+  optional string pool_id = 33;
 }
 
 // Canonical scalar type for a collection's embedding column. Mirrors

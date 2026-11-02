@@ -1813,6 +1813,7 @@ impl SharedServices {
                     storage_class: None,
                     policy_generation: None,
                     default_access_tier: None,
+                    pool_id: None,
                     name: metadata.name.clone(),
                     embedding_config: None,
                     dimension: metadata.dimension as u32,

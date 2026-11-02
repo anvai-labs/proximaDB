@@ -44,6 +44,7 @@ impl SstEngine {
             storage_class: None,
             policy_generation: None,
             default_access_tier: None,
+            pool_id: None,
             name: collection_id.to_string(),
             embedding_config: None,
             dimension: 1536,          // Default dimension

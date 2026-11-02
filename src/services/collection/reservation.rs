@@ -282,9 +282,15 @@ impl ReservationRegistry {
         collection_id: &str,
         now_unix_secs: i64,
         residency_prefixes: &[String],
+        pool_id: Option<&str>,
     ) -> Result<Grant, ReservationError> {
-        let handle =
-            self.spawn_reserve(tenant_id, collection_id, now_unix_secs, residency_prefixes);
+        let handle = self.spawn_reserve(
+            tenant_id,
+            collection_id,
+            now_unix_secs,
+            residency_prefixes,
+            pool_id,
+        );
         join_reserve(handle).await
     }
 
@@ -297,14 +303,22 @@ impl ReservationRegistry {
         collection_id: &str,
         now_unix_secs: i64,
         residency_prefixes: &[String],
+        pool_id: Option<&str>,
     ) -> tokio::task::JoinHandle<Result<Grant, ReservationError>> {
         let this = Arc::clone(self);
         let tenant = tenant_id.to_string();
         let collection = collection_id.to_string();
         let prefixes = residency_prefixes.to_vec();
+        let pool = pool_id.map(str::to_string);
         tokio::spawn(async move {
-            this.reserve_gated(&tenant, &collection, now_unix_secs, &prefixes)
-                .await
+            this.reserve_gated(
+                &tenant,
+                &collection,
+                now_unix_secs,
+                &prefixes,
+                pool.as_deref(),
+            )
+            .await
         })
     }
 
@@ -314,6 +328,7 @@ impl ReservationRegistry {
         collection_id: &str,
         now_unix_secs: i64,
         residency_prefixes: &[String],
+        pool_id: Option<&str>,
     ) -> Result<Grant, ReservationError> {
         if tenant_id.is_empty() {
             // The metering resolver rejects empty tenant ids, so an
@@ -327,7 +342,7 @@ impl ReservationRegistry {
         // Mutation + budget sync under one gate (SF1): the Σ read cannot
         // interleave with a concurrent mutation's commit.
         let _gate = self.mutation_gate.lock().await;
-        let (config, authority) = self.armed_default_pool()?;
+        let (config, authority) = self.resolve_pool(pool_id)?;
         let previous_bytes = authority
             .live_grant_snapshot(tenant_id, collection_id)
             .await
@@ -362,6 +377,37 @@ impl ReservationRegistry {
     /// The default pool and its config, refusing an unresolvable default
     /// (shared by the admission peek and the reserve — the dup-ratchet
     /// exists for exactly this twin).
+    /// The configured pool ids, for admission-time validation of a
+    /// collection's explicit `pool_id` (TD-TIER-1 SC6).
+    pub fn configured_pool_ids(&self) -> Vec<String> {
+        self.pools.keys().cloned().collect()
+    }
+
+    fn resolve_pool(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<&(ReservationPoolConfig, ReservationAuthority), ReservationError> {
+        match requested.filter(|id| !id.is_empty()) {
+            None => self.armed_default_pool(),
+            Some(id) => {
+                let entry = self.pools.get(id).ok_or_else(|| {
+                    ReservationError::Invalid(format!(
+                        "reservation pool '{id}' is not configured; configured pools: [{}]",
+                        self.pools.keys().cloned().collect::<Vec<_>>().join(", ")
+                    ))
+                })?;
+                if entry.0.default_grant_bytes == 0 {
+                    return Err(ReservationError::Invalid(format!(
+                        "reservation pool '{id}' declares no default_grant_bytes;                          PERFORMANCE admission is not armed (set default_grant_bytes in                          [storage.reservation_pools])"
+                    )));
+                }
+                Ok(entry)
+            }
+        }
+    }
+
+    /// TD-TIER-1 SC6 policy seam routing ends here; the default below is
+    /// the only behavior before `pool_id` existed.
     fn armed_default_pool(
         &self,
     ) -> Result<&(ReservationPoolConfig, ReservationAuthority), ReservationError> {
@@ -1291,9 +1337,15 @@ impl GrantCompensation {
         collection: String,
         now_unix_secs: i64,
         residency_prefixes: &[String],
+        pool_id: Option<&str>,
     ) -> Self {
-        let handle =
-            registry.spawn_reserve(&tenant, &collection, now_unix_secs, residency_prefixes);
+        let handle = registry.spawn_reserve(
+            &tenant,
+            &collection,
+            now_unix_secs,
+            residency_prefixes,
+            pool_id,
+        );
         Self {
             owed: Compensation::Pending(handle),
             target: Some((registry.clone(), tenant, collection)),
@@ -1708,6 +1760,122 @@ mod tests {
             default_grant_bytes: 0,
             is_default: false,
         }
+    }
+
+    fn armed_pool(dir: &tempfile::TempDir, id: &str, default: bool) -> ReservationPoolConfig {
+        ReservationPoolConfig {
+            id: id.to_string(),
+            path: dir.path().join(id).display().to_string(),
+            allocatable_bytes: 60 * 1024 * 1024 * 1024,
+            tenant_limit_bytes: None,
+            overhead_factor: 0.1,
+            default_grant_bytes: 1024 * 1024 * 1024,
+            is_default: default,
+        }
+    }
+
+    /// TD-TIER-1 SC6: an explicit `pool_id` charges THAT pool's ledger — the
+    /// freemium/team/enterprise routing seam. A defaulted (None) reserve
+    /// keeps charging the armed default.
+    #[tokio::test]
+    async fn named_pool_routes_its_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let pools = vec![
+            armed_pool(&dir, "default-pool", true),
+            armed_pool(&dir, "enterprise", false),
+        ];
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .expect("registry");
+        let now = current_unix_secs();
+
+        registry
+            .reserve_for_performance("t1", "c-named", now, &[], Some("enterprise"))
+            .await
+            .expect("routed reserve");
+        registry
+            .reserve_for_performance("t1", "c-default", now, &[], None)
+            .await
+            .expect("default reserve");
+
+        let enterprise = &registry.pools["enterprise"];
+        let default_pool = &registry.pools["default-pool"];
+        assert!(
+            enterprise
+                .1
+                .live_grant_snapshot("t1", "c-named")
+                .await
+                .is_some(),
+            "the named pool holds the routed grant"
+        );
+        assert!(
+            default_pool
+                .1
+                .live_grant_snapshot("t1", "c-default")
+                .await
+                .is_some(),
+            "the default pool keeps defaulted grants"
+        );
+        assert!(
+            default_pool
+                .1
+                .live_grant_snapshot("t1", "c-named")
+                .await
+                .is_none(),
+            "the routed grant does NOT charge the default pool"
+        );
+
+        // Release is pool-agnostic (it sweeps every pool): the routed grant
+        // releases cleanly from its non-default home.
+        registry.release_for_collection("t1", "c-named", now).await;
+        assert!(
+            enterprise
+                .1
+                .live_grant_snapshot("t1", "c-named")
+                .await
+                .is_none()
+        );
+    }
+
+    /// TD-TIER-1 SC6: an unknown pool id is refused fail-closed with the
+    /// configured ids listed; an ungranted (no default_grant_bytes) named
+    /// pool refuses too.
+    #[tokio::test]
+    async fn unknown_or_unarmed_pool_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let pools = vec![armed_pool(&dir, "default-pool", true)];
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .expect("registry");
+
+        let error = registry
+            .reserve_for_performance("t1", "c1", current_unix_secs(), &[], Some("nope"))
+            .await
+            .expect_err("unknown id refused");
+        assert!(
+            error.to_string().contains("default-pool"),
+            "the error lists the configured pools: {error}"
+        );
+
+        drop(registry);
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut unarmed = armed_pool(&dir2, "unarmed", false);
+        unarmed.default_grant_bytes = 0;
+        let pools = vec![armed_pool(&dir2, "default-pool", true), unarmed];
+        let registry = ReservationRegistry::open_from_config(&pools)
+            .await
+            .unwrap()
+            .expect("registry");
+        let error = registry
+            .reserve_for_performance("t1", "c2", current_unix_secs(), &[], Some("unarmed"))
+            .await
+            .expect_err("unarmed pool refused");
+        assert!(
+            error.to_string().contains("default_grant_bytes"),
+            "actionable: {error}"
+        );
     }
 
     // SC-TE3: two concurrent 40 GiB requests against 60 GiB (with overhead,
@@ -2287,7 +2455,7 @@ mod tests {
         );
 
         registry
-            .reserve_for_performance("t1", "c-budget-1", current_unix_secs(), &[])
+            .reserve_for_performance("t1", "c-budget-1", current_unix_secs(), &[], None)
             .await
             .unwrap();
         assert_eq!(
@@ -2323,7 +2491,7 @@ mod tests {
             .unwrap()
             .unwrap();
         registry
-            .reserve_for_performance("t1", "c-persist-1", current_unix_secs(), &[])
+            .reserve_for_performance("t1", "c-persist-1", current_unix_secs(), &[], None)
             .await
             .unwrap();
         drop(registry); // "crash": the grant is durable in the pool ledger
@@ -2366,6 +2534,7 @@ mod tests {
                 "cancel-1",
                 current_unix_secs(),
                 &[],
+                None,
             ));
             // One poll spawns the task; then the caller goes away.
             let _ = futures::poll!(fut.as_mut());
@@ -2408,6 +2577,7 @@ mod tests {
                 collection.to_string(),
                 current_unix_secs(),
                 &[],
+                None,
             )
         };
         // Dropped before the reserve's outcome was even observed.
@@ -2487,6 +2657,7 @@ mod tests {
                 "77",
                 current_unix_secs(),
                 std::slice::from_ref(&prefix),
+                None,
             )
             .await
             .unwrap();
@@ -2548,7 +2719,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let grant = registry
-            .reserve_for_performance("t1", "c-uuid-1", 1000, &[])
+            .reserve_for_performance("t1", "c-uuid-1", 1000, &[], None)
             .await
             .unwrap();
         assert_eq!(grant.bytes, 4096, "operator-declared default grant size");
@@ -2567,7 +2738,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let err = registry
-            .reserve_for_performance("t1", "c-uuid-1", 1000, &[])
+            .reserve_for_performance("t1", "c-uuid-1", 1000, &[], None)
             .await
             .unwrap_err()
             .to_string();
@@ -2588,7 +2759,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let err = registry
-            .reserve_for_performance("t1", "c-uuid-1", 1000, &[])
+            .reserve_for_performance("t1", "c-uuid-1", 1000, &[], None)
             .await
             .unwrap_err()
             .to_string();
@@ -2603,7 +2774,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let grant = registry
-            .reserve_for_performance("t1", "c-uuid-1", 1000, &[])
+            .reserve_for_performance("t1", "c-uuid-1", 1000, &[], None)
             .await
             .unwrap();
         assert_eq!(grant.bytes, 4096);
@@ -2622,7 +2793,7 @@ mod tests {
             .unwrap()
             .unwrap();
         registry
-            .reserve_for_performance("t1", "c-uuid-1", 500, &[])
+            .reserve_for_performance("t1", "c-uuid-1", 500, &[], None)
             .await
             .unwrap();
         registry
@@ -2705,7 +2876,7 @@ mod tests {
             .unwrap();
         registry.peek_performance_admission().await.unwrap();
         registry
-            .reserve_for_performance("t1", "c-uuid-1", current_unix_secs(), &[])
+            .reserve_for_performance("t1", "c-uuid-1", current_unix_secs(), &[], None)
             .await
             .unwrap();
         // 4000 charged of 5000: a second default grant no longer fits.
@@ -2748,7 +2919,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let err = registry
-            .reserve_for_performance("", "c-uuid-1", 1000, &[])
+            .reserve_for_performance("", "c-uuid-1", 1000, &[], None)
             .await
             .unwrap_err()
             .to_string();

@@ -2286,6 +2286,7 @@ impl ProximaRecordService for ProximaRecordServiceImpl {
         // InvalidArgument here, and a known label flows into the v1 config so
         // manager admission applies identically to REST, gRPC and Flight.
         v1_config.storage_class = v2_storage_class_field(&cfg)?;
+        v1_config.pool_id = v2_pool_id_field(&cfg);
         // TD-TIER-1 SC5: same strict parse as REST; admission is the manager's.
         v1_config.default_access_tier = v2_access_tier_field(&cfg)?;
 
@@ -2617,6 +2618,16 @@ fn v2_storage_class_field(cfg: &proximadb_v2::V2CollectionConfig) -> Result<Opti
     }
 }
 
+/// TD-TIER-1 SC6: the v2 request's `pool_id` — unset/empty ⇒ the default
+/// pool; a non-empty id is carried verbatim for admission validation (an
+/// unknown id is refused there with the configured ids listed).
+fn v2_pool_id_field(cfg: &proximadb_v2::V2CollectionConfig) -> Option<String> {
+    cfg.pool_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 /// TD-TIER-1 SC5: parse the v2 create request's `default_access_tier` label
 /// (strict, like `storage_class`): unset/empty ⇒ the account default.
 fn v2_access_tier_field(cfg: &proximadb_v2::V2CollectionConfig) -> Result<Option<i32>, Status> {
@@ -2672,6 +2683,7 @@ fn collection_to_v2(c: crate::proto::proximadb_v1::Collection) -> V2Collection {
                 cfg.default_access_tier,
             )
             .map(str::to_string),
+            pool_id: cfg.pool_id.clone(),
             description: cfg.description.unwrap_or_default(),
             index_specs: cfg
                 .index_configs
@@ -2770,6 +2782,7 @@ mod tests {
         let cfg = proximadb_v2::V2CollectionConfig {
             storage_class: None,
             default_access_tier: None,
+            pool_id: None,
             name: "c".to_string(),
             dimension: 128,
             distance_metric: "cosine".to_string(),

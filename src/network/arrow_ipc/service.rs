@@ -1956,6 +1956,7 @@ impl FlightService for ProximaFlightService {
                     storage_class: None,
                     policy_generation: None,
                     default_access_tier: None,
+                    pool_id: None,
                     name: name.to_string(),
                     embedding_config: None,
                     dimension,

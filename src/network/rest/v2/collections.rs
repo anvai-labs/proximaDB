@@ -299,6 +299,12 @@ pub struct CreateCollectionV2Request {
     /// set, a tier can be changed but not cleared back to the default.
     #[serde(default)]
     pub default_access_tier: Option<String>,
+    /// TD-TIER-1 SC6 policy seam: the reservation pool this PERFORMANCE
+    /// collection's grant charges ("pool_id" in [storage.reservation_pools]);
+    /// omitted ⇒ the configured default pool. Unknown ids are refused at
+    /// admission with the configured ids listed.
+    #[serde(default)]
+    pub pool_id: Option<String>,
 }
 
 /// REST input for the per-collection index routing policy (mirrors proto
@@ -944,6 +950,11 @@ async fn create_collection_v2_checked(
         }
     };
 
+    // TD-TIER-1 SC6: carry the requested reservation pool verbatim —
+    // admission validates it against the configured pools (unknown ids are
+    // refused there with the list; empty normalizes to the default pool).
+    let pool_id = request.pool_id.take().filter(|raw| !raw.trim().is_empty());
+
     // ADR-028: validate + map the optional index routing policy. Fail-closed on
     // nonsensical combinations (the mode×rehydrate/nprobe validity matrix) so a
     // bad policy is rejected at create rather than silently ignored at query time.
@@ -966,6 +977,7 @@ async fn create_collection_v2_checked(
         description: request.description.take(),
         storage_class,
         default_access_tier,
+        pool_id,
         ..Default::default()
     };
 
@@ -1074,6 +1086,10 @@ pub struct CollectionV2Response {
     /// Desired, not observed: an account lifecycle rule may move objects.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_access_tier: Option<String>,
+    /// Reservation pool the PERFORMANCE grant charges (TD-TIER-1 SC6);
+    /// omitted when the default pool applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_id: Option<String>,
     /// Schema definition (if defined)
     pub schema: Option<SchemaDefinition>,
     /// Collection statistics
@@ -1388,6 +1404,7 @@ pub async fn get_collection_v2(
                     config.default_access_tier,
                 )
                 .map(str::to_string),
+                pool_id: config.pool_id.clone(),
                 storage_class_status: collection
                     .storage_class_status
                     .clone()
@@ -5418,6 +5435,7 @@ mod tests {
     #[test]
     fn get_response_serializes_index_specs_and_quantization() {
         let resp = CollectionV2Response {
+            pool_id: None,
             storage_class: "balanced".into(),
             default_access_tier: None,
             storage_class_status: StorageClassStatusOutput::from_proto(
