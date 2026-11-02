@@ -66,5 +66,36 @@ class ReleaseNoteTargetsTest(unittest.TestCase):
         self.assertEqual(queue.get(timeout=1), [])
 
 
+class AsOfDateFreshness(unittest.TestCase):
+    """Release-review F19: the corridor's as_of_date must not go stale."""
+
+    def _real_contract(self) -> dict:
+        import tomllib
+
+        path = (
+            Path(__file__).resolve().parents[2] / "docs" / "00-product" / "MVP_TRUST_CORRIDOR.toml"
+        )
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+
+    def test_real_contract_is_fresh(self):
+        errors = checker.validate_contract(self._real_contract())
+        self.assertFalse(
+            [e for e in errors if "as_of_date" in e],
+            f"the shipped corridor's as_of_date must be fresh: {errors}",
+        )
+
+    def test_stale_date_is_an_error(self):
+        contract = self._real_contract()
+        contract["as_of_date"] = "2026-01-01"
+        errors = checker.validate_contract(contract)
+        self.assertTrue(any("days old" in e for e in errors), errors)
+
+    def test_future_date_is_an_error(self):
+        contract = self._real_contract()
+        contract["as_of_date"] = "2099-01-01"
+        errors = checker.validate_contract(contract)
+        self.assertTrue(any("in the future" in e for e in errors), errors)
+
+
 if __name__ == "__main__":
     unittest.main()
