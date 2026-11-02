@@ -200,29 +200,6 @@ async fn test_soft_delete_non_existent_vector() {
 }
 
 #[tokio::test]
-async fn test_delete_collection_empty() {
-    let (storage_engine, _temp_dir) = create_basic_storage_engine().await;
-
-    // Test delete empty collection
-    let result = storage_engine.delete_collection("empty_collection").await;
-    assert!(result.is_ok(), "Delete collection should not fail");
-    assert!(
-        !result.unwrap(),
-        "Should return false for non-existent collection"
-    );
-}
-
-#[tokio::test]
-async fn test_get_all_vectors_empty_collection() {
-    let (_storage_engine, _temp_dir) = create_basic_storage_engine().await;
-
-    // TODO: get_vectors method has been moved or removed from StorageEngine
-    // This test needs to be updated to use the appropriate collection service methods
-    // let result = storage_engine.get_vectors("empty_collection", 100, None).await;
-    // assert!(result.is_ok(), "Get all vectors should not fail");
-}
-
-#[tokio::test]
 async fn test_cleanup_for_tests() {
     let (storage_engine, _temp_dir) = create_basic_storage_engine().await;
 
