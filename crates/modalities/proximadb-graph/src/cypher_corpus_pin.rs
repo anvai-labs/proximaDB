@@ -19,7 +19,7 @@
 //!
 //! Corpus EXTENDED in TD-GRAPH-4 step 3 (deliberate, reviewed pin
 //! updates): 41→45 (the seam gained IN / multi-label / WITH-AS /
-//! COUNT(DISTINCT n)), then 45→54 (round-1 review) and 54→58 (round-2) proved the
+//! COUNT(DISTINCT n)), then 45→54 (round-1 review) and 54→58 (round-2) and 58→60 (round-3) proved the
 //! "no modality-only constructs remain" claim premature — the seam also
 //! gained CONTAINS / STARTS WITH / ENDS WITH, IS [NOT] NULL, <> and =~,
 //! XOR, backtick-quoted identifiers everywhere (vars, labels, WHERE
@@ -205,6 +205,14 @@ const CORPUS: &[(&str, &str)] = &[
     (
         "where_regex_nonstring",
         "MATCH (n) WHERE n.age =~ 30 RETURN n",
+    ),
+    (
+        "merge_on_lowercase",
+        "MATCH (n) MERGE (m) on create set m.x = 1",
+    ),
+    (
+        "order_by_lowercase_desc",
+        "MATCH (n) RETURN n order by n desc",
     ),
 ];
 
@@ -443,6 +451,14 @@ S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":
 Q: MATCH (n) WHERE n.age =~ 30 RETURN n
 M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":null,"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Property":{"constraint":{"Equals":30},"property":"age","variable":"n"}},"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["n"],"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
 S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":{"Property":{"constraint":{"Equals":30},"property":"age","variable":"n"}}}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+=== merge_on_lowercase
+Q: MATCH (n) MERGE (m) on create set m.x = 1
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":null,"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null,"where_clauses":[],"with_clauses":[]}}}],"return_spec":null,"union_clauses":[],"updating_clauses":[{"Merge":{"on_create":{"items":[{"Property":{"property":"x","value":1,"variable":"m"}}]},"on_match":null,"pattern":{"edges":[],"nodes":[{"label":null,"labels":[],"optional":false,"properties":{},"variable":"m"}],"paths":[],"where_clause":null,"where_clauses":[],"with_clauses":[]}}}],"with_clauses":[]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null}}}],"return_spec":null,"union_clauses":[],"updating_clauses":[{"Merge":{"on_create":{"items":[{"Property":{"property":"x","value":1,"variable":"m"}}]},"on_match":null,"pattern":{"edges":[],"nodes":[{"labels":[],"optional":false,"properties":{},"variable":"m"}],"paths":[],"where_clause":null}}}],"with_clauses":[]}
+=== order_by_lowercase_desc
+Q: MATCH (n) RETURN n order by n desc
+M: {"clauses":[],"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"label":null,"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null,"where_clauses":[],"with_clauses":[]}}}],"return_spec":{"distinct":false,"items":["n"],"limit":null,"order_by":["n DESC"],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
+S: {"reading_clauses":[{"Match":{"optional":false,"pattern":{"edges":[],"nodes":[{"labels":[],"optional":false,"properties":{},"variable":"n"}],"paths":[],"where_clause":null}}}],"return_spec":{"distinct":false,"limit":null,"order_by":[["n",false]],"projections":[{"Variable":"n"}],"skip":null,"variables":["n"]},"union_clauses":[],"updating_clauses":[],"with_clauses":[]}
 "#;
 
 /// Deterministic JSON rendering: object keys sorted at every level.

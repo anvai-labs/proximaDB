@@ -90,15 +90,12 @@ pub(super) fn parse_create_edge_spec(input: &str) -> IResult<&str, CreateEdgeSpe
                 char('['),
                 tuple((
                     opt(any_identifier), // Variable
-                    // Edge type with ALTERNATION :KNOWS|LIKES (the modality
-                    // grammar's shape — first type wins, TD-GRAPH-4 step 3)
-                    opt(preceded(
-                        char(':'),
-                        map(
-                            separated_list1(char('|'), any_identifier),
-                            |types: Vec<String>| types.into_iter().next().unwrap_or_default(),
-                        ),
-                    )),
+                    // Edge type — SINGLE type (the modality grammar's
+                    // create-edge shape; review R3-F3: alternation here
+                    // was a seam superset silently dropping the extra
+                    // types — the read path keeps the full list, CREATE
+                    // matches the modality and rejects alternation).
+                    opt(preceded(char(':'), any_identifier)),
                     opt(preceded(multispace0, parse_property_value_map)), // Properties
                 )),
                 char(']'),
@@ -311,12 +308,28 @@ pub(super) fn parse_merge_clause(input: &str) -> IResult<&str, MergeClause> {
                     ),
                 ),
             ),
+            // ON CREATE / ON MATCH — case-insensitive and spacing-
+            // permissive (the modality grammar's shape; review R3-F1: the
+            // frozen single-space case-sensitive tags never landed the
+            // claimed parity).
             opt(preceded(
-                delimited(multispace1, tag("ON CREATE"), multispace1),
+                tuple((
+                    multispace1,
+                    tag_no_case("ON"),
+                    multispace1,
+                    tag_no_case("CREATE"),
+                    multispace1,
+                )),
                 parse_set_clause,
             )),
             opt(preceded(
-                delimited(multispace1, tag("ON MATCH"), multispace1),
+                tuple((
+                    multispace1,
+                    tag_no_case("ON"),
+                    multispace1,
+                    tag_no_case("MATCH"),
+                    multispace1,
+                )),
                 parse_set_clause,
             )),
         )),
@@ -333,7 +346,10 @@ pub(super) fn parse_optional_match_clause(
     input: &str,
 ) -> IResult<&str, (Vec<NodePattern>, Vec<EdgePattern>)> {
     map(
-        preceded(tag("OPTIONAL"), preceded(multispace1, parse_match_clause)),
+        preceded(
+            tag_no_case("OPTIONAL"),
+            preceded(multispace1, parse_match_clause),
+        ),
         |(nodes, edges)| {
             // Mark all nodes and edges as optional
             let optional_nodes = nodes

@@ -781,9 +781,9 @@ fn parse_distinct(input: &str) -> IResult<&str, bool> {
 // Parse ORDER BY clause
 fn parse_order_by(input: &str) -> IResult<&str, Vec<(String, bool)>> {
     preceded(
-        delimited(multispace1, tag("ORDER"), multispace1),
+        delimited(multispace1, tag_no_case("ORDER"), multispace1),
         preceded(
-            tag("BY"),
+            tag_no_case("BY"),
             preceded(
                 multispace1,
                 separated_list1(
@@ -793,7 +793,10 @@ fn parse_order_by(input: &str) -> IResult<&str, Vec<(String, bool)>> {
                             any_identifier,
                             opt(preceded(
                                 multispace1,
-                                alt((map(tag("ASC"), |_| true), map(tag("DESC"), |_| false))),
+                                alt((
+                                    map(tag_no_case("ASC"), |_| true),
+                                    map(tag_no_case("DESC"), |_| false),
+                                )),
                             )),
                         )),
                         |(var, asc_opt)| (var, asc_opt.unwrap_or(true)),
