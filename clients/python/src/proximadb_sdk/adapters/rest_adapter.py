@@ -1030,17 +1030,38 @@ class RestProtocolAdapter(SyncGraphDelegations, BaseProtocolAdapter):
     def search_envelope(
         self,
         collection_id: str,
-        vector: list[float],
+        vector,
         top_k: int = 10,
         include_vectors: bool = False,
         include_metadata: bool = True,
         **kwargs,
-    ) -> dict[str, Any]:
-        """Run the paged search envelope via the protocol client."""
+    ) -> Any:
+        """Run the first-page search envelope via the protocol client
+        (returns ``models.SearchEnvelope``; cursored continuation is
+        :meth:`search_next_page`)."""
         return self._client.search_envelope(
             collection_id=collection_id,
             vector=vector,
             top_k=top_k,
+            include_vectors=include_vectors,
+            include_metadata=include_metadata,
+            **kwargs,
+        )
+
+    def search_next_page(
+        self,
+        collection_id: str,
+        cursor: str,
+        include_vectors: bool = False,
+        include_metadata: bool = True,
+        **kwargs,
+    ) -> Any:
+        """Fetch the next SKS search page by cursor (the protocol
+        surface's continuation primitive; ``search_envelope`` takes no
+        cursor parameter)."""
+        return self._client.search_next_page(
+            collection_id,
+            cursor,
             include_vectors=include_vectors,
             include_metadata=include_metadata,
             **kwargs,

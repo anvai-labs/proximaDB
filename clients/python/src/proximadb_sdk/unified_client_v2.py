@@ -1366,8 +1366,9 @@ class ProximaDBClient:
         include_vectors: bool = False,
         include_metadata: bool = True,
         **kwargs,
-    ):
-        """Run the paged REST OpenAPI v2 search envelope."""
+    ) -> Any:
+        """Run the first-page REST OpenAPI v2 search envelope (the REST
+        adapter returns ``models.SearchEnvelope``)."""
         if hasattr(vector, "tolist"):
             vector = vector.tolist()
         return self._adapter_call(
@@ -1389,38 +1390,37 @@ class ProximaDBClient:
         include_vectors: bool = False,
         page_limit: int | None = None,
     ):
-        """Iterate search result ITEMS (v1's yield semantics): the envelope's
-        SKS cursor pages on REST (``page_limit`` bounds each fetch);
-        transports without the envelope surface fall back to a single
+        """Iterate search result ITEMS (v1's yield semantics and v1's
+        ``page_limit`` meaning: the MAXIMUM NUMBER OF PAGES fetched;
+        ``None`` is unbounded). First page via :meth:`search_envelope`;
+        continuation via the adapter's ``search_next_page`` (the protocol
+        surface's cursor primitive — ``search_envelope`` takes no cursor).
+        Transports without the envelope surface fall back to a single
         :meth:`search` page."""
         if hasattr(vector, "tolist"):
             vector = vector.tolist()
 
         def _page(env):
-            items = getattr(env, "items", None)
-            if items is None and isinstance(env, dict):
-                items = env.get("items", [])
-            return list(items or [])
+            if isinstance(env, dict):
+                return list(env.get("items") or [])
+            return list(getattr(env, "items", None) or [])
 
         def _cursor(env):
-            return (
-                getattr(env, "cursor", None)
-                if not isinstance(env, dict)
-                else env.get("cursor")
-            )
+            if isinstance(env, dict):
+                return env.get("cursor")
+            return getattr(env, "cursor", None)
 
         def _has_more(env):
-            return (
-                getattr(env, "has_more", False)
-                if not isinstance(env, dict)
-                else bool(env.get("has_more", False))
-            )
+            if isinstance(env, dict):
+                return bool(env.get("has_more", False))
+            return bool(getattr(env, "has_more", False))
 
+        pages_fetched = 0
         try:
             env = self.search_envelope(
                 collection_id,
                 vector,
-                top_k=page_limit or top_k,
+                top_k=top_k,
                 include_vectors=include_vectors,
                 include_metadata=include_metadata,
             )
@@ -1437,17 +1437,22 @@ class ProximaDBClient:
                 items = results.get("results", [])
             yield from list(items or [])
             return
+        pages_fetched += 1
         yield from _page(env)
         cursor = _cursor(env)
-        while cursor and _has_more(env):
-            env = self.search_envelope(
+        while (
+            cursor
+            and _has_more(env)
+            and (page_limit is None or pages_fetched < page_limit)
+        ):
+            env = self._adapter_call(
+                "search_next_page",
                 collection_id,
-                vector,
-                top_k=page_limit or top_k,
+                cursor,
                 include_vectors=include_vectors,
                 include_metadata=include_metadata,
-                cursor=cursor,
             )
+            pages_fetched += 1
             page = _page(env)
             if not page:
                 break
@@ -1547,7 +1552,10 @@ class ProximaDBClient:
         of v1's forced switch (v2 holds one adapter at a time). Builds the
         replacement BEFORE closing the old adapter, so a failed build
         leaves the client untouched."""
-        candidate = create_adapter(target_protocol, config=self.config, **self._kwargs)
+        switch_kwargs = dict(self._kwargs)
+        if self._data_dir is not None:
+            switch_kwargs.setdefault("data_dir", self._data_dir)
+        candidate = create_adapter(target_protocol, config=self.config, **switch_kwargs)
         old_adapter = self._adapter
         self._adapter = candidate
         self._protocol = target_protocol

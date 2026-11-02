@@ -321,10 +321,25 @@ class BaseProtocolAdapter(ABC):
         include_vectors: bool = False,
         include_metadata: bool = True,
         **kwargs,
-    ) -> dict[str, Any]:
-        """Run the paged REST OpenAPI v2 search envelope."""
+    ) -> Any:
+        """Run the first-page REST OpenAPI v2 search envelope (the
+        concrete REST adapter returns ``models.SearchEnvelope``)."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support the paged search envelope"
+        )
+
+    def search_next_page(
+        self,
+        collection_id: str,
+        cursor: str,
+        include_vectors: bool = False,
+        include_metadata: bool = True,
+        **kwargs,
+    ) -> Any:
+        """Continue a paged search by cursor (transports with the
+        envelope surface only)."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support cursor-continued search"
         )
 
     def execute_sql(

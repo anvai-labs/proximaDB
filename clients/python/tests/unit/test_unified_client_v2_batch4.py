@@ -275,34 +275,62 @@ class TestCompositions:
         out = client.scan("c1", max_rows=1)
         assert out == [{"id": 1}]
 
-    def test_search_iter_yields_items_over_real_envelopes(self, client):
-        """v1's yield semantics: ITEMS, not pages — over the REAL
-        models.SearchEnvelope shape (.items/.cursor/.has_more)."""
+    def test_search_iter_pages_via_next_page_primitive(self, client):
+        """Continuation uses the adapter's search_next_page (the protocol
+        surface's cursor primitive — search_envelope takes NO cursor);
+        v1's ITEM-yield semantics."""
         from proximadb_sdk.models import SearchEnvelope, SearchResult
 
         def item(i):
             return SearchResult(id=f"r{i}", score=0.9, metadata={})
 
-        envs = [
-            SearchEnvelope(
-                items=[item(1), item(2)], total=2, cursor="k2", has_more=True
-            ),
-            SearchEnvelope(items=[item(3)], total=3, cursor=None, has_more=False),
-        ]
-        client._adapter.search_envelope = MagicMock(side_effect=envs)
+        env1 = SearchEnvelope(
+            items=[item(1), item(2)], total=2, cursor="k2", has_more=True
+        )
+        env2 = SearchEnvelope(items=[item(3)], total=3, cursor=None, has_more=False)
+        client._adapter.search_envelope.return_value = env1
+        client._adapter.search_next_page.return_value = env2
+
         got = list(client.search_iter("c1", [0.1]))
+
         assert [r.id for r in got] == ["r1", "r2", "r3"]
+        client._adapter.search_next_page.assert_called_once_with(
+            "c1", "k2", include_vectors=False, include_metadata=True
+        )
 
-    def test_search_iter_stops_on_empty_page(self, client):
-        from proximadb_sdk.models import SearchEnvelope
+    def test_search_iter_page_limit_is_max_pages_v1_semantics(self, client):
+        """v1's page_limit meaning: the MAXIMUM NUMBER OF PAGES — a caller
+        passing page_limit=1 gets only the first page even when has_more."""
+        from proximadb_sdk.models import SearchEnvelope, SearchResult
 
-        envs = [
-            SearchEnvelope(items=[], total=0, cursor="k2", has_more=True),
-            SearchEnvelope(items=[], total=0, cursor="k3", has_more=True),
-        ]
-        client._adapter.search_envelope = MagicMock(side_effect=envs)
-        assert list(client.search_iter("c1", [0.1])) == []
-        assert client._adapter.search_envelope.call_count == 2  # empty page stops
+        def item(i):
+            return SearchResult(id=f"r{i}", score=0.9, metadata={})
+
+        env1 = SearchEnvelope(items=[item(1)], total=1, cursor="k2", has_more=True)
+        client._adapter.search_envelope.return_value = env1
+
+        got = list(client.search_iter("c1", [0.1], page_limit=1))
+
+        assert [r.id for r in got] == ["r1"]
+        client._adapter.search_next_page.assert_not_called()
+
+    def test_search_iter_stops_on_empty_continuation_page(self, client):
+        from proximadb_sdk.models import SearchEnvelope, SearchResult
+
+        env1 = SearchEnvelope(
+            items=[SearchResult(id="r1", score=0.9, metadata={})],
+            total=1,
+            cursor="k2",
+            has_more=True,
+        )
+        empty = SearchEnvelope(items=[], total=1, cursor="k3", has_more=True)
+        client._adapter.search_envelope.return_value = env1
+        client._adapter.search_next_page.return_value = empty
+
+        got = list(client.search_iter("c1", [0.1]))
+
+        assert [r.id for r in got] == ["r1"]
+        assert client._adapter.search_next_page.call_count == 1  # empty stops
 
     def test_search_iter_falls_back_to_single_search(self, client, mock_adapter):
         mock_adapter.search_envelope.side_effect = ProximaDBNotSupportedError("x")
