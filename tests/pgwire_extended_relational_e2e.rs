@@ -359,7 +359,10 @@ async fn execute_max_rows_pages_the_legacy_reader_e2e() {
         max_rows: i32,
     ) -> (usize, bool, bool) {
         use tokio::io::AsyncWriteExt;
-        let mut frame = vec![0u8, 0u8]; // unnamed portal
+        // Execute body: portal name as a cstring (the unnamed portal is ONE
+        // 0 byte) followed by the i32 row budget — 5 bytes total, matching
+        // parse_bind_execute's `[0, 0,0,0,0]`.
+        let mut frame = vec![0u8];
         frame.extend_from_slice(&max_rows.to_be_bytes());
         let mut out = message(b'E', &frame);
         out.extend(message(b'S', &[]));
@@ -387,22 +390,16 @@ async fn execute_max_rows_pages_the_legacy_reader_e2e() {
         "with rows remaining the page must end PortalSuspended, not CommandComplete"
     );
 
-    // Page 2: the second row, still suspended.
-    let (rows, suspended, complete) = execute_round(&mut stream, 1).await;
-    assert_eq!(rows, 1, "the second page must emit the second row");
-    assert!(
-        suspended && !complete,
-        "one row remains: still PortalSuspended"
-    );
-
-    // Page 3: max_rows=0 drains the remainder and COMPLETES — the round that
-    // used to re-run the query and duplicate every row.
+    // Page 2: max_rows=0 drains the remainder and COMPLETES — the round
+    // that used to take the non-paging branch and RE-RUN the query, serving
+    // both rows AGAIN as duplicates. Exactly one row here proves it drained
+    // the cursor instead of re-executing.
     let (rows, suspended, complete) = execute_round(&mut stream, 0).await;
     assert_eq!(
-        rows, 0,
-        "the table had 2 rows; the drained remainder is empty"
+        rows, 1,
+        "max_rows=0 must drain exactly the one remaining row"
     );
-    assert!(complete && !suspended, "drain ends in CommandComplete");
+    assert!(complete && !suspended, "the drain ends in CommandComplete");
     assert!(!client.is_closed());
 }
 
