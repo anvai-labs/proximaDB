@@ -438,6 +438,10 @@ jobs:
               # this lane; the writer, the REST catalog and the gate itself feed it.
               - 'crates/storage/proximadb-iceberg-engine/**'
               - 'crates/control/proximadb-catalog/src/iceberg_rest_service.rs'
+              # Materialization and its format gates feed the same external
+              # Iceberg/retention contract; F8 escaped this lane without them.
+              - 'src/services/dml/**'
+              - 'src/services/storage_format.rs'
               - 'tests/iceberg_interop_e2e.rs'
               - 'scripts/iceberg_readback.py'
               # Release-review F2: the ordered-DV-base OLAP merge and the
