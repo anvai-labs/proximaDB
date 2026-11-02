@@ -23,6 +23,14 @@ pub mod hybrid;
 pub mod multimodal_query;
 pub mod observability;
 
+/// Shared default for pagination `limit` fields across canonical REST endpoints.
+pub(crate) const DEFAULT_LIMIT: u32 = 100;
+
+/// Serde-compatible accessor for [`DEFAULT_LIMIT`] (serde `default = "..."` needs a fn path).
+pub(crate) fn default_limit() -> u32 {
+    DEFAULT_LIMIT
+}
+
 // Deprecation-header utilities live in `crate::rest::deprecation` (a sibling
 // module) and are re-exported here so the adapters' `super::with_v1_compatibility_headers`
 // call sites resolve. See TD-V1SUNSET-1 step 2.

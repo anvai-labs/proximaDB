@@ -347,8 +347,11 @@ fn trusted_proxies() -> &'static crate::client_addr::TrustedProxies {
     TRUSTED.get_or_init(crate::client_addr::TrustedProxies::from_env)
 }
 
-/// Check if the path is a health endpoint
-fn is_health_endpoint(path: &str) -> bool {
+/// Check if the path is a health endpoint.
+///
+/// Shared across rate-limit, auth, and TLS middleware so the definition
+/// of "health endpoint" stays in one place.
+pub fn is_health_endpoint(path: &str) -> bool {
     path.starts_with("/health")
 }
 

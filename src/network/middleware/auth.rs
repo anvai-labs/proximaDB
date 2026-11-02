@@ -23,6 +23,7 @@ use axum::{
     middleware::Next,
     response::{Json, Response},
 };
+use proximadb_network_middleware::rate_limit::is_health_endpoint;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -153,11 +154,6 @@ pub async fn auth_middleware(
     Ok(next.run(request).await)
 }
 
-/// Check if the path is a health endpoint
-fn is_health_endpoint(path: &str) -> bool {
-    path.starts_with("/health")
-}
-
 /// Extension trait to extract user info from requests
 pub trait RequestUserInfo {
     /// Extract authenticated user information from request extensions
@@ -173,15 +169,6 @@ impl<T> RequestUserInfo for Request<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_is_health_endpoint() {
-        assert!(is_health_endpoint("/health"));
-        assert!(is_health_endpoint("/health/ready"));
-        assert!(is_health_endpoint("/health/live"));
-        assert!(!is_health_endpoint("/collections"));
-        assert!(!is_health_endpoint("/api/health"));
-    }
 
     #[test]
     fn test_auth_config_default() {

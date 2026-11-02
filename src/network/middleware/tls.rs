@@ -50,6 +50,7 @@ use axum::{
     middleware::Next,
     response::{Json, Response},
 };
+use proximadb_network_middleware::rate_limit::is_health_endpoint;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -407,11 +408,6 @@ pub fn matches_cn_pattern(cn: &str, pattern: &str) -> bool {
     cn == pattern
 }
 
-/// Check if path is a health endpoint
-fn is_health_endpoint(path: &str) -> bool {
-    path.starts_with("/health")
-}
-
 /// Extension trait to extract TLS authenticated user from requests
 pub trait TlsAuthenticatedUserExt {
     /// Get the TLS authenticated user if present
@@ -516,15 +512,6 @@ mod tests {
             Some(&"admin-service".to_string())
         );
         assert_eq!(config.default_roles.len(), 2);
-    }
-
-    #[test]
-    fn test_is_health_endpoint() {
-        assert!(is_health_endpoint("/health"));
-        assert!(is_health_endpoint("/health/ready"));
-        assert!(is_health_endpoint("/health/live"));
-        assert!(!is_health_endpoint("/api/collections"));
-        assert!(!is_health_endpoint("/api/health")); // Different prefix
     }
 
     // ============================================================

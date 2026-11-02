@@ -107,10 +107,7 @@ fn split_header(data: &[u8]) -> Result<(IndexHeader, &[u8])> {
 }
 
 fn unix_now_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default()
+    proximadb_kernel::time::now_unix_ms() as u128
 }
 
 /// Serialization error types
