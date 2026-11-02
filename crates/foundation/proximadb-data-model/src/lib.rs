@@ -825,16 +825,28 @@ mod tests {
     fn numeric_f64_conversion_preserves_rust_cast_semantics() {
         use ProximaValue as V;
         for (value, expected) in [
-            (V::Int8(i8::MIN), i8::MIN as f64),
-            (V::Int16(i16::MIN), i16::MIN as f64),
-            (V::Int32(i32::MIN), i32::MIN as f64),
-            (V::Int64(i64::MIN), i64::MIN as f64),
-            (V::UInt8(u8::MAX), u8::MAX as f64),
-            (V::UInt16(u16::MAX), u16::MAX as f64),
-            (V::UInt32(u32::MAX), u32::MAX as f64),
-            (V::UInt64(u64::MAX), u64::MAX as f64),
+            (V::Int8(i8::MIN), -128.0),
+            (V::Int16(i16::MIN), -32_768.0),
+            (V::Int32(i32::MIN), -2_147_483_648.0),
+            (V::Int64(i64::MIN), -9_223_372_036_854_775_808.0),
+            (V::Int64(i64::MAX), 9_223_372_036_854_775_808.0),
+            (V::UInt8(u8::MAX), 255.0),
+            (V::UInt16(u16::MAX), 65_535.0),
+            (V::UInt32(u32::MAX), 4_294_967_295.0),
+            (V::UInt64(u64::MAX), 18_446_744_073_709_551_616.0),
+            // The first integers beyond f64's exact range pin ties-to-even rounding.
+            (V::Int64(9_007_199_254_740_993), 9_007_199_254_740_992.0),
+            (V::Int64(-9_007_199_254_740_993), -9_007_199_254_740_992.0),
+            (V::UInt64(9_007_199_254_740_995), 9_007_199_254_740_996.0),
             (V::Float16(1.5), 1.5),
+            (V::Float16(-0.0), -0.0),
+            (V::Float16(f32::INFINITY), f64::INFINITY),
+            (V::Float16(f32::NEG_INFINITY), f64::NEG_INFINITY),
+            (V::Float32(-0.0), -0.0),
             (V::Float32(f32::INFINITY), f64::INFINITY),
+            (V::Float32(f32::NEG_INFINITY), f64::NEG_INFINITY),
+            (V::Float64(f64::INFINITY), f64::INFINITY),
+            (V::Float64(f64::NEG_INFINITY), f64::NEG_INFINITY),
             (V::Float64(-0.0), -0.0),
         ] {
             assert_eq!(
@@ -842,6 +854,18 @@ mod tests {
                 Some(expected.to_bits())
             );
         }
+        assert!(
+            V::Float16(f32::NAN)
+                .as_numeric_f64()
+                .is_some_and(f64::is_nan)
+        );
+        let nan_bits = 0x7ff8_0000_0000_1234;
+        assert_eq!(
+            V::Float64(f64::from_bits(nan_bits))
+                .as_numeric_f64()
+                .map(f64::to_bits),
+            Some(nan_bits)
+        );
         assert!(
             V::Float32(f32::NAN)
                 .as_numeric_f64()
@@ -864,12 +888,23 @@ mod tests {
             V::Symbol("42".into()),
             V::Decimal("42.5".into()),
             V::Date(42),
+            V::Time(42, TimeUnit::Millisecond),
             V::Timestamp(42, TimeUnit::Millisecond),
+            V::TimestampTz(42, TimeUnit::Millisecond),
+            V::Uuid([0; 16]),
+            V::ULID([0; 16]),
             V::Json(serde_json::json!(42)),
             V::Jsonb(serde_json::json!(42)),
             V::Binary(vec![42]),
             V::Array(vec![V::Int64(42)]),
+            V::Map(std::collections::HashMap::new()),
+            V::Struct(std::collections::HashMap::new()),
             V::DenseVector(vec![42.0]),
+            V::SparseVector {
+                indices: vec![0],
+                values: vec![42.0],
+            },
+            V::BinaryVector(vec![42]),
         ] {
             assert_eq!(value.as_numeric_f64(), None, "{value:?}");
         }
