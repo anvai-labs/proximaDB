@@ -10,6 +10,7 @@ mod tests {
     #[test]
     fn test_storage_locations_config() {
         let config = StorageConfig {
+            write_lease_ttl_ms: 10_000,
             storage_locations: vec![
                 StorageLocation {
                     url: "file:///nvme1/proximadb".to_string(),
