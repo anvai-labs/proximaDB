@@ -3,7 +3,9 @@
   ProximaDB Windows Installer (WiX v4)
 
   This manifest creates an MSI installer for ProximaDB on Windows.
-  Build with: wix build -d Version=0.2.0 proximadb.wxs -o proximadb-x64.msi
+  Build with: wix build -arch x64 -d Version=0.5.1 proximadb.wxs -o proximadb-x64.msi
+  (`-arch x64` is REQUIRED: WiX v4 defaults to x86 and Windows Installer then
+  redirects ProgramFiles64Folder — the v0.5.0 MSI bug; see release.yml's verify step)
 
   Features:
   - Installs binaries to C:\Program Files\ProximaDB\
