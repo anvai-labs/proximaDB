@@ -19,7 +19,7 @@
 //! Contains collection management utilities for the SST engine.
 //! This module provides:
 //! - Collection metadata and statistics
-//! - File management and cleanup operations
+//! - File management operations
 //! - Vector existence checking with bloom filters
 //! - Collection scanning and enumeration
 

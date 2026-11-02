@@ -14,9 +14,10 @@
 
 == The facts (established 2026-11-01, PR #2338 review)
 
-1. `StorageEngine::delete_collection` has exactly one repo-wide caller: a unit
-   test (`src/storage/tests/storage_engine_simple_tests.rs`) that asserts
-   `Ok(false)`. No REST/gRPC/pgwire/Flight surface reaches it. The production
+1. `StorageEngine::delete_collection` has exactly two repo-wide callers, both
+   tests: a unit test asserting `Ok(false)`
+   (`src/storage/tests/storage_engine_simple_tests.rs`) and the concurrency
+   test's delete arm (`storage_engine_concurrency_tests.rs`). No REST/gRPC/pgwire/Flight surface reaches it. The production
    DROP path is `CollectionManager::delete_collection` →
    `cleanup_storage_directories` (`src/services/collection/manager.rs`), which
    recursively removes both the legacy `{base}/{uuid}` and typed
